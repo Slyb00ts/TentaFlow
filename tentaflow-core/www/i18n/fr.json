@@ -5389,7 +5389,8 @@
       "by_scheduler": "planificateur",
       "by_unknown_account": "compte inconnu",
       "subject_last_known": "vu pour la dernière fois comme {name}",
-      "smart_batch_refused": "Test SMART non lancé sur {n} {n|disque|disques|disques} : {disks}"
+      "smart_batch_refused": "Test SMART non lancé sur {n} {n|disque|disques|disques} : {disks}",
+      "kind_elastic_add_disk_abort": "Annulation de l’ajout d’un disque de données à un Elastic Array"
     },
     "danger": {
       "retype": "Saisissez {name} pour confirmer :",
@@ -5601,7 +5602,49 @@
       "member_parity": "disque de parité {n}",
       "disk_absent": "disque absent",
       "last_seen_as": "vu pour la dernière fois comme {name}",
-      "parity_errors_window": "Erreurs de parité ({n} {n|jour|jours|jours})"
+      "parity_errors_window": "Erreurs de parité ({n} {n|jour|jours|jours})",
+      "refused_operation_pending": "Une autre opération de la grappe était en cours ou non tranchée ; rien n’a été modifié.",
+      "refused_attention_other": "La grappe attendait la restauration de ses montages ; rien n’a été modifié.",
+      "refused_fault_unacknowledged": "La synchronisation malgré une erreur non corrigée n’a pas été confirmée ; rien n’a été modifié.",
+      "refused_attention_add_disk": "L’ajout d’un disque à la grappe n’était pas terminé ; rien n’a été modifié.",
+      "attention_sync_failed": "La dernière synchronisation a échoué : une partie de la parité a pu être réécrite. Relancez la synchronisation.",
+      "attention_scrub_failed": "Le dernier scrub a signalé des erreurs ou ne s’est pas terminé correctement.",
+      "attention_fix_failed": "La dernière réparation depuis la parité a échoué.",
+      "attention_add_disk": "L’ajout d’un disque à la grappe n’a pas été terminé.",
+      "attention_other": "La grappe attend la restauration de ses montages (Restaurer les montages).",
+      "next_steps": "Étapes suivantes",
+      "step_repair": "Réparez depuis la parité les blocs que le scrub a marqués comme défectueux.",
+      "step_scrub": "Lancez un scrub pour vérifier s’il reste quelque chose à réparer.",
+      "step_sync": "Lancez une synchronisation — elle exige une confirmation, car elle retire du fichier content les fichiers que le scrub n’a pas pu lire.",
+      "sync_fault_title": "Synchronisation malgré une erreur non corrigée dans la grappe {name}",
+      "sync_fault_warning": "La grappe {name} a une erreur de scrub ou de réparation non corrigée. La synchronisation écrit malgré tout un nouveau point de contrôle de parité.",
+      "sync_fault_loses": "Les fichiers que le scrub n’a pas pu lire seront retirés du fichier content — la parité ne les couvrira plus.",
+      "sync_fault_keeps": "Les blocs marqués par le scrub restent réparables par une réparation depuis la parité.",
+      "sync_fault_explain": "Lancez d’abord la réparation depuis la parité si elle est disponible, puis un scrub. La synchronisation est la bonne étape lorsque les erreurs concernent des fichiers modifiés depuis la dernière synchronisation.",
+      "sync_fault_retype": "Saisissez à nouveau le nom de la grappe pour confirmer :",
+      "sync_fault_confirm": "Synchroniser malgré l’erreur",
+      "sync_fault_hint": "La synchronisation exige une confirmation : la grappe a une erreur de scrub ou de réparation non corrigée.",
+      "add_disk_resume": "Terminer l’ajout du disque {disk}",
+      "add_disk_resume_title": "Terminer l’ajout du disque {disk} à la grappe {name}",
+      "add_disk_resume_explain": "Terminer ne répète que les étapes que l’ajout n’a pas encore faites et se conclut par la synchronisation qui place le nouveau disque sous la parité. La grappe reste disponible tout du long.",
+      "add_disk_resume_confirm": "Terminer l’ajout",
+      "add_disk_resume_done": "La fin de l’ajout du disque a été acceptée. Vérifiez le résultat de la tâche.",
+      "add_disk_pending": "L’ajout du disque {disk} n’a pas été terminé.",
+      "add_disk_step_format": "Il s’est arrêté avant la fin du formatage du disque.",
+      "add_disk_step_mount": "Il s’est arrêté avant le montage du disque.",
+      "add_disk_step_join": "Il s’est arrêté avant que le disque ne rejoigne le partage.",
+      "add_disk_step_sync": "Le disque est déjà dans le partage ; il reste la synchronisation qui le place sous la parité.",
+      "add_disk_step_unknown": "On ne sait pas à quelle étape il s’est arrêté.",
+      "add_disk_new_disk": "nouveau disque",
+      "add_disk_undo": "Annuler",
+      "add_disk_undo_title": "Annuler l’ajout du disque {disk} à la grappe {name}",
+      "add_disk_undo_warning": "Le disque {disk} n’a pas rejoint le partage. L’annulation le retire de la grappe {name} et n’efface que le système de fichiers que cet ajout lui a donné.",
+      "add_disk_undo_explain": "La grappe revient à son état d’avant l’ajout. Le disque redevient libre et pourra être ajouté à nouveau.",
+      "add_disk_undo_confirm": "Annuler l’ajout",
+      "add_disk_undo_done": "L’annulation de l’ajout du disque a été acceptée. Vérifiez le résultat de la tâche.",
+      "add_disk_undo_unavailable": "Le disque a peut-être déjà rejoint le partage — l’ajout ne peut qu’être terminé.",
+      "repair_add_pending": "la grappe a un ajout de disque inachevé : terminez-le ou annulez-le d’abord",
+      "repair_needs_restore": "la grappe attend la restauration de ses montages : utilisez d’abord « Restaurer les montages »"
     },
     "wizard_pool": {
       "elastic_data": "Disques de données",
@@ -6704,6 +6747,10 @@
         "targets_sweep_stale": {
           "title": "Cibles bloc : le nœud n'atteint pas l'état qu'il a décidé",
           "detail": "Avant le redémarrage, des cibles bloc de ce nœud n'étaient pas dans l'état décidé ; la prochaine réconciliation remplacera ceci par le nombre actuel"
+        },
+        "elastic_add_disk_abort_unconfirmed": {
+          "title": "Grappe {array} : annulation de l’ajout de disque non confirmée",
+          "detail": "L’annulation s’est arrêtée après sa première étape ; l’ajout du disque reste inachevé et peut être terminé ou annulé à nouveau. L’erreur de l’étape figure dans le texte du nœud"
         }
       },
       "node_text": "Texte du nœud",
@@ -6717,7 +6764,7 @@
         "reallocated": "{n} {n|secteur réalloué|secteurs réalloués}",
         "temperature_over_limit": "la température de {t}°C dépasse la limite de {limit}°C",
         "temperature_high": "température de {t}°C",
-        "temperature_high_limit": "la température de {t}°C dépasse le seuil de {limit}°C",
+        "temperature_high_limit": "température de {t}°C (seuil d'alerte {limit}°C)",
         "crc_errors": "{n} {n|erreur|erreurs} CRC (câble ou fond de panier)",
         "wear": "usure de {n} %",
         "no_smart_data": "aucune donnée SMART",
@@ -7189,7 +7236,8 @@
       "ttl_label": "Demande valable pendant (heures)",
       "single_admin": "Un seul administrateur détient nas.admin : lever la protection d'un snapshot passe par le chemin rouge ordinaire (nom retapé + mot de passe sudo), car personne ne pourrait l'approuver. Dès qu'un second administrateur existe, cela revient dans la file d'approbation.",
       "op_target_delete": "Suppression d'une cible bloc",
-      "op_elastic_schedule": "Armer une planification Elastic"
+      "op_elastic_schedule": "Armer une planification Elastic",
+      "op_elastic_add_disk_abort": "Elastic Array · Annulation de l’ajout d’un disque"
     },
     "access": {
       "title": "Journal d'accès",
@@ -7478,7 +7526,25 @@
       "approval_already_rejected": "Cette demande a déjà été refusée",
       "approval_already_expired": "Cette demande a déjà expiré",
       "approval_closed": "Cette demande a déjà fait l’objet d’une décision",
-      "approval_expired": "La demande a expiré avant que quiconque n'en décide"
+      "approval_expired": "La demande a expiré avant que quiconque n'en décide",
+      "elastic_no_parity": "La grappe n’a pas de parité : SnapRAID n’a rien à vérifier ni à écrire",
+      "elastic_precondition_failed": "La grappe n’est pas prête pour cette opération : ses montages, son formatage ou sa première synchronisation ne sont pas confirmés",
+      "elastic_unsynced_changes": "Les données ont changé depuis la dernière synchronisation, le scrub n’a donc pas démarré — lancez d’abord une synchronisation",
+      "elastic_empty_parity": "La parité est vide, le scrub n’a donc rien à vérifier — lancez d’abord une synchronisation",
+      "elastic_operation_pending": "Une autre opération de la grappe est en cours ou n’a pas été tranchée — réessayez quand elle sera terminée",
+      "elastic_attention_other": "La grappe doit d’abord être restaurée (Restaurer les montages) ; ensuite seulement elle accepte cette opération",
+      "elastic_fault_unacknowledged": "Une synchronisation malgré une erreur de scrub ou de réparation non corrigée exige de confirmer son coût sur l’écran de la grappe",
+      "elastic_attention_add_disk": "L’ajout d’un disque à la grappe n’est pas terminé — terminez-le ou annulez-le d’abord",
+      "elastic_attention_parity_fault": "La grappe a une erreur de parité non résolue — d’abord réparation, scrub ou synchronisation",
+      "elastic_disk_claimed": "Le disque appartient déjà à cette grappe ou à une autre, ou porte un système de fichiers étranger",
+      "elastic_add_joined": "Le disque a peut-être déjà rejoint le partage — l’ajout ne peut qu’être terminé",
+      "elastic_fault_changed": "La grappe a enregistré une nouvelle erreur de scrub ou de réparation depuis la confirmation — confirmez à nouveau la synchronisation sur l’écran de la grappe",
+      "elastic_nothing_to_undo": "La grappe n’a pas d’ajout inachevé de ce disque — il n’y a rien à annuler",
+      "elastic_state_unknown": "L’état de la grappe n’a pas pu être lu, rien ne prouve donc que le disque n’a jamais rejoint le partage — réessayez",
+      "elastic_array_not_ready": "La grappe doit être activée et active, ou demander une intervention",
+      "elastic_add_stopped": "L’ajout du disque s’est arrêté avant la fin — terminez-le ou annulez-le sur l’écran de la grappe",
+      "elastic_undo_stopped": "L’annulation de l’ajout s’est arrêtée après sa première étape — l’ajout reste inachevé",
+      "elastic_disk_absent": "Le disque qui serait effacé n’est pas présent sur ce nœud — rebranchez-le et réessayez"
     }
   },
   "agent_accounts": {

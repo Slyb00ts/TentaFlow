@@ -54,6 +54,7 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         | HelperCommand::ElasticMover { .. }
         | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. }
         | HelperCommand::ElasticFix { .. } | HelperCommand::ElasticAddDisk { .. }
+        | HelperCommand::ElasticAddDiskAbort { .. }
         | HelperCommand::ElasticDestroy { .. }
         | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticCacheAge { .. }
         | HelperCommand::ElasticClaims { .. }

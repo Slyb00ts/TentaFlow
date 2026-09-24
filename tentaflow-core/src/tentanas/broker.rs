@@ -580,7 +580,7 @@ mod tests {
         // A NEWER helper is refused for the same reason: neither build speaks
         // this core's sequence.
         assert!(matches!(
-            version_gate(&elastic, Some("0.14.0")),
+            version_gate(&elastic, Some("0.15.0")),
             Err(BrokerError::HelperVersion(_))
         ));
 

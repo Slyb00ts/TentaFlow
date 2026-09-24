@@ -6640,6 +6640,10 @@
         "targets_sweep_stale": {
           "title": "Block targets: this node cannot reach the state it decided on",
           "detail": "Block targets on this node were not in the state it decided on before it restarted; the next reconcile replaces this with the current count"
+        },
+        "elastic_add_disk_abort_unconfirmed": {
+          "title": "Array {array}: undoing the disk addition is unconfirmed",
+          "detail": "The undo stopped after its first step; the disk addition stays unfinished and can be finished or undone again. The step error is in the node text"
         }
       },
       "node_text": "The node's text",
@@ -6653,7 +6657,7 @@
         "reallocated": "{n} reallocated {n|sector|sectors}",
         "temperature_over_limit": "temperature {t}°C is over the {limit}°C limit",
         "temperature_high": "temperature {t}°C",
-        "temperature_high_limit": "temperature {t}°C is over the {limit}°C threshold",
+        "temperature_high_limit": "temperature {t}°C (warning threshold {limit}°C)",
         "crc_errors": "{n} CRC {n|error|errors} (cable or backplane)",
         "wear": "{n}% worn",
         "no_smart_data": "no SMART data",
@@ -6875,7 +6879,8 @@
       "by_scheduler": "scheduler",
       "by_unknown_account": "unknown account",
       "subject_last_known": "last seen as {name}",
-      "smart_batch_refused": "SMART test not started on {n} {n|disk|disks|disks}: {disks}"
+      "smart_batch_refused": "SMART test not started on {n} {n|disk|disks|disks}: {disks}",
+      "kind_elastic_add_disk_abort": "Undo a data disk addition to an Elastic Array"
     },
     "elevation": {
       "title": "System privilege channel",
@@ -7351,7 +7356,49 @@
       "member_parity": "parity disk {n}",
       "disk_absent": "disk missing",
       "last_seen_as": "last seen as {name}",
-      "parity_errors_window": "Parity errors ({n} {n|day|days|days})"
+      "parity_errors_window": "Parity errors ({n} {n|day|days|days})",
+      "refused_operation_pending": "Another operation of the array was running or unsettled; nothing was changed.",
+      "refused_attention_other": "The array was waiting for its mounts to be restored; nothing was changed.",
+      "refused_fault_unacknowledged": "The Sync over an unrepaired fault was not confirmed; nothing was changed.",
+      "refused_attention_add_disk": "A disk addition on the array was unfinished; nothing was changed.",
+      "attention_sync_failed": "The last Sync failed: part of parity may have been rewritten. Run the Sync again.",
+      "attention_scrub_failed": "The last scrub reported errors or did not finish correctly.",
+      "attention_fix_failed": "The last repair from parity failed.",
+      "attention_add_disk": "Adding a disk to the array was not finished.",
+      "attention_other": "The array is waiting for its mounts to be restored (Restore mounts).",
+      "next_steps": "What next",
+      "step_repair": "Repair the blocks the scrub marked as bad from parity.",
+      "step_scrub": "Run a scrub to check whether anything is left to repair.",
+      "step_sync": "Run a Sync — it needs a confirmation, because it removes the files the scrub could not read from the content file.",
+      "sync_fault_title": "Sync despite an unrepaired fault in array {name}",
+      "sync_fault_warning": "Array {name} has an unrepaired scrub or repair fault. The Sync writes a new parity checkpoint despite it.",
+      "sync_fault_loses": "Files the scrub could not read will be removed from the content file — parity will no longer cover them.",
+      "sync_fault_keeps": "Blocks the scrub marked stay repairable by a repair from parity.",
+      "sync_fault_explain": "Run the repair from parity first if it is available, then a scrub. A Sync is the right step when the errors are in files changed since the last Sync.",
+      "sync_fault_retype": "Retype the array name to confirm:",
+      "sync_fault_confirm": "Run the Sync despite the fault",
+      "sync_fault_hint": "The Sync needs a confirmation: the array has an unrepaired scrub or repair fault.",
+      "add_disk_resume": "Finish adding disk {disk}",
+      "add_disk_resume_title": "Finish adding disk {disk} to array {name}",
+      "add_disk_resume_explain": "Finishing repeats only the steps the addition has not done yet and ends with the Sync that brings the new disk under parity. The array stays available throughout.",
+      "add_disk_resume_confirm": "Finish the addition",
+      "add_disk_resume_done": "Finishing the disk addition was accepted. Check the job result.",
+      "add_disk_pending": "Adding disk {disk} was not finished.",
+      "add_disk_step_format": "It stopped before formatting the disk was finished.",
+      "add_disk_step_mount": "It stopped before the disk was mounted.",
+      "add_disk_step_join": "It stopped before the disk joined the share.",
+      "add_disk_step_sync": "The disk is already in the share; the Sync that brings it under parity is left.",
+      "add_disk_step_unknown": "It is not known at which step it stopped.",
+      "add_disk_new_disk": "new disk",
+      "add_disk_undo": "Undo",
+      "add_disk_undo_title": "Undo adding disk {disk} to array {name}",
+      "add_disk_undo_warning": "Disk {disk} has not joined the share. Undoing removes it from array {name} and erases only the filesystem this addition gave it.",
+      "add_disk_undo_explain": "The array returns to its state before the addition. The disk becomes free again and can be added again.",
+      "add_disk_undo_confirm": "Undo the addition",
+      "add_disk_undo_done": "Undoing the disk addition was accepted. Check the job result.",
+      "add_disk_undo_unavailable": "The disk may already have joined the share — the addition can only be finished.",
+      "repair_add_pending": "the array has an unfinished disk addition: finish it or undo it first",
+      "repair_needs_restore": "the array is waiting for its mounts to be restored: use Restore mounts first"
     },
     "wizard_pool": {
       "elastic_data": "Data disks",
@@ -8405,7 +8452,8 @@
       "ttl_label": "Request stays valid for (hours)",
       "single_admin": "Only one administrator holds nas.admin: lifting a snapshot's protection goes through the ordinary red path (retyped name + sudo password), because nobody could approve it. As soon as a second administrator exists it returns to the approval queue.",
       "op_target_delete": "Block target deletion",
-      "op_elastic_schedule": "Arm an Elastic schedule"
+      "op_elastic_schedule": "Arm an Elastic schedule",
+      "op_elastic_add_disk_abort": "Elastic Array · Undo disk addition"
     },
     "access": {
       "title": "Access log",
@@ -8694,7 +8742,25 @@
       "approval_already_rejected": "This request has already been rejected",
       "approval_already_expired": "This request has already expired",
       "approval_closed": "This request has already been decided",
-      "approval_expired": "The request expired before anybody decided on it"
+      "approval_expired": "The request expired before anybody decided on it",
+      "elastic_no_parity": "The array has no parity, so SnapRAID has nothing to check or write",
+      "elastic_precondition_failed": "The array is not ready for this operation: its mounts, formatting or first Sync are not confirmed",
+      "elastic_unsynced_changes": "Data changed since the last Sync, so the scrub did not start — run a Sync first",
+      "elastic_empty_parity": "Parity is empty, so the scrub has nothing to check — run a Sync first",
+      "elastic_operation_pending": "Another operation of the array is running or has not been settled — try again once it ends",
+      "elastic_attention_other": "The array has to be restored first (Restore mounts); only then does it accept this operation",
+      "elastic_fault_unacknowledged": "A Sync over an unrepaired scrub or repair fault needs its cost confirmed on the array screen",
+      "elastic_attention_add_disk": "The array has an unfinished disk addition — finish it or undo it first",
+      "elastic_attention_parity_fault": "The array has an unresolved parity fault — repair, scrub or Sync first",
+      "elastic_disk_claimed": "The disk already belongs to this or another array, or carries a foreign filesystem",
+      "elastic_add_joined": "The disk may already have joined the share — the addition can only be finished",
+      "elastic_fault_changed": "The array recorded a new scrub or repair fault since the confirmation — confirm the Sync again on the array screen",
+      "elastic_nothing_to_undo": "The array has no unfinished addition of this disk — there is nothing to undo",
+      "elastic_state_unknown": "The array state could not be read, so nothing proves the disk never joined the share — try again",
+      "elastic_array_not_ready": "The array has to be enabled and active or needing attention",
+      "elastic_add_stopped": "The disk addition stopped before its end — finish it or undo it on the array screen",
+      "elastic_undo_stopped": "Undoing the addition stopped after its first step — the addition stays unfinished",
+      "elastic_disk_absent": "The disk that would be erased is not present on this node — reconnect it and try again"
     }
   },
   "agent_accounts": {

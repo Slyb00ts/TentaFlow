@@ -49,6 +49,10 @@ pub const OP_ELASTIC_FIX: &str = "elastic_fix";
 /// so this destroys whatever was on it — the same blast radius as one disk of
 /// a create.
 pub const OP_ELASTIC_ADD_DISK: &str = "elastic_add_disk";
+/// Undoing an unfinished add of a data disk. It ERASES the filesystem that
+/// add gave the disk, so it carries the add's own blast radius, and it takes
+/// a slot out of an array's journal.
+pub const OP_ELASTIC_ADD_DISK_ABORT: &str = "elastic_add_disk_abort";
 /// DORMANT: disk replacement is withdrawn (round 4), the dispatch handler
 /// refuses the request before anything is parked, and this operation therefore
 /// cannot appear in the queue — which is why the UI's label allowlist
@@ -535,12 +539,17 @@ fn alert_key(request_id: &str) -> String {
 fn without_secret(payload: &TentaNasPayload) -> TentaNasPayload {
     use TentaNasPayload as P;
     match payload.clone() {
-        P::ElasticArraySyncRequest { name, .. } => P::ElasticArraySyncRequest { name, sudo_password: None },
+        // The acknowledgement is the AUTHOR's decision and is kept: it is what
+        // the approver releases.
+        P::ElasticArraySyncRequest { name, acknowledge_parity_fault, .. } =>
+            P::ElasticArraySyncRequest { name, acknowledge_parity_fault, sudo_password: None },
         P::ElasticArrayScrubRequest { name, .. } => P::ElasticArrayScrubRequest { name, sudo_password: None },
         P::ElasticArrayFixRequest { name, disk, confirm_disk, .. } =>
             P::ElasticArrayFixRequest { name, disk, confirm_disk, sudo_password: None },
         P::ElasticArrayAddDiskRequest { name, disk_id, confirm_name, .. } =>
             P::ElasticArrayAddDiskRequest { name, disk_id, confirm_name, sudo_password: None },
+        P::ElasticArrayAddDiskAbortRequest { name, disk_id, confirm_name, .. } =>
+            P::ElasticArrayAddDiskAbortRequest { name, disk_id, confirm_name, sudo_password: None },
         P::ElasticArrayDestroyRequest { name, confirm_name, .. } =>
             P::ElasticArrayDestroyRequest { name, confirm_name, sudo_password: None },
         P::ElasticArrayCreateRequest { name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,.. } =>
@@ -902,6 +911,13 @@ mod tests {
             destroy_request(),
             TentaNasPayload::ElasticArraySyncRequest {
                 name: "media".into(),
+                acknowledge_parity_fault: Some("018f2c1e-6b9a-7c3d-8e4f-5a6b7c8d9e0f".into()),
+                sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
+            },
+            TentaNasPayload::ElasticArrayAddDiskAbortRequest {
+                name: "media".into(),
+                disk_id: "wwn-0x5000c500a1b2c3d4".into(),
+                confirm_name: "media".into(),
                 sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
             },
             TentaNasPayload::ElasticArrayScrubRequest {
@@ -948,6 +964,17 @@ mod tests {
             confirm_name: "media".into(),
             sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
         };
+        // The acknowledgement a Sync was parked with is what the approver
+        // releases: stripping the password must not strip the decision.
+        let acknowledged = without_secret(&TentaNasPayload::ElasticArraySyncRequest {
+            name: "media".into(),
+            acknowledge_parity_fault: Some("018f2c1e-6b9a-7c3d-8e4f-5a6b7c8d9e0f".into()),
+            sudo_password: Some(tentaflow_protocol::tentanas::SudoSecret("hunter2".into())),
+        });
+        assert!(matches!(
+            acknowledged,
+            TentaNasPayload::ElasticArraySyncRequest { acknowledge_parity_fault: Some(_), sudo_password: None, .. }
+        ));
         let redacted = without_secret(&cache_payload);
         if let TentaNasPayload::ElasticArrayCreateRequest { cache_disk_ids, sudo_password, .. } = redacted {
             assert_eq!(cache_disk_ids, vec!["cache".to_string()]);

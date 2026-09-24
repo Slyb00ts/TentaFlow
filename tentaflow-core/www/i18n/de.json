@@ -5389,7 +5389,8 @@
       "by_scheduler": "Zeitplan",
       "by_unknown_account": "unbekanntes Konto",
       "subject_last_known": "zuletzt gesehen als {name}",
-      "smart_batch_refused": "SMART-Test auf {n} {n|Laufwerk|Laufwerken|Laufwerken} nicht gestartet: {disks}"
+      "smart_batch_refused": "SMART-Test auf {n} {n|Laufwerk|Laufwerken|Laufwerken} nicht gestartet: {disks}",
+      "kind_elastic_add_disk_abort": "Hinzufügen eines Datenträgers zum Elastic Array rückgängig machen"
     },
     "danger": {
       "retype": "Zur Bestätigung {name} eingeben:",
@@ -5601,7 +5602,49 @@
       "member_parity": "Paritätsdatenträger {n}",
       "disk_absent": "Datenträger fehlt",
       "last_seen_as": "zuletzt gesehen als {name}",
-      "parity_errors_window": "Paritätsfehler ({n} {n|Tag|Tage|Tage})"
+      "parity_errors_window": "Paritätsfehler ({n} {n|Tag|Tage|Tage})",
+      "refused_operation_pending": "Ein anderer Vorgang des Arrays lief oder war nicht abgeschlossen; es wurde nichts geändert.",
+      "refused_attention_other": "Das Array wartete auf die Wiederherstellung seiner Einhängungen; es wurde nichts geändert.",
+      "refused_fault_unacknowledged": "Der Sync trotz eines nicht behobenen Fehlers wurde nicht bestätigt; es wurde nichts geändert.",
+      "refused_attention_add_disk": "Das Hinzufügen eines Datenträgers war nicht abgeschlossen; es wurde nichts geändert.",
+      "attention_sync_failed": "Der letzte Sync ist fehlgeschlagen: Ein Teil der Parität wurde möglicherweise neu geschrieben. Führen Sie den Sync erneut aus.",
+      "attention_scrub_failed": "Der letzte Scrub hat Fehler gemeldet oder wurde nicht korrekt beendet.",
+      "attention_fix_failed": "Die letzte Reparatur aus der Parität ist fehlgeschlagen.",
+      "attention_add_disk": "Das Hinzufügen eines Datenträgers zum Array wurde nicht abgeschlossen.",
+      "attention_other": "Das Array wartet auf die Wiederherstellung seiner Einhängungen (Mounts wiederherstellen).",
+      "next_steps": "Nächste Schritte",
+      "step_repair": "Reparieren Sie die vom Scrub als fehlerhaft markierten Blöcke aus der Parität.",
+      "step_scrub": "Führen Sie einen Scrub aus, um zu prüfen, ob noch etwas zu reparieren ist.",
+      "step_sync": "Führen Sie einen Sync aus — er erfordert eine Bestätigung, weil er die Dateien, die der Scrub nicht lesen konnte, aus der Content-Datei entfernt.",
+      "sync_fault_title": "Sync trotz eines nicht behobenen Fehlers im Array {name}",
+      "sync_fault_warning": "Das Array {name} hat einen nicht behobenen Scrub- oder Reparaturfehler. Der Sync schreibt trotzdem einen neuen Paritäts-Checkpoint.",
+      "sync_fault_loses": "Dateien, die der Scrub nicht lesen konnte, werden aus der Content-Datei entfernt — die Parität deckt sie nicht mehr ab.",
+      "sync_fault_keeps": "Vom Scrub markierte Blöcke bleiben durch eine Reparatur aus der Parität reparierbar.",
+      "sync_fault_explain": "Führen Sie zuerst die Reparatur aus der Parität aus, falls verfügbar, dann einen Scrub. Ein Sync ist richtig, wenn die Fehler Dateien betreffen, die seit dem letzten Sync geändert wurden.",
+      "sync_fault_retype": "Geben Sie zur Bestätigung den Array-Namen erneut ein:",
+      "sync_fault_confirm": "Sync trotz des Fehlers ausführen",
+      "sync_fault_hint": "Der Sync erfordert eine Bestätigung: Das Array hat einen nicht behobenen Scrub- oder Reparaturfehler.",
+      "add_disk_resume": "Hinzufügen von {disk} abschließen",
+      "add_disk_resume_title": "Hinzufügen des Datenträgers {disk} zum Array {name} abschließen",
+      "add_disk_resume_explain": "Das Abschließen wiederholt nur die noch nicht ausgeführten Schritte und endet mit dem Sync, der den neuen Datenträger in die Parität aufnimmt. Das Array bleibt die ganze Zeit verfügbar.",
+      "add_disk_resume_confirm": "Hinzufügen abschließen",
+      "add_disk_resume_done": "Das Abschließen des Hinzufügens wurde angenommen. Prüfen Sie das Ergebnis der Aufgabe.",
+      "add_disk_pending": "Das Hinzufügen des Datenträgers {disk} wurde nicht abgeschlossen.",
+      "add_disk_step_format": "Es wurde vor dem Ende der Formatierung des Datenträgers angehalten.",
+      "add_disk_step_mount": "Es wurde vor dem Einhängen des Datenträgers angehalten.",
+      "add_disk_step_join": "Es wurde angehalten, bevor der Datenträger der Freigabe beigetreten ist.",
+      "add_disk_step_sync": "Der Datenträger ist bereits in der Freigabe; es fehlt der Sync, der ihn in die Parität aufnimmt.",
+      "add_disk_step_unknown": "Es ist nicht bekannt, bei welchem Schritt angehalten wurde.",
+      "add_disk_new_disk": "neuer Datenträger",
+      "add_disk_undo": "Rückgängig machen",
+      "add_disk_undo_title": "Hinzufügen des Datenträgers {disk} zum Array {name} rückgängig machen",
+      "add_disk_undo_warning": "Der Datenträger {disk} ist der Freigabe nicht beigetreten. Das Rückgängigmachen entfernt ihn aus dem Array {name} und löscht nur das Dateisystem, das ihm dieses Hinzufügen gegeben hat.",
+      "add_disk_undo_explain": "Das Array kehrt in den Zustand vor dem Hinzufügen zurück. Der Datenträger wird wieder frei und kann erneut hinzugefügt werden.",
+      "add_disk_undo_confirm": "Hinzufügen rückgängig machen",
+      "add_disk_undo_done": "Das Rückgängigmachen des Hinzufügens wurde angenommen. Prüfen Sie das Ergebnis der Aufgabe.",
+      "add_disk_undo_unavailable": "Der Datenträger ist möglicherweise bereits der Freigabe beigetreten — das Hinzufügen kann nur abgeschlossen werden.",
+      "repair_add_pending": "das Array hat ein nicht abgeschlossenes Hinzufügen eines Datenträgers: schließen Sie es zuerst ab oder machen Sie es rückgängig",
+      "repair_needs_restore": "das Array wartet auf die Wiederherstellung seiner Einhängungen: verwenden Sie zuerst „Mounts wiederherstellen“"
     },
     "wizard_pool": {
       "elastic_data": "Datenträger",
@@ -6704,6 +6747,10 @@
         "targets_sweep_stale": {
           "title": "Block-Targets: der Knoten erreicht den beschlossenen Zustand nicht",
           "detail": "Vor dem Neustart waren Block-Targets dieses Knotens nicht im beschlossenen Zustand; der nächste Abgleich ersetzt dies durch die aktuelle Anzahl"
+        },
+        "elastic_add_disk_abort_unconfirmed": {
+          "title": "Array {array}: Rückgängigmachen des Hinzufügens nicht bestätigt",
+          "detail": "Das Rückgängigmachen wurde nach seinem ersten Schritt angehalten; das Hinzufügen bleibt unvollständig und kann abgeschlossen oder erneut rückgängig gemacht werden. Der Fehler des Schritts steht im Knotentext"
         }
       },
       "node_text": "Text des Knotens",
@@ -6717,7 +6764,7 @@
         "reallocated": "{n} {n|reallozierter Sektor|reallozierte Sektoren}",
         "temperature_over_limit": "Temperatur {t}°C liegt über dem Limit von {limit}°C",
         "temperature_high": "Temperatur {t}°C",
-        "temperature_high_limit": "Temperatur {t}°C liegt über der Schwelle von {limit}°C",
+        "temperature_high_limit": "Temperatur {t}°C (Warnschwelle {limit}°C)",
         "crc_errors": "{n} CRC-{n|Fehler|Fehler} (Kabel oder Backplane)",
         "wear": "{n}% abgenutzt",
         "no_smart_data": "keine SMART-Daten",
@@ -7189,7 +7236,8 @@
       "ttl_label": "Anforderung gültig für (Stunden)",
       "single_admin": "Nur ein Administrator hat nas.admin: das Aufheben des Snapshot-Schutzes läuft über den gewöhnlichen roten Pfad (Namen abtippen + sudo-Passwort), weil niemand es genehmigen könnte. Sobald ein zweiter Administrator existiert, kehrt es in die Genehmigungswarteschlange zurück.",
       "op_target_delete": "Löschen eines Block-Targets",
-      "op_elastic_schedule": "Elastic-Zeitplan scharfschalten"
+      "op_elastic_schedule": "Elastic-Zeitplan scharfschalten",
+      "op_elastic_add_disk_abort": "Elastic Array · Hinzufügen eines Datenträgers rückgängig machen"
     },
     "access": {
       "title": "Zugriffsprotokoll",
@@ -7478,7 +7526,25 @@
       "approval_already_rejected": "Diese Anfrage wurde bereits abgelehnt",
       "approval_already_expired": "Diese Anfrage ist bereits abgelaufen",
       "approval_closed": "Über diese Anfrage wurde bereits entschieden",
-      "approval_expired": "Die Anfrage ist abgelaufen, bevor jemand darüber entschieden hat"
+      "approval_expired": "Die Anfrage ist abgelaufen, bevor jemand darüber entschieden hat",
+      "elastic_no_parity": "Das Array hat keine Parität, daher hat SnapRAID nichts zu prüfen oder zu schreiben",
+      "elastic_precondition_failed": "Das Array ist für diesen Vorgang nicht bereit: seine Einhängungen, die Formatierung oder der erste Sync sind nicht bestätigt",
+      "elastic_unsynced_changes": "Die Daten haben sich seit dem letzten Sync geändert, daher wurde der Scrub nicht gestartet — führen Sie zuerst einen Sync aus",
+      "elastic_empty_parity": "Die Parität ist leer, daher hat der Scrub nichts zu prüfen — führen Sie zuerst einen Sync aus",
+      "elastic_operation_pending": "Ein anderer Vorgang des Arrays läuft oder ist nicht abgeschlossen — versuchen Sie es erneut, wenn er beendet ist",
+      "elastic_attention_other": "Das Array muss zuerst wiederhergestellt werden (Einhängungen wiederherstellen); erst dann nimmt es diesen Vorgang an",
+      "elastic_fault_unacknowledged": "Ein Sync trotz eines nicht behobenen Scrub- oder Reparaturfehlers erfordert die Bestätigung seiner Kosten in der Array-Ansicht",
+      "elastic_attention_add_disk": "Auf dem Array ist das Hinzufügen eines Datenträgers nicht abgeschlossen — schließen Sie es zuerst ab oder machen Sie es rückgängig",
+      "elastic_attention_parity_fault": "Das Array hat einen ungelösten Paritätsfehler — zuerst Reparatur, Scrub oder Sync",
+      "elastic_disk_claimed": "Der Datenträger gehört bereits zu diesem oder einem anderen Array oder trägt ein fremdes Dateisystem",
+      "elastic_add_joined": "Der Datenträger ist möglicherweise bereits der Freigabe beigetreten — das Hinzufügen kann nur abgeschlossen werden",
+      "elastic_fault_changed": "Seit der Bestätigung hat das Array einen neuen Scrub- oder Reparaturfehler gemeldet — bestätigen Sie den Sync erneut in der Array-Ansicht",
+      "elastic_nothing_to_undo": "Das Array hat kein unvollständiges Hinzufügen dieses Datenträgers — es gibt nichts rückgängig zu machen",
+      "elastic_state_unknown": "Der Zustand des Arrays konnte nicht gelesen werden, daher belegt nichts, dass der Datenträger der Freigabe nie beigetreten ist — versuchen Sie es erneut",
+      "elastic_array_not_ready": "Das Array muss aktiviert und aktiv sein oder Aufmerksamkeit erfordern",
+      "elastic_add_stopped": "Das Hinzufügen des Datenträgers wurde vor dem Ende angehalten — schließen Sie es in der Array-Ansicht ab oder machen Sie es rückgängig",
+      "elastic_undo_stopped": "Das Rückgängigmachen wurde nach seinem ersten Schritt angehalten — das Hinzufügen bleibt unvollständig",
+      "elastic_disk_absent": "Der Datenträger, der gelöscht würde, ist auf diesem Knoten nicht vorhanden — schließen Sie ihn an und versuchen Sie es erneut"
     }
   },
   "agent_accounts": {

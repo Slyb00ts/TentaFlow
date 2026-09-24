@@ -890,6 +890,37 @@ const MIGRATIONS: &[(i64, &str)] = &[(
            detail = 'block targets on this node were not in the state it decided on before it restarted; \
 the next reconcile replaces this with the current count'
      WHERE dedupe_key = 'targets:reconcile';",
+), (
+    22,
+    // The UNDO of an unfinished add of a data disk ('add_disk_abort', helper
+    // 0.14.0): the operation that removes the slot again while the disk has
+    // provably never joined the share. A widened CHECK needs the whole table
+    // rebuilt, so this repeats migration 17's statement with one kind added
+    // and nothing else changed.
+    "CREATE TABLE nas_elastic_operations_new (
+        operation_id TEXT PRIMARY KEY,
+        array_id TEXT NOT NULL REFERENCES nas_elastic_arrays(array_id) ON DELETE RESTRICT,
+        job_id TEXT NOT NULL UNIQUE REFERENCES nas_jobs(job_id) ON DELETE RESTRICT,
+        kind TEXT NOT NULL CHECK(kind IN
+            ('create','import','restore','sync','scrub','mover','fix','add_disk','add_disk_abort',
+             'replace_disk','dissolve')),
+        state TEXT NOT NULL CHECK(state IN ('running','succeeded','failed','needs_attention')),
+        request_json TEXT NOT NULL,
+        result_json TEXT,
+        error TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        finished_at TEXT
+    );
+    INSERT INTO nas_elastic_operations_new
+        SELECT operation_id,array_id,job_id,kind,state,request_json,result_json,error,created_at,finished_at
+        FROM nas_elastic_operations;
+    DROP TABLE nas_elastic_operations;
+    ALTER TABLE nas_elastic_operations_new RENAME TO nas_elastic_operations;
+    CREATE INDEX nas_elastic_operation_array ON nas_elastic_operations(array_id, created_at);
+    CREATE UNIQUE INDEX nas_elastic_operation_running
+        ON nas_elastic_operations(array_id) WHERE state = 'running';
+    CREATE UNIQUE INDEX nas_elastic_operation_origin
+        ON nas_elastic_operations(array_id) WHERE kind IN ('create','import');",
 )];
 
 /// The owner migration 20 gives a legacy share, target or account it cannot
@@ -1988,7 +2019,7 @@ pub fn insert_job_owned(
                 (array_id, operation_id, "restore", serde_json::to_string(&tentanas_helper::HelperCommand::ElasticRestore {
                     array_id: array_id.clone(), owner: owner.clone() })?)
             }
-            ElasticJobIntent::Snapraid { owner, array_id, operation_id, kind } => {
+            ElasticJobIntent::Snapraid { owner, array_id, operation_id, kind, acknowledge_parity_fault } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 let action = super::elastic::snapraid_kind(kind);
                 anyhow::ensure!(job.kind == format!("elastic_{action}") && job.subject == spec.name,
@@ -2027,7 +2058,22 @@ pub fn insert_job_owned(
                     },
                     "Macierz ma niepotwierdzoną operację; brak ponowienia");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
-                let command = super::elastic::snapraid_command(owner, array_id, operation_id, kind);
+                // Only a Sync may carry the acknowledgement; a Scrub or a Fix
+                // that claimed one would be a request the helper never reads.
+                anyhow::ensure!(
+                    acknowledge_parity_fault.is_none() || *kind == tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+                    "Potwierdzenie błędu parity dotyczy tylko Sync"
+                );
+                if let Some(fault) = acknowledge_parity_fault {
+                    tentanas_helper::elastic::validate_elastic_uuid(fault)?;
+                }
+                let command = super::elastic::snapraid_command(
+                    owner,
+                    array_id,
+                    operation_id,
+                    kind,
+                    acknowledge_parity_fault.as_deref(),
+                );
                 (array_id, operation_id, action, serde_json::to_string(&command)?)
             }
             ElasticJobIntent::AddDisk { owner, array_id, operation_id, disk } => {
@@ -2065,32 +2111,34 @@ pub fn insert_job_owned(
                         state == "active" && !unresolved
                     },
                     "Macierz ma niepotwierdzoną operację; brak ponowienia");
-                if retry {
-                    // The superseded attempt stops holding the array. Its row
-                    // stays as history — the add DID stop part-way — but a
-                    // later sync, scrub or mover no longer waits on it.
-                    // `state IN ('failed','needs_attention')` and never
-                    // `<> 'succeeded'`: a RUNNING row is what the partial
-                    // unique index refuses a second operation by, and clearing
-                    // it here would let this insert race the job that is still
-                    // executing. `reserve_added_disk` has already refused that
-                    // case, so this only closes attempts that have stopped.
-                    tx.execute(
-                        "UPDATE nas_elastic_operations SET state='failed',error=?3,
-                            finished_at=COALESCE(finished_at,?4)
-                         WHERE array_id=?1 AND kind='add_disk'
-                           AND state IN ('failed','needs_attention')
-                           AND operation_id<>?2",
-                        params![
-                            array_id,
-                            operation_id,
-                            format!("ponowione operacją {operation_id}"),
-                            job.started_at
-                        ],
-                    )?;
-                }
+                // The attempt this one resumes keeps holding the array until
+                // the resume SUCCEEDS (`finish_elastic_add_disk`): a resume
+                // the helper refuses must leave the add pinned, or the disk
+                // would sit half-joined with no way through the product to
+                // finish or undo it.
                 let command = super::elastic::add_disk_command(owner, array_id, operation_id, disk);
                 (array_id, operation_id, "add_disk", serde_json::to_string(&command)?)
+            }
+            // THE UNDO of an unfinished add (K7). It names the pinned add's
+            // own identity — nothing else may be undone, and only the
+            // filesystem that add gave the disk is ever erased — and it is
+            // admitted on an array that needs attention, because the add
+            // needing attention is what it resolves. Whether the disk may
+            // still be taken out is the helper's live read of the union, not
+            // anything this database knows.
+            ElasticJobIntent::AddDiskAbort { owner, array_id, operation_id, disk } => {
+                let spec = elastic_spec(&tx, owner, array_id)?;
+                anyhow::ensure!(job.kind == "elastic_add_disk_abort" && job.subject == spec.name,
+                    "Zadanie nie odpowiada intencji wycofania dodania dysku");
+                tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
+                anyhow::ensure!(pinned_add(&tx, array_id)?.as_ref() == Some(disk),
+                    "Macierz nie ma niedokończonego dodania tego dysku");
+                let state: String = tx.query_row("SELECT state FROM nas_elastic_arrays WHERE array_id=?1",
+                    params![array_id], |r| r.get(0))?;
+                anyhow::ensure!(matches!(state.as_str(), "active" | "needs_attention"),
+                    "Wycofanie dodania dysku wymaga macierzy aktywnej albo wymagającej uwagi");
+                let command = super::elastic::add_disk_abort_command(owner, array_id, operation_id, disk);
+                (array_id, operation_id, "add_disk_abort", serde_json::to_string(&command)?)
             }
             // DISK REPLACEMENT IS WITHDRAWN (round 4, owner's decision), and
             // this arm is the last gate: NO path may create a `replace_disk`
@@ -2219,7 +2267,9 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                 anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik SnapRAID");
                 let result: tentanas_helper::elastic::ElasticSnapraidResult =
                     serde_json::from_str(json)?;
-                super::elastic::validate_snapraid_result(&spec, &operation_id, &kind, &result)?;
+                let answered =
+                    super::elastic::answered_spec(&spec, pinned_add(&tx, &spec.array_id)?.as_ref(), &result.state)?;
+                super::elastic::validate_snapraid_result(&answered, &operation_id, &kind, &result)?;
                 Ok(result)
             });
         let (operation_state, update_array, array_state) = match validated {
@@ -2471,6 +2521,12 @@ fn snapraid_operation(conn: &Connection, job_id: &str) -> Result<Option<Snapraid
     // whole command is rebuilt from it and compared. A request whose disk had
     // been edited would fail that comparison exactly as a request whose array
     // had been.
+    // The Sync's acknowledgement is part of the stored command the same
+    // way: read back, then held to the rebuilt command like everything else.
+    let acknowledged = match &command {
+        tentanas_helper::HelperCommand::ElasticSync { acknowledge_parity_fault, .. } => acknowledge_parity_fault.clone(),
+        _ => None,
+    };
     let kind = match (action.as_str(), &command) {
         ("sync", _) => tentanas_helper::elastic::ElasticSnapraidKind::Sync,
         ("scrub", _) => tentanas_helper::elastic::ElasticSnapraidKind::Scrub,
@@ -2480,7 +2536,7 @@ fn snapraid_operation(conn: &Connection, job_id: &str) -> Result<Option<Snapraid
         _ => anyhow::bail!("Zmienione żądanie operacji SnapRAID"),
     };
     anyhow::ensure!(
-        command == super::elastic::snapraid_command(&owner, &array_id, &operation_id, &kind),
+        command == super::elastic::snapraid_command(&owner, &array_id, &operation_id, &kind, acknowledged.as_deref()),
         "Zmienione żądanie operacji SnapRAID"
     );
     Ok(Some((operation_id, spec, kind, candidate)))
@@ -2507,7 +2563,9 @@ pub fn record_snapraid_result(
         stored_id == operation_id && candidate.is_none(),
         "Wynik operacji już zapisano"
     );
-    super::elastic::validate_snapraid_result(&spec, operation_id, &kind, result)?;
+    let answered =
+        super::elastic::answered_spec(&spec, pinned_add(&tx, &spec.array_id)?.as_ref(), &result.state)?;
+    super::elastic::validate_snapraid_result(&answered, operation_id, &kind, result)?;
     let json = serde_json::to_string(result)?;
     anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik SnapRAID");
     anyhow::ensure!(tx.execute("UPDATE nas_elastic_operations SET result_json=?2 WHERE operation_id=?1 AND state='running' AND result_json IS NULL",
@@ -2843,6 +2901,7 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
             // must not disable the one action that resolves it.
             parity_run_available: parity_admission(&conn, &array_id, &state)?,
             mover_failed_runs: mover_failed_runs(&conn, &array_id)?,
+            pending_add: pinned_add(&conn, &array_id)?,
             create_spec: Some(spec), state, state_detail, created_at, updated_at,
             ..Default::default()
         })
@@ -2933,7 +2992,9 @@ fn elastic_runs(
                 .as_deref()
                 .ok_or_else(|| anyhow!("Brak potwierdzonego wyniku"))
                 .and_then(|json| {
-                    let result: ElasticSnapraidResult = serde_json::from_str(json)?;
+                    let mut result: ElasticSnapraidResult = serde_json::from_str(json)?;
+                    let pinned = pinned_add(conn, &spec.array_id)?;
+                    super::elastic::strip_unpinned_slot(spec, pinned.as_ref(), &mut result.state);
                     // The repair's disk comes from the RESULT and is then
                     // held to the array by `validate_snapraid_result`: the
                     // operations table records the action, not the disk, and a
@@ -2943,8 +3004,12 @@ fn elastic_runs(
                         "scrub" => ElasticSnapraidKind::Scrub,
                         _ => result.run.kind.clone(),
                     };
+                    // A record is judged against the array it described:
+                    // older than an add that succeeded since, or counting an
+                    // add that is still pinned (K5).
+                    let recorded = super::elastic::recorded_spec(spec, pinned.as_ref(), &result.state)?;
                     super::elastic::validate_snapraid_result(
-                        spec,
+                        &recorded,
                         &operation_id,
                         &expected,
                         &result,
@@ -3194,11 +3259,13 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
             "Identyfikator {value} jest już zarezerwowany przez macierz tej instancji"
         );
     }
-    // Another add of this array that never closed successfully holds the slot
-    // and — more importantly — the filesystem UUID its mkfs was given. A retry
-    // has to reuse that identity, so a DIFFERENT disk arriving for the same
-    // slot is refused here rather than formatting a second device, while the
-    // SAME disk is admitted and reported as the retry it is.
+    // Another add of this array that stopped part-way holds the slot and —
+    // more importantly — the filesystem UUID its mkfs was given. A retry has
+    // to reuse that identity, so a DIFFERENT disk arriving for the same slot
+    // is refused here rather than formatting a second device, while the SAME
+    // disk is admitted and reported as the retry it is. An add the helper
+    // REFUSED closed `failed` and holds nothing (K4): it never touched the
+    // helper's journal, so there is no slot to reuse.
     let Some((state, held)) = latest_add_disk(tx, array_id)? else {
         return Ok(false);
     };
@@ -3224,18 +3291,24 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
     Ok(true)
 }
 
-/// This array's LATEST add, as `(state, disk)`.
+/// This array's LATEST add that the helper may hold, as `(state, disk)`.
 ///
 /// The question is about the latest attempt and not about "any attempt that
 /// failed": an array that was grown after one failed attempt carries both rows
 /// for ever, and reading the failed one would hand a caller the identity of an
 /// add that a later one already completed — pinning the array to a disk it
-/// already holds. So the newest row is read whatever its state, and the STATE
-/// is returned with it because it decides three different things: a succeeded
-/// add holds nothing, a running one may not be touched, and only a stopped one
-/// is resumable. `(created_at, operation_id)` is the ordering for the reason
-/// `UNRESOLVED_ELASTIC_OPERATION` uses it: `created_at` has second resolution
-/// and an operation id is a uuid v7.
+/// already holds. So the newest row is read, and the STATE is returned with it
+/// because it decides three different things: a succeeded add holds nothing,
+/// a running one may not be touched, and only a stopped one
+/// (`needs_attention`, the orphan of a core restart included) is resumable.
+///
+/// A `failed` row is SKIPPED, never read as the newest (K4). It is a refusal
+/// — the helper changed nothing — or an attempt a later one superseded, so it
+/// holds no slot: reading it would let a refused retry of a stopped add
+/// unpin that add, and the disk would sit half-joined with no way through
+/// the product to finish it. `(created_at, operation_id)` is the ordering for
+/// the reason `UNRESOLVED_ELASTIC_OPERATION` uses it: `created_at` has second
+/// resolution and an operation id is a uuid v7.
 fn latest_add_disk(
     conn: &Connection,
     array_id: &str,
@@ -3243,7 +3316,7 @@ fn latest_add_disk(
     let latest: Option<(String, String)> = conn
         .query_row(
             "SELECT state,request_json FROM nas_elastic_operations
-             WHERE array_id=?1 AND kind='add_disk'
+             WHERE array_id=?1 AND kind='add_disk' AND state<>'failed'
              ORDER BY created_at DESC, operation_id DESC LIMIT 1",
             params![array_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -3431,9 +3504,142 @@ pub fn unfinished_elastic_add_disk(
     // to decide whether it may repeat the operation, and an add still in
     // flight may not be repeated. `reserve_added_disk` refuses it by name in
     // the transaction, so the answer here is simply "nothing to resume".
-    Ok(latest_add_disk(&conn, array_id)?
-        .filter(|(state, _)| !matches!(state.as_str(), "succeeded" | "running"))
+    pinned_add(&conn, array_id)
+}
+
+/// The add a helper answer about this array may count (K5/K6): the latest
+/// add that stopped part-way and that nothing has finished, undone or
+/// superseded since. Refusals never pin (`latest_add_disk`).
+fn pinned_add(conn: &Connection, array_id: &str) -> Result<Option<ElasticDiskSpec>> {
+    Ok(latest_add_disk(conn, array_id)?
+        .filter(|(state, _)| state == "needs_attention")
         .map(|(_, disk)| disk))
+}
+
+/// Closes an operation the helper REFUSED before it changed anything (I5):
+/// the row is `failed` with the refusal as its error, and the ARRAY is not
+/// touched — no state, no detail. A `failed` add pins nothing
+/// (`latest_add_disk`), so the array admits another disk at once.
+pub fn refuse_elastic_operation(
+    pool: &DbPool,
+    owner: &ElasticOwner,
+    operation_id: &str,
+    error: &str,
+) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    anyhow::ensure!(
+        tx.execute(
+            "UPDATE nas_elastic_operations SET state='failed',error=?2,finished_at=?3
+             WHERE operation_id=?1 AND state='running'
+               AND array_id IN (SELECT array_id FROM nas_elastic_arrays WHERE org_id=?4 AND addon_id=?5)",
+            params![operation_id, error, now(), owner.org_id, owner.addon_id],
+        )? == 1,
+        "Utracono running operację Elastic"
+    );
+    tx.commit()?;
+    Ok(())
+}
+
+/// Settles an add the helper no longer holds although this database still
+/// pins it (M4 of the release review): the helper answered about the array
+/// WITHOUT the disk, with no add recorded or reported (`elastic::
+/// add_undone_by_helper`). A core restart during a successful undo leaves
+/// exactly that — the undo row orphaned, the add row still pinned — and
+/// without this the only offer left would be the resume, which formats and
+/// adds the very disk the admin took out. The pinned rows close as history,
+/// and the array is `active` again when the helper says Ready and nothing
+/// else stands unresolved.
+pub fn settle_undone_add(
+    pool: &DbPool,
+    owner: &ElasticOwner,
+    array_id: &str,
+    observed: &ElasticResult,
+) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let spec = elastic_spec(&tx, owner, array_id)?;
+    super::elastic::validate_observation(&spec, observed)?;
+    anyhow::ensure!(
+        observed.pending_add.is_none()
+            && !matches!(observed.attention, Some(tentanas_helper::elastic::ElasticAttention::AddDisk { .. })),
+        "Helper nadal zgłasza niedokończone dodanie"
+    );
+    if pinned_add(&tx, array_id)?.is_none() {
+        return Ok(());
+    }
+    let at = now();
+    tx.execute(
+        "UPDATE nas_elastic_operations SET state='failed',error=?2,finished_at=COALESCE(finished_at,?3)
+         WHERE array_id=?1 AND kind='add_disk' AND state='needs_attention'",
+        params![array_id, "wycofane: helper nie przechowuje już tego dodania", at],
+    )?;
+    let unresolved: bool = tx.query_row(
+        &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
+        params![array_id],
+        |r| r.get(0),
+    )?;
+    if observed.stage == tentanas_helper::elastic::ElasticStage::Ready && !unresolved {
+        tx.execute(
+            "UPDATE nas_elastic_arrays SET state='active',state_detail='',updated_at=?2 WHERE array_id=?1",
+            params![array_id, at],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Closes a successful UNDO of an unfinished add (K7). The pinned add rows
+/// are closed `failed` — the add did stop, and it no longer holds the array
+/// — so nothing pins the slot any more, and the array is `active` again when
+/// the helper reports it Ready and nothing else stands unresolved.
+pub fn finish_elastic_add_disk_abort(
+    pool: &DbPool,
+    owner: &ElasticOwner,
+    operation_id: &str,
+    observed: &ElasticResult,
+) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let array_id: String = tx.query_row(
+        "SELECT o.array_id FROM nas_elastic_operations o
+         JOIN nas_elastic_arrays a ON a.array_id=o.array_id
+         WHERE o.operation_id=?1 AND o.kind='add_disk_abort' AND o.state='running'
+         AND a.org_id=?2 AND a.addon_id=?3",
+        params![operation_id, owner.org_id, owner.addon_id],
+        |r| r.get(0),
+    )?;
+    let spec = elastic_spec(&tx, owner, &array_id)?;
+    super::elastic::validate_observation(&spec, observed)?;
+    anyhow::ensure!(observed.pending_add.is_none(), "Helper nadal zgłasza niedokończone dodanie");
+    let at = now();
+    tx.execute(
+        "UPDATE nas_elastic_operations SET state='failed',error=?2,finished_at=COALESCE(finished_at,?3)
+         WHERE array_id=?1 AND kind='add_disk' AND state='needs_attention'",
+        params![array_id, format!("wycofane operacją {operation_id}"), at],
+    )?;
+    tx.execute(
+        "UPDATE nas_elastic_operations SET state='succeeded',result_json=?2,error='',finished_at=?3
+         WHERE operation_id=?1",
+        params![operation_id, serde_json::to_string(observed)?, at],
+    )?;
+    let unresolved: bool = tx.query_row(
+        &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
+        params![array_id],
+        |r| r.get(0),
+    )?;
+    let ready = observed.stage == tentanas_helper::elastic::ElasticStage::Ready && !unresolved;
+    tx.execute(
+        "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4 WHERE array_id=?1",
+        params![
+            array_id,
+            if ready { "active" } else { "needs_attention" },
+            if ready { String::new() } else { observed.detail.clone().unwrap_or_default() },
+            at
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Closes a successful add by making the array's persisted intention and its
@@ -3508,6 +3714,15 @@ pub fn finish_elastic_add_disk(
         "Zapis dysku nie odtworzył intencji macierzy"
     );
     let at = now();
+    // The attempts this add resumed stop holding the array only NOW, with its
+    // success (K4). Closing them when the resume was merely admitted let a
+    // resume the helper then refused unpin the add it was resuming.
+    tx.execute(
+        "UPDATE nas_elastic_operations SET state='failed',error=?3,
+            finished_at=COALESCE(finished_at,?4)
+         WHERE array_id=?1 AND kind='add_disk' AND state='needs_attention' AND operation_id<>?2",
+        params![array_id, operation_id, format!("dokończone operacją {operation_id}"), at],
+    )?;
     tx.execute(
         "UPDATE nas_elastic_operations SET state='succeeded',result_json=?2,error='',finished_at=?3
          WHERE operation_id=?1",
@@ -3678,7 +3893,10 @@ pub fn finish_elastic_operation(pool: &DbPool, owner: &ElasticOwner, operation_i
     let spec = elastic_spec(&tx,owner,&array_id)?;
     let (success, json, detail) = match result {
         Ok(observed) => {
-            super::elastic::validate_result(&spec, observed)?;
+            // A Restore over an unfinished add answers with the add's disk
+            // counted (K5).
+            let answered = super::elastic::answered_spec(&spec, pinned_add(&tx, &array_id)?.as_ref(), observed)?;
+            super::elastic::validate_result(&answered, observed)?;
             (observed.stage == tentanas_helper::elastic::ElasticStage::Ready,
                 Some(serde_json::to_string(observed)?), observed.detail.clone().unwrap_or_default())
         }
@@ -6208,6 +6426,7 @@ mod tests {
             array_id: spec.array_id.clone(),
             operation_id: id.clone(),
             kind,
+            acknowledge_parity_fault: None,
         };
         (row, intent, id)
     }
@@ -7872,16 +8091,19 @@ mod tests {
             unfinished_elastic_add_disk(&p, &spec.owner, &spec.array_id).unwrap().is_none(),
             "the retry is in flight, not resumable"
         );
-        let first_state: String = p
-            .read()
-            .unwrap()
-            .query_row(
-                "SELECT state FROM nas_elastic_operations WHERE operation_id=?1",
-                params![first_id],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(first_state, "failed", "the first attempt stays as history");
+        let first_state = || -> String {
+            p.read()
+                .unwrap()
+                .query_row(
+                    "SELECT state FROM nas_elastic_operations WHERE operation_id=?1",
+                    params![first_id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        // K4: the stopped attempt keeps holding the add while its resume runs
+        // — a resume the helper refuses must leave the add pinned.
+        assert_eq!(first_state(), "needs_attention", "a resume in flight supersedes nothing yet");
 
         let after_spec =
             super::super::elastic::spec_with_added_disk(hurt.persisted_spec().unwrap(), &added)
@@ -7895,6 +8117,7 @@ mod tests {
         )
         .unwrap();
         finish_job(&p, &second_job.job_id, "succeeded", None).unwrap();
+        assert_eq!(first_state(), "failed", "the resume's success closes the first attempt as history");
 
         let grown = elastic_array(&p, &spec.owner, "resume").unwrap().unwrap();
         assert_eq!(grown.state, "active");
@@ -9516,6 +9739,96 @@ mod tests {
         assert!(job_for_org(&p, "org-b", &mover.job_id).unwrap().is_some());
         // An empty organisation id is nobody, not an owner.
         assert!(insert_job_owned(&p, &plain_job("disk_wipe", "sds"), None, Some("")).is_err());
+    }
+
+    /// Migration 22 rebuilds `nas_elastic_operations` to admit the undo's
+    /// kind. A node upgrading from 21 keeps every row as it was — state,
+    /// request, result, error, times — and every index: the one running
+    /// operation per array and the one origin per array are still enforced,
+    /// and the new kind is accepted while an unknown one is still refused.
+    #[test]
+    fn migration_22_keeps_every_operation_row_and_admits_the_undo() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..21]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nas_elastic_arrays
+               (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
+               VALUES ('arr-a','org-a','nas','alpha','xfs','needs_attention','x','now','now');
+             INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at,log) VALUES
+               ('j-create','elastic_create','alpha','succeeded','u','now',''),
+               ('j-add','elastic_add_disk','alpha','failed','u','now',''),
+               ('j-sync','elastic_sync','alpha','failed','u','now',''),
+               ('j-undo','elastic_add_disk_abort','alpha','running','u','now',''),
+               ('j-bad','elastic_sync','alpha','running','u','now',''),
+               ('j-run','elastic_scrub','alpha','running','u','now','');
+             INSERT INTO nas_elastic_operations
+               (operation_id,array_id,job_id,kind,state,request_json,result_json,error,created_at,finished_at) VALUES
+               ('op-1','arr-a','j-create','create','succeeded','{\"c\":1}',NULL,'','t1',NULL),
+               ('op-2','arr-a','j-add','add_disk','needs_attention','{\"a\":2}','{\"r\":2}','mkfs','t2','t3'),
+               ('op-3','arr-a','j-sync','sync','failed','{\"s\":3}',NULL,'refusal:elastic_no_parity','t4','t5');",
+        )
+        .unwrap();
+        let before: Vec<(String, String, String, String, Option<String>, String, String, Option<String>)> = {
+            let mut statement = conn
+                .prepare("SELECT operation_id,kind,state,request_json,result_json,error,created_at,finished_at
+                          FROM nas_elastic_operations ORDER BY operation_id")
+                .unwrap();
+            statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        // Before 22 the undo's kind is refused.
+        assert!(conn
+            .execute(
+                "INSERT INTO nas_elastic_operations (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+                 VALUES ('op-x','arr-a','j-undo','add_disk_abort','running','{}','','t6')",
+                [],
+            )
+            .is_err());
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+        let after: Vec<(String, String, String, String, Option<String>, String, String, Option<String>)> = {
+            let mut statement = conn
+                .prepare("SELECT operation_id,kind,state,request_json,result_json,error,created_at,finished_at
+                          FROM nas_elastic_operations ORDER BY operation_id")
+                .unwrap();
+            statement
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(after, before, "every row survives the rebuild unchanged");
+        conn.execute(
+            "INSERT INTO nas_elastic_operations (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+             VALUES ('op-4','arr-a','j-undo','add_disk_abort','running','{}','','t6')",
+            [],
+        )
+        .expect("the undo's kind is admitted");
+        // The indexes are back: a second running operation, a second origin
+        // and an unknown kind are refused.
+        assert!(conn
+            .execute(
+                "INSERT INTO nas_elastic_operations (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+                 VALUES ('op-5','arr-a','j-run','scrub','running','{}','','t7')",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO nas_elastic_operations (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+                 VALUES ('op-6','arr-a','j-run','import','succeeded','{}','','t7')",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO nas_elastic_operations (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
+                 VALUES ('op-7','arr-a','j-bad','shrink','failed','{}','','t8')",
+                [],
+            )
+            .is_err());
     }
 
     /// A node upgraded with jobs and alerts already in the table: every Elastic

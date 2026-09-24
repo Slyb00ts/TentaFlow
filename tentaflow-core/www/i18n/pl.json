@@ -6691,6 +6691,10 @@
         "targets_sweep_stale": {
           "title": "Targety blokowe: node nie może osiągnąć stanu, który ustalił",
           "detail": "Przed restartem targety blokowe tego węzła nie były w ustalonym stanie; następne uzgadnianie zastąpi to bieżącą liczbą"
+        },
+        "elastic_add_disk_abort_unconfirmed": {
+          "title": "Macierz {array}: niepotwierdzone wycofanie dodania dysku",
+          "detail": "Wycofanie zatrzymało się po pierwszym kroku; dodawanie dysku pozostaje niedokończone i można je dokończyć albo ponownie wycofać. Błąd kroku jest w treści węzła"
         }
       },
       "node_text": "Treść węzła",
@@ -6704,7 +6708,7 @@
         "reallocated": "{n} {n|realokowany sektor|realokowane sektory|realokowanych sektorów}",
         "temperature_over_limit": "temperatura {t}°C przekracza limit {limit}°C",
         "temperature_high": "temperatura {t}°C",
-        "temperature_high_limit": "temperatura {t}°C przekracza próg {limit}°C",
+        "temperature_high_limit": "temperatura {t}°C (próg ostrzeżenia {limit}°C)",
         "crc_errors": "{n} {n|błąd|błędy|błędów} CRC (kabel lub backplane)",
         "wear": "zużycie {n}%",
         "no_smart_data": "brak danych SMART",
@@ -6926,7 +6930,8 @@
       "by_scheduler": "harmonogram",
       "by_unknown_account": "nieznane konto",
       "subject_last_known": "ostatnio widziany jako {name}",
-      "smart_batch_refused": "Test SMART nie ruszył na {n} {n|dysku|dyskach|dyskach}: {disks}"
+      "smart_batch_refused": "Test SMART nie ruszył na {n} {n|dysku|dyskach|dyskach}: {disks}",
+      "kind_elastic_add_disk_abort": "Wycofanie dodania dysku do Elastic Array"
     },
     "elevation": {
       "title": "Kanał uprawnień systemowych",
@@ -7402,7 +7407,49 @@
       "member_parity": "dysk parity {n}",
       "disk_absent": "brak dysku",
       "last_seen_as": "ostatnio widziany jako {name}",
-      "parity_errors_window": "Błędy parity ({n} {n|dzień|dni|dni})"
+      "parity_errors_window": "Błędy parity ({n} {n|dzień|dni|dni})",
+      "refused_operation_pending": "Inna operacja macierzy trwała albo nie była rozstrzygnięta; nic nie zostało zmienione.",
+      "refused_attention_other": "Macierz czekała na odtworzenie montowań; nic nie zostało zmienione.",
+      "refused_fault_unacknowledged": "Sync przy nienaprawionym błędzie nie został potwierdzony; nic nie zostało zmienione.",
+      "refused_attention_add_disk": "Na macierzy nie dokończono dodawania dysku; nic nie zostało zmienione.",
+      "attention_sync_failed": "Ostatni Sync się nie powiódł: część parity mogła zostać przepisana. Uruchom Sync ponownie.",
+      "attention_scrub_failed": "Ostatni scrub zgłosił błędy albo nie zakończył się poprawnie.",
+      "attention_fix_failed": "Ostatnia naprawa z parity się nie powiodła.",
+      "attention_add_disk": "Dodawanie dysku do macierzy nie zostało dokończone.",
+      "attention_other": "Macierz czeka na odtworzenie montowań (Odtwórz montowania).",
+      "next_steps": "Co dalej",
+      "step_repair": "Napraw z parity bloki, które scrub oznaczył jako błędne.",
+      "step_scrub": "Uruchom scrub, aby sprawdzić, czy coś jeszcze zostało do naprawy.",
+      "step_sync": "Uruchom Sync — wymaga potwierdzenia, bo usuwa z content pliki, których scrub nie mógł odczytać.",
+      "sync_fault_title": "Sync mimo nienaprawionego błędu w macierzy {name}",
+      "sync_fault_warning": "Macierz {name} ma nienaprawiony błąd scrub lub naprawy. Sync zapisze nowy checkpoint parity mimo niego.",
+      "sync_fault_loses": "Pliki, których scrub nie mógł odczytać, zostaną usunięte z content — parity przestanie je obejmować.",
+      "sync_fault_keeps": "Bloki oznaczone przez scrub pozostaną naprawialne naprawą z parity.",
+      "sync_fault_explain": "Najpierw uruchom naprawę z parity, jeśli jest dostępna, a potem scrub. Sync jest właściwy, gdy błędy dotyczą plików zmienionych od ostatniego Sync.",
+      "sync_fault_retype": "Przepisz nazwę macierzy, aby potwierdzić:",
+      "sync_fault_confirm": "Uruchom Sync mimo błędu",
+      "sync_fault_hint": "Sync wymaga potwierdzenia: macierz ma nienaprawiony błąd scrub lub naprawy.",
+      "add_disk_resume": "Dokończ dodawanie dysku {disk}",
+      "add_disk_resume_title": "Dokończ dodawanie dysku {disk} do macierzy {name}",
+      "add_disk_resume_explain": "Dokończenie powtarza tylko kroki, których dodawanie jeszcze nie wykonało, i kończy się Sync, który obejmuje nowy dysk ochroną parity. Macierz pozostaje dostępna przez cały czas.",
+      "add_disk_resume_confirm": "Dokończ dodawanie",
+      "add_disk_resume_done": "Przyjęto dokończenie dodawania dysku. Sprawdź wynik zadania.",
+      "add_disk_pending": "Dodawanie dysku {disk} nie zostało dokończone.",
+      "add_disk_step_format": "Zatrzymało się przed zakończeniem formatowania dysku.",
+      "add_disk_step_mount": "Zatrzymało się przed zamontowaniem dysku.",
+      "add_disk_step_join": "Zatrzymało się przed dołączeniem dysku do udziału.",
+      "add_disk_step_sync": "Dysk jest już w udziale; zostało Sync, który obejmie go parity.",
+      "add_disk_step_unknown": "Nie wiadomo, na którym kroku się zatrzymało.",
+      "add_disk_new_disk": "nowy dysk",
+      "add_disk_undo": "Wycofaj",
+      "add_disk_undo_title": "Wycofaj dodawanie dysku {disk} do macierzy {name}",
+      "add_disk_undo_warning": "Dysk {disk} nie dołączył do udziału. Wycofanie usunie go z macierzy {name} i wyczyści wyłącznie system plików, który nadało mu to dodawanie.",
+      "add_disk_undo_explain": "Macierz wraca do stanu sprzed dodawania. Dysk znów będzie wolny i będzie go można dodać ponownie.",
+      "add_disk_undo_confirm": "Wycofaj dodawanie",
+      "add_disk_undo_done": "Przyjęto wycofanie dodawania dysku. Sprawdź wynik zadania.",
+      "add_disk_undo_unavailable": "Dysk mógł już dołączyć do udziału — dodawanie można tylko dokończyć.",
+      "repair_add_pending": "macierz ma niedokończone dodawanie dysku: najpierw je dokończ albo wycofaj",
+      "repair_needs_restore": "macierz czeka na odtworzenie montowań: najpierw użyj „Odtwórz montowania”"
     },
     "wizard_pool": {
       "elastic_data": "Dyski danych",
@@ -8456,7 +8503,8 @@
       "ttl_label": "Ważność zgłoszenia (godziny)",
       "single_admin": "Tylko jeden administrator z uprawnieniem nas.admin: zdjęcie ochrony snapshotu idzie zwykłą czerwoną ścieżką (przepisanie nazwy + hasło sudo), bo nie ma kto go zatwierdzić. Gdy pojawi się drugi administrator, wróci do kolejki zatwierdzeń.",
       "op_target_delete": "Usunięcie targetu blokowego",
-      "op_elastic_schedule": "Uzbrojenie harmonogramu Elastic"
+      "op_elastic_schedule": "Uzbrojenie harmonogramu Elastic",
+      "op_elastic_add_disk_abort": "Elastic Array · Wycofanie dodania dysku"
     },
     "access": {
       "title": "Dziennik dostępu",
@@ -8745,7 +8793,25 @@
       "approval_already_rejected": "To zgłoszenie zostało już odrzucone",
       "approval_already_expired": "To zgłoszenie już wygasło",
       "approval_closed": "O tym zgłoszeniu już zdecydowano",
-      "approval_expired": "Zgłoszenie wygasło, zanim ktokolwiek o nim zdecydował"
+      "approval_expired": "Zgłoszenie wygasło, zanim ktokolwiek o nim zdecydował",
+      "elastic_no_parity": "Macierz nie ma parity, więc SnapRAID nie ma czego sprawdzić ani zapisać",
+      "elastic_precondition_failed": "Macierz nie jest gotowa na tę operację: jej montowania, formatowanie albo pierwszy Sync nie są potwierdzone",
+      "elastic_unsynced_changes": "Dane zmieniły się od ostatniego Sync, więc scrub nie został uruchomiony — najpierw uruchom Sync",
+      "elastic_empty_parity": "Parity jest pusta, więc scrub nie ma czego sprawdzić — najpierw uruchom Sync",
+      "elastic_operation_pending": "Na macierzy trwa albo nie została rozstrzygnięta inna operacja — spróbuj ponownie, gdy się zakończy",
+      "elastic_attention_other": "Macierz najpierw trzeba odtworzyć (Odtwórz montowania); dopiero potem przyjmie tę operację",
+      "elastic_fault_unacknowledged": "Sync przy nienaprawionym błędzie scrub lub naprawy wymaga potwierdzenia jego kosztu na ekranie macierzy",
+      "elastic_attention_add_disk": "Macierz ma niedokończone dodawanie dysku — najpierw je dokończ albo wycofaj",
+      "elastic_attention_parity_fault": "Macierz ma nierozwiązany błąd parity — najpierw naprawa, scrub albo Sync",
+      "elastic_disk_claimed": "Dysk należy już do tej lub innej macierzy albo nosi obcy system plików",
+      "elastic_add_joined": "Dysk mógł już dołączyć do udziału — dodawanie można tylko dokończyć",
+      "elastic_fault_changed": "Od potwierdzenia macierz zgłosiła nowy błąd scrub lub naprawy — potwierdź Sync ponownie na ekranie macierzy",
+      "elastic_nothing_to_undo": "Macierz nie ma niedokończonego dodania tego dysku — nie ma czego wycofać",
+      "elastic_state_unknown": "Nie udało się odczytać stanu macierzy, więc nic nie potwierdza, że dysk nie dołączył do udziału — spróbuj ponownie",
+      "elastic_array_not_ready": "Macierz musi być włączona i aktywna albo wymagać uwagi",
+      "elastic_add_stopped": "Dodawanie dysku zatrzymało się przed końcem — dokończ je albo wycofaj na ekranie macierzy",
+      "elastic_undo_stopped": "Wycofanie dodawania zatrzymało się po pierwszym kroku — dodawanie pozostaje niedokończone",
+      "elastic_disk_absent": "Dysku, który miałby zostać wyczyszczony, nie ma na tym nodzie — podłącz go i spróbuj ponownie"
     }
   },
   "agent_accounts": {

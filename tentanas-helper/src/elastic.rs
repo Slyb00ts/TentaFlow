@@ -244,6 +244,249 @@ pub struct ElasticResult {
     /// the array's namespace; empty when the branches could not be read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conflicts: Vec<ElasticConflict>,
+    /// Why the array stands in `NeedsAttention`, as the journal records it.
+    /// `None` on a healthy array, and on a journal an older helper left in
+    /// `NeedsAttention` without a cause (that one admits only a Restore).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<ElasticAttention>,
+    /// An intent is recorded and its outcome not yet examined.
+    #[serde(default)]
+    pub operation_pending: bool,
+    /// A mover run is open (not finished).
+    #[serde(default)]
+    pub transfer_open: bool,
+    /// The data disk an add has written into the spec and not yet finished:
+    /// what a resume would do next, and whether an undo is still possible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_add: Option<ElasticPendingAdd>,
+    /// Set only on the answer to a request the helper REFUSED before it
+    /// changed anything: the journal is exactly as it was, and `detail` says
+    /// why in words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<ElasticRefusal>,
+}
+
+impl ElasticResult {
+    /// The facts the admission gates decide on, as this answer reports them.
+    /// The same gates the helper enforces can then be asked by the core.
+    pub fn admission(&self) -> ElasticAdmission<'_> {
+        ElasticAdmission {
+            stage: self.stage,
+            pending: self.operation_pending,
+            transfer_open: self.transfer_open,
+            attention: self.attention.as_ref(),
+        }
+    }
+}
+
+/// The recorded cause of an array's `NeedsAttention`. Each cause admits
+/// exactly the operations that resolve it, and only their success clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticAttention {
+    /// A Sync, Scrub or Fix finished with a failure the helper recorded.
+    ParityRun { operation_id: String, kind: ElasticSnapraidKind },
+    /// An add of this data disk grew the spec and has not finished.
+    AddDisk {
+        disk_id: String,
+        /// DURABLE INTENT, written before the branch is appended to the live
+        /// union: the disk may have joined the share. Once true, only a live
+        /// read of that union in this boot can prove it did not, and without
+        /// that proof the add can only go forward.
+        #[serde(default)]
+        joined: bool,
+    },
+    /// Anything else: a failed Restore, a service Hold, a dissolve. Only a
+    /// Restore is admitted.
+    Other,
+}
+
+/// Why the helper refused a request without touching the array. Serialized
+/// as the snake_case code, which is also the `detail` of a refused SnapRAID
+/// run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticRefusal {
+    /// An intent is pending, a mover run is open, or the array is between
+    /// stages of another operation.
+    OperationPending,
+    /// The array needs attention for a cause only a Restore addresses, or
+    /// for no recorded cause at all.
+    AttentionOther,
+    /// A Sync over a recorded Scrub or Fix fault without the admin's
+    /// acknowledgement.
+    FaultUnacknowledged,
+    /// An add of a data disk is unfinished: only its resume or its undo may
+    /// start.
+    AttentionAddDisk,
+    /// A disk add over a recorded parity fault.
+    AttentionParityFault,
+    /// The array itself is not ready for the request: formatting or its
+    /// first Sync is unconfirmed, or its union is not published.
+    PreconditionFailed,
+    /// The disk is a member of this array in another role, or another array
+    /// claims it or its name.
+    DiskClaimed,
+    /// An undo of an add whose disk may already have joined the share.
+    AddJoined,
+    /// The disk an undo would erase is not present on this node.
+    DiskAbsent,
+}
+
+impl ElasticRefusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OperationPending => "operation_pending",
+            Self::AttentionOther => "attention_other",
+            Self::FaultUnacknowledged => "fault_unacknowledged",
+            Self::AttentionAddDisk => "attention_add_disk",
+            Self::AttentionParityFault => "attention_parity_fault",
+            Self::PreconditionFailed => "precondition_failed",
+            Self::DiskClaimed => "disk_claimed",
+            Self::AddJoined => "add_joined",
+            Self::DiskAbsent => "disk_absent",
+        }
+    }
+}
+
+/// The step a resumed add runs first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticAddStep {
+    Format,
+    Mount,
+    /// Append the branch to the live union.
+    Join,
+    /// Rewrite the SnapRAID config and run the Sync that covers the disk.
+    Sync,
+}
+
+/// An add the journal records as unfinished.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticPendingAdd {
+    pub disk_id: String,
+    /// The branch the disk takes (`d3`, …).
+    pub branch: String,
+    /// The slot's filesystem is confirmed in the journal.
+    pub formatted: bool,
+    /// Live: the branch is mounted. `None` when it could not be read.
+    pub mounted: Option<bool>,
+    /// Live: the running union serves the branch. `None` when the union
+    /// could not be read from here.
+    pub in_union: Option<bool>,
+    /// Durable: the add may have written the branch into the union.
+    pub joined: bool,
+    pub step: ElasticAddStep,
+    /// Whether `ElasticAddDiskAbort` would be admitted now
+    /// (`add_undo_admission`).
+    pub undo_possible: bool,
+}
+
+/// What the admission gates decide on. Built from the journal inside the
+/// helper, and from `ElasticResult::admission` anywhere else, so both sides
+/// ask the very same function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElasticAdmission<'a> {
+    pub stage: ElasticStage,
+    pub pending: bool,
+    pub transfer_open: bool,
+    pub attention: Option<&'a ElasticAttention>,
+}
+
+/// Whether a Sync, Scrub or Fix may start (H3).
+///
+/// Nothing starts while an intent is pending or a mover run is open. A Ready
+/// array admits everything. An array that needs attention admits only what
+/// its recorded cause names: after a failed parity run a Scrub and a Fix
+/// always, a Sync after a failed Sync, and a Sync over a Scrub or Fix fault
+/// only with the admin's acknowledgement — measured, such a Sync drops the
+/// files a Scrub could not read from the content file. No cause, `Other` or
+/// an unfinished add admit none of the three.
+///
+/// The acknowledgement is BOUND TO THE FAULT: it names the operation id of
+/// the recorded cause the admin saw and confirmed. An acknowledgement of any
+/// other run — an older fault, or one a queued request carried while a newer
+/// Scrub recorded a new one — acknowledges nothing here.
+pub fn maintenance_admission(
+    facts: &ElasticAdmission<'_>,
+    kind: &ElasticSnapraidKind,
+    acknowledged_fault: Option<&str>,
+) -> Result<(), ElasticRefusal> {
+    if facts.pending || facts.transfer_open {
+        return Err(ElasticRefusal::OperationPending);
+    }
+    match facts.stage {
+        ElasticStage::Ready => Ok(()),
+        ElasticStage::NeedsAttention => match facts.attention {
+            None | Some(ElasticAttention::Other) => Err(ElasticRefusal::AttentionOther),
+            Some(ElasticAttention::AddDisk { .. }) => Err(ElasticRefusal::AttentionAddDisk),
+            Some(ElasticAttention::ParityRun { kind: fault, operation_id }) => match kind {
+                ElasticSnapraidKind::Scrub | ElasticSnapraidKind::Fix { .. } => Ok(()),
+                ElasticSnapraidKind::Sync
+                    if *fault == ElasticSnapraidKind::Sync || acknowledged_fault == Some(operation_id.as_str()) =>
+                {
+                    Ok(())
+                }
+                ElasticSnapraidKind::Sync => Err(ElasticRefusal::FaultUnacknowledged),
+            },
+        },
+        _ => Err(ElasticRefusal::OperationPending),
+    }
+}
+
+/// How an admitted add proceeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElasticAddAdmission {
+    /// A Ready array; the disk is new, or already the last slot of an add
+    /// the core did not get to record (E9).
+    Fresh,
+    /// The unfinished add of this very disk.
+    Resume,
+}
+
+/// Whether an add of `disk` may start (H9). `last_data` is the journal's last
+/// data slot. An unfinished add admits only itself, down to the filesystem
+/// UUID the slot was given; a pending intent is its own to settle then.
+pub fn add_disk_admission(
+    facts: &ElasticAdmission<'_>,
+    last_data: Option<&ElasticDiskSpec>,
+    disk: &ElasticDiskSpec,
+) -> Result<ElasticAddAdmission, ElasticRefusal> {
+    if facts.transfer_open {
+        return Err(ElasticRefusal::OperationPending);
+    }
+    match facts.attention {
+        Some(ElasticAttention::AddDisk { disk_id, .. }) => {
+            if *disk_id == disk.disk_id && last_data == Some(disk) {
+                Ok(ElasticAddAdmission::Resume)
+            } else {
+                Err(ElasticRefusal::AttentionAddDisk)
+            }
+        }
+        Some(ElasticAttention::ParityRun { .. }) => Err(ElasticRefusal::AttentionParityFault),
+        Some(ElasticAttention::Other) => Err(ElasticRefusal::AttentionOther),
+        None if facts.pending => Err(ElasticRefusal::OperationPending),
+        None if facts.stage == ElasticStage::Ready => Ok(ElasticAddAdmission::Fresh),
+        None if facts.stage == ElasticStage::NeedsAttention => Err(ElasticRefusal::AttentionOther),
+        None => Err(ElasticRefusal::OperationPending),
+    }
+}
+
+/// Whether an unfinished add may be undone (H13, I4): the disk provably never
+/// served a file, which only the JOURNAL can prove. `joined` is written
+/// durably before the branch is appended to the live union, so
+/// `joined == false` means no client could ever have reached the disk
+/// through the share. Once `joined` is true the add goes forward only,
+/// whatever a live read says: a union that is not mounted (after a reboot,
+/// or when it failed) says nothing about the files the branch received
+/// while it was. The live read may only ADD a refusal — a branch the running
+/// union serves refuses even a journal that says it never joined.
+pub fn add_undo_admission(joined: bool, in_union: Option<bool>) -> Result<(), ElasticRefusal> {
+    if joined || in_union == Some(true) {
+        return Err(ElasticRefusal::AddJoined);
+    }
+    Ok(())
 }
 
 /// One file a stuck mover record left in two versions.
@@ -2639,6 +2882,15 @@ pub(crate) mod execution {
         /// without a pending. A Sync uses `stale_sync_operation` instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         interrupted_operation: Option<String>,
+        /// WHY the array needs attention (H1). Written only by
+        /// `enter_attention`, by the growth of an add, and cleared by the
+        /// success that resolves it; never present on a Ready array. Absent in
+        /// every journal an older helper wrote: such a `NeedsAttention` has no
+        /// recorded cause and admits only a Restore, and a parity run it left
+        /// pinned is converted on first touch (`normalise_pinned_parity_run`).
+        /// A 0.13.0 helper keeps the key verbatim in `extra`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attention: Option<ElasticAttention>,
         /// Full stuck records of closed operations, oldest first, capped at
         /// `STUCK_LIMIT`; the oldest is summarised away when a newer one
         /// arrives. Its path stays in `stuck_paths`.
@@ -2842,6 +3094,7 @@ pub(crate) mod execution {
         if journal.detail.as_ref().is_some_and(|detail| detail.len() > TRANSFER_DETAIL_LIMIT) {
             return Err("zbyt długi opis stanu macierzy".into());
         }
+        validate_attention(journal)?;
         match (journal.schema, &journal.private) {
             (1, None)
                 if journal.spec.cache.is_none()
@@ -3005,6 +3258,108 @@ pub(crate) mod execution {
         }
     }
 
+    /// The recorded cause and the state it explains. A cause never stands on
+    /// a Ready array, and an add's cause names the journal's last data slot —
+    /// the one slot an undo may remove.
+    fn validate_attention(journal: &Journal) -> Result<(), String> {
+        let Some(attention) = &journal.attention else {
+            return Ok(());
+        };
+        if journal.stage == ElasticStage::Ready {
+            return Err("przyczyna uwagi na gotowej macierzy".into());
+        }
+        match attention {
+            ElasticAttention::ParityRun { operation_id, kind } => {
+                validate_elastic_uuid(operation_id).map_err(|e| e.to_string())?;
+                if operation_id == &journal.spec.operation_id {
+                    return Err("przyczyna uwagi z identyfikatorem Create".into());
+                }
+                if let ElasticSnapraidKind::Fix { disk } = kind {
+                    validate_data_branch_name(disk).map_err(|e| e.to_string())?;
+                }
+            }
+            ElasticAttention::AddDisk { disk_id, .. } => {
+                if journal.spec.data.len() < 2
+                    || journal.spec.data.last().is_none_or(|last| &last.disk_id != disk_id)
+                {
+                    return Err("przyczyna dodawania nie wskazuje ostatniego slotu danych".into());
+                }
+            }
+            ElasticAttention::Other => (),
+        }
+        Ok(())
+    }
+
+    /// THE ONE WRITER of `NeedsAttention` with a cause (H1). A recorded fact —
+    /// a failed parity run, an unfinished add — outranks `Other`: a Restore
+    /// or a dissolve that fails over it does not make the fault go away, so
+    /// the fact stays and only the detail says what happened last.
+    fn enter_attention(journal: &mut Journal, cause: ElasticAttention, detail: &str) {
+        let keep = cause == ElasticAttention::Other
+            && matches!(
+                journal.attention,
+                Some(ElasticAttention::ParityRun { .. } | ElasticAttention::AddDisk { .. })
+            );
+        if !keep {
+            journal.attention = Some(cause);
+        }
+        journal.stage = ElasticStage::NeedsAttention;
+        journal.detail = Some(bounded_text(detail, TRANSFER_DETAIL_LIMIT));
+    }
+
+    /// The admission facts of a journal.
+    fn journal_admission(journal: &Journal) -> ElasticAdmission<'_> {
+        ElasticAdmission {
+            stage: journal.stage,
+            pending: journal.pending.is_some(),
+            transfer_open: journal
+                .transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.finished_at.is_none()),
+            attention: journal.attention.as_ref(),
+        }
+    }
+
+    /// A Sync that failed may have rewritten part of parity: the stale marker
+    /// says so, and on a schema-2 journal the run that left it is named. A
+    /// schema-1 journal carries no such name (`validate_topology`); the
+    /// recorded cause names the run there.
+    fn mark_failed_sync(journal: &mut Journal, operation_id: &str) {
+        journal.stale_parity_bytes.get_or_insert(0);
+        if journal.private.is_some() {
+            journal.stale_sync_operation = Some(operation_id.to_string());
+        }
+    }
+
+    /// H6: a Sync, Scrub or Fix a 0.13.0 helper recorded as failed kept its
+    /// `Pending::Maintenance` next to the finished run, and nothing ever
+    /// cleared it — every operation refused the array, Restore included. The
+    /// run finished and its verdict is recorded, so the intent is settled
+    /// here into the cause it always was. A run still `Running` is NOT
+    /// touched: that one is an interrupted attempt Restore closes as such.
+    /// Returns whether the journal changed; the caller saves it under the
+    /// array lock.
+    fn normalise_pinned_parity_run(journal: &mut Journal) -> bool {
+        let Some(Pending::Maintenance { operation_id, kind }) = journal.pending.clone() else {
+            return false;
+        };
+        if !journal.last_run.as_ref().is_some_and(|run| {
+            run.operation_id == operation_id
+                && run.kind == kind
+                && run.finished_at.is_some()
+                && matches!(run.outcome, ElasticSnapraidOutcome::Failed | ElasticSnapraidOutcome::NeedsAttention)
+        }) {
+            return false;
+        }
+        journal.pending = None;
+        if kind == ElasticSnapraidKind::Sync {
+            mark_failed_sync(journal, &operation_id);
+        }
+        let detail = journal.detail.clone().unwrap_or_else(|| "nieudana operacja SnapRAID".into());
+        enter_attention(journal, ElasticAttention::ParityRun { operation_id, kind }, &detail);
+        true
+    }
+
     fn valid_stuck_record(spec: &ElasticCreateSpec, record: &ElasticStuckRecord) -> bool {
         let hex = |value: &str| {
             value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
@@ -3055,7 +3410,14 @@ pub(crate) mod execution {
                 || (run.kind != ElasticSnapraidKind::Sync
                     && run.outcome == ElasticSnapraidOutcome::NeedsAttention
                     && run.finished_at.is_some()
-                    && journal.interrupted_operation.as_deref() == Some(run.operation_id.as_str()));
+                    && journal.interrupted_operation.as_deref() == Some(run.operation_id.as_str()))
+                // A failed run whose verdict is recorded as the array's cause
+                // holds no intent: nothing of it is still in flight (I1).
+                || (run.finished_at.is_some()
+                    && journal.attention.as_ref().is_some_and(|attention| {
+                        matches!(attention, ElasticAttention::ParityRun { operation_id, kind }
+                            if *operation_id == run.operation_id && *kind == run.kind)
+                    }));
             // A repair that wrote nothing changed nothing, so it holds no
             // intent: it is terminal with no pending, like a success.
             if run.outcome == ElasticSnapraidOutcome::NothingRepaired {
@@ -3501,6 +3863,71 @@ pub(crate) mod execution {
                 return Err("dysk jest już członkiem tej macierzy".into());
             }
             journal.spec.data.push(disk.clone());
+            // THE SAME WRITE records the add as the array's cause (H9). A
+            // helper killed anywhere after this point leaves a journal that
+            // names the unfinished add, which is what admits its resume and
+            // its undo; written separately, a crash in between would leave a
+            // grown spec that nothing admits.
+            enter_attention(
+                &mut journal,
+                ElasticAttention::AddDisk { disk_id: disk.disk_id.clone(), joined: false },
+                "dodawanie dysku danych w toku",
+            );
+            journal.spec.validate().map_err(|e| e.to_string())?;
+            validate_topology(&journal)?;
+            validate_operation_record(&journal)?;
+            let bytes = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
+            if bytes.len() as u64 > JOURNAL_LIMIT {
+                return Err("journal przekroczyłby limit odczytu".into());
+            }
+            atomic_write(
+                &self.path.join(format!("{}.json", journal.spec.array_id)),
+                &bytes,
+                self.uid,
+            )?;
+            Ok(journal)
+        }
+
+        /// The mirror of `grow_data`, for the undo of an add (H13): removes
+        /// ONE data slot — the last, and only while the journal records the
+        /// unfinished add of exactly that disk. Like `grow_data` it re-reads
+        /// the stored journal under the caller's array lock, so nothing but
+        /// the slot, its `formatted` entry, the add's intent and its cause can
+        /// change.
+        ///
+        /// The array goes back to what it was before the add: Ready when its
+        /// union is published, otherwise waiting for a Restore.
+        fn shrink_data(&self, array_id: &str, disk: &ElasticDiskSpec) -> Result<Journal, String> {
+            let mut journal = self.load(array_id)?;
+            let slot = journal.spec.data.len();
+            if journal.spec.data.last() != Some(disk)
+                || !matches!(&journal.attention, Some(ElasticAttention::AddDisk { disk_id, .. }) if *disk_id == disk.disk_id)
+                || slot < 2
+            {
+                return Err("wycofać można tylko niedokończone dodanie tego dysku".into());
+            }
+            if journal
+                .pending
+                .as_ref()
+                .is_some_and(|pending| !add_owned_pending(pending, slot))
+            {
+                return Err("wycofanie dodawania wymaga braku obcej intencji".into());
+            }
+            let role = ElasticRole::Data(u16::try_from(slot).map_err(|_| "numer slotu")?);
+            journal.spec.data.pop();
+            journal.formatted.retain(|formatted| *formatted != role);
+            journal.pending = None;
+            journal.attention = None;
+            journal.stage = settled_stage(&journal);
+            if journal.stage == ElasticStage::Ready {
+                journal.detail = None;
+            } else {
+                enter_attention(
+                    &mut journal,
+                    ElasticAttention::Other,
+                    "dodawanie dysku wycofane; macierz czeka na przywrócenie",
+                );
+            }
             journal.spec.validate().map_err(|e| e.to_string())?;
             validate_topology(&journal)?;
             validate_operation_record(&journal)?;
@@ -3610,6 +4037,7 @@ pub(crate) mod execution {
                 stale_parity_bytes: None,
                 stale_sync_operation: None,
                 interrupted_operation: None,
+                attention: None,
                 stuck: Vec::new(),
                 stuck_paths: Vec::new(),
                 stuck_evicted: 0,
@@ -4551,15 +4979,48 @@ pub(crate) mod execution {
             }
             disks.push(row);
         }
+        let adding = unfinished_add(journal);
         let union = devices
             .as_ref()
             .ok()
             .and_then(|d| layout(&journal.spec, d).ok())
-            .and_then(|s| union_mounted(&s).ok())
+            .and_then(|s| {
+                union_mounted(&s).ok().filter(|mounted| *mounted).or_else(|| {
+                    // An unfinished add may serve the union it started from:
+                    // the branch joins only at its own step.
+                    if adding.is_none() {
+                        return union_mounted(&s).ok();
+                    }
+                    let mut before = s.clone();
+                    before.data.pop();
+                    union_mounted(&before).ok()
+                })
+            })
             .map(|mounted| mounted && worker.is_none_or(|worker| worker.public_mount().is_some()));
         let union_readonly = worker.and_then(|worker| worker.union_readonly().ok());
         let stuck = stuck_records(journal);
         let hidden = stuck_hidden(journal);
+        let pending_add = adding.map(|(disk, joined)| {
+            let slot = journal.spec.data.len();
+            let role = ElasticRole::Data(slot as u16);
+            let mounted = disks.iter().find(|row| row.role == role).and_then(|row| row.mounted);
+            let in_union = if journal.private.is_none() || worker.is_some() {
+                live_union_has_branch(&journal.spec.name, &data_branch_name(slot))
+            } else {
+                None
+            };
+            let formatted = journal.formatted.contains(&role);
+            ElasticPendingAdd {
+                disk_id: disk.disk_id.clone(),
+                branch: data_branch_name(slot),
+                formatted,
+                mounted,
+                in_union,
+                joined,
+                step: add_step(formatted, mounted, in_union),
+                undo_possible: add_undo_admission(joined, in_union).is_ok(),
+            }
+        });
         ElasticResult {
             array_id: journal.spec.array_id.clone(),
             operation_id: journal.spec.operation_id.clone(),
@@ -4591,7 +5052,56 @@ pub(crate) mod execution {
             } else {
                 Vec::new()
             },
+            attention: journal.attention.clone(),
+            operation_pending: journal.pending.is_some(),
+            transfer_open: journal
+                .transfer
+                .as_ref()
+                .is_some_and(|transfer| transfer.finished_at.is_none()),
+            pending_add,
+            refused: None,
         }
+    }
+
+    /// The disk of the add the journal records as unfinished, with its
+    /// durable join intent.
+    fn unfinished_add(journal: &Journal) -> Option<(&ElasticDiskSpec, bool)> {
+        match &journal.attention {
+            Some(ElasticAttention::AddDisk { disk_id, joined }) => journal
+                .spec
+                .data
+                .last()
+                .filter(|last| &last.disk_id == disk_id)
+                .map(|last| (last, *joined)),
+            _ => None,
+        }
+    }
+
+    /// The step a resume of an add would run first.
+    fn add_step(formatted: bool, mounted: Option<bool>, in_union: Option<bool>) -> ElasticAddStep {
+        if !formatted {
+            ElasticAddStep::Format
+        } else if in_union == Some(true) {
+            ElasticAddStep::Sync
+        } else if mounted != Some(true) {
+            ElasticAddStep::Mount
+        } else {
+            ElasticAddStep::Join
+        }
+    }
+
+    /// Whether the union this process sees serves `branch` of `array`.
+    /// `Some(false)` when no union is mounted at the array's path at all;
+    /// `None` when the answer could not be read.
+    fn live_union_has_branch(array: &str, branch: &str) -> Option<bool> {
+        let union = union_path(array);
+        let rows = mount_rows().ok()?;
+        if !rows.iter().any(|row| row.path == union && row.filesystem == "fuse.mergerfs") {
+            return Some(false);
+        }
+        let wanted = data_branch_path(array, branch);
+        let branches = read_union_branches(Path::new(&union)).ok()?;
+        Some(branches.iter().any(|entry| entry.split_once('=').map(|(path, _)| path).unwrap_or(entry) == wanted))
     }
 
     /// The versions stuck records left beside the file's own, found on the
@@ -5512,6 +6022,11 @@ pub(crate) mod execution {
     /// recorded on its own marker and is no reason to call the array broken.
     /// Anything else keeps it `NeedsAttention`.
     fn settled_stage(journal: &Journal) -> ElasticStage {
+        // A recorded cause is a reason, and it is resolved only by its own
+        // success (I2).
+        if journal.attention.is_some() {
+            return ElasticStage::NeedsAttention;
+        }
         let ready = journal.private.as_ref().is_none_or(|private| {
             private.published
                 && private.anchor.is_some()
@@ -6368,6 +6883,30 @@ pub(crate) mod execution {
         if journal.spec.cache.is_none() {
             return Err("macierz nie ma cache".into());
         }
+        // I3 ON THE HELPER'S SIDE. A new mover run ends in a Sync nobody
+        // acknowledged, so it does not start over a recorded Scrub or Fix
+        // fault; and it does not start while an add is unfinished, whose own
+        // Sync is the one owed. The core never sends one there
+        // (`mover_admission`); this is the backstop. Neither cause can stand
+        // next to an open transfer — both are recorded only by runs that
+        // refuse one — so no run this refuses is left unfinished by it.
+        if !journal.transfer.as_ref().is_some_and(|transfer| transfer.operation_id == request.operation_id) {
+            match &journal.attention {
+                Some(ElasticAttention::ParityRun { kind, .. }) if *kind != ElasticSnapraidKind::Sync => {
+                    return Err(format!(
+                        "{}: mover kończy się Sync, a macierz ma nierozwiązany błąd scrub lub naprawy",
+                        ElasticRefusal::FaultUnacknowledged.as_str()
+                    ));
+                }
+                Some(ElasticAttention::AddDisk { .. }) => {
+                    return Err(format!(
+                        "{}: mover czeka na dokończenie albo wycofanie dodawania dysku",
+                        ElasticRefusal::AttentionAddDisk.as_str()
+                    ));
+                }
+                _ => (),
+            }
+        }
         // A restart is the same operation under the same declared UUIDs. It
         // runs with the rules and coupling that operation announced, so a core
         // that lost its own intent can still finish it.
@@ -6780,9 +7319,34 @@ pub(crate) mod execution {
             locks: &[RawFd],
         ) -> Result<(), String>;
         fn run_tool(&mut self, program: &Path, args: &[String], locks: &[RawFd]) -> Result<(), String>;
+        /// SnapRAID with its log captured, as `capture_snapraid` runs it.
+        fn run_snapraid(
+            &mut self,
+            root: &Root,
+            array_lock: &File,
+            directory: &Path,
+            label: &str,
+            program: &Path,
+            args: &[String],
+        ) -> Result<(Option<i32>, Result<SnapraidLog, String>), String>;
         fn write_file(&mut self, path: &str, content: &str, uid: u32) -> Result<(), String>;
         /// Add one branch to a union that is already mounted.
         fn add_branch(&mut self, union: &str, branch: &str) -> Result<(), String>;
+        /// The branch specs the live union at `union` serves, or `None` when
+        /// no union is mounted there. An error when it cannot be read.
+        fn union_branches(&mut self, union: &str) -> Result<Option<Vec<String>>, String>;
+        /// The names in a directory.
+        fn directory_entries(&mut self, path: &str) -> Result<Vec<String>, String>;
+        fn unmount(&mut self, mountpoint: &str) -> Result<(), String>;
+        /// Every signature `wipefs --no-act` reports on the device.
+        fn signatures(&mut self, device: &Device) -> Result<Vec<WipedSignature>, String>;
+        /// Erases every signature, behind the exclusive open, and verifies
+        /// the device reads blank afterwards.
+        fn wipe(&mut self, device: &Device) -> Result<(), String>;
+        /// Whether every parity file of `plan` is still empty — parity no
+        /// Sync has written yet. SnapRAID's log of a Sync over such parity has
+        /// its own shape, which `SnapraidLog::apply` accepts only when told.
+        fn parity_empty(&mut self, plan: &ElasticSpec) -> Result<bool, String>;
         /// Whether a private worker hosts the union.
         fn has_worker(&self) -> bool;
         fn start_mergerfs(&mut self, program: &Path, args: &[String], log: &File) -> Result<Anchor, String>;
@@ -6871,12 +7435,71 @@ pub(crate) mod execution {
             success(run(program, args, None, locks)?).map(|_| ())
         }
 
+        fn run_snapraid(
+            &mut self,
+            root: &Root,
+            array_lock: &File,
+            directory: &Path,
+            label: &str,
+            program: &Path,
+            args: &[String],
+        ) -> Result<(Option<i32>, Result<SnapraidLog, String>), String> {
+            capture_snapraid(root, array_lock, directory, label, program.to_str().ok_or("ścieżka programu")?, args)
+        }
+
         fn write_file(&mut self, path: &str, content: &str, uid: u32) -> Result<(), String> {
             atomic_write(Path::new(path), content.as_bytes(), uid)
         }
 
         fn add_branch(&mut self, union: &str, branch: &str) -> Result<(), String> {
             add_union_branch(Path::new(union), branch)
+        }
+
+        fn union_branches(&mut self, union: &str) -> Result<Option<Vec<String>>, String> {
+            if !mount_rows()?.iter().any(|row| row.path == union && row.filesystem == "fuse.mergerfs") {
+                return Ok(None);
+            }
+            read_union_branches(Path::new(union)).map(Some)
+        }
+
+        fn directory_entries(&mut self, path: &str) -> Result<Vec<String>, String> {
+            std::fs::read_dir(path)
+                .map_err(|e| format!("{path}: {e}"))?
+                .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()).map_err(|e| e.to_string()))
+                .collect()
+        }
+
+        fn unmount(&mut self, mountpoint: &str) -> Result<(), String> {
+            unmount_path(Path::new(mountpoint))
+        }
+
+        fn signatures(&mut self, device: &Device) -> Result<Vec<WipedSignature>, String> {
+            wipefs_probe(&device.path)
+        }
+
+        fn parity_empty(&mut self, plan: &ElasticSpec) -> Result<bool, String> {
+            parity_files_empty(plan)
+        }
+
+        fn wipe(&mut self, device: &Device) -> Result<(), String> {
+            // The same gate the disk wipe is built around: no holder, no
+            // mount in any namespace (the exclusive open), and `wipefs`
+            // WITHOUT `--force`, which would skip its own exclusive open.
+            if !device_holders(device)?.is_empty() {
+                return Err(format!("{}: urządzenie ma aktywnych właścicieli", device.path));
+            }
+            drop(open_exclusive(&device.path)?);
+            let wipefs = tool(&["/usr/sbin/wipefs", "/sbin/wipefs", "/usr/bin/wipefs"])?;
+            success(run(&wipefs, &["--all".into(), device.path.clone()], None, &[])?)?;
+            let remaining = wipefs_probe(&device.path)?;
+            if !remaining.is_empty() {
+                return Err(format!(
+                    "{}: po czyszczeniu urządzenie nadal zgłasza sygnatury ({})",
+                    device.path,
+                    remaining.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>().join(", ")
+                ));
+            }
+            Ok(())
         }
 
         fn has_worker(&self) -> bool {
@@ -6957,7 +7580,20 @@ pub(crate) mod execution {
                     }
                     let disk = role_disk(&journal.spec, role)?.clone();
                     let current = system.device(&disk)?;
-                    system.clean_device(&current)?;
+                    system.clean_device(&current).map_err(|error| {
+                        // H11, until M1 is measured: an add never formats over
+                        // a signature, not even the partial filesystem its own
+                        // interrupted mkfs may have left. The undo can wipe
+                        // exactly that one (`own_signatures_only`).
+                        if mode == StepMode::AddDisk {
+                            format!(
+                                "{error} — dysk nosi już podpis, być może niedokończonego formatowania tego \
+                                 dodawania; wycofaj dodawanie, a potem dodaj dysk ponownie"
+                            )
+                        } else {
+                            error
+                        }
+                    })?;
                     let expected_uuid = disk.expected_uuid.clone();
                     let args = if filesystem == "ext4" {
                         vec![
@@ -7039,7 +7675,9 @@ pub(crate) mod execution {
                     mountpoint,
                     options,
                 } => {
-                    for role in roles(&journal.spec) {
+                    // The members the PLAN serves: the journal's spec, or the
+                    // array before an add that never joined (`serving_spec`).
+                    for role in plan_roles(plan) {
                         let device = system.device(role_disk(&journal.spec, role)?)?;
                         system.filesystem_matches(&journal.spec, role, &device)?;
                         if !system.branch_mounted(&journal.spec, role, &device)? {
@@ -7099,6 +7737,10 @@ pub(crate) mod execution {
                     {
                         return Err("nieoczekiwany sync".into());
                     }
+                    if mode == StepMode::AddDisk {
+                        add_sync(root, array_lock, journal, plan, &program, &args, system)?;
+                        continue;
+                    }
                     pending_operation(
                         journal,
                         Pending::Sync,
@@ -7121,12 +7763,141 @@ pub(crate) mod execution {
                     // record and nothing to resume: the xattr write either
                     // took or it did not, and `add_union_branch` reads the
                     // live union back to find out which.
+                    //
+                    // WHAT IS RECORDED FIRST is that it may take: from here on
+                    // the disk may serve files, and only a live read of this
+                    // union can prove it does not (I4). Durable before the
+                    // write, so no crash can leave a joined disk that the
+                    // journal still calls safe to undo.
+                    if let Some(ElasticAttention::AddDisk { joined, .. }) = journal.attention.as_mut() {
+                        if !*joined {
+                            *joined = true;
+                            root.save(journal)?;
+                        }
+                    }
                     system.add_branch(&union, &branch)?;
                 }
                 _ => return Err("niedozwolony krok wykonawcy".into()),
             }
         }
         Ok(())
+    }
+
+    /// The roles a mount plan serves, in `roles` order.
+    fn plan_roles(plan: &ElasticSpec) -> Vec<ElasticRole> {
+        (1..=plan.data.len())
+            .map(|slot| ElasticRole::Data(slot as u16))
+            .chain((!plan.cache.is_empty()).then_some(ElasticRole::Cache))
+            .chain(plan.parity.iter().map(|parity| ElasticRole::Parity(parity.index)))
+            .collect()
+    }
+
+    /// H12: the Sync that ends an add, judged by its LOG exactly as a manual
+    /// Sync is (`SnapraidLog::apply`), never by the exit code alone. The
+    /// union serves throughout, so files change under this Sync as under
+    /// any other, and snapraid exits 1 for that.
+    ///
+    /// * `Complete` — parity covers the grown array; the checkpoint moves.
+    /// * `FilesChanged` — the add is done; parity is marked out of date, as
+    ///   after a manual `Partial`, and the next Sync covers those files.
+    /// * anything else — the intent is cleared (the verdict is known, I1),
+    ///   parity is marked stale, and the error fails the add, which keeps
+    ///   its cause so the resume runs this Sync again.
+    /// Whether every parity file of `spec` is still empty, as
+    /// `maintenance_guard` decides it for a manual Sync: a parity file of
+    /// length zero is parity no Sync has written.
+    fn parity_files_empty(spec: &ElasticSpec) -> Result<bool, String> {
+        for (directive, path) in snapraid_directives(spec).map_err(|e| e.to_string())? {
+            if directive == "content" || !directive.ends_with("parity") {
+                continue;
+            }
+            if std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len() != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn add_sync(
+        root: &Root,
+        array_lock: &File,
+        journal: &mut Journal,
+        plan: &ElasticSpec,
+        program: &str,
+        args: &[String],
+        system: &mut dyn StepSystem,
+    ) -> Result<(), String> {
+        let runs = root.path.join(format!("{}.runs", journal.spec.array_id));
+        directory(&runs, true, root.uid)?;
+        let disk = journal.spec.data.last().ok_or("brak dodawanego dysku")?;
+        let directory_path = runs.join(format!("add-{}", disk.expected_uuid));
+        directory(&directory_path, true, root.uid)?;
+        // Every attempt keeps its own log: a resume after a failed Sync
+        // must not refuse to start over the evidence of the first one.
+        let attempt = std::fs::read_dir(&directory_path)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_str().is_some_and(|name| name.ends_with(".log")))
+            .count()
+            + 1;
+        let label = format!("sync-{attempt}");
+        let mut run = ElasticSnapraidRun {
+            operation_id: disk.expected_uuid.clone(),
+            kind: ElasticSnapraidKind::Sync,
+            started_at: timestamp()?,
+            finished_at: None,
+            outcome: ElasticSnapraidOutcome::Running,
+            exit_code: None,
+            total_blocks: None,
+            checked_blocks: None,
+            accessed_mb: None,
+            errors_file: None,
+            errors_io: None,
+            errors_data: None,
+            detail: None,
+        };
+        // M3 of the release review: an array whose parity no Sync has written
+        // yet (created, never filled) answers this Sync with SnapRAID's
+        // "nothing to do on empty parity" log, which the log check accepts
+        // only when told — exactly as the manual Sync is told by
+        // `maintenance_guard`. Measured before the run: the run is what
+        // writes it.
+        let empty_parity = system.parity_empty(plan)?;
+        journal.pending = Some(Pending::Sync);
+        journal.stage = ElasticStage::SyncPending;
+        root.save(journal)?;
+        let verdict = system
+            .run_snapraid(root, array_lock, &directory_path, &label, Path::new(program), args)
+            .and_then(|(code, parsed)| {
+                let log = parsed?;
+                match (log.apply(&mut run, plan, empty_parity), code) {
+                    (Ok(SnapraidVerdict::Complete), Some(0)) => Ok(SnapraidVerdict::Complete),
+                    (Ok(SnapraidVerdict::FilesChanged), Some(1)) => Ok(SnapraidVerdict::FilesChanged),
+                    (Err(error), _) => Err(error),
+                    _ => Err("proces SnapRAID nie zakończył się sukcesem".to_string()),
+                }
+            });
+        journal.pending = None;
+        match verdict {
+            // The stale marker is NOT cleared here: only a write that records
+            // a successful Sync run may clear it (`transfer_transition`), and
+            // the add's Sync is not a recorded run. A marker an earlier
+            // attempt left stays until the next recorded Sync — conservative.
+            Ok(SnapraidVerdict::Complete) => {
+                journal.sync_completed_at = Some(timestamp()?);
+                root.save(journal)
+            }
+            Ok(SnapraidVerdict::FilesChanged) => {
+                journal.stale_parity_bytes.get_or_insert(0);
+                root.save(journal)
+            }
+            other => {
+                let error = other.err().unwrap_or_else(|| "niespodziewany werdykt".into());
+                journal.stale_parity_bytes.get_or_insert(0);
+                root.save(journal)?;
+                Err(bounded_text(&format!("sync po dodaniu dysku: {error}"), TRANSFER_DETAIL_LIMIT))
+            }
+        }
     }
 
     fn private_directory(base: &Path, path: &Path, uid: u32) -> Result<(), String> {
@@ -7201,8 +7972,19 @@ pub(crate) mod execution {
                         evicted = close_transfer(&mut completed)?;
                     }
                 }
-                completed.stage = ElasticStage::Ready;
-                completed.detail = None;
+                // H7: the operations that finish here remount and publish;
+                // they do not repair parity and they do not finish an add. A
+                // cause that names either stays, and the array with it (I7).
+                if matches!(
+                    completed.attention,
+                    Some(ElasticAttention::ParityRun { .. } | ElasticAttention::AddDisk { .. })
+                ) {
+                    completed.stage = ElasticStage::NeedsAttention;
+                } else {
+                    completed.attention = None;
+                    completed.stage = ElasticStage::Ready;
+                    completed.detail = None;
+                }
                 root.save(&completed)?;
                 // Only now: a refused save drops the clone, and an eviction
                 // that never reached the disk must not appear in the log.
@@ -7213,8 +7995,7 @@ pub(crate) mod execution {
             }
             Err(error) => {
                 let mut failed = journal.clone();
-                failed.stage = ElasticStage::NeedsAttention;
-                failed.detail = Some(bounded_text(&error, TRANSFER_DETAIL_LIMIT));
+                enter_attention(&mut failed, ElasticAttention::Other, &error);
                 root.save(&failed)?;
                 *journal = failed;
             }
@@ -7904,22 +8685,55 @@ pub(crate) mod execution {
         journal: Journal,
         operation_id: &str,
         kind: ElasticSnapraidKind,
+        acknowledged_fault: Option<&str>,
         worker: Option<&Worker>,
         held_array_lock: Option<&File>,
     ) -> Result<ElasticSnapraidResult, String> {
-        maintenance_with_scope(root, journal, operation_id, kind, FixScope::MarkedBlocks, worker, held_array_lock)
+        maintenance_with_scope(
+            root,
+            journal,
+            operation_id,
+            kind,
+            FixScope::MarkedBlocks,
+            acknowledged_fault,
+            worker,
+            held_array_lock,
+        )
     }
 
+    /// A SnapRAID run record that never started: the gate or a precondition
+    /// refused it, and `detail` is the closed-vocabulary reason. It is
+    /// returned, never saved — the journal stays exactly as it was (I5).
+    fn refused_run(operation_id: &str, kind: &ElasticSnapraidKind, detail: &str) -> Result<ElasticSnapraidRun, String> {
+        let now = timestamp()?;
+        Ok(ElasticSnapraidRun {
+            operation_id: operation_id.into(),
+            kind: kind.clone(),
+            started_at: now.clone(),
+            finished_at: Some(now),
+            outcome: ElasticSnapraidOutcome::Refused,
+            exit_code: None,
+            total_blocks: None,
+            checked_blocks: None,
+            accessed_mb: None,
+            errors_file: None,
+            errors_io: None,
+            errors_data: None,
+            detail: Some(detail.into()),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn maintenance_with_scope(
         root: &Root,
         mut journal: Journal,
         operation_id: &str,
         kind: ElasticSnapraidKind,
         scope: FixScope,
+        acknowledged_fault: Option<&str>,
         worker: Option<&Worker>,
         held_array_lock: Option<&File>,
     ) -> Result<ElasticSnapraidResult, String> {
-        let repairing = matches!(kind, ElasticSnapraidKind::Fix { .. });
         let owned_array_lock;
         let array_lock = match held_array_lock {
             Some(lock) => lock,
@@ -7931,19 +8745,23 @@ pub(crate) mod execution {
         if journal.private.is_some() && !worker.is_some_and(|worker| worker.public_mount().is_some()) {
             return Err("brak potwierdzonej publikacji prywatnej macierzy".into());
         }
-        // A Fix is the ONE operation that may start on an array that needs
-        // attention, and it has to be: a scrub that found errors closes as
-        // `NeedsAttention`, and refusing the repair there would leave the
-        // array with no way out of the state the repair exists to resolve. An
-        // unfinished operation still blocks it — a pending intent or a mover
-        // mid-transfer means the journal does not yet know what is on the
-        // disks.
-        let stage_ready = journal.stage == ElasticStage::Ready
-            || (repairing && journal.stage == ElasticStage::NeedsAttention);
-        if journal.pending.is_some() || !stage_ready
-            || journal.transfer.as_ref().is_some_and(|transfer| transfer.finished_at.is_none())
-        {
-            return Err("macierz wymaga uwagi lub operacja trwa".into());
+        // H6: a failed run an older helper left pinned is settled into its
+        // cause first, under the lock this process now holds, so the gate
+        // below judges the array by what happened rather than refusing it
+        // for an intent nothing will ever clear.
+        let mut stored = journal.clone();
+        if normalise_pinned_parity_run(&mut stored) {
+            root.save(&stored)?;
+            journal = stored;
+        }
+        // H3 + H5: the gate is a pure function over the journal, and its
+        // refusal is an ANSWER, not an error: the core closes it as a run
+        // that did not start, with nothing about the array touched.
+        if let Err(refusal) = maintenance_admission(&journal_admission(&journal), &kind, acknowledged_fault) {
+            return Ok(ElasticSnapraidResult {
+                state: observe(&journal, worker),
+                run: refused_run(operation_id, &kind, refusal.as_str())?,
+            });
         }
         if operation_id == journal.spec.operation_id
             || journal
@@ -8178,6 +8996,10 @@ pub(crate) mod execution {
                     journal.stale_sync_operation = None;
                 }
                 journal.pending = None;
+                // The success that resolves a recorded parity fault clears
+                // it; the admission gate let this run start only because it
+                // is such a success.
+                journal.attention = None;
                 journal.stage = ElasticStage::Ready;
                 journal.detail = None;
             }
@@ -8191,6 +9013,7 @@ pub(crate) mod execution {
                 journal.stale_parity_bytes.get_or_insert(0);
                 journal.stale_sync_operation = Some(run.operation_id.clone());
                 journal.pending = None;
+                journal.attention = None;
                 journal.stage = ElasticStage::Ready;
                 journal.detail = None;
             }
@@ -8219,8 +9042,21 @@ pub(crate) mod execution {
                     journal.stage = settled_stage(journal);
                     journal.detail = None;
                 } else {
-                    journal.stage = ElasticStage::NeedsAttention;
-                    journal.detail = Some(bounded_text(&error, TRANSFER_DETAIL_LIMIT));
+                    // H2: FAILED AND RECORDED, not failed and pinned. The run
+                    // finished and its verdict is known, so no intent remains
+                    // (I1); the verdict becomes the array's cause, which
+                    // admits exactly the runs that resolve it (I2). A Sync
+                    // that failed may have rewritten part of parity, which the
+                    // stale marker says, exactly as for a mover's failed Sync.
+                    journal.pending = None;
+                    if kind == ElasticSnapraidKind::Sync {
+                        mark_failed_sync(journal, &run.operation_id);
+                    }
+                    enter_attention(
+                        journal,
+                        ElasticAttention::ParityRun { operation_id: run.operation_id.clone(), kind: kind.clone() },
+                        &error,
+                    );
                 }
             }
         }
@@ -8291,7 +9127,13 @@ pub(crate) mod execution {
         // the array lock (`settle_interrupted_sync`); the first Sync of a
         // Create still stops it.
         let interrupted_maintenance = matches!(&journal.pending, Some(Pending::Maintenance { .. }));
-        if (matches!(journal.pending, Some(Pending::Sync | Pending::Maintenance { .. })) && !interrupted_maintenance)
+        // The final Sync of an unfinished add is the add's own intent: the
+        // array lock proves no snapraid runs, Restore settles it with parity
+        // marked stale, and the add's resume runs the Sync again.
+        let add_sync = journal.pending == Some(Pending::Sync) && unfinished_add(journal).is_some();
+        if (matches!(journal.pending, Some(Pending::Sync | Pending::Maintenance { .. }))
+            && !interrupted_maintenance
+            && !add_sync)
             || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
         {
             return Err("sync niepotwierdzony; restore nie wykonuje sync".into());
@@ -8412,15 +9254,13 @@ pub(crate) mod execution {
         journal.stage = ElasticStage::Mounting;
         root.save(&journal)?;
         if let Err(error) = set_readonly() {
-            journal.stage = ElasticStage::NeedsAttention;
-            journal.detail = Some(bounded_text(&format!("service: {error}"), TRANSFER_DETAIL_LIMIT));
+            enter_attention(&mut journal, ElasticAttention::Other, &format!("service: {error}"));
             root.save(&journal)?;
             return Err(error);
         }
         let mut completed = journal;
         completed.pending = None;
-        completed.stage = ElasticStage::NeedsAttention;
-        completed.detail = Some("service Hold: unia potwierdzona jako globalnie RO".into());
+        enter_attention(&mut completed, ElasticAttention::Other, "service Hold: unia potwierdzona jako globalnie RO");
         completed.private.as_mut().ok_or("brak prywatnej topologii")?.service.as_mut()
             .ok_or("brak stanu service")?.pending = false;
         root.save(&completed)?;
@@ -8479,10 +9319,60 @@ pub(crate) mod execution {
         {
             return Err("niepewne zakończenie mount w tym samym boot; wymagany restart".into());
         }
-        if journal.formatted.len() != roles(&journal.spec).len() {
+        let serving = serving_spec(journal);
+        if !roles(&serving).iter().all(|role| journal.formatted.contains(role)) {
             return Err("nieukończone formatowanie; restore nie formatuje".into());
         }
         Ok(())
+    }
+
+    /// The array a Restore brings up. It is the journal's spec, except while
+    /// an add that never tried to join the union is unfinished: then it is
+    /// the array as it was before that add, so a reboot neither puts a disk
+    /// into the share behind the admin's back nor fails on a slot that may
+    /// not even carry a filesystem yet. The add's resume or its undo decides
+    /// the slot afterwards.
+    fn serving_spec(journal: &Journal) -> ElasticCreateSpec {
+        let mut spec = journal.spec.clone();
+        if matches!(unfinished_add(journal), Some((_, false))) {
+            spec.data.pop();
+        }
+        spec
+    }
+
+    /// Whether `pending` is an intent the add of data slot `slot` itself
+    /// writes: the format and the mount of its own slot, the config rewrite
+    /// and the final Sync.
+    fn add_owned_pending(pending: &Pending, slot: usize) -> bool {
+        let own = u16::try_from(slot).ok().map(ElasticRole::Data);
+        match pending {
+            Pending::Format(role) | Pending::Mount(role) => Some(*role) == own,
+            Pending::Config | Pending::Sync => true,
+            Pending::Union | Pending::Maintenance { .. } => false,
+        }
+    }
+
+    /// H10: settles the intent an unfinished add left, before anything
+    /// plans. Each of its steps is idempotent against a durable fact — the
+    /// `formatted` list gates mkfs, the mount table gates the mount, the live
+    /// union gates the join, the config write is atomic — and the array lock
+    /// held here proves no snapraid of it still runs, so its intent is only
+    /// "this step may have happened", which the next step's own check
+    /// answers. A Sync that may have run part-way leaves parity stale. An
+    /// intent any other operation wrote is refused: it is not this add's to
+    /// settle. Returns whether the journal changed.
+    fn settle_add_pending(journal: &mut Journal) -> Result<bool, String> {
+        let Some(pending) = journal.pending.clone() else {
+            return Ok(false);
+        };
+        if unfinished_add(journal).is_none() || !add_owned_pending(&pending, journal.spec.data.len()) {
+            return Err("intencja innej operacji niż niedokończone dodanie dysku".into());
+        }
+        if pending == Pending::Sync {
+            journal.stale_parity_bytes.get_or_insert(0);
+        }
+        journal.pending = None;
+        Ok(true)
     }
 
     fn restore(root: &Root, mut journal: Journal, mut worker: Option<&mut Worker>, held_array_lock: Option<&File>) -> Result<ElasticResult, String> {
@@ -8496,21 +9386,37 @@ pub(crate) mod execution {
         };
         let outcome = (|| -> Result<(), String> {
             let current_boot = boot_id()?;
+            // H6 and H10 first, each saved under the array lock: a parity run
+            // an older helper left pinned becomes its recorded cause, and the
+            // intent an unfinished add left is settled — neither is a
+            // reason for a Restore to refuse, and neither is laundered by it.
+            let mut settled = journal.clone();
+            let normalised = normalise_pinned_parity_run(&mut settled);
+            let add_settled = if unfinished_add(&settled).is_some() {
+                settle_add_pending(&mut settled)?
+            } else {
+                false
+            };
+            if normalised || add_settled {
+                root.save(&settled)?;
+                journal = settled;
+            }
             settle_interrupted_sync(root, &mut journal, array_lock)?;
             restore_checkpoint_guard(&journal)?;
             let devices = inventory()?;
-            let spec = layout(&journal.spec, &devices)?;
-            for role in roles(&journal.spec) {
+            let serving = serving_spec(&journal);
+            let spec = layout(&serving, &devices)?;
+            for role in roles(&serving) {
                 filesystem_matches(
-                    &journal.spec,
+                    &serving,
                     role,
-                    resolve(role_disk(&journal.spec, role)?, &devices)?,
+                    resolve(role_disk(&serving, role)?, &devices)?,
                 )?;
             }
             restore_mount_guard(&journal, &current_boot, || union_mounted(&spec))?;
             let mut observed = Observed::default();
             observed.known = true;
-            for role in roles(&journal.spec) {
+            for role in roles(&serving) {
                 if branch_mounted(
                     &journal.spec,
                     role,
@@ -8529,7 +9435,19 @@ pub(crate) mod execution {
                 private_file(Path::new(&spec.config_path()), root.uid)?
                     .read_to_string(&mut content)
                     .map_err(|e| e.to_string())?;
-                if content != snapraid_config(&spec).map_err(|e| e.to_string())? {
+                // An add that may have joined rewrites the config as its own
+                // later step, so either the config of the array before it or
+                // the one after it is this array's.
+                let before_add = matches!(unfinished_add(&journal), Some((_, true))).then(|| {
+                    let mut before = spec.clone();
+                    before.data.pop();
+                    before
+                });
+                let expected = std::iter::once(&spec)
+                    .chain(before_add.as_ref())
+                    .map(|spec| snapraid_config(spec).map_err(|e| e.to_string()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !expected.contains(&content) {
                     return Err("konfiguracja niezgodna z journalem".into());
                 }
             }
@@ -8610,7 +9528,7 @@ pub(crate) mod execution {
     /// there.
     fn add_data_disk(
         root: &Root,
-        mut journal: Journal,
+        journal: Journal,
         disk: &ElasticDiskSpec,
         mut worker: Option<&mut Worker>,
         held_array_lock: Option<&File>,
@@ -8623,127 +9541,401 @@ pub(crate) mod execution {
                 &owned_array_lock
             }
         };
-        let outcome = (|| -> Result<(), String> {
-            if journal.private.is_some()
-                && !worker.as_deref().is_some_and(|worker| worker.public_mount().is_some())
-            {
-                return Err("brak potwierdzonej publikacji prywatnej macierzy".into());
-            }
-            if journal.pending.is_some()
-                || journal.stage != ElasticStage::Ready
-                || journal
-                    .transfer
-                    .as_ref()
-                    .is_some_and(|transfer| transfer.finished_at.is_none())
-            {
-                return Err("dodanie dysku wymaga gotowej macierzy bez trwającej operacji".into());
-            }
-            if journal.formatted.len() != roles(&journal.spec).len() {
-                return Err("nieukończone formatowanie macierzy".into());
-            }
-            if !journal.spec.parity.is_empty() && journal.sync_completed_at.is_none() {
-                return Err("niepotwierdzony pierwszy sync".into());
-            }
-            match journal.spec.data.iter().position(|old| old.disk_id == disk.disk_id) {
-                // A repeat of an add this node already recorded. The stored
-                // entry is what everything below resumes against, so it has to
-                // be the SAME disk down to the filesystem UUID the mkfs was
-                // given — a different UUID would mean formatting a member of
-                // the array a second time.
-                Some(index) => {
-                    if journal.spec.data[index] != *disk
-                        || index + 1 != journal.spec.data.len()
-                    {
-                        return Err("dysk jest już innym członkiem tej macierzy".into());
-                    }
-                }
-                None => {
-                    if journal
-                        .spec
-                        .cache
-                        .iter()
-                        .chain(&journal.spec.parity)
-                        .any(|old| old.disk_id == disk.disk_id)
-                    {
-                        return Err("dysk pełni w tej macierzy inną rolę".into());
-                    }
-                    let others: Vec<Claim> = root
-                        .claims()?
-                        .complete()?
-                        .into_iter()
-                        .filter(|other| other.spec.array_id != journal.spec.array_id)
-                        .collect();
-                    let mut candidate = journal.spec.clone();
-                    candidate.data = vec![disk.clone()];
-                    candidate.cache = None;
-                    candidate.parity = Vec::new();
-                    candidate.name = String::new();
-                    // `claims_guard` is the node-wide reservation check the
-                    // create path uses, and it is reused rather than copied so
-                    // a disk cannot be admitted here under a rule create
-                    // refuses. The name is blanked because THIS array's name
-                    // is legitimately taken — by this array.
-                    claims_guard(&others, &candidate)?;
-                    // The ONE road a persisted spec may grow by. It cannot go
-                    // through `save`, which refuses every spec change so that
-                    // no other writer can reshape an array underneath its own
-                    // journal — and it re-reads the stored journal, so what
-                    // the caller goes on saving is what is now on disk.
-                    journal = root.grow_data(&journal.spec.array_id, disk)?;
-                }
-            }
-            let slot = journal.spec.data.len();
-            let role = ElasticRole::Data(slot as u16);
-            let devices = inventory()?;
-            let spec_after = layout(&journal.spec, &devices)?;
-            let mut spec_before = spec_after.clone();
-            spec_before.data.pop();
-            for other in roles(&journal.spec) {
-                if other == role {
-                    continue;
-                }
-                let device = resolve(role_disk(&journal.spec, other)?, &devices)?;
-                filesystem_matches(&journal.spec, other, device)?;
-                if !branch_mounted(&journal.spec, other, device)? {
-                    return Err("niezamontowany branch macierzy".into());
-                }
-            }
-            // `union_mounted` is strict by design — any difference from the
-            // spec is an error rather than a `false` — so the shape a retry
-            // leaves is tried first and only the failure of the shape a FIRST
-            // attempt expects is reported.
-            let in_union = union_mounted(&spec_after).unwrap_or(false);
-            if !in_union && !union_mounted(&spec_before)? {
-                return Err("dodanie dysku wymaga działającej unii macierzy".into());
-            }
-            let added = spec_after.data.last().ok_or("brak dodanego brancha")?.clone();
-            let device = resolve(disk, &devices)?;
-            let done = AddedDiskState {
-                formatted: journal.formatted.contains(&role),
-                mounted: branch_mounted(&journal.spec, role, device)?,
-                in_union,
-            };
-            let tools = Tools::resolve(&spec_after).map_err(|e| e.to_string())?;
-            execute_steps(
+        let verdict = if journal.private.is_some()
+            && !worker.as_deref().is_some_and(|worker| worker.public_mount().is_some())
+        {
+            AddVerdict::Refused(
+                journal,
+                ElasticRefusal::PreconditionFailed,
+                "brak potwierdzonej publikacji prywatnej macierzy".into(),
+            )
+        } else {
+            add_disk_steps(
                 root,
                 array_lock,
-                &mut journal,
-                &spec_after,
-                plan_add_data_disk(&spec_after, &added, &done, &tools).map_err(|e| e.to_string())?,
-                StepMode::AddDisk,
-                &mut LiveSteps {
-                    worker: worker.as_deref_mut(),
+                journal,
+                disk,
+                &mut LiveSteps { worker: worker.as_deref_mut() },
+                |journal| {
+                    let spec_after = layout(&journal.spec, &inventory()?)?;
+                    Tools::resolve(&spec_after).map_err(|e| e.to_string())
                 },
-            )?;
-            // POSITIVE evidence that the array really grew: the live union
-            // must now report exactly the branch list the journal describes,
-            // new disk included.
-            if !union_mounted(&spec_after)? {
-                return Err("unia nie potwierdziła nowego brancha".into());
+            )?
+        };
+        match verdict {
+            AddVerdict::Refused(journal, refusal, why) => {
+                let mut state = observe(&journal, worker.as_deref());
+                state.refused = Some(refusal);
+                state.detail = Some(bounded_text(&why, TRANSFER_DETAIL_LIMIT));
+                Ok(state)
             }
-            Ok(())
-        })();
-        finish(root, &mut journal, outcome, worker.as_deref())
+            AddVerdict::Ran(mut journal, outcome) => finish(root, &mut journal, outcome, worker.as_deref()),
+        }
+    }
+
+    /// What an add request came to.
+    enum AddVerdict {
+        /// H8: A REFUSAL IS NOT A FAULT. The journal is handed back exactly as
+        /// it was read — not written, its stage not touched (I5) — with the
+        /// rule that said no and why.
+        Refused(Journal, ElasticRefusal, String),
+        /// The add ran, from the growth of the spec (or the resume of it) on;
+        /// its outcome goes through `finish`, which keeps the add's cause on a
+        /// failure.
+        Ran(Journal, Result<(), String>),
+    }
+
+    /// The admission of an add and everything after it, over the step
+    /// system. `tools` is asked only once the add is admitted and the spec
+    /// has grown.
+    fn add_disk_steps(
+        root: &Root,
+        array_lock: &File,
+        mut journal: Journal,
+        disk: &ElasticDiskSpec,
+        system: &mut dyn StepSystem,
+        tools: impl FnOnce(&Journal) -> Result<Tools, String>,
+    ) -> Result<AddVerdict, String> {
+        let refuse = |journal: Journal, refusal: ElasticRefusal, why: &str| {
+            Ok(AddVerdict::Refused(journal, refusal, why.to_string()))
+        };
+        let admission = match add_disk_admission(&journal_admission(&journal), journal.spec.data.last(), disk) {
+            Ok(admission) => admission,
+            Err(refusal) => {
+                let why = match refusal {
+                    ElasticRefusal::AttentionAddDisk => {
+                        "macierz ma niedokończone dodanie innego dysku; dokończ je albo wycofaj"
+                    }
+                    ElasticRefusal::AttentionParityFault => {
+                        "macierz ma nierozwiązany błąd parity; najpierw naprawa, scrub albo sync"
+                    }
+                    ElasticRefusal::AttentionOther => "macierz wymaga uwagi; najpierw ją przywróć",
+                    _ => "dodanie dysku wymaga gotowej macierzy bez trwającej operacji",
+                };
+                return refuse(journal, refusal, why);
+            }
+        };
+        match admission {
+            ElasticAddAdmission::Resume => {
+                // H10, saved before anything plans: the step this add
+                // stopped in is answered by the next step's own check.
+                let mut settled = journal.clone();
+                match settle_add_pending(&mut settled) {
+                    Ok(true) => {
+                        root.save(&settled)?;
+                        journal = settled;
+                    }
+                    Ok(false) => (),
+                    Err(error) => return refuse(journal, ElasticRefusal::OperationPending, &error),
+                }
+            }
+            ElasticAddAdmission::Fresh => {
+                if journal.formatted.len() != roles(&journal.spec).len() {
+                    return refuse(journal, ElasticRefusal::PreconditionFailed, "nieukończone formatowanie macierzy");
+                }
+                if !journal.spec.parity.is_empty() && journal.sync_completed_at.is_none() {
+                    return refuse(journal, ElasticRefusal::PreconditionFailed, "niepotwierdzony pierwszy sync");
+                }
+                match journal.spec.data.iter().position(|old| old.disk_id == disk.disk_id) {
+                    // A repeat of an add this node already finished and the
+                    // core did not get to record (E9). The stored entry is
+                    // what everything below goes on against, so it has to be
+                    // the SAME disk down to the filesystem UUID the mkfs was
+                    // given — a different UUID would mean formatting a member
+                    // of the array a second time.
+                    Some(index) => {
+                        if journal.spec.data[index] != *disk || index + 1 != journal.spec.data.len() {
+                            return refuse(
+                                journal,
+                                ElasticRefusal::DiskClaimed,
+                                "dysk jest już innym członkiem tej macierzy",
+                            );
+                        }
+                        // It has served the union already: forward only.
+                        enter_attention(
+                            &mut journal,
+                            ElasticAttention::AddDisk { disk_id: disk.disk_id.clone(), joined: true },
+                            "dodawanie dysku danych w toku",
+                        );
+                        root.save(&journal)?;
+                    }
+                    None => {
+                        if journal
+                            .spec
+                            .cache
+                            .iter()
+                            .chain(&journal.spec.parity)
+                            .any(|old| old.disk_id == disk.disk_id)
+                        {
+                            return refuse(journal, ElasticRefusal::DiskClaimed, "dysk pełni w tej macierzy inną rolę");
+                        }
+                        let others: Vec<Claim> = match root.claims().and_then(Claims::complete) {
+                            Ok(claims) => claims
+                                .into_iter()
+                                .filter(|other| other.spec.array_id != journal.spec.array_id)
+                                .collect(),
+                            Err(error) => return refuse(journal, ElasticRefusal::PreconditionFailed, &error),
+                        };
+                        let mut candidate = journal.spec.clone();
+                        candidate.data = vec![disk.clone()];
+                        candidate.cache = None;
+                        candidate.parity = Vec::new();
+                        candidate.name = String::new();
+                        // `claims_guard` is the node-wide reservation check the
+                        // create path uses, and it is reused rather than copied
+                        // so a disk cannot be admitted here under a rule create
+                        // refuses. The name is blanked because THIS array's
+                        // name is legitimately taken — by this array.
+                        if let Err(error) = claims_guard(&others, &candidate) {
+                            return refuse(journal, ElasticRefusal::DiskClaimed, &error);
+                        }
+                        // The ONE road a persisted spec may grow by, and the
+                        // same write records the add as the array's cause. A
+                        // failure writes nothing (the write is atomic and every
+                        // invariant is checked first), so it is a refusal too:
+                        // a parity smaller than the new disk, a 33rd device.
+                        journal = match root.grow_data(&journal.spec.array_id, disk) {
+                            Ok(grown) => grown,
+                            Err(error) => return refuse(journal, ElasticRefusal::PreconditionFailed, &error),
+                        };
+                    }
+                }
+            }
+        }
+        let outcome = tools(&journal).and_then(|tools| continue_add(root, array_lock, &mut journal, &tools, system));
+        // The add's own success is the one thing that resolves its cause.
+        if outcome.is_ok() {
+            journal.attention = None;
+        }
+        Ok(AddVerdict::Ran(journal, outcome))
+    }
+
+    /// Everything an admitted add does after the spec grew, over the step
+    /// system — so every stop point and every resume of it is reachable with
+    /// the fakes, and the executor arm is what the tests drive.
+    ///
+    /// The union is never taken down. It is checked against BOTH shapes the
+    /// array may legitimately be in — N branches before the join, N+1 after —
+    /// because a resume arrives with the branch already there.
+    fn continue_add(
+        root: &Root,
+        array_lock: &File,
+        journal: &mut Journal,
+        tools: &Tools,
+        system: &mut dyn StepSystem,
+    ) -> Result<(), String> {
+        let slot = journal.spec.data.len();
+        let role = ElasticRole::Data(u16::try_from(slot).map_err(|_| "numer slotu")?);
+        let spec_after = layout_with(&journal.spec, |disk| system.device(disk).map(|device| device.path))?;
+        let mut spec_before = spec_after.clone();
+        spec_before.data.pop();
+        for other in roles(&journal.spec) {
+            if other == role {
+                continue;
+            }
+            let device = system.device(role_disk(&journal.spec, other)?)?;
+            system.filesystem_matches(&journal.spec, other, &device)?;
+            if !system.branch_mounted(&journal.spec, other, &device)? {
+                return Err("niezamontowany branch macierzy".into());
+            }
+        }
+        // `union_mounted` is strict by design — any difference from the spec
+        // is an error rather than a `false` — so the shape a resume leaves is
+        // tried first and only the failure of the shape a FIRST attempt
+        // expects is reported.
+        let in_union = system.union_mounted(&spec_after).unwrap_or(false);
+        if !in_union && !system.union_mounted(&spec_before)? {
+            return Err("dodanie dysku wymaga działającej unii macierzy".into());
+        }
+        let added = spec_after.data.last().ok_or("brak dodanego brancha")?.clone();
+        let device = system.device(role_disk(&journal.spec, role)?)?;
+        let done = AddedDiskState {
+            formatted: journal.formatted.contains(&role),
+            mounted: system.branch_mounted(&journal.spec, role, &device)?,
+            in_union,
+        };
+        execute_steps(
+            root,
+            array_lock,
+            journal,
+            &spec_after,
+            plan_add_data_disk(&spec_after, &added, &done, tools).map_err(|e| e.to_string())?,
+            StepMode::AddDisk,
+            system,
+        )?;
+        // POSITIVE evidence that the array really grew: the live union must
+        // now report exactly the branch list the journal describes, new disk
+        // included.
+        if !system.union_mounted(&spec_after)? {
+            return Err("unia nie potwierdziła nowego brancha".into());
+        }
+        Ok(())
+    }
+
+    /// Whether every signature on the disk is the filesystem this add's slot
+    /// was given (I4): `Ok(false)` for a blank disk, `Ok(true)` when all of
+    /// them are `filesystem` with `expected_uuid` and the undo may erase
+    /// them, and a refusal naming the first signature that is not.
+    fn own_signatures_only(
+        signatures: &[WipedSignature],
+        expected_uuid: &str,
+        filesystem: &str,
+    ) -> Result<bool, String> {
+        if let Some(foreign) = signatures
+            .iter()
+            .find(|signature| signature.kind != filesystem || signature.uuid.as_deref() != Some(expected_uuid))
+        {
+            // The kind only: a filesystem UUID is an identifier, and this text
+            // travels to the core as an answer's detail.
+            return Err(format!(
+                "dysk nosi podpis {}, którego to dodawanie nie zapisało; wycofanie nie czyści cudzych danych",
+                foreign.kind,
+            ));
+        }
+        Ok(!signatures.is_empty())
+    }
+
+    /// Why an undo stopped: a refusal leaves the journal exactly as it was; a
+    /// failure happened after the first effect.
+    enum UndoStop {
+        Refused(ElasticRefusal, String),
+        Failed(String),
+    }
+
+    impl From<String> for UndoStop {
+        fn from(error: String) -> Self {
+            Self::Failed(error)
+        }
+    }
+
+    /// H13: undoes an unfinished add whose disk provably never served a
+    /// file. Every refusal comes before the first effect. The order of the
+    /// effects is the order a repeat can resume from: the new branch is
+    /// unmounted (only if it holds nothing but `lost+found`), the SnapRAID
+    /// config is written back for the array without the disk, the disk loses
+    /// the filesystem THIS add gave it and nothing else, and only then does
+    /// the journal lose the slot. A crash anywhere leaves the add still
+    /// recorded, and the next undo finds its effects already done.
+    fn undo_add(
+        root: &Root,
+        journal: &mut Journal,
+        disk: &ElasticDiskSpec,
+        system: &mut dyn StepSystem,
+    ) -> Result<(), UndoStop> {
+        let joined = match unfinished_add(journal) {
+            Some((last, joined)) if last == disk => joined,
+            _ => {
+                return Err(UndoStop::Refused(
+                    ElasticRefusal::PreconditionFailed,
+                    "macierz nie ma niedokończonego dodania tego dysku".into(),
+                ))
+            }
+        };
+        if journal_admission(journal).transfer_open
+            || journal
+                .pending
+                .as_ref()
+                .is_some_and(|pending| !add_owned_pending(pending, journal.spec.data.len()))
+        {
+            return Err(UndoStop::Refused(
+                ElasticRefusal::OperationPending,
+                "trwa inna operacja macierzy".into(),
+            ));
+        }
+        let slot = journal.spec.data.len();
+        let role = ElasticRole::Data(u16::try_from(slot).map_err(|_| "numer slotu".to_string())?);
+        let union = union_path(&journal.spec.name);
+        let branch = mount_path(&journal.spec, role);
+        let in_union = system.union_branches(&union).ok().map(|branches| {
+            branches.is_some_and(|branches| {
+                branches
+                    .iter()
+                    .any(|entry| entry.split_once('=').map(|(path, _)| path).unwrap_or(entry) == branch)
+            })
+        });
+        if let Err(refusal) = add_undo_admission(joined, in_union) {
+            return Err(UndoStop::Refused(
+                refusal,
+                "dysk mógł już dołączyć do udziału; dodawanie można tylko dokończyć".into(),
+            ));
+        }
+        // Still before the first effect: a disk that is not here is a
+        // refusal, not a failed undo.
+        let device = system
+            .device(disk)
+            .map_err(|why| UndoStop::Refused(ElasticRefusal::DiskAbsent, why))?;
+        let wipe = own_signatures_only(&system.signatures(&device)?, &disk.expected_uuid, journal.spec.filesystem.as_str())
+            .map_err(|why| UndoStop::Refused(ElasticRefusal::DiskClaimed, why))?;
+        let mounted = system.branch_mounted(&journal.spec, role, &device)?;
+        if mounted
+            && system
+                .directory_entries(&branch)?
+                .iter()
+                .any(|entry| entry != "lost+found")
+        {
+            return Err(UndoStop::Refused(
+                ElasticRefusal::AddJoined,
+                "nowy branch zawiera pliki; dodawanie można tylko dokończyć".into(),
+            ));
+        }
+        // First effect.
+        if mounted {
+            system.unmount(&branch)?;
+            if system.branch_mounted(&journal.spec, role, &device)? {
+                return Err(UndoStop::Failed("nowy branch nadal jest zamontowany".into()));
+            }
+        }
+        if !journal.spec.parity.is_empty() {
+            let mut before = journal.spec.clone();
+            before.data.pop();
+            let spec_before = layout_with(&before, |member| system.device(member).map(|device| device.path))?;
+            system.write_file(
+                &spec_before.config_path(),
+                &snapraid_config(&spec_before).map_err(|e| e.to_string())?,
+                root.uid,
+            )?;
+        }
+        if wipe {
+            system.wipe(&device)?;
+        }
+        *journal = root.shrink_data(&journal.spec.array_id, disk)?;
+        Ok(())
+    }
+
+    /// The undo command's answer: the array without the slot on success, the
+    /// unchanged array with `refused` on a refusal, and the add still
+    /// recorded with the failure as its detail otherwise.
+    fn add_disk_abort(
+        root: &Root,
+        mut journal: Journal,
+        disk: &ElasticDiskSpec,
+        mut worker: Option<&mut Worker>,
+        held_array_lock: Option<&File>,
+    ) -> Result<ElasticResult, String> {
+        let owned_array_lock;
+        let _array_lock = match held_array_lock {
+            Some(lock) => lock,
+            None => {
+                owned_array_lock = root.array_lock(&journal.spec.array_id)?;
+                &owned_array_lock
+            }
+        };
+        let outcome = undo_add(root, &mut journal, disk, &mut LiveSteps { worker: worker.as_deref_mut() });
+        match outcome {
+            Ok(()) => Ok(observe(&journal, worker.as_deref())),
+            Err(UndoStop::Refused(refusal, why)) => {
+                let mut state = observe(&journal, worker.as_deref());
+                state.refused = Some(refusal);
+                state.detail = Some(bounded_text(&why, TRANSFER_DETAIL_LIMIT));
+                Ok(state)
+            }
+            Err(UndoStop::Failed(error)) => {
+                let mut failed = root.load(&journal.spec.array_id)?;
+                enter_attention(&mut failed, ElasticAttention::Other, &format!("wycofanie dodawania: {error}"));
+                root.save(&failed)?;
+                Ok(observe(&failed, worker.as_deref()))
+            }
+        }
     }
 
     /// One typed disk-replacement request: the operation ids of the three
@@ -8895,6 +10087,7 @@ pub(crate) mod execution {
             request.rebuild_operation_id,
             ElasticSnapraidKind::Fix { disk: replaced.disk.clone() },
             FixScope::ReplacedDisk,
+            None,
             Some(worker),
             Some(array_lock),
         )?;
@@ -8912,6 +10105,7 @@ pub(crate) mod execution {
             request.sync_operation_id,
             ElasticSnapraidKind::Sync,
             FixScope::MarkedBlocks,
+            None,
             Some(worker),
             Some(array_lock),
         )?;
@@ -9122,12 +10316,12 @@ pub(crate) mod execution {
         // The journal records that this node no longer serves the array, so a
         // startup Restore cannot put it back up behind the admin's back and
         // the import scan finds it in a state that explains itself.
-        journal.stage = ElasticStage::NeedsAttention;
-        journal.detail = Some(bounded_text(
+        enter_attention(
+            &mut journal,
+            ElasticAttention::Other,
             "macierz rozwiązana: dyski zachowały systemy plików i dane, \
              import macierzy przywraca ją w całości",
-            TRANSFER_DETAIL_LIMIT,
-        ));
+        );
         root.save(&journal)?;
         Ok(ElasticDissolveResult {
             array_id: journal.spec.array_id.clone(),
@@ -9240,7 +10434,10 @@ pub(crate) mod execution {
         let current_boot = boot_id()?;
         let fresh = current_boot != journal.boot_id;
         let restoring = matches!(command, crate::HelperCommand::ElasticRestore { .. });
-        let add_disk_command = matches!(command, crate::HelperCommand::ElasticAddDisk { .. });
+        let add_disk_command = matches!(
+            command,
+            crate::HelperCommand::ElasticAddDisk { .. } | crate::HelperCommand::ElasticAddDiskAbort { .. }
+        );
         let service_command = matches!(command,
             crate::HelperCommand::ElasticEnterService { .. } | crate::HelperCommand::ElasticResume { .. });
         if fresh && matches!(command, crate::HelperCommand::ElasticInspect { .. })
@@ -9258,6 +10455,7 @@ pub(crate) mod execution {
                 | crate::HelperCommand::ElasticScrub { .. }
                 | crate::HelperCommand::ElasticFix { .. }
                 | crate::HelperCommand::ElasticAddDisk { .. }
+                | crate::HelperCommand::ElasticAddDiskAbort { .. }
         ) {
             if let Some(service) = journal.private.as_ref().and_then(|private| private.service.as_ref()) {
                 if service.mode == ElasticServiceMode::Hold || service.pending {
@@ -9276,9 +10474,10 @@ pub(crate) mod execution {
                 return Err("dodanie dysku wymaga macierzy przywróconej w tym uruchomieniu".into());
             }
             let devices = inventory()?;
-            let layout = layout(&spec, &devices)?;
-            for role in roles(&spec) {
-                filesystem_matches(&spec, role, resolve(role_disk(&spec, role)?, &devices)?)?;
+            let serving = serving_spec(&journal);
+            let layout = layout(&serving, &devices)?;
+            for role in roles(&serving) {
+                filesystem_matches(&serving, role, resolve(role_disk(&serving, role)?, &devices)?)?;
             }
             restore_mount_guard(&journal, &current_boot, || {
                 Err("sonda unii przed prywatnym Restore".into())
@@ -9409,11 +10608,12 @@ pub(crate) mod execution {
                 crate::HelperCommand::ElasticCacheAge { rules, .. } => {
                     probe_cache_age(&journal, rules).map(PrivateResponse::CacheAge)
                 }
-                crate::HelperCommand::ElasticSync { operation_id, .. } => maintenance(
+                crate::HelperCommand::ElasticSync { operation_id, acknowledge_parity_fault, .. } => maintenance(
                     root,
                     journal,
                     operation_id,
                     ElasticSnapraidKind::Sync,
+                    acknowledge_parity_fault.as_deref(),
                     Some(worker),
                     Some(&array_lock),
                 )
@@ -9423,6 +10623,7 @@ pub(crate) mod execution {
                     journal,
                     operation_id,
                     ElasticSnapraidKind::Scrub,
+                    None,
                     Some(worker),
                     Some(&array_lock),
                 )
@@ -9432,12 +10633,17 @@ pub(crate) mod execution {
                     journal,
                     operation_id,
                     ElasticSnapraidKind::Fix { disk: disk.clone() },
+                    None,
                     Some(worker),
                     Some(&array_lock),
                 )
                 .map(|result| PrivateResponse::Maintenance(Box::new(result))),
                 crate::HelperCommand::ElasticAddDisk { disk, .. } => {
                     add_data_disk(root, journal, disk, Some(worker), Some(&array_lock))
+                        .map(|state| PrivateResponse::State(Box::new(state)))
+                }
+                crate::HelperCommand::ElasticAddDiskAbort { disk, .. } => {
+                    add_disk_abort(root, journal, disk, Some(worker), Some(&array_lock))
                         .map(|state| PrivateResponse::State(Box::new(state)))
                 }
                 _ => Err("nieprawidłowa operacja prywatnej macierzy".into()),
@@ -9468,7 +10674,7 @@ pub(crate) mod execution {
                 }
                 serde_json::to_value(private_operation(&root, journal, command)?)
             }
-            crate::HelperCommand::ElasticSync { array_id, owner, operation_id }
+            crate::HelperCommand::ElasticSync { array_id, owner, operation_id, .. }
             | crate::HelperCommand::ElasticScrub { array_id, owner, operation_id }
             | crate::HelperCommand::ElasticFix { array_id, owner, operation_id, .. } => {
                 let journal = root.load(array_id)?;
@@ -9484,7 +10690,11 @@ pub(crate) mod execution {
                     }
                     _ => return Err("nie jest operacją SnapRAID".into()),
                 };
-                serde_json::to_value(maintenance(&root, journal, operation_id, kind, None, None)?)
+                let acknowledged_fault = match command {
+                    crate::HelperCommand::ElasticSync { acknowledge_parity_fault, .. } => acknowledge_parity_fault.as_deref(),
+                    _ => None,
+                };
+                serde_json::to_value(maintenance(&root, journal, operation_id, kind, acknowledged_fault, None, None)?)
             }
             crate::HelperCommand::ElasticAddDisk { array_id, owner, disk, .. } => {
                 let journal = root.load(array_id)?;
@@ -9493,6 +10703,22 @@ pub(crate) mod execution {
                     return serde_json::to_string(&private_operation(&root, journal, command)?).map_err(|e| e.to_string());
                 }
                 serde_json::to_value(add_data_disk(&root, journal, disk, None, None)?)
+            }
+            // The undo enters the array's namespace only where its branch
+            // mounts can still exist: this boot, with a live anchor. After a
+            // boot, or once the union process is gone, nothing of the array
+            // is mounted anywhere, and the undo runs here — which is what
+            // lets it be the way out of an add a reboot interrupted, before
+            // any Restore could bring the array back.
+            crate::HelperCommand::ElasticAddDiskAbort { array_id, owner, disk, .. } => {
+                let journal = root.load(array_id)?;
+                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                let in_namespace = journal.private.as_ref().is_some_and(|private| private.anchor.is_some())
+                    && journal.boot_id == boot_id()?;
+                if in_namespace {
+                    return serde_json::to_string(&private_operation(&root, journal, command)?).map_err(|e| e.to_string());
+                }
+                serde_json::to_value(add_disk_abort(&root, journal, disk, None, None)?)
             }
             // The dissolve NEVER enters the private namespace. It stops the
             // mergerfs process that owns it, and re-entering a namespace in
@@ -12255,70 +13481,125 @@ Nothing to do
                 .is_err());
         }
 
+        /// Parity-run failures as the tool reports them: a Sync that met an I/O
+        /// error, a Scrub that found damaged blocks, and a repair that could
+        /// not recover everything it was asked to.
+        fn failing_parity_runs() -> Vec<(ElasticSnapraidKind, String, &'static str)> {
+            let config = snap_spec().config_path();
+            vec![
+                (
+                    ElasticSnapraidKind::Sync,
+                    log_text(
+                        "sync",
+                        &(scan_text(true)
+                            + "block_count:9\nsummary:error_file:0\nsummary:error_io:2\nsummary:error_data:0\nsummary:exit:error\n"),
+                    ),
+                    "100% completed, 5 MB accessed\n",
+                ),
+                (
+                    ElasticSnapraidKind::Scrub,
+                    log_text(
+                        "scrub",
+                        "block_count:9\ninfo_count:9\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:3\nsummary:exit:error\n",
+                    ),
+                    "100% completed, 0 MB accessed\n",
+                ),
+                (
+                    ElasticSnapraidKind::Fix { disk: "d1".into() },
+                    fix_log(
+                        &["-c", config.as_str(), "-e", "fix"],
+                        "summary:error:5\nsummary:error_recovered:3\nsummary:error_unrecoverable:2\nsummary:exit:recovered\n",
+                    ),
+                    "100% completed, 1 MB accessed\n",
+                ),
+            ]
+        }
+
+        /// H2, REPLACING `manual_result_persists_known_failure_without_clearing_pending_or_sync`,
+        /// which pinned the opposite on purpose (D1 of the 2026-09-23 design):
+        /// a failed parity run used to keep its `Pending::Maintenance` next to
+        /// the finished run, and every operation — the repair and Restore
+        /// included — refused the array for good.
+        ///
+        /// FAILED AND RECORDED: the run finished and its verdict is known, so no
+        /// intent remains; the verdict is the array's recorded cause; a failed
+        /// Sync marks parity stale; the checkpoint stays where the last complete
+        /// Sync put it; and a Restore neither refuses the array for an intent
+        /// nor launders the cause away.
         #[test]
-        fn manual_result_persists_known_failure_without_clearing_pending_or_sync() {
+        fn a_failed_manual_run_clears_pending_and_records_its_cause() {
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            for code in [Some(0), Some(1), None] {
-                let dir = Temp::new();
-                let uid = unsafe { libc::geteuid() };
-                let root = Root::open(&dir.0, uid).expect("root");
-                let mut journal = legacy_journal(&root);
-                journal.stage = ElasticStage::Ready;
-                journal.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
-                root.save(&journal).expect("save");
-                let body = "block_count:9\ninfo_count:1\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:0\nsummary:exit:ok\n";
-                let result = perform_maintenance(
-                    &root,
-                    &mut journal,
-                    run_record(ElasticSnapraidKind::Scrub),
-                    &snap_spec(),
-                    || {
-                        let saved = root.load(&spec().array_id).expect("pending before child");
-                        assert!(matches!(
-                            saved.pending,
-                            Some(Pending::Maintenance {
-                                kind: ElasticSnapraidKind::Scrub,
-                                ..
-                            })
-                        ));
-                        Ok((
-                            code,
-                            parsed_log(
-                                &log_text("scrub", body),
-                                "100% completed, 0 MB accessed\nEverything OK\n",
-                            ),
-                        ))
-                    },
-                    || Ok(false),
-                    false,
-                )
-                .expect("typed result");
-                assert_eq!(result.exit_code, code);
-                assert_eq!(
-                    journal.sync_completed_at.as_deref(),
-                    Some("2026-09-08T10:00:00Z")
-                );
-                drop(root);
-                let root = Root::open(&dir.0, uid).expect("reopen");
-                let persisted = root.load(&spec().array_id).expect("saved result");
-                assert_eq!(persisted.last_run.as_ref(), Some(&result));
-                if code == Some(0) {
-                    assert_eq!(result.outcome, ElasticSnapraidOutcome::Succeeded);
-                    assert!(persisted.pending.is_none());
-                } else {
-                    assert_eq!(persisted.stage, ElasticStage::NeedsAttention);
-                    assert!(persisted.pending.is_some());
-                    let restored = restore(&root, persisted, None, None).expect("typed restore refusal");
+            for (kind, log, stdout) in failing_parity_runs() {
+                for code in [Some(1), Some(0), None] {
+                    let dir = Temp::new();
+                    let uid = unsafe { libc::geteuid() };
+                    let root = Root::open(&dir.0, uid).expect("root");
+                    let mut journal = legacy_journal(&root);
+                    journal.stage = ElasticStage::Ready;
+                    journal.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
+                    root.save(&journal).expect("save");
+                    let result = perform_maintenance(
+                        &root,
+                        &mut journal,
+                        run_record(kind.clone()),
+                        &snap_spec(),
+                        || {
+                            // The intent is durable before the tool starts.
+                            let saved = root.load(&spec().array_id).expect("pending before child");
+                            assert!(matches!(&saved.pending, Some(Pending::Maintenance { kind: pending, .. }) if *pending == kind));
+                            Ok((code, parsed_log(&log, stdout)))
+                        },
+                        || Ok(false),
+                        false,
+                    )
+                    .expect("typed result");
+                    let expected = if code == Some(1) {
+                        ElasticSnapraidOutcome::Failed
+                    } else {
+                        ElasticSnapraidOutcome::NeedsAttention
+                    };
+                    assert_eq!((result.outcome, result.exit_code), (expected, code), "{kind:?} {code:?}");
+                    drop(root);
+                    let root = Root::open(&dir.0, uid).expect("reopen");
+                    let persisted = root.load(&spec().array_id).expect("saved result");
+                    assert_eq!(persisted.last_run.as_ref(), Some(&result), "{kind:?} {code:?}");
+                    assert!(persisted.pending.is_none(), "{kind:?} {code:?}: a parsed verdict is never pending");
+                    assert_eq!(persisted.stage, ElasticStage::NeedsAttention, "{kind:?} {code:?}");
+                    assert_eq!(
+                        persisted.attention,
+                        Some(ElasticAttention::ParityRun { operation_id: result.operation_id.clone(), kind: kind.clone() }),
+                        "{kind:?} {code:?}"
+                    );
+                    assert!(persisted.detail.is_some(), "{kind:?} {code:?}: the array says what failed");
+                    assert_eq!(persisted.sync_completed_at.as_deref(), Some("2026-09-08T10:00:00Z"), "{kind:?}");
+                    if kind == ElasticSnapraidKind::Sync {
+                        assert_eq!(persisted.stale_parity_bytes, Some(0), "a failed Sync leaves parity stale");
+                        // A schema-1 journal names no stale run; its cause does.
+                        assert_eq!(persisted.stale_sync_operation, None);
+                    } else {
+                        assert_eq!(persisted.stale_parity_bytes, None, "{kind:?} writes no parity");
+                    }
+                    // Restore reaches its own work (and fails there: this node
+                    // has none of the fixture's disks) instead of refusing an
+                    // intent; the recorded cause outlives it (I7).
+                    let restored = restore(&root, persisted, None, None).expect("an observation");
                     assert_eq!(restored.stage, ElasticStage::NeedsAttention);
-                    assert!(root
-                        .load(&spec().array_id)
-                        .expect("preserved")
-                        .pending
-                        .is_some());
+                    assert!(
+                        !restored.detail.as_deref().unwrap_or("").contains("intencja SnapRAID"),
+                        "{:?}",
+                        restored.detail
+                    );
+                    let after = root.load(&spec().array_id).expect("after restore");
+                    assert!(after.pending.is_none());
+                    assert_eq!(
+                        after.attention,
+                        Some(ElasticAttention::ParityRun { operation_id: result.operation_id.clone(), kind: kind.clone() }),
+                        "{kind:?}: a Restore never clears a parity fault"
+                    );
+                    assert_eq!(restored.attention, after.attention, "the cause is on the wire");
                 }
             }
         }
-
 
         /// The coupled Sync records every verdict on the transfer and the array
         /// without a Hold: success leaves the array Ready with parity current, a
@@ -13585,7 +14866,15 @@ Nothing to do
             );
             assert_eq!(stored.spec.data[0], spec().data[0]);
             assert_eq!((&stored.spec.cache, &stored.spec.parity), (&None, &Vec::new()));
-            assert_eq!(stored.stage, ElasticStage::Prepared, "the state is untouched");
+            // THE SAME WRITE records the add as the array's cause: a helper
+            // killed right after it leaves an add that is resumable and
+            // undoable, never a grown spec nothing admits.
+            assert_eq!(stored.stage, ElasticStage::NeedsAttention);
+            assert_eq!(
+                stored.attention,
+                Some(ElasticAttention::AddDisk { disk_id: added.disk_id.clone(), joined: false })
+            );
+            assert_eq!((stored.pending.clone(), stored.formatted.clone()), (None, Vec::new()), "nothing else moved");
 
             // THE CALLER CAN GO ON SAVING what it was handed — the whole reason
             // `grow_data` returns the journal rather than `()`. An in-memory
@@ -13626,15 +14915,21 @@ Nothing to do
             assert!(root.save(&renamed).is_err(), "save nadal odmawia zmiany specyfikacji");
         }
 
-        /// The lifecycle refusals that come BEFORE the executor reads a single
-        /// device — the ones a test can reach on a node with none of the
-        /// array's disks attached, which is every node running this suite.
+        /// H8, REPLACING `adding_a_disk_refuses_before_it_reads_a_single_device`,
+        /// which pinned a refusal as a fault: the refused add went through
+        /// `finish(Err)` and turned a healthy array into `NeedsAttention` (C2
+        /// wedge 1 of the 2026-09-23 design). A refusal now writes NOTHING:
+        /// the journal file is byte-identical, the stage is the one it had, and
+        /// the answer names the rule in `refused` and the reason in `detail`.
         ///
-        /// A schema-1 journal is used on purpose: a schema-2 one carries a
-        /// private topology and every operation on it demands a confirmed
-        /// publication first, which would be the only refusal ever seen.
+        /// These are the refusals that come BEFORE the executor reads a single
+        /// device — the ones a test can reach on a node with none of the
+        /// array's disks attached. A schema-1 journal is used on purpose: a
+        /// schema-2 one carries a private topology and every operation on it
+        /// demands a confirmed publication first.
         #[test]
-        fn adding_a_disk_refuses_before_it_reads_a_single_device() {
+        fn a_refused_add_leaves_the_journal_byte_identical() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let uid = unsafe { libc::geteuid() };
             let added = ElasticDiskSpec {
                 disk_id: "serial:new".into(),
@@ -13654,13 +14949,16 @@ Nothing to do
                 }];
                 spec
             };
-            // (stage, formatted, sync, disk to add, expected refusal)
-            let cases: Vec<(&str, serde_json::Value, serde_json::Value, ElasticDiskSpec, &str)> = vec![
+            let formatted = || serde_json::json!([{ "data": 1 }, { "parity": 1 }]);
+            let synced = || serde_json::json!("2026-09-08T10:00:00Z");
+            // (stage, formatted, sync, disk to add, refusal, reason)
+            let cases: Vec<(&str, serde_json::Value, serde_json::Value, ElasticDiskSpec, ElasticRefusal, &str)> = vec![
                 (
                     "prepared",
                     serde_json::json!([]),
                     serde_json::Value::Null,
                     added.clone(),
+                    ElasticRefusal::OperationPending,
                     "dodanie dysku wymaga gotowej macierzy bez trwającej operacji",
                 ),
                 (
@@ -13668,47 +14966,633 @@ Nothing to do
                     serde_json::json!([]),
                     serde_json::Value::Null,
                     added.clone(),
+                    ElasticRefusal::PreconditionFailed,
                     "nieukończone formatowanie macierzy",
                 ),
                 (
                     "ready",
-                    serde_json::json!([{ "data": 1 }, { "parity": 1 }]),
+                    formatted(),
                     serde_json::Value::Null,
                     added.clone(),
+                    ElasticRefusal::PreconditionFailed,
                     "niepotwierdzony pierwszy sync",
                 ),
                 (
                     "ready",
-                    serde_json::json!([{ "data": 1 }, { "parity": 1 }]),
-                    serde_json::json!("2026-09-08T10:00:00Z"),
+                    formatted(),
+                    synced(),
                     with_parity().parity[0].clone(),
+                    ElasticRefusal::DiskClaimed,
                     "dysk pełni w tej macierzy inną rolę",
                 ),
+                (
+                    "ready",
+                    formatted(),
+                    synced(),
+                    ElasticDiskSpec { expected_uuid: "12121212-1212-4212-8212-121212121212".into(), ..spec().data[0].clone() },
+                    ElasticRefusal::DiskClaimed,
+                    "dysk jest już innym członkiem tej macierzy",
+                ),
+                (
+                    "needs_attention",
+                    formatted(),
+                    synced(),
+                    added.clone(),
+                    ElasticRefusal::AttentionOther,
+                    "najpierw ją przywróć",
+                ),
             ];
-            for (stage, formatted, sync, disk, expected) in cases {
+            for (stage, formatted, sync, disk, refusal, expected) in cases {
                 let dir = Temp::new();
                 let root = Root::open(&dir.0, uid).expect("root");
                 let journal = legacy_journal_of(&root, &with_parity(), stage, formatted, sync);
-                // Like every other operation, the add reports through `finish`:
-                // the answer is the array's state carrying the reason, not an
-                // `Err`, so the core can record WHY rather than only that
-                // something failed.
+                let path = dir.0.join(format!("{}.json", journal.spec.array_id));
+                let before = std::fs::read(&path).expect("bytes before");
                 let observed = add_data_disk(&root, journal.clone(), &disk, None, None)
                     .expect("an observation, refusal included");
-                assert_eq!(observed.stage, ElasticStage::NeedsAttention, "{expected}");
+                assert_eq!(std::fs::read(&path).expect("bytes after"), before, "{expected}: nothing written");
+                assert_eq!(observed.stage, journal.stage, "{expected}: the stage it had");
+                assert_eq!(observed.refused, Some(refusal), "{expected}");
                 assert!(
                     observed.detail.as_deref().is_some_and(|detail| detail.contains(expected)),
                     "{expected}: {:?}",
                     observed.detail
                 );
-                // AND THE SPEC IS UNTOUCHED: a refused add may not have
-                // reserved the slot, because the slot is what the next attempt
-                // reads the disk's identity from. The observation counts the
-                // members the array still has, which is what the core
-                // validates a refusal against.
-                let stored = root.load(&journal.spec.array_id).expect("load");
-                assert_eq!(stored.spec, with_parity(), "{expected}");
+                // The observation counts the members the array still has,
+                // which is what the core validates a refusal against.
                 assert_eq!(observed.disks.len(), 2, "{expected}");
+                assert!(observed.attention.is_none() && observed.pending_add.is_none(), "{expected}");
+            }
+        }
+
+        // ----- adding a data disk: resume, sync verdict, undo ------------------
+
+        fn new_disk() -> ElasticDiskSpec {
+            ElasticDiskSpec {
+                disk_id: "serial:new".into(),
+                serial: Some("new".into()),
+                wwn: None,
+                bytes: 8 << 30,
+                expected_uuid: "88888888-8888-4888-8888-888888888888".into(),
+            }
+        }
+
+        /// A Ready, published array — one data disk, one parity, its first
+        /// Sync confirmed — whose journal lives under `dir/root`.
+        fn add_bench() -> (Temp, Root, Journal) {
+            let dir = Temp::new();
+            let mut spec = spec();
+            spec.parity = vec![ElasticDiskSpec {
+                disk_id: "serial:parity".into(),
+                serial: Some("parity".into()),
+                wwn: None,
+                bytes: 64 << 30,
+                expected_uuid: "99999999-9999-4999-8999-999999999999".into(),
+            }];
+            let root = Root::open(&dir.0.join("root"), unsafe { libc::geteuid() }).expect("root");
+            let mut journal = root.reserve(&spec, boot(), || Ok(())).expect("reserve");
+            journal.formatted = roles(&spec);
+            journal.stage = ElasticStage::Ready;
+            journal.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
+            let private = journal.private.as_mut().expect("private");
+            private.anchor = Some(anchor_fixture());
+            private.published = true;
+            root.save(&journal).expect("ready");
+            (dir, root, journal)
+        }
+
+        /// The array's namespace with the new disk attached and not yet
+        /// anything else: d1 and the parity mounted, the union serving d1,
+        /// SnapRAID answering with `codes`.
+        fn add_steps(dir: &Path, journal: &Journal, codes: &[i32]) -> FakeSteps {
+            let mut grown = journal.spec.clone();
+            if grown.data.last() != Some(&new_disk()) {
+                grown.data.push(new_disk());
+            }
+            let mut steps = FakeSteps::live(&grown, &boot());
+            steps.mounted.remove(&data_branch_path("media", "d2"));
+            steps.union_data = Some(1);
+            steps.format = true;
+            steps.snapraid = Some(FakeSnapraid::new(dir, codes));
+            steps
+        }
+
+        /// One add request through the real admission and executor, ending in
+        /// the real `finish`: `Err` carries a refusal.
+        fn request_add(root: &Root, journal: Journal, steps: &mut FakeSteps) -> Result<ElasticResult, (ElasticRefusal, String)> {
+            let lock = root.array_lock(&journal.spec.array_id).expect("array lock");
+            match add_disk_steps(root, &lock, journal, &new_disk(), steps, |_| Ok(Tools::for_preview())).expect("verdict") {
+                AddVerdict::Refused(_, refusal, why) => Err((refusal, why)),
+                AddVerdict::Ran(mut journal, outcome) => Ok(finish(root, &mut journal, outcome, None).expect("finish")),
+            }
+        }
+
+        fn assert_added(root: &Root, why: &str) -> Journal {
+            let stored = root.load(&spec().array_id).expect("load");
+            assert_eq!(stored.spec.data.last(), Some(&new_disk()), "{why}");
+            assert_eq!(stored.spec.data.len(), 2, "{why}");
+            assert_eq!(stored.stage, ElasticStage::Ready, "{why}: {:?}", stored.detail);
+            assert!(stored.attention.is_none() && stored.pending.is_none(), "{why}");
+            assert!(stored.formatted.contains(&ElasticRole::Data(2)), "{why}");
+            stored
+        }
+
+        /// A FRESH add through every step, and the durable record it leaves
+        /// between them: the cause from the growth on, the join intent before
+        /// the union write.
+        #[test]
+        fn a_fresh_add_runs_every_step_and_ends_ready() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (dir, root, journal) = add_bench();
+            let mut steps = add_steps(&dir.0, &journal, &[0]);
+            let observed = request_add(&root, journal, &mut steps).expect("no refusal");
+            assert_eq!(observed.stage, ElasticStage::Ready, "{:?}", observed.detail);
+            let config = snapraid_config(&layout_with(&root.load(&spec().array_id).expect("load").spec, |disk| {
+                Ok(steps.devices.iter().find(|d| d.serial == disk.serial).expect("device").path.clone())
+            }).expect("layout")).expect("config");
+            assert!(config.contains("/data/d2"), "the config learns the disk");
+            assert_eq!(
+                steps.log,
+                vec![
+                    "mkfs /dev/vdc".to_string(),
+                    format!("mkdir {}", data_branch_path("media", "d2")),
+                    format!("mount {}", data_branch_path("media", "d2")),
+                    format!("addbranch {} {}=RW", union_path("media"), data_branch_path("media", "d2")),
+                    format!("write {}", config_path("media")),
+                    "snapraid sync-1".to_string(),
+                ]
+            );
+            let stored = assert_added(&root, "fresh");
+            assert_ne!(stored.sync_completed_at.as_deref(), Some("2026-09-08T10:00:00Z"), "the checkpoint moved");
+            assert!(stored.stale_parity_bytes.is_none());
+        }
+
+        /// Test 7 of the design: a resume from every place an add can stop,
+        /// E2 to E9, runs only the steps that remain and ends Ready with the
+        /// grown array. The stopped states are written the way a crash leaves
+        /// them.
+        #[test]
+        fn resume_after_each_add_stop_point() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let d2 = data_branch_path("media", "d2");
+            let config = format!("write {}", config_path("media"));
+            let join = format!("addbranch {} {d2}=RW", union_path("media"));
+            // (stop point, how it left the journal and the namespace, the steps a resume runs)
+            type Stop = Box<dyn Fn(&mut Journal, &mut FakeSteps)>;
+            let cases: Vec<(&str, Stop, Vec<String>)> = vec![
+                ("E2 grown, nothing done", Box::new(|_, _| ()), vec![
+                    "mkfs /dev/vdc".into(), format!("mkdir {d2}"), format!("mount {d2}"), join.clone(), config.clone(), "snapraid sync-1".into(),
+                ]),
+                ("E3 mkfs interrupted on a blank disk", Box::new(|journal, _| {
+                    journal.pending = Some(Pending::Format(ElasticRole::Data(2)));
+                    journal.stage = ElasticStage::Formatting;
+                }), vec![
+                    "mkfs /dev/vdc".into(), format!("mkdir {d2}"), format!("mount {d2}"), join.clone(), config.clone(), "snapraid sync-1".into(),
+                ]),
+                ("E4 mount interrupted", Box::new(|journal, _| {
+                    journal.formatted.push(ElasticRole::Data(2));
+                    journal.pending = Some(Pending::Mount(ElasticRole::Data(2)));
+                    journal.stage = ElasticStage::Mounting;
+                }), vec![format!("mkdir {d2}"), format!("mount {d2}"), join.clone(), config.clone(), "snapraid sync-1".into()]),
+                ("E5 the union write did not take", Box::new(|journal, steps| {
+                    journal.formatted.push(ElasticRole::Data(2));
+                    journal.attention = Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: true });
+                    steps.mounted.insert(data_branch_path("media", "d2"));
+                }), vec![join.clone(), config.clone(), "snapraid sync-1".into()]),
+                ("E6 config write interrupted", Box::new(|journal, steps| {
+                    journal.formatted.push(ElasticRole::Data(2));
+                    journal.attention = Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: true });
+                    journal.pending = Some(Pending::Config);
+                    journal.stage = ElasticStage::Mounting;
+                    steps.mounted.insert(data_branch_path("media", "d2"));
+                    steps.union_data = Some(2);
+                }), vec![config.clone(), "snapraid sync-1".into()]),
+                ("E7 final Sync interrupted", Box::new(|journal, steps| {
+                    journal.formatted.push(ElasticRole::Data(2));
+                    journal.attention = Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: true });
+                    journal.pending = Some(Pending::Sync);
+                    journal.stage = ElasticStage::SyncPending;
+                    steps.mounted.insert(data_branch_path("media", "d2"));
+                    steps.union_data = Some(2);
+                }), vec![config.clone(), "snapraid sync-1".into()]),
+                ("E8 the final union check failed", Box::new(|journal, steps| {
+                    journal.formatted.push(ElasticRole::Data(2));
+                    journal.attention = Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: true });
+                    journal.detail = Some("unia nie potwierdziła nowego brancha".into());
+                    steps.mounted.insert(data_branch_path("media", "d2"));
+                    steps.union_data = Some(2);
+                }), vec![config.clone(), "snapraid sync-1".into()]),
+                ("E9 the helper finished, the core did not record it", Box::new(|journal, steps| {
+                    journal.formatted.push(ElasticRole::Data(2));
+                    journal.attention = None;
+                    journal.stage = ElasticStage::Ready;
+                    journal.detail = None;
+                    steps.mounted.insert(data_branch_path("media", "d2"));
+                    steps.union_data = Some(2);
+                }), vec![config.clone(), "snapraid sync-1".into()]),
+            ];
+            for (stop, apply, expected) in cases {
+                let (dir, root, journal) = add_bench();
+                let mut steps = add_steps(&dir.0, &journal, &[0]);
+                let mut stopped = root.grow_data(&journal.spec.array_id, &new_disk()).expect("grow");
+                apply(&mut stopped, &mut steps);
+                root.save(&stopped).expect(stop);
+                let observed = request_add(&root, root.load(&spec().array_id).expect("load"), &mut steps)
+                    .unwrap_or_else(|refusal| panic!("{stop}: {refusal:?}"));
+                assert_eq!(observed.stage, ElasticStage::Ready, "{stop}: {:?}", observed.detail);
+                assert_eq!(steps.log, expected, "{stop}");
+                let stored = assert_added(&root, stop);
+                // An interrupted Sync marked parity stale; only a recorded Sync
+                // run clears that marker, and the add's Sync is not one.
+                let expected_stale = if stop.starts_with("E7") { Some(0) } else { None };
+                assert_eq!(stored.stale_parity_bytes, expected_stale, "{stop}");
+            }
+        }
+
+        /// H10's other half: an intent the add did not write is not the add's
+        /// to settle. The resume is refused and nothing is written.
+        #[test]
+        fn a_resume_refuses_an_intent_of_another_operation() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            for foreign in [Pending::Union, Pending::Mount(ElasticRole::Data(1)), Pending::Format(ElasticRole::Parity(1))] {
+                let (dir, root, journal) = add_bench();
+                let mut steps = add_steps(&dir.0, &journal, &[0]);
+                let mut stopped = root.grow_data(&journal.spec.array_id, &new_disk()).expect("grow");
+                stopped.pending = Some(foreign.clone());
+                stopped.stage = ElasticStage::Mounting;
+                root.save(&stopped).expect("foreign intent");
+                let path = root.path.join(format!("{}.json", spec().array_id));
+                let before = std::fs::read(&path).expect("bytes");
+                let (refusal, why) = request_add(&root, root.load(&spec().array_id).expect("load"), &mut steps)
+                    .expect_err("not the add's intent");
+                assert_eq!(refusal, ElasticRefusal::OperationPending, "{foreign:?}");
+                assert!(why.contains("intencja innej operacji"), "{why}");
+                assert_eq!(std::fs::read(&path).expect("bytes"), before, "{foreign:?}");
+                assert!(steps.log.is_empty(), "{foreign:?}: nothing ran");
+            }
+        }
+
+        /// H12, test 8 of the design: the add's final Sync is judged by its
+        /// log. Files that changed under it end the add with parity marked
+        /// stale, exactly as a manual `Partial` Sync does.
+        #[test]
+        fn add_sync_with_changed_files_completes_with_stale_parity() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (dir, root, journal) = add_bench();
+            let mut steps = add_steps(&dir.0, &journal, &[1]);
+            steps.snapraid.as_ref().expect("snapraid").reporting(&changed_during_sync_log(), CHANGED_DURING_SYNC_STDOUT);
+            let observed = request_add(&root, journal, &mut steps).expect("no refusal");
+            assert_eq!(observed.stage, ElasticStage::Ready, "{:?}", observed.detail);
+            let stored = assert_added(&root, "changed files");
+            assert_eq!(stored.stale_parity_bytes, Some(0), "parity waits for the next Sync");
+            assert_eq!(stored.sync_completed_at.as_deref(), Some("2026-09-08T10:00:00Z"), "no new checkpoint");
+        }
+
+        /// M3 of the release review: an add to an array whose parity no Sync
+        /// has written yet ends with SnapRAID's "nothing to do on empty
+        /// parity" log. It is a complete Sync there, as it is for the manual
+        /// one — and only there: the same log over parity that holds data is
+        /// still refused.
+        #[test]
+        fn add_sync_over_empty_parity_completes() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let empty = log_text("sync", &scan_text(false));
+            let (dir, root, journal) = add_bench();
+            let mut steps = add_steps(&dir.0, &journal, &[0]);
+            steps.parity_empty = true;
+            steps.snapraid.as_ref().expect("snapraid").reporting(&empty, "Initializing...\nNothing to do\n");
+            let observed = request_add(&root, journal, &mut steps).expect("no refusal");
+            assert_eq!(observed.stage, ElasticStage::Ready, "{:?}", observed.detail);
+            let stored = assert_added(&root, "empty parity");
+            assert!(stored.attention.is_none());
+            // Over parity that holds data the same log is no complete Sync.
+            let (dir, root, journal) = add_bench();
+            let mut steps = add_steps(&dir.0, &journal, &[0]);
+            steps.snapraid.as_ref().expect("snapraid").reporting(&empty, "Initializing...\nNothing to do\n");
+            let observed = request_add(&root, journal, &mut steps).expect("no refusal");
+            assert_eq!(observed.stage, ElasticStage::NeedsAttention, "{:?}", observed.detail);
+        }
+
+        /// ...and a Sync that reports damage keeps the add recorded: its
+        /// cause, no intent, parity stale — and the resume runs the Sync again
+        /// and finishes the add.
+        #[test]
+        fn add_sync_with_data_errors_records_add_attention() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (dir, root, journal) = add_bench();
+            let mut steps = add_steps(&dir.0, &journal, &[1]);
+            steps.snapraid.as_ref().expect("snapraid").reporting(
+                &log_text(
+                    "sync",
+                    &(scan_text(true)
+                        + "block_count:9\nsummary:error_file:0\nsummary:error_io:0\nsummary:error_data:3\nsummary:exit:error\n"),
+                ),
+                "100% completed, 5 MB accessed\n",
+            );
+            let observed = request_add(&root, journal, &mut steps).expect("no refusal");
+            assert_eq!(observed.stage, ElasticStage::NeedsAttention);
+            assert!(observed.detail.as_deref().is_some_and(|detail| detail.contains("sync po dodaniu dysku")), "{:?}", observed.detail);
+            let stored = root.load(&spec().array_id).expect("load");
+            assert!(stored.pending.is_none(), "the verdict is known: no intent");
+            assert_eq!(stored.attention, Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: true }));
+            assert_eq!(stored.stale_parity_bytes, Some(0));
+            let report = observed.pending_add.expect("the add is reported");
+            assert_eq!((report.branch.as_str(), report.formatted, report.joined), ("d2", true, true));
+            assert!(!report.undo_possible, "joined, and no live read here proves otherwise");
+            // The resume: a clean Sync this time, and only the Sync's steps.
+            steps.snapraid = Some(FakeSnapraid::new(&dir.0, &[0]));
+            steps.log.clear();
+            let observed = request_add(&root, stored, &mut steps).expect("the resume is admitted");
+            assert_eq!(observed.stage, ElasticStage::Ready, "{:?}", observed.detail);
+            assert_eq!(steps.log, vec![format!("write {}", config_path("media")), "snapraid sync-2".to_string()]);
+            // The marker the failed attempt left waits for the next recorded
+            // Sync; the add itself is finished.
+            assert_eq!(assert_added(&root, "resumed").stale_parity_bytes, Some(0));
+        }
+
+        /// H11, gated on M1: a resume never formats over a signature — not
+        /// even over the partial filesystem the add's own interrupted mkfs
+        /// left — and says the way out is the undo. The undo's own rule is
+        /// that it erases ONLY that filesystem.
+        #[test]
+        fn a_partial_filesystem_is_refused_by_the_resume_and_recognised_by_the_undo() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let own = |kind: &str, uuid: Option<&str>| WipedSignature {
+                kind: kind.into(),
+                offset: "0x438".into(),
+                label: None,
+                uuid: uuid.map(str::to_string),
+            };
+            let uuid = new_disk().expected_uuid;
+            assert_eq!(own_signatures_only(&[], &uuid, "ext4"), Ok(false), "blank: nothing to erase");
+            assert_eq!(own_signatures_only(&[own("ext4", Some(&uuid))], &uuid, "ext4"), Ok(true));
+            for foreign in [
+                own("ext4", Some("12121212-1212-4212-8212-121212121212")),
+                own("xfs", Some(&uuid)),
+                own("ext4", None),
+                own("zfs_member", None),
+            ] {
+                let error = own_signatures_only(&[own("ext4", Some(&uuid)), foreign.clone()], &uuid, "ext4")
+                    .expect_err("a signature the add did not write");
+                assert!(error.contains(&foreign.kind), "{error}");
+            }
+            let (dir, root, journal) = add_bench();
+            let mut steps = add_steps(&dir.0, &journal, &[0]);
+            steps.signatures = vec![own("ext4", Some(&uuid))];
+            let mut stopped = root.grow_data(&journal.spec.array_id, &new_disk()).expect("grow");
+            stopped.pending = Some(Pending::Format(ElasticRole::Data(2)));
+            stopped.stage = ElasticStage::Formatting;
+            root.save(&stopped).expect("interrupted mkfs");
+            let observed = request_add(&root, root.load(&spec().array_id).expect("load"), &mut steps).expect("an answer");
+            assert_eq!(observed.stage, ElasticStage::NeedsAttention);
+            assert!(observed.detail.as_deref().is_some_and(|detail| detail.contains("wycofaj dodawanie")), "{:?}", observed.detail);
+            assert!(!steps.log.iter().any(|line| line.starts_with("mkfs")), "{:?}", steps.log);
+            let stored = root.load(&spec().array_id).expect("load");
+            assert!(stored.pending.is_none(), "the resume settled the intent it found");
+            assert_eq!(stored.attention, Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: false }));
+        }
+
+        /// The state an add left before the join, for the undo.
+        fn stopped_before_join(root: &Root, journal: &Journal, steps: &mut FakeSteps, joined: bool) -> Journal {
+            let mut stopped = root.grow_data(&journal.spec.array_id, &new_disk()).expect("grow");
+            stopped.formatted.push(ElasticRole::Data(2));
+            stopped.attention = Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined });
+            root.save(&stopped).expect("stopped");
+            steps.mounted.insert(data_branch_path("media", "d2"));
+            steps.entries = vec!["lost+found".into()];
+            steps.signatures = vec![WipedSignature {
+                kind: "ext4".into(),
+                offset: "0x438".into(),
+                label: None,
+                uuid: Some(new_disk().expected_uuid),
+            }];
+            root.load(&spec().array_id).expect("load")
+        }
+
+        /// H13, test 10 of the design: the undo runs only while the disk
+        /// provably never joined the share, and then puts the array back
+        /// exactly as it was before the add.
+        #[test]
+        fn abort_only_before_union_join() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let d2 = data_branch_path("media", "d2");
+            // (case, joined intent, what the live union serves, expected refusal)
+            for (case, joined, union_data, in_union_branch, refused) in [
+                ("never tried to join", false, Some(1), false, None),
+                ("never tried, union unreadable", false, None, false, None),
+                // B1: joined is forward only, even when a live read finds the
+                // branch absent, and ESPECIALLY when no union is mounted at
+                // all (after a reboot): nothing can prove what the branch
+                // received while it served.
+                ("the union write did not take", true, Some(1), false, Some(ElasticRefusal::AddJoined)),
+                ("joined, union not mounted", true, Some(0), false, Some(ElasticRefusal::AddJoined)),
+                ("joined", true, Some(1), true, Some(ElasticRefusal::AddJoined)),
+                ("joined intent, union unreadable", true, None, false, Some(ElasticRefusal::AddJoined)),
+            ] {
+                let (dir, root, journal) = add_bench();
+                let mut steps = add_steps(&dir.0, &journal, &[0]);
+                let mut stopped = stopped_before_join(&root, &journal, &mut steps, joined);
+                if union_data == Some(0) {
+                    // After a boot: no union mounted, and no branch either.
+                    steps.union = false;
+                    steps.mounted.clear();
+                    steps.union_data = Some(1);
+                } else {
+                    steps.union_data = union_data;
+                }
+                if in_union_branch {
+                    steps.branches.push(format!("{d2}=NC"));
+                }
+                let path = root.path.join(format!("{}.json", spec().array_id));
+                let before = std::fs::read(&path).expect("bytes");
+                let outcome = undo_add(&root, &mut stopped, &new_disk(), &mut steps);
+                match refused {
+                    Some(expected) => {
+                        let Err(UndoStop::Refused(refusal, _)) = outcome else { panic!("{case}: not refused") };
+                        assert_eq!(refusal, expected, "{case}");
+                        assert_eq!(std::fs::read(&path).expect("bytes"), before, "{case}: nothing written");
+                        assert!(steps.log.is_empty() && steps.wiped == 0, "{case}: nothing touched");
+                    }
+                    None => {
+                        assert!(outcome.is_ok(), "{case}");
+                        assert_eq!(
+                            steps.log,
+                            vec![format!("umount {d2}"), format!("write {}", config_path("media")), "wipefs /dev/vdc".to_string()],
+                            "{case}"
+                        );
+                        let stored = root.load(&spec().array_id).expect("load");
+                        assert_eq!(stored.spec, journal.spec, "{case}: the array as it was");
+                        assert_eq!(stored.formatted, journal.formatted, "{case}");
+                        assert_eq!(stored.stage, ElasticStage::Ready, "{case}: its union is still published");
+                        assert!(stored.attention.is_none() && stored.pending.is_none(), "{case}");
+                    }
+                }
+            }
+            // NOT JOINED, AFTER A BOOT (pinned): no union and no branch are
+            // mounted, so there is no directory to read — and none is needed:
+            // the journal proves the add never tried to append the branch, so
+            // no client ever reached the disk through the share. The undo goes
+            // on, erasing only the add's own filesystem; nothing is unmounted.
+            let (dir, root, journal) = add_bench();
+            let mut steps = add_steps(&dir.0, &journal, &[0]);
+            let mut stopped = stopped_before_join(&root, &journal, &mut steps, false);
+            steps.union = false;
+            steps.mounted.clear();
+            undo_add(&root, &mut stopped, &new_disk(), &mut steps)
+                .unwrap_or_else(|_| panic!("a never-joined add is undone after a boot"));
+            assert_eq!(steps.log, vec![format!("write {}", config_path("media")), "wipefs /dev/vdc".to_string()]);
+            assert_eq!(root.load(&spec().array_id).expect("load").spec, journal.spec);
+            // A disk that is not here is refused before any effect.
+            let (dir, root, journal) = add_bench();
+            let mut steps = add_steps(&dir.0, &journal, &[0]);
+            let mut stopped = stopped_before_join(&root, &journal, &mut steps, false);
+            steps.devices.retain(|device| device.path != "/dev/vdc");
+            let Err(UndoStop::Refused(refusal, _)) = undo_add(&root, &mut stopped, &new_disk(), &mut steps) else {
+                panic!("an absent disk")
+            };
+            assert_eq!(refusal, ElasticRefusal::DiskAbsent);
+            assert!(steps.log.is_empty() && steps.wiped == 0);
+            // A branch that holds anything but lost+found has served files.
+            let (dir, root, journal) = add_bench();
+            let mut steps = add_steps(&dir.0, &journal, &[0]);
+            let mut stopped = stopped_before_join(&root, &journal, &mut steps, false);
+            steps.entries = vec!["lost+found".into(), "film.mkv".into()];
+            let Err(UndoStop::Refused(refusal, why)) = undo_add(&root, &mut stopped, &new_disk(), &mut steps) else {
+                panic!("files on the branch")
+            };
+            assert_eq!(refusal, ElasticRefusal::AddJoined, "{why}");
+            assert!(steps.log.is_empty() && steps.wiped == 0);
+        }
+
+        /// The undo erases nothing but the filesystem the add wrote: a
+        /// signature it did not write refuses it before any effect, and a
+        /// blank disk is left alone.
+        #[test]
+        fn abort_restores_config_and_wipes_only_own_uuid() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (dir, root, journal) = add_bench();
+            let mut steps = add_steps(&dir.0, &journal, &[0]);
+            let mut stopped = stopped_before_join(&root, &journal, &mut steps, false);
+            steps.signatures.push(WipedSignature {
+                kind: "zfs_member".into(),
+                offset: "0x3f000".into(),
+                label: Some("tank".into()),
+                uuid: None,
+            });
+            let path = root.path.join(format!("{}.json", spec().array_id));
+            let before = std::fs::read(&path).expect("bytes");
+            let Err(UndoStop::Refused(refusal, why)) = undo_add(&root, &mut stopped, &new_disk(), &mut steps) else {
+                panic!("a foreign signature")
+            };
+            assert_eq!(refusal, ElasticRefusal::DiskClaimed);
+            assert!(why.contains("zfs_member"), "{why}");
+            assert_eq!(std::fs::read(&path).expect("bytes"), before);
+            assert!(steps.log.is_empty() && steps.wiped == 0, "nothing unmounted, written or erased");
+            // A blank disk (mkfs never wrote): the slot goes, nothing is erased.
+            steps.signatures.clear();
+            undo_add(&root, &mut stopped, &new_disk(), &mut steps).unwrap_or_else(|_| panic!("blank disk"));
+            assert_eq!(steps.wiped, 0);
+            assert_eq!(steps.log, vec![
+                format!("umount {}", data_branch_path("media", "d2")),
+                format!("write {}", config_path("media")),
+            ]);
+            assert_eq!(root.load(&spec().array_id).expect("load").spec, journal.spec);
+        }
+
+        /// `shrink_data` is ONE slot wide: the last one, only for the disk the
+        /// journal records as being added.
+        #[test]
+        fn shrink_data_refuses_other_slot_or_disk() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_dir, root, journal) = add_bench();
+            let path = root.path.join(format!("{}.json", spec().array_id));
+            // No add recorded: nothing to shrink, not even the last slot.
+            assert!(root.shrink_data(&spec().array_id, &journal.spec.data[0]).is_err());
+            let grown = root.grow_data(&spec().array_id, &new_disk()).expect("grow");
+            let before = std::fs::read(&path).expect("bytes");
+            for (why, disk) in [
+                ("an older slot", grown.spec.data[0].clone()),
+                ("the parity", grown.spec.parity[0].clone()),
+                ("the same disk with another UUID", ElasticDiskSpec {
+                    expected_uuid: "12121212-1212-4212-8212-121212121212".into(),
+                    ..new_disk()
+                }),
+            ] {
+                assert!(root.shrink_data(&spec().array_id, &disk).is_err(), "{why}");
+                assert_eq!(std::fs::read(&path).expect("bytes"), before, "{why}");
+            }
+            let shrunk = root.shrink_data(&spec().array_id, &new_disk()).expect("the add's own slot");
+            assert_eq!(shrunk.spec, journal.spec);
+            assert_eq!(shrunk.stage, ElasticStage::Ready);
+        }
+
+        /// The observation reports an unfinished add: which branch, how far it
+        /// got, and whether an undo is still possible.
+        #[test]
+        fn an_unfinished_add_is_reported_with_its_step() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(add_step(false, None, None), ElasticAddStep::Format);
+            assert_eq!(add_step(true, Some(false), Some(false)), ElasticAddStep::Mount);
+            assert_eq!(add_step(true, Some(true), Some(false)), ElasticAddStep::Join);
+            assert_eq!(add_step(true, Some(true), Some(true)), ElasticAddStep::Sync);
+            let (_dir, root, _journal) = add_bench();
+            let grown = root.grow_data(&spec().array_id, &new_disk()).expect("grow");
+            let observed = observe(&grown, None);
+            assert_eq!(observed.attention, Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: false }));
+            let report = observed.pending_add.clone().expect("reported");
+            assert_eq!(
+                (report.disk_id.as_str(), report.branch.as_str(), report.formatted, report.joined, report.step, report.undo_possible),
+                ("serial:new", "d2", false, false, ElasticAddStep::Format, true)
+            );
+            let wire = serde_json::to_value(&observed).expect("json");
+            assert_eq!(wire["attention"], serde_json::json!({ "add_disk": { "disk_id": "serial:new", "joined": false } }));
+            assert_eq!(wire["pending_add"]["step"], serde_json::json!("format"));
+            let decoded: ElasticResult = serde_json::from_value(wire).expect("round trip");
+            assert_eq!(decoded, observed);
+            // B1: once the add may have joined, the observation never offers
+            // the undo, whatever a live read would say.
+            let mut joined = grown.clone();
+            joined.attention = Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: true });
+            assert!(!observe(&joined, None).pending_add.expect("reported").undo_possible);
+        }
+
+        /// I3's backstop in the helper: a NEW mover run ends in a Sync nobody
+        /// acknowledged, so it does not start over a recorded Scrub or Fix
+        /// fault, nor while an add is unfinished. After a failed Sync its
+        /// coupled Sync is the cure, and it runs.
+        #[test]
+        fn a_new_mover_run_does_not_start_over_a_scrub_fault_or_an_unfinished_add() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let rules = move_everything_aged();
+            for (data_disks, attention, refused) in [
+                (1, parity_fault(ElasticSnapraidKind::Scrub), Some("fault_unacknowledged")),
+                (1, parity_fault(ElasticSnapraidKind::Fix { disk: "d1".into() }), Some("fault_unacknowledged")),
+                (2, ElasticAttention::AddDisk { disk_id: "serial:data2".into(), joined: true }, Some("attention_add_disk")),
+                (1, parity_fault(ElasticSnapraidKind::Sync), None),
+            ] {
+                let (bench, root, mut journal) = mover_bench(data_disks);
+                let snapraid = FakeSnapraid::new(&bench.dir.0, &[0]);
+                journal.attention = Some(attention.clone());
+                journal.stage = ElasticStage::NeedsAttention;
+                root.save(&journal).expect("save");
+                let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
+                let before = bench.journal_bytes();
+                let result = run_mover(
+                    &root,
+                    &mut journal,
+                    &mover_request(&rules, &array_lock),
+                    &bench.env(&roomy, &nothing_open),
+                    &mut TestHost::new(&bench, &snapraid),
+                );
+                match refused {
+                    Some(code) => {
+                        let error = result.expect_err("refused");
+                        assert!(error.starts_with(code), "{attention:?}: {error}");
+                        assert_eq!(bench.journal_bytes(), before, "{attention:?}: nothing written");
+                        assert_eq!(snapraid.attempts(), 0);
+                    }
+                    None => result.unwrap_or_else(|error| panic!("{attention:?}: {error}")),
+                }
             }
         }
 
@@ -14290,75 +16174,332 @@ Nothing to do
             );
         }
 
-        /// The STAGE GATE of the three lifecycle operations, checked where it
-        /// is decided.
-        ///
-        /// A scrub that finds errors closes as `NeedsAttention`, and until now
-        /// that state refused every operation — including the repair that
-        /// exists to resolve it. So a repair, and ONLY a repair, may start
-        /// there; a sync and a scrub still may not, and nothing at all may
-        /// start while an intent is still pending. This fixture's journal
-        /// carries no parity, so the repair that gets past the gate lands on
-        /// the parity refusal, which is the proof it got past the gate at all.
+        const FAULT_OPERATION: &str = "fafafafa-fafa-4faf-8faf-fafafafafafa";
+
+        fn parity_fault(kind: ElasticSnapraidKind) -> ElasticAttention {
+            ElasticAttention::ParityRun { operation_id: FAULT_OPERATION.into(), kind }
+        }
+
+        /// H3, cell by cell: attention {none, other, add, failed Sync, Scrub,
+        /// Fix} x request {Sync, Sync with the acknowledgement, Scrub, Fix} x
+        /// {nothing pending, an intent pending, a mover run open}. The same
+        /// pure function the executor calls, so the core can ask it too.
         #[test]
-        fn only_a_repair_may_start_on_an_array_that_needs_attention() {
+        fn maintenance_admission_table() {
+            use ElasticRefusal::*;
+            let fix = ElasticSnapraidKind::Fix { disk: "d1".into() };
+            let add = ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: false };
+            let (sync_fault, scrub_fault, fix_fault) = (
+                parity_fault(ElasticSnapraidKind::Sync),
+                parity_fault(ElasticSnapraidKind::Scrub),
+                parity_fault(fix.clone()),
+            );
+            // (stage, cause, [Sync, Sync + ack, Scrub, Fix]) with nothing in flight.
+            let rows: Vec<(ElasticStage, Option<&ElasticAttention>, [Result<(), ElasticRefusal>; 4])> = vec![
+                (ElasticStage::Ready, None, [Ok(()), Ok(()), Ok(()), Ok(())]),
+                (ElasticStage::NeedsAttention, None, [Err(AttentionOther); 4]),
+                (ElasticStage::NeedsAttention, Some(&ElasticAttention::Other), [Err(AttentionOther); 4]),
+                (ElasticStage::NeedsAttention, Some(&add), [Err(AttentionAddDisk); 4]),
+                (ElasticStage::NeedsAttention, Some(&sync_fault), [Ok(()), Ok(()), Ok(()), Ok(())]),
+                (ElasticStage::NeedsAttention, Some(&scrub_fault), [Err(FaultUnacknowledged), Ok(()), Ok(()), Ok(())]),
+                (ElasticStage::NeedsAttention, Some(&fix_fault), [Err(FaultUnacknowledged), Ok(()), Ok(()), Ok(())]),
+                (ElasticStage::Mounting, None, [Err(OperationPending); 4]),
+                (ElasticStage::SyncPending, Some(&add), [Err(OperationPending); 4]),
+            ];
+            let requests = [
+                (ElasticSnapraidKind::Sync, None),
+                (ElasticSnapraidKind::Sync, Some(FAULT_OPERATION)),
+                (ElasticSnapraidKind::Scrub, None),
+                (fix.clone(), None),
+            ];
+            for (stage, attention, expected) in rows {
+                for ((kind, ack), expected) in requests.iter().zip(expected) {
+                    for (pending, transfer_open) in [(false, false), (true, false), (false, true), (true, true)] {
+                        let facts = ElasticAdmission { stage, pending, transfer_open, attention };
+                        let want = if pending || transfer_open { Err(OperationPending) } else { expected };
+                        assert_eq!(
+                            maintenance_admission(&facts, kind, *ack),
+                            want,
+                            "{stage:?} {attention:?} {kind:?} ack={ack:?} pending={pending} transfer={transfer_open}"
+                        );
+                    }
+                }
+            }
+            // M1: the acknowledgement is bound to THE fault. One that names
+            // any other run — an older fault, or a request queued before a
+            // newer Scrub recorded this one — acknowledges nothing.
+            for fault in [&scrub_fault, &fix_fault] {
+                let facts = ElasticAdmission {
+                    stage: ElasticStage::NeedsAttention,
+                    pending: false,
+                    transfer_open: false,
+                    attention: Some(fault),
+                };
+                assert_eq!(
+                    maintenance_admission(&facts, &ElasticSnapraidKind::Sync, Some("abababab-abab-4bab-8bab-abababababab")),
+                    Err(FaultUnacknowledged)
+                );
+            }
+            // The codes on the wire are the closed vocabulary.
+            for (refusal, code) in [
+                (OperationPending, "operation_pending"),
+                (AttentionOther, "attention_other"),
+                (FaultUnacknowledged, "fault_unacknowledged"),
+                (AttentionAddDisk, "attention_add_disk"),
+            ] {
+                assert_eq!(refusal.as_str(), code);
+                assert_eq!(serde_json::to_value(refusal).expect("json"), serde_json::json!(code));
+            }
+        }
+
+        /// H9 and I4 as tables: an unfinished add admits only itself, down to
+        /// the filesystem UUID; and an undo only while the disk provably
+        /// never served a file.
+        #[test]
+        fn add_and_undo_admission_tables() {
+            use ElasticRefusal::*;
+            let new = ElasticDiskSpec {
+                disk_id: "serial:new".into(),
+                serial: Some("new".into()),
+                wwn: None,
+                bytes: 8 << 30,
+                expected_uuid: "88888888-8888-4888-8888-888888888888".into(),
+            };
+            let mut other_uuid = new.clone();
+            other_uuid.expected_uuid = "89898989-8989-4989-8989-898989898989".into();
+            let old = spec().data[0].clone();
+            let add = ElasticAttention::AddDisk { disk_id: new.disk_id.clone(), joined: false };
+            let foreign_add = ElasticAttention::AddDisk { disk_id: "serial:other".into(), joined: false };
+            let fault = parity_fault(ElasticSnapraidKind::Scrub);
+            let facts = |stage, pending, transfer_open, attention| ElasticAdmission { stage, pending, transfer_open, attention };
+            let ready = ElasticStage::Ready;
+            let attention = ElasticStage::NeedsAttention;
+            for (facts, last, disk, expected) in [
+                (facts(ready, false, false, None), Some(&old), &new, Ok(ElasticAddAdmission::Fresh)),
+                // E9: the helper finished, the core did not record it.
+                (facts(ready, false, false, None), Some(&new), &new, Ok(ElasticAddAdmission::Fresh)),
+                (facts(ready, false, true, None), Some(&old), &new, Err(OperationPending)),
+                (facts(ElasticStage::Mounting, true, false, None), Some(&old), &new, Err(OperationPending)),
+                (facts(attention, false, false, None), Some(&old), &new, Err(AttentionOther)),
+                (facts(attention, false, false, Some(&ElasticAttention::Other)), Some(&old), &new, Err(AttentionOther)),
+                (facts(attention, false, false, Some(&fault)), Some(&old), &new, Err(AttentionParityFault)),
+                // The unfinished add of this very disk, pending intent or not.
+                (facts(attention, false, false, Some(&add)), Some(&new), &new, Ok(ElasticAddAdmission::Resume)),
+                (facts(ElasticStage::Formatting, true, false, Some(&add)), Some(&new), &new, Ok(ElasticAddAdmission::Resume)),
+                // ...and nothing else: another disk, the same disk with another
+                // UUID, or while a mover run is open.
+                (facts(attention, false, false, Some(&add)), Some(&new), &old, Err(AttentionAddDisk)),
+                (facts(attention, false, false, Some(&add)), Some(&new), &other_uuid, Err(AttentionAddDisk)),
+                (facts(attention, false, false, Some(&foreign_add)), Some(&new), &new, Err(AttentionAddDisk)),
+                (facts(attention, false, true, Some(&add)), Some(&new), &new, Err(OperationPending)),
+            ] {
+                assert_eq!(add_disk_admission(&facts, last, disk), expected, "{facts:?} {disk:?}");
+            }
+            for (joined, in_union, expected) in [
+                (false, None, Ok(())),
+                (false, Some(false), Ok(())),
+                (false, Some(true), Err(AddJoined)),
+                // B1: a joined intent is forward only, whatever a live read
+                // says — an unmounted union proves nothing about the files
+                // the branch received while it was mounted.
+                (true, Some(false), Err(AddJoined)),
+                (true, None, Err(AddJoined)),
+                (true, Some(true), Err(AddJoined)),
+            ] {
+                assert_eq!(add_undo_admission(joined, in_union), expected, "joined={joined} in_union={in_union:?}");
+            }
+        }
+
+        /// The end-to-end replacement of `only_a_repair_may_start_on_an_array_that_needs_attention`,
+        /// which proved the Fix-from-attention gate on a HAND-BUILT journal
+        /// with no pending — a state no real failure produced (C1 of the
+        /// 2026-09-23 design). Here the journal comes out of a real failed
+        /// Scrub, through the real run path, and each request goes through
+        /// the real executor entry. The fixture carries no parity, so a
+        /// request that lands on `no_parity` got past the gate.
+        #[test]
+        fn a_real_scrub_fault_admits_the_repair() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let dir = Temp::new();
             let uid = unsafe { libc::geteuid() };
             let root = Root::open(&dir.0, uid).expect("root");
             let mut journal = legacy_journal(&root);
-            journal.stage = ElasticStage::NeedsAttention;
+            journal.stage = ElasticStage::Ready;
             journal.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
             root.save(&journal).expect("save");
-            let operation = |n: u8| format!("6666666{n}-6666-4666-8666-666666666666");
-
-            for (index, kind) in [ElasticSnapraidKind::Sync, ElasticSnapraidKind::Scrub]
-                .into_iter()
-                .enumerate()
-            {
-                let error = maintenance(
-                    &root,
-                    root.load(&spec().array_id).expect("load"),
-                    &operation(index as u8),
-                    kind.clone(),
-                    None,
-                    None,
-                )
-                .expect_err("needs attention refuses maintenance");
-                assert_eq!(error, "macierz wymaga uwagi lub operacja trwa", "{kind:?}");
-            }
-
-            let result = maintenance(
+            let (kind, log, stdout) = failing_parity_runs().swap_remove(1);
+            assert_eq!(kind, ElasticSnapraidKind::Scrub);
+            let scrub = perform_maintenance(
                 &root,
-                root.load(&spec().array_id).expect("load"),
-                &operation(2),
-                ElasticSnapraidKind::Fix { disk: "d1".into() },
-                None,
-                None,
+                &mut journal,
+                run_record(kind),
+                &snap_spec(),
+                || Ok((Some(1), parsed_log(&log, stdout))),
+                || Ok(false),
+                false,
             )
-            .expect("the repair reaches its own preconditions");
-            assert_eq!(result.run.outcome, ElasticSnapraidOutcome::Refused);
-            assert_eq!(result.run.detail.as_deref(), Some("no_parity"));
-            assert_eq!(
-                result.run.kind,
-                ElasticSnapraidKind::Fix { disk: "d1".into() },
-                "the run names the disk it was asked to rebuild"
-            );
+            .expect("the scrub's verdict");
+            assert_eq!(scrub.outcome, ElasticSnapraidOutcome::Failed);
+            let path = dir.0.join(format!("{}.json", spec().array_id));
+            let operation = |n: u8| format!("6666666{n}-6666-4666-8666-666666666666");
+            let ask = |n: u8, kind: ElasticSnapraidKind, ack: Option<&str>| {
+                let before = std::fs::read(&path).expect("bytes");
+                let result = maintenance(&root, root.load(&spec().array_id).expect("load"), &operation(n), kind, ack, None, None)
+                    .expect("an answer, never an error");
+                assert_eq!(result.run.outcome, ElasticSnapraidOutcome::Refused);
+                assert_eq!(std::fs::read(&path).expect("bytes"), before, "nothing a refusal or a precondition does is written");
+                assert_eq!(result.state.attention, Some(ElasticAttention::ParityRun {
+                    operation_id: scrub.operation_id.clone(),
+                    kind: ElasticSnapraidKind::Scrub,
+                }));
+                result.run.detail.expect("a reason")
+            };
+            let fix = ElasticSnapraidKind::Fix { disk: "d1".into() };
+            // The repair and another Scrub get past the gate.
+            assert_eq!(ask(1, fix.clone(), None), "no_parity");
+            assert_eq!(ask(2, ElasticSnapraidKind::Scrub, None), "no_parity");
+            // A Sync over the fault needs the admin's acknowledgement (I3) —
+            // of THIS fault, by the operation id of the Scrub that recorded it.
+            assert_eq!(ask(3, ElasticSnapraidKind::Sync, None), "fault_unacknowledged");
+            assert_eq!(ask(9, ElasticSnapraidKind::Sync, Some("abababab-abab-4bab-8bab-abababababab")), "fault_unacknowledged");
+            assert_eq!(ask(4, ElasticSnapraidKind::Sync, Some(scrub.operation_id.as_str())), "no_parity");
 
-            // A pending intent still stops everything, repair included: the
+            // An intent still stops everything, the repair included: the
             // journal does not yet know what is on the disks.
             let mut held = root.load(&spec().array_id).expect("load");
             held.pending = Some(Pending::Sync);
             root.save(&held).expect("save");
-            let error = maintenance(
-                &root,
-                root.load(&spec().array_id).expect("load"),
-                &operation(3),
-                ElasticSnapraidKind::Fix { disk: "d1".into() },
-                None,
-                None,
-            )
-            .expect_err("an unfinished intent refuses even a repair");
-            assert_eq!(error, "macierz wymaga uwagi lub operacja trwa");
+            assert_eq!(ask(5, fix.clone(), None), "operation_pending");
+
+            // A NeedsAttention without a recorded cause — a journal an older
+            // helper wrote — admits none of the three (I2): a Restore only.
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, uid).expect("root");
+            let mut legacy = legacy_journal(&root);
+            legacy.stage = ElasticStage::NeedsAttention;
+            legacy.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
+            root.save(&legacy).expect("save");
+            for (n, kind, ack) in [(6, ElasticSnapraidKind::Sync, Some(FAULT_OPERATION)), (7, ElasticSnapraidKind::Scrub, None), (8, fix, None)] {
+                let result = maintenance(&root, root.load(&spec().array_id).expect("load"), &operation(n), kind, ack, None, None)
+                    .expect("an answer");
+                assert_eq!(result.run.outcome, ElasticSnapraidOutcome::Refused);
+                assert_eq!(result.run.detail.as_deref(), Some("attention_other"));
+            }
+        }
+
+        /// H6: a failed run a 0.13.0 helper left pinned — its
+        /// `Pending::Maintenance` next to the finished run — is converted on
+        /// first touch, by the maintenance path and by Restore, into the cause
+        /// it always was. The converted journal then admits the repair.
+        #[test]
+        fn legacy_pinned_failure_is_normalised() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let uid = unsafe { libc::geteuid() };
+            for kind in [ElasticSnapraidKind::Sync, ElasticSnapraidKind::Scrub, ElasticSnapraidKind::Fix { disk: "d1".into() }] {
+                for through_restore in [false, true] {
+                    let dir = Temp::new();
+                    let root = Root::open(&dir.0, uid).expect("root");
+                    let mut journal = legacy_journal(&root);
+                    let mut run = run_record(kind.clone());
+                    run.outcome = ElasticSnapraidOutcome::Failed;
+                    run.exit_code = Some(1);
+                    run.finished_at = Some("2026-09-08T12:30:00Z".into());
+                    run.detail = Some("narzędzie zgłosiło błędy".into());
+                    journal.stage = ElasticStage::NeedsAttention;
+                    journal.detail = Some("narzędzie zgłosiło błędy".into());
+                    journal.sync_completed_at = Some("2026-09-08T10:00:00Z".into());
+                    journal.pending = Some(Pending::Maintenance { operation_id: run.operation_id.clone(), kind: kind.clone() });
+                    journal.last_run = Some(run.clone());
+                    root.save(&journal).expect("the state 0.13.0 wrote");
+                    let bytes = std::fs::read(dir.0.join(format!("{}.json", spec().array_id))).expect("bytes");
+                    assert!(!String::from_utf8_lossy(&bytes).contains("\"attention\""), "an older helper's journal");
+                    if through_restore {
+                        let restored = restore(&root, root.load(&spec().array_id).expect("load"), None, None)
+                            .expect("an observation");
+                        assert!(
+                            !restored.detail.as_deref().unwrap_or("").contains("intencja SnapRAID bez zapisu próby"),
+                            "{kind:?}: {:?}",
+                            restored.detail
+                        );
+                    } else {
+                        let result = maintenance(
+                            &root,
+                            root.load(&spec().array_id).expect("load"),
+                            NEXT_OPERATION,
+                            ElasticSnapraidKind::Fix { disk: "d1".into() },
+                            None,
+                            None,
+                            None,
+                        )
+                        .expect("an answer");
+                        assert_eq!(result.run.detail.as_deref(), Some("no_parity"), "{kind:?}: the repair got past the gate");
+                    }
+                    let stored = root.load(&spec().array_id).expect("load");
+                    assert!(stored.pending.is_none(), "{kind:?} restore={through_restore}");
+                    assert_eq!(stored.stage, ElasticStage::NeedsAttention);
+                    assert_eq!(
+                        stored.attention,
+                        Some(ElasticAttention::ParityRun { operation_id: run.operation_id.clone(), kind: kind.clone() }),
+                        "{kind:?} restore={through_restore}"
+                    );
+                    assert_eq!(stored.last_run.as_ref(), Some(&run), "the history is not rewritten");
+                    assert_eq!(stored.stale_parity_bytes.is_some(), kind == ElasticSnapraidKind::Sync, "{kind:?}");
+                }
+            }
+            // A run still Running is NOT a finished failure: normalisation
+            // leaves it for Restore to close as interrupted.
+            let dir = Temp::new();
+            let root = Root::open(&dir.0, uid).expect("root");
+            let mut journal = legacy_journal(&root);
+            let run = run_record(ElasticSnapraidKind::Scrub);
+            journal.pending = Some(Pending::Maintenance { operation_id: run.operation_id.clone(), kind: run.kind.clone() });
+            journal.last_run = Some(run);
+            journal.stage = ElasticStage::SyncPending;
+            root.save(&journal).expect("an interrupted scrub");
+            let mut untouched = root.load(&spec().array_id).expect("load");
+            assert!(!normalise_pinned_parity_run(&mut untouched));
+            assert!(untouched.pending.is_some() && untouched.attention.is_none());
+        }
+
+        /// H7 through `finish(Ok)`, which Restore, Resume and Create end in:
+        /// remounting and publishing never clears a parity fault or an
+        /// unfinished add, and clears every other cause with the stage.
+        #[test]
+        fn restore_keeps_a_parity_or_add_attention() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let uid = unsafe { libc::geteuid() };
+            let mut grown_spec = spec();
+            grown_spec.data.push(ElasticDiskSpec {
+                disk_id: "serial:new".into(),
+                serial: Some("new".into()),
+                wwn: None,
+                bytes: 8 << 30,
+                expected_uuid: "88888888-8888-4888-8888-888888888888".into(),
+            });
+            for (attention, kept) in [
+                (Some(parity_fault(ElasticSnapraidKind::Scrub)), true),
+                (Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: true }), true),
+                (Some(ElasticAttention::Other), false),
+                (None, false),
+            ] {
+                let dir = Temp::new();
+                let root = Root::open(&dir.0, uid).expect("root");
+                let mut journal = legacy_journal_of(&root, &grown_spec, "needs_attention", serde_json::json!([]), serde_json::Value::Null);
+                journal.attention = attention.clone();
+                journal.detail = Some("co się stało".into());
+                root.save(&journal).expect("save");
+                let observed = finish(&root, &mut journal, Ok(()), None).expect("finish");
+                let stored = root.load(&spec().array_id).expect("load");
+                if kept {
+                    assert_eq!(observed.stage, ElasticStage::NeedsAttention, "{attention:?}");
+                    assert_eq!(stored.attention, attention, "{attention:?}");
+                    assert_eq!(stored.detail.as_deref(), Some("co się stało"));
+                } else {
+                    assert_eq!(observed.stage, ElasticStage::Ready, "{attention:?}");
+                    assert!(stored.attention.is_none() && stored.detail.is_none(), "{attention:?}");
+                }
+                assert_eq!(observed.attention, stored.attention);
+            }
         }
 
         /// The executor's MODE table. Every step is legal in exactly the modes
@@ -15227,6 +17368,22 @@ Nothing to do
             published: usize,
             /// Branch specs the executor appended to the live union, in order.
             branches: Vec<String>,
+            /// The array the namespace serves: names the live union's branches.
+            name: String,
+            /// Data branches the live union served before any append; `None`
+            /// accepts a union check of any shape.
+            union_data: Option<usize>,
+            /// The disk may be formatted: `clean_device` and mkfs succeed.
+            format: bool,
+            /// SnapRAID as a real process over its control files.
+            snapraid: Option<FakeSnapraid>,
+            /// What `wipefs --no-act` reports on every device.
+            signatures: Vec<WipedSignature>,
+            /// What a branch directory holds.
+            entries: Vec<String>,
+            wiped: usize,
+            /// No Sync has written parity yet.
+            parity_empty: bool,
         }
 
         impl FakeSteps {
@@ -15261,6 +17418,14 @@ Nothing to do
                     log: Vec::new(),
                     published: 0,
                     branches: Vec::new(),
+                    name: spec.name.clone(),
+                    union_data: None,
+                    format: false,
+                    snapraid: None,
+                    signatures: Vec::new(),
+                    entries: Vec::new(),
+                    wiped: 0,
+                    parity_empty: false,
                 }
             }
 
@@ -15290,8 +17455,11 @@ Nothing to do
                 Ok(self.mounted.contains(&mount_path(spec, role)))
             }
 
-            fn union_mounted(&mut self, _: &ElasticSpec) -> Result<bool, String> {
-                Ok(self.union)
+            fn union_mounted(&mut self, spec: &ElasticSpec) -> Result<bool, String> {
+                Ok(self.union
+                    && self
+                        .union_data
+                        .is_none_or(|data| data + self.branches.len() == spec.data.len()))
             }
 
             fn directory_empty(&mut self, _: &str) -> Result<bool, String> {
@@ -15304,6 +17472,12 @@ Nothing to do
             }
 
             fn clean_device(&mut self, _: &Device) -> Result<(), String> {
+                if self.format && self.signatures.is_empty() {
+                    return Ok(());
+                }
+                if self.format {
+                    return Err("urządzenie zawiera podpis danych".into());
+                }
                 Err("test nie formatuje".into())
             }
 
@@ -15316,8 +17490,35 @@ Nothing to do
                 Ok(())
             }
 
-            fn run_tool(&mut self, program: &Path, _: &[String], _: &[RawFd]) -> Result<(), String> {
+            fn run_tool(&mut self, program: &Path, args: &[String], _: &[RawFd]) -> Result<(), String> {
+                if self.format && program.to_string_lossy().contains("mkfs") {
+                    self.log.push(format!("mkfs {}", args.last().cloned().unwrap_or_default()));
+                    return Ok(());
+                }
                 Err(format!("nieoczekiwane narzędzie {}", program.display()))
+            }
+
+            fn run_snapraid(
+                &mut self,
+                root: &Root,
+                array_lock: &File,
+                directory: &Path,
+                label: &str,
+                _: &Path,
+                args: &[String],
+            ) -> Result<(Option<i32>, Result<SnapraidLog, String>), String> {
+                let snapraid = self.snapraid.clone().ok_or("test nie uruchamia SnapRAID")?;
+                self.log.push(format!("snapraid {label}"));
+                let mut argv = vec![snapraid.control.display().to_string()];
+                argv.extend_from_slice(args);
+                capture_snapraid(
+                    root,
+                    array_lock,
+                    directory,
+                    label,
+                    fake_snapraid_program().to_str().expect("program"),
+                    &argv,
+                )
             }
 
             fn write_file(&mut self, path: &str, _: &str, _: u32) -> Result<(), String> {
@@ -15331,6 +17532,44 @@ Nothing to do
                 }
                 self.log.push(format!("addbranch {union} {branch}"));
                 self.branches.push(branch.into());
+                Ok(())
+            }
+
+            fn union_branches(&mut self, _: &str) -> Result<Option<Vec<String>>, String> {
+                if !self.union {
+                    return Ok(None);
+                }
+                let before = self.union_data.ok_or("kształt unii nieznany")?;
+                Ok(Some(
+                    (1..=before)
+                        .map(|slot| format!("{}=NC", data_branch_path(&self.name, &data_branch_name(slot))))
+                        .chain(self.branches.iter().cloned())
+                        .collect(),
+                ))
+            }
+
+            fn directory_entries(&mut self, _: &str) -> Result<Vec<String>, String> {
+                Ok(self.entries.clone())
+            }
+
+            fn unmount(&mut self, mountpoint: &str) -> Result<(), String> {
+                self.log.push(format!("umount {mountpoint}"));
+                self.mounted.remove(mountpoint);
+                Ok(())
+            }
+
+            fn signatures(&mut self, _: &Device) -> Result<Vec<WipedSignature>, String> {
+                Ok(self.signatures.clone())
+            }
+
+            fn parity_empty(&mut self, _: &ElasticSpec) -> Result<bool, String> {
+                Ok(self.parity_empty)
+            }
+
+            fn wipe(&mut self, device: &Device) -> Result<(), String> {
+                self.log.push(format!("wipefs {}", device.path));
+                self.signatures.clear();
+                self.wiped += 1;
                 Ok(())
             }
 
@@ -19132,7 +21371,7 @@ Nothing to do
             for command in [
                 crate::HelperCommand::ElasticInspect { array_id: array_id.clone(), owner: owner.clone() },
                 crate::HelperCommand::ElasticCacheAge { array_id: array_id.clone(), owner: owner.clone(), rules: MoverRules::default() },
-                crate::HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: NEXT_OPERATION.into() },
+                crate::HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: NEXT_OPERATION.into(), acknowledge_parity_fault: None },
                 crate::HelperCommand::ElasticMover {
                     array_id: array_id.clone(),
                     owner: owner.clone(),
@@ -19348,6 +21587,9 @@ Nothing to do
                 assert_eq!((closed.outcome, closed.kind.clone()), (ElasticSnapraidOutcome::NeedsAttention, kind.clone()));
                 assert!(closed.finished_at.is_some(), "{kind:?}");
                 assert_eq!(stored.stage, ElasticStage::Ready, "{kind:?}");
+                // An interrupted run is not a recorded failure: it has no
+                // verdict, so it becomes no cause (the W1 behaviour, kept).
+                assert!(stored.attention.is_none(), "{kind:?}");
                 assert!(stored.stale_parity_bytes.is_none(), "{kind:?}: a scrub or a fix does not stale parity");
                 restore_checkpoint_guard(&stored).unwrap_or_else(|error| panic!("{kind:?}: {error}"));
                 serving_guard(&stored).expect("nothing in flight");

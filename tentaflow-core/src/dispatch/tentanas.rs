@@ -3819,17 +3819,22 @@ async fn execute_approved(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     match payload {
-        P::ElasticArraySyncRequest {name,..} => elastic_snapraid(ctx,name,secret,Origin::Approved,
-            tentanas_helper::elastic::ElasticSnapraidKind::Sync).await,
+        // The acknowledgement the AUTHOR gave travels with the parked request:
+        // the approver releases that decision, and the Sync over the fault is
+        // judged again, with it, when it runs.
+        P::ElasticArraySyncRequest {name,acknowledge_parity_fault,..} => elastic_snapraid(ctx,name,secret,Origin::Approved,
+            tentanas_helper::elastic::ElasticSnapraidKind::Sync,acknowledge_parity_fault.clone()).await,
         P::ElasticArrayScrubRequest {name,..} => elastic_snapraid(ctx,name,secret,Origin::Approved,
-            tentanas_helper::elastic::ElasticSnapraidKind::Scrub).await,
+            tentanas_helper::elastic::ElasticSnapraidKind::Scrub,None).await,
         P::ElasticArrayFixRequest {name,disk,confirm_disk,..} => {
             require_confirm(disk,confirm_disk)?;
             elastic_snapraid(ctx,name,secret,Origin::Approved,
-                tentanas_helper::elastic::ElasticSnapraidKind::Fix { disk: disk.clone() }).await
+                tentanas_helper::elastic::ElasticSnapraidKind::Fix { disk: disk.clone() },None).await
         }
         P::ElasticArrayAddDiskRequest {name,disk_id,confirm_name,..} =>
             elastic_add_disk(ctx,name,disk_id,confirm_name,secret,Origin::Approved).await,
+        P::ElasticArrayAddDiskAbortRequest {name,disk_id,confirm_name,..} =>
+            elastic_add_disk_abort(ctx,name,disk_id,confirm_name,secret,Origin::Approved).await,
         P::ElasticArrayReplaceDiskRequest {name,disk,confirm_disk,replacement_disk_id,accept_stale_parity,..} =>
             elastic_replace_disk(ctx,name,disk,confirm_disk,replacement_disk_id,*accept_stale_parity,
                 secret,Origin::Approved).await,
@@ -4085,12 +4090,21 @@ async fn elastic_import(
     Ok(tn(P::ElasticArrayGetResponse { array }))
 }
 
+/// The refusal of a manual Sync over a recorded Scrub or Repair fault that
+/// came without the admin's acknowledgement, as the code the screen words.
+const SYNC_NEEDS_ACKNOWLEDGEMENT: &str = "refusal:elastic_fault_unacknowledged";
+/// ...and of one whose acknowledgement names a fault that is no longer the
+/// array's: a request queued or parked over an older fault, released after
+/// a newer one was recorded.
+const SYNC_FAULT_CHANGED: &str = "refusal:elastic_fault_changed";
+
 async fn elastic_snapraid(
     ctx: &HandlerContext,
     name: &str,
     secret: Option<&SudoSecret>,
     origin: Origin,
     kind: tentanas_helper::elastic::ElasticSnapraidKind,
+    acknowledge_parity_fault: Option<String>,
 ) -> Result<MessageBody, ProtocolError> {
     use tentanas_helper::elastic::ElasticSnapraidKind;
     let g = gate_destructive(ctx)?;
@@ -4161,12 +4175,56 @@ async fn elastic_snapraid(
             "SnapRAID wymaga macierzy z parity bez nierozwiązanej operacji poza parity",
         ));
     }
+    // What the Sync carries to the helper, and what the approver reads.
+    let mut acknowledged = None;
+    let mut fault_warning = false;
+    if !matches!(kind, ElasticSnapraidKind::Fix { .. }) {
+        // The OBSERVED array, as for a repair: the helper's recorded cause is
+        // what its own gate enforces, and the wire carries exactly this
+        // answer to the screen — so the button and this handler read one
+        // rule over one object.
+        let observed = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
+            .await
+            .map_err(|e| internal("elastic get", e))?
+            .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        if !observed.parity_run_available {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::NotAvailable,
+                "SnapRAID wymaga macierzy z parity bez nierozwiązanej operacji poza parity",
+            ));
+        }
+        // I3: A SYNC OVER A RECORDED SCRUB OR REPAIR FAULT IS THE ADMIN'S
+        // DECISION. Measured on rig11 (snapraid 13.0-1, probe f1-f4): the
+        // marked blocks stay repairable across it, but the files the Scrub
+        // could not read leave the content file for good. The screen's
+        // confirm names that cost and is the only thing that sets the flag;
+        // the helper refuses the Sync without it too.
+        //
+        // The acknowledgement is BOUND TO THE FAULT (M1 of the release
+        // review): it has to name the fault this array carries now. One that
+        // names another — a request parked over an older fault and released
+        // after a newer Scrub recorded this one — acknowledges nothing, and
+        // one the array does not need is dropped here, so no request ever
+        // carries a blank cheque to the helper.
+        if kind == ElasticSnapraidKind::Sync && observed.sync_needs_acknowledgement {
+            match acknowledge_parity_fault.as_deref() {
+                None => return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable, SYNC_NEEDS_ACKNOWLEDGEMENT)),
+                Some(fault) if fault != observed.sync_fault_id => {
+                    return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable, SYNC_FAULT_CHANGED))
+                }
+                Some(fault) => acknowledged = Some(fault.to_string()),
+            }
+            fault_warning = true;
+        }
+    }
+    let acknowledge_parity_fault = acknowledged;
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
         let (operation, request, description) = match &kind {
             ElasticSnapraidKind::Sync => (
                 tentanas::approvals::OP_ELASTIC_SYNC,
                 P::ElasticArraySyncRequest {
                     name: name.into(),
+                    acknowledge_parity_fault,
                     sudo_password: None,
                 },
                 // A Sync over an array whose scrub reported errors is not the
@@ -4178,12 +4236,13 @@ async fn elastic_snapraid(
                 // content file by that same Sync, and parity then holds nothing
                 // of them. So the sentence names what the approval costs, and
                 // the repair is the operation to take first.
-                match tentanas::elastic::unresolved_parity_fault(&array.snapraid_history) {
-                    Some(run) => format!(
-                        "Zapisuje nowy checkpoint parity i content. UWAGA: scrub tej macierzy zgłosił {} błędów, których nic jeszcze nie naprawiło. Zaznaczone bloki pozostaną naprawialne, ale pliki, których scrub nie mógł odczytać, zostaną usunięte z content i parity przestanie je obejmować. Najpierw uruchom naprawę z parity.",
-                        run.errors.unwrap_or_default()
-                    ),
-                    None => "Zapisuje nowy checkpoint parity i content".to_string(),
+                // The warning follows the OBSERVED need — the helper's
+                // recorded cause included, which a scrub whose log broke
+                // leaves with no counts in the history.
+                if fault_warning {
+                    "Zapisuje nowy checkpoint parity i content. UWAGA: macierz ma nienaprawiony błąd scrub lub naprawy. Zaznaczone bloki pozostaną naprawialne, ale pliki, których scrub nie mógł odczytać, zostaną usunięte z content i parity przestanie je obejmować. Najpierw uruchom naprawę z parity.".to_string()
+                } else {
+                    "Zapisuje nowy checkpoint parity i content".to_string()
                 },
             ),
             ElasticSnapraidKind::Scrub => (
@@ -4219,8 +4278,15 @@ async fn elastic_snapraid(
         };
         return park(ctx, &g, operation, name, &description, &request);
     }
-    let job = tentanas::elastic::spawn_snapraid(&g.db, &array, &g.user_id, secret.map(token), kind)
-        .map_err(|e| internal("elastic snapraid", e))?;
+    let job = tentanas::elastic::spawn_snapraid(
+        &g.db,
+        &array,
+        &g.user_id,
+        secret.map(token),
+        kind,
+        acknowledge_parity_fault,
+    )
+    .map_err(|e| internal("elastic snapraid", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -4265,9 +4331,14 @@ async fn elastic_add_disk(
     // what finishes the work. Minting a new identity, or refusing the repeat,
     // would leave a disk half-joined with no way through the product to
     // either finish or undo it.
-    let pending = store::unfinished_elastic_add_disk(&g.db, &owner, &persisted.array_id)
-        .map_err(|e| internal("elastic add disk", e))?
-        .filter(|disk| disk.disk_id == disk_id);
+    let pinned = store::unfinished_elastic_add_disk(&g.db, &owner, &persisted.array_id)
+        .map_err(|e| internal("elastic add disk", e))?;
+    // An add of ANOTHER disk is unfinished: only its resume or its undo may
+    // start, and the helper would refuse this one for exactly that.
+    if pinned.as_ref().is_some_and(|disk| disk.disk_id != disk_id) {
+        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable, "refusal:elastic_attention_add_disk"));
+    }
+    let pending = pinned;
     if pending.is_none() {
         if array.state != "active" || !array.enabled {
             return Err(ProtocolError::new(
@@ -4374,6 +4445,76 @@ async fn elastic_add_disk(
     }
     let job = tentanas::elastic::spawn_add_disk(&g.db, &array, &g.user_id, explicit, disk)
         .map_err(|e| internal("elastic add disk", e))?;
+    Ok(job_response(ctx, job))
+}
+
+/// Undoes the unfinished add of `disk_id` (D3 = b): the array loses the slot
+/// again, and the disk loses only the filesystem this add gave it.
+///
+/// Admitted only while the disk PROVABLY never joined the share — the
+/// helper's live read of the union, which the observed array carries as
+/// `pending_add_disk.undo_possible`. Once it may have joined, a branch taken
+/// out of a live union can hide users' files, and the add can only go
+/// forward. The helper holds the same rule (`add_undo_admission`), so this is
+/// the sentence, and the helper the gate.
+async fn elastic_add_disk_abort(
+    ctx: &HandlerContext,
+    name: &str,
+    disk_id: &str,
+    confirm_name: &str,
+    secret: Option<&SudoSecret>,
+    origin: Origin,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_destructive(ctx)?;
+    require_confirm(name, confirm_name)?;
+    tentanas_helper::elastic::validate_array_name(name)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if disk_id.is_empty() || disk_id.len() > 128 {
+        return Err(ProtocolError::bad_request("Nieprawidłowy identyfikator dysku"));
+    }
+    let owner = elastic_owner(&g);
+    let array = store::elastic_array(&g.db, &owner, name)
+        .map_err(|e| internal("elastic array", e))?
+        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+    let refuse = |code: &str| ProtocolError::new(ProtocolErrorCode::NotAvailable, format!("refusal:elastic_{code}"));
+    if !array.enabled || !matches!(array.state.as_str(), "active" | "needs_attention") {
+        return Err(refuse("array_not_ready"));
+    }
+    // The observation first: it settles an undo the core lost track of
+    // (`elastic::reconcile_undone_add`), so a repeated undo reads "nothing to
+    // undo" rather than "can only be finished".
+    let observed = tentanas::elastic::get(&g.db, &owner, name)
+        .await
+        .map_err(|e| internal("elastic get", e))?
+        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+    let disk = store::unfinished_elastic_add_disk(&g.db, &owner, &array.persisted_spec().map_err(|e| internal("elastic spec", e))?.array_id)
+        .map_err(|e| internal("elastic add disk", e))?
+        .filter(|disk| disk.disk_id == disk_id)
+        .ok_or_else(|| refuse("nothing_to_undo"))?;
+    // Nothing read from the helper: nothing says the disk never joined.
+    if observed.state == "unknown" {
+        return Err(refuse("state_unknown"));
+    }
+    if !observed.pending_add_disk.as_ref().is_some_and(|pending| pending.disk_id == disk_id && pending.undo_possible) {
+        return Err(refuse("add_joined"));
+    }
+    if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
+        return park(
+            ctx,
+            &g,
+            tentanas::approvals::OP_ELASTIC_ADD_DISK_ABORT,
+            name,
+            "Wycofuje niedokończone dodanie dysku, zanim dysk dołączył do udziału; czyści tylko system plików nadany przez to dodanie",
+            &P::ElasticArrayAddDiskAbortRequest {
+                name: name.to_string(),
+                disk_id: disk_id.to_string(),
+                confirm_name: confirm_name.to_string(),
+                sudo_password: None,
+            },
+        );
+    }
+    let job = tentanas::elastic::spawn_add_disk_abort(&g.db, &array, &g.user_id, secret.map(token), disk)
+        .map_err(|e| internal("elastic add disk abort", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -5429,17 +5570,19 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ElasticArrayCreateRequest {name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,sudo_password} =>
             elastic_create(ctx,name,filesystem,data_disk_ids,parity_disk_ids,cache_disk_ids,confirm_name,sudo_password.as_ref(),Origin::Direct).await,
         P::ElasticArrayRestoreRequest {name,sudo_password} => elastic_restore(ctx,name,sudo_password.as_ref()).await,
-        P::ElasticArraySyncRequest {name,sudo_password} => elastic_snapraid(ctx,name,sudo_password.as_ref(),Origin::Direct,
-            tentanas_helper::elastic::ElasticSnapraidKind::Sync).await,
+        P::ElasticArraySyncRequest {name,acknowledge_parity_fault,sudo_password} => elastic_snapraid(ctx,name,sudo_password.as_ref(),Origin::Direct,
+            tentanas_helper::elastic::ElasticSnapraidKind::Sync,acknowledge_parity_fault.clone()).await,
         P::ElasticArrayScrubRequest {name,sudo_password} => elastic_snapraid(ctx,name,sudo_password.as_ref(),Origin::Direct,
-            tentanas_helper::elastic::ElasticSnapraidKind::Scrub).await,
+            tentanas_helper::elastic::ElasticSnapraidKind::Scrub,None).await,
         P::ElasticArrayFixRequest {name,disk,confirm_disk,sudo_password} => {
             require_confirm(disk,confirm_disk)?;
             elastic_snapraid(ctx,name,sudo_password.as_ref(),Origin::Direct,
-                tentanas_helper::elastic::ElasticSnapraidKind::Fix { disk: disk.clone() }).await
+                tentanas_helper::elastic::ElasticSnapraidKind::Fix { disk: disk.clone() },None).await
         }
         P::ElasticArrayAddDiskRequest {name,disk_id,confirm_name,sudo_password} =>
             elastic_add_disk(ctx,name,disk_id,confirm_name,sudo_password.as_ref(),Origin::Direct).await,
+        P::ElasticArrayAddDiskAbortRequest {name,disk_id,confirm_name,sudo_password} =>
+            elastic_add_disk_abort(ctx,name,disk_id,confirm_name,sudo_password.as_ref(),Origin::Direct).await,
         P::ElasticArrayReplaceDiskRequest {name,disk,confirm_disk,replacement_disk_id,accept_stale_parity,sudo_password} =>
             elastic_replace_disk(ctx,name,disk,confirm_disk,replacement_disk_id,*accept_stale_parity,
                 sudo_password.as_ref(),Origin::Direct).await,
@@ -5816,6 +5959,10 @@ register_tentanas_variant!("TentaNasElasticArrayFixRequest", "tentaflow_ws_handl
 register_tentanas_variant!(
     "TentaNasElasticArrayAddDiskRequest",
     "tentaflow_ws_handler_nas_elastic_add_disk"
+);
+register_tentanas_variant!(
+    "TentaNasElasticArrayAddDiskAbortRequest",
+    "tentaflow_ws_handler_nas_elastic_add_disk_abort"
 );
 register_tentanas_variant!(
     "TentaNasElasticArrayReplaceDiskRequest",
@@ -6352,6 +6499,7 @@ mod registration_tests {
                 array_id: spec.array_id.clone(),
                 operation_id: operation_id.clone(),
                 kind: tentanas_helper::elastic::ElasticSnapraidKind::Scrub,
+                acknowledge_parity_fault: None,
             }),
         )
         .unwrap();
@@ -6386,7 +6534,7 @@ mod registration_tests {
         let fix = |disk: &str| ElasticSnapraidKind::Fix { disk: disk.into() };
         let mut fixture = dispatch_fixture();
         // A reader cannot even ask.
-        let denied = elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, fix("d1"))
+        let denied = elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, fix("d1"), None)
             .await
             .unwrap_err();
         assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
@@ -6397,7 +6545,7 @@ mod registration_tests {
         // NOTHING TO REPAIR. The array is active, its parity is there, the
         // disk is one of its own — and the answer is still no, because a
         // repair would overwrite healthy data. The sentence names the remedy.
-        let healthy = elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, fix("d1"))
+        let healthy = elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, fix("d1"), None)
             .await
             .unwrap_err();
         assert_eq!(healthy.code, ProtocolErrorCode::NotAvailable);
@@ -6416,7 +6564,7 @@ mod registration_tests {
             "a scrub that failed has to leave the array with something to resolve"
         );
 
-        let foreign = elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, fix("d9"))
+        let foreign = elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, fix("d9"), None)
             .await
             .unwrap_err();
         assert_eq!(foreign.code, ProtocolErrorCode::BadRequest);
@@ -6448,7 +6596,7 @@ mod registration_tests {
         store::finish_elastic_operation(&g.db, &bare.owner, &bare.operation_id, Ok(&bare_ready))
             .unwrap();
         store::finish_job(&g.db, &bare_job.job_id, "succeeded", None).unwrap();
-        let no_parity = elastic_snapraid(&fixture.ctx, "bare", None, Origin::Direct, fix("d1"))
+        let no_parity = elastic_snapraid(&fixture.ctx, "bare", None, Origin::Direct, fix("d1"), None)
             .await
             .unwrap_err();
         assert_eq!(no_parity.code, ProtocolErrorCode::NotAvailable);
@@ -6579,6 +6727,7 @@ mod registration_tests {
             Some(&SudoSecret("never-store-repair-secret".into())),
             Origin::Direct,
             ElasticSnapraidKind::Fix { disk: "d1".into() },
+            None,
         )
         .await
         .unwrap();
@@ -6614,12 +6763,42 @@ mod registration_tests {
         // Sync over a healthy one — measured: the marked blocks stay
         // repairable, the unreadable files leave the content file for good —
         // and the approver reads only this sentence.
+        //
+        // WITHOUT THE ADMIN'S ACKNOWLEDGEMENT it does not even park (I3): the
+        // refusal is a code the screen words, and nothing is stored.
+        let unacknowledged = elastic_snapraid(
+            &fixture.ctx,
+            "media",
+            Some(&SudoSecret("never-store-sync-secret".into())),
+            Origin::Direct,
+            ElasticSnapraidKind::Sync,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(unacknowledged.code, ProtocolErrorCode::NotAvailable);
+        assert_eq!(unacknowledged.message, SYNC_NEEDS_ACKNOWLEDGEMENT);
+        // An acknowledgement of ANOTHER fault acknowledges nothing (M1).
+        let observed = tentanas::elastic::get(&g.db, &spec.owner, "media").await.unwrap().unwrap();
+        assert!(observed.sync_needs_acknowledgement && !observed.sync_fault_id.is_empty());
+        let stale = elastic_snapraid(
+            &fixture.ctx,
+            "media",
+            None,
+            Origin::Direct,
+            ElasticSnapraidKind::Sync,
+            Some("abababab-abab-4bab-8bab-abababababab".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.message, SYNC_FAULT_CHANGED);
         let parked_sync = elastic_snapraid(
             &fixture.ctx,
             "media",
             Some(&SudoSecret("never-store-sync-secret".into())),
             Origin::Direct,
             ElasticSnapraidKind::Sync,
+            Some(observed.sync_fault_id.clone()),
         )
         .await
         .unwrap();
@@ -6632,6 +6811,87 @@ mod registration_tests {
         for phrase in ["scrub", "naprawę", "content"] {
             assert!(sync_row.approval.detail.contains(phrase), "{}", sync_row.approval.detail);
         }
+        // The acknowledgement is parked WITH the request: the approver
+        // releases the author's decision, not a Sync that would be refused.
+        assert!(
+            sync_row.payload_json.contains(&format!("\"acknowledge_parity_fault\":\"{}\"", observed.sync_fault_id)),
+            "{}",
+            sync_row.payload_json
+        );
+    }
+
+    /// An add that STOPPED PART-WAY (K4, F3/F4 on the node's side): while it
+    /// is pinned no other disk is admitted — the refusal is a code the screen
+    /// words — and its UNDO is started only when the helper's live read said
+    /// the disk never joined the share. Without that answer the undo is
+    /// refused, and so is an undo of a disk nothing pinned. Nothing is started
+    /// by any of it.
+    #[tokio::test]
+    async fn an_unfinished_add_admits_only_itself_and_its_undo_needs_the_helpers_word() {
+        let mut fixture = dispatch_fixture();
+        let spec = active_array(&mut fixture);
+        let g = gate_destructive(&fixture.ctx).unwrap();
+        // Nothing pinned: there is nothing to undo.
+        let nothing = elastic_add_disk_abort(&fixture.ctx, "media", "grow-data-2", "media", None, Origin::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(nothing.code, ProtocolErrorCode::NotAvailable);
+        assert_eq!(nothing.message, "refusal:elastic_nothing_to_undo");
+
+        // An add that stopped after the helper grew its journal.
+        let pinned = tentanas_helper::elastic::ElasticDiskSpec {
+            disk_id: "grow-data-2".into(),
+            wwn: Some("wwn-grow-data-2".into()),
+            serial: Some("serial-grow-data-2".into()),
+            bytes: 16 * 1024 * 1024 * 1024,
+            expected_uuid: uuid::Uuid::new_v4().to_string(),
+        };
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_add_disk".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &g.db,
+            &job,
+            Some(&tentanas::jobs::ElasticJobIntent::AddDisk {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: operation_id.clone(),
+                disk: pinned.clone(),
+            }),
+        )
+        .unwrap();
+        store::finish_elastic_operation(&g.db, &spec.owner, &operation_id, Err("mount nie powiódł się")).unwrap();
+        store::finish_job(&g.db, &job.job_id, "failed", Some("mount nie powiódł się")).unwrap();
+        let jobs_before = store::list_jobs(&g.db, 100).unwrap().len();
+
+        // Another disk is refused while it stands, by code.
+        let other = elastic_add_disk(&fixture.ctx, "media", "some-other-disk", "media", None, Origin::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(other.code, ProtocolErrorCode::NotAvailable);
+        assert_eq!(other.message, "refusal:elastic_attention_add_disk");
+
+        // The helper could not be asked here, so nothing says the disk never
+        // joined the share: the undo is refused, and says why.
+        let undo = elastic_add_disk_abort(&fixture.ctx, "media", "grow-data-2", "media", None, Origin::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(undo.code, ProtocolErrorCode::NotAvailable);
+        assert_eq!(undo.message, "refusal:elastic_state_unknown");
+        // A wrong retype never gets that far.
+        let retype = elastic_add_disk_abort(&fixture.ctx, "media", "grow-data-2", "medi", None, Origin::Direct)
+            .await
+            .unwrap_err();
+        assert_eq!(retype.code, ProtocolErrorCode::BadRequest);
+        assert_eq!(store::list_jobs(&g.db, 100).unwrap().len(), jobs_before, "nothing was started");
+        let pending = store::unfinished_elastic_add_disk(&g.db, &spec.owner, &spec.array_id).unwrap();
+        assert_eq!(pending.as_ref(), Some(&pinned), "and the add is still pinned");
     }
 
     /// What ADDING A DISK refuses.
@@ -6794,7 +7054,7 @@ mod registration_tests {
         use tentanas_helper::elastic::ElasticSnapraidKind;
         for kind in [ElasticSnapraidKind::Sync, ElasticSnapraidKind::Scrub] {
             let mut fixture = dispatch_fixture();
-            let denied = elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, kind.clone())
+            let denied = elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, kind.clone(), None)
                 .await
                 .unwrap_err();
             assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
@@ -6828,6 +7088,9 @@ mod registration_tests {
             let request = match &kind {
                 ElasticSnapraidKind::Sync => P::ElasticArraySyncRequest {
                     name: "media".into(),
+                    // A healthy array: an acknowledgement nothing needs is
+                    // DROPPED, never parked as a blank cheque (M1).
+                    acknowledge_parity_fault: Some("abababab-abab-4bab-8bab-abababababab".into()),
                     sudo_password: Some(SudoSecret("never-store-maintenance-secret".into())),
                 },
                 ElasticSnapraidKind::Scrub => P::ElasticArrayScrubRequest {
@@ -6856,6 +7119,7 @@ mod registration_tests {
                     .contains("never-store-maintenance-secret")
             );
             assert!(!stored.payload_json.contains("sudo_password"));
+            assert!(!stored.payload_json.contains("acknowledge_parity_fault"), "{}", stored.payload_json);
             assert_eq!(
                 stored.approval.operation,
                 format!("elastic_{}", tentanas::elastic::snapraid_kind(&kind))
@@ -6864,7 +7128,7 @@ mod registration_tests {
                 tentanas::approvals::claim(&actor(&fixture.ctx, &g).unwrap(), &approval.request_id),
                 Err(tentanas::approvals::ApprovalError::OwnRequest)
             ));
-            let missing = elastic_snapraid(&fixture.ctx, "foreign", None, Origin::Direct, kind.clone())
+            let missing = elastic_snapraid(&fixture.ctx, "foreign", None, Origin::Direct, kind.clone(), None)
                 .await
                 .unwrap_err();
             assert_eq!(missing.code, ProtocolErrorCode::NotFound);
@@ -6880,7 +7144,7 @@ mod registration_tests {
                     "deny",
                 );
                 assert_eq!(
-                    elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, kind.clone())
+                    elastic_snapraid(&fixture.ctx, "media", None, Origin::Direct, kind.clone(), None)
                         .await
                         .unwrap_err()
                         .code,
@@ -7540,6 +7804,7 @@ mod registration_tests {
                 array_id: spec.array_id.clone(),
                 operation_id: sync_id.clone(),
                 kind: Kind::Sync,
+                acknowledge_parity_fault: None,
             }),
         )
         .unwrap();

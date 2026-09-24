@@ -450,12 +450,17 @@ async fn run_due_elastic_tasks(
                 store::ElasticTask::Mover => {
                     super::elastic::spawn_mover(db, array, STARTED_BY, None)
                 }
+                // NEVER acknowledged (I3): the acknowledgement of a Sync over
+                // a recorded fault is an admin's decision, and a cadence has
+                // none to give. Over such a fault the helper refuses the run,
+                // which closes `failed` with the array untouched.
                 store::ElasticTask::Sync => super::elastic::spawn_snapraid(
                     db,
                     array,
                     STARTED_BY,
                     None,
                     tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+                    None,
                 ),
                 store::ElasticTask::Scrub => super::elastic::spawn_snapraid(
                     db,
@@ -463,6 +468,7 @@ async fn run_due_elastic_tasks(
                     STARTED_BY,
                     None,
                     tentanas_helper::elastic::ElasticSnapraidKind::Scrub,
+                    None,
                 ),
             };
             // A scheduled mover marks the retrigger clock too. Without it the
@@ -1278,6 +1284,22 @@ mod tests {
             1,
             "with the fault repaired the cadence syncs again"
         );
+        // AND THE CADENCE NEVER ACKNOWLEDGES A FAULT (I3): the command it
+        // stored for the helper carries no `acknowledge_parity_fault`.
+        let stored: String = p
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT request_json FROM nas_elastic_operations WHERE kind='sync'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the scheduled sync's intent");
+        let command: tentanas_helper::HelperCommand = serde_json::from_str(&stored).expect("command");
+        assert!(
+            matches!(command, tentanas_helper::HelperCommand::ElasticSync { acknowledge_parity_fault: None, .. }),
+            "{stored}"
+        );
         assert!(
             store::list_alerts(&p, true)
                 .expect("alerts")
@@ -1330,6 +1352,7 @@ mod tests {
                 array_id: busy_spec.array_id.clone(),
                 operation_id: uuid::Uuid::now_v7().to_string(),
                 kind: tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+                acknowledge_parity_fault: None,
             }),
         )
         .expect("occupy the array");
@@ -1843,6 +1866,7 @@ mod tests {
                 array_id: spec.array_id.clone(),
                 operation_id: uuid::Uuid::now_v7().to_string(),
                 kind: tentanas_helper::elastic::ElasticSnapraidKind::Sync,
+                acknowledge_parity_fault: None,
             }),
         )
         .is_err());
@@ -1911,6 +1935,7 @@ mod tests {
                 array_id: spec.array_id.clone(),
                 operation_id: uuid::Uuid::now_v7().to_string(),
                 kind: tentanas_helper::elastic::ElasticSnapraidKind::Fix { disk: "d1".into() },
+                acknowledge_parity_fault: None,
             }),
         )
         .expect("fix");
@@ -1939,6 +1964,7 @@ mod tests {
             array_id: spec.array_id.clone(),
             operation_id: uuid::Uuid::now_v7().to_string(),
             kind,
+            acknowledge_parity_fault: None,
         };
         (job, intent)
     }

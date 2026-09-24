@@ -396,7 +396,9 @@ test('zamknięte przyczyny odmowy i etykiety approval są tłumaczone w pięciu 
   try {
     for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
       await I18n.setLanguage(language);
-      const reasons = ['no_parity', 'precondition_failed', 'unsynced_changes', 'empty_parity'];
+      const reasons = ['no_parity', 'precondition_failed', 'unsynced_changes', 'empty_parity',
+        // The helper's own admission gate (0.14.0).
+        'operation_pending', 'attention_other', 'fault_unacknowledged', 'attention_add_disk'];
       const { screen, body } = await mount(array({ snapraid: { history: reasons.map((detail, index) => ({ kind: 'scrub', outcome: 'refused', operationId: String(index), detail })) } }));
       const history = body.querySelector('.nas-snapraid-history');
       for (const reason of reasons) assert.ok(!history.textContent.includes(reason));
@@ -929,7 +931,7 @@ const okFix = { kind: 'fix', outcome: 'ok', startedAt: '2026-09-08 02:00:00', fi
 test('nieudany scrub i naprawa bez zapisu zostawiają Sync i Scrub do uruchomienia', async () => {
   const nothingRepaired = { kind: 'fix', outcome: 'nothing_repaired', errors: 391, startedAt: '2026-09-08 03:00:00', finishedAt: '2026-09-08 03:04:00' };
   for (const history of [[failedScrub], [nothingRepaired, failedScrub], [{ ...failedScrub, kind: 'sync', outcome: 'failed' }]]) {
-    const { screen, body } = await mount(array({ state: 'needs_attention', snapraid: snapraidWith(history) }), {
+    const { screen, body } = await mount(array({ state: 'needs_attention', syncFaultId: 'fault-1', snapraid: snapraidWith(history) }), {
       tentaNasElasticArraySyncRequest: { job: { jobId: 'job-sync', status: 'running' } },
     });
     for (const act of ['sync', 'scrub']) {
@@ -938,9 +940,20 @@ test('nieudany scrub i naprawa bez zapisu zostawiają Sync i Scrub do uruchomien
     assert.equal(body.querySelector('[data-act="replace-disk"]'), null, 'wymiana dysku jest wycofana');
     click(body.querySelector('[data-act="sync"]'));
     await flush();
+    // A scrub that marked blocks nothing has repaired is a fault a Sync pays
+    // for: the Sync goes through the confirm that names the cost, and only
+    // that confirm acknowledges it. A failed Sync is not such a fault.
+    const fault = history[history.length - 1].kind === 'scrub';
+    if (fault) {
+      const win = document.querySelector('tf-window');
+      assert.ok(win, `${history[0].outcome}: the confirm opens`);
+      typeInto(win.querySelector('#nas-retype'), 'media');
+      confirmWindow(win);
+      await flush();
+    }
     assert.deepEqual(
       screen.calls.filter((c) => c.kind === 'tentaNasElasticArraySyncRequest').map((c) => c.payload),
-      [{ name: 'media', sudoPassword: 'hunter2' }],
+      [fault ? { name: 'media', acknowledgeParityFault: 'fault-1', sudoPassword: 'hunter2' } : { name: 'media', sudoPassword: 'hunter2' }],
     );
     screen.dispose();
   }
@@ -1389,10 +1402,12 @@ test('a poll that changes the mover, the history and the cache figure patches va
     assert.equal(details.open, true);
 
     // The busy flag of a pending request is also a patch, not a rebuild.
+    // The Scrub is what is started here: over the scrub's unrepaired errors
+    // the Sync goes through its confirm first (F1), which is no request yet.
     let release;
     screen.withSudo = async (fn) => { await new Promise((resolve) => { release = resolve; }); return fn('x'); };
-    click(body.querySelector('[data-act="sync"]'));
-    assert.ok(before.buttons[1].hasAttribute('disabled'), 'sync is disabled while its request is pending');
+    click(body.querySelector('[data-act="scrub"]'));
+    assert.ok(before.buttons[1].hasAttribute('disabled'), 'sync is disabled while a request is pending');
     assertSameNodes(before, { ...standing(body), run: body.querySelectorAll('.nas-snapraid-history li')[1] });
     release();
     await flush();
@@ -1490,4 +1505,225 @@ test('the array detail names its tail in the shell breadcrumb and draws no bar o
   } finally {
     screen.dispose();
   }
+});
+
+// ----- recovery out of needs_attention (helper 0.14.0) ----------------------
+
+// F1: a Sync over an unrepaired Scrub or Repair fault costs the files the
+// Scrub could not read (measured on rig11). The button opens a confirm that
+// names that cost, and ONLY that confirm sends the acknowledgement — the node
+// and its helper refuse the Sync without it. Without a fault: no confirm, no
+// flag.
+test('Sync przy nienaprawionym błędzie wymaga potwierdzenia kosztu, a tylko ono wysyła zgodę', async () => {
+  const failedFix = { kind: 'fix', outcome: 'failed', startedAt: '2026-09-08 02:00:00', finishedAt: '2026-09-08 02:10:00' };
+  for (const [label, overrides] of [
+    ['helper records the cause', { state: 'needs_attention', attention: 'scrub_failed', syncNeedsAcknowledgement: true, syncFaultId: 'fault-1' }],
+    ['scrub marked blocks', { state: 'needs_attention', syncFaultId: 'fault-1', snapraid: snapraidWith([failedScrub]) }],
+    ['repair failed', { state: 'needs_attention', syncFaultId: 'fault-1', snapraid: snapraidWith([failedFix]) }],
+  ]) {
+    const { screen, body } = await mount(array(overrides), {
+      tentaNasElasticArraySyncRequest: { job: { jobId: 'job-sync', status: 'running' } },
+    });
+    const syncs = () => screen.calls.filter((c) => c.kind === 'tentaNasElasticArraySyncRequest');
+    assert.match(body.querySelector('.nas-snapraid').textContent, /wymaga potwierdzenia/, label);
+    click(body.querySelector('[data-act="sync"]'));
+    await flush();
+    assert.equal(syncs().length, 0, `${label}: nothing is sent before the confirm`);
+    const win = document.querySelector('tf-window');
+    assert.ok(win, label);
+    assert.match(win.textContent, /zostaną usunięte z content/, `${label}: the confirm names the cost`);
+    assert.match(win.textContent, /pozostaną naprawialne/, label);
+    const confirm = win.querySelector('[data-action="confirm"]');
+    typeInto(win.querySelector('#nas-retype'), 'medi');
+    assert.ok(confirm.hasAttribute('disabled'), `${label}: armed only by the array name`);
+    typeInto(win.querySelector('#nas-retype'), 'media');
+    confirmWindow(win);
+    await flush();
+    // The confirm names THE fault it showed (M1): the id stays internal.
+    assert.deepEqual(syncs().map((c) => c.payload), [{ name: 'media', acknowledgeParityFault: 'fault-1', sudoPassword: 'hunter2' }], label);
+    assert.doesNotMatch(body.innerHTML, /fault-1/, `${label}: the id is never shown`);
+    assert.deepEqual(screen.jobLogs.map((j) => j.jobId), ['job-sync'], label);
+    screen.dispose();
+  }
+  // A second click while the confirm is open opens no second one.
+  {
+    const { screen, body } = await mount(array({ state: 'needs_attention', attention: 'scrub_failed', syncNeedsAcknowledgement: true, syncFaultId: 'fault-1' }));
+    click(body.querySelector('[data-act="sync"]'));
+    click(body.querySelector('[data-act="sync"]'));
+    await flush();
+    assert.equal(document.querySelectorAll('tf-window').length, 1);
+    screen.dispose();
+  }
+  // M2: the fault ends with its cure — a clean scrub after the Sync, or for
+  // file errors alone the Sync that drops them. Then no confirm is asked.
+  const okSync = { kind: 'sync', outcome: 'ok', startedAt: '2026-09-09 01:00:00', finishedAt: '2026-09-09 01:10:00' };
+  const okScrub = { kind: 'scrub', outcome: 'ok', errors: 0, startedAt: '2026-09-10 01:00:00', finishedAt: '2026-09-10 01:10:00' };
+  for (const history of [[okScrub, okSync, failedScrub], [okSync, { ...failedScrub, errorsData: 0 }]]) {
+    const { screen, body } = await mount(array({ snapraid: snapraidWith(history) }), {
+      tentaNasElasticArraySyncRequest: { job: { jobId: 'job-sync', status: 'running' } },
+    });
+    assert.equal(body.querySelector('[data-act="fix"]'), null, 'no repair is left to offer');
+    click(body.querySelector('[data-act="sync"]'));
+    await flush();
+    assert.equal(document.querySelector('tf-window'), null);
+    screen.dispose();
+  }
+  // ...while a Sync alone does not end DATA errors: their marks stay repairable.
+  const stillMarked = await mount(array({ snapraid: snapraidWith([okSync, { ...failedScrub, errorsData: 7 }]) }));
+  assert.ok(stillMarked.body.querySelector('[data-act="fix"]'));
+  stillMarked.screen.dispose();
+  // A healthy array and a failed Sync: no confirm and no acknowledgement.
+  for (const overrides of [{}, { state: 'needs_attention', attention: 'sync_failed', snapraid: snapraidWith([{ ...failedScrub, kind: 'sync', errors: null }]) }]) {
+    const { screen, body } = await mount(array(overrides), {
+      tentaNasElasticArraySyncRequest: { job: { jobId: 'job-sync', status: 'running' } },
+    });
+    click(body.querySelector('[data-act="sync"]'));
+    await flush();
+    assert.equal(document.querySelector('tf-window'), null);
+    assert.deepEqual(screen.calls.filter((c) => c.kind === 'tentaNasElasticArraySyncRequest').map((c) => c.payload),
+      [{ name: 'media', sudoPassword: 'hunter2' }]);
+    screen.dispose();
+  }
+});
+
+// F2: on a parity fault the next steps are listed in the order that costs
+// least — the repair while a scrub's marks wait for it, a scrub, and the Sync
+// last — and the helper's recorded cause is a sentence, never a code.
+test('przy błędzie parity kolejne kroki to naprawa, scrub, Sync, a przyczyna jest zdaniem', async () => {
+  const { screen, body } = await mount(array({ state: 'needs_attention', attention: 'scrub_failed', syncNeedsAcknowledgement: true, stateDetail: 'narzędzie zgłosiło błędy', snapraid: snapraidWith([failedScrub]) }));
+  const steps = [...body.querySelectorAll('.nas-next-steps li')].map((li) => li.textContent);
+  assert.equal(steps.length, 3);
+  assert.match(steps[0], /Napraw z parity/);
+  assert.match(steps[1], /scrub/);
+  assert.match(steps[2], /Sync/);
+  const detail = body.querySelector('[data-f="state-detail"]').textContent;
+  assert.match(detail, /Ostatni scrub zgłosił błędy/);
+  assert.doesNotMatch(body.textContent, /scrub_failed|narzędzie zgłosiło/);
+  screen.dispose();
+  // Without marks to write back there is no repair to list.
+  const bare = await mount(array({ state: 'needs_attention', attention: 'scrub_failed', syncNeedsAcknowledgement: true }));
+  assert.deepEqual([...bare.body.querySelectorAll('.nas-next-steps li')].length, 2);
+  bare.screen.dispose();
+  // A healthy array lists nothing.
+  const healthy = await mount(array());
+  assert.equal(healthy.body.querySelector('.nas-next-steps'), null);
+  healthy.screen.dispose();
+});
+
+const pendingAddDisk = (overrides = {}) => ({ diskId: 'wwn-0x5000c500a1b2c3d4', diskName: 'sdh', diskLastName: '', step: 'mount', inUnion: false, undoPossible: true, ...overrides });
+
+// Minor 1 of the release review: an array the helper holds for a cause only
+// a Restore addresses — a journal an older helper left wedged, which the
+// helper settles on that Restore — offers the Restore even with a failed
+// parity run in the history.
+test('przyczyna, którą rozwiązuje tylko odtworzenie, udostępnia Odtwórz montowania mimo nieudanego przebiegu', async () => {
+  const wedged = await mount(array({ state: 'needs_attention', attention: 'other', parityRunAvailable: false, snapraid: snapraidWith([failedScrub]) }));
+  assert.ok(wedged.body.querySelector('[data-act="restore"]'));
+  wedged.screen.dispose();
+  const fault = await mount(array({ state: 'needs_attention', attention: 'scrub_failed', snapraid: snapraidWith([failedScrub]) }));
+  assert.equal(fault.body.querySelector('[data-act="restore"]'), null, 'a parity fault is not a Restore\'s to settle');
+  fault.screen.dispose();
+});
+
+// F3: an add that stopped part-way is FINISHED from the array screen, on an
+// array that needs attention too: "Dokończ dodawanie dysku sdh" sends the
+// pinned disk, with no picker. The undo appears only while the node says the
+// disk never joined the share. No id reaches the screen.
+test('niedokończone dodanie dysku: „Dokończ dodawanie dysku” wysyła przypięty dysk bez wybierania, „Wycofaj” tylko przed dołączeniem', async () => {
+  const { screen, body } = await mount(array({ state: 'needs_attention', attention: 'add_disk', unresolvedOperation: true, parityRunAvailable: false, pendingAddDisk: pendingAddDisk() }), {
+    tentaNasElasticArrayAddDiskRequest: { job: { jobId: 'job-resume', status: 'running' } },
+    tentaNasElasticArrayAddDiskAbortRequest: { job: { jobId: 'job-undo', status: 'running' } },
+  });
+  assert.equal(body.querySelector('[data-act="add-disk"]'), null, 'no other disk is offered');
+  const resume = body.querySelector('[data-act="add-disk-resume"]');
+  assert.ok(resume);
+  assert.equal(resume.getAttribute('label'), 'Dokończ dodawanie dysku sdh');
+  assert.equal(resume.hasAttribute('disabled'), false, 'finishing is enabled on an array that needs attention');
+  assert.match(body.textContent, /Dodawanie dysku sdh nie zostało dokończone\. Zatrzymało się przed zamontowaniem dysku\./);
+  assert.doesNotMatch(body.innerHTML, /wwn-0x5000c500a1b2c3d4/, 'no id on the screen');
+  assert.match(body.querySelector('[data-f="state-detail"]').textContent, /Dodawanie dysku do macierzy nie zostało dokończone/);
+  click(resume);
+  await flush();
+  const win = document.querySelector('tf-window');
+  assert.ok(win);
+  assert.equal(win.querySelector('#nas-add-disk'), null, 'the picker stays closed');
+  typeInto(win.querySelector('#nas-retype'), 'media');
+  confirmWindow(win);
+  await flush();
+  assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasElasticCapabilitiesRequest').length, 0, 'no free-disk list is asked for');
+  assert.deepEqual(screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayAddDiskRequest').map((c) => c.payload),
+    [{ name: 'media', diskId: 'wwn-0x5000c500a1b2c3d4', confirmName: 'media', sudoPassword: 'hunter2' }]);
+  // The undo: its own confirm, the pinned disk, the abort request.
+  click(body.querySelector('[data-act="add-disk-undo"]'));
+  await flush();
+  const undo = [...document.querySelectorAll('tf-window')].pop();
+  assert.match(undo.textContent, /wyczyści wyłącznie system plików, który nadało mu to dodawanie/);
+  typeInto(undo.querySelector('#nas-retype'), 'media');
+  confirmWindow(undo);
+  await flush();
+  assert.deepEqual(screen.calls.filter((c) => c.kind === 'tentaNasElasticArrayAddDiskAbortRequest').map((c) => c.payload),
+    [{ name: 'media', diskId: 'wwn-0x5000c500a1b2c3d4', confirmName: 'media', sudoPassword: 'hunter2' }]);
+  assert.deepEqual(screen.jobLogs.map((j) => j.jobId), ['job-resume', 'job-undo']);
+  screen.dispose();
+
+  // Once the disk may have joined the share there is no undo, and the screen
+  // says the add can only be finished.
+  for (const pending of [pendingAddDisk({ step: 'sync', inUnion: true, undoPossible: false }), pendingAddDisk({ undoPossible: false, inUnion: null })]) {
+    const joined = await mount(array({ state: 'needs_attention', attention: 'add_disk', unresolvedOperation: true, pendingAddDisk: pending }));
+    assert.ok(joined.body.querySelector('[data-act="add-disk-resume"]'));
+    assert.equal(joined.body.querySelector('[data-act="add-disk-undo"]'), null);
+    assert.match(joined.body.textContent, /można tylko dokończyć/);
+    joined.screen.dispose();
+  }
+  // A disk with no live name is "nowy dysk", never its id.
+  const unnamed = await mount(array({ state: 'needs_attention', attention: 'add_disk', pendingAddDisk: pendingAddDisk({ diskName: '', diskLastName: 'sdq' }) }));
+  assert.equal(unnamed.body.querySelector('[data-act="add-disk-resume"]').getAttribute('label'), 'Dokończ dodawanie dysku nowy dysk (ostatnio widziany jako sdq)');
+  unnamed.screen.dispose();
+  const nameless = await mount(array({ state: 'needs_attention', attention: 'add_disk', pendingAddDisk: pendingAddDisk({ diskName: '', diskLastName: '' }) }));
+  assert.equal(nameless.body.querySelector('[data-act="add-disk-resume"]').getAttribute('label'), 'Dokończ dodawanie dysku nowy dysk');
+  nameless.screen.dispose();
+  // A repair is not offered over an unfinished add, whatever the history says.
+  const held = await mount(array({ state: 'needs_attention', attention: 'add_disk', pendingAddDisk: pendingAddDisk(), snapraid: snapraidWith([failedScrub]) }));
+  assert.equal(held.body.querySelector('[data-act="fix"]'), null);
+  held.screen.dispose();
+  // And a reader sees neither control.
+  const reader = await mount(array({ state: 'needs_attention', attention: 'add_disk', pendingAddDisk: pendingAddDisk() }), {}, { admin: false });
+  assert.equal(reader.body.querySelector('[data-act="add-disk-resume"]'), null);
+  assert.equal(reader.body.querySelector('[data-act="add-disk-undo"]'), null);
+  reader.screen.dispose();
+});
+
+// The poll rule (owner's hard rule): a pending add that only changes its
+// step patches text; the buttons stay the same nodes.
+test('zmiana kroku niedokończonego dodania nie przebudowuje przycisków', async () => {
+  const value = array({ state: 'needs_attention', attention: 'add_disk', pendingAddDisk: pendingAddDisk() });
+  let current = value;
+  const { screen, body } = await mount(value, { tentaNasElasticArrayGetRequest: () => ({ array: current }) });
+  const resume = body.querySelector('[data-act="add-disk-resume"]');
+  const undo = body.querySelector('[data-act="add-disk-undo"]');
+  current = array({ state: 'needs_attention', attention: 'add_disk', pendingAddDisk: pendingAddDisk({ step: 'join' }) });
+  click(body.querySelector('[data-act="refresh"]'));
+  await flush();
+  assert.equal(body.querySelector('[data-act="add-disk-resume"]'), resume);
+  assert.equal(body.querySelector('[data-act="add-disk-undo"]'), undo);
+  assert.match(body.textContent, /przed dołączeniem dysku do udziału/);
+  screen.dispose();
+});
+
+test('przyczyny uwagi, kroki dodawania i potwierdzenie Sync są tłumaczone w pięciu locale', async () => {
+  try {
+    for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      for (const attention of ['sync_failed', 'scrub_failed', 'fix_failed', 'add_disk', 'other']) {
+        const { screen, body } = await mount(array({ state: 'needs_attention', attention, syncNeedsAcknowledgement: attention !== 'sync_failed', pendingAddDisk: attention === 'add_disk' ? pendingAddDisk() : null }));
+        assert.doesNotMatch(body.textContent, /tentanas\.|scrub_failed|sync_failed|fix_failed|add_disk\b|undefined/, `${language}/${attention}`);
+        screen.dispose();
+      }
+      for (const code of ['operation_pending', 'attention_other', 'fault_unacknowledged', 'attention_add_disk', 'attention_parity_fault', 'disk_claimed', 'add_joined', 'precondition_failed', 'unsynced_changes', 'empty_parity', 'no_parity']) {
+        assert.ok(!I18n.t(`tentanas.refusal.elastic_${code}`).startsWith('tentanas.'), `${language}/${code}`);
+      }
+      assert.ok(!I18n.t('tentanas.jobs.kind_elastic_add_disk_abort').startsWith('tentanas.'), language);
+      assert.ok(!I18n.t('tentanas.approvals.op_elastic_add_disk_abort').startsWith('tentanas.'), language);
+    }
+  } finally { await I18n.setLanguage('pl'); }
 });

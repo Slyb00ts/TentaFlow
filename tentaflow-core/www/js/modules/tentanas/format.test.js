@@ -236,7 +236,7 @@ test('replacementAdviceText words the advice from its codes', () => {
     'realokacje wzrosły z 3 do 8 w 7 dni'],
     [{ severity: 'advice', reason: 'warning for 5 days; 54°C; 1 UDMA CRC errors (cable/backplane)',
       reasons: [R('unhealthy_for_days', { health: 'warning', days: '5' }), R('temperature_high', { celsius: '54', limit: '50' }), R('crc_errors', { count: '1' })] },
-    'Uwaga od 5 dni; temperatura 54°C przekracza próg 50°C; 1 błąd CRC (kabel lub backplane)'],
+    'Uwaga od 5 dni; temperatura 54°C (próg ostrzeżenia 50°C); 1 błąd CRC (kabel lub backplane)'],
     [{ severity: 'urgent', reason: 'reallocated sectors grew from 4 to 9 in the last 7 days; critical for 2 days; SMART overall status FAILED',
       reasons: [R('reallocated_grew', { from: '4', to: '9' }), R('unhealthy_for_days', { health: 'critical', days: '2' }), R('smart_failed')] },
     'realokacje wzrosły z 4 do 9 w 7 dni; Awaria od 2 dni; SMART zgłasza awarię dysku'],
@@ -366,11 +366,11 @@ test('a disk health alert is worded from its grade, its name and its reason code
     reasons: [R('reallocated_growing', { from: '5', to: '8' }), R('temperature_high', { celsius: '54', limit: '50' })],
   });
   assert.equal(alertText(growing).title, 'sdd: 3 nowe realokowane sektory w 7 dni', 'the mockup, word for word');
-  assert.equal(alertText(growing).detail, 'temperatura 54°C przekracza próg 50°C');
+  assert.equal(alertText(growing).detail, 'temperatura 54°C (próg ostrzeżenia 50°C)');
   const hot = (limit) => alertText(A('disk_health', { health: 'warning', name: 'sdf', name_source: 'live' }, {
     reasons: [R('temperature_high', limit ? { celsius: '54', limit } : { celsius: '54' })],
   })).title;
-  assert.equal(hot('50'), 'sdf: temperatura 54°C przekracza próg 50°C');
+  assert.equal(hot('50'), 'sdf: temperatura 54°C (próg ostrzeżenia 50°C)');
   assert.equal(hot(null), 'sdf: temperatura 54°C', 'a row stored before the threshold was sent');
   // Polish plural forms of the counted phrases.
   const count = (code, n) => alertText(A('disk_health', { health: 'warning', name: 'sdd', name_source: 'live' }, { reasons: [R(code, { count: String(n) })] })).title;

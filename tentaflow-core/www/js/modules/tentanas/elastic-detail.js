@@ -73,6 +73,15 @@ function repairBlocker(array) {
   return '';
 }
 
+// Why the helper would refuse a repair whatever the history says: an add is
+// unfinished, or the array waits for a Restore. It mirrors the cause half of
+// `tentanas::elastic::repair_blocker`.
+function repairHeld(array) {
+  if (array?.attention === 'add_disk') return T('elastic.repair_add_pending');
+  if (array?.attention === 'other') return T('elastic.repair_needs_restore');
+  return '';
+}
+
 // What a repair would be working on, or '' when the array reports nothing a
 // repair could recover.
 //
@@ -90,8 +99,13 @@ function repairBlocker(array) {
 // unsuccessful run is one that came after it and settled it, which is the rule
 // the node applies in SQL over the same rows.
 function repairEvidence(array) {
+  // What ENDS the fault is its cure (M2 of the release review): a
+  // successful repair, a clean full scrub, or for file errors alone the Sync
+  // that drops them — `tentanas::elastic::unresolved_parity_fault`.
+  let syncedSince = false;
   for (const run of array?.snapraid?.history || []) {
-    if (run.kind === 'fix' && run.outcome === 'ok') break;
+    if (['fix', 'scrub'].includes(run.kind) && run.outcome === 'ok') break;
+    if (run.kind === 'sync' && run.outcome === 'ok') syncedSince = true;
     // ONLY A SCRUB THAT COUNTED ERRORS. A repair writes back the blocks
     // snapraid MARKED as bad, and a scrub is what marks them: measured on
     // rig11, `-e fix` with no scrub behind it writes nothing at all and still
@@ -99,11 +113,64 @@ function repairEvidence(array) {
     // figure of the reporting window is not a mark in the content file.
     if (run.kind === 'scrub' && ['failed', 'needs_attention'].includes(run.outcome)
       && typeof run.errors === 'number' && run.errors > 0) {
+      if (syncedSince && run.errorsData === 0) break;
       return T('elastic.repair_reason_scrub_errors', { n: run.errors });
     }
   }
   return '';
 }
+
+// A Repair that failed and that no later Repair or full Scrub settled —
+// newest first, the rule `tentanas::elastic::sync_acknowledgement_needed`
+// applies over the same rows.
+function unresolvedFixFault(array) {
+  for (const run of array?.snapraid?.history || []) {
+    if (['fix', 'scrub'].includes(run.kind) && run.outcome === 'ok') return false;
+    if (run.kind === 'fix' && ['failed', 'needs_attention'].includes(run.outcome)) return true;
+  }
+  return false;
+}
+
+// Whether a Sync on this array needs the admin's confirm: the node says so
+// (`syncNeedsAcknowledgement`, which carries the helper's own recorded cause),
+// or the history shows an unrepaired Scrub or Repair fault. A Sync over such a
+// fault removes the files the Scrub could not read from the content file —
+// measured on rig11 — so only the confirm that names that cost may send
+// `acknowledgeParityFault`, and the node and its helper refuse the Sync
+// without it.
+export function syncNeedsAcknowledgement(array) {
+  return array?.syncNeedsAcknowledgement === true || Boolean(repairEvidence(array)) || unresolvedFixFault(array);
+}
+
+// The helper's recorded cause, in the reader's language. A cause this build
+// has no words for gets none: the screen never prints a code.
+const ATTENTION_CAUSES = ['sync_failed', 'scrub_failed', 'fix_failed', 'add_disk', 'other'];
+function attentionText(array) {
+  return ATTENTION_CAUSES.includes(array?.attention) ? T(`elastic.attention_${array.attention}`) : '';
+}
+
+// The sentence that explains the array's state: the helper's recorded cause
+// when there is one, otherwise the node's own detail. The cause replaces the
+// helper's raw text rather than sitting beside it — that text is the
+// helper's, in one language, and may name what a screen must not show.
+export function elasticStateDetail(array) {
+  return attentionText(array) || array?.stateDetail || '';
+}
+
+// The unfinished add, if the array has one: the disk's live name, or "nowy
+// dysk" — never its id, and never the name it was last seen under presented
+// as the device now.
+const pendingAdd = (array) => array?.pendingAddDisk || null;
+// A name it was LAST seen under is said as such, beside "nowy dysk", never
+// as the device now.
+const pendingAddName = (pending) => {
+  const live = String(pending?.diskName || '').trim();
+  if (live) return live;
+  const last = String(pending?.diskLastName || '').trim();
+  return last ? `${T('elastic.add_disk_new_disk')} (${T('elastic.last_seen_as', { name: last })})` : T('elastic.add_disk_new_disk');
+};
+const ADD_STEPS = ['format', 'mount', 'join', 'sync'];
+const pendingStepText = (pending) => T(`elastic.add_disk_step_${ADD_STEPS.includes(pending?.step) ? pending.step : 'unknown'}`);
 
 // Why a SnapRAID sync or scrub cannot be started on this array right now, or
 // '' when it can. ONE rule for the detail pane's "Sync teraz"/"Scrub teraz"
@@ -253,8 +320,9 @@ export function paintElasticCard(card, array, { admin = false, syncBusy = false 
   setText(field(card, 'last-sync'), fmtDate(array.protection?.protectedAsOf));
   setText(field(card, 'protection'), protectionLabel(array));
 
-  const reason = slotEl(card.querySelector('[data-slot="reason"]'), Boolean(array.stateDetail), 'reason', '<div class="pc-reason"></div>');
-  if (reason) setText(reason, array.stateDetail);
+  const stateDetail = elasticStateDetail(array);
+  const reason = slotEl(card.querySelector('[data-slot="reason"]'), Boolean(stateDetail), 'reason', '<div class="pc-reason"></div>');
+  if (reason) setText(reason, stateDetail);
 
   const syncBlocked = elasticMaintenanceBlocker(array, admin);
   const sync = card.querySelector('[data-act="array-sync"]');
@@ -501,6 +569,109 @@ async function openAddDataDiskDialog(screen, array, onDone) {
   });
 }
 
+/// Finishing an add that stopped part-way (F3). There is no picker: the only
+/// disk this array admits is the one the add pinned, down to the filesystem
+/// UUID its mkfs was given, and the node resumes it from the step it stopped
+/// in. The retype is the array's name, as for the add itself.
+function openResumeAddDiskDialog(screen, array, onDone) {
+  const pending = pendingAdd(array);
+  if (!pending) return null;
+  const disk = pendingAddName(pending);
+  const bodyHtml = `
+    ${warningHtml('info', `${T('elastic.add_disk_pending', { disk })} ${pendingStepText(pending)}`)}
+    <div class="explain-box">${escapeHtml(T('elastic.add_disk_resume_explain'))}</div>`;
+  return openRetypeDialog({
+    title: T('elastic.add_disk_resume_title', { disk, name: array.name }),
+    icon: 'play',
+    name: array.name,
+    bodyHtml,
+    retypeLabel: `${escapeHtml(T('elastic.add_disk_retype'))} <span class="mono num-err">${escapeHtml(array.name)}</span>`,
+    confirmLabel: T('elastic.add_disk_resume_confirm'),
+    confirmIcon: 'play',
+    onConfirm: async () => {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasElasticArrayAddDiskRequest', {
+        name: array.name, diskId: pending.diskId, confirmName: array.name, sudoPassword,
+      }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic.add_disk_resume_title', { disk, name: array.name }));
+      if (res === null) return false;
+      followResponse(screen, res, onDone, T('elastic.add_disk_resume_done'));
+      return true;
+    },
+  });
+}
+
+/// Undoing an add that stopped before its disk joined the share (D3 = b).
+/// Offered only while the node says it is possible (`undoPossible`, the
+/// helper's live read of the union): once the disk may have served a file,
+/// the add can only be finished.
+function openUndoAddDiskDialog(screen, array, onDone) {
+  const pending = pendingAdd(array);
+  if (!pending?.undoPossible) return null;
+  const disk = pendingAddName(pending);
+  const bodyHtml = `
+    ${warningHtml('danger', T('elastic.add_disk_undo_warning', { disk, name: array.name }))}
+    <div class="explain-box">${escapeHtml(T('elastic.add_disk_undo_explain'))}</div>`;
+  return openRetypeDialog({
+    title: T('elastic.add_disk_undo_title', { disk, name: array.name }),
+    icon: 'rotate',
+    name: array.name,
+    bodyHtml,
+    retypeLabel: `${escapeHtml(T('elastic.add_disk_retype'))} <span class="mono num-err">${escapeHtml(array.name)}</span>`,
+    confirmLabel: T('elastic.add_disk_undo_confirm'),
+    confirmIcon: 'rotate',
+    onConfirm: async () => {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasElasticArrayAddDiskAbortRequest', {
+        name: array.name, diskId: pending.diskId, confirmName: array.name, sudoPassword,
+      }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic.add_disk_undo_title', { disk, name: array.name }));
+      if (res === null) return false;
+      followResponse(screen, res, onDone, T('elastic.add_disk_undo_done'));
+      return true;
+    },
+  });
+}
+
+/// A Sync over an unrepaired Scrub or Repair fault (F1). The confirm names
+/// the cost before anything is sent, and it is the ONLY place that sends
+/// `acknowledgeParityFault: true` — measured on rig11, such a Sync removes
+/// the files the Scrub could not read from the content file, while the
+/// marked blocks stay repairable. Shared by the detail pane and the n05
+/// card, so the two "Sync teraz" buttons cannot disagree.
+export function openSyncOverFaultDialog(screen, array, onDone) {
+  // One confirm per array at a time: a second click does not open a second
+  // window that could send the Sync twice.
+  const open = [...document.querySelectorAll('tf-window[data-sync-fault]')].find((w) => w.dataset.syncFault === array.name);
+  if (open) return open;
+  // The fault the admin is confirming, by the id of the run that recorded
+  // it — an internal key, never shown. A newer fault by the time the request
+  // runs is refused by the node, not silently acknowledged.
+  const fault = String(array.syncFaultId || '');
+  const bodyHtml = `
+    ${warningHtml('danger', T('elastic.sync_fault_warning', { name: array.name }))}
+    <ul class="loss-list">
+      <li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('elastic.sync_fault_loses'))}</span></li>
+      <li class="ll">${sprite('shield')}<span>${escapeHtml(T('elastic.sync_fault_keeps'))}</span></li>
+    </ul>
+    <div class="explain-box">${escapeHtml(T('elastic.sync_fault_explain'))}</div>`;
+  const win = openRetypeDialog({
+    title: T('elastic.sync_fault_title', { name: array.name }),
+    icon: 'alert',
+    name: array.name,
+    bodyHtml,
+    retypeLabel: `${escapeHtml(T('elastic.sync_fault_retype'))} <span class="mono num-err">${escapeHtml(array.name)}</span>`,
+    confirmLabel: T('elastic.sync_fault_confirm'),
+    confirmIcon: 'refresh',
+    onConfirm: async () => {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasElasticArraySyncRequest', {
+        name: array.name, acknowledgeParityFault: fault, sudoPassword,
+      }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('elastic.sync_fault_title', { name: array.name }));
+      if (res === null) return false;
+      followResponse(screen, res, onDone, T('elastic.maintenance_accepted'));
+      return true;
+    },
+  });
+  win.dataset.syncFault = array.name;
+  return win;
+}
+
 /// The danger zone. It says plainly what dissolving does NOT do, because that
 /// is the whole shape of the operation: nothing is formatted, so the disks keep
 /// their filesystems and their files and the array import takes the array back.
@@ -533,7 +704,12 @@ function openElasticDestroyDialog(screen, array, onDone) {
 }
 
 const RUN_OUTCOMES = { running: 'run_running', ok: 'run_ok', partial: 'run_partial', interrupted: 'run_interrupted', nothing_repaired: 'run_nothing_repaired', failed: 'run_failed', needs_attention: 'error', refused: 'run_refused' };
-const RUN_REFUSALS = { no_parity: 'no_parity', precondition_failed: 'refused_precondition', unsynced_changes: 'refused_dirty', empty_parity: 'refused_empty' };
+const RUN_REFUSALS = {
+  no_parity: 'no_parity', precondition_failed: 'refused_precondition', unsynced_changes: 'refused_dirty', empty_parity: 'refused_empty',
+  // The helper's admission gate (helper 0.14.0): nothing was changed.
+  operation_pending: 'refused_operation_pending', attention_other: 'refused_attention_other',
+  fault_unacknowledged: 'refused_fault_unacknowledged', attention_add_disk: 'refused_attention_add_disk',
+};
 const runKey = (run) => JSON.stringify([run.operationId, run.jobId, run.startedAt, run.kind]);
 
 // A run's row is keyed by its identity (operation, job, start, kind), so its
@@ -971,8 +1147,9 @@ function paneSkeletonHtml(name, admin) {
   return `<div class="stack" data-pane="elastic">
     <div class="kpi" data-part="kpi"></div>
     <div class="section-card"><div class="section-card-head"><div class="title">${sprite('cylinder')} ${escapeHtml(T('elastic.disks'))}</div><span class="hint">${escapeHtml(T('elastic.independent_fs'))}</span></div>
-      <div class="vdev-group" data-group="data"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.data'))} · MERGERFS</span><span class="mono" data-f="union-path"></span><span class="hint">${escapeHtml(T('elastic.policy'))}: <span data-f="create-policy"></span></span>${admin ? `<span class="actions"><tf-button variant="secondary" size="sm" icon="plus" data-act="add-disk">${escapeHtml(T('elastic.add_disk'))}</tf-button></span>` : ''}</div>
+      <div class="vdev-group" data-group="data"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.data'))} · MERGERFS</span><span class="mono" data-f="union-path"></span><span class="hint">${escapeHtml(T('elastic.policy'))}: <span data-f="create-policy"></span></span>${admin ? `<span class="actions"><span ${SLOT} data-slot="add-disk"></span><span ${SLOT} data-slot="add-disk-undo"></span></span>` : ''}</div>
         <div class="disk-cells" data-part="data-cells"></div>
+        <div ${SLOT} data-slot="add-disk-pending"></div>
         <div ${SLOT} data-slot="add-disk-reason"></div></div>
       <div class="vdev-group" data-group="parity"><div class="vg-head"><span class="vg-type">PARITY · SNAPRAID</span></div><div class="disk-cells" data-part="parity-cells"></div><div ${SLOT} data-slot="no-parity"></div></div>
       <div class="vdev-group" data-group="cache"><div class="vg-head"><span class="vg-type">${escapeHtml(T('elastic.cache'))}</span><span class="hint">${escapeHtml(T('elastic.cache_no_protection'))}</span></div><div class="disk-cells" data-part="cache-cells"></div><div ${SLOT} data-slot="cache-foot"></div></div>
@@ -980,13 +1157,14 @@ function paneSkeletonHtml(name, admin) {
     ${foldersSkeletonHtml(admin)}
     <div class="grid-2"><div class="section-card nas-elastic-state"><div class="section-card-head"><div class="title">${sprite('shield')} ${escapeHtml(T('elastic.state'))}</div><tf-chip dot data-f="state-chip"></tf-chip></div>
       <div class="stat-rows">${rowSkel(T('elastic.mountpoint'), 'state-path')}${rowSkel(T('elastic.state'), 'state-detail')}<div class="sr"><span class="k">${escapeHtml(T('elastic.unprotected_bytes'))}</span><span class="v" data-fig="moved-unsynced"></span></div><div class="sr"><span class="k">${escapeHtml(T('elastic.updated'))}</span><span class="v" data-fig="updated"></span></div></div>
+      <div ${SLOT} data-slot="next-steps"></div>
       <div class="explain-box mt-md">${escapeHtml(T('elastic.restore_hint'))}</div>
       <div ${SLOT} data-slot="restore"></div>
       ${admin ? '' : `<div class="hint mt-sm">${escapeHtml(T('elevation.admin_only'))}</div>`}
       <div ${SLOT} data-part="message"></div>
     </div><div class="section-card nas-snapraid"><div class="section-card-head"><div class="title">${sprite('shield')} SnapRAID</div><div class="actions">
       <tf-button variant="secondary" size="sm" icon="refresh" data-act="sync">${escapeHtml(T('elastic.sync_now'))}</tf-button><tf-button variant="ghost" size="sm" icon="search" data-act="scrub">${escapeHtml(T('elastic.scrub_now'))}</tf-button></div></div>
-      <div ${SLOT} data-slot="maintenance-reason"></div><div ${SLOT} data-slot="repair-unavailable"></div>
+      <div ${SLOT} data-slot="maintenance-reason"></div><div ${SLOT} data-slot="sync-confirm"></div><div ${SLOT} data-slot="repair-unavailable"></div>
       <div class="stat-rows" data-part="snapraid-rows"></div>
       <div class="explain-box mt-md">${escapeHtml(T('elastic.snapshot_only'))}</div><div class="hint mt-sm">${escapeHtml(T('elastic.maintenance_hint'))}</div>
       <div class="nas-snapraid-history mt-md"><div class="title">${escapeHtml(T('elastic.history'))}</div><div ${SLOT} data-slot="history-list"></div><div ${SLOT} data-slot="history-empty"></div></div>
@@ -1046,8 +1224,12 @@ export async function drawElasticDetail(screen, body) {
   let submittedJobId = null;
   let moverOpen = false;
   const expanded = new Set();
+  // A cause the helper records as one only a Restore addresses ('other' — a
+  // journal an older helper left wedged included, which the helper settles
+  // on this very Restore) offers it whatever the history holds.
   const canRestore = () => array && array.enabled && !['active', 'creating'].includes(array.state)
-    && !(array.snapraid?.history || []).some((run) => ['sync', 'scrub'].includes(run.kind) && ['running', 'failed', 'needs_attention'].includes(run.outcome));
+    && (array.attention === 'other'
+      || !(array.snapraid?.history || []).some((run) => ['sync', 'scrub'].includes(run.kind) && ['running', 'failed', 'needs_attention'].includes(run.outcome)));
   const maintenanceReason = () => elasticMaintenanceBlocker(array, screen.isAdmin);
   // The mover needs no parity — the helper skips the coupled sync on an array
   // without one — but it does need something to move, so a cacheless array is
@@ -1066,15 +1248,18 @@ export async function drawElasticDetail(screen, body) {
           // CAN it run, before WHETHER it should — and in that order, so a
           // missing disk is named as the thing to fix first rather than
           // reported as "nothing to repair".
-          : repairBlocker(array) || (!repairEvidence(array) ? T('elastic.repair_none') : '');
+          : repairBlocker(array) || repairHeld(array) || (!repairEvidence(array) ? T('elastic.repair_none') : '');
   // ONE reason for the whole array, rendered on every data disk. An array
   // with no parity evidence gets no repair control at all, so the button
   // cannot be the thing that suggests a repair is due; and an array a repair
   // could not run on gets none either, with `repairReason` saying why.
   const repairFor = () => (array && !repairReason() ? repairEvidence(array) : '');
+  // An add that stopped part-way is FINISHED from here, on an array that
+  // needs attention too — that add is what it needs attention for — and no
+  // other disk is offered while it stands (F3).
   const addDiskReason = () => !screen.isAdmin ? T('elevation.admin_only')
-    : !array?.enabled || array.state !== 'active' ? T('elastic.maintenance_not_ready')
-      : array.unresolvedOperation ? T('elastic.add_disk_unresolved')
+    : !array?.enabled || !(pendingAdd(array) ? ['active', 'needs_attention'].includes(array.state) : array.state === 'active') ? T('elastic.maintenance_not_ready')
+      : !pendingAdd(array) && array.unresolvedOperation ? T('elastic.add_disk_unresolved')
         : (array.snapraid?.history || []).some((run) => run.outcome === 'running') ? T('elastic.run_running')
           : array.mover?.lastRun?.outcome === 'running' ? T('elastic.mover_running') : '';
   // An array whose only unresolved operations are mover runs is offered the
@@ -1150,9 +1335,34 @@ export async function drawElasticDetail(screen, body) {
     // disk anyone can confirm overwriting.
     setText(field(pane, 'union-path'), array.unionPath || '');
     setText(field(pane, 'create-policy'), array.createPolicy || '');
-    const addDisk = pane.querySelector('[data-act="add-disk"]');
-    setAttr(addDisk, 'disabled', lock || Boolean(addDiskBlocked));
-    setAttr(addDisk, 'title', addDiskBlocked || T('elastic.add_disk_online'));
+    // ONE button slot: "Dodaj dysk" on a whole array, "Dokończ dodawanie
+    // dysku <name>" while an add stands unfinished — keyed, so a poll keeps
+    // whichever is there and only the add starting or ending swaps it.
+    const pending = pendingAdd(array);
+    const addHost = pane.querySelector('[data-slot="add-disk"]');
+    if (addHost) {
+      const addDisk = slotEl(addHost, true, pending ? 'resume' : 'add', pending
+        ? '<tf-button variant="primary" size="sm" icon="play" data-act="add-disk-resume"></tf-button>'
+        : `<tf-button variant="secondary" size="sm" icon="plus" data-act="add-disk">${escapeHtml(T('elastic.add_disk'))}</tf-button>`);
+      const resumeLabel = pending ? T('elastic.add_disk_resume', { disk: pendingAddName(pending) }) : '';
+      if (pending) setAttr(addDisk, 'label', resumeLabel);
+      setAttr(addDisk, 'disabled', lock || Boolean(addDiskBlocked));
+      setAttr(addDisk, 'title', addDiskBlocked || resumeLabel || T('elastic.add_disk_online'));
+      // The undo only while the node says the disk never joined the share.
+      const undo = slotEl(pane.querySelector('[data-slot="add-disk-undo"]'), Boolean(pending?.undoPossible), 'undo',
+        `<tf-button variant="ghost" size="sm" icon="rotate" data-act="add-disk-undo">${escapeHtml(T('elastic.add_disk_undo'))}</tf-button>`);
+      if (undo) {
+        setAttr(undo, 'disabled', lock || Boolean(addDiskBlocked));
+        setAttr(undo, 'title', T('elastic.add_disk_undo_title', { disk: pendingAddName(pending), name: array.name }));
+      }
+    }
+    const pendingNote = slotEl(pane.querySelector('[data-slot="add-disk-pending"]'), Boolean(pending), 'pending',
+      '<div class="hint nas-add-pending"><span data-f="add-pending"></span> <span data-f="add-step"></span> <span data-f="add-undo-note"></span></div>');
+    if (pendingNote) {
+      setText(field(pendingNote, 'add-pending'), T('elastic.add_disk_pending', { disk: pendingAddName(pending) }));
+      setText(field(pendingNote, 'add-step'), pendingStepText(pending));
+      setText(field(pendingNote, 'add-undo-note'), pending.undoPossible ? '' : T('elastic.add_disk_undo_unavailable'));
+    }
     const addHint = slotEl(pane.querySelector('[data-slot="add-disk-reason"]'), admin && Boolean(addDiskBlocked), 'hint', '<div class="hint"></div>');
     if (addHint) setText(addHint, addDiskBlocked);
     paintDiskCells(pane.querySelector('[data-part="data-cells"]'), array.dataDisks || [], (d) => d.filesystem || array.filesystem, (d) => (d.diskName ? repair : ''));
@@ -1172,7 +1382,20 @@ export async function drawElasticDetail(screen, body) {
     setAttr(chip, 'status', status.tone);
     setAttr(chip, 'label', status.label);
     setText(field(pane, 'state-path'), array.unionPath || '');
-    setText(field(pane, 'state-detail'), array.stateDetail || status.label);
+    setText(field(pane, 'state-detail'), elasticStateDetail(array) || status.label);
+    // F2: on a parity fault a Sync would pay for, what to do next and in
+    // which order — the repair while a scrub's marks wait for it, then a
+    // scrub that re-measures, and the Sync last, behind its confirm.
+    const needsConfirm = syncNeedsAcknowledgement(array) && (array.parityDisks || []).length > 0;
+    const steps = slotEl(pane.querySelector('[data-slot="next-steps"]'), needsConfirm, 'steps',
+      `<div class="explain-box mt-md nas-next-steps"><div class="title">${escapeHtml(T('elastic.next_steps'))}</div><ol data-part="steps"></ol></div>`);
+    if (steps) {
+      patchKeyedList(steps.querySelector('[data-part="steps"]'), [
+        ...(repairEvidence(array) ? [{ key: 'repair', html: `<li>${escapeHtml(T('elastic.step_repair'))}</li>` }] : []),
+        { key: 'scrub', html: `<li>${escapeHtml(T('elastic.step_scrub'))}</li>` },
+        { key: 'sync', html: `<li>${escapeHtml(T('elastic.step_sync'))}</li>` },
+      ]);
+    }
     setText(pane.querySelector('[data-fig="moved-unsynced"]'), fmtOptionalBytes(array.protection?.movedUnsyncedBytes));
     setText(pane.querySelector('[data-fig="updated"]'), fmtDate(array.updatedAt));
     const restore = slotEl(pane.querySelector('[data-slot="restore"]'), admin && Boolean(canRestore()), 'restore', `<tf-button variant="secondary" class="mt-md" data-act="restore">${escapeHtml(T('elastic.restore'))}</tf-button>`);
@@ -1188,6 +1411,8 @@ export async function drawElasticDetail(screen, body) {
     for (const act of ['sync', 'scrub']) setAttr(pane.querySelector(`.nas-snapraid [data-act="${act}"]`), 'disabled', lock || Boolean(maintenanceBlocked));
     const reasonHint = slotEl(pane.querySelector('[data-slot="maintenance-reason"]'), Boolean(maintenanceBlocked), 'hint', '<div class="hint mb-sm"></div>');
     if (reasonHint) setText(reasonHint, maintenanceBlocked);
+    slotEl(pane.querySelector('[data-slot="sync-confirm"]'), !maintenanceBlocked && syncNeedsAcknowledgement(array), 'hint',
+      `<div class="hint mb-sm">${escapeHtml(T('elastic.sync_fault_hint'))}</div>`);
     const repairHint = slotEl(pane.querySelector('[data-slot="repair-unavailable"]'), Boolean(repairUnavailable), 'hint', '<div class="hint mb-sm"></div>');
     if (repairHint) setText(repairHint, repairUnavailable);
     const snapraid = array.snapraid || {};
@@ -1238,7 +1463,16 @@ export async function drawElasticDetail(screen, body) {
       case 'refresh': refresh(); return;
       case 'jobs': screen.switchTab('jobs'); return;
       case 'disk': screen.openDisk(el.closest('[data-disk]').dataset.disk); return;
-      case 'restore': case 'sync': case 'scrub': case 'mover': execute(act); return;
+      // A Sync over an unrepaired fault goes through the confirm that names
+      // its cost; it is the only way the acknowledgement is ever sent.
+      case 'sync':
+        if (array && !maintenanceReason() && syncNeedsAcknowledgement(array)) {
+          openSyncOverFaultDialog(screen, array, refresh);
+          return;
+        }
+        execute(act);
+        return;
+      case 'restore': case 'scrub': case 'mover': execute(act); return;
       case 'history-job': screen.openJobLog(el.dataset.job, finishJob); return;
       default: break;
     }
@@ -1251,7 +1485,9 @@ export async function drawElasticDetail(screen, body) {
         if (disk) openElasticFixDialog(screen, array, disk, repairFor(), refresh);
         return;
       }
-      case 'add-disk': if (!addDiskReason()) openAddDataDiskDialog(screen, array, refresh); return;
+      case 'add-disk': if (!addDiskReason() && !pendingAdd(array)) openAddDataDiskDialog(screen, array, refresh); return;
+      case 'add-disk-resume': if (!addDiskReason()) openResumeAddDiskDialog(screen, array, refresh); return;
+      case 'add-disk-undo': if (!addDiskReason()) openUndoAddDiskDialog(screen, array, refresh); return;
       case 'destroy': openElasticDestroyDialog(screen, array, () => screen.openArray(null)); return;
       // The header button AND the pill both carry this action; delegation
       // serves both, so neither can be the one left unbound.

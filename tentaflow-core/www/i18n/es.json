@@ -5389,7 +5389,8 @@
       "by_scheduler": "programador",
       "by_unknown_account": "cuenta desconocida",
       "subject_last_known": "visto por última vez como {name}",
-      "smart_batch_refused": "Prueba SMART no iniciada en {n} {n|disco|discos|discos}: {disks}"
+      "smart_batch_refused": "Prueba SMART no iniciada en {n} {n|disco|discos|discos}: {disks}",
+      "kind_elastic_add_disk_abort": "Deshacer la adición de un disco de datos a un Elastic Array"
     },
     "danger": {
       "retype": "Escribe {name} para confirmar:",
@@ -5601,7 +5602,49 @@
       "member_parity": "disco de paridad {n}",
       "disk_absent": "falta el disco",
       "last_seen_as": "visto por última vez como {name}",
-      "parity_errors_window": "Errores de paridad ({n} {n|día|días|días})"
+      "parity_errors_window": "Errores de paridad ({n} {n|día|días|días})",
+      "refused_operation_pending": "Otra operación de la matriz estaba en curso o sin resolver; no se cambió nada.",
+      "refused_attention_other": "La matriz esperaba la restauración de sus montajes; no se cambió nada.",
+      "refused_fault_unacknowledged": "La sincronización con un error sin corregir no se confirmó; no se cambió nada.",
+      "refused_attention_add_disk": "Una adición de disco a la matriz estaba sin terminar; no se cambió nada.",
+      "attention_sync_failed": "La última sincronización falló: parte de la paridad pudo reescribirse. Ejecute la sincronización de nuevo.",
+      "attention_scrub_failed": "El último scrub informó de errores o no terminó correctamente.",
+      "attention_fix_failed": "La última reparación desde la paridad falló.",
+      "attention_add_disk": "La adición de un disco a la matriz no se terminó.",
+      "attention_other": "La matriz espera la restauración de sus montajes (Restaurar montajes).",
+      "next_steps": "Siguientes pasos",
+      "step_repair": "Repare desde la paridad los bloques que el scrub marcó como erróneos.",
+      "step_scrub": "Ejecute un scrub para comprobar si queda algo por reparar.",
+      "step_sync": "Ejecute una sincronización — requiere confirmación, porque elimina del archivo content los archivos que el scrub no pudo leer.",
+      "sync_fault_title": "Sincronización pese a un error sin corregir en la matriz {name}",
+      "sync_fault_warning": "La matriz {name} tiene un error de scrub o de reparación sin corregir. La sincronización escribe igualmente un nuevo punto de control de paridad.",
+      "sync_fault_loses": "Los archivos que el scrub no pudo leer se eliminarán del archivo content — la paridad dejará de cubrirlos.",
+      "sync_fault_keeps": "Los bloques marcados por el scrub siguen siendo reparables con una reparación desde la paridad.",
+      "sync_fault_explain": "Ejecute primero la reparación desde la paridad si está disponible y después un scrub. La sincronización es el paso correcto cuando los errores afectan a archivos cambiados desde la última sincronización.",
+      "sync_fault_retype": "Vuelva a escribir el nombre de la matriz para confirmar:",
+      "sync_fault_confirm": "Sincronizar pese al error",
+      "sync_fault_hint": "La sincronización requiere confirmación: la matriz tiene un error de scrub o de reparación sin corregir.",
+      "add_disk_resume": "Terminar de añadir el disco {disk}",
+      "add_disk_resume_title": "Terminar de añadir el disco {disk} a la matriz {name}",
+      "add_disk_resume_explain": "Terminar repite solo los pasos que la adición aún no ha hecho y acaba con la sincronización que pone el disco nuevo bajo la paridad. La matriz sigue disponible en todo momento.",
+      "add_disk_resume_confirm": "Terminar la adición",
+      "add_disk_resume_done": "Se aceptó terminar la adición del disco. Compruebe el resultado de la tarea.",
+      "add_disk_pending": "La adición del disco {disk} no se terminó.",
+      "add_disk_step_format": "Se detuvo antes de terminar el formateo del disco.",
+      "add_disk_step_mount": "Se detuvo antes de montar el disco.",
+      "add_disk_step_join": "Se detuvo antes de que el disco se uniera al recurso compartido.",
+      "add_disk_step_sync": "El disco ya está en el recurso compartido; falta la sincronización que lo pone bajo la paridad.",
+      "add_disk_step_unknown": "No se sabe en qué paso se detuvo.",
+      "add_disk_new_disk": "disco nuevo",
+      "add_disk_undo": "Deshacer",
+      "add_disk_undo_title": "Deshacer la adición del disco {disk} a la matriz {name}",
+      "add_disk_undo_warning": "El disco {disk} no se ha unido al recurso compartido. Deshacer lo quita de la matriz {name} y borra solo el sistema de archivos que le dio esta adición.",
+      "add_disk_undo_explain": "La matriz vuelve a su estado anterior a la adición. El disco vuelve a quedar libre y se podrá añadir de nuevo.",
+      "add_disk_undo_confirm": "Deshacer la adición",
+      "add_disk_undo_done": "Se aceptó deshacer la adición del disco. Compruebe el resultado de la tarea.",
+      "add_disk_undo_unavailable": "Es posible que el disco ya se haya unido al recurso compartido — la adición solo puede terminarse.",
+      "repair_add_pending": "la matriz tiene una adición de disco sin terminar: termínela o deshágala primero",
+      "repair_needs_restore": "la matriz espera la restauración de sus montajes: use primero «Restaurar montajes»"
     },
     "wizard_pool": {
       "elastic_data": "Discos de datos",
@@ -6704,6 +6747,10 @@
         "targets_sweep_stale": {
           "title": "Destinos de bloque: el nodo no puede alcanzar el estado que decidió",
           "detail": "Antes del reinicio, los destinos de bloque de este nodo no estaban en el estado decidido; la próxima reconciliación lo sustituirá por el recuento actual"
+        },
+        "elastic_add_disk_abort_unconfirmed": {
+          "title": "Matriz {array}: deshacer la adición del disco sin confirmar",
+          "detail": "Deshacer se detuvo tras su primer paso; la adición del disco sigue sin terminar y puede terminarse o deshacerse de nuevo. El error del paso está en el texto del nodo"
         }
       },
       "node_text": "Texto del nodo",
@@ -6717,7 +6764,7 @@
         "reallocated": "{n} {n|sector reasignado|sectores reasignados}",
         "temperature_over_limit": "la temperatura de {t}°C supera el límite de {limit}°C",
         "temperature_high": "temperatura de {t}°C",
-        "temperature_high_limit": "la temperatura de {t}°C supera el umbral de {limit}°C",
+        "temperature_high_limit": "temperatura de {t}°C (umbral de aviso {limit}°C)",
         "crc_errors": "{n} {n|error|errores} CRC (cable o backplane)",
         "wear": "{n}% de desgaste",
         "no_smart_data": "sin datos SMART",
@@ -7189,7 +7236,8 @@
       "ttl_label": "La solicitud es válida durante (horas)",
       "single_admin": "Solo un administrador tiene nas.admin: retirar la protección de un snapshot va por la ruta roja normal (reescribir el nombre + contraseña sudo), porque nadie podría aprobarla. En cuanto exista un segundo administrador volverá a la cola de aprobaciones.",
       "op_target_delete": "Eliminación de un destino de bloque",
-      "op_elastic_schedule": "Armar una programación de Elastic"
+      "op_elastic_schedule": "Armar una programación de Elastic",
+      "op_elastic_add_disk_abort": "Elastic Array · Deshacer la adición de un disco"
     },
     "access": {
       "title": "Registro de acceso",
@@ -7478,7 +7526,25 @@
       "approval_already_rejected": "Esta solicitud ya se rechazó",
       "approval_already_expired": "Esta solicitud ya caducó",
       "approval_closed": "Ya se decidió sobre esta solicitud",
-      "approval_expired": "La solicitud caducó antes de que nadie decidiera sobre ella"
+      "approval_expired": "La solicitud caducó antes de que nadie decidiera sobre ella",
+      "elastic_no_parity": "La matriz no tiene paridad, así que SnapRAID no tiene nada que comprobar ni escribir",
+      "elastic_precondition_failed": "La matriz no está lista para esta operación: sus montajes, su formateo o su primera sincronización no están confirmados",
+      "elastic_unsynced_changes": "Los datos cambiaron desde la última sincronización, así que el scrub no se inició — ejecute primero una sincronización",
+      "elastic_empty_parity": "La paridad está vacía, así que el scrub no tiene nada que comprobar — ejecute primero una sincronización",
+      "elastic_operation_pending": "Otra operación de la matriz está en curso o no se ha resuelto — inténtelo de nuevo cuando termine",
+      "elastic_attention_other": "Primero hay que restaurar la matriz (Restaurar montajes); solo entonces acepta esta operación",
+      "elastic_fault_unacknowledged": "Una sincronización con un error de scrub o de reparación sin corregir requiere confirmar su coste en la pantalla de la matriz",
+      "elastic_attention_add_disk": "La matriz tiene una adición de disco sin terminar — termínela o deshágala primero",
+      "elastic_attention_parity_fault": "La matriz tiene un error de paridad sin resolver — primero reparación, scrub o sincronización",
+      "elastic_disk_claimed": "El disco ya pertenece a esta u otra matriz, o lleva un sistema de archivos ajeno",
+      "elastic_add_joined": "Es posible que el disco ya se haya unido al recurso compartido — la adición solo puede terminarse",
+      "elastic_fault_changed": "La matriz registró un nuevo error de scrub o de reparación desde la confirmación — confirme de nuevo la sincronización en la pantalla de la matriz",
+      "elastic_nothing_to_undo": "La matriz no tiene ninguna adición sin terminar de este disco — no hay nada que deshacer",
+      "elastic_state_unknown": "No se pudo leer el estado de la matriz, así que nada prueba que el disco nunca se uniera al recurso compartido — inténtelo de nuevo",
+      "elastic_array_not_ready": "La matriz debe estar activada y activa, o requerir atención",
+      "elastic_add_stopped": "La adición del disco se detuvo antes del final — termínela o deshágala en la pantalla de la matriz",
+      "elastic_undo_stopped": "Deshacer la adición se detuvo tras su primer paso — la adición sigue sin terminar",
+      "elastic_disk_absent": "El disco que se borraría no está presente en este nodo — vuelva a conectarlo e inténtelo de nuevo"
     }
   },
   "agent_accounts": {

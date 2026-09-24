@@ -614,6 +614,7 @@ const ALERT_WORDS = new Map([
   ['elastic_result_unconfirmed', unconfirmed('elastic_result_unconfirmed')],
   ['elastic_replace_unconfirmed', unconfirmed('elastic_replace_unconfirmed')],
   ['elastic_add_disk_unconfirmed', unconfirmed('elastic_add_disk_unconfirmed')],
+  ['elastic_add_disk_abort_unconfirmed', unconfirmed('elastic_add_disk_abort_unconfirmed')],
   ['elastic_restore_waiting', (p) => {
     const t = textParams(p, ['array']);
     return t ? { title: T('alerts.code.elastic_restore_waiting.title', t), detail: T('alerts.code.elastic_restore_waiting.detail') } : null;

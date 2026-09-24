@@ -332,7 +332,21 @@ pub enum HelperCommand {
     ElasticEnterService { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticResume { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticMover { array_id: String, owner: elastic::ElasticOwner, operation_id: String, resume_operation_id: String, rules: elastic::MoverRules, coupled_sync: bool },
-    ElasticSync { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
+    /// `acknowledge_parity_fault` is the admin's explicit decision to run a
+    /// Sync over a recorded Scrub or Fix fault: measured, such a Sync removes
+    /// the files the Scrub could not read from the content file. It names the
+    /// operation id of THE fault the admin confirmed, and the helper admits
+    /// the Sync only while that is the recorded cause (`fault_unacknowledged`
+    /// otherwise) — a request queued over one fault acknowledges no newer
+    /// one. Nothing but an admin's confirm may set it, and a scheduler never
+    /// does. Absent means no acknowledgement.
+    ElasticSync {
+        array_id: String,
+        owner: elastic::ElasticOwner,
+        operation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acknowledge_parity_fault: Option<String>,
+    },
     ElasticScrub { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     /// Rebuilds one data disk of an array from its parity (`snapraid fix -d`).
     /// `disk` is the array's own branch name (`d1`, `d2`, …), not a device:
@@ -341,6 +355,10 @@ pub enum HelperCommand {
     ElasticFix { array_id: String, owner: elastic::ElasticOwner, operation_id: String, disk: String },
     /// One more data disk, on a LIVE array. The union is never taken down.
     ElasticAddDisk { array_id: String, owner: elastic::ElasticOwner, operation_id: String, disk: elastic::ElasticDiskSpec },
+    /// Undoes an unfinished add of `disk` — only while the disk provably never
+    /// joined the share. Removes the last data slot, and erases nothing but
+    /// the filesystem this add gave the disk.
+    ElasticAddDiskAbort { array_id: String, owner: elastic::ElasticOwner, operation_id: String, disk: elastic::ElasticDiskSpec },
     /// Replaces the disk of ONE data slot with a new one and rebuilds the
     /// array onto it: the journal's slot identity is swapped, the replacement
     /// is formatted as that branch, the array is restored, the disk is
@@ -2115,6 +2133,7 @@ impl HelperCommand {
             Self::ElasticScrub { .. } => Some("elastic_scrub"),
             Self::ElasticFix { .. } => Some("elastic_fix"),
             Self::ElasticAddDisk { .. } => Some("elastic_add_disk"),
+            Self::ElasticAddDiskAbort { .. } => Some("elastic_add_disk_abort"),
             Self::ElasticReplaceDisk { .. } => Some("elastic_replace_disk"),
             Self::ElasticDestroy { .. } => Some("elastic_destroy"),
             Self::ElasticInspect { .. } => Some("elastic_inspect"),
@@ -2177,7 +2196,8 @@ impl HelperCommand {
                 elastic::validate_data_branch_name(disk)?;
                 owner.validate()
             }
-            Self::ElasticAddDisk { array_id, owner, operation_id, disk } => {
+            Self::ElasticAddDisk { array_id, owner, operation_id, disk }
+            | Self::ElasticAddDiskAbort { array_id, owner, operation_id, disk } => {
                 elastic::validate_elastic_uuid(array_id)?;
                 elastic::validate_elastic_uuid(operation_id)?;
                 elastic::validate_elastic_uuid(&disk.expected_uuid)?;
@@ -2213,8 +2233,13 @@ impl HelperCommand {
                 }
                 owner.validate()
             }
+            Self::ElasticSync { acknowledge_parity_fault: Some(fault), .. }
+                if elastic::validate_elastic_uuid(fault).is_err() =>
+            {
+                Err(CatalogError::InvalidArgument("acknowledge_parity_fault: invalid operation id".into()))
+            }
             Self::ElasticDestroy { array_id, owner, operation_id }
-            | Self::ElasticSync { array_id, owner, operation_id }
+            | Self::ElasticSync { array_id, owner, operation_id, .. }
             | Self::ElasticScrub { array_id, owner, operation_id } => {
                 elastic::validate_elastic_uuid(array_id)?;
                 elastic::validate_elastic_uuid(operation_id)?;
@@ -2927,6 +2952,7 @@ impl HelperCommand {
             Self::ElasticScrub { .. } => ("builtin", "Sprawdza pełną parity własnej macierzy Elastic bez naprawy."),
             Self::ElasticFix { .. } => ("builtin", "Odbudowuje wskazany dysk danych własnej macierzy Elastic z parity."),
             Self::ElasticAddDisk { .. } => ("builtin", "Dodaje dysk danych do działającej unii własnej macierzy Elastic."),
+            Self::ElasticAddDiskAbort { .. } => ("builtin", "Wycofuje niedokończone dodanie dysku danych, zanim dysk dołączył do udziału."),
             Self::ElasticReplaceDisk { .. } => ("builtin", "Wymienia dysk danych własnej macierzy Elastic i odbudowuje go z parity."),
             Self::ElasticDestroy { .. } => ("builtin", "Zatrzymuje udostępnianie własnej macierzy Elastic bez formatowania dysków."),
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
@@ -3113,10 +3139,12 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::ElasticEnterService { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticResume { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticMover { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(), resume_operation_id: s(), rules: elastic::MoverRules::default(), coupled_sync: true },
-        HelperCommand::ElasticSync { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
+        HelperCommand::ElasticSync { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(), acknowledge_parity_fault: None },
         HelperCommand::ElasticScrub { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticFix { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(), disk: s() },
         HelperCommand::ElasticAddDisk { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(),
+            disk: elastic::ElasticDiskSpec { disk_id: s(), wwn: None, serial: None, bytes: 0, expected_uuid: s() } },
+        HelperCommand::ElasticAddDiskAbort { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(),
             disk: elastic::ElasticDiskSpec { disk_id: s(), wwn: None, serial: None, bytes: 0, expected_uuid: s() } },
         HelperCommand::ElasticReplaceDisk { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s(),
             rebuild_operation_id: s(), sync_operation_id: s(), branch: "d1".into(),
@@ -3376,18 +3404,43 @@ mod tests {
         let operation_id = "22222222-2222-4222-8222-222222222222".to_string();
         let owner = elastic::ElasticOwner { org_id: "org-default".into(), addon_id: "nas-owned".into() };
         for (command, label) in [
-            (HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: operation_id.clone() }, "elastic_sync"),
+            (HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: operation_id.clone(), acknowledge_parity_fault: None }, "elastic_sync"),
             (HelperCommand::ElasticScrub { array_id: array_id.clone(), owner: owner.clone(), operation_id: operation_id.clone() }, "elastic_scrub"),
         ] {
             assert_eq!(command.plan(), Ok(Plan::Builtin(label)));
             assert_eq!(serde_json::from_str::<HelperCommand>(&command.to_json_line()).unwrap(), command);
         }
         for invalid_id in ["", "../state", "00000000-0000-0000-0000-000000000000"] {
-            assert!(HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: invalid_id.into() }.plan().is_err());
+            assert!(HelperCommand::ElasticSync { array_id: array_id.clone(), owner: owner.clone(), operation_id: invalid_id.into(), acknowledge_parity_fault: None }.plan().is_err());
             assert!(HelperCommand::ElasticScrub { array_id: invalid_id.into(), owner: owner.clone(), operation_id: operation_id.clone() }.plan().is_err());
         }
-        assert!(HelperCommand::ElasticSync { array_id, operation_id,
+        assert!(HelperCommand::ElasticSync { array_id: array_id.clone(), operation_id: operation_id.clone(), acknowledge_parity_fault: None,
             owner: elastic::ElasticOwner { org_id: "".into(), addon_id: "nas-owned".into() } }.plan().is_err());
+        // The acknowledgement travels, and an older core's command without
+        // the field reads as NOT acknowledged — never the other way round.
+        let acknowledged = HelperCommand::ElasticSync {
+            array_id: array_id.clone(),
+            owner: owner.clone(),
+            operation_id: operation_id.clone(),
+            acknowledge_parity_fault: Some("33333333-3333-4333-8333-333333333333".into()),
+        };
+        // An acknowledgement names an operation, and nothing else.
+        assert!(HelperCommand::ElasticSync {
+            array_id: array_id.clone(),
+            owner: owner.clone(),
+            operation_id: operation_id.clone(),
+            acknowledge_parity_fault: Some("../state".into()),
+        }
+        .plan()
+        .is_err());
+        assert_eq!(serde_json::from_str::<HelperCommand>(&acknowledged.to_json_line()).unwrap(), acknowledged);
+        let legacy = format!(
+            r#"{{"cmd":"elastic_sync","array_id":"{array_id}","owner":{{"org_id":"org-default","addon_id":"nas-owned"}},"operation_id":"{operation_id}"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<HelperCommand>(&legacy).unwrap(),
+            HelperCommand::ElasticSync { array_id, owner, operation_id, acknowledge_parity_fault: None }
+        );
     }
 
     #[test]

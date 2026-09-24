@@ -7,7 +7,7 @@
 // the pool. Runs under happy-dom with the `/js/` hook.
 // =============================================================================
 
-import { fakeScreen as makeScreen, flush, click } from './_test-setup.js';
+import { fakeScreen as makeScreen, flush, click, typeInto, confirmWindow } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -432,6 +432,36 @@ test('"Sync teraz" on the Elastic card sends one sync through sudo, locks while 
     assert.equal(screen.jobLogs[0].jobId, 'sync-1');
     assert.ok(body.querySelector('.pool-card[data-array="media"] [data-act="array-sync"]') === sync, 'the button survives');
     assert.equal(sync.hasAttribute('disabled'), false, 'unlocked again');
+  } finally {
+    screen.dispose();
+  }
+});
+
+// F1 on the card: over an unrepaired Scrub or Repair fault, "Sync teraz"
+// opens the same confirm as the detail pane, and only that confirm sends the
+// acknowledgement.
+test('"Sync teraz" over an unrepaired fault goes through the confirm that names its cost', async () => {
+  const screen = fakeScreen({
+    tentaNasPoolsListRequest: { pools: [], freeDisks: [] },
+    tentaNasElasticArraysListRequest: { arrays: [elasticArray({ enabled: true, parityRunAvailable: true, state: 'needs_attention', attention: 'scrub_failed', syncNeedsAcknowledgement: true, syncFaultId: 'fault-1' })] },
+    tentaNasDisksListRequest: { disks: [] },
+    tentaNasElasticArraySyncRequest: { job: { jobId: 'sync-ack' } },
+  });
+  screen.later = () => {};
+  try {
+    const body = mount();
+    await drawPools(screen, body);
+    await flush();
+    click(body.querySelector('.pool-card[data-array="media"] [data-act="array-sync"]'));
+    await flush();
+    const syncs = () => screen.calls.filter((c) => c.kind === 'tentaNasElasticArraySyncRequest');
+    assert.equal(syncs().length, 0, 'nothing is sent before the confirm');
+    const win = document.querySelector('tf-window');
+    assert.match(win.textContent, /zostaną usunięte z content/);
+    typeInto(win.querySelector('#nas-retype'), 'media');
+    confirmWindow(win);
+    await flush();
+    assert.deepEqual(syncs().map((c) => c.payload), [{ name: 'media', acknowledgeParityFault: 'fault-1', sudoPassword: 'hunter2' }]);
   } finally {
     screen.dispose();
   }

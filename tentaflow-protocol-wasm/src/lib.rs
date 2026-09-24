@@ -23641,6 +23641,16 @@ pub fn encode_tentanas_elastic_array_add_disk_request(request_json: String) -> R
     encode_tentanas_json_request("ElasticArrayAddDiskRequest", &request_json)
 }
 
+/// Wycofanie niedokończonego dodania dysku danych, zanim dysk dołączył do udziału.
+///
+/// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
+/// przeglądarki: `ApiBinary` odrzuca je jako "unknown request kind", a
+/// backend, testy i przycisk w UI mogą przy tym być w porządku.
+#[wasm_bindgen(js_name = encodeTentaNasElasticArrayAddDiskAbortRequest)]
+pub fn encode_tentanas_elastic_array_add_disk_abort_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("ElasticArrayAddDiskAbortRequest", &request_json)
+}
+
 /// Wymiana dysku danych macierzy Elastic i odbudowa go z parity.
 ///
 /// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
@@ -23667,7 +23677,7 @@ mod elastic_codec_tests {
 
     #[test]
     fn elastic_encoders_roundtrip_actual_protocol_body() {
-        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 21] = [
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 23] = [
             ("ElasticCapabilitiesRequest", encode_tentanas_elastic_capabilities_request, "{}"),
             ("DiskWipePlanRequest", encode_tentanas_disk_wipe_plan_request,
                 r#"{"disk_id":"wwn-0x5000c500a1b2c3d4"}"#),
@@ -23679,6 +23689,8 @@ mod elastic_codec_tests {
             ("ElasticArrayFixRequest", encode_tentanas_elastic_array_fix_request,
                 r#"{"name":"media","disk":"d1","confirm_disk":"d1"}"#),
             ("ElasticArrayAddDiskRequest", encode_tentanas_elastic_array_add_disk_request,
+                r#"{"name":"media","disk_id":"wwn-0x5000c500a1b2c3d4","confirm_name":"media"}"#),
+            ("ElasticArrayAddDiskAbortRequest", encode_tentanas_elastic_array_add_disk_abort_request,
                 r#"{"name":"media","disk_id":"wwn-0x5000c500a1b2c3d4","confirm_name":"media"}"#),
             ("ElasticArrayReplaceDiskRequest", encode_tentanas_elastic_array_replace_disk_request,
                 r#"{"name":"media","disk":"d1","confirm_disk":"d1","replacement_disk_id":"wwn-0x5000c500a1b2c3d4","accept_stale_parity":false}"#),
@@ -23694,6 +23706,11 @@ mod elastic_codec_tests {
                 r#"{"name":"dane","sudo_password":"test-secret-not-real"}"#),
             ("ElasticArraySyncRequest", encode_tentanas_elastic_array_sync_request,
                 r#"{"name":"dane","sudo_password":"test-secret-not-real"}"#),
+            // The admin's acknowledgement of a Sync over a parity fault: a
+            // field the encoder drops would reach the node as "not
+            // acknowledged" and the confirmed Sync would be refused.
+            ("ElasticArraySyncRequest", encode_tentanas_elastic_array_sync_request,
+                r#"{"name":"dane","acknowledge_parity_fault":"018f2c1e-6b9a-7c3d-8e4f-5a6b7c8d9e0f"}"#),
             ("ElasticArrayScrubRequest", encode_tentanas_elastic_array_scrub_request,
                 r#"{"name":"dane","sudo_password":"test-secret-not-real"}"#),
             ("ElasticArrayMoverRequest", encode_tentanas_elastic_array_mover_request,

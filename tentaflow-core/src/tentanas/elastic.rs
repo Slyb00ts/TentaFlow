@@ -43,7 +43,8 @@ use std::time::{Duration, Instant};
 use tentaflow_protocol::features::FeatureState;
 use tentaflow_protocol::tentanas::{
     NasDisk, NasElasticArray, NasElasticBranch, NasElasticCapabilities, NasElasticFolder,
-    NasElasticImportCandidate, NasElasticImportMember, NasElasticParity, NasElasticPlan, NasElasticProtection,
+    NasElasticImportCandidate, NasElasticImportMember, NasElasticParity, NasElasticPendingAdd, NasElasticPlan,
+    NasElasticProtection,
     NasElasticRefusal, NasMoverRun, NasMoverSettings, NasSchedule, NasSnapraidRun,
     NasSnapraidState,
 };
@@ -434,6 +435,11 @@ pub struct ElasticArrayRow {
     /// runs a Sync settles (W5/W6 of the fourth review).
     pub parity_run_available: bool,
     pub snapraid: SnapraidConfig,
+    /// The data disk an add has pinned and not finished
+    /// (`db::unfinished_elastic_add_disk`): the identity its resume and its
+    /// undo must reuse, and the one disk a helper answer may count beyond the
+    /// spec (`answered_spec`).
+    pub pending_add: Option<ElasticDiskSpec>,
     /// The last state this node persisted, and why — carried the way
     /// `TargetRow::state`/`state_detail` are, so an array switched off by an
     /// import keeps the sentence that explains it.
@@ -2338,6 +2344,9 @@ pub(crate) fn fill_last_known_names(
     for parity in array.parity_disks.iter_mut() {
         fill(&parity.disk_name, &parity.disk_id, &mut parity.disk_last_name);
     }
+    if let Some(pending) = array.pending_add_disk.as_mut() {
+        fill(&pending.disk_name, &pending.disk_id, &mut pending.disk_last_name);
+    }
 }
 
 fn branch_to_protocol(
@@ -2629,8 +2638,107 @@ pub fn to_protocol(
         unresolved_operation: array.unresolved_operation,
         mover_settles_unresolved: array.mover_settles_unresolved,
         parity_run_available: array.parity_run_available,
+        attention: String::new(),
+        sync_needs_acknowledgement: sync_acknowledgement_needed(&array.snapraid_history),
+        sync_fault_id: unacknowledged_fault(&array.snapraid_history)
+            .and_then(|run| run.operation_id.clone())
+            .unwrap_or_default(),
+        pending_add_disk: array.pending_add.as_ref().map(|disk| NasElasticPendingAdd {
+            disk_id: disk.disk_id.clone(),
+            disk_name: member_disk_name(disks, &disk.disk_id, None),
+            ..Default::default()
+        }),
         created_at: array.created_at.clone(),
         updated_at: array.updated_at.clone(),
+    }
+}
+
+/// Whether a manual Sync on this history needs the admin's acknowledgement,
+/// from the recorded runs alone: a Scrub that marked blocks nothing has
+/// repaired (`unresolved_parity_fault`), or a Repair that failed and that no
+/// later Repair or full Scrub settled. The helper's own recorded cause is
+/// added by `observed_protocol`; either one asks for the confirm, and the
+/// helper is what enforces it.
+pub fn sync_acknowledgement_needed(history: &[NasSnapraidRun]) -> bool {
+    unacknowledged_fault(history).is_some()
+}
+
+/// The recorded run a Sync's acknowledgement has to name, from the history
+/// alone: the unresolved Scrub fault, or else the Repair that failed and
+/// that no later Repair or full Scrub settled.
+pub fn unacknowledged_fault(history: &[NasSnapraidRun]) -> Option<&NasSnapraidRun> {
+    if let Some(run) = unresolved_parity_fault(history) {
+        return Some(run);
+    }
+    for run in history {
+        match (run.kind.as_str(), run.outcome.as_str()) {
+            ("fix" | "scrub", "ok") => return None,
+            ("fix", "failed" | "needs_attention") => return Some(run),
+            _ => (),
+        }
+    }
+    None
+}
+
+/// The code of the helper's recorded cause, as `NasElasticArray::attention`
+/// spells it. An array that needs attention with no recorded cause (a
+/// journal an older helper wrote) admits only a Restore, exactly like
+/// `Other`, and reads the same.
+fn attention_code(result: &ElasticResult) -> &'static str {
+    use tentanas_helper::elastic::ElasticAttention;
+    match (&result.attention, result.stage) {
+        (Some(ElasticAttention::ParityRun { kind, .. }), _) => match kind {
+            ElasticSnapraidKind::Sync => "sync_failed",
+            ElasticSnapraidKind::Scrub => "scrub_failed",
+            ElasticSnapraidKind::Fix { .. } => "fix_failed",
+        },
+        (Some(ElasticAttention::AddDisk { .. }), _) => "add_disk",
+        (Some(ElasticAttention::Other), _) | (None, ElasticStage::NeedsAttention) => "other",
+        (None, _) => "",
+    }
+}
+
+/// The wire's step code of a helper's add step.
+fn add_step_code(step: tentanas_helper::elastic::ElasticAddStep) -> &'static str {
+    use tentanas_helper::elastic::ElasticAddStep;
+    match step {
+        ElasticAddStep::Format => "format",
+        ElasticAddStep::Mount => "mount",
+        ElasticAddStep::Join => "join",
+        ElasticAddStep::Sync => "sync",
+    }
+}
+
+/// What the helper's own answer adds to the wire (K6): its recorded cause,
+/// the gates it will enforce, and the state of an add it has not finished.
+///
+/// THE CORE OFFERS EXACTLY WHAT THE HELPER ACCEPTS. `parity_run_available`
+/// is the core's own admission (`db::parity_admission`) AND the helper's
+/// (`maintenance_admission`) over the very facts this answer reports — a
+/// Scrub admitted means a Sync admitted with the acknowledgement, the
+/// helper's gate being one rule for both. The acknowledgement is asked for
+/// whenever the helper would refuse the Sync without it.
+fn apply_helper_gates(wire: &mut NasElasticArray, result: &ElasticResult) {
+    use tentanas_helper::elastic::{maintenance_admission, ElasticRefusal};
+    let facts = result.admission();
+    wire.attention = attention_code(result).to_string();
+    wire.parity_run_available = wire.parity_run_available
+        && maintenance_admission(&facts, &ElasticSnapraidKind::Scrub, None).is_ok();
+    // The helper's own recorded fault is THE fault an acknowledgement names
+    // (its gate compares exactly this id); the history's only when the
+    // helper records none.
+    if maintenance_admission(&facts, &ElasticSnapraidKind::Sync, None) == Err(ElasticRefusal::FaultUnacknowledged) {
+        wire.sync_needs_acknowledgement = true;
+        if let Some(tentanas_helper::elastic::ElasticAttention::ParityRun { operation_id, .. }) = &result.attention {
+            wire.sync_fault_id = operation_id.clone();
+        }
+    }
+    if let Some(pending) = wire.pending_add_disk.as_mut() {
+        if let Some(add) = result.pending_add.as_ref().filter(|add| add.disk_id == pending.disk_id) {
+            pending.step = add_step_code(add.step).to_string();
+            pending.in_union = add.in_union;
+            pending.undo_possible = add.undo_possible;
+        }
     }
 }
 
@@ -2708,6 +2816,17 @@ fn parity_errors_in_window(
 /// rather than to offer a button whose only possible outcome is
 /// `precondition_failed` from the helper's own guard.
 pub fn repair_blocker(array: &NasElasticArray) -> Option<String> {
+    // The helper's recorded cause first: a repair is admitted over a parity
+    // fault, never over an unfinished add or a cause only a Restore
+    // addresses (`maintenance_admission`), and a button it then refuses
+    // reads to an admin as a fault.
+    match array.attention.as_str() {
+        "add_disk" => {
+            return Some("macierz ma niedokończone dodawanie dysku: najpierw je dokończ albo wycofaj".into())
+        }
+        "other" => return Some("macierz wymaga przywrócenia: najpierw uruchom Przywróć".into()),
+        _ => (),
+    }
     for member in &array.data_disks {
         // Named as the screen names it — `sdg`, or the member's part in the
         // array when the inventory lost it — never by the slot key.
@@ -2766,12 +2885,27 @@ fn unresolved_parity_run(array: &NasElasticArray) -> Option<&NasSnapraidRun> {
 /// (`summary:removed:1`), and after that parity holds nothing of them. That is
 /// why an unattended Sync is refused here while a manual one is not — an admin
 /// who is told can decide, the cadence cannot.
+///
+/// WHAT ENDS IT (M2 of the release review): the cure, never the passing of
+/// time. A successful repair (`fix` ok), or a clean full scrub (`scrub` ok) —
+/// positive evidence that nothing is marked any more. And for a scrub that
+/// counted FILE errors only (no data errors), a later successful Sync: `-e
+/// fix` writes nothing for unreadable files (measured, probe f4), and the
+/// Sync that drops them from content is their only cure — the same rule
+/// `db::UNRESOLVED_ELASTIC_OPERATION` applies to the operation row. A Sync
+/// does NOT end data errors: their marks stay repairable across it
+/// (measured, f1-f3), which is what keeps the repair on offer.
 pub fn unresolved_parity_fault(history: &[NasSnapraidRun]) -> Option<&NasSnapraidRun> {
+    let mut synced_since = false;
     for run in history {
         match (run.kind.as_str(), run.outcome.as_str()) {
-            ("fix", "ok") => return None,
+            ("fix" | "scrub", "ok") => return None,
+            ("sync", "ok") => synced_since = true,
             ("scrub", "failed" | "needs_attention") if run.errors.is_some_and(|errors| errors > 0) => {
-                return Some(run)
+                if synced_since && run.errors_data == Some(0) {
+                    return None;
+                }
+                return Some(run);
             }
             _ => (),
         }
@@ -2896,7 +3030,7 @@ fn health_of(
     ("ok", String::new())
 }
 
-fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Result<()> {
+pub fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Result<()> {
     ensure!(
         result.array_id == spec.array_id
             && result.operation_id == spec.operation_id
@@ -2914,6 +3048,23 @@ fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Res
             "Operacja service nie może zastępować Create"
         );
     }
+    // The slot of an add the helper reports as unfinished is the journal's
+    // LAST data slot, and until its filesystem is confirmed nothing on that
+    // disk is the array's: a blank disk, or one an interrupted mkfs left, is
+    // not an identity mismatch of a member.
+    if let Some(add) = &result.pending_add {
+        ensure!(
+            spec.data.last().is_some_and(|last| last.disk_id == add.disk_id)
+                && add.branch == tentanas_helper::elastic::data_branch_name(spec.data.len()),
+            "Niedokończone dodanie nie wskazuje ostatniego dysku danych"
+        );
+    }
+    let unconfirmed_slot = result
+        .pending_add
+        .as_ref()
+        .filter(|add| !add.formatted)
+        .and_then(|_| u16::try_from(spec.data.len()).ok())
+        .map(ElasticRole::Data);
     let mut seen = BTreeSet::new();
     for disk in &result.disks {
         let (role, index, expected) = match disk.role {
@@ -2934,6 +3085,10 @@ fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) -> Res
             seen.insert((role, index)),
             "Powtórzona rola w odpowiedzi helpera"
         );
+        if Some(disk.role) == unconfirmed_slot {
+            ensure!(disk.mounted != Some(true), "Zamontowany dysk bez potwierdzonego formatowania");
+            continue;
+        }
         ensure!(
             disk.observed_uuid
                 .as_deref()
@@ -3596,7 +3751,10 @@ async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id:
         ensure!(out.success(), "Helper Elastic zwrócił błąd {}",out.code);
         ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
         let result: ElasticResult = serde_json::from_str(&out.stdout)?;
-        validate_result(&spec, &result)?;
+        // A Restore of an array an add is unfinished on answers with the
+        // add's disk counted (K5); the add itself is what finishes it.
+        let pinned = store::unfinished_elastic_add_disk(h.db(), &spec.owner, &spec.array_id)?;
+        validate_result(&answered_spec(&spec, pinned.as_ref(), &result)?, &result)?;
         Ok::<_,anyhow::Error>(result)
     }.await;
     let key = format!("elastic:{}:restore",spec.array_id);
@@ -3651,17 +3809,24 @@ pub fn snapraid_disk(kind: &ElasticSnapraidKind) -> Option<&str> {
     }
 }
 
+/// The helper command of one SnapRAID run. `acknowledge_parity_fault` is
+/// carried into a Sync only — the admin's confirm of a Sync over a recorded
+/// Scrub or Repair fault, naming that fault's operation, which the helper
+/// refuses without it — and is meaningless for the other two kinds, which
+/// never carry it.
 pub fn snapraid_command(
     owner: &ElasticOwner,
     array_id: &str,
     operation_id: &str,
     kind: &ElasticSnapraidKind,
+    acknowledge_parity_fault: Option<&str>,
 ) -> HelperCommand {
     match kind {
         ElasticSnapraidKind::Sync => HelperCommand::ElasticSync {
             owner: owner.clone(),
             array_id: array_id.into(),
             operation_id: operation_id.into(),
+            acknowledge_parity_fault: acknowledge_parity_fault.map(str::to_string),
         },
         ElasticSnapraidKind::Scrub => HelperCommand::ElasticScrub {
             owner: owner.clone(),
@@ -3689,6 +3854,42 @@ pub fn add_disk_command(
         operation_id: operation_id.into(),
         disk: disk.clone(),
     }
+}
+
+pub fn add_disk_abort_command(
+    owner: &ElasticOwner,
+    array_id: &str,
+    operation_id: &str,
+    disk: &ElasticDiskSpec,
+) -> HelperCommand {
+    HelperCommand::ElasticAddDiskAbort {
+        owner: owner.clone(),
+        array_id: array_id.into(),
+        operation_id: operation_id.into(),
+        disk: disk.clone(),
+    }
+}
+
+/// The refusal a job reports for one of the helper's closed refusal codes,
+/// as the code the screen words (`refusal.elastic_<code>`, `format.js`
+/// `errMessage`). A code outside the vocabulary is not invented a sentence:
+/// the caller's own fallback is used.
+pub fn refusal_error(code: &str) -> Option<String> {
+    const CODES: &[&str] = &[
+        "no_parity",
+        "precondition_failed",
+        "unsynced_changes",
+        "empty_parity",
+        "operation_pending",
+        "attention_other",
+        "fault_unacknowledged",
+        "attention_add_disk",
+        "attention_parity_fault",
+        "disk_claimed",
+        "add_joined",
+        "disk_absent",
+    ];
+    CODES.contains(&code).then(|| format!("refusal:elastic_{code}"))
 }
 
 pub fn dissolve_command(
@@ -3736,14 +3937,14 @@ pub fn validate_snapraid_result(
         "Niespójny czas lub opis wyniku SnapRAID"
     );
     match run.outcome {
+        // A REFUSAL WROTE NOTHING (I5), whatever stage the array stands in:
+        // the helper answers its admission gate with the journal exactly as
+        // it read it — an array that needs attention for a cause the run does
+        // not resolve, one with an intent pending, one an add is unfinished
+        // on — and the core closes the run `failed` with the array untouched.
         ElasticSnapraidOutcome::Refused => {
             ensure!(
-                // A repair is the one operation that may be REFUSED on an
-                // array that needs attention, because it is the one that may
-                // be started there at all.
-                (result.state.stage == ElasticStage::Ready
-                    || (repairing && result.state.stage == ElasticStage::NeedsAttention))
-                    && run.exit_code.is_none()
+                run.exit_code.is_none()
                     && run.total_blocks.is_none()
                     && run.checked_blocks.is_none()
                     && run.accessed_mb.is_none()
@@ -3757,8 +3958,18 @@ pub fn validate_snapraid_result(
                                 | "precondition_failed"
                                 | "unsynced_changes"
                                 | "empty_parity"
+                                // The admission gate's own vocabulary
+                                // (`ElasticRefusal`) for a Sync, Scrub or Fix.
+                                | "operation_pending"
+                                | "attention_other"
+                                | "fault_unacknowledged"
+                                | "attention_add_disk"
                         )
-                    ),
+                    )
+                    // A Sync is the only run an acknowledgement is about.
+                    && (run.detail.as_deref() != Some("fault_unacknowledged")
+                        || *kind == ElasticSnapraidKind::Sync)
+                    && result.state.last_run.as_ref() != Some(run),
                 "Niepotwierdzona odmowa przed scrub"
             );
         }
@@ -3874,8 +4085,18 @@ async fn execute_snapraid_job(
         "Brak wiarygodnego wyniku SnapRAID"
     );
     let result: ElasticSnapraidResult = serde_json::from_str(&output.stdout)?;
-    validate_snapraid_result(spec, operation_id, kind, &result)?;
+    // While an add is pinned the helper's journal counts its disk too, and a
+    // run refused over it answers about THAT array (K5).
+    let pinned = store::unfinished_elastic_add_disk(h.db(), &spec.owner, &spec.array_id)?;
+    validate_snapraid_result(&answered_spec(spec, pinned.as_ref(), &result.state)?, operation_id, kind, &result)?;
     store::record_snapraid_result(h.db(), &spec.owner, operation_id, &result)?;
+    // A REFUSAL is worded by the screen from its closed code: the helper
+    // changed nothing, and the reason is what the admin acts on.
+    if result.run.outcome == ElasticSnapraidOutcome::Refused {
+        if let Some(refusal) = result.run.detail.as_deref().and_then(refusal_error) {
+            return Err(anyhow!(refusal));
+        }
+    }
     ensure!(
         matches!(result.run.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial),
         "{}",
@@ -4038,20 +4259,26 @@ pub fn spawn_mover(
     )
 }
 
+/// Starts one Sync, Scrub or Fix. `acknowledge_parity_fault` is the admin's
+/// confirm of a Sync over a recorded fault; the scheduler passes `false`
+/// always, and only the manual Sync request may pass `true`.
 pub fn spawn_snapraid(
     db: &DbPool,
     array: &ElasticArrayRow,
     started_by: &str,
     explicit: Option<Arc<ElevationToken>>,
     kind: ElasticSnapraidKind,
+    acknowledge_parity_fault: Option<String>,
 ) -> Result<tentaflow_protocol::tentanas::NasJob> {
     let spec = array.persisted_spec()?.clone();
     let operation_id = uuid::Uuid::now_v7().to_string();
+    let acknowledge_parity_fault = acknowledge_parity_fault.filter(|_| kind == ElasticSnapraidKind::Sync);
     let intent = jobs::ElasticJobIntent::Snapraid {
         owner: spec.owner.clone(),
         array_id: spec.array_id.clone(),
         operation_id: operation_id.clone(),
         kind: kind.clone(),
+        acknowledge_parity_fault: acknowledge_parity_fault.clone(),
     };
     jobs::spawn(
         db,
@@ -4061,7 +4288,8 @@ pub fn spawn_snapraid(
         Some(intent),
         None,
         move |h| async move {
-            let command = snapraid_command(&spec.owner, &spec.array_id, &operation_id, &kind);
+            let command =
+                snapraid_command(&spec.owner, &spec.array_id, &operation_id, &kind, acknowledge_parity_fault.as_deref());
             let run = jobs::run_step(
                 &h,
                 &command,
@@ -4089,6 +4317,48 @@ pub fn spec_with_added_disk(
     after.data.push(disk.clone());
     after.validate()?;
     Ok(after)
+}
+
+/// THE ONE ANSWER to "which array does this helper answer describe" (K5).
+///
+/// The core's spec is the array WITHOUT an add that has not finished: the
+/// member row is written only once the add succeeds. The helper's journal
+/// grows the moment the add starts, so while an add is pinned
+/// (`db::unfinished_elastic_add_disk`) every answer about the array — an
+/// inspection, a Restore, a SnapRAID run, a refusal — may count one data disk
+/// more. That answer is valid exactly then, and only for the pinned disk; any
+/// other member count is an answer about some other array.
+pub fn answered_spec(
+    spec: &ElasticCreateSpec,
+    pinned: Option<&ElasticDiskSpec>,
+    result: &ElasticResult,
+) -> Result<ElasticCreateSpec> {
+    let members = member_count(spec);
+    if result.disks.len() == members {
+        return Ok(spec.clone());
+    }
+    match pinned {
+        Some(disk) if result.disks.len() == members + 1 => spec_with_added_disk(spec, disk),
+        _ => Err(anyhow!("Niepełny zestaw obserwacji dysków")),
+    }
+}
+
+/// `answered_spec` for a RECORDED answer, which may be older than the spec:
+/// a run recorded before an add succeeded describes the array with fewer
+/// data disks. Such a record is judged against the array as it was then —
+/// the spec's own data disks, in slot order, less the ones added since.
+pub fn recorded_spec(
+    spec: &ElasticCreateSpec,
+    pinned: Option<&ElasticDiskSpec>,
+    result: &ElasticResult,
+) -> Result<ElasticCreateSpec> {
+    let members = member_count(spec);
+    if result.disks.len() < members && members - result.disks.len() < spec.data.len() {
+        let mut earlier = spec.clone();
+        earlier.data.truncate(spec.data.len() - (members - result.disks.len()));
+        return Ok(earlier);
+    }
+    answered_spec(spec, pinned, result)
 }
 
 /// The array one slot's disk replaced by another produces, validated as a
@@ -4343,6 +4613,55 @@ fn member_count(spec: &ElasticCreateSpec) -> usize {
     spec.data.len() + usize::from(spec.cache.is_some()) + spec.parity.len()
 }
 
+/// The job error of an add that stopped part-way, worded by the screen.
+const ADD_STOPPED: &str = "refusal:elastic_add_stopped";
+/// ...and of an undo that stopped after its first effect.
+const UNDO_STOPPED: &str = "refusal:elastic_undo_stopped";
+
+/// What one add's answer came to.
+#[derive(Debug)]
+enum AddVerdict {
+    /// The add succeeded: the helper's array is the one with the disk.
+    Joined(ElasticResult),
+    /// The helper REFUSED before it changed anything (I5): the answer is the
+    /// journal exactly as it was, and the job closes `failed` with the
+    /// refusal's code, pinning nothing. `None` for an answer that counted the
+    /// array without the disk and named no code (an older helper's).
+    Refused(Option<tentanas_helper::elastic::ElasticRefusal>),
+    /// The add ran and stopped part-way: the disk is the helper's pending
+    /// add, the operation stays needs_attention and pins it, and the resume
+    /// (or, before the disk joined the share, the undo) is the way on.
+    Stopped(ElasticResult),
+}
+
+/// Reads one add's answer. WHICH array the answer describes decides which
+/// spec validates it: a refusal answers with the array as it was — without
+/// the disk, or with the disk when it is some OTHER add's resume that was
+/// refused — and a run that got through answers with the disk. Holding a
+/// refusal to `spec_after` replaced its own sentence with "Niepełny zestaw
+/// obserwacji dysków", which told the admin the helper was inconsistent
+/// instead of telling them why it said no.
+fn add_disk_verdict(
+    spec_before: &ElasticCreateSpec,
+    spec_after: &ElasticCreateSpec,
+    result: ElasticResult,
+) -> Result<AddVerdict> {
+    let grown = result.disks.len() == member_count(spec_after);
+    if grown {
+        validate_observation(spec_after, &result)?;
+    } else {
+        validate_observation(spec_before, &result)?;
+    }
+    if result.refused.is_some() || !grown {
+        return Ok(AddVerdict::Refused(result.refused));
+    }
+    if result.stage == ElasticStage::Ready && result.pending_add.is_none() {
+        validate_result(spec_after, &result)?;
+        return Ok(AddVerdict::Joined(result));
+    }
+    Ok(AddVerdict::Stopped(result))
+}
+
 async fn execute_add_disk_job(
     h: &jobs::JobHandle,
     spec_before: &ElasticCreateSpec,
@@ -4352,35 +4671,44 @@ async fn execute_add_disk_job(
     run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>,
 ) -> Result<()> {
     let key = format!("elastic:{}:add-disk", spec_after.array_id);
-    let result = async {
+    let verdict = async {
         let out = run.await?;
         ensure!(out.success(), "Helper Elastic zwrócił błąd {}", out.code);
         ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
         let result: ElasticResult = serde_json::from_str(&out.stdout)?;
-        // WHICH array the answer describes decides which spec validates it.
-        // An add that was refused before it reached the journal answers with
-        // the array it started from; one that got through answers with N+1
-        // disks. Holding a refusal to `spec_after` replaced its own sentence
-        // with "Niepełny zestaw obserwacji dysków", which told the admin the
-        // helper was inconsistent instead of telling them why it said no.
-        if result.disks.len() == member_count(spec_after) {
-            validate_result(spec_after, &result)?;
-        } else {
-            validate_observation(spec_before, &result)?;
-        }
-        Ok::<_, anyhow::Error>(result)
+        add_disk_verdict(spec_before, spec_after, result)
     }
     .await;
-    let outcome = match result {
-        // A refusal, or an add that stopped part-way: the helper says what
-        // happened and the member row is NOT written. The helper records the
-        // slot in its own journal before it formats anything, so repeating the
-        // operation is what finishes it — and repeating it is what writes the
-        // row.
-        Ok(result) if result.stage != ElasticStage::Ready => Err(anyhow!(result
-            .detail
-            .unwrap_or_else(|| "Dodanie dysku wymaga interwencji; rezerwacje zachowane".into()))),
-        Ok(result) => {
+    let outcome = match verdict {
+        // K3: A REFUSAL IS NOT A FAULT. The row closes `failed`, which pins
+        // nothing (`db::unfinished_elastic_add_disk` reads only a stopped
+        // add), the array keeps its state, and no add alert is raised: the
+        // job's own error is the refusal, worded by the screen.
+        Ok(AddVerdict::Refused(refusal)) => {
+            let error = refusal
+                .and_then(|refusal| refusal_error(refusal.as_str()))
+                .unwrap_or_else(|| "refusal:elastic_precondition_failed".to_string());
+            store::refuse_elastic_operation(h.db(), &spec_after.owner, operation_id, &error)?;
+            return Err(anyhow!(error));
+        }
+        // A stopped add: the helper says where, and the member row is NOT
+        // written. The helper recorded the slot and the add's cause, so the
+        // resume of this very disk is what finishes it.
+        // The job's error is a code the screen words; the helper's own text
+        // stays with the operation row and the alert (node text).
+        Ok(AddVerdict::Stopped(result)) => {
+            let detail = result
+                .detail
+                .unwrap_or_else(|| "Dodanie dysku wymaga interwencji; rezerwacje zachowane".into());
+            let detail = format!("{detail}; dysk nie został dopisany do macierzy");
+            store::finish_elastic_operation(h.db(), &spec_after.owner, operation_id, Err(&detail))?;
+            let text = store::AlertText::new("elastic_add_disk_unconfirmed", "Niepotwierdzone dodanie dysku", &detail)
+                .param("array", &spec_after.name)
+                .param("error", &detail);
+            store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name, &text)?;
+            return Err(anyhow!(ADD_STOPPED));
+        }
+        Ok(AddVerdict::Joined(result)) => {
             // ONE transaction writes the member row and closes the operation,
             // so the instance database never holds an array whose spec and
             // whose finished operation disagree about how many disks it has.
@@ -4440,6 +4768,93 @@ pub fn spawn_add_disk(
                 Duration::from_secs(24 * 60 * 60),
             );
             execute_add_disk_job(&h, &spec_before, &spec_after, &operation_id, &disk, run).await
+        },
+    )
+}
+
+/// The undo of an unfinished add. `spec` is the array WITHOUT the disk (the
+/// core never wrote its member row), `disk` the pinned add's identity.
+async fn execute_add_disk_abort_job(
+    h: &jobs::JobHandle,
+    spec: &ElasticCreateSpec,
+    operation_id: &str,
+    disk: &ElasticDiskSpec,
+    run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>,
+) -> Result<()> {
+    let key = format!("elastic:{}:add-disk", spec.array_id);
+    let answer = async {
+        let out = run.await?;
+        ensure!(out.success(), "Helper Elastic zwrócił błąd {}", out.code);
+        ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
+        let result: ElasticResult = serde_json::from_str(&out.stdout)?;
+        validate_observation(&answered_spec(spec, Some(disk), &result)?, &result)?;
+        Ok::<_, anyhow::Error>(result)
+    }
+    .await;
+    let error = match answer {
+        // Refused before its first effect: the add stays exactly as it was,
+        // and pinned; this row closes `failed` and changes nothing else.
+        Ok(result) if result.refused.is_some() => {
+            let error = result
+                .refused
+                .and_then(|refusal| refusal_error(refusal.as_str()))
+                .unwrap_or_else(|| "refusal:elastic_precondition_failed".to_string());
+            store::refuse_elastic_operation(h.db(), &spec.owner, operation_id, &error)?;
+            return Err(anyhow!(error));
+        }
+        // The slot is gone: the helper's array is the core's again.
+        Ok(result) if result.disks.len() == member_count(spec) && result.pending_add.is_none() => {
+            store::finish_elastic_add_disk_abort(h.db(), &spec.owner, operation_id, &result)?;
+            store::resolve_alert(h.db(), &key)?;
+            h.progress(100);
+            return Ok(());
+        }
+        // Stopped after its first effect: the add is still recorded, so it
+        // stays pinned and may be undone again or resumed.
+        Ok(result) => anyhow!(result
+            .detail
+            .unwrap_or_else(|| "Wycofanie dodawania dysku wymaga interwencji".into())),
+        Err(error) => error,
+    };
+    let detail = format!("{error}; dodawanie dysku pozostaje niedokończone");
+    store::finish_elastic_operation(h.db(), &spec.owner, operation_id, Err(&detail))?;
+    let text = store::AlertText::new(
+        "elastic_add_disk_abort_unconfirmed",
+        "Niepotwierdzone wycofanie dodawania dysku",
+        &detail,
+    )
+    .param("array", &spec.name)
+    .param("error", &error);
+    store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec.name, &text)?;
+    Err(anyhow!(UNDO_STOPPED))
+}
+
+pub fn spawn_add_disk_abort(
+    db: &DbPool,
+    array: &ElasticArrayRow,
+    started_by: &str,
+    explicit: Option<Arc<ElevationToken>>,
+    disk: ElasticDiskSpec,
+) -> Result<tentaflow_protocol::tentanas::NasJob> {
+    let spec = array.persisted_spec()?.clone();
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    let intent = jobs::ElasticJobIntent::AddDiskAbort {
+        owner: spec.owner.clone(),
+        array_id: spec.array_id.clone(),
+        operation_id: operation_id.clone(),
+        disk: disk.clone(),
+    };
+    jobs::spawn(
+        db,
+        "elastic_add_disk_abort",
+        &array.name,
+        started_by,
+        Some(intent),
+        None,
+        move |h| async move {
+            let command = add_disk_abort_command(&spec.owner, &spec.array_id, &operation_id, &disk);
+            let run = jobs::run_step(&h, &command, explicit.as_deref(), Duration::from_secs(60 * 60));
+            execute_add_disk_abort_job(&h, &spec, &operation_id, &disk, run).await
         },
     )
 }
@@ -4578,8 +4993,51 @@ async fn observe_array(db: &DbPool, array: &ElasticArrayRow) -> Result<ElasticRe
         array_id: spec.array_id.clone(),owner:spec.owner.clone() }, None,Duration::from_secs(30)).await?;
     ensure!(out.success() && out.stdout.len() < 64 * 1024, "Nie można odczytać macierzy");
     let result: ElasticResult = serde_json::from_str(&out.stdout)?;
-    validate_observation(spec,&result)?;
+    validate_observation(&answered_spec(spec, array.pending_add.as_ref(), &result)?, &result)?;
     Ok(result)
+}
+
+/// Whether the helper answers about an array whose pinned add it no longer
+/// holds: the array counted without the disk, no add recorded as the cause,
+/// none reported unfinished. That is an undo (or a 0.13.0 refusal) whose end
+/// the core did not get to record — a core restart during the undo job
+/// (`fail_orphaned_jobs`) leaves exactly this (M4 of the release review).
+pub fn add_undone_by_helper(array: &ElasticArrayRow, result: &ElasticResult) -> bool {
+    let Ok(spec) = array.persisted_spec() else { return false };
+    array.pending_add.is_some()
+        && result.disks.len() == member_count(spec)
+        && result.pending_add.is_none()
+        && !matches!(result.attention, Some(tentanas_helper::elastic::ElasticAttention::AddDisk { .. }))
+}
+
+/// Settles such an add from the helper's own answer, and re-reads the row so
+/// the wire says what the array now is. A failure changes nothing: the next
+/// read tries again.
+fn reconcile_undone_add(db: &DbPool, array: &mut ElasticArrayRow, result: &ElasticResult) {
+    if !add_undone_by_helper(array, result) {
+        return;
+    }
+    let Ok(spec) = array.persisted_spec().cloned() else { return };
+    match store::settle_undone_add(db, &spec.owner, &spec.array_id, result) {
+        Ok(()) => {
+            if let Ok(Some(fresh)) = store::elastic_array(db, &spec.owner, &array.name) {
+                *array = fresh;
+            }
+        }
+        Err(error) => tracing::warn!("elastic {}: an undone add not settled: {error}", array.name),
+    }
+}
+
+/// A recorded answer that counted one data disk more than its spec, from an
+/// add no longer pinned (finished and undone since): its extra slot is
+/// dropped before the record is judged, so one old row cannot make the whole
+/// array unreadable (minor 6 of the release review).
+pub fn strip_unpinned_slot(spec: &ElasticCreateSpec, pinned: Option<&ElasticDiskSpec>, result: &mut ElasticResult) {
+    if pinned.is_none() && result.disks.len() == member_count(spec) + 1 {
+        let extra = u16::try_from(spec.data.len() + 1).ok().map(ElasticRole::Data);
+        result.disks.retain(|disk| Some(disk.role) != extra);
+        result.pending_add = None;
+    }
 }
 
 /// What a mover run would find on this array's cache right now, measured by the
@@ -4631,6 +5089,7 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
     let mut observed = ArrayObservation::default();
     let mut failure;
     let mut root_stage = None;
+    let helper = result.as_ref().ok().cloned();
     match result {
         Ok(result) => {
             observed.mount_table_known = result.union_mounted.is_some()
@@ -4698,8 +5157,12 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
         state = "unknown";
         detail = failure.unwrap_or_default();
     }
-    to_protocol(array,disks,&observed,installed(SNAPRAID_FEATURE_ID),
-        snapraid.and_then(|f| f.version.as_deref()).unwrap_or(""),(state,&detail))
+    let mut wire = to_protocol(array,disks,&observed,installed(SNAPRAID_FEATURE_ID),
+        snapraid.and_then(|f| f.version.as_deref()).unwrap_or(""),(state,&detail));
+    if let Some(result) = &helper {
+        apply_helper_gates(&mut wire, result);
+    }
+    wire
 }
 
 pub async fn list(db: &DbPool, owner: &ElasticOwner) -> Result<Vec<NasElasticArray>> {
@@ -4708,11 +5171,14 @@ pub async fn list(db: &DbPool, owner: &ElasticOwner) -> Result<Vec<NasElasticArr
     let features = environment.as_ref().map(|e| e.features.as_slice()).unwrap_or(&[]);
     let disks = super::disks::snapshot().0.into_iter().map(|d| (d.disk_id.clone(),d)).collect();
     let mut arrays = Vec::with_capacity(rows.len());
-    for array in rows {
+    for mut array in rows {
         let observed = match &environment {
             Ok(_) => observe_array(db,&array).await,
             Err(error) => Err(anyhow!("Brak pomiaru środowiska: {error}")),
         };
+        if let Ok(result) = &observed {
+            reconcile_undone_add(db, &mut array, result);
+        }
         let mut wire = observed_protocol(&array,&disks,observed,features);
         fill_last_known_names(&mut wire, |id| store::disk_last_name(db, id).ok().flatten());
         arrays.push(wire);
@@ -5091,6 +5557,7 @@ pub(crate) mod tests {
                 array_id: spec.array_id.clone(),
                 operation_id: scrub_id.clone(),
                 kind: ElasticSnapraidKind::Scrub,
+                acknowledge_parity_fault: None,
             }),
         )
         .unwrap();
@@ -5125,6 +5592,7 @@ pub(crate) mod tests {
                 array_id: spec.array_id.clone(),
                 operation_id: repair_id.clone(),
                 kind: kind.clone(),
+                acknowledge_parity_fault: None,
             }),
         )
         .unwrap();
@@ -5384,6 +5852,7 @@ pub(crate) mod tests {
     pub(crate) fn ready_result(spec: &ElasticCreateSpec) -> ElasticResult {
         ElasticResult { array_id:spec.array_id.clone(),operation_id:spec.operation_id.clone(),owner:spec.owner.clone(),
             stage:ElasticStage::Ready,union_mounted:Some(true),service:None,union_readonly:None,sync_completed_at:Some(store::now()),detail:None,last_run:None,last_mover:None,stale_parity_bytes:None,parity_stale:false,stuck_records:Vec::new(),stuck_hidden:0,stuck_evicted:0,restart_required:false,conflicts:Vec::new(),
+            attention:None,operation_pending:false,transfer_open:false,pending_add:None,refused:None,
             disks:spec.data.iter().enumerate().map(|(i,d)| (ElasticRole::Data((i+1) as u16),d))
                 .chain(spec.cache.iter().map(|d| (ElasticRole::Cache,d)))
                 .chain(spec.parity.iter().enumerate().map(|(i,d)| (ElasticRole::Parity((i+1) as u8),d)))
@@ -6690,6 +7159,7 @@ pub(crate) mod tests {
                     array_id: spec.array_id.clone(),
                     operation_id: operation_id.clone(),
                     kind: ElasticSnapraidKind::Sync,
+                    acknowledge_parity_fault: None,
                 },
                 _ => jobs::ElasticJobIntent::Restore {
                     owner: spec.owner.clone(),
@@ -6817,6 +7287,7 @@ pub(crate) mod tests {
                 array_id: spec.array_id.clone(),
                 operation_id: operation_id.clone(),
                 kind: ElasticSnapraidKind::Sync,
+                acknowledge_parity_fault: None,
             }),
             Some(completion),
             move |h| async move {
@@ -7768,6 +8239,7 @@ pub(crate) mod tests {
                     array_id: spec.array_id.clone(),
                     operation_id: operation_id.clone(),
                     kind: ElasticSnapraidKind::Sync,
+                    acknowledge_parity_fault: None,
                 }),
                 Some(completion),
                 move |h| async move {
@@ -10215,5 +10687,641 @@ pub(crate) mod tests {
         let candidates = import_candidates(&[entry.clone()], &[], &member_disks(&entry), &[], &this_addon(), &no_orgs());
         assert!(!candidates[0].union_mounted, "unknown is rendered as 'not claimed to be mounted'");
         assert_eq!(candidates[0].status, "importable", "and it does not block the adoption");
+    }
+
+    // ----- recovery out of needs_attention (helper 0.14.0) --------------------
+
+    /// Runs one job body to its end under the real `jobs::spawn` wrapper —
+    /// the one that closes the job row with `finish_job` — and returns the
+    /// body's outcome.
+    async fn run_job<F, Fut>(
+        db: &DbPool,
+        kind: &str,
+        subject: &str,
+        intent: jobs::ElasticJobIntent,
+        body: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(jobs::JobHandle) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let (completion, finished) = tokio::sync::oneshot::channel();
+        jobs::spawn(db, kind, subject, "test", Some(intent), Some(completion), body).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), finished).await.unwrap().unwrap()
+    }
+
+    /// A manual Sync, Scrub or Fix that FAILED, as helper 0.14.0 answers it
+    /// (`perform_maintenance`, Err arm): no intent left pending, the verdict
+    /// recorded as the array's cause, and for a Sync parity marked stale.
+    /// `counted` is a log that counted errors (a scrub that found damage);
+    /// without it the log broke its contract and counted nothing.
+    fn helper_failed_run(
+        spec: &ElasticCreateSpec,
+        operation_id: &str,
+        kind: ElasticSnapraidKind,
+        counted: bool,
+    ) -> ElasticSnapraidResult {
+        let mut answer = snapraid_result(spec, operation_id, kind.clone(), ElasticSnapraidOutcome::Failed);
+        if !counted {
+            answer.run.outcome = ElasticSnapraidOutcome::NeedsAttention;
+            answer.run.exit_code = Some(0);
+            answer.run.errors_file = None;
+            answer.run.errors_io = None;
+            answer.run.errors_data = None;
+        }
+        answer.state.last_run = Some(answer.run.clone());
+        answer.state.attention = Some(tentanas_helper::elastic::ElasticAttention::ParityRun {
+            operation_id: operation_id.into(),
+            kind: kind.clone(),
+        });
+        if kind == ElasticSnapraidKind::Sync {
+            answer.state.stale_parity_bytes = Some(0);
+            answer.state.parity_stale = true;
+        }
+        answer
+    }
+
+    /// A run the helper's admission gate refused: nothing written, the
+    /// journal's facts as they were, the closed code as the run's detail.
+    fn helper_refused_run(
+        spec: &ElasticCreateSpec,
+        operation_id: &str,
+        kind: ElasticSnapraidKind,
+        refusal: tentanas_helper::elastic::ElasticRefusal,
+        facts: impl FnOnce(&mut ElasticResult),
+    ) -> ElasticSnapraidResult {
+        let mut answer = snapraid_result(spec, operation_id, kind, ElasticSnapraidOutcome::Refused);
+        answer.run.detail = Some(refusal.as_str().into());
+        facts(&mut answer.state);
+        answer
+    }
+
+    /// Feeds one helper answer to a SnapRAID job on `db`, through the job
+    /// body and `finish_job`, and returns the job's outcome.
+    async fn run_snapraid_answer(
+        db: &DbPool,
+        spec: &ElasticCreateSpec,
+        operation_id: &str,
+        kind: &ElasticSnapraidKind,
+        answer: &ElasticSnapraidResult,
+    ) -> Result<()> {
+        let intent = jobs::ElasticJobIntent::Snapraid {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: operation_id.into(),
+            kind: kind.clone(),
+            acknowledge_parity_fault: None,
+        };
+        let (work_spec, work_id, work_kind, work_answer) =
+            (spec.clone(), operation_id.to_string(), kind.clone(), answer.clone());
+        run_job(db, &format!("elastic_{}", snapraid_kind(kind)), &spec.name, intent, move |h| async move {
+            execute_snapraid_job(&h, &work_spec, &work_id, &work_kind, async move { reply(&work_answer) }).await
+        })
+        .await
+    }
+
+    /// THE CROSS-LAYER RULE (design §5, test 15): what the core offers on the
+    /// wire for every kind of parity run is what the helper's own gate
+    /// (`maintenance_admission`) admits over the very same answer.
+    fn assert_core_offers_what_the_helper_admits(
+        label: &str,
+        row: &ElasticArrayRow,
+        wire: &NasElasticArray,
+        helper: &ElasticResult,
+    ) {
+        use tentanas_helper::elastic::maintenance_admission;
+        let facts = helper.admission();
+        let admits = |kind: &ElasticSnapraidKind, acknowledged: Option<&str>| {
+            maintenance_admission(&facts, kind, acknowledged).is_ok()
+        };
+        // The acknowledgement the screen's confirm would send is the fault id
+        // the core puts on the wire — and THAT is what the helper checks.
+        let confirmed = Some(wire.sync_fault_id.as_str());
+        // A Scrub, and a Sync with the confirm: offered exactly when admitted.
+        assert_eq!(wire.parity_run_available, admits(&ElasticSnapraidKind::Scrub, None), "{label}: scrub");
+        assert_eq!(wire.parity_run_available, admits(&ElasticSnapraidKind::Sync, confirmed), "{label}: confirmed sync");
+        // A Sync offered without the confirm is one the helper admits without it,
+        if wire.parity_run_available && !wire.sync_needs_acknowledgement {
+            assert!(admits(&ElasticSnapraidKind::Sync, None), "{label}: plain sync offered but refused");
+        }
+        // and whenever the helper would refuse the plain Sync, the core asks.
+        if !admits(&ElasticSnapraidKind::Sync, None) && facts.attention.is_some_and(|cause| {
+            matches!(cause, tentanas_helper::elastic::ElasticAttention::ParityRun { .. })
+        }) {
+            assert!(wire.sync_needs_acknowledgement, "{label}: the confirm is not asked for");
+        }
+        // A repair the dispatch would start is one the helper admits.
+        let fix = ElasticSnapraidKind::Fix { disk: "d1".into() };
+        if matches!(row.state.as_str(), "active" | "needs_attention")
+            && repair_blocker(wire).is_none()
+            && repair_evidence(wire).is_some()
+        {
+            assert!(admits(&fix, None), "{label}: repair offered but refused");
+        }
+    }
+
+    /// C1, the wedge that started this: a manual run that FAILED used to pin
+    /// the array for good. Every failure the helper records is fed through
+    /// the real job and `finish_job`, and the screen's offer is held to the
+    /// helper's gate over the same answer. The Sync over a Scrub or Repair
+    /// fault is offered, and only with the confirm.
+    #[tokio::test]
+    async fn after_every_failed_parity_run_the_core_offers_exactly_what_the_helper_admits() {
+        let fix = ElasticSnapraidKind::Fix { disk: "d1".into() };
+        for (label, kind, counted, attention, needs_confirm) in [
+            ("sync failed", ElasticSnapraidKind::Sync, true, "sync_failed", false),
+            ("scrub counted errors", ElasticSnapraidKind::Scrub, true, "scrub_failed", true),
+            // The log broke its contract and counted nothing: no repair
+            // evidence in the history, and still the helper's recorded cause
+            // asks for the confirm.
+            ("scrub broke its log", ElasticSnapraidKind::Scrub, false, "scrub_failed", true),
+            ("repair failed", fix.clone(), true, "fix_failed", true),
+        ] {
+            let spec = create_spec("recover");
+            let db = settled_database(&spec);
+            let operation_id = uuid::Uuid::now_v7().to_string();
+            let answer = helper_failed_run(&spec, &operation_id, kind.clone(), counted);
+            let outcome = run_snapraid_answer(&db, &spec, &operation_id, &kind, &answer).await;
+            assert!(outcome.is_err(), "{label}");
+            let row = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+            assert_eq!(row.state, "needs_attention", "{label}");
+            let wire = observed_protocol(&row, &BTreeMap::new(), Ok(answer.state.clone()), &[]);
+            assert_eq!(wire.attention, attention, "{label}");
+            assert!(wire.parity_run_available, "{label}: the array has a way out");
+            assert_eq!(wire.sync_needs_acknowledgement, needs_confirm, "{label}");
+            if needs_confirm {
+                // The id the confirm will name is the run that recorded the
+                // fault — the helper's own cause.
+                assert_eq!(wire.sync_fault_id, operation_id, "{label}");
+            }
+            assert_core_offers_what_the_helper_admits(label, &row, &wire, &answer.state);
+        }
+    }
+
+    /// I5 for a parity run: a run the helper's gate REFUSED closes `failed`
+    /// with its code as the job's error, the array keeps its state, and no
+    /// unresolved row is left — a refused repair used to add one each time.
+    #[tokio::test]
+    async fn a_gate_refusal_closes_failed_and_leaves_nothing_unresolved() {
+        use tentanas_helper::elastic::{ElasticAttention, ElasticRefusal};
+        let fix = ElasticSnapraidKind::Fix { disk: "d1".into() };
+        let cases: Vec<(&str, ElasticSnapraidKind, ElasticRefusal, Box<dyn FnOnce(&mut ElasticResult)>)> = vec![
+            ("repair over a pending intent", fix.clone(), ElasticRefusal::OperationPending, Box::new(|state| {
+                state.stage = ElasticStage::NeedsAttention;
+                state.operation_pending = true;
+            })),
+            ("sync over a scrub fault", ElasticSnapraidKind::Sync, ElasticRefusal::FaultUnacknowledged, Box::new(|state| {
+                state.stage = ElasticStage::NeedsAttention;
+                state.attention = Some(ElasticAttention::ParityRun {
+                    operation_id: uuid::Uuid::now_v7().to_string(),
+                    kind: ElasticSnapraidKind::Scrub,
+                });
+            })),
+            ("scrub over a failed restore", ElasticSnapraidKind::Scrub, ElasticRefusal::AttentionOther, Box::new(|state| {
+                state.stage = ElasticStage::NeedsAttention;
+                state.attention = Some(ElasticAttention::Other);
+            })),
+        ];
+        for (label, kind, refusal, facts) in cases {
+            let spec = create_spec("refused");
+            let db = settled_database(&spec);
+            let operation_id = uuid::Uuid::now_v7().to_string();
+            let answer = helper_refused_run(&spec, &operation_id, kind.clone(), refusal, facts);
+            let error = run_snapraid_answer(&db, &spec, &operation_id, &kind, &answer).await.unwrap_err();
+            let code = format!("refusal:elastic_{}", refusal.as_str());
+            assert_eq!(error.to_string(), code, "{label}: the job's error is the code the screen words");
+            let (state, stored): (String, String) = db
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT state,error FROM nas_elastic_operations WHERE operation_id=?1",
+                    [&operation_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((state.as_str(), stored.as_str()), ("failed", code.as_str()), "{label}");
+            let row = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+            assert_eq!(row.state, "active", "{label}: the array is untouched");
+            assert!(!row.unresolved_operation, "{label}: nothing is left unresolved");
+            let refused = row.snapraid_history.first().expect("the refused run is listed");
+            assert_eq!((refused.outcome.as_str(), refused.detail.as_str()), ("refused", refusal.as_str()), "{label}");
+            let wire = observed_protocol(&row, &BTreeMap::new(), Ok(answer.state.clone()), &[]);
+            assert_core_offers_what_the_helper_admits(label, &row, &wire, &answer.state);
+        }
+    }
+
+    /// The array a stopped add leaves in the helper: the spec grown by the
+    /// disk, the add recorded as the cause, and where it stopped.
+    fn helper_stopped_add(
+        spec_after: &ElasticCreateSpec,
+        step: tentanas_helper::elastic::ElasticAddStep,
+        formatted: bool,
+        joined: bool,
+        in_union: Option<bool>,
+    ) -> ElasticResult {
+        use tentanas_helper::elastic::{add_undo_admission, ElasticAttention, ElasticPendingAdd};
+        let disk = spec_after.data.last().unwrap().clone();
+        let mut state = ready_result(spec_after);
+        state.stage = ElasticStage::NeedsAttention;
+        state.detail = Some("krok dodawania dysku nie powiódł się".into());
+        state.attention = Some(ElasticAttention::AddDisk { disk_id: disk.disk_id.clone(), joined });
+        let slot = ElasticRole::Data(spec_after.data.len() as u16);
+        let mounted = in_union == Some(true) || step == tentanas_helper::elastic::ElasticAddStep::Join;
+        for observation in state.disks.iter_mut().filter(|d| d.role == slot) {
+            observation.mounted = Some(mounted);
+            if !formatted {
+                // A blank disk, or the start of an mkfs that never finished:
+                // nothing on it is the array's yet.
+                observation.observed_uuid = None;
+                observation.filesystem = None;
+                observation.size_bytes = None;
+                observation.used_bytes = None;
+                observation.free_bytes = None;
+            }
+        }
+        state.pending_add = Some(ElasticPendingAdd {
+            disk_id: disk.disk_id.clone(),
+            branch: tentanas_helper::elastic::data_branch_name(spec_after.data.len()),
+            formatted,
+            mounted: Some(mounted),
+            in_union,
+            joined,
+            step,
+            undo_possible: add_undo_admission(joined, in_union).is_ok(),
+        });
+        state
+    }
+
+    async fn run_add_answer(
+        db: &DbPool,
+        spec: &ElasticCreateSpec,
+        disk: &ElasticDiskSpec,
+        answer: &ElasticResult,
+    ) -> (String, Result<()>) {
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        let intent = jobs::ElasticJobIntent::AddDisk {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: operation_id.clone(),
+            disk: disk.clone(),
+        };
+        let spec_after = spec_with_added_disk(spec, disk).unwrap();
+        let (before, id, work_disk, work_answer) = (spec.clone(), operation_id.clone(), disk.clone(), answer.clone());
+        let outcome = run_job(db, "elastic_add_disk", &spec.name, intent, move |h| async move {
+            execute_add_disk_job(&h, &before, &spec_after, &id, &work_disk, async move { reply(&work_answer) }).await
+        })
+        .await;
+        (operation_id, outcome)
+    }
+
+    async fn run_abort_answer(
+        db: &DbPool,
+        spec: &ElasticCreateSpec,
+        disk: &ElasticDiskSpec,
+        answer: &ElasticResult,
+    ) -> (String, Result<()>) {
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        let intent = jobs::ElasticJobIntent::AddDiskAbort {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: operation_id.clone(),
+            disk: disk.clone(),
+        };
+        let (work_spec, id, work_disk, work_answer) = (spec.clone(), operation_id.clone(), disk.clone(), answer.clone());
+        let outcome = run_job(db, "elastic_add_disk_abort", &spec.name, intent, move |h| async move {
+            execute_add_disk_abort_job(&h, &work_spec, &id, &work_disk, async move { reply(&work_answer) }).await
+        })
+        .await;
+        (operation_id, outcome)
+    }
+
+    fn operation_state(db: &DbPool, operation_id: &str) -> String {
+        db.read()
+            .unwrap()
+            .query_row("SELECT state FROM nas_elastic_operations WHERE operation_id=?1", [operation_id], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// C2's first wedge (K3/K4, I5): an add the helper REFUSED before its
+    /// journal grew closes `failed`, keeps the array's state, raises no add
+    /// alert and pins nothing — so a different disk is admitted at once, by
+    /// the core and by the helper alike.
+    #[tokio::test]
+    async fn a_refused_add_closes_failed_and_pins_nothing() {
+        use tentanas_helper::elastic::{add_disk_admission, ElasticAddAdmission, ElasticRefusal};
+        let spec = create_spec("refused-add");
+        let db = settled_database(&spec);
+        let disk = fresh_disk("refused-add", 16 * 1024 * 1024 * 1024);
+        let mut answer = ready_result(&spec);
+        answer.refused = Some(ElasticRefusal::DiskClaimed);
+        answer.detail = Some("dysk pełni w tej macierzy inną rolę".into());
+        let (operation_id, outcome) = run_add_answer(&db, &spec, &disk, &answer).await;
+        assert_eq!(outcome.unwrap_err().to_string(), "refusal:elastic_disk_claimed");
+        assert_eq!(operation_state(&db, &operation_id), "failed");
+        let row = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(row.state, "active", "a refusal is not a fault");
+        assert!(!row.unresolved_operation);
+        assert!(row.pending_add.is_none());
+        assert!(store::unfinished_elastic_add_disk(&db, &spec.owner, &spec.array_id).unwrap().is_none());
+        assert!(
+            store::list_alerts(&db, true).unwrap().iter().all(|alert| alert.code != "elastic_add_disk_unconfirmed"),
+            "no add alert for a refusal"
+        );
+        // The helper admits another disk as a FRESH add over the same facts,
+        // and so does the core.
+        let mut other = fresh_disk("refused-add-other", 16 * 1024 * 1024 * 1024);
+        other.disk_id = "refused-add-other".into();
+        assert_eq!(add_disk_admission(&answer.admission(), spec.data.last(), &other), Ok(ElasticAddAdmission::Fresh));
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(answer.clone()), &[]);
+        assert!(wire.pending_add_disk.is_none() && wire.attention.is_empty());
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_add_disk".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &db,
+            &job,
+            Some(&jobs::ElasticJobIntent::AddDisk {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: uuid::Uuid::now_v7().to_string(),
+                disk: other,
+            }),
+        )
+        .expect("a different disk is admitted after a refusal");
+    }
+
+    /// K5: the ONE rule for a helper answer's member count. The spec, or the
+    /// spec with the PINNED add's disk — never an extra disk nothing pinned,
+    /// never two. An add that stopped before its filesystem was confirmed is
+    /// observable although its disk carries nothing of the array yet.
+    #[test]
+    fn a_half_done_add_is_observable_only_while_it_is_pinned() {
+        use tentanas_helper::elastic::ElasticAddStep;
+        let spec = create_spec("half");
+        let disk = fresh_disk("half", 16 * 1024 * 1024 * 1024);
+        let after = spec_with_added_disk(&spec, &disk).unwrap();
+        let grown = helper_stopped_add(&after, ElasticAddStep::Format, false, false, Some(false));
+        assert_eq!(answered_spec(&spec, Some(&disk), &grown).unwrap(), after);
+        validate_observation(&answered_spec(&spec, Some(&disk), &grown).unwrap(), &grown)
+            .expect("an unformatted pending slot is not an identity mismatch");
+        assert!(answered_spec(&spec, None, &grown).is_err(), "N+1 without a pinned add");
+        let mut other = disk.clone();
+        other.expected_uuid = uuid::Uuid::new_v4().to_string();
+        assert!(
+            validate_observation(&answered_spec(&spec, Some(&other), &grown).unwrap(), &grown).is_ok(),
+            "an unconfirmed slot carries no identity to compare"
+        );
+        let mut twice = grown.clone();
+        let mut extra = twice.disks.last().unwrap().clone();
+        extra.role = ElasticRole::Data(3);
+        twice.disks.push(extra);
+        assert!(answered_spec(&spec, Some(&disk), &twice).is_err(), "N+2 is another array");
+        assert_eq!(answered_spec(&spec, Some(&disk), &ready_result(&spec)).unwrap(), spec);
+        // A MOUNTED slot is a confirmed one: an unconfirmed slot may not claim it.
+        let mut mounted = grown.clone();
+        for observation in mounted.disks.iter_mut().filter(|d| d.role == ElasticRole::Data(2)) {
+            observation.mounted = Some(true);
+        }
+        assert!(validate_observation(&after, &mounted).is_err());
+        // A pending add must name the last slot.
+        let mut foreign = grown.clone();
+        foreign.pending_add.as_mut().unwrap().disk_id = "someone-else".into();
+        assert!(validate_observation(&after, &foreign).is_err());
+        // An older record, from before the add succeeded, is judged against
+        // the array it described.
+        assert_eq!(recorded_spec(&after, None, &ready_result(&spec)).unwrap(), spec);
+    }
+
+    /// C2's second wedge (K4-K7, I4, I6): an add that stopped part-way, at
+    /// every step, is pinned; the core offers its resume exactly when the
+    /// helper admits one, offers its undo exactly when the helper would take
+    /// it, offers no parity run over it, and a resume the helper refuses
+    /// leaves it pinned. Before the disk joined the share the undo removes
+    /// the slot and the array is active again; after, it is refused.
+    #[tokio::test]
+    async fn an_unfinished_add_is_pinned_and_resumed_or_undone_as_the_helper_admits() {
+        use tentanas_helper::elastic::{
+            add_disk_admission, add_undo_admission, maintenance_admission, ElasticAddAdmission, ElasticAddStep,
+            ElasticRefusal,
+        };
+        for (label, step, formatted, joined, in_union) in [
+            ("mkfs stopped", ElasticAddStep::Format, false, false, Some(false)),
+            ("mount failed", ElasticAddStep::Mount, true, false, Some(false)),
+            ("join failed", ElasticAddStep::Join, true, true, Some(false)),
+            ("final sync failed", ElasticAddStep::Sync, true, true, Some(true)),
+        ] {
+            let spec = create_spec("grow");
+            let db = settled_database(&spec);
+            let disk = fresh_disk("grow", 16 * 1024 * 1024 * 1024);
+            let after = spec_with_added_disk(&spec, &disk).unwrap();
+            let stopped = helper_stopped_add(&after, step, formatted, joined, in_union);
+            let (first, outcome) = run_add_answer(&db, &spec, &disk, &stopped).await;
+            assert!(outcome.is_err(), "{label}");
+            assert_eq!(operation_state(&db, &first), "needs_attention", "{label}");
+            let row = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+            assert_eq!(row.pending_add.as_ref(), Some(&disk), "{label}: the add is pinned");
+            let wire = observed_protocol(&row, &BTreeMap::new(), Ok(stopped.clone()), &[]);
+            let pending = wire.pending_add_disk.clone().expect("the screen sees the unfinished add");
+            assert_eq!(pending.disk_id, disk.disk_id, "{label}");
+            assert_eq!(pending.step, add_step_code(step), "{label}");
+            assert_eq!(wire.attention, "add_disk", "{label}");
+            // The resume offered is the resume the helper admits; any other
+            // disk is refused by both.
+            let facts = stopped.admission();
+            assert_eq!(add_disk_admission(&facts, after.data.last(), &disk), Ok(ElasticAddAdmission::Resume), "{label}");
+            let mut other = fresh_disk("grow-other", 16 * 1024 * 1024 * 1024);
+            other.disk_id = "grow-other".into();
+            assert_eq!(add_disk_admission(&facts, after.data.last(), &other), Err(ElasticRefusal::AttentionAddDisk));
+            let job = |disk: &ElasticDiskSpec| {
+                (
+                    tentaflow_protocol::tentanas::NasJob {
+                        job_id: uuid::Uuid::now_v7().to_string(),
+                        kind: "elastic_add_disk".into(),
+                        subject: spec.name.clone(),
+                        status: "running".into(),
+                        started_at: store::now(),
+                        ..Default::default()
+                    },
+                    jobs::ElasticJobIntent::AddDisk {
+                        owner: spec.owner.clone(),
+                        array_id: spec.array_id.clone(),
+                        operation_id: uuid::Uuid::now_v7().to_string(),
+                        disk: disk.clone(),
+                    },
+                )
+            };
+            let (other_job, other_intent) = job(&other);
+            assert!(store::insert_job(&db, &other_job, Some(&other_intent)).is_err(), "{label}: another disk");
+            // The undo offered is the undo the helper takes.
+            assert_eq!(pending.undo_possible, add_undo_admission(joined, in_union).is_ok(), "{label}");
+            // No parity run over an unfinished add, on either side.
+            assert!(!wire.parity_run_available, "{label}");
+            assert_eq!(
+                maintenance_admission(&facts, &ElasticSnapraidKind::Scrub, None),
+                Err(ElasticRefusal::AttentionAddDisk)
+            );
+            assert_core_offers_what_the_helper_admits(label, &row, &wire, &stopped);
+
+            // A RESUME THE HELPER REFUSES leaves the add pinned (K4).
+            let mut refused = stopped.clone();
+            refused.refused = Some(ElasticRefusal::OperationPending);
+            let (retry, outcome) = run_add_answer(&db, &spec, &disk, &refused).await;
+            assert_eq!(outcome.unwrap_err().to_string(), "refusal:elastic_operation_pending", "{label}");
+            assert_eq!(operation_state(&db, &retry), "failed", "{label}");
+            assert_eq!(operation_state(&db, &first), "needs_attention", "{label}: still pinned");
+            assert_eq!(
+                store::unfinished_elastic_add_disk(&db, &spec.owner, &spec.array_id).unwrap().as_ref(),
+                Some(&disk),
+                "{label}"
+            );
+
+            if pending.undo_possible {
+                // THE UNDO removes the slot: the helper's array is the core's
+                // again, nothing pins it, and the array is active.
+                let (undo, outcome) = run_abort_answer(&db, &spec, &disk, &ready_result(&spec)).await;
+                outcome.expect(label);
+                assert_eq!(operation_state(&db, &undo), "succeeded", "{label}");
+                assert_eq!(operation_state(&db, &first), "failed", "{label}: the add is closed as history");
+                let row = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+                assert!(row.pending_add.is_none(), "{label}");
+                assert_eq!(row.state, "active", "{label}");
+                assert!(!row.unresolved_operation, "{label}");
+                assert_eq!(row.data().count(), 1, "{label}: the member row was never written");
+            } else {
+                // Once the disk may have joined, the helper refuses the undo,
+                // and the add stays pinned for its resume.
+                let mut joined_refusal = stopped.clone();
+                joined_refusal.refused = Some(ElasticRefusal::AddJoined);
+                let (undo, outcome) = run_abort_answer(&db, &spec, &disk, &joined_refusal).await;
+                assert_eq!(outcome.unwrap_err().to_string(), "refusal:elastic_add_joined", "{label}");
+                assert_eq!(operation_state(&db, &undo), "failed", "{label}");
+                assert_eq!(
+                    store::unfinished_elastic_add_disk(&db, &spec.owner, &spec.array_id).unwrap().as_ref(),
+                    Some(&disk),
+                    "{label}"
+                );
+            }
+        }
+    }
+
+    fn history_run(kind: &str, outcome: &str, errors_data: Option<u64>) -> NasSnapraidRun {
+        NasSnapraidRun {
+            operation_id: Some(uuid::Uuid::now_v7().to_string()),
+            kind: kind.into(),
+            outcome: outcome.into(),
+            errors: errors_data.map(|data| data + 2),
+            errors_file: errors_data.map(|_| 2),
+            errors_io: errors_data.map(|_| 0),
+            errors_data,
+            ..Default::default()
+        }
+    }
+
+    /// M2 of the release review: the acknowledgement requirement, the
+    /// repair's evidence and the scheduled Sync's skip end with the CURE — a
+    /// clean full scrub, a successful repair, or for file errors alone the
+    /// Sync that drops them — and not before. A Sync alone does not end data
+    /// errors: their marks stay repairable across it.
+    #[test]
+    fn a_parity_fault_ends_with_its_cure_and_not_before() {
+        let data_fault = history_run("scrub", "failed", Some(3));
+        let file_fault = history_run("scrub", "failed", Some(0));
+        let (sync_ok, scrub_ok, fix_ok) =
+            (history_run("sync", "ok", None), history_run("scrub", "ok", Some(0)), history_run("fix", "ok", None));
+        let fix_failed = history_run("fix", "failed", Some(1));
+        // (newest first, fault still stands)
+        for (label, history, stands) in [
+            ("data errors", vec![data_fault.clone()], true),
+            ("data errors, then an acknowledged Sync", vec![sync_ok.clone(), data_fault.clone()], true),
+            ("data errors, Sync, then a clean scrub", vec![scrub_ok.clone(), sync_ok.clone(), data_fault.clone()], false),
+            ("data errors, then a repair", vec![fix_ok.clone(), data_fault.clone()], false),
+            ("file errors only", vec![file_fault.clone()], true),
+            ("file errors only, then the Sync that drops them", vec![sync_ok.clone(), file_fault.clone()], false),
+            ("a repair failed", vec![fix_failed.clone()], true),
+            ("a repair failed, then a clean scrub", vec![scrub_ok.clone(), fix_failed.clone()], false),
+        ] {
+            assert_eq!(sync_acknowledgement_needed(&history), stands, "{label}");
+            assert_eq!(scheduled_sync_blocker(&history).is_some(), stands && label.contains("errors"), "{label}: cadence");
+        }
+        // The id an acknowledgement names is the fault's own run.
+        assert_eq!(unacknowledged_fault(&[sync_ok, data_fault.clone()]).and_then(|r| r.operation_id.clone()), data_fault.operation_id);
+    }
+
+    /// M4 of the release review: a core restart during an undo that the
+    /// helper completed left the add pinned and the undo row orphaned; the
+    /// only offer was then the resume, which formats and adds the very disk
+    /// the admin took out. The helper's own answer — the array without the
+    /// disk, no add recorded — settles it on the next read.
+    #[tokio::test]
+    async fn an_undo_the_core_lost_is_settled_from_the_helpers_answer() {
+        use tentanas_helper::elastic::ElasticAddStep;
+        let spec = create_spec("lost-undo");
+        let db = settled_database(&spec);
+        let disk = fresh_disk("lost-undo", 16 * 1024 * 1024 * 1024);
+        let after = spec_with_added_disk(&spec, &disk).unwrap();
+        let stopped = helper_stopped_add(&after, ElasticAddStep::Mount, true, false, Some(false));
+        let (first, outcome) = run_add_answer(&db, &spec, &disk, &stopped).await;
+        assert!(outcome.is_err());
+        // The undo starts, and the core loses it: its row is orphaned.
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_add_disk_abort".into(),
+            subject: spec.name.clone(),
+            status: "running".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(
+            &db,
+            &job,
+            Some(&jobs::ElasticJobIntent::AddDiskAbort {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: uuid::Uuid::now_v7().to_string(),
+                disk: disk.clone(),
+            }),
+        )
+        .unwrap();
+        store::fail_orphaned_jobs(&db).unwrap();
+        let mut row = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(row.pending_add.as_ref(), Some(&disk), "still pinned after the restart");
+        // The helper, meanwhile, finished the undo.
+        let undone = ready_result(&spec);
+        assert!(add_undone_by_helper(&row, &undone));
+        // Not while it still holds the add, or counts its disk.
+        assert!(!add_undone_by_helper(&row, &stopped));
+        reconcile_undone_add(&db, &mut row, &undone);
+        assert!(row.pending_add.is_none(), "the add is settled");
+        assert_eq!(row.state, "active");
+        assert!(!row.unresolved_operation);
+        assert_eq!(operation_state(&db, &first), "failed");
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(undone), &[]);
+        assert!(wire.pending_add_disk.is_none(), "no resume is offered for a disk the admin took out");
+    }
+
+    /// Minor 6 of the release review: a run recorded while an add was pinned
+    /// counts the add's disk. Once the add is gone (undone) that record must
+    /// not make the whole array unreadable.
+    #[test]
+    fn a_record_that_counted_an_undone_add_still_reads() {
+        let spec = create_spec("old-record");
+        let disk = fresh_disk("old-record", 16 * 1024 * 1024 * 1024);
+        let after = spec_with_added_disk(&spec, &disk).unwrap();
+        let id = uuid::Uuid::now_v7().to_string();
+        let mut record = snapraid_result(&after, &id, ElasticSnapraidKind::Scrub, ElasticSnapraidOutcome::Refused);
+        record.run.detail = Some("attention_add_disk".into());
+        assert!(validate_snapraid_result(&spec, &id, &ElasticSnapraidKind::Scrub, &record).is_err());
+        strip_unpinned_slot(&spec, None, &mut record.state);
+        validate_snapraid_result(&recorded_spec(&spec, None, &record.state).unwrap(), &id, &ElasticSnapraidKind::Scrub, &record)
+            .expect("the record reads without the slot");
+        // While the add is pinned nothing is stripped.
+        let mut pinned = snapraid_result(&after, &id, ElasticSnapraidKind::Scrub, ElasticSnapraidOutcome::Refused);
+        strip_unpinned_slot(&spec, Some(&disk), &mut pinned.state);
+        assert_eq!(pinned.state.disks.len(), member_count(&after));
     }
 }

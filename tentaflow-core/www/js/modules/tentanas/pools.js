@@ -22,7 +22,7 @@ import '/js/components/tf-menu.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-checkbox.js';
-import { elasticCardSkeletonHtml, paintElasticCard, memberName, elasticMaintenanceBlocker } from '/js/modules/tentanas/elastic-detail.js';
+import { elasticCardSkeletonHtml, paintElasticCard, memberName, elasticMaintenanceBlocker, syncNeedsAcknowledgement, openSyncOverFaultDialog } from '/js/modules/tentanas/elastic-detail.js';
 import { nodeT } from '/js/modules/tentanas/node-phrase.js';
 
 export async function drawPools(screen, body) {
@@ -440,6 +440,13 @@ async function elasticSyncAction(screen, state, name, { repaint, refresh }) {
   const array = () => state.arrays.find((a) => a.name === name);
   const allowed = () => state.isCurrent() && !state.syncBusy.has(name) && array() && !elasticMaintenanceBlocker(array(), screen.isAdmin);
   if (!allowed()) return;
+  // Over an unrepaired Scrub or Repair fault the card takes the SAME confirm
+  // as the detail pane: it names the cost, and only it sends the
+  // acknowledgement the node requires.
+  if (syncNeedsAcknowledgement(array())) {
+    openSyncOverFaultDialog(screen, array(), refresh);
+    return;
+  }
   state.syncBusy.add(name);
   repaint();
   try {

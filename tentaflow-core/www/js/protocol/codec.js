@@ -9018,9 +9018,19 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /**
+   * `acknowledgeParityFault` is the admin's confirm of a Sync over a recorded
+   * Scrub or Repair fault: the id of THAT fault (`syncFaultId` of the array),
+   * never shown. Absent means not acknowledged, and the node refuses such a
+   * Sync over a fault — as it refuses one that names another fault.
+   */
   tentaNasElasticArraySyncRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const request = { name: csText(payload.name), sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password) };
+    const request = {
+      name: csText(payload.name),
+      acknowledge_parity_fault: csOptText(payload.acknowledgeParityFault ?? payload.acknowledge_parity_fault),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
     const body = _wasm.encodeTentaNasElasticArraySyncRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -9156,6 +9166,23 @@ export const encode = {
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
     const body = _wasm.encodeTentaNasElasticArrayAddDiskRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::TentaNasBody(ElasticArrayAddDiskAbortRequest). Undoes the
+   * unfinished add of `diskId`; the retype is the array's name, as for the
+   * add itself.
+   */
+  tentaNasElasticArrayAddDiskAbortRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      disk_id: csText(payload.diskId ?? payload.disk_id),
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasElasticArrayAddDiskAbortRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 

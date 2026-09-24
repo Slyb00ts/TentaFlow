@@ -457,6 +457,9 @@ pub struct NasAlert {
     ///   replacement job, which is withdrawn (dormant) until that feature
     ///   returns;
     /// - 'elastic_add_disk_unconfirmed' {array, error};
+    /// - 'elastic_add_disk_abort_unconfirmed' {array, error} — the undo of an
+    ///   unfinished add stopped after its first effect; the add is still
+    ///   recorded and may be resumed or undone again;
     /// - 'elastic_restore_waiting' {array};
     /// - 'targets_sweep_stale' {} — the node-wide target sweep alert as a
     ///   restart (and migration 21) leaves it: no count measured yet;
@@ -1900,8 +1903,52 @@ pub struct NasElasticArray {
     /// disabled the one action that resolves it (W5/W6 of the fourth review).
     #[serde(default)]
     pub parity_run_available: bool,
+    /// Why the node holds the array in needs_attention, as its helper
+    /// recorded it, for the screen to word: '' (nothing recorded, or the
+    /// array was not read) | 'sync_failed' | 'scrub_failed' | 'fix_failed'
+    /// (a parity run finished with a failure) | 'add_disk' (an add of a data
+    /// disk is unfinished, see `pending_add_disk`) | 'other' (a failed
+    /// Restore, a service hold, a dissolve, or no recorded cause: only a
+    /// Restore is admitted).
+    #[serde(default)]
+    pub attention: String,
+    /// A manual Sync is admitted only with the admin's acknowledgement
+    /// (`ElasticArraySyncRequest::acknowledge_parity_fault`): the array
+    /// carries an unrepaired Scrub or Repair fault, and a Sync removes the
+    /// files the Scrub could not read from the content file.
+    #[serde(default)]
+    pub sync_needs_acknowledgement: bool,
+    /// The fault a Sync's acknowledgement has to name while
+    /// `sync_needs_acknowledgement` stands: the operation that recorded it.
+    /// A key for the request, never a label. Empty when nothing needs one.
+    #[serde(default)]
+    pub sync_fault_id: String,
+    /// The data disk an add has pinned and not finished. Present, the only
+    /// add this array admits is the resume of this disk.
+    #[serde(default)]
+    pub pending_add_disk: Option<NasElasticPendingAdd>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// An unfinished add of a data disk, as the node and its helper know it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasElasticPendingAdd {
+    /// What a resume or an undo request names. A key, never a label.
+    pub disk_id: String,
+    /// The disk's kernel name now, empty when nothing names it live.
+    pub disk_name: String,
+    /// The name it was last seen under, when `disk_name` is empty.
+    #[serde(default)]
+    pub disk_last_name: String,
+    /// The step a resume runs first: 'format' | 'mount' | 'join' | 'sync',
+    /// or '' when the helper did not report one.
+    pub step: String,
+    /// Live: the running union serves the disk. `None` when not read.
+    pub in_union: Option<bool>,
+    /// Whether the undo would be admitted now: the disk provably never
+    /// joined the share (the helper's own `add_undo_admission`).
+    pub undo_possible: bool,
 }
 
 /// One reason the node refuses a layout, with a machine code beside the
@@ -3057,8 +3104,19 @@ pub enum TentaNasPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,
     },
+    /// `acknowledge_parity_fault` is the admin's explicit decision to run a
+    /// Sync over a recorded Scrub or Repair fault (`NasElasticArray::
+    /// sync_needs_acknowledgement`): measured, such a Sync removes the files
+    /// the Scrub could not read from the content file. It names THE fault the
+    /// admin confirmed (`NasElasticArray::sync_fault_id`, an internal key the
+    /// screen never shows): a request queued or parked over one fault
+    /// acknowledges no newer one. Only the screen's confirm sets it, the node
+    /// refuses the Sync without it, and the scheduler never sends one. Absent
+    /// decodes as not acknowledged.
     ElasticArraySyncRequest {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acknowledge_parity_fault: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sudo_password: Option<SudoSecret>,
     },
@@ -3096,6 +3154,19 @@ pub enum TentaNasPayload {
     /// it joins, which is why this carries the same retype a create does. It
     /// comes under parity only after the sync this operation ends with.
     ElasticArrayAddDiskRequest {
+        name: String,
+        disk_id: String,
+        confirm_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// Undoes the unfinished add of `disk_id` (`NasElasticArray::
+    /// pending_add_disk`) — admitted only while the disk provably never
+    /// joined the share (`NasElasticPendingAdd::undo_possible`). The array
+    /// loses the slot again, and nothing is erased but the filesystem this
+    /// add gave the disk. Retype-gated like the add. Answers with
+    /// `JobResponse`.
+    ElasticArrayAddDiskAbortRequest {
         name: String,
         disk_id: String,
         confirm_name: String,
@@ -4478,6 +4549,71 @@ mod tests {
         let json = serde_json::json!({ "ElasticCapabilitiesRequest": {} });
         let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
         assert_eq!(decoded, TentaNasPayload::ElasticCapabilitiesRequest {});
+    }
+
+    /// The recovery wire of an Elastic Array (helper 0.14.0): the Sync's
+    /// acknowledgement, the undo request and the pending add. The browser
+    /// sends minimal JSON, so an absent acknowledgement has to decode as NOT
+    /// acknowledged, and every field has to survive the CBOR it really rides.
+    #[test]
+    fn the_elastic_recovery_wire_keeps_the_acknowledgement_and_the_pending_add() {
+        let json = serde_json::json!({ "ElasticArraySyncRequest": { "name": "media" } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::ElasticArraySyncRequest {
+                name: "media".to_string(),
+                acknowledge_parity_fault: None,
+                sudo_password: None,
+            },
+            "a Sync that says nothing is not acknowledged"
+        );
+        let acknowledged = TentaNasPayload::ElasticArraySyncRequest {
+            name: "media".to_string(),
+            acknowledge_parity_fault: Some("018f2c1e-6b9a-7c3d-8e4f-5a6b7c8d9e0f".to_string()),
+            sudo_password: None,
+        };
+        let back: TentaNasPayload =
+            crate::cbor::decode(&crate::cbor::encode(&acknowledged).expect("encode")).expect("decode");
+        assert_eq!(back, acknowledged);
+
+        let abort = TentaNasPayload::ElasticArrayAddDiskAbortRequest {
+            name: "media".to_string(),
+            disk_id: "wwn-0x5000c500a1b2c3d4".to_string(),
+            confirm_name: "media".to_string(),
+            sudo_password: None,
+        };
+        let back: TentaNasPayload =
+            crate::cbor::decode(&crate::cbor::encode(&abort).expect("encode")).expect("decode");
+        assert_eq!(back, abort);
+
+        let array = NasElasticArray {
+            name: "media".to_string(),
+            attention: "add_disk".to_string(),
+            sync_needs_acknowledgement: true,
+            sync_fault_id: "018f2c1e-6b9a-7c3d-8e4f-5a6b7c8d9e0f".to_string(),
+            pending_add_disk: Some(NasElasticPendingAdd {
+                disk_id: "wwn-0x5000c500a1b2c3d4".to_string(),
+                disk_name: "sdh".to_string(),
+                disk_last_name: String::new(),
+                step: "mount".to_string(),
+                in_union: Some(false),
+                undo_possible: true,
+            }),
+            ..Default::default()
+        };
+        let back: NasElasticArray =
+            crate::cbor::decode(&crate::cbor::encode(&array).expect("encode")).expect("decode");
+        assert_eq!(back, array);
+        // An older node sends none of the three: nothing is pending, nothing
+        // needs an acknowledgement, and no cause is invented.
+        let mut json = serde_json::to_value(&array).expect("json");
+        for key in ["attention", "sync_needs_acknowledgement", "sync_fault_id", "pending_add_disk"] {
+            assert!(json.as_object_mut().expect("object").remove(key).is_some(), "{key}");
+        }
+        let old_peer: NasElasticArray = serde_json::from_value(json).expect("decode");
+        assert!(old_peer.pending_add_disk.is_none() && !old_peer.sync_needs_acknowledgement);
+        assert!(old_peer.attention.is_empty());
     }
 
     /// A target secret is a `NasSecret`, so the same redaction rule as every

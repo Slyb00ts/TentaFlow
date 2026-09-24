@@ -26,7 +26,12 @@ use futures::FutureExt;
 pub enum ElasticJobIntent {
     Create(ElasticCreateSpec),
     Restore { owner: ElasticOwner, array_id: String, operation_id: String },
-    Snapraid { owner: ElasticOwner, array_id: String, operation_id: String, kind: ElasticSnapraidKind },
+    /// `acknowledge_parity_fault` is carried into the helper's Sync command:
+    /// the admin's confirm of a Sync over a recorded Scrub or Repair fault,
+    /// naming the operation that recorded THAT fault. Only a manual Sync
+    /// request ever sets it; the scheduler never does.
+    Snapraid { owner: ElasticOwner, array_id: String, operation_id: String, kind: ElasticSnapraidKind,
+        acknowledge_parity_fault: Option<String> },
     /// One mover run. `resume_operation_id` is reserved up front: the helper
     /// records it with the run and refuses a command whose resume repeats its
     /// operation, and it is the UUID the Resume of a Hold an older helper's run
@@ -62,6 +67,10 @@ pub enum ElasticJobIntent {
     ReplaceDisk { owner: ElasticOwner, array_id: String, operation_id: String,
         rebuild_operation_id: String, sync_operation_id: String, branch: String,
         disk: tentanas_helper::elastic::ElasticDiskSpec, accept_stale_parity: bool },
+    /// Undoes the unfinished add of `disk`, the pinned add's own identity
+    /// (the filesystem UUID included: the undo erases only that filesystem).
+    AddDiskAbort { owner: ElasticOwner, array_id: String, operation_id: String,
+        disk: tentanas_helper::elastic::ElasticDiskSpec },
     /// Stops serving the array and deletes its rows. Formats nothing.
     Dissolve { owner: ElasticOwner, array_id: String, operation_id: String },
 }
@@ -274,6 +283,7 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::ElasticEnterService { .. } | HelperCommand::ElasticResume { .. }
         | HelperCommand::ElasticMover { .. }
         | HelperCommand::ElasticFix { .. } | HelperCommand::ElasticAddDisk { .. }
+        | HelperCommand::ElasticAddDiskAbort { .. }
         | HelperCommand::ElasticReplaceDisk { .. }
         | HelperCommand::ElasticDestroy { .. } => "Elastic Array",
         HelperCommand::DiskWipe { .. } => "wipefs",
@@ -346,6 +356,7 @@ where
             ElasticJobIntent::Snapraid { .. }
                 | ElasticJobIntent::Mover { .. }
                 | ElasticJobIntent::AddDisk { .. }
+                | ElasticJobIntent::AddDiskAbort { .. }
                 | ElasticJobIntent::ReplaceDisk { .. }
         )
     );

@@ -44,6 +44,17 @@ const cases = [
     { name: 'archiwum', sudo_password: 'test-secret-not-real' }],
   ['ElasticArraySync', { name: 'archiwum', sudoPassword: 'test-secret-not-real' },
     { name: 'archiwum', sudo_password: 'test-secret-not-real' }],
+  // The confirm of a Sync over a parity fault names THAT fault. Dropped
+  // anywhere between the screen and the node, the confirmed Sync would be
+  // refused as unacknowledged.
+  ['ElasticArraySync', { name: 'archiwum', acknowledgeParityFault: '018f2c1e-6b9a-7c3d-8e4f-5a6b7c8d9e0f' },
+    { name: 'archiwum', acknowledge_parity_fault: '018f2c1e-6b9a-7c3d-8e4f-5a6b7c8d9e0f' }],
+  // The undo of an unfinished add: the disk by id, the array name retyped.
+  ['ElasticArrayAddDiskAbort', {
+    name: 'archiwum', diskId: 'wwn-0x5000c500a1b2c3d4', confirmName: 'archiwum', sudoPassword: 'test-secret-not-real',
+  }, {
+    name: 'archiwum', disk_id: 'wwn-0x5000c500a1b2c3d4', confirm_name: 'archiwum', sudo_password: 'test-secret-not-real',
+  }],
   ['ElasticArrayScrub', { name: 'archiwum', sudo_password: 'test-secret-not-real' },
     { name: 'archiwum', sudo_password: 'test-secret-not-real' }],
   // E2-09 shipped this variant with no encoder at all, so the button could not

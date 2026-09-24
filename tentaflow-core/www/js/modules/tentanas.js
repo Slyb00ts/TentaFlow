@@ -3692,7 +3692,7 @@ const TentaNasScreen = {
         const head = win.querySelector('#nas-joblog-head');
         const pre = win.querySelector('#nas-joblog');
         if (!head || !pre) return;
-        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span class="mono"${subject.title ? ` title="${escapeAttr(subject.title)}"` : ''}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span${author.title ? ` title="${escapeAttr(author.title)}"` : ''}>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${j.error ? `<div class="num-err mt-sm">${escapeHtml(j.error)}</div>` : ''}`);
+        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span class="mono"${subject.title ? ` title="${escapeAttr(subject.title)}"` : ''}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span${author.title ? ` title="${escapeAttr(author.title)}"` : ''}>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${j.error ? `<div class="num-err mt-sm">${escapeHtml(errMessage(j.error))}</div>` : ''}`);
         paintJobLog(pre, j.log);
         if (j.status === 'running' || j.status === 'queued') timer = setTimeout(poll, POLL_JOB_MODAL_MS);
         else if (onFinish && !notified) { notified = true; onFinish(j); }

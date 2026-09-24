@@ -298,7 +298,7 @@ export async function drawTasks(screen, body) {
       node: `<span class="tf-table__cell--mono">${escapeHtml(nodeLabel(node))}</span>`,
       startedAt: `<span class="tf-table__cell--mono">${escapeHtml(fmtDate(j.startedAt))}</span>`,
       duration: `<span class="tf-table__cell--mono">${escapeHtml(jobDuration(j))}</span>`,
-      result: `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub">${escapeHtml(j.error)}</div>` : ''}`,
+      result: `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub">${escapeHtml(errMessage(j.error))}</div>` : ''}`,
     }));
   };
 
@@ -627,7 +627,16 @@ export async function drawTasks(screen, body) {
     if (it.kind.startsWith('elastic_')) {
       const request = it.verb === 'mover' ? 'tentaNasElasticArrayMoverRequest'
         : it.verb === 'sync' ? 'tentaNasElasticArraySyncRequest' : 'tentaNasElasticArrayScrubRequest';
-      const res = await screen.withSudo((sudoPassword) => screen.nas(request, { name: it.row.subject, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), title);
+      // A Sync over an unrepaired fault needs the confirm that names its
+      // cost, which lives on the array's own screen: the refusal is worded
+      // by the toast, and the admin is taken there.
+      let needsConfirm = false;
+      const res = await screen.withSudo((sudoPassword) => screen.nas(request, { name: it.row.subject, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS })
+        .catch((e) => {
+          needsConfirm = /refusal:elastic_(fault_unacknowledged|fault_changed)$/.test(String(e?.message || ''));
+          throw e;
+        }), title);
+      if (needsConfirm && screen.openArray) { screen.openArray(it.row.subject); return; }
       followResponse(screen, res, refreshJobs, T('schedules.run_started', { name: it.name }));
       return;
     }
