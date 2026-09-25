@@ -1841,7 +1841,7 @@ async fn execute_streaming_region(
                         message: e.to_string(),
                     },
                 );
-                anyhow!("pre-producer node '{}' failed: {e}", node.id)
+                anyhow!("pre-producer node '{}' failed: {e:#}", node.id)
             })?;
         emit_node_finished(&ctx, &node.id, &TraceStatus::Ok);
         let duration_ms = attempt_started.elapsed().as_millis() as u64;

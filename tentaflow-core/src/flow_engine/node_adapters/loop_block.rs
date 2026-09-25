@@ -437,7 +437,7 @@ impl LoopNodeAdapter {
             let next = runner
                 .run(&plan.body_flow_id, current, ctx, 1, true)
                 .await
-                .map_err(|e| anyhow!("loop iteration {}: {e}", iterations + 1))?;
+                .map_err(|e| anyhow!("loop iteration {}: {e:#}", iterations + 1))?;
             current = next;
             iterations += 1;
             ctx.progress.emit(
@@ -532,7 +532,7 @@ impl NodeAdapter for LoopNodeAdapter {
             current = runner
                 .run(&plan.body_flow_id, current, ctx, 1, true)
                 .await
-                .map_err(|e| anyhow!("loop final pass: {e}"))?;
+                .map_err(|e| anyhow!("loop final pass: {e:#}"))?;
             iterations += 1;
             // Clear the signal so it does not leak into the parent envelope.
             current.meta.remove("loop_final_pass");
@@ -679,7 +679,7 @@ impl StreamProducerAdapter for LoopNodeAdapter {
         let exec = runner
             .run_streaming(&plan.body_flow_id, current, ctx, 1, true)
             .await
-            .map_err(|e| anyhow!("loop final stream pass: {e}"))?;
+            .map_err(|e| anyhow!("loop final stream pass: {e:#}"))?;
         Ok(exec.stream)
     }
 }

@@ -103,7 +103,7 @@ impl From<anyhow::Error> for DispatchError {
             Some(crate::error::CoreError::SttServiceUnavailable) => {
                 DispatchError::SttServiceUnavailable
             }
-            _ => DispatchError::Internal(e.to_string()),
+            _ => DispatchError::Internal(format!("{e:#}")),
         }
     }
 }
