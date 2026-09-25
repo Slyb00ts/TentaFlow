@@ -392,10 +392,17 @@ fn parse_dsml_calls(text: &str, first_idx: usize) -> (String, Vec<LlmToolCall>) 
             .or(next_open)
             .unwrap_or(text.len());
         let body = &text[whole.end()..body_end];
+        let arguments = dsml_arguments(body);
+        if arguments.is_empty() && !body.trim().trim_start_matches(['>', '/']).trim().is_empty() {
+            // A body that carried something yet yielded no argument is a shape
+            // this reader does not know yet; the excerpt is what adds it.
+            let excerpt: String = body.chars().take(240).collect();
+            tracing::debug!(tool = %&caps[1], body = %excerpt, "DSML invoke read with no arguments");
+        }
         calls.push(LlmToolCall {
             id: generate_call_id(first_idx + calls.len(), &text[whole.start()..body_end]),
             name: caps[1].trim().to_string(),
-            arguments: serde_json::Value::Object(dsml_arguments(body)).to_string(),
+            arguments: serde_json::Value::Object(arguments).to_string(),
         });
         spans.push((whole.start(), body_end));
     }
@@ -424,6 +431,30 @@ fn parse_dsml_calls(text: &str, first_idx: usize) -> (String, Vec<LlmToolCall>) 
 /// - an attribute: `invoke name="x" arguments={…}>`;
 /// - a plain `<parameter name="arguments">{…}` tag.
 fn dsml_arguments(body: &str) -> serde_json::Map<String, serde_json::Value> {
+    unwrap_arguments(read_dsml_arguments(body))
+}
+
+/// A model that put the whole call into one `arguments` field — an object, or
+/// JSON written as a string — meant those as the arguments, not as a single
+/// argument named `arguments`.
+fn unwrap_arguments(
+    map: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::Value;
+    if map.len() != 1 {
+        return map;
+    }
+    match map.get("arguments") {
+        Some(Value::Object(object)) => object.clone(),
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(object)) => object,
+            _ => map,
+        },
+        _ => map,
+    }
+}
+
+fn read_dsml_arguments(body: &str) -> serde_json::Map<String, serde_json::Value> {
     use regex::Regex;
     use serde_json::Value;
     use std::sync::OnceLock;
@@ -451,6 +482,13 @@ fn dsml_arguments(body: &str) -> serde_json::Map<String, serde_json::Value> {
     }
     if !arguments.is_empty() {
         return arguments;
+    }
+
+    // The invoke tag closed and a bare JSON object follows it.
+    if let Some(after) = body.trim_start().strip_prefix('>') {
+        if let Some(Value::Object(object)) = first_json_value(after) {
+            return object;
+        }
     }
 
     // JSON glued to the name: the body starts where `"name":"x"` would have
@@ -915,6 +953,26 @@ mod tests {
             );
             assert_eq!(rest, "", "markup left behind for {text}");
         }
+    }
+
+    /// The whole call written into one `arguments` parameter, as JSON text or
+    /// as an object after the invoke tag, is unwrapped into the arguments.
+    #[test]
+    fn a_call_packed_into_one_arguments_field_is_unwrapped() {
+        let as_string = "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"core.fs_write\">\n<｜｜DSML｜｜ parameter name=\"arguments\" string=\"true\">{\"path\": \"a.py\", \"content\": \"x\"}</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>";
+        let (_, calls) = parse_tool_calls(as_string);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].arguments).unwrap(),
+            json!({"path": "a.py", "content": "x"})
+        );
+
+        let after_tag = "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"core.exec\">\n{\"argv\": [\"python3\", \"-V\"]}\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>";
+        let (rest, calls) = parse_tool_calls(after_tag);
+        assert_eq!(rest, "");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[0].arguments).unwrap(),
+            json!({"argv": ["python3", "-V"]})
+        );
     }
 
     /// Two hybrid invokes in one block are two calls, and prose before the
