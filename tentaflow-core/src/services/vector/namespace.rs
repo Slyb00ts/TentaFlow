@@ -846,6 +846,26 @@ impl NamespaceManager {
         Ok(entry.value().clone())
     }
 
+    /// Metadata schema recorded for the namespace (`fields_json`), the columns
+    /// its collection actually has.
+    pub fn declared_fields(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        namespace: &str,
+    ) -> Result<Vec<FieldSpec>> {
+        validate_org_id(org_id)?;
+        validate_addon_id(addon_id)?;
+        validate_namespace_name(namespace)?;
+        match self.load_row(org_id, addon_id, namespace)? {
+            Some((_, _, _, fields, _)) => Ok(fields),
+            None => Err(VectorError::NamespaceNotFound {
+                addon_id: addon_id.to_string(),
+                namespace: namespace.to_string(),
+            }),
+        }
+    }
+
     /// Transactional upsert scoped to `(org_id, addon_id)`. Checks the
     /// per-tenant quota, runs the backend upsert (which persists internally),
     /// and bumps the cached `count` row — all under a single `IMMEDIATE`
@@ -1343,6 +1363,50 @@ mod tests {
         let pool = in_memory_db_with_v27();
         let mgr = NamespaceManager::with_root(pool, dir.path().to_path_buf());
         (dir, mgr)
+    }
+
+    use tentaflow_sdk_spec::FieldValue;
+
+    /// A project's `passages` has no `collection_id`, yet the shared RAG hop
+    /// asks for it: the search must answer with the columns that exist instead
+    /// of zvec refusing the whole query ("collection_id not defined in schema").
+    #[test]
+    fn search_skips_output_fields_the_namespace_does_not_declare() {
+        let (_dir, mgr) = mgr();
+        let specs = vec![FieldSpec {
+            name: "text".to_string(),
+            field_type: FieldType::Str,
+            indexed: false,
+        }];
+        let be = mgr
+            .get_or_create(ORG_A, "ps-p1", "passages", 4, Metric::Cosine, &specs, false)
+            .unwrap();
+        be.upsert(
+            1,
+            &[1.0, 0.0, 0.0, 0.0],
+            &[Field {
+                name: "text".to_string(),
+                value: FieldValue::Str("hello".to_string()),
+            }],
+            None,
+        )
+        .unwrap();
+
+        let hits = super::super::doc_vectors::search_namespace(
+            &mgr,
+            ORG_A,
+            "ps-p1",
+            "passages",
+            &[1.0, 0.0, 0.0, 0.0],
+            5,
+            None,
+            &["text".to_string(), "collection_id".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].fields.len(), 1);
+        assert_eq!(hits[0].fields[0].name, "text");
     }
 
     #[test]

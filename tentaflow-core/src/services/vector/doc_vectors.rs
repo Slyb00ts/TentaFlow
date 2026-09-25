@@ -67,7 +67,19 @@ pub fn search_namespace(
         Err(VectorError::NamespaceNotFound { .. }) if missing_is_empty => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
-    backend.search(query, top_k, filter, output_fields)
+    // One retrieval graph serves namespaces with different schemas (the RAG
+    // addon's carries `collection_id`, a project's does not), and zvec rejects
+    // the whole query over a single undeclared output column. Output fields are
+    // a projection, so a column the namespace lacks is simply absent from the
+    // hits. The filter is NOT narrowed this way: dropping a condition would
+    // widen the result.
+    let declared = vectors.declared_fields(org_id, scope, namespace)?;
+    let output_fields: Vec<String> = output_fields
+        .iter()
+        .filter(|name| declared.iter().any(|f| &f.name == *name))
+        .cloned()
+        .collect();
+    backend.search(query, top_k, filter, &output_fields)
 }
 
 /// Removes every vector of `doc_id` from `backend`.
