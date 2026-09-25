@@ -1071,8 +1071,21 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "shared_maps_permissions",
             MigrationStep::Rust(roles_add_map_permissions),
         ),
+        (
+            171,
+            "code_workspaces_release_deleted_slugs",
+            MigrationStep::Sql(CODE_WORKSPACES_RELEASE_DELETED_SLUGS),
+        ),
     ]
 }
+
+/// Tombstones written before `set_status` released the slug on delete still
+/// hold `UNIQUE(org_id, owner_user_id, slug)`, so their owner could never reuse
+/// the name. The id is unique, which makes the freed slug unique too.
+const CODE_WORKSPACES_RELEASE_DELETED_SLUGS: &str = r#"
+UPDATE code_workspaces SET slug = 'deleted-' || id
+    WHERE status = 'deleted' AND slug <> 'deleted-' || id;
+"#;
 
 /// Fleet secrets (`hf_token`, `ngc_api_key`, `api_key_pepper`) used to replicate
 /// through the sync ledger, which kept their plaintext in the capture journal and

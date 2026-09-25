@@ -290,7 +290,11 @@ pub fn set_status(
     let tx = conn.transaction().map_err(write_err)?;
     let changed = tx
         .execute(
+            // A deleted row stays as the tombstone sync carries to other nodes,
+            // but it must not hold the (org, owner, slug) key: the owner may
+            // create a workspace under the same name again.
             "UPDATE code_workspaces SET status = ?2, status_detail = ?3, \
+             slug = CASE WHEN ?2 = 'deleted' THEN 'deleted-' || id ELSE slug END, \
              updated_at = datetime('now') WHERE id = ?1",
             params![
                 workspace_id,
@@ -1160,6 +1164,14 @@ mod tests {
         assert!(add_allowlist_entry(&db, "ws-1", "exec", "", "u-owner").is_err());
         assert!(add_allowlist_entry(&db, "ws-1", "exec", "cargo\u{7}", "u-owner").is_err());
         assert!(add_allowlist_entry(&db, "ws-1", "exec", "*", "u-owner").is_ok());
+    }
+
+    #[test]
+    fn a_deleted_workspace_releases_its_slug_for_the_same_owner() {
+        let (_dir, db) = test_db();
+        create_workspace(&db, &sample("ws-1", "u-a")).unwrap();
+        set_status(&db, "ws-1", WorkspaceStatus::Deleted, None).unwrap();
+        assert!(create_workspace(&db, &sample("ws-2", "u-a")).is_ok());
     }
 
     #[test]
