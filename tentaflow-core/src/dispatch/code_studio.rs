@@ -6673,7 +6673,16 @@ async fn start_session_run(
             parent_run_id,
             &principal,
             &[],
-            &[(tools::SESSION_META_KEY, binding)],
+            // The session is one conversation across its turns: without this
+            // every run replayed and persisted only its own messages, so the
+            // agent answered each message with no memory of the previous ones.
+            &[
+                (tools::SESSION_META_KEY, binding),
+                (
+                    crate::flow_engine::node_adapters::conversation_history::CONVERSATION_META_KEY,
+                    serde_json::Value::String(format!("code-session:{}", scope.session.id)),
+                ),
+            ],
             None,
             Some(crate::flow_engine::dispatcher::FlowRef {
                 flow_id: scope.session.flow_id.clone(),

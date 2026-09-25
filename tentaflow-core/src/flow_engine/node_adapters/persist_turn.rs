@@ -27,16 +27,12 @@ impl PersistTurnNodeAdapter {
         Self
     }
 
-    fn pick_session(node: &FlowNode, ctx: &ExecutionContext) -> Result<String> {
-        if let Some(s) = node
-            .config
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            return Ok(s.to_string());
-        }
-        ctx.session_id.clone().ok_or_else(|| {
+    fn pick_session(
+        node: &FlowNode,
+        envelope: &FlowEnvelope,
+        ctx: &ExecutionContext,
+    ) -> Result<String> {
+        super::conversation_history::conversation_of(node, envelope, ctx).ok_or_else(|| {
             anyhow!("persist_turn adapter: no session_id (node config nor ctx.session_id)")
         })
     }
@@ -71,7 +67,7 @@ impl NodeAdapter for PersistTurnNodeAdapter {
             .ok_or_else(|| anyhow!("persist_turn adapter: missing input edge"))?;
         let envelope = &input.envelope;
 
-        let session = Self::pick_session(node, ctx)?;
+        let session = Self::pick_session(node, envelope, ctx)?;
         let base = envelope
             .meta
             .get(HISTORY_BASE_LEN_META)
