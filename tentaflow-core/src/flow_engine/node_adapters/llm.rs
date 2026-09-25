@@ -739,9 +739,26 @@ impl NodeAdapter for LlmNodeAdapter {
         let envelope: &FlowEnvelope = &merged;
 
         let request = Self::build_llm_request(node, envelope, ctx)?;
+        let budget = request.max_tokens;
         let response = Self::execute_chat_with_retry(node, ctx, request).await?;
 
         ctx.usage_sink.record(&node.id, response.usage);
+
+        // A reasoning model can spend the whole output budget thinking and
+        // return neither text nor a call. Read as a final answer, that ended an
+        // agent turn as "completed" with nothing done and nothing said.
+        if response.finish_reason == FinishReason::Length
+            && response.content.trim().is_empty()
+            && response.tool_calls.is_empty()
+        {
+            return Err(anyhow!(
+                "llm node '{}': the model used its whole output budget{} before writing an \
+                 answer or a tool call; raise max_tokens on this block (empty = the model's \
+                 full budget) or lower its reasoning effort",
+                node.id,
+                budget.map(|n| format!(" (max_tokens = {n})")).unwrap_or_default()
+            ));
+        }
 
         // Uderzenie w sufit tokenow jest LEPKIE: raz ustawione, nie kasujemy go
         // nigdzie. Odpowiedz ucieta w polowie to fakt o calej turze, a nie o

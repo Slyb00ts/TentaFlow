@@ -459,7 +459,11 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "service",
             "Model LLM",
             "Wywołanie modelu językowego",
-            r#"{"model":"","prompt_id":"","system_prompt":"","temperature":0.7,"max_tokens":4096,"stream":true}"#,
+            // No `max_tokens`: its own schema says empty is the model's full
+            // budget, and a 4096 cap here was copied into every block dropped
+            // on a canvas — a reasoning model spent it thinking and answered
+            // nothing.
+            r#"{"model":"","prompt_id":"","system_prompt":"","temperature":0.7,"stream":true}"#,
             "brain",
             r#"{"properties":{"model":{"type":"string","title":"Model / alias","description":"LLM lub alias z tym samym katalogu","dynamic_enum":{"source":"models","category":"llm"}},"system_prompt":{"type":"string","title":"System prompt","format":"textarea","placeholder":"Jesteś pomocnym asystentem…"},"temperature":{"type":"number","title":"Temperature","minimum":0,"maximum":2,"step":0.1,"default":0.7},"max_tokens":{"type":"integer","title":"Max tokens","description":"Puste = pelny budzet modelu (kontekst, do 128k). Ustaw tylko gdy chcesz SKROCIC odpowiedz.","minimum":1,"maximum":131072},"top_p":{"type":"number","title":"Top P","minimum":0,"maximum":1,"step":0.05}},"required":["model"],"order":["model","system_prompt","temperature","max_tokens","top_p"]}"#,
         ),
