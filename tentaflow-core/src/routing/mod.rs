@@ -390,13 +390,21 @@ fn message_to_chat_message(m: &Message) -> Option<ChatMessage> {
 }
 
 /// Konwertuje OpenAI messages na protocol messages (rola + tekst).
+///
+/// The wire message has no `tool_calls` / `tool_call_id`, so a tool exchange
+/// is written out in the prompt-mode convention the peer's model was already
+/// told to use (`<tool_call>` blocks, see `tool_calling::render_tools_section`)
+/// instead of being dropped: a bare `role: "tool"` without its id is rejected
+/// by strict OpenAI-compatible backends (DeepSeek: "missing field
+/// `tool_call_id`"), and an assistant turn stripped of its calls leaves the
+/// following results unexplained.
 pub(crate) fn openai_messages_to_protocol(
     messages: &[crate::api::openai::types::Message],
 ) -> Vec<tentaflow_protocol::Message> {
     messages
         .iter()
         .map(|m| {
-            let content = match &m.content {
+            let mut content = match &m.content {
                 Some(MessageContent::Text(text)) => text.clone(),
                 Some(MessageContent::Parts(parts)) => parts
                     .iter()
@@ -411,8 +419,26 @@ pub(crate) fn openai_messages_to_protocol(
                     .join(""),
                 None => String::new(),
             };
+            for call in m.tool_calls.iter().flatten() {
+                let arguments = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                    .unwrap_or_else(|_| serde_json::Value::String(call.function.arguments.clone()));
+                let block = serde_json::json!({
+                    "name": call.function.name,
+                    "arguments": arguments,
+                });
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&format!("<tool_call>{block}</tool_call>"));
+            }
+            let role = if m.role == "tool" {
+                content = format!("<tool_response>\n{content}\n</tool_response>");
+                "user".to_string()
+            } else {
+                m.role.clone()
+            };
             tentaflow_protocol::Message {
-                role: m.role.clone(),
+                role,
                 content,
                 reasoning_content: m.reasoning_content.clone(),
             }
@@ -543,6 +569,47 @@ mod data_url_tests {
 #[cfg(test)]
 mod reasoning_tests {
     use super::*;
+
+    #[test]
+    fn tool_exchange_survives_mesh_message_conversion_as_prompt_mode_text() {
+        use crate::api::openai::types::{FunctionCall, Message, ToolCall};
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Some(MessageContent::Text("checking".to_string())),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "core.task_list".to_string(),
+                        arguments: "{\"limit\":5}".to_string(),
+                    },
+                }]),
+                ..Default::default()
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Some(MessageContent::Text("[]".to_string())),
+                tool_call_id: Some("call_1".to_string()),
+                ..Default::default()
+            },
+        ];
+
+        let wire = openai_messages_to_protocol(&messages);
+
+        assert_eq!(wire[0].role, "assistant");
+        let block = wire[0]
+            .content
+            .strip_prefix("checking\n<tool_call>")
+            .and_then(|rest| rest.strip_suffix("</tool_call>"))
+            .expect("call rendered after the text");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(block).unwrap(),
+            serde_json::json!({"name": "core.task_list", "arguments": {"limit": 5}})
+        );
+        assert_eq!(wire[1].role, "user");
+        assert_eq!(wire[1].content, "<tool_response>\n[]\n</tool_response>");
+    }
 
     #[test]
     fn openai_reasoning_content_survives_mesh_message_conversion() {
