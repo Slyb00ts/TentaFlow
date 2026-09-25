@@ -51,6 +51,7 @@ const {
   waitForServer,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
+const { api, ensureCodeStudioApp } = require('./helpers/code-studio');
 
 const A_PORT = 18131;
 const PEER_PORT = 18132;
@@ -97,15 +98,6 @@ function startPeer() {
   return proc;
 }
 
-// Every call goes through the same shim the dashboard uses, so the suite talks
-// over the real wire instead of a side door.
-async function api(page, action, payload) {
-  return page.evaluate(async ([a, p]) => {
-    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
-    return p === null ? ApiBinary.one(a) : ApiBinary.action(a, p);
-  }, [action, payload === undefined ? null : payload]);
-}
-
 // The dashboard's own translation of a picker note, so the assertion compares
 // against the shipped bundle rather than against a copy of the sentence. A note
 // that names a node is resolved with the same `{node}` placeholder the module
@@ -115,31 +107,6 @@ async function noteText(page, key, vars = null) {
     const { I18n } = await import('/js/i18n.js');
     return I18n.t(`code_studio.${k}`, v);
   }, [key, vars]);
-}
-
-// Code Studio is a native APP: every one of its request families passes the
-// app gate, and a node where the instance is missing or disabled answers
-// `AppUnavailable` before any handler runs. The catalog is the same one the
-// Addons screen installs from and the toggle is the switch that screen flips,
-// so the spec drives that path instead of writing a row into the database the
-// dashboard would never create.
-async function ensureCodeStudioApp(page) {
-  const catalog = await api(page, 'addonCatalogListRequest');
-  const pkg = (catalog?.packages ?? []).find(
-    (p) => (p.packageId ?? p.package_id) === 'code-studio',
-  );
-  expect(pkg, 'the code-studio app is missing from the node catalog').toBeTruthy();
-  const installed = await api(page, 'addonInstanceInstallRequest', {
-    packageId: 'code-studio',
-    version: String(pkg.latestVersion ?? pkg.latest_version ?? ''),
-    displayName: String(pkg.name ?? 'Code Studio'),
-    config: [],
-  });
-  expect(installed?.ok, `installing the code-studio app failed: ${installed?.error}`).toBe(true);
-  const addonId = String(installed.addonId ?? installed.addon_id ?? '');
-  expect(addonId, 'the install returned no instance id').toBeTruthy();
-  const toggled = await api(page, 'addonToggleRequest', { addonId, enabled: true });
-  expect(toggled?.ok, `enabling the code-studio app failed: ${toggled?.message}`).toBe(true);
 }
 
 // Waits for a value of a protocol listing, so a slow discovery or a slow

@@ -254,9 +254,16 @@ function bodyFor(step, id, model, request) {
  * @param {Array}    opts.script      steps produced by `tool()` / `say()`
  * @param {string}   opts.modelId     id advertised on /v1/models
  * @param {number}   opts.port        0 = ephemeral (read `.port` after start)
+ * @param {number}   opts.delayMs     how long every answer "thinks" before it is
+ *                                    sent; a step's own `delayMs` wins. A real
+ *                                    model spends seconds to minutes per step,
+ *                                    and what the UI shows DURING that wait is
+ *                                    exactly what an instant script never tests.
  * @returns {{port:number, baseUrl:string, calls:Array, stop:Function}}
  */
-function startScriptedModel({ script, scripts, modelId = 'harness-test', port = 0 } = {}) {
+function startScriptedModel({
+  script, scripts, modelId = 'harness-test', port = 0, delayMs = 0,
+} = {}) {
   // Either one flat script, or several keyed by a marker in the system prompt so
   // a parent agent and its child can be driven independently.
   const routed = scripts ?? (script ? [{ match: null, steps: script }] : null);
@@ -324,33 +331,7 @@ function startScriptedModel({ script, scripts, modelId = 'harness-test', port = 
 
         const id = `cmpl-${cursor}`;
         const { message, finish_reason: finish } = bodyFor(step, cursor, modelId, parsed);
-
-        if (parsed.stream) {
-          res.writeHead(200, {
-            'content-type': 'text/event-stream',
-            'cache-control': 'no-cache',
-            connection: 'keep-alive',
-          });
-          if (message.tool_calls) {
-            res.write(chunkOf(id, modelId, { role: 'assistant', tool_calls: message.tool_calls }));
-          } else {
-            res.write(chunkOf(id, modelId, { role: 'assistant', content: message.content }));
-          }
-          res.write(chunkOf(id, modelId, {}, finish));
-          res.write('data: [DONE]\n\n');
-          res.end();
-          return;
-        }
-
-        res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({
-          id,
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: modelId,
-          choices: [{ index: 0, message, finish_reason: finish }],
-          usage: { prompt_tokens: 512, completion_tokens: 64, total_tokens: 576 },
-        }));
+        setTimeout(() => respond(res, id, message, finish, parsed), step.delayMs ?? delayMs);
       });
       return;
     }
@@ -358,6 +339,35 @@ function startScriptedModel({ script, scripts, modelId = 'harness-test', port = 
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `no route for ${req.method} ${url}` } }));
   });
+
+  function respond(res, id, message, finish, parsed) {
+    if (parsed.stream) {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+      });
+      if (message.tool_calls) {
+        res.write(chunkOf(id, modelId, { role: 'assistant', tool_calls: message.tool_calls }));
+      } else {
+        res.write(chunkOf(id, modelId, { role: 'assistant', content: message.content }));
+      }
+      res.write(chunkOf(id, modelId, {}, finish));
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({
+      id,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: modelId,
+      choices: [{ index: 0, message, finish_reason: finish }],
+      usage: { prompt_tokens: 512, completion_tokens: 64, total_tokens: 576 },
+    }));
+  }
 
   server.listen(port, '127.0.0.1');
 

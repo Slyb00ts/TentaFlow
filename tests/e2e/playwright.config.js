@@ -32,6 +32,12 @@ module.exports = defineConfig({
     { name: 'code-studio-remote-sandbox', testMatch: 'code-studio-remote-sandbox.spec.js' },
     { name: 'code-studio-delegation', testMatch: 'code-studio-delegation.spec.js' },
     { name: 'code-studio-harness', testMatch: 'code-studio-harness.spec.js' },
+    {
+      name: 'code-studio-live-progress',
+      testMatch: 'code-studio-live-progress.spec.js',
+      // What the screen showed is the evidence this suite is about.
+      use: { screenshot: 'only-on-failure' },
+    },
     { name: 'frontend-cache-version', testMatch: 'frontend-cache-version.spec.js' },
     { name: 'direct-http', testMatch: 'services-direct-http.spec.js' },
     { name: 'mesh-pairing', testMatch: 'mesh-pairing.spec.js' },
