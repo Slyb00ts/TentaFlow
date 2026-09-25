@@ -131,6 +131,7 @@ impl AwaitSubagentsNodeAdapter {
             "mode": mode,
         });
         let results = manager.handle_agent_wait(&caller, &args).await?;
+        Self::refuse_all_failed(&results)?;
 
         // A compact summary on the payload lets a downstream LLM see how the
         // delegated work settled without re-reading the full result blobs.
@@ -141,6 +142,38 @@ impl AwaitSubagentsNodeAdapter {
             .insert(output_variable, FlowValue::Json(results));
         out.payload = FlowValue::Text(summary);
         Ok(out)
+    }
+
+    /// Stops the flow when nothing it waited for succeeded. A review loop reads
+    /// a failed child as "not approved yet" and spawns it again, so a child that
+    /// cannot run at all (a model missing on this node) was retried until the
+    /// session's run budget ran out, and the turn ended naming the budget
+    /// instead of the cause.
+    fn refuse_all_failed(results: &Value) -> Result<()> {
+        let Some(map) = results.as_object().filter(|m| !m.is_empty()) else {
+            return Ok(());
+        };
+        let failed = |entry: &Value| {
+            matches!(
+                entry.get("status").and_then(Value::as_str),
+                Some("failed" | "interrupted")
+            )
+        };
+        if !map.values().all(failed) {
+            return Ok(());
+        }
+        let reasons = map
+            .iter()
+            .map(|(run_id, entry)| {
+                let reason = entry
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no reason recorded");
+                format!("{run_id}: {reason}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(anyhow!("every awaited sub-agent failed — {reasons}"))
     }
 
     /// One-line-per-run status summary (no result bodies) for the payload.
@@ -293,6 +326,28 @@ mod tests {
             label: None,
             region: None,
         }
+    }
+
+    /// A child that cannot run at all stops the flow with its reason; one that
+    /// succeeded next to a failed sibling does not.
+    #[test]
+    fn only_a_wait_where_nothing_succeeded_stops_the_flow() {
+        let all_failed = json!({
+            "r1": {"status": "failed", "error": "model 'x' not found in catalog"},
+            "r2": {"status": "interrupted", "error": null},
+        });
+        let err = AwaitSubagentsNodeAdapter::refuse_all_failed(&all_failed).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("model 'x' not found in catalog"), "{text}");
+        assert!(text.contains("r2: no reason recorded"), "{text}");
+
+        let mixed = json!({
+            "r1": {"status": "failed", "error": "boom"},
+            "r2": {"status": "completed", "result": "ok"},
+        });
+        assert!(AwaitSubagentsNodeAdapter::refuse_all_failed(&mixed).is_ok());
+        let still_running = json!({"r1": {"status": "running", "timed_out": true}});
+        assert!(AwaitSubagentsNodeAdapter::refuse_all_failed(&still_running).is_ok());
     }
 
     #[tokio::test]

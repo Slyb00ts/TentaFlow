@@ -90,6 +90,15 @@ pub enum RunStatus {
     Interrupted,
 }
 
+/// Why a settled run failed, as the waiter reports it: the `error:` exit
+/// reason with its prefix dropped. `None` for a run that did not fail.
+fn failure_reason(run: &DbAgentRun) -> Option<String> {
+    run.exit_reason
+        .as_deref()
+        .and_then(|reason| reason.strip_prefix("error:"))
+        .map(|reason| reason.trim().to_string())
+}
+
 impl RunStatus {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -1013,17 +1022,19 @@ impl AgentRunManager {
             Ok(Some(run)) => json!({
                 "status": run.status,
                 "result": run.result,
+                "error": failure_reason(&run),
             }),
             _ => json!({ "status": "unknown" }),
         }
     }
 
     fn terminal_result(&self, id: &str, status: RunStatus) -> Value {
-        let result = repository::get_agent_run(&self.db, id)
-            .ok()
-            .flatten()
-            .and_then(|r| r.result);
-        json!({ "status": status.as_str(), "result": result })
+        let run = repository::get_agent_run(&self.db, id).ok().flatten();
+        json!({
+            "status": status.as_str(),
+            "result": run.as_ref().and_then(|r| r.result.clone()),
+            "error": run.as_ref().and_then(failure_reason),
+        })
     }
 
     /// Enters `waiting_user` for a run blocked on a human interaction (§3.13):
