@@ -93,6 +93,13 @@ line is auto-detected from the driver (`ONNXRUNTIME_CUDA=auto|12|13`). CUDA
 13-capable drivers get the `gpu_cuda13` artifact, which is required for SM_103
 (B300, Blackwell Ultra).
 
+On Linux sherpa-onnx is built against this same shared runtime (so
+`build-all.sh` provisions ONNX Runtime before sherpa-onnx) and the binary
+links `libonnxruntime.so.1`: one ONNX Runtime per process, no static copy in
+`lib-static/`. `linux-aarch64` with an NVIDIA GPU takes the runtime and the
+CUDA provider from the official PyPI `onnxruntime-gpu` wheel of the same
+version (CUDA 13, no TensorRT EP) and the headers from the CPU tarball.
+
 ```bash
 ./scripts/native-libs/build-all.sh --only onnxruntime           # prebuilt (default)
 ./scripts/native-libs/build-onnxruntime.sh linux-x86_64 --from-source  # native SM_103 cubins

@@ -16,6 +16,8 @@ pub mod mlx_swift_bridge;
 
 pub mod local;
 pub mod model_manager;
+#[cfg(any(feature = "vision-ort", feature = "inference-supertonic"))]
+pub mod onnxruntime;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

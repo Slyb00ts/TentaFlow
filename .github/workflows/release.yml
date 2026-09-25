@@ -292,7 +292,7 @@ jobs:
             asset: full-vulkan
             nl_backend: vulkan
             cargo_flags: "--features gpu-vulkan"
-            expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
+            expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
             forbid_cuda: "yes"
           - platform: linux-x86_64
             target: x86_64-unknown-linux-gnu
@@ -302,7 +302,7 @@ jobs:
             nl_backend: cuda12
             cuda_apt: "12-8"
             cargo_flags: "--features gpu-vulkan"
-            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
           - platform: linux-x86_64
             target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
@@ -311,7 +311,7 @@ jobs:
             nl_backend: cuda13
             cuda_apt: "13-2"
             cargo_flags: "--features gpu-vulkan"
-            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
           - platform: linux-aarch64
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
@@ -328,7 +328,7 @@ jobs:
             asset: full-vulkan
             nl_backend: vulkan
             cargo_flags: "--features gpu-vulkan"
-            expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
+            expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
             forbid_cuda: "yes"
           - platform: linux-aarch64
             target: aarch64-unknown-linux-gnu
@@ -338,7 +338,7 @@ jobs:
             nl_backend: cuda12
             cuda_apt: "12-8"
             cargo_flags: "--features gpu-vulkan"
-            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
           - platform: linux-aarch64
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04-arm
@@ -347,7 +347,7 @@ jobs:
             nl_backend: cuda13
             cuda_apt: "13-2"
             cargo_flags: "--features gpu-vulkan"
-            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
 
     env:
       TENTAFLOW_TARGET: ${{ matrix.target }}
@@ -570,6 +570,11 @@ jobs:
               exit 1
             fi
             require "$1"
+            # sherpa-onnx links the runtime, so the binary NEEDs it by its
+            # SONAME (libonnxruntime.so.<major>), which $ORIGIN must resolve.
+            ORT_FILE=$(basename "$1")
+            ORT_SONAME="${ORT_FILE%.*.*}"
+            ln -s "$ORT_FILE" "$STAGE/$ORT_SONAME"
           fi
 
           tar -czf "$STAGE.tar.gz" "$STAGE"
@@ -589,6 +594,14 @@ jobs:
             esc=$(printf '%s' "$lib" | sed 's/\./\\./g')
             printf '%s\n' "$SONAMES" | grep -q "^$esc\(\.[0-9][0-9]*\)*$" || {
               echo "::error::$BIN does not link $lib"
+              exit 1
+            }
+          done
+          # Every ONNX Runtime the binary NEEDs must resolve inside the archive:
+          # $ORIGIN is the only place an installed binary looks for it.
+          for lib in $(printf '%s\n' "$SONAMES" | grep '^libonnxruntime' || true); do
+            test -f "${{ steps.stage.outputs.stage }}/$lib" || {
+              echo "::error::$BIN needs $lib, which the archive does not carry"
               exit 1
             }
           done

@@ -971,6 +971,20 @@ identical `ggml_*` symbol names. whisper + its ggml are linked into one isolated
 `libwhisper_tf.so` (ggml_* hidden), `whisper-rs-sys/build.rs` links that dylib dynamically, and
 `tentaflow/build.rs` copies it flat next to the binary (`$ORIGIN`).
 
+### INVARIANT: one ONNX Runtime per process on Linux
+
+On Linux the process holds exactly ONE ONNX Runtime: the shared `libonnxruntime.so.1` of
+`ONNXRUNTIME_REF` that `build-onnxruntime.sh` provisions. sherpa-onnx is built against it
+(`SHERPA_ONNXRUNTIME_LIB_DIR`, so `onnxruntime` runs before `sherpa-onnx` in `build-all.sh`),
+`sherpa-rs-sys` links `dylib=onnxruntime`, and `ort` (load-dynamic) is pointed at the object the
+loader already mapped (`inference/onnxruntime.rs`), never at another copy found by a directory
+search. NEVER link a static ORT beside it: Microsoft's static Linux archive uses the pre-C++11
+std::string ABI, its ABI-agnostic templates (`std::__detail::_Scanner<char>`, `Ort::Exception`)
+merge with sherpa-onnx's and the binary aborts with `free(): invalid pointer` at OrtEnv creation.
+The binary NEEDs `libonnxruntime.so.1`, so a `full` Linux archive ships it under that SONAME.
+Verify: `nm -D --defined-only tentaflow | grep -c _ZNSs` = 0, and one `libonnxruntime` in
+`/proc/<pid>/maps`. macOS, Windows, iOS and Android still link sherpa-onnx's own static ORT.
+
 ### Inference wrappers
 
 `tentaflow-wrappers/` holds our own wrappers for llama.cpp / whisper.cpp, defining the config

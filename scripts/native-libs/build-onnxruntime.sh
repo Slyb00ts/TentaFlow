@@ -27,24 +27,21 @@
 #
 # NVIDIA GB10 (Grace-Blackwell, DGX Spark, aarch64/sbsa, SM_121) notes:
 #   - Microsoft ships NO aarch64 ONNX Runtime GPU tarball — only x64 GPU
-#     archives. The aarch64 GPU providers come from the community
-#     `onnxruntime-gpu` aarch64 wheel on the Jetson AI Lab devpi index
-#     (pypi.jetson-ai-lab.io/sbsa/cu130), built against CUDA 13 for sbsa. Its
-#     `libonnxruntime_providers_cuda.so` carries NATIVE sm_121 cubins (verified
-#     with cuobjdump: sm_87/sm_110/sm_120a/sm_121), so GB10 runs on real CUDA
-#     kernels with no PTX-JIT and no source build.
+#     archives. The aarch64 GPU runtime comes from the official PyPI
+#     `onnxruntime-gpu` manylinux aarch64 wheel of the same ONNXRUNTIME_REF,
+#     built against CUDA 13 (cudart/cublas 13) with cuDNN 9 loaded at run time.
+#     Its `libonnxruntime_providers_cuda.so` carries SASS for sm_89, sm_90a,
+#     sm_120a and sm_121a and no PTX (cuobjdump), so GB10 and GH200 run native
+#     kernels; any other SM (sm_100, sm_110, Ampere) has no CUDA EP.
 #   - The base libonnxruntime.so comes from the SAME wheel so the provider
-#     bridge ABI matches (provider libs are NOT ABI-stable across ORT minors —
-#     mixing an aarch64 GPU provider with a different CPU base would fail to
-#     register). The `ort` crate uses feature `api-24` (C API v24, ORT >= 1.24),
-#     which that wheel satisfies. This replaces the aarch64 CPU-only base.
-#   - GB10 hosts have the CUDA 13 sbsa toolkit at /usr/local/cuda (in ldconfig),
-#     so only cuDNN 9 (aarch64) has to be vendored for the CUDA EP; the toolkit
-#     runtime libs (cudart/cublas/cublasLt/cufft) resolve from the host. The
-#     TensorRT EP is skipped by default on aarch64 (sm_121 TRT engine building is
-#     unproven on this brand-new SM); the CUDA EP is the reliable GPU target and
-#     ort_common falls TensorRT->CUDA->CPU softly. Opt into TRT vendoring with
-#     TENTAFLOW_SKIP_TENSORRT_VENDOR=0.
+#     bridge ABI matches (provider libs are NOT ABI-stable across ORT minors).
+#     The wheel has no C headers; they come from Microsoft's CPU aarch64
+#     tarball of the same version, which sherpa-onnx compiles against.
+#   - The wheel has no TensorRT EP, so TensorRT is never vendored on aarch64.
+#     GB10 hosts have the CUDA 13 sbsa toolkit at /usr/local/cuda (in
+#     ldconfig), so only cuDNN 9 (aarch64) is vendored by default; the toolkit
+#     runtime libs resolve from the host (TENTAFLOW_SKIP_CUDA_VENDOR=0 vendors
+#     them too).
 #
 # Self-contained GPU runtime (no system TensorRT/cuDNN on the target host):
 #   When the CUDA-13 GPU variant is selected, the script additionally vendors
@@ -65,7 +62,7 @@
 #   toolkit libs (host has the toolkit but no TensorRT/cuDNN).
 #
 # Env knobs:
-#   ONNXRUNTIME_MODE       dynamic (default) | static | source
+#   ONNXRUNTIME_MODE       dynamic (default) | source
 #   ONNXRUNTIME_GPU        1 | 0. Default: 1 on linux-x86_64, on Windows 1 only
 #                          when an NVIDIA GPU is visible (the GPU archive plus
 #                          its NVIDIA runtimes is ~3 GB a Vulkan box never uses)
@@ -75,7 +72,7 @@
 #   CUDA_HOME / TENSORRT_HOME  toolchain roots for source builds
 #   TENTAFLOW_SKIP_TRT_VENDOR  1 = do not vendor TensorRT/cuDNN/CUDA wheels
 #   TENTAFLOW_SKIP_TENSORRT_VENDOR 1 = vendor cuDNN (+CUDA) but NOT TensorRT
-#                          (CUDA EP only). Default: aarch64 = 1, x86_64 = 0.
+#                          (CUDA EP only). Default 0; always 1 on aarch64.
 #   TENSORRT_SMS           builder-resource buckets: auto (default) | all |
 #                          comma list (sm75,sm80,sm86,sm89,sm90,sm100,sm120);
 #                          the ptx resource is always included. Cross-
@@ -109,8 +106,8 @@ done
 PLATFORM="${PLATFORM:-$(detect_platform)}"
 
 # The `ort` crate (supertonic TTS + vision detectors) needs ORT >= 1.24
-# (api-24); sherpa-onnx bundles its own onnxruntime, so this pin does not
-# affect STT.
+# (api-24). On Linux sherpa-onnx links this same shared runtime, so it must be
+# provisioned before build-sherpa-onnx.sh runs.
 ONNXRUNTIME_REF="$(require_version ONNXRUNTIME_REF)"
 prepare_layout "$PLATFORM"
 require_cmd git
@@ -409,27 +406,56 @@ gpu_present() {
   nvidia-smi -L >/dev/null 2>&1
 }
 
-# Extracts the aarch64 GPU providers (base runtime + shared/cuda/tensorrt) from
-# the Jetson AI Lab `onnxruntime-gpu` aarch64 wheel into lib-dynamic, replacing
-# the CPU-only base so the provider-bridge ABI matches (all from one wheel).
+# Replaces the CPU runtime with the base runtime + shared/cuda providers of
+# the official `onnxruntime-gpu` aarch64 wheel (all from one wheel, so the
+# provider-bridge ABI matches).
 provision_aarch64_gpu_ort() {
-  require_cmd curl
   local lib_dir="$NATIVE_ROOT/$PLATFORM/lib-dynamic"
-  local wheel_path expected
-  mkdir -p "$NATIVE_CACHE/downloads"
-  wheel_path="$NATIVE_CACHE/downloads/$(basename "$ONNXRUNTIME_AARCH64_GPU_URL")"
-  expected="$(pinned_checksum ONNXRUNTIME_AARCH64_GPU_SHA256 ONNXRUNTIME_AARCH64_GPU_REF)" || return 1
+  local wheel_name wheel_path expected
+  wheel_name="$(basename "$ONNXRUNTIME_AARCH64_GPU_URL")"
+  # The URL is a content-addressed PyPI path, so it cannot follow an
+  # overridden ONNXRUNTIME_REF by itself; a mismatch would pair the wheel with
+  # headers of another version.
+  case "$wheel_name" in
+    onnxruntime_gpu-"${ONNXRUNTIME_REF#v}"-*) ;;
+    *)
+      echo "ERROR: ONNXRUNTIME_AARCH64_GPU_URL ($wheel_name) is not ONNX Runtime ${ONNXRUNTIME_REF#v}." >&2
+      return 1
+      ;;
+  esac
+  wheel_path="$NATIVE_CACHE/downloads/$wheel_name"
+  expected="$(pinned_checksum ONNXRUNTIME_AARCH64_GPU_SHA256 ONNXRUNTIME_REF)" || return 1
   download_cached "$ONNXRUNTIME_AARCH64_GPU_URL" "$wheel_path" || return 1
   verify_checksum "$wheel_path" "$expected" || return 1
-  mkdir -p "$NATIVE_ROOT/$PLATFORM/include/onnxruntime"
   clean_stale_runtime
-  echo ">>> Vendoring aarch64 ONNX Runtime GPU $ONNXRUNTIME_AARCH64_GPU_REF (base + shared/cuda/tensorrt providers):"
+  echo ">>> Vendoring aarch64 ONNX Runtime GPU ${ONNXRUNTIME_REF#v} (base + shared/cuda providers):"
   extract_wheel_members "$wheel_path" \
-    '^onnxruntime/capi/(libonnxruntime\.so\..*|libonnxruntime_providers_(shared|cuda|tensorrt)\.so)$' \
+    '^onnxruntime/capi/(libonnxruntime\.so\..*|libonnxruntime_providers_(shared|cuda)\.so)$' \
     "$lib_dir" || return 1
-  sanity_check_gpu_linux
-  append_manifest_library "$PLATFORM" "onnxruntime" "dynamic" "$ONNXRUNTIME_AARCH64_GPU_REF" \
-    "aarch64 GPU wheel (Jetson AI Lab sbsa/cu130): CUDA+TensorRT providers with native sm_121 (GB10) cubins; ONNXRUNTIME_GPU=0 -> CPU-only Microsoft tarball."
+  link_runtime_sonames
+  sanity_check_gpu_linux libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so
+  append_manifest_library "$PLATFORM" "onnxruntime" "dynamic" "$ONNXRUNTIME_REF" \
+    "aarch64 GPU wheel (PyPI onnxruntime-gpu, CUDA 13): CUDA provider with sm_89/sm_90a/sm_120a/sm_121a SASS, no TensorRT EP; headers from the CPU tarball; ONNXRUNTIME_GPU=0 -> CPU-only Microsoft tarball."
+}
+
+# The linker resolves -lonnxruntime through libonnxruntime.so and the loader
+# resolves DT_NEEDED through the SONAME. The archives carry both as symlinks,
+# which neither copy_matching nor wheel extraction brings along.
+link_runtime_sonames() {
+  local lib_dir="$NATIVE_ROOT/$PLATFORM/lib-dynamic" real soname
+  real="$(find "$lib_dir" -maxdepth 1 -type f -name 'libonnxruntime.so.*' | sort | tail -n1)"
+  if [ -z "$real" ]; then
+    echo "ERROR: libonnxruntime.so.* missing in $lib_dir" >&2
+    return 1
+  fi
+  soname="$(readelf -d "$real" | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p')"
+  if [ -z "$soname" ] || [ "$soname" = "$(basename "$real")" ]; then
+    echo "ERROR: unexpected SONAME '$soname' of $real" >&2
+    return 1
+  fi
+  ln -sfn "$(basename "$real")" "$lib_dir/$soname"
+  ln -sfn "$soname" "$lib_dir/libonnxruntime.so"
+  echo ">>> Runtime links: libonnxruntime.so -> $soname -> $(basename "$real")"
 }
 
 # Selects the prebuilt CUDA major for x64 GPU archives. `auto` reads the
@@ -453,8 +479,8 @@ detect_cuda_major() {
   fi
 }
 
-# Fails loudly when the GPU archive/build did not produce the provider libs the
-# detector relies on, and prints what actually landed in lib-dynamic.
+# Fails loudly when the GPU archive/build did not produce the provider libs
+# named as arguments, and prints what actually landed in lib-dynamic.
 sanity_check_gpu_linux() {
   local lib_dir="$NATIVE_ROOT/$PLATFORM/lib-dynamic"
   local main_so
@@ -464,7 +490,7 @@ sanity_check_gpu_linux() {
     return 1
   fi
   local missing=0
-  for provider in libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so libonnxruntime_providers_tensorrt.so; do
+  for provider in "$@"; do
     if [ ! -f "$lib_dir/$provider" ]; then
       echo "ERROR: expected GPU provider $provider missing in $lib_dir" >&2
       missing=1
@@ -506,6 +532,7 @@ sanity_check_gpu_linux() {
     # CUDA/TensorRT provider libs resolve against the CUDA runtime and
     # libnvinfer, which only exist on the GPU host — report, don't fail.
     for provider_so in "$lib_dir"/libonnxruntime_providers_{cuda,tensorrt}.so; do
+      [ -f "$provider_so" ] || continue
       local unresolved
       # `|| true` guards pipefail: no 'not found' lines means grep exits 1.
       unresolved="$(ldd "$provider_so" 2>/dev/null | grep 'not found' | awk '{print $1}' | tr '\n' ' ' || true)"
@@ -540,29 +567,6 @@ clean_stale_runtime() {
         "$NATIVE_ROOT/$PLATFORM/lib-dynamic"/onnxruntime.dll \
         "$NATIVE_ROOT/$PLATFORM/lib-dynamic"/onnxruntime_providers_*.dll 2>/dev/null || true
 }
-
-# ---------------------------------------------------------------------------
-# Mode: static — CPU-only static archives (legacy consumers).
-# ---------------------------------------------------------------------------
-if [ "$MODE" = "static" ]; then
-  require_cmd cmake
-  SRC="$(repo_checkout onnxruntime https://github.com/microsoft/onnxruntime.git "$ONNXRUNTIME_REF")"
-  BUILD="$NATIVE_CACHE/build/onnxruntime-$PLATFORM-static"
-  reset_dir "$BUILD"
-  (
-    cd "$SRC"
-    ./build.sh \
-      --config Release \
-      --build_dir "$BUILD" \
-      --parallel "$(platform_cpu_count)" \
-      --skip_tests \
-      --build_shared_lib off \
-      --compile_no_warning_as_error
-  )
-  copy_matching "$BUILD" "$NATIVE_ROOT/$PLATFORM/lib-static" -name '*.a' -o -name '*.lib'
-  append_manifest_library "$PLATFORM" "onnxruntime" "static" "$ONNXRUNTIME_REF" "Built from source via build.sh."
-  exit 0
-fi
 
 # ---------------------------------------------------------------------------
 # Mode: source — shared runtime with CUDA + TensorRT EPs and native cubins for
@@ -614,7 +618,8 @@ if [ "$MODE" = "source" ]; then
   copy_matching "$SRC/include/onnxruntime/core/providers/cuda" "$NATIVE_ROOT/$PLATFORM/include/onnxruntime" -name '*.h'
   clean_stale_runtime
   copy_matching "$BUILD/Release" "$NATIVE_ROOT/$PLATFORM/lib-dynamic" -name 'libonnxruntime.so*' -o -name 'libonnxruntime_providers_*.so'
-  sanity_check_gpu_linux
+  link_runtime_sonames
+  sanity_check_gpu_linux libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so libonnxruntime_providers_tensorrt.so
   append_manifest_library "$PLATFORM" "onnxruntime" "dynamic" "$ONNXRUNTIME_REF" \
     "Source build: CUDA+TensorRT EPs, native cubins for SM $CUDA_ARCHS."
   # A source build implies the CUDA 13 toolchain; the target host still needs
@@ -624,26 +629,18 @@ if [ "$MODE" = "source" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Mode: dynamic, linux-aarch64 GPU — Microsoft ships no aarch64 GPU tarball, so
-# a GPU host (nvidia-smi visible) gets the community `onnxruntime-gpu` aarch64
-# wheel (base + CUDA/TensorRT providers, native sm_121 cubins) + cuDNN. The
-# CUDA toolkit and TensorRT are host-side by default (see the skip flags below),
-# so only cuDNN is vendored for the CUDA EP. ONNXRUNTIME_GPU=0 forces the
-# CPU-only Microsoft aarch64 tarball via the generic path below.
+# linux-aarch64 GPU — Microsoft ships no aarch64 GPU tarball, so a GPU host
+# (nvidia-smi visible) takes the headers from the CPU tarball below and the
+# runtime from the `onnxruntime-gpu` aarch64 wheel (provision_aarch64_gpu_ort).
+# ONNXRUNTIME_GPU=0 keeps the CPU-only Microsoft aarch64 tarball.
 # ---------------------------------------------------------------------------
+AARCH64_GPU_WHEEL=0
 if [ "$PLATFORM" = "linux-aarch64" ] && [ "${ONNXRUNTIME_GPU:-1}" = "1" ]; then
   if gpu_present; then
-    provision_aarch64_gpu_ort
-    # aarch64/GB10 defaults: sm_121 TRT is unproven -> CUDA EP only; the CUDA 13
-    # sbsa toolkit lives at /usr/local/cuda (ldconfig) so its runtime libs need
-    # not be vendored. Both respect an explicit user override.
-    : "${TENTAFLOW_SKIP_TENSORRT_VENDOR:=1}"
-    : "${TENTAFLOW_SKIP_CUDA_VENDOR:=1}"
-    export TENTAFLOW_SKIP_TENSORRT_VENDOR TENTAFLOW_SKIP_CUDA_VENDOR
-    vendor_nvidia_runtimes
-    exit 0
+    AARCH64_GPU_WHEEL=1
+  else
+    echo ">>> No NVIDIA GPU detected on this aarch64 host — provisioning the CPU-only ONNX Runtime tarball (set ONNXRUNTIME_GPU=0 to silence, or run on a GB10 box for the GPU stack)."
   fi
-  echo ">>> No NVIDIA GPU detected on this aarch64 host — provisioning the CPU-only ONNX Runtime tarball (set ONNXRUNTIME_GPU=0 to silence, or run on a GB10 box for the GPU stack)."
 fi
 
 # ---------------------------------------------------------------------------
@@ -728,18 +725,33 @@ rm -rf "$UNPACK/raw"
 
 mkdir -p "$NATIVE_ROOT/$PLATFORM/include/onnxruntime"
 cp -Rf "$UNPACK/include/"* "$NATIVE_ROOT/$PLATFORM/include/onnxruntime/"
+
+if [ "$AARCH64_GPU_WHEEL" = "1" ]; then
+  provision_aarch64_gpu_ort
+  # The CUDA 13 sbsa toolkit lives at /usr/local/cuda (ldconfig) on GB10, so
+  # its runtime libs are not vendored unless asked for.
+  TENTAFLOW_SKIP_TENSORRT_VENDOR=1
+  : "${TENTAFLOW_SKIP_CUDA_VENDOR:=1}"
+  export TENTAFLOW_SKIP_TENSORRT_VENDOR TENTAFLOW_SKIP_CUDA_VENDOR
+  vendor_nvidia_runtimes
+  exit 0
+fi
+
 clean_stale_runtime
 # GPU archives add the TensorRT/CUDA providers — the patterns below catch them
 # together with the main runtime.
 copy_matching "$UNPACK" "$NATIVE_ROOT/$PLATFORM/lib-dynamic" \
   -name 'libonnxruntime*.so*' -o -name 'libonnxruntime*.dylib' \
   -o -name 'onnxruntime.dll' -o -name 'onnxruntime_providers_*.dll'
+case "$PLATFORM" in
+  linux-*) link_runtime_sonames ;;
+esac
 
-ORT_NOTE="Official prebuilt runtime; ONNXRUNTIME_MODE=static builds from source instead."
+ORT_NOTE="Official prebuilt runtime."
 if [ "$GPU_ARCHIVE" = "1" ]; then
   case "$PLATFORM" in
     windows-*) sanity_check_gpu_windows ;;
-    *) sanity_check_gpu_linux ;;
+    *) sanity_check_gpu_linux libonnxruntime_providers_shared.so libonnxruntime_providers_cuda.so libonnxruntime_providers_tensorrt.so ;;
   esac
   ORT_NOTE="GPU variant $ARCHIVE (TensorRT+CUDA providers); ONNXRUNTIME_GPU=0 -> CPU-only, ONNXRUNTIME_CUDA=12|13 pins the CUDA line, --from-source builds native SM cubins."
 fi

@@ -128,6 +128,25 @@ if [ "$BACKEND" = "cuda" ]; then
 fi
 
 case "$PLATFORM" in
+  linux-*)
+    # One ONNX Runtime per process: sherpa-onnx links the shared runtime that
+    # build-onnxruntime.sh provisioned for `ort`. Its own default is a static
+    # manylinux archive built with the pre-C++11 std::string ABI; linked into
+    # the binary beside the shared runtime, its ABI-agnostic templates merged
+    # with sherpa-onnx's and the process aborted in free() at OrtEnv creation.
+    ORT_LIB_DIR="$NATIVE_ROOT/$PLATFORM/lib-dynamic"
+    ORT_INCLUDE_DIR="$NATIVE_ROOT/$PLATFORM/include/onnxruntime"
+    if [ ! -e "$ORT_LIB_DIR/libonnxruntime.so" ] || [ ! -f "$ORT_INCLUDE_DIR/onnxruntime_cxx_api.h" ]; then
+      echo "ERROR: shared ONNX Runtime missing in $ORT_LIB_DIR (or its headers in $ORT_INCLUDE_DIR)." >&2
+      echo "       Run scripts/native-libs/build-onnxruntime.sh $PLATFORM first." >&2
+      exit 1
+    fi
+    export SHERPA_ONNXRUNTIME_LIB_DIR="$ORT_LIB_DIR"
+    export SHERPA_ONNXRUNTIME_INCLUDE_DIR="$ORT_INCLUDE_DIR"
+    CMAKE_ARGS+=(-DSHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE=ON)
+    # Left by earlier builds, sherpa-rs-sys would otherwise still find them.
+    rm -f "$NATIVE_ROOT/$PLATFORM/lib-static/libonnxruntime.a" "$ORT_LIB_DIR/libonnxruntime.a"
+    ;;
   windows-*)
     CMAKE_ARGS+=(
       # Rust links the dynamic CRT (/MD); sherpa defaults to /MT, and one
@@ -151,9 +170,21 @@ cmake "${CMAKE_ARGS[@]}"
 cmake --build "$BUILD" -j"$(platform_cpu_count)"
 
 copy_matching "$BUILD" "$NATIVE_ROOT/$PLATFORM/lib-static" -name '*.a' -o -name '*.lib'
-copy_matching "$BUILD" "$NATIVE_ROOT/$PLATFORM/lib-dynamic" -name 'libonnxruntime*' -o -name '*.dll' -o -name '*.dylib' -o -name '*.so*'
+case "$PLATFORM" in
+  linux-*)
+    if [ -e "$NATIVE_ROOT/$PLATFORM/lib-static/libonnxruntime.a" ]; then
+      echo "ERROR: sherpa-onnx fetched its own static ONNX Runtime instead of linking $ORT_LIB_DIR." >&2
+      exit 1
+    fi
+    ORT_MANIFEST_NOTE="ONNX Runtime: shared, from build-onnxruntime.sh (lib-dynamic)."
+    ;;
+  *)
+    copy_matching "$BUILD" "$NATIVE_ROOT/$PLATFORM/lib-dynamic" -name 'libonnxruntime*' -o -name '*.dll' -o -name '*.dylib' -o -name '*.so*'
+    ORT_MANIFEST_NOTE="ONNX Runtime: sherpa-onnx's own prebuilt."
+    ;;
+esac
 
 mkdir -p "$NATIVE_ROOT/$PLATFORM/include/sherpa-onnx"
 find "$SRC/sherpa-onnx/c-api" "$SRC/sherpa-onnx/csrc" -type f -name '*.h' -exec cp -f {} "$NATIVE_ROOT/$PLATFORM/include/sherpa-onnx/" \;
 
-append_manifest_library "$PLATFORM" "sherpa-onnx" "static-preferred" "$SHERPA_ONNX_REF" "Backend: $BACKEND. ONNX Runtime może pozostać biblioteką dynamiczną."
+append_manifest_library "$PLATFORM" "sherpa-onnx" "static-preferred" "$SHERPA_ONNX_REF" "Backend: $BACKEND. $ORT_MANIFEST_NOTE"

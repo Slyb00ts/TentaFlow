@@ -787,14 +787,21 @@ fn pick_voice_style(dir: &Path, hint: Option<&str>) -> Option<PathBuf> {
     available.into_iter().next()
 }
 
-/// `ort` runs in `load-dynamic` mode (to coexist with sherpa-rs), so it needs to
-/// locate the system `libonnxruntime` at runtime. We probe `ORT_DYLIB_PATH` once
-/// (binary dir then standard locations) so a deploy needs no env wiring. The
-/// camera-CV path used to do this; it now lives here, the only remaining ort user.
+/// `ort` runs in `load-dynamic` mode, so it needs to locate `libonnxruntime` at
+/// runtime. We set `ORT_DYLIB_PATH` once — the runtime already mapped into the
+/// process first, then the binary dir and standard locations — so a deploy
+/// needs no env wiring.
 fn ensure_ort_dylib() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
+        // The runtime sherpa-onnx linked wins, even over ORT_DYLIB_PATH: any
+        // other copy would be a second ONNX Runtime in the process.
+        if let Some(mapped) = crate::inference::onnxruntime::mapped_onnxruntime() {
+            std::env::set_var("ORT_DYLIB_PATH", &mapped);
+            tracing::info!("[supertonic] ORT_DYLIB_PATH -> {} (already mapped)", mapped.display());
+            return;
+        }
         if std::env::var_os("ORT_DYLIB_PATH").is_some() {
             return;
         }

@@ -33,9 +33,9 @@ inference-mlx-whisper = ["dep:libloading"]
 # Kokoro 82M TTS przez mlx-swift port. macOS/iOS only.
 inference-mlx-kokoro = ["dep:libloading"]
 # Supertonic TTS przez ONNX Runtime (crate `ort`). Desktop: Linux/macOS/Windows.
-# `ort` z feature `load-dynamic` dlopuje onnxruntime runtime'em (nie linkuje
-# statycznie), wiec NIE koliduje ze statycznym onnxruntime sherpa-onnx
-# (sherpa-rs-sys) — oba moga byc wlaczone naraz bez kolizji symboli linkera.
+# `ort` (load-dynamic) dlopens onnxruntime at run time. On Linux sherpa-onnx
+# links the same shared runtime and `ort` opens the object already mapped into
+# the process (inference/onnxruntime.rs): one ONNX Runtime per process.
 inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel"]
 # ONNX Runtime dla głównej ścieżki wizji. Jest niezależny od Supertonic, żeby
 # AMD/Intel mogły używać Burn przez WGPU/Vulkan przy zachowaniu TTS przez ORT.
@@ -328,8 +328,8 @@ sherpa-rs-sys = { workspace = true, optional = true }
 # Supertonic TTS i wizja — ONNX Runtime przez `ort` z `load-dynamic`: runtime
 # (ONNXRUNTIME_REF z scripts/versions.env) jest w native-libs/<platform>/
 # lib-dynamic i ladowany po sciezce (vision/ort_common.rs, tts/supertonic.rs).
-# `api-24` wymaga ORT >= 1.24. Statyczny onnxruntime sherpa-onnx to osobna
-# kopia, niewidoczna dla `ort`. `ndarray` daje Value::from_array(Array3).
+# `api-24` requires ORT >= 1.24. Off Linux sherpa-onnx keeps its own static
+# onnxruntime, invisible to `ort`. `ndarray` gives Value::from_array(Array3).
 ort = { workspace = true, features = ["load-dynamic", "tls-rustls", "ndarray", "std", "api-24"], optional = true }
 ndarray = { workspace = true, optional = true }
 # MPMC job channel feeding each pooled ort session's dedicated OS thread (see

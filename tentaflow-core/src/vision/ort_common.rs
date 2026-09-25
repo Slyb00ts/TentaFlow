@@ -30,7 +30,11 @@ const DEFAULT_ORT_DYLIB: &str = "/usr/lib/libonnxruntime.so.1.24.4";
 pub fn ensure_ort_dylib() {
     static DONE: OnceLock<()> = OnceLock::new();
     DONE.get_or_init(|| {
-        let path = locate_ort_dylib().unwrap_or_else(default_ort_dylib);
+        // The runtime sherpa-onnx linked wins: any other copy would be a second
+        // ONNX Runtime in the process.
+        let path = crate::inference::onnxruntime::mapped_onnxruntime()
+            .or_else(locate_ort_dylib)
+            .unwrap_or_else(default_ort_dylib);
         #[cfg(target_os = "linux")]
         preload_cuda_provider_deps(&path);
         std::env::set_var("ORT_DYLIB_PATH", &path);

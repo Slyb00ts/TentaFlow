@@ -24,7 +24,14 @@ fn main() {
     require(&include_dir.join("sherpa-onnx").join("c-api.h"));
     require(&lib_dir.join(static_name("sherpa-onnx-c-api", &target)));
     require(&lib_dir.join(static_name("sherpa-onnx-core", &target)));
-    require(&lib_dir.join(static_name("onnxruntime", &target)));
+    // Linux links the one shared ONNX Runtime the `ort` crate also uses: a
+    // static copy beside it breaks the process (see link_onnxruntime).
+    let linux = target.contains("linux");
+    if linux {
+        require(&dynamic_dir.join("libonnxruntime.so"));
+    } else {
+        require(&lib_dir.join(static_name("onnxruntime", &target)));
+    }
 
     generate_bindings(&include_dir, &target);
 
@@ -46,10 +53,10 @@ fn main() {
         "espeak-ng",
         "ucd",
         "cargs",
-        "onnxruntime",
     ] {
         link_static_if_exists(&lib_dir, lib, &target);
     }
+    link_onnxruntime(&lib_dir, &target, linux);
 
     link_system_libs(&target);
 }
@@ -124,6 +131,19 @@ fn generate_bindings(include_dir: &Path, target: &str) {
 fn link_static_if_exists(lib_dir: &Path, name: &str, target: &str) {
     if lib_dir.join(static_name(name, target)).exists() {
         println!("cargo:rustc-link-lib=static={name}");
+    }
+}
+
+// Microsoft's static Linux ONNX Runtime is built with the pre-C++11
+// std::string ABI; linked into the binary next to the shared runtime `ort`
+// loads, its ABI-agnostic templates merged with sherpa-onnx's and the process
+// aborted in free() while creating OrtEnv. Linking the shared runtime keeps
+// exactly one ONNX Runtime in the process.
+fn link_onnxruntime(lib_dir: &Path, target: &str, linux: bool) {
+    if linux {
+        println!("cargo:rustc-link-lib=dylib=onnxruntime");
+    } else {
+        link_static_if_exists(lib_dir, "onnxruntime", target);
     }
 }
 

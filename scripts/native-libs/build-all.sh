@@ -129,8 +129,9 @@ build_platform() {
       ;;
     *)
       run_step whisper-cpp "$SCRIPT_DIR/build-whisper-cpp.sh" "$platform"
-      run_step sherpa-onnx "$SCRIPT_DIR/build-sherpa-onnx.sh" "$platform"
+      # sherpa-onnx links the shared ONNX Runtime provisioned here on Linux.
       run_step onnxruntime "$SCRIPT_DIR/build-onnxruntime.sh" "$platform"
+      run_step sherpa-onnx "$SCRIPT_DIR/build-sherpa-onnx.sh" "$platform"
       ;;
   esac
 

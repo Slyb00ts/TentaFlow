@@ -191,6 +191,14 @@ class LinuxPackagingTests(unittest.TestCase):
         with tarfile.open(self.directory / (self.stage + ".tar.gz")) as archive:
             self.assertTrue(archive.getmember(self.stage + "/libonnxruntime.so.1.30.0").isfile())
 
+    def test_onnxruntime_soname_the_binary_needs_resolves_inside_the_archive(self):
+        result = self.stage_archive()
+        self.assertEqual(0, result.returncode, result.stderr)
+        with tarfile.open(self.directory / (self.stage + ".tar.gz")) as archive:
+            soname = archive.getmember(self.stage + "/libonnxruntime.so.1")
+            self.assertTrue(soname.issym())
+            self.assertEqual("libonnxruntime.so.1.30.0", soname.linkname)
+
     def test_two_onnxruntime_versions_fail_instead_of_shipping_either(self):
         stale = self.directory / "native-libs/linux-x86_64/lib-dynamic/libonnxruntime.so.1.26.0"
         stale.write_bytes(b"stale")
