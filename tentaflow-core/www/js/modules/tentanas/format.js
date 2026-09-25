@@ -7,7 +7,7 @@
 
 import { I18n } from '/js/i18n.js';
 import { escapeAttr } from '/js/utils.js';
-import { isOpaqueId, scrubIds } from '/js/modules/tentanas/machine-id.js';
+import { isOpaqueId, isDiskIdShape, scrubIds } from '/js/modules/tentanas/machine-id.js';
 
 export const T = (k, p) => I18n.t('tentanas.' + k, p);
 
@@ -902,4 +902,22 @@ export function fmtSchedule(s) {
 export function fmtScheduleUnit(s) {
   const every = s && s.every;
   return SUB_DAILY.has(every) ? T('schedule.unit_' + every) : fmtSchedule(s);
+}
+
+// A ZFS pool leaf as a screen names it (n06 cells, device-action words, the
+// destroy dialog, the replace wizard, the Pools tab's spare shelf). A leaf
+// `zpool status` can no longer find arrives named by its GUID or by-id link
+// — an id, never text (owner's rule). So: the leaf's own kernel name; else
+// the kernel name the disk inventory has for it (`inv`); else the name the
+// node REMEMBERS for it (`lastKnownName`, pools.rs `last_known_leaf_name`),
+// marked as remembered; else "missing disk" with the leaf's 1-based
+// `position` in its group (0 when it has none). The id stays `d.name` for
+// every request — only the words change.
+export function leafDisplayName(d, inv, position = 0) {
+  if (!isDiskIdShape(d?.name)) return d.name;
+  const kernelName = inv && inv.name && !isDiskIdShape(inv.name) ? inv.name : null;
+  if (kernelName) return kernelName;
+  const remembered = String(d.lastKnownName || '').trim();
+  if (remembered && !isDiskIdShape(remembered)) return T('pool.leaf_last_known', { name: remembered });
+  return position ? T('pool.leaf_missing_at', { n: position }) : T('elastic.disk_absent');
 }

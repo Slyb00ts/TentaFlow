@@ -402,9 +402,10 @@ pub struct ElasticAdmission<'a> {
 /// its recorded cause names: after a failed parity run a Scrub and a Fix
 /// always, a Sync after a failed Sync, and a Sync over a Scrub or Fix fault
 /// only with the admin's acknowledgement — measured (M3, rig11 2026-09-24),
-/// such a Sync removes nothing from the content file and unchanged files stay
-/// repairable, but it records files deleted or changed since the last Sync
-/// in their new state. No cause, `Other` or
+/// such a Sync drops no UNCHANGED file from the content file and unchanged
+/// files stay repairable; it drops the files deleted since the last Sync, as
+/// every Sync does, and records the changed ones in their new state. No
+/// cause, `Other` or
 /// an unfinished add admit none of the three.
 ///
 /// The acknowledgement is BOUND TO THE FAULT: it names the operation id of

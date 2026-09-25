@@ -549,3 +549,28 @@ test('the pool card reason is worded from codes and follows the poll in place', 
     screen.dispose();
   }
 });
+
+// Critic wave 5 round 2, MJ2: a hot spare whose disk was pulled is a leaf
+// zpool names by its GUID or by-id link. The shelf names it like every other
+// leaf — the name the node remembers, else "brak dysku" — never by that id.
+test('a pulled hot spare is named on the shelf, never by its GUID or by-id link', async () => {
+  const byId = 'wwn-0x5000c500a1b2c3d4';
+  const guid = '3847561029384756102';
+  const spares = [
+    { name: 'spare-a', kind: 'disk', role: 'spare', state: 'unavail', disks: [{ ...member(byId), diskId: null, state: 'unavail', lastKnownName: 'sdq' }] },
+    { name: 'spare-b', kind: 'disk', role: 'spare', state: 'unavail', disks: [{ ...member(guid), diskId: null, state: 'unavail' }] },
+  ];
+  const screen = fakeScreen({
+    tentaNasPoolsListRequest: { pools: [pool({ vdevs: [tankVdevs[0], ...spares] })], freeDisks: [] },
+    tentaNasDisksListRequest: inventory,
+  });
+  const body = mount();
+  await drawPools(screen, body);
+  await flush();
+  const shelf = body.querySelector('#nas-free-cells');
+  const names = [...shelf.querySelectorAll('.disk-cell.spare .dc-name')].map((n) => n.textContent.trim());
+  assert.deepEqual(names, ['brak dysku (ostatnio sdq)', 'brak dysku']);
+  assert.doesNotMatch(shelf.textContent, /wwn-|3847561029384756102/, 'no id as text');
+  for (const el of shelf.querySelectorAll('[title]')) assert.doesNotMatch(el.getAttribute('title'), /wwn-|3847561029384756102/, 'nor as a tooltip');
+  screen.dispose();
+});

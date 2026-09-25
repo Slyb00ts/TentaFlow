@@ -8507,10 +8507,11 @@ mod tests {
         // A SCRUB THAT ONLY LOST FILES: no data error was counted, so there is
         // no marked block for a repair to write back — `-e fix` reports
         // `error:0 recovered:0` for such a scrub. A later successful Sync
-        // settles the row; it removes nothing from the content file (M3 f4:
-        // an unchanged unreadable file stays listed and `fix -f` restores it
-        // afterwards). Otherwise the array would keep a fault nothing could
-        // clear.
+        // settles the row. It drops no UNCHANGED file from the content file
+        // (M3 f4: an unchanged unreadable file stays listed and `fix -f`
+        // restores it afterwards) — only the files deleted since the previous
+        // Sync, as every Sync does. Otherwise the array would keep a fault
+        // nothing could clear.
         let (lost, lost_intent, lost_id) = maintenance(&spec, Kind::Scrub);
         insert_job(&p, &lost, Some(&lost_intent)).unwrap();
         let mut only_files =

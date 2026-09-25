@@ -11,7 +11,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, poolCrumbTail, sprite, POLL_POOLS_MS, POLL_JOB_MODAL_MS, IO_WINDOW_SECS, ADMIN_TIMEOUT_MS, parseServerTs,
   fmtDate, fmtIn, fmtDuration, fmtBytes, fmtMBps, fmtRatio, pct, healthClass, errMessage,
-  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel, firstDiskReasonWord,
+  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel, firstDiskReasonWord, leafDisplayName,
 } from '/js/modules/tentanas/format.js';
 import { isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, SLOT, slotEl, setClass, setRowsIfChanged } from '/js/lib/dom-patch.js';
@@ -465,9 +465,17 @@ export function diskCondition(d, inv) {
   // otherwise the disk's grade and first reason, worded from its codes
   // exactly like the n03/n04 chips (`diskHealthChipLabel`). The node's
   // English sentence goes in `title=` only, never on the chip itself.
+  //
+  // A WARNING whose only reason is heat (`temperature_high`, the node's
+  // 50°C-and-up grade) gets no chip: n06 shows such a disk (sdf, 54°C) by
+  // its amber dot and the temperature in its sub-line, nothing more — the
+  // chip and the border are for reasons that speak about the disk itself
+  // (owner decision, wave 5). Over the limit is critical and keeps its chip.
+  const reasons = Array.isArray(inv?.healthReasons) ? inv.healthReasons : [];
+  const hotOnly = smart === 'warn' && reasons.length > 0 && reasons.every((r) => r?.code === 'temperature_high');
   let chip = null;
   if (d.state !== 'online') chip = { status: leaf, label: stateLabel(d.state) };
-  else if (smart === 'warn' || smart === 'err') {
+  else if ((smart === 'warn' && !hotOnly) || smart === 'err') {
     const worded = diskHealthChipLabel(inv);
     chip = { status: smart, label: worded.label, title: worded.title };
   }
@@ -550,15 +558,8 @@ function vdevSkeletonHtml(v, admin, vdevs) {
 // `dm-name-…` / `dm-uuid-…` are by-id LINKS; `dm-0` is a real kernel name (a
 // LUKS or LVM device) and must stay visible as the disk it is.
 export const isUnresolvedLeafName = isDiskIdShape;
-// `position` is the leaf's 1-based place in its vdev (0 when unknown).
-function leafDisplayName(d, inv, position = 0) {
-  if (!isUnresolvedLeafName(d.name)) return d.name;
-  const kernelName = inv && inv.name && !isUnresolvedLeafName(inv.name) ? inv.name : null;
-  if (kernelName) return kernelName;
-  const remembered = String(d.lastKnownName || '').trim();
-  if (remembered && !isUnresolvedLeafName(remembered)) return T('pool.leaf_last_known', { name: remembered });
-  return position ? T('pool.leaf_missing_at', { n: position }) : T('elastic.disk_absent');
-}
+// The naming itself is `leafDisplayName` (format.js), shared with the Pools
+// tab's spare shelf.
 
 // The leaf's 1-based place in its vdev, by its wire name.
 const leafPosition = (v, d) => (v?.disks || []).findIndex((x) => x.name === d.name) + 1;
@@ -600,9 +601,10 @@ function paintDiskCell(cell, d, v, ctx) {
   const bad = d.state !== 'online';
   setClass(cell, 'faulted', bad);
   // Owner decision (wave 5, n06:218-226): the amber border marks a disk whose
-  // chip NAMES a reason (sdd "Uwaga: 3 realok."). A warning with no reason
-  // the node words (a hot disk shown by its dot alone, bare error counters)
-  // keeps the dot and no border.
+  // chip NAMES a reason (sdd "Uwaga: 3 realok."). A hot disk (a warning whose
+  // only reason is `temperature_high`) has no chip at all (`diskCondition`),
+  // and a warning with no reason the node words, or bare error counters,
+  // has no named reason: both keep the dot and no border.
   const namedReason = Boolean(cond.chip && firstDiskReasonWord(inv));
   setClass(cell, 'warn', !bad && cond.tone !== 'ok' && namedReason);
   setClass(cell, 'resilver', bad && ctx.resilvering);

@@ -9,7 +9,7 @@ import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS,
   fmtDate, fmtIn, fmtBytes, fmtRatio, pct, healthClass, healthChip, errMessage, layoutLabel, stateTone, stateLabel, fmtSchedule,
-  poolReasonsText,
+  poolReasonsText, leafDisplayName,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl } from '/js/lib/dom-patch.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
@@ -139,7 +139,11 @@ async function refreshPools(screen, body, state) {
     ['zfs', 'tentaNasPoolsListRequest', (res) => { state.pools = res.pools || []; }],
     ['elastic', 'tentaNasElasticArraysListRequest', (res) => { if (!Array.isArray(res.arrays)) throw new Error(T('elastic.bad_response')); state.arrays = res.arrays; }],
     ['capabilities', 'tentaNasElasticCapabilitiesRequest', (res) => { if (!Array.isArray(res.freeDisks)) throw new Error(T('elastic.bad_response')); state.freeDisks = res.freeDisks; }],
-    ['disks', 'tentaNasDisksListRequest', (res) => { state.diskKinds = new Map((res.disks || []).map((d) => [d.diskId, d.kind])); }],
+    ['disks', 'tentaNasDisksListRequest', (res) => {
+      state.diskKinds = new Map((res.disks || []).map((d) => [d.diskId, d.kind]));
+      // For naming a spare leaf the pool can no longer find (`leafDisplayName`).
+      state.diskInventory = new Map((res.disks || []).flatMap((d) => [[d.diskId, d], [d.name, d]]));
+    }],
   ].map(async ([source, kind, accept]) => {
     try {
       const response = await screen.nas(kind, {});
@@ -217,6 +221,10 @@ function renderPools(screen, body, state) {
   // Keyed by disk id (B3, same fix as the pool cards): a pool's spare coming
   // and going, or one disk's health flipping, no longer rebuilds every cell
   // on the shelf.
+  // A spare whose disk was pulled is a leaf zpool names by its GUID or by-id
+  // link: named like every other leaf (`leafDisplayName`), never by that id.
+  const inventory = state.diskInventory || new Map();
+  const spareName = (disk) => leafDisplayName(disk, (disk.diskId && inventory.get(disk.diskId)) || inventory.get(disk.name));
   patchKeyedList(body.querySelector('#nas-free-cells'), [
     ...spares.map(({ disk, pool }) => {
       const kind = state.diskKinds.get(disk.diskId) || '';
@@ -226,7 +234,7 @@ function renderPools(screen, body, state) {
       <div class="disk-cell spare" data-disk="${escapeAttr(disk.diskId || disk.name)}" title="${escapeAttr(T('pools.spare_title', { pool }))}">
         <span class="health-dot ${healthClass(disk.state === 'online' ? 'ok' : 'warning')}"></span>
         <div class="dc-main">
-          <div class="dc-name"><span class="mono">${escapeHtml(disk.name)}</span></div>
+          <div class="dc-name"><span class="mono">${escapeHtml(spareName(disk))}</span></div>
           <div class="dc-sub">${escapeHtml(T('pools.spare_sub', { size: fmtBytes(disk.sizeBytes), pool }))}</div>
         </div>
         ${kind ? `<span class="disk-kind ${escapeAttr(kind)}">${escapeHtml(kind)}</span>` : ''}

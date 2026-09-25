@@ -4259,12 +4259,14 @@ async fn elastic_snapraid(
                 // A Sync over an array whose scrub reported errors is not the
                 // same operation as a Sync over a healthy one, and the approver
                 // reads only this sentence. MEASURED on rig11 (snapraid
-                // 13.0-1): the marked blocks stay repairable across a Sync —
-                // an unchanged file reads `equal` and gets no new parity — but
-                // the files the scrub could NOT read are removed from the
-                // content file by that same Sync, and parity then holds nothing
-                // of them. So the sentence names what the approval costs, and
-                // the repair is the operation to take first.
+                // 13.0-1, M3 f1-f4): the marked blocks of unchanged files stay
+                // repairable across a Sync — an unchanged file reads `equal`
+                // and gets no new parity — and so do unchanged files the scrub
+                // could not read (they stay in the content file). What the
+                // Sync costs is the earlier version of every file deleted or
+                // changed since the previous Sync, a damaged one included. So
+                // the sentence names what the approval costs, and the repair
+                // is the operation to take first.
                 // The warning follows the OBSERVED need — the helper's
                 // recorded cause included, which a scrub whose log broke
                 // leaves with no counts in the history.
@@ -8428,6 +8430,64 @@ mod registration_tests {
         assert_eq!(refused.code, ProtocolErrorCode::NotFound);
         assert!(store::list_alerts(&g.db, false).unwrap().iter().any(|a| a.alert_id == their_alert),
             "and it stays unacknowledged for its owner");
+    }
+
+    /// Owner decision (wave 5): the jobs and alerts whose owner is gone (a
+    /// dissolved array's, `org_id = ''`) are the node's SOLE organisation's to
+    /// see. Through the real handlers, so a call site that went back to the
+    /// bare org id (`From<&str>`, "not sole") fails here: the job list, the job
+    /// modal, the alert list and the FleetView badge must all show the orphan
+    /// on a one-organisation node — the badge counting exactly what the list
+    /// shows — and all hide it once a second organisation exists.
+    #[tokio::test]
+    async fn the_handlers_show_a_dissolved_arrays_rows_only_to_the_sole_organisation() {
+        let mut fixture = dispatch_fixture();
+        // The test database seeds `org-default` and nothing else.
+        fixture.ctx.org_context.as_mut().unwrap().org_id = "org-default".into();
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let orphan = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_sync".into(),
+            subject: "rozwiazana".into(),
+            status: "failed".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(&g.db, &orphan, None).unwrap();
+        store::raise_alert(&g.db, "k-orphan", "warning", "elastic-array", "rozwiazana", "Macierz", "").unwrap();
+        {
+            let conn = g.db.write().unwrap();
+            conn.execute("UPDATE nas_jobs SET org_id = '' WHERE job_id = ?1", rusqlite::params![orphan.job_id]).unwrap();
+            conn.execute("UPDATE nas_alerts SET org_id = '' WHERE subject_id = 'rozwiazana'", []).unwrap();
+        }
+        let seen = |ctx: &HandlerContext| {
+            let Ok(MessageBody::TentaNasBody(P::JobsListResponse { jobs })) = jobs_list(ctx, 0) else { panic!("jobs") };
+            let Ok(MessageBody::TentaNasBody(P::AlertsListResponse { alerts })) = alerts_list(ctx, false) else { panic!("alerts") };
+            (
+                jobs.iter().any(|j| j.job_id == orphan.job_id),
+                job_get(ctx, &orphan.job_id).is_ok(),
+                alerts.iter().filter(|a| a.subject_id == "rozwiazana").count(),
+                alerts.len() as u32,
+            )
+        };
+        let body = MessageBody::TentaNasBody(P::NodesListRequest {});
+        let local_badge = |answer: MessageBody| {
+            let MessageBody::TentaNasBody(P::NodesListResponse { nodes, .. }) = answer else { panic!("nodes: {answer:?}") };
+            nodes.iter().find(|n| n.is_local).map(|n| n.alerts_active).unwrap()
+        };
+
+        let (in_list, in_modal, orphan_alerts, listed) = seen(&fixture.ctx);
+        assert!(in_list && in_modal, "the sole organisation sees its dissolved array's job");
+        assert_eq!(orphan_alerts, 1, "and its alert");
+        let (answer, _) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
+        assert_eq!(local_badge(answer), listed, "the FleetView badge counts what the list shows");
+
+        crate::services::org::create_organization(&fixture.ctx.state.db, "Tenant B", "tenant-b", None, None, None, None).unwrap();
+        let (in_list, in_modal, orphan_alerts, listed) = seen(&fixture.ctx);
+        assert!(!in_list && !in_modal, "two organisations: nobody sees it");
+        assert_eq!(orphan_alerts, 0);
+        let (answer, _) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
+        assert_eq!(local_badge(answer), listed, "and the badge still agrees with the list");
     }
 
     /// A job another tenant's user started on SHARED hardware stays on the

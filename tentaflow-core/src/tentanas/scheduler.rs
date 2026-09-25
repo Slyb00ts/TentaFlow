@@ -1178,10 +1178,13 @@ mod tests {
     /// a Sync on an array that needs attention — deliberately, because a failed
     /// or interrupted parity run must have a way out. The cadence must not take
     /// that way out by itself. MEASURED on rig11 (snapraid 13.0-1, M3 f1-f4,
-    /// design repository reviews/artifacts/elastic-measurements-2026-09-24): a Sync removes nothing from the content file — unchanged files
-    /// stay repairable, marked blocks and unreadable (EIO) files alike. What it
-    /// costs is the earlier version of every file deleted or changed since the
-    /// previous Sync, a damaged one included, and some cases stay unmeasured.
+    /// design repository reviews/artifacts/elastic-measurements-2026-09-24):
+    /// a Sync drops no UNCHANGED file from the content file — unchanged files
+    /// stay repairable, marked blocks and unreadable (EIO) files alike. It
+    /// does drop the files deleted since the previous Sync, as every Sync
+    /// does, and what it costs is the earlier version of every file deleted
+    /// or changed since then, a damaged one included; some cases stay
+    /// unmeasured.
     /// An admin who is told can weigh that; a cadence cannot.
     #[tokio::test]
     async fn a_scheduled_sync_skips_an_array_whose_scrub_reported_errors() {

@@ -475,12 +475,13 @@ test('a disk SMART warns about shows the warning tone inside an ONLINE leaf, and
   let health = 'ok';
   let leafState = 'online';
   let noReasons = false;
+  let hotOnly = false;
   const screen = liveScreen(
     { pool: () => ({ vdevs: [{ id: 'mirror-0', role: 'data', kind: 'mirror', state: 'online', faultTolerance: 1, disks: [disk('sda', { state: leafState }), disk('sdb')] }] }) },
     { disks: () => [disk('sda', {
       role: 'member', health, temperatureC: 47,
       healthReason: health === 'ok' ? '' : '8 reallocated sectors; 54°C',
-      healthReasons: health === 'ok' || noReasons ? [] : [{ code: 'reallocated', params: { count: '8' } }, { code: 'temperature_high', params: { celsius: '54' } }],
+      healthReasons: health === 'ok' || noReasons ? [] : hotOnly ? [{ code: 'temperature_high', params: { celsius: '54' } }] : [{ code: 'reallocated', params: { count: '8' } }, { code: 'temperature_high', params: { celsius: '54' } }],
     }), disk('sdb', { role: 'member' })] },
   );
   const body = mount();
@@ -514,6 +515,17 @@ test('a disk SMART warns about shows the warning tone inside an ONLINE leaf, and
   assert.ok(dot().classList.contains('warn'), 'still a warning dot');
   assert.ok(!cell().classList.contains('warn'), 'but no amber border without a named reason');
   noReasons = false;
+
+  // n06's hot disk (sdf, 54°C): a warning whose only reason is temperature,
+  // exactly as the node sends it, is the dot and nothing else — no chip, no
+  // border — with the temperature in the sub-line.
+  hotOnly = true;
+  await screen.poll();
+  assert.ok(dot().classList.contains('warn'), 'the dot says it is warm');
+  assert.equal(cell().querySelector('.dc-name tf-chip'), null, 'no chip for heat alone');
+  assert.ok(!cell().classList.contains('warn'), 'and no amber border');
+  assert.match(cell().querySelector('[data-f="sub"]').textContent, /47°C/, 'the temperature is in the sub-line');
+  hotOnly = false;
 
   // A FAULTED leaf stays red even when SMART says the disk is fine.
   health = 'ok';

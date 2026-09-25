@@ -135,10 +135,12 @@ function unresolvedFixFault(array) {
 // Whether a Sync on this array needs the admin's confirm: the node says so
 // (`syncNeedsAcknowledgement`, which carries the helper's own recorded cause),
 // or the history shows an unrepaired Scrub or Repair fault. Measured on rig11
-// (M3, design repository reviews/artifacts/elastic-measurements-2026-09-24): a Sync over such a fault removes nothing from the content file
-// — unchanged files stay repairable, marked blocks and unreadable (EIO) ones
-// alike — but it records files deleted or changed since the last Sync in
-// their new state, damaged ones included, and some cases stay unmeasured. So
+// (M3, design repository reviews/artifacts/elastic-measurements-2026-09-24):
+// a Sync over such a fault drops no UNCHANGED file from the content file —
+// unchanged files stay repairable, marked blocks and unreadable (EIO) ones
+// alike. It does drop the files deleted since the last Sync, as every Sync
+// does, and records the changed ones in their new state, damaged ones
+// included; some cases stay unmeasured. So
 // only the confirm that names that cost may send `acknowledgeParityFault`,
 // and the node and its helper refuse the Sync without it.
 export function syncNeedsAcknowledgement(array) {
