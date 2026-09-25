@@ -17,7 +17,6 @@
 //              review, and the worktree holds what the agent wrote.
 // =============================================================================
 
-const crypto = require('crypto');
 const { test, expect } = require('@playwright/test');
 const { startBinary, stopBinary, waitForServer, binaryExists } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
@@ -130,38 +129,35 @@ if __name__ == "__main__":`,
 const ANSWER_1 = 'Gotowe: snake.py z logiką gry i test_snake.py — 3 testy przechodzą.';
 const ANSWER_2 = 'Dodałem punkty (10 za jedzenie) i poziomy co 50 punktów; 4 testy przechodzą.';
 
-const sha256 = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
-
-/// The sha the agent read for `path`, taken from the fs_read result the harness
-/// fed back — what a real model would copy. Falls back to hashing the known
-/// content so a changed result shape fails on the write, not here.
-function readSha(request, path, content) {
+/// The `blob_id` the agent read for `path`, copied from the fs_read result the
+/// harness fed back — exactly what a real model does.
+function readBlobId(request, path) {
   for (const m of [...(request?.messages ?? [])].reverse()) {
     if (m.role !== 'tool') continue;
     const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
-    if (!text.includes(path)) continue;
-    const hit = text.match(/"sha256"\s*:\s*"([0-9a-f]{64})"/);
+    if (!text.includes(`"path":"${path}"`)) continue;
+    const hit = text.match(/"blob_id"\s*:\s*"([0-9a-f]+)"/);
     if (hit) return hit[1];
   }
-  return sha256(content);
+  throw new Error(`no fs_read result for ${path} in the conversation`);
 }
 
 function orchestratorSteps() {
   return [
     // Turn 1 — create.
     tool('core.workspace_info', {}),
-    tool('core.fs_write', { path: 'snake.py', content: GAME_V1, expected_sha256: '' }),
-    tool('core.fs_write', { path: 'test_snake.py', content: TESTS_V1, expected_sha256: '' }),
+    tool('core.fs_write', { path: 'snake.py', content: GAME_V1, expected_blob_id: '' }),
+    tool('core.fs_write', { path: 'test_snake.py', content: TESTS_V1, expected_blob_id: '' }),
     tool('core.exec', { argv: ['python3', 'test_snake.py'] }),
     say(ANSWER_1),
     // Turn 2 — change what turn 1 wrote.
     tool('core.fs_read', { path: 'snake.py' }),
     tool('core.fs_write', (req) => ({
-      path: 'snake.py', content: GAME_V2, expected_sha256: readSha(req, 'snake.py', GAME_V1),
+      path: 'snake.py', content: GAME_V2, expected_blob_id: readBlobId(req, 'snake.py'),
     })),
     tool('core.fs_read', { path: 'test_snake.py' }),
     tool('core.fs_write', (req) => ({
-      path: 'test_snake.py', content: TESTS_V2, expected_sha256: readSha(req, 'test_snake.py', TESTS_V1),
+      path: 'test_snake.py', content: TESTS_V2, expected_blob_id: readBlobId(req, 'test_snake.py'),
     })),
     tool('core.exec', { argv: ['python3', 'test_snake.py'] }),
     say(ANSWER_2),
@@ -242,6 +238,20 @@ async function nowLine(page) {
   return ((await line.textContent({ timeout: 1_000 }).catch(() => '')) ?? '').trim();
 }
 
+/// What the latest `core.exec` call printed, read the way an operator reads it:
+/// the result is folded into the tool row and opens with a click on it.
+async function execOutputOnScreen(page) {
+  const stream = page.locator('#cs-session-view .cs-stream[data-stream="console"]');
+  // The call's row folds the tool result (stdout included); the `Exec` event
+  // beside it carries only the working directory.
+  const row = stream.locator('.ev-tool[data-detail-text*="stdout"]').last();
+  await row.scrollIntoViewIfNeeded();
+  await row.click();
+  const detail = stream.locator('.ev-detail').last();
+  await expect(detail).toBeVisible();
+  return (await detail.textContent()) ?? '';
+}
+
 /// The root run of the n-th message. `ordinal` numbers EVERY run of the
 /// session, sub-agents included, so a turn is found by its position among roots.
 async function rootOfTurn(page, turn) {
@@ -311,7 +321,10 @@ test.describe('Code Studio — program budowany w dwóch turach, widoczny na ży
     await loginAsAdmin(page, { port: PORT });
     await ensureCodeStudioApp(page);
     await registerModelProvider(page, model);
-    workspaceId = await createWorkspace(page, PORT, WORKSPACE);
+    // `trusted_native`: the default process sandbox needs unprivileged user
+    // namespaces, which a stock Ubuntu 24.04 host denies to bwrap. This suite
+    // is about the harness and what the screen shows, not about the sandbox.
+    workspaceId = await createWorkspace(page, PORT, WORKSPACE, { execMode: 'trusted_native' });
   });
 
   test('tura 1: agent pisze grę i testy, a ekran pokazuje, co trwa', async ({ page }) => {
@@ -344,7 +357,7 @@ test.describe('Code Studio — program budowany w dwóch turach, widoczny na ży
     await expect(view.locator('[data-patch-card] .pf .n').first())
       .toHaveText(/accepted|zaakceptowan/i, { timeout: 15_000 });
     // The tests really ran: python's stdout came back through core.exec.
-    await expect(view.getByText('wszystkie testy przeszły (3)', { exact: false }).first()).toBeVisible();
+    expect(await execOutputOnScreen(page)).toContain('wszystkie testy przeszły (3)');
     // What the agent answered is on screen — not only that its run ended.
     await expect(view.getByText(ANSWER_1, { exact: false }).first()).toBeVisible({ timeout: 15_000 });
     expect(await readWorktreeFile(page, scope(), 'snake.py')).toBe(GAME_V1);
@@ -365,7 +378,7 @@ test.describe('Code Studio — program budowany w dwóch turach, widoczny na ży
     expect(root.status, `turn 2 ended ${root.status}`).toBe('completed');
 
     const view = page.locator('#cs-session-view');
-    await expect(view.getByText('wszystkie testy przeszły (4)', { exact: false }).first()).toBeVisible();
+    expect(await execOutputOnScreen(page)).toContain('wszystkie testy przeszły (4)');
     await expect(view.getByText(ANSWER_2, { exact: false }).first()).toBeVisible({ timeout: 15_000 });
     const game = await readWorktreeFile(page, scope(), 'snake.py');
     expect(game).toBe(GAME_V2);

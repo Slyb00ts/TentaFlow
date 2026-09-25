@@ -52,9 +52,9 @@ function helloWorldScript({ path = 'hello.py', message = 'Witaj z Code Studio' }
 
   return [
     tool('core.workspace_info', {}),
-    // expected_sha256 = "" asserts the file does not exist yet, which is the
+    // expected_blob_id = "" asserts the file does not exist yet, which is the
     // contract for a create (builtins.rs, CoreToolName::FsWrite).
-    tool('core.fs_write', { path, content, expected_sha256: '' }),
+    tool('core.fs_write', { path, content, expected_blob_id: '' }),
     tool('core.exec', { argv: ['python3', path] }),
     // Asking for a commit is what MATERIALISES the patch set: `core.git_commit`
     // without an accepted review opens the review and parks (that contract is
@@ -147,7 +147,7 @@ function delegationScripts({ path = 'from_subagent.py', message = 'Napisane prze
       // code-implementer's system prompt opens with this sentence.
       match: 'Piszesz kod',
       steps: [
-        tool('core.fs_write', { path, content, expected_sha256: '' }),
+        tool('core.fs_write', { path, content, expected_blob_id: '' }),
         say(`Utworzyłem ${path}.`),
       ],
     },

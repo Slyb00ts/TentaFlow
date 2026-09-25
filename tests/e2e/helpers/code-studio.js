@@ -86,8 +86,9 @@ async function gotoCodeStudio(page, port) {
 
 /// Grants the signed-in user the right to create workspaces (nobody holds it
 /// on a fresh database), then walks the wizard with an empty repository and
-/// waits for provisioning to finish. Returns the workspace id.
-async function createWorkspace(page, port, name) {
+/// waits for provisioning to finish. `execMode` picks a card on the mode step;
+/// omitted, the wizard's default stays. Returns the workspace id.
+async function createWorkspace(page, port, name, { execMode } = {}) {
   const me = await api(page, 'authMeRequest');
   const users = await api(page, 'usersListRequest');
   const mine = (users?.users ?? []).find((u) => (u.username ?? '') === (me?.username ?? 'admin'));
@@ -98,8 +99,10 @@ async function createWorkspace(page, port, name) {
   await gotoCodeStudio(page, port);
   await page.locator('#cs-new, #cs-empty-new').first().click();
   await page.locator('#cs-wz-name input').first().fill(name);
-  // Execution mode and source keep their defaults; the last `next` creates.
-  for (let i = 0; i < 3; i += 1) await page.locator('[data-action="next"]').first().click();
+  await page.locator('[data-action="next"]').first().click();
+  if (execMode) await page.locator(`#cs-wz-modes tf-choice-card[value="${execMode}"]`).click();
+  // The source keeps its default; the last `next` creates.
+  for (let i = 0; i < 2; i += 1) await page.locator('[data-action="next"]').first().click();
 
   let workspaceId = '';
   await expect.poll(async () => {
