@@ -249,7 +249,17 @@ fn strip_tool_call_tags(s: &str) -> std::borrow::Cow<'_, str> {
 /// Valid blocks are removed from the returned text (leftover blank lines
 /// collapsed); invalid blocks stay in the text untouched and are logged.
 /// Call ids are deterministic: `call_<idx>_<8 hex chars of content hash>`.
+///
+/// DeepSeek models answer the same prompt in their own DSML markup instead
+/// (see [`parse_dsml_calls`]); both forms are accepted in one turn.
 pub fn parse_tool_calls(text: &str) -> (String, Vec<LlmToolCall>) {
+    let (text, mut calls) = parse_tagged_calls(text);
+    let (text, dsml) = parse_dsml_calls(&text, calls.len());
+    calls.extend(dsml);
+    (text, calls)
+}
+
+fn parse_tagged_calls(text: &str) -> (String, Vec<LlmToolCall>) {
     let mut calls: Vec<LlmToolCall> = Vec::new();
     let mut removals: Vec<(usize, usize)> = Vec::new();
 
@@ -325,6 +335,76 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<LlmToolCall>) {
         pos = end;
     }
     cleaned.push_str(&text[pos..]);
+    (collapse_blank_lines(&cleaned), calls)
+}
+
+/// DeepSeek's native tool markup. Told to emit `<tool_call>` JSON, DeepSeek
+/// V3.2+ still answers in the format its chat template trained it on:
+///
+/// ```text
+/// <｜DSML｜function_calls>
+/// <｜DSML｜invoke name="core.fs_list">
+/// <｜DSML｜parameter name="path" string="true">.</｜DSML｜parameter>
+/// </｜DSML｜invoke>
+/// </｜DSML｜function_calls>
+/// ```
+///
+/// Read without it, such a turn has no calls at all and the agent stops after
+/// one step with the markup as its answer. The marker is matched loosely
+/// (`｜` doubled, spaces, `calls` for `function_calls` all occur in the wild).
+/// `string="true"` marks a raw string; any other value is JSON, falling back
+/// to the raw text when it does not parse.
+fn parse_dsml_calls(text: &str, first_idx: usize) -> (String, Vec<LlmToolCall>) {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    static INVOKE: OnceLock<Regex> = OnceLock::new();
+    static PARAM: OnceLock<Regex> = OnceLock::new();
+    static WRAPPER: OnceLock<Regex> = OnceLock::new();
+
+    if !text.contains("DSML") {
+        return (text.to_string(), Vec::new());
+    }
+    let invoke = INVOKE.get_or_init(|| {
+        Regex::new(
+            r#"(?s)<[^<>]*DSML[^<>]*?invoke\s+name="([^"]+)"\s*>(.*?)</[^<>]*DSML[^<>]*?invoke\s*>"#,
+        )
+        .expect("static regex")
+    });
+    let param = PARAM.get_or_init(|| {
+        Regex::new(
+            r#"(?s)<[^<>]*DSML[^<>]*?parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</[^<>]*DSML[^<>]*?parameter\s*>"#,
+        )
+        .expect("static regex")
+    });
+    let wrapper = WRAPPER.get_or_init(|| {
+        Regex::new(r"</?[^<>]*DSML[^<>]*?(?:function_)?calls\s*>").expect("static regex")
+    });
+
+    let mut calls = Vec::new();
+    for caps in invoke.captures_iter(text) {
+        let mut arguments = serde_json::Map::new();
+        for p in param.captures_iter(&caps[2]) {
+            let raw = &p[3];
+            let value = if p.get(2).map(|m| m.as_str()) == Some("true") {
+                serde_json::Value::String(raw.to_string())
+            } else {
+                serde_json::from_str(raw.trim())
+                    .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
+            };
+            arguments.insert(p[1].trim().to_string(), value);
+        }
+        calls.push(LlmToolCall {
+            id: generate_call_id(first_idx + calls.len(), &caps[0]),
+            name: caps[1].trim().to_string(),
+            arguments: serde_json::Value::Object(arguments).to_string(),
+        });
+    }
+    if calls.is_empty() {
+        return (text.to_string(), calls);
+    }
+    let cleaned = invoke.replace_all(text, "");
+    let cleaned = wrapper.replace_all(&cleaned, "");
     (collapse_blank_lines(&cleaned), calls)
 }
 
@@ -673,6 +753,46 @@ mod markup_tests {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The turn that stalled a Code Studio session: DeepSeek answered the
+    /// prompt-mode tool section with its own DSML markup (doubled `｜`, `calls`).
+    #[test]
+    fn deepseek_dsml_markup_is_read_as_tool_calls() {
+        let text = "<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name=\"core.workspace_info\">
+
+</｜｜DSML｜｜ invoke>
+<｜｜DSML｜｜ invoke name=\"core.fs_list\">
+<｜｜DSML｜｜ parameter name=\"path\" string=\"true\">.</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name=\"limit\" string=\"false\">5</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>";
+        let (rest, calls) = parse_tool_calls(text);
+        assert_eq!(rest, "");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "core.workspace_info");
+        assert_eq!(calls[0].arguments, "{}");
+        assert_eq!(calls[1].name, "core.fs_list");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[1].arguments).unwrap(),
+            json!({"path": ".", "limit": 5})
+        );
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    #[test]
+    fn official_dsml_function_calls_markup_is_read_too() {
+        let text = "Sprawdzam.
+<｜DSML｜function_calls>
+<｜DSML｜invoke name=\"core.fs_read\">
+<｜DSML｜parameter name=\"path\" string=\"true\">src/main.rs</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜function_calls>";
+        let (rest, calls) = parse_tool_calls(text);
+        assert_eq!(rest, "Sprawdzam.");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments, r#"{"path":"src/main.rs"}"#);
+    }
 
     fn spec(name: &str, description: &str, parameters: serde_json::Value) -> LlmToolSpec {
         LlmToolSpec {
