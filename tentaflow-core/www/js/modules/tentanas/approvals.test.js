@@ -447,3 +447,70 @@ test('a coded approval detail is worded in the reader language, in all five loca
     }
   } finally { await I18n.setLanguage('pl'); }
 });
+
+// Wave-6 critic MAJOR 1: a repair the node could not name at all is worded
+// without a disk — never the node's sentence, never a slot.
+test('a parked repair with no disk name or number still reads in words', async () => {
+  const screen = fakeScreen({ tentaNasApprovalsListRequest: {
+    approvals: [pending({ operation: 'elastic_fix', subject: 'media', detail: 'writes back … on a data disk of the array', detailReasons: [{ code: 'elastic_fix', params: { disk: '', number: '' } }] })],
+    settings: settings(),
+  } });
+  const body = mount();
+  const { refresh } = wireApprovals(screen, body);
+  await refresh();
+  await flush();
+  const cell = body.querySelector('#nas-approvals-table').rows[0].operation;
+  assert.match(cell, /na jednym z dysków danych macierzy\./);
+  assert.doesNotMatch(cell, />writes back/);
+  screen.dispose();
+});
+
+// Wave 6: every parked request carries its detail as a code with parameters
+// beside the node's English (`detailReasons`). The row words it in the
+// approver's language — the schedule's cadence with the schedule editor's own
+// formatter, a repair's disk by its number when the node cannot name it,
+// never its slot — and the English is only the sub-line's tooltip.
+test('a parked detail is worded from its code in all five locales, the English only in the tooltip', async () => {
+  const { I18n } = await import('./_test-setup.js');
+  const english = 'arms the schedule: scrub parity of array media, daily at 03:00';
+  const approvals = [
+    pending({
+      operation: 'elastic_schedule', subject: 'media', detail: english,
+      detailReasons: [{ code: 'elastic_schedule', params: { task: 'scrub', enabled: 'true', every: 'daily', hour: '3', minute: '0', weekday: '0', day: '1' } }],
+    }),
+    pending({
+      requestId: 'r-2', operation: 'elastic_fix', subject: 'media', detail: "writes back from parity …; recorded against disk 'd2'",
+      detailReasons: [{ code: 'elastic_fix', params: { disk: '', number: '2' } }],
+    }),
+    pending({ requestId: 'r-3', detail: 'an older sentence' }),
+  ];
+  try {
+    for (const [language, schedule, fix] of [
+      ['pl', /^Uzbraja harmonogram: scrub parity, codziennie o 03:00\.$/, /na dysku danych nr 2\.$/],
+      ['en', /^Arms the schedule: parity scrub, /, /on data disk no\. 2\.$/],
+      ['de', /^Aktiviert den Zeitplan: Paritäts-Scrub, /, /auf Datenträger Nr\. 2\.$/],
+      ['es', /^Activa la programación: scrub de paridad, /, /en el disco de datos n\.º 2\.$/],
+      ['fr', /^Arme la planification : scrub de parité, /, /sur le disque de données n° 2\.$/],
+    ]) {
+      await I18n.setLanguage(language);
+      const screen = fakeScreen({ tentaNasApprovalsListRequest: { approvals, settings: settings() } });
+      const body = mount();
+      const { refresh } = wireApprovals(screen, body);
+      await refresh();
+      await flush();
+      const rows = body.querySelector('#nas-approvals-table').rows;
+      const sub = (i) => {
+        const cell = document.createElement('div');
+        cell.innerHTML = rows[i].operation;
+        return cell.querySelector('.tf-table__cell-sub');
+      };
+      assert.match(sub(0).textContent, schedule, language);
+      assert.equal(sub(0).getAttribute('title'), english, language);
+      assert.match(sub(1).textContent, fix, language);
+      assert.doesNotMatch(sub(1).textContent, /\bd2\b/, language);
+      assert.equal(sub(2).textContent, 'an older sentence', 'a sentence without codes is shown as written');
+      assert.equal(sub(2).getAttribute('title'), null);
+      screen.dispose();
+    }
+  } finally { await I18n.setLanguage('pl'); }
+});

@@ -6,7 +6,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, wordReasons, nodeTextTitle, jobKindLabel } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchKeyedList, paintStatCards, SLOT, slotEl, setClass } from '/js/lib/dom-patch.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, dangerRowHtml, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
@@ -154,12 +154,80 @@ function attentionText(array) {
   return ATTENTION_CAUSES.includes(array?.attention) ? T(`elastic.attention_${array.attention}`) : '';
 }
 
+// The members a state sentence names, per role (`elastic::members_params`):
+// comma-separated kernel names, or "#<n>" for a member the node knows only by
+// its number — never its internal slot.
+const STATE_MEMBER_ROLES = ['data', 'cache', 'parity'];
+function stateMembers(p) {
+  const out = [];
+  for (const role of STATE_MEMBER_ROLES) {
+    for (const name of String(p[role] || '').split(',').map((n) => n.trim()).filter(Boolean)) {
+      const number = /^#(\d+)$/.exec(name)?.[1];
+      out.push(number
+        ? T(`elastic.state_member.${role}_number`, { n: number })
+        : T(`elastic.state_member.${role}`, { name }));
+    }
+  }
+  return out.join(', ');
+}
+const withMembers = (key) => (p) => {
+  const members = stateMembers(p);
+  return members ? T(key, { members }) : null;
+};
+
+// The array state's codes (`NasElasticArray::state_reasons`), in words.
+const STATE_WORDS = new Map([
+  ['mount_table_unknown', () => T('elastic.state_reason.mount_table_unknown')],
+  ['mergerfs_missing', () => T('elastic.state_reason.mergerfs_missing')],
+  ['snapraid_unusable', () => T('elastic.state_reason.snapraid_unusable')],
+  ['branches_unknown', withMembers('elastic.state_reason.branches_unknown')],
+  ['branches_mountable', withMembers('elastic.state_reason.branches_mountable')],
+  ['branches_gone', (p) => {
+    const members = stateMembers(p);
+    if (!members || !['serving', 'down'].includes(p.union)) return null;
+    return T(`elastic.state_reason.branches_gone_${p.union}`, { members });
+  }],
+  ['union_not_mounted', () => T('elastic.state_reason.union_not_mounted')],
+  ['no_parity', () => T('elastic.state_reason.no_parity')],
+  ['restart_required', () => T('elastic.state_reason.restart_required')],
+  ['checkpoint_unfinished', () => T('elastic.state_reason.checkpoint_unfinished')],
+  ['awaiting_confirmation', () => T('elastic.state_reason.awaiting_confirmation')],
+  ['service_not_online', () => T('elastic.state_reason.service_not_online')],
+  ['helper_failed', () => T('elastic.state_reason.helper_failed')],
+  // The sentences the array's row STORES (migration 23): an operation's
+  // error, named by the operation's kind, and a lost supervision.
+  ['operation_failed', (p) => {
+    const kind = p.operation === 'dissolve' ? 'destroy' : String(p.operation || '');
+    const key = 'elastic_' + kind;
+    const label = kind ? jobKindLabel(key) : key;
+    return label !== key
+      ? T('elastic.state_reason.operation_failed', { operation: label })
+      : T('elastic.state_reason.operation_failed_unnamed');
+  }],
+  ['supervision_lost', () => T('elastic.state_reason.supervision_lost')],
+]);
+
 // The sentence that explains the array's state: the helper's recorded cause
-// when there is one, otherwise the node's own detail. The cause replaces the
-// helper's raw text rather than sitting beside it — that text is the
-// helper's, in one language, and may name what a screen must not show.
+// when there is one, otherwise the node's detail in the reader's language
+// (its codes, wave 6), otherwise the node's own sentence as it came — a
+// sentence the node stored without codes (a config import's reason) or a
+// node too old to send them. The cause replaces the helper's raw text rather
+// than sitting beside it — that text is the helper's, in one language, and
+// may name what a screen must not show.
+//
+// An uncoded sentence (a row stored before migration 23 that no rule
+// recognised, an older node) is shown only through the id filter: a stored
+// error may name a by-id path or a WWN.
 export function elasticStateDetail(array) {
-  return attentionText(array) || array?.stateDetail || '';
+  return attentionText(array) || wordReasons(array?.stateReasons, STATE_WORDS) || nodeTextTitle(array?.stateDetail);
+}
+
+// The node's own sentence, as the tooltip of the worded one — '' when the
+// screen already shows that sentence itself.
+export function elasticStateTitle(array) {
+  const shown = elasticStateDetail(array);
+  const own = nodeTextTitle(array?.stateDetail);
+  return own && shown !== own ? own : '';
 }
 
 // The unfinished add, if the array has one: the disk's live name, or "nowy
@@ -335,7 +403,10 @@ export function paintElasticCard(card, array, { admin = false, syncBusy = false 
 
   const stateDetail = elasticStateDetail(array);
   const reason = slotEl(card.querySelector('[data-slot="reason"]'), Boolean(stateDetail), 'reason', '<div class="pc-reason"></div>');
-  if (reason) setText(reason, stateDetail);
+  if (reason) {
+    setText(reason, stateDetail);
+    setAttr(reason, 'title', elasticStateTitle(array));
+  }
 
   const syncBlocked = elasticMaintenanceBlocker(array, admin);
   const sync = card.querySelector('[data-act="array-sync"]');
@@ -1418,6 +1489,7 @@ export async function drawElasticDetail(screen, body) {
     setAttr(chip, 'label', status.label);
     setText(field(pane, 'state-path'), array.unionPath || '');
     setText(field(pane, 'state-detail'), elasticStateDetail(array) || status.label);
+    setAttr(field(pane, 'state-detail'), 'title', elasticStateTitle(array));
     // F2: on a parity fault a Sync would pay for, what to do next and in
     // which order — the repair while a scrub's marks wait for it, then a
     // scrub that re-measures, and the Sync last, behind its confirm.

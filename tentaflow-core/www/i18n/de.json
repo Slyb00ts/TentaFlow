@@ -5655,7 +5655,34 @@
       "create_policy_rand": "zufälliger Datenträger",
       "create_policy_msplfs": "wenigster freier Speicher auf dem längsten vorhandenen Pfad",
       "card_mover": "Verschieben aus dem Cache",
-      "card_cache_waiting": "{size} im Cache ohne Parität"
+      "card_cache_waiting": "{size} im Cache ohne Parität",
+      "state_member": {
+        "data": "Datenträger {name}",
+        "data_number": "Datenträger Nr. {n}",
+        "cache": "Cache-Datenträger {name}",
+        "cache_number": "Cache-Datenträger Nr. {n}",
+        "parity": "Paritätsdatenträger {name}",
+        "parity_number": "Paritätsdatenträger Nr. {n}"
+      },
+      "state_reason": {
+        "mount_table_unknown": "Dieser Knoten konnte seine Einhängetabelle nicht lesen und hängt daher nichts ein oder aus: Eine Union über Branches, die er nicht sieht, würde jeden Client-Schreibvorgang auf das Root-Dateisystem schicken.",
+        "mergerfs_missing": "mergerfs ist auf diesem Knoten nicht installiert, daher kann die Union nicht eingehängt werden.",
+        "snapraid_unusable": "SnapRAID ist auf diesem Knoten nicht nutzbar (fehlt oder funktioniert nicht — siehe Umgebung), daher schützen die Paritätsdatenträger dieses Arrays nichts, bis es wieder läuft.",
+        "branches_unknown": "Dieser Knoten kann nicht feststellen, ob diese vorhanden sind: {members}. Er hängt die Union erst ein, wenn er es kann.",
+        "branches_mountable": "Vorhanden und noch nicht eingehängt: {members}. Der nächste Abgleich hängt sie ein und danach die Union.",
+        "branches_gone_serving": "Nicht auf diesem Knoten: {members}. Die Union stellt die vorhandenen Datenträger weiter bereit, die Dateien des fehlenden sind darin nicht sichtbar.",
+        "branches_gone_down": "Nicht auf diesem Knoten: {members}. Die Union bleibt ausgehängt: Über einem nicht eingehängten Branch würde sie Client-Schreibvorgänge auf das Root-Dateisystem schicken.",
+        "union_not_mounted": "Gespeichert, aber dieser Knoten stellt die Union noch nicht bereit — der nächste Abgleich hängt sie ein.",
+        "no_parity": "Kein Paritätsdatenträger: Ein Datenträgerausfall verliert dessen Dateien.",
+        "restart_required": "Die Wiederherstellung nach dem Start dieses Knotens hat mittendrin angehalten — nur ein Neustart des Knotens wiederholt sie.",
+        "checkpoint_unfinished": "Der Helper hat einen unvollendeten Checkpoint dieses Arrays.",
+        "awaiting_confirmation": "Wartet auf die dauerhafte Bestätigung des Vorgangs in der Instanzdatenbank.",
+        "service_not_online": "Der Dienst des Arrays hat den Online-Lese-/Schreibmodus nicht bestätigt.",
+        "helper_failed": "Der Helper hat beim Lesen dieses Arrays einen Fehler gemeldet — Details im Tooltip.",
+        "operation_failed": "Der Vorgang „{operation}“ ist nicht gelungen — Details im Tooltip.",
+        "operation_failed_unnamed": "Ein Vorgang an diesem Array ist nicht gelungen — Details im Tooltip.",
+        "supervision_lost": "Der Knoten hat die Kontrolle über einen Vorgang dieses Arrays verloren (Neustart); sein Zustand beweist nicht, dass die Schreibvorgänge abgeschlossen sind."
+      }
     },
     "wizard_pool": {
       "elastic_data": "Datenträger",
@@ -5746,7 +5773,45 @@
       "plan_warning_mixed_media": "SSD und HDD gemischt: Das vdev arbeitet mit der Geschwindigkeit seines langsamsten Mitglieds.",
       "plan_warning_unhealthy_disks": "SMART warnt bei {disks}: Ein Pool auf einem bereits ausfallenden Datenträger startet degradiert.",
       "plan_warning_single_disk": "Ein einzelner Datenträger hat keine Redundanz: Jeder Ausfall kostet den Pool.",
-      "plan_warning_odd_mirror": "Ein Mirror bildet Paare, daher bleibt bei einer ungeraden Auswahl ein Datenträger ungenutzt."
+      "plan_warning_odd_mirror": "Ein Mirror bildet Paare, daher bleibt bei einer ungeraden Auswahl ein Datenträger ungenutzt.",
+      "elastic_role_data": "Datenträger",
+      "elastic_role_parity": "Paritätsdatenträger",
+      "elastic_role_cache": "Cache-Datenträger",
+      "elastic_owner": {
+        "elastic": "gehört bereits zu einem anderen Elastic Array",
+        "spare": "ist ein Hot Spare eines ZFS-Pools",
+        "spare_named": "ist ein Hot Spare des ZFS-Pools {name}",
+        "pool": "gehört zu einem ZFS-Pool",
+        "pool_named": "gehört zum ZFS-Pool {name}",
+        "md": "gehört zu einem md-Array",
+        "md_named": "gehört zum md-Array {name}",
+        "system": "trägt das laufende System dieses Knotens",
+        "mounted": "ist eingehängt",
+        "mounted_named": "ist unter {name} eingehängt",
+        "used": "enthält ein Dateisystem oder Partitionen"
+      },
+      "elastic_refusal": {
+        "too_many_cache_disks": "Elastic erlaubt höchstens einen Cache-Datenträger.",
+        "name_invalid": "„{name}“ kann kein Array-Name sein: Er wird zu einem Verzeichnis unter /mnt, einem Verzeichnis unter dem Branch-Stamm und einem Dateinamen.",
+        "name_taken": "„{name}“ ist bereits unter {path} eingehängt: Ein Pool und ein Array können keinen Einhängepunkt teilen, und die Union würde verdecken, was darunter liegt.",
+        "no_data_disks": "Ein Elastic Array braucht mindestens einen Datenträger.",
+        "too_many_parity": "{count} Paritätsdatenträger: Dieses Array unterstützt höchstens {max}.",
+        "disk_repeated": "{disk} ist als {first} und als {role} gewählt.",
+        "same_device": "{other} ({other_role}) und {disk} ({role}) sind dasselbe Gerät: Ein Gerät kann nicht zwei Plätze in einem Array belegen.",
+        "data_disks_same_device": "{other} und {disk} sind dasselbe Gerät: Ein Gerät kann nicht zwei Datenträger sein.",
+        "disk_in_use": "{disk} {owner} — ein Datenträger gehört zu einem davon, nicht zu beiden (dieses Array würde ihn löschen).",
+        "parity_too_small": "{disk} fasst {size}, der größte Datenträger {largest}: Ein Paritätsdatenträger muss mindestens so groß sein wie der größte Datenträger, sonst kann er ihn nicht abdecken.",
+        "filesystem_invalid": "„{filesystem}“ ist kein Dateisystem, das diese App anlegt: Ein Elastic-Datenträger trägt xfs oder ext4, damit er allein lesbar bleibt.",
+        "filesystem_unavailable": "mkfs.{filesystem} ist auf diesem Knoten nicht installiert, daher kann kein Datenträger dieses Arrays vorbereitet werden.",
+        "plan_failed": "Aus diesem Layout lässt sich kein Plan erstellen — Details im Tooltip."
+      },
+      "elastic_warning": {
+        "no_parity": "Kein Paritätsdatenträger: Dieses Array hat keinerlei Schutz, und der Verlust eines Datenträgers verliert dessen Dateien.",
+        "parity_tight": "{disk} ist nur knapp so groß wie der größte Datenträger: Die Paritätsdatei muss in ein Dateisystem passen, und dessen Metadaten lassen womöglich zu wenig Platz.",
+        "no_cache": "Kein Cache-Datenträger: Der Mover hat nichts zu tun, und neue Dateien werden direkt auf die Datenträger geschrieben.",
+        "unhealthy_disks": "SMART warnt bei {disks}: Ein Array auf einem bereits ausfallenden Datenträger startet degradiert.",
+        "mixed_sizes": "Die Datenträger sind unterschiedlich groß, und jedes Byte jedes einzelnen wird genutzt — genau dafür ist diese Array-Art da."
+      }
     },
     "pools": {
       "title": "Pools auf Knoten {node}",
@@ -6289,7 +6354,8 @@
       "elastic_sync_name": "SnapRAID-Sync {array}",
       "elastic_scrub_name": "SnapRAID-Scrub {array}",
       "skip_elastic_scrub_errors_unrepaired": "ein Scrub hat Fehler gemeldet, die noch nichts behoben hat — führen Sie die Reparatur aus der Parität aus",
-      "skip_elastic_parity_fault_unacknowledged": "das Array hat einen nicht behobenen Scrub- oder Reparaturfehler — der Sync erfordert eine Bestätigung in der Array-Ansicht"
+      "skip_elastic_parity_fault_unacknowledged": "das Array hat einen nicht behobenen Scrub- oder Reparaturfehler — der Sync erfordert eine Bestätigung in der Array-Ansicht",
+      "skip_array_not_created": "die Erstellung des Arrays ist nicht abgeschlossen — führen Sie die Wiederherstellung des Arrays aus oder entfernen Sie es"
     },
     "kpi": {
       "shares": "Freigaben",
@@ -7267,7 +7333,34 @@
       "op_elastic_schedule": "Elastic-Zeitplan scharfschalten",
       "op_elastic_add_disk_abort": "Elastic Array · Hinzufügen eines Datenträgers rückgängig machen",
       "detail_elastic_sync": "Schreibt einen neuen Paritäts- und Content-Checkpoint.",
-      "detail_elastic_sync_over_fault": "ACHTUNG: Das Array hat einen nicht behobenen Scrub- oder Reparaturfehler. Der Sync hält den aktuellen Zustand der Dateien fest. Markierte Blöcke unveränderter Dateien sowie unveränderte Dateien, die der Scrub nicht lesen konnte, bleiben reparierbar — aber Dateien, die seit dem letzten Sync gelöscht oder geändert wurden, auch beschädigte, werden in ihrem neuen Zustand festgehalten, und ihre früheren Versionen lassen sich nicht mehr aus der Parität wiederherstellen. Führen Sie zuerst die Reparatur aus."
+      "detail_elastic_sync_over_fault": "ACHTUNG: Das Array hat einen nicht behobenen Scrub- oder Reparaturfehler. Der Sync hält den aktuellen Zustand der Dateien fest. Markierte Blöcke unveränderter Dateien sowie unveränderte Dateien, die der Scrub nicht lesen konnte, bleiben reparierbar — aber Dateien, die seit dem letzten Sync gelöscht oder geändert wurden, auch beschädigte, werden in ihrem neuen Zustand festgehalten, und ihre früheren Versionen lassen sich nicht mehr aus der Parität wiederherstellen. Führen Sie zuerst die Reparatur aus.",
+      "detail": {
+        "yes": "ja",
+        "no": "nein",
+        "pool_destroy": "Zerstört den Pool {pool} mit allen Datasets und Snapshots darauf.",
+        "share_delete": "Entfernt die Freigabe {share} — die Daten unter {path} bleiben, nur der Export verschwindet.",
+        "target_delete": "Beendet den Export von {target} — ein Client, der ihn nutzt, verliert den Datenträger; {sources} und die Daten bleiben.",
+        "snapshot_release": "Hebt den Schutz von {snapshot} auf.",
+        "snapshot_release_reason": "Hebt den Schutz von {snapshot} auf — Grund: {reason}",
+        "config_import": "Überschreibt vorhandene Einträge ({count}): {items}.",
+        "elastic_create": "Formatiert die gewählten Datenträger und legt das Elastic Array {array} an.",
+        "elastic_scrub": "Prüft den vollständigen Checkpoint und schreibt die Scrub-Metadaten.",
+        "elastic_fix": "Schreibt aus der Parität die vom letzten Scrub markierten Blöcke zurück, in seit dem letzten Sync unveränderten Dateien, auf Datenträger {disk}.",
+        "elastic_fix_number": "Schreibt aus der Parität die vom letzten Scrub markierten Blöcke zurück, in seit dem letzten Sync unveränderten Dateien, auf Datenträger Nr. {n}.",
+        "elastic_add_disk": "Formatiert den Datenträger {disk} und fügt ihn dem laufenden Elastic Array hinzu.",
+        "elastic_add_disk_unnamed": "Formatiert den gewählten Datenträger und fügt ihn dem laufenden Elastic Array hinzu.",
+        "elastic_add_disk_abort": "Macht ein unvollendetes Hinzufügen rückgängig, bevor der Datenträger der Freigabe beigetreten ist; entfernt nur das Dateisystem, das dieses Hinzufügen angelegt hat.",
+        "elastic_destroy": "Beendet die Bereitstellung des Elastic Array und entfernt seine Überwachung; die Datenträger behalten Dateisysteme und Daten.",
+        "elastic_mover_coupled": "Verschiebt Dateien vom Cache auf die Datenträger und startet den gekoppelten Paritäts-Sync.",
+        "elastic_mover_uncoupled": "Verschiebt Dateien vom Cache auf die Datenträger OHNE den gekoppelten Paritäts-Sync.",
+        "elastic_schedule_arm": "Aktiviert den Zeitplan: {task}, {cadence}.",
+        "elastic_schedule_keep_off": "Ändert den Zeitplan (bleibt aus): {task}, {cadence}.",
+        "elastic_schedule_rules": "{head} Dateien älter als {age}, Schwelle für freien Cache {pct} %, gekoppelter Sync: {coupled}.",
+        "task_mover": "Mover",
+        "task_sync": "Paritäts-Sync",
+        "task_scrub": "Paritäts-Scrub",
+        "elastic_fix_unnamed": "Schreibt aus der Parität die vom letzten Scrub markierten Blöcke zurück, in seit dem letzten Sync unveränderten Dateien, auf einen Datenträger des Arrays."
+      }
     },
     "access": {
       "title": "Zugriffsprotokoll",
@@ -7442,7 +7535,22 @@
       "created": "Erstellt",
       "key_in_kernel": "Der Schlüssel geht in den Kernel (configfs). nvmet legt ihn für alle lesbar an, deshalb engt der Knoten den Dateimodus auf root ein und prüft das Ergebnis — eine Abweichung landet im Auftragsprotokoll. Auf einem Knoten mit lokalen Benutzern gilt er als mit diesem Knoten geteiltes Geheimnis.",
       "gone_title": "Dieses Target gibt es nicht mehr",
-      "gone_detail": "Es wurde auf diesem Knoten gelöscht (z. B. von einem anderen Administrator). Kehren Sie zur Freigabeliste zurück."
+      "gone_detail": "Es wurde auf diesem Knoten gelöscht (z. B. von einem anderen Administrator). Kehren Sie zur Freigabeliste zurück.",
+      "state_reason": {
+        "kernel_missing": "Der Kernel dieses Knotens kann keine {proto}-Targets bedienen.",
+        "volume_missing": "Das zugrunde liegende Volume existiert nicht — das Target bleibt außerhalb des Kernels.",
+        "portal_moved_head": "Das Portal des Targets ist nicht mehr dort, wo es festgelegt wurde. Die Adresse {address} gehörte zur Schnittstelle {interface} (die jetzt {current} hat).",
+        "portal_moved_head_gone": "Das Portal des Targets ist nicht mehr dort, wo es festgelegt wurde. Die Adresse {address} gehörte zur Schnittstelle {interface}, die es auf diesem Knoten nicht mehr gibt.",
+        "portal_moved_nowhere": "Keine Schnittstelle dieses Knotens hat diese Adresse noch.",
+        "portal_moved_reachable": "Sie liegt jetzt auf {elsewhere}, das niemand für dieses Target gewählt hat — der Export ist dort erreichbar.",
+        "portal_moved_silent": "Sie liegt jetzt auf {elsewhere}. Das Target ist nicht im Kernel, daher lauscht unter dieser Adresse nichts — der Export ist auf {elsewhere} nicht erreichbar.",
+        "portal_moved_tail": "Das Target bleibt unverändert, bis ein Admin das Portal neu wählt.",
+        "not_exported": "Gespeichert, aber dieser Knoten exportiert es noch nicht — der nächste Abgleich wendet es an.",
+        "no_auth": "Keine Authentifizierung — die IQN/NQN-Zulassungsliste ist ein Filter, keine Anmeldung.",
+        "import_secret_needed": "Das Authentifizierungsgeheimnis muss nach einem Import erneut eingegeben werden.",
+        "import_all_interfaces": "Dieses Target wurde auf allen Schnittstellen (0.0.0.0) exportiert — wählen Sie eine Schnittstelle dieses Knotens, bevor Sie es aktivieren.",
+        "portal_moved_head_no_address": "Das Portal des Targets ist nicht mehr dort, wo es festgelegt wurde. Die Adresse {address} gehörte zur Schnittstelle {interface}, die auf diesem Knoten vorhanden ist, aber derzeit keine Adresse hat (Link getrennt oder DHCP-Lease verloren)."
+      }
     },
     "wizard_target": {
       "title": "Neues Target",
@@ -7540,7 +7648,20 @@
       "portal_interface_gone": "Die Schnittstelle {iface} hat auf diesem Knoten keine Adresse mehr, die ein Portal binden kann. Du kannst deine Änderungen trotzdem speichern; das Portal bleibt, wo es war — verschieben geht erst mit einer anderen Schnittstelle.",
       "portal_drifted": "Das Portal dieses Targets liegt auf {from}, und die Schnittstelle {iface} hat jetzt {to}. Das Target wartet eingefroren — du kannst deine Änderungen speichern, ohne das Portal anzufassen, oder es hier verschieben.",
       "portal_move_confirm": "Portal auf {to} verschieben — Initiatoren auf der alten Adresse verlieren ihren Pfad",
-      "iqn_host_unknown": "‹Hostname des Knotens›"
+      "iqn_host_unknown": "‹Hostname des Knotens›",
+      "kernel": {
+        "protocol_unknown": "„{proto}“ ist kein Blockprotokoll, das dieser Knoten bedient",
+        "configfs_present": "{path} ist vorhanden",
+        "modules_available": "die Module {modules} sind verfügbar; das erste Target lädt sie",
+        "modules_missing": "diesem Kernel fehlen {modules} — er ist nicht mit dem {proto}-Target gebaut",
+        "iser_module_missing": "ib_isert ist nicht im Modulbaum dieses Kernels (kein iSER)",
+        "nvmet_rdma_module_missing": "nvmet-rdma ist nicht im Modulbaum dieses Kernels (kein NVMe-oF über RDMA)",
+        "rdma_unavailable": "RDMA ist auf diesem Knoten nicht nutzbar (Details im Tooltip)",
+        "dhchap_available": "CONFIG_NVME_TARGET_AUTH in {path} — DH-HMAC-CHAP verfügbar",
+        "dhchap_not_built": "dieser Kernel wurde ohne CONFIG_NVME_TARGET_AUTH gebaut ({path})",
+        "dhchap_not_mentioned": "{path} erwähnt CONFIG_NVME_TARGET_AUTH nicht",
+        "kernel_config_missing": "dieser Kernel veröffentlicht keine Konfiguration (kein /proc/config.gz, kein /boot/config-*), daher lässt sich DH-HMAC-CHAP nicht bestätigen — der Assistent bietet nichts an, was er nicht bestätigen kann"
+      }
     },
     "journal_owner": {
       "this_instance": "diese TentaNas-Instanz",

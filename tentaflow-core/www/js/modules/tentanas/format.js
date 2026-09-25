@@ -777,6 +777,33 @@ export function transportChipHtml(transport) {
   return `<tf-chip size="sm" status="${transport === 'rdma' ? 'accent' : 'neutral'}" label="${escapeAttr(transportLabel(transport === 'rdma'))}"></tf-chip>`;
 }
 
+// A node sentence that also travels as codes (wave 6, `tentanas::CodedText`
+// on the node: an Elastic Array's or a target's state detail, a parked
+// request's detail, a kernel-support reason). `reasons` is the wire's
+// `[{ code, params }]`; `words` maps a code to `(params) => sentence`, which
+// may answer null for parameters that do not read. The parts are joined the
+// way the node joins its sentence (" · ").
+//
+// '' when there are no reasons, or when any of them has no words in this
+// build: the caller then shows the node's own sentence as it came — truthful,
+// if not translated — rather than half a translation.
+export function wordReasons(reasons, words) {
+  const list = Array.isArray(reasons) ? reasons : [];
+  if (!list.length) return '';
+  const parts = list.map((r) => {
+    const fn = words.get(String(r?.code || ''));
+    return fn ? fn(r?.params || {}) : null;
+  });
+  return parts.every((p) => typeof p === 'string' && p) ? parts.join(' · ') : '';
+}
+
+// The node's own sentence, for a tooltip only: it is one language, and it
+// may name what a screen must not show (a by-id path, a WWN, a node id), so
+// every such id is replaced by the neutral word first.
+export function nodeTextTitle(text) {
+  return scrubIds(String(text || '').trim(), T('alerts.id_hidden'));
+}
+
 // A refusal the node sends as a CODE rather than a sentence (M1):
 // `refusal:<code>` as the whole error message (`SHARE_USER_IN_USE_ELSEWHERE`
 // in tentanas/db.rs, `ApprovalError` in tentanas/approvals.rs). Worded here

@@ -12,11 +12,11 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, errMessage, errCode } from '/js/modules/tentanas/format.js';
+import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, errMessage, errCode, wordReasons, nodeTextTitle } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, warningHtml, NAS_DIALOG, nasRetypeLabel } from '/js/modules/tentanas/dialogs.js';
-import { openTargetWizard, sharedHostWarning, parseHostNqns, invalidHostNqns } from '/js/modules/tentanas/target-wizard.js';
+import { openTargetWizard, sharedHostWarning, parseHostNqns, invalidHostNqns, kernelSupportText } from '/js/modules/tentanas/target-wizard.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';
@@ -101,6 +101,51 @@ export function sourceCellHtml(target) {
 export const sessionsCountLabel = (t) => (t.sessionsKnown !== true ? '—' : String((t.sessions ?? 0)));
 export const sessionsEmptyText = (t) => T(t.sessionsKnown !== true ? 'targets.sessions_unknown' : 'targets.sessions_none');
 
+// A target's state detail in the reader's language (wave 6, MAJOR 25): the
+// node sends it as codes (`targets::target_state`, `NasTarget::state_reasons`)
+// beside its own English sentence, which becomes the tooltip. A row stored
+// before the codes — and an older node — has only the sentence, shown as it
+// came until the node judges the row again.
+const TARGET_STATE_WORDS = new Map([
+  ['target_kernel_missing', (p) => (p.protocol ? T('targets.state_reason.kernel_missing', { proto: protocolLabel(p.protocol) }) : null)],
+  ['target_volume_missing', () => T('targets.state_reason.volume_missing')],
+  ['target_portal_moved', (p) => {
+    // N19b: where the address was, what its interface holds now, where it
+    // went, and whether anything listens there.
+    if (!p.address || !p.interface || !['true', 'false'].includes(p.in_kernel)) return null;
+    // Three states of the interface the portal was pinned to (wave-6
+    // critic MAJOR 2): it holds other addresses, it is there with NONE (link
+    // down, lease lost), or it is gone. A node before `interface_state` sent
+    // `current` only when it had addresses to name.
+    const state = p.interface_state || (p.current ? 'addressed' : 'missing');
+    let head;
+    if (state === 'addressed' && p.current) head = T('targets.state_reason.portal_moved_head', { address: p.address, interface: p.interface, current: p.current });
+    else if (state === 'no_address') head = T('targets.state_reason.portal_moved_head_no_address', { address: p.address, interface: p.interface });
+    else if (state === 'missing') head = T('targets.state_reason.portal_moved_head_gone', { address: p.address, interface: p.interface });
+    else return null;
+    const where = !p.elsewhere
+      ? T('targets.state_reason.portal_moved_nowhere')
+      : p.in_kernel === 'true'
+        ? T('targets.state_reason.portal_moved_reachable', { elsewhere: p.elsewhere })
+        : T('targets.state_reason.portal_moved_silent', { elsewhere: p.elsewhere });
+    return `${head} ${where} ${T('targets.state_reason.portal_moved_tail')}`;
+  }],
+  ['target_not_exported', () => T('targets.state_reason.not_exported')],
+  ['target_no_auth', () => T('targets.state_reason.no_auth')],
+  ['import_secret_needed', () => T('targets.state_reason.import_secret_needed')],
+  ['import_all_interfaces', () => T('targets.state_reason.import_all_interfaces')],
+]);
+
+export function targetStateText(t) {
+  return wordReasons(t?.stateReasons, TARGET_STATE_WORDS) || String(t?.stateDetail || '');
+}
+
+// The node's own sentence, as the tooltip of the worded one.
+export function targetStateTitle(t) {
+  const own = String(t?.stateDetail || '');
+  return own && targetStateText(t) !== own ? nodeTextTitle(own) : '';
+}
+
 /**
  * The one place a target's state becomes a chip.
  *
@@ -111,8 +156,9 @@ export const sessionsEmptyText = (t) => T(t.sessionsKnown !== true ? 'targets.se
  * detail window, which always wants one, supplies the green one itself.
  */
 function stateChip(t) {
+  const shown = targetStateText(t);
   if (t.state === 'error') {
-    return `<span title="${escapeAttr(t.stateDetail || '')}"><tf-chip size="sm" status="err" dot label="${escapeAttr(T('targets.state_error'))}"></tf-chip></span>`;
+    return `<span title="${escapeAttr(shown)}"><tf-chip size="sm" status="err" dot label="${escapeAttr(T('targets.state_error'))}"></tf-chip></span>`;
   }
   if (!t.enabled || t.state === 'disabled') {
     return `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('targets.state_disabled'))}"></tf-chip>`;
@@ -124,12 +170,12 @@ function stateChip(t) {
   // target lost to a transient used to sit "active" forever with nothing
   // behind it.
   if (t.state === 'pending') {
-    return `<span title="${escapeAttr(t.stateDetail || '')}"><tf-chip size="sm" status="info" dot label="${escapeAttr(T('targets.state_pending'))}"></tf-chip></span>`;
+    return `<span title="${escapeAttr(shown)}"><tf-chip size="sm" status="info" dot label="${escapeAttr(T('targets.state_pending'))}"></tf-chip></span>`;
   }
   // An ACTIVE target with a detail is the node saying the export works and is
   // not authenticated — never silent, never the same chip as a clean one.
-  if (t.stateDetail) {
-    return `<span title="${escapeAttr(t.stateDetail)}"><tf-chip size="sm" status="warn" dot label="${escapeAttr(T('targets.state_warning'))}"></tf-chip></span>`;
+  if (shown) {
+    return `<span title="${escapeAttr(shown)}"><tf-chip size="sm" status="warn" dot label="${escapeAttr(T('targets.state_warning'))}"></tf-chip></span>`;
   }
   return '';
 }
@@ -137,7 +183,7 @@ function stateChip(t) {
 export function targetRow(t) {
   return {
     _target: t,
-    name: `<div class="tf-table__cell-row">${sprite('target')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(t.name)}</span></span>${stateChip(t)}</div>${t.stateDetail ? `<div class="tf-table__cell-sub">${escapeHtml(t.stateDetail)}</div>` : ''}`,
+    name: `<div class="tf-table__cell-row">${sprite('target')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(t.name)}</span></span>${stateChip(t)}</div>${targetStateText(t) ? `<div class="tf-table__cell-sub"${targetStateTitle(t) ? ` title="${escapeAttr(targetStateTitle(t))}"` : ''}>${escapeHtml(targetStateText(t))}</div>` : ''}`,
     protocol: protocolChipHtml(t.protocol),
     source: sourceCellHtml(t),
     auth: authChipHtml(t.auth),
@@ -202,7 +248,11 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
     // cannot serve NVMe-oF says so here instead of only inside the wizard.
     patchHtml(host.querySelector('#nas-tg-services'), state.services
       .filter((s) => !s.installed)
-      .map((s) => `<div class="muted">${escapeHtml(T('targets.service_missing', { proto: protocolLabel(s.protocol), detail: s.detail }))}</div>`)
+      .map((s) => {
+        const detail = kernelSupportText(s.reasons, s.detail);
+        const title = detail !== String(s.detail || '') ? nodeTextTitle(s.detail) : '';
+        return `<div class="muted"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(T('targets.service_missing', { proto: protocolLabel(s.protocol), detail }))}</div>`;
+      })
       .join(''));
     const list = host.querySelector('#nas-tg-list');
     setAttr(host.querySelector('#nas-tg-count'), 'label', String(state.targets.length));
@@ -544,13 +594,21 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     // (`setCrumbTail` compares its markup): once, in practice.
     setCrumbs(t.name);
     const drift = slotEl(win.querySelector('[data-part="drift"]'), drifted, 'drift', driftBannerHtml(admin));
-    if (drift) setText(slotEl(drift.querySelector('[data-part="drift-detail"]'), Boolean(t.stateDetail), 'detail', '<p></p>'), t.stateDetail);
+    const stateText = targetStateText(t);
+    const stateTitle = targetStateTitle(t);
+    if (drift) {
+      const detail = slotEl(drift.querySelector('[data-part="drift-detail"]'), Boolean(stateText), 'detail', '<p></p>');
+      setText(detail, stateText);
+      setAttr(detail, 'title', stateTitle);
+    }
     setText(field('name'), t.name);
     const protocolChip = protocolChipHtml(t.protocol);
     slotEl(win.querySelector('[data-part="protocol"]'), true, protocolChip, protocolChip);
     const stateHtml = stateChip(t) || `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('targets.state_active'))}"></tf-chip>`;
     slotEl(win.querySelector('[data-part="state"]'), true, stateHtml, stateHtml);
-    setText(slotEl(win.querySelector('[data-part="state-detail"]'), Boolean(t.stateDetail) && !drifted, 'detail', '<p class="text-3"></p>'), t.stateDetail);
+    const stateDetail = slotEl(win.querySelector('[data-part="state-detail"]'), Boolean(stateText) && !drifted, 'detail', '<p class="text-3"></p>');
+    setText(stateDetail, stateText);
+    setAttr(stateDetail, 'title', stateTitle);
     const lun = (t.luns || [])[0];
     setText(field('wwn'), t.wwn);
     setText(field('lun'), lun ? `${lun.source} · ${fmtBytes(lun.sizeBytes)}${lun.thin ? ' · thin' : ''}` : '—');

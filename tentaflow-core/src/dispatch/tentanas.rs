@@ -26,7 +26,7 @@ use tentanas_helper::{HelperCommand, PackageManager, SelfTestKind};
 use super::HandlerContext;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
-use crate::tentanas::{self, broker::BrokerError, db as store};
+use crate::tentanas::{self, broker::BrokerError, db as store, CodedText};
 use tentanas_helper::elastic::{ElasticOwner, ElasticCreateSpec, ElasticDiskSpec, ElasticFilesystem};
 
 const PERM_READ: &str = "nas.read";
@@ -182,12 +182,16 @@ fn actor<'a>(
 }
 
 /// Parks one red-path request and answers with the row to watch. Nothing ran.
+///
+/// `detail` is what the approver decides on: a code with parameters the
+/// approver's screen words (`approvals.detail_<code>`) and the node's English
+/// sentence for the audit row, the forwarded alert and the tooltip.
 fn park(
     ctx: &HandlerContext,
     g: &Gate,
     operation: &str,
     subject: &str,
-    detail: &str,
+    detail: CodedText,
     payload: &P,
 ) -> Result<MessageBody, ProtocolError> {
     park_shown(ctx, g, operation, subject, subject, detail, payload)
@@ -202,7 +206,7 @@ fn park_shown(
     operation: &str,
     subject: &str,
     shown_subject: &str,
-    detail: &str,
+    detail: CodedText,
     payload: &P,
 ) -> Result<MessageBody, ProtocolError> {
     let a = actor(ctx, g)?;
@@ -1173,7 +1177,11 @@ async fn pool_destroy(
             &g,
             tentanas::approvals::OP_POOL_DESTROY,
             name,
-            &format!("destroys the pool '{name}' and every dataset and snapshot on it"),
+            CodedText::new(
+                "pool_destroy",
+                &[("pool", name.to_string())],
+                format!("destroys the pool '{name}' and every dataset and snapshot on it"),
+            ),
             &P::PoolDestroyRequest {
                 name: name.to_string(),
                 confirm_name: confirm_name.to_string(),
@@ -2073,33 +2081,61 @@ async fn snapshot_schedules_list(ctx: &HandlerContext) -> Result<MessageBody, Pr
 
 // ----- schedules (Tasks tab) ---------------------------------------------------------
 
+/// A schedule row's last outcome as the wire carries it (B, wave 6): the
+/// structured fields, with the job's status read here — the job id stays on
+/// the node — and the older sentence for a screen that predates them. A
+/// stored value this build does not read (an older bare word) travels as the
+/// sentence alone.
+fn with_outcome(db: &crate::db::DbPool, mut row: NasScheduleRow, stored: &str) -> NasScheduleRow {
+    use tentanas::scheduler::ScheduleOutcome;
+    let Some(outcome) = ScheduleOutcome::parse(stored) else {
+        row.last_result = stored.to_string();
+        return row;
+    };
+    row.last_result = outcome.legacy_sentence();
+    row.last_outcome = outcome.wire_word().to_string();
+    match outcome {
+        ScheduleOutcome::Started { job_id } => {
+            // A job that is gone (pruned) has no status: the row then says
+            // only that it ran.
+            row.last_job_status = store::job(db, &job_id).ok().flatten().map(|j| j.status).unwrap_or_default();
+        }
+        ScheduleOutcome::StartFailed { detail } => row.last_detail = detail,
+        ScheduleOutcome::Skipped { reason, detail } => {
+            row.last_reason = reason;
+            row.last_detail = detail;
+        }
+    }
+    row
+}
+
 fn schedules_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     let mut rows = Vec::new();
     for task in [store::PoolTask::Scrub, store::PoolTask::Trim] {
         for row in store::list_pool_schedules(&g.db, task).map_err(|e| internal("schedules", e))? {
-            rows.push(NasScheduleRow {
+            rows.push(with_outcome(&g.db, NasScheduleRow {
                 kind: task.kind().to_string(),
                 subject: row.pool,
                 enabled: row.enabled,
                 schedule: row.schedule,
                 last_run_at: row.last_run_at,
-                last_result: row.last_result,
                 next_run_at: row.next_run_at,
-            });
+                ..Default::default()
+            }, &row.last_result));
         }
     }
     for s in store::list_snapshot_schedules(&g.db).map_err(|e| internal("schedules", e))? {
         let last_result = store::snapshot_schedule_result(&g.db, &s.schedule_id).unwrap_or_default();
-        rows.push(NasScheduleRow {
+        rows.push(with_outcome(&g.db, NasScheduleRow {
             kind: "snapshot".to_string(),
             subject: s.dataset,
             enabled: s.enabled,
             schedule: s.schedule,
             last_run_at: s.last_run_at,
-            last_result,
             next_run_at: s.next_run_at,
-        });
+            ..Default::default()
+        }, &last_result));
     }
     // The Elastic cadences (§5.3, E2-10). The kind is PREFIXED: the Tasks tab
     // buckets a row called 'scrub' as a POOL scrub and offers to run `zpool
@@ -2117,15 +2153,15 @@ fn schedules_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
             else {
                 continue;
             };
-            rows.push(NasScheduleRow {
+            rows.push(with_outcome(&g.db, NasScheduleRow {
                 kind: format!("elastic_{}", task.kind()),
                 subject: array.name.clone(),
                 enabled: row.enabled,
                 schedule: row.schedule,
                 last_run_at: row.last_run_at,
-                last_result: row.last_result,
                 next_run_at: row.next_run_at,
-            });
+                ..Default::default()
+            }, &row.last_result));
         }
     }
     let smart = store::smart_schedule(&g.db).map_err(|e| internal("schedules", e))?;
@@ -2139,8 +2175,8 @@ fn schedules_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
             enabled: smart.enabled,
             schedule: schedule.clone(),
             last_run_at: last.clone(),
-            last_result: String::new(),
             next_run_at: next.clone(),
+            ..Default::default()
         });
     }
     Ok(tn(P::SchedulesListResponse { rows, smart }))
@@ -2154,7 +2190,6 @@ fn smart_schedule_set(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_POOLS)?;
     let now = chrono::Local::now();
-    let mut smart = store::smart_schedule(&g.db).map_err(|e| internal("schedules", e))?;
     let next_short = tentanas::scheduler::next_run_utc(short, now);
     let next_long = tentanas::scheduler::next_run_utc(long, now);
     if enabled && (next_short.is_none() || next_long.is_none()) {
@@ -2162,12 +2197,17 @@ fn smart_schedule_set(
             "unknown schedule cadence for the SMART tests",
         ));
     }
-    smart.enabled = enabled;
-    smart.short = short.clone();
-    smart.long = long.clone();
-    smart.next_short_at = enabled.then_some(next_short).flatten();
-    smart.next_long_at = enabled.then_some(next_long).flatten();
-    store::set_smart_schedule(&g.db, &smart).map_err(|e| internal("schedules", e))?;
+    // Not read-modify-write: a scheduler tick between a read here and the
+    // write would lose its run stamps (`store::save_smart_schedule`).
+    let smart = store::save_smart_schedule(
+        &g.db,
+        enabled,
+        short,
+        long,
+        enabled.then_some(next_short).flatten(),
+        enabled.then_some(next_long).flatten(),
+    )
+    .map_err(|e| internal("schedules", e))?;
     Ok(tn(P::SmartScheduleResponse { smart }))
 }
 
@@ -2453,9 +2493,13 @@ async fn share_delete(
             &g,
             tentanas::approvals::OP_SHARE_DELETE,
             &row.name,
-            &format!(
-                "removes the share '{}' — the data under {} stays, the export does not",
-                row.name, row.source_path
+            CodedText::new(
+                "share_delete",
+                &[("share", row.name.clone()), ("path", row.source_path.clone())],
+                format!(
+                    "removes the share '{}' — the data under {} stays, the export does not",
+                    row.name, row.source_path
+                ),
             ),
             &P::ShareDeleteRequest {
                 share_id: share_id.to_string(),
@@ -3124,6 +3168,7 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         // no kernel, and "disabled" is what that is.
         state: "disabled".to_string(),
         state_detail: String::new(),
+        state_reasons: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
         target_id,
@@ -3266,11 +3311,15 @@ async fn target_delete(
             &g,
             tentanas::approvals::OP_TARGET_DELETE,
             &row.name,
-            &format!(
-                "stops exporting '{}' ({}) — a client using it loses the disk; {} and its data stay",
-                row.name,
-                row.wwn,
-                sources.join(", ")
+            CodedText::new(
+                "target_delete",
+                &[("target", row.name.clone()), ("sources", sources.join(", "))],
+                format!(
+                    "stops exporting '{}' ({}) — a client using it loses the disk; {} and its data stay",
+                    row.name,
+                    row.wwn,
+                    sources.join(", ")
+                ),
             ),
             &P::TargetDeleteRequest {
                 target_id: target_id.to_string(),
@@ -3461,7 +3510,11 @@ async fn config_import_apply(
                 tentanas::approvals::OP_CONFIG_IMPORT,
                 &subject,
                 &shown,
-                &format!("overwrites {}: {}", overwritten.len(), overwritten.join(", ")),
+                CodedText::new(
+                    "config_import",
+                    &[("count", overwritten.len().to_string()), ("items", overwritten.join(", "))],
+                    format!("overwrites {}: {}", overwritten.len(), overwritten.join(", ")),
+                ),
                 &P::ConfigImportApplyRequest {
                     json: json.to_string(),
                     sudo_password: None,
@@ -3634,9 +3687,12 @@ async fn snapshot_protection_release(
         ));
     }
     if tentanas::approvals::second_pair_available(&actor(ctx, &g)?) {
-        let detail = if reason.trim().is_empty() {
+        // The author's reason is data, carried as written.
+        let mut params = vec![("snapshot", snapshot.to_string())];
+        let text = if reason.trim().is_empty() {
             format!("lifts the protection of {snapshot}")
         } else {
+            params.push(("reason", reason.trim().to_string()));
             format!("lifts the protection of {snapshot} — {}", reason.trim())
         };
         return park(
@@ -3644,7 +3700,7 @@ async fn snapshot_protection_release(
             &g,
             tentanas::approvals::OP_SNAPSHOT_RELEASE,
             snapshot,
-            &detail,
+            CodedText::new("snapshot_release", &params, text),
             &P::SnapshotProtectionReleaseRequest {
                 snapshot: snapshot.to_string(),
                 reason: reason.to_string(),
@@ -3989,7 +4045,8 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx,&g)?) {
         return park(ctx,&g,tentanas::approvals::OP_ELASTIC_CREATE,name,
-            "Formatuje wybrane dyski i tworzy macierz Elastic",
+            CodedText::new("elastic_create", &[("array", name.to_string())],
+                "formats the picked disks and creates the Elastic Array"),
             &P::ElasticArrayCreateRequest { name:name.to_string(),filesystem:filesystem.to_string(),
                 data_disk_ids:data_disk_ids.to_vec(),parity_disk_ids:parity_disk_ids.to_vec(),cache_disk_ids:cache_disk_ids.to_vec(),
                 confirm_name:confirm_name.to_string(),sudo_password:None });
@@ -4274,9 +4331,9 @@ async fn elastic_snapraid(
                 // language (`approvals.detail_<code>`): this is the data-loss
                 // warning, and a de/en/fr/es approver has to read it.
                 if fault_warning {
-                    tentanas::approvals::coded_detail("elastic_sync_over_fault")
+                    CodedText::new("elastic_sync_over_fault", &[], store::SYNC_OVER_FAULT_TEXT)
                 } else {
-                    tentanas::approvals::coded_detail("elastic_sync")
+                    CodedText::new("elastic_sync", &[], store::SYNC_TEXT)
                 },
             ),
             ElasticSnapraidKind::Scrub => (
@@ -4285,7 +4342,11 @@ async fn elastic_snapraid(
                     name: name.into(),
                     sudo_password: None,
                 },
-                "Sprawdza pełny checkpoint i zapisuje metadane scrub".to_string(),
+                CodedText::new(
+                    "elastic_scrub",
+                    &[],
+                    "checks the full checkpoint and records the scrub's metadata",
+                ),
             ),
             ElasticSnapraidKind::Fix { disk } => (
                 tentanas::approvals::OP_ELASTIC_FIX,
@@ -4305,12 +4366,30 @@ async fn elastic_snapraid(
                 // described an unfiltered `fix` this product never runs, and an
                 // approver who believed it would refuse a safe operation — or
                 // approve it expecting deleted files back.
-                format!(
-                    "Zapisuje z parity bloki zaznaczone przez ostatni scrub, w plikach niezmienionych od ostatniego Sync; operacja jest zapisana przy dysku '{disk}'"
-                ),
+                //
+                // The request keys the member by its SLOT ('d1'), which is not
+                // a name the approver has ever seen: the code names the disk by
+                // its kernel name now, and by its number when the node cannot
+                // see it (`number`, 1-based among the data disks).
+                //
+                // The ENGLISH too (wave-6 critic MAJOR 1): it is the approvals
+                // tooltip and the parked alert's text, and a slot there is as
+                // unknown to the approver as on the line itself.
+                {
+                    let branch = array.data().enumerate().find(|(_, b)| b.name == *disk);
+                    let shown = branch
+                        .and_then(|(_, b)| tentanas::disks::disk_name(&b.disk_id))
+                        .unwrap_or_default();
+                    let number = branch.map(|(i, _)| (i + 1).to_string()).unwrap_or_default();
+                    CodedText::new(
+                        "elastic_fix",
+                        &[("disk", shown.clone()), ("number", number.clone())],
+                        fix_detail_text(&shown, &number),
+                    )
+                },
             ),
         };
-        return park(ctx, &g, operation, name, &description, &request);
+        return park(ctx, &g, operation, name, description, &request);
     }
     let job = tentanas::elastic::spawn_snapraid(
         &g.db,
@@ -4419,7 +4498,11 @@ async fn elastic_add_disk(
             &g,
             tentanas::approvals::OP_ELASTIC_ADD_DISK,
             name,
-            "Formatuje wybrany dysk i dołącza go do działającej macierzy Elastic",
+            CodedText::new(
+                "elastic_add_disk",
+                &[("disk", tentanas::disks::disk_name(disk_id).unwrap_or_default())],
+                "formats the picked disk and adds it to the running Elastic Array",
+            ),
             &P::ElasticArrayAddDiskRequest {
                 name: name.to_string(),
                 disk_id: disk_id.to_string(),
@@ -4540,7 +4623,12 @@ async fn elastic_add_disk_abort(
             &g,
             tentanas::approvals::OP_ELASTIC_ADD_DISK_ABORT,
             name,
-            "Wycofuje niedokończone dodanie dysku, zanim dysk dołączył do udziału; czyści tylko system plików nadany przez to dodanie",
+            CodedText::new(
+                "elastic_add_disk_abort",
+                &[],
+                "undoes an unfinished disk add before the disk joined the share; clears only the \
+                 filesystem that add made",
+            ),
             &P::ElasticArrayAddDiskAbortRequest {
                 name: name.to_string(),
                 disk_id: disk_id.to_string(),
@@ -4676,8 +4764,12 @@ async fn elastic_destroy(
             &g,
             tentanas::approvals::OP_ELASTIC_DESTROY,
             name,
-            "Zatrzymuje udostępnianie macierzy Elastic i usuwa jej nadzór; \
-             dyski zachowują systemy plików i dane",
+            CodedText::new(
+                "elastic_destroy",
+                &[],
+                "stops serving the Elastic Array and removes its supervision; the disks keep \
+                 their filesystems and data",
+            ),
             &P::ElasticArrayDestroyRequest {
                 name: name.to_string(),
                 confirm_name: confirm_name.to_string(),
@@ -4737,11 +4829,15 @@ async fn elastic_mover(
         // What is recorded in the approval must be what will actually run: with
         // the coupling off the moved files stay outside parity, and promising a
         // sync that will not happen would be a lie preserved in the audit row.
-        let description = if array.mover.coupled_sync {
-            "Przenosi pliki z cache na dyski danych i uruchamia sprzężony sync parity"
-        } else {
-            "Przenosi pliki z cache na dyski danych BEZ sprzężonego sync parity"
-        };
+        let description = CodedText::new(
+            "elastic_mover",
+            &[("coupled_sync", array.mover.coupled_sync.to_string())],
+            if array.mover.coupled_sync {
+                "moves files from the cache to the data disks and runs the coupled parity sync"
+            } else {
+                "moves files from the cache to the data disks WITHOUT the coupled parity sync"
+            },
+        );
         return park(
             ctx,
             &g,
@@ -4763,23 +4859,40 @@ async fn elastic_mover(
 /// to. Unknown cadences are quoted rather than described: the handler refuses
 /// them anyway, and inventing a phrase for one would be the approval saying
 /// something the scheduler cannot do.
+/// The English of a parked repair, naming the disk the way its code does:
+/// by kernel name, else by its number among the data disks, else as "a data
+/// disk of the array" — never by the slot the request keys it by.
+fn fix_detail_text(disk: &str, number: &str) -> String {
+    let target = if !disk.is_empty() {
+        format!("disk {disk}")
+    } else if !number.is_empty() {
+        format!("data disk no. {number}")
+    } else {
+        "a data disk of the array".to_string()
+    };
+    format!(
+        "writes back from parity the blocks the last scrub marked bad, in files unchanged since \
+         the last Sync, on {target}"
+    )
+}
+
 fn cadence_text(s: &NasSchedule) -> String {
     match s.every.as_str() {
         // The OFFSET inside the period is what `scheduler::period_and_offset`
         // fires on, so it is carried here too — "co 15 min" alone would imply
         // the top of the period and quietly drop the half of the cadence the
         // scheduler actually reads.
-        "15m" => format!("co 15 min, o minucie :{:02}", s.minute % 15),
-        "30m" => format!("co 30 min, o minucie :{:02}", s.minute % 30),
-        "1h" => format!("co godzinę, o minucie :{:02}", s.minute),
-        "6h" => format!("co 6 godzin, o {:02}:{:02} w cyklu", s.hour % 6, s.minute),
-        "daily" => format!("codziennie o {:02}:{:02}", s.hour, s.minute),
+        "15m" => format!("every 15 min, at minute :{:02}", s.minute % 15),
+        "30m" => format!("every 30 min, at minute :{:02}", s.minute % 30),
+        "1h" => format!("hourly, at minute :{:02}", s.minute),
+        "6h" => format!("every 6 hours, at {:02}:{:02} of the cycle", s.hour % 6, s.minute),
+        "daily" => format!("daily at {:02}:{:02}", s.hour, s.minute),
         "weekly" => format!(
-            "co tydzień, dzień {}, o {:02}:{:02}",
+            "weekly, day {}, at {:02}:{:02}",
             s.weekday, s.hour, s.minute
         ),
-        "monthly" => format!("co miesiąc, {}. dnia o {:02}:{:02}", s.day, s.hour, s.minute),
-        other => format!("kadencja '{other}'"),
+        "monthly" => format!("monthly, day {} at {:02}:{:02}", s.day, s.hour, s.minute),
+        other => format!("cadence '{other}'"),
     }
 }
 
@@ -4921,27 +5034,43 @@ async fn elastic_schedule_set(
         // operation, the array, the cadence and the rules — and a request that
         // leaves the schedule switched off must say so rather than claim to
         // arm something.
-        let mut detail = format!(
-            "{}: {verb} macierzy {name}, {}",
+        //
+        // The codes carry the schedule itself ('every', 'hour', 'minute',
+        // 'weekday', 'day'): the approver's screen words the cadence with the
+        // same formatter the schedule editor uses.
+        let mut text = format!(
+            "{}: {verb} of array {name}, {}",
             if enabled {
-                "Uzbraja harmonogram"
+                "arms the schedule"
             } else {
-                "Zmienia harmonogram (pozostaje wyłączony)"
+                "changes the schedule (it stays off)"
             },
             cadence_text(schedule)
         );
+        let mut params = vec![
+            ("task", task.kind().to_string()),
+            ("enabled", enabled.to_string()),
+            ("every", schedule.every.clone()),
+            ("hour", schedule.hour.to_string()),
+            ("minute", schedule.minute.to_string()),
+            ("weekday", schedule.weekday.to_string()),
+            ("day", schedule.day.to_string()),
+        ];
         if let Some((age, pct, coupled)) = mover_rules {
-            detail.push_str(&format!(
-                "; pliki starsze niż {age} s, próg wolnego cache {pct}%, sprzężony sync: {}",
-                if coupled { "tak" } else { "nie" }
+            text.push_str(&format!(
+                "; files older than {age} s, cache free-space threshold {pct}%, coupled sync: {}",
+                if coupled { "yes" } else { "no" }
             ));
+            params.push(("min_age_secs", age.to_string()));
+            params.push(("cache_min_free_pct", pct.to_string()));
+            params.push(("coupled_sync", coupled.to_string()));
         }
         return park(
             ctx,
             &g,
             tentanas::approvals::OP_ELASTIC_SCHEDULE,
             name,
-            &detail,
+            CodedText::new("elastic_schedule", &params, text),
             &request,
         );
     }
@@ -6161,6 +6290,55 @@ mod registration_tests {
         fixture
     }
 
+    /// B (wave 6): a schedule row says what its last slot came to as
+    /// structured fields, with the started job's status read by the node —
+    /// the job id stays in the node's database and is in none of them.
+    #[tokio::test]
+    async fn a_schedule_row_says_what_its_last_slot_came_to_without_the_job_id() {
+        use tentanas::scheduler::ScheduleOutcome;
+        let fixture = dispatch_fixture();
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let daily = NasSchedule { every: "daily".into(), hour: 3, minute: 0, weekday: 0, day: 1 };
+        for task in [store::PoolTask::Scrub, store::PoolTask::Trim] {
+            store::set_pool_schedule(&g.db, task, "tank", true, &daily, None).unwrap();
+        }
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "pool_scrub".into(),
+            subject: "tank".into(),
+            status: "running".into(),
+            started_by: tentanas::scheduler::STARTED_BY.into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(&g.db, &job, None).unwrap();
+        store::finish_job(&g.db, &job.job_id, "succeeded", None).unwrap();
+        let started = ScheduleOutcome::Started { job_id: job.job_id.clone() };
+        store::record_pool_schedule_run(&g.db, store::PoolTask::Scrub, "tank", &started.stored(), None).unwrap();
+        let refused = ScheduleOutcome::StartFailed { detail: "the pool is busy".into() };
+        store::record_pool_schedule_run(&g.db, store::PoolTask::Trim, "tank", &refused.stored(), None).unwrap();
+
+        let MessageBody::TentaNasBody(P::SchedulesListResponse { rows, .. }) = schedules_list(&fixture.ctx).unwrap() else {
+            panic!("a schedules list")
+        };
+        let row = |kind: &str| rows.iter().find(|r| r.kind == kind).expect(kind).clone();
+        let scrub = row("scrub");
+        assert_eq!((scrub.last_outcome.as_str(), scrub.last_job_status.as_str()), ("started", "succeeded"));
+        assert_eq!((scrub.last_reason.as_str(), scrub.last_detail.as_str()), ("", ""));
+        let trim = row("trim");
+        assert_eq!((trim.last_outcome.as_str(), trim.last_detail.as_str()), ("start_failed", "the pool is busy"));
+        assert!(trim.last_job_status.is_empty());
+        for r in &rows {
+            for field in [&r.last_outcome, &r.last_job_status, &r.last_reason, &r.last_detail] {
+                assert!(!field.contains(&job.job_id), "{}: {field}", r.kind);
+            }
+        }
+        // An older screen still gets the sentence it parses.
+        assert_eq!(scrub.last_result, format!("started job {}", job.job_id));
+        // The SMART pair never carries an outcome.
+        assert!(row("smart_short").last_outcome.is_empty());
+    }
+
     #[tokio::test]
     async fn a_tentanas_frame_reaches_its_handler_through_dispatch() {
         let fixture = dispatch_fixture();
@@ -6788,7 +6966,9 @@ mod registration_tests {
         // The row has to name the DISK: what it authorises is overwriting that
         // one disk from parity, and an approval reading only "repair" would be
         // an approval for whichever disk the author picked afterwards.
-        assert!(stored.approval.detail.contains("d1"), "{}", stored.approval.detail);
+        // It names it as the approver knows it (by number here: this node
+        // does not see the disk); the REQUEST keeps the slot the node keys it by.
+        assert!(stored.approval.detail.contains("data disk no. 1"), "{}", stored.approval.detail);
         assert!(stored.payload_json.contains("\"disk\":\"d1\""), "{}", stored.payload_json);
         assert!(!stored.payload_json.contains("never-store-repair-secret"));
         assert!(!stored.payload_json.contains("sudo_password"));
@@ -6803,8 +6983,22 @@ mod registration_tests {
         ));
         // The repair's own sentence describes `-e fix`, not the unfiltered
         // rebuild this product never runs.
-        assert!(stored.approval.detail.contains("zaznaczone"), "{}", stored.approval.detail);
-        assert!(!stored.approval.detail.contains("nadpisując"), "{}", stored.approval.detail);
+        assert!(stored.approval.detail.contains("marked bad"), "{}", stored.approval.detail);
+        assert!(!stored.approval.detail.contains("overwrit"), "{}", stored.approval.detail);
+        // The code names the disk by its number, never by its slot: the node
+        // of this fixture does not see the disk, so it has no kernel name.
+        let [fix] = stored.approval.detail_reasons.as_slice() else {
+            panic!("one coded detail: {:?}", stored.approval.detail_reasons)
+        };
+        assert_eq!(fix.code, "elastic_fix");
+        assert_eq!(fix.params.get("number").map(String::as_str), Some("1"));
+        assert!(fix.params.values().all(|v| v != "d1"), "{:?}", fix.params);
+        // …and so does the node's own sentence, which is the approvals
+        // tooltip and the parked alert's text (wave-6 critic MAJOR 1).
+        assert!(stored.approval.detail.ends_with("on data disk no. 1"), "{}", stored.approval.detail);
+        assert!(!stored.approval.detail.contains("d1"), "{}", stored.approval.detail);
+        let parked_alert = store::alerts_for_subject(&g.db, "approval", &approval.request_id).unwrap();
+        assert!(!parked_alert.is_empty() && parked_alert.iter().all(|a| !a.detail.contains("d1")), "{parked_alert:?}");
 
         // AND THE SYNC PARKED ON THE SAME ARRAY SAYS WHAT IT COSTS. A Sync over
         // an array whose scrub reported errors is a different operation from a
@@ -6856,7 +7050,16 @@ mod registration_tests {
         };
         let sync_row = store::approval(&g.db, &sync_approval.request_id).unwrap().unwrap();
         assert_eq!(sync_row.approval.operation, tentanas::approvals::OP_ELASTIC_SYNC);
-        assert_eq!(sync_row.approval.detail, "text:elastic_sync_over_fault", "the warning, as a code the screen words");
+        assert_eq!(
+            sync_row.approval.detail_reasons.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            vec!["elastic_sync_over_fault"],
+            "the warning, as a code the screen words"
+        );
+        assert!(sync_row.approval.detail.contains("can no longer be restored"), "{}", sync_row.approval.detail);
+        // The alert the park raises carries the sentence, not a code in its
+        // place: its detail is the forwarded text and the tooltip.
+        let alert = store::alerts_for_subject(&g.db, "approval", &sync_approval.request_id).unwrap();
+        assert!(alert.iter().all(|a| !a.detail.starts_with("text:")), "{alert:?}");
         // The acknowledgement is parked WITH the request: the approver
         // releases the author's decision, not a Sync that would be refused.
         assert!(
@@ -6864,6 +7067,18 @@ mod registration_tests {
             "{}",
             sync_row.payload_json
         );
+    }
+
+    /// Wave-6 critic MAJOR 1: the repair's English names the disk the way
+    /// its code does, and never by a slot, whatever the node knows of it.
+    #[test]
+    fn a_parked_repair_is_worded_without_the_slot() {
+        assert!(fix_detail_text("sdb", "2").ends_with("on disk sdb"));
+        assert!(fix_detail_text("", "2").ends_with("on data disk no. 2"));
+        assert!(fix_detail_text("", "").ends_with("on a data disk of the array"));
+        for text in [fix_detail_text("sdb", "2"), fix_detail_text("", "2"), fix_detail_text("", "")] {
+            assert!(!["d1", "d2", "c1", "parity1"].iter().any(|slot| text.contains(slot)), "{text}");
+        }
     }
 
     /// An add that STOPPED PART-WAY (K4, F3/F4 on the node's side): while it
@@ -7612,9 +7827,27 @@ mod registration_tests {
         // offset, and the rules.
         assert!(approval.detail.contains("mover"), "{}", approval.detail);
         assert!(approval.detail.contains("media"), "{}", approval.detail);
-        assert!(approval.detail.contains("co godzinę"), "{}", approval.detail);
+        assert!(approval.detail.contains("hourly"), "{}", approval.detail);
         assert!(approval.detail.contains(":30"), "{}", approval.detail);
         assert!(approval.detail.contains("35%"), "{}", approval.detail);
+        // The same, as a code the approver's screen words (wave 6): the
+        // cadence travels as the schedule itself, so the screen formats it
+        // the way the schedule editor does. Stored with the row.
+        let stored = store::approval(&g.db, &approval.request_id).unwrap().unwrap();
+        assert_eq!(stored.approval.detail_reasons, approval.detail_reasons);
+        let [reason] = approval.detail_reasons.as_slice() else {
+            panic!("one coded detail: {:?}", approval.detail_reasons)
+        };
+        assert_eq!(reason.code, "elastic_schedule");
+        let param = |k: &str| reason.params.get(k).map(String::as_str);
+        assert_eq!(
+            (param("task"), param("enabled"), param("every"), param("minute")),
+            (Some("mover"), Some("true"), Some("1h"), Some("30"))
+        );
+        assert_eq!(
+            (param("min_age_secs"), param("cache_min_free_pct"), param("coupled_sync")),
+            (Some("1800"), Some("35"), Some("false"))
+        );
 
         // Nothing armed and no rule written until a second admin agrees.
         assert!(

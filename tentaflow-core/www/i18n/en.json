@@ -7414,7 +7414,34 @@
       "create_policy_rand": "random disk",
       "create_policy_msplfs": "least free space on the longest existing path",
       "card_mover": "Cache mover",
-      "card_cache_waiting": "{size} on the cache without parity"
+      "card_cache_waiting": "{size} on the cache without parity",
+      "state_member": {
+        "data": "data disk {name}",
+        "data_number": "data disk no. {n}",
+        "cache": "cache disk {name}",
+        "cache_number": "cache disk no. {n}",
+        "parity": "parity disk {name}",
+        "parity_number": "parity disk no. {n}"
+      },
+      "state_reason": {
+        "mount_table_unknown": "This node could not read its mount table, so it mounts and unmounts nothing: a union mounted over branches it cannot see would send every client write to the root filesystem.",
+        "mergerfs_missing": "mergerfs is not installed on this node, so the union cannot be mounted.",
+        "snapraid_unusable": "SnapRAID is not usable on this node (missing, or installed and not working — see Environment), so the parity disks of this array protect nothing until it is.",
+        "branches_unknown": "This node cannot tell whether these are there: {members}. It will not mount the union until it can.",
+        "branches_mountable": "Present and not mounted yet: {members}. The next reconcile mounts them and then the union.",
+        "branches_gone_serving": "Not on this node: {members}. The union still serves the disks it has, and the files on the missing one are not visible in it.",
+        "branches_gone_down": "Not on this node: {members}. The union stays down: mounting it over an unmounted branch would send client writes to the root filesystem.",
+        "union_not_mounted": "Saved, but this node is not serving the union yet — the next reconcile mounts it.",
+        "no_parity": "No parity disk: a disk failure loses that disk’s files.",
+        "restart_required": "The recovery after this node’s start stopped part-way — only a restart of the node retries it.",
+        "checkpoint_unfinished": "The helper has an unfinished checkpoint of this array.",
+        "awaiting_confirmation": "Waiting for the operation to be durably confirmed in the instance database.",
+        "service_not_online": "The array’s service did not confirm online read-write mode.",
+        "helper_failed": "The helper reported an error reading this array — the details are in the tooltip.",
+        "operation_failed": "The operation “{operation}” did not succeed — the details are in the tooltip.",
+        "operation_failed_unnamed": "An operation on this array did not succeed — the details are in the tooltip.",
+        "supervision_lost": "The node lost track of an operation of this array (a restart); its state does not prove that the disk writes finished."
+      }
     },
     "wizard_pool": {
       "elastic_data": "Data disks",
@@ -7505,7 +7532,45 @@
       "plan_warning_mixed_media": "Mixed SSD and HDD: the vdev runs at the speed of its slowest member.",
       "plan_warning_unhealthy_disks": "SMART warns about {disks}: a pool built on a disk that is already failing starts degraded.",
       "plan_warning_single_disk": "A single disk has no redundancy: any failure loses the pool.",
-      "plan_warning_odd_mirror": "A mirror layout pairs disks two by two, so one disk of an odd selection stays unused."
+      "plan_warning_odd_mirror": "A mirror layout pairs disks two by two, so one disk of an odd selection stays unused.",
+      "elastic_role_data": "data disk",
+      "elastic_role_parity": "parity disk",
+      "elastic_role_cache": "cache disk",
+      "elastic_owner": {
+        "elastic": "already belongs to another Elastic Array",
+        "spare": "is a hot spare of a ZFS pool",
+        "spare_named": "is a hot spare of ZFS pool {name}",
+        "pool": "is a member of a ZFS pool",
+        "pool_named": "is a member of ZFS pool {name}",
+        "md": "is a member of an md array",
+        "md_named": "is a member of md array {name}",
+        "system": "carries this node’s running system",
+        "mounted": "is mounted",
+        "mounted_named": "is mounted at {name}",
+        "used": "holds a filesystem or partitions"
+      },
+      "elastic_refusal": {
+        "too_many_cache_disks": "Elastic allows at most one cache disk.",
+        "name_invalid": "“{name}” cannot be an array name: it becomes a directory under /mnt, a directory under the branch root and a file name.",
+        "name_taken": "“{name}” is already mounted at {path}: a pool and an array cannot share a mountpoint, and the union would hide what is under it.",
+        "no_data_disks": "An Elastic Array needs at least one data disk.",
+        "too_many_parity": "{count} parity disks: this array supports at most {max}.",
+        "disk_repeated": "{disk} is picked as {first} and as {role}.",
+        "same_device": "{other} ({other_role}) and {disk} ({role}) are the same device: one device cannot take two places in an array.",
+        "data_disks_same_device": "{other} and {disk} are the same device: one device cannot be two data disks.",
+        "disk_in_use": "{disk} {owner} — a disk belongs to one of them, not both (this array would erase it).",
+        "parity_too_small": "{disk} holds {size} and the largest data disk holds {largest}: a parity disk must be at least as large as the largest data disk, or it cannot cover it.",
+        "filesystem_invalid": "“{filesystem}” is not a filesystem this app makes: an Elastic data disk carries xfs or ext4 so it stays readable on its own.",
+        "filesystem_unavailable": "mkfs.{filesystem} is not installed on this node, so no disk of this array can be prepared.",
+        "plan_failed": "This layout cannot be turned into a plan — the details are in the tooltip."
+      },
+      "elastic_warning": {
+        "no_parity": "No parity disk: this array has no protection at all, and losing one data disk loses that disk’s files.",
+        "parity_tight": "{disk} is only just as large as the largest data disk: the parity file has to fit on a filesystem, and its metadata may leave too little room.",
+        "no_cache": "No cache disk: the mover has nothing to do, and new files are written straight to the data disks.",
+        "unhealthy_disks": "SMART warns about {disks}: an array built on a disk that is already failing starts degraded.",
+        "mixed_sizes": "The data disks are different sizes, and every byte of each of them is used: that is what this array kind is for."
+      }
     },
     "pools": {
       "title": "Pools on node {node}",
@@ -8048,7 +8113,8 @@
       "elastic_sync_name": "SnapRAID sync {array}",
       "elastic_scrub_name": "SnapRAID scrub {array}",
       "skip_elastic_scrub_errors_unrepaired": "a scrub reported errors nothing has repaired yet — run the repair from parity",
-      "skip_elastic_parity_fault_unacknowledged": "the array has an unrepaired scrub or repair fault — the Sync needs a confirmation on the array screen"
+      "skip_elastic_parity_fault_unacknowledged": "the array has an unrepaired scrub or repair fault — the Sync needs a confirmation on the array screen",
+      "skip_array_not_created": "the array’s creation did not finish — run the array’s restore or remove it"
     },
     "shares": {
       "create": "New share",
@@ -8483,7 +8549,34 @@
       "op_elastic_schedule": "Arm an Elastic schedule",
       "op_elastic_add_disk_abort": "Elastic Array · Undo disk addition",
       "detail_elastic_sync": "Writes a new parity and content checkpoint.",
-      "detail_elastic_sync_over_fault": "WARNING: the array has an unrepaired scrub or repair fault. The Sync records the current state of the files. Marked blocks of unchanged files, and unchanged files the scrub could not read, stay repairable — but files deleted or changed since the last Sync, damaged ones included, are recorded in their new state and their earlier versions can no longer be restored from parity. Run the repair first."
+      "detail_elastic_sync_over_fault": "WARNING: the array has an unrepaired scrub or repair fault. The Sync records the current state of the files. Marked blocks of unchanged files, and unchanged files the scrub could not read, stay repairable — but files deleted or changed since the last Sync, damaged ones included, are recorded in their new state and their earlier versions can no longer be restored from parity. Run the repair first.",
+      "detail": {
+        "yes": "yes",
+        "no": "no",
+        "pool_destroy": "Destroys the pool {pool} and every dataset and snapshot on it.",
+        "share_delete": "Removes the share {share} — the data under {path} stays, only the export goes.",
+        "target_delete": "Stops exporting {target} — a client using it loses the disk; {sources} and its data stay.",
+        "snapshot_release": "Lifts the protection of {snapshot}.",
+        "snapshot_release_reason": "Lifts the protection of {snapshot} — reason: {reason}",
+        "config_import": "Overwrites existing items ({count}): {items}.",
+        "elastic_create": "Formats the picked disks and creates the Elastic Array {array}.",
+        "elastic_scrub": "Checks the full checkpoint and records the scrub’s metadata.",
+        "elastic_fix": "Writes back from parity the blocks the last scrub marked, in files unchanged since the last Sync, on disk {disk}.",
+        "elastic_fix_number": "Writes back from parity the blocks the last scrub marked, in files unchanged since the last Sync, on data disk no. {n}.",
+        "elastic_add_disk": "Formats disk {disk} and adds it to the running Elastic Array.",
+        "elastic_add_disk_unnamed": "Formats the picked disk and adds it to the running Elastic Array.",
+        "elastic_add_disk_abort": "Undoes an unfinished disk add before the disk joined the share; clears only the filesystem that add made.",
+        "elastic_destroy": "Stops serving the Elastic Array and removes its supervision; the disks keep their filesystems and data.",
+        "elastic_mover_coupled": "Moves files from the cache to the data disks and runs the coupled parity Sync.",
+        "elastic_mover_uncoupled": "Moves files from the cache to the data disks WITHOUT the coupled parity Sync.",
+        "elastic_schedule_arm": "Arms the schedule: {task}, {cadence}.",
+        "elastic_schedule_keep_off": "Changes the schedule (it stays off): {task}, {cadence}.",
+        "elastic_schedule_rules": "{head} Files older than {age}, cache free-space threshold {pct}%, coupled Sync: {coupled}.",
+        "task_mover": "mover",
+        "task_sync": "parity Sync",
+        "task_scrub": "parity scrub",
+        "elastic_fix_unnamed": "Writes back from parity the blocks the last scrub marked, in files unchanged since the last Sync, on a data disk of the array."
+      }
     },
     "access": {
       "title": "Access log",
@@ -8658,7 +8751,22 @@
       "created": "Created",
       "key_in_kernel": "The key goes into the kernel (configfs). nvmet creates it world-readable, so the node tightens the file mode to root only and checks the result — a mismatch goes into the job log. On a node with local users treat it as a secret shared with that node.",
       "gone_title": "This target is gone",
-      "gone_detail": "It was deleted on this node (by another admin, for example). Go back to the sharing list."
+      "gone_detail": "It was deleted on this node (by another admin, for example). Go back to the sharing list.",
+      "state_reason": {
+        "kernel_missing": "This node’s kernel cannot serve {proto} targets.",
+        "volume_missing": "The backing volume does not exist — the target stays out of the kernel.",
+        "portal_moved_head": "The target’s portal is no longer where it was pinned. The address {address} belonged to interface {interface} (which now has {current}).",
+        "portal_moved_head_gone": "The target’s portal is no longer where it was pinned. The address {address} belonged to interface {interface}, which is gone from this node.",
+        "portal_moved_nowhere": "No interface of this node has that address now.",
+        "portal_moved_reachable": "It is now on {elsewhere}, which nobody picked for this target — the export is reachable there.",
+        "portal_moved_silent": "It is now on {elsewhere}. The target is not in the kernel, so nothing listens at that address — the export is not reachable on {elsewhere}.",
+        "portal_moved_tail": "The target stays as it is until an admin re-picks the portal.",
+        "not_exported": "Saved, but this node is not exporting it yet — the next reconcile applies it.",
+        "no_auth": "No authentication — the IQN/NQN allowlist is a filter, not a login.",
+        "import_secret_needed": "The authentication secret has to be entered again after an import.",
+        "import_all_interfaces": "This target was exported on every interface (0.0.0.0) — pick an interface of this node before enabling it.",
+        "portal_moved_head_no_address": "The target’s portal is no longer where it was pinned. The address {address} belonged to interface {interface}, which is on this node but has no address now (link down or a lost DHCP lease)."
+      }
     },
     "wizard_target": {
       "title": "New target",
@@ -8756,7 +8864,20 @@
       "portal_interface_gone": "Interface {iface} no longer has an address on this node that a portal can bind. You can still save your changes; the portal stays where it was, and moving it means picking another interface.",
       "portal_drifted": "This target's portal is on {from}, and interface {iface} now has {to}. The target is frozen and waiting — you can save your changes without touching the portal, or move it here.",
       "portal_move_confirm": "Move the portal to {to} — initiators logged in on the old address lose their path",
-      "iqn_host_unknown": "‹node hostname›"
+      "iqn_host_unknown": "‹node hostname›",
+      "kernel": {
+        "protocol_unknown": "“{proto}” is not a block protocol this node serves",
+        "configfs_present": "{path} is present",
+        "modules_available": "modules {modules} are available; the first target loads them",
+        "modules_missing": "this kernel has no {modules} — it is not built with the {proto} target",
+        "iser_module_missing": "ib_isert is not in this kernel’s module tree (no iSER)",
+        "nvmet_rdma_module_missing": "nvmet-rdma is not in this kernel’s module tree (no NVMe-oF over RDMA)",
+        "rdma_unavailable": "RDMA is not usable on this node (details in the tooltip)",
+        "dhchap_available": "CONFIG_NVME_TARGET_AUTH in {path} — DH-HMAC-CHAP available",
+        "dhchap_not_built": "this kernel was built without CONFIG_NVME_TARGET_AUTH ({path})",
+        "dhchap_not_mentioned": "{path} does not mention CONFIG_NVME_TARGET_AUTH",
+        "kernel_config_missing": "this kernel publishes no configuration (no /proc/config.gz, no /boot/config-*), so DH-HMAC-CHAP support cannot be confirmed — the wizard does not offer what it cannot confirm"
+      }
     },
     "journal_owner": {
       "this_instance": "this TentaNas instance",

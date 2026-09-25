@@ -323,6 +323,34 @@ test('a kernel without CONFIG_NVME_TARGET_AUTH offers no DH-HMAC-CHAP and says w
   screen.dispose();
 });
 
+// Wave 6: the kernel's reason arrives as a code beside the node's English.
+// The wizard says it in the reader's language and keeps the English as the
+// tooltip; a node that sent only the sentence (the test above) shows it.
+test('the reason DH-HMAC-CHAP and a protocol are unavailable is worded from its code', async () => {
+  const screen = fakeScreen({});
+  const english = 'this kernel was built without CONFIG_NVME_TARGET_AUTH (/proc/config.gz)';
+  const win = openTargetWizard(screen, {
+    capabilities: caps({
+      iscsi: false,
+      iscsiDetail: 'this kernel has no target_core_mod, iscsi_target_mod — the iscsi target is not built for it',
+      iscsiReasons: [{ code: 'modules_missing', params: { modules: 'target_core_mod, iscsi_target_mod', protocol: 'iscsi' } }],
+      dhchap: false,
+      dhchapDetail: english,
+      dhchapReasons: [{ code: 'dhchap_not_built', params: { path: '/proc/config.gz' } }],
+    }),
+  });
+  await flush();
+  assert.match(win.textContent, /to jądro nie ma modułów target_core_mod, iscsi_target_mod — nie zbudowano go z targetem iSCSI/);
+  assert.doesNotMatch(win.textContent, /is not built for it/, 'the English is not the text');
+  typeInto(win.querySelector('#nas-tw-name'), 'scratch');
+  await flush();
+  click(nextButton(win));
+  await flush();
+  assert.match(win.textContent, /DH-HMAC-CHAP niedostępne: to jądro zbudowano bez CONFIG_NVME_TARGET_AUTH \(\/proc\/config\.gz\)/);
+  assert.ok(win.querySelector(`[title="${english}"]`), 'the English is the tooltip');
+  screen.dispose();
+});
+
 test('an RDMA transport the node cannot serve is disabled with the probe reason', async () => {
   const screen = fakeScreen({});
   const win = await toStepTwo(screen, { capabilities: caps({ iser: false, rdmaDetail: 'no RDMA device under /sys/class/infiniband' }) });

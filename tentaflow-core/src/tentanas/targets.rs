@@ -42,6 +42,7 @@ use tentanas_helper::HelperCommand;
 use zeroize::Zeroizing;
 
 use super::db::{self as store, TargetRow};
+use super::CodedText;
 use crate::crypto::SettingsCipher;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
@@ -131,28 +132,46 @@ fn kernel_config() -> Option<(String, String)> {
 /// The Environment row id of the DH-HMAC-CHAP probe (n16, §5.5).
 pub const DHCHAP_FEATURE_ID: &str = "dhchap";
 
-pub fn dhchap_support() -> (bool, String) {
+pub fn dhchap_support() -> (bool, CodedText) {
     match kernel_config() {
-        Some((path, text)) => match kconfig_verdict(&text, "CONFIG_NVME_TARGET_AUTH") {
-            Some(true) => (
-                true,
-                format!("CONFIG_NVME_TARGET_AUTH in {path} — DH-HMAC-CHAP available"),
-            ),
-            Some(false) => (
-                false,
-                format!("this kernel was built without CONFIG_NVME_TARGET_AUTH ({path})"),
-            ),
-            None => (
-                false,
-                format!("{path} does not mention CONFIG_NVME_TARGET_AUTH"),
-            ),
-        },
+        Some((path, text)) => {
+            let at = [("path", path.clone())];
+            match kconfig_verdict(&text, "CONFIG_NVME_TARGET_AUTH") {
+                Some(true) => (
+                    true,
+                    CodedText::new(
+                        "dhchap_available",
+                        &at,
+                        format!("CONFIG_NVME_TARGET_AUTH in {path} — DH-HMAC-CHAP available"),
+                    ),
+                ),
+                Some(false) => (
+                    false,
+                    CodedText::new(
+                        "dhchap_not_built",
+                        &at,
+                        format!("this kernel was built without CONFIG_NVME_TARGET_AUTH ({path})"),
+                    ),
+                ),
+                None => (
+                    false,
+                    CodedText::new(
+                        "dhchap_not_mentioned",
+                        &at,
+                        format!("{path} does not mention CONFIG_NVME_TARGET_AUTH"),
+                    ),
+                ),
+            }
+        }
         None => (
             false,
-            "this kernel publishes no configuration (no /proc/config.gz, no /boot/config-*), \
-             so DH-HMAC-CHAP support cannot be confirmed — the wizard does not offer what it \
-             cannot confirm"
-                .to_string(),
+            CodedText::new(
+                "kernel_config_missing",
+                &[],
+                "this kernel publishes no configuration (no /proc/config.gz, no /boot/config-*), \
+                 so DH-HMAC-CHAP support cannot be confirmed — the wizard does not offer what it \
+                 cannot confirm",
+            ),
         ),
     }
 }
@@ -202,7 +221,7 @@ fn can_serve(configfs_present: bool, missing_modules: usize) -> bool {
     configfs_present || missing_modules == 0
 }
 
-pub fn kernel_support(protocol: &str) -> (bool, String) {
+pub fn kernel_support(protocol: &str) -> (bool, CodedText) {
     // FIRST, before the configfs check: an unknown protocol used to fall
     // through to LIO's tree, which exists on any node that ever served iSCSI —
     // so "is `tentanas-nonsense` supported?" answered yes. An empty module
@@ -211,7 +230,11 @@ pub fn kernel_support(protocol: &str) -> (bool, String) {
     if modules.is_empty() {
         return (
             false,
-            format!("'{protocol}' is not a block protocol this node serves"),
+            CodedText::new(
+                "protocol_unknown",
+                &[("protocol", protocol.to_string())],
+                format!("'{protocol}' is not a block protocol this node serves"),
+            ),
         );
     }
     let root = if protocol == "nvmet" {
@@ -220,7 +243,7 @@ pub fn kernel_support(protocol: &str) -> (bool, String) {
         block::TARGET_CONFIGFS
     };
     if Path::new(root).is_dir() {
-        return (true, format!("{root} present"));
+        return (true, CodedText::new("configfs_present", &[("path", root.to_string())], format!("{root} present")));
     }
     let missing: Vec<&str> = modules
         .iter()
@@ -232,17 +255,22 @@ pub fn kernel_support(protocol: &str) -> (bool, String) {
         // `target.service`, by §3.4. The apply does it through the catalog.
         return (
             true,
-            format!(
-                "{} available, loaded on the first target",
-                modules.join(", ")
+            CodedText::new(
+                "modules_available",
+                &[("modules", modules.join(", "))],
+                format!("{} available, loaded on the first target", modules.join(", ")),
             ),
         );
     }
     (
         false,
-        format!(
-            "this kernel has no {} — the {protocol} target is not built for it",
-            missing.join(", ")
+        CodedText::new(
+            "modules_missing",
+            &[("modules", missing.join(", ")), ("protocol", protocol.to_string())],
+            format!(
+                "this kernel has no {} — the {protocol} target is not built for it",
+                missing.join(", ")
+            ),
         ),
     )
 }
@@ -281,12 +309,13 @@ pub fn refine(feature: &mut FeatureState) {
     if feature.id == DHCHAP_FEATURE_ID {
         let (ok, detail) = dhchap_support();
         feature.status = if ok { "ok" } else { "missing_module" }.to_string();
-        feature.detail = detail;
+        feature.detail = detail.text;
         feature.kernel_module = None;
         return;
     }
 
-    let (ok, mut detail) = kernel_support(&feature.id);
+    let (ok, detail) = kernel_support(&feature.id);
+    let mut detail = detail.text;
     if feature.id == "nvmet" {
         detail.push_str(&format!(
             " · nvmet-rdma {}",
@@ -506,15 +535,20 @@ pub fn capabilities(
     let (dhchap, dhchap_detail) = dhchap_support();
     let rdma_detail = if rdma_ok {
         let mut parts = Vec::new();
+        let mut reasons = Vec::new();
         if !iser_module() {
             parts.push("ib_isert is not in this kernel's module tree (no iSER)");
+            reasons.push(super::disks::coded_reason("iser_module_missing", &[]));
         }
         if !nvmet_rdma_module() {
             parts.push("nvmet-rdma is not in this kernel's module tree (no NVMe-oF over RDMA)");
+            reasons.push(super::disks::coded_reason("nvmet_rdma_module_missing", &[]));
         }
-        parts.join("; ")
+        CodedText { text: parts.join("; "), reasons }
     } else {
-        feature_detail(features, super::rdma::FEATURE_ID)
+        // The RDMA probe's own sentence (the Environment row's) says why; the
+        // screen says that RDMA is not usable here and shows it as the tooltip.
+        CodedText::new("rdma_unavailable", &[], feature_detail(features, super::rdma::FEATURE_ID))
     };
     // The two protocol rows come from the KERNEL, not from the `targetcli` /
     // `nvmetcli` Environment rows: this app never runs either tool, so a node
@@ -527,10 +561,14 @@ pub fn capabilities(
         iser: rdma_ok && iser_module(),
         nvme_rdma: rdma_ok && nvmet_rdma_module(),
         dhchap,
-        iscsi_detail,
-        nvmet_detail,
-        rdma_detail,
-        dhchap_detail,
+        iscsi_detail: iscsi_detail.text,
+        nvmet_detail: nvmet_detail.text,
+        rdma_detail: rdma_detail.text,
+        dhchap_detail: dhchap_detail.text,
+        iscsi_reasons: iscsi_detail.reasons,
+        nvmet_reasons: nvmet_detail.reasons,
+        rdma_reasons: rdma_detail.reasons,
+        dhchap_reasons: dhchap_detail.reasons,
         interfaces: interfaces(),
         volumes: volumes(datasets, targets),
         wwn_host: wwn_host(&super::config_io::hostname()),
@@ -557,7 +595,8 @@ pub fn services() -> Vec<NasShareService> {
             running,
             version: None,
             config_path: configfs.to_string(),
-            detail,
+            detail: detail.text,
+            reasons: detail.reasons,
         }
     })
     .collect()
@@ -649,7 +688,7 @@ pub fn target_state(
     installed: &dyn Fn(&str) -> bool,
     addresses: &BTreeMap<String, Vec<String>>,
     in_kernel: bool,
-) -> (&'static str, String, Disposition) {
+) -> (&'static str, CodedText, Disposition) {
     if !target.enabled {
         // A row that ARRIVED disabled keeps the sentence it arrived with.
         //
@@ -665,10 +704,12 @@ pub fn target_state(
         // and leaving that under a stopped row is stale rather than useful.
         // The two are told apart by what the row already says — an imported
         // row is written `disabled` with its reason, an active one is not.
+        //
+        // The carried sentence keeps the codes it arrived with, too.
         let carried = if target.state == "disabled" {
-            target.state_detail.clone()
+            CodedText { text: target.state_detail.clone(), reasons: target.state_reasons.clone() }
         } else {
-            String::new()
+            CodedText::default()
         };
         return ("disabled", carried, Disposition::Remove);
     }
@@ -678,12 +719,20 @@ pub fn target_state(
         } else {
             "the LIO kernel target is not available on this node"
         };
-        return ("error", missing.to_string(), Disposition::Remove);
+        return (
+            "error",
+            CodedText::new("target_kernel_missing", &[("protocol", target.protocol.clone())], missing),
+            Disposition::Remove,
+        );
     }
     if !volume_exists {
         return (
             "error",
-            "the backing volume does not exist — the target stays out of the kernel".to_string(),
+            CodedText::new(
+                "target_volume_missing",
+                &[],
+                "the backing volume does not exist — the target stays out of the kernel",
+            ),
             Disposition::Remove,
         );
     }
@@ -717,9 +766,17 @@ pub fn target_state(
                 name.as_str() != portal.interface && addrs.contains(&portal.address)
             })
             .map(|(name, _)| name.clone());
-        let on_the_interface = match held {
-            Some(current) => format!("{} now has {}", portal.interface, current.join(", ")),
-            None => format!("interface {} is gone from this node", portal.interface),
+        // THREE cases, not two (wave-6 critic MAJOR 2): the interface holds
+        // other addresses, it is THERE with none at all (link down, a DHCP
+        // lease lost — `interface_addresses` lists every interface), or it
+        // is gone from the node. Calling the second "gone" sends the admin
+        // looking for a NIC that is plugged in.
+        let (interface_state, on_the_interface) = match held {
+            Some(current) if !current.is_empty() => {
+                ("addressed", format!("{} now has {}", portal.interface, current.join(", ")))
+            }
+            Some(_) => ("no_address", format!("{} is there but has no address", portal.interface)),
+            None => ("missing", format!("interface {} is gone from this node", portal.interface)),
         };
         // "The export is reachable there" is a claim about what this node is
         // SERVING, so it is only made when the object is actually in the
@@ -738,12 +795,30 @@ pub fn target_state(
             ),
             (None, _) => "no interface of this node has that address".to_string(),
         };
+        // The same facts as parameters: the screen says them in the
+        // reader's language (N19b), the sentence stays the log's.
+        let mut params = vec![
+            ("address", portal.address.clone()),
+            ("interface", portal.interface.clone()),
+            ("in_kernel", in_kernel.to_string()),
+            ("interface_state", interface_state.to_string()),
+        ];
+        if let Some(current) = held.filter(|current| !current.is_empty()) {
+            params.push(("current", current.join(", ")));
+        }
+        if let Some(name) = &elsewhere {
+            params.push(("elsewhere", name.clone()));
+        }
         return (
             "error",
-            format!(
-                "portal {} is not on {} any more — {on_the_interface}, and {where_now}; the \
-                 target stays as it is until an admin re-picks the interface",
-                portal.address, portal.interface
+            CodedText::new(
+                "target_portal_moved",
+                &params,
+                format!(
+                    "portal {} is not on {} any more — {on_the_interface}, and {where_now}; the \
+                     target stays as it is until an admin re-picks the interface",
+                    portal.address, portal.interface
+                ),
             ),
             Disposition::Freeze,
         );
@@ -752,9 +827,13 @@ pub fn target_state(
     // whoever gets past the portal, and nothing past that point is
     // authenticated.
     let open = if target.auth_method == "none" {
-        "no authentication — the IQN/NQN allowlist is a filter, not a login"
+        CodedText::new(
+            "target_no_auth",
+            &[],
+            "no authentication — the IQN/NQN allowlist is a filter, not a login",
+        )
     } else {
-        ""
+        CodedText::default()
     };
     // "Active" is a claim about what this node is SERVING, so it is not made
     // about a target the node is not serving. A row can be judged appliable
@@ -767,16 +846,15 @@ pub fn target_state(
     // It is `pending`, not `error`: nothing is wrong, the node simply has not
     // done it yet, and the apply sweep on the next tick is what will.
     if !in_kernel {
-        let mut detail =
-            "saved, but this node is not exporting it yet — the next reconcile applies it"
-                .to_string();
-        if !open.is_empty() {
-            detail.push_str(" · ");
-            detail.push_str(open);
-        }
+        let detail = CodedText::new(
+            "target_not_exported",
+            &[],
+            "saved, but this node is not exporting it yet — the next reconcile applies it",
+        )
+        .and(open);
         return ("pending", detail, Disposition::Apply);
     }
-    ("active", open.to_string(), Disposition::Apply)
+    ("active", open, Disposition::Apply)
 }
 
 /// The dedupe key of one target's portal-drift alert. One open row per target,
@@ -1461,8 +1539,13 @@ fn evaluate_rows(
             &addresses,
             object_in_kernel(target),
         );
-        if target.state != state || target.state_detail != detail {
-            store::set_target_state(db, &target.target_id, state, &detail)?;
+        // The codes count as a change: a row stored before migration 23 has
+        // the sentence and no codes, and this is what gives it them.
+        let changed = target.state != state
+            || target.state_detail != detail.text
+            || target.state_reasons != detail.reasons;
+        if changed {
+            store::set_target_state(db, &target.target_id, state, &detail, &detail.reasons)?;
         }
         // The drift alert (§5.5, owner decision 2026-09-04). The admin who
         // picked an interface has to HEAR that the portal is no longer on it,
@@ -1485,7 +1568,7 @@ fn evaluate_rows(
                 &store::AlertText::new(
                     "target_portal_moved",
                     format!("Target {}: the portal address moved", target.name),
-                    &detail,
+                    detail.text.as_str(),
                 )
                 .param("target", &target.name),
             )
@@ -1513,10 +1596,11 @@ fn evaluate_rows(
         // day per such target, 43 000 on a ten-target node, burying every line
         // that meant something. `set_target_state` above is already gated this
         // way and so is `resolve_alert`; the log was the one that was not.
-        let changed = target.state != state || target.state_detail != detail;
+        let logged = target.state != state || target.state_detail != detail.text;
         target.state = state.to_string();
-        target.state_detail = detail;
-        if changed && !target.state_detail.is_empty() {
+        target.state_detail = detail.text;
+        target.state_reasons = detail.reasons;
+        if logged && !target.state_detail.is_empty() {
             log.push(format!("{}: {}", target.name, target.state_detail));
         }
     }
@@ -3840,6 +3924,7 @@ pub fn to_protocol(target: &TargetRow, sessions: u32, sessions_known: bool) -> N
         state_detail: target.state_detail.clone(),
         created_at: target.created_at.clone(),
         updated_at: target.updated_at.clone(),
+        state_reasons: target.state_reasons.clone(),
     }
 }
 
@@ -4065,6 +4150,7 @@ mod tests {
             },
             state: "active".into(),
             state_detail: String::new(),
+            state_reasons: Vec::new(),
             created_at: "2026-09-03T12:00:00Z".into(),
             updated_at: "2026-09-03T12:00:00Z".into(),
         }
@@ -4585,13 +4671,17 @@ mod tests {
         // row no longer describes what would be served.
         assert_eq!(
             target_state(&off, true, &|_| true, &here, true),
-            ("disabled", String::new(), Disposition::Remove)
+            ("disabled", CodedText::default(), Disposition::Remove)
         );
         assert_eq!(
             target_state(&row, true, &|_| false, &here, true),
             (
                 "error",
-                "the LIO kernel target is not available on this node".to_string(),
+                CodedText::new(
+                    "target_kernel_missing",
+                    &[("protocol", "iscsi".to_string())],
+                    "the LIO kernel target is not available on this node"
+                ),
                 Disposition::Remove
             )
         );
@@ -4787,6 +4877,68 @@ mod tests {
         assert!(detail.contains("moved to lan0"), "{detail}");
         assert!(!detail.contains("reachable there"), "{detail}");
         assert!(detail.contains("not in the kernel"), "{detail}");
+
+        // Wave 6: the same facts as a code, which the drift card (N19b)
+        // words in the reader's language.
+        let [drift] = detail.reasons.as_slice() else { panic!("one code: {:?}", detail.reasons) };
+        assert_eq!(drift.code, "target_portal_moved");
+        let param = |k: &str| drift.params.get(k).map(String::as_str);
+        assert_eq!(
+            (param("address"), param("interface"), param("current"), param("elsewhere"), param("in_kernel")),
+            (Some("10.10.0.5"), Some("storage0"), Some("10.10.9.9"), Some("lan0"), Some("false"))
+        );
+    }
+
+    /// Wave-6 critic MAJOR 2: an interface that is THERE with no address
+    /// (link down, DHCP lease lost) is not an interface that is gone — the
+    /// two are separate codes, and neither sentence claims the other.
+    #[test]
+    fn an_interface_without_an_address_is_not_a_missing_interface() {
+        let row = target("iscsi");
+        let param = |d: &CodedText, k: &str| d.reasons[0].params.get(k).cloned();
+        let bare = node(&[("storage0", &[]), ("lan0", &["192.168.1.5"])]);
+        let (state, detail, verdict) = target_state(&row, true, &|_| true, &bare, false);
+        assert_eq!((state, verdict), ("error", Disposition::Freeze));
+        assert_eq!(param(&detail, "interface_state").as_deref(), Some("no_address"));
+        assert_eq!(param(&detail, "current"), None, "no empty list of addresses");
+        assert!(detail.contains("storage0 is there but has no address"), "{detail}");
+        assert!(!detail.contains("gone"), "{detail}");
+
+        let gone = node(&[("lan0", &["192.168.1.5"])]);
+        let (_, detail, _) = target_state(&row, true, &|_| true, &gone, false);
+        assert_eq!(param(&detail, "interface_state").as_deref(), Some("missing"));
+        assert!(detail.contains("interface storage0 is gone"), "{detail}");
+
+        let moved = node(&[("storage0", &["10.10.9.9"]), ("lan0", &["192.168.1.5"])]);
+        let (_, detail, _) = target_state(&row, true, &|_| true, &moved, false);
+        assert_eq!(param(&detail, "interface_state").as_deref(), Some("addressed"));
+        assert_eq!(param(&detail, "current").as_deref(), Some("10.10.9.9"));
+    }
+
+    /// Wave 6: the other state sentences as codes, joined the way the
+    /// sentences are.
+    #[test]
+    fn the_target_state_detail_is_coded() {
+        let row = target("iscsi");
+        let codes = |d: &CodedText| d.reasons.iter().map(|r| r.code.clone()).collect::<Vec<_>>();
+        let (state, pending, _) = target_state(&row, true, &|_| true, &here(), false);
+        assert_eq!(state, "pending");
+        assert_eq!(codes(&pending), vec!["target_not_exported", "target_no_auth"], "{pending}");
+        assert_eq!(pending.text.matches(" · ").count(), 1, "{pending}");
+        let (_, active, _) = target_state(&row, true, &|_| true, &here(), true);
+        assert_eq!(codes(&active), vec!["target_no_auth"]);
+        let (_, gone, _) = target_state(&row, false, &|_| true, &here(), true);
+        assert_eq!(codes(&gone), vec!["target_volume_missing"]);
+        let mut chap = row.clone();
+        chap.auth_method = "chap".to_string();
+        assert!(target_state(&chap, true, &|_| true, &here(), true).1.reasons.is_empty());
+        // An imported row keeps the codes it arrived with while it stays off.
+        let mut imported = row.clone();
+        imported.enabled = false;
+        imported.state = "disabled".to_string();
+        imported.state_detail = "the authentication secret has to be entered again after an import".to_string();
+        imported.state_reasons = vec![crate::tentanas::disks::coded_reason("import_secret_needed", &[])];
+        assert_eq!(codes(&target_state(&imported, true, &|_| true, &here(), true).1), vec!["import_secret_needed"]);
     }
 
     /// The wizard tells "taken by another organisation" from a target name
@@ -5072,7 +5224,7 @@ mod tests {
 
         let (kernel_ok, kernel_detail) = kernel_support("iscsi");
         assert_eq!(row.status == "ok", kernel_ok);
-        assert!(row.detail.starts_with(&kernel_detail), "{}", row.detail);
+        assert!(row.detail.starts_with(kernel_detail.text.as_str()), "{}", row.detail);
 
         // §5.5: the DH-HMAC-CHAP probe lives in the Environment tab. n16 gives
         // it its OWN row — an admin scanning the Status column for "can this
@@ -5267,6 +5419,34 @@ mod tests {
                 .state,
             "pending"
         );
+    }
+
+    /// Wave 6 (migration 23): a row stored before the codes has its
+    /// sentence and no codes, and a verdict that did not change is not
+    /// written again — so the codes themselves count as a change, and the
+    /// next tick gives such a row its codes.
+    #[test]
+    fn the_next_evaluation_gives_a_row_stored_before_the_codes_its_codes() {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let mut row = target("iscsi");
+        row.luns[0].device_path = "/dev/null".to_string();
+        row.portals[0].interface = "tentanas-nie-ma-takiego0".to_string();
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let mut log = Vec::new();
+        evaluate_rows(&db, &mut [row.clone()], &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
+        let judged = store::target_by_name(&db, &row.name).expect("read").expect("row");
+        assert_eq!(judged.state_reasons.first().map(|r| r.code.as_str()), Some("target_portal_moved"));
+
+        // What an older build left: the same state and sentence, no codes.
+        store::set_target_state(&db, &row.target_id, &judged.state, &judged.state_detail, &[]).expect("older row");
+        let mut rows = vec![store::target_by_name(&db, &row.name).expect("read").expect("row")];
+        assert!(rows[0].state_reasons.is_empty());
+        evaluate_rows(&db, &mut rows, &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
+        let coded = store::target_by_name(&db, &row.name).expect("read").expect("row");
+        assert_eq!(coded.state_detail, judged.state_detail, "the sentence did not change");
+        assert_eq!(coded.state_reasons, judged.state_reasons, "and the codes came back");
     }
 
     #[test]

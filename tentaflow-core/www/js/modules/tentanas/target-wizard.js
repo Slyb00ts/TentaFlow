@@ -24,7 +24,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, errMessage, jobKindLabel, nodeLabel } from '/js/modules/tentanas/format.js';
+import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, errMessage, jobKindLabel, nodeLabel, wordReasons, nodeTextTitle } from '/js/modules/tentanas/format.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -33,6 +33,38 @@ import '/js/components/tf-segmented.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-checkbox.js';
+
+// Why this kernel can or cannot serve a block protocol, in the reader's
+// language (wave 6): `targets::kernel_support` / `dhchap_support` send the
+// reason as codes beside their English (`NasBlockCapabilities::*_reasons`,
+// `NasShareService::reasons`), and the English becomes the tooltip. An older
+// node sends only the sentence, shown as it came.
+const blockProtocolLabel = (protocol) => (protocol === 'nvmet' ? 'NVMe-oF' : protocol === 'iscsi' ? 'iSCSI' : String(protocol || ''));
+const KERNEL_SUPPORT_WORDS = new Map([
+  ['protocol_unknown', (p) => (p.protocol ? T('wizard_target.kernel.protocol_unknown', { proto: p.protocol }) : null)],
+  ['configfs_present', (p) => (p.path ? T('wizard_target.kernel.configfs_present', { path: p.path }) : null)],
+  ['modules_available', (p) => (p.modules ? T('wizard_target.kernel.modules_available', { modules: p.modules }) : null)],
+  ['modules_missing', (p) => (p.modules && p.protocol ? T('wizard_target.kernel.modules_missing', { modules: p.modules, proto: blockProtocolLabel(p.protocol) }) : null)],
+  ['iser_module_missing', () => T('wizard_target.kernel.iser_module_missing')],
+  ['nvmet_rdma_module_missing', () => T('wizard_target.kernel.nvmet_rdma_module_missing')],
+  ['rdma_unavailable', () => T('wizard_target.kernel.rdma_unavailable')],
+  ['dhchap_available', (p) => (p.path ? T('wizard_target.kernel.dhchap_available', { path: p.path }) : null)],
+  ['dhchap_not_built', (p) => (p.path ? T('wizard_target.kernel.dhchap_not_built', { path: p.path }) : null)],
+  ['dhchap_not_mentioned', (p) => (p.path ? T('wizard_target.kernel.dhchap_not_mentioned', { path: p.path }) : null)],
+  ['kernel_config_missing', () => T('wizard_target.kernel.kernel_config_missing')],
+]);
+
+export function kernelSupportText(reasons, detail) {
+  return wordReasons(reasons, KERNEL_SUPPORT_WORDS) || String(detail || '');
+}
+
+// One "not available here" line: `key` words it around the reason, and the
+// node's own sentence is its tooltip when the reason was worded.
+export function kernelSupportLine(key, reasons, detail) {
+  const text = kernelSupportText(reasons, detail);
+  const title = text !== String(detail || '') ? nodeTextTitle(detail) : '';
+  return `<div class="muted"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(T(key, { detail: text }))}</div>`;
+}
 
 // A target name becomes the tail of the IQN/NQN and a configfs directory
 // component, so it is the lowercase subset both specifications allow.
@@ -442,7 +474,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
 
   // ----- step 1/3: the protocol (n14a) -----
   const stepType = () => {
-    const unavailable = (ok, detail) => (ok ? '' : `<div class="muted">${escapeHtml(T('wizard_target.unavailable', { detail: detail || '' }))}</div>`);
+    const unavailable = (ok, reasons, detail) => (ok ? '' : kernelSupportLine('wizard_target.unavailable', reasons, detail));
     return `
       <h2 class="wizard-section-title">${escapeHtml(T('wizard_target.type_title'))}</h2>
       <p class="wizard-section-sub">${escapeHtml(T('wizard_target.type_sub'))}</p>
@@ -450,8 +482,8 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
         <tf-choice-card value="iscsi" icon="target" heading="iSCSI" description="${escapeAttr(T('wizard_target.iscsi_desc'))}" ${editing || caps.iscsi === false ? 'disabled' : ''}></tf-choice-card>
         <tf-choice-card value="nvmet" icon="zap" heading="NVMe-oF" description="${escapeAttr(T('wizard_target.nvmet_desc'))}" ${editing || caps.nvmet === false ? 'disabled' : ''}></tf-choice-card>
       </tf-choice-group>
-      ${unavailable(caps.iscsi !== false, caps.iscsiDetail)}
-      ${unavailable(caps.nvmet !== false, caps.nvmetDetail)}
+      ${unavailable(caps.iscsi !== false, caps.iscsiReasons, caps.iscsiDetail)}
+      ${unavailable(caps.nvmet !== false, caps.nvmetReasons, caps.nvmetDetail)}
       <div class="form-grid-2 mt-md">
         <tf-input id="nas-tw-name" label="${escapeAttr(T('wizard_target.name_label'))}" placeholder="vm-store" autocomplete="off" spellcheck="false" value="${escapeAttr(state.name)}" hint="${escapeAttr(T('wizard_target.name_hint'))}" ${editing ? 'readonly' : ''}></tf-input>
       </div>`;
@@ -617,14 +649,14 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
         <tf-segmented id="nas-tw-transport" value="${escapeAttr(state.transport)}" size="sm">
           ${transports.map((t) => `<option value="${escapeAttr(t.value)}" ${t.ok ? '' : 'disabled'}>${escapeHtml(t.label)}</option>`).join('')}
         </tf-segmented>
-        ${chosen && !chosen.ok ? `<div class="muted">${escapeHtml(T('wizard_target.transport_unavailable', { detail: caps.rdmaDetail || '' }))}</div>` : ''}
+        ${chosen && !chosen.ok ? kernelSupportLine('wizard_target.transport_unavailable', caps.rdmaReasons, caps.rdmaDetail) : ''}
       </div>
       <div class="field mt-md" style="margin-bottom:0;">
         <label>${escapeHtml(T('wizard_target.auth_label'))}</label>
         <tf-segmented id="nas-tw-auth" value="${escapeAttr(state.method)}" size="sm">
           ${methods.map((m) => `<option value="${escapeAttr(m)}" ${dhchapOff && m !== 'none' ? 'disabled' : ''}>${escapeHtml(T(AUTH_LABEL_KEY[m]))}</option>`).join('')}
         </tf-segmented>
-        ${dhchapOff ? `<div class="muted">${escapeHtml(T('wizard_target.dhchap_unavailable', { detail: caps.dhchapDetail || '' }))}</div>` : ''}
+        ${dhchapOff ? kernelSupportLine('wizard_target.dhchap_unavailable', caps.dhchapReasons, caps.dhchapDetail) : ''}
       </div>
       ${authFields()}
       ${hostAllowlistFields()}

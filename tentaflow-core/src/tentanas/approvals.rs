@@ -23,6 +23,7 @@ use anyhow::{anyhow, Result};
 use tentaflow_protocol::tentanas::{NasApprovalSettings, NasPendingApproval, TentaNasPayload};
 
 use super::db as store;
+use super::CodedText;
 use crate::db::DbPool;
 
 /// The operations that route through approval. Each is one arm of
@@ -288,11 +289,16 @@ pub fn second_pair_available(a: &Actor<'_>) -> bool {
 ///
 /// The payload is stored WITHOUT its sudo password — a password never reaches
 /// disk (§3.4) — so the approver supplies their own when the operation runs.
+///
+/// `detail` is what the approver decides on, in both forms (`CodedText`): the
+/// code the approver's screen words in the approver's language, and the
+/// node's own sentence the audit row, the alert's forwarded text and the
+/// tooltip keep. A bare sentence is accepted (uncoded) and shown as written.
 pub fn park(
     a: &Actor<'_>,
     operation: &str,
     subject: &str,
-    detail: &str,
+    detail: impl Into<CodedText>,
     payload: &TentaNasPayload,
 ) -> Result<NasPendingApproval> {
     park_shown(a, operation, subject, subject, detail, payload)
@@ -309,16 +315,18 @@ pub fn park_shown(
     operation: &str,
     subject: &str,
     shown_subject: &str,
-    detail: &str,
+    detail: impl Into<CodedText>,
     payload: &TentaNasPayload,
 ) -> Result<NasPendingApproval> {
+    let detail: CodedText = detail.into();
     let ttl_hours = settings(a.main_db, a.checker, a.org_id, a.addon_id).ttl_hours;
     let now = chrono::Utc::now();
     let approval = NasPendingApproval {
         request_id: uuid::Uuid::now_v7().to_string(),
         operation: operation.to_string(),
         subject: subject.to_string(),
-        detail: detail.to_string(),
+        detail: detail.text.clone(),
+        detail_reasons: detail.reasons.clone(),
         status: "pending".to_string(),
         requested_by: a.user_id.to_string(),
         requested_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -343,7 +351,7 @@ pub fn park_shown(
         "warning",
         "approval",
         &approval.request_id,
-        &approval_alert_text(operation, subject, shown_subject, detail),
+        &approval_alert_text(operation, subject, shown_subject, &detail.text),
     );
     audit_as(a, "nas.approval.requested", &approval, "pending");
     Ok(approval)
@@ -521,14 +529,6 @@ fn approval_alert_text(operation: &str, subject: &str, shown_subject: &str, deta
 /// or, when it is empty, the operation alone. Also what the read boundary
 /// rewrites a config import's stored title to once it has resolved the node
 /// (`dispatch::tentanas::alerts_list`).
-/// A parked operation's `detail` as a CODE the approver's screen words in
-/// the approver's language (`approvals.detail_<code>`, `approvals.js`),
-/// instead of a sentence in one language: `text:<code>`. The approvals list
-/// shows a detail that is not such a code as it was written.
-pub fn coded_detail(code: &str) -> String {
-    format!("text:{code}")
-}
-
 pub fn approval_alert_title(shown_subject: &str) -> String {
     if shown_subject.trim().is_empty() {
         "a red-path operation waits for a second admin".to_string()

@@ -5655,7 +5655,34 @@
       "create_policy_rand": "disco aleatorio",
       "create_policy_msplfs": "menos espacio libre en la ruta existente más larga",
       "card_mover": "Traslado desde la caché",
-      "card_cache_waiting": "{size} en la caché sin paridad"
+      "card_cache_waiting": "{size} en la caché sin paridad",
+      "state_member": {
+        "data": "disco de datos {name}",
+        "data_number": "disco de datos n.º {n}",
+        "cache": "disco de caché {name}",
+        "cache_number": "disco de caché n.º {n}",
+        "parity": "disco de paridad {name}",
+        "parity_number": "disco de paridad n.º {n}"
+      },
+      "state_reason": {
+        "mount_table_unknown": "Este nodo no pudo leer su tabla de montaje, así que no monta ni desmonta nada: una unión montada sobre ramas que no ve enviaría cada escritura de cliente al sistema de archivos raíz.",
+        "mergerfs_missing": "mergerfs no está instalado en este nodo, así que la unión no se puede montar.",
+        "snapraid_unusable": "SnapRAID no se puede usar en este nodo (falta, o está instalado y no funciona — vea Entorno), así que los discos de paridad de este array no protegen nada hasta que funcione.",
+        "branches_unknown": "Este nodo no puede saber si están presentes: {members}. No montará la unión hasta que pueda.",
+        "branches_mountable": "Presentes y aún sin montar: {members}. La próxima reconciliación los monta y después la unión.",
+        "branches_gone_serving": "No está en este nodo: {members}. La unión sigue sirviendo los discos que tiene, y los archivos del que falta no se ven en ella.",
+        "branches_gone_down": "No está en este nodo: {members}. La unión sigue desmontada: montarla sobre una rama sin montar enviaría las escrituras de los clientes al sistema de archivos raíz.",
+        "union_not_mounted": "Guardado, pero este nodo aún no sirve la unión: la próxima reconciliación la monta.",
+        "no_parity": "Sin disco de paridad: un fallo de disco pierde sus archivos.",
+        "restart_required": "La recuperación tras el arranque de este nodo se detuvo a medias: solo un reinicio del nodo la reintenta.",
+        "checkpoint_unfinished": "El helper tiene un punto de control sin terminar de este array.",
+        "awaiting_confirmation": "Esperando la confirmación duradera de la operación en la base de datos de la instancia.",
+        "service_not_online": "El servicio del array no confirmó el modo en línea de lectura y escritura.",
+        "helper_failed": "El helper informó de un error al leer este array: los detalles están en la información emergente.",
+        "operation_failed": "La operación «{operation}» no se completó: los detalles están en la información emergente.",
+        "operation_failed_unnamed": "Una operación en este array no se completó: los detalles están en la información emergente.",
+        "supervision_lost": "El nodo perdió el seguimiento de una operación de este array (un reinicio); su estado no demuestra que las escrituras en los discos terminaran."
+      }
     },
     "wizard_pool": {
       "elastic_data": "Discos de datos",
@@ -5746,7 +5773,45 @@
       "plan_warning_mixed_media": "SSD y HDD mezclados: el vdev funciona a la velocidad de su miembro más lento.",
       "plan_warning_unhealthy_disks": "SMART advierte sobre {disks}: un pool creado sobre un disco que ya está fallando arranca degradado.",
       "plan_warning_single_disk": "Un solo disco no tiene redundancia: cualquier fallo hace perder el pool.",
-      "plan_warning_odd_mirror": "Un mirror empareja los discos de dos en dos, así que en una selección impar un disco queda sin usar."
+      "plan_warning_odd_mirror": "Un mirror empareja los discos de dos en dos, así que en una selección impar un disco queda sin usar.",
+      "elastic_role_data": "disco de datos",
+      "elastic_role_parity": "disco de paridad",
+      "elastic_role_cache": "disco de caché",
+      "elastic_owner": {
+        "elastic": "ya pertenece a otro Elastic Array",
+        "spare": "es un disco de reserva de un pool ZFS",
+        "spare_named": "es un disco de reserva del pool ZFS {name}",
+        "pool": "forma parte de un pool ZFS",
+        "pool_named": "forma parte del pool ZFS {name}",
+        "md": "forma parte de un array md",
+        "md_named": "forma parte del array md {name}",
+        "system": "contiene el sistema en ejecución de este nodo",
+        "mounted": "está montado",
+        "mounted_named": "está montado en {name}",
+        "used": "contiene un sistema de archivos o particiones"
+      },
+      "elastic_refusal": {
+        "too_many_cache_disks": "Elastic admite como máximo un disco de caché.",
+        "name_invalid": "«{name}» no puede ser un nombre de array: se convierte en un directorio bajo /mnt, un directorio bajo la raíz de ramas y un nombre de archivo.",
+        "name_taken": "«{name}» ya está montado en {path}: un pool y un array no pueden compartir punto de montaje, y la unión ocultaría lo que hay debajo.",
+        "no_data_disks": "Un Elastic Array necesita al menos un disco de datos.",
+        "too_many_parity": "{count} discos de paridad: este array admite como máximo {max}.",
+        "disk_repeated": "{disk} está elegido como {first} y como {role}.",
+        "same_device": "{other} ({other_role}) y {disk} ({role}) son el mismo dispositivo: un dispositivo no puede ocupar dos lugares en un array.",
+        "data_disks_same_device": "{other} y {disk} son el mismo dispositivo: un dispositivo no puede ser dos discos de datos.",
+        "disk_in_use": "{disk} {owner}: un disco pertenece a uno de ellos, no a ambos (este array lo borraría).",
+        "parity_too_small": "{disk} tiene {size} y el mayor disco de datos {largest}: un disco de paridad debe ser al menos tan grande como el mayor disco de datos, o no puede cubrirlo.",
+        "filesystem_invalid": "«{filesystem}» no es un sistema de archivos que cree esta aplicación: un disco de datos Elastic lleva xfs o ext4 para seguir siendo legible por sí solo.",
+        "filesystem_unavailable": "mkfs.{filesystem} no está instalado en este nodo, así que no se puede preparar ningún disco de este array.",
+        "plan_failed": "Esta disposición no puede convertirse en un plan: los detalles están en la información emergente."
+      },
+      "elastic_warning": {
+        "no_parity": "Sin disco de paridad: este array no tiene ninguna protección, y perder un disco de datos pierde sus archivos.",
+        "parity_tight": "{disk} es apenas tan grande como el mayor disco de datos: el archivo de paridad debe caber en un sistema de archivos, y sus metadatos pueden dejar muy poco espacio.",
+        "no_cache": "Sin disco de caché: el mover no tiene nada que hacer, y los archivos nuevos se escriben directamente en los discos de datos.",
+        "unhealthy_disks": "SMART advierte sobre {disks}: un array creado sobre un disco que ya está fallando arranca degradado.",
+        "mixed_sizes": "Los discos de datos tienen tamaños distintos y se usa cada byte de cada uno: para eso sirve este tipo de array."
+      }
     },
     "pools": {
       "title": "Pools en el nodo {node}",
@@ -6289,7 +6354,8 @@
       "elastic_sync_name": "Sync de SnapRAID {array}",
       "elastic_scrub_name": "Scrub de SnapRAID {array}",
       "skip_elastic_scrub_errors_unrepaired": "un scrub informó de errores que aún nada ha reparado — ejecute la reparación desde la paridad",
-      "skip_elastic_parity_fault_unacknowledged": "la matriz tiene un error de scrub o de reparación sin corregir — la sincronización requiere confirmación en la pantalla de la matriz"
+      "skip_elastic_parity_fault_unacknowledged": "la matriz tiene un error de scrub o de reparación sin corregir — la sincronización requiere confirmación en la pantalla de la matriz",
+      "skip_array_not_created": "la creación del array no terminó: ejecute la restauración del array o elimínelo"
     },
     "kpi": {
       "shares": "Recursos",
@@ -7267,7 +7333,34 @@
       "op_elastic_schedule": "Armar una programación de Elastic",
       "op_elastic_add_disk_abort": "Elastic Array · Deshacer la adición de un disco",
       "detail_elastic_sync": "Escribe un nuevo punto de control de paridad y de content.",
-      "detail_elastic_sync_over_fault": "ATENCIÓN: la matriz tiene un error de scrub o de reparación sin corregir. La sincronización registra el estado actual de los archivos. Los bloques marcados de archivos sin cambios, y los archivos sin cambios que el scrub no pudo leer, siguen siendo reparables — pero los archivos eliminados o modificados desde la última sincronización, también los dañados, quedarán registrados en su nuevo estado y sus versiones anteriores ya no podrán restaurarse desde la paridad. Ejecute primero la reparación."
+      "detail_elastic_sync_over_fault": "ATENCIÓN: la matriz tiene un error de scrub o de reparación sin corregir. La sincronización registra el estado actual de los archivos. Los bloques marcados de archivos sin cambios, y los archivos sin cambios que el scrub no pudo leer, siguen siendo reparables — pero los archivos eliminados o modificados desde la última sincronización, también los dañados, quedarán registrados en su nuevo estado y sus versiones anteriores ya no podrán restaurarse desde la paridad. Ejecute primero la reparación.",
+      "detail": {
+        "yes": "sí",
+        "no": "no",
+        "pool_destroy": "Destruye el pool {pool} y todos los datasets y snapshots que contiene.",
+        "share_delete": "Elimina el recurso compartido {share}: los datos en {path} se quedan, solo desaparece la exportación.",
+        "target_delete": "Deja de exportar {target}: un cliente que lo use pierde el disco; {sources} y sus datos se quedan.",
+        "snapshot_release": "Retira la protección de {snapshot}.",
+        "snapshot_release_reason": "Retira la protección de {snapshot} (motivo: {reason})",
+        "config_import": "Sobrescribe elementos existentes ({count}): {items}.",
+        "elastic_create": "Formatea los discos elegidos y crea el Elastic Array {array}.",
+        "elastic_scrub": "Comprueba el punto de control completo y registra los metadatos del scrub.",
+        "elastic_fix": "Reescribe desde la paridad los bloques marcados por el último scrub, en archivos sin cambios desde la última sincronización, en el disco {disk}.",
+        "elastic_fix_number": "Reescribe desde la paridad los bloques marcados por el último scrub, en archivos sin cambios desde la última sincronización, en el disco de datos n.º {n}.",
+        "elastic_add_disk": "Formatea el disco {disk} y lo añade al Elastic Array en funcionamiento.",
+        "elastic_add_disk_unnamed": "Formatea el disco elegido y lo añade al Elastic Array en funcionamiento.",
+        "elastic_add_disk_abort": "Deshace una adición de disco sin terminar antes de que el disco se uniera al recurso compartido; solo borra el sistema de archivos que creó esa adición.",
+        "elastic_destroy": "Deja de servir el Elastic Array y retira su supervisión; los discos conservan sus sistemas de archivos y datos.",
+        "elastic_mover_coupled": "Mueve archivos de la caché a los discos de datos y ejecuta la sincronización de paridad acoplada.",
+        "elastic_mover_uncoupled": "Mueve archivos de la caché a los discos de datos SIN la sincronización de paridad acoplada.",
+        "elastic_schedule_arm": "Activa la programación: {task}, {cadence}.",
+        "elastic_schedule_keep_off": "Cambia la programación (sigue desactivada): {task}, {cadence}.",
+        "elastic_schedule_rules": "{head} Archivos con más de {age}, umbral de espacio libre de la caché {pct} %, sincronización acoplada: {coupled}.",
+        "task_mover": "mover",
+        "task_sync": "sincronización de paridad",
+        "task_scrub": "scrub de paridad",
+        "elastic_fix_unnamed": "Reescribe desde la paridad los bloques marcados por el último scrub, en archivos sin cambios desde la última sincronización, en un disco de datos del array."
+      }
     },
     "access": {
       "title": "Registro de acceso",
@@ -7442,7 +7535,22 @@
       "created": "Creado",
       "key_in_kernel": "La clave va al kernel (configfs). nvmet la crea legible para todos, así que el nodo restringe el modo del archivo solo a root y comprueba el resultado; cualquier discrepancia queda en el registro de la tarea. En un nodo con usuarios locales trátala como un secreto compartido con ese nodo.",
       "gone_title": "Este destino ya no existe",
-      "gone_detail": "Se eliminó en este nodo (por ejemplo, otro administrador). Vuelve a la lista de uso compartido."
+      "gone_detail": "Se eliminó en este nodo (por ejemplo, otro administrador). Vuelve a la lista de uso compartido.",
+      "state_reason": {
+        "kernel_missing": "El kernel de este nodo no puede servir destinos {proto}.",
+        "volume_missing": "El volumen de respaldo no existe: el destino se queda fuera del kernel.",
+        "portal_moved_head": "El portal del destino ya no está donde se fijó. La dirección {address} pertenecía a la interfaz {interface} (que ahora tiene {current}).",
+        "portal_moved_head_gone": "El portal del destino ya no está donde se fijó. La dirección {address} pertenecía a la interfaz {interface}, que ya no existe en este nodo.",
+        "portal_moved_nowhere": "Ninguna interfaz de este nodo tiene ya esa dirección.",
+        "portal_moved_reachable": "Ahora está en {elsewhere}, que nadie eligió para este destino: la exportación es accesible allí.",
+        "portal_moved_silent": "Ahora está en {elsewhere}. El destino no está en el kernel, así que nada escucha en esa dirección: la exportación no es accesible en {elsewhere}.",
+        "portal_moved_tail": "El destino se queda como está hasta que un administrador vuelva a elegir el portal.",
+        "not_exported": "Guardado, pero este nodo aún no lo exporta: la próxima reconciliación lo aplica.",
+        "no_auth": "Sin autenticación: la lista de permitidos IQN/NQN es un filtro, no un inicio de sesión.",
+        "import_secret_needed": "El secreto de autenticación debe introducirse de nuevo tras una importación.",
+        "import_all_interfaces": "Este destino se exportaba en todas las interfaces (0.0.0.0): elija una interfaz de este nodo antes de activarlo.",
+        "portal_moved_head_no_address": "El portal del destino ya no está donde se fijó. La dirección {address} pertenecía a la interfaz {interface}, que está en este nodo pero ahora no tiene ninguna dirección (enlace caído o concesión DHCP perdida)."
+      }
     },
     "wizard_target": {
       "title": "Nuevo destino",
@@ -7540,7 +7648,20 @@
       "portal_interface_gone": "La interfaz {iface} ya no tiene en este nodo una dirección que un portal pueda enlazar. Puedes guardar tus cambios igualmente; el portal se queda donde estaba y moverlo requiere elegir otra interfaz.",
       "portal_drifted": "El portal de este destino está en {from}, y la interfaz {iface} ahora tiene {to}. El destino está congelado y esperando: puedes guardar tus cambios sin tocar el portal, o moverlo aquí.",
       "portal_move_confirm": "Mover el portal a {to}: los initiators conectados en la dirección anterior pierden su ruta",
-      "iqn_host_unknown": "‹nombre de host del nodo›"
+      "iqn_host_unknown": "‹nombre de host del nodo›",
+      "kernel": {
+        "protocol_unknown": "«{proto}» no es un protocolo de bloques que sirva este nodo",
+        "configfs_present": "{path} está presente",
+        "modules_available": "los módulos {modules} están disponibles; el primer destino los carga",
+        "modules_missing": "este kernel no tiene {modules}: no está compilado con el destino {proto}",
+        "iser_module_missing": "ib_isert no está en el árbol de módulos de este kernel (sin iSER)",
+        "nvmet_rdma_module_missing": "nvmet-rdma no está en el árbol de módulos de este kernel (sin NVMe-oF sobre RDMA)",
+        "rdma_unavailable": "RDMA no se puede usar en este nodo (detalles en la información emergente)",
+        "dhchap_available": "CONFIG_NVME_TARGET_AUTH en {path}: DH-HMAC-CHAP disponible",
+        "dhchap_not_built": "este kernel se compiló sin CONFIG_NVME_TARGET_AUTH ({path})",
+        "dhchap_not_mentioned": "{path} no menciona CONFIG_NVME_TARGET_AUTH",
+        "kernel_config_missing": "este kernel no publica su configuración (no hay /proc/config.gz ni /boot/config-*), así que no se puede confirmar DH-HMAC-CHAP: el asistente no ofrece lo que no puede confirmar"
+      }
     },
     "journal_owner": {
       "this_instance": "esta instancia de TentaNas",

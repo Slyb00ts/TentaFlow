@@ -12,6 +12,7 @@ import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
   fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel, diskReasonsText,
+  wordReasons, nodeTextTitle,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, paintJobLog } from '/js/lib/dom-patch.js';
 import '/js/components/tf-window.js';
@@ -34,6 +35,83 @@ export const elasticNameValid = (name) => /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,63}$/.t
 const COMPRESSION_OPTIONS = ['zstd', 'lz4', 'off'];
 
 const KIND_LABELS = { zfs: 'ZFS', anyraid: 'ZFS AnyRAID', elastic: 'Elastic Array' };
+
+// The Elastic preview's refusals and warnings in the reader's language (wave
+// 6): the node sends each with a code and its parameters beside its own
+// sentence (`elastic::layout_refusals`, `layout_warning_codes`), and the
+// sentence becomes the tooltip. A code this build has no words for — or a
+// node too old to send codes — shows the node's sentence as it came.
+const ELASTIC_ROLE_WORDS = new Set(['data', 'parity', 'cache']);
+const ELASTIC_OWNERS = new Set(['elastic', 'spare', 'pool', 'md', 'system', 'mounted', 'used']);
+const elasticRole = (role) => (ELASTIC_ROLE_WORDS.has(role) ? T('wizard_pool.elastic_role_' + role) : '');
+const bytesParam = (value) => (Number.isFinite(Number(value)) && String(value) !== '' ? fmtBytes(Number(value)) : '');
+
+function elasticOwner(p) {
+  if (!ELASTIC_OWNERS.has(p.owner)) return '';
+  const named = String(p.owner_name || '');
+  return named && p.owner !== 'elastic' && p.owner !== 'system' && p.owner !== 'used'
+    ? T('wizard_pool.elastic_owner.' + p.owner + '_named', { name: named })
+    : T('wizard_pool.elastic_owner.' + p.owner);
+}
+
+const ELASTIC_REFUSAL_WORDS = new Map([
+  ['too_many_cache_disks', () => T('wizard_pool.elastic_refusal.too_many_cache_disks')],
+  ['name_invalid', (p) => (p.name ? T('wizard_pool.elastic_refusal.name_invalid', { name: String(p.name) }) : null)],
+  ['name_taken', (p) => (p.name && p.path ? T('wizard_pool.elastic_refusal.name_taken', { name: p.name, path: p.path }) : null)],
+  ['no_data_disks', () => T('wizard_pool.elastic_refusal.no_data_disks')],
+  ['too_many_parity', (p) => (p.count && p.max ? T('wizard_pool.elastic_refusal.too_many_parity', { count: p.count, max: p.max }) : null)],
+  ['disk_repeated', (p, disk) => {
+    // Two rows of one device: named by the other disk, not by the identity
+    // they share (a WWN or a serial stays in the node's sentence).
+    if (p.other) {
+      const role = elasticRole(p.role);
+      const other = elasticRole(p.other_role);
+      return disk && role && other ? T('wizard_pool.elastic_refusal.same_device', { disk, role, other: p.other, other_role: other }) : null;
+    }
+    const first = elasticRole(p.first_role);
+    const role = elasticRole(p.role);
+    return disk && first && role ? T('wizard_pool.elastic_refusal.disk_repeated', { disk, first, role }) : null;
+  }],
+  ['data_disks_same_device', (p, disk) => (disk && p.other ? T('wizard_pool.elastic_refusal.data_disks_same_device', { disk, other: p.other }) : null)],
+  ['disk_in_use', (p, disk) => {
+    const owner = elasticOwner(p);
+    return disk && owner ? T('wizard_pool.elastic_refusal.disk_in_use', { disk, owner }) : null;
+  }],
+  ['parity_too_small', (p, disk) => {
+    const size = bytesParam(p.size);
+    const largest = bytesParam(p.largest);
+    return disk && size && largest ? T('wizard_pool.elastic_refusal.parity_too_small', { disk, size, largest }) : null;
+  }],
+  ['filesystem_invalid', (p) => (p.filesystem ? T('wizard_pool.elastic_refusal.filesystem_invalid', { filesystem: p.filesystem }) : null)],
+  ['filesystem_unavailable', (p) => (p.filesystem ? T('wizard_pool.elastic_refusal.filesystem_unavailable', { filesystem: p.filesystem }) : null)],
+  ['plan_failed', () => T('wizard_pool.elastic_refusal.plan_failed')],
+]);
+
+// `{ text, title }` of one refusal: the words, and the node's sentence as the
+// tooltip when the words replace it.
+export function elasticRefusalText(r) {
+  const fn = ELASTIC_REFUSAL_WORDS.get(String(r?.code || ''));
+  const words = fn ? fn(r?.params || {}, String(r?.diskName || '')) : null;
+  const detail = String(r?.detail || '');
+  return words ? { text: words, title: nodeTextTitle(detail) } : { text: detail, title: '' };
+}
+
+const ELASTIC_WARNING_WORDS = new Map([
+  ['no_parity', () => T('wizard_pool.elastic_warning.no_parity')],
+  ['parity_tight', (p) => (p.disk ? T('wizard_pool.elastic_warning.parity_tight', { disk: p.disk }) : null)],
+  ['no_cache', () => T('wizard_pool.elastic_warning.no_cache')],
+  ['unhealthy_disks', (p) => (p.disks ? T('wizard_pool.elastic_warning.unhealthy_disks', { disks: p.disks }) : null)],
+  ['mixed_sizes', () => T('wizard_pool.elastic_warning.mixed_sizes')],
+]);
+
+// The preview's warnings, one line each: worded from `warningCodes`, or the
+// node's sentences when it sent no codes (or one this build cannot word).
+export function elasticPlanWarnings(plan) {
+  const codes = Array.isArray(plan?.warningCodes) ? plan.warningCodes : [];
+  const worded = codes.map((c) => wordReasons([c], ELASTIC_WARNING_WORDS));
+  if (codes.length && worded.every(Boolean)) return worded;
+  return Array.isArray(plan?.warnings) ? plan.warnings.map(String) : [];
+}
 
 /**
  * Every disk of the node for the picker: the free ones are selectable, the
@@ -316,8 +394,11 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     if (state.planning) return `<p>${escapeHtml(I18n.t('common.loading'))}</p>`;
     if (state.planError) return `<div class="wizard-warning danger mt-md">${sprite('alert')}<div>${escapeHtml(state.planError)}</div></div>`;
     if (!state.plan) return '';
-    return `${state.plan.refusals.map((r) => `<div class="wizard-warning danger mt-md">${sprite('alert')}<div>${escapeHtml(r.detail)}</div></div>`).join('')}
-      ${state.plan.warnings.map((w) => `<div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(w)}</div></div>`).join('')}
+    return `${state.plan.refusals.map((r) => {
+      const { text, title } = elasticRefusalText(r);
+      return `<div class="wizard-warning danger mt-md"${title ? ` title="${escapeAttr(title)}"` : ''}>${sprite('alert')}<div>${escapeHtml(text)}</div></div>`;
+    }).join('')}
+      ${elasticPlanWarnings(state.plan).map((w) => `<div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(w)}</div></div>`).join('')}
       ${state.plan.refusals.length ? '' : `<div class="explain-box mt-md">${escapeHtml(T('wizard_pool.sum_usable'))}: ${escapeHtml(fmtBytes(state.plan.usableBytes))} · ${escapeHtml(state.plan.unionPath)}</div>`}`;
   };
 

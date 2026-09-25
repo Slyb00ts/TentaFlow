@@ -934,6 +934,54 @@ test('a named job still running is re-read on the schedules poll, a finished one
   }
 });
 
+// Wave 6 B: a node of this build sends the outcome structured, with the
+// started job's status read on the node. The row says it without asking for
+// any job by id, follows the status the next poll brings in place (the row
+// and its toggle are the same nodes), and the refusal's sentence — ids
+// scrubbed — is only the tooltip.
+test('a structured outcome is shown from the row itself, with no job looked up by id', async () => {
+  const structured = (status) => ({ ...schedules, rows: [
+    { ...schedules.rows[0], lastRunAt: '2026-08-30 02:00:00', lastResult: `started job ${UUID_B}`, lastOutcome: 'started', lastJobStatus: status },
+    { ...schedules.rows[1], lastRunAt: '2026-09-01 03:30:00', lastResult: 'failed to start: x', lastOutcome: 'start_failed',
+      lastDetail: 'Na tym dysku trwa już autotest SMART; odmowa drugiego (0191f2c0-0000-7000-8000-000000000001)' },
+  ] });
+  let current = structured('running');
+  const gets = [];
+  const screen = fakeScreen(fixtures({
+    tentaNasJobsListRequest: { jobs: [] },
+    tentaNasSchedulesListRequest: () => current,
+    tentaNasJobGetRequest: (p) => { gets.push(p.jobId); return { job: { jobId: p.jobId, status: 'failed' } }; },
+  }));
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  try {
+    const body = mount();
+    await drawTasks(screen, body);
+    await flush(); await flush();
+    const sub = (i) => scheduleRows(body)[i].querySelector('[data-role="sub"]');
+    assert.match(sub(0).textContent, / · w toku$/);
+    const row = scheduleRows(body)[0];
+    const toggle = row.querySelector('[data-act="toggle"]');
+
+    current = structured('succeeded');
+    const due = scheduled.splice(0);
+    for (const fn of due) await fn();
+    await flush(); await flush();
+    assert.match(sub(0).textContent, / · OK$/, 'the status the poll brought');
+    assert.equal(scheduleRows(body)[0], row, 'the row is patched, not rebuilt');
+    assert.equal(row.querySelector('[data-act="toggle"]'), toggle);
+
+    assert.match(sub(1).textContent, / · błąd$/);
+    const title = sub(1).getAttribute('title');
+    assert.match(title, /^Na tym dysku trwa już autotest SMART/);
+    assert.doesNotMatch(title, /0191f2c0/, 'an id in the node\'s sentence is scrubbed');
+    assert.deepEqual(gets, [], 'no job is asked for by id');
+    assert.doesNotMatch(body.textContent, new RegExp(UUID_B));
+  } finally {
+    screen.dispose();
+  }
+});
+
 // A2/A3/A5 (critic-real-functionality-2026-09-21.md): Cancel only where it
 // really stops the work.
 test('Cancel is offered only for a pool scrub, never for kinds whose cancel stops nothing', () => {

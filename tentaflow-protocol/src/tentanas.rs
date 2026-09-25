@@ -1091,8 +1091,32 @@ pub struct NasScheduleRow {
     pub enabled: bool,
     pub schedule: NasSchedule,
     pub last_run_at: Option<String>,
+    /// DEPRECATED FOR DISPLAY: the stored outcome in the older sentence form
+    /// (`started job <id>`, `failed to start: <error>`, `pominięto: …`), kept
+    /// for an older screen. A screen reads the structured fields below.
     pub last_result: String,
     pub next_run_at: Option<String>,
+    /// The last slot's outcome (`tentanas::scheduler::ScheduleOutcome`):
+    /// 'started' (a job ran from it) | 'start_failed' (the node refused to
+    /// start one) | 'skipped' (declined on purpose) | '' (never ran, and
+    /// always for the SMART pair). Empty from an older node.
+    #[serde(default)]
+    pub last_outcome: String,
+    /// For 'started': the status of the job the slot started, read when the
+    /// list was built ('running', 'succeeded', 'failed', 'cancelled', …), or
+    /// '' when that job is gone. The job's id never travels.
+    #[serde(default)]
+    pub last_job_status: String,
+    /// For 'skipped', the reason as a code ('elastic_scrub_errors_unrepaired',
+    /// 'elastic_parity_fault_unacknowledged', 'array_not_created'); '' for an
+    /// older stored skip that carries only a sentence.
+    #[serde(default)]
+    pub last_reason: String,
+    /// The node's own sentence for the outcome — a refusal's error, an older
+    /// skip's reason. For a tooltip only: it is one language, and may name
+    /// what a screen must not show.
+    #[serde(default)]
+    pub last_detail: String,
 }
 
 /// A property change of `DatasetSetPropertiesRequest`: `inherit` drops the
@@ -1265,6 +1289,11 @@ pub struct NasShareService {
     /// The file the app owns for this service (smb.conf include / exports.d).
     pub config_path: String,
     pub detail: String,
+    /// `detail` as codes, for the block rows (`targets::kernel_support`, the
+    /// codes `NasBlockCapabilities::iscsi_reasons` lists). Empty for the
+    /// share services and from an older node.
+    #[serde(default)]
+    pub reasons: Vec<NasHealthReason>,
 }
 
 /// A directory entry of the share source browser. Only pool mountpoints and
@@ -1322,7 +1351,9 @@ pub struct NasPendingApproval {
     pub subject: String,
     /// One sentence naming exactly what would happen, written when the
     /// operation was parked — the approver decides on THAT, not on a replay
-    /// of a state that may have moved on.
+    /// of a state that may have moved on. The node's own English (audit,
+    /// tooltip); a screen words `detail_reasons`. An older row may hold
+    /// `text:<code>` here instead.
     pub detail: String,
     pub status: String,
     pub requested_by: String,
@@ -1339,6 +1370,11 @@ pub struct NasPendingApproval {
     /// refuses the author's own approval regardless of what the UI shows.
     #[serde(default)]
     pub is_own_request: bool,
+    /// `detail` as a code the approver's screen words in the approver's
+    /// language (`tentanas::CodedText`), stored with the row. Empty from an
+    /// older node and for a row parked before the codes.
+    #[serde(default)]
+    pub detail_reasons: Vec<NasHealthReason>,
 }
 
 /// The fleet-wide four-eyes switch and what it was decided from.
@@ -1481,9 +1517,22 @@ pub struct NasTarget {
     pub sessions_known: bool,
     /// 'active' | 'error' | 'disabled'.
     pub state: String,
+    /// The node's own sentence (log, tooltip). A screen words
+    /// `state_reasons` instead.
     pub state_detail: String,
     pub created_at: String,
     pub updated_at: String,
+    /// `state_detail` as codes, one per part of the sentence
+    /// (`targets::target_state`): 'target_kernel_missing' {protocol},
+    /// 'target_volume_missing' {}, 'target_portal_moved' {address,
+    /// interface, interface_state: 'addressed' | 'no_address' | 'missing',
+    /// current? (only when the interface holds addresses), elsewhere?,
+    /// in_kernel}, 'target_not_exported' {},
+    /// 'target_no_auth' {}, and the config import's 'import_*' reasons. Empty
+    /// from an older node and for a row stored before the codes — the
+    /// sentence is then all there is.
+    #[serde(default)]
+    pub state_reasons: Vec<NasHealthReason>,
 }
 
 /// One interface the portal picker of the wizard offers (n14 step 2).
@@ -1543,6 +1592,21 @@ pub struct NasBlockCapabilities {
     pub rdma_detail: String,
     #[serde(default)]
     pub dhchap_detail: String,
+    /// The four details above as codes (`targets::kernel_support`,
+    /// `dhchap_support`): 'protocol_unknown' {protocol}, 'configfs_present'
+    /// {path}, 'modules_available' {modules}, 'modules_missing' {modules,
+    /// protocol}, 'iser_module_missing' {}, 'nvmet_rdma_module_missing' {},
+    /// 'rdma_unavailable' {}, 'dhchap_available' {path}, 'dhchap_not_built'
+    /// {path}, 'dhchap_not_mentioned' {path}, 'kernel_config_missing' {}.
+    /// Empty from an older node.
+    #[serde(default)]
+    pub iscsi_reasons: Vec<NasHealthReason>,
+    #[serde(default)]
+    pub nvmet_reasons: Vec<NasHealthReason>,
+    #[serde(default)]
+    pub rdma_reasons: Vec<NasHealthReason>,
+    #[serde(default)]
+    pub dhchap_reasons: Vec<NasHealthReason>,
     pub interfaces: Vec<NasBlockInterface>,
     pub volumes: Vec<NasBlockVolume>,
     /// The host segment this node puts into every IQN / NQN it creates — its
@@ -1861,7 +1925,24 @@ pub struct NasElasticArray {
     pub kind: String,
     /// Stany: 'active' | 'pending' | 'creating' | 'needs_attention' | 'error' | 'disabled' | 'unknown'.
     pub state: String,
+    /// The node's own sentence (log, tooltip). A screen words
+    /// `state_reasons` instead when there are any.
     pub state_detail: String,
+    /// `state_detail` as codes (`elastic::array_state`, `elastic::get`):
+    /// 'mount_table_unknown', 'mergerfs_missing', 'snapraid_unusable',
+    /// 'branches_unknown' / 'branches_mountable' {data, cache, parity} (the
+    /// kernel names per role, comma-separated, each key only when non-empty;
+    /// '#<n>' for a member known only by its number, never a slot name),
+    /// 'branches_gone' {data, cache, parity, union: 'serving' | 'down'},
+    /// 'union_not_mounted', 'no_parity', 'restart_required',
+    /// 'checkpoint_unfinished', 'awaiting_confirmation', 'service_not_online',
+    /// 'helper_failed' (the helper's own sentence stays in `state_detail`),
+    /// and for a sentence the row stores (migration 23) 'operation_failed'
+    /// {operation} (the failed operation's kind; its error is `state_detail`)
+    /// or 'supervision_lost'. Empty from an older node and for a stored
+    /// sentence no rule recognised: `state_detail` is then all there is.
+    #[serde(default)]
+    pub state_reasons: Vec<NasHealthReason>,
     /// 'ok' | 'warning' | 'critical' | 'unknown'.
     pub health: String,
     pub health_reason: String,
@@ -1975,7 +2056,7 @@ pub struct NasElasticPendingAdd {
 /// sentence so the UI can say it in its own language.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NasElasticRefusal {
-    /// 'no_data_disks' | 'too_many_parity' | 'parity_too_small' |
+    /// 'no_data_disks' | 'too_many_parity' | 'too_many_cache_disks' | 'parity_too_small' |
     /// 'disk_in_use' | 'disk_repeated' | 'data_disks_same_device' |
     /// 'name_invalid' | 'name_taken' | 'filesystem_invalid' |
     /// 'filesystem_unavailable' | 'plan_failed'.
@@ -1986,7 +2067,19 @@ pub struct NasElasticRefusal {
     /// The disk the refusal is about, empty when it is about the array.
     pub disk_id: String,
     pub disk_name: String,
+    /// The node's own sentence, for a tooltip. A screen words `code` with
+    /// `params` and `disk_name`.
     pub detail: String,
+    /// What the sentence names beyond the disk: 'name' (name_invalid,
+    /// name_taken), 'path' (name_taken), 'count' (too_many_cache_disks,
+    /// too_many_parity) and 'max' (too_many_parity),
+    /// 'size' and 'largest' in bytes (parity_too_small), 'first_role',
+    /// 'role' (disk_repeated), 'other' and 'other_role' (the second disk of
+    /// a shared device), 'owner' + 'owner_name' (disk_in_use:
+    /// 'elastic' | 'spare' | 'pool' | 'md' | 'system' | 'mounted' | 'used'),
+    /// 'filesystem' (filesystem_*). Empty from an older node.
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
 }
 
 /// The wizard's answer for a set of picked disks: what the array would be,
@@ -2005,7 +2098,8 @@ pub struct NasElasticPlan {
     /// Hard stops. A non-empty list means the create button stays disabled;
     /// there is no "create anyway".
     pub refusals: Vec<NasElasticRefusal>,
-    /// Things an admin should know and may still choose.
+    /// Things an admin should know and may still choose — the node's English,
+    /// for an older screen. A screen words `warning_codes` instead.
     pub warnings: Vec<String>,
     pub union_path: String,
     /// Every device the create would ERASE. The red button's count comes from
@@ -2015,6 +2109,11 @@ pub struct NasElasticPlan {
     /// the first sync. Empty when `refusals` is non-empty: there is no plan
     /// for something the node will not do.
     pub steps_preview: String,
+    /// `warnings` as codes (`elastic::layout_warning_codes`): 'no_parity' {},
+    /// 'parity_tight' {disk}, 'no_cache' {}, 'unhealthy_disks' {disks},
+    /// 'mixed_sizes' {}. Empty from an older node.
+    #[serde(default)]
+    pub warning_codes: Vec<NasHealthReason>,
 }
 
 /// An Elastic Array this node holds on disk but has no database record of —
@@ -3553,6 +3652,11 @@ mod tests {
             decision_note: String::new(),
             decision_job_id: None,
             is_own_request: true,
+            // Wave 6: the coded detail round-trips with the row.
+            detail_reasons: vec![NasHealthReason {
+                code: "snapshot_release".to_string(),
+                params: [("snapshot".to_string(), "tank/projekty@przed-migracja".to_string())].into(),
+            }],
         };
         let body = MessageBody::TentaNasBody(TentaNasPayload::ApprovalsListResponse {
             approvals: vec![approval.clone()],
@@ -4323,6 +4427,7 @@ mod tests {
             state_detail: String::new(),
             created_at: "2026-09-03T12:00:00Z".to_string(),
             updated_at: "2026-09-03T12:00:00Z".to_string(),
+            state_reasons: vec![NasHealthReason { code: "target_no_auth".to_string(), params: Default::default() }],
         };
         let body = MessageBody::TentaNasBody(TentaNasPayload::TargetGetResponse {
             target: target.clone(),
@@ -4470,7 +4575,13 @@ mod tests {
                     disk_id: "d-sdn".to_string(),
                     disk_name: "sdn".to_string(),
                     detail: "sdn (4.0 TB) is smaller than the largest data disk".to_string(),
+                    params: [
+                        ("size".to_string(), "4000000000000".to_string()),
+                        ("largest".to_string(), "8000000000000".to_string()),
+                    ]
+                    .into(),
                 }],
+                warning_codes: vec![NasHealthReason { code: "no_cache".to_string(), params: Default::default() }],
                 wiped_devices: vec!["/dev/sdl".to_string()],
                 union_path: "/mnt/archiwum".to_string(),
                 ..Default::default()

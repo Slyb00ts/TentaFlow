@@ -5655,7 +5655,34 @@
       "create_policy_rand": "disque au hasard",
       "create_policy_msplfs": "le moins d’espace libre sur le plus long chemin existant",
       "card_mover": "Déplacement depuis le cache",
-      "card_cache_waiting": "{size} sur le cache sans parité"
+      "card_cache_waiting": "{size} sur le cache sans parité",
+      "state_member": {
+        "data": "disque de données {name}",
+        "data_number": "disque de données n° {n}",
+        "cache": "disque de cache {name}",
+        "cache_number": "disque de cache n° {n}",
+        "parity": "disque de parité {name}",
+        "parity_number": "disque de parité n° {n}"
+      },
+      "state_reason": {
+        "mount_table_unknown": "Ce nœud n’a pas pu lire sa table de montage, il ne monte ni ne démonte donc rien : une union montée sur des branches qu’il ne voit pas enverrait chaque écriture client sur le système de fichiers racine.",
+        "mergerfs_missing": "mergerfs n’est pas installé sur ce nœud, l’union ne peut donc pas être montée.",
+        "snapraid_unusable": "SnapRAID n’est pas utilisable sur ce nœud (absent, ou installé mais défaillant — voir Environnement) : les disques de parité de cet array ne protègent rien tant que ce n’est pas corrigé.",
+        "branches_unknown": "Ce nœud ne peut pas déterminer s’ils sont présents : {members}. Il ne montera pas l’union tant qu’il ne le pourra pas.",
+        "branches_mountable": "Présents et pas encore montés : {members}. La prochaine réconciliation les monte, puis l’union.",
+        "branches_gone_serving": "Absent de ce nœud : {members}. L’union sert toujours les disques présents, et les fichiers du disque manquant n’y sont pas visibles.",
+        "branches_gone_down": "Absent de ce nœud : {members}. L’union reste démontée : montée sur une branche non montée, elle enverrait les écritures des clients sur le système de fichiers racine.",
+        "union_not_mounted": "Enregistré, mais ce nœud ne sert pas encore l’union — la prochaine réconciliation la monte.",
+        "no_parity": "Aucun disque de parité : une panne de disque perd ses fichiers.",
+        "restart_required": "La reprise après le démarrage de ce nœud s’est arrêtée en cours de route — seul un redémarrage du nœud la relance.",
+        "checkpoint_unfinished": "Le helper a un point de contrôle inachevé de cet array.",
+        "awaiting_confirmation": "En attente de la confirmation durable de l’opération dans la base de l’instance.",
+        "service_not_online": "Le service de l’array n’a pas confirmé le mode en ligne en lecture-écriture.",
+        "helper_failed": "Le helper a signalé une erreur en lisant cet array — les détails sont dans l’infobulle.",
+        "operation_failed": "L’opération « {operation} » n’a pas abouti — les détails sont dans l’infobulle.",
+        "operation_failed_unnamed": "Une opération sur cet array n’a pas abouti — les détails sont dans l’infobulle.",
+        "supervision_lost": "Le nœud a perdu le suivi d’une opération de cet array (redémarrage) ; son état ne prouve pas que les écritures sur les disques sont terminées."
+      }
     },
     "wizard_pool": {
       "elastic_data": "Disques de données",
@@ -5746,7 +5773,45 @@
       "plan_warning_mixed_media": "SSD et HDD mélangés : le vdev fonctionne à la vitesse de son membre le plus lent.",
       "plan_warning_unhealthy_disks": "SMART signale un problème sur {disks} : un pool créé sur un disque déjà défaillant démarre dégradé.",
       "plan_warning_single_disk": "Un seul disque n’a aucune redondance : toute panne fait perdre le pool.",
-      "plan_warning_odd_mirror": "Un miroir associe les disques deux à deux, donc dans une sélection impaire un disque reste inutilisé."
+      "plan_warning_odd_mirror": "Un miroir associe les disques deux à deux, donc dans une sélection impaire un disque reste inutilisé.",
+      "elastic_role_data": "disque de données",
+      "elastic_role_parity": "disque de parité",
+      "elastic_role_cache": "disque de cache",
+      "elastic_owner": {
+        "elastic": "appartient déjà à un autre Elastic Array",
+        "spare": "est un disque de secours d’un pool ZFS",
+        "spare_named": "est un disque de secours du pool ZFS {name}",
+        "pool": "fait partie d’un pool ZFS",
+        "pool_named": "fait partie du pool ZFS {name}",
+        "md": "fait partie d’une grappe md",
+        "md_named": "fait partie de la grappe md {name}",
+        "system": "porte le système en cours de ce nœud",
+        "mounted": "est monté",
+        "mounted_named": "est monté sur {name}",
+        "used": "contient un système de fichiers ou des partitions"
+      },
+      "elastic_refusal": {
+        "too_many_cache_disks": "Elastic accepte au plus un disque de cache.",
+        "name_invalid": "« {name} » ne peut pas être un nom d’array : il devient un répertoire sous /mnt, un répertoire sous la racine des branches et un nom de fichier.",
+        "name_taken": "« {name} » est déjà monté sur {path} : un pool et un array ne peuvent pas partager un point de montage, et l’union masquerait ce qui se trouve dessous.",
+        "no_data_disks": "Un Elastic Array a besoin d’au moins un disque de données.",
+        "too_many_parity": "{count} disques de parité : cet array en accepte au plus {max}.",
+        "disk_repeated": "{disk} est choisi comme {first} et comme {role}.",
+        "same_device": "{other} ({other_role}) et {disk} ({role}) sont le même périphérique : un périphérique ne peut pas occuper deux places dans un array.",
+        "data_disks_same_device": "{other} et {disk} sont le même périphérique : un périphérique ne peut pas être deux disques de données.",
+        "disk_in_use": "{disk} {owner} — un disque appartient à l’un d’eux, pas aux deux (cet array l’effacerait).",
+        "parity_too_small": "{disk} fait {size} et le plus grand disque de données {largest} : un disque de parité doit être au moins aussi grand que le plus grand disque de données, sinon il ne peut pas le couvrir.",
+        "filesystem_invalid": "« {filesystem} » n’est pas un système de fichiers que cette application crée : un disque de données Elastic porte xfs ou ext4 pour rester lisible seul.",
+        "filesystem_unavailable": "mkfs.{filesystem} n’est pas installé sur ce nœud, aucun disque de cet array ne peut donc être préparé.",
+        "plan_failed": "Cette disposition ne peut pas devenir un plan — les détails sont dans l’infobulle."
+      },
+      "elastic_warning": {
+        "no_parity": "Aucun disque de parité : cet array n’a aucune protection, et la perte d’un disque de données perd ses fichiers.",
+        "parity_tight": "{disk} est à peine aussi grand que le plus grand disque de données : le fichier de parité doit tenir dans un système de fichiers, dont les métadonnées peuvent laisser trop peu de place.",
+        "no_cache": "Aucun disque de cache : le mover n’a rien à faire, et les nouveaux fichiers sont écrits directement sur les disques de données.",
+        "unhealthy_disks": "SMART signale un problème sur {disks} : un array créé sur un disque déjà défaillant démarre dégradé.",
+        "mixed_sizes": "Les disques de données ont des tailles différentes, et chaque octet de chacun est utilisé : c’est à cela que sert ce type d’array."
+      }
     },
     "pools": {
       "title": "Pools sur le nœud {node}",
@@ -6289,7 +6354,8 @@
       "elastic_sync_name": "Sync SnapRAID {array}",
       "elastic_scrub_name": "Scrub SnapRAID {array}",
       "skip_elastic_scrub_errors_unrepaired": "un scrub a signalé des erreurs que rien n’a encore réparées — lancez la réparation depuis la parité",
-      "skip_elastic_parity_fault_unacknowledged": "la grappe a une erreur de scrub ou de réparation non corrigée — la synchronisation exige une confirmation sur l’écran de la grappe"
+      "skip_elastic_parity_fault_unacknowledged": "la grappe a une erreur de scrub ou de réparation non corrigée — la synchronisation exige une confirmation sur l’écran de la grappe",
+      "skip_array_not_created": "la création de l’array ne s’est pas terminée — lancez la restauration de l’array ou supprimez-le"
     },
     "kpi": {
       "shares": "Partages",
@@ -7267,7 +7333,34 @@
       "op_elastic_schedule": "Armer une planification Elastic",
       "op_elastic_add_disk_abort": "Elastic Array · Annulation de l’ajout d’un disque",
       "detail_elastic_sync": "Écrit un nouveau point de contrôle de parité et de content.",
-      "detail_elastic_sync_over_fault": "ATTENTION : la grappe a une erreur de scrub ou de réparation non corrigée. La synchronisation enregistre l’état actuel des fichiers. Les blocs marqués des fichiers inchangés, ainsi que les fichiers inchangés que le scrub n’a pas pu lire, restent réparables — mais les fichiers supprimés ou modifiés depuis la dernière synchronisation, y compris les fichiers endommagés, seront enregistrés dans leur nouvel état et leurs versions antérieures ne pourront plus être restaurées depuis la parité. Lancez d’abord la réparation."
+      "detail_elastic_sync_over_fault": "ATTENTION : la grappe a une erreur de scrub ou de réparation non corrigée. La synchronisation enregistre l’état actuel des fichiers. Les blocs marqués des fichiers inchangés, ainsi que les fichiers inchangés que le scrub n’a pas pu lire, restent réparables — mais les fichiers supprimés ou modifiés depuis la dernière synchronisation, y compris les fichiers endommagés, seront enregistrés dans leur nouvel état et leurs versions antérieures ne pourront plus être restaurées depuis la parité. Lancez d’abord la réparation.",
+      "detail": {
+        "yes": "oui",
+        "no": "non",
+        "pool_destroy": "Détruit le pool {pool} et tous les datasets et snapshots qu’il contient.",
+        "share_delete": "Supprime le partage {share} — les données sous {path} restent, seul l’export disparaît.",
+        "target_delete": "Arrête d’exporter {target} — un client qui l’utilise perd le disque ; {sources} et ses données restent.",
+        "snapshot_release": "Lève la protection de {snapshot}.",
+        "snapshot_release_reason": "Lève la protection de {snapshot} — motif : {reason}",
+        "config_import": "Écrase des éléments existants ({count}) : {items}.",
+        "elastic_create": "Formate les disques choisis et crée l’Elastic Array {array}.",
+        "elastic_scrub": "Vérifie le point de contrôle complet et enregistre les métadonnées du scrub.",
+        "elastic_fix": "Réécrit depuis la parité les blocs marqués par le dernier scrub, dans les fichiers inchangés depuis la dernière synchronisation, sur le disque {disk}.",
+        "elastic_fix_number": "Réécrit depuis la parité les blocs marqués par le dernier scrub, dans les fichiers inchangés depuis la dernière synchronisation, sur le disque de données n° {n}.",
+        "elastic_add_disk": "Formate le disque {disk} et l’ajoute à l’Elastic Array en service.",
+        "elastic_add_disk_unnamed": "Formate le disque choisi et l’ajoute à l’Elastic Array en service.",
+        "elastic_add_disk_abort": "Annule un ajout de disque inachevé avant que le disque ne rejoigne le partage ; n’efface que le système de fichiers créé par cet ajout.",
+        "elastic_destroy": "Arrête de servir l’Elastic Array et supprime sa supervision ; les disques gardent leurs systèmes de fichiers et leurs données.",
+        "elastic_mover_coupled": "Déplace les fichiers du cache vers les disques de données et lance la synchronisation de parité couplée.",
+        "elastic_mover_uncoupled": "Déplace les fichiers du cache vers les disques de données SANS la synchronisation de parité couplée.",
+        "elastic_schedule_arm": "Arme la planification : {task}, {cadence}.",
+        "elastic_schedule_keep_off": "Modifie la planification (elle reste désactivée) : {task}, {cadence}.",
+        "elastic_schedule_rules": "{head} Fichiers plus anciens que {age}, seuil d’espace libre du cache {pct} %, synchronisation couplée : {coupled}.",
+        "task_mover": "mover",
+        "task_sync": "synchronisation de parité",
+        "task_scrub": "scrub de parité",
+        "elastic_fix_unnamed": "Réécrit depuis la parité les blocs marqués par le dernier scrub, dans les fichiers inchangés depuis la dernière synchronisation, sur un disque de données de l’array."
+      }
     },
     "access": {
       "title": "Journal d'accès",
@@ -7442,7 +7535,22 @@
       "created": "Créée",
       "key_in_kernel": "La clé va dans le noyau (configfs). nvmet la crée lisible par tous, donc le nœud restreint le mode du fichier à root seul et vérifie le résultat — tout écart est consigné dans le journal de la tâche. Sur un nœud avec des utilisateurs locaux, considérez-la comme un secret partagé avec ce nœud.",
       "gone_title": "Cette cible n’existe plus",
-      "gone_detail": "Elle a été supprimée sur ce nœud (par un autre administrateur, par exemple). Revenez à la liste des partages."
+      "gone_detail": "Elle a été supprimée sur ce nœud (par un autre administrateur, par exemple). Revenez à la liste des partages.",
+      "state_reason": {
+        "kernel_missing": "Le noyau de ce nœud ne peut pas servir de cibles {proto}.",
+        "volume_missing": "Le volume source n’existe pas — la cible reste hors du noyau.",
+        "portal_moved_head": "Le portail de la cible n’est plus là où il a été épinglé. L’adresse {address} appartenait à l’interface {interface} (qui a maintenant {current}).",
+        "portal_moved_head_gone": "Le portail de la cible n’est plus là où il a été épinglé. L’adresse {address} appartenait à l’interface {interface}, qui n’existe plus sur ce nœud.",
+        "portal_moved_nowhere": "Aucune interface de ce nœud n’a plus cette adresse.",
+        "portal_moved_reachable": "Elle est maintenant sur {elsewhere}, que personne n’a choisie pour cette cible — l’export y est accessible.",
+        "portal_moved_silent": "Elle est maintenant sur {elsewhere}. La cible n’est pas dans le noyau, rien n’écoute donc à cette adresse — l’export n’est pas accessible sur {elsewhere}.",
+        "portal_moved_tail": "La cible reste telle quelle jusqu’à ce qu’un administrateur choisisse à nouveau le portail.",
+        "not_exported": "Enregistrée, mais ce nœud ne l’exporte pas encore — la prochaine réconciliation l’applique.",
+        "no_auth": "Pas d’authentification — la liste d’autorisation IQN/NQN est un filtre, pas une connexion.",
+        "import_secret_needed": "Le secret d’authentification doit être saisi à nouveau après une importation.",
+        "import_all_interfaces": "Cette cible était exportée sur toutes les interfaces (0.0.0.0) — choisissez une interface de ce nœud avant de l’activer.",
+        "portal_moved_head_no_address": "Le portail de la cible n’est plus là où il a été épinglé. L’adresse {address} appartenait à l’interface {interface}, présente sur ce nœud mais sans aucune adresse pour l’instant (lien coupé ou bail DHCP perdu)."
+      }
     },
     "wizard_target": {
       "title": "Nouvelle cible",
@@ -7540,7 +7648,20 @@
       "portal_interface_gone": "L'interface {iface} n'a plus sur ce nœud d'adresse qu'un portail puisse lier. Tu peux quand même enregistrer tes modifications ; le portail reste où il était, et le déplacer suppose de choisir une autre interface.",
       "portal_drifted": "Le portail de cette cible est sur {from}, et l'interface {iface} a maintenant {to}. La cible est gelée et en attente : tu peux enregistrer tes modifications sans toucher au portail, ou le déplacer ici.",
       "portal_move_confirm": "Déplacer le portail vers {to} — les initiateurs sur l'ancienne adresse perdent leur chemin",
-      "iqn_host_unknown": "‹nom d'hôte du nœud›"
+      "iqn_host_unknown": "‹nom d'hôte du nœud›",
+      "kernel": {
+        "protocol_unknown": "« {proto} » n’est pas un protocole bloc servi par ce nœud",
+        "configfs_present": "{path} est présent",
+        "modules_available": "les modules {modules} sont disponibles ; la première cible les charge",
+        "modules_missing": "ce noyau n’a pas {modules} — il n’est pas compilé avec la cible {proto}",
+        "iser_module_missing": "ib_isert n’est pas dans l’arborescence des modules de ce noyau (pas d’iSER)",
+        "nvmet_rdma_module_missing": "nvmet-rdma n’est pas dans l’arborescence des modules de ce noyau (pas de NVMe-oF sur RDMA)",
+        "rdma_unavailable": "RDMA n’est pas utilisable sur ce nœud (détails dans l’infobulle)",
+        "dhchap_available": "CONFIG_NVME_TARGET_AUTH dans {path} — DH-HMAC-CHAP disponible",
+        "dhchap_not_built": "ce noyau a été compilé sans CONFIG_NVME_TARGET_AUTH ({path})",
+        "dhchap_not_mentioned": "{path} ne mentionne pas CONFIG_NVME_TARGET_AUTH",
+        "kernel_config_missing": "ce noyau ne publie aucune configuration (ni /proc/config.gz ni /boot/config-*), la prise en charge de DH-HMAC-CHAP ne peut donc pas être confirmée — l’assistant ne propose pas ce qu’il ne peut pas confirmer"
+      }
     },
     "journal_owner": {
       "this_instance": "cette instance TentaNas",

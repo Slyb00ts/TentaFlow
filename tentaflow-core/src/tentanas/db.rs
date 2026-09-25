@@ -36,6 +36,24 @@ macro_rules! default_elastic_scrub_schedule_json {
     };
 }
 
+/// The English a parked Elastic Sync is stored with (`dispatch` `park`), one
+/// spelling for the park and for migration 23, which gives an older build's
+/// `text:<code>` alert this sentence in place of the code.
+macro_rules! sync_over_fault_text {
+    () => {
+        "syncs parity over an unrepaired scrub fault: the earlier version of every file deleted or \
+         changed since the previous Sync can no longer be restored from parity; unchanged files \
+         stay repairable"
+    };
+}
+macro_rules! sync_text {
+    () => {
+        "syncs parity with the data disks"
+    };
+}
+pub const SYNC_OVER_FAULT_TEXT: &str = sync_over_fault_text!();
+pub const SYNC_TEXT: &str = sync_text!();
+
 /// Append-only. A released step is never edited: the runner records applied
 /// versions per file and only executes the ones above the recorded maximum.
 const MIGRATIONS: &[(i64, &str)] = &[(
@@ -921,6 +939,56 @@ the next reconcile replaces this with the current count'
         ON nas_elastic_operations(array_id) WHERE state = 'running';
     CREATE UNIQUE INDEX nas_elastic_operation_origin
         ON nas_elastic_operations(array_id) WHERE kind IN ('create','import');",
+), (
+    23,
+    // Wave 6: the node's remaining sentences as CODES the screens word in the
+    // reader's language, beside the sentence the log and the tooltip keep
+    // (`tentanas::CodedText`, the pattern migration 21 gave the alerts).
+    //   * `nas_targets.state_reasons` — `targets::target_state`'s detail as
+    //     `NasHealthReason[]` JSON. Old rows keep '[]' until the next apply
+    //     judges them again (every reconcile tick), and their sentence is
+    //     shown as it is meanwhile.
+    //   * `nas_pending_approvals.detail_reasons` — the parked request's
+    //     detail as a code (`tentanas::CodedText`). A row an older build
+    //     parked with `text:<code>` in `detail` (the Elastic Sync) gets that
+    //     code here, so the screens read one form; every other old row keeps
+    //     '[]' and its sentence.
+    //   * `nas_elastic_arrays.state_reasons` — the sentence an array's row
+    //     stores: an operation's error ('operation_failed' {operation}, the
+    //     operation's kind, found by the error it wrote) or the node's own
+    //     "supervision lost" ('supervision_lost'). A stored sentence neither
+    //     rule recognises keeps '[]' and is shown through the id filter.
+    //   * the two constant sentences a config import writes into a target it
+    //     imports disabled are coded as the import codes them now.
+    //   * the ALERT an older build raised with a parked Sync keeps
+    //     `text:<code>` as its detail (the tooltip, the node's-text section):
+    //     it gets the English the park writes now.
+    concat!("ALTER TABLE nas_targets ADD COLUMN state_reasons TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE nas_pending_approvals ADD COLUMN detail_reasons TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE nas_elastic_arrays ADD COLUMN state_reasons TEXT NOT NULL DEFAULT '[]';
+    UPDATE nas_pending_approvals
+       SET detail_reasons = json_array(json_object('code', substr(detail, 6), 'params', json_object()))
+     WHERE detail IN ('text:elastic_sync', 'text:elastic_sync_over_fault');
+    UPDATE nas_alerts SET detail = CASE detail
+           WHEN 'text:elastic_sync_over_fault' THEN '", sync_over_fault_text!(), "'
+           ELSE '", sync_text!(), "' END
+     WHERE subject_kind = 'approval' AND detail IN ('text:elastic_sync', 'text:elastic_sync_over_fault');
+    UPDATE nas_targets SET state_reasons = '[{\"code\":\"import_secret_needed\",\"params\":{}}]'
+     WHERE state = 'disabled' AND state_reasons = '[]'
+       AND state_detail = 'the authentication secret has to be entered again after an import';
+    UPDATE nas_targets SET state_reasons = '[{\"code\":\"import_all_interfaces\",\"params\":{}}]'
+     WHERE state = 'disabled' AND state_reasons = '[]'
+       AND state_detail = 'this target was exported on every interface (0.0.0.0) — pick an interface of this node before enabling it';
+    UPDATE nas_elastic_arrays SET state_reasons = '[{\"code\":\"supervision_lost\",\"params\":{}}]'
+     WHERE state_detail = 'Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O';
+    UPDATE nas_elastic_arrays
+       SET state_reasons = json_array(json_object('code', 'operation_failed', 'params', json_object('operation',
+           (SELECT o.kind FROM nas_elastic_operations o
+             WHERE o.array_id = nas_elastic_arrays.array_id AND o.error = nas_elastic_arrays.state_detail
+             ORDER BY o.created_at DESC, o.operation_id DESC LIMIT 1))))
+     WHERE state_detail <> '' AND state_reasons = '[]'
+       AND EXISTS (SELECT 1 FROM nas_elastic_operations o
+                    WHERE o.array_id = nas_elastic_arrays.array_id AND o.error = nas_elastic_arrays.state_detail);"),
 )];
 
 /// The owner migration 20 gives a legacy share, target or account it cannot
@@ -1905,6 +1973,23 @@ macro_rules! unresolved_elastic_operation {
 }
 const UNRESOLVED_ELASTIC_OPERATION: &str =
     unresolved_elastic_operation!("'sync','scrub','mover','fix','add_disk','replace_disk'");
+/// Whether the array's CREATE has not brought it to life (`?1` the array
+/// id): the create operation is still running, or closed without success,
+/// and no Restore has succeeded after it. An adopted array (`import`) is
+/// complete by definition, and so is one whose failed create a Restore
+/// finished.
+///
+/// WHY the scheduler needs this and the admission does not have it: a
+/// failed create closes `needs_attention` (`finish_elastic_operation`), and
+/// `parity_admission` admits a Sync or a Scrub on `needs_attention` — rightly,
+/// for a failed parity run, which is what they settle. On a half-made array
+/// the default scrub (written with the array row) would run all the same.
+const CREATION_UNFINISHED: &str = "EXISTS(SELECT 1 FROM nas_elastic_operations c
+    WHERE c.array_id = ?1 AND c.kind = 'create' AND c.state <> 'succeeded'
+      AND NOT EXISTS(SELECT 1 FROM nas_elastic_operations r
+          WHERE r.array_id = c.array_id AND r.kind = 'restore' AND r.state = 'succeeded'
+            AND (r.created_at, r.operation_id) > (c.created_at, c.operation_id)))";
+
 /// The same, for every kind but the mover's own runs.
 const UNRESOLVED_NON_MOVER_OPERATION: &str =
     unresolved_elastic_operation!("'sync','scrub','fix','add_disk','replace_disk'");
@@ -2425,15 +2510,20 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
         if update_array {
             anyhow::ensure!(
                 tx.execute(
-                    "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4
-                WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                    &format!(
+                        "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4,
+                         state_reasons={}
+                         WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                        stored_state_reasons_sql("?3", "(SELECT kind FROM nas_elastic_operations WHERE operation_id=?7)")
+                    ),
                     params![
                         spec.array_id,
                         array_state,
                         final_error.as_deref().unwrap_or(""),
                         at,
                         spec.owner.org_id,
-                        spec.owner.addon_id
+                        spec.owner.addon_id,
+                        operation_id
                     ]
                 )? == 1,
                 "Utracono macierz operacji SnapRAID"
@@ -2498,15 +2588,20 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
         if let Some(array_state) = array_state {
             anyhow::ensure!(
                 tx.execute(
-                    "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4
-                WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                    &format!(
+                        "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4,
+                         state_reasons={}
+                         WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                        stored_state_reasons_sql("?3", "(SELECT kind FROM nas_elastic_operations WHERE operation_id=?7)")
+                    ),
                     params![
                         spec.array_id,
                         array_state,
                         final_error.as_deref().unwrap_or(""),
                         at,
                         spec.owner.org_id,
-                        spec.owner.addon_id
+                        spec.owner.addon_id,
+                        operation_id
                     ]
                 )? == 1,
                 "Utracono macierz operacji movera"
@@ -2830,7 +2925,8 @@ pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
     // exposure and the "short-lived self-test job" follow-up on this function.
     for job_id in candidates.into_iter().filter(|id| !running.contains_key(id)) {
         tx.execute("UPDATE nas_elastic_arrays SET state='needs_attention',
-        state_detail='Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O', updated_at=?1
+        state_detail='Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O', updated_at=?1,
+        state_reasons='[{\"code\":\"supervision_lost\",\"params\":{}}]'
         WHERE array_id IN (SELECT array_id FROM nas_elastic_operations WHERE state='running' AND job_id=?2)",
         params![now(),job_id])?;
         tx.execute("UPDATE nas_elastic_operations SET state='needs_attention',
@@ -2907,10 +3003,11 @@ fn elastic_spec(conn: &Connection, owner: &ElasticOwner, array_id: &str) -> Resu
 
 pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::elastic::ElasticArrayRow>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    let headers = conn.prepare("SELECT array_id,state,state_detail,created_at,updated_at
+    let headers = conn.prepare("SELECT array_id,state,state_detail,created_at,updated_at,state_reasons
         FROM nas_elastic_arrays WHERE org_id=?1 AND addon_id=?2 ORDER BY name")?
         .query_map(params![owner.org_id,owner.addon_id], |r| Ok((r.get::<_,String>(0)?,
-            r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?
+            r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,
+            r.get::<_,String>(5)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     // The parity-errors count is read from a DATE window, never from the tail
     // of the short display history: a run with errors that is still inside the
@@ -2920,7 +3017,10 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
     let parity_since = (chrono::Utc::now()
         - chrono::Duration::days(i64::from(super::elastic::PARITY_ERRORS_WINDOW_DAYS) + 1))
     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    headers.into_iter().map(|(array_id,state,state_detail,created_at,updated_at)| {
+    headers.into_iter().map(|(array_id,state,state_detail,created_at,updated_at,state_reasons)| {
+        // A column that does not read as codes is no codes: the sentence is
+        // still there, and the screen shows it through the id filter.
+        let state_reasons: Vec<NasHealthReason> = serde_json::from_str(&state_reasons).unwrap_or_default();
         let spec = elastic_spec(&conn, owner, &array_id)?;
         // The folders are DISCOVERED, not stored: the union is published on
         // the host, so its real top level is one unprivileged `read_dir` away,
@@ -2965,6 +3065,9 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
             unresolved_operation: conn.query_row(
                 &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
                 params![array_id], |r| r.get(0))?,
+            creation_unfinished: conn.query_row(
+                &format!("SELECT {CREATION_UNFINISHED}"),
+                params![array_id], |r| r.get(0))?,
             mover_settles_unresolved: mover_admission(&conn, &array_id, &state)?.1,
             // What the button on the screen may offer: a Sync or a Scrub is
             // admitted on the array a failed parity run left behind, and the UI
@@ -2972,7 +3075,7 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
             parity_run_available: parity_admission(&conn, &array_id, &state)?,
             mover_failed_runs: mover_failed_runs(&conn, &array_id)?,
             pending_add: pinned_add(&conn, &array_id)?,
-            create_spec: Some(spec), state, state_detail, created_at, updated_at,
+            create_spec: Some(spec), state, state_detail, state_reasons, created_at, updated_at,
             ..Default::default()
         })
     }).collect()
@@ -3552,7 +3655,7 @@ pub fn finish_elastic_replace_disk(
         params![operation_id, serde_json::to_string(observed)?, at],
     )?;
     tx.execute(
-        "UPDATE nas_elastic_arrays SET state='active',state_detail='',updated_at=?2
+        "UPDATE nas_elastic_arrays SET state='active',state_detail='',state_reasons='[]',updated_at=?2
          WHERE array_id=?1",
         params![array_id, at],
     )?;
@@ -3661,7 +3764,7 @@ pub fn settle_undone_add(
     )?;
     if observed.stage == tentanas_helper::elastic::ElasticStage::Ready && !unresolved {
         tx.execute(
-            "UPDATE nas_elastic_arrays SET state='active',state_detail='',updated_at=?2 WHERE array_id=?1",
+            "UPDATE nas_elastic_arrays SET state='active',state_detail='',state_reasons='[]',updated_at=?2 WHERE array_id=?1",
             params![array_id, at],
         )?;
     }
@@ -3710,7 +3813,10 @@ pub fn finish_elastic_add_disk_abort(
     )?;
     let ready = observed.stage == tentanas_helper::elastic::ElasticStage::Ready && !unresolved;
     tx.execute(
-        "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4 WHERE array_id=?1",
+        &format!(
+            "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4,state_reasons={} WHERE array_id=?1",
+            stored_state_reasons_sql("?3", "'add_disk_abort'")
+        ),
         params![
             array_id,
             if ready { "active" } else { "needs_attention" },
@@ -3809,7 +3915,7 @@ pub fn finish_elastic_add_disk(
         params![operation_id, serde_json::to_string(observed)?, at],
     )?;
     tx.execute(
-        "UPDATE nas_elastic_arrays SET state='active',state_detail='',updated_at=?2
+        "UPDATE nas_elastic_arrays SET state='active',state_detail='',state_reasons='[]',updated_at=?2
          WHERE array_id=?1",
         params![array_id, at],
     )?;
@@ -3996,17 +4102,32 @@ pub fn finish_elastic_operation(pool: &DbPool, owner: &ElasticOwner, operation_i
     }
     tx.execute("UPDATE nas_elastic_operations SET state=?2,result_json=?3,error=?4,finished_at=?5
         WHERE operation_id=?1",params![operation_id,if success {"succeeded"} else {"needs_attention"},json,detail,at])?;
-    tx.execute("UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4 WHERE array_id=?1",
-        params![array_id,if success {"active"} else {"needs_attention"},detail,at])?;
+    tx.execute(&format!("UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4,state_reasons={}
+        WHERE array_id=?1", stored_state_reasons_sql("?3", "?5")),
+        params![array_id,if success {"active"} else {"needs_attention"},detail,at,kind])?;
     tx.commit()?;
     Ok(())
+}
+
+/// The codes of a sentence an operation stores as its array's
+/// `state_detail` (migration 23), as an SQL expression: '[]' when the detail
+/// is empty (the operation succeeded), else `operation_failed` with the
+/// operation's kind — the stored sentence is the operation's error, which
+/// the screen shows only as the tooltip of the worded line.
+fn stored_state_reasons_sql(detail: &str, kind: &str) -> String {
+    format!(
+        "CASE WHEN {detail} = '' THEN '[]' ELSE json_array(json_object('code', 'operation_failed', \
+         'params', json_object('operation', COALESCE({kind}, '')))) END"
+    )
 }
 
 pub fn fail_elastic_job(pool: &DbPool, job_id: &str, detail: &str) -> Result<()> {
     let mut conn = write(pool)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute("UPDATE nas_elastic_arrays SET state='needs_attention',state_detail=?2,updated_at=?3
+    tx.execute(&format!("UPDATE nas_elastic_arrays SET state='needs_attention',state_detail=?2,updated_at=?3,
+        state_reasons={}
         WHERE array_id IN (SELECT array_id FROM nas_elastic_operations WHERE job_id=?1 AND state='running')",
+        stored_state_reasons_sql("?2", "(SELECT kind FROM nas_elastic_operations WHERE job_id=?1 AND state='running')")),
         params![job_id,detail,now()])?;
     tx.execute("UPDATE nas_elastic_operations SET state='needs_attention',error=?2,finished_at=?3
         WHERE job_id=?1 AND state='running'",params![job_id,detail,now()])?;
@@ -4914,7 +5035,8 @@ pub struct ApprovalRow {
 
 const APPROVAL_COLUMNS: &str = "request_id, operation, subject, detail, payload_json, status, \
                                 org_id, addon_id, requested_by, requested_at, expires_at, \
-                                decided_by, decided_at, decision_note, decision_job_id";
+                                decided_by, decided_at, decision_note, decision_job_id, \
+                                detail_reasons";
 
 fn approval_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
     Ok(ApprovalRow {
@@ -4933,6 +5055,9 @@ fn approval_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
             decision_job_id: r.get(14)?,
             // Only the handler knows who is asking.
             is_own_request: false,
+            // A column that does not read as codes is no codes: the
+            // sentence is still there to show.
+            detail_reasons: serde_json::from_str(&r.get::<_, String>(15)?).unwrap_or_default(),
         },
         payload_json: r.get(4)?,
         org_id: r.get(6)?,
@@ -4946,8 +5071,8 @@ pub fn insert_approval(pool: &DbPool, row: &ApprovalRow) -> Result<()> {
     conn.execute(
         "INSERT INTO nas_pending_approvals
             (request_id, operation, subject, detail, payload_json, status, org_id, addon_id,
-             requested_by, requested_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             requested_by, requested_at, expires_at, detail_reasons)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             a.request_id,
             a.operation,
@@ -4959,7 +5084,8 @@ pub fn insert_approval(pool: &DbPool, row: &ApprovalRow) -> Result<()> {
             row.addon_id,
             a.requested_by,
             a.requested_at,
-            a.expires_at
+            a.expires_at,
+            serde_json::to_string(&a.detail_reasons)?
         ],
     )?;
     Ok(())
@@ -5068,6 +5194,45 @@ pub fn smart_schedule(pool: &DbPool) -> Result<NasSmartSchedule> {
 
 pub fn set_smart_schedule(pool: &DbPool, schedule: &NasSmartSchedule) -> Result<()> {
     set_setting(pool, SETTING_SMART_SCHEDULE, &serde_json::to_string(schedule)?)
+}
+
+/// An admin's save of the SMART schedule — the switch, the two cadences and
+/// the deadlines they arm — applied to the document AS IT IS NOW, in one
+/// write transaction, and returned as written.
+///
+/// WHY not read, change, write: the document also holds the scheduler's run
+/// stamps (`last_*_at`), and a tick that ran between the handler's read and
+/// its write used to lose them to the handler's older copy — the Tasks tab
+/// then said a test that did run never had. Only the fields the admin sets
+/// are taken from the save; the stamps are whatever the document holds when
+/// the save lands (`record_smart_tick` is the other half of the same rule).
+pub fn save_smart_schedule(
+    pool: &DbPool,
+    enabled: bool,
+    short: &NasSchedule,
+    long: &NasSchedule,
+    next_short_at: Option<String>,
+    next_long_at: Option<String>,
+) -> Result<NasSmartSchedule> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut next: NasSmartSchedule = tx
+        .query_row("SELECT value FROM nas_settings WHERE key = ?1", params![SETTING_SMART_SCHEDULE], |r| r.get::<_, String>(0))
+        .optional()?
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    next.enabled = enabled;
+    next.short = short.clone();
+    next.long = long.clone();
+    next.next_short_at = next_short_at;
+    next.next_long_at = next_long_at;
+    tx.execute(
+        "INSERT INTO nas_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![SETTING_SMART_SCHEDULE, serde_json::to_string(&next)?, now()],
+    )?;
+    tx.commit()?;
+    Ok(next)
 }
 
 /// The scheduler's write-back of one SMART tick, applied to the schedule AS IT
@@ -5828,6 +5993,8 @@ pub struct TargetRow {
     pub dhchap_dhgroup: String,
     pub state: String,
     pub state_detail: String,
+    /// `state_detail` as codes (migration 23, `targets::target_state`).
+    pub state_reasons: Vec<NasHealthReason>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -5835,7 +6002,7 @@ pub struct TargetRow {
 const TARGET_COLUMNS: &str = "target_id, name, protocol, wwn, enabled, spec_json, auth_method, \
                               auth_username, auth_secret, auth_mutual_username, \
                               auth_mutual_secret, dhchap_hash, dhchap_dhgroup, state, \
-                              state_detail, created_at, updated_at";
+                              state_detail, created_at, updated_at, state_reasons";
 
 fn target_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
     let spec: String = r.get(5)?;
@@ -5859,6 +6026,9 @@ fn target_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
         dhchap_dhgroup: r.get(12)?,
         state: r.get(13)?,
         state_detail: r.get(14)?,
+        // A column that does not read as codes is no codes: the sentence is
+        // still there to show.
+        state_reasons: serde_json::from_str(&r.get::<_, String>(17)?).unwrap_or_default(),
         created_at: r.get(15)?,
         updated_at: r.get(16)?,
     })
@@ -5977,8 +6147,8 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
                                   auth_method, auth_username, auth_secret,
                                   auth_mutual_username, auth_mutual_secret, dhchap_hash,
                                   dhchap_dhgroup, state, state_detail, created_at, updated_at,
-                                  org_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                                  org_id, state_reasons)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(target_id) DO UPDATE SET
             enabled = excluded.enabled, spec_json = excluded.spec_json,
             auth_method = excluded.auth_method, auth_username = excluded.auth_username,
@@ -5987,7 +6157,7 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
             auth_mutual_secret = excluded.auth_mutual_secret,
             dhchap_hash = excluded.dhchap_hash, dhchap_dhgroup = excluded.dhchap_dhgroup,
             state = excluded.state, state_detail = excluded.state_detail,
-            updated_at = excluded.updated_at
+            state_reasons = excluded.state_reasons, updated_at = excluded.updated_at
          WHERE nas_targets.org_id = excluded.org_id",
         params![
             target.target_id,
@@ -6007,7 +6177,8 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
             target.state_detail,
             target.created_at,
             target.updated_at,
-            org_id
+            org_id,
+            serde_json::to_string(&target.state_reasons)?
         ],
     )?;
     anyhow::ensure!(written == 1, "target not found");
@@ -6027,11 +6198,13 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
     Ok(())
 }
 
-pub fn set_target_state(pool: &DbPool, target_id: &str, state: &str, detail: &str) -> Result<()> {
+/// The judged state of one target: the sentence and its codes, written
+/// together so the two cannot describe different verdicts.
+pub fn set_target_state(pool: &DbPool, target_id: &str, state: &str, detail: &str, reasons: &[NasHealthReason]) -> Result<()> {
     let conn = write(pool)?;
     conn.execute(
-        "UPDATE nas_targets SET state = ?2, state_detail = ?3 WHERE target_id = ?1",
-        params![target_id, state, detail],
+        "UPDATE nas_targets SET state = ?2, state_detail = ?3, state_reasons = ?4 WHERE target_id = ?1",
+        params![target_id, state, detail, serde_json::to_string(reasons)?],
     )?;
     Ok(())
 }
@@ -9114,13 +9287,16 @@ mod tests {
             dhchap_hash: String::new(),
             dhchap_dhgroup: String::new(),
             state: "disabled".into(),
-            state_detail: String::new(),
+            state_detail: "the authentication secret has to be entered again after an import".into(),
+            // Migration 23: the codes are stored with the sentence.
+            state_reasons: vec![super::super::disks::coded_reason("import_secret_needed", &[])],
             created_at: now(),
             updated_at: now(),
         };
         upsert_target(&p, "org-a", &row).unwrap();
 
         let back = target(&p, "org-a", "t1").unwrap().expect("target");
+        assert_eq!(back.state_reasons, row.state_reasons, "the codes come back as written");
         assert_eq!(back.luns, row.luns);
         assert_eq!(back.portals, row.portals);
         // The ALUA/ANA port group state survives the database (R8).
@@ -9136,11 +9312,14 @@ mod tests {
         assert_eq!(back.auth_secret, "encb:ciphertext-one");
         assert_eq!(back.auth_mutual_secret, "encb:ciphertext-two");
 
-        set_target_state(&p, "t1", "active", "").unwrap();
+        set_target_state(&p, "t1", "active", "", &[]).unwrap();
         assert_eq!(list_targets(&p).unwrap()[0].state, "active");
         assert_eq!(target_counts(&p, "org-a").unwrap(), (1, 0));
-        set_target_state(&p, "t1", "error", "nvmet missing").unwrap();
+        let missing = super::super::disks::coded_reason("target_kernel_missing", &[("protocol", "nvmet".to_string())]);
+        set_target_state(&p, "t1", "error", "nvmet missing", std::slice::from_ref(&missing)).unwrap();
         assert_eq!(target_counts(&p, "org-a").unwrap(), (1, 1));
+        let judged = &list_targets(&p).unwrap()[0];
+        assert_eq!((judged.state_detail.as_str(), judged.state_reasons.clone()), ("nvmet missing", vec![missing]));
 
         // A second target may not claim the same name or the same WWN: both
         // are also configfs object names.
@@ -10813,6 +10992,148 @@ mod tests {
         assert_eq!(stored.next_long_at, ticked.next_long_at, "a stale tick moves no deadline");
         assert_eq!(stored.last_long_at.as_deref(), Some("2026-09-25T04:00:05Z"), "but the run it started is recorded");
     }
+
+    /// The other half of the same race (wave-5 minor, wave 6): the admin's
+    /// save read the document, a tick recorded the tests it started, and the
+    /// save wrote its older copy back — the Tasks tab then said a test that
+    /// did run never had. The save now lands on the document as it is: the
+    /// switch, the cadences and their deadlines are the admin's, the run
+    /// stamps whatever the ticks recorded.
+    #[test]
+    fn an_admin_save_keeps_the_run_stamps_a_tick_recorded() {
+        let p = pool();
+        let daily = |hour| NasSchedule { every: "daily".into(), hour, minute: 0, weekday: 0, day: 1 };
+        let read = NasSmartSchedule { enabled: true, short: daily(3), long: daily(4), ..Default::default() };
+        set_smart_schedule(&p, &read).unwrap();
+        // A tick lands after the admin's dialog was opened.
+        let ticked = NasSmartSchedule {
+            last_short_at: Some("2026-09-24T03:00:05Z".into()),
+            last_long_at: Some("2026-09-24T04:00:05Z".into()),
+            ..read.clone()
+        };
+        record_smart_tick(&p, &read, &ticked).unwrap();
+
+        let saved = save_smart_schedule(
+            &p,
+            true,
+            &daily(5),
+            &daily(6),
+            Some("2026-09-25T05:00:00Z".into()),
+            Some("2026-09-25T06:00:00Z".into()),
+        )
+        .unwrap();
+        assert_eq!(saved, smart_schedule(&p).unwrap(), "the answer is what was written");
+        assert_eq!((saved.short.hour, saved.long.hour), (5, 6), "the admin's cadences");
+        assert_eq!(saved.next_short_at.as_deref(), Some("2026-09-25T05:00:00Z"));
+        assert_eq!(saved.last_short_at, ticked.last_short_at, "the tick's short run is kept");
+        assert_eq!(saved.last_long_at, ticked.last_long_at, "the tick's long run is kept");
+
+        // Switching the tests off disarms them and still keeps the history.
+        let off = save_smart_schedule(&p, false, &daily(5), &daily(6), None, None).unwrap();
+        assert!(!off.enabled && off.next_short_at.is_none() && off.next_long_at.is_none());
+        assert_eq!(off.last_long_at, ticked.last_long_at);
+    }
+
+    /// Migration 23: an approval parked by an older build with its detail as
+    /// `text:<code>` (the Elastic Sync) reads back with that code as its
+    /// coded detail; a sentence stays a sentence with no codes.
+    #[test]
+    fn migration_23_codes_an_older_text_detail() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..22]).unwrap();
+        for (id, detail) in [("r-sync", "text:elastic_sync_over_fault"), ("r-pool", "destroys the pool 'tank'")] {
+            conn.execute(
+                "INSERT INTO nas_pending_approvals
+                    (request_id, operation, subject, detail, payload_json, status, org_id, addon_id,
+                     requested_by, requested_at, expires_at)
+                 VALUES (?1, 'x', 's', ?2, '{}', 'pending', 'org-a', 'tentanas', 'u', 't0', 't9')",
+                params![id, detail],
+            )
+            .unwrap();
+        }
+        // MINOR 6: the alert that older park raised carries the code as its
+        // detail — its tooltip and node-text section.
+        conn.execute(
+            "INSERT INTO nas_alerts (alert_id, severity, subject_kind, subject_id, title, detail, raised_at, dedupe_key, org_id)
+             VALUES ('a-sync', 'warning', 'approval', 'r-sync', 't', 'text:elastic_sync_over_fault', 't0', 'approval:r-sync', 'org-a')",
+            [],
+        )
+        .unwrap();
+        // MINOR 7: targets an older import wrote disabled, with its sentences.
+        for (id, name, detail) in [
+            ("t-secret", "a", "the authentication secret has to be entered again after an import"),
+            ("t-all", "b", "this target was exported on every interface (0.0.0.0) — pick an interface of this node before enabling it"),
+            ("t-other", "c", "something else"),
+        ] {
+            conn.execute(
+                "INSERT INTO nas_targets (target_id, name, protocol, wwn, enabled, spec_json, auth_method, state, state_detail, created_at, updated_at, org_id)
+                 VALUES (?1, ?2, 'iscsi', ?2, 0, '{}', 'none', 'disabled', ?3, 't0', 't0', 'org-a')",
+                params![id, name, detail],
+            )
+            .unwrap();
+        }
+        // MINOR 4: the sentences an array's row stores.
+        conn.execute_batch(
+            "INSERT INTO nas_elastic_arrays
+               (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at) VALUES
+               ('arr-lost','org-a','nas','lost','xfs','needs_attention','Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O','t','t'),
+               ('arr-sync','org-a','nas','synced','xfs','needs_attention','snapraid: /dev/disk/by-id/wwn-0x5000c500a1b2c3d4 read error','t','t'),
+               ('arr-odd','org-a','nas','odd','xfs','needs_attention','a sentence no operation wrote','t','t');
+             INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at,log) VALUES
+               ('j-sync','elastic_sync','synced','failed','u','t','');
+             INSERT INTO nas_elastic_operations
+               (operation_id,array_id,job_id,kind,state,request_json,result_json,error,created_at,finished_at) VALUES
+               ('op-s','arr-sync','j-sync','sync','needs_attention','{}',NULL,'snapraid: /dev/disk/by-id/wwn-0x5000c500a1b2c3d4 read error','t1','t2');",
+        )
+        .unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+
+        let reasons_of = |sql: &str, id: &str| -> String {
+            conn.query_row(sql, params![id], |r| r.get::<_, String>(0)).unwrap()
+        };
+        let array = |id| reasons_of("SELECT state_reasons FROM nas_elastic_arrays WHERE array_id = ?1", id);
+        assert_eq!(array("arr-lost"), r#"[{"code":"supervision_lost","params":{}}]"#);
+        assert_eq!(array("arr-sync"), r#"[{"code":"operation_failed","params":{"operation":"sync"}}]"#);
+        assert_eq!(array("arr-odd"), "[]", "a sentence no rule knows stays uncoded");
+        let target = |id| reasons_of("SELECT state_reasons FROM nas_targets WHERE target_id = ?1", id);
+        assert_eq!(target("t-secret"), r#"[{"code":"import_secret_needed","params":{}}]"#);
+        assert_eq!(target("t-all"), r#"[{"code":"import_all_interfaces","params":{}}]"#);
+        assert_eq!(target("t-other"), "[]");
+        assert_eq!(
+            reasons_of("SELECT detail FROM nas_alerts WHERE alert_id = ?1", "a-sync"),
+            SYNC_OVER_FAULT_TEXT,
+            "the alert reads the sentence, not the code"
+        );
+
+        let p = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let sync = approval(&p, "r-sync").unwrap().unwrap().approval;
+        assert_eq!(sync.detail_reasons, vec![super::super::disks::coded_reason("elastic_sync_over_fault", &[])]);
+        let pool = approval(&p, "r-pool").unwrap().unwrap().approval;
+        assert!(pool.detail_reasons.is_empty(), "{:?}", pool.detail_reasons);
+        assert_eq!(pool.detail, "destroys the pool 'tank'");
+    }
+
+    /// MINOR 4: every writer of an array's stored sentence writes its codes
+    /// with it — an operation's error is `operation_failed` {operation}, a
+    /// lost supervision `supervision_lost` — and a success clears both.
+    #[test]
+    fn an_arrays_stored_sentence_is_written_with_its_codes() {
+        let p = pool();
+        let spec = tenant_array(&p, "org-a", "alpha");
+        let job_id: String = p
+            .read()
+            .unwrap()
+            .query_row("SELECT job_id FROM nas_elastic_operations WHERE kind = 'create'", [], |r| r.get(0))
+            .unwrap();
+        fail_elastic_job(&p, &job_id, "mkfs.xfs failed on /dev/disk/by-id/wwn-0x5000c500a1b2c3d4").unwrap();
+        let row = elastic_arrays(&p, &spec.owner).unwrap().remove(0);
+        assert_eq!(row.state_detail, "mkfs.xfs failed on /dev/disk/by-id/wwn-0x5000c500a1b2c3d4");
+        assert_eq!(
+            row.state_reasons,
+            vec![super::super::disks::coded_reason("operation_failed", &[("operation", "create".to_string())])]
+        );
+    }
+
 
     /// Owner decision (wave 5): the jobs and alerts of a dissolved array
     /// (owner '' since migration 18) are shown when the node has exactly one

@@ -45,7 +45,7 @@ use tentaflow_protocol::tentanas::{
     NasDisk, NasElasticArray, NasElasticBranch, NasElasticCapabilities, NasElasticFolder,
     NasElasticImportCandidate, NasElasticImportMember, NasElasticParity, NasElasticPendingAdd, NasElasticPlan,
     NasElasticProtection,
-    NasElasticRefusal, NasMoverRun, NasMoverSettings, NasSchedule, NasSnapraidRun,
+    NasElasticRefusal, NasHealthReason, NasMoverRun, NasMoverSettings, NasSchedule, NasSnapraidRun,
     NasSnapraidState,
 };
 use tentanas_helper::elastic::{
@@ -59,7 +59,7 @@ use tentanas_helper::elastic::{ElasticCacheAge, ElasticDissolveResult, ElasticMo
 use tentanas_helper::HelperCommand;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
-use super::{db as store, jobs};
+use super::{db as store, jobs, CodedText};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// The machine kind of §5.3, next to a ZFS pool's `zfs`. The SPEC fixes the
@@ -422,6 +422,10 @@ pub struct ElasticArrayRow {
     pub mover_history: Vec<NasMoverRun>,
     /// An operation of this array is closed `needs_attention` and unresolved.
     pub unresolved_operation: bool,
+    /// The array was never brought to life: its create is still running, or
+    /// ended without success and no Restore has finished it since
+    /// (`store::CREATION_UNFINISHED`). Nothing unattended runs on it.
+    pub creation_unfinished: bool,
     /// Every unresolved operation is a mover run that stopped with something
     /// left, and the next mover run settles it. The scheduler starts that run
     /// on its own; nothing waits for a `fix` that could not run.
@@ -445,6 +449,10 @@ pub struct ElasticArrayRow {
     /// import keeps the sentence that explains it.
     pub state: String,
     pub state_detail: String,
+    /// `state_detail` as codes (migration 23): the stored sentence is an
+    /// operation's error or the node's own words, and the screen words the
+    /// code and shows the sentence only as its tooltip.
+    pub state_reasons: Vec<NasHealthReason>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -750,16 +758,17 @@ pub fn array_state(
     array: &ElasticArrayRow,
     observed: &ArrayObservation,
     installed: &dyn Fn(&str) -> bool,
-) -> (&'static str, String, Disposition) {
+) -> (&'static str, CodedText, Disposition) {
     if !array.enabled {
         // A row that ARRIVED disabled keeps the sentence it arrived with —
         // the config import writes reasons an admin has to read into exactly
         // this field. A row an admin STOPPED keeps nothing: its old detail
-        // described a running array.
+        // described a running array. The carried sentence is the importer's
+        // and has no code: the screen shows it as written.
         let carried = if array.state == "disabled" {
-            array.state_detail.clone()
+            CodedText { text: array.state_detail.clone(), reasons: array.state_reasons.clone() }
         } else {
-            String::new()
+            CodedText::default()
         };
         return ("disabled", carried, Disposition::Remove);
     }
@@ -767,10 +776,13 @@ pub fn array_state(
     if !observed.mount_table_known {
         return (
             "unknown",
-            "this node could not read its mount table, so it will not mount or unmount \
-             anything: a union mounted over branches it cannot see would send every client \
-             write to the root filesystem"
-                .to_string(),
+            CodedText::new(
+                "mount_table_unknown",
+                &[],
+                "this node could not read its mount table, so it will not mount or unmount \
+                 anything: a union mounted over branches it cannot see would send every client \
+                 write to the root filesystem",
+            ),
             Disposition::Freeze,
         );
     }
@@ -782,17 +794,24 @@ pub fn array_state(
         // every share on it away for nothing.
         return (
             "error",
-            "mergerfs is not installed on this node, so the union cannot be mounted".to_string(),
+            CodedText::new(
+                "mergerfs_missing",
+                &[],
+                "mergerfs is not installed on this node, so the union cannot be mounted",
+            ),
             Disposition::Freeze,
         );
     }
     if !array.parity.is_empty() && !installed(SNAPRAID_FEATURE_ID) {
         return (
             "error",
-            "snapraid is not usable on this node — it is missing, or installed and not \
-             working (see the Environment tab) — so the parity disks of this array protect \
-             nothing until it is"
-                .to_string(),
+            CodedText::new(
+                "snapraid_unusable",
+                &[],
+                "snapraid is not usable on this node — it is missing, or installed and not \
+                 working (see the Environment tab) — so the parity disks of this array protect \
+                 nothing until it is",
+            ),
             Disposition::Freeze,
         );
     }
@@ -810,25 +829,29 @@ pub fn array_state(
     let mut unknown = Vec::new();
     let mut gone = Vec::new();
     let mut mountable = Vec::new();
-    for (mountpoint, label) in mountpoints_of(array) {
-        let probe = observed.probe(&mountpoint);
+    for member in mountpoints_of(array, observed) {
+        let probe = observed.probe(&member.mountpoint);
         match (probe.mounted, probe.device_present) {
             (Some(true), _) => {}
-            (Some(false), Some(true)) => mountable.push(label),
-            (Some(false), Some(false)) => gone.push(label),
+            (Some(false), Some(true)) => mountable.push(member),
+            (Some(false), Some(false)) => gone.push(member),
             // Not mounted and nobody looked at the disk, or the mount table
             // itself was unreadable. Both are "this node does not know".
-            (Some(false), None) | (None, _) => unknown.push(label),
+            (Some(false), None) | (None, _) => unknown.push(member),
         }
     }
     if !unknown.is_empty() {
         return (
             "unknown",
-            format!(
-                "this node could not tell whether {} {} there, and will not mount the union \
-                 until it can",
-                unknown.join(", "),
-                if unknown.len() == 1 { "is" } else { "are" }
+            CodedText::new(
+                "branches_unknown",
+                &members_params(&unknown),
+                format!(
+                    "this node could not tell whether {} {} there, and will not mount the union \
+                     until it can",
+                    members_text(&unknown),
+                    if unknown.len() == 1 { "is" } else { "are" }
+                ),
             ),
             Disposition::Freeze,
         );
@@ -839,19 +862,26 @@ pub fn array_state(
     // not come down (that takes working shares away over a fault snapraid can
     // repair with the array running). Only an admin resolves this one.
     if !gone.is_empty() {
-        let consequence = if observed.union_mounted == Some(true) {
+        let serving = observed.union_mounted == Some(true);
+        let consequence = if serving {
             "the union is still serving the disks it has, and the files on the missing one \
              are not visible in it"
         } else {
             "the union stays down: mounting it over an unmounted branch would send client \
              writes to the root filesystem"
         };
+        let mut params = members_params(&gone);
+        params.push(("union", if serving { "serving" } else { "down" }.to_string()));
         return (
             "error",
-            format!(
-                "{} {} not on this node — {consequence}",
-                gone.join(", "),
-                if gone.len() == 1 { "is" } else { "are" }
+            CodedText::new(
+                "branches_gone",
+                &params,
+                format!(
+                    "{} {} not on this node — {consequence}",
+                    members_text(&gone),
+                    if gone.len() == 1 { "is" } else { "are" }
+                ),
             ),
             Disposition::Freeze,
         );
@@ -862,12 +892,16 @@ pub fn array_state(
     if !mountable.is_empty() {
         return (
             "pending",
-            format!(
-                "{} {} present and not mounted yet — the next reconcile mounts {} and then \
-                 the union",
-                mountable.join(", "),
-                if mountable.len() == 1 { "is" } else { "are" },
-                if mountable.len() == 1 { "it" } else { "them" }
+            CodedText::new(
+                "branches_mountable",
+                &members_params(&mountable),
+                format!(
+                    "{} {} present and not mounted yet — the next reconcile mounts {} and then \
+                     the union",
+                    members_text(&mountable),
+                    if mountable.len() == 1 { "is" } else { "are" },
+                    if mountable.len() == 1 { "it" } else { "them" }
+                ),
             ),
             Disposition::Apply,
         );
@@ -879,42 +913,109 @@ pub fn array_state(
         // booted. The next reconcile mounts it.
         return (
             "pending",
-            "saved, but this node is not serving the union yet — the next reconcile mounts it"
-                .to_string(),
+            CodedText::new(
+                "union_not_mounted",
+                &[],
+                "saved, but this node is not serving the union yet — the next reconcile mounts it",
+            ),
             Disposition::Apply,
         );
     }
 
     let detail = if array.parity.is_empty() {
-        "no parity disk: a disk failure loses that disk's files".to_string()
+        CodedText::new("no_parity", &[], "no parity disk: a disk failure loses that disk's files")
     } else {
-        String::new()
+        CodedText::default()
     };
     ("active", detail, Disposition::Apply)
 }
 
-/// Every mountpoint the array needs, with the label an error message uses.
-fn mountpoints_of(array: &ElasticArrayRow) -> Vec<(String, String)> {
+/// One mountpoint the array needs: where it is, which part of the array it
+/// serves ('data' | 'cache' | 'parity') and the member's shown name
+/// (`member_shown_name`).
+struct ArrayMember {
+    mountpoint: String,
+    role: &'static str,
+    name: String,
+}
+
+/// Every mountpoint the array needs, with the member it belongs to.
+fn mountpoints_of(array: &ElasticArrayRow, observed: &ArrayObservation) -> Vec<ArrayMember> {
     let mut out = Vec::new();
-    for branch in array.data() {
-        out.push((
-            data_branch_path(&array.name, &branch.name),
-            format!("data disk {}", branch.name),
-        ));
+    let member = |mountpoint: String, role: &'static str, disk_id: &str, slot: &str, number: usize| {
+        let name = member_shown_name(observed.kernel_names.get(&mountpoint).map(String::as_str), disk_id, slot, number);
+        ArrayMember { mountpoint, role, name }
+    };
+    for (i, branch) in array.data().enumerate() {
+        out.push(member(data_branch_path(&array.name, &branch.name), "data", &branch.disk_id, &branch.name, i + 1));
     }
-    for branch in array.cache() {
-        out.push((
-            cache_branch_path(&array.name, &branch.name),
-            format!("cache disk {}", branch.name),
-        ));
+    for (i, branch) in array.cache().enumerate() {
+        out.push(member(cache_branch_path(&array.name, &branch.name), "cache", &branch.disk_id, &branch.name, i + 1));
     }
     for parity in &array.parity {
-        out.push((
+        out.push(member(
             parity_mount_path(&array.name, parity.index),
-            format!("parity disk {}", parity.name),
+            "parity",
+            &parity.disk_id,
+            &parity.name,
+            usize::from(parity.index),
         ));
     }
     out
+}
+
+/// The name a state sentence gives one member: the kernel name its mount
+/// was found under, else the one the live inventory has for its disk. A
+/// stored array's branch is keyed by its SLOT ('d1', 'c1', 'parity1' — the
+/// directory under the branch root), and a slot is not a name an admin has
+/// ever seen: a member neither knows by a kernel name is "#<its number>",
+/// which the screen words as "data disk no. 2". A branch row that already
+/// carries a kernel name (the wizard's plan) keeps it.
+fn member_shown_name(mounted_as: Option<&str>, disk_id: &str, slot: &str, number: usize) -> String {
+    if let Some(name) = mounted_as.filter(|n| !n.is_empty()) {
+        return name.to_string();
+    }
+    if let Some(name) = super::disks::disk_name(disk_id).filter(|n| !n.is_empty()) {
+        return name;
+    }
+    if is_slot_name(slot) || slot.is_empty() {
+        format!("#{number}")
+    } else {
+        slot.to_string()
+    }
+}
+
+/// Whether a branch or parity name is a stored SLOT ('d3', 'c1', 'parity2')
+/// rather than a kernel name.
+fn is_slot_name(name: &str) -> bool {
+    let digits = |rest: &str| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix("parity").is_some_and(digits)
+        || name.strip_prefix('d').is_some_and(digits)
+        || name.strip_prefix('c').is_some_and(digits)
+}
+
+/// The members of a state sentence, the way the English names them:
+/// "data disk sdb, cache disk nvme0n1".
+fn members_text(members: &[ArrayMember]) -> String {
+    members
+        .iter()
+        .map(|m| format!("{} disk {}", m.role, m.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The same members as parameters of a state code: one key per role
+/// ('data', 'cache', 'parity'), the names comma-separated, a role with no
+/// member left out. The screen words each role and joins them.
+fn members_params(members: &[ArrayMember]) -> Vec<(&'static str, String)> {
+    ["data", "cache", "parity"]
+        .into_iter()
+        .filter_map(|role| {
+            let names: Vec<&str> =
+                members.iter().filter(|m| m.role == role).map(|m| m.name.as_str()).collect();
+            (!names.is_empty()).then(|| (role, names.join(",")))
+        })
+        .collect()
 }
 
 // =============================================================================
@@ -1679,12 +1780,37 @@ fn branch_device(disk: &NasDisk) -> String {
 
 /// A refusal, built where the rule lives so the sentence and the machine code
 /// cannot drift apart.
-fn refuse(code: &str, disk: &NasDisk, detail: String) -> NasElasticRefusal {
+fn refuse(code: &str, disk: &NasDisk, params: &[(&str, String)], detail: String) -> NasElasticRefusal {
     NasElasticRefusal {
         code: code.to_string(),
         disk_id: disk.disk_id.clone(),
         disk_name: disk.name.clone(),
         detail,
+        params: refusal_params(params),
+    }
+}
+
+/// A refusal's parameters, as the wire carries them.
+fn refusal_params(params: &[(&str, String)]) -> BTreeMap<String, String> {
+    params.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+}
+
+/// `conflicting_owner` as a code the wizard words: the kind of owner
+/// ('spare' | 'pool' | 'md' | 'system' | 'mounted' | 'used') and the name it
+/// goes by ('' when it has none). One rule, two spellings — kept beside the
+/// sentence so the two cannot drift.
+pub fn conflicting_owner_code(disk: &NasDisk) -> Option<(&'static str, String)> {
+    let named = |name: Option<&String>| name.cloned().unwrap_or_default();
+    if disk.vdev_role == "spare" {
+        return Some(("spare", named(disk.member_of.as_ref())));
+    }
+    match disk.role.as_str() {
+        "pool_member" => Some(("pool", named(disk.member_of.as_ref()))),
+        "array_member" => Some(("md", named(disk.member_of.as_ref()))),
+        "system" => Some(("system", String::new())),
+        "mounted" => Some(("mounted", named(disk.mountpoints.first()))),
+        "used" => Some(("used", String::new())),
+        _ => None,
     }
 }
 
@@ -1695,33 +1821,21 @@ fn refuse(code: &str, disk: &NasDisk, detail: String) -> NasElasticRefusal {
 /// hunting and "this disk is in the pool tank" does not. The inventory's
 /// `role` is the authority — it is derived from what `lsblk` and `zpool`
 /// actually report, not from what this app remembers writing.
+///
+/// ONE rule (wave-6 critic MINOR 9): the sentence is worded from
+/// `conflicting_owner_code`, the rule itself, so the refusal and its words
+/// cannot disagree about whether a disk is in use.
 pub fn conflicting_owner(disk: &NasDisk) -> Option<String> {
-    // A spare is a pool member with a `spare` vdev role, so it is checked
-    // first: otherwise it would be reported as an ordinary member and the
-    // admin would go looking for it in the pool's data vdevs.
-    if disk.vdev_role == "spare" {
-        return Some(match disk.member_of.as_deref() {
-            Some(pool) => format!("a hot spare of pool {pool}"),
-            None => "a hot spare".to_string(),
-        });
-    }
-    match disk.role.as_str() {
-        "pool_member" => Some(match disk.member_of.as_deref() {
-            Some(pool) => format!("a member of ZFS pool {pool}"),
-            None => "a member of a ZFS pool".to_string(),
-        }),
-        "array_member" => Some(match disk.member_of.as_deref() {
-            Some(array) => format!("a member of md array {array}"),
-            None => "a member of an md array".to_string(),
-        }),
-        "system" => Some("carrying this node's running system".to_string()),
-        "mounted" => Some(match disk.mountpoints.first() {
-            Some(mp) => format!("mounted at {mp}"),
-            None => "mounted".to_string(),
-        }),
-        "used" => Some("holding a filesystem or partitions".to_string()),
-        _ => None,
-    }
+    let (kind, name) = conflicting_owner_code(disk)?;
+    let named = |with: String, without: &str| if name.is_empty() { without.to_string() } else { with };
+    Some(match kind {
+        "spare" => named(format!("a hot spare of pool {name}"), "a hot spare"),
+        "pool" => named(format!("a member of ZFS pool {name}"), "a member of a ZFS pool"),
+        "md" => named(format!("a member of md array {name}"), "a member of an md array"),
+        "system" => "carrying this node's running system".to_string(),
+        "mounted" => named(format!("mounted at {name}"), "mounted"),
+        _ => "holding a filesystem or partitions".to_string(),
+    })
 }
 
 /// Whether two inventory rows are the same piece of hardware, and by which
@@ -1771,6 +1885,7 @@ pub fn layout_refusals(
         out.push(NasElasticRefusal {
             code: "too_many_cache_disks".to_string(),
             detail: "Elastic dopuszcza najwyżej jeden dysk cache".to_string(),
+            params: refusal_params(&[("count", cache.len().to_string())]),
             ..Default::default()
         });
     }
@@ -1785,6 +1900,7 @@ pub fn layout_refusals(
                 "'{name}' cannot be an array name: it becomes a directory under /mnt, a \
                  directory under the branch root and a file name"
             ),
+            params: refusal_params(&[("name", name.to_string())]),
             ..Default::default()
         });
     }
@@ -1802,6 +1918,7 @@ pub fn layout_refusals(
                  mountpoint, and the union would hide what is under it",
                 union_path(name)
             ),
+            params: refusal_params(&[("name", name.to_string()), ("path", union_path(name))]),
             ..Default::default()
         });
     }
@@ -1820,6 +1937,10 @@ pub fn layout_refusals(
                 parity.len(),
                 tentanas_helper::elastic::MAX_PARITY
             ),
+            params: refusal_params(&[
+                ("count", parity.len().to_string()),
+                ("max", tentanas_helper::elastic::MAX_PARITY.to_string()),
+            ]),
             ..Default::default()
         });
     }
@@ -1832,6 +1953,7 @@ pub fn layout_refusals(
                 out.push(refuse(
                     "disk_repeated",
                     disk,
+                    &[("first_role", previous.to_string()), ("role", role.to_string())],
                     format!("{} is picked as {previous} and as {role}", disk.name),
                 ));
             }
@@ -1859,6 +1981,13 @@ pub fn layout_refusals(
                     "disk_repeated"
                 },
                 b,
+                // The shared identity (a WWN, a serial) stays in the node's
+                // sentence: the screen names the two disks, not the id.
+                &[
+                    ("other", a.name.clone()),
+                    ("other_role", a_role.to_string()),
+                    ("role", b_role.to_string()),
+                ],
                 format!(
                     "{} ({a_role}) i {} ({b_role}) wskazują ten sam nośnik ({shared}): \
                      jeden nośnik nie może zajmować dwóch miejsc w macierzy",
@@ -1874,14 +2003,18 @@ pub fn layout_refusals(
                 out.push(refuse(
                     "disk_in_use",
                     disk,
+                    &[("owner", "elastic".to_string()), ("role", role.to_string())],
                     format!("{} already belongs to another Elastic Array", disk.name),
                 ));
                 continue;
             }
-            if let Some(owner) = conflicting_owner(disk) {
+            // Keyed on the rule alone: the sentence is worded from it.
+            if let Some((kind, owner_name)) = conflicting_owner_code(disk) {
+                let owner = conflicting_owner(disk).unwrap_or_default();
                 out.push(refuse(
                     "disk_in_use",
                     disk,
+                    &[("owner", kind.to_string()), ("owner_name", owner_name), ("role", role.to_string())],
                     format!("{} is {owner} — a disk belongs to one of them, not both (the {role} role of this array would erase it)", disk.name),
                 ));
             }
@@ -1908,6 +2041,7 @@ pub fn layout_refusals(
                 out.push(refuse(
                     "parity_too_small",
                     disk,
+                    &[("size", disk.size_bytes.to_string()), ("largest", largest.to_string())],
                     format!(
                         "{} holds {} and the largest data disk holds {}: a parity disk must be \
                          at least as large as the largest data disk, or it cannot cover it",
@@ -1922,15 +2056,25 @@ pub fn layout_refusals(
     out
 }
 
-/// Things an admin should know and may still choose.
+/// Things an admin should know and may still choose, as the node's English
+/// (`warnings`, for an older screen) — one sentence per code of
+/// `layout_warning_codes`.
 fn layout_warnings(data: &[NasDisk], parity: &[NasDisk], cache: &[NasDisk]) -> Vec<String> {
+    layout_warning_codes(data, parity, cache).iter().map(layout_warning_sentence).collect()
+}
+
+/// The same warnings as CODES the wizard words in the reader's language:
+/// - `no_parity` {} — no protection at all;
+/// - `parity_tight` {disk} — a parity disk only just as large as the largest
+///   data disk;
+/// - `no_cache` {} — nothing for the mover to do;
+/// - `unhealthy_disks` {disks} — kernel names SMART warns about, comma-separated;
+/// - `mixed_sizes` {} — the data disks differ in size, which is the point of
+///   this array kind.
+pub fn layout_warning_codes(data: &[NasDisk], parity: &[NasDisk], cache: &[NasDisk]) -> Vec<NasHealthReason> {
     let mut out = Vec::new();
     if parity.is_empty() {
-        out.push(
-            "no parity disk: this array has no protection at all, and losing one data disk \
-             loses that disk's files"
-                .to_string(),
-        );
+        out.push(super::disks::coded_reason("no_parity", &[]));
     }
     // A parity disk exactly the size of the largest data disk passes the hard
     // rule and can still come up short: the parity FILE lives on a
@@ -1940,20 +2084,12 @@ fn layout_warnings(data: &[NasDisk], parity: &[NasDisk], cache: &[NasDisk]) -> V
     if let Some(largest) = data.iter().map(|d| d.size_bytes).max() {
         for disk in parity {
             if disk.size_bytes >= largest && disk.size_bytes < largest + largest / 100 {
-                out.push(format!(
-                    "{} is only just as large as the largest data disk: the parity file has to \
-                     fit on a filesystem, and its metadata may leave too little room",
-                    disk.name
-                ));
+                out.push(super::disks::coded_reason("parity_tight", &[("disk", disk.name.clone())]));
             }
         }
     }
     if cache.is_empty() {
-        out.push(
-            "no cache disk: there is nothing for the mover to do, and new files are written \
-             straight to the data disks"
-                .to_string(),
-        );
+        out.push(super::disks::coded_reason("no_cache", &[]));
     }
     let unhealthy: Vec<&str> = data
         .iter()
@@ -1963,11 +2099,7 @@ fn layout_warnings(data: &[NasDisk], parity: &[NasDisk], cache: &[NasDisk]) -> V
         .map(|d| d.name.as_str())
         .collect();
     if !unhealthy.is_empty() {
-        out.push(format!(
-            "SMART warnings on {}: building an array on a disk that is already failing starts \
-             it degraded",
-            unhealthy.join(", ")
-        ));
+        out.push(super::disks::coded_reason("unhealthy_disks", &[("disks", unhealthy.join(", "))]));
     }
     // Mixed sizes are the POINT of this array kind, so they are not warned
     // about the way a ZFS vdev warns about them — the note says the opposite
@@ -1976,14 +2108,38 @@ fn layout_warnings(data: &[NasDisk], parity: &[NasDisk], cache: &[NasDisk]) -> V
         let smallest = data.iter().map(|d| d.size_bytes).min().unwrap_or(0);
         let largest = data.iter().map(|d| d.size_bytes).max().unwrap_or(0);
         if largest > smallest {
-            out.push(
-                "the data disks are different sizes, and every byte of each of them is used: \
-                 that is what this array kind is for"
-                    .to_string(),
-            );
+            out.push(super::disks::coded_reason("mixed_sizes", &[]));
         }
     }
     out
+}
+
+/// The English of one `layout_warning_codes` entry, as the wizard used to
+/// show it.
+fn layout_warning_sentence(code: &NasHealthReason) -> String {
+    let param = |key: &str| super::disks::reason_param(code, key).to_string();
+    match code.code.as_str() {
+        "no_parity" => "no parity disk: this array has no protection at all, and losing one data disk \
+             loses that disk's files"
+            .to_string(),
+        "parity_tight" => format!(
+            "{} is only just as large as the largest data disk: the parity file has to \
+             fit on a filesystem, and its metadata may leave too little room",
+            param("disk")
+        ),
+        "no_cache" => "no cache disk: there is nothing for the mover to do, and new files are written \
+             straight to the data disks"
+            .to_string(),
+        "unhealthy_disks" => format!(
+            "SMART warnings on {}: building an array on a disk that is already failing starts \
+             it degraded",
+            param("disks")
+        ),
+        "mixed_sizes" => "the data disks are different sizes, and every byte of each of them is used: \
+             that is what this array kind is for"
+            .to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// The wizard's whole answer for a set of picked disks.
@@ -2017,6 +2173,7 @@ pub fn plan_layout(
     if !tentanas_helper::elastic::FILESYSTEMS.contains(&wanted) {
         refusals.push(NasElasticRefusal {
             code: "filesystem_invalid".to_string(),
+            params: refusal_params(&[("filesystem", wanted.to_string())]),
             detail: format!(
                 "'{wanted}' is not a filesystem this app makes: an Elastic Array data disk \
                  carries {} so it stays readable on its own",
@@ -2029,6 +2186,7 @@ pub fn plan_layout(
     {
         refusals.push(NasElasticRefusal {
             code: "filesystem_unavailable".to_string(),
+            params: refusal_params(&[("filesystem", wanted.to_string())]),
             detail: format!(
                 "mkfs.{wanted} is not installed on this node, so no disk of this array can \
                  be prepared"
@@ -2037,6 +2195,7 @@ pub fn plan_layout(
         });
     }
     let warnings = layout_warnings(data, parity, cache);
+    let warning_codes = layout_warning_codes(data, parity, cache);
 
     let usable: u64 = data.iter().map(|d| d.size_bytes).sum();
     let parity_bytes: u64 = parity.iter().map(|d| d.size_bytes).sum();
@@ -2121,6 +2280,7 @@ pub fn plan_layout(
         union_path: union_path(array_name),
         wiped_devices: wiped,
         steps_preview,
+        warning_codes,
     }
 }
 
@@ -2655,6 +2815,8 @@ pub fn to_protocol(
         }),
         created_at: array.created_at.clone(),
         updated_at: array.updated_at.clone(),
+        // `observed_protocol` sets the codes of the detail it chose.
+        state_reasons: Vec::new(),
     }
 }
 
@@ -5137,7 +5299,9 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
             observed.last_mover = result.last_mover.clone();
             observed.conflicts = result.conflicts.clone();
             root_stage = Some(result.stage);
-            failure = result.detail.or_else(|| {
+            // The helper's own sentence has no code: the screen says that the
+            // helper reported a failure, and the sentence is its tooltip.
+            failure = result.detail.map(|detail| CodedText::new("helper_failed", &[], detail)).or_else(|| {
                 if result.stage == ElasticStage::Ready
                     && result.service.as_ref().is_some_and(|service| {
                         service.mode != ElasticServiceMode::Online
@@ -5145,16 +5309,22 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
                             || result.union_readonly != Some(false)
                     })
                 {
-                    Some("Service nie potwierdził trybu Online RW".to_string())
+                    Some(CodedText::new("service_not_online", &[], "Service nie potwierdził trybu Online RW"))
                 } else {
                     None
                 }
             });
             // A recovery after a boot stopped part-way: only a reboot retries it.
+            // The code says the one thing the admin must do; the cause the
+            // helper gave stays in the sentence.
             if result.restart_required {
                 failure = Some(match failure {
-                    Some(detail) => format!("Wymagany restart noda: {detail}"),
-                    None => "Wymagany restart noda".to_string(),
+                    Some(detail) => CodedText::new(
+                        "restart_required",
+                        &[],
+                        format!("Wymagany restart noda: {}", detail.text),
+                    ),
+                    None => CodedText::new("restart_required", &[], "Wymagany restart noda"),
                 });
             }
             let service_safe = result.service.as_ref().is_none_or(|service| {
@@ -5167,7 +5337,7 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
             }
             observed.record_disks(&array.name, result.disks);
         }
-        Err(error) => failure = Some(error.to_string()),
+        Err(error) => failure = Some(CodedText::new("helper_failed", &[], error.to_string())),
     }
     let installed = |id: &str| features.iter().any(|f| f.id == id && f.status == "ok");
     let snapraid = features.iter().find(|f| f.id == SNAPRAID_FEATURE_ID);
@@ -5175,19 +5345,34 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
     if let Some(stage) = root_stage {
         if stage != ElasticStage::Ready {
             state = "needs_attention";
-            detail = failure.unwrap_or_else(|| "Nieukończony checkpoint helpera".to_string());
+            detail = failure.unwrap_or_else(|| {
+                CodedText::new("checkpoint_unfinished", &[], "Nieukończony checkpoint helpera")
+            });
         } else if array.state != "active" {
             state = if array.state == "creating" { "creating" } else { "needs_attention" };
+            // A sentence the database holds (an operation's own words) has
+            // no code; the empty one is the node's own and has.
             detail = if array.state_detail.is_empty() {
-                "Oczekuje na trwałe potwierdzenie operacji w bazie instancji".to_string()
-            } else { array.state_detail.clone() };
+                CodedText::new(
+                    "awaiting_confirmation",
+                    &[],
+                    "Oczekuje na trwałe potwierdzenie operacji w bazie instancji",
+                )
+            } else {
+                // Stored with its codes since migration 23 (an operation's
+                // error: `operation_failed` {operation}; a lost supervision:
+                // `supervision_lost`), so the screen words it and keeps the
+                // stored sentence for the tooltip.
+                CodedText { text: array.state_detail.clone(), reasons: array.state_reasons.clone() }
+            };
         }
     } else {
         state = "unknown";
         detail = failure.unwrap_or_default();
     }
     let mut wire = to_protocol(array,disks,&observed,installed(SNAPRAID_FEATURE_ID),
-        snapraid.and_then(|f| f.version.as_deref()).unwrap_or(""),(state,&detail));
+        snapraid.and_then(|f| f.version.as_deref()).unwrap_or(""),(state,detail.text.as_str()));
+    wire.state_reasons = detail.reasons;
     if let Some(result) = &helper {
         apply_helper_gates(&mut wire, result);
     }
@@ -8528,9 +8713,9 @@ pub(crate) mod tests {
     /// Everything mounted, everything measured.
     fn all_mounted(array: &ElasticArrayRow, cache_used: u64) -> ArrayObservation {
         let mut probes = BTreeMap::new();
-        for (mountpoint, _) in mountpoints_of(array) {
+        for member in mountpoints_of(array, &ArrayObservation::default()) {
             probes.insert(
-                mountpoint,
+                member.mountpoint,
                 BranchProbe {
                     mounted: Some(true),
                     device_present: Some(true),
@@ -8589,7 +8774,7 @@ pub(crate) mod tests {
         let healthy = all_mounted(&a, 0);
         assert_eq!(
             array_state(&a, &healthy, &installed_all),
-            ("active", String::new(), Disposition::Apply)
+            ("active", CodedText::default(), Disposition::Apply)
         );
 
         // Every branch present, none mounted, union down: the state of this
@@ -8677,6 +8862,165 @@ pub(crate) mod tests {
         let (cold_state, _, cold_verdict) = array_state(&a, &cold, &installed_all);
         assert_eq!((cold_state, cold_verdict), ("pending", Disposition::Apply));
         assert_ne!(cold_state, state);
+    }
+
+    /// Wave 6: every state sentence travels as a code the screen words, with
+    /// the members it names as parameters per role — never a slot name. The
+    /// English stays the node's (log, tooltip).
+    #[test]
+    fn the_state_detail_is_coded_with_its_members_per_role() {
+        let codes = |detail: &CodedText| {
+            detail
+                .reasons
+                .iter()
+                .map(|r| (r.code.clone(), r.params.clone().into_iter().collect::<Vec<_>>()))
+                .collect::<Vec<_>>()
+        };
+        let p = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+        let a = array();
+        let healthy = all_mounted(&a, 0);
+
+        let mut cold = healthy.clone();
+        for probe in cold.probes.values_mut() {
+            *probe = BranchProbe::cold();
+        }
+        cold.union_mounted = Some(false);
+        let (_, detail, _) = array_state(&a, &cold, &installed_all);
+        assert_eq!(
+            codes(&detail),
+            vec![("branches_mountable".to_string(), p(&[("cache", "nvme2n1"), ("data", "sdg,sdh"), ("parity", "sdj")]))]
+        );
+
+        let mut gone = healthy.clone();
+        gone.probes.insert(data_branch_path("media", "sdh"), BranchProbe::device_gone());
+        let (_, detail, _) = array_state(&a, &gone, &installed_all);
+        assert_eq!(codes(&detail), vec![("branches_gone".to_string(), p(&[("data", "sdh"), ("union", "serving")]))]);
+        gone.union_mounted = Some(false);
+        let (_, detail, _) = array_state(&a, &gone, &installed_all);
+        assert_eq!(codes(&detail), vec![("branches_gone".to_string(), p(&[("data", "sdh"), ("union", "down")]))]);
+
+        let mut unknown = healthy.clone();
+        unknown.probes.insert(cache_branch_path("media", "nvme2n1"), BranchProbe { mounted: None, ..Default::default() });
+        let (_, detail, _) = array_state(&a, &unknown, &installed_all);
+        assert_eq!(codes(&detail), vec![("branches_unknown".to_string(), p(&[("cache", "nvme2n1")]))]);
+
+        let mut up_union_down = healthy.clone();
+        up_union_down.union_mounted = Some(false);
+        let (_, detail, _) = array_state(&a, &up_union_down, &installed_all);
+        assert_eq!(codes(&detail), vec![("union_not_mounted".to_string(), vec![])]);
+
+        let blind = ArrayObservation { mount_table_known: false, ..healthy.clone() };
+        assert_eq!(codes(&array_state(&a, &blind, &installed_all).1), vec![("mount_table_unknown".to_string(), vec![])]);
+        let no_mergerfs = |id: &str| id != MERGERFS_FEATURE_ID;
+        assert_eq!(codes(&array_state(&a, &healthy, &no_mergerfs).1), vec![("mergerfs_missing".to_string(), vec![])]);
+        let no_snapraid = |id: &str| id != SNAPRAID_FEATURE_ID;
+        assert_eq!(codes(&array_state(&a, &healthy, &no_snapraid).1), vec![("snapraid_unusable".to_string(), vec![])]);
+        let mut unprotected = a.clone();
+        unprotected.parity.clear();
+        let observed = all_mounted(&unprotected, 0);
+        assert_eq!(codes(&array_state(&unprotected, &observed, &installed_all).1), vec![("no_parity".to_string(), vec![])]);
+        assert!(array_state(&a, &healthy, &installed_all).1.reasons.is_empty(), "a healthy array says nothing");
+
+        // A stored array keys its members by SLOT ('d1', 'c1', 'parity1'),
+        // which no admin has seen. A member neither mounted nor in the live
+        // inventory is its number; a mounted one is its kernel name.
+        let mut stored = a.clone();
+        for (i, branch) in stored.branches.iter_mut().enumerate() {
+            branch.disk_id = format!("id-slot-{i}");
+            branch.name = if branch.role == "cache" { "c1".to_string() } else { format!("d{}", i + 1) };
+        }
+        stored.parity[0].name = "parity1".to_string();
+        stored.parity[0].disk_id = "id-slot-parity".to_string();
+        let mut stored_cold = all_mounted(&stored, 0);
+        for probe in stored_cold.probes.values_mut() {
+            *probe = BranchProbe::cold();
+        }
+        stored_cold.kernel_names.insert(data_branch_path("media", "d2"), "sdh".to_string());
+        let (_, detail, _) = array_state(&stored, &stored_cold, &installed_all);
+        assert_eq!(
+            codes(&detail),
+            vec![("branches_mountable".to_string(), p(&[("cache", "#1"), ("data", "#1,sdh"), ("parity", "#1")]))]
+        );
+        for slot in ["d1", "d2", "c1", "parity1"] {
+            assert!(!detail.text.split(|c: char| !c.is_alphanumeric()).any(|w| w == slot), "{slot} in: {detail}");
+        }
+    }
+
+    /// Wave-6 critic MINOR 9: a disk in use is refused on ONE rule. For
+    /// every inventory role, the refusal, the code it carries and the
+    /// sentence agree — a role that one of them forgot would let the create
+    /// format a disk something else owns.
+    #[test]
+    fn a_disk_in_use_is_refused_on_one_rule_and_worded_from_it() {
+        let base = NasDisk { disk_id: "id-sdf".into(), name: "sdf".into(), size_bytes: 8 * TB, health: "ok".into(), ..Default::default() };
+        let cases = [
+            ("free", "", None, None),
+            ("pool_member", "", Some("tank"), Some("pool")),
+            ("pool_member", "spare", Some("tank"), Some("spare")),
+            ("array_member", "", Some("md0"), Some("md")),
+            ("system", "", None, Some("system")),
+            ("mounted", "", None, Some("mounted")),
+            ("used", "", None, Some("used")),
+        ];
+        for (role, vdev_role, member_of, owner) in cases {
+            let disk = NasDisk {
+                role: role.into(),
+                vdev_role: vdev_role.into(),
+                member_of: member_of.map(str::to_string),
+                mountpoints: if role == "mounted" { vec!["/srv".into()] } else { Vec::new() },
+                ..base.clone()
+            };
+            let code = conflicting_owner_code(&disk);
+            assert_eq!(code.as_ref().map(|c| c.0), owner, "{role}/{vdev_role}");
+            assert_eq!(conflicting_owner(&disk).is_some(), code.is_some(), "{role}: the sentence and the rule disagree");
+            let refusals = layout_refusals("media", &[disk.clone()], &[], &[], &BTreeSet::new(), &BTreeSet::new());
+            let in_use = refusals.iter().find(|r| r.code == "disk_in_use");
+            assert_eq!(in_use.is_some(), code.is_some(), "{role}: refused iff the rule says in use");
+            if let Some(r) = in_use {
+                assert_eq!(r.params.get("owner").map(String::as_str), owner);
+                assert!(r.detail.contains(&conflicting_owner(&disk).unwrap()), "{}", r.detail);
+            }
+        }
+    }
+
+    /// The wizard's layout warnings and refusals as codes (wave 6), one code
+    /// per English sentence, with what each names as parameters.
+    #[test]
+    fn the_layout_answers_in_codes_beside_its_sentences() {
+        let disk = |id: &str, size: u64, health: &str| NasDisk {
+            disk_id: format!("id-{id}"),
+            name: id.to_string(),
+            size_bytes: size,
+            health: health.to_string(),
+            role: "free".to_string(),
+            ..Default::default()
+        };
+        let data = [disk("sdb", 8 * TB, "ok"), disk("sdc", 4 * TB, "warning")];
+        let parity = [disk("sdd", 8 * TB, "ok")];
+        let codes = layout_warning_codes(&data, &parity, &[]);
+        let words: Vec<&str> = codes.iter().map(|c| c.code.as_str()).collect();
+        assert_eq!(words, vec!["parity_tight", "no_cache", "unhealthy_disks", "mixed_sizes"]);
+        assert_eq!(codes[0].params.get("disk").map(String::as_str), Some("sdd"));
+        assert_eq!(codes[2].params.get("disks").map(String::as_str), Some("sdc"));
+        let sentences = layout_warnings(&data, &parity, &[]);
+        assert_eq!(sentences.len(), codes.len(), "one sentence per code");
+        assert!(sentences[2].contains("SMART warnings on sdc"), "{sentences:?}");
+        assert_eq!(layout_warning_codes(&data, &[], &[])[0].code, "no_parity");
+
+        let small = [disk("sde", 4 * TB, "ok")];
+        let refusals = layout_refusals("media", &data, &small, &[], &BTreeSet::new(), &BTreeSet::new());
+        let too_small = refusals.iter().find(|r| r.code == "parity_too_small").expect("refused");
+        assert_eq!(too_small.disk_name, "sde");
+        assert_eq!(too_small.params.get("size").map(String::as_str), Some(&*(4 * TB).to_string()));
+        assert_eq!(too_small.params.get("largest").map(String::as_str), Some(&*(8 * TB).to_string()));
+
+        let mut member = disk("sdf", 8 * TB, "ok");
+        member.role = "pool_member".to_string();
+        member.member_of = Some("tank".to_string());
+        let refusals = layout_refusals("media", &[member], &[], &[], &BTreeSet::new(), &BTreeSet::new());
+        let in_use = refusals.iter().find(|r| r.code == "disk_in_use").expect("refused");
+        let param = |k: &str| in_use.params.get(k).map(String::as_str);
+        assert_eq!((param("owner"), param("owner_name"), param("role")), (Some("pool"), Some("tank"), Some("data")));
     }
 
     /// Unknown is not "not mounted", and the two produce different sentences.
@@ -10171,7 +10515,7 @@ pub(crate) mod tests {
         // cannot see is 'unknown', never 'ok'.
         let observed = all_mounted(&a, 18 * 1024 * 1024 * 1024);
         let state = array_state(&a, &observed, &installed_all);
-        let wire = to_protocol(&a, &disks, &observed, true, "12.3", (state.0, state.1.as_str()));
+        let wire = to_protocol(&a, &disks, &observed, true, "12.3", (state.0, state.1.text.as_str()));
 
         assert_eq!(wire.kind, "elastic-array");
         assert_eq!(wire.union_path, "/mnt/media");

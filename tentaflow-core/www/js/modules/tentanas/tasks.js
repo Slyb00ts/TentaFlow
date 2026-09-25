@@ -11,7 +11,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage,
-  jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
+  jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames, nodeTextTitle,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, setClass, patchHtml, patchKeyedList } from '/js/lib/dom-patch.js';
 import { isOpaqueId, isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
@@ -63,17 +63,22 @@ export function jobSubject(j) {
   return { text: subject };
 }
 
-// ===== A schedule's last outcome (n15 B2).
+// ===== A schedule's last outcome (n15 B2, wave 6 B).
 //
-// The scheduler does not store an outcome: it stores its own sentence,
-// `started job <uuid>` or `failed to start: <error>` (scheduler.rs, for the
-// pool, Elastic and snapshot cadences alike). Feeding that sentence to
-// `schedules.result_*` printed the raw key with the UUID glued on, and no
-// "failed" chip could ever fire. The real outcome is the named job's status,
-// so it is resolved from the job itself; the job id never becomes text.
+// A node of this build sends the outcome STRUCTURED (`NasScheduleRow`
+// `lastOutcome` 'started' | 'start_failed' | 'skipped', `lastJobStatus`,
+// `lastReason`, `lastDetail`; `scheduler::ScheduleOutcome`): the status of
+// the started job is read by the node, and the job id never reaches the
+// screen at all. That is the path taken whenever `lastOutcome` is set.
 //
-// Every sentence the scheduler stores (scheduler.rs; `last_result` is
-// written nowhere else):
+// An older node stores and sends only its own sentence, `started job <uuid>`
+// or `failed to start: <error>` (scheduler.rs, for the pool, Elastic and
+// snapshot cadences alike). Feeding that sentence to `schedules.result_*`
+// printed the raw key with the UUID glued on, and no "failed" chip could
+// ever fire. The real outcome is the named job's status, so it is resolved
+// from the job itself; the job id never becomes text.
+//
+// Every sentence an older scheduler stores (`last_result`):
 // - `started job <uuid>` — the pool scrub/TRIM, Elastic and snapshot
 //   cadences, when the spawn worked;
 // - `failed to start: <error>` — the same cadences, when it was refused;
@@ -85,9 +90,12 @@ export function jobSubject(j) {
 // - '' — never ran, and always for the SMART pair (dispatch sends none).
 // The bare words in RESULT_WORDS are an older stored form, still read.
 //
-// `statusOf(jobId)` returns the job's status, or null while it is not known
-// (not loaded yet, or the job is gone). Returns `{ label, failed, skipped,
-// title }`, or null when there is no outcome to show — never a raw key.
+// `row` is the schedule row (or, from an older caller, its bare
+// `lastResult`). `statusOf(jobId)` returns the job's status, or null while it
+// is not known (not loaded yet, or the job is gone) — asked only on the older
+// path. Returns `{ label, failed, skipped, title }`, or null when there is no
+// outcome to show — never a raw key. A `title` carrying the node's own
+// sentence has every id in it replaced (`nodeTextTitle`).
 const RESULT_WORDS = new Set(['ok', 'succeeded', 'failed', 'skipped']);
 const STARTED_JOB = /^started job (\S+)$/;
 const FAILED_TO_START = /^failed to start:?\s*/;
@@ -97,12 +105,41 @@ const JOB_STATUSES = new Set(['queued', 'running', 'succeeded', 'done', 'failed'
 // The statuses a job never leaves: only these may be cached for good.
 const FINISHED_JOB_STATUSES = new Set(['succeeded', 'done', 'failed', 'cancelled']);
 
-export function scheduleOutcome(lastResult, statusOf = () => null) {
+function structuredOutcome(row) {
+  const reason = String(row.lastReason || '');
+  const detail = String(row.lastDetail || '');
+  switch (row.lastOutcome) {
+    case 'started': {
+      const status = String(row.lastJobStatus || '');
+      // A job that is gone (pruned) has no status: nothing to claim.
+      if (!JOB_STATUSES.has(status)) return null;
+      if (status === 'succeeded' || status === 'failed') {
+        return { label: T('schedules.result_' + status), failed: status === 'failed', skipped: false, title: '' };
+      }
+      return { label: T('jobs.status_' + status), failed: false, skipped: false, title: '' };
+    }
+    case 'start_failed':
+      return { label: T('schedules.result_failed'), failed: true, skipped: false, title: nodeTextTitle(detail) };
+    case 'skipped': {
+      const words = reason ? T('schedules.skip_' + reason) : '';
+      if (reason && words !== 'tentanas.schedules.skip_' + reason) {
+        return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: words, reason: words };
+      }
+      return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: nodeTextTitle(detail) };
+    }
+    default:
+      return null;
+  }
+}
+
+export function scheduleOutcome(row, statusOf = () => null) {
+  if (row && typeof row === 'object' && row.lastOutcome) return structuredOutcome(row);
+  const lastResult = row && typeof row === 'object' ? row.lastResult : row;
   const raw = String(lastResult || '').trim();
   if (!raw) return null;
   if (RESULT_WORDS.has(raw)) return { label: T('schedules.result_' + raw), failed: raw === 'failed', skipped: raw === 'skipped', title: '' };
   if (FAILED_TO_START.test(raw)) {
-    return { label: T('schedules.result_failed'), failed: true, skipped: false, title: raw.replace(FAILED_TO_START, '') };
+    return { label: T('schedules.result_failed'), failed: true, skipped: false, title: nodeTextTitle(raw.replace(FAILED_TO_START, '')) };
   }
   // The reason is the node's own sentence: it belongs in the tooltip, and
   // the row itself reads the translated word.
@@ -115,7 +152,7 @@ export function scheduleOutcome(lastResult, statusOf = () => null) {
     if (code && words !== 'tentanas.schedules.skip_' + code) {
       return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: words, reason: words };
     }
-    return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: why };
+    return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: nodeTextTitle(why) };
   }
   const started = STARTED_JOB.exec(raw);
   const status = started ? statusOf(started[1]) : null;
@@ -259,7 +296,7 @@ export async function drawTasks(screen, body) {
       if (status !== null && !FINISHED_JOB_STATUSES.has(status)) jobsToReread.add(jobId);
     }
   }
-  const outcomeOf = (row) => scheduleOutcome(row?.lastResult, statusOf);
+  const outcomeOf = (row) => scheduleOutcome(row, statusOf);
   // A parked red-path operation is a task of this node like any other, so the
   // list sits with the jobs and shares their refresh cadence.
   const approvals = wireApprovals(screen, body, { onExecuted: () => refreshJobs() });

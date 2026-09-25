@@ -231,3 +231,29 @@ test('zawijany renderer podsumowania pokazuje serial jako tekst, nie HTML', asyn
   assert.equal(shadow.querySelector('img'), null);
   screen.dispose();
 });
+// Wave 6: the node's refusals and warnings arrive as codes with parameters
+// beside its English. The preview words them in the reader's language — the
+// disk by its name, sizes as the screen formats them, the owner by kind —
+// with the English as the tooltip; a code this build cannot word, or an
+// older node, shows the node's sentence.
+test('the preview words the node\'s refusals and warnings from their codes', async () => {
+  const worded = (p) => ({ plan: { ...preview(p).plan,
+    refusals: [
+      { code: 'disk_in_use', diskId: 'id1', diskName: 'sd1', detail: 'sd1 is a member of ZFS pool tank — a disk belongs to one of them, not both', params: { owner: 'pool', owner_name: 'tank', role: 'data' } },
+      { code: 'a_future_code', diskId: '', diskName: '', detail: 'the node\'s own sentence', params: {} },
+    ],
+    warnings: ['no cache disk: there is nothing for the mover to do'],
+    warningCodes: [{ code: 'no_cache', params: {} }],
+  } });
+  const { screen, win } = setup({ tentaNasElasticArrayPlanRequest: worded });
+  await toParity(win);
+  check(win, 'id2', 'parity');
+  click(win.querySelector('[data-pw-preview]')); await flush(); await flush();
+  const lines = [...win.querySelectorAll('#nas-pw-preview .wizard-warning')];
+  assert.equal(lines[0].textContent, 'sd1 należy do puli ZFS tank — dysk należy do jednego z nich, nie do obu (ta macierz by go wyczyściła).');
+  assert.equal(lines[0].getAttribute('title'), 'sd1 is a member of ZFS pool tank — a disk belongs to one of them, not both');
+  assert.equal(lines[1].textContent, 'the node\'s own sentence', 'an unknown code shows the node\'s sentence');
+  assert.equal(lines[2].textContent, 'Bez dysku cache: mover nie ma nic do roboty, a nowe pliki trafiają od razu na dyski danych.');
+  assert.ok(win.querySelector('[data-wizard-next]').hasAttribute('disabled'), 'a refused layout still cannot be created');
+  screen.dispose();
+});

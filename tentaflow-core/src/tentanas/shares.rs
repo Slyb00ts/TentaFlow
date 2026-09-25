@@ -600,6 +600,7 @@ pub async fn services(db: &DbPool) -> Vec<NasShareService> {
             version: smb.as_ref().and_then(|f| f.version.clone()),
             config_path: tentanas_helper::SMB_INCLUDE_PATH.to_string(),
             detail: smb.map(|f| f.detail).unwrap_or_default(),
+            reasons: Vec::new(),
         },
         NasShareService {
             protocol: "nfs".to_string(),
@@ -608,6 +609,7 @@ pub async fn services(db: &DbPool) -> Vec<NasShareService> {
             version: nfs.as_ref().and_then(|f| f.version.clone()),
             config_path: tentanas_helper::NFS_EXPORTS_PATH.to_string(),
             detail: nfs.map(|f| f.detail).unwrap_or_default(),
+            reasons: Vec::new(),
         },
     ]
 }

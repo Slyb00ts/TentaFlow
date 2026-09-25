@@ -7465,7 +7465,34 @@
       "create_policy_rand": "losowy dysk",
       "create_policy_msplfs": "najmniej wolnego miejsca w najdłuższej istniejącej ścieżce",
       "card_mover": "Przenoszenie z cache",
-      "card_cache_waiting": "{size} na cache bez parity"
+      "card_cache_waiting": "{size} na cache bez parity",
+      "state_member": {
+        "data": "dysk danych {name}",
+        "data_number": "dysk danych nr {n}",
+        "cache": "dysk cache {name}",
+        "cache_number": "dysk cache nr {n}",
+        "parity": "dysk parity {name}",
+        "parity_number": "dysk parity nr {n}"
+      },
+      "state_reason": {
+        "mount_table_unknown": "Węzeł nie odczytał swojej tablicy montowań, więc niczego nie montuje ani nie odmontowuje: unia zamontowana nad gałęziami, których nie widzi, wysłałaby każdy zapis klienta na system główny.",
+        "mergerfs_missing": "mergerfs nie jest zainstalowany na tym węźle, więc unii nie da się zamontować.",
+        "snapraid_unusable": "SnapRAID nie działa na tym węźle (brak go albo jest niesprawny — zobacz Środowisko), więc dyski parity tej macierzy niczego nie chronią, dopóki tego nie naprawisz.",
+        "branches_unknown": "Węzeł nie może ustalić, czy są na miejscu: {members}. Unia nie zostanie zamontowana, dopóki tego nie ustali.",
+        "branches_mountable": "Obecne i jeszcze niezamontowane: {members}. Następne uzgodnienie zamontuje je, a potem unię.",
+        "branches_gone_serving": "Brak na tym węźle: {members}. Unia nadal udostępnia pozostałe dyski, a plików z brakującego w niej nie widać.",
+        "branches_gone_down": "Brak na tym węźle: {members}. Unia pozostaje odmontowana: zamontowana nad niezamontowaną gałęzią wysłałaby zapisy klientów na system główny.",
+        "union_not_mounted": "Zapisana, ale węzeł jeszcze nie udostępnia unii — zamontuje ją następne uzgodnienie.",
+        "no_parity": "Bez dysku parity: awaria dysku oznacza utratę jego plików.",
+        "restart_required": "Odtwarzanie po starcie węzła zatrzymało się w połowie — ponowi je tylko restart węzła.",
+        "checkpoint_unfinished": "Helper ma nieukończony checkpoint tej macierzy.",
+        "awaiting_confirmation": "Czeka na trwałe potwierdzenie operacji w bazie instancji.",
+        "service_not_online": "Usługa macierzy nie potwierdziła trybu online z zapisem.",
+        "helper_failed": "Helper zgłosił błąd przy odczycie tej macierzy — szczegóły w podpowiedzi.",
+        "operation_failed": "Operacja „{operation}” nie powiodła się — szczegóły w podpowiedzi.",
+        "operation_failed_unnamed": "Operacja na tej macierzy nie powiodła się — szczegóły w podpowiedzi.",
+        "supervision_lost": "Węzeł stracił nadzór nad operacją tej macierzy (restart); jej stan nie dowodzi, że zapis na dyskach się zakończył."
+      }
     },
     "wizard_pool": {
       "elastic_data": "Dyski danych",
@@ -7556,7 +7583,45 @@
       "plan_warning_mixed_media": "SSD i HDD razem: vdev działa z prędkością najwolniejszego dysku.",
       "plan_warning_unhealthy_disks": "SMART ostrzega o dyskach {disks}: pula zbudowana na dysku, który już się psuje, startuje zdegradowana.",
       "plan_warning_single_disk": "Jeden dysk nie ma redundancji: każda awaria oznacza utratę puli.",
-      "plan_warning_odd_mirror": "Układ mirror łączy dyski w pary, więc jeden z nieparzystej liczby dysków pozostanie niewykorzystany."
+      "plan_warning_odd_mirror": "Układ mirror łączy dyski w pary, więc jeden z nieparzystej liczby dysków pozostanie niewykorzystany.",
+      "elastic_role_data": "dysk danych",
+      "elastic_role_parity": "dysk parity",
+      "elastic_role_cache": "dysk cache",
+      "elastic_owner": {
+        "elastic": "należy już do innej macierzy Elastic",
+        "spare": "jest dyskiem zapasowym puli ZFS",
+        "spare_named": "jest dyskiem zapasowym puli ZFS {name}",
+        "pool": "należy do puli ZFS",
+        "pool_named": "należy do puli ZFS {name}",
+        "md": "należy do macierzy md",
+        "md_named": "należy do macierzy md {name}",
+        "system": "zawiera system tego węzła",
+        "mounted": "jest zamontowany",
+        "mounted_named": "jest zamontowany w {name}",
+        "used": "zawiera system plików lub partycje"
+      },
+      "elastic_refusal": {
+        "too_many_cache_disks": "Elastic dopuszcza najwyżej jeden dysk cache.",
+        "name_invalid": "„{name}” nie może być nazwą macierzy: staje się katalogiem w /mnt, katalogiem w katalogu gałęzi i nazwą pliku.",
+        "name_taken": "„{name}” jest już zamontowane w {path}: pula i macierz nie mogą dzielić punktu montowania, a unia zasłoniłaby to, co jest pod nią.",
+        "no_data_disks": "Macierz Elastic potrzebuje co najmniej jednego dysku danych.",
+        "too_many_parity": "Dysków parity: {count} — ta macierz obsługuje najwyżej {max}.",
+        "disk_repeated": "{disk} wybrano jako {first} i jako {role}.",
+        "same_device": "{other} ({other_role}) i {disk} ({role}) to ten sam nośnik: jeden nośnik nie może zajmować dwóch miejsc w macierzy.",
+        "data_disks_same_device": "{other} i {disk} to ten sam nośnik: jeden nośnik nie może być dwoma dyskami danych.",
+        "disk_in_use": "{disk} {owner} — dysk należy do jednego z nich, nie do obu (ta macierz by go wyczyściła).",
+        "parity_too_small": "{disk} ma {size}, a największy dysk danych {largest}: dysk parity musi być co najmniej tak duży jak największy dysk danych, inaczej go nie obejmie.",
+        "filesystem_invalid": "„{filesystem}” nie jest systemem plików, który tworzy ta aplikacja: dysk danych Elastic ma xfs albo ext4, żeby pozostał czytelny osobno.",
+        "filesystem_unavailable": "mkfs.{filesystem} nie jest zainstalowany na tym węźle, więc żadnego dysku tej macierzy nie da się przygotować.",
+        "plan_failed": "Z tego układu nie da się zbudować planu — szczegóły w podpowiedzi."
+      },
+      "elastic_warning": {
+        "no_parity": "Bez dysku parity: ta macierz nie ma żadnej ochrony, a utrata jednego dysku danych oznacza utratę jego plików.",
+        "parity_tight": "{disk} jest ledwie tak duży jak największy dysk danych: plik parity musi zmieścić się w systemie plików, a jego metadane mogą zostawić za mało miejsca.",
+        "no_cache": "Bez dysku cache: mover nie ma nic do roboty, a nowe pliki trafiają od razu na dyski danych.",
+        "unhealthy_disks": "SMART ostrzega o dyskach {disks}: macierz zbudowana na dysku, który już się psuje, startuje zdegradowana.",
+        "mixed_sizes": "Dyski danych mają różne rozmiary i każdy bajt każdego z nich jest wykorzystany — do tego służy ten rodzaj macierzy."
+      }
     },
     "pools": {
       "title": "Pule na nodzie {node}",
@@ -8099,7 +8164,8 @@
       "elastic_sync_name": "SnapRAID sync {array}",
       "elastic_scrub_name": "SnapRAID scrub {array}",
       "skip_elastic_scrub_errors_unrepaired": "scrub zgłosił błędy, których nic jeszcze nie naprawiło — uruchom naprawę z parity",
-      "skip_elastic_parity_fault_unacknowledged": "macierz ma nienaprawiony błąd scrub lub naprawy — Sync wymaga potwierdzenia na ekranie macierzy"
+      "skip_elastic_parity_fault_unacknowledged": "macierz ma nienaprawiony błąd scrub lub naprawy — Sync wymaga potwierdzenia na ekranie macierzy",
+      "skip_array_not_created": "tworzenie macierzy się nie zakończyło — uruchom przywracanie macierzy albo ją usuń"
     },
     "shares": {
       "create": "Nowy share",
@@ -8534,7 +8600,34 @@
       "op_elastic_schedule": "Uzbrojenie harmonogramu Elastic",
       "op_elastic_add_disk_abort": "Elastic Array · Wycofanie dodania dysku",
       "detail_elastic_sync": "Zapisuje nowy checkpoint parity i content.",
-      "detail_elastic_sync_over_fault": "UWAGA: macierz ma nienaprawiony błąd scrub lub naprawy. Sync zapisze obecny stan plików. Oznaczone bloki niezmienionych plików oraz niezmienione pliki, których scrub nie mógł odczytać, pozostaną do naprawienia — ale pliki usunięte lub zmienione od ostatniego Sync, także uszkodzone, zostaną zapisane w nowym stanie i ich wcześniejszych wersji nie da się już odtworzyć z parity. Najpierw uruchom naprawę."
+      "detail_elastic_sync_over_fault": "UWAGA: macierz ma nienaprawiony błąd scrub lub naprawy. Sync zapisze obecny stan plików. Oznaczone bloki niezmienionych plików oraz niezmienione pliki, których scrub nie mógł odczytać, pozostaną do naprawienia — ale pliki usunięte lub zmienione od ostatniego Sync, także uszkodzone, zostaną zapisane w nowym stanie i ich wcześniejszych wersji nie da się już odtworzyć z parity. Najpierw uruchom naprawę.",
+      "detail": {
+        "yes": "tak",
+        "no": "nie",
+        "pool_destroy": "Niszczy pulę {pool} ze wszystkimi datasetami i snapshotami.",
+        "share_delete": "Usuwa udział {share} — dane w {path} zostają, znika tylko eksport.",
+        "target_delete": "Przestaje eksportować {target} — klient, który go używa, traci dysk; {sources} i ich dane zostają.",
+        "snapshot_release": "Zdejmuje ochronę ze snapshotu {snapshot}.",
+        "snapshot_release_reason": "Zdejmuje ochronę ze snapshotu {snapshot} — powód: {reason}",
+        "config_import": "Nadpisuje istniejące elementy ({count}): {items}.",
+        "elastic_create": "Formatuje wybrane dyski i tworzy macierz Elastic {array}.",
+        "elastic_scrub": "Sprawdza pełny checkpoint i zapisuje metadane scrub.",
+        "elastic_fix": "Zapisuje z parity bloki oznaczone przez ostatni scrub, w plikach niezmienionych od ostatniego Sync, na dysku {disk}.",
+        "elastic_fix_number": "Zapisuje z parity bloki oznaczone przez ostatni scrub, w plikach niezmienionych od ostatniego Sync, na dysku danych nr {n}.",
+        "elastic_add_disk": "Formatuje dysk {disk} i dołącza go do działającej macierzy Elastic.",
+        "elastic_add_disk_unnamed": "Formatuje wybrany dysk i dołącza go do działającej macierzy Elastic.",
+        "elastic_add_disk_abort": "Wycofuje niedokończone dodanie dysku, zanim dysk dołączył do udziału; czyści tylko system plików nadany przez to dodanie.",
+        "elastic_destroy": "Zatrzymuje udostępnianie macierzy Elastic i usuwa jej nadzór; dyski zachowują systemy plików i dane.",
+        "elastic_mover_coupled": "Przenosi pliki z cache na dyski danych i uruchamia sprzężony Sync parity.",
+        "elastic_mover_uncoupled": "Przenosi pliki z cache na dyski danych BEZ sprzężonego Sync parity.",
+        "elastic_schedule_arm": "Uzbraja harmonogram: {task}, {cadence}.",
+        "elastic_schedule_keep_off": "Zmienia harmonogram (pozostaje wyłączony): {task}, {cadence}.",
+        "elastic_schedule_rules": "{head} Pliki starsze niż {age}, próg wolnego cache {pct}%, sprzężony Sync: {coupled}.",
+        "task_mover": "mover",
+        "task_sync": "Sync parity",
+        "task_scrub": "scrub parity",
+        "elastic_fix_unnamed": "Zapisuje z parity bloki oznaczone przez ostatni scrub, w plikach niezmienionych od ostatniego Sync, na jednym z dysków danych macierzy."
+      }
     },
     "access": {
       "title": "Dziennik dostępu",
@@ -8709,7 +8802,22 @@
       "created": "Utworzony",
       "key_in_kernel": "Klucz trafia do jądra (configfs). nvmet tworzy go czytelnym dla wszystkich, więc node zawęża prawa pliku do roota i sprawdza wynik — rozbieżność trafia do logu zadania. Na nodzie z dostępem lokalnym traktuj go jak sekret współdzielony z tym nodem.",
       "gone_title": "Tego targetu już nie ma",
-      "gone_detail": "Został usunięty na tym węźle (np. przez innego administratora). Wróć do listy udostępniania."
+      "gone_detail": "Został usunięty na tym węźle (np. przez innego administratora). Wróć do listy udostępniania.",
+      "state_reason": {
+        "kernel_missing": "Jądro tego węzła nie obsługuje targetów {proto}.",
+        "volume_missing": "Wolumen źródłowy nie istnieje — target pozostaje poza jądrem.",
+        "portal_moved_head": "Portal targetu nie jest już tam, gdzie go przypięto. Adres {address} należał do interfejsu {interface} (który ma teraz {current}).",
+        "portal_moved_head_gone": "Portal targetu nie jest już tam, gdzie go przypięto. Adres {address} należał do interfejsu {interface}, którego nie ma już na tym węźle.",
+        "portal_moved_nowhere": "Żaden interfejs tego węzła nie ma już tego adresu.",
+        "portal_moved_reachable": "Teraz jest na {elsewhere}, którego nikt nie wybrał dla tego targetu — eksport jest tam osiągalny.",
+        "portal_moved_silent": "Teraz jest na {elsewhere}. Target nie jest w jądrze, więc pod tym adresem nic nie nasłuchuje — eksport nie jest osiągalny na {elsewhere}.",
+        "portal_moved_tail": "Target pozostaje bez zmian, dopóki administrator nie wybierze portalu ponownie.",
+        "not_exported": "Zapisany, ale węzeł jeszcze go nie eksportuje — zastosuje go następne uzgodnienie.",
+        "no_auth": "Bez uwierzytelniania — lista dozwolonych IQN/NQN to filtr, nie logowanie.",
+        "import_secret_needed": "Po imporcie trzeba ponownie wpisać sekret uwierzytelniania.",
+        "import_all_interfaces": "Ten target był eksportowany na wszystkich interfejsach (0.0.0.0) — wybierz interfejs tego węzła, zanim go włączysz.",
+        "portal_moved_head_no_address": "Portal targetu nie jest już tam, gdzie go przypięto. Adres {address} należał do interfejsu {interface}, który jest na tym węźle, ale nie ma teraz żadnego adresu (łącze wyłączone albo utracona dzierżawa DHCP)."
+      }
     },
     "wizard_target": {
       "title": "Nowy target",
@@ -8807,7 +8915,20 @@
       "portal_interface_gone": "Interfejs {iface} nie ma już na tym nodzie adresu, który portal mógłby związać. Zmiany zapiszesz, ale portal zostaje tam, gdzie był — przenieść go można dopiero po wybraniu innego interfejsu.",
       "portal_drifted": "Portal tego targetu jest na {from}, a interfejs {iface} ma teraz {to}. Target czeka zamrożony — możesz zapisać zmiany bez ruszania portalu albo przenieść go tutaj.",
       "portal_move_confirm": "Przenieś portal na {to} — initiatory zalogowane na starym adresie stracą ścieżkę",
-      "iqn_host_unknown": "‹nazwa hosta noda›"
+      "iqn_host_unknown": "‹nazwa hosta noda›",
+      "kernel": {
+        "protocol_unknown": "„{proto}” nie jest protokołem blokowym obsługiwanym przez ten węzeł",
+        "configfs_present": "{path} jest obecny",
+        "modules_available": "moduły {modules} są dostępne; załaduje je pierwszy target",
+        "modules_missing": "to jądro nie ma modułów {modules} — nie zbudowano go z targetem {proto}",
+        "iser_module_missing": "modułu ib_isert nie ma w drzewie modułów jądra (bez iSER)",
+        "nvmet_rdma_module_missing": "modułu nvmet-rdma nie ma w drzewie modułów jądra (bez NVMe-oF przez RDMA)",
+        "rdma_unavailable": "RDMA nie jest dostępne na tym węźle (szczegóły w podpowiedzi)",
+        "dhchap_available": "CONFIG_NVME_TARGET_AUTH w {path} — DH-HMAC-CHAP dostępne",
+        "dhchap_not_built": "to jądro zbudowano bez CONFIG_NVME_TARGET_AUTH ({path})",
+        "dhchap_not_mentioned": "{path} nie wspomina o CONFIG_NVME_TARGET_AUTH",
+        "kernel_config_missing": "to jądro nie publikuje swojej konfiguracji (brak /proc/config.gz i /boot/config-*), więc obsługi DH-HMAC-CHAP nie da się potwierdzić — kreator nie oferuje tego, czego nie może potwierdzić"
+      }
     },
     "journal_owner": {
       "this_instance": "ta instancja TentaNas",

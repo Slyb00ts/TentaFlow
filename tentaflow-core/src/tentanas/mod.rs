@@ -71,6 +71,110 @@ use crate::db::DbPool;
 
 pub const PACKAGE_ID: &str = "tentanas";
 
+/// A sentence the node says in two forms: codes with parameters, which a
+/// screen words in the reader's language, and the node's own text — what the
+/// log, the database and a tooltip carry. The pattern `store::AlertText`
+/// follows for alerts, for the state details and the parked requests that
+/// are not alerts (wave 6).
+///
+/// It reads as its text (`Deref<Target = str>`, `Display`, `== "…"`), so a
+/// caller that only logs or compares the sentence does not change, and the
+/// codes travel beside it to the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodedText {
+    pub text: String,
+    pub reasons: Vec<tentaflow_protocol::tentanas::NasHealthReason>,
+}
+
+impl CodedText {
+    /// One coded sentence.
+    pub fn new(code: &str, params: &[(&str, String)], text: impl Into<String>) -> Self {
+        Self { text: text.into(), reasons: vec![disks::coded_reason(code, params)] }
+    }
+
+    /// A sentence nobody coded (the node stored it, or a tool wrote it): the
+    /// screen has only the text to show.
+    pub fn uncoded(text: impl Into<String>) -> Self {
+        Self { text: text.into(), reasons: Vec::new() }
+    }
+
+    /// Two parts of one detail, the way the sentences were always joined
+    /// (" · "); an empty part adds nothing.
+    pub fn and(mut self, other: CodedText) -> Self {
+        if other.text.is_empty() && other.reasons.is_empty() {
+            return self;
+        }
+        if self.text.is_empty() {
+            self.text = other.text;
+        } else if !other.text.is_empty() {
+            self.text = format!("{} · {}", self.text, other.text);
+        }
+        self.reasons.extend(other.reasons);
+        self
+    }
+}
+
+impl From<&str> for CodedText {
+    fn from(text: &str) -> Self {
+        Self::uncoded(text)
+    }
+}
+
+impl From<String> for CodedText {
+    fn from(text: String) -> Self {
+        Self::uncoded(text)
+    }
+}
+
+impl From<&String> for CodedText {
+    fn from(text: &String) -> Self {
+        Self::uncoded(text.as_str())
+    }
+}
+
+impl std::ops::Deref for CodedText {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for CodedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl PartialEq<&str> for CodedText {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<str> for CodedText {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<String> for CodedText {
+    fn eq(&self, other: &String) -> bool {
+        &self.text == other
+    }
+}
+
+impl PartialEq<CodedText> for String {
+    fn eq(&self, other: &CodedText) -> bool {
+        *self == other.text
+    }
+}
+
+impl PartialEq<CodedText> for &str {
+    fn eq(&self, other: &CodedText) -> bool {
+        *self == other.text
+    }
+}
+
 /// The instance database, opened on first use.
 pub fn open_db(main_db: &DbPool, org_id: &str, addon_id: &str) -> Result<DbPool> {
     crate::addon::app_db::open(main_db, org_id, addon_id, db::migrate)
@@ -417,5 +521,74 @@ mod tests {
         let without = config_teardown_entries(&|path| path != tentanas_helper::KSMBD_CONF_PATH);
         assert_eq!(without.first().map(|e| e.kind), Some("tentanas_smb_config"));
         assert!(config_teardown_entries(&|_| false).is_empty());
+    }
+
+    /// Every code a `CodedText` of the node is built with, read from the
+    /// source: `CodedText::new("<code>"` and `coded_reason("<code>"` calls.
+    fn codes_in(source: &str, call: &str) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let mut rest = source;
+        while let Some(at) = rest.find(call) {
+            rest = &rest[at + call.len()..];
+            let trimmed = rest.trim_start();
+            if let Some(quoted) = trimmed.strip_prefix('"') {
+                if let Some(end) = quoted.find('"') {
+                    out.insert(quoted[..end].to_string());
+                }
+            }
+        }
+        out
+    }
+
+    fn read(path: &str) -> String {
+        std::fs::read_to_string(format!("{}/{path}", env!("CARGO_MANIFEST_DIR"))).expect(path)
+    }
+
+    /// Wave 6: a coded sentence the node sends and no screen words would
+    /// fall back to the node's English on every screen, silently. Every code
+    /// the node builds for the Elastic state, a target's state, the kernel
+    /// support and a parked request has an entry in the screen that words it
+    /// (`['<code>', …]` in its word table).
+    #[test]
+    fn every_coded_sentence_the_node_sends_has_words_on_its_screen() {
+        let cases = [
+            ("src/tentanas/elastic.rs", "CodedText::new(", vec!["www/js/modules/tentanas/elastic-detail.js"]),
+            (
+                "src/tentanas/targets.rs",
+                "CodedText::new(",
+                vec!["www/js/modules/tentanas/targets.js", "www/js/modules/tentanas/target-wizard.js"],
+            ),
+            ("src/dispatch/tentanas.rs", "CodedText::new(", vec!["www/js/modules/tentanas/approvals.js"]),
+        ];
+        for (rust, call, screens) in cases {
+            let codes = codes_in(&read(rust), call);
+            assert!(codes.len() >= 5, "{rust}: the scan found {codes:?}");
+            let words: String = screens.iter().map(|s| read(s)).collect();
+            for code in &codes {
+                assert!(words.contains(&format!("['{code}',")), "{rust} sends '{code}', and {screens:?} have no words for it");
+            }
+        }
+        // The config import's target reasons and the rdma reasons are built
+        // as bare reasons.
+        let targets_js = read("www/js/modules/tentanas/targets.js") + &read("www/js/modules/tentanas/target-wizard.js");
+        for rust in ["src/tentanas/config_io.rs", "src/tentanas/targets.rs"] {
+            for code in codes_in(&read(rust), "coded_reason(") {
+                assert!(targets_js.contains(&format!("['{code}',")), "{rust} sends '{code}' without words");
+            }
+        }
+        // The codes the database writes with an array's stored sentence.
+        let elastic_js = read("www/js/modules/tentanas/elastic-detail.js");
+        for code in ["operation_failed", "supervision_lost"] {
+            assert!(read("src/tentanas/db.rs").contains(code), "db.rs no longer writes '{code}'");
+            assert!(elastic_js.contains(&format!("['{code}',")), "the array screens have no words for '{code}'");
+        }
+        // The Elastic preview's warnings.
+        let wizard = read("www/js/modules/tentanas/pool-wizard.js");
+        let elastic = read("src/tentanas/elastic.rs");
+        let start = elastic.find("pub fn layout_warning_codes").expect("the warning codes");
+        let end = start + elastic[start..].find("\n}\n").expect("its end");
+        for code in codes_in(&elastic[start..end], "coded_reason(") {
+            assert!(wizard.contains(&format!("['{code}',")), "the preview has no words for '{code}'");
+        }
     }
 }

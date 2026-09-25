@@ -1136,6 +1136,15 @@ pub async fn apply_with(
             } else {
                 String::new()
             },
+            // The same two reasons as codes, which the row keeps while it
+            // stays disabled (`targets::target_state` carries both).
+            state_reasons: if authenticated {
+                vec![super::disks::coded_reason("import_secret_needed", &[])]
+            } else if all_interfaces {
+                vec![super::disks::coded_reason("import_all_interfaces", &[])]
+            } else {
+                Vec::new()
+            },
             created_at: now.clone(),
             updated_at: now,
         };
@@ -1250,12 +1259,18 @@ pub async fn apply_with(
     }
     if document.schedules.smart.enabled {
         let now = chrono::Local::now();
-        let smart = NasSmartSchedule {
-            next_short_at: super::scheduler::next_run_utc(&document.schedules.smart.short, now),
-            next_long_at: super::scheduler::next_run_utc(&document.schedules.smart.long, now),
-            ..document.schedules.smart.clone()
-        };
-        store::set_smart_schedule(&db, &smart)?;
+        let smart = &document.schedules.smart;
+        // The cadences are the document's; the run stamps stay THIS node's
+        // (the document's are another node's runs), and a tick that lands
+        // meanwhile keeps its own (`store::save_smart_schedule`).
+        store::save_smart_schedule(
+            &db,
+            smart.enabled,
+            &smart.short,
+            &smart.long,
+            super::scheduler::next_run_utc(&smart.short, now),
+            super::scheduler::next_run_utc(&smart.long, now),
+        )?;
         handle.log("SMART schedule: written");
         step(handle, &mut done);
     }

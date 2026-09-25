@@ -257,6 +257,71 @@ test('zmiana noda podczas sudo nie wysyła starej mutacji; spóźniony Get nie o
   stale.dispose();
 });
 
+// Wave 6: the array state detail arrives as codes beside the node's English.
+// The n05 card and the n11 pane read the reader's language, name members by
+// kernel name or number (never the slot), and keep the English as the
+// tooltip; a poll that brings a new state patches the same line.
+test('the array state is worded from its codes on the card and the pane, the English only in the tooltip', async () => {
+  const english = 'data disk #1, data disk sdh are present and not mounted yet — the next reconcile mounts them and then the union';
+  const pending = array({
+    state: 'pending',
+    stateDetail: english,
+    stateReasons: [{ code: 'branches_mountable', params: { data: '#1,sdh' } }],
+  });
+  const card = renderedElasticCard(pending);
+  const reason = card.querySelector('.pc-reason');
+  assert.equal(reason.textContent, 'Obecne i jeszcze niezamontowane: dysk danych nr 1, dysk danych sdh. Następne uzgodnienie zamontuje je, a potem unię.');
+  assert.equal(reason.getAttribute('title'), english);
+
+  let current = pending;
+  const { screen, body, poll } = await mountPolled(() => current);
+  try {
+    const line = body.querySelector('[data-f="state-detail"]');
+    assert.match(line.textContent, /^Obecne i jeszcze niezamontowane: dysk danych nr 1, dysk danych sdh\./);
+    assert.equal(line.getAttribute('title'), english);
+    current = array({
+      state: 'error',
+      stateDetail: 'data disk sdh is not on this node — the union stays down',
+      stateReasons: [{ code: 'branches_gone', params: { data: 'sdh', union: 'down' } }],
+    });
+    await poll();
+    assert.equal(body.querySelector('[data-f="state-detail"]'), line, 'the same line, patched');
+    assert.match(line.textContent, /^Brak na tym węźle: dysk danych sdh\. Unia pozostaje odmontowana/);
+    // A sentence the node stored without codes is shown as it came, with no
+    // tooltip repeating it.
+    current = array({ state: 'disabled', enabled: false, stateDetail: 'switched off by the import: the cache disk is not on this node' });
+    await poll();
+    assert.equal(line.textContent, 'switched off by the import: the cache disk is not on this node');
+    assert.equal(line.getAttribute('title'), null);
+  } finally {
+    screen.dispose();
+  }
+});
+
+// Wave-6 critic MINOR 4: a sentence the array's row STORES reaches the
+// screen coded and worded; the stored error is only the (id-filtered)
+// tooltip, and an older uncoded row goes through the id filter too.
+test('a stored array sentence is worded from its code, and an uncoded one never shows an id', () => {
+  const wwn = 'mkfs.xfs failed on /dev/disk/by-id/wwn-0x5000c500a1b2c3d4';
+  const failed = renderedElasticCard(array({
+    state: 'needs_attention', stateDetail: wwn,
+    stateReasons: [{ code: 'operation_failed', params: { operation: 'create' } }],
+  })).querySelector('.pc-reason');
+  assert.equal(failed.textContent, 'Operacja „Tworzenie Elastic Array” nie powiodła się — szczegóły w podpowiedzi.');
+  assert.doesNotMatch(failed.getAttribute('title'), /wwn-0x5000/);
+  assert.match(failed.getAttribute('title'), /^mkfs\.xfs failed on /);
+  const lost = renderedElasticCard(array({
+    state: 'needs_attention', stateDetail: 'Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O',
+    stateReasons: [{ code: 'supervision_lost', params: {} }],
+  })).querySelector('.pc-reason');
+  assert.match(lost.textContent, /^Węzeł stracił nadzór nad operacją tej macierzy/);
+  const unknownOp = renderedElasticCard(array({ state: 'needs_attention', stateDetail: 'x', stateReasons: [{ code: 'operation_failed', params: { operation: 'replace_disk' } }] })).querySelector('.pc-reason');
+  assert.equal(unknownOp.textContent, 'Operacja na tej macierzy nie powiodła się — szczegóły w podpowiedzi.');
+  const old = renderedElasticCard(array({ state: 'needs_attention', stateDetail: wwn })).querySelector('.pc-reason');
+  assert.doesNotMatch(old.textContent, /wwn-0x5000/, 'an uncoded stored sentence goes through the id filter');
+  assert.match(old.textContent, /^mkfs\.xfs failed on /);
+});
+
 test('odpowiedź obcej macierzy i HTML w diagnostyce są bezpiecznie odrzucane/renderowane', async () => {
   const wrong = await mount(array({ name: 'other' }));
   assert.ok(wrong.body.querySelector('tf-alert'));

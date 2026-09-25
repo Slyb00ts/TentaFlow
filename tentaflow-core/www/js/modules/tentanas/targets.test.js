@@ -122,6 +122,28 @@ test('an active target with no authentication carries the reason as a warning ch
   assert.match(targetRow(iscsiTarget({ state: 'error', stateDetail: 'nvmet missing' })).name, /status="err"/);
 });
 
+// Wave 6 (MAJOR 25): the node sends the state detail as codes beside its
+// English; the row reads the reader's language and the English is only the
+// tooltip. A row stored before the codes shows its sentence as it came.
+test('a target\'s state detail is worded from its codes, the node\'s sentence only in the tooltip', () => {
+  const english = 'saved, but this node is not exporting it yet — the next reconcile applies it · no authentication — the IQN/NQN allowlist is a filter, not a login';
+  const pending = iscsiTarget({
+    state: 'pending',
+    auth: { method: 'none' },
+    stateDetail: english,
+    stateReasons: [{ code: 'target_not_exported', params: {} }, { code: 'target_no_auth', params: {} }],
+  });
+  const row = targetRow(pending).name;
+  assert.match(row, /Zapisany, ale węzeł jeszcze go nie eksportuje — zastosuje go następne uzgodnienie\. · Bez uwierzytelniania/);
+  assert.match(row, new RegExp(`title="${english.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`), 'the English is the sub-line tooltip');
+  assert.equal((row.match(/filter, not a login/g) || []).length, 1, 'and never shown as text');
+  // A code this build cannot word leaves the node's sentence on screen.
+  const unknown = targetRow(iscsiTarget({ state: 'error', stateDetail: 'something new', stateReasons: [{ code: 'target_from_the_future', params: {} }] })).name;
+  assert.match(unknown, />something new</);
+  // An older row: the sentence alone.
+  assert.match(targetRow(iscsiTarget({ state: 'error', stateDetail: 'nvmet missing' })).name, />nvmet missing</);
+});
+
 test('the section lists the targets and offers the n12 row actions to an admin', async () => {
   const screen = fakeScreen({});
   const host = document.createElement('div');
@@ -876,7 +898,7 @@ test('the drift banner and the state line come and go with the data, the rest st
     await runPoll(screen);
     const banner = win.querySelector('[data-testid="portal-drift-banner"]');
     assert.ok(banner, 'the drift is shown when the portal address left its interface');
-    assert.match(banner.textContent, /portal moved/);
+    assert.match(banner.textContent, /portal moved/, 'an older row: the node\'s sentence as it came');
     assert.ok(win.querySelector('#nas-td-interfaces'), 'the interfaces to pick from are listed');
     assert.ok(win.querySelector('[data-testid="portal_configured"]') === before.portal, 'the portal row is patched in place');
     assert.equal(before.portal.textContent, '10.10.0.99:3260');
@@ -886,6 +908,61 @@ test('the drift banner and the state line come and go with the data, the rest st
     assert.equal(win.querySelector('[data-testid="portal-drift-banner"]'), null, 'the banner goes when the drift does');
     assert.equal(win.querySelector('#nas-td-interfaces'), null);
     assert.ok(win.querySelector('[data-f="wwn"]') === before.wwn);
+  } finally {
+    screen.dispose();
+  }
+});
+
+// Wave-6 critic MAJOR 2: an interface that is there with no address is not
+// "gone" — three heads for three states, and an older node's rows (no
+// `interface_state`) keep their two.
+test('the drift words tell an interface with no address from a missing one', () => {
+  const drift = (params) => targetRow(iscsiTarget({
+    state: 'error',
+    stateDetail: 'portal moved',
+    stateReasons: [{ code: 'target_portal_moved', params: { address: '10.10.0.7', interface: 'storage1', in_kernel: 'false', ...params } }],
+  })).name;
+  const bare = drift({ interface_state: 'no_address' });
+  assert.match(bare, /należał do interfejsu storage1, który jest na tym węźle, ale nie ma teraz żadnego adresu/);
+  assert.doesNotMatch(bare, /którego nie ma już na tym węźle/);
+  assert.match(drift({ interface_state: 'missing' }), /którego nie ma już na tym węźle/);
+  assert.match(drift({ interface_state: 'addressed', current: '10.10.0.9' }), /\(który ma teraz 10\.10\.0\.9\)/);
+  // An older node: `current` or nothing.
+  assert.match(drift({ current: '10.10.0.9' }), /\(który ma teraz 10\.10\.0\.9\)/);
+  assert.match(drift({}), /którego nie ma już na tym węźle/);
+});
+
+// N19b in the reader's language: the drift banner words the codes the node
+// sends (where the address was, what the interface has now, where it went,
+// whether anything listens there) and keeps the English as the tooltip; the
+// next poll patches the same paragraph.
+test('the drift banner words the portal drift from its codes, N19b', async () => {
+  const english = 'portal 10.10.0.99 is not on storage0 any more — storage0 now has 10.10.0.5, and the address moved to bond0';
+  const moved = (inKernel) => iscsiTarget({
+    state: 'error',
+    portals: [{ interface: 'storage0', address: '10.10.0.99', port: 3260, transport: 'tcp' }],
+    stateDetail: english,
+    stateReasons: [{ code: 'target_portal_moved', params: { address: '10.10.0.99', interface: 'storage0', current: '10.10.0.5', elsewhere: 'bond0', in_kernel: inKernel } }],
+  });
+  const screen = detailScreen([
+    { target: moved('false'), sessions: [], configPreview: '' },
+    { target: moved('true'), sessions: [], configPreview: '' },
+  ]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const detail = win.querySelector('[data-part="drift-detail"] p') || win.querySelector('[data-part="drift-detail"]');
+    const text = () => win.querySelector('[data-testid="portal-drift-banner"]').textContent;
+    assert.match(text(), /Portal targetu nie jest już tam, gdzie go przypięto\. Adres 10\.10\.0\.99 należał do interfejsu storage0 \(który ma teraz 10\.10\.0\.5\)\./);
+    assert.match(text(), /Target nie jest w jądrze, więc pod tym adresem nic nie nasłuchuje — eksport nie jest osiągalny na bond0\./);
+    assert.doesNotMatch(text(), /is not on storage0/);
+    assert.ok(win.querySelector(`[title="${english}"]`), 'the English is the tooltip');
+
+    await runPoll(screen);
+    assert.match(text(), /eksport jest tam osiągalny\./, 'the in-kernel wording after the poll');
+    const again = win.querySelector('[data-part="drift-detail"] p') || win.querySelector('[data-part="drift-detail"]');
+    assert.equal(again, detail, 'the same paragraph, patched');
   } finally {
     screen.dispose();
   }
