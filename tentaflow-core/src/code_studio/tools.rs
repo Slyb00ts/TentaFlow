@@ -3481,6 +3481,51 @@ pub fn restore_factory_version(
     Ok(version_id)
 }
 
+/// The version a new session pins: the graph as it is NOW.
+///
+/// `flow_versions` is written by every edit with the graph as it was BEFORE the
+/// edit, so its newest row is the previous graph, never the current one.
+/// Pinning that row opened every session on the harness from before the last
+/// save — a block the operator had just deleted kept failing their turns. The
+/// newest row is reused when it already holds the live graph; otherwise the live
+/// graph enters the history as a new version, in the same transaction that read
+/// it.
+pub fn pin_current_flow_version(db: &DbPool, flow_id: &str) -> Result<String> {
+    use rusqlite::OptionalExtension;
+    let mut conn = db.write().map_err(|e| anyhow!("core db write: {e}"))?;
+    let tx = conn.transaction()?;
+    let (name, flow_json): (String, String) = tx
+        .query_row(
+            "SELECT name, flow_json FROM flows WHERE id = ?1",
+            rusqlite::params![flow_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| anyhow!("flow '{flow_id}' cannot be read: {e}"))?;
+    let newest: Option<(String, i64, Option<String>)> = tx
+        .query_row(
+            "SELECT id, version_num, flow_json FROM flow_versions WHERE flow_id = ?1 \
+             ORDER BY version_num DESC LIMIT 1",
+            rusqlite::params![flow_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((id, _, Some(json))) = &newest {
+        if *json == flow_json {
+            return Ok(id.clone());
+        }
+    }
+    let version_id = uuid::Uuid::new_v4().to_string();
+    let next = newest.map(|(_, num, _)| num + 1).unwrap_or(1);
+    tx.execute(
+        "INSERT INTO flow_versions \
+            (id, flow_id, version_num, flow_json, name, description, status, created_by) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'session pin', 'active', NULL)",
+        rusqlite::params![version_id, flow_id, next, flow_json, name],
+    )?;
+    tx.commit()?;
+    Ok(version_id)
+}
+
 /// The graph a session actually runs.
 ///
 /// A session is pinned at open time (`sessions.flow_version_id`) and keeps that
@@ -3520,6 +3565,38 @@ pub fn resolve_session_flow(db: &DbPool, session: &SessionRecord) -> Result<Reso
 
 #[cfg(test)]
 mod tests {
+
+    /// A session opened right after an edit runs the edited graph, and opening
+    /// another one without a further edit does not grow the history.
+    #[test]
+    fn a_session_pins_the_graph_as_it_is_now() {
+        let pool = crate::db::init(std::path::Path::new(":memory:")).expect("init db");
+        let flow = crate::db::seed::CODE_HARNESS_FLOW_ID;
+        let live = |pool: &DbPool| -> String {
+            pool.read()
+                .unwrap()
+                .query_row("SELECT flow_json FROM flows WHERE id = ?1", [flow], |r| r.get(0))
+                .unwrap()
+        };
+        // What an edit leaves behind: the history holds the old graph, the
+        // flow row the new one.
+        let edited = live(&pool).replacen("\"nodes\"", "\"edited\":true,\"nodes\"", 1);
+        pool.write()
+            .unwrap()
+            .execute(
+                "UPDATE flows SET flow_json = ?2 WHERE id = ?1",
+                rusqlite::params![flow, edited],
+            )
+            .unwrap();
+
+        let pinned = pin_current_flow_version(&pool, flow).expect("pin");
+        let version = crate::db::repository::get_flow_version(&pool, flow, &pinned)
+            .unwrap()
+            .unwrap();
+        assert_eq!(version.flow_json.as_deref(), Some(edited.as_str()));
+        assert_eq!(pin_current_flow_version(&pool, flow).unwrap(), pinned);
+    }
+
     use super::*;
 
     #[test]

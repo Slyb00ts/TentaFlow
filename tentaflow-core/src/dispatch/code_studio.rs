@@ -2838,17 +2838,9 @@ fn resolve_harness_flow(db: &DbPool) -> Result<(String, String), ProtocolError> 
                 "the Code Studio harness flow is not installed on this node",
             )
         })?;
-    let version = crate::db::repository::list_flow_versions(db, &flow.id)
-        .map_err(|e| db_error("list_flow_versions", e))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "the Code Studio harness flow has no saved version to pin a session to",
-            )
-        })?;
-    Ok((flow.id, version.id))
+    let version_id = tools::pin_current_flow_version(db, &flow.id)
+        .map_err(|e| db_error("pin_current_flow_version", e))?;
+    Ok((flow.id, version_id))
 }
 
 async fn session_close_v1(
