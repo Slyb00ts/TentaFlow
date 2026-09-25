@@ -9,6 +9,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage, transportLabel, transportChipHtml, nodeLabel } from '/js/modules/tentanas/format.js';
 import { setAttr, patchHtml } from '/js/lib/dom-patch.js';
+import { scrubIds } from '/js/modules/tentanas/machine-id.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, warningHtml, NAS_DIALOG, nasRetypeLabel } from '/js/modules/tentanas/dialogs.js';
 import { openShareWizard } from '/js/modules/tentanas/share-wizard.js';
@@ -55,7 +56,7 @@ export const smbDirectChipHtml = (share) => (share.smb?.smbDirect
  */
 export function fleetSummary(share) {
   const mounts = share.mounts || [];
-  const title = mounts.map((m) => `${nodeLabel(m)} ${mountGlyph(m.state)}${m.state === 'mounted' && m.transport ? ` ${transportLabel(m.transport === 'rdma')}` : ''}${m.detail ? ` ${m.detail}` : ''}`).join(' · ');
+  const title = mounts.map((m) => `${nodeLabel(m)} ${mountGlyph(m.state)}${m.state === 'mounted' && m.transport ? ` ${transportLabel(m.transport === 'rdma')}` : ''}${m.detail ? ` ${scrubIds(m.detail, T('alerts.id_hidden'))}` : ''}`).join(' · ');
   if (!share.fleetMount) return { tone: 'neutral', label: T('shares.fleet_off'), title };
   const errors = mounts.filter((m) => m.state === 'error');
   const pending = mounts.filter((m) => m.state === 'pending');

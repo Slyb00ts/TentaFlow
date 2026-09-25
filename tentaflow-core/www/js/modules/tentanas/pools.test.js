@@ -457,7 +457,7 @@ test('"Sync teraz" over an unrepaired fault goes through the confirm that names 
     const syncs = () => screen.calls.filter((c) => c.kind === 'tentaNasElasticArraySyncRequest');
     assert.equal(syncs().length, 0, 'nothing is sent before the confirm');
     const win = document.querySelector('tf-window');
-    assert.match(win.textContent, /zostaną usunięte z content/);
+    assert.match(win.textContent, /nie da się już odtworzyć z parity/);
     typeInto(win.querySelector('#retype-input'), 'media');
     confirmWindow(win);
     await flush();

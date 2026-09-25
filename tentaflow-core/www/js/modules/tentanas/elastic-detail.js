@@ -134,11 +134,13 @@ function unresolvedFixFault(array) {
 
 // Whether a Sync on this array needs the admin's confirm: the node says so
 // (`syncNeedsAcknowledgement`, which carries the helper's own recorded cause),
-// or the history shows an unrepaired Scrub or Repair fault. A Sync over such a
-// fault removes the files the Scrub could not read from the content file —
-// measured on rig11 — so only the confirm that names that cost may send
-// `acknowledgeParityFault`, and the node and its helper refuse the Sync
-// without it.
+// or the history shows an unrepaired Scrub or Repair fault. Measured on rig11
+// (M3, design repository reviews/artifacts/elastic-measurements-2026-09-24): a Sync over such a fault removes nothing from the content file
+// — unchanged files stay repairable, marked blocks and unreadable (EIO) ones
+// alike — but it records files deleted or changed since the last Sync in
+// their new state, damaged ones included, and some cases stay unmeasured. So
+// only the confirm that names that cost may send `acknowledgeParityFault`,
+// and the node and its helper refuse the Sync without it.
 export function syncNeedsAcknowledgement(array) {
   return array?.syncNeedsAcknowledgement === true || Boolean(repairEvidence(array)) || unresolvedFixFault(array);
 }
@@ -248,6 +250,7 @@ export function elasticCardSkeletonHtml(array) {
       <div class="pc-ico">${sprite('cylinder')}</div>
       <div class="pc-meta"><span class="pc-name">${escapeHtml(array.name)}</span>
         <tf-chip dot data-f="state"></tf-chip>
+        <span ${SLOT} data-slot="cache-waiting"></span>
         <tf-chip status="accent" label="Elastic Array"></tf-chip>
         <div class="pc-desc" data-f="desc"></div>
       </div>
@@ -267,7 +270,7 @@ export function elasticCardSkeletonHtml(array) {
         </div>
         <div ${SLOT} data-slot="unmeasured"></div>
       </div>
-      <div class="stat-rows">${rowSkel(T('pools.row_disks'), 'disks')}${rowSkel(T('elastic.mountpoint'), 'mountpoint')}${rowSkel(T('elastic.last_sync'), 'last-sync')}${rowSkel(T('elastic.protection'), 'protection')}</div>
+      <div class="stat-rows">${rowSkel(T('pools.row_disks'), 'disks')}${rowSkel(T('elastic.mountpoint'), 'mountpoint')}${rowSkel(T('elastic.last_sync'), 'last-sync')}${rowSkel(T('elastic.card_mover'), 'mover')}${rowSkel(T('elastic.protection'), 'protection')}</div>
     </div>
     <div ${SLOT} data-slot="reason"></div>
   </div>`;
@@ -319,7 +322,14 @@ export function paintElasticCard(card, array, { admin = false, syncBusy = false 
   setText(field(card, 'disks'), elasticDisksText(array));
   setText(field(card, 'mountpoint'), array.unionPath || '—');
   setText(field(card, 'last-sync'), fmtDate(array.protection?.protectedAsOf));
+  // n05 M9: the mover as n11 states it (moving is automatic; a schedule is
+  // only a window), and the bytes waiting on the cache outside parity as the
+  // head's warning chip — the node's own figure, shown only when non-zero.
+  setText(field(card, 'mover'), moverScheduleValue(array.mover || {}));
   setText(field(card, 'protection'), protectionLabel(array));
+  const waiting = cacheWaitingBytes(array);
+  const waitingChip = slotEl(card.querySelector('[data-slot="cache-waiting"]'), waiting != null, 'chip', '<tf-chip dot status="warn"></tf-chip>');
+  if (waitingChip) setAttr(waitingChip, 'label', T('elastic.card_cache_waiting', { size: fmtOptionalBytes(waiting) }));
 
   const stateDetail = elasticStateDetail(array);
   const reason = slotEl(card.querySelector('[data-slot="reason"]'), Boolean(stateDetail), 'reason', '<div class="pc-reason"></div>');
@@ -450,6 +460,9 @@ function paintDiskCells(host, disks, filesystemOf, repairOf = () => '') {
 /// operation overwrites is that one disk, so the mistake worth making
 /// impossible is repairing the wrong disk of the right array.
 ///
+/// The loss line names the disk by that same kernel name, never by its
+/// branch mountpoint (`…/data/d1` ends in the internal slot name).
+///
 /// The admin retypes the name they SEE on the cell, the kernel name — which
 /// is why the repair is offered only on a member that has one. The request
 /// still addresses the member by its slot (`disk`, echoed in `confirmDisk`,
@@ -460,7 +473,7 @@ function openElasticFixDialog(screen, array, disk, evidence, onDone) {
   const bodyHtml = `
     ${warningHtml('danger', T('elastic.repair_warning', { disk: shown, name: array.name }))}
     <ul class="loss-list">
-      <li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('elastic.repair_loses', { disk: shown, path: disk.mountpoint }))}</span></li>
+      <li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('elastic.repair_loses', { disk: shown }))}</span></li>
       <li class="ll">${sprite('shield')}<span>${escapeHtml(evidence)}</span></li>
     </ul>
     <div class="explain-box">${escapeHtml(T('elastic.repair_explain'))}</div>`;
@@ -633,13 +646,26 @@ function openUndoAddDiskDialog(screen, array, onDone) {
   });
 }
 
+// The mergerfs create policy the node mounts the union with (`mfs`, …), in
+// the reader's words — the code is mergerfs' own shorthand. A policy this
+// build has no words for is shown as the node sent it: truthful, if terse.
+export function createPolicyLabel(policy) {
+  const code = String(policy || '');
+  if (!code) return '';
+  const key = 'elastic.create_policy_' + code;
+  const words = T(key);
+  return words === 'tentanas.' + key ? code : words;
+}
+
 /// A Sync over an unrepaired Scrub or Repair fault (F1). The confirm names
 /// the cost before anything is sent, and it is the ONLY place that sends
 /// `acknowledgeParityFault`: the id of the very fault it showed
 /// (`syncFaultId`), which the node and its helper compare with the fault
-/// the array carries when the Sync runs. Measured on rig11, such a Sync
-/// removes the files the Scrub could not read from the content file, while
-/// the marked blocks stay repairable. Shared by the detail pane and the n05
+/// the array carries when the Sync runs. Measured on rig11 (M3, design
+/// repository reviews/artifacts/elastic-measurements-2026-09-24): marked
+/// blocks and unchanged files the Scrub could not read stay repairable across
+/// such a Sync; what it finalises is the state of files deleted or changed
+/// since the previous Sync, damaged ones included. Shared by the detail pane and the n05
 /// card, so the two "Sync teraz" buttons cannot disagree.
 export function openSyncOverFaultDialog(screen, array, onDone) {
   // One confirm per array at a time: a second click does not open a second
@@ -1187,7 +1213,7 @@ function paneSkeletonHtml(name, admin) {
 // "Ochrona" tile has to lead with (n11: "18 GiB na cache", warning colour).
 // Only an array WITH parity and a cache has such bytes to report; with no
 // parity every byte is outside it and the tile says so in words instead.
-function cacheWaitingBytes(array) {
+export function cacheWaitingBytes(array) {
   const bytes = array.protection?.cacheUnprotectedBytes;
   if (!(array.parityDisks || []).length || !(array.cacheDisks || []).length || !knownBytes(bytes)) return null;
   return Number(bytes) > 0 ? Number(bytes) : null;
@@ -1341,7 +1367,7 @@ export async function drawElasticDetail(screen, body) {
     // confirms by retyping the name on the cell, and "brak dysku" is not a
     // disk anyone can confirm overwriting.
     setText(field(pane, 'union-path'), array.unionPath || '');
-    setText(field(pane, 'create-policy'), array.createPolicy || '');
+    setText(field(pane, 'create-policy'), createPolicyLabel(array.createPolicy));
     // ONE button slot: "Dodaj dysk" on a whole array, "Dokończ dodawanie
     // dysku <name>" while an add stands unfinished — keyed, so a poll keeps
     // whichever is there and only the add starting or ending swaps it.

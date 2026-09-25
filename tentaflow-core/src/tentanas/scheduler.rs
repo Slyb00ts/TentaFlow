@@ -391,13 +391,18 @@ async fn run_due_elastic_tasks(
             // A Sync is admitted on an array that needs attention — that is
             // what gives a failed or interrupted parity run a way out — but the
             // cadence must not take it while a scrub's errors are still
-            // unrepaired. MEASURED on rig11 (snapraid 13.0-1, probe f1-f3): a
-            // Sync leaves a marked block repairable, so the case the repair
-            // exists for survives it; but the files a scrub could NOT read are
-            // removed from the content file by that same Sync, and parity then
-            // holds nothing of them. An admin who is told can weigh that; a
-            // cadence cannot, so it skips, says why in the schedule row, and
-            // raises an alert that repairing clears.
+            // unrepaired. MEASURED on rig11 (snapraid 13.0-1, M3 f1-f4, raw
+            // logs in the design repository's
+            // reviews/artifacts/elastic-measurements-2026-09-24): a Sync leaves
+            // a marked block repairable, and an UNCHANGED file the scrub could
+            // not read (EIO) stays in the content file and `fix -f` restores it
+            // after the Sync. What the Sync does finalise is the state of every
+            // file deleted or changed since the previous Sync, a damaged one
+            // included: its earlier version can no longer be restored from
+            // parity. Unmeasured cases remain (an unreadable file that also
+            // changed; a disk degrading during the Sync). An admin who is told
+            // can weigh that; a cadence cannot, so it skips, says why in the
+            // schedule row, and raises an alert that repairing clears.
             //
             // Only the Sync. A full Scrub writes no parity and is how the array
             // is re-measured, and the mover has its own gate (an unresolved
@@ -424,8 +429,9 @@ async fn run_due_elastic_tasks(
                         "elastic_sync_held",
                         "Zaplanowany Sync wstrzymany: parity zgłasza błędy",
                         "Scrub tej macierzy zgłosił błędy, których nic jeszcze nie naprawiło. Node nie uruchamia \
-                         zaplanowanego Sync, bo usunąłby z content pliki, których scrub nie mógł odczytać. Uruchom \
-                         naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
+                         zaplanowanego Sync, bo zapisałby obecny stan plików usuniętych lub zmienionych od ostatniego \
+                         Sync, także uszkodzonych, i ich wcześniejszych wersji nie dałoby się już odtworzyć z parity. \
+                         Uruchom naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
                     )
                     .param("array", &array.name)
                     // Which fault holds it: counted scrub errors, or a fault
@@ -751,6 +757,9 @@ async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>, disks: Vec<(Stri
     if !smart.enabled {
         return;
     }
+    // What this tick read, so its write-back can tell an admin's save made
+    // in between (`store::record_smart_tick`).
+    let read = smart.clone();
     let mut changed = false;
     // Long pass FIRST. Starting a short test aborts a long one already on the
     // disk, so when both come due in the same tick the long pass — the one
@@ -824,7 +833,7 @@ async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>, disks: Vec<(Stri
         }
     }
     if changed {
-        if let Err(e) = store::set_smart_schedule(db, &smart) {
+        if let Err(e) = store::record_smart_tick(db, &read, &smart) {
             tracing::warn!("tentanas scheduler: SMART schedule not saved: {e}");
         }
     }
@@ -1168,11 +1177,12 @@ mod tests {
     /// The admission rule that unblocked the repair (`parity_admission`) admits
     /// a Sync on an array that needs attention — deliberately, because a failed
     /// or interrupted parity run must have a way out. The cadence must not take
-    /// that way out by itself. MEASURED on rig11 (snapraid 13.0-1, probe f1-f3):
-    /// a Sync leaves a marked block repairable, so what it costs is the other
-    /// half of a scrub's report — the files the scrub could not read, which the
-    /// Sync removes from the content file, after which parity holds nothing of
-    /// them. An admin who is told can weigh that; a cadence cannot.
+    /// that way out by itself. MEASURED on rig11 (snapraid 13.0-1, M3 f1-f4,
+    /// design repository reviews/artifacts/elastic-measurements-2026-09-24): a Sync removes nothing from the content file — unchanged files
+    /// stay repairable, marked blocks and unreadable (EIO) files alike. What it
+    /// costs is the earlier version of every file deleted or changed since the
+    /// previous Sync, a damaged one included, and some cases stay unmeasured.
+    /// An admin who is told can weigh that; a cadence cannot.
     #[tokio::test]
     async fn a_scheduled_sync_skips_an_array_whose_scrub_reported_errors() {
         use tentanas_helper::elastic::{ElasticSnapraidKind as Kind, ElasticSnapraidOutcome as Outcome};

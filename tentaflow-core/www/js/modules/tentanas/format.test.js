@@ -80,27 +80,23 @@ test('refusedBatchNames names the disks, never a disk id', () => {
 // (never the disk rule) — an unresolved account's UUID is hidden, but a
 // display name shaped like a disk id (this can't happen for a real account,
 // but the routing must not accidentally hide one if it ever did) stays text.
-test('jobAuthor hides an opaque id (UUID, long GUID, 64-hex) behind "nieznane konto"', () => {
+test('jobAuthor hides an opaque id (UUID, long GUID, 64-hex) behind "nieznane konto", with no tooltip', () => {
   const ids = ['3fa85f64-5717-4562-b3fc-2c963f66afa6', '1283746501928374650', 'a'.repeat(64)];
   for (const id of ids) {
-    const { label, title } = jobAuthor(id);
-    assert.equal(label, 'nieznane konto', `${id} must read as an unknown account`);
-    assert.equal(title, id);
+    const author = jobAuthor(id);
+    assert.deepEqual(author, { label: 'nieznane konto' }, `${id} must read as an unknown account and go nowhere else`);
   }
 });
 
 test('jobAuthor never hides a disk-id-shaped or short-digit display name', () => {
   for (const name of ['dev-backups', 'usb-backup', 'pci-store', '2024', 'sn-archive']) {
-    const { label, title } = jobAuthor(name);
-    assert.equal(label, name, `${name} is not an opaque id, so it stays the label`);
-    assert.equal(title, '');
+    assert.deepEqual(jobAuthor(name), { label: name }, `${name} is not an opaque id, so it stays the label`);
   }
 });
 
 test('jobAuthor keeps the system authors translated, with no tooltip', () => {
-  assert.equal(jobAuthor('scheduler').label, 'harmonogram');
-  assert.equal(jobAuthor('scheduler').title, '');
-  assert.equal(jobAuthor('startup').title, '');
+  assert.deepEqual(jobAuthor('scheduler'), { label: 'harmonogram' });
+  assert.deepEqual(jobAuthor('startup'), { label: 'start noda' });
 });
 
 // ----- Health reasons worded from the node's codes ---------------------------
@@ -358,10 +354,19 @@ test('a disk health alert is worded from its grade, its name and its reason code
   assert.deepEqual(alertText(live), {
     title: 'sde: ZFS wyłączył dysk jako uszkodzony (FAULTED)',
     detail: '3 realokowane sektory',
+    // No pool and no advice on the alert: the node sent neither.
+    place: '',
+    advice: '',
+    copies: [],
     tooltip: 'Disk sde: critical — ZFS reports this disk FAULTED; 3 reallocated sectors',
     known: true,
     nodeText: false,
   });
+  // With them, as disks.rs `HealthAlertPlace` writes them.
+  const placed = alertText({ ...live, params: { ...live.params, pool: 'tank', layout: 'raidz2', advice: 'replace' } });
+  assert.equal(placed.place, 'tank · RAIDZ2');
+  assert.equal(placed.advice, 'zaplanuj wymianę dysku');
+  assert.equal(alertText({ ...live, params: { ...live.params, advice: 'maybe' } }).advice, '', 'only the one advice the node sends');
   const growing = A('disk_health', { health: 'warning', name: 'sdd', name_source: 'live' }, {
     reasons: [R('reallocated_growing', { from: '5', to: '8' }), R('temperature_high', { celsius: '54', limit: '50' })],
   });
@@ -426,7 +431,7 @@ test('the node text of an alert carries no id: a placeholder, or the node\'s nam
 });
 
 test('an unknown code, an old uncoded row or broken parameters fall back to a translated generic alert', () => {
-  const generic = { title: 'Alert węzła', detail: 'Pełny alert jest w treści węzła — ta wersja nie ma jego tłumaczenia', known: false, nodeText: true };
+  const generic = { title: 'Alert węzła', detail: 'Pełny alert jest w treści węzła — ta wersja nie ma jego tłumaczenia', place: '', advice: '', copies: [], known: false, nodeText: true };
   // A row from an older node: no code, no params, no reasons at all.
   const old = { alertId: 'a1', severity: 'warning', subjectKind: 'elastic-array', subjectId: 'media', title: 'Macierz wymaga interwencji', detail: 'x' };
   assert.deepEqual(alertText(old), { ...generic, tooltip: 'Macierz wymaga interwencji — x' });

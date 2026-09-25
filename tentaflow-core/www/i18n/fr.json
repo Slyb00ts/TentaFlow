@@ -5391,7 +5391,8 @@
       "by_unknown_account": "compte inconnu",
       "subject_last_known": "vu pour la dernière fois comme {name}",
       "smart_batch_refused": "Test SMART non lancé sur {n} {n|disque|disques|disques} : {disks}",
-      "kind_elastic_add_disk_abort": "Annulation de l’ajout d’un disque de données à un Elastic Array"
+      "kind_elastic_add_disk_abort": "Annulation de l’ajout d’un disque de données à un Elastic Array",
+      "subject_unknown_disk": "disque inconnu"
     },
     "danger": {
       "retype": "Saisissez {name} pour confirmer :",
@@ -5415,7 +5416,7 @@
       "repair_confirm": "Réparer les blocs marqués ({disk})",
       "repair_done": "Réparation du disque {disk} acceptée. Vérifiez le résultat de la tâche.",
       "repair_warning": "La réparation ne réécrit que les blocs que le dernier Scrub a marqués comme erronés, et uniquement dans les fichiers inchangés depuis le dernier Sync. Elle porte sur toute la matrice {name} et pas sur le seul disque {disk} : elle ne restaure pas les fichiers manquants et n’annule pas les écritures postérieures au dernier Sync.",
-      "repair_loses": "{disk} ({path}) — les blocs marqués seront réécrits avec le contenu du dernier point de contrôle de parité",
+      "repair_loses": "{disk} — les blocs marqués seront réécrits avec le contenu du dernier point de contrôle de parité",
       "repair_explain": "Une réparation n’écrit aucun nouveau point de contrôle de parité et ne formate rien. Si le Scrub n’a marqué aucun bloc, la réparation n’écrit rien et s’achève sur « Rien n’a été réparé » : c’est alors un Sync qu’il faut lancer. La matrice reste disponible et la tâche peut durer de nombreuses heures.",
       "repair_none": "La matrice ne signale aucune panne de disque ni erreur de parité. Lancez un scrub pour détecter les dommages.",
       "repair_not_ready": "Une réparation exige une matrice activée, active ou nécessitant une intervention.",
@@ -5616,11 +5617,11 @@
       "next_steps": "Étapes suivantes",
       "step_repair": "Réparez depuis la parité les blocs que le scrub a marqués comme défectueux.",
       "step_scrub": "Lancez un scrub pour vérifier s’il reste quelque chose à réparer.",
-      "step_sync": "Lancez une synchronisation — elle exige une confirmation, car elle retire du fichier content les fichiers que le scrub n’a pas pu lire.",
+      "step_sync": "Lancez une synchronisation — elle exige une confirmation, car elle enregistre l’état actuel des fichiers supprimés ou modifiés depuis la dernière synchronisation.",
       "sync_fault_title": "Synchronisation malgré une erreur non corrigée dans la grappe {name}",
       "sync_fault_warning": "La grappe {name} a une erreur de scrub ou de réparation non corrigée. La synchronisation écrit malgré tout un nouveau point de contrôle de parité.",
-      "sync_fault_loses": "Les fichiers que le scrub n’a pas pu lire seront retirés du fichier content — la parité ne les couvrira plus.",
-      "sync_fault_keeps": "Les blocs marqués par le scrub restent réparables par une réparation depuis la parité.",
+      "sync_fault_loses": "Les fichiers supprimés ou modifiés depuis la dernière synchronisation, y compris les fichiers endommagés, seront enregistrés dans leur nouvel état — leurs versions antérieures ne pourront plus être restaurées depuis la parité.",
+      "sync_fault_keeps": "Les blocs marqués des fichiers inchangés, ainsi que les fichiers inchangés que le scrub n’a pas pu lire, restent réparables depuis la parité.",
       "sync_fault_explain": "Lancez d’abord la réparation depuis la parité si elle est disponible, puis un scrub. La synchronisation est la bonne étape lorsque les erreurs concernent des fichiers modifiés depuis la dernière synchronisation.",
       "sync_fault_retype": "Saisissez à nouveau le nom de la grappe pour confirmer :",
       "sync_fault_confirm": "Synchroniser malgré l’erreur",
@@ -5645,7 +5646,16 @@
       "add_disk_undo_done": "L’annulation de l’ajout du disque a été acceptée. Vérifiez le résultat de la tâche.",
       "add_disk_undo_unavailable": "Le disque a peut-être déjà rejoint le partage — l’ajout ne peut qu’être terminé.",
       "repair_add_pending": "la grappe a un ajout de disque inachevé : terminez-le ou annulez-le d’abord",
-      "repair_needs_restore": "la grappe attend la restauration de ses montages : utilisez d’abord « Restaurer les montages »"
+      "repair_needs_restore": "la grappe attend la restauration de ses montages : utilisez d’abord « Restaurer les montages »",
+      "create_policy_mfs": "le plus d’espace libre",
+      "create_policy_epmfs": "le plus d’espace libre sur un chemin existant",
+      "create_policy_ff": "premier disque avec de la place",
+      "create_policy_lfs": "le moins d’espace libre",
+      "create_policy_epff": "premier disque avec le chemin existant",
+      "create_policy_rand": "disque au hasard",
+      "create_policy_msplfs": "le moins d’espace libre sur le plus long chemin existant",
+      "card_mover": "Déplacement depuis le cache",
+      "card_cache_waiting": "{size} sur le cache sans parité"
     },
     "wizard_pool": {
       "elastic_data": "Disques de données",
@@ -5731,7 +5741,12 @@
       "spare_sub": "hot-spare du pool {pool}",
       "erase_warning_none": "Les données des disques sélectionnés seront définitivement effacées.",
       "sum_layout_value": "{layout} · {n} × {size} ({disks})",
-      "loss_erased": "les données seront effacées"
+      "loss_erased": "les données seront effacées",
+      "plan_warning_mixed_sizes": "Disques de tailles différentes ({smallest} … {largest}) : chaque vdev est dimensionné sur le plus petit disque, la capacité supplémentaire des plus grands reste inutilisée.",
+      "plan_warning_mixed_media": "SSD et HDD mélangés : le vdev fonctionne à la vitesse de son membre le plus lent.",
+      "plan_warning_unhealthy_disks": "SMART signale un problème sur {disks} : un pool créé sur un disque déjà défaillant démarre dégradé.",
+      "plan_warning_single_disk": "Un seul disque n’a aucune redondance : toute panne fait perdre le pool.",
+      "plan_warning_odd_mirror": "Un miroir associe les disques deux à deux, donc dans une sélection impaire un disque reste inutilisé."
     },
     "pools": {
       "title": "Pools sur le nœud {node}",
@@ -5889,7 +5904,9 @@
       "trim_start_done": "TRIM du pool {name} lancé",
       "trim_suspend_done": "TRIM du pool {name} suspendu",
       "trim_resume_done": "TRIM du pool {name} repris",
-      "trim_cancel_done": "TRIM du pool {name} annulé"
+      "trim_cancel_done": "TRIM du pool {name} annulé",
+      "leaf_last_known": "disque absent (vu en dernier comme {name})",
+      "leaf_missing_at": "disque absent n° {n}"
     },
     "props": {
       "title": "Propriétés du pool",
@@ -5918,7 +5935,6 @@
       "removes": "À supprimer",
       "fs": "Système de fichiers {type}",
       "fs_label": "Étiquette {label}",
-      "fs_uuid": "UUID {uuid}",
       "mounted_at": "Monté sur {paths}",
       "nothing": "Ce disque ne signale aucune signature : il n'y a rien à supprimer.",
       "bad_plan": "Réponse du plan incomplète ou incohérente. Effacement bloqué.",
@@ -5943,7 +5959,9 @@
       "done": "Pool {name} détruit",
       "snapshots": "{n} {n|snapshot|snapshots|snapshots}",
       "explain_others": " ainsi que les vdev {roles}",
-      "retype": "Retapez le nom du pool pour confirmer :"
+      "retype": "Retapez le nom du pool pour confirmer :",
+      "share_stops": "le partage {protocol} « {name} » cessera de fonctionner",
+      "target_stops": "la cible {protocol} « {name} » cessera de fonctionner"
     },
     "add_vdev": {
       "title": "Ajouter un vdev à {name}",
@@ -5978,7 +5996,8 @@
       "free_sub": "S/N {serial} · non attribué · sera effacé avant utilisation",
       "explain_pick": "Choisissez un disque de remplacement pour voir le plan.",
       "start": "Démarrer le remplacement",
-      "resilver_progress": "resilver {pct}% · reste {eta}"
+      "resilver_progress": "resilver {pct}% · reste {eta}",
+      "done_detail_spare": "Resilver terminé — {new} a repris les données de {device}, mais {device} reste dans la configuration du pool tant qu’il n’est pas détaché (zpool detach). Cette version de TentaNas ne le fait pas encore : ne retirez pas le disque avant qu’il soit détaché."
     },
     "elastic_import": {
       "title": "Importer un Elastic Array",
@@ -6669,7 +6688,8 @@
           "title_unnamed": "Disque : {grade}",
           "title_live_reason": "{name} : {reason}",
           "title_last_known_reason": "Disque vu pour la dernière fois comme {name} : {reason}",
-          "title_unnamed_reason": "Disque : {reason}"
+          "title_unnamed_reason": "Disque : {reason}",
+          "advice_replace": "planifiez le remplacement du disque"
         },
         "approval_pending": {
           "title": "{operation} « {subject} » attend un second administrateur",
@@ -6678,8 +6698,8 @@
         },
         "elastic_sync_held": {
           "title": "Matrice {array} : Sync planifié suspendu, la parité signale des erreurs",
-          "detail": "Un scrub a signalé des erreurs que rien n'a encore réparées. Un Sync planifié retirerait du fichier content les fichiers que le scrub n'a pas pu lire. Lancez la réparation depuis la parité, puis un scrub ; le Sync manuel reste disponible.",
-          "detail_fault": "Le scrub ne s’est pas terminé correctement ou une réparation a échoué. La synchronisation planifiée retirerait du fichier content les fichiers que le scrub n’a pas pu lire ; elle exige donc une confirmation sur l’écran de la grappe. Lancez un scrub ou la réparation depuis la parité ; une synchronisation manuelle reste disponible après confirmation."
+          "detail": "Un scrub a signalé des erreurs que rien n'a encore réparées. Un Sync planifié enregistrerait l'état actuel des fichiers supprimés ou modifiés depuis le dernier Sync, y compris les fichiers endommagés, et leurs versions antérieures ne pourraient plus être restaurées depuis la parité. Lancez la réparation depuis la parité, puis un scrub ; le Sync manuel reste disponible.",
+          "detail_fault": "Le scrub ne s’est pas terminé correctement ou une réparation a échoué. La synchronisation planifiée enregistrerait l’état actuel des fichiers supprimés ou modifiés depuis la dernière synchronisation, y compris les fichiers endommagés ; elle exige donc une confirmation sur l’écran de la grappe. Lancez un scrub ou la réparation depuis la parité ; une synchronisation manuelle reste disponible après confirmation."
         },
         "elastic_mover_settle_stopped": {
           "title": "Matrice {array} : achèvement automatique du déplacement suspendu",
@@ -6699,7 +6719,10 @@
           "detail": "Un déplacement interrompu a laissé deux versions de fichiers et aucune n'a été supprimée. Comparez-les et supprimez celle en trop ; l'alerte disparaîtra quand il n'en restera qu'une.",
           "file_quarantine": "{path} : version visible {visible}, l’autre est une copie en quarantaine sur le disque de cache {disk}",
           "file_data": "{path} : version visible {visible}, l’autre est au même chemin sur le disque de données {disk}",
-          "file_branch": "{path} : version visible {visible}, l’autre est sur l’un des disques de la matrice"
+          "file_branch": "{path} : version visible {visible}, l’autre est sur l’un des disques de la matrice",
+          "copy_kept": "Copier le chemin de l’autre version : {path}",
+          "copied": "Chemin de l’autre version de {path} copié",
+          "copy_failed": "Impossible de copier le chemin — le navigateur n’a pas autorisé l’accès au presse-papiers"
         },
         "elastic_needs_attention": {
           "title": "La matrice {array} nécessite une intervention",
@@ -7141,7 +7164,8 @@
       "head_versions": "TentaNas : {list}",
       "chip_services_down_list": "Services arrêtés : {list}",
       "chip_services_unknown": "Services : aucune réponse de {nodes}",
-      "chip_services_none": "Aucun service de partage"
+      "chip_services_none": "Aucun service de partage",
+      "not_answered_hint": "Inconnu : la liste des partages de ce nœud n’a pas pu être lue (pas de réponse ou une erreur). Le nombre apparaîtra dès que le nœud répondra."
     },
     "node": {
       "head_sub_node": "nœud {name}",
@@ -7243,7 +7267,7 @@
       "op_elastic_schedule": "Armer une planification Elastic",
       "op_elastic_add_disk_abort": "Elastic Array · Annulation de l’ajout d’un disque",
       "detail_elastic_sync": "Écrit un nouveau point de contrôle de parité et de content.",
-      "detail_elastic_sync_over_fault": "Écrit un nouveau point de contrôle de parité et de content. ATTENTION : la grappe a une erreur de scrub ou de réparation non corrigée. Les blocs marqués restent réparables, mais les fichiers que le scrub n’a pas pu lire seront retirés du fichier content et la parité ne les couvrira plus. Lancez d’abord la réparation depuis la parité."
+      "detail_elastic_sync_over_fault": "ATTENTION : la grappe a une erreur de scrub ou de réparation non corrigée. La synchronisation enregistre l’état actuel des fichiers. Les blocs marqués des fichiers inchangés, ainsi que les fichiers inchangés que le scrub n’a pas pu lire, restent réparables — mais les fichiers supprimés ou modifiés depuis la dernière synchronisation, y compris les fichiers endommagés, seront enregistrés dans leur nouvel état et leurs versions antérieures ne pourront plus être restaurées depuis la parité. Lancez d’abord la réparation."
     },
     "access": {
       "title": "Journal d'accès",
@@ -7550,7 +7574,8 @@
       "elastic_array_not_ready": "La grappe doit être activée et active, ou demander une intervention",
       "elastic_add_stopped": "L’ajout du disque s’est arrêté avant la fin — terminez-le ou annulez-le sur l’écran de la grappe",
       "elastic_undo_stopped": "L’annulation de l’ajout s’est arrêtée après sa première étape — l’ajout reste inachevé",
-      "elastic_disk_absent": "Le disque qui serait effacé n’est pas présent sur ce nœud — rebranchez-le et réessayez"
+      "elastic_disk_absent": "Le disque qui serait effacé n’est pas présent sur ce nœud — rebranchez-le et réessayez",
+      "job_not_cancellable": "Cette tâche ne peut pas être annulée — l’arrêter n’arrêterait pas le travail déjà commencé"
     }
   },
   "agent_accounts": {

@@ -5391,7 +5391,8 @@
       "by_unknown_account": "cuenta desconocida",
       "subject_last_known": "visto por última vez como {name}",
       "smart_batch_refused": "Prueba SMART no iniciada en {n} {n|disco|discos|discos}: {disks}",
-      "kind_elastic_add_disk_abort": "Deshacer la adición de un disco de datos a un Elastic Array"
+      "kind_elastic_add_disk_abort": "Deshacer la adición de un disco de datos a un Elastic Array",
+      "subject_unknown_disk": "disco desconocido"
     },
     "danger": {
       "retype": "Escribe {name} para confirmar:",
@@ -5415,7 +5416,7 @@
       "repair_confirm": "Reparar los bloques marcados ({disk})",
       "repair_done": "Reparación del disco {disk} aceptada. Comprueba el resultado del trabajo.",
       "repair_warning": "La reparación solo reescribe los bloques que el último Scrub marcó como erróneos, y solo en archivos sin cambios desde el último Sync. Abarca toda la matriz {name} y no únicamente el disco {disk}: no restaura archivos que falten ni deshace los cambios escritos después del último Sync.",
-      "repair_loses": "{disk} ({path}) — los bloques marcados se sobrescribirán con el contenido del último punto de control de paridad",
+      "repair_loses": "{disk} — los bloques marcados se sobrescribirán con el contenido del último punto de control de paridad",
       "repair_explain": "Una reparación no escribe un punto de control de paridad nuevo y no formatea nada. Si el Scrub no marcó ningún bloque, la reparación no escribe nada y termina como «No se reparó nada»: entonces lo que hay que lanzar es un Sync. La matriz sigue disponible y el trabajo puede durar muchas horas.",
       "repair_none": "La matriz no informa de ningún fallo de disco ni de errores de paridad. Ejecuta un scrub para detectar daños.",
       "repair_not_ready": "La reparación requiere una matriz habilitada que esté activa o que requiera atención.",
@@ -5616,11 +5617,11 @@
       "next_steps": "Siguientes pasos",
       "step_repair": "Repare desde la paridad los bloques que el scrub marcó como erróneos.",
       "step_scrub": "Ejecute un scrub para comprobar si queda algo por reparar.",
-      "step_sync": "Ejecute una sincronización — requiere confirmación, porque elimina del archivo content los archivos que el scrub no pudo leer.",
+      "step_sync": "Ejecute una sincronización — requiere confirmación, porque registra el estado actual de los archivos eliminados o modificados desde la última sincronización.",
       "sync_fault_title": "Sincronización pese a un error sin corregir en la matriz {name}",
       "sync_fault_warning": "La matriz {name} tiene un error de scrub o de reparación sin corregir. La sincronización escribe igualmente un nuevo punto de control de paridad.",
-      "sync_fault_loses": "Los archivos que el scrub no pudo leer se eliminarán del archivo content — la paridad dejará de cubrirlos.",
-      "sync_fault_keeps": "Los bloques marcados por el scrub siguen siendo reparables con una reparación desde la paridad.",
+      "sync_fault_loses": "Los archivos eliminados o modificados desde la última sincronización, también los dañados, quedarán registrados en su nuevo estado — sus versiones anteriores ya no podrán restaurarse desde la paridad.",
+      "sync_fault_keeps": "Los bloques marcados de archivos sin cambios, y los archivos sin cambios que el scrub no pudo leer, siguen siendo reparables desde la paridad.",
       "sync_fault_explain": "Ejecute primero la reparación desde la paridad si está disponible y después un scrub. La sincronización es el paso correcto cuando los errores afectan a archivos cambiados desde la última sincronización.",
       "sync_fault_retype": "Vuelva a escribir el nombre de la matriz para confirmar:",
       "sync_fault_confirm": "Sincronizar pese al error",
@@ -5645,7 +5646,16 @@
       "add_disk_undo_done": "Se aceptó deshacer la adición del disco. Compruebe el resultado de la tarea.",
       "add_disk_undo_unavailable": "Es posible que el disco ya se haya unido al recurso compartido — la adición solo puede terminarse.",
       "repair_add_pending": "la matriz tiene una adición de disco sin terminar: termínela o deshágala primero",
-      "repair_needs_restore": "la matriz espera la restauración de sus montajes: use primero «Restaurar montajes»"
+      "repair_needs_restore": "la matriz espera la restauración de sus montajes: use primero «Restaurar montajes»",
+      "create_policy_mfs": "más espacio libre",
+      "create_policy_epmfs": "más espacio libre en una ruta existente",
+      "create_policy_ff": "primer disco con espacio",
+      "create_policy_lfs": "menos espacio libre",
+      "create_policy_epff": "primer disco con la ruta existente",
+      "create_policy_rand": "disco aleatorio",
+      "create_policy_msplfs": "menos espacio libre en la ruta existente más larga",
+      "card_mover": "Traslado desde la caché",
+      "card_cache_waiting": "{size} en la caché sin paridad"
     },
     "wizard_pool": {
       "elastic_data": "Discos de datos",
@@ -5731,7 +5741,12 @@
       "spare_sub": "hot-spare del pool {pool}",
       "erase_warning_none": "Los datos de los discos seleccionados se borrarán de forma irreversible.",
       "sum_layout_value": "{layout} · {n} × {size} ({disks})",
-      "loss_erased": "los datos se borrarán"
+      "loss_erased": "los datos se borrarán",
+      "plan_warning_mixed_sizes": "Discos de distinto tamaño ({smallest} … {largest}): cada vdev se dimensiona según el disco más pequeño, así que la capacidad adicional de los mayores queda sin usar.",
+      "plan_warning_mixed_media": "SSD y HDD mezclados: el vdev funciona a la velocidad de su miembro más lento.",
+      "plan_warning_unhealthy_disks": "SMART advierte sobre {disks}: un pool creado sobre un disco que ya está fallando arranca degradado.",
+      "plan_warning_single_disk": "Un solo disco no tiene redundancia: cualquier fallo hace perder el pool.",
+      "plan_warning_odd_mirror": "Un mirror empareja los discos de dos en dos, así que en una selección impar un disco queda sin usar."
     },
     "pools": {
       "title": "Pools en el nodo {node}",
@@ -5889,7 +5904,9 @@
       "trim_start_done": "TRIM del pool {name} iniciado",
       "trim_suspend_done": "TRIM del pool {name} suspendido",
       "trim_resume_done": "TRIM del pool {name} reanudado",
-      "trim_cancel_done": "TRIM del pool {name} cancelado"
+      "trim_cancel_done": "TRIM del pool {name} cancelado",
+      "leaf_last_known": "falta el disco (visto por última vez como {name})",
+      "leaf_missing_at": "falta el disco n.º {n}"
     },
     "props": {
       "title": "Propiedades del pool",
@@ -5918,7 +5935,6 @@
       "removes": "Se eliminará",
       "fs": "Sistema de archivos {type}",
       "fs_label": "Etiqueta {label}",
-      "fs_uuid": "UUID {uuid}",
       "mounted_at": "Montado en {paths}",
       "nothing": "Este disco no informa de ninguna firma: no hay nada que eliminar.",
       "bad_plan": "Respuesta del plan incompleta o incoherente. Borrado bloqueado.",
@@ -5943,7 +5959,9 @@
       "done": "Pool {name} destruido",
       "snapshots": "{n} {n|snapshot|snapshots|snapshots}",
       "explain_others": " y los vdev {roles}",
-      "retype": "Vuelve a escribir el nombre del pool para confirmar:"
+      "retype": "Vuelve a escribir el nombre del pool para confirmar:",
+      "share_stops": "el recurso compartido {protocol} «{name}» dejará de funcionar",
+      "target_stops": "el target {protocol} «{name}» dejará de funcionar"
     },
     "add_vdev": {
       "title": "Añadir vdev a {name}",
@@ -5978,7 +5996,8 @@
       "free_sub": "S/N {serial} · sin asignar · se borrará antes de usarlo",
       "explain_pick": "Elige un disco sustituto para ver el plan de sustitución.",
       "start": "Iniciar la sustitución",
-      "resilver_progress": "resilver {pct}% · quedan {eta}"
+      "resilver_progress": "resilver {pct}% · quedan {eta}",
+      "done_detail_spare": "Resilver terminado: {new} ha asumido los datos de {device}, pero {device} sigue en la configuración del pool hasta que se desvincule (zpool detach). Esta versión de TentaNas aún no lo hace: no retire el disco antes de desvincularlo."
     },
     "elastic_import": {
       "title": "Importar un Elastic Array",
@@ -6669,7 +6688,8 @@
           "title_unnamed": "Disco: {grade}",
           "title_live_reason": "{name}: {reason}",
           "title_last_known_reason": "Disco visto por última vez como {name}: {reason}",
-          "title_unnamed_reason": "Disco: {reason}"
+          "title_unnamed_reason": "Disco: {reason}",
+          "advice_replace": "planifique la sustitución del disco"
         },
         "approval_pending": {
           "title": "{operation} «{subject}» espera a un segundo administrador",
@@ -6678,8 +6698,8 @@
         },
         "elastic_sync_held": {
           "title": "Matriz {array}: Sync programado detenido, la paridad informa de errores",
-          "detail": "Un scrub informó de errores que nada ha reparado todavía. Un Sync programado quitaría del archivo content los archivos que el scrub no pudo leer. Ejecuta la reparación desde la paridad y después un scrub; el Sync manual sigue disponible.",
-          "detail_fault": "El scrub no terminó correctamente o una reparación falló. La sincronización programada eliminaría del archivo content los archivos que el scrub no pudo leer, así que requiere confirmación en la pantalla de la matriz. Ejecute un scrub o la reparación desde la paridad; la sincronización manual sigue disponible tras la confirmación."
+          "detail": "Un scrub informó de errores que nada ha reparado todavía. Un Sync programado registraría el estado actual de los archivos eliminados o modificados desde el último Sync, también los dañados, y sus versiones anteriores ya no podrían restaurarse desde la paridad. Ejecuta la reparación desde la paridad y después un scrub; el Sync manual sigue disponible.",
+          "detail_fault": "El scrub no terminó correctamente o una reparación falló. La sincronización programada registraría el estado actual de los archivos eliminados o modificados desde la última sincronización, también los dañados, así que requiere confirmación en la pantalla de la matriz. Ejecute un scrub o la reparación desde la paridad; la sincronización manual sigue disponible tras la confirmación."
         },
         "elastic_mover_settle_stopped": {
           "title": "Matriz {array}: finalización automática del movimiento en pausa",
@@ -6699,7 +6719,10 @@
           "detail": "Un movimiento interrumpido dejó dos versiones de archivos y ninguna se eliminó. Compáralas y elimina la sobrante; la alerta desaparecerá cuando quede una.",
           "file_quarantine": "{path}: versión visible {visible}, la otra es una copia en cuarentena en el disco de caché {disk}",
           "file_data": "{path}: versión visible {visible}, la otra está en la misma ruta en el disco de datos {disk}",
-          "file_branch": "{path}: versión visible {visible}, la otra está en uno de los discos de la matriz"
+          "file_branch": "{path}: versión visible {visible}, la otra está en uno de los discos de la matriz",
+          "copy_kept": "Copiar la ruta de la otra versión: {path}",
+          "copied": "Se copió la ruta de la otra versión de {path}",
+          "copy_failed": "No se pudo copiar la ruta: el navegador no permitió el acceso al portapapeles"
         },
         "elastic_needs_attention": {
           "title": "La matriz {array} requiere intervención",
@@ -7141,7 +7164,8 @@
       "head_versions": "TentaNas: {list}",
       "chip_services_down_list": "Servicios detenidos: {list}",
       "chip_services_unknown": "Servicios: sin respuesta de {nodes}",
-      "chip_services_none": "Sin servicios de compartición"
+      "chip_services_none": "Sin servicios de compartición",
+      "not_answered_hint": "Desconocido: no se pudo leer la lista de recursos compartidos de este nodo (sin respuesta o con error). El número aparecerá cuando el nodo responda."
     },
     "node": {
       "head_sub_node": "nodo {name}",
@@ -7243,7 +7267,7 @@
       "op_elastic_schedule": "Armar una programación de Elastic",
       "op_elastic_add_disk_abort": "Elastic Array · Deshacer la adición de un disco",
       "detail_elastic_sync": "Escribe un nuevo punto de control de paridad y de content.",
-      "detail_elastic_sync_over_fault": "Escribe un nuevo punto de control de paridad y de content. ATENCIÓN: la matriz tiene un error de scrub o de reparación sin corregir. Los bloques marcados siguen siendo reparables, pero los archivos que el scrub no pudo leer se eliminarán del archivo content y la paridad dejará de cubrirlos. Ejecute primero la reparación desde la paridad."
+      "detail_elastic_sync_over_fault": "ATENCIÓN: la matriz tiene un error de scrub o de reparación sin corregir. La sincronización registra el estado actual de los archivos. Los bloques marcados de archivos sin cambios, y los archivos sin cambios que el scrub no pudo leer, siguen siendo reparables — pero los archivos eliminados o modificados desde la última sincronización, también los dañados, quedarán registrados en su nuevo estado y sus versiones anteriores ya no podrán restaurarse desde la paridad. Ejecute primero la reparación."
     },
     "access": {
       "title": "Registro de acceso",
@@ -7550,7 +7574,8 @@
       "elastic_array_not_ready": "La matriz debe estar activada y activa, o requerir atención",
       "elastic_add_stopped": "La adición del disco se detuvo antes del final — termínela o deshágala en la pantalla de la matriz",
       "elastic_undo_stopped": "Deshacer la adición se detuvo tras su primer paso — la adición sigue sin terminar",
-      "elastic_disk_absent": "El disco que se borraría no está presente en este nodo — vuelva a conectarlo e inténtelo de nuevo"
+      "elastic_disk_absent": "El disco que se borraría no está presente en este nodo — vuelva a conectarlo e inténtelo de nuevo",
+      "job_not_cancellable": "Esta tarea no se puede cancelar: detenerla no pararía el trabajo ya iniciado"
     }
   },
   "agent_accounts": {

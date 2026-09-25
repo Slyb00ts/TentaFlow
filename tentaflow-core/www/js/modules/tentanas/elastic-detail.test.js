@@ -43,6 +43,37 @@ async function mount(value, fixtures = {}, options) {
   return { screen, body };
 }
 
+// B5: the create policy is the node's real mount option (`mfs`), but in
+// mergerfs' shorthand; the pane words it in the reader's language.
+test('the union\'s create policy reads in words, not as the mergerfs code', async () => {
+  const { screen, body } = await mount(array());
+  try {
+    assert.equal(body.querySelector('[data-f="create-policy"]').textContent, 'najwięcej wolnego miejsca');
+  } finally {
+    screen.dispose?.();
+    body.remove();
+  }
+});
+
+// n05 M9: the card names the bytes waiting on the cache outside parity (the
+// node's figure, only when non-zero) as a warning chip in its head, and the
+// mover as n11 states it — and a later paint patches the chip in place.
+test('the n05 card carries the cache-without-parity chip and the mover row from the node\'s figures', () => {
+  const cache = { ...disk, diskId: 'serial-c', name: 'c1', diskName: 'nvme0n1', role: 'cache' };
+  const withCache = (bytes) => array({ cacheDisks: [cache], protection: { status: 'protected', faultTolerance: 1, cacheUnprotectedBytes: bytes, protectedAsOf: '2026-09-07 12:00:00' }, mover: {} });
+  const card = renderedElasticCard(withCache(18 * GiB));
+  const chip = card.querySelector('[data-slot="cache-waiting"] tf-chip');
+  assert.ok(chip, 'the chip is there');
+  assert.equal(chip.getAttribute('label'), `${fmtOptionalBytes(18 * GiB)} na cache bez parity`);
+  assert.equal(chip.getAttribute('status'), 'warn');
+  assert.equal(card.querySelector('[data-f="mover"]').textContent, 'bez ograniczeń — automatycznie');
+  paintElasticCard(card, withCache(20 * GiB));
+  assert.ok(card.querySelector('[data-slot="cache-waiting"] tf-chip') === chip, 'patched in place');
+  paintElasticCard(card, withCache(0));
+  assert.equal(card.querySelector('[data-slot="cache-waiting"] tf-chip'), null, 'nothing waiting, no chip');
+  assert.equal(renderedElasticCard(array()).querySelector('[data-slot="cache-waiting"] tf-chip'), null, 'no cache, no chip');
+});
+
 test('null nie staje się zerem, zaś zmierzone zero pozostaje 0 B', () => {
   assert.equal(fmtOptionalBytes(null), '—');
   assert.equal(fmtOptionalBytes(undefined), '—');
@@ -1030,6 +1061,10 @@ test('naprawa wymaga przepisania nazwy dysku i wysyła dokładnie jedno żądani
   assert.match(win.textContent, /nie przywraca brakujących plików/);
   assert.match(win.textContent, /Nic nie naprawiono/, 'i co zrobić, gdy nic nie zaznaczono');
   assert.doesNotMatch(win.textContent, /Odtwarza pliki z ostatniego udanego sync/);
+  // The loss line names the disk as the cell does, never by its branch
+  // mountpoint, which ends in the internal slot name.
+  assert.match(win.querySelector('.loss-list').textContent, /vdb — oznaczone bloki/);
+  assert.doesNotMatch(win.textContent, /tentanas-branches/);
   const confirm = win.querySelector('[data-action="confirm"]');
   assert.ok(confirm.hasAttribute('disabled'), 'przycisk startuje zablokowany');
   typeInto(win.querySelector('#retype-input'), 'media');
@@ -1531,8 +1566,8 @@ test('Sync przy nienaprawionym błędzie wymaga potwierdzenia kosztu, a tylko on
     assert.equal(syncs().length, 0, `${label}: nothing is sent before the confirm`);
     const win = document.querySelector('tf-window');
     assert.ok(win, label);
-    assert.match(win.textContent, /zostaną usunięte z content/, `${label}: the confirm names the cost`);
-    assert.match(win.textContent, /pozostaną naprawialne/, label);
+    assert.match(win.textContent, /nie da się już odtworzyć z parity/, `${label}: the confirm names the cost`);
+    assert.match(win.textContent, /Oznaczone bloki niezmienionych plików oraz niezmienione pliki, których scrub nie mógł odczytać, pozostaną do naprawienia/, label);
     const confirm = win.querySelector('[data-action="confirm"]');
     typeInto(win.querySelector('#retype-input'), 'medi');
     assert.ok(confirm.hasAttribute('disabled'), `${label}: armed only by the array name`);

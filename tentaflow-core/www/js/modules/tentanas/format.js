@@ -43,18 +43,19 @@ export const nodeLabel = (node) => String(node?.nodeName || '').trim() || T('nod
 // tokens `startup` / `scheduler` (`scheduler.rs` `STARTED_BY`).
 const SYSTEM_AUTHORS = new Set(['startup', 'scheduler']);
 
-// Who started a job, as `{ label, title }`. The node resolves a user id to the
+// Who started a job, as `{ label }`. The node resolves a user id to the
 // account's display name (`dispatch::tentanas::display_names`) and passes an
 // id with no account behind it through unchanged — a deleted account, or one
 // that exists only on the node that forwarded the request. That UUID is not a
-// name: the label says the account is unknown here and the id becomes the
-// tooltip. An author is always a user id or a system token, never a name
-// that could collide with a disk-id prefix, so the opaque rule alone applies.
+// name: the label says the account is unknown here, and the id is not shown
+// at all, not even as a tooltip (owner's rule: no ids anywhere in the GUI).
+// An author is always a user id or a system token, never a name that could
+// collide with a disk-id prefix, so the opaque rule alone applies.
 export function jobAuthor(startedBy) {
   const by = String(startedBy || '').trim();
-  if (SYSTEM_AUTHORS.has(by)) return { label: T('jobs.by_' + by), title: '' };
-  if (isOpaqueId(by)) return { label: T('jobs.by_unknown_account'), title: by };
-  return { label: by || '—', title: '' };
+  if (SYSTEM_AUTHORS.has(by)) return { label: T('jobs.by_' + by) };
+  if (isOpaqueId(by)) return { label: T('jobs.by_unknown_account') };
+  return { label: by || '—' };
 }
 
 export const POLL_DISKS_MS = 5000;
@@ -471,6 +472,20 @@ function alertLines(reasons) {
     .filter(Boolean);
 }
 
+// The other version of each conflicted file, for the row's deliberate "copy
+// path" control: `{ path, kept }` — `path` is the file's path in the array
+// (what the admin knows it by, the button's label), `kept` the node's path of
+// the other version (`kept_path`, elastic.rs `conflict_alert`). A quarantined
+// copy is named after its operation's uuid, so `kept` is never rendered: it
+// only goes to the clipboard when the admin asks for it. A line without it
+// (another array's place, an older node) offers nothing.
+function conflictCopies(reasons) {
+  return (Array.isArray(reasons) ? reasons : [])
+    .filter((r) => r?.code === 'conflict_file')
+    .map((r) => ({ path: textParam(r.params, 'path'), kept: textParam(r.params, 'kept_path') }))
+    .filter((c) => c.path && c.kept);
+}
+
 // The words a detail falls back to when a known code has nothing to word in
 // it but the node did write a sentence (a backfilled disk alert has its grade
 // and name, no reasons): say where the text is, never print it. The place it
@@ -538,16 +553,30 @@ function diskAlertTitle(p, first) {
   return null;
 }
 
-// code -> (params, reasons, alert) => { title, detail } | null. A Map, so a
-// prototype name is not a code.
+// What the node put on a disk alert beyond its grade (disks.rs
+// `HealthAlertPlace`): the ZFS pool the disk serves with its group's layout —
+// n02's sub-line "tank · RAIDZ2" — and whether the node advises replacing
+// it — n01's "— zaplanuj wymianę dysku". Neither is ever inferred here: a
+// row raised by an older build, or a disk in no pool, simply has none.
+function diskAlertPlace(p) {
+  const pool = textParam(p, 'pool');
+  const layout = textParam(p, 'layout');
+  return {
+    place: pool ? [pool, layout ? layoutLabel(layout) : null].filter(Boolean).join(' · ') : '',
+    advice: p?.advice === 'replace' ? T('alerts.code.disk_health.advice_replace') : '',
+  };
+}
+
+// code -> (params, reasons, alert) => { title, detail, place?, advice? } |
+// null. A Map, so a prototype name is not a code.
 const ALERT_WORDS = new Map([
   ['disk_health', (p, reasons, alert) => {
     if (!UNHEALTHY.has(p.health)) return null;
     const [first, ...rest] = wordsOf(DISK_REASON_SENTENCES, reasons);
     const title = diskAlertTitle(p, first);
     if (!title) return null;
-    if (first) return { title, detail: rest.join('; ') };
-    return { title, ...detailOrNodeTextHint('', alert) };
+    if (first) return { title, detail: rest.join('; '), ...diskAlertPlace(p) };
+    return { title, ...detailOrNodeTextHint('', alert), ...diskAlertPlace(p) };
   }],
   // `subject` is optional: a config import from an export the fleet has no
   // node name for arrives without one (dispatch `config_import_subject`),
@@ -601,6 +630,7 @@ const ALERT_WORDS = new Map([
     return {
       title: T('alerts.code.elastic_conflict.title', { count: n.count, array: t.array }),
       detail: files.length ? `${lead} ${files.join('; ')}` : lead,
+      copies: conflictCopies(reasons),
     };
   }],
   ['elastic_needs_attention', (p) => {
@@ -666,7 +696,11 @@ function alertTooltip(alert, raw, nameOf) {
   return scrubIds(text, T('alerts.id_hidden'), nameOf);
 }
 
-// `{ title, detail, tooltip, known, nodeText }` for one alert. `known` is
+// `{ title, detail, place, advice, tooltip, known, nodeText }` for one alert.
+// `place` (where the subject sits, "tank · RAIDZ2") and `advice` (what the
+// node advises, "zaplanuj wymianę dysku") are '' unless the node sent them;
+// `copies` are a conflict's files whose other version can be copied
+// (`conflictCopies`). `known` is
 // false for the generic fallback (unknown code, no code, or parameters that
 // do not read). `nodeText` is true when the detail points at the node's own
 // text instead of saying it: a row must then also offer that text where a
@@ -683,13 +717,16 @@ export function alertText(alert, { nameOf } = {}) {
     return {
       title: worded.title,
       detail: worded.detail || '',
+      place: worded.place || '',
+      advice: worded.advice || '',
+      copies: worded.copies || [],
       tooltip,
       known: true,
       nodeText: Boolean(tooltip) && (Boolean(worded.nodeText) || Boolean(worded.raw)),
     };
   }
   const tooltip = alertTooltip(alert, '', nameOf);
-  return { title: T('alerts.untranslated_title'), detail: T('alerts.untranslated_detail'), tooltip, known: false, nodeText: Boolean(tooltip) };
+  return { title: T('alerts.untranslated_title'), detail: T('alerts.untranslated_detail'), place: '', advice: '', copies: [], tooltip, known: false, nodeText: Boolean(tooltip) };
 }
 
 // The codes this build words — for the test that holds the node's list to it.

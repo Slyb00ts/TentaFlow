@@ -369,8 +369,8 @@ pub async fn publish_local_summary(main_db: &DbPool, addon_id: &str, db: &DbPool
 /// which may undercount the tenant's own alerts there but never counts
 /// another tenant's. A failed read keeps the node-wide figure for the same
 /// reason.
-pub fn scope_local_alerts(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) {
-    let Ok(count) = super::db::count_open_alerts_for_org(db, org_id) else {
+pub fn scope_local_alerts<'v>(nodes: &mut [NasNodeInfo], db: &DbPool, viewer: impl Into<super::db::OrgViewer<'v>>) {
+    let Ok(count) = super::db::count_open_alerts_for_org(db, viewer) else {
         return;
     };
     for node in nodes.iter_mut().filter(|n| n.is_local) {

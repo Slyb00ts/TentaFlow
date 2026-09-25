@@ -206,10 +206,18 @@ fn parse_config_row(line: &str) -> Option<ConfigRow<'_>> {
     if trimmed.is_empty() || trimmed.starts_with("NAME ") {
         return None;
     }
-    // A trailing free-text note is parenthesized ("(resilvering)", "(was …)").
+    // A trailing free-text note is parenthesized ("(resilvering)"), with one
+    // exception kept here: a leaf zpool can no longer open prints its last
+    // path as plain trailing text ("12156453278383891134  UNAVAIL  0 0 0
+    // was /dev/sdk1"), the one hint of WHICH disk fell out. Any other
+    // unparenthesized trailing text ("cannot open") is zpool's English and is
+    // not kept.
     let (fields_part, note) = match trimmed.split_once('(') {
         Some((head, tail)) => (head.trim(), tail.trim_end_matches(')').trim().to_string()),
-        None => (trimmed, String::new()),
+        None => match trimmed.split_once(" was ") {
+            Some((head, path)) if path.trim().starts_with('/') => (head.trim(), format!("was {}", path.trim())),
+            _ => (trimmed, String::new()),
+        },
     };
     let f: Vec<&str> = fields_part.split_whitespace().collect();
     let name = f.first()?;
@@ -335,7 +343,78 @@ fn leaf(row: &ConfigRow<'_>) -> NasVdevDisk {
         cksum_errors: row.cksum,
         size_bytes: 0,
         note: row.note.clone(),
+        last_known_name: None,
     }
+}
+
+/// The by-id link prefixes a leaf name or a remembered path can carry, and a
+/// bare device GUID (what `zpool status` prints for a leaf it cannot open).
+/// Neither is a name anybody reads.
+const BY_ID_LINK_PREFIXES: &[&str] = &[
+    "wwn-", "nvme-eui.", "nvme-uuid.", "eui.", "ata-", "nvme-", "scsi-", "usb-", "virtio-", "mmc-",
+    "dm-uuid-", "dm-name-", "md-uuid-", "md-name-", "lvm-pv-uuid-",
+];
+
+fn is_by_id_link(name: &str) -> bool {
+    BY_ID_LINK_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+fn is_device_guid(name: &str) -> bool {
+    name.len() >= 12 && name.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `wwn-0x5000c500a1b2c3d4-part1` → `wwn-0x5000c500a1b2c3d4`: the whole-disk
+/// link a partition link belongs to.
+fn whole_disk_link(link: &str) -> &str {
+    match link.rsplit_once("-part") {
+        Some((disk, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => disk,
+        _ => link,
+    }
+}
+
+/// How this node's disk records are searched for a by-id link: by the disk id
+/// a `wwn-` link maps to (`disks::disk_id` spells it `wwn-<hex>` without the
+/// `0x`), else by the serial an `ata-`/`scsi-`/`nvme-`/`usb-` link ends with
+/// (`<bus>-<model>_<serial>`).
+pub(crate) fn last_name_by_link(db: &DbPool, link: &str) -> Option<String> {
+    let link = whole_disk_link(link);
+    if let Some(hex) = link.strip_prefix("wwn-") {
+        let id = format!("wwn-{}", hex.trim_start_matches("0x"));
+        return store::disk_last_name(db, &id).ok().flatten();
+    }
+    let (_, serial) = link.rsplit_once('_')?;
+    store::disk_last_name_by_serial(db, serial).ok().flatten()
+}
+
+/// The kernel name a leaf zpool can no longer find was last seen under, for
+/// `NasVdevDisk::last_known_name`, or `None` when nothing says. Only for a
+/// leaf that is not bound to a live disk and whose own name is not a name (a
+/// GUID or a by-id link): a leaf already named `sdk` needs no memory.
+///
+/// Where it comes from, most direct first:
+/// - zpool's own "was <path>" note: a kernel path names the disk outright
+///   (`/dev/sdk1` → `sdk`), a by-id path is looked up in this node's records;
+/// - the leaf's own by-id name, looked up the same way.
+///
+/// `by_link` is `last_name_by_link` over the node's database; a parameter so
+/// the rule is testable without one.
+fn last_known_leaf_name(leaf: &NasVdevDisk, by_link: impl Fn(&str) -> Option<String>) -> Option<String> {
+    if leaf.disk_id.is_some() || !(is_device_guid(&leaf.name) || is_by_id_link(&leaf.name)) {
+        return None;
+    }
+    let remembered = leaf.note.strip_prefix("was ").map(str::trim).and_then(|path| {
+        let base = path.rsplit('/').next().unwrap_or(path);
+        if base.is_empty() || is_device_guid(base) {
+            None
+        } else if is_by_id_link(base) {
+            by_link(base)
+        } else {
+            Some(zfs::strip_partition_suffix(base))
+        }
+    });
+    remembered
+        .or_else(|| is_by_id_link(&leaf.name).then(|| by_link(&leaf.name)).flatten())
+        .filter(|name| !name.trim().is_empty())
 }
 
 /// The `scan:` block: the header line plus the indented continuation lines a
@@ -693,7 +772,6 @@ pub fn recommended_layout(disks: usize) -> Option<&'static str> {
 pub fn plan(disks: &[NasDisk]) -> (Vec<NasPoolLayoutOption>, Vec<String>, u64) {
     let n = disks.len();
     let smallest = disks.iter().map(|d| d.size_bytes).min().unwrap_or(0);
-    let largest = disks.iter().map(|d| d.size_bytes).max().unwrap_or(0);
     let recommended = recommended_layout(n);
 
     let options = LAYOUTS
@@ -725,19 +803,31 @@ pub fn plan(disks: &[NasDisk]) -> (Vec<NasPoolLayoutOption>, Vec<String>, u64) {
         })
         .collect();
 
-    let mut warnings = Vec::new();
+    let warnings = plan_warning_codes(disks).iter().map(plan_warning_sentence).collect();
+    (options, warnings, smallest)
+}
+
+/// The warnings of the layout step as CODES the wizard words in the reader's
+/// language (M1 part 3); `plan` keeps the English beside them for an older
+/// screen and the log. One rule, two spellings:
+/// - `mixed_sizes` {smallest, largest} (bytes) — every vdev is sized by the
+///   smallest disk;
+/// - `mixed_media` {} — SSD and HDD in one selection;
+/// - `unhealthy_disks` {disks} — kernel names of the picked disks SMART warns
+///   about, comma-separated;
+/// - `single_disk` {} — no redundancy;
+/// - `odd_mirror` {} — a mirror leaves one disk of an odd selection unused.
+pub fn plan_warning_codes(disks: &[NasDisk]) -> Vec<NasHealthReason> {
+    let n = disks.len();
+    let smallest = disks.iter().map(|d| d.size_bytes).min().unwrap_or(0);
+    let largest = disks.iter().map(|d| d.size_bytes).max().unwrap_or(0);
+    let mut codes = Vec::new();
     if largest > 0 && (largest - smallest) as f64 / largest as f64 > SIZE_SPREAD_WARNING {
-        warnings.push(format!(
-            "mixed disk sizes ({} … {} bytes): every vdev is sized by the smallest disk, \
-             so the extra capacity of the larger ones stays unused",
-            smallest, largest
-        ));
+        codes.push(plan_warning("mixed_sizes", &[("smallest", smallest.to_string()), ("largest", largest.to_string())]));
     }
     let rotating = disks.iter().filter(|d| d.rotational).count();
     if rotating > 0 && rotating < n {
-        warnings.push(
-            "mixed SSD and HDD: the vdev runs at the speed of its slowest member".to_string(),
-        );
+        codes.push(plan_warning("mixed_media", &[]));
     }
     let unhealthy: Vec<&str> = disks
         .iter()
@@ -745,22 +835,43 @@ pub fn plan(disks: &[NasDisk]) -> (Vec<NasPoolLayoutOption>, Vec<String>, u64) {
         .map(|d| d.name.as_str())
         .collect();
     if !unhealthy.is_empty() {
-        warnings.push(format!(
-            "SMART warnings on {}: building a pool on a disk that is already failing \
-             starts it degraded",
-            unhealthy.join(", ")
-        ));
+        codes.push(plan_warning("unhealthy_disks", &[("disks", unhealthy.join(", "))]));
     }
     if n == 1 {
-        warnings.push("a single disk has no redundancy: any failure loses the pool".to_string());
+        codes.push(plan_warning("single_disk", &[]));
     }
     if n % 2 == 1 && n > 2 {
-        warnings.push(
-            "a mirror layout pairs disks two by two, so one of an odd selection stays unused"
-                .to_string(),
-        );
+        codes.push(plan_warning("odd_mirror", &[]));
     }
-    (options, warnings, smallest)
+    codes
+}
+
+/// One layout-step warning. Not `disks::coded_reason`: these are the wizard's
+/// codes, not a pool's health reasons, and the screens' code scans tell the
+/// two families apart by the builder.
+fn plan_warning(code: &str, params: &[(&str, String)]) -> NasHealthReason {
+    coded_reason(code, params)
+}
+
+/// The English of one `plan_warning_codes` entry, as the wizard used to show it.
+fn plan_warning_sentence(code: &NasHealthReason) -> String {
+    match code.code.as_str() {
+        "mixed_sizes" => format!(
+            "mixed disk sizes ({} … {} bytes): every vdev is sized by the smallest disk, \
+             so the extra capacity of the larger ones stays unused",
+            reason_param(code, "smallest"),
+            reason_param(code, "largest")
+        ),
+        "mixed_media" => "mixed SSD and HDD: the vdev runs at the speed of its slowest member".to_string(),
+        "unhealthy_disks" => format!(
+            "SMART warnings on {}: building a pool on a disk that is already failing \
+             starts it degraded",
+            reason_param(code, "disks")
+        ),
+        "single_disk" => "a single disk has no redundancy: any failure loses the pool".to_string(),
+        "odd_mirror" => "a mirror layout pairs disks two by two, so one of an odd selection stays unused".to_string(),
+        other => other.to_string(),
+    }
 }
 
 // ----- vdev spec building ---------------------------------------------------------
@@ -859,12 +970,20 @@ fn assemble(
             // `leaf.name` is the display guess; a leaf whose node is gone
             // would otherwise be linked to the NEW disk that took its kernel
             // name (`zfs::resolved_kernel_name`).
-            if !leaf.path.is_empty() && zfs::resolved_kernel_name(&leaf.path).is_none() {
-                continue;
+            let gone = !leaf.path.is_empty() && zfs::resolved_kernel_name(&leaf.path).is_none();
+            if !gone {
+                if let Some((disk_id, size)) = disks.get(&leaf.name) {
+                    leaf.disk_id = Some(disk_id.clone());
+                    leaf.size_bytes = *size;
+                }
             }
-            if let Some((disk_id, size)) = disks.get(&leaf.name) {
-                leaf.disk_id = Some(disk_id.clone());
-                leaf.size_bytes = *size;
+            // A leaf zpool cannot find is named by what the node remembers,
+            // never by its GUID or by-id link (owner's rule: no ids in the
+            // GUI). The "was …" note is consumed here: it carries the old
+            // path, often a by-id link, and a screen prints `note` as it is.
+            leaf.last_known_name = last_known_leaf_name(leaf, |link| last_name_by_link(db, link));
+            if leaf.note.starts_with("was ") {
+                leaf.note.clear();
             }
         }
     }
@@ -1669,6 +1788,20 @@ errors: No known data errors\n";
         assert!(warnings.iter().any(|w| w.contains("mixed disk sizes")));
         assert!(warnings.iter().any(|w| w.contains("mixed SSD and HDD")));
         assert!(warnings.iter().any(|w| w.contains("SMART warnings on sdb")));
+        // The same warnings as the codes the wizard words (M1 part 3).
+        let codes = plan_warning_codes(&four);
+        assert_eq!(
+            codes.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(),
+            vec!["mixed_sizes", "mixed_media", "unhealthy_disks"]
+        );
+        assert_eq!(codes[0].params.get("smallest").map(String::as_str), Some("4000787030016"));
+        assert_eq!(codes[0].params.get("largest").map(String::as_str), Some("8001563222016"));
+        assert_eq!(codes[2].params.get("disks").map(String::as_str), Some("sdb"));
+        assert_eq!(warnings.len(), codes.len(), "one sentence per code");
+        let one = vec![disk("sda", TB8, true, "ok")];
+        assert_eq!(plan_warning_codes(&one).iter().map(|c| c.code.as_str()).collect::<Vec<_>>(), vec!["single_disk"]);
+        let three: Vec<NasDisk> = (0..3).map(|i| disk(&format!("sd{i}"), TB8, true, "ok")).collect();
+        assert_eq!(plan_warning_codes(&three).iter().map(|c| c.code.as_str()).collect::<Vec<_>>(), vec!["odd_mirror"]);
     }
 
     #[test]
@@ -1867,5 +2000,85 @@ errors: No known data errors\n";
         assert_eq!(parse_trim(HEALTHY_MIRROR).state, "idle");
         // The vdev line's own name is never mistaken for a percentage.
         assert_eq!(parse_trim("\t  raidz2-0 ONLINE 0 0 0\n").state, "idle");
+    }
+
+    const MISSING_LEAVES: &str = "  pool: tank\n\
+ state: DEGRADED\n\
+config:\n\
+\n\
+\tNAME                                  STATE     READ WRITE CKSUM\n\
+\ttank                                  DEGRADED     0     0     0\n\
+\t  raidz2-0                            DEGRADED     0     0     0\n\
+\t    /dev/sda                          ONLINE       0     0     0\n\
+\t    12156453278383891134              UNAVAIL      0     0     0  was /dev/sdk1\n\
+\t    3847561029384756102               UNAVAIL      0     0     0  was /dev/disk/by-id/wwn-0x5000c500a1b2c3d4-part1\n\
+\t    /dev/disk/by-id/ata-WDC_WD40_WD-7788-part1  REMOVED  0     0     0\n\
+\t    918273645501928374                UNAVAIL      0     0     0  cannot open\n\
+\t    /dev/sde                          ONLINE       0     0     0  (resilvering)\n\
+\n\
+errors: No known data errors\n";
+
+    /// A leaf zpool can no longer open prints its GUID and, as plain trailing
+    /// text, the path it was last at. The parser keeps that "was …" hint (and
+    /// still the parenthesized notes), and drops zpool's other English.
+    #[test]
+    fn a_missing_leaf_keeps_the_path_zpool_says_it_was_at() {
+        let s = parse_status(MISSING_LEAVES);
+        let leaves = &s.vdevs[0].disks;
+        assert_eq!(leaves.len(), 6);
+        assert_eq!(leaves[1].name, "12156453278383891134");
+        assert_eq!(leaves[1].state, "unavail");
+        assert_eq!(leaves[1].note, "was /dev/sdk1");
+        assert_eq!(leaves[2].note, "was /dev/disk/by-id/wwn-0x5000c500a1b2c3d4-part1");
+        assert_eq!(leaves[3].name, "ata-WDC_WD40_WD-7788-part1");
+        assert_eq!(leaves[3].state, "removed");
+        assert_eq!(leaves[4].note, "", "zpool's own English is not a note");
+        assert_eq!(leaves[4].state, "unavail");
+        assert_eq!(leaves[5].note, "resilvering");
+    }
+
+    /// Owner's rule: a leaf is never named by its GUID or by-id link. The node
+    /// names it by what it remembers — zpool's "was" path, or the disk its
+    /// by-id link belongs to in this node's records — and by nothing else.
+    #[test]
+    fn a_missing_leaf_is_named_by_the_disk_it_last_was_never_by_its_id() {
+        let s = parse_status(MISSING_LEAVES);
+        let leaves = &s.vdevs[0].disks;
+        let records = |link: &str| match link {
+            "wwn-0x5000c500a1b2c3d4-part1" | "ata-WDC_WD40_WD-7788-part1" => Some("sdm".to_string()),
+            _ => None,
+        };
+        let named = |i: usize| last_known_leaf_name(&leaves[i], records);
+        assert_eq!(named(0), None, "a live leaf needs no memory");
+        assert_eq!(named(1).as_deref(), Some("sdk"), "a kernel path names the disk outright");
+        assert_eq!(named(2).as_deref(), Some("sdm"), "a by-id path is looked up");
+        assert_eq!(named(3).as_deref(), Some("sdm"), "the leaf's own by-id name is looked up");
+        assert_eq!(named(4), None, "nothing is known: no name, and never the GUID");
+        assert_eq!(last_known_leaf_name(&leaves[3], |_| None), None);
+        // A leaf bound to a live disk is that disk, whatever its name says.
+        let mut bound = leaves[1].clone();
+        bound.disk_id = Some("wwn-5000c500a1b2c3d4".into());
+        assert_eq!(last_known_leaf_name(&bound, |_| panic!("not consulted")), None);
+    }
+
+    /// The records a by-id link is resolved through: a `wwn-` link by the
+    /// disk id `disks::disk_id` spells for it, any other link by its serial.
+    #[test]
+    fn a_by_id_link_finds_the_disk_it_named_in_the_node_records() {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        store::migrate(&conn).expect("migrate");
+        let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+        for (disk_id, name, serial) in [("wwn-5000c500a1b2c3d4", "sdq", "S-Q"), ("sn-WD-7788", "sdm", "WD-7788")] {
+            store::upsert_disk_seen(
+                &db,
+                &store::DiskIdentity { disk_id, name, model: "M", serial, wwn: None, size_bytes: 1, kind: "hdd" },
+            )
+            .expect("record the disk");
+        }
+        assert_eq!(last_name_by_link(&db, "wwn-0x5000c500a1b2c3d4-part1").as_deref(), Some("sdq"));
+        assert_eq!(last_name_by_link(&db, "wwn-0x5000c500a1b2c3d4").as_deref(), Some("sdq"));
+        assert_eq!(last_name_by_link(&db, "ata-WDC_WD40_WD-7788-part1").as_deref(), Some("sdm"));
+        assert_eq!(last_name_by_link(&db, "ata-WDC_WD40_WD-0000"), None);
+        assert_eq!(last_name_by_link(&db, "wwn-0x1111"), None);
     }
 }

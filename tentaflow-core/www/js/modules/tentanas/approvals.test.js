@@ -99,10 +99,10 @@ test('a config import with no node name shows no subject, not an id', async () =
 // name. `requestedBy`/`decidedBy` used to be printed raw, so an account the
 // server could not resolve (deleted, or one that exists only on the node that
 // forwarded the request) showed its UUID in the open. Both columns must route
-// through `jobAuthor` — the UUID becomes "nieznane konto" with the id moved to
-// a tooltip, and a system author (the scheduler) reads as its translated name
+// through `jobAuthor` — the UUID becomes "nieznane konto" and is not even a
+// tooltip (owner's rule: no ids in the GUI), and a system author (the scheduler) reads as its translated name
 // with no tooltip at all.
-test('an unresolved account reads "nieznane konto" with the id in a tooltip; the scheduler is not a UUID', async () => {
+test('an unresolved account reads "nieznane konto" and its id goes nowhere; the scheduler is not a UUID', async () => {
   const uuid = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
   const screen = fakeScreen({
     tentaNasApprovalsListRequest: {
@@ -116,12 +116,11 @@ test('an unresolved account reads "nieznane konto" with the id in a tooltip; the
   await flush();
 
   const table = body.querySelector('#nas-approvals-table');
-  // The raw id lives ONLY in a title= tooltip, never as visible text.
+  // The raw id is neither visible text nor a tooltip.
   const wrap = document.createElement('div');
   wrap.innerHTML = table.rows[0].requested;
-  assert.doesNotMatch(wrap.textContent, new RegExp(uuid), 'the id is not visible text');
+  assert.doesNotMatch(wrap.innerHTML, new RegExp(uuid), 'the id is nowhere in the cell');
   assert.match(wrap.textContent, /nieznane konto/);
-  assert.equal(wrap.querySelector('.tf-table__cell-sub').getAttribute('title'), uuid);
   // The scheduler is a system author, not an unresolved account: it is
   // translated and gets no tooltip.
   assert.match(table.rows[0].status, /harmonogram/);

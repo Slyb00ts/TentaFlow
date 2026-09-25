@@ -9,9 +9,10 @@
 
 import { fakeScreen, flush, click, typeInto, window, windowTitle } from './_test-setup.js';
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 
-const { openPoolWizard, poolNameValid } = await import('./pool-wizard.js');
+const { openPoolWizard, poolNameValid, planWarnings } = await import('./pool-wizard.js');
 
 const TB = 1024 ** 4;
 const disk = (id, overrides = {}) => ({ diskId: id, name: id, kind: 'hdd', model: 'WD Red', serial: `WD-${id}`, sizeBytes: 4 * TB, health: 'ok', healthReason: '', ...overrides });
@@ -350,5 +351,34 @@ test('the Elastic parity and cache pickers name a critical disk\'s reason in the
     assert.equal(cell('cache', 'nvme0n1').getAttribute('title'), 'last self-test failed');
   } finally {
     screen.dispose();
+  }
+});
+
+// M1 part 3: the layout step's warnings were the node's English. The node
+// sends them as codes now and the wizard words them; an older node that sends
+// only its sentences is shown as it came, and an unknown code is left out.
+test('the layout step words the node\'s plan warnings from their codes', () => {
+  const words = planWarnings({
+    warnings: ['mixed disk sizes (4000787030016 … 8001563222016 bytes): …', 'SMART warnings on sdb: …'],
+    warningCodes: [
+      { code: 'mixed_sizes', params: { smallest: String(4 * TB), largest: String(8 * TB) } },
+      { code: 'unhealthy_disks', params: { disks: 'sdb' } },
+      { code: 'gremlins', params: {} },
+    ],
+  });
+  assert.equal(words.length, 2, 'one line per known code');
+  assert.match(words[0], /^Dyski różnej wielkości \(4\.0 TiB … 8\.0 TiB\)/);
+  assert.match(words[1], /^SMART ostrzega o dyskach sdb/);
+  assert.ok(words.every((w) => !/bytes|SMART warnings on/.test(w)), 'no English left');
+  assert.deepEqual(planWarnings({ warnings: ['old node sentence'] }), ['old node sentence'], 'an older node without codes');
+});
+
+test('every layout warning code the node produces has words in the wizard', () => {
+  const source = readFileSync(new URL('../../../../src/tentanas/pools.rs', import.meta.url), 'utf8');
+  const codes = [...new Set([...source.matchAll(/plan_warning\(\s*"(\w+)"/g)].map((m) => m[1]))];
+  assert.ok(codes.length >= 5, `the scan found the codes (${codes.join(', ')})`);
+  for (const code of codes) {
+    const [words] = planWarnings({ warningCodes: [{ code, params: { smallest: '1', largest: '2', disks: 'sdb' } }] });
+    assert.ok(words && !/tentanas\.|\{/.test(words), `${code}: ${words}`);
   }
 });

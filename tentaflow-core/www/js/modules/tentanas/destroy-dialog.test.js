@@ -24,6 +24,9 @@ const datasets = [
 ];
 
 const confirmButton = (win) => win.querySelector('tf-button[data-action="confirm"]');
+// The dialog also reads the share and target lists on open (what dies with
+// the pool); only the destroy request is what these tests count.
+const destroys = (screen) => screen.calls.filter((c) => c.kind === 'tentaNasPoolDestroyRequest');
 
 test('lists what is lost and keeps the danger button locked until the exact name', async () => {
   const screen = fakeScreen({ tentaNasPoolDestroyRequest: { job: { jobId: 'job-9', kind: 'pool_destroy', status: 'running' } } });
@@ -46,7 +49,7 @@ test('lists what is lost and keeps the danger button locked until the exact name
 
   confirmWindow(win);
   await flush();
-  assert.equal(screen.calls.length, 0, 'nothing sent while locked');
+  assert.equal(destroys(screen).length, 0, 'nothing sent while locked');
 
   typeInto(input, 'tank');
   assert.ok(!btn.hasAttribute('disabled'), 'exact name unlocks');
@@ -81,9 +84,8 @@ test('an armed confirm sends PoolDestroyRequest with the confirm name and follow
   confirmWindow(win);
   await flush();
   await flush();
-  assert.equal(screen.calls.length, 1);
-  assert.equal(screen.calls[0].kind, 'tentaNasPoolDestroyRequest');
-  assert.deepEqual(screen.calls[0].payload, { name: 'tank', confirmName: 'tank', sudoPassword: 'hunter2' });
+  assert.equal(destroys(screen).length, 1);
+  assert.deepEqual(destroys(screen)[0].payload, { name: 'tank', confirmName: 'tank', sudoPassword: 'hunter2' });
   assert.equal(screen.jobLogs.length, 1, 'the job log opened');
   assert.equal(screen.jobLogs[0].jobId, 'job-9');
   assert.equal(done, 0, 'onDone waits for the job to finish');
@@ -102,7 +104,7 @@ test('a cancelled sudo prompt keeps the dialog open and armed', async () => {
   confirmWindow(win);
   await flush();
   await flush();
-  assert.equal(screen.calls.length, 0);
+  assert.equal(destroys(screen).length, 0);
   assert.ok(document.querySelector('tf-window'), 'still open');
   assert.ok(!confirmButton(win).hasAttribute('disabled'), 'retry possible');
   win.remove();
@@ -121,6 +123,43 @@ test('a failed destroy shows the error under the retype field and unlocks again'
   assert.equal(err.hidden, false);
   assert.match(err.textContent, /pool is busy/);
   assert.ok(!confirmButton(win).hasAttribute('disabled'));
+  win.remove();
+  screen.dispose();
+});
+
+// n17a (M15): the shares and block targets whose data lives on the pool die
+// with it, and the mockup lists each one. They come from this organisation's
+// own lists; a share or target elsewhere is not named, and a list that cannot
+// be read adds nothing.
+test('the loss list names every share and block target that lives on the pool', async () => {
+  const screen = fakeScreen({
+    tentaNasSharesListRequest: {
+      shares: [
+        { name: 'projekty', protocol: 'smb', dataset: 'tank/media', sourcePath: '/tank/media' },
+        { name: 'backups', protocol: 'nfs', dataset: null, sourcePath: '/tank/home/backups' },
+        { name: 'inne', protocol: 'smb', dataset: 'tankless/x', sourcePath: '/tankless/x' },
+      ],
+    },
+    tentaNasTargetsListRequest: {
+      targets: [
+        { name: 'vm-store', protocol: 'iscsi', luns: [{ source: 'tank/vm-store', sourceKind: 'zvol' }] },
+        { name: 'elsewhere', protocol: 'nvmet', luns: [{ source: 'fast/vm', sourceKind: 'zvol' }] },
+      ],
+    },
+  });
+  const onPool = [
+    { name: 'tank/media', usedBytes: 2 * TB, mountpoint: '/tank/media' },
+    { name: 'tank/home', usedBytes: TB, mountpoint: '/tank/home' },
+  ];
+  const win = openPoolDestroyDialog(screen, pool, onPool, () => {});
+  await flush();
+  await flush();
+  const deps = [...win.querySelectorAll('[data-role="dependents"] li')].map((li) => li.textContent);
+  assert.deepEqual(deps, [
+    'tank/media — share SMB „projekty” przestanie działać',
+    '/tank/home/backups — share NFS „backups” przestanie działać',
+    'tank/vm-store — target iSCSI „vm-store” przestanie działać',
+  ]);
   win.remove();
   screen.dispose();
 });

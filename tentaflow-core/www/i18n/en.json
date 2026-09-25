@@ -6560,7 +6560,8 @@
           "title_unnamed": "Disk: {grade}",
           "title_live_reason": "{name}: {reason}",
           "title_last_known_reason": "Disk last seen as {name}: {reason}",
-          "title_unnamed_reason": "Disk: {reason}"
+          "title_unnamed_reason": "Disk: {reason}",
+          "advice_replace": "plan a disk replacement"
         },
         "approval_pending": {
           "title": "{operation} “{subject}” waits for a second admin",
@@ -6569,8 +6570,8 @@
         },
         "elastic_sync_held": {
           "title": "Array {array}: scheduled Sync held, parity reports errors",
-          "detail": "A scrub reported errors nothing has repaired yet. A scheduled Sync would drop from the content file the files the scrub could not read. Run the repair from parity, then a scrub; a manual Sync stays available.",
-          "detail_fault": "The scrub did not finish correctly or a repair failed. The scheduled Sync would remove the files the scrub could not read from the content file, so it needs a confirmation on the array screen. Run a scrub or the repair from parity; a manual Sync stays available after the confirmation."
+          "detail": "A scrub reported errors nothing has repaired yet. A scheduled Sync would record the current state of files deleted or changed since the last Sync, damaged ones included, and their earlier versions could no longer be restored from parity. Run the repair from parity, then a scrub; a manual Sync stays available.",
+          "detail_fault": "The scrub did not finish correctly or a repair failed. The scheduled Sync would record the current state of files deleted or changed since the last Sync, damaged ones included, so it needs a confirmation on the array screen. Run a scrub or the repair from parity; a manual Sync stays available after the confirmation."
         },
         "elastic_mover_settle_stopped": {
           "title": "Array {array}: automatic move completion paused",
@@ -6590,7 +6591,10 @@
           "detail": "An interrupted move left two versions of files and neither was removed. Compare them and remove the one you do not need; the alert goes away once one remains.",
           "file_quarantine": "{path}: visible version {visible}, the other is a quarantined copy on cache disk {disk}",
           "file_data": "{path}: visible version {visible}, the other is at the same path on data disk {disk}",
-          "file_branch": "{path}: visible version {visible}, the other is on one of the array's disks"
+          "file_branch": "{path}: visible version {visible}, the other is on one of the array's disks",
+          "copy_kept": "Copy the other version's path: {path}",
+          "copied": "Copied the path of the other version of {path}",
+          "copy_failed": "Could not copy the path — the browser did not allow clipboard access"
         },
         "elastic_needs_attention": {
           "title": "Array {array} needs intervention",
@@ -6882,7 +6886,8 @@
       "by_unknown_account": "unknown account",
       "subject_last_known": "last seen as {name}",
       "smart_batch_refused": "SMART test not started on {n} {n|disk|disks|disks}: {disks}",
-      "kind_elastic_add_disk_abort": "Undo a data disk addition to an Elastic Array"
+      "kind_elastic_add_disk_abort": "Undo a data disk addition to an Elastic Array",
+      "subject_unknown_disk": "unknown disk"
     },
     "elevation": {
       "title": "System privilege channel",
@@ -7170,7 +7175,7 @@
       "repair_confirm": "Repair the marked blocks ({disk})",
       "repair_done": "Repair of disk {disk} accepted. Check the job result.",
       "repair_warning": "The repair writes back only the blocks the last Scrub marked as bad, and only in files unchanged since the last Sync. It covers the whole array {name} rather than disk {disk} alone: it does not restore missing files and does not undo changes written after the last Sync.",
-      "repair_loses": "{disk} ({path}) — the marked blocks will be overwritten with the content of the last parity checkpoint",
+      "repair_loses": "{disk} — the marked blocks will be overwritten with the content of the last parity checkpoint",
       "repair_explain": "A repair writes no new parity checkpoint and formats nothing. If the Scrub marked no blocks, the repair writes nothing and ends as 'Nothing was repaired' — a Sync is then the operation to run. The array stays available and the job can take many hours.",
       "repair_none": "The array reports no disk failure and no parity errors. Run a scrub to detect damage.",
       "repair_not_ready": "A repair needs an enabled array that is active or needs attention.",
@@ -7371,11 +7376,11 @@
       "next_steps": "What next",
       "step_repair": "Repair the blocks the scrub marked as bad from parity.",
       "step_scrub": "Run a scrub to check whether anything is left to repair.",
-      "step_sync": "Run a Sync — it needs a confirmation, because it removes the files the scrub could not read from the content file.",
+      "step_sync": "Run a Sync — it needs a confirmation, because it records the current state of files deleted or changed since the last Sync.",
       "sync_fault_title": "Sync despite an unrepaired fault in array {name}",
       "sync_fault_warning": "Array {name} has an unrepaired scrub or repair fault. The Sync writes a new parity checkpoint despite it.",
-      "sync_fault_loses": "Files the scrub could not read will be removed from the content file — parity will no longer cover them.",
-      "sync_fault_keeps": "Blocks the scrub marked stay repairable by a repair from parity.",
+      "sync_fault_loses": "Files deleted or changed since the last Sync, damaged ones included, are recorded in their new state — their earlier versions can no longer be restored from parity.",
+      "sync_fault_keeps": "Marked blocks of unchanged files, and unchanged files the scrub could not read, stay repairable from parity.",
       "sync_fault_explain": "Run the repair from parity first if it is available, then a scrub. A Sync is the right step when the errors are in files changed since the last Sync.",
       "sync_fault_retype": "Retype the array name to confirm:",
       "sync_fault_confirm": "Run the Sync despite the fault",
@@ -7400,7 +7405,16 @@
       "add_disk_undo_done": "Undoing the disk addition was accepted. Check the job result.",
       "add_disk_undo_unavailable": "The disk may already have joined the share — the addition can only be finished.",
       "repair_add_pending": "the array has an unfinished disk addition: finish it or undo it first",
-      "repair_needs_restore": "the array is waiting for its mounts to be restored: use Restore mounts first"
+      "repair_needs_restore": "the array is waiting for its mounts to be restored: use Restore mounts first",
+      "create_policy_mfs": "most free space",
+      "create_policy_epmfs": "most free space on an existing path",
+      "create_policy_ff": "first disk with room",
+      "create_policy_lfs": "least free space",
+      "create_policy_epff": "first disk with an existing path",
+      "create_policy_rand": "random disk",
+      "create_policy_msplfs": "least free space on the longest existing path",
+      "card_mover": "Cache mover",
+      "card_cache_waiting": "{size} on the cache without parity"
     },
     "wizard_pool": {
       "elastic_data": "Data disks",
@@ -7486,7 +7500,12 @@
       "spare_sub": "hot-spare of pool {pool}",
       "erase_warning_none": "Data on the selected disks will be erased for good.",
       "sum_layout_value": "{layout} · {n} × {size} ({disks})",
-      "loss_erased": "data will be erased"
+      "loss_erased": "data will be erased",
+      "plan_warning_mixed_sizes": "Mixed disk sizes ({smallest} … {largest}): every vdev is sized by the smallest disk, so the extra capacity of the larger ones stays unused.",
+      "plan_warning_mixed_media": "Mixed SSD and HDD: the vdev runs at the speed of its slowest member.",
+      "plan_warning_unhealthy_disks": "SMART warns about {disks}: a pool built on a disk that is already failing starts degraded.",
+      "plan_warning_single_disk": "A single disk has no redundancy: any failure loses the pool.",
+      "plan_warning_odd_mirror": "A mirror layout pairs disks two by two, so one disk of an odd selection stays unused."
     },
     "pools": {
       "title": "Pools on node {node}",
@@ -7644,7 +7663,9 @@
       "trim_start_done": "TRIM of pool {name} started",
       "trim_suspend_done": "TRIM of pool {name} suspended",
       "trim_resume_done": "TRIM of pool {name} resumed",
-      "trim_cancel_done": "TRIM of pool {name} cancelled"
+      "trim_cancel_done": "TRIM of pool {name} cancelled",
+      "leaf_last_known": "disk missing (last seen as {name})",
+      "leaf_missing_at": "disk missing, no. {n}"
     },
     "props": {
       "title": "Pool properties",
@@ -7673,7 +7694,6 @@
       "removes": "To be removed",
       "fs": "{type} filesystem",
       "fs_label": "Label {label}",
-      "fs_uuid": "UUID {uuid}",
       "mounted_at": "Mounted at {paths}",
       "nothing": "This disk reports no signature at all — there is nothing to remove.",
       "bad_plan": "Incomplete or inconsistent plan response. Clearing blocked.",
@@ -7698,7 +7718,9 @@
       "done": "Pool {name} destroyed",
       "snapshots": "{n} {n|snapshot|snapshots|snapshots}",
       "explain_others": " and the {roles} vdevs",
-      "retype": "Retype the pool name to confirm:"
+      "retype": "Retype the pool name to confirm:",
+      "share_stops": "{protocol} share “{name}” stops working",
+      "target_stops": "{protocol} target “{name}” stops working"
     },
     "add_vdev": {
       "title": "Add vdev to {name}",
@@ -7733,7 +7755,8 @@
       "free_sub": "S/N {serial} · unassigned · will be erased before use",
       "explain_pick": "Pick a replacement disk to see the replacement plan.",
       "start": "Start replacement",
-      "resilver_progress": "resilver {pct}% · {eta} left"
+      "resilver_progress": "resilver {pct}% · {eta} left",
+      "done_detail_spare": "Resilver finished — {new} has taken over the data of {device}, but {device} stays in the pool configuration until it is detached (zpool detach). This version of TentaNas does not do that yet: do not pull the disk before it is detached."
     },
     "elastic_import": {
       "title": "Import an Elastic Array",
@@ -8357,7 +8380,8 @@
       "head_versions": "TentaNas: {list}",
       "chip_services_down_list": "Services down: {list}",
       "chip_services_unknown": "Services: no answer from {nodes}",
-      "chip_services_none": "No sharing services"
+      "chip_services_none": "No sharing services",
+      "not_answered_hint": "Unknown: this node's share list could not be read (no answer or an error). The count appears once the node answers."
     },
     "node": {
       "head_sub_node": "node {name}",
@@ -8459,7 +8483,7 @@
       "op_elastic_schedule": "Arm an Elastic schedule",
       "op_elastic_add_disk_abort": "Elastic Array · Undo disk addition",
       "detail_elastic_sync": "Writes a new parity and content checkpoint.",
-      "detail_elastic_sync_over_fault": "Writes a new parity and content checkpoint. WARNING: the array has an unrepaired scrub or repair fault. Marked blocks stay repairable, but files the scrub could not read will be removed from the content file and parity will no longer cover them. Run the repair from parity first."
+      "detail_elastic_sync_over_fault": "WARNING: the array has an unrepaired scrub or repair fault. The Sync records the current state of the files. Marked blocks of unchanged files, and unchanged files the scrub could not read, stay repairable — but files deleted or changed since the last Sync, damaged ones included, are recorded in their new state and their earlier versions can no longer be restored from parity. Run the repair first."
     },
     "access": {
       "title": "Access log",
@@ -8766,7 +8790,8 @@
       "elastic_array_not_ready": "The array has to be enabled and active or needing attention",
       "elastic_add_stopped": "The disk addition stopped before its end — finish it or undo it on the array screen",
       "elastic_undo_stopped": "Undoing the addition stopped after its first step — the addition stays unfinished",
-      "elastic_disk_absent": "The disk that would be erased is not present on this node — reconnect it and try again"
+      "elastic_disk_absent": "The disk that would be erased is not present on this node — reconnect it and try again",
+      "job_not_cancellable": "This job cannot be cancelled — stopping it would not stop the work already under way"
     }
   },
   "agent_accounts": {

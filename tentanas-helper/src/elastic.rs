@@ -401,8 +401,10 @@ pub struct ElasticAdmission<'a> {
 /// array admits everything. An array that needs attention admits only what
 /// its recorded cause names: after a failed parity run a Scrub and a Fix
 /// always, a Sync after a failed Sync, and a Sync over a Scrub or Fix fault
-/// only with the admin's acknowledgement — measured, such a Sync drops the
-/// files a Scrub could not read from the content file. No cause, `Other` or
+/// only with the admin's acknowledgement — measured (M3, rig11 2026-09-24),
+/// such a Sync removes nothing from the content file and unchanged files stay
+/// repairable, but it records files deleted or changed since the last Sync
+/// in their new state. No cause, `Other` or
 /// an unfinished add admit none of the three.
 ///
 /// The acknowledgement is BOUND TO THE FAULT: it names the operation id of

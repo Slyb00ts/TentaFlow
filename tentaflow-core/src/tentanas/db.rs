@@ -1113,6 +1113,25 @@ pub fn disk_last_name(pool: &DbPool, disk_id: &str) -> Result<Option<String>> {
         .filter(|name| !name.is_empty()))
 }
 
+/// The kernel name the disk with this serial was last seen under — the most
+/// recently seen one, should two records share a serial. For a by-id link
+/// that ends with a serial (`ata-<model>_<serial>`), when the disk it named
+/// has left the inventory.
+pub fn disk_last_name_by_serial(pool: &DbPool, serial: &str) -> Result<Option<String>> {
+    if serial.trim().is_empty() {
+        return Ok(None);
+    }
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT name FROM nas_disks WHERE serial = ?1 AND trim(name) <> ''
+             ORDER BY last_seen_at DESC LIMIT 1",
+            params![serial],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?)
+}
+
 /// Stores one SMART read: the document, SMART's grade, and its reasons both
 /// as the English sentence and as codes. One statement, so a restart never
 /// reads a sentence and codes from two different reads.
@@ -1401,6 +1420,44 @@ fn alert_owner_sql(kind: &str, subject: &str) -> String {
 /// from matching the unowned rows.
 const VISIBLE_TO_ORG_SQL: &str = "(org_id IS NULL OR (org_id = ?1 AND ?1 <> ''))";
 
+/// `VISIBLE_TO_ORG_SQL` plus the '' rows, for the one organisation of a node
+/// that has no other (owner decision, wave 5): a row whose owner is gone —
+/// the jobs and alerts of a dissolved array (migration 18) — can only have
+/// been that organisation's, and there is nobody to leak it to. From two
+/// organisations up they stay hidden from everyone.
+const VISIBLE_TO_SOLE_ORG_SQL: &str = "(org_id IS NULL OR (?1 <> '' AND (org_id = ?1 OR org_id = '')))";
+
+/// Who reads an org-scoped list: the organisation, and whether it is the ONLY
+/// organisation of this node (`VISIBLE_TO_SOLE_ORG_SQL`). A bare org id is a
+/// viewer on a node with other tenants — the safe default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrgViewer<'a> {
+    pub org_id: &'a str,
+    pub sole_org: bool,
+}
+
+impl<'a> From<&'a str> for OrgViewer<'a> {
+    fn from(org_id: &'a str) -> Self {
+        Self { org_id, sole_org: false }
+    }
+}
+
+impl<'a> From<&'a String> for OrgViewer<'a> {
+    fn from(org_id: &'a String) -> Self {
+        Self { org_id: org_id.as_str(), sole_org: false }
+    }
+}
+
+impl OrgViewer<'_> {
+    fn visible_sql(&self) -> &'static str {
+        if self.sole_org {
+            VISIBLE_TO_SOLE_ORG_SQL
+        } else {
+            VISIBLE_TO_ORG_SQL
+        }
+    }
+}
+
 /// Raises an alert unless an open one with the same `dedupe_key` exists, and
 /// REFRESHES the text of the one that does. Returns true when a new row was
 /// inserted — an already-open alert is not a new event.
@@ -1607,17 +1664,19 @@ pub fn list_alerts(pool: &DbPool, include_acked: bool) -> Result<Vec<NasAlert>> 
 
 /// `list_alerts` as one organisation may see it (migration 18). The unscoped
 /// `list_alerts` stays for the node's own loops, which act on every array.
-pub fn list_alerts_for_org(pool: &DbPool, org_id: &str, include_acked: bool) -> Result<Vec<NasAlert>> {
+pub fn list_alerts_for_org<'v>(pool: &DbPool, viewer: impl Into<OrgViewer<'v>>, include_acked: bool) -> Result<Vec<NasAlert>> {
+    let viewer = viewer.into();
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let sql = format!(
         "SELECT {ALERT_COLUMNS} FROM nas_alerts
-         WHERE resolved_at IS NULL AND {VISIBLE_TO_ORG_SQL} {}
+         WHERE resolved_at IS NULL AND {} {}
          ORDER BY raised_at DESC LIMIT 500",
+        viewer.visible_sql(),
         if include_acked { "" } else { "AND acked_at IS NULL" }
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(params![org_id], alert_from_row)?
+        .query_map(params![viewer.org_id], alert_from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -1625,14 +1684,16 @@ pub fn list_alerts_for_org(pool: &DbPool, org_id: &str, include_acked: bool) -> 
 /// `ack_alert` limited to the alerts `org_id` may see: another tenant's alert
 /// is "not found" to it, exactly like an id that does not exist, so the
 /// answer confirms nothing about it.
-pub fn ack_alert_for_org(pool: &DbPool, org_id: &str, alert_id: &str) -> Result<bool> {
+pub fn ack_alert_for_org<'v>(pool: &DbPool, viewer: impl Into<OrgViewer<'v>>, alert_id: &str) -> Result<bool> {
+    let viewer = viewer.into();
     let conn = write(pool)?;
     let n = conn.execute(
         &format!(
             "UPDATE nas_alerts SET acked_at = ?3
-              WHERE alert_id = ?2 AND acked_at IS NULL AND {VISIBLE_TO_ORG_SQL}"
+              WHERE alert_id = ?2 AND acked_at IS NULL AND {}",
+            viewer.visible_sql()
         ),
-        params![org_id, alert_id, now()],
+        params![viewer.org_id, alert_id, now()],
     )?;
     Ok(n == 1)
 }
@@ -1669,14 +1730,16 @@ pub fn count_open_node_alerts(pool: &DbPool) -> Result<u32> {
 /// Open, unacknowledged alerts one organisation may see — exactly the rows
 /// `list_alerts_for_org(pool, org_id, false)` lists (the same visibility
 /// clause), so a badge and the list under it never disagree.
-pub fn count_open_alerts_for_org(pool: &DbPool, org_id: &str) -> Result<u32> {
+pub fn count_open_alerts_for_org<'v>(pool: &DbPool, viewer: impl Into<OrgViewer<'v>>) -> Result<u32> {
+    let viewer = viewer.into();
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     Ok(conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM nas_alerts
-              WHERE resolved_at IS NULL AND acked_at IS NULL AND {VISIBLE_TO_ORG_SQL}"
+              WHERE resolved_at IS NULL AND acked_at IS NULL AND {}",
+            viewer.visible_sql()
         ),
-        params![org_id],
+        params![viewer.org_id],
         |r| r.get::<_, i64>(0),
     )? as u32)
 }
@@ -1793,11 +1856,14 @@ const JOB_COLUMNS: &str = "job_id, kind, subject, status, progress_pct, started_
 ///   and `-e fix` still recovers it afterwards. So a Sync settles nothing about
 ///   it, and saying it did would hide a fault that is still repairable.
 /// * a `scrub` row with FILE errors only -> also a succeeded `sync`, because
-///   that is the only cure the product has for it: `-e fix` writes nothing at
-///   all for unreadable or missing files (measured, probe f4:
-///   `error:0 recovered:0`), while a Sync removes them from the content file
-///   and the next scrub then comes back clean. Without this the array would
-///   have no action left that could clear the row.
+///   that is the only action the product has that ends it: such an error
+///   marks no block, so `-e fix` writes nothing for it (`error:0
+///   recovered:0`). The Sync does NOT drop an unchanged unreadable file: it
+///   ends `equal`, the content file still lists it, and `fix -f` restores it
+///   afterwards (M3 f4, rig11 2026-09-24, raw logs in the design repository's
+///   reviews/artifacts/elastic-measurements-2026-09-24; the earlier "removed
+///   from content" came from a probe that had deleted the file). Without this
+///   the array would have no action left that could clear the row.
 ///
 /// So every row keeps at least one reachable way out, and none is closed by a
 /// run that did not address it.
@@ -2679,26 +2745,29 @@ pub fn list_jobs(pool: &DbPool, limit: u32) -> Result<Vec<NasJob>> {
 /// and the node-wide ones, never another tenant's array work — whose subject
 /// is that array's name and whose log and author are that tenant's. The
 /// unscoped `list_jobs` stays for the node's own loops.
-pub fn list_jobs_for_org(pool: &DbPool, org_id: &str, limit: u32) -> Result<Vec<NasJob>> {
+pub fn list_jobs_for_org<'v>(pool: &DbPool, viewer: impl Into<OrgViewer<'v>>, limit: u32) -> Result<Vec<NasJob>> {
+    let viewer = viewer.into();
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {JOB_COLUMNS} FROM nas_jobs WHERE {VISIBLE_TO_ORG_SQL}
-         ORDER BY started_at DESC LIMIT ?2"
+        "SELECT {JOB_COLUMNS} FROM nas_jobs WHERE {}
+         ORDER BY started_at DESC LIMIT ?2",
+        viewer.visible_sql()
     ))?;
     let rows = stmt
-        .query_map(params![org_id, i64::from(limit.clamp(1, 500))], job_from_row)?
+        .query_map(params![viewer.org_id, i64::from(limit.clamp(1, 500))], job_from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
 /// One job, when `org_id` may see it. Another tenant's job is `None` — the
 /// same answer as an id that never existed, so a guessed id confirms nothing.
-pub fn job_for_org(pool: &DbPool, org_id: &str, job_id: &str) -> Result<Option<NasJob>> {
+pub fn job_for_org<'v>(pool: &DbPool, viewer: impl Into<OrgViewer<'v>>, job_id: &str) -> Result<Option<NasJob>> {
+    let viewer = viewer.into();
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     Ok(conn
         .query_row(
-            &format!("SELECT {JOB_COLUMNS} FROM nas_jobs WHERE job_id = ?2 AND {VISIBLE_TO_ORG_SQL}"),
-            params![org_id, job_id],
+            &format!("SELECT {JOB_COLUMNS} FROM nas_jobs WHERE job_id = ?2 AND {}", viewer.visible_sql()),
+            params![viewer.org_id, job_id],
             job_from_row,
         )
         .optional()?)
@@ -3187,6 +3256,18 @@ pub fn elastic_claims(pool: &DbPool) -> Result<Vec<ElasticClaim>> {
 /// in order from slot 1, the cache disk at `cache`/1, the parity disks in
 /// order. The create and the import write the same three tables from this, so
 /// the two paths cannot disagree about which slot a disk lands in.
+/// A member disk as a refusal names it: its kernel name while the live
+/// inventory has it, else its place in the array ("danych 2") — never its
+/// disk id, WWN or serial (owner's rule: no ids in the GUI, and a refusal is
+/// a toast).
+fn member_words(role: &str, slot: i64, disk: &ElasticDiskSpec) -> String {
+    super::disks::disk_name(&disk.disk_id).unwrap_or_else(|| match role {
+        "data" => format!("danych {slot}"),
+        "parity" => format!("parity {slot}"),
+        _ => "cache".to_string(),
+    })
+}
+
 fn elastic_disk_slots(spec: &ElasticCreateSpec) -> Result<Vec<(&'static str, i64, &ElasticDiskSpec)>> {
     let mut slots = Vec::new();
     for (role, disks) in [("data", &spec.data), ("parity", &spec.parity)] {
@@ -3237,11 +3318,9 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
         params![disk.disk_id, disk.expected_uuid],
         |r| r.get(0),
     )?;
-    anyhow::ensure!(
-        !claimed,
-        "Dysk {} należy już do macierzy tej instancji",
-        disk.disk_id
-    );
+    // Named by its kernel name while the inventory has it, never by its id.
+    let words = super::disks::disk_name(&disk.disk_id).map_or_else(|| "Ten dysk".to_string(), |name| format!("Dysk {name}"));
+    anyhow::ensure!(!claimed, "{words} należy już do macierzy tej instancji");
     for value in [
         Some(disk.disk_id.as_str()),
         disk.wwn.as_deref(),
@@ -3257,7 +3336,7 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
         )?;
         anyhow::ensure!(
             !reserved,
-            "Identyfikator {value} jest już zarezerwowany przez macierz tej instancji"
+            "{words} jest już zarezerwowany przez macierz tej instancji (po WWN lub numerze seryjnym)"
         );
     }
     // Another add of this array that stopped part-way holds the slot and —
@@ -3841,19 +3920,20 @@ pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, started_by: &str)
     let name_taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays WHERE name=?1)",
         params![spec.name], |r| r.get(0))?;
     anyhow::ensure!(!name_taken, "Nazwa macierzy jest już zajęta w tej instancji");
-    for (_, _, disk) in elastic_disk_slots(spec)? {
+    for (role, slot, disk) in elastic_disk_slots(spec)? {
+        let words = member_words(role, slot, disk);
         let claimed: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM nas_elastic_disks WHERE disk_id=?1 OR expected_uuid=?2)",
             params![disk.disk_id, disk.expected_uuid], |r| r.get(0))?;
         anyhow::ensure!(!claimed,
-            "Dysk {} należy już do innej macierzy tej instancji", disk.disk_id);
+            "Dysk {words} należy już do innej macierzy tej instancji");
         for value in [Some(disk.disk_id.as_str()), disk.wwn.as_deref(), disk.serial.as_deref()]
             .into_iter().flatten() {
             let reserved: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM nas_elastic_disk_aliases WHERE value=?1)",
                 params![value], |r| r.get(0))?;
             anyhow::ensure!(!reserved,
-                "Identyfikator {value} jest już zarezerwowany przez inną macierz tej instancji");
+                "Dysk {words} jest już zarezerwowany przez inną macierz tej instancji (po WWN lub numerze seryjnym)");
         }
     }
     let job_id = uuid::Uuid::now_v7().to_string();
@@ -4988,6 +5068,42 @@ pub fn smart_schedule(pool: &DbPool) -> Result<NasSmartSchedule> {
 
 pub fn set_smart_schedule(pool: &DbPool, schedule: &NasSmartSchedule) -> Result<()> {
     set_setting(pool, SETTING_SMART_SCHEDULE, &serde_json::to_string(schedule)?)
+}
+
+/// The scheduler's write-back of one SMART tick, applied to the schedule AS IT
+/// IS NOW rather than to the copy the tick read.
+///
+/// WHY: the schedule is one settings document, and the tick used to write its
+/// whole copy back. An admin who saved new cadences (or switched the tests
+/// off) between the tick's read and its write lost that save to the tick's
+/// stale copy. Here the document is re-read in the same write transaction:
+/// - the run stamps (`last_*_at`) are the tick's — the tests it started did
+///   run, whatever the admin changed since;
+/// - the deadlines (`next_*_at`) are the tick's only while the document still
+///   holds what the tick read: an admin's save re-armed them for the cadence
+///   the admin chose, and that choice stands.
+pub fn record_smart_tick(pool: &DbPool, read: &NasSmartSchedule, ticked: &NasSmartSchedule) -> Result<()> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current: NasSmartSchedule = tx
+        .query_row("SELECT value FROM nas_settings WHERE key = ?1", params![SETTING_SMART_SCHEDULE], |r| r.get::<_, String>(0))
+        .optional()?
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    let mut next = current.clone();
+    next.last_short_at = ticked.last_short_at.clone();
+    next.last_long_at = ticked.last_long_at.clone();
+    if &current == read {
+        next.next_short_at = ticked.next_short_at.clone();
+        next.next_long_at = ticked.next_long_at.clone();
+    }
+    tx.execute(
+        "INSERT INTO nas_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![SETTING_SMART_SCHEDULE, serde_json::to_string(&next)?, now()],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 // ----- pool samples -------------------------------------------------------------
@@ -6217,11 +6333,13 @@ mod tests {
 
         // A different array that wants a disk this one already holds. The
         // UNIQUE columns would refuse it as a raw SQL error; the point of the
-        // pre-check is that the admin is told WHICH disk.
+        // pre-check is that the admin is told WHICH disk — by its kernel name
+        // or its place in the array, never by its id (iteration-5 minor 3).
         let mut overlapping = super::super::elastic::tests::create_spec("archiwum");
         overlapping.data[0] = created.data[0].clone();
         let taken = elastic_import(&pool, &overlapping, "admin").unwrap_err().to_string();
-        assert!(taken.contains(&created.data[0].disk_id), "the refusal names the disk: {taken}");
+        assert!(taken.contains("Dysk danych 1 "), "the refusal names the disk: {taken}");
+        assert!(!taken.contains(&created.data[0].disk_id), "and never by its id: {taken}");
 
         // Only the filesystem UUID is shared: still a refusal, because that
         // UUID is the identity a second array must not be able to claim.
@@ -7941,11 +8059,13 @@ mod tests {
                 }),
             )
             .expect_err("a member of another array is not free");
+            // Refused in words, and without the disk's id (iteration-5 minor 3).
             assert!(
-                error.to_string().contains(&taken.disk_id)
+                error.to_string().contains("należy już do macierzy")
                     || error.to_string().contains("zarezerwowany"),
                 "{error}"
             );
+            assert!(!error.to_string().contains(&taken.disk_id), "{error}");
             assert!(
                 super::super::db::job(&p, &stealing.job_id).unwrap().is_none(),
                 "no job row survived"
@@ -8385,10 +8505,12 @@ mod tests {
         assert!(!elastic_array(&p, &spec.owner, "scoped-settle").unwrap().unwrap().unresolved_operation);
 
         // A SCRUB THAT ONLY LOST FILES: no data error was counted, so there is
-        // no marked block for a repair to write back — measured on rig11,
-        // `-e fix` reports `error:0 recovered:0` for unreadable files. The Sync
-        // that removes them from the content file is the cure, and it settles
-        // the row; otherwise the array would keep a fault nothing could clear.
+        // no marked block for a repair to write back — `-e fix` reports
+        // `error:0 recovered:0` for such a scrub. A later successful Sync
+        // settles the row; it removes nothing from the content file (M3 f4:
+        // an unchanged unreadable file stays listed and `fix -f` restores it
+        // afterwards). Otherwise the array would keep a fault nothing could
+        // clear.
         let (lost, lost_intent, lost_id) = maintenance(&spec, Kind::Scrub);
         insert_job(&p, &lost, Some(&lost_intent)).unwrap();
         let mut only_files =
@@ -10630,5 +10752,102 @@ mod tests {
         // Even when nothing else changed: the subject alone is a refresh.
         raise_coded_alert(&p, "target:t1:drift", "warning", "target", "vm-c", &renamed).unwrap();
         assert_eq!(list_alerts(&p, true).unwrap()[0].subject_id, "vm-c");
+    }
+
+    /// Iteration-5 minor 3: an adoption or add refused over a disk another
+    /// array holds is a toast, and it named the disk by its id (`wwn-…`) or
+    /// by the alias it collided on. It names the disk's place instead when
+    /// the inventory has no name for it — never an id.
+    #[test]
+    fn a_member_refusal_names_the_disk_by_its_place_never_by_its_id() {
+        let disk = ElasticDiskSpec {
+            disk_id: "wwn-not-in-the-live-inventory-5000c500".into(),
+            wwn: Some("0x5000c500".into()),
+            serial: Some("WD-7788".into()),
+            bytes: 1,
+            expected_uuid: "33333333-3333-4333-8333-333333333333".into(),
+        };
+        assert_eq!(member_words("data", 2, &disk), "danych 2");
+        assert_eq!(member_words("parity", 1, &disk), "parity 1");
+        assert_eq!(member_words("cache", 1, &disk), "cache");
+        for words in [member_words("data", 2, &disk), member_words("cache", 1, &disk)] {
+            assert!(!words.contains("wwn-") && !words.contains("WD-7788") && !words.contains("3333"), "{words}");
+        }
+    }
+
+    /// Wave-2 iteration-2 nit: the SMART tick wrote back its whole stale copy
+    /// of the schedule, so an admin's save between the tick's read and its
+    /// write was lost. The write-back now lands on the document as it is.
+    #[test]
+    fn a_smart_tick_keeps_an_admin_save_made_while_it_ran() {
+        let p = pool();
+        let daily = |hour| NasSchedule { every: "daily".into(), hour, minute: 0, weekday: 0, day: 1 };
+        let read = NasSmartSchedule {
+            enabled: true,
+            short: daily(3),
+            long: daily(4),
+            next_short_at: Some("2026-09-24T03:00:00Z".into()),
+            next_long_at: Some("2026-09-24T04:00:00Z".into()),
+            ..Default::default()
+        };
+        set_smart_schedule(&p, &read).unwrap();
+        let ticked = NasSmartSchedule {
+            last_short_at: Some("2026-09-24T03:00:05Z".into()),
+            next_short_at: Some("2026-09-25T03:00:00Z".into()),
+            ..read.clone()
+        };
+
+        // Nobody touched it: the tick's stamps and deadlines land.
+        record_smart_tick(&p, &read, &ticked).unwrap();
+        assert_eq!(smart_schedule(&p).unwrap(), ticked);
+
+        // The admin moves the short test to 05:00 while a tick is running.
+        let admin = NasSmartSchedule { short: daily(5), next_short_at: Some("2026-09-25T05:00:00Z".into()), ..ticked.clone() };
+        set_smart_schedule(&p, &admin).unwrap();
+        let late = NasSmartSchedule { last_long_at: Some("2026-09-25T04:00:05Z".into()), next_long_at: Some("2026-09-26T04:00:00Z".into()), ..ticked.clone() };
+        record_smart_tick(&p, &ticked, &late).unwrap();
+        let stored = smart_schedule(&p).unwrap();
+        assert_eq!(stored.short, daily(5), "the admin's cadence stands");
+        assert_eq!(stored.next_short_at.as_deref(), Some("2026-09-25T05:00:00Z"), "and so does the deadline it armed");
+        assert_eq!(stored.next_long_at, ticked.next_long_at, "a stale tick moves no deadline");
+        assert_eq!(stored.last_long_at.as_deref(), Some("2026-09-25T04:00:05Z"), "but the run it started is recorded");
+    }
+
+    /// Owner decision (wave 5): the jobs and alerts of a dissolved array
+    /// (owner '' since migration 18) are shown when the node has exactly one
+    /// organisation — they can only have been its own — and stay hidden from
+    /// everyone as soon as there are two.
+    #[test]
+    fn rows_whose_owner_is_gone_are_the_sole_organisations_to_see() {
+        let p = pool();
+        let orphan = plain_job("elastic_sync", "dissolved");
+        insert_job(&p, &orphan, None).unwrap();
+        raise_alert(&p, "elastic:dissolved:parity", "warning", "elastic-array", "dissolved", "t", "d").unwrap();
+        {
+            let conn = write(&p).unwrap();
+            conn.execute("UPDATE nas_jobs SET org_id = '' WHERE job_id = ?1", params![orphan.job_id]).unwrap();
+            conn.execute("UPDATE nas_alerts SET org_id = '' WHERE subject_id = 'dissolved'", []).unwrap();
+        }
+        let sole = OrgViewer { org_id: "org-a", sole_org: true };
+        let shared = OrgViewer::from("org-a");
+        assert!(job_for_org(&p, sole, &orphan.job_id).unwrap().is_some(), "the only organisation sees its old job");
+        assert_eq!(list_jobs_for_org(&p, sole, 100).unwrap().len(), 1);
+        assert_eq!(list_alerts_for_org(&p, sole, true).unwrap().len(), 1);
+        assert_eq!(count_open_alerts_for_org(&p, sole).unwrap(), 1, "the badge counts what the list shows");
+        assert!(job_for_org(&p, shared, &orphan.job_id).unwrap().is_none(), "with two organisations: nobody");
+        assert!(list_alerts_for_org(&p, shared, true).unwrap().is_empty());
+        assert_eq!(count_open_alerts_for_org(&p, shared).unwrap(), 0);
+        // An empty org id is no tenant at all, sole or not.
+        let nobody = OrgViewer { org_id: "", sole_org: true };
+        assert!(job_for_org(&p, nobody, &orphan.job_id).unwrap().is_none());
+        assert!(list_alerts_for_org(&p, nobody, true).unwrap().is_empty());
+        // Another organisation's own rows stay hidden from the sole viewer's
+        // clause too (a second org would make it not sole, but the clause
+        // itself must not widen beyond '').
+        let theirs = plain_job("pool_scrub", "x");
+        insert_job(&p, &theirs, None).unwrap();
+        write(&p).unwrap().execute("UPDATE nas_jobs SET org_id = 'org-b' WHERE job_id = ?1", params![theirs.job_id]).unwrap();
+        assert!(job_for_org(&p, sole, &theirs.job_id).unwrap().is_none());
+        assert!(ack_alert_for_org(&p, sole, &list_alerts_for_org(&p, sole, false).unwrap()[0].alert_id).unwrap());
     }
 }

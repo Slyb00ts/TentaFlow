@@ -13,7 +13,7 @@ import { fakeScreen, flush, click, window } from './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { drawPoolDetail, openAddVdevDialog, openReplaceWizard, isUnresolvedLeafName, REPLACE_SCAN_EVERY_MS } = await import('./pool-detail.js');
+const { drawPoolDetail, openAddVdevDialog, openReplaceWizard, openPoolDestroyDialog, isUnresolvedLeafName, REPLACE_SCAN_EVERY_MS } = await import('./pool-detail.js');
 const { KIND_BADGE } = await import('./format.js');
 
 const TB = 1024 ** 4;
@@ -474,12 +474,13 @@ test('a disk that comes or goes changes only its own cell; every other group and
 test('a disk SMART warns about shows the warning tone inside an ONLINE leaf, and the KPI counts it (M3)', async () => {
   let health = 'ok';
   let leafState = 'online';
+  let noReasons = false;
   const screen = liveScreen(
     { pool: () => ({ vdevs: [{ id: 'mirror-0', role: 'data', kind: 'mirror', state: 'online', faultTolerance: 1, disks: [disk('sda', { state: leafState }), disk('sdb')] }] }) },
     { disks: () => [disk('sda', {
       role: 'member', health, temperatureC: 47,
       healthReason: health === 'ok' ? '' : '8 reallocated sectors; 54°C',
-      healthReasons: health === 'ok' ? [] : [{ code: 'reallocated', params: { count: '8' } }, { code: 'temperature_high', params: { celsius: '54' } }],
+      healthReasons: health === 'ok' || noReasons ? [] : [{ code: 'reallocated', params: { count: '8' } }, { code: 'temperature_high', params: { celsius: '54' } }],
     }), disk('sdb', { role: 'member' })] },
   );
   const body = mount();
@@ -505,6 +506,14 @@ test('a disk SMART warns about shows the warning tone inside an ONLINE leaf, and
   assert.equal(chip.getAttribute('title'), '8 reallocated sectors; 54°C', 'the server reason lives in the title only');
   assert.ok(cell().classList.contains('warn'));
   assert.match(stateTile().getAttribute('delta'), /1 ostrzeżenie dysku/, 'the KPI counts the SMART warning (n06:188)');
+
+  // The border marks a NAMED reason only (owner decision, n06 mockup): the
+  // same warning with no reason the node words keeps the dot and no border.
+  noReasons = true;
+  await screen.poll();
+  assert.ok(dot().classList.contains('warn'), 'still a warning dot');
+  assert.ok(!cell().classList.contains('warn'), 'but no amber border without a named reason');
+  noReasons = false;
 
   // A FAULTED leaf stays red even when SMART says the disk is fine.
   health = 'ok';
@@ -652,7 +661,7 @@ test('a bare-leaf vdev header names its role, never the by-id path zpool prints 
   assert.equal(label('raidz1-0').textContent, 'raidz1-0', 'a zpool-generated group id is not a machine identifier and stays visible');
   const spareLabel = label('wwn-0x5000c500a1b2c3d4');
   assert.equal(spareLabel.textContent, 'Zapasowy', 'the by-id path never appears as visible text');
-  assert.equal(spareLabel.getAttribute('title'), 'wwn-0x5000c500a1b2c3d4', 'the real id lives in title= only');
+  assert.equal(spareLabel.getAttribute('title'), null, 'the id is not even a tooltip');
   assert.equal(label('nvme-eui.0000000000000001').textContent, 'Cache (L2ARC) 1', 'an ordinal tells apart two bare vdevs of the same role');
   assert.equal(label('nvme-eui.0000000000000002').textContent, 'Cache (L2ARC) 2');
   // MINOR 10: the role already names the bare leaf in the mono span above —
@@ -673,12 +682,10 @@ test('a bare-leaf vdev header names its role, never the by-id path zpool prints 
 // pools.rs) keeps that GUID verbatim in `name` — it must never reach the
 // screen as visible text, in the cell or in the replace wizard.
 //
-// `zpool`'s "was /dev/…" annotation on a removed leaf is not parenthesized,
-// so `parse_config_row` (pools.rs:176-180, note captured only from `(...)`)
-// never puts it in `note` — a fixture that expects a name recovered from
-// `note` exercises a shape the parser cannot produce. There is nothing in
-// the wire payload a GUID-only leaf can be named from, so it always falls
-// back to the translated "missing disk" label.
+// The node names such a leaf by what it remembers (`lastKnownName`, from
+// zpool's "was /dev/…" or its by-id link in the node's records); with
+// nothing remembered the cell says "missing disk" and the leaf's position.
+// The id is never shown, not even as a tooltip.
 // ---------------------------------------------------------------------------
 
 test('a leaf zpool can no longer find shows "brak dysku" in its cell, never the raw GUID (M4)', async () => {
@@ -693,10 +700,34 @@ test('a leaf zpool can no longer find shows "brak dysku" in its cell, never the 
   await drawPoolDetail(screen, body);
   await flush();
   const nameSpan = (guid) => body.querySelector(`.disk-cell[data-device="${guid}"] .dc-name .mono`);
-  assert.equal(nameSpan('17705618834980784999').textContent, 'brak dysku', 'a bare GUID names no real device: the translated missing-disk label');
-  assert.equal(nameSpan('17705618834980784999').getAttribute('title'), '17705618834980784999', 'the GUID lives in title= only');
+  assert.equal(nameSpan('17705618834980784999').textContent, 'brak dysku nr 2', 'a bare GUID names no real device: the translated missing-disk label and its position');
+  assert.equal(nameSpan('17705618834980784999').getAttribute('title'), null, 'the GUID is not even a tooltip');
   // The wire identity (device actions, replace) is unchanged: still the GUID.
   assert.equal(body.querySelector('.disk-cell[data-device="17705618834980784999"]') !== null, true);
+  screen.dispose();
+});
+
+test('a missing leaf is named by the disk the node remembers, marked as remembered, and nothing on the cell carries an id', async () => {
+  const guid = '12156453278383891134';
+  const remembered = disk(guid, { name: guid, diskId: undefined, state: 'unavail', note: '', lastKnownName: 'sdk' });
+  const idShaped = disk('3847561029384756102', { name: '3847561029384756102', diskId: undefined, state: 'unavail', note: '', lastKnownName: 'wwn-0x5000c500a1b2c3d4' });
+  const screen = makeScreen({
+    tentaNasPoolGetRequest: {
+      ...poolGet,
+      pool: { ...poolGet.pool, vdevs: [{ id: 'raidz1-0', role: 'data', kind: 'raidz1', state: 'degraded', faultTolerance: 1, disks: [disk('sda'), remembered, idShaped] }] },
+    },
+  });
+  const body = mount();
+  await drawPoolDetail(screen, body);
+  await flush();
+  const cell = (id) => body.querySelector(`.disk-cell[data-device="${id}"]`);
+  assert.equal(cell(guid).querySelector('.dc-name .mono').textContent, 'brak dysku (ostatnio sdk)');
+  assert.equal(cell('3847561029384756102').querySelector('.dc-name .mono').textContent, 'brak dysku nr 3', 'a remembered id is no name either');
+  for (const el of body.querySelectorAll('.vdev-group *')) {
+    const title = el.getAttribute('title') || '';
+    assert.doesNotMatch(title, /\d{12,}|wwn-/, el.outerHTML);
+  }
+  assert.doesNotMatch(body.querySelector('.vdev-group').textContent, /\d{12,}|wwn-/);
   screen.dispose();
 });
 
@@ -725,9 +756,9 @@ test('a by-id leaf name never shows in its cell: the inventory\'s kernel name wh
   await flush();
   const nameSpan = (id) => body.querySelector(`.disk-cell[data-device="${id}"] .dc-name .mono`);
   assert.equal(nameSpan('wwn-0x5000c500a1b2c3d4-part1').textContent, 'sdk', 'a by-id leaf the disk inventory still knows shows its real kernel name');
-  assert.equal(nameSpan('wwn-0x5000c500a1b2c3d4-part1').getAttribute('title'), 'wwn-0x5000c500a1b2c3d4-part1', 'the by-id path lives in title= only, never as text');
-  assert.equal(nameSpan('ata-WDC_WD40EFRX-68N32N0_WD-WCC7K0000000-part1').textContent, 'brak dysku', 'no inventory match: the translated missing-disk label, never the ata- basename');
-  assert.equal(nameSpan('ata-WDC_WD40EFRX-68N32N0_WD-WCC7K0000000-part1').getAttribute('title'), 'ata-WDC_WD40EFRX-68N32N0_WD-WCC7K0000000-part1');
+  assert.equal(nameSpan('wwn-0x5000c500a1b2c3d4-part1').getAttribute('title'), null, 'the by-id path is not even a tooltip');
+  assert.equal(nameSpan('ata-WDC_WD40EFRX-68N32N0_WD-WCC7K0000000-part1').textContent, 'brak dysku nr 3', 'no inventory match: the translated missing-disk label, never the ata- basename');
+  assert.equal(nameSpan('ata-WDC_WD40EFRX-68N32N0_WD-WCC7K0000000-part1').getAttribute('title'), null);
   // The wire identity (device actions, replace) is unchanged: still the by-id text.
   assert.equal(body.querySelector('.disk-cell[data-device="wwn-0x5000c500a1b2c3d4-part1"]') !== null, true);
   screen.dispose();
@@ -840,4 +871,78 @@ test('a device-mapper kernel name is a disk, a device-mapper by-id link is an id
   ]) {
     assert.equal(isUnresolvedLeafName(id), true, `${id} is an id`);
   }
+});
+
+// Critic wave 5, M2: a missing leaf was named on its cell but printed raw in
+// the device-action toast and in the destroy dialog's disk list. The request
+// still names the leaf as zpool knows it; the words never do.
+test('a missing leaf is named, not printed by its id, in the clear toast and the destroy dialog', async () => {
+  const byId = 'wwn-0x5000c500a1b2c3d4-part1';
+  const missing = disk(byId, { name: byId, diskId: undefined, state: 'faulted', cksumErrors: 3, note: '', lastKnownName: 'sdk' });
+  const pool = { ...poolGet.pool, vdevs: [{ id: 'raidz1-0', role: 'data', kind: 'raidz1', state: 'degraded', faultTolerance: 1, disks: [disk('sda'), missing] }] };
+  const screen = makeScreen({
+    tentaNasPoolGetRequest: { ...poolGet, pool },
+    tentaNasPoolDeviceStateRequest: {},
+  });
+  const toasts = [];
+  const append = window.Node.prototype.appendChild;
+  window.Node.prototype.appendChild = function (child) {
+    if (/(?:^|\s)toast-(success|error|info|warning)/.test(child?.className || '')) toasts.push(child.textContent);
+    return append.call(this, child);
+  };
+  try {
+    const body = document.createElement('div');
+    document.body.appendChild(body);
+    await drawPoolDetail(screen, body);
+    await flush();
+    click(body.querySelector(`.disk-cell[data-device="${byId}"] [data-act="clear"]`));
+    await flush();
+    await flush();
+    const sent = screen.calls.filter((c) => c.kind === 'tentaNasPoolDeviceStateRequest');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].payload.device, byId, 'the node gets the leaf as zpool knows it');
+    assert.ok(toasts.some((t) => /brak dysku \(ostatnio sdk\)/.test(t)), toasts.join(' | '));
+    assert.ok(toasts.every((t) => !t.includes('wwn-')), toasts.join(' | '));
+    body.remove();
+  } finally {
+    window.Node.prototype.appendChild = append;
+  }
+
+  const win = openPoolDestroyDialog(screen, pool, [], () => {}, []);
+  await flush();
+  const explain = win.querySelector('.explain-box').textContent;
+  assert.match(explain, /\(sda, brak dysku \(ostatnio sdk\)\)/);
+  assert.doesNotMatch(win.innerHTML, /wwn-0x5000c500a1b2c3d4/);
+  win.remove();
+  screen.dispose();
+});
+
+// Owner decision (wave 5, d): a replace onto a hot spare leaves the old leaf
+// in the pool's spare group until `zpool detach`, which this version does not
+// run — the result must not say the disk "can be pulled". A replace onto a
+// free disk detaches the old leaf itself, and there it can.
+test('the replace result says a disk can be pulled only when the old leaf really left the pool', async () => {
+  const done = async (useSpare) => {
+    const screen = fakeScreen({
+      tentaNasPoolReplaceDiskRequest: {},
+      tentaNasPoolGetRequest: () => ({ ...poolGet, pool: { ...poolGet.pool, scan: { kind: 'resilver', status: 'finished', errors: 0 } } }),
+    });
+    const spareDisk = disk('sdk', { role: 'member' });
+    const pool = { ...poolGet.pool, vdevs: [...poolGet.pool.vdevs, { id: 'sdk', role: 'spare', kind: 'disk', state: 'online', faultTolerance: 0, disks: [disk('sdk')] }] };
+    const win = openReplaceWizard(screen, { pool, vdev: pool.vdevs[0], disk: pool.vdevs[0].disks[2], freeDisks: [disk('sdd', { role: 'free' })], disks: [spareDisk] });
+    await flush();
+    click(win.querySelector(`.target-option[data-disk="${useSpare ? 'sdk' : 'sdd'}"]`));
+    click(win.querySelector('[data-wizard-next]'));
+    await flush();
+    await flush();
+    await flush();
+    const text = win.querySelector('.result-box').textContent;
+    win.remove();
+    screen.dispose();
+    return text;
+  };
+  const spare = await done(true);
+  assert.match(spare, /pozostaje w konfiguracji puli, dopóki nie zostanie odłączony/);
+  assert.doesNotMatch(spare, /można bezpiecznie wyjąć/);
+  assert.match(await done(false), /można bezpiecznie wyjąć/);
 });

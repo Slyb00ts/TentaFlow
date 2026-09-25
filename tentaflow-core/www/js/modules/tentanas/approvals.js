@@ -106,10 +106,10 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
         _approval: a,
         operation: `<span class="tf-table__cell-title">${escapeHtml(operationLabel(a.operation))}</span><div class="tf-table__cell-sub">${escapeHtml(approvalDetail(a.detail))}</div>`,
         subject: a.subject ? `<span class="tf-table__cell--mono">${escapeHtml(a.subject)}</span>` : '—',
-        requested: `<span>${escapeHtml(fmtAgo(a.requestedAt))}</span><div class="tf-table__cell-sub"${requester.title ? ` title="${escapeAttr(requester.title)}"` : ''}>${escapeHtml(T('approvals.requested_by', { user: requester.label }))}</div>`,
+        requested: `<span>${escapeHtml(fmtAgo(a.requestedAt))}</span><div class="tf-table__cell-sub">${escapeHtml(T('approvals.requested_by', { user: requester.label }))}</div>`,
         expires: `<span class="tf-table__cell--mono">${escapeHtml(a.status === 'pending' ? fmtIn(a.expiresAt) : fmtDate(a.expiresAt))}</span>`,
         status: `<tf-chip size="sm" dot status="${statusTone(a.status)}" label="${escapeAttr(T('approvals.status_' + a.status))}"></tf-chip>${
-          decider ? `<div class="tf-table__cell-sub"${decider.title ? ` title="${escapeAttr(decider.title)}"` : ''}>${escapeHtml(T('approvals.decided_by', { user: decider.label }))}</div>` : ''}`,
+          decider ? `<div class="tf-table__cell-sub">${escapeHtml(T('approvals.decided_by', { user: decider.label }))}</div>` : ''}`,
       };
     });
   };

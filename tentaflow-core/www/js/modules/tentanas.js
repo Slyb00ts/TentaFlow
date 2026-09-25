@@ -30,7 +30,7 @@ import { drawPools, poolDescription } from '/js/modules/tentanas/pools.js';
 import { drawPoolDetail, openReplaceWizard } from '/js/modules/tentanas/pool-detail.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
 import { drawTasks, openSmartScheduleEditor, jobSubject, jobRowSkeleton, paintJobRow } from '/js/modules/tentanas/tasks.js';
-import { drawShares, protocolChipHtml } from '/js/modules/tentanas/shares.js';
+import { drawShares, protocolChipHtml, mountStateLabel } from '/js/modules/tentanas/shares.js';
 import { warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openDiskWipeDialog } from '/js/modules/tentanas/disk-wipe.js';
 import { exportConfig, mountImportPicker, applyImport, planBlocked } from '/js/modules/tentanas/config-transfer.js';
@@ -57,7 +57,7 @@ import '/js/components/tf-choice-card.js';
 import '/js/components/tf-line-chart.js';
 import '/js/components/tf-stream-chart.js';
 import { openTargetDetail } from '/js/modules/tentanas/targets.js';
-import { drawElasticDetail, elasticState, elasticProtection, elasticCapacity } from '/js/modules/tentanas/elastic-detail.js';
+import { drawElasticDetail, elasticState, elasticProtection, elasticCapacity, cacheWaitingBytes } from '/js/modules/tentanas/elastic-detail.js';
 
 // -----------------------------------------------------------------------------
 // Screen-local helpers
@@ -199,8 +199,11 @@ function paintArrayMini(row, a) {
   const protection = elasticProtection(a);
   setAttr(row.querySelector('[data-role="state"]'), 'status', state.tone);
   setAttr(row.querySelector('[data-role="state"]'), 'label', state.label);
-  setAttr(row.querySelector('[data-role="protection"]'), 'status', protection.tone);
-  setAttr(row.querySelector('[data-role="protection"]'), 'label', protection.label);
+  // n02:299 — the bytes waiting on the cache outside parity lead the row
+  // when there are any (the node's figure); otherwise the protection word.
+  const waiting = cacheWaitingBytes(a);
+  setAttr(row.querySelector('[data-role="protection"]'), 'status', waiting != null ? 'warn' : protection.tone);
+  setAttr(row.querySelector('[data-role="protection"]'), 'label', waiting != null ? T('elastic.card_cache_waiting', { size: fmtOptionalBytes(waiting) }) : protection.label);
   const fs = a.filesystem ? String(a.filesystem).toUpperCase() : T('elastic.unknown');
   const topology = T('elastic.topology', { data: (a.dataDisks || []).length, parity: (a.parityDisks || []).length, fs });
   setText(row.querySelector('[data-role="sub"]'), `Elastic Array · ${topology}`);
@@ -243,7 +246,8 @@ function alertRowSkeleton(a) {
         ${sprite(a.severity === 'critical' ? 'alert' : a.severity === 'warning' ? 'alert' : 'info')}
         <div class="a-main">
           <div class="a-title" data-role="title"></div>
-          <div class="a-sub"><span data-role="detail"></span><span data-role="detail-sep"></span>${subject}<span data-role="ago"></span></div>
+          <div class="a-sub"><span data-role="detail"></span><span data-role="detail-sep"></span>${subject}<span data-role="place"></span><span data-role="ago"></span></div>
+          <div class="a-copy row" data-role="copy"></div>
           <details class="a-node" data-role="node" hidden><summary>${escapeHtml(T('alerts.node_text'))}</summary><div class="a-node-text" data-role="node-text"></div></details>
         </div>
         ${a.ackedAt ? `<tf-chip status="info" label="${escapeAttr(T('alerts.acked'))}"></tf-chip>` : `<tf-button size="sm" variant="ghost" icon="check" data-ack="${escapeAttr(a.alertId)}">${escapeHtml(T('alerts.ack'))}</tf-button>`}
@@ -259,32 +263,63 @@ function paintAlertRow(row, a, nameOf) {
   setAttr(title, 'title', text.tooltip);
   setText(row.querySelector('[data-role="detail"]'), text.detail);
   setText(row.querySelector('[data-role="detail-sep"]'), text.detail ? ' · ' : '');
+  // Where the subject sits (a disk alert's pool, "tank · RAIDZ2"), when the
+  // node put it on the alert; its own slot, since a re-raise can change it.
+  setText(row.querySelector('[data-role="place"]'), text.place ? `${text.place} · ` : '');
   setText(row.querySelector('[data-role="ago"]'), fmtAgo(a.raisedAt));
   // A detail that points at the node's text ("…w treści węzła") must reach
   // it without a hover too: the same text behind a tap (wave-4 critic minor
   // 13). Patched in place, so an opened one stays open across polls.
+  // A conflict's "copy path" controls: one per file, labelled by the file's
+  // path in the array. The other version's own path never enters the
+  // markup — the click reads it from the alert (`copyConflictPath`).
+  patchKeyedList(row.querySelector('[data-role="copy"]'), text.copies.map((c, i) => ({
+    key: `${i}:${c.path}`,
+    html: `<tf-button size="sm" variant="ghost" icon="copy" data-copy="${i}">${escapeHtml(T('alerts.code.elastic_conflict.copy_kept', { path: c.path }))}</tf-button>`,
+  })));
   setAttr(row.querySelector('[data-role="node"]'), 'hidden', !text.nodeText);
   setText(row.querySelector('[data-role="node-text"]'), text.nodeText ? text.tooltip : '');
 }
 
+// Copies the other version of a conflicted file to the clipboard — the one
+// deliberate way to find a quarantined copy, whose name carries its
+// operation's uuid and is never shown. The toast names the file by its path
+// in the array, never by the copied path.
+async function copyConflictPath(alert, index) {
+  const copy = alert ? alertText(alert).copies[index] : null;
+  if (!copy) return;
+  try {
+    await navigator.clipboard.writeText(copy.kept);
+    toast(T('alerts.code.elastic_conflict.copied', { path: copy.path }), 'success');
+  } catch {
+    toast(T('alerts.code.elastic_conflict.copy_failed'), 'error');
+  }
+}
+
 // The n01 fleet table's alert cell, worded like the n02 row (`alertText`);
 // the node's English is the cell's tooltip, and — when the detail points at
-// it — also one tap away, for a reader with no hover.
+// it — also one tap away, for a reader with no hover. A disk the node
+// advises replacing reads as the mockup writes it (n01:298): "sdd: … —
+// zaplanuj wymianę dysku" — only when the node's alert says so.
 function fleetAlertCellHtml(alert, nameOf) {
   const text = alertText(alert, { nameOf });
+  const title = text.advice ? `${text.title} — ${text.advice}` : text.title;
   const node = text.nodeText
     ? `<details class="l2"><summary>${escapeHtml(T('alerts.node_text'))}</summary>${escapeHtml(text.tooltip)}</details>`
     : '';
-  return `<div class="cell-2" title="${escapeAttr(text.tooltip)}"><div class="l1">${escapeHtml(text.title)}</div><div class="l2">${escapeHtml(text.detail)}</div>${node}</div>`;
+  return `<div class="cell-2" title="${escapeAttr(text.tooltip)}"><div class="l1">${escapeHtml(title)}</div><div class="l2">${escapeHtml(text.detail)}</div>${node}</div>`;
 }
 
-// One square per fleet node, in node order: the mount state of a share.
+// One square per fleet node, in node order: the mount state of a share. The
+// tooltip names the node and the state in words (`mountStateLabel`), or the
+// node's own mount error with any id in it replaced — never a raw state code.
 function mountDotsHtml(mounts, nodes) {
   return `<span class="mount-dots">${nodes.map((n) => {
     const m = (mounts || []).find((x) => x.nodeId === n.nodeId);
     const state = m ? m.state : 'na';
     const cls = state === 'mounted' || state === 'source' ? '' : state === 'pending' ? 'pending' : state === 'error' ? 'error' : 'na';
-    return `<span class="md ${cls}" title="${escapeAttr(`${nodeLabel(n)}: ${m ? (m.detail || m.state) : T('fleet.mount_na')}`)}"></span>`;
+    const what = m ? (m.detail ? scrubIds(m.detail, T('alerts.id_hidden')) : mountStateLabel(m.state, m.transport)) : T('fleet.mount_na');
+    return `<span class="md ${cls}" title="${escapeAttr(`${nodeLabel(n)}: ${what}`)}"></span>`;
   }).join('')}</span>`;
 }
 
@@ -965,7 +1000,7 @@ const TentaNasScreen = {
           ${kv(T('kpi.disks'), `${n.disksTotal}${n.disksCritical ? ` · <span class="num-err">${n.disksCritical}!</span>` : ''}${n.disksWarning ? ` · <span class="num-warn">${n.disksWarning}!</span>` : ''}`)}
           ${kv(T('kpi.pools'), String(n.poolsTotal))}
           ${!counted ? kv('Elastic Array', notCountedHtml(T('fleet.arrays_not_counted_hint'))) : n.arraysTotal ? kv('Elastic Array', String(n.arraysTotal)) : ''}
-          ${kv(T('kpi.shares'), shares ? String(shares.total) : notCountedHtml(T('fleet.not_counted_hint')))}
+          ${kv(T('kpi.shares'), shares ? String(shares.total) : notCountedHtml(sharesNotCountedHint(n, this.fleet?.rows)))}
         </div>
         <div class="nc-foot">
           <tf-chip size="sm" status="${channelMode(n.elevationMode) === 'unarmed' ? 'warn' : 'ok'}" icon="${channelMode(n.elevationMode) === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('elevation.short_' + channelMode(n.elevationMode)))}"></tf-chip>
@@ -1542,7 +1577,7 @@ const TentaNasScreen = {
         // on. Degraded like ARC and for the same reason: a node without
         // Elastic support, or one whose array probe fails, must lose the array
         // rows and NOT the dashboard.
-        this.nas('tentaNasElasticArraysListRequest', {}).catch(() => ({ arrays: [] })),
+        this.nas('tentaNasElasticArraysListRequest', {}).catch(() => ({ arrays: [], failed: true })),
       ]);
     } catch (e) {
       if (this.disposed || !body.isConnected) return;
@@ -1561,6 +1596,15 @@ const TentaNasScreen = {
     if (this.disposed || !body.isConnected) return;
     // The node answered, so retract the banner the last failure raised.
     patchHtml(body.querySelector('#nas-ov-error'), '');
+    // The node's own lists, answered for this organisation, are the count its
+    // Pools tab has — also for a remote node, whose fleet row counts no
+    // arrays (`nodeTabCounts`). Only when both halves answered: a failed
+    // array list would pass the ZFS half off as the whole.
+    if (!arraysRes.failed) {
+      const poolsTab = this.root?.querySelector('#nas-tabs tf-tab#pools');
+      setAttr(poolsTab, 'count', String((poolsRes.pools || []).length + (arraysRes.arrays || []).length));
+      setAttr(poolsTab, 'title', null);
+    }
 
     const disks = disksRes.disks || [];
     // Split, because collapsing them is what made this screen lie: the disks
@@ -1979,6 +2023,12 @@ const TentaNasScreen = {
           } catch (err) {
             toast(errMessage(err), 'error');
           }
+          return;
+        }
+        const copyBtn = e.target.closest('[data-copy]');
+        if (copyBtn) {
+          const a = el.__tfAlertsByKey?.get(copyBtn.closest('[data-alert]')?.dataset.alert);
+          await copyConflictPath(a, Number(copyBtn.dataset.copy));
           return;
         }
         const gotoBtn = e.target.closest('[data-goto]');
@@ -3186,6 +3236,12 @@ const TentaNasScreen = {
 
   // n16 ARC slider: the cap is a share of the node's RAM, written through the
   // permission channel so it survives a reboot.
+  //
+  // Live (n16 MAJOR 16): the card is built once and re-read every
+  // POLL_OVERVIEW_MS; a poll writes only the values that changed (the live
+  // ARC size, the hit ratio, the configured cap) into the nodes on screen.
+  // The slider follows the node's cap only while the admin has not moved it:
+  // an unsaved choice is never overwritten by a poll.
   async paintArcSettings(body, env) {
     const host = body.querySelector('#nas-env-arc');
     if (!host) return;
@@ -3193,46 +3249,70 @@ const TentaNasScreen = {
     if (this.disposed || !host.isConnected) return;
     const arc = res.arc;
     if (!arc || !arc.ramBytes) {
-      host.innerHTML = `<div class="muted">${escapeHtml(T('arc.unavailable'))}</div>`;
-      return;
+      host.__arc = null;
+      patchHtml(host, `<div class="muted">${escapeHtml(T('arc.unavailable'))}</div>`);
+    } else {
+      if (!host.__arc) this.buildEnvArcCard(host);
+      this.paintEnvArcCard(host, arc);
     }
-    const ram = Number(arc.ramBytes);
-    const current = Math.max(10, Math.min(75, Math.round((Number(arc.maxBytes) || 0) / ram * 100)));
+    this.later(() => { if (host.isConnected) this.paintArcSettings(body, env); }, POLL_OVERVIEW_MS);
+  },
+
+  buildEnvArcCard(host) {
     host.innerHTML = `
       <div class="slider-row">
         <div>
           <div class="sl-name">${escapeHtml(T('arc.slider_name'))}</div>
           <div class="sl-desc">${escapeHtml(T('arc.slider_desc'))}</div>
         </div>
-        <tf-slider id="nas-arc-slider" min="10" max="75" step="1" value="${current}" ${this.isAdmin ? '' : 'disabled'}></tf-slider>
-        <div class="sl-val" id="nas-arc-val">${escapeHtml(T('arc.slider_value', { pct: current, size: fmtBytes(ram * current / 100) }))}</div>
+        <tf-slider id="nas-arc-slider" min="10" max="75" step="1" ${this.isAdmin ? '' : 'disabled'}></tf-slider>
+        <div class="sl-val" id="nas-arc-val"></div>
       </div>
       <div class="grid-2 mt-md">
         <div class="stat-rows">
-          <div class="sr"><span class="k">${escapeHtml(T('arc.live_usage'))}</span><span class="v">${escapeHtml(fmtBytes(arc.sizeBytes))}</span></div>
-          <div class="sr"><span class="k">${escapeHtml(T('arc.hit_ratio_24h'))}</span><span class="v num-ok">${(Number(arc.hitRatio) || 0).toFixed(1)}% · <a data-act="arc-details">${escapeHtml(T('arc.details'))}</a></span></div>
+          <div class="sr"><span class="k">${escapeHtml(T('arc.live_usage'))}</span><span class="v" data-f="arc-size"></span></div>
+          <div class="sr"><span class="k">${escapeHtml(T('arc.hit_ratio_24h'))}</span><span class="v num-ok"><span data-f="arc-hit"></span> · <a data-act="arc-details">${escapeHtml(T('arc.details'))}</a></span></div>
         </div>
         ${warningHtml('warning', T('arc.warning'))}
       </div>
       <div class="row mt-md" style="justify-content:flex-end">
         <tf-button variant="primary" icon="save" data-act="arc-apply" disabled>${escapeHtml(T('arc.apply'))}</tf-button>
       </div>`;
+    // `ram` and `current` are the last read's; the handlers read them from
+    // here so a poll never has to re-wire them.
+    const state = { ram: 0, current: 0, dirty: false };
+    host.__arc = state;
     const slider = host.querySelector('#nas-arc-slider');
     const valEl = host.querySelector('#nas-arc-val');
     const apply = host.querySelector('[data-act="arc-apply"]');
     slider.addEventListener('input', (e) => {
-      const p = Number(e.detail.value) || current;
-      valEl.textContent = T('arc.slider_value', { pct: p, size: fmtBytes(ram * p / 100) });
-      if (this.isAdmin && p !== current) apply.removeAttribute('disabled'); else apply.setAttribute('disabled', '');
+      const p = Number(e.detail.value) || state.current;
+      state.dirty = p !== state.current;
+      setText(valEl, T('arc.slider_value', { pct: p, size: fmtBytes(state.ram * p / 100) }));
+      setAttr(apply, 'disabled', !(this.isAdmin && state.dirty));
     });
     host.querySelector('[data-act="arc-details"]').addEventListener('click', () => this.switchTab('overview'));
     apply.addEventListener('click', async () => {
-      const p = Number(slider.value) || current;
-      const ok = await this.withSudo((sudoPassword) => this.nas('tentaNasArcLimitSetRequest', { maxBytes: Math.round(ram * p / 100), sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('arc.settings_title'));
+      const p = Number(slider.value) || state.current;
+      const ok = await this.withSudo((sudoPassword) => this.nas('tentaNasArcLimitSetRequest', { maxBytes: Math.round(state.ram * p / 100), sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('arc.settings_title'));
       if (!ok) return;
       toast(T('arc.applied'), 'success');
-      this.paintArcSettings(body, env);
+      // The node's cap is the admin's choice now: the next read shows it.
+      state.dirty = false;
+      setAttr(apply, 'disabled', true);
     });
+  },
+
+  paintEnvArcCard(host, arc) {
+    const state = host.__arc;
+    state.ram = Number(arc.ramBytes);
+    state.current = Math.max(10, Math.min(75, Math.round((Number(arc.maxBytes) || 0) / state.ram * 100)));
+    if (!state.dirty) {
+      setAttr(host.querySelector('#nas-arc-slider'), 'value', String(state.current));
+      setText(host.querySelector('#nas-arc-val'), T('arc.slider_value', { pct: state.current, size: fmtBytes(state.ram * state.current / 100) }));
+    }
+    setText(host.querySelector('[data-f="arc-size"]'), fmtBytes(arc.sizeBytes));
+    setText(host.querySelector('[data-f="arc-hit"]'), `${(Number(arc.hitRatio) || 0).toFixed(1)}%`);
   },
 
   // MAJ-27: what the helper is actually allowed to run, straight from the
@@ -3692,7 +3772,7 @@ const TentaNasScreen = {
         const head = win.querySelector('#nas-joblog-head');
         const pre = win.querySelector('#nas-joblog');
         if (!head || !pre) return;
-        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span class="mono"${subject.title ? ` title="${escapeAttr(subject.title)}"` : ''}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span${author.title ? ` title="${escapeAttr(author.title)}"` : ''}>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${j.error ? `<div class="num-err mt-sm">${escapeHtml(errMessage(j.error))}</div>` : ''}`);
+        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span class="mono">${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${j.error ? `<div class="num-err mt-sm">${escapeHtml(errMessage(j.error))}</div>` : ''}`);
         paintJobLog(pre, j.log);
         if (j.status === 'running' || j.status === 'queued') timer = setTimeout(poll, POLL_JOB_MODAL_MS);
         else if (onFinish && !notified) { notified = true; onFinish(j); }
@@ -3962,6 +4042,15 @@ function nodeShares(n, fleetRows) {
   return { total: list.length, errors: list.filter((s) => s.state === 'error').length };
 }
 
+// Why a node's share count is "—": the node did not answer the share list
+// this screen asked it for (its row carries the error), or it answered but
+// the count is per organisation and not sent between nodes. Two different
+// facts; the old hint said the second for both.
+function sharesNotCountedHint(n, fleetRows) {
+  const row = (fleetRows || []).find((r) => r.node && r.node.nodeId === n?.nodeId);
+  return row && typeof row.shares === 'string' ? T('fleet.not_answered_hint') : T('fleet.not_counted_hint');
+}
+
 // The node card's grade: a remote node's own broken share makes it a warning,
 // as fleet.rs does for the local row (`add_own_shares`).
 function nodeCardHealth(n, shares) {
@@ -3983,7 +4072,7 @@ function nodeTabCounts(n, fleetRows) {
     pools: counted ? String((Number(n.poolsTotal) || 0) + (Number(n.arraysTotal) || 0)) : '—',
     poolsTitle: counted ? null : T('fleet.arrays_not_counted_hint'),
     shares: shares ? String(shares.total) : '—',
-    sharesTitle: shares ? null : T('fleet.not_counted_hint'),
+    sharesTitle: shares ? null : sharesNotCountedHint(n, fleetRows),
   };
 }
 

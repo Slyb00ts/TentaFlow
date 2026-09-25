@@ -428,7 +428,11 @@ pub struct NasAlert {
     /// - 'disk_health' {health, name_source, name?} — `health` is
     ///   'warning' | 'critical'; `name_source` is 'live' | 'last_known' |
     ///   'unknown' (`name` absent for 'unknown'); `reasons` are the disk's
-    ///   `NasHealthReason`s, worst first;
+    ///   `NasHealthReason`s, worst first. Also, when they hold at raise
+    ///   time: `pool` + `layout` — the ZFS pool the disk serves and its
+    ///   group's layout ('raidz2', 'mirror'…; never an Elastic Array, which
+    ///   is an organisation's); `advice` = 'replace' — the node's own
+    ///   replacement advice holds for the disk;
     /// - 'approval_pending' {operation, subject} — `operation` is the
     ///   `NasPendingApproval::operation` code;
     /// - 'elastic_sync_held' {array, cause?} — the scheduled Sync is skipped
@@ -448,8 +452,11 @@ pub struct NasAlert {
     ///   'quarantine' (a quarantined copy in the root of cache disk
     ///   `kept_disk`), 'data' (under the same path on data disk `kept_disk`)
     ///   or 'branch' (somewhere else on the array's disks, no `kept_disk`).
-    ///   The quarantine file's own name carries the operation id and is never
-    ///   sent;
+    ///   The quarantine file's own name carries the operation id: it is in no
+    ///   worded parameter, only in `kept_path` (with `kept_disk`, i.e. inside
+    ///   this array's branches) — the node's path of the other version, which
+    ///   a screen never renders and only copies to the clipboard on the
+    ///   admin's explicit request;
     /// - 'elastic_needs_attention' {array, helper_detail?} — `helper_detail`
     ///   is the helper's own text: a tooltip, never the screen's sentence;
     /// - 'elastic_result_unconfirmed' {array, error} — `error` is the raw
@@ -756,9 +763,20 @@ pub struct NasVdevDisk {
     pub write_errors: u64,
     pub cksum_errors: u64,
     pub size_bytes: u64,
-    /// Free text from `zpool status` for this leaf ("resilvering", "was
-    /// /dev/sdk1") — shown as-is next to the cell.
+    /// Free text from `zpool status` for this leaf ("resilvering") — shown
+    /// as-is next to the cell. A "was /dev/…" annotation never stays here: it
+    /// names the device by its old path (often a by-id link, an id), and the
+    /// node turns it into `last_known_name` instead.
     pub note: String,
+    /// For a leaf `zpool status` can no longer find (no `disk_id`, its name a
+    /// GUID or a by-id link): the kernel name the disk was last seen under,
+    /// resolved on the node — from zpool's own "was /dev/sdk1", or from the
+    /// by-id link through this node's disk records. A REMEMBERED name, which
+    /// the kernel may since have given to another disk, so a screen marks it
+    /// as such. `None` when the node knows none; the screen then names the
+    /// leaf by its position, never by the id.
+    #[serde(default)]
+    pub last_known_name: Option<String>,
 }
 
 /// A top-level vdev of the pool. `kind` is the redundancy of the group
@@ -2321,9 +2339,17 @@ pub enum TentaNasPayload {
     },
     PoolPlanResponse {
         options: Vec<NasPoolLayoutOption>,
+        /// DEPRECATED FOR DISPLAY: the node's English sentences, kept for an
+        /// older screen. A screen words `warning_codes` instead.
         warnings: Vec<String>,
         /// Smallest disk decides the vdev — the size the plan is computed with.
         smallest_disk_bytes: u64,
+        /// The same warnings as codes (`pools::plan_warning_codes`):
+        /// 'mixed_sizes' {smallest, largest} (bytes), 'mixed_media' {},
+        /// 'unhealthy_disks' {disks} (kernel names), 'single_disk' {},
+        /// 'odd_mirror' {}. Empty from an older node.
+        #[serde(default)]
+        warning_codes: Vec<NasHealthReason>,
     },
     /// Wizard step "create". `layout` is one of `NasPoolLayoutOption::layout`;
     /// `encryption` = create the root dataset encrypted with a key kept in

@@ -11,7 +11,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, poolCrumbTail, sprite, POLL_POOLS_MS, POLL_JOB_MODAL_MS, IO_WINDOW_SECS, ADMIN_TIMEOUT_MS, parseServerTs,
   fmtDate, fmtIn, fmtDuration, fmtBytes, fmtMBps, fmtRatio, pct, healthClass, errMessage,
-  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel,
+  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel, firstDiskReasonWord,
 } from '/js/modules/tentanas/format.js';
 import { isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, SLOT, slotEl, setClass, setRowsIfChanged } from '/js/lib/dom-patch.js';
@@ -22,6 +22,7 @@ import { scrubAction, trimAction } from '/js/modules/tentanas/pools.js';
 import { toggleCellCheckbox } from '/js/modules/tentanas/pool-wizard.js';
 import { drawDatasets } from '/js/modules/tentanas/datasets.js';
 import { drawSnapshots } from '/js/modules/tentanas/snapshots.js';
+import { protocolLabel as targetProtocolLabel } from '/js/modules/tentanas/targets.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
@@ -345,12 +346,21 @@ function onPaneClick(e, root, screen, state, refresh) {
     }
     case 'offline':
     case 'online':
-    case 'clear':
-      deviceAction(screen, p, act, el.dataset.device, refresh);
+    case 'clear': {
+      // The request names the leaf as zpool knows it (a GUID or by-id path
+      // for a missing leaf); the confirm and the toast name it as the cell
+      // does — never by that id.
+      // These buttons carry no `data-vdev`: the leaf's group is the one that
+      // holds it.
+      const v = (p.vdevs || []).find((x) => (x.disks || []).some((y) => y.name === el.dataset.device));
+      const d = (v?.disks || []).find((x) => x.name === el.dataset.device);
+      const shown = d ? leafDisplayName(d, inventoryFor(inventoryOf(state.disks || []), d), leafPosition(v, d)) : T('elastic.disk_absent');
+      deviceAction(screen, p, act, el.dataset.device, shown, refresh);
       return;
+    }
     case 'disk': screen.openDisk(el.dataset.disk); return;
     case 'export': exportPool(screen, p, Boolean(root.querySelector('#nas-export-force')?.checked)); return;
-    case 'destroy': openPoolDestroyDialog(screen, p, state.res.datasets || [], () => leavePool(screen)); return;
+    case 'destroy': openPoolDestroyDialog(screen, p, state.res.datasets || [], () => leavePool(screen), state.disks || []); return;
   }
 }
 
@@ -361,13 +371,15 @@ async function removeVdev(screen, p, v, refresh) {
   followResponse(screen, res, refresh, T('pool.vdev_remove_done'));
 }
 
-async function deviceAction(screen, p, action, device, refresh) {
+// `device` goes to the node; `shown` is the leaf's name as the cell shows it
+// (`leafDisplayName`), the only one the confirm and the toast may carry.
+async function deviceAction(screen, p, action, device, shown, refresh) {
   if (action === 'offline') {
-    const ok = await TfWindow.confirm({ title: T('pool.disk_offline'), message: T('pool.disk_offline_confirm', { device, ft: p.faultTolerance }), confirmLabel: T('pool.disk_offline'), cancelLabel: I18n.t('common.cancel'), danger: true });
+    const ok = await TfWindow.confirm({ title: T('pool.disk_offline'), message: T('pool.disk_offline_confirm', { device: shown, ft: p.faultTolerance }), confirmLabel: T('pool.disk_offline'), cancelLabel: I18n.t('common.cancel'), danger: true });
     if (!ok) return;
   }
   const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolDeviceStateRequest', { name: p.name, device, action, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.disk_' + action));
-  followResponse(screen, res, refresh, T('pool.disk_' + action + '_done', { device }));
+  followResponse(screen, res, refresh, T('pool.disk_' + action + '_done', { device: shown }));
 }
 
 async function exportPool(screen, p, force) {
@@ -468,7 +480,8 @@ export function diskCondition(d, inv) {
 // sets `id` to the leaf's own path, which is often a by-id serial or WWN
 // path (M4, hard rule: no machine identifier as visible text). Label it by
 // role instead, with an ordinal when the pool carries more than one bare
-// vdev of that role, and keep the real id in `title=` only.
+// vdev of that role. The id is not shown at all, not even as a tooltip
+// (owner's rule: no ids anywhere in the GUI).
 function bareVdevLabel(vdevs, v) {
   if (v.kind !== 'disk') return v.id;
   const bare = (vdevs || []).filter((x) => x.kind === 'disk' && x.role === v.role);
@@ -493,7 +506,7 @@ function vdevSkeletonHtml(v, admin, vdevs) {
     <div class="vdev-group" data-vdev="${escapeAttr(v.id)}">
       <div class="vg-head">
         <span class="vg-type">${escapeHtml(v.role === 'data' || v.kind === 'disk' ? layoutLabel(v.kind) : `${T('pool.role_' + v.role)} · ${layoutLabel(v.kind)}`)}</span>
-        <span class="mono text-3" title="${escapeAttr(v.id)}">${escapeHtml(bareVdevLabel(vdevs, v))}</span>
+        <span class="mono text-3">${escapeHtml(bareVdevLabel(vdevs, v))}</span>
         <span data-slot="state" ${SLOT}></span>
         <span class="hint" data-f="hint"></span>
         <span class="spacer"></span>
@@ -519,19 +532,15 @@ function vdevSkeletonHtml(v, admin, vdevs) {
 //
 // Prefer the real kernel name from the disk inventory when the leaf
 // resolves to one there (matched by `disk_id` or by name, same as
-// `inventoryFor` elsewhere on this screen); otherwise fall back to a
-// translated "missing disk" label. The id goes in `title=` only. The wire
-// is not changed by this: the GUID/by-id text stays `d.name` for every
-// server request (device actions, replace) — only what is painted on
-// screen changes.
-//
-// `zpool`'s own "was /dev/…" annotation on a removed leaf is not
-// parenthesized, so `parse_config_row` — which only captures a note inside
-// `(...)` (pools.rs:176-180) — never puts it in `note`. Recovering a kernel
-// name by parsing `note` for "was …" would be dead code (unreachable given
-// the parser), so this does not attempt it; the note text itself is shown
-// verbatim in the sub-line (`d.note`, unrelated to the leaf's name) exactly
-// as before.
+// `inventoryFor` elsewhere on this screen); then the name the NODE remembers
+// for it (`lastKnownName`: zpool's own "was /dev/sdk1", or the disk its
+// by-id link belongs to in the node's records — pools.rs
+// `last_known_leaf_name`), marked as remembered because the kernel may have
+// given it to another disk since; otherwise a translated "missing disk"
+// label with the leaf's position in its group. The id is never shown, not
+// even as a tooltip (owner's rule). The wire is not changed by this: the
+// GUID/by-id text stays `d.name` for every server request (device actions,
+// replace) — only what is painted on screen changes.
 // The shapes (digit-only GUID, UUID, every by-id/by-path prefix) live in
 // `machine-id.js`'s `isDiskIdShape` — a ZFS leaf name is only ever a kernel
 // name or a disk id/by-id basename, never a human-chosen name, so the disk
@@ -541,22 +550,25 @@ function vdevSkeletonHtml(v, admin, vdevs) {
 // `dm-name-…` / `dm-uuid-…` are by-id LINKS; `dm-0` is a real kernel name (a
 // LUKS or LVM device) and must stay visible as the disk it is.
 export const isUnresolvedLeafName = isDiskIdShape;
-function leafDisplayName(d, inv) {
+// `position` is the leaf's 1-based place in its vdev (0 when unknown).
+function leafDisplayName(d, inv, position = 0) {
   if (!isUnresolvedLeafName(d.name)) return d.name;
   const kernelName = inv && inv.name && !isUnresolvedLeafName(inv.name) ? inv.name : null;
-  return kernelName || T('elastic.disk_absent');
-}
-function leafDisplayTitle(d) {
-  return isUnresolvedLeafName(d.name) ? d.name : null;
+  if (kernelName) return kernelName;
+  const remembered = String(d.lastKnownName || '').trim();
+  if (remembered && !isUnresolvedLeafName(remembered)) return T('pool.leaf_last_known', { name: remembered });
+  return position ? T('pool.leaf_missing_at', { n: position }) : T('elastic.disk_absent');
 }
 
+// The leaf's 1-based place in its vdev, by its wire name.
+const leafPosition = (v, d) => (v?.disks || []).findIndex((x) => x.name === d.name) + 1;
+
 function diskSkeletonHtml(d, v, inv) {
-  const name = leafDisplayName(d, inv);
-  const title = leafDisplayTitle(d);
+  const name = leafDisplayName(d, inv, leafPosition(v, d));
   return `
     <div class="disk-cell ${v.role === 'spare' ? 'spare' : ''}" data-device="${escapeAttr(d.name)}">
       <div class="dc-main">
-        <div class="dc-name"><span class="health-dot"></span><span class="mono"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(name)}</span><span data-slot="chip" ${SLOT}></span></div>
+        <div class="dc-name"><span class="health-dot"></span><span class="mono">${escapeHtml(name)}</span><span data-slot="chip" ${SLOT}></span></div>
         <div class="dc-sub" data-f="sub"></div>
         <div class="dc-sub mono" data-f="errs"></div>
       </div>
@@ -587,7 +599,12 @@ function paintDiskCell(cell, d, v, ctx) {
   const cond = diskCondition(d, inv);
   const bad = d.state !== 'online';
   setClass(cell, 'faulted', bad);
-  setClass(cell, 'warn', !bad && cond.tone !== 'ok');
+  // Owner decision (wave 5, n06:218-226): the amber border marks a disk whose
+  // chip NAMES a reason (sdd "Uwaga: 3 realok."). A warning with no reason
+  // the node words (a hot disk shown by its dot alone, bare error counters)
+  // keeps the dot and no border.
+  const namedReason = Boolean(cond.chip && firstDiskReasonWord(inv));
+  setClass(cell, 'warn', !bad && cond.tone !== 'ok' && namedReason);
   setClass(cell, 'resilver', bad && ctx.resilvering);
   const dot = cell.querySelector('.health-dot');
   for (const t of ['ok', 'warn', 'err']) setClass(dot, t, cond.tone === t);
@@ -1082,7 +1099,9 @@ export function openPropertyEditor(screen, target, prop, onDone, { dataset = fal
 
 // Destroy (n17a): the loss list names every dataset that goes with the pool
 // and the disks that come back as free; the name must be retyped.
-export function openPoolDestroyDialog(screen, pool, datasets, onDone) {
+// `disks` is the node's disk inventory, for naming the pool's leaves as the
+// cells do (`leafDisplayName`) — a missing leaf is never its GUID or by-id.
+export function openPoolDestroyDialog(screen, pool, datasets, onDone, disks = []) {
   // The pool root is the subject of the modal, not an item in it: listing it
   // would show the pool's whole capacity twice (root + its children) and shift
   // the "+N więcej" overflow counter by one.
@@ -1091,11 +1110,13 @@ export function openPoolDestroyDialog(screen, pool, datasets, onDone) {
   const more = children.length - shown.length;
   const dataVdevs = (pool.vdevs || []).filter((v) => v.role === 'data');
   const dataDisks = dataVdevs.flatMap((v) => v.disks || []);
+  const inventory = inventoryOf(disks);
+  const leafNames = dataVdevs.flatMap((v) => (v.disks || []).map((d) => leafDisplayName(d, inventoryFor(inventory, d), leafPosition(v, d))));
   const otherRoles = [...new Set((pool.vdevs || []).filter((v) => v.role !== 'data').map((v) => v.role))].map((r) => T('pool.role_' + r));
   const explain = T('destroy_pool.explain', {
     n: dataDisks.length,
     layout: escapeHtml(layoutLabel(dataVdevs[0]?.kind || pool.layout)),
-    disks: escapeHtml(dataDisks.map((d) => d.name).join(', ') || '—'),
+    disks: escapeHtml(leafNames.join(', ') || '—'),
     others: otherRoles.length ? escapeHtml(T('destroy_pool.explain_others', { roles: otherRoles.join(', ') })) : '',
     export: `<b>${escapeHtml(T('danger.export'))}</b>`,
   });
@@ -1106,8 +1127,9 @@ export function openPoolDestroyDialog(screen, pool, datasets, onDone) {
       ${more > 0 ? `<li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('destroy_pool.more', { n: more }))}</span></li>` : ''}
       <li class="ll bad">${sprite('trash')}<span><b>${escapeHtml(T('destroy_pool.snapshots', { n: pool.snapshotCount }))}</b></span></li>
     </ul>
+    <ul class="loss-list" data-role="dependents"></ul>
     <div class="explain-box">${explain}</div>`;
-  return openRetypeDialog({
+  const win = openRetypeDialog({
     ...NAS_DIALOG,
     title: T('destroy_pool.title', { name: pool.name }),
     icon: 'alert',
@@ -1122,6 +1144,45 @@ export function openPoolDestroyDialog(screen, pool, datasets, onDone) {
       return true;
     },
   });
+  paintPoolDependents(screen, win, pool, datasets);
+  return win;
+}
+
+// Whether a dataset name / an absolute path lives on `pool`.
+const onPool = (pool, name) => name === pool.name || String(name || '').startsWith(pool.name + '/');
+const underMount = (datasets, path) => datasets.some((d) => d.mountpoint && d.mountpoint !== '/' && String(path || '').startsWith(d.mountpoint.replace(/\/$/, '') + '/'));
+
+// n17a (M15): what else dies with the pool — every share and block target of
+// this organisation whose data lives on it, one line each, as the mockup
+// lists them. Read when the dialog opens (the lists are the Sharing tab's own
+// reads); a list that cannot be read adds nothing rather than guessing, and
+// the lines land in their own slot so the dialog is never rebuilt.
+export async function paintPoolDependents(screen, win, pool, datasets) {
+  const host = win?.querySelector('[data-role="dependents"]');
+  if (!host) return;
+  const [shares, targets] = await Promise.all([
+    screen.nas('tentaNasSharesListRequest', {}).then((r) => r.shares || []).catch(() => []),
+    screen.nas('tentaNasTargetsListRequest', {}).then((r) => r.targets || []).catch(() => []),
+  ]);
+  if (!win.isConnected) return;
+  const items = [];
+  for (const s of shares) {
+    const where = s.dataset && onPool(pool, s.dataset) ? s.dataset : underMount(datasets, s.sourcePath) ? s.sourcePath : null;
+    if (!where) continue;
+    items.push({
+      key: 'share:' + s.name,
+      html: `<li class="ll bad">${sprite('trash')}<span><b>${escapeHtml(where)}</b> — ${escapeHtml(T('destroy_pool.share_stops', { protocol: String(s.protocol || '').toUpperCase(), name: s.name }))}</span></li>`,
+    });
+  }
+  for (const t of targets) {
+    const lun = (t.luns || []).find((l) => (l.sourceKind === 'zvol' ? onPool(pool, l.source) : underMount(datasets, l.source)));
+    if (!lun) continue;
+    items.push({
+      key: 'target:' + t.name,
+      html: `<li class="ll bad">${sprite('trash')}<span><b>${escapeHtml(lun.source)}</b> — ${escapeHtml(T('destroy_pool.target_stops', { protocol: targetProtocolLabel(t.protocol), name: t.name }))}</span></li>`,
+    });
+  }
+  patchKeyedList(host, items);
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,7 +1365,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
   // this label instead of `disk.name`; the wire request still sends
   // `disk.name` (the GUID/by-id text), which is what the server needs to
   // find it.
-  const oldDiskLabel = leafDisplayName(disk, inventoryFor(inventoryOf(disks), disk));
+  const oldDiskLabel = leafDisplayName(disk, inventoryFor(inventoryOf(disks), disk), leafPosition(vdev, disk));
   const minBytes = Number(disk.sizeBytes) || 0;
   const byId = new Map(disks.map((d) => [d.diskId, d]));
   const candidates = [
@@ -1562,7 +1623,12 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
     const failed = state.scan.kind === 'resilver' && Number(state.scan.errors) > 0;
     state.result = failed
       ? { ok: false, detail: T('pools.scrub_errors', { n: Number(state.scan.errors) || 0 }) }
-      : { ok: true, detail: T('replace.done_detail', { device: oldDiskLabel }) };
+      // A replace onto a HOT SPARE leaves the old leaf in the pool's `spare-N`
+      // group until `zpool detach`, which this version does not run (the
+      // command comes with the next helper release): saying it "can be
+      // pulled" would be false. A replace onto a free disk detaches the old
+      // leaf itself when the resilver ends.
+      : { ok: true, detail: T(state.pick?.spare ? 'replace.done_detail_spare' : 'replace.done_detail', { device: oldDiskLabel, new: state.pick?.name || '' }) };
     paint();
     if (onDone) onDone(state.job);
   };

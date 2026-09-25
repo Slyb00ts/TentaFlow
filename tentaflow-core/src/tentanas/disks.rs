@@ -2223,6 +2223,9 @@ struct LeafRegrade {
     reason: String,
     /// `reason` as codes, for the alert's coded detail.
     reasons: Vec<NasHealthReason>,
+    /// The disk as regraded, for what the alert says beyond the grade
+    /// (`health_alert_place`): its pool and whether to replace it.
+    disk: NasDisk,
 }
 
 /// One inventory pass's regrade of one disk by its leaf state.
@@ -2268,6 +2271,7 @@ fn regrade_leaf(
         health,
         reason,
         reasons: live.disk.health_reasons.clone(),
+        disk: live.disk.clone(),
     })
 }
 
@@ -2297,7 +2301,7 @@ fn settle_leaf_alerts(db: &DbPool, regrades: Vec<LeafRegrade>) -> Vec<(LeafRegra
     regrades
         .into_iter()
         .filter_map(|r| {
-            write_health_alert(db, &r.disk_id, &r.health, &r.reason, &r.reasons)
+            write_health_alert(db, &r.disk_id, &r.health, &r.reason, &r.reasons, Some(&r.disk))
                 .err()
                 .map(|e| (r, e))
         })
@@ -2318,16 +2322,66 @@ fn settle_leaf_alerts(db: &DbPool, regrades: Vec<LeafRegrade>) -> Vec<(LeafRegra
 ///
 /// The SMART pass writes through here too: after a failed write the shown
 /// grade it would otherwise move from is not what the table holds either.
+///
+/// `disk` is the disk as just graded, when the caller holds it: what the
+/// alert says beyond the grade is read from it (`health_alert_place`).
 fn write_health_alert(
     db: &DbPool,
     disk_id: &str,
     health: &str,
     reason: &str,
     reasons: &[NasHealthReason],
+    disk: Option<&NasDisk>,
 ) -> Result<()> {
     let open = store::open_alert_severity(db, &health_alert_key(disk_id))?;
     let from = open.as_deref().unwrap_or("ok");
-    sync_health_alert(db, disk_id, from, health, reason, reasons)
+    // Only an alert that will stand needs its place: a healthy disk's write
+    // closes the row, and the two reads behind the advice would be wasted.
+    let place = disk
+        .filter(|_| matches!(health, "warning" | "critical"))
+        .map(|d| health_alert_place(db, d, from == health))
+        .unwrap_or_default();
+    sync_health_alert(db, disk_id, from, health, reason, reasons, &place)
+}
+
+/// What a disk's health alert says beyond its grade and reasons, decided at
+/// raise time from what the node knows then:
+/// - `pool`: the ZFS pool the disk serves and the layout of its group, the
+///   n02 sub-line "tank · raidz2". Only a pool: an Elastic Array is an
+///   organisation's, and a disk alert is node hardware every node admin
+///   reads — it never names an array;
+/// - `advise_replacement`: the node's own replacement advice holds for the
+///   disk (`replacement_advice`, the same verdict the advice list gives),
+///   the n01 suffix "— zaplanuj wymianę dysku". Never inferred by a screen.
+///   Only for a ZFS pool member: replacing an Elastic member is not offered
+///   in this version, and n03/n04 word its advice as "watch this disk"
+///   (`replace_advice.array_*`) — the alert must not say otherwise.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct HealthAlertPlace {
+    pool: Option<(String, String)>,
+    advise_replacement: bool,
+}
+
+/// `same_verdict`: the open alert already carries this grade, so its
+/// `raised_at` is how long the disk has been in it — the advice's two-day
+/// clock (`warning_since`). A changed grade is a fresh row: zero days.
+///
+/// The advice's clock moves without a new read, so a disk crosses the two
+/// days between two writes of its alert; the next SMART pass (or leaf
+/// change) rewrites the parameter. The advice list itself is always current.
+fn health_alert_place(db: &DbPool, disk: &NasDisk, same_verdict: bool) -> HealthAlertPlace {
+    let pool = match (disk.role.as_str(), disk.member_of.as_deref()) {
+        ("pool_member", Some(pool)) if !pool.is_empty() && !disk.vdev_kind.is_empty() => {
+            Some((pool.to_string(), disk.vdev_kind.clone()))
+        }
+        _ => None,
+    };
+    let advise_replacement = pool.is_some() && {
+        let week_ago = store::attribute_week_ago(db, &disk.disk_id, "reallocated").unwrap_or(None);
+        let since = if same_verdict { warning_since(db, &disk.disk_id) } else { None };
+        replacement_advice(disk, since.as_deref(), week_ago, false).is_some()
+    };
+    HealthAlertPlace { pool, advise_replacement }
 }
 
 fn health_alert_key(disk_id: &str) -> String {
@@ -2454,16 +2508,16 @@ fn settle_smart_read(
     if let Err(e) = store::store_smart(db, id, &doc.to_string(), smart_health, &smart_reasons) {
         tracing::warn!("tentanas: SMART verdict of disk {id} not stored: {e}");
     }
-    let (health, reason, reasons) = {
+    let (health, reason, reasons, disk) = {
         let mut st = cell.write();
         let Some(live) = st.disks.get_mut(id) else { return };
         apply_summary(&mut live.disk, &summary);
         live.disk.smart_read_at = Some(store::now());
         live.smart = summary;
         let (health, reason) = apply_smart_verdict(live, smart_health, smart_reasons);
-        (health, reason, live.disk.health_reasons.clone())
+        (health, reason, live.disk.health_reasons.clone(), live.disk.clone())
     };
-    if let Err(e) = write_health_alert(db, id, &health, &reason, &reasons) {
+    if let Err(e) = write_health_alert(db, id, &health, &reason, &reasons, Some(&disk)) {
         tracing::warn!("tentanas: health alert of disk {id} not written, retried next pass: {e}");
         if let Some(live) = cell.write().disks.get_mut(id) {
             live.alert_settled = false;
@@ -2574,23 +2628,31 @@ pub(super) fn smartctl_failure_detail(out: &broker::CommandOutput) -> String {
 }
 
 /// The disk's health alert (code 'disk_health', see `NasAlert::code`): the
-/// grade and the name as parameters, the reasons as coded lines. The English
-/// title and detail are written beside them for forwarding and the tooltip.
+/// grade and the name as parameters, the reasons as coded lines, and what
+/// `HealthAlertPlace` adds (`pool` + `layout`, `advice`). The English title
+/// and detail are written beside them for forwarding and the tooltip.
 fn health_alert_text(
     health: &str,
     name: &ShownDiskName,
     reason: &str,
     reasons: &[NasHealthReason],
+    place: &HealthAlertPlace,
 ) -> store::AlertText {
     let (title, source, shown) = match name {
         ShownDiskName::Live(name) => (format!("Disk {name}: {health}"), "live", Some(name)),
         ShownDiskName::LastKnown(name) => (format!("Disk last seen as {name}: {health}"), "last_known", Some(name)),
         ShownDiskName::Unknown => (format!("Disk: {health}"), "unknown", None),
     };
-    let text = store::AlertText::new("disk_health", title, reason)
+    let mut text = store::AlertText::new("disk_health", title, reason)
         .param("health", health)
         .param("name_source", source)
         .reasons(reasons.to_vec());
+    if let Some((pool, layout)) = &place.pool {
+        text = text.param("pool", pool).param("layout", layout);
+    }
+    if place.advise_replacement {
+        text = text.param("advice", "replace");
+    }
     match shown {
         Some(name) => text.param("name", name),
         None => text,
@@ -2604,6 +2666,7 @@ fn sync_health_alert(
     health: &str,
     reason: &str,
     reasons: &[NasHealthReason],
+    place: &HealthAlertPlace,
 ) -> Result<()> {
     let key = health_alert_key(disk_id);
     match health {
@@ -2617,7 +2680,7 @@ fn sync_health_alert(
             // inventory is exactly the one whose alert matters most: it is
             // titled by the name it was last seen under, said as such, and
             // never by its id — which stays the alert's subject, not its text.
-            let text = health_alert_text(health, &shown_disk_name(db, disk_id, None), reason, reasons);
+            let text = health_alert_text(health, &shown_disk_name(db, disk_id, None), reason, reasons, place);
             store::raise_coded_alert(db, &key, health, "disk", disk_id, &text)?;
         }
         _ => store::resolve_alert(db, &key)?,
@@ -5137,7 +5200,7 @@ mod tests {
         .expect("record the disk");
         assert!(disk_name(id).is_none(), "the disk is not in the live inventory");
         let reasons = [coded_reason("reallocated", &[("count", "2".to_string())])];
-        sync_health_alert(&db, id, "ok", "warning", "2 reallocated sectors", &reasons).expect("raise");
+        sync_health_alert(&db, id, "ok", "warning", "2 reallocated sectors", &reasons, &HealthAlertPlace::default()).expect("raise");
         let alert = store::list_alerts(&db, false)
             .expect("alerts")
             .into_iter()
@@ -5159,7 +5222,7 @@ mod tests {
 
         // A disk the node never recorded: still never the id.
         let unknown = "wwn-never-recorded-5000cca27dc7a4c7";
-        sync_health_alert(&db, unknown, "ok", "critical", "8 reallocated sectors", &[]).expect("raise");
+        sync_health_alert(&db, unknown, "ok", "critical", "8 reallocated sectors", &[], &HealthAlertPlace::default()).expect("raise");
         let alert = store::list_alerts(&db, false)
             .expect("alerts")
             .into_iter()
@@ -5182,5 +5245,102 @@ mod tests {
         assert_eq!(pick_shown_name(None, Some(""), || Some("sdq".into())), ShownDiskName::LastKnown("sdq".into()));
         assert_eq!(pick_shown_name(None, None, || None), ShownDiskName::Unknown);
         assert_eq!(pick_shown_name(None, None, || Some("  ".into())), ShownDiskName::Unknown);
+    }
+
+    /// n02 names a disk alert's pool ("tank · raidz2") and n01 adds "—
+    /// zaplanuj wymianę dysku" — both only from what the node put on the
+    /// alert when it wrote it: the pool of a ZFS member (never an Elastic
+    /// Array, which is an organisation's), and the node's own replacement
+    /// advice, whose clock is the open row's age.
+    #[test]
+    fn a_disk_alert_names_its_pool_and_carries_the_nodes_replacement_advice() {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        store::migrate(&conn).expect("migrate");
+        let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+        let id = "wwn-place-5000cca27dc7a4c8";
+        let disk = NasDisk {
+            disk_id: id.into(),
+            name: "sdd".into(),
+            role: "pool_member".into(),
+            member_of: Some("tank".into()),
+            vdev_role: "data".into(),
+            vdev_kind: "raidz2".into(),
+            health: "warning".into(),
+            ..Default::default()
+        };
+        let alert = |db: &DbPool| {
+            store::alerts_for_subject(db, "disk", id)
+                .unwrap()
+                .into_iter()
+                .find(|a| a.resolved_at.is_none())
+                .expect("an open alert")
+        };
+        let param = |a: &tentaflow_protocol::tentanas::NasAlert, k: &str| a.params.get(k).cloned();
+
+        write_health_alert(&db, id, "warning", "2 reallocated sectors", &[], Some(&disk)).expect("raise");
+        let fresh = alert(&db);
+        assert_eq!(param(&fresh, "pool").as_deref(), Some("tank"));
+        assert_eq!(param(&fresh, "layout").as_deref(), Some("raidz2"));
+        assert_eq!(param(&fresh, "advice"), None, "a fresh warning is not yet advice");
+
+        // Three days in the same verdict: the node's advice holds, and the
+        // row says so without being raised again.
+        {
+            let conn = db.write().expect("write");
+            conn.execute(
+                "UPDATE nas_alerts SET raised_at = ?2 WHERE subject_id = ?1",
+                rusqlite::params![
+                    id,
+                    (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                ],
+            )
+            .expect("age the alert");
+        }
+        write_health_alert(&db, id, "warning", "2 reallocated sectors", &[], Some(&disk)).expect("refresh");
+        let aged = alert(&db);
+        assert_eq!(aged.alert_id, fresh.alert_id, "the same row");
+        assert_eq!(param(&aged, "advice").as_deref(), Some("replace"));
+        assert!(replacement_advice(&disk, Some(&aged.raised_at), None, false).is_some(), "the advice list agrees");
+
+        // A changed grade is a new row, and a new row has no age yet.
+        let critical = NasDisk { health: "critical".into(), ..disk.clone() };
+        write_health_alert(&db, id, "critical", "FAULTED", &[], Some(&critical)).expect("escalate");
+        let escalated = alert(&db);
+        assert_ne!(escalated.alert_id, fresh.alert_id);
+        assert_eq!(param(&escalated, "advice"), None, "no two days in this verdict yet");
+
+        // An Elastic member: its array is never named on a node-wide alert.
+        let member = NasDisk {
+            role: "array_member".into(),
+            member_of: Some("media".into()),
+            vdev_kind: String::new(),
+            ..disk.clone()
+        };
+        write_health_alert(&db, id, "critical", "FAULTED", &[], Some(&member)).expect("refresh");
+        let array = alert(&db);
+        assert_eq!(param(&array, "pool"), None);
+        assert_eq!(param(&array, "layout"), None);
+        assert!(array.params.values().all(|v| v != "media"), "{:?}", array.params);
+
+        // An Elastic member whose own advice holds (three days in warning):
+        // still no "replace" on the alert — n03/n04 say "watch it", and
+        // replacing an array member is not offered in this version.
+        let member_warning = NasDisk { health: "warning".into(), ..member };
+        write_health_alert(&db, id, "warning", "2 reallocated sectors", &[], Some(&member_warning)).expect("re-raise");
+        {
+            let conn = db.write().expect("write");
+            conn.execute(
+                "UPDATE nas_alerts SET raised_at = ?2 WHERE subject_id = ?1 AND resolved_at IS NULL",
+                rusqlite::params![
+                    id,
+                    (chrono::Utc::now() - chrono::Duration::days(3)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                ],
+            )
+            .expect("age the alert");
+        }
+        let aged_since = alert(&db).raised_at;
+        assert!(replacement_advice(&member_warning, Some(&aged_since), None, false).is_some(), "the advice itself holds");
+        write_health_alert(&db, id, "warning", "2 reallocated sectors", &[], Some(&member_warning)).expect("refresh");
+        assert_eq!(param(&alert(&db), "advice"), None, "no replacement suffix for an Elastic member");
     }
 }

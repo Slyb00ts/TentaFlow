@@ -333,8 +333,10 @@ pub enum HelperCommand {
     ElasticResume { array_id: String, owner: elastic::ElasticOwner, operation_id: String },
     ElasticMover { array_id: String, owner: elastic::ElasticOwner, operation_id: String, resume_operation_id: String, rules: elastic::MoverRules, coupled_sync: bool },
     /// `acknowledge_parity_fault` is the admin's explicit decision to run a
-    /// Sync over a recorded Scrub or Fix fault: measured, such a Sync removes
-    /// the files the Scrub could not read from the content file. It names the
+    /// Sync over a recorded Scrub or Fix fault: measured (M3, rig11
+    /// 2026-09-24), such a Sync removes nothing from the content file and
+    /// unchanged files stay repairable, but files deleted or changed since the
+    /// last Sync are recorded in their new state. It names the
     /// operation id of THE fault the admin confirmed, and the helper admits
     /// the Sync only while that is the recorded cause (`fault_unacknowledged`
     /// otherwise) — a request queued over one fault acknowledges no newer

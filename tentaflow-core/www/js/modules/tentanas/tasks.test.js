@@ -148,12 +148,11 @@ test('the job history node column falls back to "Node bez nazwy" for an unnamed 
 });
 
 // Same rule for who started a job: `jobAuthor` translates the system authors
-// and turns an unresolvable UUID into "nieznane konto" with the id in a
-// tooltip. The running-jobs strip used to print `j.startedBy` raw, so an
+// and turns an unresolvable UUID into "nieznane konto", with the id nowhere. The running-jobs strip used to print `j.startedBy` raw, so an
 // account the server could not resolve leaked its UUID into the open here —
 // even though the finished-jobs history and the job-log modal already went
 // through `jobAuthor`.
-test('a running job started by an unresolved account shows "nieznane konto" with the id in a tooltip', async () => {
+test('a running job started by an unresolved account shows "nieznane konto" and never its id', async () => {
   const uuid = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
   const running = [{ jobId: 'j9', kind: 'pool_scrub', subject: 'tank', status: 'running', startedBy: uuid, startedAt: '2026-09-02 08:00:00', finishedAt: null, log: [] }];
   const screen = fakeScreen(fixtures({ tentaNasJobsListRequest: { jobs: running } }));
@@ -162,16 +161,15 @@ test('a running job started by an unresolved account shows "nieznane konto" with
   await flush();
 
   const sub = body.querySelector('#nas-jobs-running .job-sub');
-  assert.doesNotMatch(sub.textContent, new RegExp(uuid), 'the id is not visible text');
+  assert.doesNotMatch(sub.outerHTML, new RegExp(uuid), 'the id is neither text nor a tooltip');
   assert.match(sub.textContent, /nieznane konto/);
-  assert.equal(sub.getAttribute('title'), uuid);
   screen.dispose();
 });
 
 // A SMART job is spawned on the disk id; the node names it. A name the node
 // only remembers (the disk has left its inventory) is marked as last-known,
-// and an id that still reached the row is a tooltip, never text — in the
-// running list and in the history alike.
+// and an id that still reached the row reads "nieznany dysk" — never the id,
+// not even as a tooltip — in the running list and in the history alike.
 test('a job subject is marked when last-known and never shows a disk id', async () => {
   const wwn = 'wwn-0x5000cca27dc7a4c6';
   const list = [
@@ -189,14 +187,14 @@ test('a job subject is marked when last-known and never shows a disk id', async 
   const running = body.querySelector('#nas-jobs-running');
   const name = (id) => running.querySelector(`.job-row[data-job="${id}"] .job-name .mono`);
   assert.equal(name('r1').textContent, 'ostatnio widziany jako sdq');
-  assert.equal(name('r2').textContent, '', 'the id is not visible text');
-  assert.equal(name('r2').getAttribute('title'), wwn, 'it is the tooltip');
-  assert.doesNotMatch(running.textContent, /wwn-/);
+  assert.equal(name('r2').textContent, 'nieznany dysk', 'the id is not visible text');
+  assert.doesNotMatch(running.innerHTML, /wwn-/, 'nor a tooltip');
 
   const history = body.querySelector('#nas-jobs-table').rows;
   const task = (id) => history.find((r) => r._job.jobId === id).task;
   assert.match(task('h1'), />ostatnio widziany jako sdq</);
-  assert.match(task('h2'), new RegExp(`title="${wwn}"></div>`), 'the id only as the tooltip');
+  assert.match(task('h2'), />nieznany dysk</);
+  assert.doesNotMatch(task('h2'), /wwn-/, 'the id is nowhere in the cell');
   assert.match(task('h3'), />sdd</, 'a live name is shown as it is');
   assert.doesNotMatch(task('h3'), /ostatnio/);
   screen.dispose();
@@ -214,24 +212,18 @@ test('a pool/share/target/dataset name is never hidden as an id, even in a disk-
   for (const kind of ['pool_scrub', 'snapshot_destroy', 'pool_replace', 'elastic_mover', 'share_create']) {
     for (const name of names) {
       const subject = jobSubject({ kind, subject: name });
-      assert.equal(subject.text, name, `${kind} subject "${name}" must stay visible`);
-      assert.equal(subject.title, '', `${kind} subject "${name}" is not an id, so no tooltip`);
+      assert.deepEqual(subject, { text: name }, `${kind} subject "${name}" must stay visible`);
     }
   }
 });
 
 // The same by-id shape IS a disk id when the job is a SMART test — hidden,
-// with the id moved to the tooltip — but stays a visible name for every
+// the subject reading "nieznany dysk" — but stays a visible name for every
 // other kind, because that kind's subject is never a disk id.
 test('a wwn- shaped subject is hidden for a SMART test, but shown for every other job kind', () => {
   const wwn = 'wwn-0x5000c500a1b2c3d4';
-  const smart = jobSubject({ kind: 'smart_test', subject: wwn });
-  assert.equal(smart.text, '', 'hidden for a SMART test');
-  assert.equal(smart.title, wwn);
-
-  const scrub = jobSubject({ kind: 'pool_scrub', subject: wwn });
-  assert.equal(scrub.text, wwn, 'shown for a pool subject of the same shape');
-  assert.equal(scrub.title, '');
+  assert.deepEqual(jobSubject({ kind: 'smart_test', subject: wwn }), { text: 'nieznany dysk' }, 'hidden for a SMART test');
+  assert.deepEqual(jobSubject({ kind: 'pool_scrub', subject: wwn }), { text: wwn }, 'shown for a pool subject of the same shape');
 });
 
 // Opaque ids (UUID, a long-enough digit-run GUID, a 64-hex id) are never a
@@ -241,8 +233,7 @@ test('an opaque id is hidden for every job kind, not only smart_test', () => {
   const uuid = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
   for (const kind of ['pool_scrub', 'snapshot_destroy', 'smart_test']) {
     const subject = jobSubject({ kind, subject: uuid });
-    assert.equal(subject.text, '', `${kind} subject must hide the opaque id`);
-    assert.equal(subject.title, uuid);
+    assert.deepEqual(subject, { text: kind === 'smart_test' ? 'nieznany dysk' : '' }, `${kind} subject must hide the opaque id, tooltip included`);
   }
 });
 

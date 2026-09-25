@@ -945,14 +945,18 @@ pub fn conflict_alert_key(array: &str) -> String {
 /// The alert stands for as long as the helper still finds a second version.
 ///
 /// Coded 'elastic_conflict' {array, count}, with one 'conflict_file'
-/// {path, visible, kept_kind, kept_disk?} line per file: the paths are data,
-/// the sentence around them is the screen's.
+/// {path, visible, kept_kind, kept_disk?, kept_path?} line per file: the
+/// paths are data, the sentence around them is the screen's.
 ///
-/// WHERE the other version is goes out as a place, not as the helper's path
+/// WHERE the other version is is WORDED as a place, not as the helper's path
 /// (wave-4 critic M2): a quarantined original sits in the cache root under
 /// `.tentanas-quarantine-<operation uuid>-<seq>`, and that uuid is not
 /// something a screen may show. The file's own path (`path`) is what the
-/// admin knows it by.
+/// admin knows it by. The helper's path does travel as `kept_path`, for one
+/// use only: the row's deliberate "copy path" control puts it on the
+/// clipboard, the one way to find a quarantined copy, and no screen renders
+/// it. Only for a place inside THIS array's branches (`kept_place` found a
+/// disk): any other path could name another array.
 pub fn conflict_alert(array: &str, conflicts: &[ElasticConflict]) -> Option<store::AlertText> {
     if conflicts.is_empty() {
         return None;
@@ -970,6 +974,7 @@ pub fn conflict_alert(array: &str, conflicts: &[ElasticConflict]) -> Option<stor
             .collect();
             if let Some(disk) = disk {
                 params.insert("kept_disk".to_string(), disk);
+                params.insert("kept_path".to_string(), conflict.kept.clone());
             }
             tentaflow_protocol::tentanas::NasHealthReason {
                 code: "conflict_file".to_string(),
@@ -2880,19 +2885,27 @@ fn unresolved_parity_run(array: &NasElasticArray) -> Option<&NasSnapraidRun> {
 /// `scratchpad/f1probe/run3.sh`, cases f1-f3): a Sync does NOT cost the marked
 /// blocks their repairability — it sees an unchanged file as `equal`, writes no
 /// parity for it, and `-e fix` still recovers the block afterwards
-/// (`error_recovered:1`). What a Sync DOES finalise is the other half of what a
-/// scrub reports: files it could not read are removed from the content file
-/// (`summary:removed:1`), and after that parity holds nothing of them. That is
-/// why an unattended Sync is refused here while a manual one is not — an admin
-/// who is told can decide, the cadence cannot.
+/// (`error_recovered:1`). An unchanged file the scrub could not READ (EIO)
+/// survives it too: the Sync ends `equal`, the content file still lists it,
+/// and `fix -f` restores it afterwards (M3 f4, raw logs in the design
+/// repository's reviews/artifacts/elastic-measurements-2026-09-24). An earlier
+/// probe that reported such files "removed from the content file" had DELETED
+/// the file — ordinary Sync behaviour, not a cost of the fault. What a Sync
+/// DOES finalise is the state of every file deleted or changed since the
+/// previous Sync, a damaged one included: its earlier version can no longer be
+/// restored from parity, and cases stay unmeasured (an unreadable file that
+/// also changed, a disk degrading during the Sync). That is why an unattended
+/// Sync is refused here while a manual one is not — an admin who is told can
+/// decide, the cadence cannot.
 ///
 /// WHAT ENDS IT (M2 of the release review): the cure, never the passing of
 /// time. A successful repair (`fix` ok), or a clean full scrub (`scrub` ok) —
 /// positive evidence that nothing is marked any more. And for a scrub that
-/// counted FILE errors only (no data errors), a later successful Sync: `-e
-/// fix` writes nothing for unreadable files (measured, probe f4), and the
-/// Sync that drops them from content is their only cure — the same rule
-/// `db::UNRESOLVED_ELASTIC_OPERATION` applies to the operation row. A Sync
+/// counted FILE errors only (no data errors), a later successful Sync — the
+/// same rule `db::UNRESOLVED_ELASTIC_OPERATION` applies to the operation row.
+/// Such an error marks no block, so `-e fix` has nothing to recover; the
+/// Sync over it keeps the file in content (M3 f4), and a later `fix -f`
+/// still restores it, so ending the fault there hides no lost file. A Sync
 /// does NOT end data errors: their marks stay repairable across it
 /// (measured, f1-f3), which is what keeps the repair on offer.
 pub fn unresolved_parity_fault(history: &[NasSnapraidRun]) -> Option<&NasSnapraidRun> {
@@ -6402,7 +6415,7 @@ pub(crate) mod tests {
             assert!(alerts[0].detail.contains(place), "{place}: {}", alerts[0].detail);
         }
         // Wave-4 critic M2: the quarantine name carries the operation's uuid,
-        // and neither the node's sentence nor a parameter may carry it.
+        // and the node's sentence never carries it.
         assert!(!alerts[0].detail.contains(".tentanas-quarantine-"), "{}", alerts[0].detail);
         // Coded: the count, and each file's three paths as data.
         assert_eq!(alerts[0].code, "elastic_conflict");
@@ -6414,13 +6427,20 @@ pub(crate) mod tests {
             vec![
                 ("kept_disk".to_string(), "c1".to_string()),
                 ("kept_kind".to_string(), "quarantine".to_string()),
+                ("kept_path".to_string(), conflict.kept.clone()),
                 ("path".to_string(), conflict.path.clone()),
                 ("visible".to_string(), conflict.visible.clone()),
             ]
         );
+        // Only the copy-path value carries the quarantine name; every
+        // parameter a screen words is free of it.
         assert!(
-            alerts[0].reasons[0].params.values().all(|v| !v.contains(&conflict.operation_id) && !v.contains("quarantine-")),
-            "no parameter carries the quarantine name: {:?}",
+            alerts[0].reasons[0]
+                .params
+                .iter()
+                .filter(|(k, _)| k.as_str() != "kept_path")
+                .all(|(_, v)| !v.contains(&conflict.operation_id) && !v.contains("quarantine-")),
+            "no worded parameter carries the quarantine name: {:?}",
             alerts[0].reasons[0].params
         );
         record_conflict_alert(&db, &spec.name, &[]).unwrap();
@@ -6463,10 +6483,22 @@ pub(crate) mod tests {
         .expect("an alert");
         assert!(!text.detail.contains(uuid) && !text.detail.contains("/srv/elsewhere"), "{}", text.detail);
         for line in &text.reasons {
-            assert!(line.params.values().all(|v| !v.contains(uuid)), "{:?}", line.params);
+            assert!(
+                line.params.iter().filter(|(k, _)| k.as_str() != "kept_path").all(|(_, v)| !v.contains(uuid)),
+                "{:?}",
+                line.params
+            );
         }
+        // The quarantined copy can be copied by its path (the row's "copy
+        // path" control); a place outside this array's branches cannot —
+        // it could name another array.
+        assert_eq!(
+            text.reasons[0].params.get("kept_path").map(String::as_str),
+            Some(format!("/mnt/tentanas-branches/media/cache/nvme2n1/.tentanas-quarantine-{uuid}-3").as_str())
+        );
         assert_eq!(text.reasons[1].params.get("kept_kind").map(String::as_str), Some("branch"));
         assert!(!text.reasons[1].params.contains_key("kept_disk"));
+        assert!(!text.reasons[1].params.contains_key("kept_path"));
     }
 
     #[test]

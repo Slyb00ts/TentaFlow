@@ -84,10 +84,11 @@ test('the scan is a separate action and its result names the owner, the counts a
   const media = row(win, MEDIA);
   assert.match(media.textContent, /Elastic · xfs/);
   assert.match(media.textContent, /dane: 2 · parity: 1 · cache: 0/);
-  // Whose array this is — in words. The owner ids are the tooltip only.
+  // Whose array this is — in words. The owner ids are neither text nor a tooltip.
   assert.match(media.textContent, /Właściciel w dzienniku: instancja „NAS Pracownia” tej organizacji/, 'whose array this is');
   assert.doesNotMatch(media.textContent, /orgtentanas-rig11|addontentanas/);
-  assert.equal(media.querySelector('.hint[title]').getAttribute('title'), 'orgtentanas-rig11 / addontentanas');
+  assert.doesNotMatch(media.innerHTML, /orgtentanas-rig11|addontentanas/, 'not even as a tooltip');
+  assert.doesNotMatch(media.innerHTML, new RegExp(MEDIA), 'nor the array id');
   assert.match(media.textContent, /UUID potwierdzony na 3 z 3 dysków/);
   assert.match(media.textContent, /unia zamontowana/, 'it is serving right now');
   assert.ok(!adoptButton(media).hasAttribute('disabled'), 'an importable array can be adopted');
@@ -140,7 +141,7 @@ test('an unreadable journal is listed with its reason and cannot be adopted', as
   assert.match(listed.querySelector('.num-err').textContent, /unknown variant `exploded`/);
   assert.match(listed.querySelector('.vg-head').textContent, /macierz bez nazwy/);
   assert.doesNotMatch(listed.textContent, new RegExp(ARCHIVE), 'the UUID is not printed');
-  assert.equal(listed.querySelector('.vg-head [title]').getAttribute('title'), ARCHIVE, 'it is the tooltip');
+  assert.doesNotMatch(listed.innerHTML, new RegExp(ARCHIVE), 'not even as a tooltip');
   assert.ok(adoptButton(listed).hasAttribute('disabled'));
   win.remove();
   screen.dispose();
@@ -296,7 +297,7 @@ test('missing and reused members are worded in the UI language from structured d
   assert.match(pl.el.textContent, /Dyski użyte ponownie: sdh/);
   assert.doesNotMatch(pl.el.textContent, /SN-1/, 'a disk that is here goes by its kernel name');
   // Another installation: no ids anywhere, the tooltip included.
-  assert.equal(pl.el.querySelector('.hint[title]').getAttribute('title'), '');
+  assert.equal(pl.el.querySelector('.hint[title]'), null);
   pl.win.remove();
   pl.screen.dispose();
 

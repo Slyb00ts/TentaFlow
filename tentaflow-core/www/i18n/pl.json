@@ -6611,7 +6611,8 @@
           "title_unnamed": "Dysk: {grade}",
           "title_live_reason": "{name}: {reason}",
           "title_last_known_reason": "Dysk ostatnio widziany jako {name}: {reason}",
-          "title_unnamed_reason": "Dysk: {reason}"
+          "title_unnamed_reason": "Dysk: {reason}",
+          "advice_replace": "zaplanuj wymianę dysku"
         },
         "approval_pending": {
           "title": "{operation} „{subject}” czeka na drugiego administratora",
@@ -6620,8 +6621,8 @@
         },
         "elastic_sync_held": {
           "title": "Macierz {array}: zaplanowany Sync wstrzymany, parity zgłasza błędy",
-          "detail": "Scrub zgłosił błędy, których nic jeszcze nie naprawiło. Zaplanowany Sync usunąłby z content pliki, których scrub nie mógł odczytać. Uruchom naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
-          "detail_fault": "Scrub nie zakończył się poprawnie albo naprawa się nie powiodła. Zaplanowany Sync usunąłby z content pliki, których scrub nie mógł odczytać, więc wymaga potwierdzenia na ekranie macierzy. Uruchom scrub albo naprawę z parity; Sync ręczny pozostaje dostępny po potwierdzeniu."
+          "detail": "Scrub zgłosił błędy, których nic jeszcze nie naprawiło. Zaplanowany Sync zapisałby obecny stan plików usuniętych lub zmienionych od ostatniego Sync, także uszkodzonych, i ich wcześniejszych wersji nie dałoby się już odtworzyć z parity. Uruchom naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
+          "detail_fault": "Scrub nie zakończył się poprawnie albo naprawa się nie powiodła. Zaplanowany Sync zapisałby obecny stan plików usuniętych lub zmienionych od ostatniego Sync, także uszkodzonych, więc wymaga potwierdzenia na ekranie macierzy. Uruchom scrub albo naprawę z parity; Sync ręczny pozostaje dostępny po potwierdzeniu."
         },
         "elastic_mover_settle_stopped": {
           "title": "Macierz {array}: automatyczne dokończenie przenoszenia wstrzymane",
@@ -6641,7 +6642,10 @@
           "detail": "Przerwane przenoszenie zostawiło dwie wersje plików i żadna nie została usunięta. Porównaj je i usuń zbędną; alert zniknie, gdy zostanie jedna.",
           "file_quarantine": "{path}: wersja widoczna {visible}, druga — kopia w kwarantannie na dysku cache {disk}",
           "file_data": "{path}: wersja widoczna {visible}, druga pod tą samą ścieżką na dysku danych {disk}",
-          "file_branch": "{path}: wersja widoczna {visible}, druga na jednym z dysków macierzy"
+          "file_branch": "{path}: wersja widoczna {visible}, druga na jednym z dysków macierzy",
+          "copy_kept": "Kopiuj ścieżkę drugiej wersji: {path}",
+          "copied": "Skopiowano ścieżkę drugiej wersji pliku {path}",
+          "copy_failed": "Nie udało się skopiować ścieżki — przeglądarka nie zezwoliła na dostęp do schowka"
         },
         "elastic_needs_attention": {
           "title": "Macierz {array} wymaga interwencji",
@@ -6933,7 +6937,8 @@
       "by_unknown_account": "nieznane konto",
       "subject_last_known": "ostatnio widziany jako {name}",
       "smart_batch_refused": "Test SMART nie ruszył na {n} {n|dysku|dyskach|dyskach}: {disks}",
-      "kind_elastic_add_disk_abort": "Wycofanie dodania dysku do Elastic Array"
+      "kind_elastic_add_disk_abort": "Wycofanie dodania dysku do Elastic Array",
+      "subject_unknown_disk": "nieznany dysk"
     },
     "elevation": {
       "title": "Kanał uprawnień systemowych",
@@ -7221,7 +7226,7 @@
       "repair_confirm": "Napraw oznaczone bloki ({disk})",
       "repair_done": "Przyjęto naprawę dysku {disk}. Sprawdź wynik zadania.",
       "repair_warning": "Naprawa zapisuje z parity wyłącznie bloki, które ostatni Scrub oznaczył jako błędne, i tylko w plikach niezmienionych od ostatniego Sync. Obejmuje całą macierz {name}, a nie sam dysk {disk}: nie przywraca brakujących plików i nie cofa zmian zapisanych po ostatnim Sync.",
-      "repair_loses": "{disk} ({path}) — oznaczone bloki zostaną nadpisane treścią z ostatniego checkpointu parity",
+      "repair_loses": "{disk} — oznaczone bloki zostaną nadpisane treścią z ostatniego checkpointu parity",
       "repair_explain": "Naprawa nie zapisuje nowego checkpointu parity i nie formatuje dysku. Jeśli Scrub nie oznaczył żadnych bloków, naprawa nic nie zapisze i zakończy się wynikiem „Nic nie naprawiono” — wtedy właściwą operacją jest Sync. Macierz pozostaje dostępna, a zadanie może potrwać wiele godzin.",
       "repair_none": "Macierz nie zgłasza awarii dysku ani błędów parity. Uruchom scrub, aby wykryć uszkodzenia.",
       "repair_not_ready": "Naprawa wymaga włączonej macierzy aktywnej albo wymagającej uwagi.",
@@ -7422,11 +7427,11 @@
       "next_steps": "Co dalej",
       "step_repair": "Napraw z parity bloki, które scrub oznaczył jako błędne.",
       "step_scrub": "Uruchom scrub, aby sprawdzić, czy coś jeszcze zostało do naprawy.",
-      "step_sync": "Uruchom Sync — wymaga potwierdzenia, bo usuwa z content pliki, których scrub nie mógł odczytać.",
+      "step_sync": "Uruchom Sync — wymaga potwierdzenia, bo zapisuje obecny stan plików usuniętych lub zmienionych od ostatniego Sync.",
       "sync_fault_title": "Sync mimo nienaprawionego błędu w macierzy {name}",
       "sync_fault_warning": "Macierz {name} ma nienaprawiony błąd scrub lub naprawy. Sync zapisze nowy checkpoint parity mimo niego.",
-      "sync_fault_loses": "Pliki, których scrub nie mógł odczytać, zostaną usunięte z content — parity przestanie je obejmować.",
-      "sync_fault_keeps": "Bloki oznaczone przez scrub pozostaną naprawialne naprawą z parity.",
+      "sync_fault_loses": "Pliki usunięte lub zmienione od ostatniego Sync, także uszkodzone, zostaną zapisane w nowym stanie — ich wcześniejszych wersji nie da się już odtworzyć z parity.",
+      "sync_fault_keeps": "Oznaczone bloki niezmienionych plików oraz niezmienione pliki, których scrub nie mógł odczytać, pozostaną do naprawienia z parity.",
       "sync_fault_explain": "Najpierw uruchom naprawę z parity, jeśli jest dostępna, a potem scrub. Sync jest właściwy, gdy błędy dotyczą plików zmienionych od ostatniego Sync.",
       "sync_fault_retype": "Przepisz nazwę macierzy, aby potwierdzić:",
       "sync_fault_confirm": "Uruchom Sync mimo błędu",
@@ -7451,7 +7456,16 @@
       "add_disk_undo_done": "Przyjęto wycofanie dodawania dysku. Sprawdź wynik zadania.",
       "add_disk_undo_unavailable": "Dysk mógł już dołączyć do udziału — dodawanie można tylko dokończyć.",
       "repair_add_pending": "macierz ma niedokończone dodawanie dysku: najpierw je dokończ albo wycofaj",
-      "repair_needs_restore": "macierz czeka na odtworzenie montowań: najpierw użyj „Odtwórz montowania”"
+      "repair_needs_restore": "macierz czeka na odtworzenie montowań: najpierw użyj „Odtwórz montowania”",
+      "create_policy_mfs": "najwięcej wolnego miejsca",
+      "create_policy_epmfs": "najwięcej wolnego miejsca w istniejącej ścieżce",
+      "create_policy_ff": "pierwszy dysk z miejscem",
+      "create_policy_lfs": "najmniej wolnego miejsca",
+      "create_policy_epff": "pierwszy dysk z istniejącą ścieżką",
+      "create_policy_rand": "losowy dysk",
+      "create_policy_msplfs": "najmniej wolnego miejsca w najdłuższej istniejącej ścieżce",
+      "card_mover": "Przenoszenie z cache",
+      "card_cache_waiting": "{size} na cache bez parity"
     },
     "wizard_pool": {
       "elastic_data": "Dyski danych",
@@ -7537,7 +7551,12 @@
       "spare_sub": "hot-spare puli {pool}",
       "erase_warning_none": "Dane na wybranych dyskach zostaną bezpowrotnie wymazane.",
       "sum_layout_value": "{layout} · {n} × {size} ({disks})",
-      "loss_erased": "dane zostaną wymazane"
+      "loss_erased": "dane zostaną wymazane",
+      "plan_warning_mixed_sizes": "Dyski różnej wielkości ({smallest} … {largest}): każdy vdev ma rozmiar najmniejszego dysku, więc dodatkowa pojemność większych pozostanie niewykorzystana.",
+      "plan_warning_mixed_media": "SSD i HDD razem: vdev działa z prędkością najwolniejszego dysku.",
+      "plan_warning_unhealthy_disks": "SMART ostrzega o dyskach {disks}: pula zbudowana na dysku, który już się psuje, startuje zdegradowana.",
+      "plan_warning_single_disk": "Jeden dysk nie ma redundancji: każda awaria oznacza utratę puli.",
+      "plan_warning_odd_mirror": "Układ mirror łączy dyski w pary, więc jeden z nieparzystej liczby dysków pozostanie niewykorzystany."
     },
     "pools": {
       "title": "Pule na nodzie {node}",
@@ -7695,7 +7714,9 @@
       "trim_start_done": "TRIM puli {name} uruchomiony",
       "trim_suspend_done": "TRIM puli {name} wstrzymany",
       "trim_resume_done": "TRIM puli {name} wznowiony",
-      "trim_cancel_done": "TRIM puli {name} przerwany"
+      "trim_cancel_done": "TRIM puli {name} przerwany",
+      "leaf_last_known": "brak dysku (ostatnio {name})",
+      "leaf_missing_at": "brak dysku nr {n}"
     },
     "props": {
       "title": "Właściwości puli",
@@ -7724,7 +7745,6 @@
       "removes": "Do usunięcia",
       "fs": "System plików {type}",
       "fs_label": "Etykieta {label}",
-      "fs_uuid": "UUID {uuid}",
       "mounted_at": "Zamontowany w {paths}",
       "nothing": "Ten dysk nie zgłasza żadnej sygnatury — nie ma czego usuwać.",
       "bad_plan": "Niepełna lub niespójna odpowiedź planu. Czyszczenie zablokowane.",
@@ -7749,7 +7769,9 @@
       "done": "Pula {name} została usunięta",
       "snapshots": "{n} {n|snapshot|snapshoty|snapshotów}",
       "explain_others": " oraz vdev {roles}",
-      "retype": "Przepisz nazwę puli, aby potwierdzić:"
+      "retype": "Przepisz nazwę puli, aby potwierdzić:",
+      "share_stops": "share {protocol} „{name}” przestanie działać",
+      "target_stops": "target {protocol} „{name}” przestanie działać"
     },
     "add_vdev": {
       "title": "Dodaj vdev do {name}",
@@ -7784,7 +7806,8 @@
       "free_sub": "S/N {serial} · nieprzypisany · zostanie wymazany przed użyciem",
       "explain_pick": "Wybierz dysk zastępczy, aby zobaczyć plan wymiany.",
       "start": "Rozpocznij wymianę",
-      "resilver_progress": "resilver {pct}% · pozostało {eta}"
+      "resilver_progress": "resilver {pct}% · pozostało {eta}",
+      "done_detail_spare": "Resilver zakończony — {new} przejął dane dysku {device}, ale {device} pozostaje w konfiguracji puli, dopóki nie zostanie odłączony (zpool detach). Ta wersja TentaNas jeszcze tego nie robi: nie wyjmuj dysku przed odłączeniem."
     },
     "elastic_import": {
       "title": "Importuj macierz Elastic",
@@ -8408,7 +8431,8 @@
       "head_versions": "TentaNas: {list}",
       "chip_services_down_list": "Usługi nieaktywne: {list}",
       "chip_services_unknown": "Usługi: brak odpowiedzi z {nodes}",
-      "chip_services_none": "Brak usług udostępniania"
+      "chip_services_none": "Brak usług udostępniania",
+      "not_answered_hint": "Nieznane: nie udało się odczytać listy udziałów tego node'a (brak odpowiedzi albo błąd). Liczba pojawi się, gdy node odpowie."
     },
     "node": {
       "head_sub_node": "node {name}",
@@ -8510,7 +8534,7 @@
       "op_elastic_schedule": "Uzbrojenie harmonogramu Elastic",
       "op_elastic_add_disk_abort": "Elastic Array · Wycofanie dodania dysku",
       "detail_elastic_sync": "Zapisuje nowy checkpoint parity i content.",
-      "detail_elastic_sync_over_fault": "Zapisuje nowy checkpoint parity i content. UWAGA: macierz ma nienaprawiony błąd scrub lub naprawy. Zaznaczone bloki pozostaną naprawialne, ale pliki, których scrub nie mógł odczytać, zostaną usunięte z content i parity przestanie je obejmować. Najpierw uruchom naprawę z parity."
+      "detail_elastic_sync_over_fault": "UWAGA: macierz ma nienaprawiony błąd scrub lub naprawy. Sync zapisze obecny stan plików. Oznaczone bloki niezmienionych plików oraz niezmienione pliki, których scrub nie mógł odczytać, pozostaną do naprawienia — ale pliki usunięte lub zmienione od ostatniego Sync, także uszkodzone, zostaną zapisane w nowym stanie i ich wcześniejszych wersji nie da się już odtworzyć z parity. Najpierw uruchom naprawę."
     },
     "access": {
       "title": "Dziennik dostępu",
@@ -8817,7 +8841,8 @@
       "elastic_array_not_ready": "Macierz musi być włączona i aktywna albo wymagać uwagi",
       "elastic_add_stopped": "Dodawanie dysku zatrzymało się przed końcem — dokończ je albo wycofaj na ekranie macierzy",
       "elastic_undo_stopped": "Wycofanie dodawania zatrzymało się po pierwszym kroku — dodawanie pozostaje niedokończone",
-      "elastic_disk_absent": "Dysku, który miałby zostać wyczyszczony, nie ma na tym nodzie — podłącz go i spróbuj ponownie"
+      "elastic_disk_absent": "Dysku, który miałby zostać wyczyszczony, nie ma na tym nodzie — podłącz go i spróbuj ponownie",
+      "job_not_cancellable": "Tego zadania nie można anulować — przerwanie nie zatrzymałoby już rozpoczętej pracy"
     }
   },
   "agent_accounts": {

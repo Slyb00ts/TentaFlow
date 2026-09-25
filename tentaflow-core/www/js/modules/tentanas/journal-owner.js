@@ -56,16 +56,3 @@ export function journalOwnerPhrase(c) {
   }
   return T('journal_owner.other_installation');
 }
-
-/**
- * The owner ids, for a tooltip only: they identify, nobody reads them. Only
- * an owner of the asking organisation has any — the node blanks another
- * installation's (`owner_ids_for` in elastic.rs), and this repeats the rule
- * so an older node that still sends them does not put another tenant's ids
- * in the tooltip either.
- */
-export function journalOwnerIds(c) {
-  const kind = ownerKindOf(c);
-  if (kind !== 'this_instance' && kind !== 'this_org') return '';
-  return [c?.ownerOrgId, c?.ownerAddonId].filter(Boolean).join(' / ');
-}

@@ -15,7 +15,8 @@ import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl } from '/js/l
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
-import { journalOwnerPhrase, journalOwnerIds, isOtherOrgOnNode } from '/js/modules/tentanas/journal-owner.js';
+import { journalOwnerPhrase, isOtherOrgOnNode } from '/js/modules/tentanas/journal-owner.js';
+import { scrubIds } from '/js/modules/tentanas/machine-id.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';
@@ -663,25 +664,27 @@ export function openElasticImportDialog(screen, onDone) {
   // this instance, another instance of this organisation (by name when the
   // node gave one), or "another installation" — never another tenant's name
   // or ids, which the node does not send. The adoption request does not need
-  // the ids either (it names the array and the retyped name), so the own
-  // organisation's ids are only the tooltip.
+  // the ids either (it names the array and the retyped name), and no id is
+  // shown, not even as a tooltip (owner's rule): the array is its name, the
+  // owner its phrase. The node's own sentence (`detail`) is the row's tooltip
+  // with any id in it replaced by a neutral word.
 
   const candidateHtml = (c) => {
     const [tone, label] = CHIP[c.status] || CHIP.incomplete;
     const total = (c.disksMatched || 0) + (c.disksMissing || []).length + (c.disksReused || []).length;
     return `
-      <div class="vdev-group ${c.status === 'importable' ? 'picked' : ''}" data-array="${escapeAttr(c.arrayId)}" title="${escapeAttr(c.detail || '')}">
+      <div class="vdev-group ${c.status === 'importable' ? 'picked' : ''}" data-array="${escapeAttr(c.arrayId)}" title="${escapeAttr(scrubIds(c.detail || '', T('alerts.id_hidden')))}">
         <div class="vg-head">
           <span class="vg-type">${escapeHtml(T('elastic_import.vg_type', { fs: c.filesystem || '' }))}</span>
-          <span class="mono fw-800" title="${escapeAttr(c.arrayId || '')}">${escapeHtml(c.name || T('elastic_import.unnamed'))}</span>
+          <span class="mono fw-800">${escapeHtml(c.name || T('elastic_import.unnamed'))}</span>
           <tf-chip size="sm" status="${escapeAttr(tone)}" dot label="${escapeAttr(T('elastic_import.' + label))}"></tf-chip>
           <span class="hint">${escapeHtml(T('elastic_import.counts', { data: c.dataDisks || 0, parity: c.parityDisks || 0, cache: c.cacheDisks || 0 }))}</span>
         </div>
-        ${c.status === 'unreadable' && !c.name ? '' : `<div class="hint" title="${escapeAttr(journalOwnerIds(c))}">${escapeHtml(T('elastic_import.owner', { owner: journalOwnerPhrase(c) }))}</div>`}
+        ${c.status === 'unreadable' && !c.name ? '' : `<div class="hint">${escapeHtml(T('elastic_import.owner', { owner: journalOwnerPhrase(c) }))}</div>`}
         <div class="hint">${escapeHtml(T('elastic_import.matched', { n: c.disksMatched || 0, total }))}${c.unionMounted ? ` · ${escapeHtml(T('elastic_import.union_mounted'))}` : ''}</div>
         ${(c.disksMissing || []).length ? `<div class="num-err">${escapeHtml(T('elastic_import.missing', { disks: c.disksMissing.map(importMemberLabel).join(', ') }))}</div>` : ''}
         ${(c.disksReused || []).length ? `<div class="num-err">${escapeHtml(T('elastic_import.reused', { disks: c.disksReused.map(importMemberLabel).join(', ') }))}</div>` : ''}
-        ${c.status === 'unreadable' ? `<div class="num-err">${escapeHtml(c.detail || '')}</div>` : ''}
+        ${c.status === 'unreadable' ? `<div class="num-err">${escapeHtml(scrubIds(c.detail || '', T('alerts.id_hidden')))}</div>` : ''}
         <div class="row">
           <tf-button size="sm" variant="primary" icon="download" data-act="adopt" ${c.status === 'importable' ? '' : 'disabled'}>${escapeHtml(T('elastic_import.adopt'))}</tf-button>
         </div>

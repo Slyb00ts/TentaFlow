@@ -54,7 +54,7 @@ const claim = {
 const confirmBtn = (win) => win.querySelector('[data-action="confirm"]');
 const armed = (win) => !confirmBtn(win).hasAttribute('disabled');
 
-test('the plan is read first and its removal list names the signature and the label, with the UUID as a tooltip', async () => {
+test('the plan is read first and its removal list names the signature and the label, and never the UUID', async () => {
   const screen = fakeScreen({
     tentaNasDiskWipePlanRequest: plan(),
     tentaNasDiskWipeRequest: { job: { jobId: 'j1', kind: 'disk_wipe', subject: 'sdc' } },
@@ -72,10 +72,9 @@ test('the plan is read first and its removal list names the signature and the la
   assert.match(win.shadowRoot.querySelector('.tf-window-subtitle-text')?.textContent || '', /S\/N K5/);
   assert.match(win.textContent, /System plików xfs/);
   assert.match(win.textContent, /Etykieta d1/);
-  // The UUID identifies the filesystem and names nothing: it is the line's
-  // tooltip, never text on the dialog.
-  assert.doesNotMatch(win.textContent, /33333333-3333-4333-8333-333333333333/);
-  assert.match(win.querySelector('.loss-list [title]').getAttribute('title'), /33333333-3333-4333-8333-333333333333/);
+  // The UUID identifies the filesystem and names nothing: it is neither text
+  // on the dialog nor a tooltip (owner's rule: no ids in the GUI).
+  assert.doesNotMatch(win.innerHTML, /33333333-3333-4333-8333-333333333333/);
   // The dialog says WHY the node can refuse late, so a kernel EBUSY is not
   // read as a transient fault worth retrying.
   assert.match(win.textContent, /wyłączność/);
@@ -137,10 +136,10 @@ test('a dissolved array’s journal claim needs its own acknowledgement, sent as
   assert.match(win.textContent, /Rezerwacja dziennika/);
   assert.match(win.textContent, /produkt/);
   assert.match(win.textContent, /9 dyskami/, 'how much of the array is being given up');
-  // Whose array it is — in words. The ids are the tooltip, never the text.
+  // Whose array it is — in words. The ids are neither text nor a tooltip.
   assert.match(win.textContent, /Właściciel zapisany w dzienniku: instancja „NAS Pracownia” tej organizacji/, 'whose array it is');
   assert.doesNotMatch(win.textContent, /orgtentanas-rig11|addontentanas/);
-  assert.equal(win.querySelector('.wizard-warning [title]').getAttribute('title'), 'orgtentanas-rig11 / addontentanas');
+  assert.doesNotMatch(win.innerHTML, /orgtentanas-rig11|addontentanas/, 'not even as a tooltip');
   assert.match(win.textContent, /import/i, 'and that an import would otherwise recover it');
 
   // The retyped device name alone is NOT enough: the second victim is the

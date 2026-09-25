@@ -411,6 +411,30 @@ where
     Ok(job)
 }
 
+/// The job kinds an admin may cancel: those where cancelling really stops the
+/// work. Every other kind runs its command through the root helper (TRIM,
+/// pool create/replace, dataset destroy, share/target apply, imports…) or
+/// keeps going on the drive itself (a SMART self-test): dropping the job's
+/// future would only stop TRACKING it and still write "cancelled". The same
+/// allowlist as the screen's `jobCanCancel` (www/js/modules/tentanas/
+/// format.js), enforced here so a request that skips the screen cannot make
+/// a job read "cancelled" while its work runs on.
+/// - `pool_scrub`: a guard issues `zpool scrub -s` on drop
+///   (`pools::StopScrubOnCancel`), so the scrub really stops.
+///
+/// `snapshot_destroy` stays out by the owner's decision (wave 5): its loop
+/// could stop between snapshots, but a cancelled job would then read
+/// "cancelled" with some snapshots already destroyed.
+///
+/// `cancel_all` (the uninstall teardown) is not limited by this: there the
+/// point is to stop issuing new commands, not to tell an admin a job stopped.
+pub const USER_CANCELLABLE_KINDS: &[&str] = &["pool_scrub"];
+
+/// Whether an admin's cancel request may stop a job of this kind.
+pub fn user_cancellable(kind: &str) -> bool {
+    USER_CANCELLABLE_KINDS.contains(&kind)
+}
+
 /// Cancels every job running on this node and returns how many there were.
 /// The uninstall teardown does this first: a scrub or an import still issuing
 /// commands while the channel is being taken down would leave work half-done.
@@ -458,6 +482,19 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }).await.unwrap()
+    }
+
+    /// A2/A3/A5: a cancel an admin can ask for must really stop the work.
+    /// Only a scrub has a guard that does (`zpool scrub -s` on drop); a
+    /// SMART test keeps running on the drive, a helper command keeps running
+    /// as root, so neither may be cancelled on request.
+    #[test]
+    fn only_a_scrub_is_cancellable_on_request() {
+        assert!(user_cancellable("pool_scrub"));
+        for kind in ["smart_test", "pool_trim", "pool_create", "pool_replace", "dataset_destroy", "snapshot_destroy",
+            "disk_wipe", "config_import", "elastic_create", "elastic_sync", ""] {
+            assert!(!user_cancellable(kind), "{kind}");
+        }
     }
 
     #[tokio::test]

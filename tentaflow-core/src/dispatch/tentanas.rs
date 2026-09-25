@@ -578,7 +578,7 @@ fn jobs_list(ctx: &HandlerContext, limit: u32) -> Result<MessageBody, ProtocolEr
     let g = gate(ctx, PERM_READ)?;
     // Scoped to the caller's organisation: this database is the whole
     // node's, and another tenant's array jobs name that tenant's array.
-    let mut jobs = store::list_jobs_for_org(&g.db, &g.org_id, if limit == 0 { 50 } else { limit })
+    let mut jobs = store::list_jobs_for_org(&g.db, org_viewer(ctx, &g), if limit == 0 { 50 } else { limit })
         .map_err(|e| internal("jobs", e))?;
     name_jobs(ctx, Some(&g.db), &mut jobs);
     Ok(tn(P::JobsListResponse { jobs }))
@@ -586,22 +586,31 @@ fn jobs_list(ctx: &HandlerContext, limit: u32) -> Result<MessageBody, ProtocolEr
 
 fn job_get(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    let job = store::job_for_org(&g.db, &g.org_id, job_id)
+    let job = store::job_for_org(&g.db, org_viewer(ctx, &g), job_id)
         .map_err(|e| internal("jobs", e))?
         .ok_or_else(|| ProtocolError::not_found("job not found"))?;
     Ok(job_response_in(ctx, Some(&g.db), job))
 }
 
+/// The refusal of a cancel request for a job kind whose cancel would not stop
+/// its work; worded by the screen from `refusal.job_not_cancellable`.
+const JOB_NOT_CANCELLABLE: &str = "refusal:job_not_cancellable";
+
 fn job_cancel(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_ADMIN)?;
     // Another tenant's job is "not found" here as in `job_get`: an admin of
     // one organisation must not stop another organisation's array work.
-    let job = store::job_for_org(&g.db, &g.org_id, job_id)
+    let job = store::job_for_org(&g.db, org_viewer(ctx, &g), job_id)
         .map_err(|e| internal("jobs", e))?
         .ok_or_else(|| ProtocolError::not_found("job not found"))?;
     if matches!(job.kind.as_str(), "elastic_create" | "elastic_restore") {
         return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,
             "Przyjęte tworzenie/przywracanie macierzy nie jest anulowalne"));
+    }
+    // Only a kind whose cancel really stops the work (`jobs::user_cancellable`):
+    // anything else would read "cancelled" while its command runs on.
+    if !tentanas::jobs::user_cancellable(&job.kind) {
+        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable, JOB_NOT_CANCELLABLE));
     }
     if !tentanas::jobs::cancel(job_id) {
         return Err(ProtocolError::new(
@@ -993,6 +1002,7 @@ fn pool_plan(ctx: &HandlerContext, disk_ids: &[String]) -> Result<MessageBody, P
         options,
         warnings,
         smallest_disk_bytes,
+        warning_codes: tentanas::pools::plan_warning_codes(&disks),
     }))
 }
 
@@ -3575,7 +3585,7 @@ fn alerts_list(ctx: &HandlerContext, include_acked: bool) -> Result<MessageBody,
     let g = gate(ctx, PERM_READ)?;
     // Scoped like the job list: shared hardware for everyone, an alert about
     // an array only for the organisation that owns it (migration 18).
-    let mut alerts = store::list_alerts_for_org(&g.db, &g.org_id, include_acked)
+    let mut alerts = store::list_alerts_for_org(&g.db, org_viewer(ctx, &g), include_acked)
         .map_err(|e| internal("alerts", e))?;
     resolve_import_alerts(&mut alerts, |id| tentanas::fleet::node_name(ctx, id));
     Ok(tn(P::AlertsListResponse { alerts }))
@@ -3583,7 +3593,7 @@ fn alerts_list(ctx: &HandlerContext, include_acked: bool) -> Result<MessageBody,
 
 fn alert_ack(ctx: &HandlerContext, alert_id: &str) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
-    if !store::ack_alert_for_org(&g.db, &g.org_id, alert_id).map_err(|e| internal("alerts", e))? {
+    if !store::ack_alert_for_org(&g.db, org_viewer(ctx, &g), alert_id).map_err(|e| internal("alerts", e))? {
         return Err(ProtocolError::not_found("alert not found or already acknowledged"));
     }
     alerts_list(ctx, false)
@@ -3910,6 +3920,25 @@ fn own_array_names(g: &Gate) -> Result<std::collections::BTreeSet<String>, Proto
 /// an error, never an empty set — an empty set would make every other tenant
 /// "unknown", which is exactly the case that is shown and adoptable.
 fn orgs_on_node(ctx: &HandlerContext) -> Result<std::collections::BTreeSet<String>, ProtocolError> {
+    orgs_on_node_of(ctx)
+}
+
+/// Who reads the job and alert lists (`store::OrgViewer`): the caller's
+/// organisation, and whether it is the ONLY organisation of this node — then
+/// the rows whose owner is gone (a dissolved array's jobs and alerts,
+/// migration 18) are its to see (owner decision, wave 5). A failed read of
+/// the organisations answers "not the only one": hidden, never leaked.
+fn org_viewer<'a>(ctx: &HandlerContext, g: &'a Gate) -> store::OrgViewer<'a> {
+    let sole_org = orgs_on_node_of(ctx).is_ok_and(|orgs| is_sole_org(&orgs, &g.org_id));
+    store::OrgViewer { org_id: &g.org_id, sole_org }
+}
+
+/// Whether `org_id` is the one and only organisation in `orgs`.
+fn is_sole_org(orgs: &std::collections::BTreeSet<String>, org_id: &str) -> bool {
+    !org_id.is_empty() && orgs.len() == 1 && orgs.contains(org_id)
+}
+
+fn orgs_on_node_of(ctx: &HandlerContext) -> Result<std::collections::BTreeSet<String>, ProtocolError> {
     crate::services::org::list_organizations(&ctx.state.db, None)
         .map(|orgs| orgs.into_iter().map(|org| org.org_id).collect())
         .map_err(|e| internal("organisations", e))
@@ -5124,7 +5153,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             // The published summary counts node-wide alerts and pools only;
             // this node's row becomes what this tenant's alert list shows,
             // plus this tenant's own Elastic Arrays.
-            tentanas::fleet::scope_local_alerts(&mut nodes, &g.db, &g.org_id);
+            tentanas::fleet::scope_local_alerts(&mut nodes, &g.db, org_viewer(ctx, &g));
             // Shares are per organisation too (migration 20): the published
             // row carries none, and this node's row gets this tenant's own.
             // `per_org_counted` says whether both reads made it.
@@ -6225,6 +6254,18 @@ mod registration_tests {
         assert!(store::list_jobs(&g.db,100).unwrap().is_empty());
         assert!(store::elastic_claims(&g.db).unwrap().is_empty());
         assert_eq!(tentanas::elevation::audit_entries(&g.db),0);
+    }
+
+    /// Owner decision (wave 5): the orphaned rows are one viewer's only when it
+    /// is the node's single organisation.
+    #[test]
+    fn a_viewer_is_the_sole_organisation_only_when_the_node_has_no_other() {
+        let set = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>();
+        assert!(is_sole_org(&set(&["org-a"]), "org-a"));
+        assert!(!is_sole_org(&set(&["org-a", "org-b"]), "org-a"), "two organisations: nobody sees the orphans");
+        assert!(!is_sole_org(&set(&["org-b"]), "org-a"), "not the one organisation there is");
+        assert!(!is_sole_org(&set(&[""]), ""), "an empty org id is no tenant");
+        assert!(!is_sole_org(&set(&[]), "org-a"));
     }
 
     /// The set an Elastic journal's owner is judged against: every

@@ -42,7 +42,8 @@ const TRIM_ONLY = ['weekly', 'monthly'];
 // on the `disk_id`, and the node swaps in the disk's name when it has one
 // (`name_jobs` in dispatch/tentanas.rs). So:
 // - an id that reached the row anyway (a disk the node never named) is not
-//   text — the row shows the kind alone and the id is the tooltip;
+//   shown at all, not even as a tooltip (owner's rule): a SMART test's reads
+//   "nieznany dysk", any other kind's row shows the kind alone;
 // - a name the node only REMEMBERS (the disk has since left its inventory)
 //   is marked as last-known, never shown as if it were the current device:
 //   the kernel may have handed that name to another disk since.
@@ -52,14 +53,14 @@ const TRIM_ONLY = ['weekly', 'monthly'];
 // that must not be hidden just because it starts with `dev-`/`usb-`/`pci-`/…
 // or is all digits (a share named `dev-backups`, a pool `2024`).
 //
-// Returns `{ text, title }`; both are plain strings, escaped by the caller.
+// Returns `{ text }`, a plain string escaped by the caller.
 export function jobSubject(j) {
   const subject = String(j?.subject || '').trim();
-  if (!subject) return { text: '', title: '' };
-  const isId = j?.kind === 'smart_test' ? isDiskIdShape(subject) : isOpaqueId(subject);
-  if (isId) return { text: '', title: subject };
-  if (j.subjectLastKnown) return { text: T('jobs.subject_last_known', { name: subject }), title: '' };
-  return { text: subject, title: '' };
+  if (!subject) return { text: '' };
+  const smart = j?.kind === 'smart_test';
+  if (smart ? isDiskIdShape(subject) : isOpaqueId(subject)) return { text: smart ? T('jobs.subject_unknown_disk') : '' };
+  if (j.subjectLastKnown) return { text: T('jobs.subject_last_known', { name: subject }) };
+  return { text: subject };
 }
 
 // ===== A schedule's last outcome (n15 B2).
@@ -125,10 +126,6 @@ export function scheduleOutcome(lastResult, statusOf = () => null) {
   return { label: T('jobs.status_' + status), failed: false, skipped: false, title: '' };
 }
 
-function titleAttr(title) {
-  return title ? ` title="${escapeAttr(title)}"` : '';
-}
-
 // ===== The running-job row: ONE skeleton + painter shared by the n02 node
 // dashboard (tentanas.js overview card) and this tab's own running-jobs list.
 // Before this, tentanas.js kept a second copy (`jobRowHtml`/`wireJobRows`)
@@ -147,7 +144,7 @@ export function jobRowSkeleton(j, subject = jobSubject(j)) {
     <div class="job-row" data-job="${escapeAttr(j.jobId)}">
       <div class="job-ico" data-role="ico"></div>
       <div class="job-main">
-        <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="mono text-2"${titleAttr(subject.title)}>${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
+        <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="mono text-2">${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
         <div class="job-sub" data-role="sub"></div>
         ${j.progressPct != null ? `<tf-progress-bar data-role="progress" size="sm" tone="accent"></tf-progress-bar>` : ''}
       </div>
@@ -174,14 +171,13 @@ export function paintJobRow(row, j) {
   const author = jobAuthor(j.startedBy);
   const sub = row.querySelector('[data-role="sub"]');
   setText(sub, T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }) + (last ? ' · ' + last : ''));
-  setAttr(sub, 'title', author.title || '');
   if (j.progressPct != null) setAttr(row.querySelector('[data-role="progress"]'), 'value', Number(j.progressPct));
 }
 
 // The history table's task cell: the kind, and the subject under it.
 function historyTaskHtml(j) {
   const subject = jobSubject(j);
-  return `<span class="tf-table__cell-title">${escapeHtml(jobKindLabel(j.kind))}</span><div class="tf-table__cell-sub tf-table__cell-sub--mono"${titleAttr(subject.title)}>${escapeHtml(subject.text)}</div>`;
+  return `<span class="tf-table__cell-title">${escapeHtml(jobKindLabel(j.kind))}</span><div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(subject.text)}</div>`;
 }
 
 export async function drawTasks(screen, body) {

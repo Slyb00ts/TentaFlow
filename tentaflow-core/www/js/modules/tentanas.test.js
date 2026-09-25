@@ -382,6 +382,9 @@ test('fleet alerts and resources aggregate every node and keep an unreachable no
   assert.equal(res.length, 2, 'one share plus the unreachable node');
   assert.match(res[0].resource, /projekty/);
   assert.match(res[0].mounts, /mount-dots/);
+  // The dot's tooltip is the node and the state in words, never the code.
+  assert.match(res[0].mounts, /title="orion: źródło"/);
+  assert.doesNotMatch(res[0].mounts, /: source"/);
   assert.match(res[1].source, /mesh timeout/);
   Screen.unmount();
 });
@@ -751,6 +754,31 @@ test('zakładka Pule liczy pule ZFS RAZEM z macierzami, pozostałe badge pozosta
   } finally { Screen.unmount(); }
 });
 
+// Backlog N1 minor: a remote node's own screen read "—" on its Pools tab even
+// after the node had answered both lists for this organisation. Its overview
+// now sets the count from those answers — and only when both halves came
+// back, so a failed array list never passes the ZFS pools off as the whole.
+test('a remote node view counts its Pools tab from the lists the node itself answered', async () => {
+  const remote = { localNodeId: LOCAL, nodes: [node({}), node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, poolsTotal: 5, arraysTotal: 0 })] };
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: remote,
+    tentaNasElasticArraysListRequest: { arrays: [elasticArray()] } });
+  let root = await mountScreen({ node: REMOTE });
+  try {
+    await flush();
+    const pools = root.querySelector('tf-tab#pools');
+    assert.equal(pools.getAttribute('count'), '2', 'one ZFS pool and one array, as the node answered');
+    assert.equal(pools.hasAttribute('title'), false);
+  } finally { Screen.unmount(); }
+
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: remote,
+    tentaNasElasticArraysListRequest: () => { throw new Error('array probe failed'); } });
+  root = await mountScreen({ node: REMOTE });
+  try {
+    await flush();
+    assert.equal(root.querySelector('tf-tab#pools').getAttribute('count'), '—', 'half an answer is no count');
+  } finally { Screen.unmount(); }
+});
+
 test('a remote node view whose share list fails shows "—" on the Shares tab, not the published figure', async () => {
   stubTransport({ ...fixtures,
     tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [node({}), node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, sharesTotal: 0 })] },
@@ -903,6 +931,25 @@ const elasticArray = (overrides) => ({
   parityDisks: [{ diskId: 'sdh', sizeBytes: 5 * TIB }],
   protection: { status: 'window_open', protectedAsOf: '2026-09-02 09:00:00' },
   ...overrides,
+});
+
+// n02:299 — an array with bytes waiting on its cache outside parity leads its
+// mini row with that figure (the node's `cacheUnprotectedBytes`), in warning.
+test('the overview mini row of an Elastic Array with data waiting on its cache names the bytes', async () => {
+  const waiting = elasticArray({
+    cacheDisks: [{ diskId: 'nv0', name: 'c1', diskName: 'nvme0n1', role: 'cache', sizeBytes: TIB }],
+    protection: { status: 'window_open', protectedAsOf: '2026-09-02 09:00:00', cacheUnprotectedBytes: 18 * 1024 ** 3 },
+  });
+  stubTransport({ ...fixtures, tentaNasElasticArraysListRequest: { arrays: [waiting] } });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  try {
+    const chip = root.querySelector('#nas-ov-pools .pool-mini[data-array="produkt"] [data-role="protection"]');
+    assert.match(chip.getAttribute('label'), /^18(\.0)? GiB na cache bez parity$/);
+    assert.equal(chip.getAttribute('status'), 'warn');
+  } finally {
+    Screen.unmount();
+  }
 });
 
 test('the overview mini-list carries the Elastic Array too, and its row opens the ARRAY detail (n02:297)', async () => {
@@ -1174,6 +1221,98 @@ test('n02: the alert sub-line joins only the parts it has, in place across polls
     await flush();
     assert.match(root.querySelector('#nas-ov-alerts .a-sub').textContent, /^dysk · /, 'and loses it with the detail');
   } finally {
+    Screen.unmount();
+  }
+});
+
+// n02 names a disk alert's pool on its sub-line ("tank · raidz2", n02:316)
+// and n01 ends the alert with "— zaplanuj wymianę dysku" (n01:298) — each
+// only from what the node put on the alert (disks.rs `HealthAlertPlace`):
+// no pool param, no pool; no advice param, no suffix.
+test('n01/n02: a disk alert carries its pool and the node\'s replacement advice only when the node sent them', async () => {
+  const advised = {
+    alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'wwn-0x5000c500a1b2c3d4', title: 'Disk sdd: warning', detail: '',
+    code: 'disk_health', params: { health: 'warning', name: 'sdd', name_source: 'live', pool: 'tank', layout: 'raidz2', advice: 'replace' },
+    reasons: [{ code: 'reallocated_growing', params: { from: '5', to: '8' } }],
+    raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null,
+  };
+  const plain = { ...advised, alertId: 'a2', subjectId: 'wwn-0x5000c500a1b2c3d5', params: { health: 'warning', name: 'sdf', name_source: 'live' } };
+  let alerts = [advised, plain];
+  stubTransport({ ...fixtures, tentaNasAlertsListRequest: () => ({ alerts }) });
+  let root = await mountScreen({ node: LOCAL });
+  await flush();
+  try {
+    const row = (id) => root.querySelector(`#nas-ov-alerts .alert-row[data-alert="${id}"]`);
+    const sub = row('a1').querySelector('.a-sub');
+    assert.match(sub.textContent, /dysk · tank · RAIDZ2 · /, 'the pool and its layout, from the alert');
+    assert.doesNotMatch(row('a1').textContent, /zaplanuj/, 'n02 keeps the title as the mockup writes it');
+    assert.doesNotMatch(row('a2').querySelector('.a-sub').textContent, /tank|RAIDZ/, 'no pool param, no pool');
+    // A re-raise that moves the disk out of the pool patches the same line.
+    alerts = [{ ...advised, params: { health: 'warning', name: 'sdd', name_source: 'live' } }, plain];
+    await Screen.refreshOverview(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.ok(row('a1').querySelector('.a-sub') === sub, 'patched in place');
+    assert.doesNotMatch(sub.textContent, /tank/);
+  } finally {
+    Screen.unmount();
+  }
+
+  alerts = [advised, plain];
+  root = await mountScreen();
+  await flush();
+  await flush();
+  try {
+    const cells = root.querySelector('#nas-fleet-alerts').rows.filter((r) => r._row.alert).map((r) => r.alert);
+    const cell = (name) => cells.find((c) => c.includes(`>${name}:`));
+    assert.match(cell('sdd'), />sdd: [^<]* — zaplanuj wymianę dysku</, 'the node advised it');
+    assert.doesNotMatch(cell('sdf'), /zaplanuj/, 'the node did not');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// A conflict's quarantined copy is named after its operation's uuid, so the
+// row never shows where it is — and the admin had no way to find it. Each
+// file gets a deliberate "copy path" control: labelled by the file's own
+// path, it puts the node's path of the other version on the clipboard on a
+// click, and that path never enters the DOM, not even as a tooltip.
+test('n02: a conflict row copies the other version\'s path on request and never renders it', async () => {
+  const uuid = '01a0cf8c-5a61-7283-8410-924a0fceb01f';
+  const kept = `/mnt/tentanas-branches/media/cache/nvme2n1/.tentanas-quarantine-${uuid}-3`;
+  const alert = {
+    alertId: 'c1', severity: 'warning', subjectKind: 'elastic-array', subjectId: 'media', title: 'Pliki zachowane w dwóch wersjach: 2', detail: '',
+    code: 'elastic_conflict', params: { array: 'media', count: '2' },
+    reasons: [
+      { code: 'conflict_file', params: { path: 'docs/a.odt', visible: '/mnt/media/docs/a.odt', kept_kind: 'quarantine', kept_disk: 'nvme2n1', kept_path: kept } },
+      { code: 'conflict_file', params: { path: 'docs/b.odt', visible: '/mnt/media/docs/b.odt', kept_kind: 'branch' } },
+    ],
+    raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null,
+  };
+  const copied = [];
+  const clipboard = Object.getOwnPropertyDescriptor(globalThis.navigator, 'clipboard');
+  Object.defineProperty(globalThis.navigator, 'clipboard', { configurable: true, value: { writeText: async (t) => { copied.push(t); } } });
+  stubTransport({ ...fixtures, tentaNasAlertsListRequest: () => ({ alerts: [alert] }) });
+  const rec = recordToasts();
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  try {
+    const row = root.querySelector('#nas-ov-alerts .alert-row[data-alert="c1"]');
+    const buttons = [...row.querySelectorAll('[data-copy]')];
+    assert.equal(buttons.length, 1, 'only a copy inside this array can be copied');
+    assert.equal(buttons[0].textContent.trim(), 'Kopiuj ścieżkę drugiej wersji: docs/a.odt');
+    assert.doesNotMatch(root.innerHTML, new RegExp(uuid), 'the path is nowhere in the DOM');
+    await Screen.refreshOverview(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.ok(row.querySelector('[data-copy]') === buttons[0], 'the control survives a poll');
+    click(buttons[0]);
+    await flush();
+    assert.deepEqual(copied, [kept], 'the click copies the other version\'s path');
+    assert.match(rec.toasts.map((t) => t.text).join('\n'), /Skopiowano ścieżkę drugiej wersji pliku docs\/a\.odt/);
+    assert.doesNotMatch(rec.toasts.map((t) => t.text).join('\n'), new RegExp(uuid));
+  } finally {
+    rec.restore();
+    if (clipboard) Object.defineProperty(globalThis.navigator, 'clipboard', clipboard);
+    else delete globalThis.navigator.clipboard;
     Screen.unmount();
   }
 });
@@ -1587,7 +1726,7 @@ test('a node with no known hostname is "Node bez nazwy" everywhere, never its id
 // A job's author is a person by display name, or one of the node's own two
 // system authors in words. An id the node could not resolve to an account is
 // not a name: it is the tooltip.
-test('a job author is a name, a system author in words, or an unknown account with the id as tooltip', async () => {
+test('a job author is a name, a system author in words, or an unknown account with no id anywhere', async () => {
   stubTransport(fixtures);
   await mountScreen({ node: LOCAL, tab: 'pools' });
   const host = document.createElement('div');
@@ -1601,13 +1740,13 @@ test('a job author is a name, a system author in words, or an unknown account wi
   assert.match(subs[2].textContent, /^start noda · /);
   assert.match(subs[3].textContent, /^nieznane konto · /);
   assert.doesNotMatch(host.textContent, /0191f2c0|scheduler|startup/);
-  assert.equal(subs[3].getAttribute('title'), uuid);
+  for (const el of host.querySelectorAll('[title]')) assert.doesNotMatch(el.getAttribute('title'), /0191f2c0/, 'not even as a tooltip');
   host.remove();
   Screen.unmount();
 });
 
 // A SMART job's subject is a disk id the node swaps for a name. A name it only
-// remembers is marked as last-known; an id it could not swap is a tooltip.
+// remembers is marked as last-known; an id it could not swap reads "nieznany dysk".
 // The overview card and the job-log header render the same way.
 test('a job row marks a last-known subject and keeps a disk id out of the text', async () => {
   stubTransport(fixtures);
@@ -1619,10 +1758,9 @@ test('a job row marks a last-known subject and keeps a disk id out of the text',
   [job('a', 'sdq', { subjectLastKnown: true }), job('b', wwn), job('c', 'sdd')].forEach((j) => buildJobRow(host, j));
   const subject = (id) => host.querySelector(`.job-row[data-job="${id}"] .job-name .mono`);
   assert.equal(subject('a').textContent, 'ostatnio widziany jako sdq');
-  assert.equal(subject('b').textContent, '');
-  assert.equal(subject('b').getAttribute('title'), wwn);
+  assert.equal(subject('b').textContent, 'nieznany dysk');
   assert.equal(subject('c').textContent, 'sdd');
-  assert.doesNotMatch(host.textContent, /wwn-/);
+  assert.doesNotMatch(host.innerHTML, /wwn-/, 'not even as a tooltip');
   host.remove();
   Screen.unmount();
 });
@@ -2016,7 +2154,9 @@ test('a remote node card shows "—" for what it does not count, says why, and i
     const card = root.querySelector(`.node-card[data-node="${REMOTE}"]`);
     const shares = cardStat(card, 'Share');
     assert.equal(shares.querySelector('.v').textContent, '—', 'not "0"');
-    assert.match(shares.querySelector('[data-not-counted]').getAttribute('title'), /dane organizacji nie są przesyłane między nodami/);
+    // The node did not give its share list: that is the reason, not the
+    // per-organisation rule (backlog N1 minor).
+    assert.match(shares.querySelector('[data-not-counted]').getAttribute('title'), /nie udało się odczytać listy udziałów/);
     const arrays = cardStat(card, 'Elastic Array');
     assert.ok(arrays, 'the arrays stat is shown to say it was not counted');
     assert.equal(arrays.querySelector('.v').textContent, '—');
@@ -2062,7 +2202,7 @@ test('the local node card shows "—" for figures its scoped read did not count'
     const card = root.querySelector(`.node-card[data-node="${LOCAL}"]`);
     const shares = cardStat(card, 'Share');
     assert.equal(shares.querySelector('.v').textContent, '—', 'a failed read is not "3" nor "0"');
-    assert.match(shares.querySelector('[data-not-counted]').getAttribute('title'), /dane organizacji nie są przesyłane między nodami/);
+    assert.match(shares.querySelector('[data-not-counted]').getAttribute('title'), /nie udało się odczytać listy udziałów/);
     const arrays = cardStat(card, 'Elastic Array');
     assert.equal(arrays.querySelector('.v').textContent, '—');
     assert.ok(card.querySelector('[data-pools-only]'), 'the capacity is the pools\' alone');
@@ -2117,7 +2257,7 @@ test('the not-counted words are translated in every locale, with the same placeh
   for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
     all[lang] = JSON.parse(readFileSync(new URL(`i18n/${lang}.json`, root), 'utf8')).tentanas;
   }
-  const keys = [['fleet', 'not_counted_hint'], ['fleet', 'arrays_not_counted_hint'], ['fleet', 'role_uncounted'],
+  const keys = [['fleet', 'not_counted_hint'], ['fleet', 'not_answered_hint'], ['fleet', 'arrays_not_counted_hint'], ['fleet', 'role_uncounted'],
     ['fleet', 'pools_only'], ['fleet', 'badge_nas_uncounted'], ['kpi', 'capacity_pools_only']];
   for (const [group, key] of keys) {
     const values = Object.values(all).map((t) => t[group][key]);
@@ -2630,6 +2770,42 @@ test('the environment tab carries the ksmbd row with the kernel version and the 
   assert.match(row.version, /6\.12\.4-arch1-1/, 'the kernel release is the version of this backend');
   assert.match(row.version, /EXPERIMENTAL \(kernel docs\)/);
   assert.equal(row.status.status, 'ok');
+});
+
+// n16 MAJOR 16: the ARC card read the node once and never again. It is
+// re-read on the overview cadence now, and a read writes only the values
+// into the nodes already on screen — and never moves a slider the admin has
+// moved but not applied.
+test('n16: the ARC card follows the node without rebuilding and keeps an unsaved slider', async () => {
+  let current = arc;
+  stubTransport({ ...fixtures, tentaNasArcStatsRequest: () => ({ arc: current }) });
+  const root = await mountScreen({ node: LOCAL, tab: 'environment' });
+  await flush();
+  await flush();
+  try {
+    const host = root.querySelector('#nas-env-arc');
+    const size = host.querySelector('[data-f="arc-size"]');
+    const slider = host.querySelector('#nas-arc-slider');
+    assert.ok(size.textContent.trim(), 'painted');
+    const before = size.textContent;
+    assert.equal(slider.getAttribute('value'), '25');
+    current = { ...arc, sizeBytes: 5e9, hitRatio: 71.5, maxBytes: 4e9 };
+    await Screen.paintArcSettings(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.ok(host.querySelector('[data-f="arc-size"]') === size, 'the same node, patched');
+    assert.notEqual(size.textContent, before, 'the live size moved');
+    assert.equal(host.querySelector('[data-f="arc-hit"]').textContent, '71.5%');
+    assert.equal(slider.getAttribute('value'), '50', 'the slider follows the node\'s cap');
+    // The admin moves it; the next read must not take it back.
+    slider.dispatchEvent(new CustomEvent('input', { detail: { value: 30 } }));
+    current = { ...arc, maxBytes: 6e9 };
+    await Screen.paintArcSettings(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.equal(slider.getAttribute('value'), '50', 'an unsaved choice stays');
+    assert.match(host.querySelector('#nas-arc-val').textContent, /30%/);
+  } finally {
+    Screen.unmount();
+  }
 });
 
 test('a ksmbd row refused by the exposure guard reads as a warning, not as a missing package', async () => {

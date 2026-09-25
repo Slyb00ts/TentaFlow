@@ -5391,7 +5391,8 @@
       "by_unknown_account": "unbekanntes Konto",
       "subject_last_known": "zuletzt gesehen als {name}",
       "smart_batch_refused": "SMART-Test auf {n} {n|Laufwerk|Laufwerken|Laufwerken} nicht gestartet: {disks}",
-      "kind_elastic_add_disk_abort": "Hinzufügen eines Datenträgers zum Elastic Array rückgängig machen"
+      "kind_elastic_add_disk_abort": "Hinzufügen eines Datenträgers zum Elastic Array rückgängig machen",
+      "subject_unknown_disk": "unbekannter Datenträger"
     },
     "danger": {
       "retype": "Zur Bestätigung {name} eingeben:",
@@ -5415,7 +5416,7 @@
       "repair_confirm": "Markierte Blöcke reparieren ({disk})",
       "repair_done": "Reparatur des Datenträgers {disk} angenommen. Prüfen Sie das Auftragsergebnis.",
       "repair_warning": "Die Reparatur schreibt nur die Blöcke zurück, die der letzte Scrub als fehlerhaft markiert hat, und nur in Dateien, die seit dem letzten Sync unverändert sind. Sie betrifft das ganze Array {name} und nicht allein den Datenträger {disk}: fehlende Dateien stellt sie nicht wieder her, und Änderungen nach dem letzten Sync macht sie nicht rückgängig.",
-      "repair_loses": "{disk} ({path}) — die markierten Blöcke werden mit dem Inhalt des letzten Paritäts-Checkpoints überschrieben",
+      "repair_loses": "{disk} — die markierten Blöcke werden mit dem Inhalt des letzten Paritäts-Checkpoints überschrieben",
       "repair_explain": "Eine Reparatur schreibt keinen neuen Paritäts-Checkpoint und formatiert nichts. Hat der Scrub keine Blöcke markiert, schreibt die Reparatur nichts und endet mit „Nichts wurde repariert“ — dann ist ein Sync die richtige Aktion. Das Array bleibt verfügbar, der Auftrag kann viele Stunden dauern.",
       "repair_none": "Das Array meldet keinen Datenträgerausfall und keine Paritätsfehler. Führen Sie einen Scrub aus, um Schäden zu finden.",
       "repair_not_ready": "Eine Reparatur benötigt ein aktiviertes Array, das aktiv ist oder Aufmerksamkeit braucht.",
@@ -5616,11 +5617,11 @@
       "next_steps": "Nächste Schritte",
       "step_repair": "Reparieren Sie die vom Scrub als fehlerhaft markierten Blöcke aus der Parität.",
       "step_scrub": "Führen Sie einen Scrub aus, um zu prüfen, ob noch etwas zu reparieren ist.",
-      "step_sync": "Führen Sie einen Sync aus — er erfordert eine Bestätigung, weil er die Dateien, die der Scrub nicht lesen konnte, aus der Content-Datei entfernt.",
+      "step_sync": "Führen Sie einen Sync aus — er erfordert eine Bestätigung, weil er den aktuellen Zustand der seit dem letzten Sync gelöschten oder geänderten Dateien festhält.",
       "sync_fault_title": "Sync trotz eines nicht behobenen Fehlers im Array {name}",
       "sync_fault_warning": "Das Array {name} hat einen nicht behobenen Scrub- oder Reparaturfehler. Der Sync schreibt trotzdem einen neuen Paritäts-Checkpoint.",
-      "sync_fault_loses": "Dateien, die der Scrub nicht lesen konnte, werden aus der Content-Datei entfernt — die Parität deckt sie nicht mehr ab.",
-      "sync_fault_keeps": "Vom Scrub markierte Blöcke bleiben durch eine Reparatur aus der Parität reparierbar.",
+      "sync_fault_loses": "Dateien, die seit dem letzten Sync gelöscht oder geändert wurden, auch beschädigte, werden in ihrem neuen Zustand festgehalten — ihre früheren Versionen lassen sich danach nicht mehr aus der Parität wiederherstellen.",
+      "sync_fault_keeps": "Markierte Blöcke unveränderter Dateien sowie unveränderte Dateien, die der Scrub nicht lesen konnte, bleiben aus der Parität reparierbar.",
       "sync_fault_explain": "Führen Sie zuerst die Reparatur aus der Parität aus, falls verfügbar, dann einen Scrub. Ein Sync ist richtig, wenn die Fehler Dateien betreffen, die seit dem letzten Sync geändert wurden.",
       "sync_fault_retype": "Geben Sie zur Bestätigung den Array-Namen erneut ein:",
       "sync_fault_confirm": "Sync trotz des Fehlers ausführen",
@@ -5645,7 +5646,16 @@
       "add_disk_undo_done": "Das Rückgängigmachen des Hinzufügens wurde angenommen. Prüfen Sie das Ergebnis der Aufgabe.",
       "add_disk_undo_unavailable": "Der Datenträger ist möglicherweise bereits der Freigabe beigetreten — das Hinzufügen kann nur abgeschlossen werden.",
       "repair_add_pending": "das Array hat ein nicht abgeschlossenes Hinzufügen eines Datenträgers: schließen Sie es zuerst ab oder machen Sie es rückgängig",
-      "repair_needs_restore": "das Array wartet auf die Wiederherstellung seiner Einhängungen: verwenden Sie zuerst „Mounts wiederherstellen“"
+      "repair_needs_restore": "das Array wartet auf die Wiederherstellung seiner Einhängungen: verwenden Sie zuerst „Mounts wiederherstellen“",
+      "create_policy_mfs": "meister freier Speicher",
+      "create_policy_epmfs": "meister freier Speicher auf vorhandenem Pfad",
+      "create_policy_ff": "erster Datenträger mit Platz",
+      "create_policy_lfs": "wenigster freier Speicher",
+      "create_policy_epff": "erster Datenträger mit vorhandenem Pfad",
+      "create_policy_rand": "zufälliger Datenträger",
+      "create_policy_msplfs": "wenigster freier Speicher auf dem längsten vorhandenen Pfad",
+      "card_mover": "Verschieben aus dem Cache",
+      "card_cache_waiting": "{size} im Cache ohne Parität"
     },
     "wizard_pool": {
       "elastic_data": "Datenträger",
@@ -5731,7 +5741,12 @@
       "spare_sub": "Hot-Spare des Pools {pool}",
       "erase_warning_none": "Die Daten auf den gewählten Laufwerken werden unwiderruflich gelöscht.",
       "sum_layout_value": "{layout} · {n} × {size} ({disks})",
-      "loss_erased": "Daten werden gelöscht"
+      "loss_erased": "Daten werden gelöscht",
+      "plan_warning_mixed_sizes": "Unterschiedlich große Datenträger ({smallest} … {largest}): Jedes vdev richtet sich nach dem kleinsten Datenträger, die zusätzliche Kapazität der größeren bleibt ungenutzt.",
+      "plan_warning_mixed_media": "SSD und HDD gemischt: Das vdev arbeitet mit der Geschwindigkeit seines langsamsten Mitglieds.",
+      "plan_warning_unhealthy_disks": "SMART warnt bei {disks}: Ein Pool auf einem bereits ausfallenden Datenträger startet degradiert.",
+      "plan_warning_single_disk": "Ein einzelner Datenträger hat keine Redundanz: Jeder Ausfall kostet den Pool.",
+      "plan_warning_odd_mirror": "Ein Mirror bildet Paare, daher bleibt bei einer ungeraden Auswahl ein Datenträger ungenutzt."
     },
     "pools": {
       "title": "Pools auf Knoten {node}",
@@ -5889,7 +5904,9 @@
       "trim_start_done": "TRIM des Pools {name} gestartet",
       "trim_suspend_done": "TRIM des Pools {name} angehalten",
       "trim_resume_done": "TRIM des Pools {name} fortgesetzt",
-      "trim_cancel_done": "TRIM des Pools {name} abgebrochen"
+      "trim_cancel_done": "TRIM des Pools {name} abgebrochen",
+      "leaf_last_known": "Datenträger fehlt (zuletzt als {name})",
+      "leaf_missing_at": "Datenträger fehlt, Nr. {n}"
     },
     "props": {
       "title": "Pool-Eigenschaften",
@@ -5918,7 +5935,6 @@
       "removes": "Wird entfernt",
       "fs": "Dateisystem {type}",
       "fs_label": "Bezeichnung {label}",
-      "fs_uuid": "UUID {uuid}",
       "mounted_at": "Eingehängt unter {paths}",
       "nothing": "Dieser Datenträger meldet keine Signatur — es gibt nichts zu entfernen.",
       "bad_plan": "Unvollständige oder widersprüchliche Planantwort. Löschen gesperrt.",
@@ -5943,7 +5959,9 @@
       "done": "Pool {name} zerstört",
       "snapshots": "{n} {n|Snapshot|Snapshots|Snapshots}",
       "explain_others": " sowie den vdevs {roles}",
-      "retype": "Gib den Pool-Namen erneut ein, um zu bestätigen:"
+      "retype": "Gib den Pool-Namen erneut ein, um zu bestätigen:",
+      "share_stops": "{protocol}-Freigabe „{name}“ funktioniert nicht mehr",
+      "target_stops": "{protocol}-Target „{name}“ funktioniert nicht mehr"
     },
     "add_vdev": {
       "title": "Vdev zu {name} hinzufügen",
@@ -5978,7 +5996,8 @@
       "free_sub": "S/N {serial} · nicht zugewiesen · wird vor der Verwendung gelöscht",
       "explain_pick": "Wähle ein Ersatzlaufwerk, um den Austauschplan zu sehen.",
       "start": "Austausch starten",
-      "resilver_progress": "resilver {pct}% · noch {eta}"
+      "resilver_progress": "resilver {pct}% · noch {eta}",
+      "done_detail_spare": "Resilver abgeschlossen — {new} hat die Daten von {device} übernommen, aber {device} bleibt in der Pool-Konfiguration, bis er abgetrennt wird (zpool detach). Diese TentaNas-Version erledigt das noch nicht: Ziehen Sie den Datenträger nicht vor dem Abtrennen."
     },
     "elastic_import": {
       "title": "Elastic Array importieren",
@@ -6669,7 +6688,8 @@
           "title_unnamed": "Laufwerk: {grade}",
           "title_live_reason": "{name}: {reason}",
           "title_last_known_reason": "Laufwerk, zuletzt gesehen als {name}: {reason}",
-          "title_unnamed_reason": "Laufwerk: {reason}"
+          "title_unnamed_reason": "Laufwerk: {reason}",
+          "advice_replace": "Austausch des Datenträgers planen"
         },
         "approval_pending": {
           "title": "{operation} „{subject}“ wartet auf einen zweiten Administrator",
@@ -6678,8 +6698,8 @@
         },
         "elastic_sync_held": {
           "title": "Array {array}: geplanter Sync angehalten, Parity meldet Fehler",
-          "detail": "Ein Scrub hat Fehler gemeldet, die noch nichts repariert hat. Ein geplanter Sync würde die Dateien, die der Scrub nicht lesen konnte, aus der Content-Datei entfernen. Führen Sie die Reparatur aus der Parity und danach einen Scrub aus; ein manueller Sync bleibt verfügbar.",
-          "detail_fault": "Der Scrub wurde nicht korrekt beendet oder eine Reparatur ist fehlgeschlagen. Der geplante Sync würde die Dateien, die der Scrub nicht lesen konnte, aus der Content-Datei entfernen und erfordert daher eine Bestätigung in der Array-Ansicht. Führen Sie einen Scrub oder die Reparatur aus der Parität aus; ein manueller Sync bleibt nach der Bestätigung verfügbar."
+          "detail": "Ein Scrub hat Fehler gemeldet, die noch nichts repariert hat. Ein geplanter Sync würde den aktuellen Zustand der seit dem letzten Sync gelöschten oder geänderten Dateien festhalten, auch beschädigter, und ihre früheren Versionen ließen sich nicht mehr aus der Parität wiederherstellen. Führen Sie die Reparatur aus der Parität und danach einen Scrub aus; ein manueller Sync bleibt verfügbar.",
+          "detail_fault": "Der Scrub wurde nicht korrekt beendet oder eine Reparatur ist fehlgeschlagen. Der geplante Sync würde den aktuellen Zustand der seit dem letzten Sync gelöschten oder geänderten Dateien festhalten, auch beschädigter, und erfordert daher eine Bestätigung in der Array-Ansicht. Führen Sie einen Scrub oder die Reparatur aus der Parität aus; ein manueller Sync bleibt nach der Bestätigung verfügbar."
         },
         "elastic_mover_settle_stopped": {
           "title": "Array {array}: automatischer Abschluss des Verschiebens pausiert",
@@ -6699,7 +6719,10 @@
           "detail": "Ein unterbrochenes Verschieben hat zwei Versionen von Dateien hinterlassen, keine wurde gelöscht. Vergleichen Sie sie und löschen Sie die überflüssige; der Alarm verschwindet, sobald eine übrig ist.",
           "file_quarantine": "{path}: sichtbare Version {visible}, die andere ist eine Kopie in Quarantäne auf dem Cache-Laufwerk {disk}",
           "file_data": "{path}: sichtbare Version {visible}, die andere liegt unter demselben Pfad auf dem Datenlaufwerk {disk}",
-          "file_branch": "{path}: sichtbare Version {visible}, die andere liegt auf einem der Laufwerke des Arrays"
+          "file_branch": "{path}: sichtbare Version {visible}, die andere liegt auf einem der Laufwerke des Arrays",
+          "copy_kept": "Pfad der zweiten Version kopieren: {path}",
+          "copied": "Pfad der zweiten Version von {path} kopiert",
+          "copy_failed": "Der Pfad konnte nicht kopiert werden — der Browser hat den Zugriff auf die Zwischenablage nicht erlaubt"
         },
         "elastic_needs_attention": {
           "title": "Array {array} erfordert einen Eingriff",
@@ -7141,7 +7164,8 @@
       "head_versions": "TentaNas: {list}",
       "chip_services_down_list": "Dienste gestoppt: {list}",
       "chip_services_unknown": "Dienste: keine Antwort von {nodes}",
-      "chip_services_none": "Keine Freigabedienste"
+      "chip_services_none": "Keine Freigabedienste",
+      "not_answered_hint": "Unbekannt: Die Freigabeliste dieses Nodes konnte nicht gelesen werden (keine Antwort oder ein Fehler). Die Zahl erscheint, sobald der Node antwortet."
     },
     "node": {
       "head_sub_node": "Knoten {name}",
@@ -7243,7 +7267,7 @@
       "op_elastic_schedule": "Elastic-Zeitplan scharfschalten",
       "op_elastic_add_disk_abort": "Elastic Array · Hinzufügen eines Datenträgers rückgängig machen",
       "detail_elastic_sync": "Schreibt einen neuen Paritäts- und Content-Checkpoint.",
-      "detail_elastic_sync_over_fault": "Schreibt einen neuen Paritäts- und Content-Checkpoint. ACHTUNG: Das Array hat einen nicht behobenen Scrub- oder Reparaturfehler. Markierte Blöcke bleiben reparierbar, aber Dateien, die der Scrub nicht lesen konnte, werden aus der Content-Datei entfernt und von der Parität nicht mehr abgedeckt. Führen Sie zuerst die Reparatur aus der Parität aus."
+      "detail_elastic_sync_over_fault": "ACHTUNG: Das Array hat einen nicht behobenen Scrub- oder Reparaturfehler. Der Sync hält den aktuellen Zustand der Dateien fest. Markierte Blöcke unveränderter Dateien sowie unveränderte Dateien, die der Scrub nicht lesen konnte, bleiben reparierbar — aber Dateien, die seit dem letzten Sync gelöscht oder geändert wurden, auch beschädigte, werden in ihrem neuen Zustand festgehalten, und ihre früheren Versionen lassen sich nicht mehr aus der Parität wiederherstellen. Führen Sie zuerst die Reparatur aus."
     },
     "access": {
       "title": "Zugriffsprotokoll",
@@ -7550,7 +7574,8 @@
       "elastic_array_not_ready": "Das Array muss aktiviert und aktiv sein oder Aufmerksamkeit erfordern",
       "elastic_add_stopped": "Das Hinzufügen des Datenträgers wurde vor dem Ende angehalten — schließen Sie es in der Array-Ansicht ab oder machen Sie es rückgängig",
       "elastic_undo_stopped": "Das Rückgängigmachen wurde nach seinem ersten Schritt angehalten — das Hinzufügen bleibt unvollständig",
-      "elastic_disk_absent": "Der Datenträger, der gelöscht würde, ist auf diesem Knoten nicht vorhanden — schließen Sie ihn an und versuchen Sie es erneut"
+      "elastic_disk_absent": "Der Datenträger, der gelöscht würde, ist auf diesem Knoten nicht vorhanden — schließen Sie ihn an und versuchen Sie es erneut",
+      "job_not_cancellable": "Dieser Auftrag kann nicht abgebrochen werden — ein Abbruch würde die bereits begonnene Arbeit nicht anhalten"
     }
   },
   "agent_accounts": {

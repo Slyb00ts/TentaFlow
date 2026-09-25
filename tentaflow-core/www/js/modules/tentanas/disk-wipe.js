@@ -29,7 +29,7 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { T, sprite, fmtBytes, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
-import { journalOwnerPhrase, journalOwnerIds, isOtherOrgOnNode } from '/js/modules/tentanas/journal-owner.js';
+import { journalOwnerPhrase, isOtherOrgOnNode } from '/js/modules/tentanas/journal-owner.js';
 import '/js/components/tf-checkbox.js';
 
 // `NasDiskWipeJournalClaim.arrayRole` → the locale key the Disks tab already
@@ -46,11 +46,10 @@ function lossListHtml(plan) {
   if (plan.fsType) {
     // The label is what an admin named the filesystem, so it is text. The
     // UUID identifies it and names nothing — no mockup prints one — so it is
-    // the tooltip of the line, there for the admin who wants to check it
-    // against `blkid` before erasing.
+    // not shown at all, not even as a tooltip (owner's rule: no ids in the
+    // GUI); the disk is already named by the dialog's title.
     const detail = plan.fsLabel ? T('wipe_disk.fs_label', { label: plan.fsLabel }) : '';
-    const title = plan.fsUuid ? ` title="${escapeAttr(T('wipe_disk.fs_uuid', { uuid: plan.fsUuid }))}"` : '';
-    items.push(`<b${title}>${escapeHtml(T('wipe_disk.fs', { type: plan.fsType }))}</b>${detail ? ` — ${escapeHtml(detail)}` : ''}`);
+    items.push(`<b>${escapeHtml(T('wipe_disk.fs', { type: plan.fsType }))}</b>${detail ? ` — ${escapeHtml(detail)}` : ''}`);
   }
   if (plan.mountpoints?.length) {
     items.push(escapeHtml(T('wipe_disk.mounted_at', { paths: plan.mountpoints.join(', ') })));
@@ -82,10 +81,10 @@ function journalHtml(claim) {
   // always filled in, which called this instance's own dissolved arrays
   // another instance's, and for another installation the node now blanks
   // them altogether. The owner phrase is composed from the node's code
-  // (`journalOwnerPhrase`); the ids, when this org may see them, are only the
+  // (`journalOwnerPhrase`); the owner ids are never shown, not even as a
   // tooltip.
   const foreign = claim.ownerForeign
-    ? ` <span title="${escapeAttr(journalOwnerIds(claim))}">${escapeHtml(T('wipe_disk.journal_foreign', { owner: journalOwnerPhrase(claim) }))}</span>`
+    ? ` <span>${escapeHtml(T('wipe_disk.journal_foreign', { owner: journalOwnerPhrase(claim) }))}</span>`
     : '';
   return `
     <div class="wizard-warning danger">${sprite('alert')}<div>

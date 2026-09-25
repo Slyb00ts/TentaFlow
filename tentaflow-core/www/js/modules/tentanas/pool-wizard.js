@@ -58,6 +58,25 @@ export function wizardDisks(freeDisks, pools) {
   return rows;
 }
 
+// The layout step's warnings in the reader's language (M1 part 3): the node
+// sends them as codes (`pools::plan_warning_codes`) beside its English. A
+// code this build has no words for is left out rather than shown raw; a node
+// that predates the codes sends none, and its sentences are shown as they
+// came — truthful, if not translated.
+const PLAN_WARNINGS = new Set(['mixed_sizes', 'mixed_media', 'unhealthy_disks', 'single_disk', 'odd_mirror']);
+export function planWarnings(res) {
+  const codes = Array.isArray(res?.warningCodes) ? res.warningCodes : [];
+  if (!codes.length) return Array.isArray(res?.warnings) ? res.warnings : [];
+  return codes.filter((c) => PLAN_WARNINGS.has(c?.code)).map((c) => {
+    const p = c.params || {};
+    return T('wizard_pool.plan_warning_' + c.code, {
+      smallest: fmtBytes(Number(p.smallest) || 0),
+      largest: fmtBytes(Number(p.largest) || 0),
+      disks: String(p.disks || ''),
+    });
+  });
+}
+
 /**
  * Opens the wizard on `screen` (the TentaNas screen: `nas`, `withSudo`,
  * `currentNode`, `environment`). `freeDisks` are the node's unassigned
@@ -531,7 +550,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
         state.plan = p;
         state.planRevision = revision;
       } else {
-        state.plan = { options: r.options || [], warnings: r.warnings || [], smallestDiskBytes: Number(r.smallestDiskBytes) || 0 };
+        state.plan = { options: r.options || [], warnings: planWarnings(r), smallestDiskBytes: Number(r.smallestDiskBytes) || 0 };
         const recommended = state.plan.options.find((o) => o.recommended && o.available) || state.plan.options.find((o) => o.available);
         state.layout = recommended ? recommended.layout : '';
       }
