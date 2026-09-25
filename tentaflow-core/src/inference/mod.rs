@@ -5,6 +5,8 @@
 
 #[cfg(feature = "inference-llamacpp")]
 pub mod llamacpp;
+#[cfg(feature = "inference-llamacpp")]
+pub mod llama_aux;
 
 // MLX inference — implementacja przez Swift bridge (mlx-swift / MLXLLM).
 // Stary modul `mlx` (mlx-rs / mlx-models w Rust) zostal usuniety bo Rust port

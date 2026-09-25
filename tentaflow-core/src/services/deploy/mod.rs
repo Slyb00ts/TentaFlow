@@ -3363,7 +3363,7 @@ mod tests {
         let db = open_db();
         let ports = Arc::new(PortAllocator::new((45_900, 45_999), Default::default()).unwrap());
         // engine.id "llama-cpp" maps to a local inference backend; other ids
-        // (e.g. "emb-ok") are rejected by prepare_embedded_llm — see
+        // (e.g. "emb-ok") are rejected by prepare_embedded_model — see
         // embedded.rs:145.
         let manifest = dummy_manifest("llama-cpp", NativeRuntime::Embedded);
         let cfg = serde_json::json!({});

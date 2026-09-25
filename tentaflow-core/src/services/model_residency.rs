@@ -154,18 +154,17 @@ impl ModelResidency {
     }
 
     /// Eviction category-aware przed zaladowaniem `keep_model` (kategoria
-    /// `new_category`). TTS male → load TTS nic nie wypiera; TTS nigdy nie
-    /// wypierany (wspolistnieje z LLM dla streaming audio-chat). DUZE (llm/stt)
-    /// wypieraja inne DUZE (poza `keep_model` i poza TTS).
+    /// `new_category`). Male modele (`coexists`) niczego nie wypieraja i nigdy
+    /// nie sa wypierane. DUZE (llm/stt) wypieraja inne DUZE (poza `keep_model`).
     async fn evict_for(&self, new_category: &str, keep_model: &str) {
-        if new_category == "tts" {
+        if coexists(new_category) {
             return;
         }
         let to_evict: Vec<(String, Resident)> = {
             let mut res = self.resident.lock().await;
             let names: Vec<String> = res
                 .iter()
-                .filter(|(name, info)| name.as_str() != keep_model && info.category != "tts")
+                .filter(|(name, info)| name.as_str() != keep_model && !coexists(&info.category))
                 .map(|(name, _)| name.clone())
                 .collect();
             names
@@ -227,6 +226,13 @@ impl ModelResidency {
             }
         });
     }
+}
+
+/// Small models that stay resident next to a large one: TTS (a streaming
+/// audio chat synthesizes while the LLM still generates) and the few-hundred-MB
+/// GGUF embedders/rerankers a RAG turn calls right before the LLM.
+fn coexists(category: &str) -> bool {
+    matches!(category, "tts" | "embeddings" | "reranker")
 }
 
 // =============================================================================
@@ -315,12 +321,16 @@ pub(crate) async fn unload_engine(category: &str, engine_id: &str) {
                 .await
                 .unregister(engine_id);
         }
+        // GGUF embedders/rerankers live in their own llama.cpp registry keyed
+        // by engine id; an engine that never loaded there is a no-op.
+        Category::Embeddings | Category::Reranker => {
+            #[cfg(feature = "inference-llamacpp")]
+            crate::inference::llama_aux::unload(engine_id).await;
+        }
         // Bez silnika osadzonego w procesie core: model (jesli jest) zyje w
         // kontenerze albo w osobnym procesie, ktory konczy sciezka zatrzymania
         // wyzej. Nie ma tu czego zwalniac.
-        Category::Embeddings
-        | Category::Reranker
-        | Category::Vision
+        Category::Vision
         | Category::ImageGen
         | Category::VideoGen
         | Category::MusicGen

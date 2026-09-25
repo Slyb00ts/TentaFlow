@@ -405,13 +405,24 @@ impl EmbeddedDeploy {
         // jina-embed-mlx (embeddings) i jina-rerank-mlx (reranker) to oba modele
         // Qwen3 ladowane in-process TA SAMA sciezka (EmbedderModelFactory ->
         // load_embedder_model). Reranker reuzywa zaladowany model przez rerank().
-        let engine_id = self.manifest.engine.id.as_str();
-        let handled = (self.manifest.engine.category == Category::Embeddings
-            && engine_id == "jina-embed-mlx")
-            || (self.manifest.engine.category == Category::Reranker
-                && engine_id == "jina-rerank-mlx");
-        if !handled {
+        let category = self.manifest.engine.category;
+        if category != Category::Embeddings && category != Category::Reranker {
             return Ok(());
+        }
+        // GGUF embedders and rerankers load in `prepare_embedded_model`.
+        if self.uses_llamacpp() {
+            return Ok(());
+        }
+        let engine_id = self.manifest.engine.id.as_str();
+        let handled = (category == Category::Embeddings && engine_id == "jina-embed-mlx")
+            || (category == Category::Reranker && engine_id == "jina-rerank-mlx");
+        if !handled {
+            // Returning Ok here used to mark the service `running` with nothing
+            // loaded: every request then failed with "no local model loaded".
+            return Err(DeployError::Other(format!(
+                "engine '{engine_id}' has no in-process embeddings/reranker backend; \
+                 deploy it with the docker method"
+            )));
         }
 
         let (repo, model_name) = if let Some(repo) = self
@@ -535,8 +546,23 @@ impl EmbeddedDeploy {
         }
     }
 
-    fn selected_llm_model(&self) -> Option<EmbeddedLlmSelection> {
-        if self.manifest.engine.category != Category::Llm {
+    /// Embedders and rerankers whose native runtime is llama.cpp: one GGUF,
+    /// loaded beside the chat model instead of into its single slot.
+    fn uses_llamacpp(&self) -> bool {
+        matches!(
+            self.manifest.engine.category,
+            Category::Embeddings | Category::Reranker
+        ) && self
+            .manifest
+            .deploy
+            .native
+            .as_ref()
+            .and_then(|n| n.feature_flag.as_deref())
+            == Some("inference-llamacpp")
+    }
+
+    fn selected_model(&self) -> Option<EmbeddedLlmSelection> {
+        if self.manifest.engine.category != Category::Llm && !self.uses_llamacpp() {
             return None;
         }
 
@@ -579,12 +605,13 @@ impl EmbeddedDeploy {
         })
     }
 
-    async fn prepare_embedded_llm(&self) -> DeployResult<Option<PathBuf>> {
-        let Some(selection) = self.selected_llm_model() else {
+    async fn prepare_embedded_model(&self) -> DeployResult<Option<PathBuf>> {
+        let Some(selection) = self.selected_model() else {
             return Ok(None);
         };
 
         let preferred_backend = match self.manifest.engine.id.as_str() {
+            _ if self.uses_llamacpp() => "llamacpp",
             "mlx" => "mlx",
             "llama-cpp" => "llamacpp",
             other => {
@@ -855,6 +882,10 @@ impl EmbeddedDeploy {
                 .acquire()
                 .await
                 .expect("EMBEDDED_LOAD_GATE never closed");
+            if self.uses_llamacpp() {
+                self.load_llamacpp_aux(&load_path, &deploy_params).await?;
+                return Ok(Some(load_path));
+            }
             let shared = crate::inference::shared_inference_manager();
             let mut manager = shared.write().await;
             let info = manager
@@ -878,6 +909,43 @@ impl EmbeddedDeploy {
 
             Ok(Some(load_path))
         }
+    }
+}
+
+impl EmbeddedDeploy {
+    #[cfg(all(not(test), feature = "inference-llamacpp"))]
+    async fn load_llamacpp_aux(
+        &self,
+        load_path: &Path,
+        deploy_params: &crate::inference::DeployParamsSnapshot,
+    ) -> DeployResult<()> {
+        let config =
+            tentaflow_wrappers::llama::LlamaLoadConfig::from_deploy_hash_map(&deploy_params.llamacpp);
+        crate::inference::llama_aux::load(&self.manifest.engine.id, load_path, config)
+            .await
+            .map_err(|e| {
+                DeployError::Other(format!(
+                    "load embedded model '{}' with backend 'llamacpp': {e:#}",
+                    load_path.display()
+                ))
+            })?;
+        if let Some(s) = &self.log_sink {
+            s.info(&format!("[model] loaded {} via llamacpp", load_path.display()));
+        }
+        Ok(())
+    }
+
+    // Unreachable in practice: the backend preflight above already refuses a
+    // binary without llama.cpp before anything is downloaded.
+    #[cfg(all(not(test), not(feature = "inference-llamacpp")))]
+    async fn load_llamacpp_aux(
+        &self,
+        _load_path: &Path,
+        _deploy_params: &crate::inference::DeployParamsSnapshot,
+    ) -> DeployResult<()> {
+        Err(DeployError::Other(
+            "backend 'llamacpp' nie jest wkompilowany w te binarke".to_string(),
+        ))
     }
 }
 
@@ -951,7 +1019,7 @@ impl DeployStrategy for EmbeddedDeploy {
         self.prepare_embedded_stt().await?;
         self.prepare_embedded_tts().await?;
         self.prepare_embedded_embeddings().await?;
-        let loaded_model_path = self.prepare_embedded_llm().await?;
+        let loaded_model_path = self.prepare_embedded_model().await?;
 
         let runtime = RuntimeHandle::default();
         let models = models_from_manifest(&self.manifest, &self.user_config);
@@ -1005,6 +1073,10 @@ impl DeployStrategy for EmbeddedDeploy {
     }
 
     async fn rollback(&self, _prepared: PreparedDeploy) -> DeployResult<()> {
+        #[cfg(feature = "inference-llamacpp")]
+        if self.uses_llamacpp() {
+            crate::inference::llama_aux::unload(&self.manifest.engine.id).await;
+        }
         for key in &self.registered_vision_keys {
             crate::vision::unregister_engine(key);
         }
@@ -1177,7 +1249,7 @@ mod tests {
 
     #[tokio::test]
     async fn prepare_emits_models_for_embedded() {
-        // engine.id must be known to prepare_embedded_llm — "llama-cpp" or "mlx".
+        // engine.id must be known to prepare_embedded_model — "llama-cpp" or "mlx".
         // Other ids return DeployError::Manifest("no local inference backend mapping").
         let m = manifest(
             "llama-cpp",

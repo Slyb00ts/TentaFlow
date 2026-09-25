@@ -2397,17 +2397,9 @@ pub fn resolve_local_v1_base_url(
     }
 }
 
-/// Współdzielona ścieżka forwardu rerankingu (resolve serwisu Rerank + POST na
-/// Cohere-style `<base>/v1/rerank` + parsowanie odpowiedzi vLLM). Używana przez
-/// HTTP `/v1/ranking` (Tier 2) ORAZ natywny handler `RerankRequest` (Tier 1) —
-/// jedna implementacja forwardu, zero duplikacji logiki HTTP.
-///
-/// Autoryzacja modelu (`v1_authorize` / `#[policy]`) MUSI być sprawdzona przez
-/// wywołującego przed wejściem tu.
-/// Embedded MLX reranker (jina-rerank-mlx) — liczy score'y IN-PROCESS przez
-/// MLXBridge zamiast forwardu HTTP (spójnie z embedded embeddings/vision). Zwraca
-/// `None` gdy serwis rerank NIE jest embedded (caller idzie ścieżką HTTP).
-#[cfg(feature = "inference-mlx")]
+/// Embedded reranker (llama.cpp GGUF or MLX) — scores IN-PROCESS through the
+/// same `embedded_rerank` the executor uses instead of an HTTP forward. `None`
+/// when the rerank service is not embedded (the caller takes the HTTP path).
 async fn try_embedded_rerank(
     router: &Router,
     model: &str,
@@ -2436,37 +2428,32 @@ async fn try_embedded_rerank(
         )
         .ok()?;
     // Tylko embedded local handle idzie in-process; reszta (HTTP/mesh/flow) -> None.
-    match &target {
+    let engine_id = match &target {
         crate::services::runtime::target::ResolvedExecutionTarget::Local {
-            handle: crate::services::handles_cache::BackendHandle::Embedded { .. },
+            handle: crate::services::handles_cache::BackendHandle::Embedded { engine_id, .. },
             ..
-        } => {}
+        } => engine_id.clone(),
         _ => return None,
-    }
-    // Model rerankera zaladowany przez embedded deploy (load_embedder_model).
-    let scores = match crate::inference::mlx_swift_bridge::rerank(query, documents).await {
-        Ok(s) => s,
-        Err(e) => {
-            return Some(Err(format!(
-                "{}: embedded MLX rerank: {}",
-                context_label, e
-            )))
-        }
     };
-    let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let n = top_n
-        .map(|n| n as usize)
-        .unwrap_or(ranked.len())
-        .min(ranked.len());
+    let request = crate::api::openai::types::RerankRequest {
+        model: model.to_string(),
+        query: query.to_string(),
+        documents: documents.to_vec(),
+        top_n,
+    };
+    let ranked = match crate::services::runtime::executor::embedded_rerank(&engine_id, &request).await
+    {
+        Ok(r) => r,
+        Err(e) => return Some(Err(format!("{context_label}: {e}"))),
+    };
     let results = ranked
+        .results
         .into_iter()
-        .take(n)
-        .map(|(idx, score)| tentaflow_protocol::RerankResultItem {
-            index: idx,
-            relevance_score: score,
+        .map(|r| tentaflow_protocol::RerankResultItem {
+            index: r.index,
+            relevance_score: r.relevance_score,
             document: if return_documents {
-                documents.get(idx).cloned()
+                documents.get(r.index).cloned()
             } else {
                 None
             },
@@ -2478,20 +2465,13 @@ async fn try_embedded_rerank(
     }))
 }
 
-#[cfg(not(feature = "inference-mlx"))]
-async fn try_embedded_rerank(
-    _router: &Router,
-    _model: &str,
-    _query: &str,
-    _documents: &[String],
-    _top_n: Option<u32>,
-    _return_documents: bool,
-    _user_ctx: Option<crate::auth::acl::UserContext>,
-    _context_label: &str,
-) -> Option<std::result::Result<tentaflow_protocol::RerankResult, String>> {
-    None
-}
-
+/// Współdzielona ścieżka forwardu rerankingu (resolve serwisu Rerank + POST na
+/// Cohere-style `<base>/v1/rerank` + parsowanie odpowiedzi vLLM). Używana przez
+/// HTTP `/v1/ranking` (Tier 2) ORAZ natywny handler `RerankRequest` (Tier 1) —
+/// jedna implementacja forwardu, zero duplikacji logiki HTTP.
+///
+/// Autoryzacja modelu (`v1_authorize` / `#[policy]`) MUSI być sprawdzona przez
+/// wywołującego przed wejściem tu.
 pub async fn rerank_forward(
     router: &Router,
     model: &str,

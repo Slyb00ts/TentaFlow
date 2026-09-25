@@ -204,6 +204,13 @@ pub struct Embedding {
     pub prompt_tokens: usize,
 }
 
+/// Relevance score per document, in input order, plus the tokens scored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rerank {
+    pub scores: Vec<f32>,
+    pub prompt_tokens: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlamaModelMetadata {
     pub name: String,
@@ -573,6 +580,8 @@ pub enum LlamaError {
     EmbeddingsUnsupported,
     #[error("nie udało się pobrać embeddingu")]
     EmbeddingsMissing,
+    #[error("model nie ma głowy klasyfikacyjnej rerankera")]
+    RerankUnsupported,
 }
 
 #[cfg(feature = "llama")]
@@ -651,14 +660,18 @@ impl LlamaRuntime {
             return Err(LlamaError::EmbeddingsUnsupported);
         }
 
-        let tokens = self.tokenize(text, true)?;
+        let tokens = self.tokenize(text, true, false)?;
         if tokens.is_empty() {
             return Err(LlamaError::EmptyPrompt);
         }
         self.ensure_prompt_fits(tokens.len())?;
 
-        let mut context = self.context(true)?;
-        let mut batch = LlamaBatchGuard::new(self.context_limit() as i32, 1);
+        let mut context = self.context(
+            tokens.len() as u32,
+            true,
+            sys::LLAMA_POOLING_TYPE_UNSPECIFIED,
+        )?;
+        let mut batch = LlamaBatchGuard::new(tokens.len() as i32, 1);
         eval_tokens(&mut context, &mut batch, &tokens, 0, true)?;
         unsafe { sys::llama_synchronize(context.raw) };
 
@@ -682,12 +695,96 @@ impl LlamaRuntime {
         })
     }
 
-    fn context(&self, embeddings: bool) -> Result<LlamaContextGuard, LlamaError> {
+    /// Scores every document against `query` with a cross-encoder GGUF
+    /// (`--pooling rank` in llama-server terms). The prompt follows the
+    /// model's own `rerank` chat template when it ships one, otherwise the
+    /// `[BOS]query[EOS][SEP]doc[EOS]` layout llama-server uses, so a model
+    /// scores the same here as behind the docker image.
+    pub fn rerank(&self, query: &str, documents: &[String]) -> Result<Rerank, LlamaError> {
+        if unsafe { sys::llama_model_n_cls_out(self.model.raw) } == 0 {
+            return Err(LlamaError::RerankUnsupported);
+        }
+        let template = model_chat_template(self.model.raw, "rerank");
+        let mut scores = Vec::with_capacity(documents.len());
+        let mut prompt_tokens = 0usize;
+        for doc in documents {
+            let tokens = match &template {
+                Some(t) => {
+                    let prompt = t.replace("{query}", query).replace("{document}", doc);
+                    self.tokenize(&prompt, false, true)?
+                }
+                None => self.rerank_pair_tokens(query, doc)?,
+            };
+            if tokens.is_empty() {
+                return Err(LlamaError::EmptyPrompt);
+            }
+            self.ensure_prompt_fits(tokens.len())?;
+
+            let mut context =
+                self.context(tokens.len() as u32, true, sys::LLAMA_POOLING_TYPE_RANK)?;
+            let mut batch = LlamaBatchGuard::new(tokens.len() as i32, 1);
+            eval_tokens(&mut context, &mut batch, &tokens, 0, true)?;
+            unsafe { sys::llama_synchronize(context.raw) };
+
+            let ptr = unsafe { sys::llama_get_embeddings_seq(context.raw, 0) };
+            if ptr.is_null() {
+                return Err(LlamaError::EmbeddingsMissing);
+            }
+            scores.push(unsafe { *ptr });
+            prompt_tokens += tokens.len();
+        }
+        Ok(Rerank {
+            scores,
+            prompt_tokens,
+        })
+    }
+
+    fn rerank_pair_tokens(&self, query: &str, doc: &str) -> Result<Vec<sys::llama_token>, LlamaError> {
+        let vocab = unsafe { sys::llama_model_get_vocab(self.model.raw) };
+        let mut eos = unsafe { sys::llama_vocab_eos(vocab) };
+        // LLAMA_TOKEN_NULL is a C macro (-1) that bindgen does not export.
+        if eos == -1 {
+            eos = unsafe { sys::llama_vocab_sep(vocab) };
+        }
+        let add_bos = unsafe { sys::llama_vocab_get_add_bos(vocab) };
+        let add_eos = unsafe { sys::llama_vocab_get_add_eos(vocab) };
+        let add_sep = unsafe { sys::llama_vocab_get_add_sep(vocab) };
+
+        let mut tokens = Vec::new();
+        if add_bos {
+            tokens.push(unsafe { sys::llama_vocab_bos(vocab) });
+        }
+        tokens.extend(self.tokenize(query, false, false)?);
+        if add_eos {
+            tokens.push(eos);
+        }
+        if add_sep {
+            tokens.push(unsafe { sys::llama_vocab_sep(vocab) });
+        }
+        tokens.extend(self.tokenize(doc, false, false)?);
+        if add_eos {
+            tokens.push(eos);
+        }
+        Ok(tokens)
+    }
+
+    /// A context just large enough for one prompt: embedding and rerank calls
+    /// are one-shot, and sizing every one to the full trained window would
+    /// allocate a KV cache of tens of thousands of positions per request.
+    fn context(
+        &self,
+        prompt_tokens: u32,
+        embeddings: bool,
+        pooling: sys::llama_pooling_type,
+    ) -> Result<LlamaContextGuard, LlamaError> {
+        let n_ctx = prompt_tokens.max(1).min(self.context_limit());
         let mut params = unsafe { sys::llama_context_default_params() };
-        params.n_ctx = self.context_limit();
-        params.n_batch = self.load_config.batch_size.max(1);
-        params.n_ubatch = self.load_config.batch_size.max(1);
+        params.n_ctx = n_ctx;
+        // A pooled output needs the whole prompt in one ubatch.
+        params.n_batch = n_ctx;
+        params.n_ubatch = n_ctx;
         params.embeddings = embeddings;
+        params.pooling_type = pooling;
         params.flash_attn_type = match self.load_config.flash_attn {
             FlashAttentionMode::Auto => sys::LLAMA_FLASH_ATTN_TYPE_AUTO,
             FlashAttentionMode::Off => sys::LLAMA_FLASH_ATTN_TYPE_DISABLED,
@@ -705,11 +802,14 @@ impl LlamaRuntime {
         Ok(LlamaContextGuard { raw })
     }
 
+    /// `ctx_size = 0` means "what the model was trained for", the same rule
+    /// the generation engine applies; taken literally it was a 1-token window.
     fn context_limit(&self) -> u32 {
-        self.load_config
-            .ctx_size
-            .min(self.metadata.context_train)
-            .max(1)
+        match self.load_config.ctx_size {
+            0 => self.metadata.context_train,
+            n => n.min(self.metadata.context_train),
+        }
+        .max(1)
     }
 
     fn ensure_prompt_fits(&self, prompt_tokens: usize) -> Result<(), LlamaError> {
@@ -724,8 +824,13 @@ impl LlamaRuntime {
         }
     }
 
-    fn tokenize(&self, text: &str, add_special: bool) -> Result<Vec<sys::llama_token>, LlamaError> {
-        tokenize_with_model(self.model.raw, text, add_special)
+    fn tokenize(
+        &self,
+        text: &str,
+        add_special: bool,
+        parse_special: bool,
+    ) -> Result<Vec<sys::llama_token>, LlamaError> {
+        tokenize_with_model(self.model.raw, text, add_special, parse_special)
     }
 }
 
@@ -964,6 +1069,17 @@ fn model_meta_value(model: *const sys::llama_model, idx: i32) -> Option<String> 
     })
 }
 
+/// A named chat template stored in the GGUF (`tokenizer.chat_template.<name>`).
+#[cfg(feature = "llama")]
+fn model_chat_template(model: *const sys::llama_model, name: &str) -> Option<String> {
+    let c_name = std::ffi::CString::new(name).ok()?;
+    let raw = unsafe { sys::llama_model_chat_template(model, c_name.as_ptr()) };
+    if raw.is_null() {
+        return None;
+    }
+    Some(unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned())
+}
+
 #[cfg(feature = "llama")]
 fn model_meta_string(read: impl Fn(*mut std::os::raw::c_char, usize) -> i32) -> Option<String> {
     let needed = read(std::ptr::null_mut(), 0);
@@ -1132,6 +1248,7 @@ pub(crate) fn tokenize_with_model(
     model: *const sys::llama_model,
     text: &str,
     add_special: bool,
+    parse_special: bool,
 ) -> Result<Vec<sys::llama_token>, LlamaError> {
     let vocab = unsafe { sys::llama_model_get_vocab(model) };
     let text_bytes = text.as_bytes();
@@ -1143,7 +1260,7 @@ pub(crate) fn tokenize_with_model(
             std::ptr::null_mut(),
             0,
             add_special,
-            false,
+            parse_special,
         )
     };
 
@@ -1161,7 +1278,7 @@ pub(crate) fn tokenize_with_model(
             tokens.as_mut_ptr(),
             tokens.len() as i32,
             add_special,
-            false,
+            parse_special,
         )
     };
     if written < 0 {

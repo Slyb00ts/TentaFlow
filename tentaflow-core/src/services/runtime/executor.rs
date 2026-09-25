@@ -1735,11 +1735,18 @@ impl ModelRuntimeExecutor {
 
         match target {
             ResolvedExecutionTarget::Local { handle, .. } => match handle {
-                BackendHandle::Embedded { .. } => self
-                    .local_inference
-                    .handle_embeddings(&request)
-                    .await
-                    .map_err(|e| ExecutorError::Internal(e.to_string())),
+                BackendHandle::Embedded { engine_id, .. } => {
+                    #[cfg(feature = "inference-llamacpp")]
+                    if crate::inference::llama_aux::is_loaded(engine_id).await {
+                        return llama_aux_embeddings(engine_id, request).await;
+                    }
+                    #[cfg(not(feature = "inference-llamacpp"))]
+                    let _ = engine_id;
+                    self.local_inference
+                        .handle_embeddings(&request)
+                        .await
+                        .map_err(|e| ExecutorError::Internal(format!("{e:#}")))
+                }
                 BackendHandle::Http(client) => client
                     .embeddings_request(request)
                     .await
@@ -2038,7 +2045,7 @@ impl ModelRuntimeExecutor {
 
         match target {
             ResolvedExecutionTarget::Local { handle, .. } => match handle {
-                BackendHandle::Embedded { .. } => embedded_rerank(&request).await,
+                BackendHandle::Embedded { engine_id, .. } => embedded_rerank(engine_id, &request).await,
                 BackendHandle::Http(client) => client
                     .rerank_request(request)
                     .await
@@ -3645,11 +3652,39 @@ fn rerank_model_request(request: &RerankRequest) -> tentaflow_protocol::ModelReq
 /// Embedded MLX reranker (jina-reranker-v3): liczy score'y in-process przez
 /// MLXBridge, zwraca posortowane malejąco (`top_n` honorowane). Poza feature
 /// `inference-mlx` embedded rerankera nie ma — błąd, żeby fallback chain szedł dalej.
-#[cfg(feature = "inference-mlx")]
-async fn embedded_rerank(request: &RerankRequest) -> Result<RerankResponse, ExecutorError> {
-    let scores = crate::inference::mlx_swift_bridge::rerank(&request.query, &request.documents)
+/// In-process reranking: a llama.cpp cross-encoder GGUF registered for this
+/// engine, otherwise the MLX embedder slot on Apple.
+pub(crate) async fn embedded_rerank(
+    engine_id: &str,
+    request: &RerankRequest,
+) -> Result<RerankResponse, ExecutorError> {
+    #[cfg(feature = "inference-llamacpp")]
+    if crate::inference::llama_aux::is_loaded(engine_id).await {
+        let ranked = crate::inference::llama_aux::rerank(
+            engine_id,
+            request.query.clone(),
+            request.documents.clone(),
+        )
         .await
-        .map_err(|e| ExecutorError::Internal(format!("embedded MLX rerank: {e}")))?;
+        .map_err(|e| ExecutorError::Internal(format!("embedded llama.cpp rerank: {e:#}")))?;
+        return Ok(rerank_response(ranked.scores, request.top_n));
+    }
+    #[cfg(feature = "inference-mlx")]
+    let result = crate::inference::mlx_swift_bridge::rerank(&request.query, &request.documents)
+        .await
+        .map(|scores| rerank_response(scores, request.top_n))
+        .map_err(|e| ExecutorError::Internal(format!("embedded MLX rerank ({engine_id}): {e}")));
+    #[cfg(not(feature = "inference-mlx"))]
+    let result = Err(ExecutorError::Internal(format!(
+        "embedded engine '{engine_id}' has no reranker model loaded for '{}'",
+        request.model
+    )));
+    result
+}
+
+/// Scores in document order → entries sorted best-first, cut to `top_n`.
+#[cfg(any(feature = "inference-llamacpp", feature = "inference-mlx"))]
+fn rerank_response(scores: Vec<f32>, top_n: Option<u32>) -> RerankResponse {
     let mut results: Vec<RerankResultEntry> = scores
         .into_iter()
         .enumerate()
@@ -3663,17 +3698,45 @@ async fn embedded_rerank(request: &RerankRequest) -> Result<RerankResponse, Exec
             .partial_cmp(&a.relevance_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    if let Some(n) = request.top_n {
+    if let Some(n) = top_n {
         results.truncate(n as usize);
     }
-    Ok(RerankResponse { results })
+    RerankResponse { results }
 }
 
-#[cfg(not(feature = "inference-mlx"))]
-async fn embedded_rerank(_request: &RerankRequest) -> Result<RerankResponse, ExecutorError> {
-    Err(ExecutorError::Internal(
-        "embedded backend does not support reranking".into(),
-    ))
+/// Embeddings from a llama.cpp GGUF registered for this engine. The runtime
+/// tokenizes, so usage is the real prompt token count.
+#[cfg(feature = "inference-llamacpp")]
+async fn llama_aux_embeddings(
+    engine_id: &str,
+    request: EmbeddingRequest,
+) -> Result<EmbeddingResponse, ExecutorError> {
+    let texts = match request.input {
+        EmbeddingInput::Single(text) => vec![text],
+        EmbeddingInput::Multiple(texts) => texts,
+    };
+    let vectors = crate::inference::llama_aux::embeddings(engine_id, texts, true)
+        .await
+        .map_err(|e| ExecutorError::Internal(format!("embedded llama.cpp embeddings: {e:#}")))?;
+    let prompt_tokens = vectors.iter().map(|v| v.prompt_tokens as u32).sum();
+    let data = vectors
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| EmbeddingData {
+            object: "embedding".to_string(),
+            index: i as u32,
+            embedding: v.vector,
+        })
+        .collect();
+    Ok(EmbeddingResponse {
+        object: "list".to_string(),
+        data,
+        model: request.model,
+        usage: EmbeddingUsage {
+            prompt_tokens,
+            total_tokens: prompt_tokens,
+        },
+    })
 }
 
 /// Mapuje `ModelResult` (QUIC/mesh) na `RerankResponse`. Wynik z silnika niesie

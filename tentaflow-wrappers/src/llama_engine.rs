@@ -1476,7 +1476,7 @@ fn start_job(
         _ => request.prompt.clone(),
     };
 
-    let tokens = match tokenize_with_model(model, &full_prompt, true) {
+    let tokens = match tokenize_with_model(model, &full_prompt, true, false) {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => {
             reject_job(&mut sink, inflight, FinishReason::Error("pusty prompt".into()));
