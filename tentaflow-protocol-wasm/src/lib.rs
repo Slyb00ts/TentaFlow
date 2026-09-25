@@ -24018,6 +24018,13 @@ pub fn encode_tentanas_pool_device_state_request(request_json: String) -> Result
     encode_tentanas_json_request("PoolDeviceStateRequest", &request_json)
 }
 
+/// MessageBody::TentaNasBody(PoolDetachRequest) — `zpool detach` of the disk a hot spare
+/// replaced; the node re-checks that the leaf may go.
+#[wasm_bindgen(js_name = encodeTentaNasPoolDetachRequest)]
+pub fn encode_tentanas_pool_detach_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolDetachRequest", &request_json)
+}
+
 #[wasm_bindgen(js_name = encodeTentaNasPoolSetPropertiesRequest)]
 pub fn encode_tentanas_pool_set_properties_request(
     request_json: String,
@@ -24696,7 +24703,8 @@ pub fn encode_tentanas_target_get_request(request_json: String) -> Result<Vec<u8
 
 /// MessageBody::TentaNasBody(TargetsListRequest) — the block targets of the node (n12) plus
 /// what this node can serve: LIO, nvmet, iSER, NVMe-oF/RDMA, DH-HMAC-CHAP, its interfaces
-/// and the zvols the wizard may export.
+/// and the zvols the wizard may export. `{"summary": true}` asks for the fleet's light
+/// answer (targets and service rows only).
 #[wasm_bindgen(js_name = encodeTentaNasTargetsListRequest)]
 pub fn encode_tentanas_targets_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("TargetsListRequest", &request_json)

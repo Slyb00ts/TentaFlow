@@ -2854,6 +2854,13 @@ pub fn request_smart_refresh() {
     state().write().last_smart = None;
 }
 
+/// Republishes this node's fleet summary on the next tick instead of up to a
+/// minute later: an arm or a disarm changes `armed_until`, and the other
+/// nodes' fleet and Environment screens read it from that row.
+pub fn request_summary_refresh() {
+    state().write().last_summary = None;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -146,7 +146,10 @@ pub fn armed_token() -> Option<Arc<ElevationToken>> {
     }
 }
 
-fn armed_until() -> Option<String> {
+/// Until when the armed password is kept, RFC 3339 UTC, or `None` when
+/// nothing is armed (or it has expired). Read by the Environment status and by
+/// the fleet row (`NasNodeInfo::armed_until`).
+pub fn armed_until() -> Option<String> {
     let slot = armed_slot().lock().unwrap_or_else(|p| p.into_inner());
     slot.as_ref()
         .filter(|a| a.until > Instant::now())

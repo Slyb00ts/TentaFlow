@@ -17,7 +17,7 @@ const {
   mountTargetsSection, openTargetDetail, openTargetDeleteDialog, setTargetEnabled,
   authChipHtml, authLabel, portalCellHtml, sourceCellHtml, protocolLabel, parseInitiators,
   groupStateLabel, targetRow, sessionsCountLabel, sessionsEmptyText,
-  sessionLine, protocolChipHtml, transportLabel,
+  sessionLine, protocolChipHtml, transportLabel, hostConnectionHtml,
 } = await import('./targets.js');
 
 const iscsiTarget = (over = {}) => ({
@@ -1033,6 +1033,37 @@ test('the poll stops once the detail is no longer on screen', async () => {
     await runPoll(screen);
     assert.equal(screen.calls.length, calls, 'a gone pane sends no request');
     assert.equal(screen.polls.length, 0, 'and schedules nothing more');
+  } finally {
+    screen.dispose();
+  }
+});
+
+// MAJOR 27 front slice (owner decision, wave 7): the allowlist says whether
+// each host is connected, from the sessions the node already returns — and
+// "—" with the reason where the node could not measure sessions.
+test('the allowlist marks each host connected or not from the session list, and unknown sessions as a dash', () => {
+  const known = { sessionsKnown: true };
+  const sessions = [{ client: '10.10.0.21', user: 'nqn.2014-08.org.nvmexpress:uuid:host-a', connectedAt: null }];
+  assert.match(hostConnectionHtml(known, sessions, 'NQN.2014-08.org.nvmexpress:uuid:host-a'), /status="ok"[^>]*label="Połączony"/);
+  assert.match(hostConnectionHtml(known, sessions, 'nqn.2014-08.org.nvmexpress:uuid:host-b'), /label="Niepołączony"/);
+  // An iSCSI session carries the IQN as its client.
+  assert.match(hostConnectionHtml(known, [{ client: 'iqn.1998-01.com.vmware:esx01', user: '' }], 'iqn.1998-01.com.vmware:esx01'), /Połączony/);
+  const unknown = hostConnectionHtml({ sessionsKnown: false }, [], 'nqn.x');
+  assert.match(unknown, /^<span class="text-3" title="[^"]+">—<\/span>$/);
+  assert.ok(unknown.includes(sessionsEmptyText({ sessionsKnown: false }).replace(/"/g, '&quot;').slice(0, 20)));
+  assert.doesNotMatch(unknown, /Niepołączony/, 'unmeasured is never "not connected"');
+});
+
+test('the target detail paints the allowlist state column', async () => {
+  const target = iscsiTarget({ initiators: ['iqn.1998-01.com.vmware:esx01', 'iqn.1998-01.com.vmware:esx02'] });
+  const screen = detailScreen([{ target, sessions: [{ client: 'iqn.1998-01.com.vmware:esx01', user: 'iqn.1998-01.com.vmware:esx01', connectedAt: null }], configPreview: '' }]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const rows = win.querySelector('#nas-td-hosts').rows;
+    assert.deepEqual(rows.map((r) => /Połączony/.test(r.connected) && !/Niepołączony/.test(r.connected)), [true, false]);
+    assert.ok(win.querySelector('#nas-td-hosts tf-column[key="connected"]'));
   } finally {
     screen.dispose();
   }

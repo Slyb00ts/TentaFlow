@@ -18,6 +18,26 @@ export const T = (k, p) => I18n.t('tentanas.' + k, p);
 // badge said ok, and `elevation.short_unset` rendered as a raw key. One
 // spelling from here on — the i18n keys keep theirs.
 export const channelMode = (mode) => (!mode || mode === 'unset' ? 'unarmed' : mode);
+
+// The channel a node REALLY has right now, from its mode and — for mode B —
+// until when its password is held (`NasNodeInfo::armed_until`,
+// `NasElevation::armed_until`). The mode alone called every mode-B node a
+// working channel, so a node whose password had expired read green and its
+// "Uzbrój…" was never offered (n16: "tryb B — nieuzbrojony"). A missing or
+// past instant is "not armed"; an older node that does not send the field
+// therefore reads as not armed, which asks for a password rather than
+// promising one is held. Answers 'helper' | 'interactive' |
+// 'interactive_unarmed' | 'unarmed'.
+export function liveChannelMode(mode, armedUntil, now = Date.now()) {
+  const m = channelMode(mode);
+  if (m !== 'interactive') return m;
+  const until = Date.parse(String(armedUntil || ''));
+  return Number.isFinite(until) && until > now ? 'interactive' : 'interactive_unarmed';
+}
+export const nodeChannelMode = (n, now = Date.now()) => liveChannelMode(n?.elevationMode, n?.armedUntil, now);
+// Both "no channel" and "mode B with no password held" leave the node unable
+// to run a privileged step without someone typing a password.
+export const channelIsUnarmed = (m) => m === 'unarmed' || m === 'interactive_unarmed';
 export const sprite = (id) => `<svg class="icon"><use href="#i-${id}"/></svg>`;
 
 // ----- Names, never identifiers ---------------------------------------------
@@ -826,10 +846,24 @@ export function errCode(e) {
   return WIRE_ERROR_PREFIX.exec(String(e?.message ?? e ?? '').trim())?.[1] || '';
 }
 
-export function errMessage(e) {
+// A long hex run is a node id (64 hex), a GUID written without dashes or a
+// digest — never words a reader needs, and the owner's rule keeps every id off
+// the screen, a toast included.
+const HEX_ID = /[0-9a-f]{32,}/gi;
+
+// `nameOf` (node id -> name, `nodeNameOf`) lets an id the fleet knows read as
+// that node's name instead of the neutral placeholder.
+export function errMessage(e, nameOf = () => '') {
+  // "The addressed node did not answer" (dispatch/app_route.rs) is worded
+  // here, whatever the forwarder wrote: its sentence names the node by its
+  // 64-hex id, and a toast, a banner or a tab body would print it as is.
+  if (errCode(e) === 'NodeUnreachable') return T('unreachable.error');
   const message = (e && e.message) ? e.message : String(e);
   const code = REFUSAL.exec(message.trim().replace(WIRE_ERROR_PREFIX, ''))?.[1];
-  if (!code) return message;
+  if (!code) {
+    const hidden = T('alerts.id_hidden');
+    return scrubIds(message, hidden, nameOf).replace(HEX_ID, (id) => String(nameOf(id) || '').trim() || hidden);
+  }
   const key = 'refusal.' + code;
   const words = T(key);
   return words === 'tentanas.' + key ? message : words;

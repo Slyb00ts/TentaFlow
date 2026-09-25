@@ -552,6 +552,20 @@ test('every refusal code the node sends is worded in every locale, an unknown on
   // A code this build does not know, and a plain message, pass through as sent.
   assert.equal(errMessage(new Error('refusal:quota_exceeded')), 'refusal:quota_exceeded');
   assert.equal(errMessage(new Error('Macierz nie istnieje w tej instancji')), 'Macierz nie istnieje w tej instancji');
+  // A lost node is worded whatever the forwarder wrote, and no 64-hex id is
+  // ever passed through (critic wave 7, BLOCKER 1).
+  const id = 'b'.repeat(64);
+  assert.equal(errMessage(new Error(`protocol error NodeUnreachable: node '${id}' did not answer: timeout`)), 'Węzeł nie odpowiada — utracono połączenie przez mesh');
+  assert.equal(errMessage(Object.assign(new Error(`node '${id}' did not answer`), { code: 'NodeUnreachable' })), 'Węzeł nie odpowiada — utracono połączenie przez mesh');
+  const other = errMessage(new Error(`protocol error Internal: peer '${id}' closed the stream`));
+  assert.ok(!other.includes(id), other);
+  assert.match(other, /closed the stream/);
+  // Where the word-by-word scrubber sees no id (glued to other text), the hex
+  // backstop still takes it out.
+  for (const glued of [`peer_${id} gone`, `${id}—gone`]) {
+    assert.ok(!errMessage(new Error(glued)).includes(id), glued);
+  }
+  assert.equal(errMessage(new Error(`peer '${id}' closed`), (x) => (x === id ? 'atlas' : '')), "peer 'atlas' closed", 'a known node reads as its name');
   assert.equal(errMessage('mesh timeout'), 'mesh timeout');
   // A refusal code inside a longer message is not a refusal code — but the
   // client's own `protocol error <Code>: ` wrapping is not "a longer message"

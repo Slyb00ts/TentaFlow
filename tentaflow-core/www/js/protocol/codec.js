@@ -9542,6 +9542,19 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaNasBody(PoolDetachRequest) — `zpool detach` of the disk a hot
+   *  spare replaced (`NasVdevDisk.detachable`). payload: { name, device, sudoPassword? } */
+  tentaNasPoolDetachRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      device: csText(payload.device),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolDetachRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaNasBody(PoolSetPropertiesRequest). */
   tentaNasPoolSetPropertiesRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
@@ -9876,12 +9889,13 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::TentaNasBody(TargetsListRequest). payload: {} — the block targets of n12
-   *  plus what this node can serve (LIO, nvmet, iSER, NVMe-oF/RDMA, DH-HMAC-CHAP), its
-   *  interfaces and the zvols the wizard may export. */
+  /** MessageBody::TentaNasBody(TargetsListRequest). payload: { summary? } — the block
+   *  targets of n12 plus what this node can serve (LIO, nvmet, iSER, NVMe-oF/RDMA,
+   *  DH-HMAC-CHAP), its interfaces and the zvols the wizard may export. `summary: true` is
+   *  the fleet poll's light answer: targets and service rows, no capabilities. */
   tentaNasTargetsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasTargetsListRequest(JSON.stringify({}));
+    const body = _wasm.encodeTentaNasTargetsListRequest(JSON.stringify({ summary: payload.summary === true }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 

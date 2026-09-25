@@ -257,3 +257,15 @@ test('the preview words the node\'s refusals and warnings from their codes', asy
   assert.ok(win.querySelector('[data-wizard-next]').hasAttribute('disabled'), 'a refused layout still cannot be created');
   screen.dispose();
 });
+test('a node that cannot run Elastic says why in the reader’s language; its own sentence is the tooltip', async () => {
+  const detail = 'mergerfs: missing: mergerfs; neither mkfs.xfs nor mkfs.ext4 is installed, so no data disk can be prepared';
+  const { screen, win } = setup({ tentaNasElasticCapabilitiesRequest: { capabilities: {
+    mergerfs: false, snapraid: true, filesystems: [], detail,
+    reasons: [{ code: 'elastic_tool_unavailable', params: { tool: 'mergerfs', status: 'missing' } }, { code: 'elastic_no_mkfs', params: {} }],
+  }, freeDisks: disks } });
+  await flush();
+  const box = win.querySelector('.wizard-warning.info > div');
+  assert.equal(box.textContent.split(/\s{2,}/)[0].trim().replace(/Środowisko$/, '').trim(), 'mergerfs: brak · brak mkfs.xfs i mkfs.ext4 — nie da się przygotować dysku danych');
+  assert.equal(box.getAttribute('title'), detail);
+  screen.dispose();
+});

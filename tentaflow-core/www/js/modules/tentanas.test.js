@@ -151,6 +151,7 @@ const fixtures = {
   tentaNasElasticCapabilitiesRequest: { capabilities: { mergerfs: true, snapraid: true, filesystems: ['xfs', 'ext4'] }, freeDisks: [disk({})] },
   tentaNasArcStatsRequest: { arc },
   tentaNasSharesListRequest: { shares: [share], services: [{ protocol: 'smb', installed: true, running: true, version: '4.21', configPath: '/etc/samba/tentanas.conf', detail: '' }], users: [], mountRoot: '/mnt/tentanas' },
+  tentaNasTargetsListRequest: { targets: [], services: [{ protocol: 'iscsi', installed: true, running: false, version: null, configPath: '/sys/kernel/config/target', detail: '' }, { protocol: 'nvmet', installed: true, running: false, version: null, configPath: '/sys/kernel/config/nvmet', detail: '' }], capabilities: {} },
   tentaNasSchedulesListRequest: { rows: [], smart: { enabled: true, short: { every: 'daily', hour: 1, minute: 0, weekday: 0, day: 1 }, long: { every: 'monthly', hour: 4, minute: 0, weekday: 0, day: 1 }, lastShortAt: null, lastLongAt: null, nextShortAt: null, nextLongAt: null } },
 };
 
@@ -4325,4 +4326,364 @@ test('C3: an Elastic Array disk is never told to be replaced or to get a spare (
   } finally {
     Screen.unmount();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Wave 7 — targets in the fleet figures (M7 / MAJOR 11), the services chip
+// over iSCSI / NVMe-oF, `armed_until` (MAJOR 17) and the n18c overlay
+// (MAJOR 23).
+// ---------------------------------------------------------------------------
+
+const blockService = (protocol, running) => ({ protocol, installed: true, running, version: null, configPath: '/sys/kernel/config', detail: '' });
+function target(overrides) {
+  return {
+    targetId: 't1', name: 'vm-store', protocol: 'iscsi', wwn: 'iqn.2026-09.local.tentaflow:vega.vm-store', enabled: true,
+    luns: [{ index: 0, source: 'tank/vm-store', devicePath: '/dev/zvol/tank/vm-store', sizeBytes: 2e12, thin: false }],
+    portals: [{ interface: 'storage0', address: '10.10.0.5', port: 3260, transport: 'tcp' }],
+    auth: { method: 'chap', username: 'u' }, initiators: ['iqn.1994-05.com.redhat:a', 'iqn.1994-05.com.redhat:b'],
+    portGroups: [], sessions: 2, sessionsKnown: true, state: 'active', stateDetail: '', stateReasons: [], createdAt: '', updatedAt: '',
+    ...overrides,
+  };
+}
+
+function targetsFleet(remoteTargets, { remoteSharesAnswer = { ...fixtures.tentaNasSharesListRequest } } = {}) {
+  stubTransport({ ...fixtures,
+    tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+      node({}),
+      node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, poolsTotal: 1, sharesTotal: 0, features: [] }),
+    ] },
+    tentaNasSharesListRequest: (payload, options) => (options.targetNodeId === REMOTE ? remoteSharesAnswer : fixtures.tentaNasSharesListRequest),
+    tentaNasTargetsListRequest: (payload, options) => {
+      if (options.targetNodeId !== REMOTE) return fixtures.tentaNasTargetsListRequest;
+      if (remoteTargets instanceof Error) throw remoteTargets;
+      return remoteTargets;
+    } });
+}
+
+test('M7: a remote node card and the fleet resources count its block targets with its shares (n01 "Share 6")', async () => {
+  targetsFleet({
+    targets: [target({}), target({ targetId: 't2', name: 'scratch', protocol: 'nvmet', initiators: ['nqn.2014-08.org:h1'], auth: { method: 'none' }, sessionsKnown: false, sessions: 0 })],
+    services: [blockService('iscsi', true), blockService('nvmet', true)],
+    capabilities: {},
+  });
+  const root = await mountScreen();
+  try {
+    await flush();
+    await flush();
+    const card = root.querySelector(`.node-card[data-node="${REMOTE}"]`);
+    assert.equal(cardStat(card, 'Share').querySelector('.v').textContent, '3', '1 share + 2 targets');
+    const res = root.querySelector('#nas-fleet-res-table').rows;
+    const vm = res.find((r) => r._target?.name === 'vm-store');
+    const scratch = res.find((r) => r._target?.name === 'scratch');
+    assert.ok(vm && scratch, 'both targets are fleet resources');
+    assert.match(vm.protocol, /label="iSCSI"/);
+    assert.match(scratch.protocol, /label="NVMe-oF"/);
+    assert.match(vm.source, /zvol tank\/vm-store/);
+    assert.equal(vm.mounts, '<span class="text-xs">2 initiatory (CHAP)</span>');
+    assert.equal(scratch.mounts, '<span class="text-xs">1 host NQN</span>');
+    assert.equal(vm.sessions, '2');
+    assert.equal(scratch.sessions, '—', 'an unmeasured NVMe-oF session count is a dash, never 0');
+    const kpi = root.querySelector('[data-kpi="resources"]');
+    // Two SMB shares (local + remote), then the targets, one of each.
+    assert.equal(kpi.getAttribute('value'), '4');
+    assert.equal(kpi.getAttribute('delta'), '2×SMB · iSCSI · NVMe-oF');
+    // Every export runs: the services chip stays green.
+    assert.match(root.querySelector('#nas-fleet-chips').innerHTML, /status="ok"[^>]*label="Usługi aktywne"/);
+  } finally { Screen.unmount(); }
+});
+
+test('M7: a target list that did not come back makes the node\'s resources unknown, not the shares alone', async () => {
+  targetsFleet(new Error('targets probe failed'));
+  const root = await mountScreen();
+  try {
+    await flush();
+    await flush();
+    const card = root.querySelector(`.node-card[data-node="${REMOTE}"]`);
+    const shares = cardStat(card, 'Share');
+    assert.equal(shares.querySelector('.v').textContent, '—');
+    assert.match(shares.querySelector('[data-not-counted]').getAttribute('title'), /listy udziałów lub targetów/);
+    const res = root.querySelector('#nas-fleet-res-table').rows;
+    assert.equal(res.filter((r) => r._node?.nodeId === REMOTE && (r._share || r._target)).length, 0, 'no half of the node is listed');
+    assert.ok(res.some((r) => r._node?.nodeId === REMOTE && /targets probe failed/.test(r.source)), 'the node is a "did not answer" row');
+    // Half an answer is no services verdict either.
+    assert.match(root.querySelector('#nas-fleet-chips').innerHTML, /brak odpowiedzi z vega/);
+  } finally { Screen.unmount(); }
+});
+
+test('services chip: a dead LIO under an enabled iSCSI target is a failure; a kernel that merely could serve iSCSI is not', async () => {
+  targetsFleet({ targets: [target({})], services: [blockService('iscsi', false), blockService('nvmet', false)], capabilities: {} });
+  let root = await mountScreen();
+  try {
+    await flush();
+    await flush();
+    const chips = root.querySelector('#nas-fleet-chips').innerHTML;
+    assert.match(chips, /Usługi nieaktywne: vega: iSCSI/);
+    assert.doesNotMatch(chips, /NVMe-oF|NVMET/, 'no NVMe-oF target, so nvmet is not expected');
+  } finally { Screen.unmount(); }
+
+  // A paused target does not make its service expected.
+  targetsFleet({ targets: [target({ enabled: false, state: 'disabled' })], services: [blockService('iscsi', false)], capabilities: {} });
+  root = await mountScreen();
+  try {
+    await flush();
+    await flush();
+    assert.match(root.querySelector('#nas-fleet-chips').innerHTML, /label="Usługi aktywne"/);
+  } finally { Screen.unmount(); }
+});
+
+test('the node header counts its targets on the Sharing tab and judges its block services', async () => {
+  stubTransport({ ...fixtures,
+    tentaNasTargetsListRequest: { targets: [target({ protocol: 'nvmet', name: 'scratch' })], services: [blockService('iscsi', false), blockService('nvmet', false)], capabilities: {} } });
+  const root = await mountScreen({ node: LOCAL });
+  try {
+    await flush();
+    assert.equal(root.querySelector('tf-tab#shares').getAttribute('count'), '2', 'one share + one target');
+    assert.match(root.querySelector('#nas-head-chips').innerHTML, /Usługi nieaktywne: NVMe-oF/);
+  } finally { Screen.unmount(); }
+});
+
+test('MAJOR 17: a mode-B node whose password expired reads "tryb B — nieuzbrojony" and offers "Uzbrój…"; an armed one does not', async () => {
+  const past = new Date(Date.now() - 60_000).toISOString();
+  const future = new Date(Date.now() + 600_000).toISOString();
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [
+    node({}),
+    node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, elevationMode: 'interactive', armedUntil: past }),
+    node({ nodeId: MAC, nodeName: 'atlas', isLocal: false, elevationMode: 'interactive', armedUntil: future }),
+  ] } });
+  let root = await mountScreen({ node: LOCAL, tab: 'environment' });
+  try {
+    await flush();
+    await flush();
+    const others = root.querySelector('#nas-others-table').rows;
+    const vega = others.find((r) => r._node.nodeId === REMOTE);
+    const atlas = others.find((r) => r._node.nodeId === MAC);
+    assert.deepEqual([vega.channel.status, vega.channel.label], ['warn', 'tryb B — nieuzbrojony']);
+    assert.deepEqual([atlas.channel.status, atlas.channel.label], ['ok', 'tryb B — hasło sudo']);
+    const table = root.querySelector('#nas-others-table');
+    const actions = (row) => table.rowActions(row, 0, () => row);
+    assert.ok(actions(vega).querySelector('[data-act="arm-node"]'), 'the expired node offers "Uzbrój…"');
+    assert.equal(actions(atlas).querySelector('[data-act="arm-node"]'), null);
+  } finally { Screen.unmount(); }
+
+  // The fleet: foot chip, channel badge and the KPI name the expired node.
+  root = await mountScreen();
+  try {
+    await flush();
+    const card = root.querySelector(`.node-card[data-node="${REMOTE}"]`);
+    const chip = card.querySelector('.nc-foot tf-chip');
+    assert.deepEqual([chip.getAttribute('status'), chip.getAttribute('label')], ['warn', 'nieuzbrojony (tryb B)']);
+    assert.match(root.querySelector('#nas-fleet-badges').innerHTML, /1× tryb B/);
+    assert.match(root.querySelector('[data-kpi="nodes"]').getAttribute('delta'), /vega/);
+  } finally { Screen.unmount(); }
+});
+
+test('MAJOR 17: an older node that sends no armedUntil is not promised a held password', async () => {
+  const { nodeChannelMode, liveChannelMode } = await import('./tentanas/format.js');
+  assert.equal(nodeChannelMode({ elevationMode: 'interactive' }), 'interactive_unarmed');
+  assert.equal(nodeChannelMode({ elevationMode: 'helper', armedUntil: null }), 'helper');
+  assert.equal(nodeChannelMode({ elevationMode: 'unset' }), 'unarmed');
+  assert.equal(liveChannelMode('interactive', '2026-09-25T10:00:00Z', Date.parse('2026-09-25T09:59:59Z')), 'interactive');
+  assert.equal(liveChannelMode('interactive', '2026-09-25T10:00:00Z', Date.parse('2026-09-25T10:00:00Z')), 'interactive_unarmed', 'the instant itself is expired');
+  assert.equal(liveChannelMode('interactive', 'garbage'), 'interactive_unarmed');
+  const { fleetPlan } = await import('./tentanas/share-wizard.js');
+  const plan = fleetPlan([
+    node({}), node({ nodeId: REMOTE, isLocal: false, elevationMode: 'interactive', armedUntil: null }),
+  ], LOCAL);
+  assert.equal(plan[1].outcome, 'after_arm', 'an unarmed mode-B node mounts only once armed');
+});
+
+// n18c. The remote node's requests fail with NodeUnreachable; the screen shows
+// the overlay, stops sending, and resumes on the probe's answer.
+test('MAJOR 23: an unreachable node gets the n18c overlay, its polls wait behind it and resume when it answers', async () => {
+  let down = true;
+  const unreachable = () => { const e = new Error(`node '${REMOTE}' did not answer: timeout`); e.code = 'NodeUnreachable'; return e; };
+  const remoteOnly = (answer) => (payload, options) => {
+    if (options.targetNodeId === REMOTE && down) throw unreachable();
+    return typeof answer === 'function' ? answer(payload, options) : answer;
+  };
+  const wrapped = {};
+  for (const [kind, answer] of Object.entries(fixtures)) wrapped[kind] = kind === 'tentaNasNodesListRequest' || kind === 'authMeRequest' ? answer : remoteOnly(answer);
+  wrapped.tentaNasNodesListRequest = { localNodeId: LOCAL, nodes: [node({}), node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false })] };
+  stubTransport(wrapped);
+  const root = await mountScreen({ node: REMOTE, tab: 'disks' });
+  try {
+    await flush();
+    await flush();
+    const overlay = document.querySelector('.conn-overlay.nas-conn');
+    assert.ok(overlay, 'the overlay exists');
+    assert.ok(overlay.classList.contains('visible'), 'and is shown');
+    assert.equal(overlay.querySelector('.conn-overlay-head h3').textContent, 'Węzeł vega niedostępny');
+    assert.equal(overlay.querySelector('.conn-overlay-heading').textContent, 'Utracono połączenie przez mesh');
+    assert.match(overlay.querySelector('.nas-conn-keep').textContent, /na vega pracują dalej/);
+    assert.equal(overlay.textContent.includes(REMOTE), false, 'no node id on the card');
+    assert.ok(root.classList.contains('nas-link-lost'), 'the screen behind is blurred');
+
+    // While lost, a poll is parked, not sent.
+    const sentBefore = calls.filter((c) => c.options.targetNodeId === REMOTE).length;
+    const parked = Screen.refreshDisks(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.equal(calls.filter((c) => c.options.targetNodeId === REMOTE).length, sentBefore, 'nothing is sent to a lost node');
+
+    // The node is back: "Połącz teraz" probes, the overlay goes, the parked
+    // poll is sent and patches the tab.
+    down = false;
+    overlay.querySelector('[data-action="retry"]').click();
+    await parked;
+    for (let i = 0; i < 4; i += 1) await flush();
+    // The card fades out (connection-overlay's hide delay) and takes the blur.
+    await new Promise((r) => setTimeout(r, 600));
+    assert.equal(overlay.classList.contains('visible'), false, 'the overlay is gone');
+    assert.equal(root.classList.contains('nas-link-lost'), false, 'the blur is gone');
+    assert.ok(kinds('tentaNasDisksListRequest').some((c) => c.options.targetNodeId === REMOTE), 'the parked poll was sent');
+    // The probe had failed while the node was gone, so the body is drawn anew
+    // and shows the node's disks.
+    assert.equal(root.querySelector('#nas-probe-failed'), null);
+    assert.equal(root.querySelector('#nas-disk-table').rows.length, 2, 'the disks tab is back with the node\'s disks');
+  } finally { Screen.unmount(); }
+  assert.equal(document.querySelector('.conn-overlay.nas-conn'), null, 'unmount removes the card');
+});
+
+test('MAJOR 23: the overlay leads out to the fleet and never covers a local node or the fleet view', async () => {
+  const unreachable = () => { const e = new Error('protocol error NodeUnreachable: node did not answer'); return e; };
+  const wrapped = { ...fixtures,
+    tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [node({}), node({ nodeId: REMOTE, nodeName: '', isLocal: false })] } };
+  for (const kind of ['tentaNasEnvironmentRequest', 'tentaNasSharesListRequest', 'tentaNasTargetsListRequest', 'tentaNasAlertsListRequest', 'tentaNasJobsListRequest', 'tentaNasDisksListRequest', 'tentaNasPoolsListRequest', 'tentaNasElasticArraysListRequest', 'tentaNasArcStatsRequest']) {
+    const answer = fixtures[kind];
+    wrapped[kind] = (payload, options) => { if (options.targetNodeId === REMOTE) throw unreachable(); return answer; };
+  }
+  stubTransport(wrapped);
+  // The fleet view lists the node as a row; no overlay.
+  let root = await mountScreen();
+  try {
+    await flush();
+    await flush();
+    const card = document.querySelector('.conn-overlay.nas-conn');
+    assert.ok(!card || !card.classList.contains('visible'), 'no overlay on the fleet view');
+  } finally { Screen.unmount(); }
+
+  root = await mountScreen({ node: REMOTE });
+  try {
+    await flush();
+    await flush();
+    const overlay = document.querySelector('.conn-overlay.nas-conn');
+    assert.ok(overlay.classList.contains('visible'));
+    assert.equal(overlay.querySelector('.conn-overlay-head h3').textContent, 'Węzeł bez nazwy niedostępny', 'a nameless node, never its id');
+    overlay.querySelector('[data-action="fleet"]').click();
+    await flush();
+    await flush();
+    assert.equal(Screen.nodeId, null, 'the way out is the fleet view');
+    assert.ok(root.querySelector('#nas-node-grid'), 'the fleet grid is drawn');
+    assert.equal(overlay.classList.contains('visible'), false);
+    assert.ok(!root.classList.contains('nas-link-lost'));
+  } finally { Screen.unmount(); }
+});
+
+// Wave 7: the Environment rows' details arrive as codes too
+// (`NasEnvironment.featureReasons`); the table words them and keeps the node's
+// English as the cell's tooltip.
+test('n16: a feature row with coded details is worded, the node sentence is the tooltip', async () => {
+  const detail = 'enp1s0f0np0 10.10.0.5 · EXPERIMENTAL (kernel docs) · ksmbd loaded';
+  const ksmbd = {
+    id: 'ksmbd', status: 'ok', version: '6.12.4-arch1-1', requiredVersion: null,
+    binaries: [], kernelModule: 'ksmbd', packages: [], detail, optional: true,
+  };
+  stubTransport({
+    ...fixtures,
+    tentaNasEnvironmentRequest: { environment: {
+      ...environment,
+      features: [...environment.features, ksmbd],
+      featureReasons: { ksmbd: [
+        { code: 'ksmbd_listener', params: { listener: 'enp1s0f0np0 10.10.0.5' } },
+        { code: 'ksmbd_experimental', params: {} },
+        { code: 'module_loaded', params: { module: 'ksmbd' } },
+      ] },
+    } },
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'environment' });
+  try {
+    await flush();
+    await flush();
+    const row = root.querySelector('#nas-feature-table').rows.find((r) => r._feature.id === 'ksmbd');
+    assert.match(row.version, /6\.12\.4-arch1-1 · enp1s0f0np0 10\.10\.0\.5 · EKSPERYMENTALNE \(wg dokumentacji jądra\) · ksmbd załadowany/);
+    assert.ok(row.version.includes(`title="${detail}"`), row.version);
+  } finally {
+    // The environment tab polls (ARC card); a mounted screen keeps the
+    // runner alive after the last test.
+    Screen.unmount();
+  }
+});
+
+// Critic wave 7, BLOCKER 1: a lost node's 64-hex id reached toasts, banners
+// and a disk detail's body through the transport's own error sentence.
+test('BLOCKER 1: losing a node puts its id nowhere on the page, and a disk detail whose first read failed comes back', async () => {
+  let down = true;
+  const unreachable = () => Object.assign(new Error(`protocol error NodeUnreachable: node '${REMOTE}' did not answer: timeout`), { code: 'NodeUnreachable' });
+  // Only the disk read meets the loss: the header and the probe answer, so
+  // the detail's FIRST read is the one that fails.
+  const wrapped = { ...fixtures };
+  wrapped.tentaNasNodesListRequest = { localNodeId: LOCAL, nodes: [node({}), node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false })] };
+  wrapped.tentaNasDiskGetRequest = (payload, options) => {
+    if (options.targetNodeId === REMOTE && down) throw unreachable();
+    return { disk: disk({}), history: [], smartAttributes: [], selfTests: [] };
+  };
+  stubTransport(wrapped);
+  // What a reader can see: text, and the attributes a component renders as
+  // text or a tooltip. (Routing values — an href, an option value — carry the
+  // id by design and are never shown.)
+  const noId = () => {
+    assert.equal(document.body.textContent.includes(REMOTE), false, 'no id in any visible text');
+    for (const el of document.querySelectorAll('*')) {
+      for (const name of ['title', 'label', 'message', 'aria-label', 'placeholder', 'delta']) {
+        const v = el.getAttribute(name);
+        assert.ok(!v || !v.includes(REMOTE), `${el.tagName} ${name}="${v}"`);
+      }
+    }
+  };
+
+  const root = await mountScreen({ node: REMOTE, tab: 'disks', disk: 'sda' });
+  try {
+    for (let i = 0; i < 4; i += 1) await flush();
+    const overlay = document.querySelector('.conn-overlay.nas-conn');
+    assert.ok(overlay.classList.contains('visible'));
+    noId();
+    // The detail body says the node is gone, in words.
+    assert.match(root.querySelector('#nas-tab-body tf-alert').getAttribute('message'), /Węzeł vega niedostępny|Węzeł nie odpowiada/);
+    down = false;
+    overlay.querySelector('[data-action="retry"]').click();
+    for (let i = 0; i < 6; i += 1) await flush();
+    assert.equal(root.querySelector('#nas-tab-body tf-alert[tone="danger"]'), null, 'the failed detail was drawn again');
+    assert.ok(kinds('tentaNasDiskGetRequest').filter((c) => c.options.targetNodeId === REMOTE).length >= 2, 'the disk was read again');
+    noId();
+  } finally { Screen.unmount(); }
+});
+
+test('BLOCKER 1: a disks poll refused because the node is lost raises no toast, and none carries an id', async () => {
+  const unreachable = () => Object.assign(new Error(`protocol error NodeUnreachable: node '${REMOTE}' did not answer`), { code: 'NodeUnreachable' });
+  stubTransport({ ...fixtures,
+    tentaNasNodesListRequest: { localNodeId: LOCAL, nodes: [node({}), node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false })] },
+    tentaNasDisksListRequest: (payload, options) => { if (options.targetNodeId === REMOTE) throw unreachable(); return fixtures.tentaNasDisksListRequest; } });
+  const root = await mountScreen({ node: REMOTE, tab: 'disks' });
+  try {
+    for (let i = 0; i < 3; i += 1) await flush();
+    assert.ok(document.querySelector('.conn-overlay.nas-conn').classList.contains('visible'));
+    assert.equal([...document.querySelectorAll('.toast')].some((t) => /vega|niedostęp|nie odpowiada/.test(t.textContent)), false, 'the overlay says it, not a toast');
+    assert.equal(document.body.textContent.includes(REMOTE), false);
+    assert.ok(root);
+  } finally { Screen.unmount(); }
+});
+
+test('MAJOR 2 (wave 7): the fleet poll and the node header ask for the light target list; the Sharing tab does not', async () => {
+  stubTransport(fixtures);
+  await mountScreen();
+  try {
+    await flush();
+    const fleetAsks = kinds('tentaNasTargetsListRequest');
+    assert.ok(fleetAsks.length >= 1);
+    assert.ok(fleetAsks.every((c) => c.payload.summary === true), JSON.stringify(fleetAsks.map((c) => c.payload)));
+  } finally { Screen.unmount(); }
+  await mountScreen({ node: LOCAL });
+  try {
+    await flush();
+    assert.ok(kinds('tentaNasTargetsListRequest').every((c) => c.payload.summary === true), 'the header wants targets and services only');
+  } finally { Screen.unmount(); }
 });

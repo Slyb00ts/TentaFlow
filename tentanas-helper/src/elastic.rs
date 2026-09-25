@@ -735,6 +735,82 @@ pub struct ElasticCacheAge {
     pub oldest_secs: Option<u64>,
 }
 
+/// The most folders one usage measurement names — the core's own bound on
+/// the folders one array publishes (`FOLDERS_MAX_ROWS`).
+pub const USAGE_FOLDERS_MAX: usize = 256;
+
+/// Entries one usage measurement may visit, over every folder and branch.
+///
+/// MEASURED (2026-09-25, XFS on NVMe, 303 031 entries in 3 000 directories):
+/// 0.27-0.49 s warm, 0.9-1.6 µs per entry — the same as `du -s`. At that rate
+/// this cap is 5-10 s of a warm walk; its real job is to bound the memory the
+/// walk holds (one open directory's names per level, and the inodes of every
+/// file with more than one link).
+pub const USAGE_ENTRY_LIMIT: u64 = 5_000_000;
+
+/// The wall-clock bound of one usage measurement. A cold walk of HDD branches
+/// costs a seek per directory and per inode cluster instead of a microsecond
+/// per entry, and that is the case the deadline exists for: past it, every
+/// folder not yet finished answers "too large to measure" rather than a sum
+/// of whatever was read by then. The walk holds no Elastic lock (see
+/// `probe_folder_usage`), so this bounds I/O load, not anybody's wait.
+pub const USAGE_DEADLINE_SECS: u64 = 5 * 60;
+
+/// Why a folder has no figure in an `ElasticFolderUsage`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElasticFolderGap {
+    /// The entry budget or the deadline ran out before the folder was counted.
+    OverBudget,
+    /// An entry under the folder could not be read.
+    Unreadable,
+    /// A data or cache branch was not mounted, so its share of every folder
+    /// is unknown.
+    NotMounted,
+}
+
+/// One folder of an `ElasticFolderUsage`: its bytes, or why there are none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticFolderBytes {
+    pub name: String,
+    /// Allocated bytes over every data and cache branch. `None` exactly when
+    /// `gap` says why.
+    pub bytes: Option<u64>,
+    pub gap: Option<ElasticFolderGap>,
+}
+
+/// Every folder the core named, in the order it named them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ElasticFolderUsage {
+    pub folders: Vec<ElasticFolderBytes>,
+}
+
+/// A usage request names top-level folders of the union: each one directory
+/// name, bounded, unique.
+pub fn validate_usage_folders(folders: &[String]) -> Result<(), CatalogError> {
+    if folders.is_empty() || folders.len() > USAGE_FOLDERS_MAX {
+        return Err(invalid(format!("folder usage names 1..={USAGE_FOLDERS_MAX} folders")));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for folder in folders {
+        if folder.is_empty()
+            || folder.len() > 255
+            || folder == "."
+            || folder == ".."
+            || folder.contains('/')
+            || folder.chars().any(char::is_control)
+        {
+            return Err(invalid("a usage folder must be one directory name"));
+        }
+        if !seen.insert(folder.as_str()) {
+            return Err(invalid("a usage folder is named twice"));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElasticClaim {
@@ -7163,6 +7239,226 @@ pub(crate) mod execution {
         Ok(cache_age(entries, rules, &stuck, &open, now_ns()?))
     }
 
+    /// Per-folder bytes over the array's data and cache branches, walked
+    /// inside its namespace (`folder_usage`).
+    ///
+    /// A branch whose directory sits on the same device as its parent is NOT
+    /// mounted — its folders there would read as empty — so every folder is
+    /// reported `NotMounted` instead; the check runs again after the walk, so
+    /// a branch unmounted during it cannot leave a short figure behind.
+    #[cfg(target_os = "linux")]
+    fn probe_folder_usage(spec: &ElasticCreateSpec, folders: &[String]) -> Result<ElasticFolderUsage, String> {
+        let branches: Vec<PathBuf> = roles(spec)
+            .into_iter()
+            .filter(|role| !matches!(role, ElasticRole::Parity(_)))
+            .map(|role| PathBuf::from(mount_path(spec, role)))
+            .collect();
+        let mounted = |branches: &[PathBuf]| -> Result<bool, String> {
+            for branch in branches {
+                let parent = branch.parent().ok_or("branch bez katalogu nadrzędnego")?;
+                match (crate::folder_usage::device_of(branch), crate::folder_usage::device_of(parent)) {
+                    (Ok(own), Ok(above)) if own != above => {}
+                    _ => return Ok(false),
+                }
+            }
+            Ok(true)
+        };
+        let all = |gap| ElasticFolderUsage {
+            folders: folders
+                .iter()
+                .map(|name| ElasticFolderBytes { name: name.clone(), bytes: None, gap: Some(gap) })
+                .collect(),
+        };
+        if !mounted(&branches)? {
+            return Ok(all(ElasticFolderGap::NotMounted));
+        }
+        let mut budget = crate::folder_usage::Budget::new(
+            USAGE_ENTRY_LIMIT,
+            std::time::Instant::now() + std::time::Duration::from_secs(USAGE_DEADLINE_SECS),
+        );
+        let usage = ElasticFolderUsage { folders: folder_usage_over(&branches, folders, &mut budget) };
+        if !mounted(&branches)? {
+            return Ok(all(ElasticFolderGap::NotMounted));
+        }
+        Ok(usage)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn probe_folder_usage(_: &ElasticCreateSpec, _: &[String]) -> Result<ElasticFolderUsage, String> {
+        Err("pomiar folderów wymaga Linuxa".into())
+    }
+
+    /// Each folder summed over `branches`, sharing one budget: a folder with
+    /// any branch unreadable or over budget has no figure at all.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn folder_usage_over(
+        branches: &[PathBuf],
+        folders: &[String],
+        budget: &mut crate::folder_usage::Budget,
+    ) -> Vec<ElasticFolderBytes> {
+        folders
+            .iter()
+            .map(|name| {
+                let mut total = 0u64;
+                for branch in branches {
+                    if budget.spent() {
+                        return ElasticFolderBytes { name: name.clone(), bytes: None, gap: Some(ElasticFolderGap::OverBudget) };
+                    }
+                    match crate::folder_usage::folder_bytes(branch, name, budget) {
+                        Ok(bytes) => total = total.saturating_add(bytes),
+                        Err(gap) => {
+                            let gap = match gap {
+                                crate::folder_usage::Gap::OverBudget => ElasticFolderGap::OverBudget,
+                                crate::folder_usage::Gap::Unreadable => ElasticFolderGap::Unreadable,
+                            };
+                            return ElasticFolderBytes { name: name.clone(), bytes: None, gap: Some(gap) };
+                        }
+                    }
+                }
+                ElasticFolderBytes { name: name.clone(), bytes: Some(total), gap: None }
+            })
+            .collect()
+    }
+
+    /// The usage walk, entered WITHOUT the Elastic locks.
+    ///
+    /// The journal is read under them like every command's, and the array
+    /// must be private, restored in this boot and anchored; then the locks
+    /// are released before the namespace is entered. The walk only reads, and
+    /// holding the node lock for up to `USAGE_DEADLINE_SECS` would refuse
+    /// every other Elastic command on the node as busy for that long — the
+    /// n11 read of this very array included. What the locks would have kept
+    /// out is a mover or a Restore running meanwhile: a file in flight may
+    /// then be counted on both branches or on neither, the same imprecision a
+    /// client writing during the walk already brings, and a branch unmounted
+    /// meanwhile is caught by `probe_folder_usage`'s second mount check.
+    ///
+    /// The walk is REGISTERED before the locks go (critic wave 7, MAJOR 1):
+    /// its worker holds descriptors on the branch filesystems and sits in the
+    /// array's namespace for up to `USAGE_DEADLINE_SECS`, so an unmount (a
+    /// replace, an add-disk abort) would get `EBUSY` and a dissolve would find
+    /// a live process in the namespace it is releasing. Every command that may
+    /// change the array stops a registered walk first (`stop_folder_walk`),
+    /// and a new walk cannot start meanwhile because it needs the node lock
+    /// that command holds.
+    fn folder_usage_unlocked(root: Root, journal: Journal, folders: &[String]) -> Result<serde_json::Value, String> {
+        if journal.boot_id != boot_id()? {
+            return Err("pomiar folderów wymaga macierzy przywróconej w tym uruchomieniu".into());
+        }
+        let anchor = journal
+            .private
+            .as_ref()
+            .and_then(|private| private.anchor.clone())
+            .ok_or("brak kotwicy macierzy; pomiar folderów niemożliwy")?;
+        let spec = journal.spec.clone();
+        let walk = walk_lock(&root.path, &spec.array_id, root.uid)?;
+        let walk_fd = walk.as_raw_fd();
+        drop(root);
+        let result = elastic_namespace::run(
+            &private_paths(&spec),
+            Entry::Existing(&anchor),
+            &[walk_fd],
+            |_| {
+                // The worker is what holds the branches: its pid is what a
+                // stopping command kills.
+                record_walker(walk_fd)?;
+                probe_folder_usage(&spec, folders).map(PrivateResponse::FolderUsage)
+            },
+            |_| Err("pomiar folderów nie publikuje unii".into()),
+        )?;
+        drop(walk);
+        result.value.public_result(false)
+    }
+
+    /// The registration of a running folder walk of array `id`: an exclusive
+    /// lock on `<root>/<id>.walk`, emptied, into which the walk's worker writes
+    /// its pid. A second walk of the same array is refused as busy.
+    fn walk_lock(root: &Path, id: &str, uid: u32) -> Result<File, String> {
+        validate_elastic_uuid(id).map_err(|e| e.to_string())?;
+        let file = lock(&root.join(format!("{id}.walk")), uid)?;
+        file.set_len(0).map_err(|e| e.to_string())?;
+        Ok(file)
+    }
+
+    /// Writes this process's pid into the walk registration (in the worker).
+    fn record_walker(fd: RawFd) -> Result<(), String> {
+        let pid = std::process::id().to_string();
+        let written = unsafe { libc::pwrite(fd, pid.as_ptr().cast(), pid.len(), 0) };
+        if written != pid.len() as isize {
+            return Err(format!("rejestracja pomiaru: {}", std::io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// How long a stopping command waits for a killed walk to let go.
+    const WALK_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Stops a folder walk of array `id` that is running right now, and waits
+    /// until it has let go of the branches. Called with the node lock held by
+    /// every command that may unmount, replace, add, remove or dissolve.
+    ///
+    /// No walk (the registration is free): returns at once. A walk: its worker
+    /// — named by the pid it wrote, and killed only if that pid is a process
+    /// running THIS helper binary, so a stale or reused pid is never shot — is
+    /// sent SIGKILL. The walk's own helper then sees its worker die, answers
+    /// the core with an error (the core retries the measurement later) and
+    /// releases the registration, which is what this waits for. A walk that
+    /// does not let go within `wait` refuses the command as busy rather than
+    /// letting it meet `EBUSY` halfway through.
+    fn stop_folder_walk(root: &Path, id: &str, uid: u32, wait: std::time::Duration) -> Result<(), String> {
+        validate_elastic_uuid(id).map_err(|e| e.to_string())?;
+        let path = root.join(format!("{id}.walk"));
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("rejestracja pomiaru: {e}")),
+        };
+        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.uid() != uid || metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600 {
+            return Err("obcy plik rejestracji pomiaru".into());
+        }
+        let deadline = std::time::Instant::now() + wait;
+        let mut killed = None;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+                return Ok(());
+            }
+            if let Some(pid) = registered_walker(&file) {
+                if killed != Some(pid) && same_executable(pid) {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                    killed = Some(pid);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("{ELASTIC_BUSY} pomiar folderów macierzy nie zakończył się"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn registered_walker(file: &File) -> Option<libc::pid_t> {
+        let mut text = [0u8; 16];
+        let read = unsafe { libc::pread(file.as_raw_fd(), text.as_mut_ptr().cast(), text.len(), 0) };
+        if read <= 0 {
+            return None;
+        }
+        std::str::from_utf8(&text[..read as usize]).ok()?.trim().parse().ok().filter(|pid| *pid > 1)
+    }
+
+    /// Whether `pid` runs the same binary as this process.
+    fn same_executable(pid: libc::pid_t) -> bool {
+        match (std::fs::read_link(format!("/proc/{pid}/exe")), std::fs::read_link("/proc/self/exe")) {
+            (Ok(theirs), Ok(ours)) => theirs == ours,
+            _ => false,
+        }
+    }
+
     fn mover(
         root: &Root,
         journal: &mut Journal,
@@ -10350,6 +10646,7 @@ pub(crate) mod execution {
         Mover(Box<ElasticMoverResult>),
         Replace(Box<ElasticReplaceResult>),
         CacheAge(ElasticCacheAge),
+        FolderUsage(ElasticFolderUsage),
     }
 
     impl PrivateResponse {
@@ -10362,6 +10659,7 @@ pub(crate) mod execution {
                 // No array state travels with it, so there is no publication
                 // to mask.
                 Self::CacheAge(age) => return serde_json::to_value(*age).map_err(|e| e.to_string()),
+                Self::FolderUsage(usage) => return serde_json::to_value(&*usage).map_err(|e| e.to_string()),
             };
             state.union_mounted = state.union_mounted.map(|mounted| mounted && published);
             match self {
@@ -10370,6 +10668,7 @@ pub(crate) mod execution {
                 Self::Mover(result) => serde_json::to_value(result),
                 Self::Replace(result) => serde_json::to_value(result),
                 Self::CacheAge(age) => serde_json::to_value(age),
+                Self::FolderUsage(usage) => serde_json::to_value(usage),
             }
             .map_err(|e| e.to_string())
         }
@@ -10667,9 +10966,36 @@ pub(crate) mod execution {
             return Err("wykonawca Elastic wymaga root".into());
         }
         let root = Root::open(Path::new(ROOT), 0)?;
+        // Everything that may change or unmount an array stops that array's
+        // running folder walk first (MAJOR 1, wave 7); the reads do not.
+        match command {
+            crate::HelperCommand::ElasticEnterService { array_id, .. }
+            | crate::HelperCommand::ElasticResume { array_id, .. }
+            | crate::HelperCommand::ElasticMover { array_id, .. }
+            | crate::HelperCommand::ElasticReplaceDisk { array_id, .. }
+            | crate::HelperCommand::ElasticSync { array_id, .. }
+            | crate::HelperCommand::ElasticScrub { array_id, .. }
+            | crate::HelperCommand::ElasticFix { array_id, .. }
+            | crate::HelperCommand::ElasticAddDisk { array_id, .. }
+            | crate::HelperCommand::ElasticAddDiskAbort { array_id, .. }
+            | crate::HelperCommand::ElasticDestroy { array_id, .. }
+            | crate::HelperCommand::ElasticRestore { array_id, .. }
+            | crate::HelperCommand::ElasticAdopt { array_id, .. } => {
+                stop_folder_walk(&root.path, array_id, root.uid, WALK_STOP_WAIT)?;
+            }
+            _ => {}
+        }
         let value = match command {
             crate::HelperCommand::ElasticCreate { operation } => {
                 return serde_json::to_string(&private_create(&root, operation)?).map_err(|e| e.to_string());
+            }
+            crate::HelperCommand::ElasticFolderUsage { array_id, owner, folders } => {
+                let journal = root.load(array_id)?;
+                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                if journal.private.is_none() {
+                    return Err("pomiar folderów wymaga prywatnej topologii".into());
+                }
+                return serde_json::to_string(&folder_usage_unlocked(root, journal, folders)?).map_err(|e| e.to_string());
             }
             crate::HelperCommand::ElasticEnterService { array_id, owner, .. }
             | crate::HelperCommand::ElasticResume { array_id, owner, .. }
@@ -14179,6 +14505,90 @@ Nothing to do
             let detail = run.detail.as_deref().expect("powód niepowodzenia");
             assert!(detail.contains("diagnostyka błędu w logu"), "{detail}");
             assert!(detail.contains("unexpected end of content file"), "{detail}");
+        }
+
+        /// Critic wave 7, MAJOR 1: a folder walk holds the branches from a
+        /// worker in the array's namespace for up to minutes, which made an
+        /// unmount `EBUSY` and a dissolve find a live process. A real forked
+        /// "worker" registers exactly as `folder_usage_unlocked` does; the
+        /// stop kills it, waits for the registration to be released and
+        /// returns — and it never shoots a process that is not this binary.
+        #[test]
+        fn an_array_command_stops_a_running_folder_walk_and_nothing_else() {
+            let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let id = "11111111-1111-4111-8111-111111111111";
+            let wait = std::time::Duration::from_secs(5);
+
+            // No walk: nothing to stop, at once.
+            let started = std::time::Instant::now();
+            stop_folder_walk(&dir.0, id, uid, wait).expect("no walk");
+            assert!(started.elapsed() < std::time::Duration::from_millis(500));
+
+            // A walk: the worker holds the registration and names itself.
+            let spawn_walker = |named: Option<libc::pid_t>| -> libc::pid_t {
+                let walk = walk_lock(&dir.0, id, uid).expect("registration");
+                let mut ready = [0 as libc::c_int; 2];
+                assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0);
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0);
+                if pid == 0 {
+                    // Async-signal-safe only, until the process dies.
+                    let text = named.unwrap_or_else(|| unsafe { libc::getpid() }).to_string();
+                    unsafe {
+                        libc::pwrite(walk.as_raw_fd(), text.as_ptr().cast(), text.len(), 0);
+                        libc::write(ready[1], b"x".as_ptr().cast(), 1);
+                        loop {
+                            libc::pause();
+                        }
+                    }
+                }
+                // Like the walk's own helper once its worker is gone, this
+                // side lets go of its copy; the worker keeps the lock.
+                drop(walk);
+                let mut byte = [0u8; 1];
+                unsafe {
+                    libc::read(ready[0], byte.as_mut_ptr().cast(), 1);
+                    libc::close(ready[0]);
+                    libc::close(ready[1]);
+                }
+                pid
+            };
+            // A failing assertion must not leave a paused child behind (it
+            // would hold the runner's output pipe open for ever).
+            struct Reap(libc::pid_t);
+            impl Drop for Reap {
+                fn drop(&mut self) {
+                    unsafe {
+                        libc::kill(self.0, libc::SIGKILL);
+                        libc::waitpid(self.0, std::ptr::null_mut(), libc::WNOHANG);
+                    }
+                }
+            }
+            let walker = spawn_walker(None);
+            let _reap = Reap(walker);
+            assert!(walk_lock(&dir.0, id, uid).is_err(), "a second walk of the array is refused as busy");
+            stop_folder_walk(&dir.0, id, uid, wait).expect("the walk is stopped and released");
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(walker, &mut status, 0) }, walker);
+            assert!(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL, "the worker was killed");
+            // The registration is free again: the next walk may start.
+            drop(walk_lock(&dir.0, id, uid).expect("free after the stop"));
+
+            // A registration naming a process that is not this helper (a
+            // stale or reused pid): nobody is killed and the command is
+            // refused as busy instead of meeting EBUSY halfway through.
+            let mut other = std::process::Command::new("sleep").arg("30").spawn().expect("sleep");
+            let holder = spawn_walker(Some(other.id() as libc::pid_t));
+            let _reap_holder = Reap(holder);
+            let refused = stop_folder_walk(&dir.0, id, uid, std::time::Duration::from_millis(300)).unwrap_err();
+            assert!(refused.starts_with(ELASTIC_BUSY), "{refused}");
+            assert!(other.try_wait().expect("status").is_none(), "a foreign process is never shot");
+            unsafe { libc::kill(holder, libc::SIGKILL) };
+            unsafe { libc::waitpid(holder, &mut status, 0) };
+            let _ = other.kill();
+            let _ = other.wait();
         }
 
         #[test]
@@ -22867,6 +23277,58 @@ mod tests {
                 labels.len(),
                 "two disks of one array share a label: {labels:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod folder_usage_catalog_tests {
+    use super::*;
+
+    /// A usage request names top-level folders: one directory name each,
+    /// bounded, none twice. Anything else could make root walk outside the
+    /// folder it was asked about.
+    #[test]
+    fn usage_folders_are_single_bounded_unique_names() {
+        assert!(validate_usage_folders(&["filmy".into(), "muzyka i foto".into()]).is_ok());
+        for bad in [vec![], vec!["".to_string()], vec!["a/b".into()], vec!["..".into()], vec![".".into()],
+            vec!["a\nb".to_string()], vec!["x".repeat(256)], vec!["a".into(), "a".into()]]
+        {
+            assert!(validate_usage_folders(&bad).is_err(), "{bad:?}");
+        }
+        let many: Vec<String> = (0..=USAGE_FOLDERS_MAX).map(|i| format!("f{i}")).collect();
+        assert!(validate_usage_folders(&many).is_err());
+        assert!(validate_usage_folders(&many[..USAGE_FOLDERS_MAX]).is_ok());
+    }
+
+    /// MAJOR 1 (wave 7): every Elastic command that names an array stops its
+    /// running folder walk first, except the ones that only read. A command
+    /// added to the catalog later lands on the wrong side of this list only
+    /// if someone decides so here.
+    #[test]
+    fn every_changing_array_command_stops_the_folder_walk() {
+        const READS: [&str; 3] = ["ElasticFolderUsage", "ElasticInspect", "ElasticCacheAge"];
+        let catalog = include_str!("lib.rs");
+        let body = catalog.split_once("pub enum HelperCommand {").expect("enum").1;
+        let body = body.split_once("\n}\n").expect("enum end").0;
+        let with_array: Vec<&str> = body
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let name = line.split([' ', '{']).next()?;
+                (name.starts_with("Elastic") && line.contains("array_id")).then_some(name)
+            })
+            .collect();
+        assert!(with_array.len() >= 12, "{with_array:?}");
+        let source = include_str!("elastic.rs");
+        let stops = source
+            .split_once("// running folder walk first (MAJOR 1, wave 7); the reads do not.")
+            .expect("the stop")
+            .1;
+        let stops = stops.split_once("stop_folder_walk(").expect("the call").0;
+        for name in with_array {
+            let listed = stops.contains(&format!("HelperCommand::{name} {{"));
+            assert_eq!(listed, !READS.contains(&name), "{name}: stops the walk = {listed}");
         }
     }
 }

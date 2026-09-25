@@ -5581,6 +5581,17 @@
       "folders_col_name": "Ordner",
       "folders_col_share": "Freigabe",
       "folders_col_cache": "Cache",
+      "folders_col_used": "Belegung",
+      "folder_usage": {
+        "pending": "Noch nicht gemessen — der Knoten zählt die Ordner alle paar Stunden im Hintergrund.",
+        "over_budget": "Nicht gemessen: Der Ordner enthält zu viele Dateien, um ihn innerhalb des Messlimits zu zählen ({entries} Einträge, {minutes} Min.).",
+        "unreadable": "Nicht gemessen: Ein Teil der Dateien des Ordners ließ sich nicht von der Festplatte lesen.",
+        "not_mounted": "Nicht gemessen: Nicht alle Festplatten des Arrays waren eingehängt.",
+        "failed": "Nicht gemessen: Der Knoten konnte die Ordnermessung nicht ausführen. Er versucht es in 30 Min. erneut.",
+        "measured": "Gemessen {ago}; der Knoten aktualisiert die Messung alle 6 Std.",
+        "unknown": "Nicht gemessen",
+        "name_refused": "Nicht gemessen: Der Ordnername enthält Zeichen, die die Messung nicht annimmt (z. B. ein Steuerzeichen) — die übrigen Ordner werden gemessen."
+      },
       "folders_unknown": "Die Ordnerliste dieses Verbunds konnte nicht gelesen werden. Nicht gemessen ist nicht dasselbe wie keine Ordner — prüfe, ob die Union eingehängt ist.",
       "folders_unknown_partial": "Die Ordnerliste konnte nicht gelesen werden, daher stehen unten nur Ordner mit gespeicherter Richtlinie. Nicht gemessen ist nicht dasselbe wie keine Ordner.",
       "folders_explain": "Neue Dateien landen immer zuerst auf dem Cache: eine mergerfs-Erstellungsrichtlinie gilt für die gesamte Union, also kann keine mergerfs-Einstellung einen einzelnen Ordner vom Cache freihalten. Die Richtlinie des Ordners entscheidet, wie schnell — oder ob überhaupt — seine Dateien auf die Datenplatten wandern.",
@@ -5811,6 +5822,11 @@
         "no_cache": "Kein Cache-Datenträger: Der Mover hat nichts zu tun, und neue Dateien werden direkt auf die Datenträger geschrieben.",
         "unhealthy_disks": "SMART warnt bei {disks}: Ein Array auf einem bereits ausfallenden Datenträger startet degradiert.",
         "mixed_sizes": "Die Datenträger sind unterschiedlich groß, und jedes Byte jedes einzelnen wird genutzt — genau dafür ist diese Array-Art da."
+      },
+      "elastic_reason": {
+        "tool_unavailable": "{tool}: {status}",
+        "tool_not_probed": "{tool}: nicht geprüft (Umgebung → Erneut prüfen)",
+        "no_mkfs": "weder mkfs.xfs noch mkfs.ext4 ist installiert — kein Datenlaufwerk kann vorbereitet werden"
       }
     },
     "pools": {
@@ -5971,7 +5987,10 @@
       "trim_resume_done": "TRIM des Pools {name} fortgesetzt",
       "trim_cancel_done": "TRIM des Pools {name} abgebrochen",
       "leaf_last_known": "Datenträger fehlt (zuletzt als {name})",
-      "leaf_missing_at": "Datenträger fehlt, Nr. {n}"
+      "leaf_missing_at": "Datenträger fehlt, Nr. {n}",
+      "disk_detach": "Alten Datenträger abtrennen",
+      "disk_detach_confirm": "Der Datenträger {device} wird vom Pool {pool} abgetrennt (zpool detach). Seine Daten liegen bereits auf dem Hot Spare, der an seiner Stelle im Pool bleibt. Nach dem Abtrennen kann {device} sicher entfernt werden.",
+      "disk_detach_done": "Datenträger {device} abgetrennt — er kann entfernt werden"
     },
     "props": {
       "title": "Pool-Eigenschaften",
@@ -6062,7 +6081,7 @@
       "explain_pick": "Wähle ein Ersatzlaufwerk, um den Austauschplan zu sehen.",
       "start": "Austausch starten",
       "resilver_progress": "resilver {pct}% · noch {eta}",
-      "done_detail_spare": "Resilver abgeschlossen — {new} hat die Daten von {device} übernommen, aber {device} bleibt in der Pool-Konfiguration, bis er abgetrennt wird (zpool detach). Diese TentaNas-Version erledigt das noch nicht: Ziehen Sie den Datenträger nicht vor dem Abtrennen."
+      "done_detail_spare": "Resilver abgeschlossen — {new} hat die Daten von {device} übernommen, aber {device} bleibt in der Pool-Konfiguration. Trenne ihn mit der Aktion „Alten Datenträger abtrennen“ neben ihm in der Pool-Topologie ab; erst dann kann er entfernt werden."
     },
     "elastic_import": {
       "title": "Elastic Array importieren",
@@ -7065,7 +7084,9 @@
       "catalog_empty": "Der Helper hat keine Befehle gemeldet",
       "short_helper": "Modus A",
       "short_interactive": "Modus B",
-      "short_unarmed": "nicht scharfgeschaltet"
+      "short_unarmed": "nicht scharfgeschaltet",
+      "mode_interactive_unarmed": "Modus B — nicht scharfgeschaltet",
+      "short_interactive_unarmed": "nicht scharfgeschaltet (Modus B)"
     },
     "env": {
       "failed": "Umgebung konnte nicht geladen werden: {error}",
@@ -7094,7 +7115,25 @@
       "arm_node": "Scharfschalten…",
       "arm_node_title": "Rechtekanal scharfschalten — {node} (Modus B)",
       "armed_node": "Kanal auf {node} scharfgeschaltet",
-      "armed_node_unnamed": "Kanal auf dem Knoten ohne Namen scharfgeschaltet"
+      "armed_node_unnamed": "Kanal auf dem Knoten ohne Namen scharfgeschaltet",
+      "detail": {
+        "feature_binaries_missing": "Programm fehlt: {binaries}",
+        "feature_version_too_low": "gefunden {found}, mindestens {required} erforderlich",
+        "feature_module_not_loaded": "Kernelmodul {module} ist nicht geladen",
+        "snapraid_killed": "SnapRAID ist installiert, wurde aber beim Lesen einer einfachen Konfiguration beendet — mit -O2 neu bauen; bis dahin wirkt das Array nur geschützt",
+        "snapraid_killed_signal": "SnapRAID ist installiert, wurde aber beim Lesen einer einfachen Konfiguration durch Signal {signal} beendet — mit -O2 neu bauen; bis dahin wirkt das Array nur geschützt",
+        "snapraid_probe_unconfirmed": "die SnapRAID-Prüfung endete mit Code {code}, ohne zu bestätigen, dass das Programm funktioniert",
+        "snapraid_probe_failed": "die SnapRAID-Prüfung konnte nicht ausgeführt werden (Details im Tooltip)",
+        "snapraid_vanished": "SnapRAID ist vor der Funktionsprüfung verschwunden",
+        "rdma_no_device": "kein RDMA-Gerät unter {path}",
+        "ksmbd_no_interface": "keine RDMA-Schnittstelle mit Adresse",
+        "ksmbd_exposed": "{interfaces} führt auch das Standard-Gateway — SMB Direct braucht ein eigenes Storage-Netz",
+        "ksmbd_tools_missing": "fehlt: {tools} · der Listener wäre auf {listener}",
+        "ksmbd_experimental": "EXPERIMENTELL (laut Kernel-Dokumentation)",
+        "module_loaded": "{module} geladen",
+        "module_on_demand": "{module} verfügbar, wird bei der ersten Nutzung geladen",
+        "module_absent": "{module} fehlt im Modulbaum dieses Kernels"
+      }
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -7231,7 +7270,10 @@
       "chip_services_down_list": "Dienste gestoppt: {list}",
       "chip_services_unknown": "Dienste: keine Antwort von {nodes}",
       "chip_services_none": "Keine Freigabedienste",
-      "not_answered_hint": "Unbekannt: Die Freigabeliste dieses Nodes konnte nicht gelesen werden (keine Antwort oder ein Fehler). Die Zahl erscheint, sobald der Node antwortet."
+      "not_answered_hint": "Unbekannt: Die Freigabe- oder Target-Liste dieses Nodes konnte nicht gelesen werden (keine Antwort oder ein Fehler). Die Zahl erscheint, sobald der Node antwortet.",
+      "target_any_client": "jeder Portal-Client",
+      "target_initiators": "{n} {n|Initiator|Initiatoren}",
+      "target_hosts": "{n} {n|Host-NQN|Host-NQNs}"
     },
     "node": {
       "head_sub_node": "Knoten {name}",
@@ -7550,7 +7592,10 @@
         "import_secret_needed": "Das Authentifizierungsgeheimnis muss nach einem Import erneut eingegeben werden.",
         "import_all_interfaces": "Dieses Target wurde auf allen Schnittstellen (0.0.0.0) exportiert — wählen Sie eine Schnittstelle dieses Knotens, bevor Sie es aktivieren.",
         "portal_moved_head_no_address": "Das Portal des Targets ist nicht mehr dort, wo es festgelegt wurde. Die Adresse {address} gehörte zur Schnittstelle {interface}, die auf diesem Knoten vorhanden ist, aber derzeit keine Adresse hat (Link getrennt oder DHCP-Lease verloren)."
-      }
+      },
+      "host_state": "Status",
+      "host_connected": "Verbunden",
+      "host_not_connected": "Nicht verbunden"
     },
     "wizard_target": {
       "title": "Neues Target",
@@ -7696,7 +7741,33 @@
       "elastic_add_stopped": "Das Hinzufügen des Datenträgers wurde vor dem Ende angehalten — schließen Sie es in der Array-Ansicht ab oder machen Sie es rückgängig",
       "elastic_undo_stopped": "Das Rückgängigmachen wurde nach seinem ersten Schritt angehalten — das Hinzufügen bleibt unvollständig",
       "elastic_disk_absent": "Der Datenträger, der gelöscht würde, ist auf diesem Knoten nicht vorhanden — schließen Sie ihn an und versuchen Sie es erneut",
-      "job_not_cancellable": "Dieser Auftrag kann nicht abgebrochen werden — ein Abbruch würde die bereits begonnene Arbeit nicht anhalten"
+      "job_not_cancellable": "Dieser Auftrag kann nicht abgebrochen werden — ein Abbruch würde die bereits begonnene Arbeit nicht anhalten",
+      "pool_detach_not_allowed": "Dieser Datenträger kann jetzt nicht abgetrennt werden: Abtrennen lässt sich nur ein Datenträger, den ein funktionierender Hot Spare ersetzt hat, und erst nach Abschluss des Resilvers."
+    },
+    "unreachable": {
+      "title": "Knoten {node} nicht erreichbar",
+      "title_unnamed": "Unbenannter Knoten nicht erreichbar",
+      "heading": "Mesh-Verbindung verloren",
+      "desc": "Vorgänge auf dem Knoten {node} sind angehalten, bis die Verbindung zurück ist. Die NAS-Dienste auf dem Knoten selbst laufen unabhängig vom Dashboard weiter.",
+      "desc_unnamed": "Vorgänge auf diesem Knoten sind angehalten, bis die Verbindung zurück ist. Die NAS-Dienste auf dem Knoten selbst laufen unabhängig vom Dashboard weiter.",
+      "keep": "Freigaben, Targets und Zeitpläne auf {node} arbeiten weiter — nur das Dashboard hat die Verbindung zum Knoten verloren.",
+      "keep_unnamed": "Freigaben, Targets und Zeitpläne auf diesem Knoten arbeiten weiter — nur das Dashboard hat die Verbindung zum Knoten verloren.",
+      "retry_line": "Verbindung zum Knoten wird wiederhergestellt",
+      "retry_attempt": "Versuch {attempt} · Backoff bis {max} s",
+      "btn_fleet": "Flottenübersicht",
+      "btn_refresh": "Aktualisieren",
+      "btn_retry": "Jetzt verbinden",
+      "log_manual": "Verbindungsversuch erzwungen",
+      "log_no_answer": "keine Antwort von {node} (Versuch {attempt})",
+      "log_no_answer_unnamed": "keine Antwort vom Knoten (Versuch {attempt})",
+      "log_restored": "Verbindung wiederhergestellt",
+      "log_mesh_connected": "das Mesh sieht {node} als verbunden, aber der Knoten antwortet nicht",
+      "log_mesh_connected_unnamed": "das Mesh sieht den Knoten als verbunden, aber er antwortet nicht",
+      "log_mesh_offline": "das Mesh sieht {node} nicht — der Knoten ist getrennt",
+      "log_mesh_offline_unnamed": "das Mesh sieht diesen Knoten nicht — er ist getrennt",
+      "log_lost": "{node} antwortet nicht mehr",
+      "log_lost_unnamed": "der Knoten antwortet nicht mehr",
+      "error": "Der Knoten antwortet nicht — die Mesh-Verbindung ist verloren"
     }
   },
   "agent_accounts": {

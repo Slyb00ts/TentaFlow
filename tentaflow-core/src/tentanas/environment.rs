@@ -11,10 +11,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tentaflow_protocol::features::FeatureState;
-use tentaflow_protocol::tentanas::NasEnvironment;
+use std::collections::BTreeMap;
+
+use tentaflow_protocol::tentanas::{NasEnvironment, NasHealthReason};
 use tentanas_helper::PackageManager;
 
 use super::broker::run_unprivileged;
+use super::CodedText;
 use crate::db::DbPool;
 
 const TOOL_DIRS: &[&str] = &["/usr/sbin", "/usr/bin", "/sbin", "/bin", "/usr/local/sbin", "/usr/local/bin"];
@@ -319,13 +322,15 @@ async fn probe_version(binary_path: &str, feature_id: &str) -> Option<String> {
     extract_version(&out.stdout).or_else(|| extract_version(&out.stderr))
 }
 
-/// Brak wyniku sondy nie potwierdza sprawności binarki, nawet gdy odpowiadała na --version.
+/// A probe with no verdict does not confirm the binary works, even when it
+/// answered `--version`. Returns the row's new detail as codes, empty when the
+/// row stays as the generic probe left it.
 async fn snapraid_health(
     binary: &str,
     feature: &mut FeatureState,
     temp_root: &Path,
     timeout: Duration,
-) {
+) -> Vec<NasHealthReason> {
     let outcome = async {
         let dir = tempfile::Builder::new()
             .prefix("tentanas-snapraid-probe-")
@@ -343,28 +348,31 @@ async fn snapraid_health(
         ))
     }
     .await;
-    match outcome {
-        Ok(super::elastic::ToolHealth::Working) => {}
-        Ok(super::elastic::ToolHealth::Broken(why)) => {
-            feature.status = "broken".to_string();
-            feature.detail = why;
-        }
-        Ok(super::elastic::ToolHealth::Unknown(why)) => {
-            feature.status = "unknown".to_string();
-            feature.detail = why;
-        }
-        Err(error) => {
-            feature.status = "unknown".to_string();
-            feature.detail = format!("Nie można sprawdzić działania SnapRAID: {error}");
-        }
-    }
+    let (status, why) = match outcome {
+        Ok(super::elastic::ToolHealth::Working) => return Vec::new(),
+        Ok(super::elastic::ToolHealth::Broken(why)) => ("broken", why),
+        Ok(super::elastic::ToolHealth::Unknown(why)) => ("unknown", why),
+        Err(error) => (
+            "unknown",
+            CodedText::new(
+                "snapraid_probe_failed",
+                &[("error", error.to_string())],
+                format!("the SnapRAID probe could not be run: {error}"),
+            ),
+        ),
+    };
+    feature.status = status.to_string();
+    feature.detail = why.text;
+    why.reasons
 }
 
 fn kernel_module_loaded(name: &str) -> bool {
     Path::new(&format!("/sys/module/{name}")).is_dir()
 }
 
-async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> FeatureState {
+/// One row of the generic probe, with its detail as codes beside the
+/// English (`NasEnvironment::feature_reasons`).
+async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> (FeatureState, Vec<NasHealthReason>) {
     let packages = manager
         .and_then(|m| packages_for(spec.id, m))
         .unwrap_or_default();
@@ -381,33 +389,38 @@ async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> F
         }
     }
     let (status, version, detail) = if !missing.is_empty() {
+        let binaries = missing.join(", ");
         (
             "missing",
             None,
-            format!("missing: {}", missing.join(", ")),
+            CodedText::new("feature_binaries_missing", &[("binaries", binaries.clone())], format!("missing: {binaries}")),
         )
     } else {
         let version = probe_version(first_path.as_deref().unwrap_or_default(), spec.id).await;
         let outdated = match (spec.required_version, version.as_deref()) {
-            (Some(req), Some(v)) if !version_at_least(v, req) => {
-                Some(format!("found {v}, need at least {req}"))
-            }
+            (Some(req), Some(v)) if !version_at_least(v, req) => Some(CodedText::new(
+                "feature_version_too_low",
+                &[("found", v.to_string()), ("required", req.to_string())],
+                format!("found {v}, need at least {req}"),
+            )),
             _ => None,
         };
         match outdated {
             Some(detail) => ("outdated", version, detail),
             None => {
                 let module_note = match spec.kernel_module {
-                    Some(m) if !kernel_module_loaded(m) => {
-                        format!("kernel module {m} not loaded")
-                    }
-                    _ => String::new(),
+                    Some(m) if !kernel_module_loaded(m) => CodedText::new(
+                        "feature_module_not_loaded",
+                        &[("module", m.to_string())],
+                        format!("kernel module {m} not loaded"),
+                    ),
+                    _ => CodedText::default(),
                 };
                 ("ok", version, module_note)
             }
         }
     };
-    FeatureState {
+    let state = FeatureState {
         id: spec.id.to_string(),
         status: status.to_string(),
         version,
@@ -415,9 +428,10 @@ async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> F
         binaries: spec.binaries.iter().map(|s| s.to_string()).collect(),
         kernel_module: spec.kernel_module.map(str::to_string),
         packages,
-        detail,
+        detail: detail.text,
         optional: spec.optional,
-    }
+    };
+    (state, detail.reasons)
 }
 
 fn read_trimmed(path: &str) -> Option<String> {
@@ -475,14 +489,15 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
     let manager = if linux { detect_package_manager() } else { None };
     let (os_name, os_version) = os_release();
     let mut features = Vec::with_capacity(FEATURES.len());
+    let mut feature_reasons = BTreeMap::new();
     if linux {
         for spec in FEATURES {
-            let mut feature = probe_feature(spec, manager).await;
+            let (mut feature, mut reasons) = probe_feature(spec, manager).await;
             if spec.id == super::rdma::FEATURE_ID {
-                super::rdma::refine(&mut feature);
+                reasons = super::rdma::refine_coded(&mut feature);
             }
             if spec.id == super::ksmbd::FEATURE_ID {
-                super::ksmbd::refine(&mut feature);
+                reasons = super::ksmbd::refine_coded(&mut feature);
             }
             // "Present" is not "working" — see `elastic::probe_verdict`. A
             // snapraid that segfaults answers `--version` happily and then
@@ -493,16 +508,21 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
             // indistinguishable from success.
             if spec.id == super::elastic::SNAPRAID_FEATURE_ID && feature.status == "ok" {
                 if let Some(path) = find_binary("snapraid") {
-                    snapraid_health(
+                    let health = snapraid_health(
                         &path,
                         &mut feature,
                         &std::env::temp_dir(),
                         Duration::from_secs(15),
                     )
                     .await;
+                    if !health.is_empty() {
+                        reasons = health;
+                    }
                 } else {
+                    let why = CodedText::new("snapraid_vanished", &[], "SnapRAID disappeared before its health probe");
                     feature.status = "unknown".to_string();
-                    feature.detail = "SnapRAID zniknął przed sprawdzeniem działania".to_string();
+                    feature.detail = why.text;
+                    reasons = why.reasons;
                 }
             }
             // §5.5 asks for the DH-HMAC-CHAP probe to be IN the Environment
@@ -510,7 +530,10 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
             // `nvmetcli` — this app never runs either. See `targets::refine`.
             if spec.id == "iscsi" || spec.id == "nvmet" || spec.id == super::targets::DHCHAP_FEATURE_ID
             {
-                super::targets::refine(&mut feature);
+                reasons = super::targets::refine_coded(&mut feature);
+            }
+            if !reasons.is_empty() {
+                feature_reasons.insert(feature.id.clone(), reasons);
             }
             features.push(feature);
         }
@@ -532,6 +555,7 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
         features,
         elevation,
         probed_at: super::db::now(),
+        feature_reasons,
     }
 }
 
@@ -645,9 +669,16 @@ mod tests {
             let (dir, binary) = snapraid_probe_fixture(body);
             let mut feature = present_snapraid();
 
-            snapraid_health(binary.to_str().unwrap(), &mut feature, dir.path(), Duration::from_secs(5)).await;
+            let reasons = snapraid_health(binary.to_str().unwrap(), &mut feature, dir.path(), Duration::from_secs(5)).await;
 
             assert_eq!(feature.status, expected, "{body}: {}", feature.detail);
+            // A downgraded row says why in codes too; a working one adds none.
+            let want = match expected {
+                "ok" => None,
+                "broken" => Some("snapraid_killed"),
+                _ => Some("snapraid_probe_unconfirmed"),
+            };
+            assert_eq!(reasons.first().map(|r| r.code.as_str()), want, "{body}");
             let capabilities = super::super::elastic::capabilities(std::slice::from_ref(&feature), &|_| true);
             assert_eq!(capabilities.snapraid, expected == "ok");
             if expected != "ok" {
@@ -678,7 +709,7 @@ mod tests {
         .await;
 
         assert_eq!(feature.status, "unknown");
-        assert!(feature.detail.contains("Nie można sprawdzić"));
+        assert!(feature.detail.contains("could not be run"), "{}", feature.detail);
         assert!(
             !dir.path().join("paths").exists(),
             "program nie powinien się uruchomić"
@@ -696,7 +727,7 @@ mod tests {
         .await;
 
         assert_eq!(feature.status, "unknown");
-        assert!(feature.detail.contains("Nie można sprawdzić"));
+        assert!(feature.detail.contains("could not be run"), "{}", feature.detail);
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
             2,
@@ -815,6 +846,29 @@ mod tests {
     /// `CONFIG_NVME_TARGET_AUTH`". An install button there would promise
     /// something no package manager can deliver.
     const NO_PACKAGE_FEATURES: &[&str] = &["iscsi", "nvmet", super::super::targets::DHCHAP_FEATURE_ID];
+
+    /// Wave 7: the generic probe's detail travels as codes too, and the
+    /// English it always wrote stays the tooltip.
+    #[tokio::test]
+    async fn the_generic_probe_codes_a_missing_binary() {
+        let spec = FeatureSpec {
+            id: "zz-test",
+            binaries: &["tentanas-no-such-binary-w7"],
+            kernel_module: None,
+            required_version: None,
+            optional: true,
+            apt: &[],
+            dnf: &[],
+            pacman: &[],
+            zypper: &[],
+        };
+        let (feature, reasons) = probe_feature(&spec, None).await;
+        assert_eq!(feature.status, "missing");
+        assert_eq!(feature.detail, "missing: tentanas-no-such-binary-w7");
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, "feature_binaries_missing");
+        assert_eq!(reasons[0].params.get("binaries").map(String::as_str), Some("tentanas-no-such-binary-w7"));
+    }
 
     #[test]
     fn every_feature_has_packages_for_every_manager() {

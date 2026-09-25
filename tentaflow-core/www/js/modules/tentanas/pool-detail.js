@@ -344,6 +344,12 @@ function onPaneClick(e, root, screen, state, refresh) {
       if (d) openReplaceWizard(screen, { pool: p, vdev: v, disk: d, freeDisks: free, disks: state.disks, onDone: refresh });
       return;
     }
+    case 'detach': {
+      const v = (p.vdevs || []).find((x) => (x.disks || []).some((y) => y.name === el.dataset.device));
+      const d = (v?.disks || []).find((x) => x.name === el.dataset.device);
+      if (d) detachDisk(screen, p, d, leafDisplayName(d, inventoryFor(inventoryOf(state.disks || []), d), leafPosition(v, d)), refresh);
+      return;
+    }
     case 'offline':
     case 'online':
     case 'clear': {
@@ -380,6 +386,22 @@ async function deviceAction(screen, p, action, device, shown, refresh) {
   }
   const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolDeviceStateRequest', { name: p.name, device, action, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.disk_' + action));
   followResponse(screen, res, refresh, T('pool.disk_' + action + '_done', { device: shown }));
+}
+
+// Owner decision (wave 7): `zpool detach` of the disk a hot spare replaced.
+// The confirm names the disk as its cell does (`shown`, never an id); the
+// request names the leaf as zpool knows it, and the node re-checks it.
+async function detachDisk(screen, p, d, shown, refresh) {
+  const ok = await TfWindow.confirm({
+    title: T('pool.disk_detach'),
+    message: T('pool.disk_detach_confirm', { device: shown, pool: p.name }),
+    confirmLabel: T('pool.disk_detach'),
+    cancelLabel: I18n.t('common.cancel'),
+    danger: true,
+  });
+  if (!ok) return;
+  const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolDetachRequest', { name: p.name, device: d.name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.disk_detach'));
+  followResponse(screen, res, refresh, T('pool.disk_detach_done', { device: shown }));
 }
 
 async function exportPool(screen, p, force) {
@@ -590,6 +612,10 @@ function diskButtons(d, v, admin, freeCount) {
     if (d.state === 'online') out.push(btn('offline', 'ban', T('pool.disk_offline'), dev));
     else if (d.state === 'offline') out.push(btn('online', 'play', T('pool.disk_online'), dev));
     if (leafErrors(d)) out.push(btn('clear', 'check', T('pool.disk_clear'), dev));
+    // The disk a hot spare replaced stays in the pool until it is detached;
+    // the node says when that is safe (`detachable`: the spare is ONLINE and
+    // no resilver runs) and refuses any other leaf itself.
+    if (d.detachable === true) out.push(btn('detach', 'arrow-out', T('pool.disk_detach'), dev));
   }
   if (d.diskId) out.push({ ...btn('disk', 'chevron-right', T('disks.details'), `data-disk="${escapeAttr(d.diskId)}"`), key: 'disk:' + d.diskId });
   return out;
@@ -1626,10 +1652,10 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
     state.result = failed
       ? { ok: false, detail: T('pools.scrub_errors', { n: Number(state.scan.errors) || 0 }) }
       // A replace onto a HOT SPARE leaves the old leaf in the pool's `spare-N`
-      // group until `zpool detach`, which this version does not run (the
-      // command comes with the next helper release): saying it "can be
-      // pulled" would be false. A replace onto a free disk detaches the old
-      // leaf itself when the resilver ends.
+      // group until `zpool detach`: the text sends the admin to the
+      // "Odłącz stary dysk" action on that leaf (helper 0.15.0), and says
+      // it can be pulled only after that. A replace onto a free disk detaches
+      // the old leaf itself when the resilver ends.
       : { ok: true, detail: T(state.pick?.spare ? 'replace.done_detail_spare' : 'replace.done_detail', { device: oldDiskLabel, new: state.pick?.name || '' }) };
     paint();
     if (onDone) onDone(state.job);

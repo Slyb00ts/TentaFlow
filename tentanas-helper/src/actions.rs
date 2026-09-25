@@ -57,6 +57,7 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         | HelperCommand::ElasticAddDiskAbort { .. }
         | HelperCommand::ElasticDestroy { .. }
         | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticCacheAge { .. }
+        | HelperCommand::ElasticFolderUsage { .. }
         | HelperCommand::ElasticClaims { .. }
         | HelperCommand::ElasticJournals {} | HelperCommand::ElasticAdopt { .. } => {
             crate::elastic::execution::execute(command)

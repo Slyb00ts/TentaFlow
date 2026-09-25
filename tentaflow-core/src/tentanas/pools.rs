@@ -100,6 +100,10 @@ pub struct StatusReport {
     pub data_errors: u64,
     /// Every physical leaf as the disks inventory binds it, in config order.
     pub leaves: Vec<LeafSeen>,
+    /// The `replacing-N` / `spare-N` container the rows being read sit in.
+    open_container: Option<String>,
+    /// Leaves inside a `spare-N` container: (vdev index, leaf index, container).
+    spare_members: Vec<(usize, usize, String)>,
 }
 
 /// One physical leaf of `zpool status`, as the disks inventory needs it: the
@@ -269,6 +273,7 @@ pub fn parse_status(text: &str) -> StatusReport {
         }
         i += 1;
     }
+    mark_detachable(&mut report);
     report
 }
 
@@ -280,6 +285,9 @@ fn apply_config_row(report: &mut StatusReport, row: &ConfigRow<'_>, role: &mut S
         // Depth 0 is either a section keyword or the pool row itself; the pool
         // row's state already came from the `state:` header.
         return;
+    }
+    if row.depth <= 2 {
+        report.open_container = None;
     }
     if row.depth == 1 {
         let kind = group_kind(row.name).unwrap_or("disk");
@@ -309,12 +317,56 @@ fn apply_config_row(report: &mut StatusReport, row: &ConfigRow<'_>, role: &mut S
     // Deeper rows are leaves of the current top-level vdev; a `replacing-N`
     // or `spare-N` container in between contributes no leaf of its own.
     if group_kind(row.name).is_some() && row.depth == 2 {
+        report.open_container = Some(row.name.to_string());
         return;
     }
+    let vdev_index = report.vdevs.len().wrapping_sub(1);
     if let Some(vdev) = report.vdevs.last_mut() {
         vdev.disks.push(leaf(row));
         vdev.fault_tolerance = fault_tolerance_of(&vdev.kind, vdev.disks.len());
         report.leaves.push(leaf_seen(row, &vdev.role, &vdev.kind));
+        if let Some(container) = report.open_container.as_ref().filter(|c| c.starts_with("spare-")) {
+            report.spare_members.push((vdev_index, vdev.disks.len() - 1, container.clone()));
+        }
+    }
+}
+
+/// Marks the leaves `zpool detach` may take out: the ORIGINAL disk of a
+/// `spare-N` group — a hot spare took its place and the pool kept both.
+///
+/// A leaf is detachable only when (a) it is not the hot spare itself (the
+/// spare is the member the `spares` section also lists), (b) the spare beside
+/// it is ONLINE, and (c) no resilver is running: detaching the old disk
+/// before the spare holds the data would take redundancy the pool still
+/// needs. Anything else keeps `detachable` false, and the node refuses a
+/// detach of it whatever a screen sends (`PoolDetachRequest`).
+fn mark_detachable(report: &mut StatusReport) {
+    let spares: std::collections::BTreeSet<String> = report
+        .vdevs
+        .iter()
+        .filter(|v| v.role == "spare")
+        .flat_map(|v| v.disks.iter().map(|d| d.name.clone()))
+        .collect();
+    let resilvering = report.scan.kind == "resilver" && report.scan.status == "running";
+    let members = std::mem::take(&mut report.spare_members);
+    for (vdev, _, container) in &members {
+        let group: Vec<usize> = members
+            .iter()
+            .filter(|(v, _, c)| v == vdev && c == container)
+            .map(|(_, leaf, _)| *leaf)
+            .collect();
+        let disks = &report.vdevs[*vdev].disks;
+        let spare_ready = group
+            .iter()
+            .any(|&i| spares.contains(&disks[i].name) && disks[i].state == "online");
+        let marks: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|&i| !spares.contains(&disks[i].name))
+            .collect();
+        for i in marks {
+            report.vdevs[*vdev].disks[i].detachable = spare_ready && !resilvering;
+        }
     }
 }
 
@@ -344,6 +396,7 @@ fn leaf(row: &ConfigRow<'_>) -> NasVdevDisk {
         size_bytes: 0,
         note: row.note.clone(),
         last_known_name: None,
+        detachable: false,
     }
 }
 
@@ -1565,6 +1618,57 @@ errors: No known data errors\n";
         assert!(s.scan.finished_at.is_some());
         assert_eq!(s.data_errors, 0);
         assert_eq!(layout_summary(&s.vdevs), "mirror");
+    }
+
+    /// A RAIDZ2 whose `sdb` was replaced by the hot spare `sdk`: the pool
+    /// keeps both in `spare-1` until `zpool detach` takes the old one out.
+    fn spare_in_use(scan: &str, spare_state: &str) -> String {
+        format!(
+            "  pool: tank\n state: DEGRADED\n  scan: {scan}\nconfig:\n\n\
+\tNAME            STATE     READ WRITE CKSUM\n\
+\ttank            DEGRADED     0     0     0\n\
+\t  raidz2-0      DEGRADED     0     0     0\n\
+\t    /dev/sda    ONLINE       0     0     0\n\
+\t    spare-1     DEGRADED     0     0     0\n\
+\t      /dev/sdb  FAULTED      9    40     0  too many errors\n\
+\t      /dev/sdk  {spare_state}       0     0     0\n\
+\t    /dev/sdc    ONLINE       0     0     0\n\
+\t    /dev/sdd    ONLINE       0     0     0\n\
+\tspares\n\
+\t  /dev/sdk      INUSE     currently in use\n\
+\t  /dev/sdm      AVAIL\n\
+\nerrors: No known data errors\n"
+        )
+    }
+
+    /// Owner decision (wave 7): only the ORIGINAL disk of a `spare-N` group
+    /// is detachable, and only once the spare beside it is ONLINE with no
+    /// resilver running. Never the spare itself, never an ordinary leaf.
+    #[test]
+    fn only_the_disk_a_ready_hot_spare_replaced_is_detachable() {
+        let detachable = |text: &str| -> Vec<String> {
+            parse_status(text)
+                .vdevs
+                .iter()
+                .flat_map(|v| v.disks.iter())
+                .filter(|d| d.detachable)
+                .map(|d| d.name.clone())
+                .collect()
+        };
+        let done = spare_in_use("resilvered 1.2T in 03:10:00 with 0 errors on Tue Sep  1 12:00:00 2026", "ONLINE");
+        assert_eq!(detachable(&done), ["sdb"]);
+        let report = parse_status(&done);
+        assert_eq!(report.vdevs[0].disks.len(), 5, "the spare-1 container is no leaf of its own");
+        // The spare is still resilvering: the old disk holds data the pool needs.
+        let running = spare_in_use(
+            "resilver in progress since Tue Sep  1 09:00:00 2026\n\t1T scanned, 500G issued\n\t0B repaired, 40.00% done, 01:00:00 to go",
+            "ONLINE",
+        );
+        assert!(detachable(&running).is_empty(), "{:?}", detachable(&running));
+        // A spare that is itself not healthy: nothing may go.
+        assert!(detachable(&spare_in_use("none requested", "FAULTED")).is_empty());
+        // A pool with no spare group: nothing at all.
+        assert!(detachable(DEGRADED_RAIDZ2).is_empty());
     }
 
     #[test]

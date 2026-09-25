@@ -552,12 +552,24 @@ mod tests {
     #[test]
     fn every_coded_sentence_the_node_sends_has_words_on_its_screen() {
         let cases = [
-            ("src/tentanas/elastic.rs", "CodedText::new(", vec!["www/js/modules/tentanas/elastic-detail.js"]),
+            (
+                "src/tentanas/elastic.rs",
+                "CodedText::new(",
+                vec!["www/js/modules/tentanas/elastic-detail.js", "www/js/modules/tentanas/feature-words.js"],
+            ),
             (
                 "src/tentanas/targets.rs",
                 "CodedText::new(",
-                vec!["www/js/modules/tentanas/targets.js", "www/js/modules/tentanas/target-wizard.js"],
+                vec![
+                    "www/js/modules/tentanas/targets.js",
+                    "www/js/modules/tentanas/target-wizard.js",
+                    "www/js/modules/tentanas/feature-words.js",
+                ],
             ),
+            // Wave 7: the Environment rows (`NasEnvironment::feature_reasons`).
+            ("src/tentanas/environment.rs", "CodedText::new(", vec!["www/js/modules/tentanas/feature-words.js"]),
+            ("src/tentanas/rdma.rs", "CodedText::new(", vec!["www/js/modules/tentanas/feature-words.js"]),
+            ("src/tentanas/ksmbd.rs", "CodedText::new(", vec!["www/js/modules/tentanas/feature-words.js"]),
             ("src/dispatch/tentanas.rs", "CodedText::new(", vec!["www/js/modules/tentanas/approvals.js"]),
         ];
         for (rust, call, screens) in cases {
@@ -567,6 +579,16 @@ mod tests {
             for code in &codes {
                 assert!(words.contains(&format!("['{code}',")), "{rust} sends '{code}', and {screens:?} have no words for it");
             }
+        }
+        // The folder usage reasons (n11 "Użycie") are bare reasons too.
+        let elastic_js = read("www/js/modules/tentanas/elastic-detail.js");
+        let usage: Vec<String> = codes_in(&read("src/tentanas/elastic.rs"), "coded_reason(")
+            .into_iter()
+            .filter(|code| code.starts_with("folder_usage_"))
+            .collect();
+        assert_eq!(usage.len(), 6, "the scan found {usage:?}");
+        for code in &usage {
+            assert!(elastic_js.contains(&format!("['{code}',")), "elastic.rs sends '{code}', and elastic-detail.js has no words for it");
         }
         // The config import's target reasons and the rdma reasons are built
         // as bare reasons.

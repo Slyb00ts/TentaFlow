@@ -39,6 +39,14 @@ macro_rules! default_elastic_scrub_schedule_json {
 /// The English a parked Elastic Sync is stored with (`dispatch` `park`), one
 /// spelling for the park and for migration 23, which gives an older build's
 /// `text:<code>` alert this sentence in place of the code.
+///
+/// FROZEN WITH MIGRATION 23. Both macros are spliced into that migration's SQL,
+/// and a released migration is never edited (see `MIGRATIONS`): changing a
+/// word here would silently change what a fresh install runs, and an
+/// apostrophe would end the SQL string literal it sits in. The park may get a
+/// new sentence only through a NEW constant; the test
+/// `migration_23_sentences_are_frozen` and the const assertion below hold
+/// these two to their released text.
 macro_rules! sync_over_fault_text {
     () => {
         "syncs parity over an unrepaired scrub fault: the earlier version of every file deleted or \
@@ -53,6 +61,23 @@ macro_rules! sync_text {
 }
 pub const SYNC_OVER_FAULT_TEXT: &str = sync_over_fault_text!();
 pub const SYNC_TEXT: &str = sync_text!();
+
+/// Whether `text` can sit inside a single-quoted SQL literal as it is.
+const fn sql_literal_safe(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(
+    sql_literal_safe(SYNC_OVER_FAULT_TEXT) && sql_literal_safe(SYNC_TEXT),
+    "a sentence spliced into migration 23's SQL may not contain an apostrophe"
+);
 
 /// Append-only. A released step is never edited: the runner records applied
 /// versions per file and only executes the ones above the recorded maximum.
@@ -11111,6 +11136,25 @@ mod tests {
         let pool = approval(&p, "r-pool").unwrap().unwrap().approval;
         assert!(pool.detail_reasons.is_empty(), "{:?}", pool.detail_reasons);
         assert_eq!(pool.detail, "destroys the pool 'tank'");
+    }
+
+    /// R2-2: migration 23 carries these two sentences inside its SQL, so they
+    /// are part of a released migration and may never change. Pinned byte for
+    /// byte here, and found quoted in the migration's own text.
+    #[test]
+    fn migration_23_sentences_are_frozen() {
+        assert_eq!(
+            SYNC_OVER_FAULT_TEXT,
+            "syncs parity over an unrepaired scrub fault: the earlier version of every file deleted or \
+             changed since the previous Sync can no longer be restored from parity; unchanged files \
+             stay repairable"
+        );
+        assert_eq!(SYNC_TEXT, "syncs parity with the data disks");
+        assert!(sql_literal_safe(SYNC_OVER_FAULT_TEXT) && sql_literal_safe(SYNC_TEXT));
+        assert!(!sql_literal_safe("it's"), "the guard must see an apostrophe");
+        let sql = MIGRATIONS.iter().find(|(v, _)| *v == 23).expect("migration 23").1;
+        assert!(sql.contains(&format!("THEN '{SYNC_OVER_FAULT_TEXT}'")), "{sql}");
+        assert!(sql.contains(&format!("ELSE '{SYNC_TEXT}' END")), "{sql}");
     }
 
     /// MINOR 4: every writer of an array's stored sentence writes its codes

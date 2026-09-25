@@ -26,7 +26,8 @@ const ksmbdEnv = (status, detail = '') => ({ features: [{ id: 'rdma', status: 'o
 // at all read as a working one everywhere the UI compared against 'unarmed'.
 const fleet = [
   { nodeId: 'node-orion', nodeName: 'orion', instanceStatus: 'ready', elevationMode: 'helper' },
-  { nodeId: 'node-atlas', nodeName: 'atlas', instanceStatus: 'ready', elevationMode: 'interactive' },
+  // Mode B with the password held (MAJOR 17: `armedUntil` in the future).
+  { nodeId: 'node-atlas', nodeName: 'atlas', instanceStatus: 'ready', elevationMode: 'interactive', armedUntil: '2999-01-01T00:00:00Z' },
   { nodeId: 'node-helios', nodeName: 'helios', instanceStatus: 'ready', elevationMode: 'unset' },
   { nodeId: 'node-tabbie', nodeName: 'tabbie', instanceStatus: 'missing', elevationMode: null },
 ];
@@ -66,6 +67,9 @@ test('the fleet plan names the source, the unarmed and the NAS-less nodes', () =
     ['orion', 'source'], ['atlas', 'will_mount'], ['helios', 'after_arm'], ['tabbie', 'unsupported'],
   ]);
   assert.deepEqual(fleetPlan(undefined, 'node-orion'), []);
+  // The same mode-B node once its password expired mounts only after an arm.
+  const expired = fleet.map((n) => (n.nodeId === 'node-atlas' ? { ...n, armedUntil: '2020-01-01T00:00:00Z' } : n));
+  assert.equal(fleetPlan(expired, 'node-orion')[1].outcome, 'after_arm');
 });
 
 test('step one is gated on a valid name and an absolute source path', async () => {

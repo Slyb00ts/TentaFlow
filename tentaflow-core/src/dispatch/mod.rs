@@ -2473,6 +2473,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::PoolRemoveVdevRequest { .. } => "TentaNasPoolRemoveVdevRequest",
                 Tn::PoolReplaceDiskRequest { .. } => "TentaNasPoolReplaceDiskRequest",
                 Tn::PoolDeviceStateRequest { .. } => "TentaNasPoolDeviceStateRequest",
+                Tn::PoolDetachRequest { .. } => "TentaNasPoolDetachRequest",
                 Tn::PoolSetPropertiesRequest { .. } => "TentaNasPoolSetPropertiesRequest",
                 Tn::ScrubScheduleSetRequest { .. } => "TentaNasScrubScheduleSetRequest",
                 Tn::DatasetsListRequest { .. } => "TentaNasDatasetsListRequest",

@@ -400,6 +400,36 @@ fn name_jobs(
             }
         }
     }
+    // A job's error and log are an operation's own words, and an Elastic
+    // operation's may carry a branch path whose slot is not a disk name
+    // (R2-3). Loaded only when some line has one.
+    if let Some(db) = db {
+        let has_path = |t: &str| t.contains(tentanas_helper::elastic::BRANCH_ROOT);
+        if jobs.iter().any(|j| j.error.as_deref().is_some_and(has_path) || j.log.iter().any(|l| has_path(l))) {
+            let names = tentanas::elastic::BranchNames::load(db);
+            for job in jobs.iter_mut() {
+                if let Some(error) = job.error.as_mut() {
+                    *error = names.name(error);
+                }
+                for line in job.log.iter_mut() {
+                    *line = names.name(line);
+                }
+            }
+        }
+    }
+}
+
+/// Alert and approval sentences through the same branch-path naming as the
+/// job lines (`name_jobs`): a stored sentence may carry a slot directory.
+fn name_branch_paths<'t>(db: &DbPool, texts: impl IntoIterator<Item = &'t mut String>) {
+    let mut texts: Vec<&mut String> = texts.into_iter().collect();
+    if !texts.iter().any(|t| t.contains(tentanas_helper::elastic::BRANCH_ROOT)) {
+        return;
+    }
+    let names = tentanas::elastic::BranchNames::load(db);
+    for text in texts.iter_mut() {
+        **text = names.name(text);
+    }
 }
 
 /// The shown subject of a config import. An export with no `node_name` gives
@@ -533,12 +563,14 @@ async fn elevation_arm(ctx: &HandlerContext, secret: &SudoSecret, ttl_secs: u32)
             .map_err(|e| internal("settings", e))?;
     }
     tentanas::disks::request_smart_refresh();
+    tentanas::disks::request_summary_refresh();
     Ok(tn(P::ElevationResponse { elevation }))
 }
 
 async fn elevation_disarm(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let g = gate_admin(ctx)?;
     tentanas::elevation::disarm();
+    tentanas::disks::request_summary_refresh();
     Ok(tn(P::ElevationResponse {
         elevation: tentanas::elevation::status(&g.db).await,
     }))
@@ -1432,6 +1464,43 @@ async fn pool_device_state(
         }
     };
     run_now(&g, "device state", &command, secret).await?;
+    pool_view(&g, name).await
+}
+
+/// The refusal of a detach the node does not allow (`refusal:<code>`, worded
+/// by the screen).
+const POOL_DETACH_NOT_ALLOWED: &str = "refusal:pool_detach_not_allowed";
+
+/// Whether `device` of this pool status may be detached: a leaf the node
+/// itself marked `detachable` (the original disk of a `spare-N` group whose
+/// hot spare is ONLINE, with no resilver running — `pools::mark_detachable`).
+/// The screen's word is never enough: a detach of any other leaf would take
+/// redundancy, or a disk, the pool still needs.
+fn detach_allowed(status: &tentanas::pools::StatusReport, device: &str) -> bool {
+    !device.is_empty()
+        && status
+            .vdevs
+            .iter()
+            .flat_map(|v| &v.disks)
+            .any(|d| d.detachable && d.name == device)
+}
+
+/// Owner decision (wave 7): after a replace onto a hot spare the old disk
+/// stays in the pool's `spare-N` group; this takes it out with `zpool detach`
+/// once the node — reading `zpool status` again, now — agrees it may go.
+async fn pool_detach(
+    ctx: &HandlerContext,
+    name: &str,
+    device: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_POOLS)?;
+    let status = tentanas::pools::status(name).await.map_err(|e| broker_error("pool", e))?;
+    if !detach_allowed(&status, device) {
+        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable, POOL_DETACH_NOT_ALLOWED));
+    }
+    let command = HelperCommand::ZpoolDetach { pool: name.to_string(), device: device.to_string() };
+    run_now(&g, "detach", &command, secret).await?;
     pool_view(&g, name).await
 }
 
@@ -2748,6 +2817,14 @@ async fn block_capabilities(
     tentanas::targets::capabilities(&features, &datasets, targets)
 }
 
+thread_local! {
+    /// Capability computations asked for on this thread (each one an
+    /// environment read and a `zfs list` unless the 5 s cache holds them) —
+    /// the dispatch test's proof that the fleet's summary path never asks.
+    /// Per thread, so parallel tests do not count each other.
+    static CAPABILITY_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// How long the two EXPENSIVE inputs of `block_capabilities` are reused on the
 /// polled list path.
 const CAPABILITIES_CACHE: Duration = Duration::from_secs(5);
@@ -2782,6 +2859,7 @@ async fn block_capabilities_cached(
     g: &Gate,
     targets: &[store::TargetRow],
 ) -> tentaflow_protocol::tentanas::NasBlockCapabilities {
+    CAPABILITY_READS.with(|n| n.set(n.get() + 1));
     let cached = capabilities_cache()
         .lock()
         .ok()
@@ -2803,9 +2881,31 @@ async fn block_capabilities_cached(
     tentanas::targets::capabilities(&features, &datasets, targets)
 }
 
-async fn targets_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+async fn targets_list(ctx: &HandlerContext, summary: bool) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     let rows = store::list_targets_of_org(&g.db, &g.org_id).map_err(|e| internal("targets", e))?;
+    // The fleet's 10 s poll (critic wave 7, MAJOR 2): it reads the targets and
+    // the service rows, never the capabilities, so it pays for neither the
+    // environment read nor the `zfs list` behind them, and it takes a session
+    // reading up to `FLEET_SESSIONS_MAX_AGE` old instead of a sudo per tick.
+    if summary {
+        let nvmet = if rows.iter().any(|row| row.protocol == "nvmet") {
+            tentanas::targets::nvmet_sessions_within(&g.db, tentanas::targets::FLEET_SESSIONS_MAX_AGE).await
+        } else {
+            Default::default()
+        };
+        return Ok(tn(P::TargetsListResponse {
+            targets: rows
+                .iter()
+                .map(|row| {
+                    let (sessions, known) = tentanas::targets::sessions_from(row, &nvmet);
+                    tentanas::targets::to_protocol(row, sessions.len() as u32, known)
+                })
+                .collect(),
+            services: tentanas::targets::services(),
+            capabilities: Default::default(),
+        }));
+    }
     // The cached variant: this list is POLLED, and the uncached one spawns two
     // or three `zfs` processes and may fall through to a full environment
     // probe on every single request. Judged against EVERY target of the node
@@ -3641,6 +3741,7 @@ fn alerts_list(ctx: &HandlerContext, include_acked: bool) -> Result<MessageBody,
     let mut alerts = store::list_alerts_for_org(&g.db, org_viewer(ctx, &g), include_acked)
         .map_err(|e| internal("alerts", e))?;
     resolve_import_alerts(&mut alerts, |id| tentanas::fleet::node_name(ctx, id));
+    name_branch_paths(&g.db, alerts.iter_mut().flat_map(|a| [&mut a.title, &mut a.detail]));
     Ok(tn(P::AlertsListResponse { alerts }))
 }
 
@@ -3819,6 +3920,7 @@ fn approvals_view(
             row.decided_by = Some(name);
         }
     }
+    name_branch_paths(a.nas_db, approvals.iter_mut().map(|r| &mut r.detail));
     Ok(tn(P::ApprovalsListResponse {
         approvals,
         settings: tentanas::approvals::settings(a.main_db, a.checker, a.org_id, a.addon_id),
@@ -5501,6 +5603,11 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             action,
             sudo_password,
         } => pool_device_state(ctx, name, device, action, sudo_password.as_ref()).await,
+        P::PoolDetachRequest {
+            name,
+            device,
+            sudo_password,
+        } => pool_detach(ctx, name, device, sudo_password.as_ref()).await,
         P::PoolSetPropertiesRequest {
             name,
             changes,
@@ -5615,7 +5722,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ShareBrowseRequest { path } => share_browse(ctx, path).await,
 
         // ----- block targets -----
-        P::TargetsListRequest {} => targets_list(ctx).await,
+        P::TargetsListRequest { summary } => targets_list(ctx, *summary).await,
         P::TargetGetRequest { target_id } => target_get(ctx, target_id).await,
         P::TargetCreateRequest { .. } => target_create(ctx, payload).await,
         P::TargetUpdateRequest { .. } => target_update(ctx, payload).await,
@@ -5954,6 +6061,7 @@ register_tentanas_variant!(
     "TentaNasPoolDeviceStateRequest",
     "tentaflow_ws_handler_nas_pool_device_state"
 );
+register_tentanas_variant!("TentaNasPoolDetachRequest", "tentaflow_ws_handler_nas_pool_detach");
 register_tentanas_variant!(
     "TentaNasPoolSetPropertiesRequest",
     "tentaflow_ws_handler_nas_pool_set_properties"
@@ -6337,6 +6445,82 @@ mod registration_tests {
         assert_eq!(scrub.last_result, format!("started job {}", job.job_id));
         // The SMART pair never carries an outcome.
         assert!(row("smart_short").last_outcome.is_empty());
+    }
+
+    /// Owner decision (wave 7): the node decides what a detach may take out,
+    /// from `zpool status` read again at the request — only the original disk
+    /// of a `spare-N` group whose spare is ready. The spare itself, an
+    /// ordinary leaf, an empty name and any disk during a resilver are refused.
+    #[test]
+    fn a_detach_is_allowed_only_for_the_disk_a_ready_spare_replaced() {
+        let status = |scan: &str| {
+            tentanas::pools::parse_status(&format!(
+                "  pool: tank\n state: DEGRADED\n  scan: {scan}\nconfig:\n\n\
+\tNAME            STATE     READ WRITE CKSUM\n\
+\ttank            DEGRADED     0     0     0\n\
+\t  mirror-0      DEGRADED     0     0     0\n\
+\t    /dev/sda    ONLINE       0     0     0\n\
+\t    spare-1     DEGRADED     0     0     0\n\
+\t      /dev/sdb  FAULTED      9    40     0\n\
+\t      /dev/sdk  ONLINE       0     0     0\n\
+\tspares\n\
+\t  /dev/sdk      INUSE     currently in use\n\
+\nerrors: No known data errors\n"
+            ))
+        };
+        let settled = status("resilvered 1T in 01:00:00 with 0 errors on Tue Sep  1 12:00:00 2026");
+        assert!(detach_allowed(&settled, "sdb"));
+        for other in ["sdk", "sda", "", "tank"] {
+            assert!(!detach_allowed(&settled, other), "{other}");
+        }
+        let running = status("resilver in progress since Tue Sep  1 09:00:00 2026\n\t1T scanned\n\t0B repaired, 40.00% done, 01:00:00 to go");
+        assert!(!detach_allowed(&running, "sdb"), "not while the spare resilvers");
+        assert_eq!(POOL_DETACH_NOT_ALLOWED, "refusal:pool_detach_not_allowed");
+    }
+
+    /// Critic wave 7, MAJOR 2: the fleet's 10 s poll asks for the light
+    /// answer. It never computes the capabilities (environment read + full
+    /// `zfs list`), and a second poll within `FLEET_SESSIONS_MAX_AGE` makes no
+    /// privileged NVMe-oF session read; the targets and the service rows are
+    /// still there. The Sharing tab's full answer does compute them.
+    #[tokio::test]
+    async fn the_fleet_summary_of_targets_skips_the_heavy_reads() {
+        let fixture = dispatch_fixture();
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let row = store::TargetRow {
+            target_id: "t-nvme".into(),
+            name: "scratch".into(),
+            protocol: "nvmet".into(),
+            wwn: "nqn.2026-09.local.tentaflow:helios:scratch".into(),
+            enabled: true,
+            state: "active".into(),
+            created_at: store::now(),
+            updated_at: store::now(),
+            ..Default::default()
+        };
+        store::upsert_target(&g.db, &g.org_id, &row).unwrap();
+        let caps = || CAPABILITY_READS.with(|n| n.get());
+        let sudo = || tentanas::targets::SESSION_READS.with(|n| n.get());
+
+        let (caps0, sudo0) = (caps(), sudo());
+        for _ in 0..2 {
+            let MessageBody::TentaNasBody(P::TargetsListResponse { targets, services, .. }) =
+                targets_list(&fixture.ctx, true).await.unwrap()
+            else {
+                panic!("a targets list")
+            };
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].name, "scratch");
+            assert_eq!(services.len(), 2, "the LIO and nvmet rows the services chip reads");
+        }
+        assert_eq!(caps() - caps0, 0, "the summary never computes capabilities");
+        assert!(sudo() - sudo0 <= 1, "at most one privileged session read for two polls, not one per poll");
+        let after_two = sudo();
+        targets_list(&fixture.ctx, true).await.unwrap();
+        assert_eq!(sudo(), after_two, "a poll within the window reads no sessions");
+
+        targets_list(&fixture.ctx, false).await.unwrap();
+        assert_eq!(caps() - caps0, 1, "the Sharing tab's full answer still computes them");
     }
 
     #[tokio::test]

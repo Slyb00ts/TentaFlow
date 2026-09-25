@@ -52,8 +52,14 @@ pub struct NasNodeInfo {
     pub disks_total: u32,
     pub disks_warning: u32,
     pub pools_total: u32,
+    /// The asking organisation's shared resources on the node: SMB/NFS shares
+    /// AND iSCSI/NVMe-oF targets, as the Sharing tab lists them (see
+    /// `per_org_counted` for when it is a real count).
     pub shares_total: u32,
     pub alerts_active: u32,
+    /// Usable bytes of the node's storage (pools' root datasets, used +
+    /// available, plus measured Elastic Arrays) — the unit of the node's own
+    /// capacity tile, never zpool's raw size.
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     pub updated_at: Option<String>,
@@ -95,6 +101,15 @@ pub struct NasNodeInfo {
     /// on a row from an older build.
     #[serde(default)]
     pub per_org_counted: bool,
+    /// Until when the node's interactive (mode B) channel holds the sudo
+    /// password, RFC 3339 UTC; `None` when it is not armed — or the node is in
+    /// another mode, or too old to say. `elevation_mode` alone cannot tell an
+    /// armed mode-B node from one whose password expired, and the fleet and
+    /// Environment screens have to (n16: "tryb B — nieuzbrojony" + "Uzbrój…").
+    /// A remote row carries the value of its last published summary; a reader
+    /// compares it with the clock, since a past instant means "not armed".
+    #[serde(default)]
+    pub armed_until: Option<String>,
 }
 
 // =============================================================================
@@ -151,6 +166,26 @@ pub struct NasEnvironment {
     pub features: Vec<FeatureState>,
     pub elevation: NasElevation,
     pub probed_at: String,
+    /// Each feature row's `detail` as codes, keyed by the row's `id`
+    /// (`environment::probe`): the screen words these and keeps `detail`, the
+    /// node's English, for the tooltip. Beside `features` rather than inside
+    /// `FeatureState`, because that struct is shared with TentaVM and its
+    /// shape is pinned for both apps (`features.rs`). A row with no entry has
+    /// nothing to say or comes from an older node. Codes:
+    /// 'feature_binaries_missing' {binaries}, 'feature_version_too_low'
+    /// {found, required}, 'feature_module_not_loaded' {module},
+    /// 'snapraid_killed' {signal?}, 'snapraid_probe_unconfirmed' {code},
+    /// 'snapraid_probe_failed' {error}, 'snapraid_vanished' {}; the RDMA row
+    /// 'rdma_no_device' {path}, 'rdma_devices' {devices}; the ksmbd row
+    /// 'ksmbd_no_interface' {}, 'ksmbd_exposed' {interfaces},
+    /// 'ksmbd_tools_missing' {tools, listener}, 'ksmbd_listener' {listener},
+    /// 'ksmbd_experimental' {}; both rows' module part 'module_loaded'
+    /// {module}, 'module_on_demand' {module}, 'module_absent' {module}; the
+    /// block rows `NasBlockCapabilities::iscsi_reasons`' codes plus
+    /// 'module_on_demand' / 'module_absent' {module} for ib_isert and
+    /// nvmet-rdma.
+    #[serde(default)]
+    pub feature_reasons: std::collections::BTreeMap<String, Vec<NasHealthReason>>,
 }
 
 /// One entry of the helper's compiled-in command catalog: everything the
@@ -777,6 +812,13 @@ pub struct NasVdevDisk {
     /// leaf by its position, never by the id.
     #[serde(default)]
     pub last_known_name: Option<String>,
+    /// This leaf is the ORIGINAL disk of a `spare-N` group — a hot spare took
+    /// its place and holds its data (the spare is ONLINE, no resilver runs) —
+    /// so `zpool detach` may take it out of the pool (`PoolDetachRequest`).
+    /// The node judges it from `zpool status`; false everywhere else and from
+    /// an older node.
+    #[serde(default)]
+    pub detachable: bool,
 }
 
 /// A top-level vdev of the pool. `kind` is the redundancy of the group
@@ -1740,7 +1782,22 @@ pub struct NasElasticFolder {
     /// them down on its first run whatever their age; 'only' means it never
     /// takes them down at all.
     pub cache_policy: String,
+    /// Allocated bytes of the folder over every data and cache disk, from the
+    /// node's last bounded walk (`elastic::FolderUsage`) — never measured on a
+    /// read. `None` exactly when `used_reasons` says why.
     pub used_bytes: Option<u64>,
+    /// When `used_bytes` was measured (RFC 3339), so the screen can say how
+    /// old the figure is. `None` with `used_bytes`.
+    #[serde(default)]
+    pub used_measured_at: Option<String>,
+    /// Why `used_bytes` is `None`, one code: 'folder_usage_pending' (not
+    /// measured yet), 'folder_usage_over_budget' {entries, minutes} (too many
+    /// files to count within the walk's bound), 'folder_usage_unreadable',
+    /// 'folder_usage_not_mounted', 'folder_usage_name_refused' (a name the
+    /// walk cannot take, e.g. a control character), 'folder_usage_failed' (the helper did not
+    /// answer the measurement). Empty when measured and from an older node.
+    #[serde(default)]
+    pub used_reasons: Vec<NasHealthReason>,
     /// The share serving this folder, empty when none does.
     pub share_id: String,
     pub share_label: String,
@@ -2214,8 +2271,13 @@ pub struct NasElasticCapabilities {
     /// filesystem picker offers what will work.
     pub filesystems: Vec<String>,
     /// Why a capability above is false, for the UI to show instead of hiding
-    /// the option.
+    /// the option. The node's English; a screen words `reasons`.
     pub detail: String,
+    /// `detail` as codes (`elastic::capabilities`): 'elastic_tool_unavailable'
+    /// {tool, status — the tool's Environment status}, 'elastic_tool_not_probed'
+    /// {tool}, 'elastic_no_mkfs' {}. Empty from an older node.
+    #[serde(default)]
+    pub reasons: Vec<NasHealthReason>,
 }
 
 /// Every TentaNas request/response. Ciborium tags variants by NAME, but the
@@ -2548,6 +2610,16 @@ pub enum TentaNasPayload {
         name: String,
         old: String,
         disk_id: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// `zpool detach` of the original disk a hot spare replaced
+    /// (`NasVdevDisk::detachable`). The node re-reads the pool and refuses
+    /// any other leaf (`refusal:pool_detach_not_allowed`). Answers with
+    /// `PoolGetResponse`.
+    PoolDetachRequest {
+        name: String,
+        device: String,
         #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
@@ -3054,7 +3126,15 @@ pub enum TentaNasPayload {
     },
 
     // ----- block targets: iSCSI and NVMe-oF (§5.5) -----
-    TargetsListRequest {},
+    /// `summary`: the fleet's 10 s poll (n01) — the targets and the service
+    /// rows only. The node then skips `capabilities` (a full `zfs list` and an
+    /// environment read, answered as its default) and reads NVMe-oF sessions
+    /// through the privileged channel at most every few minutes instead of on
+    /// every tick. The Sharing tab never sets it.
+    TargetsListRequest {
+        #[serde(default)]
+        summary: bool,
+    },
     TargetsListResponse {
         targets: Vec<NasTarget>,
         /// The LIO and nvmet rows of the service table, next to smbd/nfsd.
@@ -4312,7 +4392,10 @@ mod tests {
     fn the_block_target_wire_decodes_from_minimal_json() {
         let json = serde_json::json!({ "TargetsListRequest": {} });
         let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
-        assert_eq!(decoded, TentaNasPayload::TargetsListRequest {});
+        assert_eq!(decoded, TentaNasPayload::TargetsListRequest { summary: false });
+        let json = serde_json::json!({ "TargetsListRequest": { "summary": true } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(decoded, TentaNasPayload::TargetsListRequest { summary: true });
 
         let json = serde_json::json!({
             "TargetCreateRequest": {
@@ -4608,6 +4691,7 @@ mod tests {
                 snapraid_version: "12.3".to_string(),
                 filesystems: vec!["xfs".to_string(), "ext4".to_string()],
                 detail: String::new(),
+                reasons: vec![NasHealthReason { code: "elastic_no_mkfs".to_string(), params: Default::default() }],
             },
             free_disks: Vec::new(),
         });

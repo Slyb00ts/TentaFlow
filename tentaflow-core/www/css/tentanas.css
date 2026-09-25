@@ -338,10 +338,11 @@
    written as ONE patched string (dom-patch.js), and a tf-table takes its rows
    through a property the string cannot carry. */
 .nas-root .nas-folder-rows { display: flex; flex-direction: column; margin-top: 8px; }
-.nas-root .nas-folder-rows .fr { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--border); font-size: 12px; min-width: 0; }
+.nas-root .nas-folder-rows .fr { display: grid; grid-template-columns: minmax(0, 2fr) auto minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--border); font-size: 12px; min-width: 0; }
 .nas-root .nas-folder-rows .fr-head { border-top: 0; padding-top: 0; color: var(--text-3); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
 .nas-root .nas-folder-rows .fr-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
 .nas-root .nas-folder-rows .fr-sub { font-weight: 400; font-size: 11px; color: var(--text-3); overflow-wrap: anywhere; }
+.nas-root .nas-folder-rows .fr-used { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .nas-root .nas-folder-rows .fr-share { color: var(--text-2); overflow-wrap: anywhere; min-width: 0; }
 .nas-root .nas-folder-rows .fr-cache { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .nas-root .nas-folders .nas-folders-pinned { margin-top: 12px; }
@@ -534,4 +535,42 @@
   .nas-target-detail .stat-rows .sr { flex-direction: column; align-items: flex-start; gap: 4px; }
   .nas-target-detail .stat-rows .k { flex-basis: auto; }
   .nas-target-detail .stat-rows .v { justify-content: flex-start; text-align: left; }
+}
+
+/* n18c — the selected node stopped answering (tentanas/node-link.js). The card
+   is the shared connection overlay; this is only its TentaNas variant. The
+   screen behind it blurs (the mockup's `app-blurred`), and the platform
+   overlay (9999) stays above it: losing the daemon outranks losing a node. */
+.nas-root.nas-link-lost {
+  filter: blur(4px) saturate(0.7);
+  pointer-events: none;
+  transition: filter 0.3s ease;
+}
+/* Above every dialog (tf-modal backdrop 9990, card 9991; tf-window stacks
+   from 1000) so a confirm left open when the node went away cannot be
+   clicked under the card — node-link.js also makes those dialogs inert —
+   and below the platform overlay (9999). */
+.conn-overlay.nas-conn { z-index: 9995; }
+.nas-conn-keep {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm, 6px);
+  background: rgba(34, 197, 94, 0.06);
+  border: 1px solid rgba(34, 197, 94, 0.25);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+  text-align: left;
+}
+.nas-conn-keep .icon {
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  flex-shrink: 0;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  color: var(--success);
 }

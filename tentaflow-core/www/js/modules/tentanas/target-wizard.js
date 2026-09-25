@@ -40,7 +40,7 @@ import '/js/components/tf-checkbox.js';
 // `NasShareService::reasons`), and the English becomes the tooltip. An older
 // node sends only the sentence, shown as it came.
 const blockProtocolLabel = (protocol) => (protocol === 'nvmet' ? 'NVMe-oF' : protocol === 'iscsi' ? 'iSCSI' : String(protocol || ''));
-const KERNEL_SUPPORT_WORDS = new Map([
+export const KERNEL_SUPPORT_WORDS = new Map([
   ['protocol_unknown', (p) => (p.protocol ? T('wizard_target.kernel.protocol_unknown', { proto: p.protocol }) : null)],
   ['configfs_present', (p) => (p.path ? T('wizard_target.kernel.configfs_present', { path: p.path }) : null)],
   ['modules_available', (p) => (p.modules ? T('wizard_target.kernel.modules_available', { modules: p.modules }) : null)],

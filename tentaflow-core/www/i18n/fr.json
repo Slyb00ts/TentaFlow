@@ -5581,6 +5581,17 @@
       "folders_col_name": "Dossier",
       "folders_col_share": "Partage",
       "folders_col_cache": "Cache",
+      "folders_col_used": "Utilisation",
+      "folder_usage": {
+        "pending": "Pas encore mesuré — le nœud compte les dossiers en arrière-plan toutes les quelques heures.",
+        "over_budget": "Non mesuré : le dossier contient trop de fichiers pour être compté dans la limite de mesure ({entries} entrées, {minutes} min).",
+        "unreadable": "Non mesuré : une partie des fichiers du dossier n'a pas pu être lue sur le disque.",
+        "not_mounted": "Non mesuré : tous les disques de la grappe n'étaient pas montés.",
+        "failed": "Non mesuré : le nœud n'a pas pu effectuer la mesure des dossiers. Il réessaiera dans 30 min.",
+        "measured": "Mesuré {ago} ; le nœud actualise la mesure toutes les 6 h",
+        "unknown": "Non mesuré",
+        "name_refused": "Non mesuré : le nom du dossier contient des caractères que la mesure n’accepte pas (p. ex. un caractère de contrôle) — les autres dossiers sont mesurés."
+      },
       "folders_unknown": "La liste des dossiers de cette matrice n'a pas pu être lue. Non mesuré n'est pas la même chose qu'aucun dossier : vérifiez que l'union est montée.",
       "folders_unknown_partial": "La liste des dossiers n'a pas pu être lue ; seuls les dossiers dotés d'une politique enregistrée figurent ci-dessous. Non mesuré n'est pas la même chose qu'aucun dossier.",
       "folders_explain": "Les nouveaux fichiers arrivent toujours d'abord sur le cache : une politique de création mergerfs couvre l'union entière, aucun réglage mergerfs ne peut donc tenir un seul dossier à l'écart du cache. La politique du dossier décide à quelle vitesse — ou même si — ses fichiers descendent vers les disques de données.",
@@ -5811,6 +5822,11 @@
         "no_cache": "Aucun disque de cache : le mover n’a rien à faire, et les nouveaux fichiers sont écrits directement sur les disques de données.",
         "unhealthy_disks": "SMART signale un problème sur {disks} : un array créé sur un disque déjà défaillant démarre dégradé.",
         "mixed_sizes": "Les disques de données ont des tailles différentes, et chaque octet de chacun est utilisé : c’est à cela que sert ce type d’array."
+      },
+      "elastic_reason": {
+        "tool_unavailable": "{tool} : {status}",
+        "tool_not_probed": "{tool} : non vérifié (Environnement → Vérifier à nouveau)",
+        "no_mkfs": "ni mkfs.xfs ni mkfs.ext4 n’est installé — aucun disque de données ne peut être préparé"
       }
     },
     "pools": {
@@ -5971,7 +5987,10 @@
       "trim_resume_done": "TRIM du pool {name} repris",
       "trim_cancel_done": "TRIM du pool {name} annulé",
       "leaf_last_known": "disque absent (vu en dernier comme {name})",
-      "leaf_missing_at": "disque absent n° {n}"
+      "leaf_missing_at": "disque absent n° {n}",
+      "disk_detach": "Détacher l’ancien disque",
+      "disk_detach_confirm": "Le disque {device} sera détaché du pool {pool} (zpool detach). Le disque de secours qui reste dans le pool à sa place détient déjà ses données. Une fois détaché, {device} peut être retiré sans risque.",
+      "disk_detach_done": "Disque {device} détaché — il peut être retiré"
     },
     "props": {
       "title": "Propriétés du pool",
@@ -6062,7 +6081,7 @@
       "explain_pick": "Choisissez un disque de remplacement pour voir le plan.",
       "start": "Démarrer le remplacement",
       "resilver_progress": "resilver {pct}% · reste {eta}",
-      "done_detail_spare": "Resilver terminé — {new} a repris les données de {device}, mais {device} reste dans la configuration du pool tant qu’il n’est pas détaché (zpool detach). Cette version de TentaNas ne le fait pas encore : ne retirez pas le disque avant qu’il soit détaché."
+      "done_detail_spare": "Resilver terminé — {new} a repris les données du disque {device}, mais {device} reste dans la configuration du pool. Détachez-le avec l’action « Détacher l’ancien disque » à côté de lui dans la topologie du pool ; ce n’est qu’ensuite qu’il peut être retiré."
     },
     "elastic_import": {
       "title": "Importer un Elastic Array",
@@ -7065,7 +7084,9 @@
       "catalog_empty": "Le helper n'a signalé aucune commande",
       "short_helper": "mode A",
       "short_interactive": "mode B",
-      "short_unarmed": "non armé"
+      "short_unarmed": "non armé",
+      "mode_interactive_unarmed": "mode B — non armé",
+      "short_interactive_unarmed": "non armé (mode B)"
     },
     "env": {
       "failed": "Impossible de récupérer l'environnement : {error}",
@@ -7094,7 +7115,25 @@
       "arm_node": "Armer…",
       "arm_node_title": "Armer le canal de privilèges — {node} (mode B)",
       "armed_node": "Canal de {node} armé",
-      "armed_node_unnamed": "Canal du nœud sans nom armé"
+      "armed_node_unnamed": "Canal du nœud sans nom armé",
+      "detail": {
+        "feature_binaries_missing": "programme manquant : {binaries}",
+        "feature_version_too_low": "version {found} trouvée, {required} au minimum requise",
+        "feature_module_not_loaded": "le module noyau {module} n’est pas chargé",
+        "snapraid_killed": "SnapRAID est installé mais a été tué en lisant une configuration triviale — recompilez-le en -O2 ; d’ici là, la grappe n’est protégée qu’en apparence",
+        "snapraid_killed_signal": "SnapRAID est installé mais a été tué par le signal {signal} en lisant une configuration triviale — recompilez-le en -O2 ; d’ici là, la grappe n’est protégée qu’en apparence",
+        "snapraid_probe_unconfirmed": "la sonde SnapRAID s’est terminée avec le code {code} sans confirmer que le programme fonctionne",
+        "snapraid_probe_failed": "la sonde SnapRAID n’a pas pu être lancée (détails dans l’infobulle)",
+        "snapraid_vanished": "SnapRAID a disparu avant la vérification de son fonctionnement",
+        "rdma_no_device": "aucun périphérique RDMA sous {path}",
+        "ksmbd_no_interface": "aucune interface RDMA avec une adresse",
+        "ksmbd_exposed": "{interfaces} porte aussi la passerelle par défaut — SMB Direct exige un réseau de stockage dédié",
+        "ksmbd_tools_missing": "manquant : {tools} · l’écoute serait sur {listener}",
+        "ksmbd_experimental": "EXPÉRIMENTAL (selon la documentation du noyau)",
+        "module_loaded": "{module} chargé",
+        "module_on_demand": "{module} disponible, chargé à la première utilisation",
+        "module_absent": "{module} est absent de l’arborescence des modules de ce noyau"
+      }
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -7231,7 +7270,10 @@
       "chip_services_down_list": "Services arrêtés : {list}",
       "chip_services_unknown": "Services : aucune réponse de {nodes}",
       "chip_services_none": "Aucun service de partage",
-      "not_answered_hint": "Inconnu : la liste des partages de ce nœud n’a pas pu être lue (pas de réponse ou une erreur). Le nombre apparaîtra dès que le nœud répondra."
+      "not_answered_hint": "Inconnu : la liste des partages ou des cibles de ce nœud n’a pas pu être lue (pas de réponse ou une erreur). Le nombre apparaîtra dès que le nœud répondra.",
+      "target_any_client": "tout client du portail",
+      "target_initiators": "{n} {n|initiateur|initiateurs}",
+      "target_hosts": "{n} {n|NQN d’hôte|NQN d’hôtes}"
     },
     "node": {
       "head_sub_node": "nœud {name}",
@@ -7550,7 +7592,10 @@
         "import_secret_needed": "Le secret d’authentification doit être saisi à nouveau après une importation.",
         "import_all_interfaces": "Cette cible était exportée sur toutes les interfaces (0.0.0.0) — choisissez une interface de ce nœud avant de l’activer.",
         "portal_moved_head_no_address": "Le portail de la cible n’est plus là où il a été épinglé. L’adresse {address} appartenait à l’interface {interface}, présente sur ce nœud mais sans aucune adresse pour l’instant (lien coupé ou bail DHCP perdu)."
-      }
+      },
+      "host_state": "État",
+      "host_connected": "Connecté",
+      "host_not_connected": "Non connecté"
     },
     "wizard_target": {
       "title": "Nouvelle cible",
@@ -7696,7 +7741,33 @@
       "elastic_add_stopped": "L’ajout du disque s’est arrêté avant la fin — terminez-le ou annulez-le sur l’écran de la grappe",
       "elastic_undo_stopped": "L’annulation de l’ajout s’est arrêtée après sa première étape — l’ajout reste inachevé",
       "elastic_disk_absent": "Le disque qui serait effacé n’est pas présent sur ce nœud — rebranchez-le et réessayez",
-      "job_not_cancellable": "Cette tâche ne peut pas être annulée — l’arrêter n’arrêterait pas le travail déjà commencé"
+      "job_not_cancellable": "Cette tâche ne peut pas être annulée — l’arrêter n’arrêterait pas le travail déjà commencé",
+      "pool_detach_not_allowed": "Ce disque ne peut pas être détaché maintenant : seul un disque remplacé par un disque de secours sain peut être détaché, et seulement une fois le resilver terminé."
+    },
+    "unreachable": {
+      "title": "Nœud {node} injoignable",
+      "title_unnamed": "Nœud sans nom injoignable",
+      "heading": "Connexion mesh perdue",
+      "desc": "Les opérations sur le nœud {node} sont suspendues jusqu’au retour de la connexion. Les services NAS du nœud lui-même continuent de fonctionner, indépendamment du tableau de bord.",
+      "desc_unnamed": "Les opérations sur ce nœud sont suspendues jusqu’au retour de la connexion. Les services NAS du nœud lui-même continuent de fonctionner, indépendamment du tableau de bord.",
+      "keep": "Les partages, cibles et planifications sur {node} continuent de fonctionner — seul le tableau de bord a perdu sa connexion au nœud.",
+      "keep_unnamed": "Les partages, cibles et planifications sur ce nœud continuent de fonctionner — seul le tableau de bord a perdu sa connexion au nœud.",
+      "retry_line": "Reconnexion au nœud",
+      "retry_attempt": "tentative {attempt} · délai jusqu’à {max} s",
+      "btn_fleet": "Vue de la flotte",
+      "btn_refresh": "Actualiser",
+      "btn_retry": "Se connecter maintenant",
+      "log_manual": "tentative de connexion forcée",
+      "log_no_answer": "pas de réponse de {node} (tentative {attempt})",
+      "log_no_answer_unnamed": "pas de réponse du nœud (tentative {attempt})",
+      "log_restored": "connexion rétablie",
+      "log_mesh_connected": "le mesh voit {node} comme connecté, mais le nœud ne répond pas",
+      "log_mesh_connected_unnamed": "le mesh voit le nœud comme connecté, mais il ne répond pas",
+      "log_mesh_offline": "le mesh ne voit pas {node} — le nœud est déconnecté",
+      "log_mesh_offline_unnamed": "le mesh ne voit pas ce nœud — il est déconnecté",
+      "log_lost": "{node} ne répond plus",
+      "log_lost_unnamed": "le nœud ne répond plus",
+      "error": "Le nœud ne répond pas — la connexion mesh est perdue"
     }
   },
   "agent_accounts": {

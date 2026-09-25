@@ -930,8 +930,8 @@ test('a missing leaf is named, not printed by its id, in the clear toast and the
 });
 
 // Owner decision (wave 5, d): a replace onto a hot spare leaves the old leaf
-// in the pool's spare group until `zpool detach`, which this version does not
-// run — the result must not say the disk "can be pulled". A replace onto a
+// in the pool's spare group until `zpool detach` — the result must not say the
+// disk "can be pulled"; since wave 7 it points to "Odłącz stary dysk". A replace onto a
 // free disk detaches the old leaf itself, and there it can.
 test('the replace result says a disk can be pulled only when the old leaf really left the pool', async () => {
   const done = async (useSpare) => {
@@ -954,7 +954,42 @@ test('the replace result says a disk can be pulled only when the old leaf really
     return text;
   };
   const spare = await done(true);
-  assert.match(spare, /pozostaje w konfiguracji puli, dopóki nie zostanie odłączony/);
+  // Wave 7 (helper 0.15.0): the text sends the admin to the detach action.
+  assert.match(spare, /pozostaje w konfiguracji puli\. Odłącz go akcją „Odłącz stary dysk”/);
   assert.doesNotMatch(spare, /można bezpiecznie wyjąć/);
   assert.match(await done(false), /można bezpiecznie wyjąć/);
+});
+
+// Owner decision (wave 7): the disk a hot spare replaced gets "Odłącz stary
+// dysk" — only where the node marked it `detachable` — with a confirm that
+// names it as its cell does, and a PoolDetachRequest naming the leaf.
+test('only the leaf the node marks detachable offers "Odłącz stary dysk", confirmed by its name', async () => {
+  const { TfWindow } = await import('/js/components/tf-window.js');
+  const pool = { ...poolGet.pool, vdevs: [{ id: 'raidz1-0', role: 'data', kind: 'raidz1', state: 'degraded', faultTolerance: 1,
+    disks: [disk('sda'), disk('sdb', { state: 'faulted', detachable: true }), disk('sdk'), disk('sdc')] }] };
+  const screen = makeScreen({ tentaNasPoolGetRequest: { ...poolGet, pool }, tentaNasPoolDetachRequest: { ...poolGet, pool } });
+  const confirm = TfWindow.confirm;
+  const asked = [];
+  TfWindow.confirm = async (opts) => { asked.push(opts); return true; };
+  try {
+    const body = document.createElement('div');
+    document.body.appendChild(body);
+    await drawPoolDetail(screen, body);
+    await flush();
+    const offered = [...body.querySelectorAll('[data-act="detach"]')].map((b) => b.closest('.disk-cell').dataset.device);
+    assert.deepEqual(offered, ['sdb'], 'the spare and the healthy disks offer nothing');
+    assert.equal(body.querySelector('[data-act="detach"]').getAttribute('title'), 'Odłącz stary dysk');
+    click(body.querySelector('[data-act="detach"]'));
+    for (let i = 0; i < 4; i += 1) await flush();
+    assert.equal(asked.length, 1);
+    assert.match(asked[0].message, /^Dysk sdb zostanie odłączony od puli tank \(zpool detach\)/);
+    assert.equal(asked[0].danger, true);
+    const sent = screen.calls.filter((c) => c.kind === 'tentaNasPoolDetachRequest');
+    assert.equal(sent.length, 1);
+    assert.deepEqual([sent[0].payload.name, sent[0].payload.device], ['tank', 'sdb']);
+    body.remove();
+  } finally {
+    TfWindow.confirm = confirm;
+    screen.dispose();
+  }
 });

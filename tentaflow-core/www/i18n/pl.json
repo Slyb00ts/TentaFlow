@@ -6995,7 +6995,9 @@
       "catalog_empty": "Helper nie zgłosił żadnych poleceń",
       "short_helper": "tryb A",
       "short_interactive": "tryb B",
-      "short_unarmed": "nieuzbrojony"
+      "short_unarmed": "nieuzbrojony",
+      "mode_interactive_unarmed": "tryb B — nieuzbrojony",
+      "short_interactive_unarmed": "nieuzbrojony (tryb B)"
     },
     "env": {
       "failed": "Nie udało się pobrać środowiska: {error}",
@@ -7024,7 +7026,25 @@
       "arm_node": "Uzbrój…",
       "arm_node_title": "Uzbrój kanał uprawnień — {node} (tryb B)",
       "armed_node": "Kanał na nodzie {node} uzbrojony",
-      "armed_node_unnamed": "Kanał na nodzie bez nazwy uzbrojony"
+      "armed_node_unnamed": "Kanał na nodzie bez nazwy uzbrojony",
+      "detail": {
+        "feature_binaries_missing": "brak programu: {binaries}",
+        "feature_version_too_low": "wykryto {found}, wymagane co najmniej {required}",
+        "feature_module_not_loaded": "moduł jądra {module} nie jest załadowany",
+        "snapraid_killed": "SnapRAID jest zainstalowany, ale został zabity przy czytaniu prostej konfiguracji — przebuduj go z -O2; do tego czasu macierz tylko wygląda na chronioną",
+        "snapraid_killed_signal": "SnapRAID jest zainstalowany, ale został zabity sygnałem {signal} przy czytaniu prostej konfiguracji — przebuduj go z -O2; do tego czasu macierz tylko wygląda na chronioną",
+        "snapraid_probe_unconfirmed": "sonda SnapRAID zakończyła się kodem {code} bez potwierdzenia, że program działa",
+        "snapraid_probe_failed": "nie udało się uruchomić sondy SnapRAID (szczegóły w podpowiedzi)",
+        "snapraid_vanished": "SnapRAID zniknął przed sprawdzeniem działania",
+        "rdma_no_device": "brak urządzenia RDMA w {path}",
+        "ksmbd_no_interface": "brak interfejsu RDMA z adresem",
+        "ksmbd_exposed": "{interfaces} ma też bramę domyślną — SMB Direct wymaga osobnej sieci storage",
+        "ksmbd_tools_missing": "brak: {tools} · nasłuch byłby na {listener}",
+        "ksmbd_experimental": "EKSPERYMENTALNE (wg dokumentacji jądra)",
+        "module_loaded": "{module} załadowany",
+        "module_on_demand": "{module} dostępny, ładowany przy pierwszym użyciu",
+        "module_absent": "modułu {module} nie ma w drzewie modułów jądra"
+      }
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -7391,6 +7411,17 @@
       "folders_col_name": "Folder",
       "folders_col_share": "Udział",
       "folders_col_cache": "Cache",
+      "folders_col_used": "Użycie",
+      "folder_usage": {
+        "pending": "Jeszcze nie zmierzono — węzeł liczy foldery w tle co kilka godzin.",
+        "over_budget": "Nie zmierzono: folder ma za dużo plików, by policzyć go w limicie pomiaru ({entries} wpisów, {minutes} min).",
+        "unreadable": "Nie zmierzono: części plików folderu nie dało się odczytać z dysku.",
+        "not_mounted": "Nie zmierzono: nie wszystkie dyski macierzy były zamontowane.",
+        "failed": "Nie zmierzono: węzeł nie wykonał pomiaru folderów. Spróbuje ponownie za 30 min.",
+        "measured": "Zmierzono {ago}; węzeł odświeża pomiar co 6 h",
+        "unknown": "Nie zmierzono",
+        "name_refused": "Nie zmierzono: nazwa folderu zawiera znaki, których pomiar nie przyjmuje (np. znak sterujący) — pozostałe foldery są mierzone."
+      },
       "folders_unknown": "Nie można odczytać listy folderów tej macierzy. Nie zmierzono ≠ brak folderów — sprawdź, czy unia jest zamontowana.",
       "folders_unknown_partial": "Listy folderów nie udało się odczytać, więc poniżej są tylko te z zapisaną polityką. Nie zmierzono ≠ brak folderów.",
       "folders_explain": "Nowe pliki zawsze trafiają najpierw na cache: polityka tworzenia mergerfs obowiązuje całą unię, więc żadne jej ustawienie nie utrzyma jednego folderu poza cache. Polityka folderu decyduje, jak szybko — albo czy w ogóle — pliki z niego zjeżdżają na dyski danych.",
@@ -7621,6 +7652,11 @@
         "no_cache": "Bez dysku cache: mover nie ma nic do roboty, a nowe pliki trafiają od razu na dyski danych.",
         "unhealthy_disks": "SMART ostrzega o dyskach {disks}: macierz zbudowana na dysku, który już się psuje, startuje zdegradowana.",
         "mixed_sizes": "Dyski danych mają różne rozmiary i każdy bajt każdego z nich jest wykorzystany — do tego służy ten rodzaj macierzy."
+      },
+      "elastic_reason": {
+        "tool_unavailable": "{tool}: {status}",
+        "tool_not_probed": "{tool}: nie sprawdzono (Środowisko → Sprawdź ponownie)",
+        "no_mkfs": "brak mkfs.xfs i mkfs.ext4 — nie da się przygotować dysku danych"
       }
     },
     "pools": {
@@ -7781,7 +7817,10 @@
       "trim_resume_done": "TRIM puli {name} wznowiony",
       "trim_cancel_done": "TRIM puli {name} przerwany",
       "leaf_last_known": "brak dysku (ostatnio {name})",
-      "leaf_missing_at": "brak dysku nr {n}"
+      "leaf_missing_at": "brak dysku nr {n}",
+      "disk_detach": "Odłącz stary dysk",
+      "disk_detach_confirm": "Dysk {device} zostanie odłączony od puli {pool} (zpool detach). Jego dane przejął już dysk zapasowy, który zostaje w puli na jego miejscu. Po odłączeniu {device} można bezpiecznie wyjąć.",
+      "disk_detach_done": "Dysk {device} odłączony — można go wyjąć"
     },
     "props": {
       "title": "Właściwości puli",
@@ -7872,7 +7911,7 @@
       "explain_pick": "Wybierz dysk zastępczy, aby zobaczyć plan wymiany.",
       "start": "Rozpocznij wymianę",
       "resilver_progress": "resilver {pct}% · pozostało {eta}",
-      "done_detail_spare": "Resilver zakończony — {new} przejął dane dysku {device}, ale {device} pozostaje w konfiguracji puli, dopóki nie zostanie odłączony (zpool detach). Ta wersja TentaNas jeszcze tego nie robi: nie wyjmuj dysku przed odłączeniem."
+      "done_detail_spare": "Resilver zakończony — {new} przejął dane dysku {device}, ale {device} pozostaje w konfiguracji puli. Odłącz go akcją „Odłącz stary dysk” przy nim w topologii puli; dopiero potem można go wyjąć."
     },
     "elastic_import": {
       "title": "Importuj macierz Elastic",
@@ -8498,7 +8537,10 @@
       "chip_services_down_list": "Usługi nieaktywne: {list}",
       "chip_services_unknown": "Usługi: brak odpowiedzi z {nodes}",
       "chip_services_none": "Brak usług udostępniania",
-      "not_answered_hint": "Nieznane: nie udało się odczytać listy udziałów tego node'a (brak odpowiedzi albo błąd). Liczba pojawi się, gdy node odpowie."
+      "not_answered_hint": "Nieznane: nie udało się odczytać listy udziałów lub targetów tego node'a (brak odpowiedzi albo błąd). Liczba pojawi się, gdy node odpowie.",
+      "target_any_client": "każdy klient portalu",
+      "target_initiators": "{n} {n|initiator|initiatory|initiatorów}",
+      "target_hosts": "{n} {n|host NQN|hosty NQN|hostów NQN}"
     },
     "node": {
       "head_sub_node": "node {name}",
@@ -8817,7 +8859,10 @@
         "import_secret_needed": "Po imporcie trzeba ponownie wpisać sekret uwierzytelniania.",
         "import_all_interfaces": "Ten target był eksportowany na wszystkich interfejsach (0.0.0.0) — wybierz interfejs tego węzła, zanim go włączysz.",
         "portal_moved_head_no_address": "Portal targetu nie jest już tam, gdzie go przypięto. Adres {address} należał do interfejsu {interface}, który jest na tym węźle, ale nie ma teraz żadnego adresu (łącze wyłączone albo utracona dzierżawa DHCP)."
-      }
+      },
+      "host_state": "Stan",
+      "host_connected": "Połączony",
+      "host_not_connected": "Niepołączony"
     },
     "wizard_target": {
       "title": "Nowy target",
@@ -8963,7 +9008,33 @@
       "elastic_add_stopped": "Dodawanie dysku zatrzymało się przed końcem — dokończ je albo wycofaj na ekranie macierzy",
       "elastic_undo_stopped": "Wycofanie dodawania zatrzymało się po pierwszym kroku — dodawanie pozostaje niedokończone",
       "elastic_disk_absent": "Dysku, który miałby zostać wyczyszczony, nie ma na tym nodzie — podłącz go i spróbuj ponownie",
-      "job_not_cancellable": "Tego zadania nie można anulować — przerwanie nie zatrzymałoby już rozpoczętej pracy"
+      "job_not_cancellable": "Tego zadania nie można anulować — przerwanie nie zatrzymałoby już rozpoczętej pracy",
+      "pool_detach_not_allowed": "Tego dysku nie można teraz odłączyć: odłączyć można tylko dysk zastąpiony dyskiem zapasowym, który jest sprawny, i dopiero po zakończeniu resilvera."
+    },
+    "unreachable": {
+      "title": "Węzeł {node} niedostępny",
+      "title_unnamed": "Węzeł bez nazwy niedostępny",
+      "heading": "Utracono połączenie przez mesh",
+      "desc": "Operacje na węźle {node} są wstrzymane do czasu odzyskania łączności. Usługi NAS na samym węźle działają dalej niezależnie od dashboardu.",
+      "desc_unnamed": "Operacje na tym węźle są wstrzymane do czasu odzyskania łączności. Usługi NAS na samym węźle działają dalej niezależnie od dashboardu.",
+      "keep": "Share'y, targety i harmonogramy na {node} pracują dalej — to tylko utrata łączności dashboardu z węzłem.",
+      "keep_unnamed": "Share'y, targety i harmonogramy na tym węźle pracują dalej — to tylko utrata łączności dashboardu z węzłem.",
+      "retry_line": "Ponawiam połączenie z węzłem",
+      "retry_attempt": "próba {attempt} · backoff do {max} s",
+      "btn_fleet": "Przegląd floty",
+      "btn_refresh": "Odśwież",
+      "btn_retry": "Połącz teraz",
+      "log_manual": "wymuszona próba połączenia",
+      "log_no_answer": "brak odpowiedzi z {node} (próba {attempt})",
+      "log_no_answer_unnamed": "brak odpowiedzi z węzła (próba {attempt})",
+      "log_restored": "połączenie wróciło",
+      "log_mesh_connected": "mesh widzi {node} jako połączony, ale węzeł nie odpowiada",
+      "log_mesh_connected_unnamed": "mesh widzi węzeł jako połączony, ale węzeł nie odpowiada",
+      "log_mesh_offline": "mesh nie widzi {node} — węzeł jest rozłączony",
+      "log_mesh_offline_unnamed": "mesh nie widzi tego węzła — jest rozłączony",
+      "log_lost": "{node} przestał odpowiadać",
+      "log_lost_unnamed": "węzeł przestał odpowiadać",
+      "error": "Węzeł nie odpowiada — utracono połączenie przez mesh"
     }
   },
   "agent_accounts": {

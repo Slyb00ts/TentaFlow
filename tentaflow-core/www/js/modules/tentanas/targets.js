@@ -389,6 +389,27 @@ export const sessionLine = (s) => (s.client && s.user && s.user !== s.client
   : escapeHtml(s.client || s.user || '—'));
 
 /**
+ * The allowlist's "Stan" cell (n19, MAJOR 27 front slice): whether this
+ * IQN/NQN has a session right now, read from the session list the node
+ * already returns — the identity each session logged in with.
+ * Where the node could not measure sessions (`sessionsKnown` is not true:
+ * NVMe-oF without the channel or debugfs) the cell is a dash with the reason
+ * the sessions card gives, never a confident "niepołączony".
+ */
+export function hostConnectionHtml(t, sessions, identity) {
+  if (t?.sessionsKnown !== true) {
+    return `<span class="text-3" title="${escapeAttr(sessionsEmptyText(t))}">—</span>`;
+  }
+  const id = String(identity || '').toLowerCase();
+  // `user` is the identity (NVMe-oF: `client` is the address); an iSCSI
+  // session carries the IQN in both.
+  const on = (sessions || []).some((s) => String(s.user || s.client || '').toLowerCase() === id);
+  return on
+    ? `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('targets.host_connected'))}"></tf-chip>`
+    : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('targets.host_not_connected'))}"></tf-chip>`;
+}
+
+/**
  * One IQN/NQN per line; blanks and duplicates fall away.
  *
  * Delegates to the wizard's parser rather than repeating it: the two used to
@@ -529,6 +550,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     if (!t || !hostsTable) return;
     setRowsIfChanged(hostsTable, parseInitiators(state.initiatorsText).map((identity) => ({
       identity,
+      connected: hostConnectionHtml(t, state.sessions, identity),
       auth: authChipHtml(t.auth),
       shared: state.capabilities ? state.siblings.filter((other) => other.targetId !== t.targetId && other.protocol === t.protocol && (other.initiators || []).includes(identity)).map((other) => other.name).join(', ') || '—' : T('targets.portal_unknown'),
     })));
@@ -819,7 +841,7 @@ function targetDetailHtml(admin) {
     </section>
     <section class="nas-target-card">
     <div class="section-card-head"><h3 class="title">${sprite('shield')} ${escapeHtml(T('targets.initiators'))}</h3></div>
-    <tf-table id="nas-td-hosts" empty-message="${escapeAttr(T('targets.no_initiators'))}"><tf-column key="identity" label="IQN / NQN" fill></tf-column><tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html"></tf-column><tf-column key="shared" label="${escapeAttr(T('targets.host_shared'))}"></tf-column></tf-table>
+    <tf-table id="nas-td-hosts" empty-message="${escapeAttr(T('targets.no_initiators'))}"><tf-column key="identity" label="IQN / NQN" fill></tf-column><tf-column key="connected" label="${escapeAttr(T('targets.host_state'))}" renderer="html"></tf-column><tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html"></tf-column><tf-column key="shared" label="${escapeAttr(T('targets.host_shared'))}"></tf-column></tf-table>
     ${admin ? `<details><summary>${escapeHtml(T('targets.edit_initiators'))}</summary>
       <tf-input id="nas-td-initiators" multiline rows="3" spellcheck="false" hint="${escapeAttr(T('targets.initiators_hint'))}"></tf-input>
       </details><p class="muted" data-testid="initiators-draft-hint">${escapeHtml(T('targets.initiators_draft'))}</p>` : ''}

@@ -228,6 +228,7 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::ZpoolAttach { .. }
         | HelperCommand::ZpoolRemove { .. }
         | HelperCommand::ZpoolReplace { .. }
+        | HelperCommand::ZpoolDetach { .. }
         | HelperCommand::ZpoolOffline { .. }
         | HelperCommand::ZpoolOnline { .. }
         | HelperCommand::ZpoolClear { .. }
@@ -277,6 +278,7 @@ fn command_label(command: &HelperCommand) -> &'static str {
         HelperCommand::NvmetSessionsRead {} => "the NVMe-oF controller list",
         HelperCommand::ElasticCreate { .. } | HelperCommand::ElasticRestore { .. }
         | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticCacheAge { .. }
+        | HelperCommand::ElasticFolderUsage { .. }
         | HelperCommand::ElasticClaims { .. }
         | HelperCommand::ElasticJournals {} | HelperCommand::ElasticAdopt { .. }
         | HelperCommand::ElasticSync { .. } | HelperCommand::ElasticScrub { .. }

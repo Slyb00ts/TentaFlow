@@ -1004,6 +1004,109 @@ fn members_text(members: &[ArrayMember]) -> String {
         .join(", ")
 }
 
+/// Where every array's branch directories live (`<root><array>/<role>/<slot>`).
+const BRANCH_ROOT: &str = tentanas_helper::elastic::BRANCH_ROOT;
+
+/// How a sentence names one member instead of its branch directory: "data
+/// disk sdb", or "data disk no. 2" for a member no source can name
+/// (`member_shown_name`'s "#2").
+fn branch_member_label(role: &str, name: &str) -> String {
+    match name.strip_prefix('#') {
+        Some(number) => format!("{role} disk no. {number}"),
+        None => format!("{role} disk {name}"),
+    }
+}
+
+/// Every branch directory of the node's arrays with the member it belongs to,
+/// so a sentence a helper or an operation wrote with a branch PATH in it
+/// (`rename failed: /mnt/tentanas-branches/media/data/d1/film.mkv`) can name
+/// the disk instead of its slot (R2-3). The slot (`d1`, `c1`, `parity/1`) is
+/// a directory name nobody has ever seen on a shelf, and the owner's rule is
+/// that the GUI names a disk by its name, tooltips included.
+///
+/// Built once per response from the node's own array rows; the names follow
+/// `member_shown_name` exactly as the state sentences do (the live
+/// inventory's kernel name, else the member's number).
+pub struct BranchNames {
+    /// (mountpoint, label), longest mountpoint first.
+    members: Vec<(String, String)>,
+}
+
+impl BranchNames {
+    pub fn load(db: &DbPool) -> Self {
+        Self::of(&store::elastic_arrays_all(db).unwrap_or_default())
+    }
+
+    pub fn of(arrays: &[ElasticArrayRow]) -> Self {
+        let observed = ArrayObservation::default();
+        Self::from_members(arrays.iter().flat_map(|a| mountpoints_of(a, &observed)))
+    }
+
+    /// One array, named by what this read observed as well: the kernel name
+    /// a member's mount was found under comes first, as in its state sentence.
+    pub fn for_array(array: &ElasticArrayRow, observed: &ArrayObservation) -> Self {
+        Self::from_members(mountpoints_of(array, observed))
+    }
+
+    fn from_members(members: impl IntoIterator<Item = ArrayMember>) -> Self {
+        let mut members: Vec<(String, String)> = members
+            .into_iter()
+            .map(|m| (m.mountpoint, branch_member_label(m.role, &m.name)))
+            .collect();
+        members.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        Self { members }
+    }
+
+    /// `text` with every branch path's directory part replaced by the
+    /// member's label: `…/media/data/d1/film.mkv` → `data disk sdb:/film.mkv`,
+    /// a bare `…/media/data/d1` → `data disk sdb`. A branch path of an array
+    /// or member this node has no row for keeps no slot either: it reads
+    /// "a data disk of media".
+    pub fn name(&self, text: &str) -> String {
+        if !text.contains(BRANCH_ROOT) {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find(BRANCH_ROOT) {
+            out.push_str(&rest[..at]);
+            let tail = &rest[at..];
+            let known = self.members.iter().find(|(path, _)| {
+                tail.starts_with(path.as_str()) && !tail[path.len()..].starts_with(|c: char| c.is_ascii_alphanumeric())
+            });
+            let (label, used) = match known {
+                Some((path, label)) => (label.clone(), path.len()),
+                None => unknown_branch(tail),
+            };
+            out.push_str(&label);
+            rest = &tail[used..];
+            if rest.starts_with('/') {
+                out.push(':');
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+}
+
+/// A branch path no array row explains: `<root><array>/<role>/<slot>` becomes
+/// "a <role> disk of <array>"; anything shorter is the branch root of an
+/// array, said as "the branches of <array>". Returns the words and how many
+/// bytes of `tail` they replace.
+fn unknown_branch(tail: &str) -> (String, usize) {
+    let body = &tail[BRANCH_ROOT.len()..];
+    let end = body.find(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | ',' | ';' | ')')).unwrap_or(body.len());
+    let parts: Vec<&str> = body[..end].splitn(4, '/').collect();
+    let array = parts.first().copied().unwrap_or_default();
+    match parts.as_slice() {
+        [_, role @ ("data" | "cache" | "parity"), slot, ..] if !slot.is_empty() => {
+            let used = BRANCH_ROOT.len() + array.len() + 1 + role.len() + 1 + slot.len();
+            (format!("a {role} disk of {array}"), used)
+        }
+        _ => (format!("the branches of {array}"), BRANCH_ROOT.len() + array.len()),
+    }
+}
+
 /// The same members as parameters of a state code: one key per role
 /// ('data', 'cache', 'parity'), the names comma-separated, a role with no
 /// member left out. The screen words each role and joins them.
@@ -1758,6 +1861,325 @@ impl MoverClock {
 }
 
 // =============================================================================
+// Folder usage (n11 "Foldery", column "Użycie")
+// =============================================================================
+
+/// How often an array's folders are measured.
+///
+/// A folder's bytes are known only by a WALK of every data and cache branch
+/// (XFS/ext4 keep no per-directory total), and the walk is not free: measured
+/// (2026-09-25, XFS on NVMe) at 0.9-1.6 µs per entry warm, i.e. ~0.5 s per
+/// 300 000 files, while a cold walk of HDD branches costs a seek per
+/// directory and per inode cluster — minutes for a large library, and every
+/// sleeping data disk spun up. Six hours keeps the figure within one working
+/// day of the truth without waking an idle array's disks more than four
+/// times a day. A mover run does not make it stale: it moves a folder's
+/// bytes between that folder's branches, and the sum is over all of them.
+pub const FOLDER_USAGE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// How soon a folder the last measurement did not know (created since), or a
+/// measurement that failed, is measured again.
+pub const FOLDER_USAGE_RETRY: Duration = Duration::from_secs(30 * 60);
+
+/// The core's wait for one measurement: the helper's own deadline plus the
+/// time to enter the namespace and answer.
+const FOLDER_USAGE_TIMEOUT: Duration =
+    Duration::from_secs(tentanas_helper::elastic::USAGE_DEADLINE_SECS + 120);
+
+/// One folder's figure from a measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderFigure {
+    Bytes(u64),
+    Gap(tentanas_helper::elastic::ElasticFolderGap),
+    /// A folder whose NAME the helper's walk refuses (a control character,
+    /// over 255 bytes — an NFS client can create one). It is left out of the
+    /// request so it cannot take the other folders' figures down with it.
+    NameRefused,
+}
+
+/// What the node last measured of one array's folders.
+#[derive(Debug, Clone, Default)]
+struct FolderUsageReading {
+    /// The last SUCCESSFUL measurement: when (process clock, and RFC 3339 for
+    /// the wire) and each folder's figure. A later failure keeps it — an old
+    /// figure with its date is truer than none.
+    measured: Option<(Instant, String, BTreeMap<String, FolderFigure>)>,
+    /// When the last attempt failed, and it failed after `measured`.
+    failed_at: Option<Instant>,
+}
+
+/// The per-array folder measurements of this process, keyed by array id (a
+/// name can be reused by a new array; its id cannot).
+///
+/// Held in memory, like `MoverClock`: a restart measures again on the first
+/// pass, which costs one walk. A READ NEVER MEASURES — `fill_folder_usage`
+/// only copies what is here onto the wire, and only the scheduler's pass
+/// (`run_folder_usage_pass`) walks, at most once per `FOLDER_USAGE_EVERY`.
+#[derive(Debug, Default)]
+pub struct FolderUsageCache {
+    readings: Mutex<BTreeMap<String, FolderUsageReading>>,
+    /// One pass at a time: a pass can outlive the tick that started it.
+    running: std::sync::atomic::AtomicBool,
+}
+
+impl FolderUsageCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn global() -> &'static Self {
+        static CACHE: OnceLock<FolderUsageCache> = OnceLock::new();
+        CACHE.get_or_init(FolderUsageCache::new)
+    }
+
+    /// Whether `folders` of this array should be measured now: never measured,
+    /// the last measurement older than `every`, or a folder it did not cover
+    /// (or its own failure) older than `retry`. A poisoned lock answers
+    /// `false` — an unknown cache must not turn the pacing off.
+    pub fn due(&self, array_id: &str, folders: &BTreeSet<String>, every: Duration, retry: Duration) -> bool {
+        let Ok(readings) = self.readings.lock() else { return false };
+        let Some(reading) = readings.get(array_id) else { return true };
+        if reading.failed_at.is_some_and(|at| at.elapsed() < retry) {
+            return false;
+        }
+        match &reading.measured {
+            None => true,
+            Some((at, _, figures)) => {
+                at.elapsed() >= every
+                    || (at.elapsed() >= retry && folders.iter().any(|f| !figures.contains_key(f)))
+                    || reading.failed_at.is_some()
+            }
+        }
+    }
+
+    fn record(&self, array_id: &str, outcome: Result<BTreeMap<String, FolderFigure>, ()>) {
+        let Ok(mut readings) = self.readings.lock() else { return };
+        let reading = readings.entry(array_id.to_string()).or_default();
+        match outcome {
+            Ok(figures) => {
+                // A branch that was not mounted is a passing state (a
+                // Restore, a disk being replaced), not a measurement: the
+                // folders it covered are measured again after
+                // `FOLDER_USAGE_RETRY`, not after six hours (MINOR 5).
+                let unmounted = figures
+                    .values()
+                    .any(|f| *f == FolderFigure::Gap(tentanas_helper::elastic::ElasticFolderGap::NotMounted));
+                reading.measured = Some((Instant::now(), super::db::now(), figures));
+                reading.failed_at = unmounted.then(Instant::now);
+            }
+            Err(()) => reading.failed_at = Some(Instant::now()),
+        }
+    }
+
+    /// Moves a measurement back in time so a test can reach the next one.
+    #[cfg(test)]
+    pub(crate) fn age_for_test(&self, array_id: &str, by: Duration) {
+        let mut readings = self.readings.lock().expect("folder usage cache");
+        let reading = readings.get_mut(array_id).expect("a reading to age");
+        if let Some((at, _, _)) = reading.measured.as_mut() {
+            *at -= by;
+        }
+        if let Some(at) = reading.failed_at.as_mut() {
+            *at -= by;
+        }
+    }
+}
+
+/// One folder's usage as the wire carries it: (bytes, measured at, reasons).
+fn folder_usage_wire(
+    cache: &FolderUsageCache,
+    array_id: Option<&str>,
+    folder: &str,
+) -> (Option<u64>, Option<String>, Vec<NasHealthReason>) {
+    let pending = || vec![super::disks::coded_reason("folder_usage_pending", &[])];
+    let readings = match cache.readings.lock() {
+        Ok(readings) => readings,
+        Err(_) => return (None, None, pending()),
+    };
+    let reading = array_id.and_then(|id| readings.get(id));
+    let measured = reading.and_then(|r| r.measured.as_ref());
+    match measured.and_then(|(_, at, figures)| figures.get(folder).map(|f| (at, f))) {
+        Some((at, FolderFigure::Bytes(bytes))) => (Some(*bytes), Some(at.clone()), Vec::new()),
+        Some((_, FolderFigure::Gap(gap))) => {
+            use tentanas_helper::elastic::ElasticFolderGap as G;
+            let reason = match gap {
+                G::OverBudget => super::disks::coded_reason(
+                    "folder_usage_over_budget",
+                    &[
+                        ("entries", tentanas_helper::elastic::USAGE_ENTRY_LIMIT.to_string()),
+                        ("minutes", (tentanas_helper::elastic::USAGE_DEADLINE_SECS / 60).to_string()),
+                    ],
+                ),
+                G::Unreadable => super::disks::coded_reason("folder_usage_unreadable", &[]),
+                G::NotMounted => super::disks::coded_reason("folder_usage_not_mounted", &[]),
+            };
+            (None, None, vec![reason])
+        }
+        Some((_, FolderFigure::NameRefused)) => {
+            (None, None, vec![super::disks::coded_reason("folder_usage_name_refused", &[])])
+        }
+        // Not covered by any measurement: a failure says so; otherwise the
+        // folder simply waits for its first one.
+        None if reading.is_some_and(|r| r.failed_at.is_some()) => {
+            (None, None, vec![super::disks::coded_reason("folder_usage_failed", &[])])
+        }
+        None => (None, None, pending()),
+    }
+}
+
+/// Copies the cached measurement of `array` onto its wire folders. Reads the
+/// cache and nothing else — it is on the n11 poll.
+pub fn fill_folder_usage(wire: &mut NasElasticArray, array: &ElasticArrayRow, cache: &FolderUsageCache) {
+    for folder in wire.folders.iter_mut() {
+        let (bytes, at, reasons) = folder_usage_wire(cache, array.array_id(), &folder.name);
+        folder.used_bytes = bytes;
+        folder.used_measured_at = at;
+        folder.used_reasons = reasons;
+    }
+}
+
+/// The helper's walk behind `run_folder_usage_pass`. A trait so the pass is
+/// tested against a real database with canned answers: a unit test has no
+/// helper to ask.
+pub(crate) trait FolderUsageProber {
+    async fn measure(
+        &self,
+        array: &ElasticArrayRow,
+        folders: &[String],
+    ) -> Result<tentanas_helper::elastic::ElasticFolderUsage>;
+}
+
+pub(crate) struct HelperFolderUsageProber<'a> {
+    pub db: &'a DbPool,
+}
+
+impl FolderUsageProber for HelperFolderUsageProber<'_> {
+    async fn measure(
+        &self,
+        array: &ElasticArrayRow,
+        folders: &[String],
+    ) -> Result<tentanas_helper::elastic::ElasticFolderUsage> {
+        let spec = array.persisted_spec()?;
+        let command = HelperCommand::ElasticFolderUsage {
+            array_id: spec.array_id.clone(),
+            owner: spec.owner.clone(),
+            folders: folders.to_vec(),
+        };
+        let (out, _) = super::broker::run_privileged(self.db, &command, None, FOLDER_USAGE_TIMEOUT).await?;
+        ensure!(
+            out.success() && out.stdout.len() < 256 * 1024,
+            "Nie można zmierzyć folderów macierzy (kod {})",
+            out.code
+        );
+        Ok(serde_json::from_str(&out.stdout)?)
+    }
+}
+
+/// The helper's answer, held to the question: one entry per folder asked, in
+/// order, each with exactly one of a figure and a gap. Anything else is not a
+/// measurement of these folders.
+fn folder_figures(
+    folders: &[String],
+    usage: tentanas_helper::elastic::ElasticFolderUsage,
+) -> Result<BTreeMap<String, FolderFigure>> {
+    ensure!(usage.folders.len() == folders.len(), "pomiar folderów nie odpowiada zapytaniu");
+    let mut figures = BTreeMap::new();
+    for (asked, answer) in folders.iter().zip(usage.folders) {
+        ensure!(&answer.name == asked, "pomiar folderów nie odpowiada zapytaniu");
+        let figure = match (answer.bytes, answer.gap) {
+            (Some(bytes), None) => FolderFigure::Bytes(bytes),
+            (None, Some(gap)) => FolderFigure::Gap(gap),
+            _ => anyhow::bail!("pomiar folderu {asked} jest sprzeczny"),
+        };
+        figures.insert(answer.name, figure);
+    }
+    Ok(figures)
+}
+
+/// Measures the folders of every array that is due (`FolderUsageCache::due`).
+///
+/// Skipped: a disabled array, one whose create has not completed, one whose
+/// folder list is unknown or empty, and one with an operation running — a
+/// Restore or a disk replacement changes the very mounts the walk reads.
+pub(crate) async fn run_folder_usage_pass(
+    db: &DbPool,
+    arrays: &[ElasticArrayRow],
+    cache: &FolderUsageCache,
+    prober: &impl FolderUsageProber,
+) {
+    for array in arrays {
+        let Some(array_id) = array.array_id() else { continue };
+        if !array.enabled
+            || array.state == "creating"
+            || array.creation_unfinished
+            || !array.folders_known
+            || array.folders.is_empty()
+        {
+            continue;
+        }
+        let all: Vec<String> = array.folders.iter().map(|f| f.name.clone()).collect();
+        let set: BTreeSet<String> = all.iter().cloned().collect();
+        // A name the helper would refuse is asked about by nobody: one such
+        // folder used to make the helper refuse the whole request, so the
+        // array had no figures at all, retried every 30 min for ever
+        // (MINOR 6). It gets a reason of its own; the others are measured.
+        let (folders, refused): (Vec<String>, Vec<String>) = all
+            .into_iter()
+            .partition(|name| tentanas_helper::elastic::validate_usage_folders(std::slice::from_ref(name)).is_ok());
+        if !cache.due(array_id, &set, FOLDER_USAGE_EVERY, FOLDER_USAGE_RETRY) {
+            continue;
+        }
+        match store::elastic_operation_running(db, array_id) {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(e) => {
+                tracing::warn!("tentanas folder usage: operations of {} unreadable: {e}", array.name);
+                continue;
+            }
+        }
+        let measured = if folders.is_empty() {
+            Ok(BTreeMap::new())
+        } else {
+            prober.measure(array, &folders).await.and_then(|usage| folder_figures(&folders, usage))
+        };
+        let outcome = match measured {
+            Ok(mut figures) => {
+                figures.extend(refused.iter().map(|name| (name.clone(), FolderFigure::NameRefused)));
+                Ok(figures)
+            }
+            Err(e) => {
+                tracing::warn!("tentanas folder usage: folders of {} not measured: {e}", array.name);
+                Err(())
+            }
+        };
+        cache.record(array_id, outcome);
+    }
+}
+
+/// Starts `run_folder_usage_pass` in the background unless one still runs.
+/// A cold walk can take minutes, and the scheduler's tick must not wait for it.
+pub fn spawn_folder_usage_pass(db: &DbPool, arrays: Vec<ElasticArrayRow>) {
+    use std::sync::atomic::Ordering;
+    let cache = FolderUsageCache::global();
+    if cache.running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    // Cleared on drop, so a pass that panics does not stop every later one.
+    struct Running(&'static FolderUsageCache);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            self.0.running.store(false, Ordering::SeqCst);
+        }
+    }
+    let running = Running(cache);
+    let db = db.clone();
+    tokio::spawn(async move {
+        let _running = running;
+        run_folder_usage_pass(&db, &arrays, cache, &HelperFolderUsageProber { db: &db }).await;
+    });
+}
+
+// =============================================================================
 // The wizard: refusals, warnings and the plan
 // =============================================================================
 
@@ -2309,10 +2731,12 @@ fn human_bytes(bytes: u64) -> String {
 pub enum ToolHealth {
     /// It ran and did the work.
     Working,
-    /// It is on the node and it does NOT work, with the reason.
-    Broken(String),
-    /// Wynik nie pozwala rozstrzygnąć, czy narzędzie działa.
-    Unknown(String),
+    /// It is on the node and it does NOT work, with the reason
+    /// ('snapraid_killed' {signal?}).
+    Broken(CodedText),
+    /// The answer does not settle whether the tool works
+    /// ('snapraid_probe_unconfirmed' {code}).
+    Unknown(CodedText),
 }
 
 /// The smallest snapraid configuration that makes the binary do real work.
@@ -2374,14 +2798,12 @@ pub fn probe_verdict(code: i32, stdout: &str, stderr: &str) -> ToolHealth {
     // reports -1 when the child had no exit status, and a shell-style wrapper
     // reports 128 + signo — 139 for SIGSEGV, which is what was measured.
     if code < 0 || code >= 128 {
-        let signal = if code >= 128 {
-            format!(" by signal {}", code - 128)
-        } else {
-            String::new()
-        };
-        return ToolHealth::Broken(format!(
-            "snapraid is installed but was killed{signal} while reading a trivial configuration. A build made with -march=native -O3 -flto is known to segfault on `status` and `sync`; rebuilding at -O2 fixes it. Until then this node cannot sync or scrub and its parity would never report an error, so the array would look protected and would not be."
-        ));
+        let signal = (code >= 128).then(|| (code - 128).to_string());
+        let words = signal.as_ref().map(|n| format!(" by signal {n}")).unwrap_or_default();
+        let params: Vec<(&str, String)> = signal.into_iter().map(|n| ("signal", n)).collect();
+        return ToolHealth::Broken(CodedText::new("snapraid_killed", &params, format!(
+            "snapraid is installed but was killed{words} while reading a trivial configuration. A build made with -march=native -O3 -flto is known to segfault on `status` and `sync`; rebuilding at -O2 fixes it. Until then this node cannot sync or scrub and its parity would never report an error, so the array would look protected and would not be."
+        )));
     }
     let expected_diagnostic = "You must have at least 2 'content' files in different disks.";
     if code == 0
@@ -2393,8 +2815,10 @@ pub fn probe_verdict(code: i32, stdout: &str, stderr: &str) -> ToolHealth {
     {
         ToolHealth::Working
     } else {
-        ToolHealth::Unknown(format!(
-            "Sonda SnapRAID zakończyła się kodem {code} bez rozpoznanego potwierdzenia działania"
+        ToolHealth::Unknown(CodedText::new(
+            "snapraid_probe_unconfirmed",
+            &[("code", code.to_string())],
+            format!("the SnapRAID probe exited with code {code} without a recognised sign that it works"),
         ))
     }
 }
@@ -2427,24 +2851,31 @@ pub fn capabilities(features: &[FeatureState], has_mkfs: &dyn Fn(&str) -> bool) 
         .map(String::from)
         .collect();
 
-    let mut reasons = Vec::new();
-    if !ok(mergerfs) {
-        reasons.push(format!(
-            "mergerfs: {}",
-            mergerfs.map(|f| f.detail.clone()).unwrap_or_else(|| "not probed".to_string())
-        ));
-    }
-    if !ok(snapraid) {
-        reasons.push(format!(
-            "snapraid: {}",
-            snapraid.map(|f| f.detail.clone()).unwrap_or_else(|| "not probed".to_string())
-        ));
+    // One coded part per missing capability, and the node's English beside
+    // it for the tooltip. A tool's part names the tool and its Environment
+    // status ('missing', 'broken', …) — the words the Environment tab already
+    // has for that row — rather than carrying the row's own sentence, which
+    // the tab words from its own codes.
+    let mut detail = CodedText::default();
+    for (tool, row) in [(MERGERFS_FEATURE_ID, mergerfs), (SNAPRAID_FEATURE_ID, snapraid)] {
+        if ok(row) {
+            continue;
+        }
+        detail = detail.and(match row {
+            Some(f) => CodedText::new(
+                "elastic_tool_unavailable",
+                &[("tool", tool.to_string()), ("status", f.status.clone())],
+                format!("{tool}: {}", if f.detail.is_empty() { f.status.as_str() } else { f.detail.as_str() }),
+            ),
+            None => CodedText::new("elastic_tool_not_probed", &[("tool", tool.to_string())], format!("{tool}: not probed")),
+        });
     }
     if filesystems.is_empty() {
-        reasons.push(
-            "neither mkfs.xfs nor mkfs.ext4 is installed, so no data disk can be prepared"
-                .to_string(),
-        );
+        detail = detail.and(CodedText::new(
+            "elastic_no_mkfs",
+            &[],
+            "neither mkfs.xfs nor mkfs.ext4 is installed, so no data disk can be prepared",
+        ));
     }
 
     NasElasticCapabilities {
@@ -2453,7 +2884,8 @@ pub fn capabilities(features: &[FeatureState], has_mkfs: &dyn Fn(&str) -> bool) 
         snapraid: ok(snapraid),
         snapraid_version: snapraid.and_then(|f| f.version.clone()).unwrap_or_default(),
         filesystems,
-        detail: reasons.join("; "),
+        detail: detail.text,
+        reasons: detail.reasons,
     }
 }
 
@@ -2738,7 +3170,9 @@ pub fn to_protocol(
         name: array.name.clone(),
         kind: KIND.to_string(),
         state: state.0.to_string(),
-        state_detail: state.1.to_string(),
+        // A stored or helper sentence may carry a branch path; the slot in it
+        // is not a disk name (R2-3).
+        state_detail: BranchNames::for_array(array, observed).name(state.1),
         health: health.0.to_string(),
         health_reason: health.1,
         enabled: array.enabled,
@@ -2759,7 +3193,11 @@ pub fn to_protocol(
                 name: f.name.clone(),
                 path: format!("{}/{}", array.union_path(), f.name),
                 cache_policy: f.cache_policy.clone(),
+                // Filled from the node's last walk by `fill_folder_usage`;
+                // this function never measures.
                 used_bytes: None,
+                used_measured_at: None,
+                used_reasons: Vec::new(),
                 share_id: f.share_id.clone(),
                 share_label: f.share_label.clone(),
             })
@@ -5394,6 +5832,7 @@ pub async fn list(db: &DbPool, owner: &ElasticOwner) -> Result<Vec<NasElasticArr
             reconcile_undone_add(db, &mut array, result);
         }
         let mut wire = observed_protocol(&array,&disks,observed,features);
+        fill_folder_usage(&mut wire, &array, FolderUsageCache::global());
         fill_last_known_names(&mut wire, |id| store::disk_last_name(db, id).ok().flatten());
         arrays.push(wire);
     }
@@ -10089,17 +10528,19 @@ pub(crate) mod tests {
             let ToolHealth::Broken(why) = probe_verdict(code, "Self-test...", "") else {
                 panic!("a snapraid killed by a signal is not working (code {code})");
             };
-            assert!(why.contains("-O2"), "the fix has to be in the sentence: {why}");
+            assert!(why.text.contains("-O2"), "the fix has to be in the sentence: {why:?}");
             assert!(
-                why.contains("look protected"),
-                "and so has the consequence: {why}"
+                why.text.contains("look protected"),
+                "and so has the consequence: {why:?}"
             );
+            assert_eq!(why.reasons[0].code, "snapraid_killed");
         }
         // 139 is named as a signal, -1 is not (we do not know which one).
         let ToolHealth::Broken(why) = probe_verdict(139, "", "") else {
             unreachable!()
         };
-        assert!(why.contains("signal 11"), "SIGSEGV should be named: {why}");
+        assert!(why.text.contains("signal 11"), "SIGSEGV should be named: {why:?}");
+        assert_eq!(why.reasons[0].params.get("signal").map(String::as_str), Some("11"));
 
         // `Self-test...` is NOT the discriminator: both builds print it, so a
         // verdict that keyed on it would call the crashing build healthy.
@@ -10685,6 +11126,88 @@ pub(crate) mod tests {
         let caps = capabilities(&features, &|_| false);
         assert!(caps.filesystems.is_empty());
         assert!(caps.detail.contains("mkfs"), "{}", caps.detail);
+    }
+
+    /// The reasons travel as codes beside the English, one per missing part,
+    /// so the wizard words them in the reader's language (wave 7).
+    #[test]
+    fn capabilities_code_each_missing_part() {
+        let code = |code: &str, params: &[(&str, &str)]| {
+            super::super::disks::coded_reason(code, &params.iter().map(|(k, v)| (*k, v.to_string())).collect::<Vec<_>>())
+        };
+        let features = vec![
+            FeatureState { id: MERGERFS_FEATURE_ID.to_string(), status: "ok".to_string(), ..Default::default() },
+            FeatureState { id: SNAPRAID_FEATURE_ID.to_string(), status: "broken".to_string(), detail: "killed".to_string(), ..Default::default() },
+        ];
+        let caps = capabilities(&features, &|_| true);
+        assert_eq!(caps.reasons, vec![code("elastic_tool_unavailable", &[("tool", "snapraid"), ("status", "broken")])]);
+        assert_eq!(caps.detail, "snapraid: killed");
+
+        let caps = capabilities(&[], &|_| false);
+        assert_eq!(
+            caps.reasons,
+            vec![
+                code("elastic_tool_not_probed", &[("tool", "mergerfs")]),
+                code("elastic_tool_not_probed", &[("tool", "snapraid")]),
+                code("elastic_no_mkfs", &[]),
+            ]
+        );
+
+        // Everything there: no reason, no sentence.
+        let all_ok = vec![
+            FeatureState { id: MERGERFS_FEATURE_ID.to_string(), status: "ok".to_string(), ..Default::default() },
+            FeatureState { id: SNAPRAID_FEATURE_ID.to_string(), status: "ok".to_string(), ..Default::default() },
+        ];
+        let caps = capabilities(&all_ok, &|fs| fs == "ext4");
+        assert!(caps.reasons.is_empty() && caps.detail.is_empty(), "{caps:?}");
+    }
+
+    fn branch_names_array() -> ElasticArrayRow {
+        let mut branches: Vec<BranchRow> = (1..=10)
+            .map(|i| BranchRow { disk_id: format!("id-d{i}"), name: format!("d{i}"), role: "data".to_string(), ..Default::default() })
+            .collect();
+        branches.push(BranchRow { disk_id: "id-c1".to_string(), name: "c1".to_string(), role: "cache".to_string(), ..Default::default() });
+        ElasticArrayRow {
+            name: "media".to_string(),
+            branches,
+            parity: vec![ParityRow { disk_id: "id-p1".to_string(), name: "parity1".to_string(), index: 1, ..Default::default() }],
+            ..Default::default()
+        }
+    }
+
+    /// R2-3: a sentence with a branch path names the member, never its slot
+    /// directory — `d1`, `d10` and `parity/1` included, for a known array and
+    /// an unknown one alike.
+    #[test]
+    fn branch_paths_in_a_sentence_name_the_disk_not_the_slot() {
+        let names = BranchNames::of(&[branch_names_array()]);
+        let text = "rename failed: /mnt/tentanas-branches/media/data/d2/film.mkv; \
+                    read /mnt/tentanas-branches/media/data/d10/a, /mnt/tentanas-branches/media/data/d1 \
+                    and /mnt/tentanas-branches/media/cache/c1/x; \
+                    parity /mnt/tentanas-branches/media/parity/1/snapraid.parity; \
+                    gone /mnt/tentanas-branches/other/data/d7/y";
+        let named = names.name(text);
+        assert_eq!(
+            named,
+            "rename failed: data disk no. 2:/film.mkv; \
+                    read data disk no. 10:/a, data disk no. 1 \
+                    and cache disk no. 1:/x; \
+                    parity parity disk no. 1:/snapraid.parity; \
+                    gone a data disk of other:/y"
+        );
+        for slot in ["/d1", "/d2", "/d7", "/d10", "/c1", "/parity/1", "tentanas-branches"] {
+            assert!(!named.contains(slot), "{slot} left in: {named}");
+        }
+        // A sentence without a branch path is returned as it is.
+        assert_eq!(names.name("mkfs.xfs failed on sdb"), "mkfs.xfs failed on sdb");
+
+        // What this read observed names the member first, as in the state
+        // sentence.
+        let array = branch_names_array();
+        let mut observed = ArrayObservation::default();
+        observed.kernel_names.insert(data_branch_path("media", "d2"), "sdg".to_string());
+        let named = BranchNames::for_array(&array, &observed).name("io error at /mnt/tentanas-branches/media/data/d2/f");
+        assert_eq!(named, "io error at data disk sdg:/f");
     }
 
     /// The free-disk list is the wizard's candidate list, and it excludes

@@ -5581,6 +5581,17 @@
       "folders_col_name": "Carpeta",
       "folders_col_share": "Recurso compartido",
       "folders_col_cache": "Caché",
+      "folders_col_used": "Uso",
+      "folder_usage": {
+        "pending": "Aún no medido: el nodo cuenta las carpetas en segundo plano cada pocas horas.",
+        "over_budget": "No medido: la carpeta tiene demasiados archivos para contarla dentro del límite de medición ({entries} entradas, {minutes} min).",
+        "unreadable": "No medido: no se pudo leer del disco una parte de los archivos de la carpeta.",
+        "not_mounted": "No medido: no todos los discos del arreglo estaban montados.",
+        "failed": "No medido: el nodo no pudo realizar la medición de carpetas. Lo intentará de nuevo en 30 min.",
+        "measured": "Medido {ago}; el nodo actualiza la medición cada 6 h",
+        "unknown": "No medido",
+        "name_refused": "No medido: el nombre de la carpeta tiene caracteres que la medición no acepta (p. ej. un carácter de control) — las demás carpetas se miden."
+      },
       "folders_unknown": "No se pudo leer la lista de carpetas de esta matriz. Sin medir no es lo mismo que sin carpetas: comprueba si la unión está montada.",
       "folders_unknown_partial": "No se pudo leer la lista de carpetas, así que abajo solo aparecen las que tienen una política guardada. Sin medir no es lo mismo que sin carpetas.",
       "folders_explain": "Los archivos nuevos aterrizan siempre primero en la caché: la política de creación de mergerfs abarca toda la unión, así que ningún ajuste de mergerfs puede mantener una carpeta fuera de la caché. La política de la carpeta decide con qué rapidez — o si acaso — sus archivos bajan a los discos de datos.",
@@ -5811,6 +5822,11 @@
         "no_cache": "Sin disco de caché: el mover no tiene nada que hacer, y los archivos nuevos se escriben directamente en los discos de datos.",
         "unhealthy_disks": "SMART advierte sobre {disks}: un array creado sobre un disco que ya está fallando arranca degradado.",
         "mixed_sizes": "Los discos de datos tienen tamaños distintos y se usa cada byte de cada uno: para eso sirve este tipo de array."
+      },
+      "elastic_reason": {
+        "tool_unavailable": "{tool}: {status}",
+        "tool_not_probed": "{tool}: sin comprobar (Entorno → Comprobar de nuevo)",
+        "no_mkfs": "no están instalados ni mkfs.xfs ni mkfs.ext4 — no se puede preparar ningún disco de datos"
       }
     },
     "pools": {
@@ -5971,7 +5987,10 @@
       "trim_resume_done": "TRIM del pool {name} reanudado",
       "trim_cancel_done": "TRIM del pool {name} cancelado",
       "leaf_last_known": "falta el disco (visto por última vez como {name})",
-      "leaf_missing_at": "falta el disco n.º {n}"
+      "leaf_missing_at": "falta el disco n.º {n}",
+      "disk_detach": "Desconectar el disco antiguo",
+      "disk_detach_confirm": "El disco {device} se desconectará del pool {pool} (zpool detach). El disco de repuesto que queda en el pool en su lugar ya tiene sus datos. Una vez desconectado, {device} se puede retirar con seguridad.",
+      "disk_detach_done": "Disco {device} desconectado — se puede retirar"
     },
     "props": {
       "title": "Propiedades del pool",
@@ -6062,7 +6081,7 @@
       "explain_pick": "Elige un disco sustituto para ver el plan de sustitución.",
       "start": "Iniciar la sustitución",
       "resilver_progress": "resilver {pct}% · quedan {eta}",
-      "done_detail_spare": "Resilver terminado: {new} ha asumido los datos de {device}, pero {device} sigue en la configuración del pool hasta que se desvincule (zpool detach). Esta versión de TentaNas aún no lo hace: no retire el disco antes de desvincularlo."
+      "done_detail_spare": "Resilver terminado — {new} asumió los datos del disco {device}, pero {device} sigue en la configuración del pool. Desconéctalo con la acción «Desconectar el disco antiguo» junto a él en la topología del pool; solo entonces se puede retirar."
     },
     "elastic_import": {
       "title": "Importar un Elastic Array",
@@ -7065,7 +7084,9 @@
       "catalog_empty": "El helper no ha comunicado ningún comando",
       "short_helper": "modo A",
       "short_interactive": "modo B",
-      "short_unarmed": "sin activar"
+      "short_unarmed": "sin activar",
+      "mode_interactive_unarmed": "modo B — sin activar",
+      "short_interactive_unarmed": "sin activar (modo B)"
     },
     "env": {
       "failed": "No se pudo obtener el entorno: {error}",
@@ -7094,7 +7115,25 @@
       "arm_node": "Activar…",
       "arm_node_title": "Activar el canal de privilegios — {node} (modo B)",
       "armed_node": "Canal de {node} activado",
-      "armed_node_unnamed": "Canal del nodo sin nombre activado"
+      "armed_node_unnamed": "Canal del nodo sin nombre activado",
+      "detail": {
+        "feature_binaries_missing": "falta el programa: {binaries}",
+        "feature_version_too_low": "encontrada {found}, se necesita al menos {required}",
+        "feature_module_not_loaded": "el módulo del kernel {module} no está cargado",
+        "snapraid_killed": "SnapRAID está instalado, pero lo mataron al leer una configuración trivial — recompílalo con -O2; hasta entonces el array solo parece protegido",
+        "snapraid_killed_signal": "SnapRAID está instalado, pero lo mató la señal {signal} al leer una configuración trivial — recompílalo con -O2; hasta entonces el array solo parece protegido",
+        "snapraid_probe_unconfirmed": "la sonda de SnapRAID terminó con el código {code} sin confirmar que el programa funciona",
+        "snapraid_probe_failed": "no se pudo ejecutar la sonda de SnapRAID (detalles en la descripción emergente)",
+        "snapraid_vanished": "SnapRAID desapareció antes de comprobar su funcionamiento",
+        "rdma_no_device": "ningún dispositivo RDMA en {path}",
+        "ksmbd_no_interface": "ninguna interfaz RDMA con dirección",
+        "ksmbd_exposed": "{interfaces} también lleva la puerta de enlace predeterminada — SMB Direct necesita una red de almacenamiento dedicada",
+        "ksmbd_tools_missing": "falta: {tools} · la escucha estaría en {listener}",
+        "ksmbd_experimental": "EXPERIMENTAL (según la documentación del kernel)",
+        "module_loaded": "{module} cargado",
+        "module_on_demand": "{module} disponible, se carga en el primer uso",
+        "module_absent": "{module} no está en el árbol de módulos de este kernel"
+      }
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -7231,7 +7270,10 @@
       "chip_services_down_list": "Servicios detenidos: {list}",
       "chip_services_unknown": "Servicios: sin respuesta de {nodes}",
       "chip_services_none": "Sin servicios de compartición",
-      "not_answered_hint": "Desconocido: no se pudo leer la lista de recursos compartidos de este nodo (sin respuesta o con error). El número aparecerá cuando el nodo responda."
+      "not_answered_hint": "Desconocido: no se pudo leer la lista de recursos compartidos o de targets de este nodo (sin respuesta o con error). El número aparecerá cuando el nodo responda.",
+      "target_any_client": "cualquier cliente del portal",
+      "target_initiators": "{n} {n|iniciador|iniciadores}",
+      "target_hosts": "{n} {n|NQN de host|NQN de hosts}"
     },
     "node": {
       "head_sub_node": "nodo {name}",
@@ -7550,7 +7592,10 @@
         "import_secret_needed": "El secreto de autenticación debe introducirse de nuevo tras una importación.",
         "import_all_interfaces": "Este destino se exportaba en todas las interfaces (0.0.0.0): elija una interfaz de este nodo antes de activarlo.",
         "portal_moved_head_no_address": "El portal del destino ya no está donde se fijó. La dirección {address} pertenecía a la interfaz {interface}, que está en este nodo pero ahora no tiene ninguna dirección (enlace caído o concesión DHCP perdida)."
-      }
+      },
+      "host_state": "Estado",
+      "host_connected": "Conectado",
+      "host_not_connected": "No conectado"
     },
     "wizard_target": {
       "title": "Nuevo destino",
@@ -7696,7 +7741,33 @@
       "elastic_add_stopped": "La adición del disco se detuvo antes del final — termínela o deshágala en la pantalla de la matriz",
       "elastic_undo_stopped": "Deshacer la adición se detuvo tras su primer paso — la adición sigue sin terminar",
       "elastic_disk_absent": "El disco que se borraría no está presente en este nodo — vuelva a conectarlo e inténtelo de nuevo",
-      "job_not_cancellable": "Esta tarea no se puede cancelar: detenerla no pararía el trabajo ya iniciado"
+      "job_not_cancellable": "Esta tarea no se puede cancelar: detenerla no pararía el trabajo ya iniciado",
+      "pool_detach_not_allowed": "Este disco no se puede desconectar ahora: solo se puede desconectar un disco sustituido por un disco de repuesto sano, y solo cuando el resilver haya terminado."
+    },
+    "unreachable": {
+      "title": "Nodo {node} inaccesible",
+      "title_unnamed": "Nodo sin nombre inaccesible",
+      "heading": "Se perdió la conexión mesh",
+      "desc": "Las operaciones en el nodo {node} quedan en pausa hasta que vuelva la conexión. Los servicios NAS del propio nodo siguen funcionando, independientemente del panel.",
+      "desc_unnamed": "Las operaciones en este nodo quedan en pausa hasta que vuelva la conexión. Los servicios NAS del propio nodo siguen funcionando, independientemente del panel.",
+      "keep": "Los recursos compartidos, targets y programaciones de {node} siguen funcionando — solo el panel perdió la conexión con el nodo.",
+      "keep_unnamed": "Los recursos compartidos, targets y programaciones de este nodo siguen funcionando — solo el panel perdió la conexión con el nodo.",
+      "retry_line": "Reconectando con el nodo",
+      "retry_attempt": "intento {attempt} · espera de hasta {max} s",
+      "btn_fleet": "Vista de la flota",
+      "btn_refresh": "Actualizar",
+      "btn_retry": "Conectar ahora",
+      "log_manual": "intento de conexión forzado",
+      "log_no_answer": "sin respuesta de {node} (intento {attempt})",
+      "log_no_answer_unnamed": "sin respuesta del nodo (intento {attempt})",
+      "log_restored": "conexión restablecida",
+      "log_mesh_connected": "la mesh ve {node} como conectado, pero el nodo no responde",
+      "log_mesh_connected_unnamed": "la mesh ve el nodo como conectado, pero no responde",
+      "log_mesh_offline": "la mesh no ve {node} — el nodo está desconectado",
+      "log_mesh_offline_unnamed": "la mesh no ve este nodo — está desconectado",
+      "log_lost": "{node} dejó de responder",
+      "log_lost_unnamed": "el nodo dejó de responder",
+      "error": "El nodo no responde — se perdió la conexión mesh"
     }
   },
   "agent_accounts": {

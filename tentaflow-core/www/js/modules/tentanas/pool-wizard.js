@@ -15,6 +15,7 @@ import {
   wordReasons, nodeTextTitle,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, paintJobLog } from '/js/lib/dom-patch.js';
+import { elasticCapabilitiesDetail } from '/js/modules/tentanas/feature-words.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-checkbox.js';
@@ -268,7 +269,15 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
       <tf-choice-card value="elastic" icon="cylinder" heading="Elastic Array" description="${escapeAttr(T('wizard_pool.kind_elastic_desc'))}" ${elasticAvailable() ? '' : 'disabled'}></tf-choice-card>
     </tf-choice-group>
     <div class="text-xs text-3 mt-md">${escapeHtml(T('wizard_pool.kind_hint'))}</div>
-    ${elasticAvailable() ? '' : `<div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(state.capabilitiesError || state.capabilities?.detail || (state.capabilities ? T('wizard_pool.elastic_unavailable') : I18n.t('common.loading')))}<tf-button variant="ghost" data-pw-environment>${escapeHtml(T('tabs.environment'))}</tf-button></div></div>`}`;
+    ${elasticAvailable() ? '' : elasticUnavailableHtml()}`;
+  // Why the Elastic card is disabled: the node's reasons in the reader's
+  // language (`elasticCapabilitiesDetail`), its own sentence as the tooltip.
+  function elasticUnavailableHtml() {
+    const caps = state.capabilities ? elasticCapabilitiesDetail(state.capabilities) : { text: '', title: '' };
+    const text = state.capabilitiesError || caps.text || (state.capabilities ? T('wizard_pool.elastic_unavailable') : I18n.t('common.loading'));
+    const title = !state.capabilitiesError && caps.title ? ` title="${escapeAttr(caps.title)}"` : '';
+    return `<div class="wizard-warning info mt-md">${sprite('info')}<div${title}>${escapeHtml(text)}<tf-button variant="ghost" data-pw-environment>${escapeHtml(T('tabs.environment'))}</tf-button></div></div>`;
+  }
 
   // Step 2 — disks. Members and spares of other pools are disabled with the
   // reason; a free disk with a critical SMART verdict cannot be picked either.

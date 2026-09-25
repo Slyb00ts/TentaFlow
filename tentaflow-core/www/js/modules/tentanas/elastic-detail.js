@@ -6,7 +6,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, wordReasons, nodeTextTitle, jobKindLabel } from '/js/modules/tentanas/format.js';
+import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, fmtAgo, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, wordReasons, nodeTextTitle, jobKindLabel } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchKeyedList, paintStatCards, SLOT, slotEl, setClass } from '/js/lib/dom-patch.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, dangerRowHtml, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
@@ -1087,9 +1087,41 @@ function folderSkeletonHtml(folder, admin) {
     : '<span data-f="folder-policy"></span>';
   return `<div class="fr" data-folder="${escapeAttr(folder.name)}">
     <span class="fr-name"><span class="mono">${escapeHtml(folder.name)}</span><span class="fr-sub mono" data-f="folder-path"></span></span>
+    <span class="fr-used num" data-f="folder-used"></span>
     <span class="fr-share" data-f="folder-share"></span>
     <span class="fr-cache">${cell}<span ${SLOT} data-slot="folder-pinned"></span></span>
   </div>`;
+}
+
+// Why a folder has no size, in the reader's language. The node measures
+// folders by walking the disks in the background, hours apart, so "not yet"
+// and "too many files to count in time" are ordinary answers, not faults.
+const FOLDER_USAGE_WORDS = new Map([
+  ['folder_usage_pending', () => T('elastic.folder_usage.pending')],
+  ['folder_usage_over_budget', (p) => T('elastic.folder_usage.over_budget', { entries: Number(p.entries || 0).toLocaleString(I18n.getLanguage()), minutes: p.minutes || '' })],
+  ['folder_usage_unreadable', () => T('elastic.folder_usage.unreadable')],
+  ['folder_usage_not_mounted', () => T('elastic.folder_usage.not_mounted')],
+  ['folder_usage_failed', () => T('elastic.folder_usage.failed')],
+  ['folder_usage_name_refused', () => T('elastic.folder_usage.name_refused')],
+]);
+
+/**
+ * One folder's "Użycie" cell: the measured bytes with their age as the
+ * tooltip, or "—" with the reason. A folder with no figure and no reason
+ * (an older node) says only that it was not measured.
+ */
+export function folderUsageCell(folder) {
+  const bytes = folder?.usedBytes;
+  if (bytes !== null && bytes !== undefined && Number.isFinite(Number(bytes))) {
+    return {
+      text: fmtBytes(Number(bytes)),
+      title: folder.usedMeasuredAt ? T('elastic.folder_usage.measured', { ago: fmtAgo(folder.usedMeasuredAt) }) : '',
+    };
+  }
+  return {
+    text: '—',
+    title: wordReasons(folder?.usedReasons, FOLDER_USAGE_WORDS) || T('elastic.folder_usage.unknown'),
+  };
 }
 
 function paintFolders(card, array, admin) {
@@ -1098,13 +1130,17 @@ function paintFolders(card, array, admin) {
   const table = slotEl(card.querySelector('[data-slot="folder-table"]'), folders.length > 0, 'table', '<div class="nas-folder-rows"></div>');
   if (table) {
     patchKeyedList(table, [
-      { key: 'head', html: `<div class="fr fr-head"><span>${escapeHtml(T('elastic.folders_col_name'))}</span><span>${escapeHtml(T('elastic.folders_col_share'))}</span><span>${escapeHtml(T('elastic.folders_col_cache'))}</span></div>` },
+      { key: 'head', html: `<div class="fr fr-head"><span>${escapeHtml(T('elastic.folders_col_name'))}</span><span>${escapeHtml(T('elastic.folders_col_used'))}</span><span>${escapeHtml(T('elastic.folders_col_share'))}</span><span>${escapeHtml(T('elastic.folders_col_cache'))}</span></div>` },
       ...folders.map((folder) => ({ key: `folder:${folder.name}`, html: folderSkeletonHtml(folder, admin) })),
     ]);
     const rows = [...table.children].slice(1);
     folders.forEach((folder, i) => {
       const r = rows[i];
       setText(field(r, 'folder-path'), folder.path || '');
+      const used = folderUsageCell(folder);
+      const usedEl = field(r, 'folder-used');
+      setText(usedEl, used.text);
+      setAttr(usedEl, 'title', used.title || null);
       setText(field(r, 'folder-share'), folder.shareLabel || T('elastic.folders_share_none'));
       setText(field(r, 'folder-policy'), cachePolicyLabel(folder.cachePolicy));
       const chip = slotEl(r.querySelector('[data-slot="folder-pinned"]'), folder.cachePolicy === 'only', 'pinned', '<tf-chip status="warn"></tf-chip>');

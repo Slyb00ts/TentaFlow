@@ -18,13 +18,15 @@ import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import {
-  T, sprite, channelMode, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
-  parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, jobTone, jobKindLabel,
+  T, sprite, channelMode, liveChannelMode, nodeChannelMode, channelIsUnarmed, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
+  parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, errCode, jobTone, jobKindLabel,
   layoutLabel, stateChipHtml, stateTone, stateLabel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
   firstDiskReasonWord, diskReasonsText, diskHealthChipLabel, replacementAdviceText, ADVICE_KINDS, alertText,
 } from '/js/modules/tentanas/format.js';
+import { featureDetail } from '/js/modules/tentanas/feature-words.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { nodeT, nodeHeadSub } from '/js/modules/tentanas/node-phrase.js';
+import { createNodeLink } from '/js/modules/tentanas/node-link.js';
 import { isOpaqueId, isDiskIdShape, scrubIds } from '/js/modules/tentanas/machine-id.js';
 import { drawPools, poolDescription } from '/js/modules/tentanas/pools.js';
 import { drawPoolDetail, openReplaceWizard } from '/js/modules/tentanas/pool-detail.js';
@@ -56,7 +58,10 @@ import '/js/components/tf-section-card.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-line-chart.js';
 import '/js/components/tf-stream-chart.js';
-import { openTargetDetail } from '/js/modules/tentanas/targets.js';
+import {
+  openTargetDetail, protocolLabel as targetProtocolLabel, protocolChipHtml as targetProtocolChipHtml,
+  sourceCellHtml as targetSourceCellHtml, sessionsCountLabel as targetSessionsLabel, authLabel as targetAuthLabel,
+} from '/js/modules/tentanas/targets.js';
 import { drawElasticDetail, elasticState, elasticProtection, elasticCapacity, cacheWaitingBytes } from '/js/modules/tentanas/elastic-detail.js';
 
 // -----------------------------------------------------------------------------
@@ -90,22 +95,40 @@ function sparklineSvg(points, cls = '', w = 90, h = 22) {
 // another read as healthy. A service is expected when the node reports it
 // installed, or when a share of that protocol exists there (a share whose
 // service is not even installed is the worst case, not an exemption).
-// `entries` are `{ node, answer }`, where `answer` is the node's
-// SharesListResponse or null when the node did not answer.
+// `entries` are `{ node, answer, targets }`, where `answer` is the node's
+// SharesListResponse and `targets` its TargetsListResponse, each null when the
+// node did not answer it.
 // `named` prefixes each failing service with its node (the fleet chip); the
 // node's own header leaves the node name out.
+//
+// The block services (LIO, nvmet) are judged by a different rule than smbd and
+// nfsd: their "installed" is only whether the KERNEL could serve them
+// (`targets::services`) and "running" whether the configfs tree exists, which
+// it does only after the first target was applied. So they are expected only
+// where an ENABLED target of that protocol exists — a node that merely could
+// serve iSCSI is not a node whose iSCSI is down.
 function servicesVerdict(entries, { named = true } = {}) {
   const down = [];
   const silent = [];
   let expected = 0;
-  for (const { node, answer } of entries) {
-    if (!answer) { silent.push(nodeLabel(node)); continue; }
+  const failing = (node, label) => down.push(named ? `${nodeLabel(node)}: ${label}` : label);
+  for (const { node, answer, targets } of entries) {
+    // Half an answer is no verdict: a node whose target list did not come
+    // back may have a dead iSCSI export nobody looked at.
+    if (!answer || !targets) { silent.push(nodeLabel(node)); continue; }
     const used = new Set((answer.shares || []).map((s) => String(s.protocol || '').toLowerCase()));
     for (const svc of answer.services || []) {
       const proto = String(svc.protocol || '').toLowerCase();
       if (!svc.installed && !used.has(proto)) continue;
       expected += 1;
-      if (!svc.running) down.push(named ? `${nodeLabel(node)}: ${proto.toUpperCase()}` : proto.toUpperCase());
+      if (!svc.running) failing(node, proto.toUpperCase());
+    }
+    const served = new Set((targets.targets || []).filter((t) => t.enabled !== false).map((t) => String(t.protocol || '').toLowerCase()));
+    for (const svc of targets.services || []) {
+      const proto = String(svc.protocol || '').toLowerCase();
+      if (!served.has(proto)) continue;
+      expected += 1;
+      if (!svc.running) failing(node, targetProtocolLabel(proto));
     }
   }
   const unknown = silent.length ? T('fleet.chip_services_unknown', { nodes: silent.join(', ') }) : '';
@@ -374,6 +397,10 @@ const TentaNasScreen = {
     // them straight here (addons.js). Install is fleet-wide; the privilege
     // channel is per node, so this forces the setup step for ONE node.
     this.forceSetup = params.setup === '1' || params.setup === true;
+    // n18c: the selected remote node stops answering → one overlay, parked
+    // requests, a backoff probe (tentanas/node-link.js).
+    this.nodeLink?.destroy();
+    this.nodeLink = createNodeLink(this);
 
     try {
       const me = await ApiBinary.one('authMeRequest');
@@ -398,6 +425,8 @@ const TentaNasScreen = {
 
   unmount() {
     this.disposed = true;
+    this.nodeLink?.destroy();
+    this.nodeLink = null;
     this.clearTimers();
     if (this.openWindow) { this.openWindow.remove(); this.openWindow = null; }
   },
@@ -426,7 +455,35 @@ const TentaNasScreen = {
   // aggregation and the "arm another node" action address a node directly.
   nasOn(node, kind, payload = {}, opts = {}) {
     const forward = node && !node.isLocal ? { targetNodeId: node.nodeId } : {};
-    return ApiBinary.action(kind, payload, { ...forward, ...opts });
+    const run = () => ApiBinary.action(kind, payload, { ...forward, ...opts });
+    // A remote node that stopped answering parks its requests behind the
+    // n18c overlay instead of failing each poll on its own (node-link.js).
+    return this.nodeLink ? this.nodeLink.send(node, run) : run();
+  },
+
+  // n18c: the node answers again (node-link.js). The polls that waited behind
+  // the overlay resume by themselves and patch what they get; only a view
+  // that never had its first answer — the probe failed while the node was
+  // gone, so the body is the "probe failed" state and nothing polls — is
+  // asked again, exactly as its own retry button would.
+  async nodeRecovered(nodeId) {
+    if (this.disposed || nodeId !== this.nodeId) return;
+    const body = this.root.querySelector('#nas-tab-body');
+    if (!body) return;
+    // A tab whose FIRST read failed while the node was gone (a disk detail)
+    // has no poll to bring it back: it is drawn again.
+    if (this.drawLostOnLoss && !this.environmentError) { this.drawTab(); return; }
+    if (!this.environmentError) return;
+    this.drawProbePending(body);
+    await this.refreshHeader(true);
+    if (!this.disposed && nodeId === this.nodeId) this.drawTab();
+  },
+
+  // The overlay's way out: the fleet view, where an unreachable node is a row.
+  leaveToFleet() {
+    this.nodeId = null;
+    this.diskId = null;
+    this.draw();
   },
 
   currentNode() {
@@ -471,7 +528,11 @@ const TentaNasScreen = {
   },
 
   selectNode(nodeId, tab = null, extra = {}) {
-    if (nodeId !== this.nodeId) document.querySelector('tf-window.nas-elastic-wizard')?.close();
+    if (nodeId !== this.nodeId) {
+      document.querySelector('tf-window.nas-elastic-wizard')?.close();
+      // Leaving a lost node releases what waited for it.
+      this.nodeLink?.leave();
+    }
     this.nodeId = nodeId;
     this.diskId = extra.disk || null;
     this.targetId = null;
@@ -554,12 +615,21 @@ const TentaNasScreen = {
   // something to hide.
   async loadFleetData() {
     const supported = this.nodes.filter((n) => n.instanceStatus === 'ready');
+    // Targets are asked beside shares: the Sharing tab lists both, the node
+    // card's figure and the fleet's resources count both (n01 "Share 6" =
+    // 2×SMB · 2×NFS · iSCSI · NVMe-oF), and a dead LIO/nvmet is as much a
+    // service failure as a dead smbd.
+    // Errors keep a node id the fleet knows as that node's name (`errMessage`).
+    const nameOf = this.nodeNameOf();
     const rows = await Promise.all(supported.map(async (n) => {
-      const [alerts, shares] = await Promise.all([
-        this.nasOn(n, 'tentaNasAlertsListRequest', { includeAcked: false }).then((r) => r.alerts || [], (e) => errMessage(e)),
-        this.nasOn(n, 'tentaNasSharesListRequest', {}).then((r) => r, (e) => errMessage(e)),
+      const [alerts, shares, targets] = await Promise.all([
+        this.nasOn(n, 'tentaNasAlertsListRequest', { includeAcked: false }).then((r) => r.alerts || [], (e) => errMessage(e, nameOf)),
+        this.nasOn(n, 'tentaNasSharesListRequest', {}).then((r) => r, (e) => errMessage(e, nameOf)),
+        // The light answer (targets + service rows): no capabilities, and an
+        // NVMe-oF session reading up to a few minutes old (MAJOR 2, wave 7).
+        this.nasOn(n, 'tentaNasTargetsListRequest', { summary: true }).then((r) => r, (e) => errMessage(e, nameOf)),
       ]);
-      return { node: n, alerts, shares };
+      return { node: n, alerts, shares, targets };
     }));
     // Asked of EVERY supported node, once per mount: the first node's answer
     // printed as "TentaNas 1.4.0" claimed a fleet-wide version nothing had
@@ -590,13 +660,32 @@ const TentaNasScreen = {
     return T('fleet.head_versions', { list: [...groups].map(([v, names]) => `${v} (${names.join(', ')})`).join(' · ') });
   },
 
+  // Every shared resource the fleet answered: SMB/NFS shares and iSCSI /
+  // NVMe-oF targets, each with its node. Only a node that answered BOTH lists
+  // contributes, so the count never passes half a node off as all of it; a
+  // node missing either one is an "unreachable" row (`fleetUnanswered`).
   fleetShares() {
-    return (this.fleet?.rows || []).flatMap((r) => (typeof r.shares === 'string' ? [] : (r.shares.shares || []).map((s) => ({ share: s, node: r.node }))));
+    return (this.fleet?.rows || []).flatMap((r) => (fleetRowAnswered(r)
+      ? [
+        ...(r.shares.shares || []).map((s) => ({ share: s, node: r.node })),
+        ...(r.targets.targets || []).map((t) => ({ target: t, node: r.node })),
+      ]
+      : []));
+  },
+
+  // Nodes that did not answer the share or the target list, with what they said.
+  fleetUnanswered() {
+    return (this.fleet?.rows || []).filter((r) => !fleetRowAnswered(r))
+      .map((r) => ({ node: r.node, error: typeof r.shares === 'string' ? r.shares : typeof r.targets === 'string' ? r.targets : '' }));
   },
 
   // Every reachable node's services, and every node that did not answer.
   fleetServicesChip() {
-    return servicesVerdict((this.fleet?.rows || []).map((r) => ({ node: r.node, answer: typeof r.shares === 'string' ? null : r.shares })));
+    return servicesVerdict((this.fleet?.rows || []).map((r) => ({
+      node: r.node,
+      answer: typeof r.shares === 'string' ? null : r.shares,
+      targets: typeof r.targets === 'string' || !r.targets ? null : r.targets,
+    })));
   },
 
   // Builds the fleet screen ONCE. Every value that a poll can move lives in a
@@ -745,18 +834,24 @@ const TentaNasScreen = {
     const nasNodes = ready.filter((n) => n.poolsTotal + (perOrgCounted(n) ? n.arraysTotal : 0) > 0);
     const arraysUncounted = ready.filter((n) => !perOrgCounted(n) && n.poolsTotal === 0);
     const poolsOnly = ready.filter((n) => !perOrgCounted(n));
-    const unarmed = ready.filter((n) => channelMode(n.elevationMode) === 'unarmed');
+    const unarmed = ready.filter((n) => channelIsUnarmed(nodeChannelMode(n)));
     const shares = this.fleetShares();
     const loaded = Boolean(this.fleet);
     const alertRows = this.fleetAlertRows();
 
-    const channelParts = ['helper', 'interactive', 'unarmed']
-      .map((mode) => ({ mode, n: ready.filter((n) => channelMode(n.elevationMode) === mode).length }))
+    const channelParts = ['helper', 'interactive', 'interactive_unarmed', 'unarmed']
+      .map((mode) => ({ mode, n: ready.filter((n) => nodeChannelMode(n) === mode).length }))
       .filter((p) => p.n > 0)
       .map((p) => T('fleet.badge_channel_part', { n: p.n, mode: T('elevation.short_' + p.mode) }))
       .join(' · ');
-    const protoCounts = [...new Set(shares.map((s) => s.share.protocol))]
-      .map((p) => T('fleet.kpi_protocol', { n: shares.filter((s) => s.share.protocol === p).length, protocol: p.toUpperCase() }))
+    // n01: "2×SMB · 2×NFS · iSCSI · NVMe-oF" — shares first, then targets.
+    const protoOf = (r) => (r.share ? r.share.protocol : r.target.protocol);
+    const protoName = (r) => (r.share ? String(r.share.protocol || '').toUpperCase() : targetProtocolLabel(r.target.protocol));
+    const protoCounts = [...new Set(shares.map((r) => `${r.share ? 's' : 't'}:${protoOf(r)}`))]
+      .map((key) => {
+        const same = shares.filter((r) => `${r.share ? 's' : 't'}:${protoOf(r)}` === key);
+        return same.length === 1 ? protoName(same[0]) : T('fleet.kpi_protocol', { n: same.length, protocol: protoName(same[0]) });
+      })
       .join(' · ');
 
     // The worst state leads: a failure is `err` and says "failures", and only
@@ -924,9 +1019,11 @@ const TentaNasScreen = {
   paintFleetResources() {
     const table = this.root.querySelector('#nas-fleet-res-table');
     if (!table) return;
-    const offline = (this.fleet?.rows || []).filter((r) => typeof r.shares === 'string');
-    table.rows = [
-      ...this.fleetShares().map(({ share, node }) => ({
+    const nameOf = this.nodeNameOf();
+    // Only when the rows really changed: `rows =` re-renders every cell, and
+    // this runs on every fleet poll.
+    setRowsIfChanged(table, [
+      ...this.fleetShares().map(({ share, target, node }) => (share ? {
         _share: share,
         _node: node,
         resource: `<span class="fw-700">${escapeHtml(share.name)}</span>`,
@@ -934,17 +1031,29 @@ const TentaNasScreen = {
         source: `<span class="mono">${escapeHtml(share.dataset || share.sourcePath)}</span>`,
         mounts: share.fleetMount ? mountDotsHtml(share.mounts, this.nodes) : `<span class="text-3 text-xs">${escapeHtml(T('shares.fleet_off'))}</span>`,
         sessions: share.sessions,
+      } : {
+        // A block target is not mounted by the fleet: its clients are
+        // initiators / hosts, so the column says who may connect and how
+        // they authenticate (n01: "2 initiatory (CHAP)", "1 host NQN").
+        _target: target,
+        _node: node,
+        resource: `<span class="fw-700">${escapeHtml(target.name)}</span>`,
+        protocol: targetProtocolChipHtml(target.protocol),
+        source: targetSourceCellHtml(target),
+        mounts: `<span class="text-xs">${escapeHtml(targetClientsText(target))}</span>`,
+        // Unknown is a dash, never a confident zero (`sessionsKnown`).
+        sessions: targetSessionsLabel(target),
       })),
-      ...offline.map((r) => ({
+      ...this.fleetUnanswered().map((r) => ({
         _node: r.node,
         resource: `<span class="mono">${escapeHtml(nodeLabel(r.node))}</span>`,
         protocol: `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('fleet.node_offline'))}"></tf-chip>`,
-        source: escapeHtml(T('fleet.node_unreachable', { error: r.shares })),
+        source: escapeHtml(T('fleet.node_unreachable', { error: scrubIds(r.error, T('alerts.id_hidden'), nameOf) })),
         mounts: '—',
         // Unknown, not zero: the node did not answer, so nobody counted.
         sessions: '—',
       })),
-    ];
+    ]);
   },
 
   // n01 node card: health dot + identity + status chip, the fill bar, four
@@ -1003,7 +1112,7 @@ const TentaNasScreen = {
           ${kv(T('kpi.shares'), shares ? String(shares.total) : notCountedHtml(sharesNotCountedHint(n, this.fleet?.rows)))}
         </div>
         <div class="nc-foot">
-          <tf-chip size="sm" status="${channelMode(n.elevationMode) === 'unarmed' ? 'warn' : 'ok'}" icon="${channelMode(n.elevationMode) === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('elevation.short_' + channelMode(n.elevationMode)))}"></tf-chip>
+          <tf-chip size="sm" status="${channelIsUnarmed(nodeChannelMode(n)) ? 'warn' : 'ok'}" icon="${channelIsUnarmed(nodeChannelMode(n)) ? 'lock' : 'shield'}" label="${escapeAttr(T('elevation.short_' + nodeChannelMode(n)))}"></tf-chip>
           <span>${escapeHtml(role)}</span>
         </div>
       </div>`;
@@ -1098,7 +1207,7 @@ const TentaNasScreen = {
   },
 
   crumbAction(act) {
-    if (act === 'fleet') { this.nodeId = null; this.diskId = null; this.draw(); return; }
+    if (act === 'fleet') { this.nodeLink?.leave(); this.leaveToFleet(); return; }
     if (act === 'node') { this.switchTab('overview'); return; }
     if (act === 'disks' || act === 'pools' || act === 'shares') this.switchTab(act);
   },
@@ -1115,9 +1224,10 @@ const TentaNasScreen = {
       // service rows), not which packages the probe found installed. That
       // read is secondary: its failure costs the chip its verdict, never the
       // header.
-      const [res, sharesRes] = await Promise.all([
+      const [res, sharesRes, targetsRes] = await Promise.all([
         this.nas('tentaNasEnvironmentRequest', { refresh }),
         this.nas('tentaNasSharesListRequest', {}).catch(() => null),
+        this.nas('tentaNasTargetsListRequest', { summary: true }).catch(() => null),
       ]);
       if (this.disposed) return;
       // Recorded before the header guard: the tab body's gate reads these two
@@ -1135,11 +1245,11 @@ const TentaNasScreen = {
         `<tf-chip status="${node.disksCritical ? 'err' : node.disksWarning ? 'warn' : 'ok'}" dot label="${escapeAttr(node.disksCritical
           ? `${node.disksCritical} ${T('kpi.failures_suffix', { n: node.disksCritical })}`
           : node.disksWarning ? T('node.chip_disks_warn', { n: node.disksWarning }) : T('node.chip_ok'))}"></tf-chip>`,
-        servicesChipHtml(servicesVerdict([{ node, answer: sharesRes }], { named: false })),
+        servicesChipHtml(servicesVerdict([{ node, answer: sharesRes, targets: targetsRes }], { named: false })),
       ].join('');
       const badges = [
         zfs && zfs.version ? `<tf-chip status="accent" label="${escapeAttr(T('node.badge_zfs', { v: zfs.version }))}"></tf-chip>` : `<tf-chip status="warn" label="${escapeAttr(T('env.no_zfs'))}"></tf-chip>`,
-        `<tf-chip status="${channelMode(env.elevation.mode) === 'unarmed' ? 'warn' : 'ok'}" icon="${channelMode(env.elevation.mode) === 'unarmed' ? 'lock' : 'shield'}" label="${escapeAttr(T('node.badge_channel', { mode: T('elevation.short_' + channelMode(env.elevation.mode)) }))}"></tf-chip>`,
+        `<tf-chip status="${channelIsUnarmed(liveChannelMode(env.elevation.mode, env.elevation.armedUntil)) ? 'warn' : 'ok'}" icon="${channelIsUnarmed(liveChannelMode(env.elevation.mode, env.elevation.armedUntil)) ? 'lock' : 'shield'}" label="${escapeAttr(T('node.badge_channel', { mode: T('elevation.short_' + liveChannelMode(env.elevation.mode, env.elevation.armedUntil)) }))}"></tf-chip>`,
         `<tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: this.nodes.length }))}"></tf-chip>`,
       ];
       this.root.querySelector('#nas-head-badges').innerHTML = badges.join('');
@@ -1150,11 +1260,12 @@ const TentaNasScreen = {
         T('refreshed', { t: fmtAgo(env.probedAt) }),
       ];
       this.root.querySelector('#nas-head-sub').textContent = sub.filter(Boolean).join(' · ');
-      // The node's own share list, answered for this organisation, is the
-      // count its Shares tab has; a remote row alone has none (`nodeShares`).
-      if (Array.isArray(sharesRes?.shares)) {
+      // The node's own share and target lists, answered for this
+      // organisation, are the count its Sharing tab has (the tab lists both);
+      // a remote row alone has none (`nodeShares`).
+      if (Array.isArray(sharesRes?.shares) && Array.isArray(targetsRes?.targets)) {
         const tab = this.root.querySelector('#nas-tabs tf-tab#shares');
-        setAttr(tab, 'count', String(sharesRes.shares.length));
+        setAttr(tab, 'count', String(sharesRes.shares.length + targetsRes.targets.length));
         setAttr(tab, 'title', null);
       }
     } catch (e) {
@@ -1176,6 +1287,7 @@ const TentaNasScreen = {
   drawTab() {
     const body = this.root.querySelector('#nas-tab-body');
     if (!body) return;
+    this.drawLostOnLoss = false;
     body.innerHTML = '';
     // The one home for the rule, and the order is the rule. A probe that
     // FAILED is an error state with a retry, never a dashboard that would
@@ -1240,7 +1352,7 @@ const TentaNasScreen = {
   drawProbeFailed(body) {
     body.innerHTML = `
       <div class="stack" id="nas-probe-failed">
-        <tf-alert tone="danger" title="${escapeAttr(T('setup.probe_failed_title'))}" message="${escapeAttr(T('setup.probe_failed_msg', { error: this.environmentError }))}"></tf-alert>
+        <tf-alert tone="danger" title="${escapeAttr(T('setup.probe_failed_title'))}" message="${escapeAttr(T('setup.probe_failed_msg', { error: scrubIds(this.environmentError, T('alerts.id_hidden'), this.nodeNameOf()) }))}"></tf-alert>
         <div class="section-card">
           <p class="wizard-section-sub">${escapeHtml(T('setup.probe_failed_hint'))}</p>
           <tf-button variant="primary" icon="refresh" data-act="probe-retry">${escapeHtml(T('setup.probe_retry'))}</tf-button>
@@ -2240,7 +2352,8 @@ const TentaNasScreen = {
       this.applyDiskRows();
     } catch (e) {
       if (this.disposed || !body.isConnected) return;
-      toast(T('disks.failed', { error: errMessage(e) }), 'error');
+      // A lost node is said once, by the n18c overlay — not by a toast per poll.
+      if (errCode(e) !== 'NodeUnreachable') toast(T('disks.failed', { error: errMessage(e) }), 'error');
     }
     this.later(() => this.refreshDisks(body), POLL_DISKS_MS);
   },
@@ -2476,6 +2589,9 @@ const TentaNasScreen = {
     } catch (e) {
       if (this.disposed || !body.isConnected) return;
       body.innerHTML = `<tf-alert tone="danger" title="${escapeAttr(T('load_failed'))}" message="${escapeAttr(errMessage(e))}"></tf-alert>`;
+      // Nothing polls a detail whose first read failed; if the node was lost,
+      // `nodeRecovered` draws it again once the node answers.
+      if (errCode(e) === 'NodeUnreachable') this.drawLostOnLoss = true;
       return;
     }
     if (this.disposed || !body.isConnected) return;
@@ -3166,10 +3282,12 @@ const TentaNasScreen = {
       // the tools, and its RDMA interface also routes the world — a network
       // the admin can fix, which installing a package never would (§5.4b).
       status: { status: f.status === 'ok' ? 'ok' : f.status === 'broken' ? 'err' : ['outdated', 'version_too_low', 'exposed', 'unknown'].includes(f.status) ? 'warn' : f.optional ? 'info' : 'err', label: T('feature_status.' + f.status), dot: true },
-      version: `<span class="mono">${escapeHtml([
+      // The detail in the reader's language (`featureDetail`), the node's
+      // own sentence as the tooltip.
+      version: ((detail) => `<span class="mono"${detail.title ? ` title="${escapeAttr(detail.title)}"` : ''}>${escapeHtml([
         f.version ? `${f.version}${f.requiredVersion ? ` (≥ ${f.requiredVersion})` : ''}` : f.requiredVersion ? `≥ ${f.requiredVersion}` : '',
-        f.detail || '',
-      ].filter(Boolean).join(' · ') || '—')}</span>`,
+        detail.text,
+      ].filter(Boolean).join(' · ') || '—')}</span>`)(featureDetail(f, env.featureReasons)),
     }));
     ftable.rowActions = (row, idx, currentRow) => {
       const live = () => currentRow?.() ?? row;
@@ -3197,7 +3315,7 @@ const TentaNasScreen = {
       // no ids anywhere in the GUI).
       name: `<div class="cell-2"><div class="l1">${escapeHtml(nodeLabel(n))}${n.isLocal ? ` <span class="text-3">(${escapeHtml(T('this_node'))})</span>` : ''}${n.online ? '' : ` <tf-chip status="info" label="${escapeAttr(T('offline'))}"></tf-chip>`}</div></div>`,
       platform: n.instanceStatus === 'ready' ? (n.osName || '—') : T('instance.' + n.instanceStatus),
-      channel: { status: channelMode(n.elevationMode) === 'unarmed' ? 'warn' : 'ok', label: T('elevation.mode_' + channelMode(n.elevationMode)), dot: true },
+      channel: { status: channelIsUnarmed(nodeChannelMode(n)) ? 'warn' : 'ok', label: T('elevation.mode_' + nodeChannelMode(n)), dot: true },
       features: (n.features || []).join(' · ') || (n.instanceStatus === 'ready' ? T('env.features_unknown') : T('instance.' + n.instanceStatus)),
     }));
     otable.rowActions = (row, idx, currentRow) => {
@@ -3206,7 +3324,7 @@ const TentaNasScreen = {
       if (n.instanceStatus !== 'ready') return null;
       const wrap = document.createElement('div');
       wrap.className = 'row-actions';
-      const unarmed = channelMode(n.elevationMode) === 'unarmed';
+      const unarmed = channelIsUnarmed(nodeChannelMode(n));
       wrap.innerHTML = unarmed && admin
         ? `<tf-button size="sm" variant="secondary" icon="unlock" data-act="arm-node">${escapeHtml(T('env.arm_node'))}</tf-button>`
         : `<tf-button size="sm" variant="ghost" icon="chevron-right" data-act="go">${escapeHtml(T('env.go_to_node'))}</tf-button>`;
@@ -4029,26 +4147,47 @@ function perOrgCounted(n) {
   return Boolean(n && n.isLocal && n.perOrgCounted === true);
 }
 
-// The organisation's shares on one node, as far as this screen knows them:
-// the local row's scoped figure (its share errors are already in its
-// `health`), or, for a remote node, the share list that node answered itself
+// Whether a fleet row carries BOTH lists the Sharing tab is made of — the
+// shares and the block targets. Either one missing makes the row's resources
+// unknown, not "the half that came back".
+function fleetRowAnswered(r) {
+  return Boolean(r && r.shares && typeof r.shares === 'object' && Array.isArray(r.shares.shares)
+    && r.targets && typeof r.targets === 'object' && Array.isArray(r.targets.targets));
+}
+
+// Who may connect to a block target, for the fleet's "Montowania" column: the
+// allowlist size in the protocol's own noun and the authentication method
+// (n01: "2 initiatory (CHAP)", "1 host NQN"). An empty allowlist is "anyone
+// who reaches the portal", said as such.
+function targetClientsText(t) {
+  const n = Array.isArray(t?.initiators) ? t.initiators.length : 0;
+  const who = !n ? T('fleet.target_any_client')
+    : T(t.protocol === 'nvmet' ? 'fleet.target_hosts' : 'fleet.target_initiators', { n });
+  const method = t?.auth?.method || 'none';
+  return method === 'none' ? who : `${who} (${targetAuthLabel(method)})`;
+}
+
+// The organisation's shared resources on one node — SMB/NFS shares and block
+// targets together, as the Sharing tab lists them — as far as this screen
+// knows them: the local row's scoped figure (its errors are already in its
+// `health`), or, for a remote node, the two lists that node answered itself
 // for this organisation on the fleet poll. Null when nobody counted them.
 function nodeShares(n, fleetRows) {
   if (!n) return null;
   if (perOrgCounted(n)) return { total: n.sharesTotal, errors: 0 };
   const row = (fleetRows || []).find((r) => r.node && r.node.nodeId === n.nodeId);
-  const list = row && row.shares && typeof row.shares === 'object' ? row.shares.shares : null;
-  if (!Array.isArray(list)) return null;
-  return { total: list.length, errors: list.filter((s) => s.state === 'error').length };
+  if (!fleetRowAnswered(row)) return null;
+  const items = [...row.shares.shares, ...row.targets.targets];
+  return { total: items.length, errors: items.filter((s) => s.state === 'error').length };
 }
 
-// Why a node's share count is "—": the node did not answer the share list
-// this screen asked it for (its row carries the error), or it answered but
-// the count is per organisation and not sent between nodes. Two different
-// facts; the old hint said the second for both.
+// Why a node's share count is "—": the node did not answer the share or the
+// target list this screen asked it for (its row carries the error), or it
+// answered but the count is per organisation and not sent between nodes. Two
+// different facts; the old hint said the second for both.
 function sharesNotCountedHint(n, fleetRows) {
   const row = (fleetRows || []).find((r) => r.node && r.node.nodeId === n?.nodeId);
-  return row && typeof row.shares === 'string' ? T('fleet.not_answered_hint') : T('fleet.not_counted_hint');
+  return row && (typeof row.shares === 'string' || typeof row.targets === 'string') ? T('fleet.not_answered_hint') : T('fleet.not_counted_hint');
 }
 
 // The node card's grade: a remote node's own broken share makes it a warning,

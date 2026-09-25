@@ -6944,7 +6944,9 @@
       "catalog_empty": "The helper reported no commands",
       "short_helper": "mode A",
       "short_interactive": "mode B",
-      "short_unarmed": "not armed"
+      "short_unarmed": "not armed",
+      "mode_interactive_unarmed": "mode B — not armed",
+      "short_interactive_unarmed": "not armed (mode B)"
     },
     "env": {
       "failed": "Could not fetch the environment: {error}",
@@ -6973,7 +6975,25 @@
       "arm_node": "Arm…",
       "arm_node_title": "Arm the permission channel — {node} (mode B)",
       "armed_node": "Channel on {node} armed",
-      "armed_node_unnamed": "Channel on the unnamed node armed"
+      "armed_node_unnamed": "Channel on the unnamed node armed",
+      "detail": {
+        "feature_binaries_missing": "missing program: {binaries}",
+        "feature_version_too_low": "found {found}, need at least {required}",
+        "feature_module_not_loaded": "kernel module {module} is not loaded",
+        "snapraid_killed": "SnapRAID is installed but was killed while reading a trivial configuration — rebuild it with -O2; until then the array only looks protected",
+        "snapraid_killed_signal": "SnapRAID is installed but was killed by signal {signal} while reading a trivial configuration — rebuild it with -O2; until then the array only looks protected",
+        "snapraid_probe_unconfirmed": "the SnapRAID probe exited with code {code} without confirming that the program works",
+        "snapraid_probe_failed": "the SnapRAID probe could not be run (details in the tooltip)",
+        "snapraid_vanished": "SnapRAID disappeared before its health probe",
+        "rdma_no_device": "no RDMA device under {path}",
+        "ksmbd_no_interface": "no RDMA interface with an address",
+        "ksmbd_exposed": "{interfaces} also carries the default gateway — SMB Direct needs a dedicated storage network",
+        "ksmbd_tools_missing": "missing: {tools} · the listener would be on {listener}",
+        "ksmbd_experimental": "EXPERIMENTAL (per the kernel documentation)",
+        "module_loaded": "{module} loaded",
+        "module_on_demand": "{module} available, loaded on first use",
+        "module_absent": "{module} is not in this kernel’s module tree"
+      }
     },
     "feature": {
       "snapraid": "SnapRAID",
@@ -7340,6 +7360,17 @@
       "folders_col_name": "Folder",
       "folders_col_share": "Share",
       "folders_col_cache": "Cache",
+      "folders_col_used": "Usage",
+      "folder_usage": {
+        "pending": "Not measured yet — the node counts folders in the background every few hours.",
+        "over_budget": "Not measured: the folder has too many files to count within the measurement limit ({entries} entries, {minutes} min).",
+        "unreadable": "Not measured: some of the folder's files could not be read from disk.",
+        "not_mounted": "Not measured: not every disk of the array was mounted.",
+        "failed": "Not measured: the node could not run the folder measurement. It will try again in 30 min.",
+        "measured": "Measured {ago}; the node refreshes it every 6 h",
+        "unknown": "Not measured",
+        "name_refused": "Not measured: the folder name has characters the measurement does not accept (e.g. a control character) — the other folders are measured."
+      },
       "folders_unknown": "This array's folder list could not be read. Not measured is not the same as no folders — check whether the union is mounted.",
       "folders_unknown_partial": "The folder list could not be read, so only the folders with a stored policy are listed below. Not measured is not the same as no folders.",
       "folders_explain": "New files always land on the cache first: a mergerfs create policy covers the whole union, so no mergerfs setting can keep one folder off the cache. A folder's policy decides how fast — or whether — its files move down to the data disks.",
@@ -7570,6 +7601,11 @@
         "no_cache": "No cache disk: the mover has nothing to do, and new files are written straight to the data disks.",
         "unhealthy_disks": "SMART warns about {disks}: an array built on a disk that is already failing starts degraded.",
         "mixed_sizes": "The data disks are different sizes, and every byte of each of them is used: that is what this array kind is for."
+      },
+      "elastic_reason": {
+        "tool_unavailable": "{tool}: {status}",
+        "tool_not_probed": "{tool}: not checked (Environment → Check again)",
+        "no_mkfs": "neither mkfs.xfs nor mkfs.ext4 is installed — no data disk can be prepared"
       }
     },
     "pools": {
@@ -7730,7 +7766,10 @@
       "trim_resume_done": "TRIM of pool {name} resumed",
       "trim_cancel_done": "TRIM of pool {name} cancelled",
       "leaf_last_known": "disk missing (last seen as {name})",
-      "leaf_missing_at": "disk missing, no. {n}"
+      "leaf_missing_at": "disk missing, no. {n}",
+      "disk_detach": "Detach old disk",
+      "disk_detach_confirm": "Disk {device} will be detached from pool {pool} (zpool detach). The hot spare that stays in the pool in its place already holds its data. Once detached, {device} can be removed safely.",
+      "disk_detach_done": "Disk {device} detached — it can be removed"
     },
     "props": {
       "title": "Pool properties",
@@ -7821,7 +7860,7 @@
       "explain_pick": "Pick a replacement disk to see the replacement plan.",
       "start": "Start replacement",
       "resilver_progress": "resilver {pct}% · {eta} left",
-      "done_detail_spare": "Resilver finished — {new} has taken over the data of {device}, but {device} stays in the pool configuration until it is detached (zpool detach). This version of TentaNas does not do that yet: do not pull the disk before it is detached."
+      "done_detail_spare": "Resilver finished — {new} took over the data of disk {device}, but {device} stays in the pool's configuration. Detach it with the “Detach old disk” action next to it in the pool topology; only then can it be removed."
     },
     "elastic_import": {
       "title": "Import an Elastic Array",
@@ -8447,7 +8486,10 @@
       "chip_services_down_list": "Services down: {list}",
       "chip_services_unknown": "Services: no answer from {nodes}",
       "chip_services_none": "No sharing services",
-      "not_answered_hint": "Unknown: this node's share list could not be read (no answer or an error). The count appears once the node answers."
+      "not_answered_hint": "Unknown: this node's share or target list could not be read (no answer or an error). The count appears once the node answers.",
+      "target_any_client": "any portal client",
+      "target_initiators": "{n} {n|initiator|initiators}",
+      "target_hosts": "{n} {n|host NQN|host NQNs}"
     },
     "node": {
       "head_sub_node": "node {name}",
@@ -8766,7 +8808,10 @@
         "import_secret_needed": "The authentication secret has to be entered again after an import.",
         "import_all_interfaces": "This target was exported on every interface (0.0.0.0) — pick an interface of this node before enabling it.",
         "portal_moved_head_no_address": "The target’s portal is no longer where it was pinned. The address {address} belonged to interface {interface}, which is on this node but has no address now (link down or a lost DHCP lease)."
-      }
+      },
+      "host_state": "State",
+      "host_connected": "Connected",
+      "host_not_connected": "Not connected"
     },
     "wizard_target": {
       "title": "New target",
@@ -8912,7 +8957,33 @@
       "elastic_add_stopped": "The disk addition stopped before its end — finish it or undo it on the array screen",
       "elastic_undo_stopped": "Undoing the addition stopped after its first step — the addition stays unfinished",
       "elastic_disk_absent": "The disk that would be erased is not present on this node — reconnect it and try again",
-      "job_not_cancellable": "This job cannot be cancelled — stopping it would not stop the work already under way"
+      "job_not_cancellable": "This job cannot be cancelled — stopping it would not stop the work already under way",
+      "pool_detach_not_allowed": "This disk cannot be detached now: only a disk replaced by a healthy hot spare can be detached, and only once the resilver has finished."
+    },
+    "unreachable": {
+      "title": "Node {node} unreachable",
+      "title_unnamed": "Unnamed node unreachable",
+      "heading": "Mesh connection lost",
+      "desc": "Operations on node {node} are paused until the connection is back. The NAS services on the node itself keep running, independently of the dashboard.",
+      "desc_unnamed": "Operations on this node are paused until the connection is back. The NAS services on the node itself keep running, independently of the dashboard.",
+      "keep": "Shares, targets and schedules on {node} keep working — only the dashboard lost its connection to the node.",
+      "keep_unnamed": "Shares, targets and schedules on this node keep working — only the dashboard lost its connection to the node.",
+      "retry_line": "Reconnecting to the node",
+      "retry_attempt": "attempt {attempt} · backoff up to {max} s",
+      "btn_fleet": "Fleet overview",
+      "btn_refresh": "Refresh",
+      "btn_retry": "Connect now",
+      "log_manual": "connection attempt forced",
+      "log_no_answer": "no answer from {node} (attempt {attempt})",
+      "log_no_answer_unnamed": "no answer from the node (attempt {attempt})",
+      "log_restored": "connection restored",
+      "log_mesh_connected": "the mesh sees {node} as connected, but the node does not answer",
+      "log_mesh_connected_unnamed": "the mesh sees the node as connected, but it does not answer",
+      "log_mesh_offline": "the mesh does not see {node} — the node is disconnected",
+      "log_mesh_offline_unnamed": "the mesh does not see this node — it is disconnected",
+      "log_lost": "{node} stopped answering",
+      "log_lost_unnamed": "the node stopped answering",
+      "error": "The node does not answer — the mesh connection was lost"
     }
   },
   "agent_accounts": {

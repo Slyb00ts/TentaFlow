@@ -1827,3 +1827,41 @@ test('przyczyny uwagi, kroki dodawania i potwierdzenie Sync są tłumaczone w pi
     }
   } finally { await I18n.setLanguage('pl'); }
 });
+
+// n11 "Użycie": the node's last bounded walk of each folder. A poll that
+// brings a new figure writes it into the SAME cell, and a folder with no
+// figure says "—" with the reason as its tooltip, never a zero.
+test('the folder usage column shows the measured size, patches it in place and words a missing one', async () => {
+  const measuredAt = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+  let usage = { usedBytes: 2 * 1024 ** 4, usedMeasuredAt: measuredAt, usedReasons: [] };
+  const read = () => array({
+    foldersKnown: true,
+    folders: [
+      { ...folders[0], ...usage },
+      { ...folders[1], usedBytes: null, usedReasons: [{ code: 'folder_usage_unreadable', params: {} }] },
+      { ...folders[2] },
+    ],
+  });
+  const { screen, body, poll } = await mountPolled(read);
+  try {
+    const cell = (name) => body.querySelector(`.nas-folders .fr[data-folder="${name}"] [data-f="folder-used"]`);
+    const filmy = cell('filmy');
+    assert.equal(filmy.textContent, '2.0 TiB');
+    assert.match(filmy.getAttribute('title'), /^Zmierzono 3 h temu/);
+    assert.equal(cell('foto').textContent, '—');
+    assert.match(cell('foto').getAttribute('title'), /nie dało się odczytać/);
+    // A node too old to send the field: no figure, no reason, no zero.
+    assert.equal(cell('backup').textContent, '—');
+    assert.equal(cell('backup').getAttribute('title'), 'Nie zmierzono');
+    assert.match(body.querySelector('.nas-folders .fr-head').textContent, /Użycie/);
+
+    usage = { usedBytes: 3 * 1024 ** 4, usedMeasuredAt: new Date().toISOString(), usedReasons: [] };
+    await poll();
+    assert.ok(cell('filmy') === filmy, 'the cell is the same node');
+    assert.equal(filmy.textContent, '3.0 TiB');
+    assert.match(filmy.getAttribute('title'), /^Zmierzono 0 s temu|^Zmierzono \d+ s temu/);
+  } finally {
+    screen.dispose?.();
+    body.remove();
+  }
+});

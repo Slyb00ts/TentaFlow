@@ -393,6 +393,9 @@ async fn run_elastic_passes(
     };
     run_due_elastic_tasks(db, &arrays, now).await;
     run_automatic_movers(db, &arrays, clock, observer).await;
+    // In the background: a cold walk of a large array takes minutes, and it
+    // paces itself (`FolderUsageCache::due`), so most ticks start nothing.
+    super::elastic::spawn_folder_usage_pass(db, arrays);
 }
 
 /// The recurring scrub and the recurring TRIM (§5.10) are the same loop over
@@ -2607,5 +2610,232 @@ mod tests {
             next_run_utc(&after.short, now),
             "the cadence re-arms forward anyway"
         );
+    }
+
+    // ----- folder usage (n11 "Użycie") ----------------------------------------
+
+    use crate::tentanas::elastic::{
+        fill_folder_usage, run_folder_usage_pass, FolderRow, FolderUsageCache, FolderUsageProber,
+        FOLDER_USAGE_EVERY, FOLDER_USAGE_RETRY,
+    };
+    use tentanas_helper::elastic::{ElasticFolderBytes, ElasticFolderGap, ElasticFolderUsage};
+
+    /// Canned folder walks, counted: what the pass asked and how often.
+    struct Walks {
+        answer: Option<Vec<ElasticFolderBytes>>,
+        asked: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Walks {
+        fn answering(answer: Option<Vec<ElasticFolderBytes>>) -> Self {
+            Self { answer, asked: Default::default() }
+        }
+        fn count(&self) -> usize {
+            self.asked.lock().unwrap().len()
+        }
+    }
+
+    impl FolderUsageProber for Walks {
+        async fn measure(&self, _: &ElasticArrayRow, folders: &[String]) -> anyhow::Result<ElasticFolderUsage> {
+            self.asked.lock().unwrap().push(folders.to_vec());
+            match &self.answer {
+                Some(folders) => Ok(ElasticFolderUsage { folders: folders.clone() }),
+                None => Err(anyhow::anyhow!("elastic_folder_usage exited with 69: unknown command")),
+            }
+        }
+    }
+
+    fn bytes(name: &str, bytes: u64) -> ElasticFolderBytes {
+        ElasticFolderBytes { name: name.into(), bytes: Some(bytes), gap: None }
+    }
+
+    fn gap(name: &str, gap: ElasticFolderGap) -> ElasticFolderBytes {
+        ElasticFolderBytes { name: name.into(), bytes: None, gap: Some(gap) }
+    }
+
+    /// A settled array whose union was read: two folders.
+    fn array_with_folders(p: &DbPool, name: &str) -> ElasticArrayRow {
+        settled_cached_array(p, name);
+        let mut array = store::elastic_arrays_all(p).expect("arrays").remove(0);
+        array.folders = ["filmy", "foto"]
+            .iter()
+            .map(|f| FolderRow { name: f.to_string(), cache_policy: "yes".into(), ..Default::default() })
+            .collect();
+        array.folders_known = true;
+        array
+    }
+
+    /// The folders of `array` as the wire carries them after `fill_folder_usage`.
+    fn wire_folders(array: &ElasticArrayRow, cache: &FolderUsageCache) -> Vec<tentaflow_protocol::tentanas::NasElasticFolder> {
+        let mut wire = tentaflow_protocol::tentanas::NasElasticArray {
+            folders: array
+                .folders
+                .iter()
+                .map(|f| tentaflow_protocol::tentanas::NasElasticFolder { name: f.name.clone(), ..Default::default() })
+                .collect(),
+            ..Default::default()
+        };
+        fill_folder_usage(&mut wire, array, cache);
+        wire.folders
+    }
+
+    fn codes(folder: &tentaflow_protocol::tentanas::NasElasticFolder) -> Vec<&str> {
+        folder.used_reasons.iter().map(|r| r.code.as_str()).collect()
+    }
+
+    /// The pass measures an array once, the read copies the figures, and the
+    /// NEXT pass asks nothing until `FOLDER_USAGE_EVERY` has passed: the walk
+    /// is paced by the cache, never started by a read.
+    #[tokio::test]
+    async fn folder_usage_is_measured_once_per_period_and_the_read_only_copies_it() {
+        let p = db();
+        let array = array_with_folders(&p, "media");
+        let cache = FolderUsageCache::new();
+        let walks = Walks::answering(Some(vec![bytes("filmy", 4_000), gap("foto", ElasticFolderGap::OverBudget)]));
+
+        let before = wire_folders(&array, &cache);
+        assert_eq!(codes(&before[0]), ["folder_usage_pending"], "nothing measured yet");
+        assert_eq!(before[0].used_bytes, None);
+        assert_eq!(walks.count(), 0, "a read never walks");
+
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 1);
+        assert_eq!(walks.asked.lock().unwrap()[0], ["filmy", "foto"]);
+        let wire = wire_folders(&array, &cache);
+        assert_eq!(wire[0].used_bytes, Some(4_000));
+        assert!(wire[0].used_measured_at.is_some());
+        assert!(wire[0].used_reasons.is_empty());
+        assert_eq!(wire[1].used_bytes, None, "over budget is no figure, never a partial one");
+        assert_eq!(codes(&wire[1]), ["folder_usage_over_budget"]);
+        assert_eq!(wire[1].used_reasons[0].params.get("minutes").map(String::as_str), Some("5"));
+
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 1, "measured within the period: not walked again");
+
+        cache.age_for_test(array.array_id().unwrap(), FOLDER_USAGE_EVERY);
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 2, "the period passed: measured again");
+    }
+
+    /// A helper that refuses the command (an older build) leaves the folders
+    /// with NO figure and the reason, is asked again only after
+    /// `FOLDER_USAGE_RETRY`, and never turns an earlier figure into a zero.
+    #[tokio::test]
+    async fn a_refused_measurement_is_a_reason_and_is_retried_later() {
+        let p = db();
+        let array = array_with_folders(&p, "media");
+        let cache = FolderUsageCache::new();
+        let refused = Walks::answering(None);
+
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &refused).await;
+        let wire = wire_folders(&array, &cache);
+        assert_eq!(wire[0].used_bytes, None);
+        assert_eq!(codes(&wire[0]), ["folder_usage_failed"]);
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &refused).await;
+        assert_eq!(refused.count(), 1, "not re-asked before the retry");
+
+        cache.age_for_test(array.array_id().unwrap(), FOLDER_USAGE_RETRY);
+        let working = Walks::answering(Some(vec![bytes("filmy", 7), bytes("foto", 9)]));
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &working).await;
+        assert_eq!(working.count(), 1, "retried after the retry period");
+        assert_eq!(wire_folders(&array, &cache)[1].used_bytes, Some(9));
+
+        // A later failure keeps the measured figures with their date.
+        cache.age_for_test(array.array_id().unwrap(), FOLDER_USAGE_EVERY);
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &refused).await;
+        assert_eq!(wire_folders(&array, &cache)[1].used_bytes, Some(9));
+    }
+
+    /// MINOR 5 (wave 7): a branch that was not mounted (a Restore, a disk
+    /// being replaced) is a passing state. The folders it covered are asked
+    /// again after `FOLDER_USAGE_RETRY`, not after `FOLDER_USAGE_EVERY`.
+    #[tokio::test]
+    async fn an_unmounted_branch_is_measured_again_after_the_retry_not_six_hours() {
+        let p = db();
+        let array = array_with_folders(&p, "media");
+        let cache = FolderUsageCache::new();
+        let unmounted = Walks::answering(Some(vec![gap("filmy", ElasticFolderGap::NotMounted), gap("foto", ElasticFolderGap::NotMounted)]));
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &unmounted).await;
+        assert_eq!(codes(&wire_folders(&array, &cache)[0]), ["folder_usage_not_mounted"]);
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &unmounted).await;
+        assert_eq!(unmounted.count(), 1, "not re-asked at once");
+        cache.age_for_test(array.array_id().unwrap(), FOLDER_USAGE_RETRY);
+        let mounted = Walks::answering(Some(vec![bytes("filmy", 3), bytes("foto", 4)]));
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &mounted).await;
+        assert_eq!(mounted.count(), 1, "re-measured after the retry, well before six hours");
+        assert_eq!(wire_folders(&array, &cache)[0].used_bytes, Some(3));
+    }
+
+    /// MINOR 6 (wave 7): a folder name the walk refuses (a control character,
+    /// over 255 bytes) is left out of the request and gets its own reason; the
+    /// other folders are measured instead of the whole array failing forever.
+    #[tokio::test]
+    async fn a_refused_folder_name_does_not_take_the_other_folders_down() {
+        let p = db();
+        let mut array = array_with_folders(&p, "media");
+        array.folders.push(FolderRow { name: "bad\nname".into(), cache_policy: "yes".into(), ..Default::default() });
+        array.folders.push(FolderRow { name: "x".repeat(256), cache_policy: "yes".into(), ..Default::default() });
+        let cache = FolderUsageCache::new();
+        let walks = Walks::answering(Some(vec![bytes("filmy", 5), bytes("foto", 6)]));
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.asked.lock().unwrap()[0], ["filmy", "foto"], "only the valid names are asked");
+        let wire = wire_folders(&array, &cache);
+        assert_eq!((wire[0].used_bytes, wire[1].used_bytes), (Some(5), Some(6)));
+        assert_eq!(codes(&wire[2]), ["folder_usage_name_refused"]);
+        assert_eq!(codes(&wire[3]), ["folder_usage_name_refused"]);
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 1, "a refused name is an answer, not a reason to retry every pass");
+    }
+
+    /// An answer that is not about the folders asked — another name, another
+    /// count, a figure and a gap at once — is not a measurement.
+    #[tokio::test]
+    async fn an_answer_about_other_folders_is_not_recorded() {
+        let p = db();
+        let array = array_with_folders(&p, "media");
+        for answer in [
+            vec![bytes("filmy", 1)],
+            vec![bytes("filmy", 1), bytes("muzyka", 2)],
+            vec![bytes("filmy", 1), ElasticFolderBytes { name: "foto".into(), bytes: Some(2), gap: Some(ElasticFolderGap::Unreadable) }],
+        ] {
+            let cache = FolderUsageCache::new();
+            run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &Walks::answering(Some(answer))).await;
+            let wire = wire_folders(&array, &cache);
+            assert_eq!(wire[0].used_bytes, None);
+            assert_eq!(codes(&wire[0]), ["folder_usage_failed"]);
+        }
+    }
+
+    /// Not walked: an array whose folder list is unknown, and one with an
+    /// operation running (a Restore changes the very mounts the walk reads).
+    #[tokio::test]
+    async fn folder_usage_skips_unknown_folders_and_a_running_operation() {
+        let p = db();
+        let mut array = array_with_folders(&p, "media");
+        let cache = FolderUsageCache::new();
+        let walks = Walks::answering(Some(vec![bytes("filmy", 1), bytes("foto", 2)]));
+        array.folders_known = false;
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 0, "an unknown folder list is not measured");
+        array.folders_known = true;
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_restore".to_string(),
+            subject: array.name.clone(),
+            status: "running".to_string(),
+            started_by: "test".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        let spec = array.persisted_spec().unwrap().clone();
+        store::insert_job(&p, &job, Some(&crate::tentanas::jobs::ElasticJobIntent::Restore {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: uuid::Uuid::now_v7().to_string(),
+        }))
+        .expect("restore job");
+        assert!(store::elastic_operation_running(&p, &spec.array_id).unwrap());
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 0, "not walked while an operation runs");
     }
 }

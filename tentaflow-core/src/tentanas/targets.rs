@@ -289,6 +289,13 @@ pub fn kernel_support(protocol: &str) -> (bool, CodedText) {
 /// asks for it ("sonda w Środowisku"), and the iSCSI row carries the iSER
 /// module state (§5.5a).
 pub fn refine(feature: &mut FeatureState) {
+    refine_coded(feature);
+}
+
+/// `refine`, answering the row's detail as codes too
+/// (`NasEnvironment::feature_reasons`): the same codes the wizard words for
+/// `NasBlockCapabilities`, plus the transport module's state.
+pub fn refine_coded(feature: &mut FeatureState) -> Vec<tentaflow_protocol::tentanas::NasHealthReason> {
     // Nothing is installable for any of these rows: the modules come with the
     // kernel, the build option comes with the kernel, and the userspace tools
     // are exactly what this app does not use.
@@ -311,22 +318,25 @@ pub fn refine(feature: &mut FeatureState) {
         feature.status = if ok { "ok" } else { "missing_module" }.to_string();
         feature.detail = detail.text;
         feature.kernel_module = None;
-        return;
+        return detail.reasons;
     }
 
     let (ok, detail) = kernel_support(&feature.id);
-    let mut detail = detail.text;
-    if feature.id == "nvmet" {
-        detail.push_str(&format!(
-            " · nvmet-rdma {}",
-            module_state(nvmet_rdma_module())
-        ));
+    let (module, available) = if feature.id == "nvmet" {
+        ("nvmet-rdma", nvmet_rdma_module())
     } else {
-        detail.push_str(&format!(" · ib_isert {}", module_state(iser_module())));
-    }
+        ("ib_isert", iser_module())
+    };
+    let transport = CodedText::new(
+        if available { "module_on_demand" } else { "module_absent" },
+        &[("module", module.to_string())],
+        format!("{module} {}", module_state(available)),
+    );
+    let detail = detail.and(transport);
     feature.status = if ok { "ok" } else { "missing_module" }.to_string();
-    feature.detail = detail;
+    feature.detail = detail.text;
     feature.kernel_module = modules_for(&feature.id).first().map(|m| m.to_string());
+    detail.reasons
 }
 
 fn module_state(available: bool) -> &'static str {
@@ -3699,9 +3709,21 @@ fn sessions_cache() -> &'static std::sync::Mutex<Option<(std::time::Instant, blo
 /// kernel option all mean the same thing to the caller — unknown — and each
 /// one carries its own sentence for the UI.
 pub async fn nvmet_sessions(db: &DbPool) -> block::NvmetSessions {
+    nvmet_sessions_within(db, SESSIONS_CACHE).await
+}
+
+/// How old a session reading the FLEET poll accepts (`TargetsListRequest
+/// { summary }`). The fleet asks every node every 10 s for as long as anyone
+/// has n01 open; at the Sharing tab's 10 s window that was one privileged
+/// read per node per tick. Five minutes keeps the fleet's count honest to
+/// within a few minutes and the channel's audit free of a polling screen.
+pub const FLEET_SESSIONS_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// `nvmet_sessions` accepting a reading up to `max_age` old.
+pub async fn nvmet_sessions_within(db: &DbPool, max_age: Duration) -> block::NvmetSessions {
     if let Ok(cache) = sessions_cache().lock() {
         if let Some((at, found)) = cache.as_ref() {
-            if at.elapsed() < SESSIONS_CACHE {
+            if at.elapsed() < max_age {
                 return found.clone();
             }
         }
@@ -3713,7 +3735,15 @@ pub async fn nvmet_sessions(db: &DbPool) -> block::NvmetSessions {
     found
 }
 
+thread_local! {
+    /// Privileged session reads made on this thread — how the dispatch tests
+    /// prove that the fleet's light path does not pay one per poll. Per
+    /// thread, so tests running in parallel cannot count each other's reads.
+    pub(crate) static SESSION_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 async fn read_nvmet_sessions(db: &DbPool) -> block::NvmetSessions {
+    SESSION_READS.with(|n| n.set(n.get() + 1));
     let outcome = super::broker::run_privileged(
         db,
         &HelperCommand::NvmetSessionsRead {},

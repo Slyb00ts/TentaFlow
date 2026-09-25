@@ -77,6 +77,8 @@ pub mod elastic;
 mod elastic_namespace;
 #[cfg(unix)]
 mod elastic_transfer;
+#[cfg(target_os = "linux")]
+mod folder_usage;
 
 /// Catalog version the wrapper reports with `--version`; core refuses to use
 /// a wrapper built from a different catalog. Bumps with the crate version.
@@ -396,6 +398,11 @@ pub enum HelperCommand {
     /// core start a run only when aged files are actually waiting, instead of
     /// starting privileged runs on a timer to discover there was nothing.
     ElasticCacheAge { array_id: String, owner: elastic::ElasticOwner, rules: elastic::MoverRules },
+    /// How many bytes each named top-level folder of the array holds, summed
+    /// over its data and cache branches (n11 "Użycie"). Read-only and
+    /// bounded: a folder the entry budget or the deadline runs out in is
+    /// reported without a figure, never with the part that was counted.
+    ElasticFolderUsage { array_id: String, owner: elastic::ElasticOwner, folders: Vec<String> },
     ElasticClaims { name: Option<String> },
     /// Every Elastic journal on this node, whatever its owner. Owner-blind on
     /// purpose: a journal whose owner no longer matches the addon asking is
@@ -513,6 +520,14 @@ pub enum HelperCommand {
         pool: String,
         old: String,
         new: String,
+    },
+    /// `zpool detach <pool> <device>`: takes the original disk out of a
+    /// `spare-N` group once the hot spare that replaced it holds the data.
+    /// The core decides WHICH leaf (`NasVdevDisk::detachable`); this entry
+    /// only validates the two names, like `ZpoolOffline`.
+    ZpoolDetach {
+        pool: String,
+        device: String,
     },
     ZpoolOffline {
         pool: String,
@@ -2141,6 +2156,7 @@ impl HelperCommand {
             Self::ElasticDestroy { .. } => Some("elastic_destroy"),
             Self::ElasticInspect { .. } => Some("elastic_inspect"),
             Self::ElasticCacheAge { .. } => Some("elastic_cache_age"),
+            Self::ElasticFolderUsage { .. } => Some("elastic_folder_usage"),
             Self::ElasticClaims { .. } => Some("elastic_claims"),
             Self::ElasticJournals {} => Some("elastic_journals"),
             Self::ElasticAdopt { .. } => Some("elastic_adopt"),
@@ -2269,6 +2285,11 @@ impl HelperCommand {
             Self::ElasticCacheAge { array_id, owner, rules } => {
                 elastic::validate_elastic_uuid(array_id)?;
                 rules.validate()?;
+                owner.validate()
+            }
+            Self::ElasticFolderUsage { array_id, owner, folders } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_usage_folders(folders)?;
                 owner.validate()
             }
             Self::ElasticClaims { name } => match name {
@@ -2621,6 +2642,15 @@ impl HelperCommand {
                     env: env_c,
                 })
             }
+            Self::ZpoolDetach { pool, device } => {
+                validate_pool_name(pool)?;
+                validate_vdev_name(device)?;
+                Ok(Resolved {
+                    program: find_tool("zpool", ZPOOL)?,
+                    args: vec!["detach".into(), pool.clone(), device.clone()],
+                    env: env_c,
+                })
+            }
             Self::ZpoolOffline { pool, device } | Self::ZpoolOnline { pool, device } => {
                 validate_pool_name(pool)?;
                 validate_vdev_name(device)?;
@@ -2960,6 +2990,7 @@ impl HelperCommand {
             Self::ElasticDestroy { .. } => ("builtin", "Zatrzymuje udostępnianie własnej macierzy Elastic bez formatowania dysków."),
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
             Self::ElasticCacheAge { .. } => ("builtin", "Odczytuje, ile plików na cache własnej macierzy Elastic czeka na przeniesienie, bez przenoszenia."),
+            Self::ElasticFolderUsage { .. } => ("builtin", "Odczytuje, ile miejsca zajmują foldery własnej macierzy Elastic, z limitem wpisów i czasu, bez zmian."),
             Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
             Self::ElasticJournals {} => ("builtin", "Wypisuje dzienniki macierzy Elastic obecne na tym nodzie."),
             Self::ElasticAdopt { .. } => ("builtin", "Przepisuje właściciela dziennika macierzy Elastic na przejmującą instancję."),
@@ -2989,6 +3020,7 @@ impl HelperCommand {
             }
             Self::ZpoolRemove { .. } => ("zpool", "Remove a cache, log or spare device from a pool."),
             Self::ZpoolReplace { .. } => ("zpool", "Replace a pool device with a free disk and resilver."),
+            Self::ZpoolDetach { .. } => ("zpool", "Detach the original disk a hot spare replaced."),
             Self::ZpoolOffline { .. } => ("zpool", "Take one pool device offline."),
             Self::ZpoolOnline { .. } => ("zpool", "Bring one pool device back online."),
             Self::ZpoolClear { .. } => ("zpool", "Clear the error counters of a device or a whole pool."),
@@ -3156,6 +3188,7 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::ElasticDestroy { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticInspect { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
         HelperCommand::ElasticCacheAge { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, rules: elastic::MoverRules::default() },
+        HelperCommand::ElasticFolderUsage { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, folders: vec![s()] },
         HelperCommand::ElasticClaims { name: Some(s()) },
         HelperCommand::ElasticJournals {},
         HelperCommand::ElasticAdopt { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
@@ -3221,6 +3254,10 @@ fn catalog_examples() -> Vec<HelperCommand> {
             pool: s(),
             old: s(),
             new: s(),
+        },
+        HelperCommand::ZpoolDetach {
+            pool: s(),
+            device: s(),
         },
         HelperCommand::ZpoolOffline {
             pool: s(),
@@ -3567,6 +3604,34 @@ mod tests {
             Err(e) => assert_eq!(e, CatalogError::ToolMissing("zpool")),
         }
         assert!(!cmd.reads_key_from_stdin());
+    }
+
+    /// Owner decision (wave 7): `zpool detach` of the disk a hot spare
+    /// replaced. Both names are validated like `zpool offline`'s — no option,
+    /// no path outside /dev, no pool keyword — before the tool is looked up.
+    #[test]
+    fn zpool_detach_validates_the_pool_and_the_leaf() {
+        let detach = |pool: &str, device: &str| HelperCommand::ZpoolDetach { pool: pool.into(), device: device.into() };
+        match detach("tank", "sdb").resolve_exec() {
+            Ok(r) => assert_eq!(r.args, vec!["detach", "tank", "sdb"]),
+            Err(e) => assert_eq!(e, CatalogError::ToolMissing("zpool")),
+        }
+        for (pool, device) in [
+            ("tank", "-f"),
+            ("tank", "sdb;rm"),
+            ("tank", "../etc/passwd"),
+            ("tank", ""),
+            ("-f", "sdb"),
+            ("mirror", "sdb"),
+            ("tank/x", "sdb"),
+        ] {
+            assert!(
+                matches!(detach(pool, device).resolve_exec(), Err(CatalogError::InvalidArgument(_))),
+                "{pool} {device}"
+            );
+        }
+        assert!(!detach("tank", "sdb").guards_storage(), "a detach adds no device to a pool");
+        assert!(detach("tank", "sdb").builtin_label().is_none());
     }
 
     #[test]
