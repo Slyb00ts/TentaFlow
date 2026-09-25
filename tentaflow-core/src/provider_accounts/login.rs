@@ -333,18 +333,46 @@ async fn await_verification_url(bridge: &BridgeHandle, bridge_flow_id: &str) -> 
             }
         }
         if flow_failed(bridge, bridge_flow_id).await {
-            return Err(anyhow!("the sign-in failed before it showed an address"));
+            return Err(no_address("the sign-in failed before it showed an address", &transcript));
         }
         if let Some(url) = first_url(&transcript) {
             return Ok(url);
         }
         if events.get("status").and_then(Value::as_str) == Some("closed") {
-            return Err(anyhow!("the sign-in ended before it showed an address"));
+            return Err(no_address("the sign-in ended before it showed an address", &transcript));
         }
         if Instant::now() >= deadline {
-            return Err(anyhow!("the CLI did not show a sign-in address in time"));
+            return Err(no_address("the CLI did not show a sign-in address in time", &transcript));
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// How much of the CLI's own output a failed sign-in carries.
+const TRANSCRIPT_TAIL_CHARS: usize = 600;
+
+/// A sign-in that never showed an address, with what the CLI printed. The
+/// operator is told to read the node's logs, so the logs have to hold the
+/// reason — a sandbox that could not start or a CLI that could not reach its
+/// provider says so on the terminal, and nowhere else.
+fn no_address(what: &str, transcript: &str) -> anyhow::Error {
+    static ANSI: OnceLock<regex::Regex> = OnceLock::new();
+    let ansi = ANSI.get_or_init(|| {
+        regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07").expect("static regex")
+    });
+    let printable: String = ansi
+        .replace_all(transcript, "")
+        .chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect();
+    let skip = printable.chars().count().saturating_sub(TRANSCRIPT_TAIL_CHARS);
+    let tail: String = printable.chars().skip(skip).collect();
+    let tail = crate::code_studio::redact::redact_text(tail.trim());
+    tracing::warn!(output = %tail, "provider sign-in: {what}");
+    if tail.is_empty() {
+        anyhow!("{what}")
+    } else {
+        anyhow!("{what}; the CLI printed: {tail}")
     }
 }
 
