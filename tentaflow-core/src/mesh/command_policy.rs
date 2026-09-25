@@ -46,6 +46,7 @@ pub fn required_privilege(command: &MeshCommandType) -> CommandPrivilege {
         | C::ServiceUpdateRemote { .. }
         | C::ServiceDeployDistributed { .. }
         | C::ServiceStopDistributed { .. }
+        | C::ClusterDeploymentStop { .. }
         | C::DistributedStartServe { .. }
         | C::EnsureModelLocal { .. }
         | C::PushModelToPeer { .. }
@@ -103,6 +104,10 @@ mod tests {
             },
             MeshCommandType::ContainerStop {
                 container_id: "c".to_string(),
+            },
+            MeshCommandType::ClusterDeploymentStop {
+                deployment_cluster_id: "dep".to_string(),
+                cluster_id: String::new(),
             },
         ];
         for command in commands {

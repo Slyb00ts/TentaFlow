@@ -7,6 +7,7 @@
 
 pub mod binary;
 pub mod cluster_health;
+pub mod cluster_stop;
 pub mod distributed;
 pub mod docker;
 pub mod embedded;

@@ -65,6 +65,7 @@ fn service_info(endpoint_url: &str) -> ServiceInfo {
         usage_updated_at: None,
         gpu_selection: String::new(),
         cluster_deployment_id: String::new(),
+        cluster_coordinator_node_id: String::new(),
     }
 }
 

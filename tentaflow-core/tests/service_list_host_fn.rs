@@ -44,6 +44,7 @@ fn svc(id: i64, node: &str, name: &str, kind: &str, status: &str) -> ServiceInfo
         request_time_parameters: RequestTimeParameters::default(),
         gpu_selection: String::new(),
         cluster_deployment_id: String::new(),
+        cluster_coordinator_node_id: String::new(),
     }
 }
 

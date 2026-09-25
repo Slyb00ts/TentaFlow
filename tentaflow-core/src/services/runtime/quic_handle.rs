@@ -928,6 +928,7 @@ mod snapshot_helpers_tests {
                 request_time_parameters: Default::default(),
                 gpu_selection: String::new(),
                 cluster_deployment_id: String::new(),
+                cluster_coordinator_node_id: String::new(),
             }],
         );
         mgr.set_mesh_services_registry(registry);
@@ -1001,6 +1002,7 @@ mod snapshot_helpers_tests {
                 request_time_parameters: Default::default(),
                 gpu_selection: String::new(),
                 cluster_deployment_id: String::new(),
+                cluster_coordinator_node_id: String::new(),
             }],
         );
         let h = shared_cache

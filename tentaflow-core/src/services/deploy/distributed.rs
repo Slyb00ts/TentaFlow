@@ -999,7 +999,12 @@ async fn download_model_via_container(
 /// docelowym czlonku. Klucze: `_distributed` (host-net + RDMA flagi),
 /// `launch_command_override` (ray + vllm verbatim), `engine_env` (NCCL/RoCE),
 /// `model_repo`/`served_model_name`/`transport_explicit`/`gpu_select_mode`.
-pub fn build_member_config_json(spec: &DistributedDeploySpec) -> Result<String, String> {
+/// `coordinator_node_id` is the node that ran the cluster deploy and holds its
+/// record; it is stored so a stop from any dashboard can find that node.
+pub fn build_member_config_json(
+    spec: &DistributedDeploySpec,
+    coordinator_node_id: &str,
+) -> Result<String, String> {
     let mut cfg: Map<String, Value> = if spec.config_json.trim().is_empty() {
         Map::new()
     } else {
@@ -1045,6 +1050,7 @@ pub fn build_member_config_json(spec: &DistributedDeploySpec) -> Result<String, 
             "dist_port": spec.dist_port,
             "deployment_cluster_id": spec.deployment_cluster_id,
             "cluster_id": spec.cluster_id,
+            "coordinator_node_id": coordinator_node_id,
             "num_gpus": spec.num_gpus,
             "tp_size": spec.tp_size,
         }),
@@ -1949,9 +1955,10 @@ mod tests {
 
     #[test]
     fn config_carries_distributed_block_and_nccl_env() {
-        let json = build_member_config_json(&spec("head")).unwrap();
+        let json = build_member_config_json(&spec("head"), "coord-node").unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["_distributed"]["role"], "head");
+        assert_eq!(v["_distributed"]["coordinator_node_id"], "coord-node");
         assert_eq!(v["engine_env"]["NCCL_IB_HCA"], "roceP2p1s0f0,rocep1s0f0");
         assert_eq!(v["engine_env"]["NCCL_IB_GID_INDEX"], "3");
         assert_eq!(v["transport_explicit"], "direct_http");
@@ -1961,7 +1968,7 @@ mod tests {
     fn gid_index_flows_from_spec() {
         let mut s = spec("head");
         s.gid_index = 1;
-        let json = build_member_config_json(&s).unwrap();
+        let json = build_member_config_json(&s, "coord-node").unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["engine_env"]["NCCL_IB_GID_INDEX"], "1");
     }

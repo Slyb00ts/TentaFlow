@@ -2711,6 +2711,7 @@ mod tests {
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
             cluster_deployment_id: String::new(),
+            cluster_coordinator_node_id: String::new(),
         };
         registry.replace_node("peerB".into(), vec![remote_svc]);
 

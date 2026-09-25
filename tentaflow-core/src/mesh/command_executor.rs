@@ -581,6 +581,13 @@ impl MeshCommandExecutor {
                 self.handle_service_stop_distributed(&deployment_cluster_id)
                     .await
             }
+            MeshCommandType::ClusterDeploymentStop {
+                deployment_cluster_id,
+                cluster_id,
+            } => {
+                self.handle_cluster_deployment_stop(&deployment_cluster_id, &cluster_id)
+                    .await
+            }
             MeshCommandType::DistributedReadiness {
                 deployment_cluster_id,
                 ray_port,
@@ -2538,11 +2545,13 @@ impl MeshCommandExecutor {
         if let Err(e) = crate::services::deploy::distributed::preflight_member(&spec).await {
             return CommandResponse::fail(e);
         }
-        let config_json =
-            match crate::services::deploy::distributed::build_member_config_json(&spec) {
-                Ok(c) => c,
-                Err(e) => return CommandResponse::fail(e),
-            };
+        let config_json = match crate::services::deploy::distributed::build_member_config_json(
+            &spec,
+            requester_node_id,
+        ) {
+            Ok(c) => c,
+            Err(e) => return CommandResponse::fail(e),
+        };
         let resp = self
             .handle_service_deploy_remote(
                 requester_node_id,
@@ -2580,22 +2589,54 @@ impl MeshCommandExecutor {
             Some(c) => c,
             None => return CommandResponse::fail("service action context not configured"),
         };
-        crate::services::deploy::distributed::forget_head_spec(deployment_cluster_id);
-        let (removed, errors) = crate::services::deploy::distributed::stop_distributed(
-            &actions.db,
-            actions.port_allocator.clone(),
-            deployment_cluster_id,
-        )
-        .await;
-        for id in removed {
-            push_service_change_after_action(&actions, &self.local_node_id, id, true).await;
-        }
+        let deps = crate::services::deploy::cluster_stop::ClusterStopDeps {
+            db: &actions.db,
+            ports: actions.port_allocator.clone(),
+            mesh: &actions.iroh,
+            local_node_id: &self.local_node_id,
+        };
+        let errors =
+            crate::services::deploy::cluster_stop::stop_local_member(&deps, deployment_cluster_id)
+                .await;
         // P1-2: incomplete teardown must surface as a failure so the coordinator
         // keeps the deployment record for retry (no silently-orphaned Ray).
         if errors.is_empty() {
             CommandResponse::ok(MeshCommandResponsePayload::Empty)
         } else {
             CommandResponse::fail(format!("teardown niekompletny: {}", errors.join("; ")))
+        }
+    }
+
+    /// Coordinator side of a cluster stop requested on another node: when this
+    /// node holds the deployment's record it runs the full teardown (members,
+    /// leased ports, record); otherwise it answers `None` and changes nothing.
+    async fn handle_cluster_deployment_stop(
+        &self,
+        deployment_cluster_id: &str,
+        cluster_id: &str,
+    ) -> CommandResponse {
+        use crate::services::deploy::cluster_stop::{stop_held, ClusterStopDeps, StopHeldError};
+        let actions = match self.service_action_ctx().await {
+            Some(c) => c,
+            None => return CommandResponse::fail("service action context not configured"),
+        };
+        let deps = ClusterStopDeps {
+            db: &actions.db,
+            ports: actions.port_allocator.clone(),
+            mesh: &actions.iroh,
+            local_node_id: &self.local_node_id,
+        };
+        match stop_held(&deps, deployment_cluster_id, cluster_id).await {
+            Ok(resp) => CommandResponse::ok(
+                MeshCommandResponsePayload::ClusterDeploymentStopResult(Some(resp)),
+            ),
+            Err(StopHeldError::NotHeld) => CommandResponse::ok(
+                MeshCommandResponsePayload::ClusterDeploymentStopResult(None),
+            ),
+            Err(StopHeldError::ClusterMismatch) => {
+                CommandResponse::fail("deployment nie należy do podanego klastra")
+            }
+            Err(StopHeldError::Db(e)) => CommandResponse::fail(format!("database error: {e}")),
         }
     }
 

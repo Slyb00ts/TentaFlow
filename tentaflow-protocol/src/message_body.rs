@@ -153,6 +153,12 @@ pub struct ServiceInfo {
     /// zwyklych serwisow. `#[serde(default)]` dla kompatybilnosci mesh.
     #[serde(default)]
     pub cluster_deployment_id: String,
+    /// Node that coordinated the cluster deployment of this member row — the
+    /// one holding its `cluster_deployments` record. A stop issued on any
+    /// other node is sent there. Empty for ordinary services and for members
+    /// deployed before the coordinator was recorded.
+    #[serde(default)]
+    pub cluster_coordinator_node_id: String,
 }
 
 /// Wartosci parametrow konsumowane przy kazdym requestcie do silnika.

@@ -16640,6 +16640,13 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
         collectors_arr.clone().into(),
     );
     set(&obj, "profilingCollectorsAvailable", collectors_arr.into());
+    set(&obj, "nodeKind", n.node_kind.clone().into());
+    set(&obj, "node_kind", n.node_kind.into());
+    set(&obj, "operator", n.operator.into());
+    // Absent = unknown environment; mesh.js groups a missing value as "unknown".
+    if let Some(env) = n.environment {
+        set(&obj, "environment", env.as_str().into());
+    }
     obj
 }
 

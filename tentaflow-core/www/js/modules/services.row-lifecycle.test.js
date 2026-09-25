@@ -45,7 +45,7 @@ const NAMES = [
   'serviceActionKey', 'deployIdFor', 'clampPct', 'syncDeployWatchers',
   'startDeployWatcher', 'onDeployChunk', 'paintDeployProgress', 'endDeployWatcher',
   'closeDeployWatcher', 'dropDeploySubscription', 'stopDeployWatchers',
-  'renderRow', 'mapStatusToChip', 'categoryChipClass',
+  'renderRow', 'mapStatusToChip', 'categoryChipClass', 'clusterStopFailure',
 ];
 
 const PRELUDE = `
@@ -454,4 +454,21 @@ test('deployIdFor prefers the active deployment over the last finished one', () 
   assert.equal(mod.deployIdFor({ active_deploy_id: 'a', last_deploy_id: 'b' }), 'a');
   assert.equal(mod.deployIdFor({ last_deploy_id: 'b' }), 'b');
   assert.equal(mod.deployIdFor({}), '');
+});
+
+test('a failed cluster stop names each member that stayed up and why', () => {
+  const env = makeEnv();
+  const mod = build(env);
+  const text = mod.clusterStopFailure({
+    ok: false,
+    message: 'teardown niekompletny — rekord zachowany, ponów STOP',
+    members: [
+      { nodeId: 'n24', hostname: 'rig24', ok: true },
+      { nodeId: 'n25', hostname: '', ok: false, error: 'node n24 is not an operator on node n25' },
+    ],
+  });
+  assert.match(text, /teardown niekompletny/);
+  assert.match(text, /n25: node n24 is not an operator on node n25/);
+  assert.doesNotMatch(text, /rig24/);
+  assert.equal(mod.clusterStopFailure({ ok: false, members: [] }), 'stop klastra nieudany');
 });

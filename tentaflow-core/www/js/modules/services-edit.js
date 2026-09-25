@@ -133,7 +133,9 @@ export async function openEditModal(svc, opts = {}) {
     saveBtn.textContent = savingLabel;
     try {
       const payload = collectPayload(overlay, svc.id, opts.nodeId);
-      const res = await ApiBinary.action('serviceConfigUpdateRequest', payload);
+      // Save-and-restart on a remote owner answers after the runtime stopped,
+      // which the server allows 60 s for.
+      const res = await ApiBinary.action('serviceConfigUpdateRequest', payload, { timeoutMs: 75000 });
       if (res && res.success === false && res.error) {
         showInlineError(overlay, res.error);
         saveBtn.removeAttribute('disabled');

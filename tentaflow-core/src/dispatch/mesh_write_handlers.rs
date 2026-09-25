@@ -1322,7 +1322,10 @@ async fn deploy_distributed_local(
     // Preflight (P1-4): same OS port-check + stale-Ray cleanup the remote path
     // runs in the executor.
     crate::services::deploy::distributed::preflight_member(spec).await?;
-    let config_json = crate::services::deploy::distributed::build_member_config_json(spec)?;
+    let config_json = crate::services::deploy::distributed::build_member_config_json(
+        spec,
+        ctx.state.local_node_id.as_ref(),
+    )?;
     let user_config: serde_json::Value =
         serde_json::from_str(&config_json).map_err(|e| format!("config parse: {e}"))?;
     let manifest = crate::services::manifest::registry()
@@ -1896,39 +1899,6 @@ fn update_cluster_placeholder_status(
             tentaflow_protocol::ServiceChange::Updated(info),
         );
     }
-}
-
-/// Usuwa canoniczny placeholder cluster-deployu i broadcastuje
-/// `ServiceChange::Removed` (wywolywane przy jawnym STOP klastra). No-op gdy
-/// placeholder juz nie istnieje.
-fn remove_cluster_placeholder(ctx: &HandlerContext, deployment_cluster_id: &str) {
-    let service_id = {
-        let conn = match ctx.state.db.read() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        match crate::services_repo::services::find_id_by_active_deploy_id(
-            &conn,
-            deployment_cluster_id,
-        ) {
-            Ok(Some(id)) => id,
-            _ => return,
-        }
-    };
-    {
-        let conn = match ctx.state.db.write() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        if let Err(e) = crate::services_repo::services::delete(&conn, service_id) {
-            warn!("cluster placeholder delete failed: {}", e);
-            return;
-        }
-    }
-    super::handlers::broadcast_service_change(
-        ctx,
-        tentaflow_protocol::ServiceChange::Removed { service_id },
-    );
 }
 
 async fn cdeploy_fail(
@@ -2899,42 +2869,24 @@ async fn teardown_distributed_members(
     deployment_cluster_id: &str,
     members: &[crate::db::models::DbClusterDeploymentMember],
 ) -> Vec<String> {
-    let mut errors = Vec::new();
-    let port_allocator = ctx.state.port_allocator.clone();
-    // Distinct nodes (one container per node).
-    let mut seen = std::collections::HashSet::new();
-    for m in members {
-        if !seen.insert(m.node_id.clone()) {
-            continue;
-        }
-        if m.node_id == local_id {
-            if let Some(ports) = port_allocator.clone() {
-                let (_removed, errs) = crate::services::deploy::distributed::stop_distributed(
-                    &ctx.state.db,
-                    ports,
-                    deployment_cluster_id,
-                )
-                .await;
-                errors.extend(errs);
-            } else {
-                errors.push(format!("{}: port allocator niedostepny", m.node_id));
-            }
-        } else {
-            let cmd = MeshCommandType::ServiceStopDistributed {
-                deployment_cluster_id: deployment_cluster_id.to_string(),
-            };
-            match qm.send_command_and_wait(&m.node_id, cmd, 60).await {
-                Ok(resp) if resp.ok => {}
-                Ok(resp) => errors.push(format!(
-                    "{}: {}",
-                    m.node_id,
-                    resp.error.unwrap_or_else(|| "stop nieudany".to_string())
-                )),
-                Err(e) => errors.push(format!("{}: mesh send nieudany: {}", m.node_id, e)),
-            }
-        }
-    }
-    errors
+    let Some(ports) = ctx.state.port_allocator.clone() else {
+        return vec!["port allocator niedostepny".to_string()];
+    };
+    let deps = crate::services::deploy::cluster_stop::ClusterStopDeps {
+        db: &ctx.state.db,
+        ports,
+        mesh: qm,
+        local_node_id: local_id,
+    };
+    let members: Vec<(String, String)> = members
+        .iter()
+        .map(|m| (m.node_id.clone(), m.role.clone()))
+        .collect();
+    crate::services::deploy::cluster_stop::teardown_members(&deps, deployment_cluster_id, &members)
+        .await
+        .into_iter()
+        .filter_map(|s| s.error.map(|e| format!("{}: {}", s.node_id, e)))
+        .collect()
 }
 
 #[handler(variant = "ClusterDeployStopRequest", since = (1, 0))]
@@ -2944,6 +2896,8 @@ pub async fn cluster_deploy_stop(
     req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
+    use crate::services::deploy::cluster_stop::{stop_held, ClusterStopDeps, StopHeldError};
+
     let payload = match req {
         MessageBody::ClusterDeployStopRequestBody(p) => p,
         _ => {
@@ -2957,144 +2911,120 @@ pub async fn cluster_deploy_stop(
         deployment_cluster_id,
     } = payload;
 
-    let dep = crate::db::repository::get_cluster_deployment(&ctx.state.db, deployment_cluster_id)
-        .map_err(|e| ProtocolError::new(ProtocolErrorCode::Internal, e.to_string()))?
-        .ok_or_else(|| ProtocolError::not_found("deployment not found"))?;
-    // P2-3: the deployment must belong to the cluster named in the request — a
-    // stale/forged cluster_id must not tear down another cluster's deployment.
-    // Pusty `cluster_id` = wywolanie z wiersza serwisu (GUI zna tylko
-    // deployment_cluster_id) — wtedy bierzemy cluster z rekordu deploymentu.
-    if !cluster_id.is_empty() && dep.cluster_id != *cluster_id {
-        return Err(ProtocolError::bad_request(
-            "deployment nie należy do podanego klastra",
-        ));
-    }
-    let cluster_id = &dep.cluster_id;
-    let dep_members = crate::db::repository::list_cluster_deployment_members(
-        &ctx.state.db,
-        deployment_cluster_id,
-    )
-    .map_err(|e| ProtocolError::new(ProtocolErrorCode::Internal, e.to_string()))?;
-
     let local_id = ctx.state.local_node_id.to_string();
     let qm = require_quic_mesh(ctx)?;
-    let port_allocator = ctx.state.port_allocator.clone().ok_or_else(|| {
+    let ports = ctx.state.port_allocator.clone().ok_or_else(|| {
         ProtocolError::new(ProtocolErrorCode::Internal, "port allocator niedostepny")
     })?;
+    let deps = ClusterStopDeps {
+        db: &ctx.state.db,
+        ports,
+        mesh: &qm,
+        local_node_id: &local_id,
+    };
 
-    let mut statuses: Vec<ClusterDeployMemberStatus> = Vec::new();
-    for m in &dep_members {
-        let status = if m.node_id == local_id {
-            let (_removed, errs) = crate::services::deploy::distributed::stop_distributed(
-                &ctx.state.db,
-                port_allocator.clone(),
-                deployment_cluster_id,
-            )
-            .await;
-            ClusterDeployMemberStatus {
-                node_id: m.node_id.clone(),
-                hostname: hostname_for(ctx, &m.node_id),
-                role: m.role.clone(),
-                ok: errs.is_empty(),
-                deploy_id: None,
-                error: if errs.is_empty() {
-                    None
-                } else {
-                    Some(errs.join("; "))
-                },
-            }
-        } else {
-            let cmd = MeshCommandType::ServiceStopDistributed {
-                deployment_cluster_id: deployment_cluster_id.clone(),
-            };
-            match qm.send_command_and_wait(&m.node_id, cmd, 60).await {
-                Ok(resp) if resp.ok => ClusterDeployMemberStatus {
-                    node_id: m.node_id.clone(),
-                    hostname: hostname_for(ctx, &m.node_id),
-                    role: m.role.clone(),
-                    ok: true,
-                    deploy_id: None,
-                    error: None,
-                },
-                Ok(resp) => ClusterDeployMemberStatus {
-                    node_id: m.node_id.clone(),
-                    hostname: hostname_for(ctx, &m.node_id),
-                    role: m.role.clone(),
-                    ok: false,
-                    deploy_id: None,
-                    error: Some(resp.error.unwrap_or_else(|| "stop nieudany".to_string())),
-                },
-                Err(e) => ClusterDeployMemberStatus {
-                    node_id: m.node_id.clone(),
-                    hostname: hostname_for(ctx, &m.node_id),
-                    role: m.role.clone(),
-                    ok: false,
-                    deploy_id: None,
-                    error: Some(format!("mesh send nieudany: {}", e)),
-                },
-            }
+    // Empty `cluster_id` = issued from a service row (the GUI knows only the
+    // deployment id); P2-3 checks a named cluster against the record wherever
+    // the record lives, so a stale/forged id cannot stop another cluster.
+    let mut response = match stop_held(&deps, deployment_cluster_id, cluster_id).await {
+        Ok(resp) => resp,
+        Err(StopHeldError::NotHeld) => {
+            stop_through_mesh(ctx, &deps, deployment_cluster_id, cluster_id).await?
+        }
+        Err(StopHeldError::ClusterMismatch) => {
+            return Err(ProtocolError::bad_request(
+                "deployment nie należy do podanego klastra",
+            ))
+        }
+        Err(StopHeldError::Db(e)) => {
+            return Err(ProtocolError::new(ProtocolErrorCode::Internal, e))
+        }
+    };
+    for member in &mut response.members {
+        if member.hostname.is_empty() {
+            member.hostname = hostname_for(ctx, &member.node_id);
+        }
+    }
+    Ok(MessageBody::ClusterDeployStopResponseBody(response))
+}
+
+/// Stop of a deployment whose record this node does not hold. The record, the
+/// member list and the leased ports live on the coordinator, so the stop is
+/// handed to it: first the coordinator the member rows name, then each node
+/// carrying a member row. Only when every candidate answered that it holds no
+/// record are the member rows the mesh advertises torn down directly — a
+/// candidate that refused or did not answer may be the coordinator, and
+/// stopping its members behind its back would leave its record claiming a
+/// deployment that no longer runs.
+async fn stop_through_mesh(
+    ctx: &HandlerContext,
+    deps: &crate::services::deploy::cluster_stop::ClusterStopDeps<'_>,
+    deployment_cluster_id: &str,
+    cluster_id: &str,
+) -> Result<ClusterDeployStopResponse, ProtocolError> {
+    use crate::services::deploy::cluster_stop::{
+        coordinator_candidates, member_nodes, teardown_members, COORDINATOR_STOP_TIMEOUT_SECS,
+    };
+
+    let services = ctx.state.mesh_services_registry.visible_services();
+    let mut unanswered = Vec::new();
+    for node_id in coordinator_candidates(&services, deployment_cluster_id, deps.local_node_id) {
+        let cmd = MeshCommandType::ClusterDeploymentStop {
+            deployment_cluster_id: deployment_cluster_id.to_string(),
+            cluster_id: cluster_id.to_string(),
         };
-        statuses.push(status);
-    }
-
-    let all_ok = statuses.iter().all(|s| s.ok);
-    // P1-2: only delete the record when teardown FULLY succeeded; on partial
-    // failure keep it (status failed) so the admin can retry STOP — never leave
-    // a possibly-orphaned Ray container untracked.
-    if all_ok {
-        // Release the two coordinator-leased ports (serve `dep.port` + torch.distributed
-        // `dep.dist_port`) back to THIS node's allocator — the leases were taken here at
-        // deploy time, never on the workers, and `deploy::stop` deliberately never frees
-        // them. dist_port==0 marks a legacy row predating allocation; nothing to free.
-        let _ = port_allocator.release(dep.port as u16);
-        if dep.dist_port > 0 {
-            let _ = port_allocator.release(dep.dist_port as u16);
-        }
-        if let Err(e) =
-            crate::db::repository::delete_cluster_deployment(&ctx.state.db, deployment_cluster_id)
+        let reason = match deps
+            .mesh
+            .send_command_and_wait(&node_id, cmd, COORDINATOR_STOP_TIMEOUT_SECS)
+            .await
         {
-            warn!("delete_cluster_deployment nieudany: {}", e);
-        }
-        remove_cluster_placeholder(ctx, deployment_cluster_id);
-    } else {
-        let _ = crate::db::repository::set_cluster_deployment_status(
-            &ctx.state.db,
-            deployment_cluster_id,
-            "failed",
-        );
-        update_cluster_placeholder_status(
-            ctx,
-            deployment_cluster_id,
-            crate::services_repo::services::ServiceStatus::Failed,
-        );
+            Ok(resp) if resp.ok => match resp.payload {
+                MeshCommandResponsePayload::ClusterDeploymentStopResult(Some(result)) => {
+                    return Ok(result)
+                }
+                MeshCommandResponsePayload::ClusterDeploymentStopResult(None) => continue,
+                _ => "nieoczekiwana odpowiedź mesh".to_string(),
+            },
+            Ok(resp) => resp.error.unwrap_or_else(|| "stop nieudany".to_string()),
+            Err(e) => format!("mesh send nieudany: {e}"),
+        };
+        unanswered.push(format!("{}: {}", hostname_for(ctx, &node_id), reason));
+    }
+    if !unanswered.is_empty() {
+        return Ok(ClusterDeployStopResponse {
+            ok: false,
+            members: Vec::new(),
+            message: Some(format!(
+                "nie udało się zlecić zatrzymania węzłowi, który przechowuje deployment — nic nie zatrzymano ({})",
+                unanswered.join("; ")
+            )),
+        });
     }
 
+    let members = member_nodes(&services, deployment_cluster_id);
+    if members.is_empty() {
+        return Err(ProtocolError::not_found("deployment not found"));
+    }
+    let statuses = teardown_members(deps, deployment_cluster_id, &members).await;
+    let all_ok = statuses.iter().all(|s| s.ok);
     let _ = crate::db::repository::log_audit(
         &ctx.state.db,
         None,
         None,
         "cluster.deploy_stop",
-        Some(&format!(
-            "cluster:{} dep:{}",
-            cluster_id, deployment_cluster_id
-        )),
+        Some(&format!("dep:{} (no record)", deployment_cluster_id)),
         Some(if all_ok { "ok" } else { "partial" }),
         None,
-        Some(ctx.state.local_node_id.as_ref()),
+        Some(deps.local_node_id),
     );
-
-
-    Ok(MessageBody::ClusterDeployStopResponseBody(
-        ClusterDeployStopResponse {
-            ok: all_ok,
-            members: statuses,
-            message: if all_ok {
-                None
-            } else {
-                Some("teardown niekompletny — rekord zachowany, ponów STOP".to_string())
-            },
-        },
-    ))
+    Ok(ClusterDeployStopResponse {
+        ok: all_ok,
+        members: statuses,
+        message: (!all_ok).then(|| {
+            "żaden węzeł nie przechowuje rekordu deploymentu, a usunięcie kontenerów członków jest niekompletne — ponów STOP"
+                .to_string()
+        }),
+    })
 }
 
 // =============================================================================

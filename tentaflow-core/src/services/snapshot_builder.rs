@@ -102,18 +102,23 @@ pub fn project_service_row(
 
     let request_time_parameters = parse_request_time_parameters(&svc.config_json);
     let gpu_selection = gpu_selection_summary(&svc.config_json);
-    // `deployment_cluster_id` z bloku `_distributed` (pusty dla zwyklych serwisow)
-    // — wedruje w snapshotach mesh, wiec KAZDY dashboard moze skierowac stop/usun
-    // wiersza czlonka na caly klaster (ClusterDeployStopRequest).
-    let cluster_deployment_id = serde_json::from_str::<serde_json::Value>(&svc.config_json)
+    // The `_distributed` block's deployment id and coordinator travel in mesh
+    // snapshots (both empty for ordinary services), so a stop/delete of a
+    // member row on ANY dashboard can reach the whole cluster and the node
+    // holding its record (ClusterDeployStopRequest).
+    let distributed = serde_json::from_str::<serde_json::Value>(&svc.config_json)
         .ok()
-        .and_then(|v| {
-            v.get("_distributed")
-                .and_then(|d| d.get("deployment_cluster_id"))
-                .and_then(|x| x.as_str())
-                .map(String::from)
-        })
-        .unwrap_or_default();
+        .and_then(|v| v.get("_distributed").cloned());
+    let distributed_field = |key: &str| {
+        distributed
+            .as_ref()
+            .and_then(|d| d.get(key))
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .unwrap_or_default()
+    };
+    let cluster_deployment_id = distributed_field("deployment_cluster_id");
+    let cluster_coordinator_node_id = distributed_field("coordinator_node_id");
 
     // Wykrycie aktualizacji: hash zrodel z deployu vs aktualny hash z manifestu
     // (build.rs liczy go w czasie kompilacji). Roznica = wbudowany bundle
@@ -164,6 +169,7 @@ pub fn project_service_row(
         request_time_parameters,
         gpu_selection,
         cluster_deployment_id,
+        cluster_coordinator_node_id,
     })
 }
 

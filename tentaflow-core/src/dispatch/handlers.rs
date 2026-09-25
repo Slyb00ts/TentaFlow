@@ -10632,6 +10632,13 @@ fn reject_ambiguous_local_service_action(
     Ok(())
 }
 
+/// How long a forwarded service action may run on the owner node. Delete,
+/// pause and update-with-restart stop the runtime before answering: `docker
+/// stop` spends up to its 10 s grace before the forced remove, a native group
+/// gets 10 s between SIGTERM and SIGKILL, and delete then sweeps the port.
+/// A shorter wait reported those as failures although they succeeded.
+const SERVICE_ACTION_FORWARD_TIMEOUT_SECS: u64 = 60;
+
 /// Forward a service-action `MeshCommandType::*Remote` over iroh and convert
 /// the typed `MeshCommandResponse` envelope into the boolean ok/error pair the
 /// dispatch-side `Service*Response` expects. Errors from the transport
@@ -10658,7 +10665,10 @@ async fn forward_service_action(
             );
         }
     }
-    match iroh.send_command_and_wait(target_node_id, cmd, 10).await {
+    match iroh
+        .send_command_and_wait(target_node_id, cmd, SERVICE_ACTION_FORWARD_TIMEOUT_SECS)
+        .await
+    {
         Ok(resp) => (resp.ok, resp.error),
         Err(e) => (false, Some(e.to_string())),
     }

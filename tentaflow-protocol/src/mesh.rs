@@ -696,6 +696,16 @@ pub enum MeshCommandType {
         assertion: SessionAssertion,
         payload_cbor: Vec<u8>,
     },
+    /// Stop a whole distributed deployment on the node that coordinated it —
+    /// the only node holding its `cluster_deployments` record, member list
+    /// and leased ports. A node that does not hold the record answers
+    /// `ClusterDeploymentStopResult(None)` and touches nothing, so a dashboard
+    /// on any node can ask candidates until the coordinator answers. A
+    /// non-empty `cluster_id` must match the record. Appended at END.
+    ClusterDeploymentStop {
+        deployment_cluster_id: String,
+        cluster_id: String,
+    },
 }
 
 // =============================================================================
@@ -1152,6 +1162,10 @@ pub enum MeshCommandResponsePayload {
         payload_cbor: Vec<u8>,
         error: Option<crate::ProtocolError>,
     },
+    /// Outcome of `ClusterDeploymentStop`: `None` when the receiver holds no
+    /// record of the deployment (it is not the coordinator), otherwise the
+    /// per-member teardown result. Appended at END.
+    ClusterDeploymentStopResult(Option<crate::ClusterDeployStopResponse>),
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -1519,6 +1533,14 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("sub", &assertion.sub)
                 .field("jti", &assertion.jti)
                 .field("payload_bytes", &payload_cbor.len())
+                .finish(),
+            Self::ClusterDeploymentStop {
+                deployment_cluster_id,
+                cluster_id,
+            } => f
+                .debug_struct("ClusterDeploymentStop")
+                .field("deployment_cluster_id", deployment_cluster_id)
+                .field("cluster_id", cluster_id)
                 .finish(),
         }
     }

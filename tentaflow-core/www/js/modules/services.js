@@ -1990,6 +1990,17 @@ async function deleteAlias(id, name) {
 
 // ---- Helpers --------------------------------------------------------------
 
+// The reason a cluster stop failed: the coordinator's summary plus every
+// member that did not come down, so the toast names the node and its refusal
+// (e.g. the operator gate) instead of a bare "incomplete".
+function clusterStopFailure(resp) {
+  const failed = (resp.members || [])
+    .filter((m) => m && m.ok === false)
+    .map((m) => `${m.hostname || m.nodeId}: ${m.error || '?'}`);
+  const parts = [resp.message, ...failed].filter(Boolean);
+  return parts.length ? parts.join(' · ') : 'stop klastra nieudany';
+}
+
 async function stopService(id, name, nodeId, nodeLabel, clusterDep) {
   // Wiersz czlonka klastra (head/worker kontenera TP): usuniecie pojedynczego
   // ranka rozwaliloby caly TP-klaster, wiec kierujemy akcje na CALY klaster —
@@ -2026,16 +2037,18 @@ async function stopService(id, name, nodeId, nodeLabel, clusterDep) {
         deploymentClusterId: clusterDep,
       }, { timeoutMs: 180000 });
       if (resp && resp.ok === false) {
-        throw new Error(resp.message || 'stop klastra nieudany');
+        throw new Error(clusterStopFailure(resp));
       }
     } else {
       // ServiceDeleteRequest stops the runtime AND removes the row; FK cascade
       // wipes attached model_registry rows. When nodeId points at a remote peer
       // the dispatcher forwards the call as `MeshCommandType::ServiceDeleteRemote`.
+      // A remote owner answers only after its runtime is torn down, which the
+      // server allows 60 s for.
       const resp = await ApiBinary.action('serviceDeleteRequest', {
         serviceId: id,
         nodeId: nodeId || undefined,
-      });
+      }, { timeoutMs: 75000 });
       if (resp && resp.success === false) {
         throw new Error(resp.error || 'Unknown error');
       }
