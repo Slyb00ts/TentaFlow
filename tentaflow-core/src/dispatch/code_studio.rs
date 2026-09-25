@@ -5932,6 +5932,15 @@ async fn patch_decide_v1(
             decided_by: org.user_id.clone(),
         },
     )?;
+    // A run parked on this set's review is waiting for exactly this decision.
+    // The answer's text is not read: the review finds the set decided and
+    // reports what was stored. No waiting review is not an error.
+    crate::agents::interaction_registry_global().reply(
+        &tools::review_interaction_id(patch_set_id),
+        InteractionReply::Question(crate::agents::QuestionReply {
+            answer: outcome.status.clone(),
+        }),
+    );
 
     Ok(cs(CodeStudioPayload::PatchDecideResponse {
         patch_set_id: patch_set_id.to_string(),
@@ -6747,8 +6756,8 @@ fn watch_session_run(
     let session_id = session_id.to_string();
     let run_id = run_id.to_string();
     tokio::spawn(async move {
-        let (status, error, accounting) = match manager.await_run(&run_id, RUN_WATCH_TIMEOUT).await
-        {
+        let (status, error, accounting, answer) =
+            match manager.await_run(&run_id, RUN_WATCH_TIMEOUT).await {
             Ok(run) => {
                 let error = run
                     .exit_reason
@@ -6757,7 +6766,11 @@ fn watch_session_run(
                 // settled. The harness is the only measurer of the native path,
                 // so a row that does not copy it here has no other source.
                 let accounting = (run.prompt_tokens, run.completion_tokens, run.model);
-                (run.status, error, accounting)
+                let answer = run
+                    .result
+                    .filter(|text| !text.trim().is_empty())
+                    .map(|text| (text, run.agent_id));
+                (run.status, error, accounting, answer)
             }
             // The run outlived the watcher or vanished with its process. Either
             // way the row cannot be closed on evidence, so it is left as it is.
@@ -6781,6 +6794,23 @@ fn watch_session_run(
             ) {
                 tracing::warn!(run_id, error = %e, "code studio: cannot close a run row");
                 return;
+            }
+        }
+        // The turn's answer is what the operator asked for. It lives in the run
+        // row only, so without this the session showed the run start and end
+        // and never what the agent actually said.
+        if let Some((text, agent_id)) = answer {
+            let event = events::SessionEvent::new(
+                format!("run:{run_id}:answer"),
+                EventPayload::AgentMessage {
+                    role: "assistant".to_string(),
+                    text,
+                },
+            )
+            .with_run(run_id.clone())
+            .with_agent(agent_id);
+            if let Err(e) = events::append(&pool, &session_id, event) {
+                tracing::warn!(run_id, error = %e, "code studio: cannot journal a run answer");
             }
         }
         let event = events::SessionEvent::new(

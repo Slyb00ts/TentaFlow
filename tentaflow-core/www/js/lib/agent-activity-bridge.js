@@ -18,6 +18,7 @@ export function activityLabels() {
     background_many: t('agent_activity.background_many', '{n} w tle'),
     iteration: t('agent_activity.iteration', 'iteracja'),
     idle: t('agent_activity.idle', 'bezczynny'),
+    thinking: t('agent_activity.thinking', 'myśli…'),
     runs_title: t('agent_activity.runs_title', 'Aktywne przebiegi'),
     no_runs: t('agent_activity.no_runs', 'Brak aktywnych przebiegów'),
     timeline_title: t('agent_activity.timeline_title', 'Oś czasu'),

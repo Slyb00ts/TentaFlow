@@ -208,7 +208,8 @@ impl ApprovalGate for InteractionGate<'_> {
     }
 
     async fn present_review(&self, prompt: &ReviewPrompt) -> Option<String> {
-        let interaction_id = uuid::Uuid::new_v4().to_string();
+        let interaction_id =
+            crate::code_studio::tools::review_interaction_id(&prompt.patch_set_id);
         let question = format!(
             "Review the change set {} before it is committed.\n\n{}",
             prompt.patch_set_id, prompt.detail

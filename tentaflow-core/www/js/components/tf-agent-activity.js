@@ -106,6 +106,7 @@ const DEFAULT_LABELS = {
   background_many: '{n} in background',
   iteration: 'iteration',
   idle: 'idle',
+  thinking: 'thinking…',
   runs_title: 'Active runs',
   no_runs: 'No active runs',
   timeline_title: 'Timeline',
@@ -212,6 +213,7 @@ class TfAgentActivity extends HTMLElement {
     this._variant = this.getAttribute('variant') || 'chat';
     this._built = false;
     this._reflectingLevel = false;
+    this._clock = null;
     const initial = LEVEL_INDEX[(this.getAttribute('level') || '').toLowerCase()];
     if (initial !== undefined) this._level = initial;
   }
@@ -324,6 +326,11 @@ class TfAgentActivity extends HTMLElement {
       question: null,
       permission: null,
       currentStep: '',
+      // The tool call still executing, and when the run last showed a sign of
+      // life. Together they tell "running a tool" from "the model is thinking"
+      // — a run between two events is working, not idle.
+      toolInFlight: '',
+      lastEventAt: Date.now(),
     };
   }
 
@@ -384,6 +391,10 @@ class TfAgentActivity extends HTMLElement {
       if (run.status === 'waiting_user') run.status = 'running';
     }
 
+    if (ev.kind === 'tool_call_started') run.toolInFlight = ev.name || this._labels.step_tool;
+    else if (ev.kind === 'tool_call_finished') run.toolInFlight = '';
+    run.lastEventAt = Date.now();
+
     const step = eventToStep(ev, this._labels);
     step.ts = new Date().toLocaleTimeString();
     run.steps.push(step);
@@ -417,7 +428,10 @@ class TfAgentActivity extends HTMLElement {
       this._runs.set(runId, run);
     }
     if (info.agent) run.agent = String(info.agent);
-    if (info.status) run.status = String(info.status);
+    if (info.status && info.status !== run.status) {
+      run.status = String(info.status);
+      run.lastEventAt = Date.now();
+    }
     if (info.parentRunId && info.parentRunId !== runId) run.parentRunId = String(info.parentRunId);
     if (info.model) run.model = String(info.model);
     // Set, not merged: '' is the answer for a run the host says has no account.
@@ -490,10 +504,17 @@ class TfAgentActivity extends HTMLElement {
     return best;
   }
 
+  // What the driving run is doing NOW, with how long it has been at it. A run
+  // that is running but has no tool in flight is waiting on its model — that is
+  // work, so it reads "thinking", never "idle", and the clock keeps moving so a
+  // long generation is visibly alive.
   _currentLine() {
     const best = this._driver();
     if (!best) return this._labels.idle;
     const agent = best.agent ? `${best.agent} · ` : '';
+    const since = formatElapsed(Date.now() - best.lastEventAt);
+    if (best.toolInFlight) return `${agent}${this._labels.step_tool} · ${best.toolInFlight} · ${since}`;
+    if (best.status === 'running') return `${agent}${this._labels.thinking} · ${since}`;
     return `${agent}${best.currentStep || this._labels.idle}`;
   }
 
@@ -505,9 +526,30 @@ class TfAgentActivity extends HTMLElement {
       : '';
   }
 
+  // Re-renders the collapsed line once a second while something runs, so its
+  // clock advances between events. Not while an operator card is open: a
+  // re-render would wipe what they are typing into it.
+  _syncClock(active, waiting) {
+    const want = active && !waiting && this._level === 0 && this.isConnected;
+    if (want && !this._clock) {
+      this._clock = setInterval(() => this._render(), 1000);
+    } else if (!want && this._clock) {
+      clearInterval(this._clock);
+      this._clock = null;
+    }
+  }
+
+  disconnectedCallback() {
+    if (this._clock) {
+      clearInterval(this._clock);
+      this._clock = null;
+    }
+  }
+
   _render() {
     const active = this.hasActivity();
     const waiting = this.hasWaiting();
+    this._syncClock(active, waiting);
     // Auto-hide: zero footprint when nothing runs and no card is pending.
     if (!active && !waiting && this._level === 0) {
       this._root.hidden = true;

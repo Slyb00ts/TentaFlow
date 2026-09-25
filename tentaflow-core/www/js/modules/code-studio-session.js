@@ -742,6 +742,7 @@ function activityLabels() {
     background_many: t('activity.background'),
     iteration: t('activity.iteration'),
     idle: t('activity.idle'),
+    thinking: t('activity.thinking'),
     runs_title: t('activity.runs_title'),
     no_runs: t('activity.no_runs'),
     timeline_title: t('activity.timeline_title'),
@@ -1411,10 +1412,16 @@ function reactToEvent(ev, refresh) {
       refresh.add('patchsets');
       refresh.add('files');
       break;
-    case 'patch_decided':
+    case 'patch_decided': {
       refresh.add('patchsets');
       refresh.add('files');
+      // The card in the stream was filled when the set opened; left alone it
+      // keeps saying "undecided" about files the operator already accepted.
+      const id = String(ev.p.patch_set_id || '');
+      const card = id ? host?.querySelector(`[data-patch-card="${CSS.escape(id)}"]`) : null;
+      if (card) void fillPatchCard(id, card);
       break;
+    }
     case 'run_started':
     case 'run_finished':
       refresh.add('runs');
@@ -1465,9 +1472,26 @@ async function refreshSide(kinds) {
   await Promise.allSettled(jobs);
 }
 
+// The root runs still going. A change set's review names no run, but it is
+// the turn that is parked on it — the orchestrator waits for the operator.
+function runningRootIds() {
+  return state.runs
+    .filter((run) => run.kind === 'root' && run.status === 'running')
+    .map((run) => run.run_id);
+}
+
 function feedActivity(ev) {
   const widgets = [state.widgets.dock, state.widgets.now].filter(Boolean);
   if (!widgets.length) return;
+  // Waiting on a review is the operator's move, not the model's: without this
+  // the line kept saying "thinking" for as long as nobody looked at the diff.
+  if (ev.kind === 'patch_set_opened' || ev.kind === 'patch_decided') {
+    const status = ev.kind === 'patch_set_opened' ? 'waiting_user' : 'running';
+    for (const widget of widgets) {
+      for (const runId of runningRootIds()) widget.setRunStatus(runId, status);
+    }
+    return;
+  }
   const runId = ev.runId || ev.p.run_id || '';
   if (!runId) return;
   for (const widget of widgets) {

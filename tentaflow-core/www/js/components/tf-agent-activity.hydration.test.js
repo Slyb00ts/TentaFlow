@@ -13,7 +13,7 @@
 // =============================================================================
 
 import '../sdk-runtime/_dom-test-harness.js';
-import { test } from 'node:test';
+import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -27,6 +27,12 @@ const { TfAgentActivity } = await import(
 );
 
 const LABELS = { tokens: 'tok', runs_title: 'Runs', no_runs: 'No runs', cancel: 'Cancel' };
+
+// A widget left connected with a run in flight keeps its clock ticking, and a
+// ticking interval keeps the test process alive after the last test.
+afterEach(() => {
+  document.body.innerHTML = '';
+});
 
 function mount(level = 'tree', labels = LABELS) {
   const el = new TfAgentActivity();
@@ -336,8 +342,8 @@ test('a timed-out child is finished on every surface that reads the set', () => 
   // The background badge and the line's driver both go through the set, and both
   // would read a finished child as work still going.
   assert.equal(el.querySelector('.tf-aa-badge'), null, 'a finished child is still counted in background');
-  assert.equal(
-    el.querySelector('.tf-aa-line').textContent.trim(), 'root #1 · idle',
+  assert.match(
+    el.querySelector('.tf-aa-line').textContent.trim(), /^root #1 · thinking… · \d+s$/,
     'a finished run drove the collapsed line',
   );
 

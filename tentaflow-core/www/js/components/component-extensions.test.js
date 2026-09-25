@@ -12,7 +12,7 @@
 // =============================================================================
 
 import '../sdk-runtime/_dom-test-harness.js';
-import { test } from 'node:test';
+import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -55,6 +55,14 @@ const { TfChip } = await import('./tf-chip.js');
 const { TfBadge } = await import('./tf-badge.js');
 const { TfTable, TfColumn } = await import('./tf-table.js');
 const { TfAgentActivity } = await import('./tf-agent-activity.js');
+
+// An activity widget left connected with a run in flight keeps its clock
+// ticking, and that interval would keep the test process alive forever.
+afterEach(() => {
+  for (const el of [...document.body.children]) {
+    if (el instanceof TfAgentActivity) el.remove();
+  }
+});
 // The light-DOM adoption in tf-select/tf-button runs off MutationObserver, which
 // happy-dom implements on the window but does not export as a bare global.
 if (typeof globalThis.MutationObserver !== 'function' && window.MutationObserver) {

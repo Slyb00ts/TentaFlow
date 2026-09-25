@@ -2859,6 +2859,36 @@ impl ReviewTimeout {
 
 /// Runs one review to a decision. Opens (or reuses) the session's patch set,
 /// renders the diff, asks, records the verdicts through `patch::decide`.
+/// The interaction a change set's review waits on. Keyed by the set, so a
+/// decision made anywhere else — the Changes pane — can answer the waiting
+/// review instead of leaving the run parked until its timeout.
+pub fn review_interaction_id(patch_set_id: &str) -> String {
+    format!("review:{patch_set_id}")
+}
+
+/// What a set some other path already decided reports: the decision stored on
+/// the rows, not a second one.
+fn settled_review(set: &PatchSet) -> Option<ReviewReport> {
+    if matches!(set.status.as_str(), "open" | "in_review" | "conflicted") {
+        return None;
+    }
+    let paths = |wanted: &[&str]| {
+        set.files
+            .iter()
+            .filter(|f| wanted.contains(&f.status.as_str()))
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>()
+    };
+    Some(ReviewReport {
+        patch_set_id: set.id.clone(),
+        status: set.status.clone(),
+        accepted: paths(&["accepted", "partially_accepted"]),
+        rejected: paths(&["rejected"]),
+        conflicted: paths(&["conflicted"]),
+        timed_out: false,
+    })
+}
+
 pub async fn run_review(
     pool: &DbPool,
     workspace_id: &str,
@@ -2913,6 +2943,17 @@ pub async fn run_review(
             timeout,
         })
         .await;
+
+    // The operator may have decided the set in the Changes pane while the
+    // review was waiting; that decision answered the wait and is the verdict.
+    let pool_for_reload = pool.clone();
+    let reload_id = set.id.clone();
+    let stored = tokio::task::spawn_blocking(move || patch::load_patch_set(&pool_for_reload, &reload_id))
+        .await
+        .map_err(|e| anyhow!("patch set task failed: {e}"))??;
+    if let Some(report) = settled_review(&stored) {
+        return Ok(report);
+    }
 
     let (decisions, timed_out) = match answer {
         Some(raw) => (parse_review_answer(&raw, &set, decided_by), false),

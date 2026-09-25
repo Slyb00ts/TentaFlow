@@ -286,6 +286,10 @@
 /* ---- Event stream ------------------------------------------------------- */
 .cs-stream {
   flex: 1;
+  /* The conversation never collapses: an open question card once took the whole
+     column on a 720px screen and left the operator a 25px strip, so they had to
+     answer without seeing what the agent had done. */
+  min-height: 22dvh;
   overflow-y: auto;
   padding: 16px 16px 8px;
   display: flex;
@@ -776,7 +780,9 @@
   flex-direction: column;
   gap: 6px;
   padding: 0 10px 10px;
-  max-height: 38dvh;
+  /* What the column has left after the chrome and the stream's own floor; on a
+     tall screen the plain 38dvh cap. The fade below shows there is more. */
+  max-height: clamp(96px, calc(100dvh - 600px), 38dvh);
   overflow-y: auto;
   scrollbar-width: thin;
   background:
