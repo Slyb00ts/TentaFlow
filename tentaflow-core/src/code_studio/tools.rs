@@ -1409,7 +1409,7 @@ async fn fs_read_call(bound: &Bound, tool: CoreToolName, args: &Value) -> Result
                 Ok(json!({
                     "path": path.as_str(),
                     "content": slice.content,
-                    "sha256": slice.blob_sha,
+                    "blob_id": slice.blob_sha,
                     "total_lines": slice.total_lines,
                     "truncated": slice.truncated,
                 }))
@@ -1530,7 +1530,7 @@ async fn fs_write_call(
                 Ok(WriteEffect {
                     value: json!({
                         "path": path.as_str(),
-                        "sha256": outcome.blob_sha,
+                        "blob_id": outcome.blob_sha,
                         "bytes": outcome.bytes,
                         "created": outcome.created,
                     }),
@@ -1563,7 +1563,7 @@ async fn fs_write_call(
                 Ok(WriteEffect {
                     value: json!({
                         "path": path.as_str(),
-                        "sha256": outcome.blob_sha,
+                        "blob_id": outcome.blob_sha,
                         "bytes": outcome.bytes,
                     }),
                     edit: before.map(|expect| RecordedEdit {
@@ -1708,7 +1708,7 @@ fn fs_conditions(
     tool: CoreToolName,
     args: &Value,
 ) -> Result<(Precondition, Postcondition, OperationInput)> {
-    let expected = optional_str(args, "expected_sha256").map(str::to_string);
+    let expected = optional_str(args, "expected_blob_id").map(str::to_string);
     let path = match tool {
         CoreToolName::FsMove => require_str(args, "from")?.to_string(),
         _ => require_str(args, "path")?.to_string(),
@@ -1760,7 +1760,7 @@ fn fs_conditions(
 }
 
 fn expected_precondition(args: &Value) -> FsPrecondition {
-    match optional_str(args, "expected_sha256") {
+    match optional_str(args, "expected_blob_id") {
         Some("") => FsPrecondition::Absent,
         Some(sha) => FsPrecondition::BlobIs(sha.to_string()),
         None => FsPrecondition::Any,
