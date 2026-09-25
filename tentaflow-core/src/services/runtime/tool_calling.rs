@@ -358,54 +358,141 @@ fn parse_dsml_calls(text: &str, first_idx: usize) -> (String, Vec<LlmToolCall>) 
     use regex::Regex;
     use std::sync::OnceLock;
 
-    static INVOKE: OnceLock<Regex> = OnceLock::new();
-    static PARAM: OnceLock<Regex> = OnceLock::new();
-    static WRAPPER: OnceLock<Regex> = OnceLock::new();
+    static OPEN: OnceLock<Regex> = OnceLock::new();
+    static STOP: OnceLock<Regex> = OnceLock::new();
+    static STRAY: OnceLock<Regex> = OnceLock::new();
 
     if !text.contains("DSML") {
         return (text.to_string(), Vec::new());
     }
-    let invoke = INVOKE.get_or_init(|| {
-        Regex::new(
-            r#"(?s)<[^<>]*DSML[^<>]*?invoke\s+name="([^"]+)"\s*>(.*?)</[^<>]*DSML[^<>]*?invoke\s*>"#,
-        )
-        .expect("static regex")
+    let open = OPEN.get_or_init(|| {
+        Regex::new(r#"<[^<>]*DSML[^<>]*?invoke\s+name="([^"]+)""#).expect("static regex")
     });
+    // Where an invoke's body ends when the next one does not start first: the
+    // closing wrapper of the whole block.
+    let stop = STOP.get_or_init(|| {
+        Regex::new(r"</[^<>]*DSML[^<>]*?(?:function_)?calls\s*>").expect("static regex")
+    });
+    // Every DSML tag, and the plain `</invoke>` / `</parameter>` closers a
+    // hybrid answer leaves behind once its calls are taken out.
+    let stray = STRAY.get_or_init(|| {
+        Regex::new(r"</?[^<>]*DSML[^<>]*>|</(?:invoke|parameter)>").expect("static regex")
+    });
+
+    let opens: Vec<_> = open.captures_iter(text).collect();
+    let mut calls = Vec::new();
+    let mut spans = Vec::new();
+    for (i, caps) in opens.iter().enumerate() {
+        let whole = caps.get(0).expect("match");
+        let next_open = opens.get(i + 1).map(|c| c.get(0).expect("match").start());
+        let body_end = stop
+            .find_at(text, whole.end())
+            .map(|m| m.start())
+            .filter(|at| next_open.map_or(true, |n| *at < n))
+            .or(next_open)
+            .unwrap_or(text.len());
+        let body = &text[whole.end()..body_end];
+        calls.push(LlmToolCall {
+            id: generate_call_id(first_idx + calls.len(), &text[whole.start()..body_end]),
+            name: caps[1].trim().to_string(),
+            arguments: serde_json::Value::Object(dsml_arguments(body)).to_string(),
+        });
+        spans.push((whole.start(), body_end));
+    }
+    if calls.is_empty() {
+        return (text.to_string(), calls);
+    }
+    let mut cleaned = String::with_capacity(text.len());
+    let mut pos = 0;
+    for (from, to) in spans {
+        cleaned.push_str(&text[pos..from]);
+        pos = to;
+    }
+    cleaned.push_str(&text[pos..]);
+    let cleaned = stray.replace_all(&cleaned, "");
+    (collapse_blank_lines(&cleaned), calls)
+}
+
+/// The arguments of one DSML invoke, read from whichever of the shapes DeepSeek
+/// actually emits. Only the first is the documented one; the others are what the
+/// model writes once a conversation also shows `<tool_call>` JSON, measured on
+/// live runs where every one of them otherwise left a sub-agent's call unrun:
+///
+/// - `<｜DSML｜parameter name="k" string="true">v</｜DSML｜parameter>` per argument;
+/// - JSON glued to the name: `invoke name="x","arguments":{…}}` or the flat
+///   `invoke name="x","path":"a.py"}`, and both at once;
+/// - an attribute: `invoke name="x" arguments={…}>`;
+/// - a plain `<parameter name="arguments">{…}` tag.
+fn dsml_arguments(body: &str) -> serde_json::Map<String, serde_json::Value> {
+    use regex::Regex;
+    use serde_json::Value;
+    use std::sync::OnceLock;
+
+    static PARAM: OnceLock<Regex> = OnceLock::new();
+    static PLAIN_PARAM: OnceLock<Regex> = OnceLock::new();
     let param = PARAM.get_or_init(|| {
         Regex::new(
             r#"(?s)<[^<>]*DSML[^<>]*?parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>(.*?)</[^<>]*DSML[^<>]*?parameter\s*>"#,
         )
         .expect("static regex")
     });
-    let wrapper = WRAPPER.get_or_init(|| {
-        Regex::new(r"</?[^<>]*DSML[^<>]*?(?:function_)?calls\s*>").expect("static regex")
-    });
+    let plain_param = PLAIN_PARAM
+        .get_or_init(|| Regex::new(r#"<parameter\s+name="([^"]+)"\s*>"#).expect("static regex"));
 
-    let mut calls = Vec::new();
-    for caps in invoke.captures_iter(text) {
-        let mut arguments = serde_json::Map::new();
-        for p in param.captures_iter(&caps[2]) {
-            let raw = &p[3];
-            let value = if p.get(2).map(|m| m.as_str()) == Some("true") {
-                serde_json::Value::String(raw.to_string())
-            } else {
-                serde_json::from_str(raw.trim())
-                    .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
-            };
-            arguments.insert(p[1].trim().to_string(), value);
+    let mut arguments = serde_json::Map::new();
+    for p in param.captures_iter(body) {
+        let raw = &p[3];
+        let value = if p.get(2).map(|m| m.as_str()) == Some("true") {
+            Value::String(raw.to_string())
+        } else {
+            serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
+        };
+        arguments.insert(p[1].trim().to_string(), value);
+    }
+    if !arguments.is_empty() {
+        return arguments;
+    }
+
+    // JSON glued to the name: the body starts where `"name":"x"` would have
+    // ended, so re-opening the object reads it whole. Keys other than `name`
+    // are the flat arguments; an `arguments` object is merged over them.
+    let rest = body.trim_start();
+    if rest.starts_with(',') {
+        if let Some(Value::Object(mut object)) = first_json_value(&format!("{{\"name\":\"\"{rest}")) {
+            object.remove("name");
+            if let Some(Value::Object(nested)) = object.remove("arguments") {
+                object.extend(nested);
+            }
+            return object;
         }
-        calls.push(LlmToolCall {
-            id: generate_call_id(first_idx + calls.len(), &caps[0]),
-            name: caps[1].trim().to_string(),
-            arguments: serde_json::Value::Object(arguments).to_string(),
+    }
+    if let Some(at) = body.find("arguments=") {
+        if let Some(Value::Object(object)) = first_json_value(&body[at + "arguments=".len()..]) {
+            return object;
+        }
+    }
+    for p in plain_param.captures_iter(body) {
+        let after = &body[p.get(0).expect("match").end()..];
+        let value = first_json_value(after).unwrap_or_else(|| {
+            Value::String(after.split('<').next().unwrap_or_default().trim().to_string())
         });
+        match (&p[1], value) {
+            ("arguments", Value::Object(object)) => arguments.extend(object),
+            (key, value) => {
+                arguments.insert(key.trim().to_string(), value);
+            }
+        }
     }
-    if calls.is_empty() {
-        return (text.to_string(), calls);
-    }
-    let cleaned = invoke.replace_all(text, "");
-    let cleaned = wrapper.replace_all(&cleaned, "");
-    (collapse_blank_lines(&cleaned), calls)
+    arguments
+}
+
+/// The first JSON value at the start of `text` (after whitespace), ignoring
+/// whatever follows it — the tag soup a hybrid answer closes with.
+fn first_json_value(text: &str) -> Option<serde_json::Value> {
+    serde_json::Deserializer::from_str(text.trim_start())
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()
 }
 
 /// Coerces `args` values toward the property types declared in `schema`
@@ -777,6 +864,68 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&calls[1].arguments).unwrap(),
             json!({"path": ".", "limit": 5})
         );
+        assert_ne!(calls[0].id, calls[1].id);
+    }
+
+    /// The hybrids a live DeepSeek run emitted once the conversation also
+    /// showed `<tool_call>` JSON. Each one used to end a sub-agent's run with
+    /// its call unrun.
+    #[test]
+    fn deepseek_hybrid_dsml_shapes_are_read() {
+        let cases: &[(&str, &str, serde_json::Value)] = &[
+            (
+                "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"core.fs_read\",\"arguments\":{\"path\":\"snake.py\"}}</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>",
+                "core.fs_read",
+                json!({"path": "snake.py"}),
+            ),
+            (
+                "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"core.fs_read\",\"path\":\"snake.py\"}\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>",
+                "core.fs_read",
+                json!({"path": "snake.py"}),
+            ),
+            (
+                "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"core.fs_read\",\"path\":\"a.py\",\"arguments\":{}}</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>",
+                "core.fs_read",
+                json!({"path": "a.py"}),
+            ),
+            (
+                "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"core.exec\" arguments={\"argv\":[\"python3\",\"--version\"],\"purpose\":\"x\"}></｜｜DSML｜｜ calls>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>",
+                "core.exec",
+                json!({"argv": ["python3", "--version"], "purpose": "x"}),
+            ),
+            (
+                "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"core.exec\">\n<parameter name=\"arguments\">{\"argv\":[\"python3\",\"-m\",\"unittest\"]}\n</invoke>",
+                "core.exec",
+                json!({"argv": ["python3", "-m", "unittest"]}),
+            ),
+            (
+                "<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"core.fs_list\",\"arguments\":{}}</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>",
+                "core.fs_list",
+                json!({}),
+            ),
+        ];
+        for (text, name, args) in cases {
+            let (rest, calls) = parse_tool_calls(text);
+            assert_eq!(calls.len(), 1, "{text}");
+            assert_eq!(calls[0].name, *name, "{text}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&calls[0].arguments).unwrap(),
+                *args,
+                "{text}"
+            );
+            assert_eq!(rest, "", "markup left behind for {text}");
+        }
+    }
+
+    /// Two hybrid invokes in one block are two calls, and prose before the
+    /// block survives.
+    #[test]
+    fn several_hybrid_invokes_are_several_calls() {
+        let text = "Two files. Let me read them both.\n\n<｜｜DSML｜｜ calls>\n<｜｜DSML｜｜ invoke name=\"core.fs_read\",\"path\":\"snake.py\"}</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n<｜｜DSML｜｜ invoke name=\"core.fs_read\",\"path\":\"test_snake.py\"}</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>";
+        let (rest, calls) = parse_tool_calls(text);
+        assert_eq!(rest, "Two files. Let me read them both.");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].arguments, r#"{"path":"test_snake.py"}"#);
         assert_ne!(calls[0].id, calls[1].id);
     }
 
