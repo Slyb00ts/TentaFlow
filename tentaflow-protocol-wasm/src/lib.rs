@@ -10221,6 +10221,21 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 consequences.push(&co.into());
             }
             set(&obj, "consequences", consequences.into());
+            // Wave 10: every node the disable reaches, by name (the id only
+            // routes), and the answering node's privilege mode.
+            let nodes = js_sys::Array::new();
+            for n in r.nodes {
+                let no = js_sys::Object::new();
+                set(&no, "nodeId", n.node_id.into());
+                set(&no, "name", n.name.into());
+                set(&no, "local", n.local.into());
+                set(&no, "online", n.online.into());
+                set(&no, "status", n.status.into());
+                set(&no, "unpaired", n.unpaired.into());
+                nodes.push(&no.into());
+            }
+            set(&obj, "nodes", nodes.into());
+            set(&obj, "privilege", r.privilege.into());
         }
         MessageBody::AddonConfigGetResponseBody(r) => {
             set(&obj, "variant", "AddonConfigGetResponse".into());
@@ -23726,6 +23741,15 @@ pub fn encode_tentanas_elastic_folder_cache_set_request(
     encode_tentanas_json_request("ElasticFolderCacheSetRequest", &request_json)
 }
 
+/// MessageBody::TentaNasBody(SharingStopRequest) — n18d "Wyłącz i zatrzymaj
+/// udostępnianie…" (wave 10): a four-eyes request to take every share and
+/// target of the answering node out of service and then disable TentaNas.
+/// Carries no field; answers with ApprovalPendingResponse.
+#[wasm_bindgen(js_name = encodeTentaNasSharingStopRequest)]
+pub fn encode_tentanas_sharing_stop_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SharingStopRequest", &request_json)
+}
+
 /// Plan wyczyszczenia dysku — co zostanie usunięte i każda odmowa.
 ///
 /// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
@@ -23822,7 +23846,7 @@ mod elastic_codec_tests {
 
     #[test]
     fn elastic_encoders_roundtrip_actual_protocol_body() {
-        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 23] = [
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 24] = [
             ("ElasticCapabilitiesRequest", encode_tentanas_elastic_capabilities_request, "{}"),
             ("DiskWipePlanRequest", encode_tentanas_disk_wipe_plan_request,
                 r#"{"disk_id":"wwn-0x5000c500a1b2c3d4"}"#),
@@ -23873,6 +23897,8 @@ mod elastic_codec_tests {
             // how a folder goes back to the default rather than a fourth value.
             ("ElasticFolderCacheSetRequest", encode_tentanas_elastic_folder_cache_set_request,
                 r#"{"name":"dane","folder":"foto","cache_policy":"only"}"#),
+            // Wave 10: the stop-sharing request has no field at all.
+            ("SharingStopRequest", encode_tentanas_sharing_stop_request, r#"{}"#),
         ];
         for (variant, encode, fields) in cases {
             let bytes = encode(fields.to_owned()).unwrap();

@@ -5499,7 +5499,8 @@
         "refused": "no iniciada",
         "skipped": "omitida",
         "interrupted": "interrumpida",
-        "cancelled": "cancelada"
+        "cancelled": "cancelada",
+        "done": "hecho"
       },
       "disk_reason": {
         "self_test_running": "ya hay una prueba SMART en curso en este disco",
@@ -5512,11 +5513,27 @@
         "test_no_result": "el disco no dio un resultado concluyente",
         "test_no_entry": "el disco no registró resultado para esta prueba",
         "test_stalled": "sin rastro de la prueba durante {min} min",
-        "test_overran": "la prueba superó {min} min: su progreso ya no es fiable"
+        "test_overran": "la prueba superó {min} min: su progreso ya no es fiable",
+        "shares_stopped": "{smb} SMB, {nfs} NFS detenidos",
+        "targets_stopped": "{iscsi} iSCSI, {nvmet} NVMe-oF fuera del núcleo",
+        "targets_left": "{count} todavía en el núcleo",
+        "step_privilege": "no hay canal de privilegios, o la contraseña fue rechazada",
+        "step_failed": "el paso falló — los detalles están en el registro del nodo",
+        "already_stopped": "la compartición ya se está deteniendo o está detenida",
+        "targets_frozen": "{count} {count|destino con el portal movido sigue sirviendo|destinos con el portal movido siguen sirviendo} — no se detuvo nada",
+        "rollback_partial": "no restablecido: {rows}",
+        "not_resumed": "no ha vuelto: {rows}"
       },
       "kind_smart_batch_short": "SMART short",
       "kind_smart_batch_long": "SMART long",
-      "subject_all_disks": "— todos los discos"
+      "subject_all_disks": "— todos los discos",
+      "kind_sharing_stop": "Detener la compartición",
+      "kind_sharing_resume": "Reanudar la compartición",
+      "step": {
+        "shares": "Recursos compartidos SMB/NFS",
+        "targets": "Destinos iSCSI/NVMe-oF",
+        "disable": "Desactivar TentaNas"
+      }
     },
     "danger": {
       "retype": "Escribe {name} para confirmar:",
@@ -6660,8 +6677,10 @@
         "source_invalid": "El origen del recurso compartido no es un directorio válido en un pool o una matriz de este nodo; detalles en la información emergente",
         "source_unmounted": "El origen del recurso compartido no está montado: el recurso queda fuera de la configuración",
         "service_missing": "Falta el paquete {package} en este nodo",
-        "smb_direct_not_served": "SMB Direct no se sirve en este nodo (el recurso compartido sigue funcionando por la LAN)"
-      }
+        "smb_direct_not_served": "SMB Direct no se sirve en este nodo (el recurso compartido sigue funcionando por la LAN)",
+        "sharing_suspended": "La compartición en este nodo se detuvo junto con la desactivación de TentaNas — vuelve cuando TentaNas se activa de nuevo. En el modo B vuelve en cuanto se arma el canal de privilegios."
+      },
+      "state_suspended": "En pausa"
     },
     "wizard_share": {
       "title": "Nuevo recurso",
@@ -7007,6 +7026,14 @@
         "pool_not_imported": {
           "title": "El pool {pool} no se ha importado",
           "detail": "{n} {n|disco de este nodo lleva|discos de este nodo llevan} la etiqueta de este pool, pero el nodo no lo ha importado en los {minutes} min posteriores al inicio de TentaNas. Importa el pool (un pool cifrado puede estar esperando su clave); si ya no existe, sus discos se pueden borrar."
+        },
+        "sharing_resume_failed": {
+          "title": "La compartición no ha vuelto en este nodo",
+          "detail": "No se pudo escribir la configuración de los recursos compartidos (intento {n}). El nodo reintenta con un intervalo creciente; en el modo B se necesita un canal de privilegios armado."
+        },
+        "sharing_share_not_resumed": {
+          "title": "El recurso compartido {share} no volvió al reanudar la compartición",
+          "detail": "El estado del recurso indica por qué. El nodo reintenta con un intervalo creciente; la alerta se cierra cuando el recurso vuelve a servir."
         }
       },
       "node_text": "Texto del nodo",
@@ -7561,8 +7588,15 @@
           "trim": "programación del TRIM del pool {subject}",
           "snapshot": "programación de instantáneas del dataset {subject}",
           "smart": "programación de las pruebas SMART"
-        }
-      }
+        },
+        "sharing_stop": "Detiene la compartición en el nodo {node} — recursos compartidos: {shares}; destinos: {targets} — y después desactiva TentaNas en toda la flota.",
+        "sharing_stop_none": "ninguno",
+        "sharing_stop_node_unnamed": "sin nombre",
+        "sharing_stop_other_shares": "{n} {n|recurso compartido|recursos compartidos} de otras organizaciones",
+        "sharing_stop_other_targets": "{n} {n|destino|destinos} de otras organizaciones",
+        "sharing_stop_other_org": "Detención de la compartición en el nodo {node}, solicitada en otra organización. Bloquea este nodo — puede rechazarla."
+      },
+      "op_sharing_stop": "Detener la compartición y desactivar TentaNas"
     },
     "access": {
       "title": "Registro de acceso",
@@ -7767,11 +7801,13 @@
         "import_all_interfaces": "Este destino se exportaba en todas las interfaces (0.0.0.0): elija una interfaz de este nodo antes de activarlo.",
         "portal_moved_head_no_address": "El portal del destino ya no está donde se fijó. La dirección {address} pertenecía a la interfaz {interface}, que está en este nodo pero ahora no tiene ninguna dirección (enlace caído o concesión DHCP perdida).",
         "portal_moved_silent_since": "Desde {since} está en {elsewhere}. El destino no está en el kernel, así que nada escucha en esa dirección: la exportación no es accesible en {elsewhere} y no se trasladará allí automáticamente.",
-        "portal_moved_reachable_since": "Desde {since} está en {elsewhere}, que nadie eligió para este destino: la exportación es accesible allí."
+        "portal_moved_reachable_since": "Desde {since} está en {elsewhere}, que nadie eligió para este destino: la exportación es accesible allí.",
+        "sharing_suspended": "La compartición en este nodo se detuvo junto con la desactivación de TentaNas — el destino vuelve al núcleo cuando TentaNas se activa de nuevo. En el modo B vuelve en cuanto se arma el canal de privilegios."
       },
       "host_state": "Estado",
       "host_connected": "Conectado",
-      "host_not_connected": "No conectado"
+      "host_not_connected": "No conectado",
+      "state_suspended": "en pausa"
     },
     "wizard_target": {
       "title": "Nuevo destino",
@@ -7925,7 +7961,18 @@
       "pool_destroy_in_progress": "Se está destruyendo un pool en este nodo; inténtalo de nuevo en un momento.",
       "forward_address_refused": "Esta dirección no está permitida: una red privada fuera de la lista de colectores internos del administrador de la plataforma, o loopback, link-local o una dirección de metadatos de la nube.",
       "forward_https_only": "El webhook debe ser una dirección https:// (http:// solo a un host de la lista del administrador de la plataforma marcado «permitir http»).",
-      "forward_node_retired": "El destino compartido del nodo está retirado: solo se puede eliminar."
+      "forward_node_retired": "El destino compartido del nodo está retirado: solo se puede eliminar.",
+      "sharing_stop_platform_admin": "Detener la compartición requiere el rol de administrador de la plataforma — para solicitarlo y para aprobarlo.",
+      "sharing_stop_no_second_admin": "No hay un segundo administrador de la plataforma en esta organización que pueda aprobarlo.",
+      "sharing_stop_pending": "La detención de la compartición en este nodo ya espera aprobación o está en curso, o la compartición ya está detenida.",
+      "sharing_stop_failed": "No se pudo detener la compartición — TentaNas no se desactivó y la compartición se restableció.",
+      "sharing_resume_failed": "La compartición aún no ha vuelto del todo — el nodo lo reintenta.",
+      "sharing_stop_frozen_targets": "En este nodo sigue sirviendo un destino cuyo portal cambió de dirección — una detención no podría restablecerlo después. Elija primero de nuevo la interfaz del portal.",
+      "sharing_stop_failed_partial": "No se pudo detener la compartición y TentaNas no se desactivó — pero no todo se pudo restablecer; la línea del paso indica lo que no sirve.",
+      "sharing_stop_busy": "La compartición en este nodo ya se está deteniendo o está detenida — no se cambió nada.",
+      "sharing_stop_author_gone": "El autor de esta solicitud ya no es administrador de la plataforma en esta organización — no se puede aprobar; recházela.",
+      "sharing_resume_partial": "La compartición ha vuelto, pero no del todo — las líneas de la tarea indican lo que aún no sirve; el nodo lo reintenta.",
+      "sharing_stop_pending_elsewhere": "En este nodo ya espera aprobación una detención de la compartición solicitada en otra organización. Un administrador de la plataforma la ve en TentaNas → Tareas y puede rechazarla."
     },
     "unreachable": {
       "title": "Nodo {node} inaccesible",
@@ -10890,6 +10937,34 @@
       "tentanas_nvmet_targets_continue": "{n} {n|subsistema NVMe-oF sigue|subsistemas NVMe-oF siguen} exportando zvol, también tras reiniciar el nodo.",
       "tentanas_iscsi_targets_until_reboot": "{n} {n|destino iSCSI funciona|destinos iSCSI funcionan} hasta que el nodo se reinicie; después no vuelven mientras TentaNas esté desactivado (sin helper de privilegios).",
       "tentanas_nvmet_targets_until_reboot": "{n} {n|subsistema NVMe-oF funciona|subsistemas NVMe-oF funcionan} hasta que el nodo se reinicie; después no vuelven mientras TentaNas esté desactivado (sin helper de privilegios)."
+    },
+    "col_effects": "Efectos",
+    "node_unpaired": "separado de la flota — la desactivación no le llegará",
+    "node_unsupported": "la aplicación no funciona en este nodo — aquí no cambia nada",
+    "node_offline": "el nodo no responde — sus efectos no se conocen; la desactivación le llegará cuando vuelva",
+    "node_error": "no se pudieron leer los efectos de este nodo",
+    "node_nothing": "aquí no cambia nada",
+    "confirm_keep_serving": "Desactivar la aplicación (los servicios siguen funcionando)",
+    "stop_hint": "Si también quiere detener la compartición de datos en este nodo, use el botón separado de abajo — los clientes de este nodo pierden el acceso a sus recursos compartidos y destinos hasta que se vuelva a activar.",
+    "stop_button": "Desactivar y detener la compartición…",
+    "stop_title": "Detener la compartición en el nodo {node} y desactivar TentaNas",
+    "stop_text": "Una vez aprobado, el nodo detiene sus recursos compartidos y destinos en los servicios y en el núcleo (su configuración se conserva) y después desactiva TentaNas en toda la flota. Un fallo en cualquier paso lo detiene todo antes de la desactivación. Volver a activar TentaNas restablece la compartición.",
+    "stop_item_smb": "{n} {n|recurso compartido SMB deja|recursos compartidos SMB dejan} de servir datos",
+    "stop_item_nfs": "{n} {n|recurso compartido NFS deja|recursos compartidos NFS dejan} de servir datos",
+    "stop_item_iscsi": "{n} {n|destino iSCSI sale|destinos iSCSI salen} del núcleo",
+    "stop_item_nvmet": "{n} {n|subsistema NVMe-oF sale|subsistemas NVMe-oF salen} del núcleo",
+    "stop_item_none": "Este nodo no comparte ahora ningún recurso ni destino",
+    "stop_item_disable": "Al final TentaNas se desactiva en toda la flota",
+    "stop_approval": "Requiere la aprobación de un segundo administrador de la plataforma — hasta entonces no cambia nada. Se aprueba en TentaNas → Tareas en este nodo.",
+    "stop_send": "Enviar para aprobación",
+    "stop_parked": "Enviado para aprobación — TentaNas sigue funcionando hasta que un segundo administrador lo apruebe.",
+    "stop_error": "No se pudo enviar la solicitud para detener la compartición.",
+    "refusal": {
+      "sharing_stop_platform_admin": "Detener la compartición requiere el rol de administrador de la plataforma — para solicitarlo y para aprobarlo.",
+      "sharing_stop_no_second_admin": "No hay un segundo administrador de la plataforma en esta organización que pueda aprobarlo — no se envió nada.",
+      "sharing_stop_pending": "La detención de la compartición en este nodo ya espera aprobación o está en curso, o la compartición ya está detenida.",
+      "sharing_stop_frozen_targets": "En este nodo sigue sirviendo un destino cuyo portal cambió de dirección — una detención no podría restablecerlo después. Elija primero de nuevo la interfaz del portal (TentaNas → Compartición).",
+      "sharing_stop_pending_elsewhere": "En este nodo ya espera aprobación una detención de la compartición solicitada en otra organización. Un administrador de la plataforma la ve en TentaNas → Tareas y puede rechazarla."
     }
   }
 }

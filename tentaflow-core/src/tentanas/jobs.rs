@@ -372,6 +372,21 @@ where
     spawn_inner(db, store::SMART_BATCH_KIND, subject, started_by, None, None, None, disks, body)
 }
 
+/// One job of the sharing stop or resume (`sharing::STOP_KIND` /
+/// `RESUME_KIND`, wave 10): its step lines are written by the same
+/// transaction as the row, all pending, and the body moves them on.
+/// `owner` is the organisation that asked for the stop (its names the lines
+/// may say), `None` for a node-wide job.
+pub fn spawn_steps<F, Fut>(db: &DbPool, kind: &str, subject: &str, started_by: &str, owner: Option<&str>, body: F) -> Result<NasJob>
+where
+    F: FnOnce(JobHandle) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    anyhow::ensure!(super::sharing::is_step_kind(kind), "not a step job: {kind}");
+    let lines = super::sharing::step_lines(kind);
+    spawn_inner(db, kind, subject, started_by, owner, None, None, &lines, body)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_inner<F, Fut>(db: &DbPool, kind: &str, subject: &str, started_by: &str,
     owner: Option<&str>,

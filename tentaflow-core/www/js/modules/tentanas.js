@@ -31,7 +31,7 @@ import { isOpaqueId, isDiskIdShape, scrubIds } from '/js/modules/tentanas/machin
 import { drawPools, poolDescription } from '/js/modules/tentanas/pools.js';
 import { drawPoolDetail, openReplaceWizard } from '/js/modules/tentanas/pool-detail.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
-import { drawTasks, openSmartScheduleEditor, jobSubject, jobRowSkeleton, paintJobRow, paintJobDisks, jobErrorText, SMART_BATCH_KIND } from '/js/modules/tentanas/tasks.js';
+import { drawTasks, openSmartScheduleEditor, jobSubject, jobRowSkeleton, paintJobRow, paintJobDisks, jobErrorText, hasJobLines } from '/js/modules/tentanas/tasks.js';
 import { drawShares, protocolChipHtml, mountStateLabel } from '/js/modules/tentanas/shares.js';
 import { warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openDiskWipeDialog } from '/js/modules/tentanas/disk-wipe.js';
@@ -3987,7 +3987,7 @@ const TentaNasScreen = {
         patchHtml(head, `${escapeHtml(jobKindLabel(j.kind, j.subject))} <span${subject.words ? '' : ' class="mono"'}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${jobErrorText(j) ? `<div class="num-err mt-sm">${escapeHtml(jobErrorText(j))}</div>` : ''}`);
         // A multi-disk job's lines, each disk by name with its own state —
         // patched line by line, like the running-job row.
-        if (j.kind === SMART_BATCH_KIND) paintJobDisks(win.querySelector('#nas-joblog-disks'), j);
+        if (hasJobLines(j)) paintJobDisks(win.querySelector('#nas-joblog-disks'), j);
         paintJobLog(pre, jobLogLines(j.log, this.nodeNameOf()));
         if (j.status === 'running' || j.status === 'queued') timer = setTimeout(poll, POLL_JOB_MODAL_MS);
         else if (onFinish && !notified) { notified = true; onFinish(j); }

@@ -1501,6 +1501,48 @@ fn object_in_kernel(target: &TargetRow) -> bool {
     Path::new(&path).is_dir()
 }
 
+/// The enabled targets this node judges FROZEN (portal drift): still in the
+/// kernel and serving, left exactly as they are by the drift policy. The
+/// sharing stop refuses while one exists (critic wave 10, M3): it would have
+/// to take the export out, and neither a rollback nor the resume can put a
+/// frozen target back — re-applying it would bind an address that moved.
+pub fn frozen_targets(db: &DbPool) -> Result<Vec<TargetRow>> {
+    let addresses = interface_addresses();
+    Ok(frozen_among(store::list_targets(db)?, &kernel_can_serve, &addresses, &object_in_kernel, &|t| {
+        t.luns.iter().all(|lun| Path::new(&lun.device_path).exists())
+    }))
+}
+
+/// `frozen_targets` over given rows, with the host's facts injected. Only a
+/// target that is IN THE KERNEL counts (critic wave 10, R2-1): a drifted
+/// target configfs no longer holds — after a reboot — serves nothing, so
+/// there is nothing a stop would take out and fail to put back.
+pub(crate) fn frozen_among(
+    targets: Vec<TargetRow>,
+    installed: &dyn Fn(&str) -> bool,
+    addresses: &BTreeMap<String, Vec<String>>,
+    in_kernel: &dyn Fn(&TargetRow) -> bool,
+    volume_exists: &dyn Fn(&TargetRow) -> bool,
+) -> Vec<TargetRow> {
+    targets
+        .into_iter()
+        .filter(|t| t.enabled && in_kernel(t))
+        .filter(|t| target_state(t, volume_exists(t), installed, addresses, true).2 == Disposition::Freeze)
+        .collect()
+}
+
+/// Whether this node's kernel holds `target` (its configfs object exists).
+pub fn in_kernel(target: &TargetRow) -> bool {
+    object_in_kernel(target)
+}
+
+/// How many ENABLED targets this node's kernel still holds — what the
+/// sharing stop reads back after its sweep (wave 10): a target still there
+/// is a client still holding a raw disk.
+pub fn enabled_in_kernel(db: &DbPool) -> Result<usize> {
+    Ok(store::list_targets(db)?.iter().filter(|t| t.enabled && object_in_kernel(t)).count())
+}
+
 /// Judges every row, persists what changed and raises or resolves the
 /// portal-drift alert. Returns what `apply` should DO with each row.
 ///
@@ -1531,6 +1573,11 @@ fn evaluate_rows(
     log: &mut Vec<String>,
 ) -> Result<BTreeMap<String, Disposition>> {
     let addresses = interface_addresses();
+    // While this node's sharing is stopped (n18d, wave 10) every enabled
+    // target is judged `suspended` / `Remove`: the sweeps take it out of the
+    // kernel and nothing puts it back until the resume lifts the mark. Read
+    // with `?`: an unreadable mark must not put every target back.
+    let stopped = super::sharing::suspended(db)?;
     let mut disposition: BTreeMap<String, Disposition> = BTreeMap::new();
     for target in targets.iter_mut() {
         // Asked of the DEVICE NODE, not of `zfs list`. A zvol the kernel can
@@ -1542,12 +1589,10 @@ fn evaluate_rows(
             .luns
             .iter()
             .all(|lun| Path::new(&lun.device_path).exists());
-        let (state, mut detail, verdict) = target_state(
+        let (state, mut detail, verdict) = super::sharing::target_state_while(
+            stopped,
             target,
-            volume_exists,
-            installed,
-            &addresses,
-            object_in_kernel(target),
+            target_state(target, volume_exists, installed, &addresses, object_in_kernel(target)),
         );
         // The drift alert (§5.5, owner decision 2026-09-04). The admin who
         // picked an interface has to HEAR that the portal is no longer on it,
@@ -1687,7 +1732,10 @@ fn removal_is_due(target: &TargetRow) -> bool {
 /// directions. A test that can pass while the code is broken is worse than no
 /// test, and these were the ones watching a client's disk.
 fn removal_is_due_with(target: &TargetRow, since: &GraceClock) -> bool {
-    if !target.enabled {
+    // A disabled target, and one stopped with the node's sharing (its judged
+    // state, `sharing::target_state_while`): the admin asked for it to stop,
+    // so no grace period applies.
+    if !target.enabled || target.state == "suspended" {
         return true;
     }
     let volume_exists = target
@@ -2046,12 +2094,11 @@ pub fn unapplied_reason(db: &DbPool, name: &str) -> Result<Option<String>> {
         .iter()
         .all(|lun| Path::new(&lun.device_path).exists());
     let in_kernel = object_in_kernel(target);
-    let (_, detail, verdict) = target_state(
+    // The same judgement the sweeps act on, the stopped node's included.
+    let (_, detail, verdict) = super::sharing::target_state_while(
+        super::sharing::suspended(db)?,
         target,
-        volume_exists,
-        &kernel_can_serve,
-        &interface_addresses(),
-        in_kernel,
+        target_state(target, volume_exists, &kernel_can_serve, &interface_addresses(), in_kernel),
     );
     let because = |what: &str| {
         Some(if detail.is_empty() {
@@ -3491,6 +3538,13 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                     }
                 }
                 if armed {
+                    // Wave 10: sharing stopped with the disable (n18d) comes
+                    // back here once TentaNas is enabled again and a channel
+                    // answers — a mode-B node the moment an admin arms it.
+                    // A cheap read when nothing is stopped.
+                    if let Some(job) = super::sharing::resume_if_due(&main_db, &db).await {
+                        tracing::info!("tentanas: sharing resumes on this node (job {})", job.job_id);
+                    }
                     // Two clocks, not one. A removal the kernel keeps
                     // refusing must not stretch the tick for a HEALTHY apply:
                     // a new target whose udev link has not appeared yet would
@@ -7050,4 +7104,32 @@ mod tests {
             }
         }
     }
+    /// Critic wave 10, R2-1: only a drifted target that is IN THE KERNEL is
+    /// frozen for the sharing stop; the same row after a reboot (configfs
+    /// empty) serves nothing and holds nothing back.
+    #[test]
+    fn a_drifted_target_blocks_the_stop_only_while_it_is_in_the_kernel() {
+        let row = TargetRow {
+            target_id: "t1".into(),
+            name: "vm-store".into(),
+            protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.local.tentaflow:vm-store".into(),
+            enabled: true,
+            auth_method: "none".into(),
+            portals: vec![NasTargetPortal { interface: "eth9".into(), address: "192.0.2.10".into(), port: 3260, ..Default::default() }],
+            ..Default::default()
+        };
+        let nowhere: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let frozen = |in_kernel: bool| {
+            frozen_among(vec![row.clone()], &|_| true, &nowhere, &|_| in_kernel, &|_| true)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(frozen(true), vec!["vm-store".to_string()], "serving with a moved portal: the stop is refused");
+        assert!(frozen(false).is_empty(), "not in the kernel: nothing frozen serves");
+        let disabled = TargetRow { enabled: false, ..row.clone() };
+        assert!(frozen_among(vec![disabled], &|_| true, &nowhere, &|_| true, &|_| true).is_empty());
+    }
+
 }

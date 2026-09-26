@@ -6501,6 +6501,18 @@ pub struct AddonDisablePreviewResponse {
     /// Empty when the app supplies no consequence provider — the dashboard
     /// then disables without a dialog, as before.
     pub consequences: Vec<AddonDisableConsequence>,
+    /// Every node the (fleet-wide) disable reaches, this one first, by name —
+    /// the same list the uninstall dialog gets (`AddonTeardownNode`). The
+    /// dialog asks each node for its own consequences (the request forwarded
+    /// to it). Empty from an older node: the dialog then shows this node's
+    /// consequences alone. Appended, `#[serde(default)]` (wave 10).
+    #[serde(default)]
+    pub nodes: Vec<AddonTeardownNode>,
+    /// How the ANSWERING node gets root, for its mode chip (n18a/n18d):
+    /// '' (the app needs none) | 'helper' (mode A) | 'password' (mode B).
+    /// Appended, `#[serde(default)]` (wave 10).
+    #[serde(default)]
+    pub privilege: String,
 }
 
 /// Another installed instance that declares `[[uses_app]]` on the package

@@ -1214,3 +1214,44 @@ test('every disk-line code and state of a multi-disk job is worded in every loca
     await I18n.setLanguage('pl');
   }
 });
+
+// Wave 10 (n18d): the sharing stop is one job with a line per STEP —
+// SMB/NFS shares, iSCSI/NVMe-oF targets, the disable — each worded, with
+// its coded reason; a failure shows which step, and the steps after it read
+// skipped.
+test('a sharing stop shows its steps as worded lines, and the history names the step that failed', async () => {
+  const step = (name, state, reasons = []) => ({ name, lastKnown: false, state, progressPct: null, reasons });
+  const running = {
+    jobId: 'job-s', kind: 'sharing_stop', subject: 'helios', status: 'running', startedBy: 'admin', startedAt: '2026-09-26 10:00:00', log: [],
+    disks: [step('shares', 'done', [{ code: 'shares_stopped', params: { smb: '2', nfs: '1' } }]), step('targets', 'running'), step('disable', 'pending')],
+  };
+  const failed = {
+    jobId: 'job-f', kind: 'sharing_stop', subject: 'helios', status: 'failed', startedBy: 'admin', startedAt: '2026-09-26 09:00:00',
+    finishedAt: '2026-09-26 09:01:00', log: [], error: 'refusal:sharing_stop_failed_partial',
+    disks: [step('shares', 'done'), step('targets', 'failed', [
+      { code: 'targets_left', params: { count: '1' } },
+      { code: 'rollback_partial', params: { shares: 'projekty', targets: '', other_shares: '0', other_targets: '1' } },
+    ]), step('disable', 'skipped')],
+  };
+  const screen = fakeScreen(fixtures({ tentaNasJobsListRequest: { jobs: [running, failed] } }));
+  const body = mount();
+  await drawTasks(screen, body);
+  await flush();
+  const lines = [...body.querySelectorAll('#nas-jobs-running .job-disk')];
+  assert.equal(lines.length, 3, 'one line per step');
+  assert.match(body.querySelector('#nas-jobs-running .job-name').textContent, /Zatrzymanie udostępniania\s+helios/);
+  assert.equal(lines[0].querySelector('[data-role="name"]').textContent, 'Udziały SMB/NFS');
+  assert.equal(lines[0].querySelector('[data-role="state"]').getAttribute('label'), 'gotowe');
+  assert.equal(lines[0].querySelector('[data-role="state"]').getAttribute('status'), 'ok');
+  assert.equal(lines[0].querySelector('[data-role="detail"]').textContent, '2 SMB, 1 NFS zatrzymane');
+  assert.equal(lines[1].querySelector('[data-role="name"]').textContent, 'Targety iSCSI/NVMe-oF');
+  assert.equal(lines[2].querySelector('[data-role="name"]').textContent, 'Wyłączenie TentaNas');
+  const row = body.querySelector('#nas-jobs-table').rows.find((r) => r._job.jobId === 'job-f');
+  // Critic wave 10, M4: a partial rollback is said as such, and what did
+  // not come back is named — the asking organisation's by name, another's
+  // counted.
+  assert.match(row.result, /nie wszystko udało się przywrócić/);
+  assert.match(row.result, /Targety iSCSI\/NVMe-oF: nie przeszedł — 1 nadal w jądrze; nie przywrócono: projekty, 1 target innych organizacji · Wyłączenie TentaNas: pominięty/);
+  assert.doesNotMatch(body.textContent + row.result, /tentanas\.|shares_stopped|targets_left|rollback_partial|refusal:|\{rows\}/, 'no raw key, code or placeholder');
+  screen.dispose();
+});

@@ -6804,6 +6804,14 @@
         "pool_not_imported": {
           "title": "Pula {pool} nie została zaimportowana",
           "detail": "{n} {n|dysk tego węzła ma|dyski tego węzła mają|dysków tego węzła ma} etykietę tej puli, a węzeł nie zaimportował jej w ciągu {minutes} min od startu TentaNas. Zaimportuj pulę (pula szyfrowana może czekać na klucz); jeśli pula już nie istnieje, jej dyski można wyczyścić."
+        },
+        "sharing_resume_failed": {
+          "title": "Udostępnianie na tym węźle nie wróciło",
+          "detail": "Nie udało się zapisać konfiguracji udziałów (próba {n}). Węzeł ponawia z rosnącym odstępem; w trybie B potrzebny jest uzbrojony kanał uprawnień."
+        },
+        "sharing_share_not_resumed": {
+          "title": "Udział {share} nie wrócił po wznowieniu udostępniania",
+          "detail": "Stan udziału mówi dlaczego. Węzeł ponawia z rosnącym odstępem; alert zamknie się, gdy udział znów zacznie działać."
         }
       },
       "node_text": "Treść węzła",
@@ -7052,7 +7060,8 @@
         "refused": "nie ruszył",
         "skipped": "pominięty",
         "interrupted": "przerwany",
-        "cancelled": "anulowany"
+        "cancelled": "anulowany",
+        "done": "gotowe"
       },
       "disk_reason": {
         "self_test_running": "na tym dysku trwa już test SMART",
@@ -7065,11 +7074,27 @@
         "test_no_result": "dysk nie podał rozstrzygającego wyniku",
         "test_no_entry": "dysk nie zapisał wyniku tego testu",
         "test_stalled": "brak śladu testu przez {min} min",
-        "test_overran": "test trwał ponad {min} min — jego postęp przestał być wiarygodny"
+        "test_overran": "test trwał ponad {min} min — jego postęp przestał być wiarygodny",
+        "shares_stopped": "{smb} SMB, {nfs} NFS zatrzymane",
+        "targets_stopped": "{iscsi} iSCSI, {nvmet} NVMe-oF poza jądrem",
+        "targets_left": "{count} nadal w jądrze",
+        "step_privilege": "brak kanału uprawnień lub hasło odrzucone",
+        "step_failed": "krok się nie powiódł — szczegóły w dzienniku węzła",
+        "already_stopped": "udostępnianie jest już zatrzymywane albo zatrzymane",
+        "targets_frozen": "{count} {count|target z przeniesionym portalem nadal działa|targety z przeniesionym portalem nadal działają|targetów z przeniesionym portalem nadal działa} — nic nie zatrzymano",
+        "rollback_partial": "nie przywrócono: {rows}",
+        "not_resumed": "nie wróciło: {rows}"
       },
       "kind_smart_batch_short": "SMART short",
       "kind_smart_batch_long": "SMART long",
-      "subject_all_disks": "— wszystkie dyski"
+      "subject_all_disks": "— wszystkie dyski",
+      "kind_sharing_stop": "Zatrzymanie udostępniania",
+      "kind_sharing_resume": "Wznowienie udostępniania",
+      "step": {
+        "shares": "Udziały SMB/NFS",
+        "targets": "Targety iSCSI/NVMe-oF",
+        "disable": "Wyłączenie TentaNas"
+      }
     },
     "elevation": {
       "title": "Kanał uprawnień systemowych",
@@ -8436,8 +8461,10 @@
         "source_invalid": "Źródło udziału nie jest poprawnym katalogiem na puli ani w macierzy tego węzła — szczegóły w podpowiedzi",
         "source_unmounted": "Źródło udziału nie jest zamontowane — udział nie trafia do konfiguracji",
         "service_missing": "Na tym węźle brakuje pakietu {package}",
-        "smb_direct_not_served": "SMB Direct nie jest obsługiwany na tym węźle (udział działa dalej przez sieć LAN)"
-      }
+        "smb_direct_not_served": "SMB Direct nie jest obsługiwany na tym węźle (udział działa dalej przez sieć LAN)",
+        "sharing_suspended": "Udostępnianie na tym węźle zatrzymano razem z wyłączeniem TentaNas — wróci po ponownym włączeniu. W trybie B wraca, gdy kanał uprawnień zostanie uzbrojony."
+      },
+      "state_suspended": "Wstrzymany"
     },
     "wizard_share": {
       "title": "Nowy share",
@@ -8828,8 +8855,15 @@
           "trim": "harmonogram TRIM puli {subject}",
           "snapshot": "harmonogram snapshotów datasetu {subject}",
           "smart": "harmonogram testów SMART"
-        }
-      }
+        },
+        "sharing_stop": "Zatrzymuje udostępnianie na węźle {node} — udziały: {shares}; targety: {targets} — a potem wyłącza TentaNas na całej flocie.",
+        "sharing_stop_none": "brak",
+        "sharing_stop_node_unnamed": "bez nazwy",
+        "sharing_stop_other_shares": "{n} {n|udział|udziały|udziałów} innych organizacji",
+        "sharing_stop_other_targets": "{n} {n|target|targety|targetów} innych organizacji",
+        "sharing_stop_other_org": "Zatrzymanie udostępniania na węźle {node}, zgłoszone w innej organizacji. Blokuje ten węzeł — możesz je odrzucić."
+      },
+      "op_sharing_stop": "Zatrzymanie udostępniania i wyłączenie TentaNas"
     },
     "access": {
       "title": "Dziennik dostępu",
@@ -9034,11 +9068,13 @@
         "import_all_interfaces": "Ten target był eksportowany na wszystkich interfejsach (0.0.0.0) — wybierz interfejs tego węzła, zanim go włączysz.",
         "portal_moved_head_no_address": "Portal targetu nie jest już tam, gdzie go przypięto. Adres {address} należał do interfejsu {interface}, który jest na tym węźle, ale nie ma teraz żadnego adresu (łącze wyłączone albo utracona dzierżawa DHCP).",
         "portal_moved_silent_since": "Od {since} znajduje się na {elsewhere}. Target nie jest w jądrze, więc pod tym adresem nic nie nasłuchuje — eksport nie jest osiągalny na {elsewhere} i nie zostanie tam przepięty automatycznie.",
-        "portal_moved_reachable_since": "Od {since} jest na {elsewhere}, którego nikt nie wybrał dla tego targetu — eksport jest tam osiągalny."
+        "portal_moved_reachable_since": "Od {since} jest na {elsewhere}, którego nikt nie wybrał dla tego targetu — eksport jest tam osiągalny.",
+        "sharing_suspended": "Udostępnianie na tym węźle zatrzymano razem z wyłączeniem TentaNas — target wróci do jądra po ponownym włączeniu. W trybie B wraca, gdy kanał uprawnień zostanie uzbrojony."
       },
       "host_state": "Stan",
       "host_connected": "Połączony",
-      "host_not_connected": "Niepołączony"
+      "host_not_connected": "Niepołączony",
+      "state_suspended": "wstrzymany"
     },
     "wizard_target": {
       "title": "Nowy target",
@@ -9192,7 +9228,18 @@
       "pool_destroy_in_progress": "Trwa niszczenie puli na tym węźle, spróbuj ponownie za chwilę.",
       "forward_address_refused": "Ten adres jest niedozwolony: sieć prywatna spoza listy kolektorów wewnętrznych administratora platformy, albo loopback, link-local lub adres metadanych chmury.",
       "forward_https_only": "Webhook musi być adresem https:// (http:// tylko do hosta z listy administratora platformy oznaczonego „zezwól na http”).",
-      "forward_node_retired": "Wspólny cel noda jest wycofany: można go tylko usunąć."
+      "forward_node_retired": "Wspólny cel noda jest wycofany: można go tylko usunąć.",
+      "sharing_stop_platform_admin": "Zatrzymanie udostępniania wymaga roli administratora platformy — do zgłoszenia i do zatwierdzenia.",
+      "sharing_stop_no_second_admin": "Nie ma drugiego administratora platformy w tej organizacji, który mógłby to zatwierdzić.",
+      "sharing_stop_pending": "Na tym węźle zatrzymanie udostępniania już czeka na zatwierdzenie, trwa albo udostępnianie jest już zatrzymane.",
+      "sharing_stop_failed": "Zatrzymanie udostępniania nie powiodło się — TentaNas nie został wyłączony, a udostępnianie przywrócono.",
+      "sharing_resume_failed": "Udostępnianie jeszcze nie wróciło w całości — węzeł ponawia próbę.",
+      "sharing_stop_frozen_targets": "Na tym węźle działa target z przeniesionym portalem — zatrzymanie nie mogłoby go potem przywrócić. Najpierw wybierz ponownie interfejs portalu.",
+      "sharing_stop_failed_partial": "Zatrzymanie udostępniania nie powiodło się, a TentaNas nie został wyłączony — ale nie wszystko udało się przywrócić; linia kroku wymienia, co nie działa.",
+      "sharing_stop_busy": "Udostępnianie na tym węźle jest już zatrzymywane albo zatrzymane — nic nie zmieniono.",
+      "sharing_stop_author_gone": "Autor tej prośby nie jest już administratorem platformy w tej organizacji — nie można jej zatwierdzić; odrzuć ją.",
+      "sharing_resume_partial": "Udostępnianie wróciło, ale nie w całości — linie zadania wymieniają, co jeszcze nie działa; węzeł ponawia próbę.",
+      "sharing_stop_pending_elsewhere": "Na tym węźle czeka już na zatwierdzenie zatrzymanie udostępniania zgłoszone w innej organizacji. Administrator platformy widzi je w TentaNas → Zadania i może je odrzucić."
     },
     "unreachable": {
       "title": "Węzeł {node} niedostępny",
@@ -12125,6 +12172,34 @@
       "tentanas_nvmet_targets_continue": "{n} {n|subsystem|subsystemy|subsystemów} NVMe-oF nadal {n|udostępnia|udostępniają|udostępnia} zvole — także po restarcie węzła.",
       "tentanas_iscsi_targets_until_reboot": "{n} {n|target|targety|targetów} iSCSI {n|działa|działają|działa} do restartu węzła — potem nie wrócą, dopóki TentaNas jest wyłączony (brak helpera uprawnień).",
       "tentanas_nvmet_targets_until_reboot": "{n} {n|subsystem|subsystemy|subsystemów} NVMe-oF {n|działa|działają|działa} do restartu węzła — potem nie wrócą, dopóki TentaNas jest wyłączony (brak helpera uprawnień)."
+    },
+    "col_effects": "Skutki",
+    "node_unpaired": "odłączony od floty — wyłączenie do niego nie dotrze",
+    "node_unsupported": "aplikacja nie działa na tym węźle — nic się tu nie zmieni",
+    "node_offline": "węzeł nie odpowiada — jego skutki nie są znane; wyłączenie dotrze do niego, gdy wróci",
+    "node_error": "nie udało się pobrać skutków z tego węzła",
+    "node_nothing": "nic się tu nie zmieni",
+    "confirm_keep_serving": "Wyłącz aplikację (usługi działają dalej)",
+    "stop_hint": "Jeżeli chcesz też zatrzymać udostępnianie danych na tym węźle, użyj osobnego przycisku poniżej — klienci tego węzła stracą dostęp do jego udziałów i targetów do czasu ponownego włączenia.",
+    "stop_button": "Wyłącz i zatrzymaj udostępnianie…",
+    "stop_title": "Zatrzymaj udostępnianie na węźle {node} i wyłącz TentaNas",
+    "stop_text": "Po zatwierdzeniu węzeł zatrzyma swoje udziały i targety w usługach i w jądrze (ich konfiguracja zostaje), a potem wyłączy TentaNas na całej flocie. Błąd w którymkolwiek kroku zatrzymuje całość przed wyłączeniem. Ponowne włączenie TentaNas przywróci udostępnianie.",
+    "stop_item_smb": "{n} {n|udział|udziały|udziałów} SMB {n|przestanie|przestaną|przestanie} serwować dane",
+    "stop_item_nfs": "{n} {n|udział|udziały|udziałów} NFS {n|przestanie|przestaną|przestanie} serwować dane",
+    "stop_item_iscsi": "{n} {n|target|targety|targetów} iSCSI {n|zniknie|znikną|zniknie} z jądra",
+    "stop_item_nvmet": "{n} {n|subsystem|subsystemy|subsystemów} NVMe-oF {n|zniknie|znikną|zniknie} z jądra",
+    "stop_item_none": "Ten węzeł nie udostępnia teraz żadnego udziału ani targetu",
+    "stop_item_disable": "Na końcu TentaNas zostanie wyłączony na całej flocie",
+    "stop_approval": "Wymaga zatwierdzenia przez drugiego administratora platformy — do tego czasu nic się nie zmienia. Zatwierdza się w TentaNas → Zadania na tym węźle.",
+    "stop_send": "Wyślij do zatwierdzenia",
+    "stop_parked": "Wysłano do zatwierdzenia — TentaNas działa dalej, dopóki drugi administrator nie zatwierdzi.",
+    "stop_error": "Nie udało się wysłać prośby o zatrzymanie udostępniania.",
+    "refusal": {
+      "sharing_stop_platform_admin": "Zatrzymanie udostępniania wymaga roli administratora platformy — do zgłoszenia i do zatwierdzenia.",
+      "sharing_stop_no_second_admin": "Nie ma drugiego administratora platformy w tej organizacji, który mógłby to zatwierdzić — nic nie wysłano.",
+      "sharing_stop_pending": "Na tym węźle zatrzymanie udostępniania już czeka na zatwierdzenie, trwa albo udostępnianie jest już zatrzymane.",
+      "sharing_stop_frozen_targets": "Na tym węźle działa target z przeniesionym portalem — zatrzymanie nie mogłoby go potem przywrócić. Najpierw wybierz ponownie interfejs portalu (TentaNas → Udostępnianie).",
+      "sharing_stop_pending_elsewhere": "Na tym węźle czeka już na zatwierdzenie zatrzymanie udostępniania zgłoszone w innej organizacji. Administrator platformy widzi je w TentaNas → Zadania i może je odrzucić."
     }
   }
 }

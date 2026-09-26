@@ -2594,6 +2594,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::ElasticFolderCacheSetRequest { .. } => {
                     "TentaNasElasticFolderCacheSetRequest"
                 }
+                Tn::SharingStopRequest {} => "TentaNasSharingStopRequest",
             }
         }
         MessageBody::TentaVmBody(p) => {

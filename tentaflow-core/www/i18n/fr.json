@@ -5499,7 +5499,8 @@
         "refused": "non lancé",
         "skipped": "ignoré",
         "interrupted": "interrompu",
-        "cancelled": "annulé"
+        "cancelled": "annulé",
+        "done": "terminé"
       },
       "disk_reason": {
         "self_test_running": "un test SMART est déjà en cours sur ce disque",
@@ -5512,11 +5513,27 @@
         "test_no_result": "le disque n’a donné aucun résultat concluant",
         "test_no_entry": "le disque n’a enregistré aucun résultat pour ce test",
         "test_stalled": "aucun signe du test pendant {min} min",
-        "test_overran": "le test a dépassé {min} min — sa progression n’est plus crédible"
+        "test_overran": "le test a dépassé {min} min — sa progression n’est plus crédible",
+        "shares_stopped": "{smb} SMB, {nfs} NFS arrêtés",
+        "targets_stopped": "{iscsi} iSCSI, {nvmet} NVMe-oF hors du noyau",
+        "targets_left": "{count} encore dans le noyau",
+        "step_privilege": "aucun canal de privilèges, ou le mot de passe a été refusé",
+        "step_failed": "l'étape a échoué — les détails sont dans le journal du nœud",
+        "already_stopped": "le partage est déjà en cours d'arrêt ou arrêté",
+        "targets_frozen": "{count} {count|cible au portail déplacé sert|cibles au portail déplacé servent} encore — rien n'a été arrêté",
+        "rollback_partial": "non rétabli : {rows}",
+        "not_resumed": "non revenu : {rows}"
       },
       "kind_smart_batch_short": "SMART short",
       "kind_smart_batch_long": "SMART long",
-      "subject_all_disks": "— tous les disques"
+      "subject_all_disks": "— tous les disques",
+      "kind_sharing_stop": "Arrêt du partage",
+      "kind_sharing_resume": "Reprise du partage",
+      "step": {
+        "shares": "Partages SMB/NFS",
+        "targets": "Cibles iSCSI/NVMe-oF",
+        "disable": "Désactivation de TentaNas"
+      }
     },
     "danger": {
       "retype": "Saisissez {name} pour confirmer :",
@@ -6660,8 +6677,10 @@
         "source_invalid": "La source du partage n’est pas un répertoire valide sur un pool ou une grappe de ce nœud — détails dans l’infobulle",
         "source_unmounted": "La source du partage n’est pas montée — le partage reste hors de la configuration",
         "service_missing": "Le paquet {package} manque sur ce nœud",
-        "smb_direct_not_served": "SMB Direct n’est pas servi sur ce nœud (le partage continue de fonctionner via le LAN)"
-      }
+        "smb_direct_not_served": "SMB Direct n’est pas servi sur ce nœud (le partage continue de fonctionner via le LAN)",
+        "sharing_suspended": "Le partage sur ce nœud a été arrêté avec la désactivation de TentaNas — il revient quand TentaNas est réactivé. En mode B, il revient dès que le canal de privilèges est armé."
+      },
+      "state_suspended": "Suspendu"
     },
     "wizard_share": {
       "title": "Nouveau partage",
@@ -7007,6 +7026,14 @@
         "pool_not_imported": {
           "title": "Le pool {pool} n'a pas été importé",
           "detail": "{n} {n|disque de ce nœud porte|disques de ce nœud portent} l'étiquette de ce pool, mais le nœud ne l'a pas importé dans les {minutes} min suivant le démarrage de TentaNas. Importez le pool (un pool chiffré peut attendre sa clé) ; s'il n'existe plus, ses disques peuvent être effacés."
+        },
+        "sharing_resume_failed": {
+          "title": "Le partage n'est pas revenu sur ce nœud",
+          "detail": "La configuration des partages n'a pas pu être écrite (tentative {n}). Le nœud réessaie à intervalle croissant ; en mode B, un canal de privilèges armé est nécessaire."
+        },
+        "sharing_share_not_resumed": {
+          "title": "Le partage {share} n'est pas revenu à la reprise du partage",
+          "detail": "L'état du partage indique pourquoi. Le nœud réessaie à intervalle croissant ; l'alerte se ferme dès que le partage sert de nouveau."
         }
       },
       "node_text": "Texte du nœud",
@@ -7561,8 +7588,15 @@
           "trim": "planification du TRIM du pool {subject}",
           "snapshot": "planification des instantanés du dataset {subject}",
           "smart": "planification des tests SMART"
-        }
-      }
+        },
+        "sharing_stop": "Arrête le partage sur le nœud {node} — partages : {shares} ; cibles : {targets} — puis désactive TentaNas sur toute la flotte.",
+        "sharing_stop_none": "aucun",
+        "sharing_stop_node_unnamed": "sans nom",
+        "sharing_stop_other_shares": "{n} {n|partage|partages} d'autres organisations",
+        "sharing_stop_other_targets": "{n} {n|cible|cibles} d'autres organisations",
+        "sharing_stop_other_org": "Arrêt du partage sur le nœud {node}, demandé dans une autre organisation. Il bloque ce nœud — vous pouvez le rejeter."
+      },
+      "op_sharing_stop": "Arrêter le partage et désactiver TentaNas"
     },
     "access": {
       "title": "Journal d'accès",
@@ -7767,11 +7801,13 @@
         "import_all_interfaces": "Cette cible était exportée sur toutes les interfaces (0.0.0.0) — choisissez une interface de ce nœud avant de l’activer.",
         "portal_moved_head_no_address": "Le portail de la cible n’est plus là où il a été épinglé. L’adresse {address} appartenait à l’interface {interface}, présente sur ce nœud mais sans aucune adresse pour l’instant (lien coupé ou bail DHCP perdu).",
         "portal_moved_silent_since": "Depuis {since}, elle est sur {elsewhere}. La cible n’est pas dans le noyau, rien n’écoute donc à cette adresse — l’export n’est pas accessible sur {elsewhere} et n’y sera pas rebasculé automatiquement.",
-        "portal_moved_reachable_since": "Depuis {since}, elle est sur {elsewhere}, que personne n’a choisie pour cette cible — l’export y est accessible."
+        "portal_moved_reachable_since": "Depuis {since}, elle est sur {elsewhere}, que personne n’a choisie pour cette cible — l’export y est accessible.",
+        "sharing_suspended": "Le partage sur ce nœud a été arrêté avec la désactivation de TentaNas — la cible revient dans le noyau quand TentaNas est réactivé. En mode B, elle revient dès que le canal de privilèges est armé."
       },
       "host_state": "État",
       "host_connected": "Connecté",
-      "host_not_connected": "Non connecté"
+      "host_not_connected": "Non connecté",
+      "state_suspended": "suspendue"
     },
     "wizard_target": {
       "title": "Nouvelle cible",
@@ -7925,7 +7961,18 @@
       "pool_destroy_in_progress": "Un pool est en cours de destruction sur ce nœud ; réessayez dans un instant.",
       "forward_address_refused": "Cette adresse n’est pas autorisée : un réseau privé absent de la liste des collecteurs internes de l’administrateur de la plateforme, ou loopback, lien local ou une adresse de métadonnées cloud.",
       "forward_https_only": "Le webhook doit être une adresse https:// (http:// uniquement vers un hôte de la liste de l’administrateur de la plateforme marqué « autoriser http »).",
-      "forward_node_retired": "La cible partagée du nœud est retirée : elle ne peut qu’être supprimée."
+      "forward_node_retired": "La cible partagée du nœud est retirée : elle ne peut qu’être supprimée.",
+      "sharing_stop_platform_admin": "Arrêter le partage nécessite le rôle d'administrateur de la plateforme — pour le demander et pour l'approuver.",
+      "sharing_stop_no_second_admin": "Aucun second administrateur de la plateforme dans cette organisation ne pourrait l'approuver.",
+      "sharing_stop_pending": "L'arrêt du partage sur ce nœud attend déjà son approbation ou est en cours, ou le partage est déjà arrêté.",
+      "sharing_stop_failed": "L'arrêt du partage a échoué — TentaNas n'a pas été désactivé et le partage a été rétabli.",
+      "sharing_resume_failed": "Le partage n'est pas encore entièrement revenu — le nœud réessaie.",
+      "sharing_stop_frozen_targets": "Une cible dont le portail a changé d'adresse sert encore sur ce nœud — un arrêt ne pourrait pas la rétablir ensuite. Choisissez d'abord à nouveau l'interface du portail.",
+      "sharing_stop_failed_partial": "L'arrêt du partage a échoué et TentaNas n'a pas été désactivé — mais tout n'a pas pu être rétabli ; la ligne de l'étape indique ce qui ne sert pas.",
+      "sharing_stop_busy": "Le partage sur ce nœud est déjà en cours d'arrêt ou arrêté — rien n'a été modifié.",
+      "sharing_stop_author_gone": "L'auteur de cette demande n'est plus administrateur de la plateforme dans cette organisation — elle ne peut pas être approuvée ; rejetez-la.",
+      "sharing_resume_partial": "Le partage est revenu, mais pas entièrement — les lignes de la tâche indiquent ce qui ne sert pas encore ; le nœud réessaie.",
+      "sharing_stop_pending_elsewhere": "Un arrêt du partage demandé dans une autre organisation attend déjà son approbation sur ce nœud. Un administrateur de la plateforme le voit dans TentaNas → Tâches et peut le rejeter."
     },
     "unreachable": {
       "title": "Nœud {node} injoignable",
@@ -10890,6 +10937,34 @@
       "tentanas_nvmet_targets_continue": "{n} {n|sous-système NVMe-oF continue|sous-systèmes NVMe-oF continuent} d’exporter des zvol — y compris après un redémarrage du nœud.",
       "tentanas_iscsi_targets_until_reboot": "{n} {n|cible iSCSI tourne|cibles iSCSI tournent} jusqu’au redémarrage du nœud — ensuite elles ne reviennent pas tant que TentaNas est désactivé (pas de helper de privilèges).",
       "tentanas_nvmet_targets_until_reboot": "{n} {n|sous-système NVMe-oF tourne|sous-systèmes NVMe-oF tournent} jusqu’au redémarrage du nœud — ensuite ils ne reviennent pas tant que TentaNas est désactivé (pas de helper de privilèges)."
+    },
+    "col_effects": "Effets",
+    "node_unpaired": "détaché de la flotte — la désactivation ne l'atteindra pas",
+    "node_unsupported": "l'application ne tourne pas sur ce nœud — rien ne change ici",
+    "node_offline": "le nœud ne répond pas — ses effets sont inconnus ; la désactivation l'atteindra à son retour",
+    "node_error": "impossible de lire les effets sur ce nœud",
+    "node_nothing": "rien ne change ici",
+    "confirm_keep_serving": "Désactiver l'application (les services continuent)",
+    "stop_hint": "Si vous voulez aussi arrêter le partage des données sur ce nœud, utilisez le bouton séparé ci-dessous — les clients de ce nœud perdent l'accès à ses partages et à ses cibles jusqu'à la réactivation.",
+    "stop_button": "Désactiver et arrêter le partage…",
+    "stop_title": "Arrêter le partage sur le nœud {node} et désactiver TentaNas",
+    "stop_text": "Une fois approuvé, le nœud arrête ses partages et ses cibles dans les services et dans le noyau (leur configuration est conservée), puis désactive TentaNas sur toute la flotte. Un échec à n'importe quelle étape arrête tout avant la désactivation. Réactiver TentaNas rétablit le partage.",
+    "stop_item_smb": "{n} {n|partage SMB cesse|partages SMB cessent} de servir les données",
+    "stop_item_nfs": "{n} {n|partage NFS cesse|partages NFS cessent} de servir les données",
+    "stop_item_iscsi": "{n} {n|cible iSCSI quitte|cibles iSCSI quittent} le noyau",
+    "stop_item_nvmet": "{n} {n|sous-système NVMe-oF quitte|sous-systèmes NVMe-oF quittent} le noyau",
+    "stop_item_none": "Ce nœud ne partage actuellement aucun partage ni aucune cible",
+    "stop_item_disable": "Enfin TentaNas est désactivé sur toute la flotte",
+    "stop_approval": "Nécessite l'approbation d'un second administrateur de la plateforme — rien ne change d'ici là. L'approbation se fait dans TentaNas → Tâches sur ce nœud.",
+    "stop_send": "Envoyer pour approbation",
+    "stop_parked": "Envoyé pour approbation — TentaNas continue de fonctionner jusqu'à ce qu'un second administrateur approuve.",
+    "stop_error": "La demande d'arrêt du partage n'a pas pu être envoyée.",
+    "refusal": {
+      "sharing_stop_platform_admin": "Arrêter le partage nécessite le rôle d'administrateur de la plateforme — pour le demander et pour l'approuver.",
+      "sharing_stop_no_second_admin": "Aucun second administrateur de la plateforme dans cette organisation ne pourrait l'approuver — rien n'a été envoyé.",
+      "sharing_stop_pending": "L'arrêt du partage sur ce nœud attend déjà son approbation ou est en cours, ou le partage est déjà arrêté.",
+      "sharing_stop_frozen_targets": "Une cible dont le portail a changé d'adresse sert encore sur ce nœud — un arrêt ne pourrait pas la rétablir ensuite. Choisissez d'abord à nouveau l'interface du portail (TentaNas → Partage).",
+      "sharing_stop_pending_elsewhere": "Un arrêt du partage demandé dans une autre organisation attend déjà son approbation sur ce nœud. Un administrateur de la plateforme le voit dans TentaNas → Tâches et peut le rejeter."
     }
   }
 }

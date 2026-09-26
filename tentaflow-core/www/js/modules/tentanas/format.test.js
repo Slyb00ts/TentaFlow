@@ -233,7 +233,7 @@ const { alertText, ALERT_CODES } = await import('./format.js');
 // this test instead of showing the generic "Alert węzła" on screen.
 function raisedAlertCodes() {
   const codes = new Set();
-  for (const file of ['disks.rs', 'elastic.rs', 'scheduler.rs', 'approvals.rs', 'targets.rs']) {
+  for (const file of ['disks.rs', 'elastic.rs', 'scheduler.rs', 'approvals.rs', 'targets.rs', 'sharing.rs']) {
     const source = readFileSync(join(WWW_ROOT, '..', 'src', 'tentanas', file), 'utf8').split('mod tests {')[0];
     for (const m of source.matchAll(/AlertText::new\(\s*"(\w+)"/g)) codes.add(m[1]);
   }
@@ -251,7 +251,7 @@ function documentedAlertCodes() {
 const ALERT_PARAMS = {
   health: 'warning', name: 'sdq', name_source: 'live', operation: 'pool_destroy', subject: 'tank', array: 'media',
   runs: '4', oldest_secs: '32400', limit_secs: '28800', cause: 'files_busy', count: '2', alerted: '1',
-  sweep_failed: 'true', error: 'EIO', target: 'vm-a', pool: 'tank', disks: '3', minutes: '10',
+  sweep_failed: 'true', error: 'EIO', target: 'vm-a', pool: 'tank', disks: '3', minutes: '10', attempts: '2', share: 'projekty',
 };
 const A = (code, params = ALERT_PARAMS, extra = {}) => ({
   alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'x', title: 'English title', detail: 'English detail', code, params, reasons: [], ...extra,

@@ -708,6 +708,15 @@ const ALERT_WORDS = new Map([
   ['target_not_applied', targetFailure('target_not_applied')],
   ['target_still_in_kernel', targetFailure('target_still_in_kernel')],
   ['elevation_unarmed', () => ({ title: T('alerts.code.elevation_unarmed.title'), detail: T('alerts.code.elevation_unarmed.detail') })],
+  // Raised by tentanas/sharing.rs (wave 10): the resume of a node's sharing.
+  ['sharing_resume_failed', (p) => {
+    const n = numParams(p, ['attempts']);
+    return n ? { title: T('alerts.code.sharing_resume_failed.title'), detail: T('alerts.code.sharing_resume_failed.detail', { n: n.attempts }) } : null;
+  }],
+  ['sharing_share_not_resumed', (p) => {
+    const t = textParams(p, ['share']);
+    return t ? { title: T('alerts.code.sharing_share_not_resumed.title', t), detail: T('alerts.code.sharing_share_not_resumed.detail') } : null;
+  }],
   ['targets_sweep_failing', (p) => {
     const n = numParams(p, ['count', 'alerted']);
     if (!n || !['true', 'false'].includes(p.sweep_failed)) return null;

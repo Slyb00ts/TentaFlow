@@ -225,6 +225,9 @@ async fn run_with_stdin(
     // Validate against the catalog BEFORE choosing a channel: a bad device
     // name must fail the same way whether or not the node is armed.
     let plan = command.plan().map_err(catalog)?;
+    if let Some(out) = recorded(db, command, payload) {
+        return Ok((out, Channel::Helper));
+    }
     // A builtin has no argv to hand to `sudo`: the sequence lives in the
     // helper, so it always crosses the channel as a helper invocation.
     let exec = match &plan {
@@ -530,10 +533,24 @@ async fn through_helper(
     }
 }
 
+/// Production has no test channel (`test_channel`, test builds only).
+#[cfg(not(test))]
+fn recorded(_db: &DbPool, _command: &HelperCommand, _payload: Option<&[u8]>) -> Option<CommandOutput> {
+    None
+}
+
+#[cfg(not(test))]
+fn recorded_channel(_db: &DbPool) -> bool {
+    false
+}
+
 /// Whether ANY channel could run a privileged command right now. Used by the
 /// sampler to decide whether SMART refresh is possible without producing an
 /// error per disk per tick.
 pub async fn channel_available(db: &DbPool) -> bool {
+    if recorded_channel(db) {
+        return true;
+    }
     match super::elevation::mode(db) {
         super::elevation::Mode::Helper => super::elevation::helper_status().await.state == "ok",
         super::elevation::Mode::Interactive => super::elevation::armed_token().is_some(),
@@ -670,3 +687,92 @@ mod tests {
         assert_eq!(cached_version(path, now), None);
     }
 }
+
+// Kept after the tests module on purpose: the source scans above count
+// production call sites up to the first test-only attribute.
+#[cfg(test)]
+fn recorded(db: &DbPool, command: &HelperCommand, payload: Option<&[u8]>) -> Option<CommandOutput> {
+    test_channel::for_db(db).map(|r| r.run(command, payload))
+}
+
+#[cfg(test)]
+fn recorded_channel(db: &DbPool) -> bool {
+    test_channel::for_db(db).is_some()
+}
+
+/// A privilege channel for tests, bound to ONE database (the `Arc` it is
+/// registered for), so tests running side by side never see each other's:
+/// every privileged command a job sends on that node is recorded with its
+/// stdin payload (the generated smb.conf include, /etc/exports) and answers
+/// success, and nothing reaches the host. It exists so a job can be run
+/// end to end — the real apply, the real sweep, the real job — without root.
+#[cfg(test)]
+pub mod test_channel {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tentanas_helper::HelperCommand;
+
+    use super::CommandOutput;
+    use crate::db::DbPool;
+
+    #[derive(Default)]
+    pub struct Recorder {
+        pub calls: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl Recorder {
+        pub(super) fn run(&self, command: &HelperCommand, payload: Option<&[u8]>) -> CommandOutput {
+            let name = serde_json::to_value(command)
+                .ok()
+                .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            let payload = payload.map(|p| String::from_utf8_lossy(p).into_owned());
+            self.calls.lock().unwrap().push((name, payload));
+            CommandOutput { code: 0, stdout: String::new(), stderr: String::new() }
+        }
+
+        /// The payload of the last call named `command`.
+        pub fn last_payload(&self, command: &str) -> Option<String> {
+            self.calls.lock().unwrap().iter().rev().find(|(n, _)| n == command).and_then(|(_, p)| p.clone())
+        }
+    }
+
+    fn registry() -> &'static Mutex<HashMap<usize, Arc<Recorder>>> {
+        static REG: OnceLock<Mutex<HashMap<usize, Arc<Recorder>>>> = OnceLock::new();
+        REG.get_or_init(Default::default)
+    }
+
+    /// Routes every privileged command sent for `db` into a new recorder,
+    /// until the returned guard is dropped (an address a dropped database
+    /// had can be handed to another test's database).
+    pub fn install(db: &DbPool) -> Installed {
+        let key = Arc::as_ptr(db) as *const () as usize;
+        let recorder = Arc::new(Recorder::default());
+        registry().lock().unwrap().insert(key, recorder.clone());
+        Installed { key, recorder }
+    }
+
+    pub struct Installed {
+        key: usize,
+        pub recorder: Arc<Recorder>,
+    }
+
+    impl std::ops::Deref for Installed {
+        type Target = Recorder;
+        fn deref(&self) -> &Recorder {
+            &self.recorder
+        }
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            registry().lock().unwrap().remove(&self.key);
+        }
+    }
+
+    pub(super) fn for_db(db: &DbPool) -> Option<Arc<Recorder>> {
+        registry().lock().unwrap().get(&(Arc::as_ptr(db) as *const () as usize)).cloned()
+    }
+}
+

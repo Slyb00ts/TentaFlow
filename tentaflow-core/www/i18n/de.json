@@ -5499,7 +5499,8 @@
         "refused": "nicht gestartet",
         "skipped": "übersprungen",
         "interrupted": "unterbrochen",
-        "cancelled": "abgebrochen"
+        "cancelled": "abgebrochen",
+        "done": "erledigt"
       },
       "disk_reason": {
         "self_test_running": "auf diesem Laufwerk läuft bereits ein SMART-Test",
@@ -5512,11 +5513,27 @@
         "test_no_result": "das Laufwerk lieferte kein eindeutiges Ergebnis",
         "test_no_entry": "das Laufwerk hat für diesen Test kein Ergebnis protokolliert",
         "test_stalled": "{min} Min. lang kein Anzeichen des Tests",
-        "test_overran": "der Test lief länger als {min} Min. — sein Fortschritt gilt nicht mehr als glaubwürdig"
+        "test_overran": "der Test lief länger als {min} Min. — sein Fortschritt gilt nicht mehr als glaubwürdig",
+        "shares_stopped": "{smb} SMB, {nfs} NFS gestoppt",
+        "targets_stopped": "{iscsi} iSCSI, {nvmet} NVMe-oF aus dem Kernel entfernt",
+        "targets_left": "{count} noch im Kernel",
+        "step_privilege": "kein Berechtigungskanal, oder das Passwort wurde abgelehnt",
+        "step_failed": "der Schritt ist fehlgeschlagen — Details im Knotenprotokoll",
+        "already_stopped": "die Freigabe wird bereits gestoppt oder ist gestoppt",
+        "targets_frozen": "{count} {count|Target mit verschobenem Portal läuft|Targets mit verschobenem Portal laufen} noch — nichts wurde gestoppt",
+        "rollback_partial": "nicht wiederhergestellt: {rows}",
+        "not_resumed": "nicht zurück: {rows}"
       },
       "kind_smart_batch_short": "SMART short",
       "kind_smart_batch_long": "SMART long",
-      "subject_all_disks": "— alle Laufwerke"
+      "subject_all_disks": "— alle Laufwerke",
+      "kind_sharing_stop": "Freigabe stoppen",
+      "kind_sharing_resume": "Freigabe fortsetzen",
+      "step": {
+        "shares": "SMB/NFS-Freigaben",
+        "targets": "iSCSI/NVMe-oF-Targets",
+        "disable": "TentaNas deaktivieren"
+      }
     },
     "danger": {
       "retype": "Zur Bestätigung {name} eingeben:",
@@ -6660,8 +6677,10 @@
         "source_invalid": "Die Quelle der Freigabe ist kein gültiges Verzeichnis auf einem Pool oder Array dieses Knotens — Details im Tooltip",
         "source_unmounted": "Die Quelle der Freigabe ist nicht eingehängt — die Freigabe bleibt außerhalb der Konfiguration",
         "service_missing": "Auf diesem Knoten fehlt das Paket {package}",
-        "smb_direct_not_served": "SMB Direct wird auf diesem Knoten nicht bereitgestellt (die Freigabe funktioniert weiter über das LAN)"
-      }
+        "smb_direct_not_served": "SMB Direct wird auf diesem Knoten nicht bereitgestellt (die Freigabe funktioniert weiter über das LAN)",
+        "sharing_suspended": "Die Freigabe auf diesem Knoten wurde zusammen mit der Deaktivierung von TentaNas gestoppt — sie kehrt zurück, sobald TentaNas wieder aktiviert wird. Im Modus B kehrt sie zurück, sobald der Berechtigungskanal scharfgeschaltet ist."
+      },
+      "state_suspended": "Angehalten"
     },
     "wizard_share": {
       "title": "Neue Freigabe",
@@ -7007,6 +7026,14 @@
         "pool_not_imported": {
           "title": "Pool {pool} wurde nicht importiert",
           "detail": "{n} {n|Datenträger dieses Knotens trägt|Datenträger dieses Knotens tragen} das Label dieses Pools, doch der Knoten hat ihn {minutes} Min. nach dem Start von TentaNas nicht importiert. Importieren Sie den Pool (ein verschlüsselter Pool wartet eventuell auf seinen Schlüssel); existiert er nicht mehr, können seine Datenträger gelöscht werden."
+        },
+        "sharing_resume_failed": {
+          "title": "Die Freigabe auf diesem Knoten ist nicht zurückgekehrt",
+          "detail": "Die Freigabekonfiguration konnte nicht geschrieben werden (Versuch {n}). Der Knoten versucht es mit wachsendem Abstand erneut; im Modus B wird ein scharfgeschalteter Berechtigungskanal benötigt."
+        },
+        "sharing_share_not_resumed": {
+          "title": "Freigabe {share} ist nach dem Fortsetzen nicht zurückgekehrt",
+          "detail": "Der Zustand der Freigabe nennt den Grund. Der Knoten versucht es mit wachsendem Abstand erneut; der Alarm schließt sich, sobald die Freigabe wieder läuft."
         }
       },
       "node_text": "Text des Knotens",
@@ -7561,8 +7588,15 @@
           "trim": "TRIM-Zeitplan des Pools {subject}",
           "snapshot": "Snapshot-Zeitplan des Datasets {subject}",
           "smart": "SMART-Testzeitplan"
-        }
-      }
+        },
+        "sharing_stop": "Stoppt die Freigabe auf Knoten {node} — Freigaben: {shares}; Targets: {targets} — und deaktiviert dann TentaNas in der ganzen Flotte.",
+        "sharing_stop_none": "keine",
+        "sharing_stop_node_unnamed": "ohne Namen",
+        "sharing_stop_other_shares": "{n} {n|Freigabe|Freigaben} anderer Organisationen",
+        "sharing_stop_other_targets": "{n} {n|Target|Targets} anderer Organisationen",
+        "sharing_stop_other_org": "Stoppen der Freigabe auf Knoten {node}, angefordert in einer anderen Organisation. Es blockiert diesen Knoten — Sie können es ablehnen."
+      },
+      "op_sharing_stop": "Freigabe stoppen und TentaNas deaktivieren"
     },
     "access": {
       "title": "Zugriffsprotokoll",
@@ -7767,11 +7801,13 @@
         "import_all_interfaces": "Dieses Target wurde auf allen Schnittstellen (0.0.0.0) exportiert — wählen Sie eine Schnittstelle dieses Knotens, bevor Sie es aktivieren.",
         "portal_moved_head_no_address": "Das Portal des Targets ist nicht mehr dort, wo es festgelegt wurde. Die Adresse {address} gehörte zur Schnittstelle {interface}, die auf diesem Knoten vorhanden ist, aber derzeit keine Adresse hat (Link getrennt oder DHCP-Lease verloren).",
         "portal_moved_silent_since": "Seit {since} liegt sie auf {elsewhere}. Das Target ist nicht im Kernel, daher lauscht unter dieser Adresse nichts — der Export ist auf {elsewhere} nicht erreichbar und wird dort nicht automatisch neu gebunden.",
-        "portal_moved_reachable_since": "Seit {since} liegt sie auf {elsewhere}, das niemand für dieses Target gewählt hat — der Export ist dort erreichbar."
+        "portal_moved_reachable_since": "Seit {since} liegt sie auf {elsewhere}, das niemand für dieses Target gewählt hat — der Export ist dort erreichbar.",
+        "sharing_suspended": "Die Freigabe auf diesem Knoten wurde zusammen mit der Deaktivierung von TentaNas gestoppt — das Target kehrt in den Kernel zurück, sobald TentaNas wieder aktiviert wird. Im Modus B kehrt es zurück, sobald der Berechtigungskanal scharfgeschaltet ist."
       },
       "host_state": "Status",
       "host_connected": "Verbunden",
-      "host_not_connected": "Nicht verbunden"
+      "host_not_connected": "Nicht verbunden",
+      "state_suspended": "angehalten"
     },
     "wizard_target": {
       "title": "Neues Target",
@@ -7925,7 +7961,18 @@
       "pool_destroy_in_progress": "Auf diesem Knoten wird gerade ein Pool zerstört; versuchen Sie es gleich noch einmal.",
       "forward_address_refused": "Diese Adresse ist nicht erlaubt: ein privates Netz außerhalb der Liste interner Kollektoren des Plattform-Admins, oder Loopback, Link-Local bzw. eine Cloud-Metadatenadresse.",
       "forward_https_only": "Der Webhook muss eine https://-Adresse sein (http:// nur zu einem Host auf der Liste des Plattform-Admins mit „http erlauben“).",
-      "forward_node_retired": "Das gemeinsame Ziel des Knotens ist eingestellt: es kann nur gelöscht werden."
+      "forward_node_retired": "Das gemeinsame Ziel des Knotens ist eingestellt: es kann nur gelöscht werden.",
+      "sharing_stop_platform_admin": "Das Stoppen der Freigabe erfordert die Rolle Plattformadministrator — für die Anfrage und für die Genehmigung.",
+      "sharing_stop_no_second_admin": "In dieser Organisation gibt es keinen zweiten Plattformadministrator, der genehmigen könnte.",
+      "sharing_stop_pending": "Das Stoppen der Freigabe auf diesem Knoten wartet bereits auf Genehmigung oder läuft, oder die Freigabe ist bereits gestoppt.",
+      "sharing_stop_failed": "Das Stoppen der Freigabe ist fehlgeschlagen — TentaNas wurde nicht deaktiviert, und die Freigabe wurde wiederhergestellt.",
+      "sharing_resume_failed": "Die Freigabe ist noch nicht vollständig zurück — der Knoten versucht es erneut.",
+      "sharing_stop_frozen_targets": "Auf diesem Knoten läuft ein Target mit verschobenem Portal — ein Stopp könnte es danach nicht wiederherstellen. Wählen Sie zuerst die Schnittstelle des Portals neu.",
+      "sharing_stop_failed_partial": "Das Stoppen der Freigabe ist fehlgeschlagen, und TentaNas wurde nicht deaktiviert — aber nicht alles konnte wiederhergestellt werden; die Schrittzeile nennt, was nicht läuft.",
+      "sharing_stop_busy": "Die Freigabe auf diesem Knoten wird bereits gestoppt oder ist gestoppt — nichts wurde geändert.",
+      "sharing_stop_author_gone": "Der Autor dieser Anfrage ist in dieser Organisation kein Plattformadministrator mehr — sie kann nicht genehmigt werden; lehnen Sie sie ab.",
+      "sharing_resume_partial": "Die Freigabe ist zurück, aber nicht vollständig — die Auftragszeilen nennen, was noch nicht läuft; der Knoten versucht es erneut.",
+      "sharing_stop_pending_elsewhere": "Auf diesem Knoten wartet bereits ein in einer anderen Organisation angefordertes Stoppen der Freigabe auf Genehmigung. Ein Plattformadministrator sieht es unter TentaNas → Aufgaben und kann es ablehnen."
     },
     "unreachable": {
       "title": "Knoten {node} nicht erreichbar",
@@ -10890,6 +10937,34 @@
       "tentanas_nvmet_targets_continue": "{n} NVMe-oF-{n|Subsystem exportiert|Subsysteme exportieren} weiter zvols — auch nach einem Neustart des Knotens.",
       "tentanas_iscsi_targets_until_reboot": "{n} iSCSI-{n|Target läuft|Targets laufen} bis zum Neustart des Knotens — danach kommen sie nicht zurück, solange TentaNas deaktiviert ist (kein Rechte-Helper).",
       "tentanas_nvmet_targets_until_reboot": "{n} NVMe-oF-{n|Subsystem läuft|Subsysteme laufen} bis zum Neustart des Knotens — danach kommen sie nicht zurück, solange TentaNas deaktiviert ist (kein Rechte-Helper)."
+    },
+    "col_effects": "Auswirkungen",
+    "node_unpaired": "von der Flotte getrennt — die Deaktivierung erreicht ihn nicht",
+    "node_unsupported": "die App läuft auf diesem Knoten nicht — hier ändert sich nichts",
+    "node_offline": "der Knoten antwortet nicht — seine Auswirkungen sind unbekannt; die Deaktivierung erreicht ihn, sobald er zurück ist",
+    "node_error": "die Auswirkungen konnten von diesem Knoten nicht gelesen werden",
+    "node_nothing": "hier ändert sich nichts",
+    "confirm_keep_serving": "App deaktivieren (Dienste laufen weiter)",
+    "stop_hint": "Wenn Sie auch die Datenfreigabe auf diesem Knoten stoppen möchten, nutzen Sie die separate Schaltfläche unten — die Clients dieses Knotens verlieren den Zugriff auf seine Freigaben und Targets bis zur erneuten Aktivierung.",
+    "stop_button": "Deaktivieren und Freigabe stoppen…",
+    "stop_title": "Freigabe auf Knoten {node} stoppen und TentaNas deaktivieren",
+    "stop_text": "Nach der Genehmigung stoppt der Knoten seine Freigaben und Targets in den Diensten und im Kernel (ihre Konfiguration bleibt erhalten) und deaktiviert dann TentaNas in der ganzen Flotte. Ein Fehler in irgendeinem Schritt hält alles vor der Deaktivierung an. Eine erneute Aktivierung von TentaNas stellt die Freigabe wieder her.",
+    "stop_item_smb": "{n} SMB-{n|Freigabe hört|Freigaben hören} auf, Daten bereitzustellen",
+    "stop_item_nfs": "{n} NFS-{n|Freigabe hört|Freigaben hören} auf, Daten bereitzustellen",
+    "stop_item_iscsi": "{n} iSCSI-{n|Target verlässt|Targets verlassen} den Kernel",
+    "stop_item_nvmet": "{n} NVMe-oF-{n|Subsystem verlässt|Subsysteme verlassen} den Kernel",
+    "stop_item_none": "Dieser Knoten gibt derzeit keine Freigabe und kein Target frei",
+    "stop_item_disable": "Zum Schluss wird TentaNas in der ganzen Flotte deaktiviert",
+    "stop_approval": "Erfordert die Genehmigung durch einen zweiten Plattformadministrator — bis dahin ändert sich nichts. Genehmigt wird in TentaNas → Aufgaben auf diesem Knoten.",
+    "stop_send": "Zur Genehmigung senden",
+    "stop_parked": "Zur Genehmigung gesendet — TentaNas läuft weiter, bis ein zweiter Administrator genehmigt.",
+    "stop_error": "Die Anfrage zum Stoppen der Freigabe konnte nicht gesendet werden.",
+    "refusal": {
+      "sharing_stop_platform_admin": "Das Stoppen der Freigabe erfordert die Rolle Plattformadministrator — für die Anfrage und für die Genehmigung.",
+      "sharing_stop_no_second_admin": "In dieser Organisation gibt es keinen zweiten Plattformadministrator, der genehmigen könnte — nichts wurde gesendet.",
+      "sharing_stop_pending": "Das Stoppen der Freigabe auf diesem Knoten wartet bereits auf Genehmigung oder läuft, oder die Freigabe ist bereits gestoppt.",
+      "sharing_stop_frozen_targets": "Auf diesem Knoten läuft ein Target mit verschobenem Portal — ein Stopp könnte es danach nicht wiederherstellen. Wählen Sie zuerst die Schnittstelle des Portals neu (TentaNas → Freigaben).",
+      "sharing_stop_pending_elsewhere": "Auf diesem Knoten wartet bereits ein in einer anderen Organisation angefordertes Stoppen der Freigabe auf Genehmigung. Ein Plattformadministrator sieht es unter TentaNas → Aufgaben und kann es ablehnen."
     }
   }
 }

@@ -88,6 +88,13 @@ pub const OP_ELASTIC_DESTROY: &str = "elastic_destroy";
 /// repeating, so one admin alone must not be able to arm one.
 pub const OP_ELASTIC_SCHEDULE: &str = "elastic_schedule";
 
+/// Stopping every share and target of ONE node and then disabling TentaNas
+/// (n18d "Wyłącz i zatrzymaj udostępnianie…", wave 10). Always parked, and
+/// released only by another PLATFORM admin: the disable is the platform's
+/// switch (`AddonToggleRequest` is `#[policy(Admin)]`), and the stop reaches
+/// every organisation's shares on the node, not only the approver's.
+pub const OP_SHARING_STOP: &str = "sharing_stop";
+
 /// How long a parked operation stays approvable when nobody configured it.
 /// A day is long enough for a colleague in another timezone and short enough
 /// that a forgotten request cannot be approved next month.
@@ -410,6 +417,55 @@ pub fn reject(
     let _ = store::resolve_alert(a.nas_db, &alert_key(request_id));
     audit_as(a, "nas.approval.rejected", &row.approval, "rejected");
     Ok(row.approval)
+}
+
+/// The pending sharing stops parked in OTHER organisations on this node
+/// (critic wave 10, R2-2). A stop blocks the whole node, so a platform admin
+/// of any organisation must be able to see one and reject it — but not read
+/// it: the row carries the node only, with a neutral coded detail; the
+/// author, the other organisation's share names and the payload stay out.
+pub fn foreign_pending_stops(a: &Actor<'_>) -> Result<Vec<NasPendingApproval>> {
+    expire_due(a.main_db, a.nas_db, a.node_id);
+    Ok(store::list_pending_of_operation(a.nas_db, OP_SHARING_STOP)?
+        .into_iter()
+        .filter(|row| row.org_id != a.org_id)
+        .map(|row| {
+            let node = row.approval.subject.clone();
+            NasPendingApproval {
+                detail: "a stop of this node's sharing, requested in another organisation, waits for approval".to_string(),
+                detail_reasons: vec![super::disks::coded_reason("sharing_stop_other_org", &[("node", node)])],
+                requested_by: String::new(),
+                decided_by: None,
+                decision_note: String::new(),
+                is_own_request: false,
+                ..row.approval
+            }
+        })
+        .collect())
+}
+
+/// Rejects a pending sharing stop parked in ANOTHER organisation — the
+/// only foreign request anyone may decide, and only by rejecting it. The
+/// caller's platform role is the dispatcher's check.
+pub fn reject_foreign_stop(a: &Actor<'_>, request_id: &str, note: &str) -> Result<NasPendingApproval, ApprovalError> {
+    let row = store::approval(a.nas_db, request_id).ok().flatten().ok_or(ApprovalError::NotFound)?;
+    if row.approval.operation != OP_SHARING_STOP || row.org_id == a.org_id {
+        return Err(ApprovalError::NotFound);
+    }
+    if row.approval.status != "pending" {
+        return Err(ApprovalError::Closed(row.approval.status));
+    }
+    if !store::close_approval(a.nas_db, request_id, "rejected", Some(a.user_id), note).unwrap_or(false) {
+        return Err(ApprovalError::Closed("closed".to_string()));
+    }
+    let _ = store::resolve_alert(a.nas_db, &alert_key(request_id));
+    let mut approval = row.approval;
+    approval.status = "rejected".to_string();
+    approval.decided_by = Some(a.user_id.to_string());
+    // Audited under the request's own organisation: that is whose request
+    // it was.
+    audit(a.main_db, &row.org_id, a.addon_id, a.node_id, a.user_id, "nas.approval.rejected", &approval, "rejected");
+    Ok(approval)
 }
 
 /// Records what the approved operation started. A job id makes the row point

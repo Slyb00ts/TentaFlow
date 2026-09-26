@@ -6753,6 +6753,14 @@
         "pool_not_imported": {
           "title": "Pool {pool} was not imported",
           "detail": "{n} {n|disk of this node carries|disks of this node carry} this pool's label, and the node has not imported it within {minutes} min of TentaNas starting. Import the pool (an encrypted pool may be waiting for its key); if the pool is gone for good, its disks can be wiped."
+        },
+        "sharing_resume_failed": {
+          "title": "Sharing did not come back on this node",
+          "detail": "The share configs could not be written (attempt {n}). The node retries with a growing interval; in mode B an armed privilege channel is needed."
+        },
+        "sharing_share_not_resumed": {
+          "title": "Share {share} did not come back when sharing was resumed",
+          "detail": "The share's state says why. The node retries with a growing interval; the alert closes once the share serves again."
         }
       },
       "node_text": "The node's text",
@@ -7001,7 +7009,8 @@
         "refused": "not started",
         "skipped": "skipped",
         "interrupted": "interrupted",
-        "cancelled": "cancelled"
+        "cancelled": "cancelled",
+        "done": "done"
       },
       "disk_reason": {
         "self_test_running": "a SMART test already runs on this disk",
@@ -7014,11 +7023,27 @@
         "test_no_result": "the disk gave no conclusive result",
         "test_no_entry": "the disk recorded no result for this test",
         "test_stalled": "no sign of the test for {min} min",
-        "test_overran": "the test ran past {min} min — its progress is no longer believed"
+        "test_overran": "the test ran past {min} min — its progress is no longer believed",
+        "shares_stopped": "{smb} SMB, {nfs} NFS stopped",
+        "targets_stopped": "{iscsi} iSCSI, {nvmet} NVMe-oF out of the kernel",
+        "targets_left": "{count} still in the kernel",
+        "step_privilege": "no privilege channel, or the password was rejected",
+        "step_failed": "the step failed — details are in the node log",
+        "already_stopped": "sharing is already being stopped or is stopped",
+        "targets_frozen": "{count} {count|target with a moved portal still serves|targets with a moved portal still serve} — nothing was stopped",
+        "rollback_partial": "not restored: {rows}",
+        "not_resumed": "not back: {rows}"
       },
       "kind_smart_batch_short": "SMART short",
       "kind_smart_batch_long": "SMART long",
-      "subject_all_disks": "— all disks"
+      "subject_all_disks": "— all disks",
+      "kind_sharing_stop": "Stop sharing",
+      "kind_sharing_resume": "Resume sharing",
+      "step": {
+        "shares": "SMB/NFS shares",
+        "targets": "iSCSI/NVMe-oF targets",
+        "disable": "Disable TentaNas"
+      }
     },
     "elevation": {
       "title": "System privilege channel",
@@ -8385,8 +8410,10 @@
         "source_invalid": "The share source is not a valid directory on a pool or array of this node — details in the tooltip",
         "source_unmounted": "The share source is not mounted — the share stays out of the configuration",
         "service_missing": "The {package} package is missing on this node",
-        "smb_direct_not_served": "SMB Direct is not served on this node (the share keeps working over the LAN)"
-      }
+        "smb_direct_not_served": "SMB Direct is not served on this node (the share keeps working over the LAN)",
+        "sharing_suspended": "Sharing on this node was stopped together with disabling TentaNas — it comes back when TentaNas is enabled again. In mode B it returns once the privilege channel is armed."
+      },
+      "state_suspended": "Paused"
     },
     "wizard_share": {
       "title": "New share",
@@ -8777,8 +8804,15 @@
           "trim": "TRIM schedule of pool {subject}",
           "snapshot": "snapshot schedule of dataset {subject}",
           "smart": "SMART test schedule"
-        }
-      }
+        },
+        "sharing_stop": "Stops sharing on node {node} — shares: {shares}; targets: {targets} — then disables TentaNas on the whole fleet.",
+        "sharing_stop_none": "none",
+        "sharing_stop_node_unnamed": "without a name",
+        "sharing_stop_other_shares": "{n} {n|share|shares} of other organisations",
+        "sharing_stop_other_targets": "{n} {n|target|targets} of other organisations",
+        "sharing_stop_other_org": "A stop of sharing on node {node}, requested in another organisation. It blocks this node — you can reject it."
+      },
+      "op_sharing_stop": "Stop sharing and disable TentaNas"
     },
     "access": {
       "title": "Access log",
@@ -8983,11 +9017,13 @@
         "import_all_interfaces": "This target was exported on every interface (0.0.0.0) — pick an interface of this node before enabling it.",
         "portal_moved_head_no_address": "The target’s portal is no longer where it was pinned. The address {address} belonged to interface {interface}, which is on this node but has no address now (link down or a lost DHCP lease).",
         "portal_moved_silent_since": "Since {since} it has been on {elsewhere}. The target is not in the kernel, so nothing listens at that address — the export is not reachable on {elsewhere} and will not be moved there automatically.",
-        "portal_moved_reachable_since": "Since {since} it has been on {elsewhere}, which nobody picked for this target — the export is reachable there."
+        "portal_moved_reachable_since": "Since {since} it has been on {elsewhere}, which nobody picked for this target — the export is reachable there.",
+        "sharing_suspended": "Sharing on this node was stopped together with disabling TentaNas — the target returns to the kernel when TentaNas is enabled again. In mode B it returns once the privilege channel is armed."
       },
       "host_state": "State",
       "host_connected": "Connected",
-      "host_not_connected": "Not connected"
+      "host_not_connected": "Not connected",
+      "state_suspended": "paused"
     },
     "wizard_target": {
       "title": "New target",
@@ -9141,7 +9177,18 @@
       "pool_destroy_in_progress": "A pool is being destroyed on this node; try again in a moment.",
       "forward_address_refused": "This address is not allowed: a private network not on the platform admin’s internal collector list, or loopback, link-local or a cloud metadata address.",
       "forward_https_only": "The webhook must be an https:// address (http:// only to a host on the platform admin’s list marked “allow http”).",
-      "forward_node_retired": "The node’s shared target is retired: it can only be deleted."
+      "forward_node_retired": "The node’s shared target is retired: it can only be deleted.",
+      "sharing_stop_platform_admin": "Stopping sharing needs the platform administrator role — to request it and to approve it.",
+      "sharing_stop_no_second_admin": "There is no second platform administrator in this organisation who could approve it.",
+      "sharing_stop_pending": "Stopping sharing on this node is already waiting for approval or running, or sharing is already stopped.",
+      "sharing_stop_failed": "Stopping sharing failed — TentaNas was not disabled and sharing was restored.",
+      "sharing_resume_failed": "Sharing is not fully back yet — the node retries.",
+      "sharing_stop_frozen_targets": "A target whose portal moved still serves on this node — a stop could not put it back afterwards. Re-pick the portal's interface first.",
+      "sharing_stop_failed_partial": "Stopping sharing failed and TentaNas was not disabled — but not everything could be restored; the step line lists what does not serve.",
+      "sharing_stop_busy": "Sharing on this node is already being stopped or is stopped — nothing was changed.",
+      "sharing_stop_author_gone": "The author of this request is no longer a platform administrator in this organisation — it cannot be approved; reject it.",
+      "sharing_resume_partial": "Sharing is back, but not all of it — the job lines list what does not serve yet; the node retries.",
+      "sharing_stop_pending_elsewhere": "A stop of sharing requested in another organisation is already waiting for approval on this node. A platform administrator sees it in TentaNas → Tasks and can reject it."
     },
     "unreachable": {
       "title": "Node {node} unreachable",
@@ -12125,6 +12172,34 @@
       "tentanas_nvmet_targets_continue": "{n} NVMe-oF {n|subsystem keeps|subsystems keep} exporting zvols — after a reboot of the node too.",
       "tentanas_iscsi_targets_until_reboot": "{n} iSCSI {n|target runs|targets run} until the node reboots — then they do not come back while TentaNas is disabled (no privilege helper).",
       "tentanas_nvmet_targets_until_reboot": "{n} NVMe-oF {n|subsystem runs|subsystems run} until the node reboots — then they do not come back while TentaNas is disabled (no privilege helper)."
+    },
+    "col_effects": "Effects",
+    "node_unpaired": "detached from the fleet — the disable will not reach it",
+    "node_unsupported": "the app does not run on this node — nothing changes here",
+    "node_offline": "the node does not answer — its effects are unknown; the disable reaches it when it is back",
+    "node_error": "the effects could not be read from this node",
+    "node_nothing": "nothing changes here",
+    "confirm_keep_serving": "Disable the app (services keep running)",
+    "stop_hint": "If you also want to stop sharing data on this node, use the separate button below — this node's clients lose access to its shares and targets until the app is enabled again.",
+    "stop_button": "Disable and stop sharing…",
+    "stop_title": "Stop sharing on node {node} and disable TentaNas",
+    "stop_text": "Once approved, the node stops its shares and targets in the services and in the kernel (their configuration stays), then disables TentaNas on the whole fleet. A failure in any step stops everything before the disable. Enabling TentaNas again brings the sharing back.",
+    "stop_item_smb": "{n} SMB {n|share stops|shares stop} serving data",
+    "stop_item_nfs": "{n} NFS {n|share stops|shares stop} serving data",
+    "stop_item_iscsi": "{n} iSCSI {n|target leaves|targets leave} the kernel",
+    "stop_item_nvmet": "{n} NVMe-oF {n|subsystem leaves|subsystems leave} the kernel",
+    "stop_item_none": "This node shares no share or target right now",
+    "stop_item_disable": "Finally TentaNas is disabled on the whole fleet",
+    "stop_approval": "Needs approval by a second platform administrator — nothing changes until then. It is approved in TentaNas → Tasks on this node.",
+    "stop_send": "Send for approval",
+    "stop_parked": "Sent for approval — TentaNas keeps running until a second administrator approves.",
+    "stop_error": "The request to stop sharing could not be sent.",
+    "refusal": {
+      "sharing_stop_platform_admin": "Stopping sharing needs the platform administrator role — to request it and to approve it.",
+      "sharing_stop_no_second_admin": "There is no second platform administrator in this organisation who could approve it — nothing was sent.",
+      "sharing_stop_pending": "Stopping sharing on this node is already waiting for approval or running, or sharing is already stopped.",
+      "sharing_stop_frozen_targets": "A target whose portal moved still serves on this node — a stop could not put it back afterwards. Re-pick the portal's interface first (TentaNas → Sharing).",
+      "sharing_stop_pending_elsewhere": "A stop of sharing requested in another organisation is already waiting for approval on this node. A platform administrator sees it in TentaNas → Tasks and can reject it."
     }
   }
 }

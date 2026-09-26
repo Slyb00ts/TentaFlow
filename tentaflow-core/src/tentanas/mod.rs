@@ -25,6 +25,8 @@
 //   datasets      zfs list/get for filesystems, zvols and their properties
 //   snapshots     snapshot list, GFS retention, the automatic snapshot job
 //   shares        SMB/NFS shares: config generation, apply, sessions, browser
+//   sharing       stopping this node's shares and targets with the disable, and
+//                 bringing them back on enable (n18d "zatrzymaj udostępnianie")
 //   targets       iSCSI/NVMe-oF block export: configfs, CHAP, ALUA/ANA
 //   fleet_mounts  the same share on every node, over NFS, without a secret
 //   config_io     configuration export, import plan and import apply
@@ -61,6 +63,7 @@ pub mod pools;
 pub mod rdma;
 pub mod scheduler;
 pub mod shares;
+pub mod sharing;
 pub mod snapshots;
 pub mod targets;
 pub mod zfs;
@@ -203,6 +206,9 @@ pub fn instance_should_run(main_db: &DbPool, db: &DbPool) -> bool {
 pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
     let pool = open_db(ctx.db, ctx.org_id, ctx.addon_id)?;
     let orphaned = db::fail_orphaned_jobs(&pool)?;
+    // A sharing stop or resume that died with the process (wave 10): its
+    // record is `stopped` again, and resumed once TentaNas is enabled.
+    sharing::recover_after_restart(&pool)?;
     if orphaned > 0 {
         tracing::info!("tentanas: marked {orphaned} interrupted jobs as failed");
     }
@@ -223,6 +229,32 @@ pub fn native_init(ctx: &NativeAppContext) -> Result<()> {
         ctx.addon_id,
         ctx.data_dir
     );
+    Ok(())
+}
+
+/// Native enable hook (wave 10): TentaNas was switched on — by the admin
+/// here, by a replicated enable, or at start as an enabled instance. When
+/// this node's sharing was stopped with the disable (n18d "Wyłącz i zatrzymaj
+/// udostępnianie…"), it is brought back now (`sharing::resume_if_due`): the
+/// shares and targets serve again. Without a privilege channel (mode B, not
+/// armed) nothing can be re-applied yet; the target restore loop resumes the
+/// moment an admin arms one, and the shares and targets read "stopped" until
+/// then.
+pub fn native_on_enable(ctx: &NativeAppContext) -> Result<()> {
+    let pool = open_db(ctx.db, ctx.org_id, ctx.addon_id)?;
+    if !sharing::suspended(&pool)? {
+        return Ok(());
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        tracing::warn!("tentanas: no tokio runtime, sharing is resumed by the restore loop");
+        return Ok(());
+    };
+    let main_db = ctx.db.clone();
+    handle.spawn(async move {
+        if let Some(job) = sharing::resume_if_due(&main_db, &pool).await {
+            tracing::info!("tentanas: sharing resumes on this node (job {})", job.job_id);
+        }
+    });
     Ok(())
 }
 

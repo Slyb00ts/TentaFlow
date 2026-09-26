@@ -31,7 +31,7 @@ import '/js/components/tf-window.js';
 // `elastic_replace_disk` is deliberately NOT here: disk replacement is
 // withdrawn, the node refuses the request before anything is parked, so a
 // label for it would describe an operation that cannot appear.
-const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import', 'elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover', 'elastic_fix', 'elastic_add_disk', 'elastic_add_disk_abort', 'elastic_destroy', 'elastic_schedule'];
+const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import', 'elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover', 'elastic_fix', 'elastic_add_disk', 'elastic_add_disk_abort', 'elastic_destroy', 'elastic_schedule', 'sharing_stop'];
 
 export const operationLabel = (op) => T('approvals.op_' + (OPERATIONS.includes(op) ? op : 'unknown'));
 
@@ -61,6 +61,26 @@ function configImportItems(p) {
   return pairs.map(([task, subject]) => T('approvals.detail.config_import_task.' + task, { subject })).join(', ');
 }
 const SCHEDULE_TASKS = new Set(['mover', 'sync', 'scrub']);
+
+// n18d's stop of a node's sharing (wave 10): which shares and targets stop,
+// BY NAME — the asking organisation's; another organisation's arrive only
+// counted (`sharing::stop_detail`) and are said as counts.
+const countParam = (v) => (/^\d+$/.test(String(v ?? '')) ? Number(v) : null);
+function sharingStopWords(p) {
+  const otherShares = countParam(p.other_shares);
+  const otherTargets = countParam(p.other_targets);
+  if (otherShares === null || otherTargets === null) return null;
+  const list = (names, others, otherKey) => {
+    const parts = String(names || '').split(', ').filter(Boolean);
+    if (others > 0) parts.push(T(otherKey, { n: others }));
+    return parts.length ? parts.join(', ') : T('approvals.detail.sharing_stop_none');
+  };
+  return T('approvals.detail.sharing_stop', {
+    node: String(p.node || '').trim() || T('approvals.detail.sharing_stop_node_unnamed'),
+    shares: list(p.shares, otherShares, 'approvals.detail.sharing_stop_other_shares'),
+    targets: list(p.targets, otherTargets, 'approvals.detail.sharing_stop_other_targets'),
+  });
+}
 const yesNo = (v) => (v === 'true' ? T('approvals.detail.yes') : v === 'false' ? T('approvals.detail.no') : null);
 const DETAIL_WORDS = new Map([
   ['pool_destroy', (p) => (p.pool ? T('approvals.detail.pool_destroy', { pool: p.pool }) : null)],
@@ -90,6 +110,11 @@ const DETAIL_WORDS = new Map([
   ['elastic_add_disk', (p) => (p.disk ? T('approvals.detail.elastic_add_disk', { disk: p.disk }) : T('approvals.detail.elastic_add_disk_unnamed'))],
   ['elastic_add_disk_abort', () => T('approvals.detail.elastic_add_disk_abort')],
   ['elastic_destroy', () => T('approvals.detail.elastic_destroy')],
+  ['sharing_stop', sharingStopWords],
+  // Another organisation's stop of this node (R2-2): the node only.
+  ['sharing_stop_other_org', (p) => T('approvals.detail.sharing_stop_other_org', {
+    node: String(p.node || '').trim() || T('approvals.detail.sharing_stop_node_unnamed'),
+  })],
   ['elastic_mover', (p) => (yesNo(p.coupled_sync) ? T(p.coupled_sync === 'true' ? 'approvals.detail.elastic_mover_coupled' : 'approvals.detail.elastic_mover_uncoupled') : null)],
   ['elastic_schedule', (p) => {
     if (!SCHEDULE_TASKS.has(p.task) || !['true', 'false'].includes(p.enabled) || !p.every) return null;
@@ -208,10 +233,13 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
       wrap.appendChild(note);
       return wrap;
     }
+    // Another organisation's stop blocks this node too: a platform admin
+    // may reject it, never approve it (the node refuses that anyway).
+    const foreign = (a.detailReasons || []).some((r) => r?.code === 'sharing_stop_other_org');
     for (const [act, icon, variant, label] of [
       ['approve', 'check', 'primary', T('approvals.approve')],
       ['reject', 'x', 'ghost', T('approvals.reject')],
-    ]) {
+    ].filter(([act]) => !(foreign && act === 'approve'))) {
       const b = document.createElement('tf-button');
       b.setAttribute('size', 'sm');
       b.setAttribute('variant', variant);

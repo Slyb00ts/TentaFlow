@@ -162,6 +162,8 @@ const TARGET_STATE_WORDS = new Map([
     return `${head} ${T('targets.state_reason.portal_moved_reachable' + sinceKey, { elsewhere: p.elsewhere, since })} ${T('targets.state_reason.portal_moved_tail')}`;
   }],
   ['target_not_exported', () => T('targets.state_reason.not_exported')],
+  // The node's sharing was stopped with the disable (n18d, wave 10).
+  ['sharing_suspended', () => T('targets.state_reason.sharing_suspended')],
   ['target_no_auth', () => T('targets.state_reason.no_auth')],
   ['import_secret_needed', () => T('targets.state_reason.import_secret_needed')],
   ['import_all_interfaces', () => T('targets.state_reason.import_all_interfaces')],
@@ -193,6 +195,11 @@ function stateChip(t) {
   }
   if (!t.enabled || t.state === 'disabled') {
     return `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('targets.state_disabled'))}"></tf-chip>`;
+  }
+  // Stopped with the node's sharing (n18d, wave 10): out of the kernel until
+  // TentaNas is enabled again — not an error, and not active either.
+  if (t.state === 'suspended') {
+    return `<span title="${escapeAttr(shown)}"><tf-chip size="sm" status="warn" label="${escapeAttr(T('targets.state_suspended'))}"></tf-chip></span>`;
   }
   // The node has decided this target should be exported and is not exporting
   // it yet — saved seconds ago, a pool still importing, a reconcile that has

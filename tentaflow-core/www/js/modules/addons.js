@@ -352,12 +352,18 @@ function renderList() {
       const addonId = card?.dataset.addonCard;
       if (!addonId) return;
       const enabled = !!(e.detail?.checked ?? t.hasAttribute('checked'));
-      // n18d: switching an app OFF first says what that does on this node —
-      // the app's own consequences, from its real state. Dismissing the
-      // dialog puts the switch back and sends nothing.
+      // n18d: switching an app OFF first says what that does on every node
+      // it reaches — the app's own consequences, from each node's real
+      // state. Dismissing the dialog puts the switch back and sends nothing;
+      // so does a parked "stop sharing" request (the node disables only
+      // once a second admin releases it).
       if (!enabled) {
         const entry = addonsList.find((a) => (a.addonId ?? a.addon_id) === addonId);
-        const ok = await confirmDisable({ addonId, displayName: entry?.displayName ?? entry?.display_name ?? '' });
+        const ok = await confirmDisable({
+          addonId,
+          displayName: entry?.displayName ?? entry?.display_name ?? '',
+          packageId: entry?.packageId ?? entry?.package_id ?? '',
+        });
         if (!ok) {
           t.setAttribute('checked', '');
           return;

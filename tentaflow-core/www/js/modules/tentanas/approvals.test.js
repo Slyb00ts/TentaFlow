@@ -542,3 +542,68 @@ test('a config-import approval words the overwritten schedules in the reader\'s 
     }
   } finally { await I18n.setLanguage('pl'); }
 });
+
+// Wave 10 (n18d): a stop of a node's sharing tells the approver which shares
+// and targets stop BY NAME — the asking organisation's — with another
+// organisation's only counted, in all five locales, and a node without a
+// name is named in words, never by an id.
+test('a sharing-stop approval names the node, its shares and targets, and counts other organisations', async () => {
+  const { I18n } = await import('./_test-setup.js');
+  const approval = (over = {}) => ({
+    operation: 'sharing_stop',
+    detail: 'stops sharing on helios: …',
+    detailReasons: [{ code: 'sharing_stop', params: {
+      node: 'helios', shares: 'media, projekty', targets: 'vm-store', other_shares: '2', other_targets: '0',
+      smb: '3', nfs: '1', iscsi: '1', nvmet: '0', ...over,
+    } }],
+  });
+  try {
+    for (const [language, expected, label] of [
+      ['pl', 'Zatrzymuje udostępnianie na węźle helios — udziały: media, projekty, 2 udziały innych organizacji; targety: vm-store — a potem wyłącza TentaNas na całej flocie.', 'Zatrzymanie udostępniania i wyłączenie TentaNas'],
+      ['en', 'Stops sharing on node helios — shares: media, projekty, 2 shares of other organisations; targets: vm-store — then disables TentaNas on the whole fleet.', 'Stop sharing and disable TentaNas'],
+      ['de', 'Stoppt die Freigabe auf Knoten helios — Freigaben: media, projekty, 2 Freigaben anderer Organisationen; Targets: vm-store — und deaktiviert dann TentaNas in der ganzen Flotte.', 'Freigabe stoppen und TentaNas deaktivieren'],
+      ['fr', 'Arrête le partage sur le nœud helios — partages : media, projekty, 2 partages d\'autres organisations ; cibles : vm-store — puis désactive TentaNas sur toute la flotte.', 'Arrêter le partage et désactiver TentaNas'],
+      ['es', 'Detiene la compartición en el nodo helios — recursos compartidos: media, projekty, 2 recursos compartidos de otras organizaciones; destinos: vm-store — y después desactiva TentaNas en toda la flota.', 'Detener la compartición y desactivar TentaNas'],
+    ]) {
+      await I18n.setLanguage(language);
+      assert.equal(approvalDetail(approval()).text, expected, language);
+      assert.equal(operationLabel('sharing_stop'), label, language);
+    }
+    await I18n.setLanguage('pl');
+    assert.equal(
+      approvalDetail(approval({ node: '', shares: '', targets: '', other_shares: '0' })).text,
+      'Zatrzymuje udostępnianie na węźle bez nazwy — udziały: brak; targety: brak — a potem wyłącza TentaNas na całej flocie.',
+    );
+    // Counts that are not numbers are not worded: the node's sentence is.
+    assert.equal(approvalDetail(approval({ other_shares: 'x' })).text, 'stops sharing on helios: …');
+  } finally { await I18n.setLanguage('pl'); }
+});
+
+// Wave 10 round 3 (R2-2): another organisation's stop of this node is listed
+// for a platform admin with the node only, and offers ONLY a rejection.
+test('another organisation\'s stop of this node is worded by the node and can only be rejected', async () => {
+  let sent = null;
+  const foreign = pending({
+    requestId: 'r-f', operation: 'sharing_stop', subject: 'helios', requestedBy: '',
+    detail: 'a stop of this node\'s sharing, requested in another organisation, waits for approval',
+    detailReasons: [{ code: 'sharing_stop_other_org', params: { node: 'helios' } }],
+  });
+  const screen = fakeScreen({
+    tentaNasApprovalsListRequest: { approvals: [foreign], settings: settings() },
+    tentaNasApprovalDecideRequest: (p) => { sent = p; return { approvals: [], settings: settings() }; },
+  });
+  const body = mount();
+  const { refresh } = wireApprovals(screen, body);
+  await refresh();
+  await flush();
+  const table = body.querySelector('#nas-approvals-table');
+  assert.match(table.rows[0].operation, /Zatrzymanie udostępniania na węźle helios, zgłoszone w innej organizacji/);
+  const buttons = [...table.rowActions(table.rows[0]).querySelectorAll('tf-button')];
+  assert.deepEqual(buttons.map((b) => b.textContent), ['Odrzuć'], 'no approve button');
+  click(buttons[0]);
+  await confirmDecision();
+  await flush();
+  assert.equal(sent.approve, false);
+  assert.equal(sent.requestId, 'r-f');
+  screen.dispose();
+});

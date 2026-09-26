@@ -992,6 +992,27 @@ pub fn addon_disable_preview(
         }
         None => Vec::new(),
     };
+    // n18d per node (wave 10): the mode chip of THIS node, from the same hook
+    // the uninstall dialog reads (`teardown_node_info`); '' for an app that
+    // needs no privilege.
+    let privilege = native_hooks_of(&addon)
+        .and_then(|hooks| hooks.teardown_node_info)
+        .and_then(|info| {
+            let org_id = crate::services::org::DEFAULT_ORG_ID;
+            let data_dir = crate::addon::fs_sandbox::addon_data_dir_no_create(org_id, &addon.addon_id).ok()?;
+            Some(info(&crate::addon::native_apps::NativeAppContext {
+                db: &ctx.state.db,
+                addon_id: &addon.addon_id,
+                org_id,
+                data_dir,
+            }))
+        })
+        .map(|info| info.privilege.to_string())
+        .unwrap_or_default();
+    // Disabling is fleet-wide: every node it reaches, by name. Listed only
+    // when the app has consequences to show at all — a provider-less app is
+    // disabled without a dialog and needs no roster.
+    let nodes = if consequences.is_empty() { Vec::new() } else { instance_nodes(ctx, &payload.addon_id) };
     Ok(MessageBody::AddonDisablePreviewResponseBody(AddonDisablePreviewResponse {
         addon_id: addon.addon_id,
         display_name: if addon.display_name.is_empty() {
@@ -1005,6 +1026,8 @@ pub fn addon_disable_preview(
         ),
         background_on_disable,
         consequences,
+        nodes,
+        privilege,
     }))
 }
 

@@ -533,6 +533,10 @@ pub struct NasAlert {
     /// - 'pool_not_imported' {pool, disks, minutes} — a pool whose disks were
     ///   held for its import at boot is still not imported `minutes` after
     ///   the core started; `disks` of this node carry its label.
+    /// - 'sharing_resume_failed' {attempts} — sharing stopped with the
+    ///   disable (n18d, wave 10) could not be resumed; retried with a back-off;
+    /// - 'sharing_share_not_resumed' {share} — one share that was serving
+    ///   when sharing stopped did not come back (its organisation's alert).
     ///
     /// Every parameter is a string, as in `NasHealthReason`.
     #[serde(default)]
@@ -3568,6 +3572,15 @@ pub enum TentaNasPayload {
         folder: String,
         cache_policy: String,
     },
+    /// n18d "Wyłącz i zatrzymaj udostępnianie…" (wave 10): take every share
+    /// (SMB/NFS) and block target (iSCSI/NVMe-oF) of THIS node out of
+    /// service, then disable TentaNas fleet-wide. Always a four-eyes request:
+    /// it parks (`ApprovalPendingResponse`) and a second platform admin
+    /// releases it. Out of service means stopped in the daemon or the
+    /// kernel; the configuration rows stay, and enabling TentaNas again puts
+    /// them back. Carries nothing: the node reads its own shares and targets
+    /// when it parks and again when it runs.
+    SharingStopRequest {},
 }
 
 #[cfg(test)]
@@ -3778,6 +3791,17 @@ mod tests {
         let back: TentaNasPayload =
             crate::cbor::decode(&crate::cbor::encode(&folder).expect("encode")).expect("decode");
         assert_eq!(back, folder, "ElasticFolderCacheSetRequest wire drift");
+
+        // Wave 10: the stop-sharing request carries no field, and its tag is
+        // frozen like the others ("SharingStopRequest" + an empty map).
+        assert_eq!(
+            crate::cbor::encode(&TentaNasPayload::SharingStopRequest {}).expect("encode"),
+            hex_bytes("a17253686172696e6753746f7052657175657374a0"),
+            "SharingStopRequest wire drift"
+        );
+        let decoded: TentaNasPayload =
+            serde_json::from_value(serde_json::json!({ "SharingStopRequest": {} })).expect("decode");
+        assert_eq!(decoded, TentaNasPayload::SharingStopRequest {});
         let json = serde_json::json!({
             "ElasticFolderCacheSetRequest": { "name": "media", "folder": "foto", "cache_policy": "yes" }
         });

@@ -1211,6 +1211,13 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Removes a setting; a key that is not there is not an error.
+pub fn delete_setting(pool: &DbPool, key: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute("DELETE FROM nas_settings WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
 /// Adds one to a numeric setting and returns the new value, in a single
 /// statement: the privilege-channel counter is bumped from every request
 /// handler and a read-modify-write would lose invocations under load.
@@ -1643,6 +1650,7 @@ fn alert_owner_sql(kind: &str, subject: &str) -> String {
          WHEN 'elastic-array' THEN COALESCE((SELECT org_id FROM nas_elastic_arrays WHERE name = {subject}), '') \
          WHEN 'approval' THEN COALESCE((SELECT org_id FROM nas_pending_approvals WHERE request_id = {subject}), '') \
          WHEN 'target' THEN COALESCE((SELECT org_id FROM nas_targets WHERE name = {subject}), '') \
+         WHEN 'share' THEN COALESCE((SELECT org_id FROM nas_shares WHERE name = {subject}), '') \
          END"
     )
 }
@@ -2311,7 +2319,9 @@ pub fn insert_job_full(
     owner: Option<&str>,
     disks: &[(String, String)],
 ) -> Result<()> {
-    anyhow::ensure!(disks.is_empty() || job.kind == SMART_BATCH_KIND,
+    // Lines belong to a multi-disk SMART job (one per disk) and to the two
+    // step jobs of the sharing stop and resume (one per step, wave 10).
+    anyhow::ensure!(disks.is_empty() || job.kind == SMART_BATCH_KIND || super::sharing::is_step_kind(&job.kind),
         "Linie dysków ma tylko zadanie {SMART_BATCH_KIND}");
     anyhow::ensure!(owner.is_none() || !job.kind.starts_with("elastic_"),
         "Zadanie Elastic należy do organizacji swojej macierzy; jawny właściciel jest odrzucany");
@@ -2354,7 +2364,7 @@ pub fn insert_job_full(
         ],
     )?;
     for (position, (disk_id, name)) in disks.iter().enumerate() {
-        let (state, reasons) = if self_test_running_on(&tx, disk_id)? {
+        let (state, reasons) = if job.kind == SMART_BATCH_KIND && self_test_running_on(&tx, disk_id)? {
             ("refused", vec![super::disks::coded_reason("self_test_running", &[])])
         } else {
             ("pending", Vec::new())
@@ -5460,6 +5470,22 @@ pub fn list_approvals(pool: &DbPool, org_id: &str, include_closed: bool) -> Resu
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![org_id], approval_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every PENDING request of one operation on this node, whatever its
+/// organisation — only for the sharing stop, whose foreign rows a platform
+/// admin sees stripped (`approvals::foreign_pending_stops`).
+pub fn list_pending_of_operation(pool: &DbPool, operation: &str) -> Result<Vec<ApprovalRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let sql = format!(
+        "SELECT {APPROVAL_COLUMNS} FROM nas_pending_approvals WHERE operation = ?1 AND status = 'pending' \
+         ORDER BY requested_at DESC LIMIT 50"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![operation], approval_from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }

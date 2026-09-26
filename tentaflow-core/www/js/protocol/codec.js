@@ -9143,6 +9143,17 @@ export const encode = {
   },
 
   /**
+   * MessageBody::TentaNasBody(SharingStopRequest) — n18d "Wyłącz i zatrzymaj
+   * udostępnianie…" (wave 10): a four-eyes request for the answering node.
+   * No fields; answers with ApprovalPendingResponse.
+   */
+  tentaNasSharingStopRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasSharingStopRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
    * MessageBody::TentaNasBody(DiskWipePlanRequest) — read-only, but privileged:
    * the refusals name this node's pools, arrays and journal owners.
    */

@@ -420,7 +420,7 @@ static REGISTRY: &[NativeAppHooks] = &[
     NativeAppHooks {
         package_id: crate::tentanas::PACKAGE_ID,
         init: crate::tentanas::native_init,
-        on_enable: None,
+        on_enable: Some(crate::tentanas::native_on_enable),
         on_disable: None,
         teardown_plan: crate::tentanas::native_teardown_plan,
         teardown: crate::tentanas::native_teardown,

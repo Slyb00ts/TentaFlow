@@ -313,6 +313,8 @@ const SHARE_STATE_WORDS = new Map([
   ['share_source_unmounted', () => T('shares.state_reason.source_unmounted')],
   ['share_service_missing', (p) => (p.package ? T('shares.state_reason.service_missing', { package: p.package }) : null)],
   ['smb_direct_not_served', () => T('shares.state_reason.smb_direct_not_served')],
+  // The node's sharing was stopped with the disable (n18d, wave 10).
+  ['sharing_suspended', () => T('shares.state_reason.sharing_suspended')],
   ...FEATURE_DETAIL_WORDS,
 ]);
 
@@ -332,6 +334,8 @@ function shareRow(s) {
   // read the same as one that did.
   const stateChip = s.state === 'error'
     ? titled(`<tf-chip size="sm" status="err" dot label="${escapeAttr(T('shares.state_error'))}"></tf-chip>`)
+    : s.state === 'suspended' && s.enabled
+      ? titled(`<tf-chip size="sm" status="warn" label="${escapeAttr(T('shares.state_suspended'))}"></tf-chip>`)
     : !s.enabled || s.state === 'disabled'
       ? `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.state_disabled'))}"></tf-chip>`
       : detail.text
@@ -393,7 +397,7 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
         <div class="row">
           ${protocolChipHtml(s.protocol)}
           ${smbDirectChipHtml(s)}
-          ${s.state === 'error' ? `<tf-chip size="sm" status="err" dot label="${escapeAttr(T('shares.state_error'))}"></tf-chip>` : s.enabled ? `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('shares.state_active'))}"></tf-chip>` : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.state_disabled'))}"></tf-chip>`}
+          ${s.state === 'error' ? `<tf-chip size="sm" status="err" dot label="${escapeAttr(T('shares.state_error'))}"></tf-chip>` : s.state === 'suspended' && s.enabled ? `<tf-chip size="sm" status="warn" label="${escapeAttr(T('shares.state_suspended'))}"></tf-chip>` : s.enabled ? `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('shares.state_active'))}"></tf-chip>` : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.state_disabled'))}"></tf-chip>`}
           ${(() => { const d = shareStateText(s); return d.text ? `<span class="text-3"${d.title ? ` title="${escapeAttr(d.title)}"` : ''}>${escapeHtml(d.text)}</span>` : ''; })()}
         </div>
         <div class="stat-rows">

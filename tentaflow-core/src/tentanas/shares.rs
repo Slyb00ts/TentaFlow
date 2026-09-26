@@ -698,6 +698,12 @@ pub enum ApplyTrigger {
     Change,
     /// The unattended rewrite of the startup queue.
     Startup,
+    /// The sharing resume and the stop's rollback (wave 10): unattended, so an
+    /// unreadable dataset listing is refused as at startup — it would write
+    /// every ZFS share out as an error — but a share that does not come back
+    /// is judged on its own and does not hold the others back (critic wave
+    /// 10, B2): its row says why, and `sharing` names it in an alert.
+    Resume,
 }
 
 /// The dataset listing a rewrite may work from. An unreadable listing is
@@ -711,7 +717,9 @@ pub fn readable_datasets(
 ) -> Result<Vec<NasDataset>> {
     match listing {
         Ok(datasets) => Ok(datasets),
-        Err(error) if trigger == ApplyTrigger::Startup => Err(anyhow!(
+        // A node with no ZFS at all has no listing to read: nothing to lose.
+        Err(super::broker::BrokerError::ToolMissing(_)) if trigger == ApplyTrigger::Resume => Ok(Vec::new()),
+        Err(error) if trigger != ApplyTrigger::Change => Err(anyhow!(
             "Nie można odczytać listy datasetów ZFS ({error}); konfiguracje share pozostają bez zmian"
         )),
         Err(_) => Ok(Vec::new()),
@@ -725,7 +733,10 @@ pub fn transient_reading<D>(shares: &[ShareRow], computed: &[(&'static str, D)])
     let dropped: Vec<&str> = shares
         .iter()
         .zip(computed)
-        .filter(|(share, (state, _))| share.state == "active" && *state != "active")
+        // A share stopped with the node's sharing (`suspended`, wave 10) was
+        // serving before and serves again on the resume: a reading that
+        // cannot confirm its source must not drop it either.
+        .filter(|(share, (state, _))| (share.state == "active" || share.state == "suspended") && *state != "active")
         .map(|(share, _)| share.name.as_str())
         .collect();
     (!dropped.is_empty()).then(|| {
@@ -736,12 +747,36 @@ pub fn transient_reading<D>(shares: &[ShareRow], computed: &[(&'static str, D)])
     })
 }
 
+/// Serialises every rewrite of the share configs on this node with the
+/// sharing stop and resume (critic wave 10, M2): a share edit, a config
+/// import or the Elastic startup apply that read "sharing is not stopped"
+/// must not write smb.conf or /etc/exports WITH the shares after the stop
+/// wrote them without. The stop and the resume hold it for their whole run
+/// and call `apply_locked`.
+pub fn apply_mutex() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Recomputes every share's state and rewrites the app-owned configs. Returns
 /// the log lines the calling job records.
 ///
 /// Only `active` shares reach the generated files; a share whose source is not
 /// mounted stays out of them and says so in `state_detail`.
 pub async fn apply(
+    db: &DbPool,
+    main_db: &DbPool,
+    addon_id: &str,
+    explicit: Option<&ElevationToken>,
+    trigger: ApplyTrigger,
+) -> Result<Vec<String>> {
+    let _serial = apply_mutex().lock().await;
+    apply_locked(db, main_db, addon_id, explicit, trigger).await
+}
+
+/// `apply` for a caller that already holds `apply_mutex` (the sharing stop
+/// and resume).
+pub async fn apply_locked(
     db: &DbPool,
     main_db: &DbPool,
     addon_id: &str,
@@ -765,7 +800,7 @@ pub async fn apply(
 
     // Every state is computed BEFORE anything is persisted or written: an
     // unattended rewrite that would drop a serving share acts on nothing.
-    let computed: Vec<(&'static str, CodedText)> = shares
+    let judged: Vec<(&'static str, CodedText)> = shares
         .iter()
         .map(|share| {
             let source = resolve_source(&datasets, &arrays, &[], &share.source_path);
@@ -773,10 +808,20 @@ pub async fn apply(
         })
         .collect();
     if trigger == ApplyTrigger::Startup {
-        if let Some(refusal) = transient_reading(&shares, &computed) {
+        if let Some(refusal) = transient_reading(&shares, &judged) {
             anyhow::bail!(refusal);
         }
     }
+    // While this node's sharing is stopped (n18d, wave 10) every enabled
+    // share is `suspended` and reaches no generated file; the rows keep their
+    // options for the resume. Read with `?`: an unreadable mark must not put
+    // every share back into the configs.
+    let stopped = super::sharing::suspended(db)?;
+    let computed: Vec<(&'static str, CodedText)> = shares
+        .iter()
+        .zip(judged)
+        .map(|(share, judged)| super::sharing::share_state_while(stopped, share, judged))
+        .collect();
 
     for (share, (state, detail)) in shares.iter_mut().zip(computed) {
         // The codes count as a change: a row judged before migration 24 has
@@ -794,6 +839,13 @@ pub async fn apply(
         }
     }
     let active: Vec<ShareRow> = shares.iter().filter(|s| s.state == "active").cloned().collect();
+    // A share that serves again closes the alert the sharing resume raised
+    // for it (wave 10) — whichever apply brought it back.
+    for share in &active {
+        if let Err(e) = store::resolve_alert(db, &super::sharing::share_alert_key(&share.name)) {
+            tracing::warn!("tentanas: the resume alert of share {} not closed: {e}", share.name);
+        }
+    }
 
     // The interfaces the second SMB backend takes, or none when no share asked
     // for SMB Direct or this node may not serve it.

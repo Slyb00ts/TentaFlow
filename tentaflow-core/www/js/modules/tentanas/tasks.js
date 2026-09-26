@@ -82,24 +82,59 @@ export function jobSubject(j) {
 // the history's result cell and the job-log window.
 export const SMART_BATCH_KIND = 'smart_test_batch';
 
+// The sharing stop and resume (n18d, wave 10) report their STEPS the same
+// way: one line per step — SMB/NFS shares, iSCSI/NVMe-oF targets, the
+// disable — its name the step's code, worded here.
+export const STEP_JOB_KINDS = new Set(['sharing_stop', 'sharing_resume']);
+
+/** Whether a job carries lines (disks of a SMART batch, steps of a sharing job). */
+export const hasJobLines = (j) => j?.kind === SMART_BATCH_KIND || STEP_JOB_KINDS.has(j?.kind);
+
 const DISK_LINE_TONE = {
-  pending: 'info', running: 'accent', passed: 'ok', failed: 'err', incomplete: 'warn',
+  pending: 'info', running: 'accent', passed: 'ok', done: 'ok', failed: 'err', incomplete: 'warn',
   refused: 'warn', skipped: 'neutral', interrupted: 'warn', cancelled: 'warn',
 };
 
-function diskLineName(d) {
+function diskLineName(d, kind = SMART_BATCH_KIND) {
   const name = String(d?.name || '').trim();
+  if (STEP_JOB_KINDS.has(kind)) {
+    const words = T('jobs.step.' + name);
+    return words === 'tentanas.jobs.step.' + name ? name : words;
+  }
   if (!name) return T('jobs.subject_unknown_disk');
   return d.lastKnown ? T('jobs.subject_last_known', { name }) : name;
 }
 
 /** Why a line did not pass, in the reader's language ('' when the state says it all). */
 export function diskLineReason(d) {
-  const reason = Array.isArray(d?.reasons) ? d.reasons[0] : null;
-  if (!reason?.code) return '';
-  const key = 'jobs.disk_reason.' + reason.code;
-  const words = T(key, { ...(reason.params || {}) });
-  return words === 'tentanas.' + key ? '' : words;
+  // Every reason the line carries: a sharing step that failed also says
+  // what its rollback could not put back (wave 10).
+  return (Array.isArray(d?.reasons) ? d.reasons : [])
+    .filter((reason) => reason?.code)
+    .map((reason) => {
+      const key = 'jobs.disk_reason.' + reason.code;
+      const words = T(key, rowListParams(reason.params || {}));
+      return words === 'tentanas.' + key ? '' : words;
+    })
+    .filter(Boolean)
+    .join('; ');
+}
+
+// A step reason that lists rows (`shares`/`targets` by name, `other_*`
+// counted — `sharing::rows_reason`) as one phrase in the reader's words.
+function rowListParams(p) {
+  if (!('other_shares' in p) && !('other_targets' in p)) return p;
+  const list = (names, others, otherKey) => {
+    const parts = String(names || '').split(', ').filter(Boolean);
+    const n = Number(others) || 0;
+    if (n > 0) parts.push(T(otherKey, { n }));
+    return parts.join(', ');
+  };
+  const rows = [
+    list(p.shares, p.other_shares, 'approvals.detail.sharing_stop_other_shares'),
+    list(p.targets, p.other_targets, 'approvals.detail.sharing_stop_other_targets'),
+  ].filter(Boolean).join(', ');
+  return { ...p, rows };
 }
 
 function diskLineState(d) {
@@ -109,10 +144,10 @@ function diskLineState(d) {
 }
 
 /** "sdb: nie przeszedł — …" — one line of plain text, for a table cell. */
-export function diskLineText(d) {
+export function diskLineText(d, kind = SMART_BATCH_KIND) {
   const reason = diskLineReason(d);
   const pct = d?.state === 'running' && d.progressPct != null ? ` ${Number(d.progressPct)}%` : '';
-  return `${diskLineName(d)}: ${diskLineState(d)}${pct}${reason ? ' — ' + reason : ''}`;
+  return `${diskLineName(d, kind)}: ${diskLineState(d)}${pct}${reason ? ' — ' + reason : ''}`;
 }
 
 const DISK_LINE_SKELETON = `<div class="job-disk"><span class="mono" data-role="name"></span> <tf-chip size="sm" data-role="state"></tf-chip> <span class="job-disk-detail" data-role="detail"></span></div>`;
@@ -129,7 +164,7 @@ export function paintJobDisks(host, j) {
   disks.forEach((d, i) => {
     const line = host.children[i];
     if (!line) return;
-    setText(line.querySelector('[data-role="name"]'), diskLineName(d));
+    setText(line.querySelector('[data-role="name"]'), diskLineName(d, j.kind));
     const chip = line.querySelector('[data-role="state"]');
     setAttr(chip, 'status', DISK_LINE_TONE[d.state] || 'neutral');
     setAttr(chip, 'label', diskLineState(d) + (d.state === 'running' && d.progressPct != null ? ` ${Number(d.progressPct)}%` : ''));
@@ -279,7 +314,7 @@ export function jobRowSkeleton(j, subject = jobSubject(j)) {
         <div class="job-name">${escapeHtml(jobKindLabel(j.kind, j.subject))} <span class="${subject.words ? '' : 'mono '}text-2">${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
         <div class="job-sub" data-role="sub"></div>
         ${j.progressPct != null ? `<tf-progress-bar data-role="progress" size="sm" tone="accent"></tf-progress-bar>` : ''}
-        ${j.kind === SMART_BATCH_KIND ? `<div class="job-disks" data-role="disks"></div>` : ''}
+        ${hasJobLines(j) ? `<div class="job-disks" data-role="disks"></div>` : ''}
       </div>
       <div class="job-actions">
         <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
@@ -305,7 +340,7 @@ export function paintJobRow(row, j) {
   const sub = row.querySelector('[data-role="sub"]');
   setText(sub, T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }) + (last ? ' · ' + last : ''));
   if (j.progressPct != null) setAttr(row.querySelector('[data-role="progress"]'), 'value', Number(j.progressPct));
-  if (j.kind === SMART_BATCH_KIND) paintJobDisks(row.querySelector('[data-role="disks"]'), j);
+  if (hasJobLines(j)) paintJobDisks(row.querySelector('[data-role="disks"]'), j);
 }
 
 // The history table's result cell. A multi-disk job reads "18/18 OK" and
@@ -321,7 +356,11 @@ function historyResultHtml(j) {
       + (error ? `<div class="tf-table__cell-sub">${escapeHtml(error)}</div>` : '')
       + (j.status !== 'running' && bad.length ? `<div class="tf-table__cell-sub">${escapeHtml(bad.map(diskLineText).join(' · '))}</div>` : '');
   }
-  return `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub">${escapeHtml(errMessage(j.error))}</div>` : ''}`;
+  // A sharing job's steps that did not finish, each worded (wave 10).
+  const steps = STEP_JOB_KINDS.has(j.kind) && j.status !== 'running' && Array.isArray(j.disks)
+    ? j.disks.filter((d) => d.state !== 'done').map((d) => diskLineText(d, j.kind)) : [];
+  return `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub">${escapeHtml(errMessage(j.error))}</div>` : ''}${
+    steps.length ? `<div class="tf-table__cell-sub">${escapeHtml(steps.join(' · '))}</div>` : ''}`;
 }
 
 // The history table's task cell: the kind, and the subject under it.

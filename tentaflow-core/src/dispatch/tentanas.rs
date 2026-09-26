@@ -402,6 +402,13 @@ fn name_jobs(
                 }
             }
         }
+        // The steps of a sharing stop or resume (wave 10): shares, targets,
+        // the disable — each line named by its step.
+        if tentanas::sharing::is_step_kind(&job.kind) {
+            if let Some(db) = db {
+                job.disks = job_disk_lines(db, &job.job_id);
+            }
+        }
         if job.kind == "smart_test" {
             if let Some((name, last_known)) = smart_subject_name(&job.subject, |id| {
                 match db {
@@ -478,6 +485,17 @@ fn job_disk_lines(db: &DbPool, job_id: &str) -> Vec<tentaflow_protocol::tentanas
         .unwrap_or_default()
         .into_iter()
         .map(|row| {
+            // A step of the sharing stop or resume (wave 10): its name is the
+            // step's code, which the screen words.
+            if row.disk_id.starts_with("step:") {
+                return tentaflow_protocol::tentanas::NasJobDisk {
+                    name: row.name,
+                    last_known: false,
+                    state: row.state,
+                    progress_pct: row.progress_pct,
+                    reasons: row.reasons,
+                };
+            }
             let (name, last_known) = match tentanas::disks::shown_disk_name(db, &row.disk_id, None) {
                 tentanas::disks::ShownDiskName::Live(name) => (name, false),
                 tentanas::disks::ShownDiskName::LastKnown(name) => (name, true),
@@ -4146,6 +4164,11 @@ fn approvals_view(
         }
     }
     name_branch_paths(a.nas_db, approvals.iter_mut().map(|r| &mut r.detail));
+    // A stop parked in another organisation blocks this node too (R2-2): a
+    // platform admin sees it — stripped to the node — and may reject it.
+    if platform_admin(ctx) && gate_admin(ctx).is_ok() {
+        approvals.extend(tentanas::approvals::foreign_pending_stops(&a).map_err(|e| internal("approvals", e))?);
+    }
     Ok(tn(P::ApprovalsListResponse {
         approvals,
         settings: tentanas::approvals::settings(a.main_db, a.checker, a.org_id, a.addon_id),
@@ -4183,13 +4206,45 @@ async fn approval_decide(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_admin(ctx)?;
     if !approve {
-        tentanas::approvals::reject(&actor(ctx, &g)?, request_id, note).map_err(approval_error)?;
+        match tentanas::approvals::reject(&actor(ctx, &g)?, request_id, note) {
+            // Another organisation's stop blocks this node too: a platform
+            // admin may reject it (R2-2) — reject only, never release.
+            Err(tentanas::approvals::ApprovalError::NotFound) if platform_admin(ctx) => {
+                tentanas::approvals::reject_foreign_stop(&actor(ctx, &g)?, request_id, note).map_err(approval_error)?;
+            }
+            other => {
+                other.map_err(approval_error)?;
+            }
+        }
         return approvals_response(ctx, &g);
+    }
+    // A stop of the node's sharing is released only by a PLATFORM admin
+    // (wave 10) — refused BEFORE the claim, so the request stays pending for
+    // one who is, instead of closing as 'failed'. Another organisation's row
+    // is left to `claim`, which answers it like a missing one.
+    if sharing_stop_needs_platform_admin(ctx, &g, request_id) {
+        return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, SHARING_STOP_PLATFORM_ADMIN));
+    }
+    // And its AUTHOR must still be one, and still an admin of this
+    // organisation (critic wave 10, MINOR 2): a request whose author lost the
+    // role since it was parked is not carried out.
+    if sharing_stop_author_gone(ctx, &g, request_id) {
+        return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, SHARING_STOP_AUTHOR_GONE));
     }
     let row = tentanas::approvals::claim(&actor(ctx, &g)?, request_id).map_err(approval_error)?;
     let payload =
         tentanas::approvals::stored_payload(&row).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    let outcome = execute_approved(ctx, &payload, secret).await;
+    let outcome = match payload {
+        // The stop carries its request: the record and the audit say which
+        // request stopped sharing and who asked (MINOR 1).
+        P::SharingStopRequest {} => sharing_stop_run(ctx, secret, tentanas::sharing::StopContext {
+            request_id: row.approval.request_id.clone(),
+            requested_by: row.approval.requested_by.clone(),
+            approved_by: g.user_id.clone(),
+            org_id: g.org_id.clone(),
+        }),
+        payload => execute_approved(ctx, &payload, secret).await,
+    };
     let job_id = match &outcome {
         Ok(MessageBody::TentaNasBody(P::JobResponse { job })) => Some(job.job_id.clone()),
         _ => None,
@@ -4259,6 +4314,11 @@ async fn execute_approved(
         P::ConfigImportApplyRequest { json, .. } => {
             config_import_apply(ctx, json, secret, Origin::Approved).await
         }
+        // Released ONLY through `approval_decide`, which re-checks its author
+        // and hands it its request (R2-3): never replayed from here.
+        P::SharingStopRequest {} => Err(ProtocolError::bad_request(
+            "'SharingStopRequest' is released only through its own approval",
+        )),
         P::SnapshotProtectionReleaseRequest { snapshot, .. } => {
             let g = gate_destructive(ctx)?;
             let explicit = secret.map(token);
@@ -4271,6 +4331,143 @@ async fn execute_approved(
             variant_of(other)
         ))),
     }
+}
+
+// ----- stopping this node's sharing (n18d, wave 10) ---------------------------------
+
+/// The requester or the approver of a sharing stop is not a platform admin.
+const SHARING_STOP_PLATFORM_ADMIN: &str = "refusal:sharing_stop_platform_admin";
+/// No other platform admin of the organisation could release the request.
+const SHARING_STOP_NO_SECOND_ADMIN: &str = "refusal:sharing_stop_no_second_admin";
+/// A stop of this node's sharing already waits for its second admin, or runs,
+/// or sharing is stopped here — in any organisation.
+const SHARING_STOP_PENDING: &str = "refusal:sharing_stop_pending";
+/// A stop parked in ANOTHER organisation waits for approval on this node.
+const SHARING_STOP_PENDING_ELSEWHERE: &str = "refusal:sharing_stop_pending_elsewhere";
+/// The author of a parked stop is no longer a platform admin of this
+/// organisation.
+const SHARING_STOP_AUTHOR_GONE: &str = "refusal:sharing_stop_author_gone";
+/// A block target with a moved portal still serves on this node.
+const SHARING_STOP_FROZEN: &str = "refusal:sharing_stop_frozen_targets";
+
+/// Whether the caller holds the platform's account role `admin` — what the
+/// Applications screen's switch requires (`AddonToggleRequest` is
+/// `#[policy(Admin)]`). The org Admin role is not enough: the stop is the
+/// platform's disable, and it reaches every organisation's shares here.
+fn platform_admin(ctx: &HandlerContext) -> bool {
+    super::SessionAuthKind::Admin.session_satisfies(&ctx.session)
+}
+
+/// Whether the account `user_id` holds the platform role `admin`.
+fn platform_admin_account(ctx: &HandlerContext, user_id: &str) -> bool {
+    crate::db::repository::get_user_role(&ctx.state.db, user_id)
+        .ok()
+        .flatten()
+        .is_some_and(|(role, _)| role == "admin")
+}
+
+/// Whether `request_id` is a sharing stop of the caller's organisation that
+/// the caller, lacking the platform role, may not release.
+fn sharing_stop_needs_platform_admin(ctx: &HandlerContext, g: &Gate, request_id: &str) -> bool {
+    !platform_admin(ctx)
+        && store::approval(&g.db, request_id)
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.org_id == g.org_id && row.approval.operation == tentanas::approvals::OP_SHARING_STOP)
+}
+
+/// Whether `request_id` is a sharing stop of the caller's organisation whose
+/// author is no longer a platform admin, or no longer an approver (org Admin
+/// with `nas.admin`) of this organisation.
+fn sharing_stop_author_gone(ctx: &HandlerContext, g: &Gate, request_id: &str) -> bool {
+    let Some(row) = store::approval(&g.db, request_id).ok().flatten() else { return false };
+    if row.org_id != g.org_id || row.approval.operation != tentanas::approvals::OP_SHARING_STOP {
+        return false;
+    }
+    let author = &row.approval.requested_by;
+    let still_approver = actor(ctx, g)
+        .map(|a| tentanas::approvals::approver_ids(a.main_db, a.checker, a.org_id, a.addon_id).contains(author))
+        .unwrap_or(false);
+    !(platform_admin_account(ctx, author) && still_approver)
+}
+
+/// n18d "Wyłącz i zatrzymaj udostępnianie…": parks the stop of THIS node's
+/// sharing for a second platform admin, with what it stops by name. Always
+/// parked, whatever the four-eyes switch says — the owner's decision makes
+/// it a four-eyes request — and refused outright when nobody could release
+/// it, rather than parking a request that can only expire.
+fn sharing_stop(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let g = gate_admin(ctx)?;
+    if !platform_admin(ctx) {
+        return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, SHARING_STOP_PLATFORM_ADMIN));
+    }
+    let a = actor(ctx, &g)?;
+    let second = tentanas::approvals::approver_ids(a.main_db, a.checker, a.org_id, a.addon_id)
+        .into_iter()
+        .any(|id| id != g.user_id && platform_admin_account(ctx, &id));
+    if !second {
+        return Err(ProtocolError::new(ProtocolErrorCode::Conflict, SHARING_STOP_NO_SECOND_ADMIN));
+    }
+    // Per NODE (critic wave 10, M2): a stop parked by another
+    // organisation's admin, a stop or resume running, a node already stopped.
+    match tentanas::sharing::busy(&g.db, &g.org_id).map_err(|e| internal("sharing", e))? {
+        None => {}
+        // Said as such, never naming the organisation (R2-2): this node's
+        // platform admins see it in their approvals list and can reject it.
+        Some(tentanas::sharing::Busy::PendingElsewhere) => {
+            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, SHARING_STOP_PENDING_ELSEWHERE));
+        }
+        Some(_) => return Err(ProtocolError::new(ProtocolErrorCode::Conflict, SHARING_STOP_PENDING)),
+    }
+    // A frozen target cannot be put back by a rollback or the resume
+    // (critic M3): the stop is refused while one serves.
+    if !tentanas::targets::frozen_targets(&g.db).map_err(|e| internal("targets", e))?.is_empty() {
+        return Err(ProtocolError::new(ProtocolErrorCode::Conflict, SHARING_STOP_FROZEN));
+    }
+    let plan = tentanas::sharing::plan(&g.db, &g.org_id).map_err(|e| internal("sharing plan", e))?;
+    // The node by its NAME; a node without one is named by nobody (the
+    // screen then shows the operation alone) — never by its id.
+    let node = crate::dispatch::app_route::node_display_name(ctx, &ctx.state.local_node_id.to_string());
+    park(
+        ctx,
+        &g,
+        tentanas::approvals::OP_SHARING_STOP,
+        &node,
+        tentanas::sharing::stop_detail(&plan, &node),
+        &P::SharingStopRequest {},
+    )
+}
+
+/// The released stop: one job, shares → targets → disable, with the
+/// approver's password when the node has no unattended channel. The job
+/// belongs to the organisation that asked, and holds the node-wide share
+/// lock for its whole run (M2).
+fn sharing_stop_run(
+    ctx: &HandlerContext,
+    secret: Option<&SudoSecret>,
+    stop: tentanas::sharing::StopContext,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_admin(ctx)?;
+    if !platform_admin(ctx) {
+        return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, SHARING_STOP_PLATFORM_ADMIN));
+    }
+    let plan = tentanas::sharing::plan(&g.db, &g.org_id).map_err(|e| internal("sharing plan", e))?;
+    let ops = tentanas::sharing::NodeOps {
+        main_db: ctx.state.db.clone(),
+        db: g.db.clone(),
+        addon_id: g.addon_id.clone(),
+        explicit: secret.map(token),
+        cipher: None,
+    };
+    let db = g.db.clone();
+    let node = crate::dispatch::app_route::node_display_name(ctx, &ctx.state.local_node_id.to_string());
+    let owner = g.org_id.clone();
+    let job = tentanas::jobs::spawn_steps(&g.db, tentanas::sharing::STOP_KIND, &node, &g.user_id, Some(&owner), move |h| async move {
+        let _serial = tentanas::shares::apply_mutex().lock().await;
+        tentanas::sharing::run_stop(&db, &ops, &h, &stop, &plan).await
+    })
+    .map_err(|e| internal("sharing stop", e))?;
+    Ok(job_response(ctx, job))
 }
 
 // ----- Elastic Array (§5.3) ---------------------------------------------------------
@@ -6040,6 +6237,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ApprovalSettingsSetRequest { enabled, ttl_hours } => {
             approval_settings_set(ctx, *enabled, *ttl_hours)
         }
+        P::SharingStopRequest {} => sharing_stop(ctx),
         P::SnapshotProtectionReleaseRequest {
             snapshot,
             reason,
@@ -6522,6 +6720,7 @@ register_tentanas_variant!(
     "TentaNasElasticFolderCacheSetRequest",
     "tentaflow_ws_handler_nas_elastic_folder_cache_set"
 );
+register_tentanas_variant!("TentaNasSharingStopRequest", "tentaflow_ws_handler_nas_sharing_stop");
 
 #[cfg(test)]
 mod config_import_subject_tests {
@@ -9629,5 +9828,307 @@ mod registration_tests {
         let mut mine = branch("media");
         tentanas::disks::hide_other_org_array(&mut mine, &own_array_names(&g).unwrap());
         assert_eq!(mine, branch("media"));
+    }
+
+    // ----- wave 10: stopping this node's sharing (n18d) --------------------------------
+
+    /// The fixture's organisation made real (memberships need a row), with the
+    /// fixture's user and — when asked — a second user as org Admins holding
+    /// every TentaNas permission, each with the platform account role given.
+    /// Returns the second user's context (another session on the same node).
+    fn two_admins(fixture: &mut DispatchFixture, me_platform: bool, other_platform: bool) -> HandlerContext {
+        let db = fixture.ctx.state.db.clone();
+        let org = crate::services::org::create_organization(&db, "Acme", "acme-w10", None, None, None, None).unwrap();
+        let admin_role = crate::services::org::repo::list_roles(&db).unwrap()
+            .into_iter().find(|r| r.name == "org_admin").expect("the seeded org admin role").role_id;
+        let me = fixture.ctx.org_context.as_ref().unwrap().user_id.clone();
+        let other = uuid::Uuid::from_bytes([8u8; 16]).to_string();
+        db.write().unwrap().execute(
+            "INSERT INTO user_accounts (id, username, password_hash, is_active, must_change_password, role) \
+             VALUES (?1, 'second-admin', 'test', 1, 0, ?2)",
+            rusqlite::params![other, if other_platform { "admin" } else { "user" }],
+        ).unwrap();
+        db.write().unwrap().execute(
+            "UPDATE user_accounts SET role = ?2 WHERE id = ?1",
+            rusqlite::params![me, if me_platform { "admin" } else { "user" }],
+        ).unwrap();
+        {
+            let ctx = fixture.ctx.org_context.as_mut().unwrap();
+            ctx.org_id = org.org_id.clone();
+        }
+        elastic_admin(fixture);
+        for user in [&me, &other] {
+            crate::services::org::repo::add_membership(&db, &org.org_id, user, &admin_role, "test").unwrap();
+            for permission in [PERM_READ, PERM_ADMIN, PERM_POOLS] {
+                crate::dispatch::app_gate::test_support::set_permission(&fixture.ctx.state, &fixture.addon_id, "user", user, permission, "allow");
+            }
+        }
+        if let tentaflow_protocol::SessionAuth::UserSession { role, .. } = &mut fixture.ctx.session {
+            *role = Some(if me_platform { "admin" } else { "user" }.to_string());
+        }
+        let mut second = crate::dispatch::test_handler_context(
+            fixture.ctx.state.clone(),
+            Some(if other_platform { "admin" } else { "user" }),
+            Some(crate::services::rbac::OrgContext {
+                user_id: other.clone(),
+                org_id: org.org_id.clone(),
+                role_id: admin_role,
+                permissions: ["org.admin".to_string()].into_iter().collect(),
+            }),
+        );
+        second.session = tentaflow_protocol::SessionAuth::UserSession { user_id: [8u8; 16], role: Some(if other_platform { "admin" } else { "user" }.to_string()) };
+        second
+    }
+
+    fn stop_request() -> MessageBody {
+        tn(P::SharingStopRequest {})
+    }
+
+    fn refusal_of(response: &MessageBody) -> String {
+        match response {
+            MessageBody::Error(e) => e.message.clone(),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// n18d, through the real dispatcher: only a PLATFORM admin asks, and
+    /// only when another platform admin of the organisation could release
+    /// it. The parked request names the node and the caller's shares and
+    /// targets, counts another organisation's, stores no id as its subject,
+    /// and a second one for the same node is refused while it waits.
+    #[tokio::test]
+    async fn stopping_sharing_parks_for_a_second_platform_admin_with_the_names_it_stops() {
+        // Each fixture holds the storage-override lock: one at a time.
+        {
+            let mut fixture = dispatch_fixture();
+            let _second = two_admins(&mut fixture, false, false);
+            let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+            assert!(error);
+            assert_eq!(refusal_of(&response), SHARING_STOP_PLATFORM_ADMIN, "an org admin without the platform role");
+        }
+        {
+            let mut fixture = dispatch_fixture();
+            let _second = two_admins(&mut fixture, true, false);
+            let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+            assert!(error);
+            assert_eq!(refusal_of(&response), SHARING_STOP_NO_SECOND_ADMIN, "nobody else could release it");
+        }
+
+        let mut fixture = dispatch_fixture();
+        let _second = two_admins(&mut fixture, true, true);
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let share = |id: &str, name: &str, enabled: bool| store::ShareRow {
+            share_id: id.into(), name: name.into(), protocol: "smb".into(), source_path: format!("/tank/{name}"),
+            enabled, created_at: "now".into(), updated_at: "now".into(), ..Default::default()
+        };
+        store::upsert_share(&g.db, &g.org_id, &share("s1", "projekty", true)).unwrap();
+        store::upsert_share(&g.db, &g.org_id, &share("s2", "stare", false)).unwrap();
+        store::upsert_share(&g.db, "org-other", &share("s3", "kadry", true)).unwrap();
+        store::upsert_target(&g.db, &g.org_id, &store::TargetRow {
+            target_id: "t1".into(), name: "vm-store".into(), protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.local.tentaflow:vm-store".into(), enabled: true, auth_method: "none".into(),
+            created_at: "now".into(), updated_at: "now".into(), ..Default::default()
+        }).unwrap();
+        let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) = response else { panic!("parked") };
+        assert_eq!(approval.operation, tentanas::approvals::OP_SHARING_STOP);
+        let node = crate::dispatch::app_route::node_display_name(&fixture.ctx, &fixture.ctx.state.local_node_id.to_string());
+        assert_eq!(approval.subject, node, "the node by its name");
+        assert!(!approval.subject.contains(&fixture.ctx.state.local_node_id.to_string()), "never its id");
+        let reason = &approval.detail_reasons[0];
+        assert_eq!(reason.code, "sharing_stop");
+        assert_eq!(reason.params["shares"], "projekty", "the caller's enabled share, by name");
+        assert_eq!(reason.params["targets"], "vm-store");
+        assert_eq!(reason.params["other_shares"], "1", "another organisation's share, counted");
+        assert!(!approval.detail.contains("kadry") && reason.params.values().all(|v| !v.contains("kadry")));
+        let stored = store::approval(&g.db, &approval.request_id).unwrap().unwrap();
+        assert_eq!(stored.approval.status, "pending");
+        assert!(store::list_jobs(&g.db, 100).unwrap().is_empty(), "nothing ran");
+        assert!(!tentanas::sharing::suspended(&g.db).unwrap(), "nothing is stopped yet");
+
+        let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        assert!(error);
+        assert_eq!(refusal_of(&response), SHARING_STOP_PENDING, "one waiting stop per node");
+    }
+
+    /// The release: another org Admin WITHOUT the platform role is refused
+    /// before the claim (the request stays pending for one who has it); the
+    /// author cannot release their own; a second platform admin starts ONE
+    /// job, which runs for real (only the privilege channel is recorded, so
+    /// nothing reaches the host) and ends with TentaNas disabled and the
+    /// record naming the request. Its three step lines reach the screen
+    /// through the real job list (critic wave 10, M1, M5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_second_platform_admin_releases_a_sharing_stop_and_it_runs_as_three_steps() {
+        let mut fixture = dispatch_fixture();
+        let second = two_admins(&mut fixture, true, true);
+        let (response, _) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) = response else { panic!("parked") };
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let _channel = tentanas::broker::test_channel::install(&g.db);
+        let decide = |approve: bool| tn(P::ApprovalDecideRequest {
+            request_id: approval.request_id.clone(), approve, note: String::new(), sudo_password: None,
+        });
+
+        // The same second admin, seen without the platform role.
+        let mut org_only = crate::dispatch::test_handler_context(fixture.ctx.state.clone(), Some("user"), second.org_context.clone());
+        org_only.session = tentaflow_protocol::SessionAuth::UserSession { user_id: [8u8; 16], role: Some("user".into()) };
+        let (response, error) = crate::dispatch::dispatch(&decide(true), &org_only).await;
+        assert!(error);
+        assert_eq!(refusal_of(&response), SHARING_STOP_PLATFORM_ADMIN);
+        assert_eq!(store::approval(&g.db, &approval.request_id).unwrap().unwrap().approval.status, "pending", "still waiting");
+
+        let (response, error) = crate::dispatch::dispatch(&decide(true), &fixture.ctx).await;
+        assert!(error, "the author never releases their own: {response:?}");
+        assert_eq!(store::approval(&g.db, &approval.request_id).unwrap().unwrap().approval.status, "pending");
+
+        let (response, error) = crate::dispatch::dispatch(&decide(true), &second).await;
+        assert!(!error, "{response:?}");
+        let stored = store::approval(&g.db, &approval.request_id).unwrap().unwrap();
+        assert_eq!(stored.approval.status, "approved");
+        let job_id = stored.approval.decision_job_id.expect("the job it started");
+        let mut job = None;
+        for _ in 0..500 {
+            job = store::list_jobs(&g.db, 100).unwrap().into_iter().find(|j| j.job_id == job_id && j.status != "running");
+            if job.is_some() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let job = job.expect("the stop finished");
+        assert_eq!(job.kind, tentanas::sharing::STOP_KIND);
+        assert_eq!(job.status, "succeeded", "{:?}", job.error);
+        let record = tentanas::sharing::mark(&g.db).unwrap().expect("sharing stopped");
+        assert_eq!(record.request_id, approval.request_id, "the record names the request");
+        assert_eq!(record.phase, tentanas::sharing::PHASE_STOPPED);
+        assert_eq!(
+            crate::db::repository::get_addon_enabled(&fixture.ctx.state.db, &fixture.addon_id).unwrap(),
+            Some(false),
+            "TentaNas disabled"
+        );
+        // The job list reaches the screen through the real read path (the
+        // app enabled again so its API answers).
+        crate::db::repository::set_addon_enabled(&fixture.ctx.state.db, &fixture.addon_id, true).unwrap();
+        let (response, error) = crate::dispatch::dispatch(&tn(P::JobsListRequest { limit: 50 }), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::JobsListResponse { jobs }) = response else { panic!("a job list") };
+        let listed = jobs.iter().find(|j| j.job_id == job_id).expect("the stop is in the owner organisation's list");
+        let lines: Vec<(&str, &str)> = listed.disks.iter().map(|l| (l.name.as_str(), l.state.as_str())).collect();
+        assert_eq!(lines, vec![("shares", "done"), ("targets", "done"), ("disable", "done")]);
+        assert!(listed.disks.iter().all(|l| !l.last_known), "a step is not a remembered disk");
+    }
+
+    /// Critic wave 10, M2 and M3: a second stop is refused per NODE — also
+    /// when another organisation's admin parked the first — and a stop is
+    /// refused up front while a frozen target serves.
+    #[tokio::test]
+    async fn one_stop_per_node_and_none_while_a_target_is_frozen() {
+        let mut fixture = dispatch_fixture();
+        let _second = two_admins(&mut fixture, true, true);
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        // Another organisation's stop waits on this node.
+        let other = tentanas::approvals::Actor { org_id: "org-somebody-else", ..actor(&fixture.ctx, &g).unwrap() };
+        tentanas::approvals::park(&other, tentanas::approvals::OP_SHARING_STOP, "helios", "stops sharing", &P::SharingStopRequest {}).unwrap();
+        let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        assert!(error);
+        assert_eq!(
+            refusal_of(&response),
+            SHARING_STOP_PENDING_ELSEWHERE,
+            "the node is one, and the refusal says the waiting stop is another organisation's (R2-2)"
+        );
+        // A platform admin of THIS organisation sees it, stripped to the
+        // node, and may reject it — never release it.
+        let (response, error) = crate::dispatch::dispatch(&tn(P::ApprovalsListRequest { include_closed: false }), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::ApprovalsListResponse { approvals, .. }) = response else { panic!("a list") };
+        let foreign = approvals.iter().find(|p| p.operation == tentanas::approvals::OP_SHARING_STOP).expect("listed");
+        assert_eq!(foreign.detail_reasons[0].code, "sharing_stop_other_org");
+        assert_eq!(foreign.detail_reasons[0].params["node"], "helios");
+        assert!(foreign.requested_by.is_empty() && !foreign.detail.contains("org-somebody-else"), "nothing of the other organisation");
+        let request_id = foreign.request_id.clone();
+        let decide = |approve: bool| tn(P::ApprovalDecideRequest {
+            request_id: request_id.clone(), approve, note: String::new(), sudo_password: None,
+        });
+        let (_, error) = crate::dispatch::dispatch(&decide(true), &fixture.ctx).await;
+        assert!(error, "another organisation's stop is never released from here");
+        // An org admin without the platform role neither sees nor rejects it.
+        if let tentaflow_protocol::SessionAuth::UserSession { role, .. } = &mut fixture.ctx.session {
+            *role = Some("user".into());
+        }
+        let (response, _) = crate::dispatch::dispatch(&tn(P::ApprovalsListRequest { include_closed: false }), &fixture.ctx).await;
+        let MessageBody::TentaNasBody(P::ApprovalsListResponse { approvals, .. }) = response else { panic!("a list") };
+        assert!(approvals.iter().all(|p| p.request_id != request_id));
+        let (_, error) = crate::dispatch::dispatch(&decide(false), &fixture.ctx).await;
+        assert!(error);
+        assert_eq!(store::approval(&g.db, &request_id).unwrap().unwrap().approval.status, "pending");
+        if let tentaflow_protocol::SessionAuth::UserSession { role, .. } = &mut fixture.ctx.session {
+            *role = Some("admin".into());
+        }
+        let (response, error) = crate::dispatch::dispatch(&decide(false), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        assert_eq!(store::approval(&g.db, &request_id).unwrap().unwrap().approval.status, "rejected");
+        // A running stop job counts too.
+        let job = tentanas::jobs::spawn_steps(&g.db, tentanas::sharing::STOP_KIND, "helios", "u", None, |_h| async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(())
+        }).unwrap();
+        let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        assert!(error);
+        assert_eq!(refusal_of(&response), SHARING_STOP_PENDING, "a stop runs");
+        store::finish_job(&g.db, &job.job_id, "cancelled", None).unwrap();
+        tentanas::jobs::cancel(&job.job_id);
+        // A frozen target: its portal's interface does not hold its address.
+        store::upsert_target(&g.db, &g.org_id, &store::TargetRow {
+            target_id: "t-frozen".into(), name: "frozen".into(), protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.local.tentaflow:frozen".into(), enabled: true, auth_method: "none".into(),
+            portals: vec![tentaflow_protocol::tentanas::NasTargetPortal {
+                address: "203.0.113.77".into(), port: 3260, interface: "tfw10-none0".into(), ..Default::default()
+            }],
+            created_at: "now".into(), updated_at: "now".into(), ..Default::default()
+        }).unwrap();
+        let frozen = tentanas::targets::frozen_targets(&g.db).unwrap();
+        if frozen.is_empty() {
+            // Only a host with a kernel target can judge drift (the judgement
+            // asks `installed` first); the refusal itself is covered by
+            // `sharing::tests::the_stop_refuses_up_front_while_a_frozen_target_serves`.
+            return;
+        }
+        let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        assert!(error);
+        assert_eq!(refusal_of(&response), SHARING_STOP_FROZEN);
+    }
+
+    /// Critic wave 10, R2-3: a stop is released only through its own
+    /// approval (which re-checks its author) — a replay through
+    /// `execute_approved` is refused and starts nothing.
+    #[tokio::test]
+    async fn a_stop_is_never_replayed_outside_its_approval() {
+        let mut fixture = dispatch_fixture();
+        let _second = two_admins(&mut fixture, true, true);
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let refused = execute_approved(&fixture.ctx, &P::SharingStopRequest {}, None).await.expect_err("refused");
+        assert_eq!(refused.code, ProtocolErrorCode::BadRequest);
+        assert!(store::list_jobs(&g.db, 10).unwrap().is_empty(), "no stop job");
+        assert!(!tentanas::sharing::suspended(&g.db).unwrap());
+    }
+
+    /// Critic wave 10, MINOR 2: a stop whose author lost the platform role
+    /// after parking it is not carried out, and stays pending.
+    #[tokio::test]
+    async fn a_stop_whose_author_lost_the_platform_role_is_not_released() {
+        let mut fixture = dispatch_fixture();
+        let second = two_admins(&mut fixture, true, true);
+        let (response, _) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) = response else { panic!("parked") };
+        let me = fixture.ctx.org_context.as_ref().unwrap().user_id.clone();
+        fixture.ctx.state.db.write().unwrap()
+            .execute("UPDATE user_accounts SET role = 'user' WHERE id = ?1", rusqlite::params![me]).unwrap();
+        let (response, error) = crate::dispatch::dispatch(&tn(P::ApprovalDecideRequest {
+            request_id: approval.request_id.clone(), approve: true, note: String::new(), sudo_password: None,
+        }), &second).await;
+        assert!(error);
+        assert_eq!(refusal_of(&response), SHARING_STOP_AUTHOR_GONE);
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        assert_eq!(store::approval(&g.db, &approval.request_id).unwrap().unwrap().approval.status, "pending");
+        assert!(store::list_jobs(&g.db, 10).unwrap().is_empty(), "nothing ran");
     }
 }
