@@ -885,6 +885,7 @@ pub fn forget_alerts(db: &DbPool, target_id: &str) -> Result<()> {
         store::resolve_alert(db, &reconcile_alert_key(kind, target_id))?;
     }
     store::resolve_alert(db, &unresettable_alert_key(target_id))?;
+    store::resolve_alert(db, &rebuild_alert_key(target_id))?;
     Ok(())
 }
 
@@ -896,11 +897,21 @@ fn unresettable_alert_key(target_id: &str) -> String {
     format!("target:{target_id}:unresettable")
 }
 
-/// Raises that alert on the helper's coded refusal and closes it on the next
-/// apply of the target that went through. Raised AT ONCE, not after the
-/// sweep's three failures: a client the admin just excluded is still reading
-/// and writing the disk.
+/// The alert of a target whose open → allowlist switch needed a TPG rebuild
+/// (cached dynamic ACLs, measured on rig11) that stopped short with even the
+/// disable failed (`block::TPG_REBUILD_MAY_SERVE`, critic ACL-fix M-1): the old
+/// OPEN portal group may still accept any client behind an allowlist the
+/// screen already shows.
+fn rebuild_alert_key(target_id: &str) -> String {
+    format!("target:{target_id}:rebuild")
+}
+
+/// Raises the two alerts above on the helper's coded failures and closes
+/// them on the next apply of the target that went through. Raised AT ONCE,
+/// not after the sweep's three failures: a client the admin just excluded is
+/// still reading and writing the disk, or may log in again.
 pub(crate) fn note_unresettable(db: &DbPool, target: &TargetRow, error: Option<&str>) {
+    note_rebuild_failed(db, target, error);
     let key = unresettable_alert_key(&target.target_id);
     let outcome = match error {
         Some(e) if e.contains(block::UNRESETTABLE_SESSION) => store::raise_coded_alert(
@@ -915,6 +926,37 @@ pub(crate) fn note_unresettable(db: &DbPool, target: &TargetRow, error: Option<&
                 "the allowlist is written, but a client that is not on it is still logged in and the \
                  target's sessions could not be reset (the TPG enable toggle failed) — stop the target to \
                  cut every client off"
+                    .to_string(),
+            )
+            .param("target", &target.name),
+        )
+        .map(|_| ()),
+        Some(_) => Ok(()),
+        None => store::resolve_alert(db, &key),
+    };
+    if let Err(e) = outcome {
+        tracing::warn!("tentanas targets: alert {key} not written: {e}");
+    }
+}
+
+/// `tpg_rebuild_failed: not_disabled` → the critical alert. The `disabled`
+/// variant raises nothing here: logins are refused (measured), so it is an
+/// ordinary failed apply the sweep alerts on.
+fn note_rebuild_failed(db: &DbPool, target: &TargetRow, error: Option<&str>) {
+    let key = rebuild_alert_key(&target.target_id);
+    let outcome = match error {
+        Some(e) if e.contains(block::TPG_REBUILD_MAY_SERVE) => store::raise_coded_alert(
+            db,
+            &key,
+            "critical",
+            "target",
+            &target.name,
+            &store::AlertText::new(
+                "target_rebuild_not_disabled",
+                format!("Target {}: the old open target may still accept any client", target.name),
+                "the target was open and had to be rebuilt before its new allowlist could take effect; \
+                 the rebuild stopped short and the target could not even be disabled, so the allowlist \
+                 is NOT in force and any client may still log in — stop the target"
                     .to_string(),
             )
             .param("target", &target.name),
@@ -8277,5 +8319,46 @@ mod tests {
         channel.failing.lock().unwrap().clear();
         apply_one_now(&db, &cipher, &row, None).await.expect("applied");
         assert!(store::list_alerts(&db, true).expect("alerts").iter().all(|a| a.code != "target_session_not_reset"), "closed by the next apply");
+    }
+
+    /// Critic ACL-fix M-1: a rebuild of an open target that stopped short
+    /// with the disable failed may leave the OLD open TPG serving anyone
+    /// behind the allowlist on screen — the critical alert goes up AT ONCE.
+    /// A rebuild that did disable the target raises nothing here.
+    #[tokio::test]
+    async fn a_rebuild_that_may_leave_the_open_target_serving_raises_the_alert_at_once() {
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let db = memory_db();
+        let mut row = target("iscsi");
+        row.target_id = "t-rebuild".into();
+        row.auth_method = "none".into();
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let channel = super::super::broker::test_channel::install(&db);
+        let rebuild_alerts = |db: &DbPool| -> Vec<_> {
+            store::list_alerts(db, true).expect("alerts").into_iter()
+                .filter(|a| a.code == "target_rebuild_not_disabled").collect()
+        };
+        // Disabled: refused logins, no critical alert from this path.
+        channel.fail(
+            "iscsi_target_apply",
+            &format!("tentanas-helper: iscsi_target_apply: {}: iqn.x: the target was open …", block::TPG_REBUILD_DISABLED),
+        );
+        assert!(apply_one_now(&db, &cipher, &row, None).await.is_err(), "the apply fails");
+        assert!(rebuild_alerts(&db).is_empty(), "a disabled target is not serving");
+        // Not disabled: it may still serve openly.
+        channel.failing.lock().unwrap().clear();
+        channel.fail(
+            "iscsi_target_apply",
+            &format!("tentanas-helper: iscsi_target_apply: {}: iqn.x: the target was open …", block::TPG_REBUILD_MAY_SERVE),
+        );
+        assert!(apply_one_now(&db, &cipher, &row, None).await.is_err(), "the apply fails");
+        let open = rebuild_alerts(&db);
+        assert_eq!(open.len(), 1, "raised at once");
+        assert_eq!(open[0].severity, "critical");
+        assert_eq!(open[0].params.get("target").map(String::as_str), Some("vm-store"));
+        channel.failing.lock().unwrap().clear();
+        apply_one_now(&db, &cipher, &row, None).await.expect("applied");
+        assert!(rebuild_alerts(&db).is_empty(), "closed by the next apply");
     }
 }

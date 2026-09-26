@@ -890,7 +890,7 @@ mod tests {
         let result=spawn(&db,"elastic_create",&spec.name,"test",Some(ElasticJobIntent::Create(spec.clone())),None,move |_| async move {
             body_calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst); Ok(())
         });
-        assert!(result.unwrap_err().to_string().contains("usuwanie instancji"));
+        assert!(result.unwrap_err().to_string().starts_with("refusal:elastic_teardown_started "));
         tokio::task::yield_now().await;
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),0);
         assert!(store::list_jobs(&db,100).unwrap().is_empty());

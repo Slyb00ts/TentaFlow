@@ -6,7 +6,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, fmtAgo, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, wordReasons, nodeTextTitle, jobKindLabel } from '/js/modules/tentanas/format.js';
+import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, fmtAgo, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, errDetail, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, wordReasons, nodeTextTitle, jobKindLabel } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchKeyedList, paintStatCards, SLOT, slotEl, setClass } from '/js/lib/dom-patch.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, dangerRowHtml, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
@@ -1059,6 +1059,8 @@ export function openFolderCacheDialog(screen, array, folder, onDone) {
       btn.removeAttribute('disabled');
       const errEl = win.querySelector('#nas-folder-error');
       errEl.textContent = errMessage(err);
+      // The node's own sentence behind a coded refusal, ids scrubbed.
+      setAttr(errEl, 'title', errDetail(err));
       errEl.hidden = false;
     }
   });
@@ -1251,6 +1253,8 @@ export function openMoverScheduleEditor(screen, array, onDone) {
       btn.removeAttribute('disabled');
       const errEl = win.querySelector('#nas-mover-error');
       errEl.textContent = errMessage(err);
+      // The node's own sentence behind a coded refusal, ids scrubbed.
+      setAttr(errEl, 'title', errDetail(err));
       errEl.hidden = false;
     }
   });

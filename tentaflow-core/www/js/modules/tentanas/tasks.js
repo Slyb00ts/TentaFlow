@@ -10,7 +10,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
-  T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage,
+  T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage, errDetail, parseRefusal,
   jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, nodeTextTitle, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, setClass, patchHtml, patchKeyedList } from '/js/lib/dom-patch.js';
@@ -186,6 +186,13 @@ export function jobErrorText(j) {
   return errMessage(j.error);
 }
 
+/** The node's own sentence behind a coded job error (wave 13), as the
+ *  tooltip of the worded line; ids scrubbed. */
+function errorTitleAttr(j) {
+  const detail = j?.error ? errDetail(j.error) : '';
+  return detail ? ` title="${escapeAttr(detail)}"` : '';
+}
+
 /** The history's result words of a multi-disk job: "18/18 OK" (n15). */
 function batchResultLabel(j) {
   const disks = Array.isArray(j?.disks) ? j.disks : [];
@@ -235,6 +242,20 @@ const JOB_STATUSES = new Set(['queued', 'running', 'succeeded', 'done', 'failed'
 // The statuses a job never leaves: only these may be cached for good.
 const FINISHED_JOB_STATUSES = new Set(['succeeded', 'done', 'failed', 'cancelled']);
 
+// Why a slot did not start, for its tooltip. A node of wave 13 sends a coded
+// refusal as `lastReason` (`refusal:<code>?k=v`, the sentence in
+// `lastDetail`): worded here in the reader's language. A detail that is
+// itself a wire refusal (stored by a build between the two) is worded the
+// same way; any other sentence is the node's own, ids scrubbed.
+function startFailedTitle(reason, detail) {
+  if (parseRefusal(reason)) {
+    const words = errMessage(reason);
+    if (!parseRefusal(words)) return words;
+  }
+  if (parseRefusal(detail)) return errMessage(detail);
+  return nodeTextTitle(detail);
+}
+
 function structuredOutcome(row) {
   const reason = String(row.lastReason || '');
   const detail = String(row.lastDetail || '');
@@ -249,7 +270,7 @@ function structuredOutcome(row) {
       return { label: T('jobs.status_' + status), failed: false, skipped: false, title: '' };
     }
     case 'start_failed':
-      return { label: T('schedules.result_failed'), failed: true, skipped: false, title: nodeTextTitle(detail) };
+      return { label: T('schedules.result_failed'), failed: true, skipped: false, title: startFailedTitle(reason, detail) };
     case 'skipped': {
       const words = reason ? T('schedules.skip_' + reason) : '';
       if (reason && words !== 'tentanas.schedules.skip_' + reason) {
@@ -269,7 +290,7 @@ export function scheduleOutcome(row, statusOf = () => null) {
   if (!raw) return null;
   if (RESULT_WORDS.has(raw)) return { label: T('schedules.result_' + raw), failed: raw === 'failed', skipped: raw === 'skipped', title: '' };
   if (FAILED_TO_START.test(raw)) {
-    return { label: T('schedules.result_failed'), failed: true, skipped: false, title: nodeTextTitle(raw.replace(FAILED_TO_START, '')) };
+    return { label: T('schedules.result_failed'), failed: true, skipped: false, title: startFailedTitle('', raw.replace(FAILED_TO_START, '')) };
   }
   // The reason is the node's own sentence: it belongs in the tooltip, and
   // the row itself reads the translated word.
@@ -353,13 +374,13 @@ function historyResultHtml(j) {
     const bad = j.disks.filter((d) => d.state !== 'passed');
     const error = jobErrorText(j);
     return `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(j.status === 'running' ? T('jobs.status_running') : batchResultLabel(j))}"></tf-chip>`
-      + (error ? `<div class="tf-table__cell-sub">${escapeHtml(error)}</div>` : '')
+      + (error ? `<div class="tf-table__cell-sub"${errorTitleAttr(j)}>${escapeHtml(error)}</div>` : '')
       + (j.status !== 'running' && bad.length ? `<div class="tf-table__cell-sub">${escapeHtml(bad.map(diskLineText).join(' · '))}</div>` : '');
   }
   // A sharing job's steps that did not finish, each worded (wave 10).
   const steps = STEP_JOB_KINDS.has(j.kind) && j.status !== 'running' && Array.isArray(j.disks)
     ? j.disks.filter((d) => d.state !== 'done').map((d) => diskLineText(d, j.kind)) : [];
-  return `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub">${escapeHtml(errMessage(j.error))}</div>` : ''}${
+  return `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub"${errorTitleAttr(j)}>${escapeHtml(errMessage(j.error))}</div>` : ''}${
     steps.length ? `<div class="tf-table__cell-sub">${escapeHtml(steps.join(' · '))}</div>` : ''}`;
 }
 

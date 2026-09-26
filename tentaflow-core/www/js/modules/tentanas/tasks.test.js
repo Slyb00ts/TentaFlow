@@ -903,6 +903,32 @@ test('scheduleOutcome maps every stored shape and never returns a raw key', () =
   assert.equal(scheduleOutcome('the node wrote something new'), null, 'free text is not classified');
 });
 
+// Critic wave 13, MAJOR 1: a scheduled run the node refused IN CODE
+// (`elastic_operation_unresolved` on a busy array) has its tooltip worded in
+// the reader's language — never the raw `refusal:…` wire.
+test('a scheduled run refused in code is worded in the tooltip, never shown as the wire', () => {
+  const coded = scheduleOutcome({
+    lastOutcome: 'start_failed',
+    lastReason: 'refusal:elastic_disk_in_array?data=2&array=media',
+    lastDetail: 'Data disk no. 2 is already in the array media',
+  });
+  assert.equal(coded.label, 'błąd');
+  assert.equal(coded.title, 'Dysk danych nr 2 jest już w macierzy media');
+  // A detail that is itself the wire (stored before the code had its own
+  // field) and the older `failed to start:` sentence are worded too.
+  const wire = 'refusal:elastic_operation_unresolved The array has an unresolved operation; resolve it before starting another';
+  for (const outcome of [
+    scheduleOutcome({ lastOutcome: 'start_failed', lastDetail: wire }),
+    scheduleOutcome(`failed to start: ${wire}`),
+  ]) {
+    assert.equal(outcome.title, 'Macierz ma nierozstrzygniętą operację — rozwiąż ją, zanim zaczniesz następną');
+  }
+  // A code this build cannot word leaves the node's sentence, never the code.
+  const unknown = scheduleOutcome({ lastOutcome: 'start_failed', lastReason: 'refusal:quota_exceeded?n=3', lastDetail: 'Over the quota' });
+  assert.equal(unknown.title, 'Over the quota');
+  for (const o of [coded, unknown]) assert.doesNotMatch(o.title, /refusal:/);
+});
+
 // n15 (critic-round2-wave2 MINOR 9): the scheduler stores `pominięto: <why>`
 // when it declines a Sync slot because parity errors await a repair
 // (`elastic::scheduled_sync_blocker`). That is neither a run nor a failure,

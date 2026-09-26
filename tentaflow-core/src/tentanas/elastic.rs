@@ -60,6 +60,7 @@ use tentanas_helper::HelperCommand;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
 use super::{db as store, jobs, CodedText};
+use super::refusal::{DiskWords, Refusal};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// The machine kind of §5.3, next to a ZFS pool's `zfs`. The SPEC fixes the
@@ -3496,33 +3497,56 @@ fn parity_errors_in_window(
 /// WITHDRAWN (round 4), so the honest answer is to say what has to happen first
 /// rather than to offer a button whose only possible outcome is
 /// `precondition_failed` from the helper's own guard.
-pub fn repair_blocker(array: &NasElasticArray) -> Option<String> {
+pub fn repair_blocker(array: &NasElasticArray) -> Option<Refusal> {
     // The helper's recorded cause first: a repair is admitted over a parity
     // fault, never over an unfinished add or a cause only a Restore
     // addresses (`maintenance_admission`), and a button it then refuses
     // reads to an admin as a fault.
+    let refuse = |code, text: String| Refusal::not_available(code, text).param("array", &array.name);
     match array.attention.as_str() {
         "add_disk" => {
-            return Some("macierz ma niedokończone dodawanie dysku: najpierw je dokończ albo wycofaj".into())
+            return Some(refuse(
+                "elastic_repair_add_unfinished",
+                "The array has an unfinished disk add: finish or undo it first".into(),
+            ))
         }
-        "other" => return Some("macierz wymaga przywrócenia: najpierw uruchom Przywróć".into()),
+        "other" => {
+            return Some(refuse(
+                "elastic_repair_needs_restore",
+                "The array needs a Restore first".into(),
+            ))
+        }
         _ => (),
     }
     for member in &array.data_disks {
         // Named as the screen names it — `sdg`, or the member's part in the
         // array when the inventory lost it — never by the slot key.
-        let shown = member_label(&member.name, &member.disk_name);
+        let words = DiskWords::member(&member.name, &member.disk_name);
         if member.device_present == Some(false) {
-            return Some(format!(
-                "dysk '{shown}' nie jest widoczny na tym nodzie: podłącz go ponownie, \
-                 bo naprawa z parity zapisuje właśnie ten dysk"
-            ));
+            return Some(
+                refuse(
+                    "elastic_repair_disk_absent",
+                    format!(
+                        "{} is not visible on this node: connect it again, because a repair from parity \
+                         writes exactly that disk",
+                        words.english()
+                    ),
+                )
+                .disk(words),
+            );
         }
         if member.mounted == Some(false) {
-            return Some(format!(
-                "dysk '{shown}' nie jest zamontowany: odtwórz montowania macierzy, \
-                 bo naprawa zapisałaby katalog brancha na systemie plików noda"
-            ));
+            return Some(
+                refuse(
+                    "elastic_repair_disk_unmounted",
+                    format!(
+                        "{} is not mounted: restore the array's mounts, because a repair would write the \
+                         branch directory onto the node's own filesystem",
+                        words.english()
+                    ),
+                )
+                .disk(words),
+            );
         }
     }
     None
@@ -4008,35 +4032,6 @@ fn member_names(spec: &ElasticCreateSpec) -> Vec<(NasElasticImportMember, &Elast
         .collect()
 }
 
-/// A member as a node-side refusal names it: its kernel name when this node
-/// has the disk, otherwise its part in the array ("dysk danych 2").
-///
-/// Only `repair_blocker` still needs it, for a refusal the node itself
-/// returns (the server-text class tracked in the backlog). Anything the
-/// SCREEN shows is worded on the front end from structured data — the detail
-/// screen's own `repairBlocker` and the import dialog both use
-/// `memberName` in `elastic-detail.js` — so this is not a second source of
-/// on-screen member names.
-///
-/// Never the `disk_id` (`wwn-…`, `sn-…`) and never the bare slot: both are
-/// keys, and the owner's rule is that a disk is named the way the admin sees
-/// it on the Disks tab.
-pub(crate) fn member_label(slot: &str, disk_name: &str) -> String {
-    if !disk_name.is_empty() {
-        return disk_name.to_string();
-    }
-    if let Some(n) = slot.strip_prefix("parity") {
-        return format!("dysk parity {n}");
-    }
-    if slot.starts_with('c') {
-        return "dysk cache".to_string();
-    }
-    if let Some(n) = slot.strip_prefix('d') {
-        return format!("dysk danych {n}");
-    }
-    slot.to_string()
-}
-
 /// Whose journal this is, as a CODE the front end turns into a sentence
 /// (`tentanas.owner_kind.*`). The node never sends the sentence itself: it
 /// would be Polish in every locale.
@@ -4277,39 +4272,62 @@ pub fn import_selection<'a>(
     let candidate = candidates
         .iter()
         .find(|candidate| candidate.array_id == array_id)
-        .ok_or_else(|| anyhow!("Node nie widzi już dziennika tej macierzy; powtórz skanowanie"))?;
-    // The same sentence every other retype-to-confirm path in this module
-    // answers with, so one typo reads the same wherever it happens.
-    ensure!(
-        candidate.name == confirm_name,
-        "the typed confirmation does not match the name"
-    );
+        .ok_or_else(journal_gone)?;
+    // The same refusal every other retype-to-confirm path answers with, so
+    // one typo reads the same wherever it happens.
+    super::refusal::require(candidate.name == confirm_name, confirm_mismatch)?;
     match candidate.status.as_str() {
         "importable" => Ok(candidate),
-        "already_known" => Err(anyhow!("Ta macierz jest już zapisana w tej instancji")),
+        "already_known" => Err(store::elastic_already_adopted().into()),
         // Counts, and the one name that is a name: a REUSED member is here
         // under a kernel name. A missing member's part in the array is
         // words, and the dialog already lists it in the admin's language
         // from the scan's structured members.
-        _ => Err(anyhow!(
-            "Macierz niekompletna: {} z {} dysków potwierdziło UUID z dziennika (brakuje: {}; użyte ponownie: {})",
-            candidate.disks_matched,
-            candidate.disks_matched as usize + candidate.disks_missing.len() + candidate.disks_reused.len(),
-            candidate.disks_missing.len(),
-            if candidate.disks_reused.is_empty() {
-                "—".to_string()
-            } else {
-                candidate.disks_reused.iter().map(|m| m.disk_name.as_str()).collect::<Vec<_>>().join(", ")
-            },
-        )),
+        _ => {
+            let total =
+                candidate.disks_matched as usize + candidate.disks_missing.len() + candidate.disks_reused.len();
+            let reused = candidate
+                .disks_reused
+                .iter()
+                .map(|m| m.disk_name.as_str())
+                .filter(|name| !name.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(Refusal::conflict(
+                "elastic_import_incomplete",
+                format!(
+                    "The array is incomplete: {} of {total} disks confirmed the UUID its journal recorded \
+                     (missing: {}; reused: {})",
+                    candidate.disks_matched,
+                    candidate.disks_missing.len(),
+                    if reused.is_empty() { "none" } else { reused.as_str() },
+                ),
+            )
+            .param("matched", candidate.disks_matched)
+            .param("total", total)
+            .param("missing", candidate.disks_missing.len())
+            .param("reused", reused)
+            .into())
+        }
     }
+}
+
+/// The journal the request names is not in this node's scan (any more).
+fn journal_gone() -> Refusal {
+    Refusal::not_found("elastic_journal_gone", "This node no longer sees the array's journal; scan again")
+}
+
+/// A retyped name that is not the name: the one refusal every
+/// retype-to-confirm request answers a typo with.
+pub fn confirm_mismatch() -> Refusal {
+    Refusal::bad_request("confirm_mismatch", "the typed confirmation does not match the name")
 }
 
 /// The helper's refusal line, bounded. The broker already caps stderr, and a
 /// refusal is one sentence; this keeps a runaway one out of a dialog.
 fn helper_detail(stderr: &str) -> String {
     let text: String = stderr.trim().lines().next().unwrap_or_default().chars().take(200).collect();
-    if text.is_empty() { "brak opisu z helpera".to_string() } else { text }
+    if text.is_empty() { "the helper gave no reason".to_string() } else { text }
 }
 
 /// The journals of every owner on this node. Privileged even though it reads
@@ -4329,12 +4347,12 @@ pub async fn journals(
     // The helper's own one-line refusal is the only thing that can say WHY a
     // journal could not be read (a corrupt file, a foreign mode), so it
     // travels with the error instead of being replaced by it.
-    ensure!(
-        out.success() && out.stdout.len() < 512 * 1024,
-        "Nie można odczytać dzienników macierzy (kod {}): {}",
-        out.code,
-        helper_detail(&out.stderr)
-    );
+    super::refusal::require(out.success() && out.stdout.len() < 512 * 1024, || {
+        Refusal::not_available(
+            "elastic_journals_unreadable",
+            format!("The array journals cannot be read (code {}): {}", out.code, helper_detail(&out.stderr)),
+        )
+    })?;
     let result: ElasticJournalsResult = serde_json::from_str(&out.stdout)?;
     for entry in &result.arrays {
         entry.spec.validate()?;
@@ -4408,7 +4426,7 @@ pub async fn import_apply(
         .iter()
         .find(|entry| entry.spec.array_id == array_id)
         .map(|entry| entry.spec.owner.clone())
-        .ok_or_else(|| anyhow!("Node nie widzi już dziennika tej macierzy; powtórz skanowanie"))?;
+        .ok_or_else(journal_gone)?;
     let name = candidate.name.clone();
     let (out, _) = super::broker::run_privileged(
         db,
@@ -4420,18 +4438,25 @@ pub async fn import_apply(
         Duration::from_secs(60),
     )
     .await?;
-    ensure!(
-        out.success() && out.stdout.len() < 64 * 1024,
-        "Nie można przejąć dziennika macierzy (kod {}): {}",
-        out.code,
-        helper_detail(&out.stderr)
-    );
+    super::refusal::require(out.success() && out.stdout.len() < 64 * 1024, || {
+        Refusal::not_available(
+            "elastic_adopt_failed",
+            format!("The array journal cannot be taken over (code {}): {}", out.code, helper_detail(&out.stderr)),
+        )
+        .param("array", &name)
+    })?;
     let spec: ElasticCreateSpec = serde_json::from_str(&out.stdout)?;
     spec.validate()?;
-    ensure!(
+    super::refusal::require(
         spec.owner == *owner && spec.array_id == array_id && spec.name == name,
-        "Helper zwrócił niezgodną specyfikację przejmowanej macierzy"
-    );
+        || {
+            Refusal::conflict(
+                "elastic_adopt_mismatch",
+                "The helper answered the adoption with another array's specification; nothing was recorded",
+            )
+            .param("array", &name)
+        },
+    )?;
     store::elastic_import(db, &spec, started_by)?;
     // The audit of WHO the array was taken from. Ids are an operator's
     // business, so they go where the operator reads — the node's log — and
@@ -6508,14 +6533,17 @@ pub(crate) mod tests {
         // its part in the array — never the slot key `d1`.
         let mut absent = observed_array();
         absent.data_disks[0].device_present = Some(false);
-        assert!(repair_blocker(&absent).is_some_and(|why| why.contains("dysk danych 1")
-            && !why.contains("'d1'") && why.contains("podłącz")));
+        let why = repair_blocker(&absent).expect("an absent member blocks the repair").wire();
+        assert!(
+            why.starts_with("refusal:elastic_repair_disk_absent?array=media&data=1 ") && !why.contains("d1"),
+            "{why}"
+        );
 
         let mut cold = observed_array();
         cold.data_disks[0].mounted = Some(false);
         cold.data_disks[0].disk_name = "sdg".into();
-        assert!(repair_blocker(&cold).is_some_and(|why| why.contains("'sdg'")
-            && why.contains("odtwórz montowania")));
+        let why = repair_blocker(&cold).expect("an unmounted member blocks the repair").wire();
+        assert!(why.starts_with("refusal:elastic_repair_disk_unmounted?array=media&disk=sdg "), "{why}");
 
         // Both are tri-states and only `Some(false)` counts: `None` is
         // "nothing looked", the state of every array on a node whose disks
@@ -11413,7 +11441,13 @@ pub(crate) mod tests {
         let refusal = import_selection(&candidates, &candidate.array_id, "media")
             .expect_err("a changed UUID must refuse")
             .to_string();
-        assert!(refusal.contains("2 z 3") && refusal.contains(&disks[0].name), "{refusal}");
+        assert!(
+            refusal.starts_with(&format!(
+                "refusal:elastic_import_incomplete?matched=2&total=3&missing=0&reused={} ",
+                disks[0].name
+            )),
+            "{refusal}"
+        );
         assert!(!refusal.contains("media-data"), "no disk id in the refusal: {refusal}");
 
         // And the same disk present with NO readable signature at all is not
@@ -11537,14 +11571,14 @@ pub(crate) mod tests {
         let typo = import_selection(&candidates, &entry.spec.array_id, "Media")
             .expect_err("the retyped name must match exactly")
             .to_string();
-        assert_eq!(typo, "the typed confirmation does not match the name");
+        assert_eq!(typo, "refusal:confirm_mismatch The typed confirmation does not match the name");
 
         // Nothing is adopted on a name alone: the array is addressed by id,
         // and an id the fresh scan does not carry is gone.
         let vanished = import_selection(&candidates, "11111111-1111-4111-8111-111111111111", "media")
             .expect_err("an array with no journal cannot be adopted")
             .to_string();
-        assert!(vanished.contains("nie widzi już dziennika"), "{vanished}");
+        assert!(vanished.starts_with("refusal:elastic_journal_gone "), "{vanished}");
     }
 
     #[test]
@@ -11650,7 +11684,7 @@ pub(crate) mod tests {
         assert!(!wire.contains("\"media\"") && !wire.contains(&entry.spec.array_id), "the name is never sent: {wire}");
 
         let refusal = import_selection(&candidates, &entry.spec.array_id, "media").unwrap_err().to_string();
-        assert!(refusal.contains("nie widzi już dziennika"), "refused like a journal that is not there: {refusal}");
+        assert!(refusal.starts_with("refusal:elastic_journal_gone "), "refused like a journal that is not there: {refusal}");
         assert!(!refusal.contains("media"), "{refusal}");
     }
 
@@ -11668,14 +11702,6 @@ pub(crate) mod tests {
         assert_eq!(candidates[0].owner_kind, OWNER_KIND_OTHER_INSTALLATION);
         assert_eq!((candidates[0].owner_org_id.as_str(), candidates[0].owner_addon_id.as_str()), ("", ""));
         assert!(import_selection(&candidates, &entry.spec.array_id, "media").is_ok());
-    }
-
-    #[test]
-    fn a_member_is_named_by_its_kernel_name_or_by_its_part_in_the_array() {
-        assert_eq!(member_label("d2", "sdh"), "sdh");
-        assert_eq!(member_label("d2", ""), "dysk danych 2");
-        assert_eq!(member_label("c1", ""), "dysk cache");
-        assert_eq!(member_label("parity1", ""), "dysk parity 1");
     }
 
     #[test]

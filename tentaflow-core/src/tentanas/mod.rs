@@ -21,6 +21,7 @@
 //   forward       the alert pipeline and the access log leaving the node
 //   pools         zpool list/status/iostat, health, the layout wizard
 //   rdma          the node's RDMA devices and whether NFS may use them
+//   refusal       a refusal the admin reads: a code with parameters on the wire
 //   ksmbd         the second SMB backend: SMB Direct on RDMA interfaces only
 //   datasets      zfs list/get for filesystems, zvols and their properties
 //   snapshots     snapshot list, GFS retention, the automatic snapshot job
@@ -61,6 +62,7 @@ pub mod ksmbd;
 pub mod log_ids;
 pub mod pools;
 pub mod rdma;
+pub mod refusal;
 pub mod scheduler;
 pub mod shares;
 pub mod sharing;

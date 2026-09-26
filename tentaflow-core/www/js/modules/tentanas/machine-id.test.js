@@ -108,6 +108,18 @@ test('empty, null and whitespace-only values are not ids under either rule', () 
 // Wave-4 round-2 critic minor 4: the "Treść węzła" section shows a node's
 // own text, and nothing makes that text name things by name. `scrubIds`
 // takes the ids out of it and leaves every name and number a reader needs.
+// Critic wave 13, MINOR 4: an identity NAMED in prose — the Elastic plan's
+// "same device" refusal says "WWN 0x…" / "serial …" — is an id whatever its
+// shape; the words around it stay.
+test('scrubIds hides a WWN or a serial the text names as such', () => {
+  const text = 'sdb and sdc are the same device (WWN 0x5000c500a1b2c3d4); sdd repeats serial WD-WCC4E1234567, numer seryjny ZA1B2C3D';
+  const out = scrubIds(text, '[id]');
+  assert.equal(out, 'sdb and sdc are the same device (WWN [id]); sdd repeats serial [id], numer seryjny [id]');
+  // A sentence that only MENTIONS the words keeps them.
+  const mention = 'reserved by its WWN or serial number (serial numbers differ)';
+  assert.equal(scrubIds(mention, '[id]'), mention);
+});
+
 test('scrubIds replaces the ids in a node\'s free text and keeps the names', () => {
   const P = '[id]';
   const uuid = '0191f2c0-4b1e-7c3a-9f2d-8ac41b5e9d70';

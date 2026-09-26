@@ -1114,30 +1114,10 @@ fn iscsi_target_apply(payload: &[u8]) -> Result<String, String> {
     let spec: block::IscsiTargetSpec =
         serde_json::from_slice(payload).map_err(|e| format!("iSCSI target spec: {e}"))?;
     require_configfs(block::TARGET_CONFIGFS)?;
-    // Observed HERE, not by the core: between a preview and this apply another
-    // request may have changed what the kernel holds, and a plan built for the
-    // wrong state either writes an attribute LIO refuses or removes an object
-    // somebody else just created.
-    let observed = block::observe_iscsi(Path::new(block::TARGET_CONFIGFS), &spec);
-    let plan = block::plan_iscsi(&spec, &observed).map_err(|e| e.to_string())?;
-    // The warnings are the credential-mode check (see `protect_attr`). They go
-    // into the job log ABOVE the summary line, because a key that stayed
-    // world-readable is the one thing about this apply an admin has to act on.
-    let warnings = block::apply_plan(&plan)?;
-    // The post-condition of an allowlist (MAJOR 27 F3): no excluded client is
-    // still logged in. Re-read AFTER the plan, and the TPG toggled when one
-    // is — see `block::enforce_allowlist`. Only a failed toggle fails the apply.
-    let enforced = block::enforce_allowlist(Path::new(block::TARGET_CONFIGFS), &spec)?;
-    // The rendered plan goes into the job log — `render` is the only rendering
-    // there is and it prints `***` for every secret.
-    Ok(format!(
-        "{}\n{}{}iSCSI target {} applied ({} configfs steps)",
-        block::render(&plan).trim_end(),
-        warnings.iter().map(|w| format!("{w}\n")).collect::<String>(),
-        enforced.map(|line| format!("{line}\n")).unwrap_or_default(),
-        spec.iqn,
-        block::kernel_step_count(&plan)
-    ))
+    // Observe, plan, rebuild an open TPG that gets an allowlist, apply, and
+    // check the allowlist's post-condition — see `block::execute_iscsi_apply`,
+    // where the sequence lives so it can run against a fake configfs.
+    block::execute_iscsi_apply(Path::new(block::TARGET_CONFIGFS), &spec)
 }
 
 /// "Rozłącz" for one allowlisted initiator: drop its ACL, re-create it at

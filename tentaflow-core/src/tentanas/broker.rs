@@ -455,6 +455,29 @@ fn is_elastic(command: &HelperCommand) -> bool {
         .is_some_and(|label| label.starts_with("elastic_"))
 }
 
+/// Whether this command WRITES an iSCSI or NVMe-oF target's allowlist or
+/// sessions — the commands whose behaviour a security fix changes inside the
+/// helper (0.17.1: an open TPG getting an allowlist is rebuilt, or the ACLs
+/// LIO cached for its former clients keep letting them in). An older helper
+/// accepts them and silently leaves that hole open, so they are gated like
+/// the Elastic operations (critic ACL-fix).
+///
+/// NOT the removals (`iscsi_target_remove`, `nvmet_subsystem_remove`): the
+/// delete path drops the row before it calls the helper, so a refused
+/// removal would leave a live export the app no longer knows about — and an
+/// older helper removes a target the same way. NOT the session read either.
+fn is_target_write(command: &HelperCommand) -> bool {
+    matches!(
+        command.builtin_label(),
+        Some("iscsi_target_apply" | "iscsi_session_reset" | "nvmet_subsystem_apply")
+    )
+}
+
+/// The commands that never reach a helper of another build.
+fn is_version_gated(command: &HelperCommand) -> bool {
+    is_elastic(command) || is_target_write(command)
+}
+
 /// The gate itself, over the version the probe read (`None` = unknown).
 ///
 /// UNKNOWN REFUSES, and that is the point of the third arm: a probe that fails
@@ -463,7 +486,7 @@ fn is_elastic(command: &HelperCommand) -> bool {
 /// where running it blind is worst. An older helper is refused for the same
 /// reason as a newer one: neither speaks this core's sequence.
 fn version_gate(command: &HelperCommand, installed: Option<&str>) -> Result<(), BrokerError> {
-    if !is_elastic(command) {
+    if !is_version_gated(command) {
         return Ok(());
     }
     let expected = tentanas_helper::VERSION;
@@ -514,7 +537,7 @@ async fn through_helper(
     // automatic mover, the startup restores and the privileged reads that are
     // not jobs at all (the cache and age probes). A check at the job-spawn
     // boundary would have missed the last of those.
-    if is_elastic(command) {
+    if is_version_gated(command) {
         version_gate(command, installed_version(helper).await.as_deref())?;
     }
     let mut cmd = Command::new("sudo");
@@ -654,6 +677,36 @@ mod tests {
         assert!(!is_elastic(&share));
         for installed in [Some(tentanas_helper::VERSION), Some("0.12.0"), None] {
             version_gate(&share, installed).expect("a share writer is not gated");
+        }
+    }
+
+    /// The target writes are gated too (critic ACL-fix): an older helper
+    /// would accept `iscsi_target_apply` and leave the cached-dynamic-ACL hole
+    /// open without a word. The removals and the session read are not.
+    #[test]
+    fn the_version_gate_covers_the_target_writes_but_not_the_removals() {
+        let gated = [
+            HelperCommand::IscsiTargetApply {},
+            HelperCommand::IscsiSessionReset { initiator: "iqn.1994-05.com.redhat:vmhost-01".into() },
+            HelperCommand::NvmetSubsystemApply {},
+        ];
+        for command in &gated {
+            assert!(is_version_gated(command), "{:?}", command.builtin_label());
+            version_gate(command, Some(tentanas_helper::VERSION)).expect("the matching helper runs");
+            for installed in [Some("0.17.0"), None] {
+                let refused = version_gate(command, installed).expect_err("an older or unknown helper is refused");
+                let BrokerError::HelperVersion(why) = &refused else { panic!("{refused:?}") };
+                assert!(why.contains(HELPER_VERSION_MARKER), "{why}");
+            }
+        }
+        let free = [
+            HelperCommand::IscsiTargetRemove { iqn: "iqn.2026-09.local.tentaflow:helios.vm-store".into() },
+            HelperCommand::NvmetSubsystemRemove { nqn: "nqn.2026-09.local.tentaflow:helios.scratch".into() },
+            HelperCommand::NvmetSessionsRead {},
+        ];
+        for command in &free {
+            assert!(!is_version_gated(command), "{:?}", command.builtin_label());
+            version_gate(command, Some("0.17.0")).expect("a removal is never refused");
         }
     }
 

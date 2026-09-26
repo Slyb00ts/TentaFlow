@@ -712,6 +712,11 @@ const ALERT_WORDS = new Map([
     const t = textParams(p, ['target']);
     return t ? { title: T('alerts.code.target_session_not_reset.title', t), detail: T('alerts.code.target_session_not_reset.detail') } : null;
   }],
+  // Helper 0.17.1: an open target's rebuild stopped short and could not even disable it.
+  ['target_rebuild_not_disabled', (p) => {
+    const t = textParams(p, ['target']);
+    return t ? { title: T('alerts.code.target_rebuild_not_disabled.title', t), detail: T('alerts.code.target_rebuild_not_disabled.detail') } : null;
+  }],
   ['elevation_unarmed', () => ({ title: T('alerts.code.elevation_unarmed.title'), detail: T('alerts.code.elevation_unarmed.detail') })],
   // Raised by tentanas/sharing.rs (wave 10): the resume of a node's sharing.
   ['sharing_resume_failed', (p) => {
@@ -894,11 +899,23 @@ export function nodeTextTitle(text) {
 // from `refusal.<code>`; a code this build has no words for is shown as the
 // node sent it — truthful, if not pretty — rather than dropped.
 //
+// Wave 13 (`tentanas/refusal.rs`) lets the code carry PARAMETERS and the
+// node's own English sentence:
+//
+//     refusal:<code>[?<key>=<value>[&…]][ <sentence>]
+//
+// The values are percent-encoded, so the code-and-parameters token ends at
+// the first space; the sentence is only ever a tooltip or a detail
+// (`errDetail`), ids scrubbed. A disk comes as ONE of `disk` (kernel name),
+// `data` / `parity` (its 1-based number in the array), `cache` or `model`,
+// and the words always see it as one `{disk}` phrase (`refusalDiskWords`).
+// Parameters never carry an id, and each value is scrubbed anyway.
+//
 // What a screen catches is not the node's message alone: `binary-ws-client.js`
 // rejects every error reply as `protocol error <Code>: <message>` (the same
 // wrapping `describeError` in agent-accounts.js strips), so the code is looked
 // for after that prefix.
-const REFUSAL = /^refusal:([a-z0-9_]+)$/;
+const REFUSAL = /^refusal:([a-z0-9_]+)(?:\?(\S*))?(?: ([\s\S]*))?$/;
 const WIRE_ERROR_PREFIX = /^protocol error ([A-Za-z]+):\s*/;
 
 // The wire enum of a failed call (`ProtocolErrorCode`: 'NotFound',
@@ -915,6 +932,82 @@ export function errCode(e) {
 // the screen, a toast included.
 const HEX_ID = /[0-9a-f]{32,}/gi;
 
+function scrubText(text, nameOf = () => '') {
+  const hidden = T('alerts.id_hidden');
+  return scrubIds(wordIdTokens(String(text || '')), hidden, nameOf).replace(HEX_ID, (id) => String(nameOf(id) || '').trim() || hidden);
+}
+
+/** The coded refusal an error carries — `{ code, params, text }` — or null. */
+export function parseRefusal(e) {
+  const message = (e && e.message) ? e.message : String(e ?? '');
+  const m = REFUSAL.exec(message.trim().replace(WIRE_ERROR_PREFIX, ''));
+  if (!m) return null;
+  const params = {};
+  for (const pair of String(m[2] || '').split('&')) {
+    if (!pair) continue;
+    const at = pair.indexOf('=');
+    const key = at < 0 ? pair : pair.slice(0, at);
+    let value = at < 0 ? '' : pair.slice(at + 1);
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      // A value that does not decode is not read at all: the words that need
+      // it fall back to the node's sentence.
+      continue;
+    }
+    if (/^[a-z0-9_]+$/.test(key) && value !== '') params[key] = scrubText(value);
+  }
+  return { code: m[1], params, text: String(m[3] || '').trim() };
+}
+
+/** One disk of a refusal as ONE phrase the words embed after their own
+ *  noun ("Dysk {disk} …"): the kernel name, else its place in the array,
+ *  else its model; '' when the refusal names none. */
+export function refusalDiskWords(p) {
+  if (p.disk) return p.disk;
+  if (/^\d+$/.test(p.data || '')) return T('refusal_disk.data', { n: Number(p.data) });
+  if (/^\d+$/.test(p.parity || '')) return T('refusal_disk.parity', { n: Number(p.parity) });
+  if (p.cache) return T('refusal_disk.cache');
+  if (p.model) return T('refusal_disk.model', { model: p.model });
+  return '';
+}
+
+const OWNER_KINDS = new Set(['elastic', 'spare', 'pool', 'md', 'system', 'mounted', 'used', 'remote']);
+
+/** What holds a disk (`elastic::conflicting_owner_code`): 'pool' + 'tank'
+ *  → "należy do puli ZFS tank". '' for a kind this build does not know. */
+export function diskOwnerWords(owner, name = '') {
+  if (!OWNER_KINDS.has(owner)) return '';
+  const named = String(name || '');
+  return named && owner !== 'elastic' && owner !== 'system' && owner !== 'used' && owner !== 'remote'
+    ? T('wizard_pool.elastic_owner.' + owner + '_named', { name: named })
+    : T('wizard_pool.elastic_owner.' + owner);
+}
+
+// Parameters a refusal's words need in a form the wire does not carry.
+const REFUSAL_PARAMS = new Map([
+  ['elastic_disk_in_use', (p) => ({ owner: diskOwnerWords(p.owner, p.owner_name) })],
+  ['elastic_import_incomplete', (p) => ({ reused: p.reused || '—' })],
+]);
+
+const PLACEHOLDER = /\{([a-zA-Z0-9_]+)(?:\|[^}]*)?\}/g;
+
+/** The words of a coded refusal in the reader's language, or '' when this
+ *  build has none for its code or a placeholder they need has no value. */
+export function refusalWords(refusal) {
+  if (!refusal) return '';
+  const key = 'refusal.' + refusal.code;
+  const template = T(key);
+  if (template === 'tentanas.' + key) return '';
+  const vars = { ...refusal.params, ...(REFUSAL_PARAMS.get(refusal.code)?.(refusal.params) || {}) };
+  const disk = refusalDiskWords(refusal.params);
+  if (disk) vars.disk = disk;
+  for (const [, name] of template.matchAll(PLACEHOLDER)) {
+    if (vars[name] === undefined || vars[name] === '') return '';
+  }
+  return T(key, vars);
+}
+
 // `nameOf` (node id -> name, `nodeNameOf`) lets an id the fleet knows read as
 // that node's name instead of the neutral placeholder.
 export function errMessage(e, nameOf = () => '') {
@@ -923,14 +1016,22 @@ export function errMessage(e, nameOf = () => '') {
   // 64-hex id, and a toast, a banner or a tab body would print it as is.
   if (errCode(e) === 'NodeUnreachable') return T('unreachable.error');
   const message = (e && e.message) ? e.message : String(e);
-  const code = REFUSAL.exec(message.trim().replace(WIRE_ERROR_PREFIX, ''))?.[1];
-  if (!code) {
-    const hidden = T('alerts.id_hidden');
-    return scrubIds(wordIdTokens(message), hidden, nameOf).replace(HEX_ID, (id) => String(nameOf(id) || '').trim() || hidden);
-  }
-  const key = 'refusal.' + code;
-  const words = T(key);
-  return words === 'tentanas.' + key ? message : words;
+  const refusal = parseRefusal(message);
+  if (!refusal) return scrubText(message, nameOf);
+  const words = refusalWords(refusal);
+  if (words) return words;
+  // No words in this build: the node's own sentence, ids scrubbed — or, with
+  // no sentence either, the message as it came.
+  return scrubText(refusal.text || message, nameOf);
+}
+
+/** The node's own sentence behind a worded refusal, ids scrubbed — for a
+ *  tooltip or a detail line only. '' when there is none, or when the
+ *  sentence is already what `errMessage` shows. */
+export function errDetail(e, nameOf = () => '') {
+  const refusal = parseRefusal(e);
+  if (!refusal?.text || !refusalWords(refusal)) return '';
+  return scrubText(refusal.text, nameOf);
 }
 
 export function jobTone(status) {

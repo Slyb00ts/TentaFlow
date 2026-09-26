@@ -11,7 +11,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
-  fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel, diskReasonsText,
+  fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel, diskReasonsText, diskOwnerWords,
   wordReasons, nodeTextTitle, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, paintJobLog } from '/js/lib/dom-patch.js';
@@ -60,17 +60,10 @@ export function anyraidCardText(environment, fallbackVersion = '') {
 // sentence becomes the tooltip. A code this build has no words for — or a
 // node too old to send codes — shows the node's sentence as it came.
 const ELASTIC_ROLE_WORDS = new Set(['data', 'parity', 'cache']);
-const ELASTIC_OWNERS = new Set(['elastic', 'spare', 'pool', 'md', 'system', 'mounted', 'used', 'remote']);
 const elasticRole = (role) => (ELASTIC_ROLE_WORDS.has(role) ? T('wizard_pool.elastic_role_' + role) : '');
 const bytesParam = (value) => (Number.isFinite(Number(value)) && String(value) !== '' ? fmtBytes(Number(value)) : '');
 
-function elasticOwner(p) {
-  if (!ELASTIC_OWNERS.has(p.owner)) return '';
-  const named = String(p.owner_name || '');
-  return named && p.owner !== 'elastic' && p.owner !== 'system' && p.owner !== 'used' && p.owner !== 'remote'
-    ? T('wizard_pool.elastic_owner.' + p.owner + '_named', { name: named })
-    : T('wizard_pool.elastic_owner.' + p.owner);
-}
+const elasticOwner = (p) => diskOwnerWords(p.owner, p.owner_name);
 
 const ELASTIC_REFUSAL_WORDS = new Map([
   ['too_many_cache_disks', () => T('wizard_pool.elastic_refusal.too_many_cache_disks')],

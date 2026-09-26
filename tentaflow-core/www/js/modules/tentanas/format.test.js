@@ -475,23 +475,60 @@ test('the Elastic and approval alerts word their parameters, never the node text
 
 // ----- Refusals the node sends as codes ------------------------------------
 
-const { errMessage } = await import('./format.js');
+const { errMessage, errDetail, parseRefusal, wordIdTokens, T } = await import('./format.js');
+const { scrubIds } = await import('./machine-id.js');
 
-test('every refusal code the node sends is worded in every locale, an unknown one is shown as sent', async () => {
+// Every code the node refuses with: the `"refusal:<code>"` literals, and the
+// coded refusals with parameters (`Refusal::<kind>("<code>", …)`, wave 13).
+function nodeRefusalCodes() {
   const codes = new Set();
   for (const file of ['tentanas/db.rs', 'tentanas/approvals.rs', 'tentanas/jobs.rs', 'tentanas/elastic.rs', 'dispatch/tentanas.rs']) {
     const source = readFileSync(join(WWW_ROOT, '..', 'src', file), 'utf8');
     for (const m of source.matchAll(/"refusal:([a-z0-9_]+)"/g)) codes.add(m[1]);
+    for (const m of source.matchAll(/Refusal::(?:not_available|bad_request|not_found|conflict)\(\s*"([a-z0-9_]+)"/g)) codes.add(m[1]);
+    for (const m of source.matchAll(/\brefuse\(\s*"(elastic_[a-z0-9_]+)"/g)) codes.add(m[1]);
   }
+  return codes;
+}
+
+// A value for every placeholder the Polish words of a code need — the way
+// the node sends them: a disk as its kernel name, the rest as plain values.
+function sampleParams(code) {
+  const words = JSON.parse(readFileSync(join(WWW_ROOT, 'i18n', 'pl.json'), 'utf8')).tentanas.refusal[code] || '';
+  const params = {};
+  for (const [, name] of words.matchAll(/\{([a-z0-9_]+)(?:\|[^}]*)?\}/g)) params[name] = '3';
+  if ('disk' in params) params.disk = 'sdq';
+  if ('owner' in params) Object.assign(params, { owner: 'pool', owner_name: 'tank' });
+  return params;
+}
+
+const wireOf = (code, params, text = 'The node\'s own sentence') => `refusal:${code}${Object.keys(params).length ? '?' : ''}${
+  Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&')} ${text}`;
+
+test('every refusal code the node sends is worded in every locale, an unknown one is shown as sent', async () => {
+  const codes = nodeRefusalCodes();
   assert.ok(codes.has('elastic_one_cache_disk') && codes.has('pool_detach_not_allowed'), 'the dispatcher\'s own refusals are scanned too');
   assert.ok(codes.has('share_user_in_use_elsewhere') && codes.has('approval_own_request'), `the scan found the codes (${[...codes].join(', ')})`);
-  assert.ok(codes.size >= 8, [...codes].join(', '));
+  for (const coded of ['elastic_disk_member', 'elastic_import_incomplete', 'elastic_array_not_found', 'confirm_mismatch', 'elastic_repair_disk_absent']) {
+    assert.ok(codes.has(coded), `the coded refusals with parameters are scanned too: ${coded}`);
+  }
+  assert.ok(codes.size >= 60, [...codes].join(', '));
   try {
     for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
       await I18n.setLanguage(lang);
       for (const code of codes) {
-        const text = errMessage(new Error(`refusal:${code}`));
-        assert.doesNotMatch(text, /refusal:|tentanas\./, `${code} is worded in ${lang}: ${text}`);
+        const params = sampleParams(code);
+        // With its parameters and the node's sentence, as wave 13 sends it,
+        // and through the websocket client's wrapping.
+        const error = new Error(`protocol error Conflict: ${wireOf(code, params)}`);
+        const text = errMessage(error);
+        assert.doesNotMatch(text, /refusal:|tentanas\.|\{|own sentence/, `${code} is worded in ${lang}: ${text}`);
+        for (const [name, value] of Object.entries(params)) {
+          if (name !== 'owner' && name !== 'owner_name') assert.ok(text.includes(value), `${code} in ${lang} carries {${name}}: ${text}`);
+        }
+        assert.equal(errDetail(error), 'The node\'s own sentence', `${code}: the sentence is the detail`);
+        // A code that needs no parameter is also worded in the old form.
+        if (!Object.keys(params).length) assert.equal(errMessage(new Error(`refusal:${code}`)), text, code);
       }
     }
   } finally {
@@ -521,6 +558,87 @@ test('every refusal code the node sends is worded in every locale, an unknown on
   // (the real wrapped error is produced by the client itself in
   // refusal-wire.test.js).
   assert.equal(errMessage(new Error('failed: refusal:approval_expired')), 'failed: refusal:approval_expired');
+});
+
+// Wave 13: a coded refusal carries PARAMETERS and the node's own sentence
+// (`tentanas/refusal.rs`). The words come from the code; the sentence is a
+// detail only, ids scrubbed; a disk is ONE phrase whatever names it.
+test('a coded refusal is worded with its parameters, the node sentence only as the detail', async () => {
+  const wire = 'refusal:elastic_disk_in_array?data=2&array=media Data disk no. 2 is already in the array media';
+  assert.deepEqual(parseRefusal(new Error(wire)), {
+    code: 'elastic_disk_in_array', params: { data: '2', array: 'media' }, text: 'Data disk no. 2 is already in the array media',
+  });
+  assert.equal(errMessage(new Error(wire)), 'Dysk danych nr 2 jest już w macierzy media');
+  assert.equal(errDetail(new Error(wire)), 'Data disk no. 2 is already in the array media');
+  // Each way the node names a disk, as one phrase after the words' own noun.
+  const disk = (query) => errMessage(new Error(`refusal:elastic_disk_member?${query} x`));
+  assert.equal(disk('disk=sdq'), 'Dysk sdq należy już do macierzy Elastic na tym węźle');
+  assert.equal(disk('parity=1'), 'Dysk parity nr 1 należy już do macierzy Elastic na tym węźle');
+  assert.equal(disk('cache=1'), 'Dysk cache należy już do macierzy Elastic na tym węźle');
+  assert.equal(disk('model=WD%20Red%20Plus'), 'Dysk WD Red Plus należy już do macierzy Elastic na tym węźle');
+  // Percent-encoded values come back whole; an owner is worded from its kind.
+  assert.equal(errMessage(new Error('refusal:elastic_destroy_shared?array=media&shares=kadry%2C%20foto%20%26%20wideo x')),
+    'Macierz media udostępnia udziały: kadry, foto & wideo. Usuń je przed rozwiązaniem macierzy');
+  assert.equal(errMessage(new Error('refusal:elastic_disk_in_use?disk=sdq&owner=pool&owner_name=tank x')),
+    'Dysk sdq należy do puli ZFS tank — do macierzy można dodać tylko wolny dysk');
+  assert.equal(errMessage(new Error('refusal:elastic_import_incomplete?matched=2&total=3&missing=1 x')),
+    'Macierz jest niekompletna: 2 z 3 dysków potwierdziło UUID z dziennika (brakuje: 1; użyte ponownie: —)');
+  try {
+    await I18n.setLanguage('de');
+    assert.equal(errMessage(new Error(wire)), 'Datenträger Nr. 2 (Daten) ist bereits im Array media');
+    assert.equal(errMessage(new Error('refusal:elastic_disk_larger_than_parity?disk=sdq x')),
+      'Datenträger sdq ist größer als die Parität des Arrays — die Parität würde ihn nicht vollständig abdecken');
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+});
+
+test('a coded refusal the words cannot fill falls back to the node sentence, ids scrubbed, never to a raw key', () => {
+  const id = 'wwn-0x5000c500a1b2c3d4';
+  // No disk parameter: the words need one, so the sentence is the text —
+  // with the id it should never have carried hidden.
+  const unnamed = errMessage(new Error(`refusal:elastic_disk_member Disk ${id} is taken`));
+  assert.ok(!unnamed.includes(id) && unnamed.startsWith('Disk '), unnamed);
+  // A parameter value is scrubbed too, before it reaches the words.
+  const leaked = errMessage(new Error(`refusal:elastic_disk_member?disk=${encodeURIComponent(id)} x`));
+  assert.ok(!leaked.includes(id), leaked);
+  // A value that does not decode is not read; the sentence stands in.
+  assert.equal(errMessage(new Error('refusal:elastic_array_not_found?array=%E0%A4 The array x does not exist')), 'The array x does not exist');
+  assert.equal(errDetail(new Error('refusal:elastic_array_not_found?array=%E0%A4 The array x does not exist')), '', 'the sentence is not said twice');
+  // An unknown code with a sentence reads the sentence; with none, as sent.
+  assert.equal(errMessage(new Error('refusal:quota_exceeded?n=3 Over the quota')), 'Over the quota');
+  assert.equal(errMessage(new Error('refusal:quota_exceeded?n=3')), 'refusal:quota_exceeded?n=3');
+  assert.equal(errDetail(new Error('plain failure')), '');
+  // No words and no sentence: the message as sent — ids still scrubbed
+  // (critic wave 13, MINOR 3).
+  const bare = errMessage(new Error(`refusal:quota_exceeded?disk=${encodeURIComponent(id)}`));
+  assert.ok(!bare.includes('5000c500a1b2c3d4'), bare);
+});
+
+// A screen from before wave 13: a PINNED COPY of its `errMessage` (HEAD
+// before wave 13, format.js), fed the new wire through the client's
+// wrapping. It knows only `^refusal:<code>$`, so it shows the whole message
+// through its scrubber — the code, the parameters and the node's sentence,
+// which still reads.
+function preWave13ErrMessage(e) {
+  const REFUSAL_OLD = /^refusal:([a-z0-9_]+)$/;
+  const PREFIX = /^protocol error ([A-Za-z]+):\s*/;
+  const message = (e && e.message) ? e.message : String(e);
+  const code = REFUSAL_OLD.exec(message.trim().replace(PREFIX, ''))?.[1];
+  if (!code) {
+    const hidden = T('alerts.id_hidden');
+    return scrubIds(wordIdTokens(message), hidden).replace(/[0-9a-f]{32,}/gi, hidden);
+  }
+  const words = T('refusal.' + code);
+  return words === 'tentanas.refusal.' + code ? message : words;
+}
+
+test('a screen from before wave 13 still shows the node sentence of a coded refusal', () => {
+  const wire = 'refusal:elastic_disk_in_array?data=2&array=media Data disk no. 2 is already in the array media';
+  const shown = preWave13ErrMessage(new Error(`protocol error BadRequest: ${wire}`));
+  assert.match(shown, /Data disk no\. 2 is already in the array media$/);
+  // And a parameter-less code it knew still reads as its words.
+  assert.equal(preWave13ErrMessage(new Error('refusal:elastic_add_joined')), errMessage(new Error('refusal:elastic_add_joined')));
 });
 
 test('errCode reads the wire enum from the client wrapping or from .code', () => {

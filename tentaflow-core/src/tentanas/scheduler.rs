@@ -51,9 +51,15 @@ pub enum ScheduleOutcome {
     /// A job ran from the slot; its status is the slot's result.
     Started { job_id: String },
     /// The node refused to start one: `insert_job`'s serialisation (a busy
-    /// array, a running self-test) or a failed spawn. `detail` is that error,
-    /// the node's own sentence.
-    StartFailed { detail: String },
+    /// array, a running self-test) or a failed spawn. `detail` is the node's
+    /// own sentence; a CODED refusal (`tentanas::refusal`, wave 13) is kept
+    /// as its code and parameters in `refusal`, and `detail` is then only its
+    /// sentence — never the wire form, which is not text to show.
+    StartFailed {
+        detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<StoredRefusal>,
+    },
     /// Declined on purpose, with the reason as a code
     /// ('elastic_scrub_errors_unrepaired', 'elastic_parity_fault_unacknowledged',
     /// 'array_not_created'). `detail` is the sentence of a skip stored before
@@ -65,12 +71,38 @@ pub enum ScheduleOutcome {
     },
 }
 
+/// A coded refusal as a schedule outcome stores it: the code and its
+/// parameters (no ids, `tentanas::refusal`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredRefusal {
+    pub code: String,
+    #[serde(default)]
+    pub params: Vec<(String, String)>,
+}
+
+impl StoredRefusal {
+    /// The refusal as the screens read it (`refusal:<code>?k=v <sentence>`).
+    pub fn wire(&self, sentence: &str) -> String {
+        super::refusal::wire_form(&self.code, self.params.iter().map(|(k, v)| (k.as_str(), v.as_str())), sentence)
+    }
+}
+
 impl ScheduleOutcome {
-    /// The outcome of one spawn attempt.
-    pub fn of_spawn<E: std::fmt::Display>(started: &Result<tentaflow_protocol::tentanas::NasJob, E>) -> Self {
+    /// The outcome of one spawn attempt. A coded refusal is stored as its
+    /// code and parameters, with its sentence as the detail.
+    pub fn of_spawn(started: &anyhow::Result<tentaflow_protocol::tentanas::NasJob>) -> Self {
         match started {
             Ok(job) => Self::Started { job_id: job.job_id.clone() },
-            Err(e) => Self::StartFailed { detail: e.to_string() },
+            Err(e) => match super::refusal::Refusal::find(e) {
+                Some(refusal) => Self::StartFailed {
+                    detail: refusal.text.clone(),
+                    refusal: Some(StoredRefusal {
+                        code: refusal.code.to_string(),
+                        params: refusal.params.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+                    }),
+                },
+                None => Self::StartFailed { detail: e.to_string(), refusal: None },
+            },
         }
     }
 
@@ -101,7 +133,7 @@ impl ScheduleOutcome {
         }
         if let Some(detail) = stored.strip_prefix("failed to start") {
             let detail = detail.trim_start_matches(':').trim();
-            return Some(Self::StartFailed { detail: detail.to_string() });
+            return Some(Self::StartFailed { detail: detail.to_string(), refusal: None });
         }
         if let Some(why) = stored.strip_prefix("pominięto") {
             let why = why.trim_start_matches(':').trim();
@@ -120,7 +152,7 @@ impl ScheduleOutcome {
     pub fn legacy_sentence(&self) -> String {
         match self {
             Self::Started { job_id } => format!("started job {job_id}"),
-            Self::StartFailed { detail } => format!("failed to start: {detail}"),
+            Self::StartFailed { detail, .. } => format!("failed to start: {detail}"),
             Self::Skipped { reason, .. } if !reason.is_empty() => format!("pominięto: reason:{reason}"),
             Self::Skipped { detail, .. } => format!("pominięto: {detail}"),
         }
@@ -1598,7 +1630,7 @@ mod tests {
             .expect("read")
             .expect("row");
         assert!(
-            matches!(ScheduleOutcome::parse(&refused.last_result), Some(ScheduleOutcome::StartFailed { ref detail }) if !detail.is_empty()),
+            matches!(ScheduleOutcome::parse(&refused.last_result), Some(ScheduleOutcome::StartFailed { ref detail, .. }) if !detail.is_empty()),
             "the refusal is recorded, not swallowed: {}",
             refused.last_result
         );
@@ -1880,11 +1912,44 @@ mod tests {
     /// The stored outcome is JSON this build reads back, and the sentence an
     /// older build wrote is read too — so a row written before the upgrade
     /// keeps its meaning on the Tasks tab.
+    /// Critic wave 13, MAJOR 1: a scheduled run the store refuses in code
+    /// (`elastic_operation_unresolved` on a busy array) is stored as the
+    /// code, its parameters and its sentence — never as the wire string a
+    /// tooltip would show raw — and goes out as a code the screen words.
+    #[test]
+    fn a_coded_refusal_of_a_scheduled_run_is_stored_as_code_and_params() {
+        let refused: anyhow::Result<tentaflow_protocol::tentanas::NasJob> = Err(
+            super::super::refusal::Refusal::not_available("elastic_disk_in_array", "data disk no. 2 is already in the array media")
+                .disk(super::super::refusal::DiskWords::Data(2))
+                .param("array", "media")
+                .into(),
+        );
+        let outcome = ScheduleOutcome::of_spawn(&refused);
+        let stored = outcome.stored();
+        assert!(!stored.contains("refusal:"), "no wire string is stored: {stored}");
+        let ScheduleOutcome::StartFailed { detail, refusal: Some(refusal) } = ScheduleOutcome::parse(&stored).unwrap() else {
+            panic!("a coded start failure: {stored}")
+        };
+        assert_eq!(detail, "data disk no. 2 is already in the array media");
+        assert_eq!(refusal.code, "elastic_disk_in_array");
+        assert_eq!(refusal.params, vec![("data".to_string(), "2".to_string()), ("array".to_string(), "media".to_string())]);
+        assert_eq!(refusal.wire(""), "refusal:elastic_disk_in_array?data=2&array=media");
+        assert_eq!(outcome.legacy_sentence(), "failed to start: data disk no. 2 is already in the array media");
+        // An uncoded failure keeps its sentence and no refusal.
+        let plain: anyhow::Result<tentaflow_protocol::tentanas::NasJob> = Err(anyhow::anyhow!("busy"));
+        assert_eq!(ScheduleOutcome::of_spawn(&plain), ScheduleOutcome::StartFailed { detail: "busy".into(), refusal: None });
+        // A value stored before wave 13 reads back without one.
+        assert_eq!(
+            ScheduleOutcome::parse(r#"{"outcome":"start_failed","detail":"busy"}"#),
+            Some(ScheduleOutcome::StartFailed { detail: "busy".into(), refusal: None })
+        );
+    }
+
     #[test]
     fn a_schedule_outcome_reads_back_in_both_forms() {
         for outcome in [
             ScheduleOutcome::Started { job_id: "0191f2c0-0000-7000-8000-000000000001".to_string() },
-            ScheduleOutcome::StartFailed { detail: "Na tym dysku trwa już autotest SMART".to_string() },
+            ScheduleOutcome::StartFailed { detail: "Na tym dysku trwa już autotest SMART".to_string(), refusal: None },
             ScheduleOutcome::skipped("elastic_scrub_errors_unrepaired"),
         ] {
             assert_eq!(ScheduleOutcome::parse(&outcome.stored()), Some(outcome.clone()));
@@ -1896,7 +1961,7 @@ mod tests {
         );
         assert_eq!(
             ScheduleOutcome::parse("failed to start: busy"),
-            Some(ScheduleOutcome::StartFailed { detail: "busy".to_string() })
+            Some(ScheduleOutcome::StartFailed { detail: "busy".to_string(), refusal: None })
         );
         assert_eq!(
             ScheduleOutcome::parse("pominięto: parity zgłasza błędy"),

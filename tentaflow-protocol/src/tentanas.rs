@@ -529,6 +529,10 @@ pub struct NasAlert {
     /// - 'target_session_not_reset' {target} — the allowlist of a target is
     ///   written, but a client it excludes is still logged in and the TPG
     ///   enable toggle that resets the target's sessions failed (wave 12);
+    /// - 'target_rebuild_not_disabled' {target} — an open target getting an
+    ///   allowlist had to be rebuilt (cached dynamic ACLs), the rebuild
+    ///   stopped short and even disabling it failed: the old open portal
+    ///   group may still accept any client (helper 0.17.1);
     /// - 'elevation_unarmed' {};
     /// - 'targets_sweep_failing' {count, alerted, sweep_failed} — `alerted`
     ///   is how many of `count` have an alert their organisation can read,
@@ -1207,7 +1211,10 @@ pub struct NasScheduleRow {
     pub last_job_status: String,
     /// For 'skipped', the reason as a code ('elastic_scrub_errors_unrepaired',
     /// 'elastic_parity_fault_unacknowledged', 'array_not_created'); '' for an
-    /// older stored skip that carries only a sentence.
+    /// older stored skip that carries only a sentence. For 'start_failed'
+    /// (wave 13), the coded refusal without its sentence
+    /// (`refusal:<code>?k=v`, `tentanas::refusal`) when the node refused in
+    /// code, which the screen words; '' otherwise.
     #[serde(default)]
     pub last_reason: String,
     /// The node's own sentence for the outcome — a refusal's error, an older

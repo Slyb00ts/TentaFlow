@@ -19,6 +19,7 @@ use crate::db::DbPool;
 use std::collections::BTreeMap;
 use tentanas_helper::elastic::{ElasticClaim, ElasticCreateSpec, ElasticDiskSpec, ElasticOwner, ElasticResult};
 use super::jobs::ElasticJobIntent;
+use super::refusal::{require, DiskWords, Refusal};
 
 const APP: &str = "tentanas";
 
@@ -2354,7 +2355,7 @@ pub fn insert_job_full(
     if intent.is_some() {
         let closing:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_settings WHERE key='elastic_teardown_started')",
             [],|r| r.get(0))?;
-        anyhow::ensure!(!closing,"Rozpoczęto usuwanie instancji; odmowa nowej intencji Elastic");
+        require(!closing, elastic_teardown_refusal)?;
     }
     // A second self-test on a disk that is already running one would ABORT the
     // first (ATA, SPC and NVMe all behave this way), and the long test spans
@@ -2407,7 +2408,7 @@ pub fn insert_job_full(
             ElasticJobIntent::Create(spec) => {
                 spec.validate()?;
                 anyhow::ensure!(job.kind == "elastic_create" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji create");
+                    "the job does not match the create intent");
                 tx.execute("INSERT INTO nas_elastic_arrays
                     (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
                     VALUES (?1,?2,?3,?4,?5,'creating','',?6,?6)",
@@ -2422,9 +2423,9 @@ pub fn insert_job_full(
             ElasticJobIntent::Restore { owner, array_id, operation_id } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_restore" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji restore");
+                    "the job does not match the restore intent");
                 anyhow::ensure!(uuid::Uuid::parse_str(operation_id)?.to_string() == *operation_id,
-                    "Niekanoniczny identyfikator operacji");
+                    "the operation id is not canonical");
                 (array_id, operation_id, "restore", serde_json::to_string(&tentanas_helper::HelperCommand::ElasticRestore {
                     array_id: array_id.clone(), owner: owner.clone() })?)
             }
@@ -2432,18 +2433,20 @@ pub fn insert_job_full(
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 let action = super::elastic::snapraid_kind(kind);
                 anyhow::ensure!(job.kind == format!("elastic_{action}") && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji SnapRAID");
-                anyhow::ensure!(!spec.parity.is_empty(), "Macierz bez parity nie wykonuje SnapRAID");
+                    "the job does not match the SnapRAID intent");
+                require(!spec.parity.is_empty(), || {
+                    Refusal::not_available("elastic_no_parity", "The array has no parity, so SnapRAID has nothing to check or write")
+                })?;
                 if let Some(disk) = super::elastic::snapraid_disk(kind) {
                     // The repair's disk is checked against the array HERE, in
                     // the transaction that reserves the operation: a row that
                     // could only ever produce a refusal must not be written,
                     // and the helper's own refusal would arrive as a failed job
                     // with no sentence the admin can act on.
-                    anyhow::ensure!(
+                    require(
                         spec.data.iter().enumerate().any(|(index, _)|
                             tentanas_helper::elastic::data_branch_name(index + 1) == disk),
-                        "Macierz nie ma dysku danych '{disk}'");
+                        || no_such_data_disk(disk))?;
                 }
                 let state: String = tx.query_row("SELECT state FROM nas_elastic_arrays WHERE array_id=?1",
                     params![array_id], |r| r.get(0))?;
@@ -2456,7 +2459,7 @@ pub fn insert_job_full(
                 // refusing the repair here would make the unresolved operation
                 // permanent and the array unrepairable through the product.
                 let _ = unresolved;
-                anyhow::ensure!(
+                require(
                     if super::elastic::snapraid_disk(kind).is_some() {
                         matches!(state.as_str(), "active" | "needs_attention")
                     } else {
@@ -2465,13 +2468,13 @@ pub fn insert_job_full(
                         // array such a run left behind (`parity_admission`).
                         parity_admission(&tx, array_id, &state)?
                     },
-                    "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                    elastic_unresolved_refusal)?;
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
                 // Only a Sync may carry the acknowledgement; a Scrub or a Fix
                 // that claimed one would be a request the helper never reads.
                 anyhow::ensure!(
                     acknowledge_parity_fault.is_none() || *kind == tentanas_helper::elastic::ElasticSnapraidKind::Sync,
-                    "Potwierdzenie błędu parity dotyczy tylko Sync"
+                    "only a Sync carries a parity fault acknowledgement"
                 );
                 if let Some(fault) = acknowledge_parity_fault {
                     tentanas_helper::elastic::validate_elastic_uuid(fault)?;
@@ -2488,7 +2491,7 @@ pub fn insert_job_full(
             ElasticJobIntent::AddDisk { owner, array_id, operation_id, disk } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_add_disk" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji dodania dysku");
+                    "the job does not match the disk add intent");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
                 // The array the add would PRODUCE has to be a legal array: the
                 // 32-device ceiling and the identity uniqueness are checked on
@@ -2513,13 +2516,13 @@ pub fn insert_job_full(
                 // anything, so repeating the command is what finishes the work
                 // — and refusing it here would leave a disk half-joined with no
                 // way through the product to either finish or undo it.
-                anyhow::ensure!(
+                require(
                     if retry {
                         matches!(state.as_str(), "active" | "needs_attention")
                     } else {
                         state == "active" && !unresolved
                     },
-                    "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                    elastic_unresolved_refusal)?;
                 // The attempt this one resumes keeps holding the array until
                 // the resume SUCCEEDS (`finish_elastic_add_disk`): a resume
                 // the helper refuses must leave the add pinned, or the disk
@@ -2539,14 +2542,22 @@ pub fn insert_job_full(
             ElasticJobIntent::AddDiskAbort { owner, array_id, operation_id, disk } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_add_disk_abort" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji wycofania dodania dysku");
+                    "the job does not match the disk add undo intent");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
-                anyhow::ensure!(pinned_add(&tx, array_id)?.as_ref() == Some(disk),
-                    "Macierz nie ma niedokończonego dodania tego dysku");
+                require(pinned_add(&tx, array_id)?.as_ref() == Some(disk), || {
+                    Refusal::not_available(
+                        "elastic_nothing_to_undo",
+                        "The array has no unfinished add of this disk; there is nothing to undo",
+                    )
+                })?;
                 let state: String = tx.query_row("SELECT state FROM nas_elastic_arrays WHERE array_id=?1",
                     params![array_id], |r| r.get(0))?;
-                anyhow::ensure!(matches!(state.as_str(), "active" | "needs_attention"),
-                    "Wycofanie dodania dysku wymaga macierzy aktywnej albo wymagającej uwagi");
+                require(matches!(state.as_str(), "active" | "needs_attention"), || {
+                    Refusal::not_available(
+                        "elastic_array_not_ready",
+                        "The array has to be enabled and active, or need attention",
+                    )
+                })?;
                 let command = super::elastic::add_disk_abort_command(owner, array_id, operation_id, disk);
                 (array_id, operation_id, "add_disk_abort", serde_json::to_string(&command)?)
             }
@@ -2562,14 +2573,12 @@ pub fn insert_job_full(
             // `dispatch::tentanas::elastic_replace_disk` carries the list of
             // what that task still has to solve.
             ElasticJobIntent::ReplaceDisk { .. } => {
-                anyhow::bail!(
-                    "Wymiana dysku nie jest udostępniona w tej wersji; operacja nie została otwarta"
-                );
+                return Err(replace_withdrawn_refusal().into());
             }
             ElasticJobIntent::Dissolve { owner, array_id, operation_id } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_destroy" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji rozwiązania");
+                    "the job does not match the dissolve intent");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
                 let command = super::elastic::dissolve_command(owner, array_id, operation_id);
                 (array_id, operation_id, "dissolve", serde_json::to_string(&command)?)
@@ -2577,7 +2586,7 @@ pub fn insert_job_full(
             ElasticJobIntent::Mover { owner, array_id, operation_id, resume_operation_id, rules, coupled_sync } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_mover" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji movera");
+                    "the job does not match the mover intent");
                 // DELIBERATELY no parity guard, unlike SnapRAID: moving files
                 // off the cache is worth doing on an array with no parity at
                 // all, and the helper simply skips the coupled sync there.
@@ -2589,7 +2598,7 @@ pub fn insert_job_full(
                 // sync on top of that unknown. An unresolved MOVER does not: the
                 // next run is what finishes or reverses what it left.
                 let (admitted, _) = mover_admission(&tx, array_id, &state)?;
-                anyhow::ensure!(admitted, "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                require(admitted, elastic_unresolved_refusal)?;
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
                 tentanas_helper::elastic::validate_elastic_uuid(resume_operation_id)?;
                 // The same distinctness `validate_observation` demands of the
@@ -2597,13 +2606,13 @@ pub fn insert_job_full(
                 // produce a refused answer never reaches the journal.
                 anyhow::ensure!(resume_operation_id != operation_id
                     && *resume_operation_id != spec.operation_id && *operation_id != spec.operation_id,
-                    "Resume movera musi mieć osobną operację");
+                    "a mover resume needs an operation of its own");
                 let command = super::elastic::mover_command(owner, array_id, operation_id,
                     resume_operation_id, rules, *coupled_sync);
                 (array_id, operation_id, "mover", serde_json::to_string(&command)?)
             }
         };
-        anyhow::ensure!(request.len() < 16 * 1024, "Intencja Elastic przekracza limit");
+        anyhow::ensure!(request.len() < 16 * 1024, "the Elastic intent exceeds its size limit");
         tx.execute("INSERT INTO nas_elastic_operations
             (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
             VALUES (?1,?2,?3,?4,'running',?5,'',?6)",
@@ -3725,12 +3734,77 @@ pub fn elastic_claims(pool: &DbPool) -> Result<Vec<ElasticClaim>> {
 /// inventory has it, else its place in the array ("danych 2") — never its
 /// disk id, WWN or serial (owner's rule: no ids in the GUI, and a refusal is
 /// a toast).
-fn member_words(role: &str, slot: i64, disk: &ElasticDiskSpec) -> String {
-    super::disks::disk_name(&disk.disk_id).unwrap_or_else(|| match role {
-        "data" => format!("danych {slot}"),
-        "parity" => format!("parity {slot}"),
-        _ => "cache".to_string(),
-    })
+fn member_words(role: &str, slot: i64, disk: &ElasticDiskSpec) -> DiskWords {
+    if let Some(name) = super::disks::disk_name(&disk.disk_id) {
+        return DiskWords::Kernel(name);
+    }
+    let slot = usize::try_from(slot).unwrap_or_default();
+    match role {
+        "data" => DiskWords::Data(slot),
+        "parity" => DiskWords::Parity(slot),
+        _ => DiskWords::Cache,
+    }
+}
+
+// ----- the Elastic refusals the admin reads (wave 13, `super::refusal`) --------
+
+/// The instance is being uninstalled: no new Elastic operation, no adoption.
+pub(crate) fn elastic_teardown_refusal() -> Refusal {
+    Refusal::not_available(
+        "elastic_teardown_started",
+        "This instance is being uninstalled; no new Elastic Array operation is started",
+    )
+}
+
+/// An operation of the array is still unresolved, and this one would start
+/// on top of it.
+pub(crate) fn elastic_unresolved_refusal() -> Refusal {
+    Refusal::not_available(
+        "elastic_operation_unresolved",
+        "The array has an unresolved operation; resolve it before starting another",
+    )
+}
+
+/// The array the request names is already recorded in this instance.
+pub(crate) fn elastic_already_adopted() -> Refusal {
+    Refusal::conflict("elastic_already_adopted", "This array is already recorded in this instance")
+}
+
+/// Disk replacement is withdrawn (round 4, owner's decision).
+pub(crate) fn replace_withdrawn_refusal() -> Refusal {
+    Refusal::not_available(
+        "elastic_replace_withdrawn",
+        "Disk replacement is not available in this version; no operation was opened",
+    )
+}
+
+/// A repair named a data slot (`d3`) the array does not have — named by its
+/// number, never by the slot key.
+pub(crate) fn no_such_data_disk(slot: &str) -> Refusal {
+    let words = match DiskWords::member(slot, "") {
+        words @ DiskWords::Data(_) => words,
+        _ => DiskWords::Unnamed,
+    };
+    let text = match &words {
+        DiskWords::Data(_) => format!("The array has no {}", words.english()),
+        _ => "The array has no such data disk".to_string(),
+    };
+    Refusal::bad_request("elastic_no_such_data_disk", text).disk(words)
+}
+
+/// How a refusal names a disk by its id: the live kernel name, else the
+/// model this node last saw it with. Never the id.
+fn refusal_disk_words(conn: &Connection, disk_id: &str) -> DiskWords {
+    if let Some(name) = super::disks::disk_name(disk_id) {
+        return DiskWords::Kernel(name);
+    }
+    conn.query_row("SELECT model FROM nas_disks WHERE disk_id=?1", params![disk_id], |r| r.get::<_, String>(0))
+        .optional()
+        .ok()
+        .flatten()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .map_or(DiskWords::Unnamed, DiskWords::Model)
 }
 
 fn elastic_disk_slots(spec: &ElasticCreateSpec) -> Result<Vec<(&'static str, i64, &ElasticDiskSpec)>> {
@@ -3783,9 +3857,17 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
         params![disk.disk_id, disk.expected_uuid],
         |r| r.get(0),
     )?;
-    // Named by its kernel name while the inventory has it, never by its id.
-    let words = super::disks::disk_name(&disk.disk_id).map_or_else(|| "Ten dysk".to_string(), |name| format!("Dysk {name}"));
-    anyhow::ensure!(!claimed, "{words} należy już do macierzy tej instancji");
+    // Named by its kernel name while the inventory has it, else by its
+    // model — never by its id. No array is named: it may be another
+    // organisation's.
+    let words = refusal_disk_words(tx, &disk.disk_id);
+    require(!claimed, || {
+        Refusal::conflict(
+            "elastic_disk_member",
+            format!("{} already belongs to an Elastic Array of this instance", words.english()),
+        )
+        .disk(words.clone())
+    })?;
     for value in [
         Some(disk.disk_id.as_str()),
         disk.wwn.as_deref(),
@@ -3799,10 +3881,16 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
             params![value],
             |r| r.get(0),
         )?;
-        anyhow::ensure!(
-            !reserved,
-            "{words} jest już zarezerwowany przez macierz tej instancji (po WWN lub numerze seryjnym)"
-        );
+        require(!reserved, || {
+            Refusal::conflict(
+                "elastic_disk_reserved",
+                format!(
+                    "{} is already reserved by an Elastic Array of this instance (by its WWN or serial number)",
+                    words.english()
+                ),
+            )
+            .disk(words.clone())
+        })?;
     }
     // Another add of this array that stopped part-way holds the slot and —
     // more importantly — the filesystem UUID its mkfs was given. A retry has
@@ -3823,16 +3911,37 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
     // over the same slot: the disk ends up joined to the live union with no
     // member row, because the loser's `finish_elastic_add_disk` finds no
     // running operation of its own. Wait for the verdict instead.
-    anyhow::ensure!(
-        state != "running",
-        "Dodanie dysku {} do tej macierzy jest w toku; poczekaj na jego wynik",
-        held.disk_id
-    );
-    anyhow::ensure!(
-        held == *disk,
-        "Poprzednie dodanie dysku {} nie zostało zakończone; powtórz je tym samym dyskiem",
-        held.disk_id
-    );
+    // The disk that add holds is named by its kernel name, else by the data
+    // slot it takes (the next one), else by its model.
+    let held_words = || -> Result<DiskWords> {
+        if let Some(name) = super::disks::disk_name(&held.disk_id) {
+            return Ok(DiskWords::Kernel(name));
+        }
+        let next: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(slot),0)+1 FROM nas_elastic_disks WHERE array_id=?1 AND role='data'",
+            params![array_id],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(next).map_or_else(|_| refusal_disk_words(tx, &held.disk_id), DiskWords::Data))
+    };
+    if state == "running" {
+        let words = held_words()?;
+        return Err(Refusal::not_available(
+            "elastic_add_running",
+            format!("Adding {} to this array is in progress; wait for its result", words.english()),
+        )
+        .disk(words)
+        .into());
+    }
+    if held != *disk {
+        let words = held_words()?;
+        return Err(Refusal::not_available(
+            "elastic_add_other_unfinished",
+            format!("The earlier add of {} has not finished; repeat it with the same disk", words.english()),
+        )
+        .disk(words)
+        .into());
+    }
     Ok(true)
 }
 
@@ -4383,27 +4492,43 @@ pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, started_by: &str)
     let closing: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM nas_settings WHERE key='elastic_teardown_started')",
         [], |r| r.get(0))?;
-    anyhow::ensure!(!closing, "Rozpoczęto usuwanie instancji; odmowa adopcji macierzy");
+    require(!closing, elastic_teardown_refusal)?;
     let known: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays WHERE array_id=?1)",
         params![spec.array_id], |r| r.get(0))?;
-    anyhow::ensure!(!known, "Ta macierz jest już zapisana w tej instancji");
+    require(!known, elastic_already_adopted)?;
     let name_taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays WHERE name=?1)",
         params![spec.name], |r| r.get(0))?;
-    anyhow::ensure!(!name_taken, "Nazwa macierzy jest już zajęta w tej instancji");
+    require(!name_taken, || {
+        Refusal::conflict("elastic_name_taken", format!("The array name {} is already taken in this instance", spec.name))
+            .param("array", &spec.name)
+    })?;
     for (role, slot, disk) in elastic_disk_slots(spec)? {
         let words = member_words(role, slot, disk);
         let claimed: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM nas_elastic_disks WHERE disk_id=?1 OR expected_uuid=?2)",
             params![disk.disk_id, disk.expected_uuid], |r| r.get(0))?;
-        anyhow::ensure!(!claimed,
-            "Dysk {words} należy już do innej macierzy tej instancji");
+        require(!claimed, || {
+            Refusal::conflict(
+                "elastic_member_claimed",
+                format!("{} already belongs to another Elastic Array of this instance", words.english()),
+            )
+            .disk(words.clone())
+        })?;
         for value in [Some(disk.disk_id.as_str()), disk.wwn.as_deref(), disk.serial.as_deref()]
             .into_iter().flatten() {
             let reserved: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM nas_elastic_disk_aliases WHERE value=?1)",
                 params![value], |r| r.get(0))?;
-            anyhow::ensure!(!reserved,
-                "Dysk {words} jest już zarezerwowany przez inną macierz tej instancji (po WWN lub numerze seryjnym)");
+            require(!reserved, || {
+                Refusal::conflict(
+                    "elastic_member_reserved",
+                    format!(
+                        "{} is already reserved by another Elastic Array of this instance (by its WWN or serial number)",
+                        words.english()
+                    ),
+                )
+                .disk(words.clone())
+            })?;
         }
     }
     let job_id = uuid::Uuid::now_v7().to_string();
@@ -7219,7 +7344,7 @@ mod tests {
 
         // Same array, offered a second time.
         let again = elastic_import(&pool, &created, "admin").unwrap_err().to_string();
-        assert!(again.contains("już zapisana w tej instancji"), "{again}");
+        assert!(again.starts_with("refusal:elastic_already_adopted "), "{again}");
 
         // A different array that wants a disk this one already holds. The
         // UNIQUE columns would refuse it as a raw SQL error; the point of the
@@ -7228,7 +7353,7 @@ mod tests {
         let mut overlapping = super::super::elastic::tests::create_spec("archiwum");
         overlapping.data[0] = created.data[0].clone();
         let taken = elastic_import(&pool, &overlapping, "admin").unwrap_err().to_string();
-        assert!(taken.contains("Dysk danych 1 "), "the refusal names the disk: {taken}");
+        assert!(taken.starts_with("refusal:elastic_member_claimed?data=1 "), "the refusal names the disk: {taken}");
         assert!(!taken.contains(&created.data[0].disk_id), "and never by its id: {taken}");
 
         // Only the filesystem UUID is shared: still a refusal, because that
@@ -7241,7 +7366,7 @@ mod tests {
         let mut renamed = super::super::elastic::tests::create_spec("produkt");
         renamed.owner = previous_owner();
         let name = elastic_import(&pool, &renamed, "admin").unwrap_err().to_string();
-        assert!(name.contains("Nazwa macierzy jest już zajęta"), "{name}");
+        assert!(name.starts_with("refusal:elastic_name_taken?array=produkt "), "{name}");
 
         assert_eq!(
             (rows("nas_elastic_arrays"), rows("nas_elastic_disks"), rows("nas_elastic_disk_aliases"), rows("nas_jobs")),
@@ -8570,7 +8695,7 @@ mod tests {
         let (row, intent, _) = replace_job(&spec, "d1", &fresh);
         let refused = insert_job(&p, &row, Some(&intent)).unwrap_err();
         assert!(
-            refused.to_string().contains("Wymiana dysku"),
+            refused.to_string().starts_with("refusal:elastic_replace_withdrawn "),
             "{refused}"
         );
 
@@ -8951,8 +9076,8 @@ mod tests {
             .expect_err("a member of another array is not free");
             // Refused in words, and without the disk's id (iteration-5 minor 3).
             assert!(
-                error.to_string().contains("należy już do macierzy")
-                    || error.to_string().contains("zarezerwowany"),
+                error.to_string().starts_with("refusal:elastic_disk_member")
+                    || error.to_string().starts_with("refusal:elastic_disk_reserved"),
                 "{error}"
             );
             assert!(!error.to_string().contains(&taken.disk_id), "{error}");
@@ -9047,7 +9172,9 @@ mod tests {
         // its own. The wait has to be for the verdict.
         let (racing_job, racing_intent, _) = start(&added);
         let racing = insert_job(&p, &racing_job, Some(&racing_intent)).unwrap_err();
-        assert!(racing.to_string().contains("jest w toku"), "{racing}");
+        // Named by the data slot it takes, never by its id.
+        assert!(racing.to_string().starts_with("refusal:elastic_add_running?data="), "{racing}");
+        assert!(!racing.to_string().contains(&added.disk_id), "{racing}");
         assert!(super::super::db::job(&p, &racing_job.job_id).unwrap().is_none());
         // The in-flight row is still running and still holds the array.
         let running: String = p
@@ -9085,9 +9212,11 @@ mod tests {
         let (other_job, other_intent, _) = start(&other);
         let refused = insert_job(&p, &other_job, Some(&other_intent)).unwrap_err();
         assert!(
-            refused.to_string().contains("powtórz je tym samym dyskiem"),
+            refused.to_string().starts_with("refusal:elastic_add_other_unfinished?data=")
+                && refused.to_string().contains("repeat it with the same disk"),
             "{refused}"
         );
+        assert!(!refused.to_string().contains(&added.disk_id), "{refused}");
 
         // THE SAME DISK is admitted, on an array that needs attention.
         assert_eq!(
@@ -11666,6 +11795,14 @@ mod tests {
         assert_eq!(list_alerts(&p, true).unwrap()[0].subject_id, "vm-c");
     }
 
+    /// Critic wave 13, MINOR 7: a slot of no known shape reads as a
+    /// sentence, not "The array has no the disk".
+    #[test]
+    fn a_missing_data_slot_is_named_by_its_number_or_not_at_all() {
+        assert_eq!(no_such_data_disk("d9").wire(), "refusal:elastic_no_such_data_disk?data=9 The array has no data disk no. 9");
+        assert_eq!(no_such_data_disk("x7").wire(), "refusal:elastic_no_such_data_disk The array has no such data disk");
+    }
+
     /// Iteration-5 minor 3: an adoption or add refused over a disk another
     /// array holds is a toast, and it named the disk by its id (`wwn-…`) or
     /// by the alias it collided on. It names the disk's place instead when
@@ -11679,11 +11816,12 @@ mod tests {
             bytes: 1,
             expected_uuid: "33333333-3333-4333-8333-333333333333".into(),
         };
-        assert_eq!(member_words("data", 2, &disk), "danych 2");
-        assert_eq!(member_words("parity", 1, &disk), "parity 1");
-        assert_eq!(member_words("cache", 1, &disk), "cache");
+        assert_eq!(member_words("data", 2, &disk), DiskWords::Data(2));
+        assert_eq!(member_words("parity", 1, &disk), DiskWords::Parity(1));
+        assert_eq!(member_words("cache", 1, &disk), DiskWords::Cache);
         for words in [member_words("data", 2, &disk), member_words("cache", 1, &disk)] {
-            assert!(!words.contains("wwn-") && !words.contains("WD-7788") && !words.contains("3333"), "{words}");
+            let wire = Refusal::conflict("elastic_member_claimed", words.english()).disk(words).wire();
+            assert!(!wire.contains("wwn-") && !wire.contains("WD-7788") && !wire.contains("3333"), "{wire}");
         }
     }
 

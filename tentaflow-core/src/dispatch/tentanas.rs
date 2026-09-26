@@ -26,7 +26,7 @@ use tentanas_helper::{HelperCommand, PackageManager, SelfTestKind};
 use super::HandlerContext;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
-use crate::tentanas::{self, broker::BrokerError, db as store, CodedText};
+use crate::tentanas::{self, broker::BrokerError, db as store, refusal::{DiskWords, Refusal}, CodedText};
 use tentanas_helper::elastic::{ElasticOwner, ElasticCreateSpec, ElasticDiskSpec, ElasticFilesystem};
 
 const PERM_READ: &str = "nas.read";
@@ -57,13 +57,13 @@ fn broker_error(scope: &str, error: BrokerError) -> ProtocolError {
         // Environment tab and start the wizard" pointed at a card that is not
         // on screen in exactly the state that produces this error.
         //
-        // Polish, like every other operator-facing refusal this file writes
-        // ("Macierz nie istnieje w tej instancji", "Nieprawidłowy zestaw
-        // dysków Elastic"). The two arms below read English because they
-        // forward `BrokerError`'s own `#[error]` text verbatim from
-        // broker.rs — a pre-existing split across one error surface. It is
-        // real, and it is not silently converted here: those strings have
-        // other callers, so flipping them is its own change.
+        // Still a Polish sentence, not yet a coded refusal: the Elastic
+        // refusals of this file are coded since wave 13
+        // (`tentanas::refusal`), this one is shared by every privileged path
+        // and is tracked in the backlog. The two arms below read English
+        // because they forward `BrokerError`'s own `#[error]` text verbatim
+        // from broker.rs — those strings have other callers, so flipping
+        // them is its own change.
         BrokerError::Unarmed(why) => ProtocolError::new(
             ProtocolErrorCode::NotAvailable,
             format!(
@@ -96,11 +96,27 @@ fn broker_error(scope: &str, error: BrokerError) -> ProtocolError {
 /// request with. `anyhow` keeps the concrete error in the chain, so the
 /// actionable half is recoverable; anything that is not a `BrokerError` is a
 /// genuine internal fault and stays one.
+///
+/// A refusal the admin reads (`tentanas::refusal`) anywhere in the chain is
+/// answered as it is, with its code and parameters — never as an internal
+/// fault (wave 13).
 fn privileged_error(scope: &str, error: anyhow::Error) -> ProtocolError {
+    if let Some(refusal) = Refusal::find(&error) {
+        return logged_refusal(scope, refusal);
+    }
     match error.downcast::<BrokerError>() {
         Ok(broker) => broker_error(scope, broker),
         Err(other) => internal(scope, other),
     }
+}
+
+/// A refusal the store or the Elastic layer raised, as the answer — and in
+/// the node's log with its sentence, because a toast shows only the words
+/// and some sentences carry the one reason an operator can act on (a
+/// helper's refusal line: "the reason is in the node's log").
+fn logged_refusal(scope: &str, refusal: &Refusal) -> ProtocolError {
+    tracing::info!(scope, refusal = %refusal, "tentanas refusal");
+    refusal.into()
 }
 
 /// The caller's instance + database after the matrix check.
@@ -1072,6 +1088,16 @@ fn since_24h() -> String {
 /// The coded refusal of a remote LUN on any disk-accepting request.
 const DISK_REMOTE_REFUSAL: &str = "refusal:disk_remote";
 
+/// A disk id the node's inventory does not hold. The id is not echoed: it is
+/// an id, and the screen that sent it knows which disk it meant.
+fn disk_not_found() -> ProtocolError {
+    Refusal::not_found("disk_not_found", "the disk is not on this node (any more)").into()
+}
+
+fn no_disks_selected() -> ProtocolError {
+    Refusal::bad_request("no_disks_selected", "no disks selected").into()
+}
+
 /// Disks by id for a read-only PREVIEW: unknown ids are refused, and every
 /// disk the node has comes back whatever its role — a remote LUN included —
 /// so the preview's own per-disk refusals can name it (critic wave 12 R2-1).
@@ -1080,11 +1106,11 @@ fn disks_for_plan(disk_ids: &[String]) -> Result<Vec<NasDisk>, ProtocolError> {
     for id in disk_ids {
         out.push(
             tentanas::disks::disk(id)
-                .ok_or_else(|| ProtocolError::not_found(format!("disk '{id}' not found on this node")))?,
+                .ok_or_else(disk_not_found)?,
         );
     }
     if out.is_empty() {
-        return Err(ProtocolError::bad_request("no disks selected"));
+        return Err(no_disks_selected());
     }
     Ok(out)
 }
@@ -1096,7 +1122,7 @@ fn disks_by_id(disk_ids: &[String], require_free: bool) -> Result<Vec<NasDisk>, 
     let mut out = Vec::with_capacity(disk_ids.len());
     for id in disk_ids {
         let disk = tentanas::disks::disk(id)
-            .ok_or_else(|| ProtocolError::not_found(format!("disk '{id}' not found on this node")))?;
+            .ok_or_else(disk_not_found)?;
         // A LUN another target serves to this node (MAJOR 27 F4) is never a
         // pool disk — on EVERY path, the ones that do not require a free disk
         // included (`PoolReplaceDiskRequest` accepts a spare; critic wave 12).
@@ -1106,15 +1132,17 @@ fn disks_by_id(disk_ids: &[String], require_free: bool) -> Result<Vec<NasDisk>, 
             return Err(ProtocolError::new(ProtocolErrorCode::Conflict, DISK_REMOTE_REFUSAL));
         }
         if require_free && disk.role != "free" {
-            return Err(ProtocolError::bad_request(format!(
-                "disk {} is not free: {}",
-                disk.name, disk.role
-            )));
+            return Err(Refusal::bad_request(
+                "disk_not_free",
+                format!("disk {} is not free: {}", disk.name, disk.role),
+            )
+            .disk(DiskWords::Kernel(disk.name.clone()))
+            .into());
         }
         out.push(disk);
     }
     if out.is_empty() {
-        return Err(ProtocolError::bad_request("no disks selected"));
+        return Err(no_disks_selected());
     }
     Ok(out)
 }
@@ -1347,9 +1375,7 @@ fn require_confirm(name: &str, confirm_name: &str) -> Result<(), ProtocolError> 
     if name == confirm_name {
         Ok(())
     } else {
-        Err(ProtocolError::bad_request(
-            "the typed confirmation does not match the name",
-        ))
+        Err(tentanas::elastic::confirm_mismatch().into())
     }
 }
 
@@ -2409,7 +2435,12 @@ fn with_outcome(db: &crate::db::DbPool, mut row: NasScheduleRow, stored: &str) -
             // only that it ran.
             row.last_job_status = store::job(db, &job_id).ok().flatten().map(|j| j.status).unwrap_or_default();
         }
-        ScheduleOutcome::StartFailed { detail } => row.last_detail = detail,
+        // A coded refusal travels as its code and parameters, which the
+        // screen words; the sentence stays the detail an older screen shows.
+        ScheduleOutcome::StartFailed { detail, refusal } => {
+            row.last_reason = refusal.map(|r| r.wire("")).unwrap_or_default();
+            row.last_detail = detail;
+        }
         ScheduleOutcome::Skipped { reason, detail } => {
             row.last_reason = reason;
             row.last_detail = detail;
@@ -4650,6 +4681,50 @@ fn elastic_owner(g: &Gate) -> ElasticOwner {
     ElasticOwner { org_id: g.org_id.clone(), addon_id: g.addon_id.clone() }
 }
 
+// Every refusal of an Elastic request is CODED (wave 13, `tentanas::refusal`):
+// the screen words it in the reader's language from its code and parameters,
+// and the English sentence beside it is only a tooltip. The scan test
+// `elastic_requests_answer_no_raw_sentence` holds this section to it.
+
+/// An error of the Elastic layer (a store write, a job spawn): its refusal as
+/// it is, a privilege-channel failure as `broker_error` words it, anything
+/// else an internal fault.
+fn elastic_error(scope: &str, error: anyhow::Error) -> ProtocolError {
+    privileged_error(scope, error)
+}
+
+fn elastic_refusal(refusal: Refusal) -> ProtocolError {
+    refusal.into()
+}
+
+/// The array the request names is not one of this instance's.
+fn array_missing(name: &str) -> ProtocolError {
+    elastic_refusal(
+        Refusal::not_found("elastic_array_not_found", format!("The array {name} does not exist in this instance"))
+            .param("array", name),
+    )
+}
+
+/// A name no array can have (the helper's rule, `validate_array_name`).
+fn valid_array_name(name: &str) -> Result<(), ProtocolError> {
+    tentanas_helper::elastic::validate_array_name(name)
+        .map_err(|e| elastic_refusal(Refusal::bad_request("elastic_name_invalid", e.to_string()).param("array", name)))
+}
+
+/// A disk id the request carries that no inventory could hold.
+fn valid_disk_id(disk_id: &str) -> Result<(), ProtocolError> {
+    if disk_id.is_empty() || disk_id.len() > 128 {
+        return Err(elastic_refusal(Refusal::bad_request("elastic_disk_id_invalid", "The request names no valid disk")));
+    }
+    Ok(())
+}
+
+/// The array's operation in flight blocks this one (the store refuses the
+/// same, `db::elastic_unresolved_refusal`).
+fn unresolved_operation() -> ProtocolError {
+    elastic_refusal(store::elastic_unresolved_refusal())
+}
+
 /// The asking organisation's array names, for `disks::hide_other_org_array`.
 /// An unreadable table is an error, not an empty set: an empty set would call
 /// every one of this organisation's own arrays "another organisation's".
@@ -4755,16 +4830,25 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     secret: Option<&SudoSecret>,origin: Origin) -> Result<MessageBody,ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name,confirm_name)?;
-    tentanas_helper::elastic::validate_array_name(name).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     let filesystem_kind = match filesystem {
         "ext4" => ElasticFilesystem::Ext4,
         "xfs" => ElasticFilesystem::Xfs,
-        _ => return Err(ProtocolError::bad_request("Wymagany filesystem xfs albo ext4")),
+        _ => {
+            return Err(elastic_refusal(
+                Refusal::bad_request("elastic_filesystem_invalid", "The filesystem has to be xfs or ext4")
+                    .param("filesystem", filesystem),
+            ))
+        }
     };
     if data_disk_ids.is_empty() || parity_disk_ids.len() > 2 || cache_disk_ids.len() > 1
         || data_disk_ids.len() + parity_disk_ids.len() + cache_disk_ids.len() > 32
         || data_disk_ids.iter().chain(parity_disk_ids).chain(cache_disk_ids).any(|id| id.is_empty() || id.len() > 128) {
-        return Err(ProtocolError::bad_request("Nieprawidłowy zestaw dysków Elastic"));
+        return Err(elastic_refusal(Refusal::bad_request(
+            "elastic_disk_set_invalid",
+            "The disk set is not one an Elastic Array can have: at least one data disk, at most two parity \
+             disks and one cache disk, 32 disks in all",
+        )));
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx,&g)?) {
         return park(ctx,&g,tentanas::approvals::OP_ELASTIC_CREATE,name,
@@ -4781,7 +4865,13 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     let explicit = secret.map(token);
     let global = root_claims(&g,"elastic root claims",Some(name),explicit.as_deref()).await?;
     if global.name_claimed != Some(false) || global.namespace_clear != Some(true) {
-        return Err(ProtocolError::bad_request("Nazwa lub przestrzeń montowania jest zajęta albo niepotwierdzona"));
+        return Err(elastic_refusal(
+            Refusal::bad_request(
+                "elastic_name_unavailable",
+                format!("The name {name} or its mount namespace is taken, or could not be confirmed free"),
+            )
+            .param("array", name),
+        ));
     }
     let mut claims = store::elastic_claims(&g.db).map_err(|e| internal("elastic claims",e))?;
     claims.extend(global.disks);
@@ -4792,13 +4882,23 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     let capabilities = tentanas::elastic::capabilities(&features,&has_mkfs);
     if !capabilities.mergerfs || (!parity.is_empty() && !capabilities.snapraid)
         || !capabilities.filesystems.iter().any(|fs| fs == filesystem) {
-        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,"Brak działających narzędzi macierzy"));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_tools_missing",
+            "The tools an Elastic Array needs (mergerfs, snapraid for parity, the mkfs of the filesystem) \
+             are not all installed",
+        )));
     }
     // Pusty zbiór nazw wynika z pozytywnego odczytu namespace przez roota, nie błędu zpool.
     let plan = tentanas::elastic::plan_layout(name,filesystem,&data,&parity,&cache,&taken,
         &std::collections::BTreeSet::new(),&capabilities.filesystems,&tentanas_helper::elastic::Tools::for_preview());
     if !plan.refusals.is_empty() {
-        return Err(ProtocolError::bad_request(plan.refusals.iter().map(|r| r.detail.as_str()).collect::<Vec<_>>().join("; ")));
+        return Err(elastic_refusal(
+            Refusal::bad_request(
+                "elastic_plan_refused",
+                plan.refusals.iter().map(|r| r.detail.as_str()).collect::<Vec<_>>().join("; "),
+            )
+            .param("count", plan.refusals.len()),
+        ));
     }
     let disk_spec = |disk: &NasDisk| ElasticDiskSpec {
         disk_id:disk.disk_id.clone(),wwn:disk.wwn.clone().filter(|w| !w.is_empty()),
@@ -4809,10 +4909,10 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
         operation_id:uuid::Uuid::now_v7().to_string(),owner:elastic_owner(&g),name:name.to_string(),
         filesystem:filesystem_kind,data:data.iter().map(disk_spec).collect(),
         cache:cache.first().map(disk_spec),parity:parity.iter().map(disk_spec).collect() };
-    spec.validate().map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    spec.validate().map_err(|e| logged_refusal("elastic spec", &Refusal::bad_request("elastic_spec_invalid", e.to_string())))?;
     let intent = tentanas::jobs::ElasticJobIntent::Create(spec.clone());
     let job = tentanas::jobs::spawn(&g.db,"elastic_create",name,&g.user_id,Some(intent),None,
-        move |h| tentanas::elastic::create_job(h,spec,explicit)).map_err(|e| internal("elastic create",e))?;
+        move |h| tentanas::elastic::create_job(h,spec,explicit)).map_err(|e| elastic_error("elastic create",e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -4820,9 +4920,9 @@ async fn elastic_restore(ctx: &HandlerContext,name: &str,secret: Option<&SudoSec
     let g = gate_admin(ctx)?;
     let row = store::elastic_array(&g.db,&elastic_owner(&g),name)
         .map_err(|e| internal("elastic array",e))?
-        .ok_or_else(||ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     let job = tentanas::elastic::spawn_restore(&g.db,&row,&g.user_id,secret.map(token),None)
-        .map_err(|e| internal("elastic restore",e))?;
+        .map_err(|e| elastic_error("elastic restore",e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -4830,10 +4930,24 @@ async fn elastic_restore(ctx: &HandlerContext,name: &str,secret: Option<&SudoSec
 /// member no longer carries the UUID its journal recorded" — and not a server
 /// fault. Only the privilege channel failing is, and that arrives as a
 /// `BrokerError`, so it keeps `broker_error`'s classification.
+///
+/// A refusal is answered with its code; any other failure of the adoption is
+/// coded as `elastic_import_failed`, its sentence (ids scrubbed on the
+/// screen) only the detail.
+///
+/// Every refusal of the adoption answers `BadRequest`, whatever status the
+/// store or the Elastic layer gave it: that is what this request answered
+/// with before its refusals were coded, and the code, not the status, is
+/// what a screen reads.
 fn import_error(scope: &str, error: anyhow::Error) -> ProtocolError {
+    if let Some(refusal) = Refusal::find(&error) {
+        let mut answer = logged_refusal(scope, refusal);
+        answer.code = ProtocolErrorCode::BadRequest;
+        return answer;
+    }
     match error.downcast::<BrokerError>() {
         Ok(broker) => broker_error(scope, broker),
-        Err(other) => ProtocolError::bad_request(other.to_string()),
+        Err(other) => logged_refusal(scope, &Refusal::bad_request("elastic_import_failed", other.to_string())),
     }
 }
 
@@ -4873,8 +4987,9 @@ async fn elastic_import(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
-    tentanas_helper::elastic::validate_elastic_uuid(array_id)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    tentanas_helper::elastic::validate_elastic_uuid(array_id).map_err(|_| {
+        elastic_refusal(Refusal::bad_request("elastic_import_request_invalid", "The request names no valid array journal"))
+    })?;
     let owner = elastic_owner(&g);
     // The same tenant rule as the scan: another org of this node's journal is
     // not a candidate, so the adoption refuses it like a journal that is not
@@ -4895,7 +5010,7 @@ async fn elastic_import(
     let array = tentanas::elastic::get(&g.db, &owner, &name)
         .await
         .map_err(|e| internal("elastic get", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(&name))?;
     Ok(tn(P::ElasticArrayGetResponse { array }))
 }
 
@@ -4918,16 +5033,15 @@ async fn elastic_snapraid(
     use tentanas_helper::elastic::ElasticSnapraidKind;
     let g = gate_destructive(ctx)?;
     super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_READ)?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     let array = store::elastic_array(&g.db, &elastic_owner(&g), name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     if array.parity.is_empty() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "SnapRAID wymaga zakończonej aktywnej macierzy z parity",
-        ));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_no_parity",
+            "The array has no parity, so SnapRAID has nothing to check or write",
+        )));
     }
     if let ElasticSnapraidKind::Fix { disk } = &kind {
         // A repair is the ONE operation an array that needs attention may
@@ -4935,15 +5049,13 @@ async fn elastic_snapraid(
         // reported errors leaves exactly this array, and refusing the repair
         // here would leave it with no way out through the product.
         if !matches!(array.state.as_str(), "active" | "needs_attention") {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "Naprawa wymaga macierzy aktywnej albo wymagającej uwagi",
-            ));
+            return Err(elastic_refusal(Refusal::not_available(
+                "elastic_repair_not_ready",
+                "A repair needs an array that is active or needs attention",
+            )));
         }
         if !array.branches.iter().any(|b| b.role == "data" && b.name == *disk) {
-            return Err(ProtocolError::bad_request(format!(
-                "Macierz '{name}' nie ma dysku danych '{disk}'"
-            )));
+            return Err(elastic_refusal(store::no_such_data_disk(disk).param("array", name)));
         }
         // The OBSERVED array is read here, not the database row: the button on
         // the screen reads exactly these fields off the wire, and one rule over
@@ -4951,27 +5063,27 @@ async fn elastic_snapraid(
         let observed = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
             .await
             .map_err(|e| internal("elastic get", e))?
-            .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+            .ok_or_else(|| array_missing(name))?;
         // CAN it run, before WHETHER it should. A repair writes the named disk,
         // so a data disk that is missing or unmounted makes it impossible —
         // and that is the very state a repair is reached for, so the refusal
         // has to say what must happen first instead of handing the admin the
         // helper's `precondition_failed`.
         if let Some(blocker) = tentanas::elastic::repair_blocker(&observed) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                format!("Naprawa macierzy '{name}' nie jest teraz możliwa: {blocker}"),
-            ));
+            return Err(elastic_refusal(blocker));
         }
         // Nothing to repair — see `elastic::repair_evidence` for why a repair
         // needs evidence rather than permission.
         if tentanas::elastic::repair_evidence(&observed).is_none() {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                format!(
-                    "Macierz '{name}' nie zgłasza awarii dysku ani błędów parity; naprawa \
-                     jest dostępna po scrubie, który wykryje błędy"
-                ),
+            return Err(elastic_refusal(
+                Refusal::not_available(
+                    "elastic_repair_nothing",
+                    format!(
+                        "The array {name} reports no disk failure and no parity errors; a repair is \
+                         offered after a scrub that finds errors"
+                    ),
+                )
+                .param("array", name),
             ));
         }
     } else if !array.parity_run_available {
@@ -4979,10 +5091,7 @@ async fn elastic_snapraid(
         // without success, so they are offered on the array such a run left
         // behind; everything else — a mover record in flight, a half-finished
         // add — still refuses (`db::parity_admission`).
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "SnapRAID wymaga macierzy z parity bez nierozwiązanej operacji poza parity",
-        ));
+        return Err(parity_run_blocked());
     }
     // What the Sync carries to the helper, and what the approver reads.
     let mut acknowledged = None;
@@ -4995,12 +5104,9 @@ async fn elastic_snapraid(
         let observed = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
             .await
             .map_err(|e| internal("elastic get", e))?
-            .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+            .ok_or_else(|| array_missing(name))?;
         if !observed.parity_run_available {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "SnapRAID wymaga macierzy z parity bez nierozwiązanej operacji poza parity",
-            ));
+            return Err(parity_run_blocked());
         }
         // I3: A SYNC OVER A RECORDED SCRUB OR REPAIR FAULT IS THE ADMIN'S
         // DECISION. Measured on rig11 (snapraid 13.0-1, probe f1-f4): the
@@ -5122,8 +5228,17 @@ async fn elastic_snapraid(
         kind,
         acknowledge_parity_fault,
     )
-    .map_err(|e| internal("elastic snapraid", e))?;
+    .map_err(|e| elastic_error("elastic snapraid", e))?;
     Ok(job_response(ctx, job))
+}
+
+/// A Sync or a Scrub on an array whose unresolved operation is not a parity
+/// run (a mover record in flight, a half-finished add).
+fn parity_run_blocked() -> ProtocolError {
+    elastic_refusal(Refusal::not_available(
+        "elastic_parity_run_blocked",
+        "SnapRAID needs an array with parity and no unresolved operation other than a parity run",
+    ))
 }
 
 /// §5.3's headline: one more data disk on an array that keeps serving.
@@ -5145,15 +5260,12 @@ async fn elastic_add_disk(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name, confirm_name)?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    if disk_id.is_empty() || disk_id.len() > 128 {
-        return Err(ProtocolError::bad_request("Nieprawidłowy identyfikator dysku"));
-    }
+    valid_array_name(name)?;
+    valid_disk_id(disk_id)?;
     let owner = elastic_owner(&g);
     let array = store::elastic_array(&g.db, &owner, name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     let persisted = array
         .persisted_spec()
         .map_err(|e| internal("elastic spec", e))?
@@ -5177,22 +5289,19 @@ async fn elastic_add_disk(
     let pending = pinned;
     if pending.is_none() {
         if array.state != "active" || !array.enabled {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "Dodanie dysku wymaga zakończonej aktywnej macierzy",
-            ));
+            return Err(elastic_refusal(Refusal::not_available(
+                "elastic_add_not_ready",
+                "Adding a disk needs an enabled array whose creation has finished",
+            )));
         }
         if array.unresolved_operation {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "Macierz ma niepotwierdzoną operację; rozwiąż ją przed dodaniem dysku",
-            ));
+            return Err(unresolved_operation());
         }
     } else if !array.enabled || !matches!(array.state.as_str(), "active" | "needs_attention") {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "Powtórzenie dodania dysku wymaga włączonej macierzy",
-        ));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_add_retry_not_ready",
+            "Repeating the disk add needs an enabled array",
+        )));
     }
     // A disk this array (or any array of this instance) already holds is not a
     // "not free" disk to the admin reading the error — it is THEIR disk in
@@ -5211,9 +5320,17 @@ async fn elastic_add_disk(
                 .map(|parity| parity.name.clone())
         })
     {
-        return Err(ProtocolError::bad_request(format!(
-            "Dysk jest już w macierzy '{name}' jako '{member}'"
-        )));
+        // Named by its kernel name, else by its place in the array — never by
+        // the slot key the request would have to spell.
+        let words = DiskWords::member(&member, &tentanas::disks::disk_name(disk_id).unwrap_or_default());
+        return Err(elastic_refusal(
+            Refusal::bad_request(
+                "elastic_disk_in_array",
+                format!("{} is already in the array {name}", words.english()),
+            )
+            .disk(words)
+            .param("array", name),
+        ));
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
         return park(
@@ -5244,7 +5361,9 @@ async fn elastic_add_disk(
             let picked = disks_by_id(std::slice::from_ref(&disk_id.to_string()), true)?
                 .into_iter()
                 .next()
-                .ok_or_else(|| ProtocolError::bad_request("Nie wybrano dysku"))?;
+                .ok_or_else(|| {
+                    elastic_refusal(Refusal::bad_request("elastic_no_disk_picked", "No disk was picked"))
+                })?;
             let global = root_claims(&g, "elastic root claims", None, explicit.as_deref()).await?;
             let mut claims =
                 store::elastic_claims(&g.db).map_err(|e| internal("elastic claims", e))?;
@@ -5252,12 +5371,28 @@ async fn elastic_add_disk(
             if !tentanas::elastic::claimed_disk_ids(std::slice::from_ref(&picked), &claims)
                 .is_empty()
             {
-                return Err(ProtocolError::bad_request(
-                    "Dysk jest już zarezerwowany przez macierz Elastic na tym nodzie",
+                return Err(elastic_refusal(
+                    Refusal::bad_request(
+                        "elastic_disk_claimed_here",
+                        format!("Disk {} is already reserved by an Elastic Array on this node", picked.name),
+                    )
+                    .disk(DiskWords::Kernel(picked.name.clone())),
                 ));
             }
-            if let Some(conflict) = tentanas::elastic::conflicting_owner(&picked) {
-                return Err(ProtocolError::bad_request(conflict));
+            if let Some((owner, owner_name)) = tentanas::elastic::conflicting_owner_code(&picked) {
+                return Err(elastic_refusal(
+                    Refusal::bad_request(
+                        "elastic_disk_in_use",
+                        format!(
+                            "Disk {} is {}",
+                            picked.name,
+                            tentanas::elastic::conflicting_owner(&picked).unwrap_or_default()
+                        ),
+                    )
+                    .disk(DiskWords::Kernel(picked.name.clone()))
+                    .param("owner", owner)
+                    .param("owner_name", owner_name),
+                ));
             }
             ElasticDiskSpec {
                 disk_id: picked.disk_id.clone(),
@@ -5275,16 +5410,24 @@ async fn elastic_add_disk(
     // refuses only once the data has outgrown the parity (MEASURED 2026-09-06,
     // snapraid 14.7).
     let after = tentanas::elastic::spec_with_added_disk(&persisted, &disk)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+        .map_err(|e| logged_refusal("elastic spec", &Refusal::bad_request("elastic_spec_invalid", e.to_string())))?;
     if let Some(parity) = after.parity.iter().map(|p| p.bytes).min() {
         if disk.bytes > parity {
-            return Err(ProtocolError::bad_request(
-                "Dysk danych jest większy niż parity macierzy; parity nie pokryłaby go w całości",
+            let words = tentanas::disks::disk_name(&disk.disk_id).map_or(DiskWords::Unnamed, DiskWords::Kernel);
+            return Err(elastic_refusal(
+                Refusal::bad_request(
+                    "elastic_disk_larger_than_parity",
+                    format!(
+                        "{} is larger than the array's parity; parity would not cover all of it",
+                        words.english()
+                    ),
+                )
+                .disk(words),
             ));
         }
     }
     let job = tentanas::elastic::spawn_add_disk(&g.db, &array, &g.user_id, explicit, disk)
-        .map_err(|e| internal("elastic add disk", e))?;
+        .map_err(|e| elastic_error("elastic add disk", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -5309,18 +5452,15 @@ async fn elastic_add_disk_abort(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name, confirm_name)?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    if disk_id.is_empty() || disk_id.len() > 128 {
-        return Err(ProtocolError::bad_request("Nieprawidłowy identyfikator dysku"));
-    }
+    valid_array_name(name)?;
+    valid_disk_id(disk_id)?;
     let owner = elastic_owner(&g);
     let array = store::elastic_array(&g.db, &owner, name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
-    let refuse = |code: &str| ProtocolError::new(ProtocolErrorCode::NotAvailable, format!("refusal:elastic_{code}"));
+        .ok_or_else(|| array_missing(name))?;
+    let refuse = |code: &'static str| elastic_refusal(Refusal::not_available(code, ""));
     if !array.enabled || !matches!(array.state.as_str(), "active" | "needs_attention") {
-        return Err(refuse("array_not_ready"));
+        return Err(refuse("elastic_array_not_ready"));
     }
     // The observation first: it settles an undo the core lost track of
     // (`elastic::reconcile_undone_add`), so a repeated undo reads "nothing to
@@ -5328,17 +5468,17 @@ async fn elastic_add_disk_abort(
     let observed = tentanas::elastic::get(&g.db, &owner, name)
         .await
         .map_err(|e| internal("elastic get", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     let disk = store::unfinished_elastic_add_disk(&g.db, &owner, &array.persisted_spec().map_err(|e| internal("elastic spec", e))?.array_id)
         .map_err(|e| internal("elastic add disk", e))?
         .filter(|disk| disk.disk_id == disk_id)
-        .ok_or_else(|| refuse("nothing_to_undo"))?;
+        .ok_or_else(|| refuse("elastic_nothing_to_undo"))?;
     // Nothing read from the helper: nothing says the disk never joined.
     if observed.state == "unknown" {
-        return Err(refuse("state_unknown"));
+        return Err(refuse("elastic_state_unknown"));
     }
     if !observed.pending_add_disk.as_ref().is_some_and(|pending| pending.disk_id == disk_id && pending.undo_possible) {
-        return Err(refuse("add_joined"));
+        return Err(refuse("elastic_add_joined"));
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
         return park(
@@ -5361,7 +5501,7 @@ async fn elastic_add_disk_abort(
         );
     }
     let job = tentanas::elastic::spawn_add_disk_abort(&g.db, &array, &g.user_id, secret.map(token), disk)
-        .map_err(|e| internal("elastic add disk abort", e))?;
+        .map_err(|e| elastic_error("elastic add disk abort", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -5424,13 +5564,17 @@ async fn elastic_replace_disk(
     // arrays from a withdrawn feature either.
     let _g = gate_destructive(ctx)?;
     let _ = (branch, confirm_disk, replacement_disk_id, accept_stale_parity, secret, origin);
-    Err(ProtocolError::new(
-        ProtocolErrorCode::NotAvailable,
-        format!(
-            "Wymiana dysku macierzy '{name}' nie jest udostępniona w tej wersji. Macierz serwuje \
-             dalej z dysków, które ma; naprawa z parity działa dla dysków obecnych na nodzie, a \
-             macierz z brakującym dyskiem można rozwiązać i przejąć ponownie po jego podłączeniu."
-        ),
+    Err(elastic_refusal(
+        Refusal::not_available(
+            "elastic_replace_withdrawn",
+            format!(
+                "Disk replacement of the array {name} is not available in this version. The array keeps \
+                 serving from the disks it has; a repair from parity works for the disks present on the \
+                 node, and an array with a missing disk can be dissolved and adopted again once the disk \
+                 is connected."
+            ),
+        )
+        .param("array", name),
     ))
 }
 
@@ -5457,12 +5601,11 @@ async fn elastic_destroy(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name, confirm_name)?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     let owner = elastic_owner(&g);
     let array = store::elastic_array(&g.db, &owner, name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     let union = array.union_path();
     let shares: Vec<String> = store::list_shares(&g.db)
         .map_err(|e| internal("shares", e))?
@@ -5473,12 +5616,16 @@ async fn elastic_destroy(
         .map(|share| share.name)
         .collect();
     if !shares.is_empty() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            format!(
-                "Macierz udostępnia share'y: {}. Usuń je przed rozwiązaniem macierzy",
-                shares.join(", ")
-            ),
+        return Err(elastic_refusal(
+            Refusal::not_available(
+                "elastic_destroy_shared",
+                format!(
+                    "The array serves shares: {}. Delete them before dissolving the array",
+                    shares.join(", ")
+                ),
+            )
+            .param("array", name)
+            .param("shares", shares.join(", ")),
         ));
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
@@ -5501,7 +5648,7 @@ async fn elastic_destroy(
         );
     }
     let job = tentanas::elastic::spawn_dissolve(&g.db, &array, &g.user_id, secret.map(token))
-        .map_err(|e| internal("elastic destroy", e))?;
+        .map_err(|e| elastic_error("elastic destroy", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -5514,27 +5661,26 @@ async fn elastic_mover(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_READ)?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     let array = store::elastic_array(&g.db, &elastic_owner(&g), name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     // An array whose only unresolved operations are mover runs takes the
     // next run: that run is what settles them.
     if array.state != "active" && !array.mover_settles_unresolved {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "Mover wymaga zakończonej aktywnej macierzy",
-        ));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_mover_not_ready",
+            "The mover needs an array whose creation has finished and that is active",
+        )));
     }
     // Nothing to move. Without a cache branch every write already lands on the
     // data disks, so a run would walk an empty source and report having moved
     // nothing — a job whose success says nothing about anything.
     if array.cache().next().is_none() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "Macierz bez dysku cache nie ma czego przenosić",
-        ));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_mover_no_cache",
+            "An array without a cache disk has nothing to move",
+        )));
     }
     // An unresolved operation blocks the mover in the store. Without this the
     // refusal would surface as a generic internal error from `insert_job`, and
@@ -5543,10 +5689,7 @@ async fn elastic_mover(
     // does exactly that, which is how an enabled button used to meet an opaque
     // error. Clearing such an operation is E2-13, not this path.
     if array.unresolved_operation && !array.mover_settles_unresolved {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "Macierz ma niepotwierdzoną operację; rozwiąż ją przed uruchomieniem movera",
-        ));
+        return Err(unresolved_operation());
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
         // What is recorded in the approval must be what will actually run: with
@@ -5574,7 +5717,7 @@ async fn elastic_mover(
         );
     }
     let job = tentanas::elastic::spawn_mover(&g.db, &array, &g.user_id, secret.map(token))
-        .map_err(|e| internal("elastic mover", e))?;
+        .map_err(|e| elastic_error("elastic mover", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -5654,9 +5797,10 @@ async fn elastic_schedule_set(
         (None, None, None) => None,
         (Some(age), Some(pct), Some(coupled)) => Some((age, pct, coupled)),
         _ => {
-            return Err(ProtocolError::bad_request(
-                "Niepełne reguły movera: podaj wszystkie trzy albo żadnej",
-            ))
+            return Err(elastic_refusal(Refusal::bad_request(
+                "elastic_mover_rules_incomplete",
+                "Incomplete mover rules: send all three or none",
+            )))
         }
     };
     // EVERY range check belongs above the park below. A value the replay would
@@ -5665,24 +5809,28 @@ async fn elastic_schedule_set(
     // the approver would have been shown "próg wolnego cache 200%".
     if let Some((min_age_secs, cache_min_free_pct, _)) = mover_rules {
         if cache_min_free_pct > 100 {
-            return Err(ProtocolError::bad_request(
-                "Minimum wolnego miejsca na cache to 0–100%",
-            ));
+            return Err(elastic_refusal(Refusal::bad_request(
+                "elastic_cache_free_range",
+                "The cache free-space threshold is 0–100%",
+            )));
         }
         if min_age_secs > MAX_MOVER_MIN_AGE_SECS {
-            return Err(ProtocolError::bad_request(
-                "Wiek plików do przeniesienia nie może przekraczać 365 dni",
+            return Err(elastic_refusal(
+                Refusal::bad_request(
+                    "elastic_mover_age_range",
+                    "The age of the files to move cannot exceed 365 days",
+                )
+                .param("days", MAX_MOVER_MIN_AGE_SECS / 86_400),
             ));
         }
     }
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     let array_id = store::elastic_array(&g.db, &elastic_owner(&g), name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?
+        .ok_or_else(|| array_missing(name))?
         .array_id()
         .map(str::to_string)
-        .ok_or_else(|| internal("elastic schedule", "macierz bez utrwalonej intencji"))?;
+        .ok_or_else(|| internal("elastic schedule", "the array has no persisted intent"))?;
     // An unknown cadence never fires — `next_run_after` refuses to guess one —
     // so an enabled schedule this node could never run is refused here instead
     // of being stored as a promise nothing keeps.
@@ -5690,9 +5838,9 @@ async fn elastic_schedule_set(
         .then(|| tentanas::scheduler::next_run_utc(schedule, chrono::Local::now()))
         .flatten();
     if enabled && next.is_none() {
-        return Err(ProtocolError::bad_request(format!(
-            "unknown schedule cadence '{}'",
-            schedule.every
+        return Err(elastic_refusal(Refusal::bad_request(
+            "schedule_cadence_unknown",
+            format!("unknown schedule cadence '{}'", schedule.every),
         )));
     }
     // §5.10 applies to any request that CHANGES what will run — not merely to
@@ -5812,7 +5960,7 @@ async fn elastic_schedule_set(
     let array = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
         .await
         .map_err(|e| internal("elastic get", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     Ok(tn(P::ElasticArrayGetResponse { array }))
 }
 
@@ -5840,22 +5988,25 @@ async fn elastic_folder_cache_set(
     // Both shapes before either lookup: a caller who spelled the policy wrong
     // gets told which values exist, rather than a refusal about a folder.
     let policy = tentanas::elastic::CachePolicy::parse(cache_policy).ok_or_else(|| {
-        ProtocolError::bad_request("Nieznana polityka cache: dozwolone „yes”, „no” i „only”")
+        elastic_refusal(Refusal::bad_request(
+            "elastic_cache_policy_invalid",
+            "Unknown cache policy: the values are \"yes\", \"no\" and \"only\"",
+        ))
     })?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     if !tentanas::elastic::folder_name_valid(folder) {
-        return Err(ProtocolError::bad_request(
-            "Folder musi być jedną nazwą bezpośrednio pod unią macierzy",
-        ));
+        return Err(elastic_refusal(Refusal::bad_request(
+            "elastic_folder_invalid",
+            "A folder has to be one name directly under the array's union",
+        )));
     }
     let array = store::elastic_array(&g.db, &elastic_owner(&g), name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     let array_id = array
         .array_id()
         .map(str::to_string)
-        .ok_or_else(|| internal("elastic folder cache", "macierz bez utrwalonej intencji"))?;
+        .ok_or_else(|| internal("elastic folder cache", "the array has no persisted intent"))?;
     // The two refusals are NOT interchangeable. `NoSuchFolder` is a folder the
     // node looked for in a list it could read; `FoldersUnknown` is a list it
     // could not read at all, which happens on every array whose branches are
@@ -5863,27 +6014,34 @@ async fn elastic_folder_cache_set(
     // their folder is gone.
     if let Some(refusal) = tentanas::elastic::folder_policy_refusal(&array, folder) {
         return Err(match refusal {
-            tentanas::elastic::FolderPolicyRefusal::NoSuchFolder => {
-                ProtocolError::not_found("Ten folder nie istnieje w tej macierzy")
-            }
-            tentanas::elastic::FolderPolicyRefusal::FoldersUnknown => ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "Nie można odczytać listy folderów macierzy — polityka cache nie została zapisana",
+            tentanas::elastic::FolderPolicyRefusal::NoSuchFolder => elastic_refusal(
+                Refusal::not_found("elastic_folder_not_found", format!("The folder {folder} does not exist in this array"))
+                    .param("folder", folder),
             ),
+            tentanas::elastic::FolderPolicyRefusal::FoldersUnknown => elastic_refusal(Refusal::not_available(
+                "elastic_folders_unreadable",
+                "The array's folder list cannot be read; the cache policy was not saved",
+            )),
         });
     }
     if !store::set_elastic_folder_policy(&g.db, &array_id, folder, policy)
         .map_err(|e| internal("elastic folder cache", e))?
     {
-        return Err(ProtocolError::bad_request(format!(
-            "Najwyżej {} folderów tej macierzy może mieć własną politykę cache",
-            store::FOLDER_POLICY_LIMIT
-        )));
+        return Err(elastic_refusal(
+            Refusal::bad_request(
+                "elastic_folder_policy_limit",
+                format!(
+                    "At most {} folders of this array can have their own cache policy",
+                    store::FOLDER_POLICY_LIMIT
+                ),
+            )
+            .param("limit", store::FOLDER_POLICY_LIMIT),
+        ));
     }
     let array = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
         .await
         .map_err(|e| internal("elastic get", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     Ok(tn(P::ElasticArrayGetResponse { array }))
 }
 
@@ -5939,7 +6097,10 @@ async fn elastic_array_plan(
     // because the plan is what tells them to install it. Nothing here runs.
     let global = namespace.await?;
     if !name.is_empty() && (global.name_claimed.is_none() || global.namespace_clear.is_none()) {
-        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,"Niepotwierdzona przestrzeń nazw"));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_namespace_unconfirmed",
+            "The mount namespace of the name could not be confirmed",
+        )));
     }
     let mut reserved = std::collections::BTreeSet::new();
     if global.name_claimed == Some(true) || global.namespace_clear == Some(false) {
@@ -6507,7 +6668,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ElasticArrayGetRequest {name} => {
             let g = gate(ctx,PERM_READ)?;
             let array = tentanas::elastic::get(&g.db,&elastic_owner(&g),name).await
-                .map_err(|e| internal("elastic get",e))?.ok_or_else(||ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+                .map_err(|e| internal("elastic get",e))?.ok_or_else(|| array_missing(name))?;
             Ok(tn(P::ElasticArrayGetResponse {array}))
         }
         P::ElasticArrayImportScanRequest { sudo_password } => {
@@ -6901,6 +7062,330 @@ register_tentanas_variant!(
 );
 register_tentanas_variant!("TentaNasSharingStopRequest", "tentaflow_ws_handler_nas_sharing_stop");
 
+/// Wave 13: every refusal an Elastic request answers is CODED
+/// (`tentanas::refusal`), and a raw sentence cannot come back unnoticed.
+///
+/// A scan of the sources, in the manner of the alert raisers' scan in
+/// `tentanas/db.rs`: the Elastic section of this dispatcher builds no
+/// `ProtocolError` from a sentence, the store and Elastic functions a request
+/// runs through refuse in no Polish sentence, and every refusal code those
+/// files send has words in all five locales.
+#[cfg(test)]
+mod elastic_refusal_scan_tests {
+    const DISPATCH: &str = include_str!("tentanas.rs");
+    const DB: &str = include_str!("../tentanas/db.rs");
+    const ELASTIC: &str = include_str!("../tentanas/elastic.rs");
+    const LOCALES: [(&str, &str); 5] = [
+        ("pl", include_str!("../../www/i18n/pl.json")),
+        ("en", include_str!("../../www/i18n/en.json")),
+        ("de", include_str!("../../www/i18n/de.json")),
+        ("es", include_str!("../../www/i18n/es.json")),
+        ("fr", include_str!("../../www/i18n/fr.json")),
+    ];
+
+    /// The code of `source` with every comment dropped, and the string
+    /// literals it holds. In the code, a char literal becomes `'_'` and a raw
+    /// string an ordinary one (its quotes and backslashes escaped), so a
+    /// `'{'`, a `'('` or a `"` inside `r#"…"#` never unbalances the matchers
+    /// below (critic wave 13, MINOR 6).
+    fn code_and_strings(source: &str) -> (String, Vec<String>) {
+        let bytes = source.as_bytes();
+        let mut code = String::with_capacity(source.len());
+        let mut strings = Vec::new();
+        let mut i = 0;
+        let word_before = |i: usize| i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        while i < bytes.len() {
+            let rest = &source[i..];
+            if rest.starts_with("//") {
+                i += rest.find('\n').unwrap_or(rest.len());
+                continue;
+            }
+            if rest.starts_with("/*") {
+                i += rest.find("*/").map_or(rest.len(), |at| at + 2);
+                continue;
+            }
+            // A raw string: `r"…"`, `r#"…"#`, `br"…"` (hashes counted).
+            let raw_at = if rest.starts_with("br") { 2 } else if rest.starts_with('r') { 1 } else { 0 };
+            if raw_at > 0 && !word_before(i) {
+                let hashes = rest[raw_at..].bytes().take_while(|b| *b == b'#').count();
+                if rest[raw_at + hashes..].starts_with('"') {
+                    let open = raw_at + hashes + 1;
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let end = rest[open..].find(&close).map_or(rest.len(), |at| open + at);
+                    let content = &rest[open..end];
+                    strings.push(content.to_string());
+                    code.push('"');
+                    code.push_str(&content.replace('\\', "\\\\").replace('"', "\\\""));
+                    code.push('"');
+                    i += (end + close.len()).min(rest.len());
+                    continue;
+                }
+            }
+            // A char literal (`'x'`, `'\n'`, `'\u{7b}'`); a lifetime (`'a`)
+            // has no closing quote right after one character.
+            if bytes[i] == b'\'' {
+                let len = if rest.starts_with("'\\") {
+                    rest.get(3..).and_then(|tail| tail.find('\'')).map(|at| at + 4)
+                } else {
+                    let mut chars = rest[1..].chars();
+                    chars.next().and_then(|c| (chars.next() == Some('\'')).then(|| c.len_utf8() + 2))
+                };
+                if let Some(len) = len {
+                    code.push_str("'_'");
+                    i += len;
+                    continue;
+                }
+            }
+            if bytes[i] == b'"' {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    if bytes[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                strings.push(source[i + 1..j.min(bytes.len())].to_string());
+                code.push_str(&source[i..(j + 1).min(bytes.len())]);
+                i = j + 1;
+                continue;
+            }
+            let ch = rest.chars().next().unwrap();
+            code.push(ch);
+            i += ch.len_utf8();
+        }
+        (code, strings)
+    }
+
+    #[test]
+    fn the_scanner_reads_char_literals_raw_strings_and_comments() {
+        let source = "fn f() { let a = '{'; let b = '\\''; let c = r#\"say \"(\" now\"#; /* { */ g(\"x)\") }";
+        let (code, strings) = code_and_strings(source);
+        assert_eq!(strings, vec!["say \"(\" now".to_string(), "x)".to_string()]);
+        assert!(!code.contains("/*"), "{code}");
+        let body = function(&code, "f", None);
+        assert!(body.ends_with("g(\"x)\") "), "the whole body, not cut at a brace in a literal: {body}");
+        let at = code.find("g(").unwrap() + 1;
+        assert_eq!(parenthesised(&code, at), "\"x)\"");
+    }
+
+    /// The text between the `(` at `open` and its matching `)`.
+    fn parenthesised(code: &str, open: usize) -> &str {
+        let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+        for (at, ch) in code[open..].char_indices() {
+            if in_string {
+                match (escaped, ch) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &code[open + 1..open + at];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parentheses at {open}");
+    }
+
+    /// The body of `fn name(` in `source` (to its closing brace), from
+    /// `from` on when that marker is given.
+    fn function<'a>(source: &'a str, name: &str, from: Option<&str>) -> &'a str {
+        let head = [format!("fn {name}("), format!("fn {name}<")]
+            .iter()
+            .filter_map(|head| source.find(head.as_str()))
+            .min()
+            .unwrap_or_else(|| panic!("fn {name}"));
+        let open = head + source[head..].find('{').expect("a body");
+        let (mut depth, mut end, mut in_string, mut escaped) = (0usize, open, false, false);
+        for (at, ch) in source[open..].char_indices() {
+            if in_string {
+                match (escaped, ch) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + at;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &source[open..end];
+        match from {
+            Some(marker) => &body[body.find(marker).unwrap_or_else(|| panic!("{marker} in {name}"))..],
+            None => body,
+        }
+    }
+
+    fn polish(text: &str) -> bool {
+        const WORDS: [&str; 12] =
+            ["nie", "Brak", "brak", "Macierz", "macierz", "macierzy", "dysk", "Dysk", "dysku", "Zadanie", "Operacja", "jest"];
+        text.chars().any(|c| "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ".contains(c))
+            || text.split(|c: char| !c.is_alphanumeric()).any(|word| WORDS.contains(&word))
+    }
+
+    /// The Elastic handlers and the dispatcher's Elastic arms.
+    fn elastic_dispatch() -> String {
+        let cut = |start: &str, end: &str| {
+            let from = DISPATCH.find(start).unwrap_or_else(|| panic!("{start}"));
+            let to = from + DISPATCH[from..].find(end).unwrap_or_else(|| panic!("{end}"));
+            DISPATCH[from..to].to_string()
+        };
+        cut("// ----- Elastic Array (§5.3)", "// ----- dispatcher")
+            + &cut("// ----- Elastic Array -----", "P::NodesListResponse { .. }")
+    }
+
+    #[test]
+    fn elastic_requests_answer_no_raw_sentence() {
+        let (code, strings) = code_and_strings(&elastic_dispatch());
+        let mut raw = Vec::new();
+        let mut checked = 0;
+        for constructor in ["ProtocolError::bad_request(", "ProtocolError::not_found(", "ProtocolError::new("] {
+            for (at, _) in code.match_indices(constructor) {
+                let args = parenthesised(&code, at + constructor.len() - 1);
+                checked += 1;
+                // The message argument (after an explicit status) is exactly
+                // a `"refusal:<code>"` literal, or exactly the name of a
+                // constant this file declares as one — nothing built around
+                // it (critic wave 13, MINOR 6: any ALL_CAPS token used to pass).
+                let message = match args.trim().strip_prefix("ProtocolErrorCode::") {
+                    Some(rest) => rest.split_once(',').map_or("", |(_, message)| message),
+                    None => args,
+                }
+                .trim();
+                let literal = message.strip_prefix("\"refusal:").and_then(|rest| rest.strip_suffix('"'));
+                let coded = literal.is_some_and(|code| {
+                    !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                }) || (!message.is_empty()
+                    && message.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                    && DISPATCH.contains(&format!("const {message}: &str = \"refusal:")));
+                if !coded {
+                    raw.push(args.trim().to_string());
+                }
+            }
+        }
+        assert!(checked >= 3, "the scan found the constructors ({checked})");
+        assert!(raw.is_empty(), "Elastic requests answer raw sentences: {raw:#?}");
+        let polish: Vec<&String> = strings.iter().filter(|s| polish(s)).collect();
+        assert!(polish.is_empty(), "Polish sentences in the Elastic handlers: {polish:#?}");
+        // The refusals really are there: the section is not an empty cut.
+        assert!(code.matches("Refusal::").count() >= 30, "the section builds its refusals");
+    }
+
+    /// The store and Elastic functions a request runs through before any
+    /// job is started: whatever they refuse reaches the admin, so it is a
+    /// `Refusal` or an internal fault in English — never a Polish sentence.
+    #[test]
+    fn the_elastic_refusal_paths_refuse_in_no_polish_sentence() {
+        // Comments out first: a quote in a comment is not a string.
+        let db = code_and_strings(DB).0;
+        let elastic = code_and_strings(ELASTIC).0;
+        let paths = [
+            // The Elastic intents (the SMART and ownership checks above them
+            // are not Elastic refusals; the teardown one is coded).
+            ("db.rs", function(&db, "insert_job_full", Some("if let Some(intent) = intent {"))),
+            ("db.rs", function(&db, "reserve_added_disk", None)),
+            ("db.rs", function(&db, "elastic_import", None)),
+            ("elastic.rs", function(&elastic, "import_selection", None)),
+            ("elastic.rs", function(&elastic, "journals", None)),
+            ("elastic.rs", function(&elastic, "import_apply", None)),
+            ("elastic.rs", function(&elastic, "repair_blocker", None)),
+        ];
+        let mut found = Vec::new();
+        let mut refusals = 0;
+        // EVERY literal of these bodies, not only the arguments of
+        // `bail!`/`ensure!`/`anyhow!`: a `.context("…")`, an `Error::msg`
+        // or a sentence built first and raised later is caught too.
+        for (file, body) in paths {
+            let (code, strings) = code_and_strings(body);
+            refusals += code.matches("Refusal::").count() + code.matches("refuse(").count();
+            found.extend(strings.into_iter().filter(|s| polish(s)).map(|s| format!("{file}: {s}")));
+        }
+        assert!(refusals >= 15, "the scan found the refusals ({refusals})");
+        assert!(found.is_empty(), "raw Polish refusals on an Elastic request path: {found:#?}");
+    }
+
+    /// Every code the Elastic layer and this dispatcher refuse with.
+    fn refusal_codes() -> std::collections::BTreeSet<String> {
+        let mut codes = std::collections::BTreeSet::new();
+        for source in [DISPATCH, DB, ELASTIC] {
+            let production = source.split("mod tests {").next().unwrap_or(source);
+            let (code, _) = code_and_strings(production);
+            for opener in [
+                "Refusal::not_available(",
+                "Refusal::bad_request(",
+                "Refusal::not_found(",
+                "Refusal::conflict(",
+                "refuse(",
+            ] {
+                for (at, _) in code.match_indices(opener) {
+                    let rest = code[at + opener.len()..].trim_start();
+                    if let Some(literal) = rest.strip_prefix('"') {
+                        let name = &literal[..literal.find('"').unwrap()];
+                        // `refuse(` is also the layout plan's helper
+                        // (`elastic::layout_refusals`), whose codes are the
+                        // wizard's and not refusals of a request.
+                        let wire = opener != "refuse(" || name.starts_with("elastic_");
+                        if wire && !name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
+                            codes.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+            for (at, _) in code.match_indices("\"refusal:") {
+                let name: String = code[at + 9..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                    .collect();
+                // `"refusal:elastic_{code}"` builds a code; its parts are
+                // the helper's refusal codes, worded under their full names.
+                if !name.is_empty() && !name.ends_with('_') {
+                    codes.insert(name);
+                }
+            }
+        }
+        codes
+    }
+
+    #[test]
+    fn every_elastic_refusal_code_has_words_in_all_five_locales() {
+        let codes = refusal_codes();
+        for known in ["elastic_disk_member", "elastic_import_incomplete", "elastic_array_not_found", "confirm_mismatch"] {
+            assert!(codes.contains(known), "the scan found {known}: {codes:?}");
+        }
+        let mut missing = Vec::new();
+        for (locale, text) in LOCALES {
+            let bundle: serde_json::Value = serde_json::from_str(text).expect("a locale bundle");
+            for code in &codes {
+                let words = bundle["tentanas"]["refusal"][code.as_str()].as_str().unwrap_or_default();
+                if words.trim().is_empty() {
+                    missing.push(format!("{locale}: {code}"));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "refusal codes without words: {missing:#?}");
+    }
+}
+
 #[cfg(test)]
 mod smart_batch_id_tests {
     use super::*;
@@ -7081,7 +7566,7 @@ mod registration_tests {
         store::finish_job(&g.db, &job.job_id, "succeeded", None).unwrap();
         let started = ScheduleOutcome::Started { job_id: job.job_id.clone() };
         store::record_pool_schedule_run(&g.db, store::PoolTask::Scrub, "tank", &started.stored(), None).unwrap();
-        let refused = ScheduleOutcome::StartFailed { detail: "the pool is busy".into() };
+        let refused = ScheduleOutcome::StartFailed { detail: "the pool is busy".into(), refusal: None };
         store::record_pool_schedule_run(&g.db, store::PoolTask::Trim, "tank", &refused.stored(), None).unwrap();
 
         let MessageBody::TentaNasBody(P::SchedulesListResponse { rows, .. }) = schedules_list(&fixture.ctx).unwrap() else {
@@ -7094,6 +7579,20 @@ mod registration_tests {
         let trim = row("trim");
         assert_eq!((trim.last_outcome.as_str(), trim.last_detail.as_str()), ("start_failed", "the pool is busy"));
         assert!(trim.last_job_status.is_empty());
+        assert!(trim.last_reason.is_empty(), "an uncoded failure carries no code");
+        // A CODED refusal (wave 13) goes out as its code for the screen to
+        // word, and its sentence stays the detail (critic wave 13, MAJOR 1).
+        let coded: anyhow::Result<tentaflow_protocol::tentanas::NasJob> =
+            Err(store::elastic_unresolved_refusal().into());
+        store::record_pool_schedule_run(&g.db, store::PoolTask::Trim, "tank", &ScheduleOutcome::of_spawn(&coded).stored(), None)
+            .unwrap();
+        let MessageBody::TentaNasBody(P::SchedulesListResponse { rows, .. }) = schedules_list(&fixture.ctx).unwrap() else {
+            panic!("a schedules list")
+        };
+        let trim = rows.iter().find(|r| r.kind == "trim").unwrap();
+        assert_eq!(trim.last_outcome, "start_failed");
+        assert_eq!(trim.last_reason, "refusal:elastic_operation_unresolved");
+        assert!(!trim.last_detail.contains("refusal:") && trim.last_detail.contains("unresolved operation"), "{}", trim.last_detail);
         for r in &rows {
             for field in [&r.last_outcome, &r.last_job_status, &r.last_reason, &r.last_detail] {
                 assert!(!field.contains(&job.job_id), "{}: {field}", r.kind);
@@ -8000,7 +8499,8 @@ mod registration_tests {
             .unwrap_err();
         assert_eq!(healthy.code, ProtocolErrorCode::NotAvailable);
         assert!(
-            healthy.message.contains("nie zgłasza awarii") && healthy.message.contains("scrub"),
+            healthy.message.starts_with("refusal:elastic_repair_nothing?array=media ")
+                && healthy.message.contains("scrub"),
             "{}",
             healthy.message
         );
@@ -8018,7 +8518,12 @@ mod registration_tests {
             .await
             .unwrap_err();
         assert_eq!(foreign.code, ProtocolErrorCode::BadRequest);
-        assert!(foreign.message.contains("d9"), "{}", foreign.message);
+        // Named by its number among the data disks, never by the slot key.
+        assert!(
+            foreign.message.starts_with("refusal:elastic_no_such_data_disk?data=9&array=media "),
+            "{}",
+            foreign.message
+        );
 
         // NO PARITY. The array's own parity disk is what a repair rebuilds
         // from; without one there is nothing to rebuild from at all.
@@ -8128,7 +8633,8 @@ mod registration_tests {
             .await
             .unwrap_err();
             assert_eq!(refused.code, ProtocolErrorCode::NotAvailable, "{}", refused.message);
-            assert!(refused.message.contains("naprawa"), "{}", refused.message);
+            assert!(refused.message.starts_with("refusal:elastic_replace_withdrawn?array="), "{}", refused.message);
+            assert!(refused.message.contains("repair from parity"), "{}", refused.message);
         }
 
         // NOTHING WAS WRITTEN: no operation of any kind, no job, no approval,
@@ -8412,19 +8918,22 @@ mod registration_tests {
         // A DISK THIS ARRAY ALREADY HOLDS, by its data role and by its parity
         // role, each named as the member it is.
         for (disk_id, member) in [
-            (spec.data[0].disk_id.clone(), "d1"),
-            (spec.parity[0].disk_id.clone(), "parity1"),
+            (spec.data[0].disk_id.clone(), "data=1"),
+            (spec.parity[0].disk_id.clone(), "parity=1"),
         ] {
             let error =
                 elastic_add_disk(&fixture.ctx, "media", &disk_id, "media", None, Origin::Direct)
                     .await
                     .unwrap_err();
             assert_eq!(error.code, ProtocolErrorCode::BadRequest, "{member}");
+            // The fixture's disks are in no inventory: named by their place
+            // in the array, never by the slot key or the id.
             assert!(
-                error.message.contains("media") && error.message.contains(member),
+                error.message.starts_with(&format!("refusal:elastic_disk_in_array?{member}&array=media ")),
                 "{member}: {}",
                 error.message
             );
+            assert!(!error.message.contains(&disk_id), "{}", error.message);
         }
 
         // A disk that is not on this node at all is not free either, and the
@@ -8534,6 +9043,50 @@ mod registration_tests {
             0
         );
         assert_eq!(tentanas::elevation::audit_entries(&g.db), 0);
+    }
+
+    /// Critic wave 13, MINOR 2: the adoption answers every refusal with the
+    /// status it always had (`BadRequest`), whatever status the Elastic layer
+    /// gave it; a refusal raised while a job opens keeps its own status (the
+    /// documented change: it used to be an `Internal` "failed").
+    #[test]
+    fn the_adoption_keeps_its_status_and_a_store_refusal_keeps_its_own() {
+        let taken = || anyhow::Error::from(store::elastic_already_adopted());
+        let adopted = import_error("elastic import", taken());
+        assert_eq!(adopted.code, ProtocolErrorCode::BadRequest);
+        assert!(adopted.message.starts_with("refusal:elastic_already_adopted "), "{}", adopted.message);
+        let gone = import_error("elastic import", anyhow::Error::from(Refusal::not_found("elastic_journal_gone", "gone")));
+        assert_eq!(gone.code, ProtocolErrorCode::BadRequest);
+        assert_eq!(elastic_error("elastic create", taken()).code, ProtocolErrorCode::Conflict);
+        assert_eq!(elastic_error("elastic create", anyhow::anyhow!("disk full")).code, ProtocolErrorCode::Internal);
+    }
+
+    /// Wave 13: a refusal the STORE raises while the request opens its job
+    /// (`db::insert_job_full`) reaches the admin as its code — not as
+    /// "tentanas elastic destroy failed", which is what `internal()` made of
+    /// every one of them — and nothing is started.
+    #[tokio::test]
+    async fn a_store_refusal_reaches_the_admin_coded_and_starts_nothing() {
+        let mut fixture = dispatch_fixture();
+        let spec = active_array(&mut fixture);
+        let g = gate_destructive(&fixture.ctx).unwrap();
+        g.db.write()
+            .unwrap()
+            .execute(
+                "INSERT INTO nas_settings(key,value,updated_at) VALUES ('elastic_teardown_started','true',?1)",
+                rusqlite::params![store::now()],
+            )
+            .unwrap();
+        let refused = elastic_destroy(&fixture.ctx, "media", "media", None, Origin::Approved)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ProtocolErrorCode::NotAvailable, "{}", refused.message);
+        assert!(refused.message.starts_with("refusal:elastic_teardown_started "), "{}", refused.message);
+        assert!(store::elastic_array(&g.db, &spec.owner, "media").unwrap().is_some());
+        assert!(
+            store::list_jobs(&g.db, 100).unwrap().iter().all(|job| job.kind != "elastic_destroy"),
+            "no job was opened"
+        );
     }
 
     #[tokio::test]
@@ -8823,11 +9376,7 @@ mod registration_tests {
             .await
             .unwrap_err();
         assert_eq!(unknown.code, ProtocolErrorCode::NotAvailable);
-        assert!(
-            unknown.message.contains("Nie można odczytać listy folderów"),
-            "{}",
-            unknown.message
-        );
+        assert!(unknown.message.starts_with("refusal:elastic_folders_unreadable "), "{}", unknown.message);
         // And it wrote nothing — a refused request must not leave a rule the
         // next mover run would honour.
         let stored: i64 = g
@@ -9345,8 +9894,8 @@ mod registration_tests {
             .unwrap_err();
         assert_eq!(refused.code, ProtocolErrorCode::NotAvailable, "{refused:?}");
         assert!(
-            refused.message.contains("niepotwierdzoną operację"),
-            "odmowa musi nazwać powód: {}",
+            refused.message.starts_with("refusal:elastic_operation_unresolved "),
+            "the refusal names its reason: {}",
             refused.message
         );
         assert!(

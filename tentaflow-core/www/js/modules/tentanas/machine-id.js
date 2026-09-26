@@ -104,6 +104,11 @@ const TEXT_ID_BY_ID = /^(ata-|scsi-|sn-)[^_]+(_[^_]+)*_([A-Za-z0-9.-]*\d[A-Za-z0
 // TentaNas's own disk id for a disk with a serial and no WWN: `sn-<serial>`.
 const TEXT_ID_OWN_SERIAL = /^sn-(?=[A-Za-z0-9._-]*\d)[A-Za-z0-9._-]{6,}$/i;
 const BY_DISK_PATH = /^(\/dev\/disk\/by-[a-z]+\/)(.+)$/i;
+// A disk identity NAMED in prose (critic wave 13, MINOR 4): "WWN 0x5000c5…",
+// "serial WD-WCC4E1234567", "numer seryjny …". The value alone is an id even
+// when its shape is not one of the above; the word before it stays.
+const NAMED_WWN = /\b(WWN:?\s+)((?:0x)?[0-9a-f]{8,})/gi;
+const NAMED_SERIAL = /\b((?:serial(?:\s+number)?|S\/N|numer(?:ze|em)?\s+seryjny(?:m)?):?\s+)((?=[A-Za-z0-9._-]*\d)[A-Za-z0-9._-]{4,})/gi;
 
 function isByIdName(token) {
   const m = TEXT_ID_BY_ID.exec(token);
@@ -126,6 +131,8 @@ export function scrubIds(text, placeholder, nameOf = () => '', { guidDigits = fa
   const digits = guidDigits ? [17, 20] : [16, Infinity];
   const shown = (id) => String(nameOf(id) || '').trim() || placeholder;
   return String(text ?? '')
+    .replace(NAMED_WWN, (m, word, id) => word + shown(id))
+    .replace(NAMED_SERIAL, (m, word, id) => word + shown(id))
     .replace(EMBEDDED_UUID, (id) => shown(id))
     .replace(TEXT_TOKEN, (token) => {
       const byPath = BY_DISK_PATH.exec(token);
