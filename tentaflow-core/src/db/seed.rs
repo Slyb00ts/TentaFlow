@@ -2611,7 +2611,10 @@ fn seed_code_studio_agents(conn: &Connection) -> Result<()> {
             // only one whose fan-out numbers mean anything: ten specialists in
             // parallel, three levels deep (an orchestrator may delegate to
             // another orchestrator, which is where depth beyond one comes from).
-            40, 3600, 10, 3,
+            // No turn deadline: a turn on a real project outlives any fixed hour,
+            // the operator can cancel it, and every specialist it delegates to
+            // keeps its own per-run timeout.
+            40, 0, 10, 3,
             Some(
                 r#"["code-planner","code-implementer","code-searcher","code-reviewer","code-tester","code-critic"]"#,
             ),
@@ -2745,6 +2748,18 @@ fn seed_code_studio_agents(conn: &Connection) -> Result<()> {
     )?;
     if upgraded > 0 {
         info!("seed: upgraded untouched 'code-implementer' prompt to expected_blob_id");
+    }
+
+    // The orchestrator used to carry a one-hour turn deadline, which cut a long
+    // turn off mid-work. Only the value the seed wrote is lifted; an operator's
+    // own deadline stays.
+    let lifted = conn.execute(
+        "UPDATE agents SET timeout_secs = 0, updated_at = datetime('now') \
+         WHERE id = ?1 AND timeout_secs = 3600",
+        rusqlite::params![CODE_ORCHESTRATOR_AGENT_ID],
+    )?;
+    if lifted > 0 {
+        info!("seed: lifted the one-hour turn deadline of 'code-orchestrator'");
     }
     Ok(())
 }
@@ -3884,6 +3899,39 @@ mod tests {
         set("admin wrote this");
         super::seed_code_studio_agents(&conn).expect("reseed keeps admin edits");
         assert_eq!(prompt(), "admin wrote this");
+    }
+
+    /// A Code Studio turn has no wall-clock ceiling: a fresh orchestrator has
+    /// none, the old seeded hour is lifted, and a deadline an operator chose
+    /// stays.
+    #[test]
+    fn orchestrator_turn_has_no_seeded_deadline() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.write().unwrap();
+        let timeout = || -> i64 {
+            conn.query_row(
+                "SELECT timeout_secs FROM agents WHERE id = ?1",
+                [super::CODE_ORCHESTRATOR_AGENT_ID],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(timeout(), 0);
+
+        let set = |secs: i64| {
+            conn.execute(
+                "UPDATE agents SET timeout_secs = ?2 WHERE id = ?1",
+                rusqlite::params![super::CODE_ORCHESTRATOR_AGENT_ID, secs],
+            )
+            .unwrap();
+        };
+        set(3600);
+        super::seed_code_studio_agents(&conn).expect("reseed lifts the seeded hour");
+        assert_eq!(timeout(), 0);
+
+        set(7200);
+        super::seed_code_studio_agents(&conn).expect("reseed keeps an operator deadline");
+        assert_eq!(timeout(), 7200);
     }
 
     /// §3.8 + idempotencja: drugi przebieg seed_defaults na tej samej bazie nie

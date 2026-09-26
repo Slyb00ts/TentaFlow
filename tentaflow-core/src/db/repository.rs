@@ -9017,8 +9017,9 @@ pub fn validate_agent_params(params: &AgentParams<'_>) -> Result<()> {
             "agent max_iterations must be 1..={AGENT_MAX_ITERATIONS_CAP}"
         ));
     }
-    if params.timeout_secs < 1 {
-        return Err(anyhow::anyhow!("agent timeout_secs must be >= 1"));
+    // 0 is "no deadline": the run manager arms a deadline only for a positive value.
+    if params.timeout_secs < 0 {
+        return Err(anyhow::anyhow!("agent timeout_secs must be >= 0 (0 = no deadline)"));
     }
     if params.max_subagents < 0 {
         return Err(anyhow::anyhow!("agent max_subagents must be >= 0"));
