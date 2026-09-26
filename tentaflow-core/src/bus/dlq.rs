@@ -653,6 +653,7 @@ mod tests {
                 environment: NodeEnvironment::Prod,
                 created_at_ms: 0,
                 updated_at_ms: 0,
+                generation: 0,
             }
         }
 
@@ -720,6 +721,7 @@ mod tests {
             environment: NodeEnvironment::Prod,
             created_at_ms: 0,
             updated_at_ms: 0,
+            generation: 0,
         };
         let opts = dlq_topic_options(&source);
         assert_eq!(opts.max_inline_bytes, Some(8 * 1024 * 1024));

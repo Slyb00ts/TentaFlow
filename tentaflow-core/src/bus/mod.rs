@@ -2099,6 +2099,19 @@ pub struct BusService {
     /// `dlq::DiscardStore`'s doc (M1-R2 review N-5, coordinator decision 2).
     discarded: Arc<dlq::DiscardStore>,
     partitions: DashMap<PartitionKey, tentaflow_bus::Partition>,
+    /// Serializes every read-check-purge-write of a topic's incarnation
+    /// marker with `delete_topic`'s own purge: two partitions of one
+    /// re-created topic open concurrently, and the second must not purge
+    /// the directory the first just stamped. Rare (placement changes and
+    /// deletes only), so one lock for all topics.
+    topic_incarnation_lock: parking_lot::Mutex<()>,
+    /// The incarnation each topic's log was last checked or stamped at by
+    /// `ensure_topic_incarnation` in this process — the in-memory mirror of
+    /// the on-disk markers, so `partition_handle` compares one map entry on
+    /// every call instead of reading a file. Every call, not only on a cache
+    /// miss: a handle opened for a deleted incarnation stays cached until
+    /// something drops it, and a re-created topic must not be handed it.
+    topic_incarnations: DashMap<TopicKey, u64>,
     round_robin: DashMap<TopicKey, AtomicU32>,
     dedup_stores: DashMap<TopicKey, Arc<dedup::MmapDedupStore>>,
     quota: quota::QuotaManager,
@@ -2455,6 +2468,81 @@ fn environment_from_u8(v: u8) -> NodeEnvironment {
     }
 }
 
+/// What `BusService::purge_local_topic_state` removed, for the audit line,
+/// and whether the log directory really went.
+struct LocalTopicPurge {
+    offset_keys_purged: usize,
+    producer_seq_keys_purged: usize,
+    discarded_keys_purged: usize,
+    groups_purged: usize,
+    log_removed: std::io::Result<()>,
+}
+
+/// Whether `dir` looks like a topic's log directory: it holds a partition
+/// directory (`pNNNN`) or an incarnation marker.
+fn holds_a_topic_log(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        name == TOPIC_INCARNATION_FILE
+            || (entry.file_type().is_ok_and(|t| t.is_dir())
+                && name
+                    .strip_prefix('p')
+                    .is_some_and(|n| n.len() == 4 && n.bytes().all(|b| b.is_ascii_digit())))
+    })
+}
+
+/// `<topic_dir>/incarnation`: the `topic_generation` of the incarnation the
+/// directory's log belongs to (`BusService::ensure_topic_incarnation`).
+const TOPIC_INCARNATION_FILE: &str = "incarnation";
+
+/// A missing marker is incarnation 0: every log written before markers
+/// existed, and every name that was never deleted.
+fn read_topic_incarnation(
+    bus_dir: &std::path::Path,
+    org_id: &str,
+    topic: &str,
+) -> Result<u64, BusServiceError> {
+    let path = topics::topic_dir(bus_dir, org_id, topic).join(TOPIC_INCARNATION_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => text
+            .trim()
+            .parse()
+            .map_err(|_| BusServiceError::PartitionUnavailable {
+                reason: format!("unreadable incarnation marker {}", path.display()),
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(BusServiceError::PartitionUnavailable {
+            reason: format!("reading incarnation marker {}: {e}", path.display()),
+        }),
+    }
+}
+
+/// Written through a synced temporary file and a rename, so a crash leaves
+/// either the previous marker or the new one — never a torn number that
+/// would make the next open refuse the topic.
+fn write_topic_incarnation(
+    bus_dir: &std::path::Path,
+    org_id: &str,
+    topic: &str,
+    topic_generation: u64,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = topics::topic_dir(bus_dir, org_id, topic);
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("{TOPIC_INCARNATION_FILE}.tmp"));
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(topic_generation.to_string().as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, dir.join(TOPIC_INCARNATION_FILE))?;
+    std::fs::File::open(&dir)?.sync_all()
+}
+
 /// One partition's stored log bytes, read straight out of the engine's own
 /// segment bookkeeping: every sealed segment's length plus the still-growing
 /// active one's. Both accessors read an in-memory `RwLock`ed descriptor list
@@ -2564,6 +2652,8 @@ impl BusService {
             producer_seq,
             discarded,
             partitions: DashMap::new(),
+            topic_incarnation_lock: parking_lot::Mutex::new(()),
+            topic_incarnations: DashMap::new(),
             round_robin: DashMap::new(),
             dedup_stores: DashMap::new(),
             quota,
@@ -2608,8 +2698,96 @@ impl BusService {
         // WITHOUT this a restarted engine would let every org re-publish its
         // entire ceiling before the counter caught up. Best-effort and off
         // any request path — see `seed_org_stored_bytes`'s own doc.
+        svc.sweep_orphan_topic_dirs();
         svc.seed_org_stored_bytes();
         Ok(svc)
+    }
+
+    /// Startup half of migration v173: removes the local state of every
+    /// topic directory whose `bus_topics` row is gone. Builds before v172
+    /// left such directories behind whenever a delete reached a node through
+    /// the ledger — the row went, the log stayed, and a later topic of the
+    /// same name would have reopened it. Runs before anything can open a
+    /// partition, so no handle exists yet.
+    ///
+    /// Conservative on every doubt: a directory whose name is not a valid
+    /// org or topic name, that holds neither a partition directory nor an
+    /// incarnation marker, or whose row cannot be read, is left alone. A
+    /// topic whose row exists is never touched. Each removal is logged.
+    fn sweep_orphan_topic_dirs(&self) {
+        let Ok(orgs) = std::fs::read_dir(&self.bus_dir) else {
+            return;
+        };
+        for org in orgs.flatten() {
+            if !org.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let Some(org_id) = org.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if topics::validate_org_id(&org_id).is_err() {
+                continue;
+            }
+            let Ok(topic_dirs) = std::fs::read_dir(org.path()) else {
+                continue;
+            };
+            for topic_dir in topic_dirs.flatten() {
+                if !topic_dir.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let Some(name) = topic_dir.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if topics::validate_user_topic_name(&name).is_err()
+                    && topics::validate_internal_topic_name(&name).is_err()
+                {
+                    continue;
+                }
+                if !holds_a_topic_log(&topic_dir.path()) {
+                    continue;
+                }
+                match crate::db::repository::bus_topic_get(
+                    &self.db,
+                    &self.instance_id,
+                    &org_id,
+                    &name,
+                ) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            org_id, topic = %name, error = %e,
+                            "bus init: topic row unreadable; its log directory is left alone"
+                        );
+                        continue;
+                    }
+                }
+                let _incarnation = self.topic_incarnation_lock.lock();
+                match self.purge_local_topic_state(&org_id, &name) {
+                    Ok(LocalTopicPurge {
+                        log_removed: Ok(()),
+                        offset_keys_purged,
+                        groups_purged,
+                        ..
+                    }) => tracing::info!(
+                        org_id, topic = %name, offset_keys_purged, groups_purged,
+                        "bus init: removed the log of a topic deleted before this node \
+                         cleaned up after deletes (no topic row)"
+                    ),
+                    Ok(LocalTopicPurge {
+                        log_removed: Err(e),
+                        ..
+                    }) => tracing::warn!(
+                        org_id, topic = %name, error = %e,
+                        "bus init: log directory of a deleted topic not removed"
+                    ),
+                    Err(e) => tracing::warn!(
+                        org_id, topic = %name, error = %e,
+                        "bus init: state of a deleted topic not purged"
+                    ),
+                }
+            }
+        }
     }
 
     /// The TentaBus instance every table this service touches is scoped to.
@@ -3204,6 +3382,227 @@ impl BusService {
             .remove(&(org_id.to_string(), topic.to_string()));
     }
 
+    /// Everything this node keeps for one topic OUTSIDE the platform
+    /// database: open partition handles, the log directory, dedup stores,
+    /// cached config, consumer-group state, committed offsets, producer
+    /// sequences, DLQ discard markers and `bus_groups` rows. Shared by
+    /// `delete_topic` (the author of a delete) and
+    /// `ensure_topic_incarnation` (every other replica, which learns of the
+    /// delete only through the ledger and must not carry the old log, its
+    /// leader epoch or its consumer offsets into a re-created topic of the
+    /// same name) — and by the startup sweep of log directories whose topic
+    /// row is gone (`sweep_orphan_topic_dirs`). Callers hold
+    /// `topic_incarnation_lock`.
+    ///
+    /// The log directory is removed LAST and its failure is returned (a
+    /// directory that does not exist is not one): a caller about to reuse
+    /// the name must not stamp a new incarnation over a log it could not
+    /// remove — on Windows an open file handle is enough to keep it.
+    fn purge_local_topic_state(
+        &self,
+        org_id: &str,
+        name: &str,
+    ) -> Result<LocalTopicPurge, BusServiceError> {
+        self.topic_incarnations
+            .remove(&(org_id.to_string(), name.to_string()));
+        self.partitions.retain(|k, v| {
+            if k.0 == org_id && k.1 == name {
+                v.detach();
+                false
+            } else {
+                true
+            }
+        });
+        self.detach_consumer_partitions(org_id, Some(name));
+        // Dedup stores are mmapped: dropping the `Arc` here unmaps the file
+        // before it is unlinked below, rather than leaving the mapping open
+        // against a deleted inode.
+        self.dedup_stores
+            .remove(&(org_id.to_string(), name.to_string()));
+        self.invalidate_topic_config_cache(org_id, name);
+        self.round_robin
+            .remove(&(org_id.to_string(), name.to_string()));
+        self.group_state.remove_topic(org_id, name);
+        let offset_keys_purged = self.offsets.purge_topic(org_id, name)?;
+        let producer_seq_keys_purged = self.producer_seq.purge_topic(org_id, name)?;
+        // A no-op scan (0 rows) when `name` never had any discard markers
+        // (i.e. it is not a DLQ topic, or is one nobody ever discarded a
+        // record on) — mirrors `offsets`/`producer_seq` above, which pay
+        // the same harmless empty-prefix-scan cost for every non-DLQ topic
+        // deleted (M1-R2 review N-5, coordinator decision 2).
+        let discarded_keys_purged = self.discarded.purge_topic(org_id, name)?;
+        let groups_purged =
+            crate::db::repository::bus_groups_delete_by_topic(&self.local_db, org_id, name)?;
+        // Best-effort: stale history of a deleted topic only ever shows up in
+        // a re-created topic of the same name, which pruning clears in 24 h.
+        // Under `lag_history_lock`, after the `bus_topics` row is gone: a
+        // sampling round either wrote before this delete or sees the topic
+        // missing and drops its rows (`sample_lag_history`).
+        {
+            let _history = self.lag_history_lock.lock();
+            if let Err(e) = lag_history::delete_topic(&self.local_db, org_id, name) {
+                tracing::warn!(topic = %name, error = %e, "lag history: delete for topic failed");
+            }
+        }
+        self.lag_trends
+            .retain(|(org, _, topic), _| !(org == org_id && topic == name));
+        let dir = topics::topic_dir(&self.bus_dir, org_id, name);
+        let log_removed = match std::fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+        Ok(LocalTopicPurge {
+            offset_keys_purged,
+            producer_seq_keys_purged,
+            discarded_keys_purged,
+            groups_purged,
+            log_removed,
+        })
+    }
+
+    /// Makes sure the local log of `topic` belongs to incarnation
+    /// `topic_generation` before any handle is opened on it from disk —
+    /// every such open goes through `partition_handle`, whichever path asks
+    /// (a replication handle for a placement, a local publish, the creator's
+    /// own first write).
+    ///
+    /// A delete that reaches this node through the ledger removes the
+    /// topic row and its placements, but not the log: that lives in this
+    /// process, not in the database the materializer writes. Without this
+    /// check a re-created topic would reopen the deleted incarnation's
+    /// segments — its records, and its persisted leader epoch, which then
+    /// refuses the new incarnation's epoch-1 leader as stale — on a replica
+    /// and on the node that re-creates it alike.
+    ///
+    /// Older local incarnation: purged, then the new one is recorded — only
+    /// once the purge really removed the old log. Newer local incarnation
+    /// than asked for: refused, with the cached config dropped, since a
+    /// stale cached config is how a caller ends up asking for an old one.
+    fn ensure_topic_incarnation(
+        &self,
+        org_id: &str,
+        topic: &str,
+        topic_generation: u64,
+    ) -> Result<(), BusServiceError> {
+        let _incarnation = self.topic_incarnation_lock.lock();
+        let local = read_topic_incarnation(&self.bus_dir, org_id, topic)?;
+        if local == topic_generation {
+            self.topic_incarnations
+                .insert((org_id.to_string(), topic.to_string()), local);
+            return Ok(());
+        }
+        // No marker and no log: nothing of an older incarnation is here —
+        // this is the topic's first open on this node. Only stamped: purging
+        // now would take what the current incarnation already keeps outside
+        // the log (a consumer group opened before the first write, a dedup
+        // store) with it.
+        if local == 0 && !holds_a_topic_log(&topics::topic_dir(&self.bus_dir, org_id, topic)) {
+            write_topic_incarnation(&self.bus_dir, org_id, topic, topic_generation).map_err(
+                |e| BusServiceError::PartitionUnavailable {
+                    reason: format!("recording the incarnation of topic '{topic}': {e}"),
+                },
+            )?;
+            self.topic_incarnations
+                .insert((org_id.to_string(), topic.to_string()), topic_generation);
+            return Ok(());
+        }
+        if local > topic_generation {
+            self.invalidate_topic_config_cache(org_id, topic);
+            return Err(BusServiceError::PartitionUnavailable {
+                reason: format!(
+                    "topic '{topic}' was asked for incarnation {topic_generation}, \
+                     older than the local log's {local}"
+                ),
+            });
+        }
+        let released_bytes = self.topic_log_bytes(org_id, topic);
+        let purged = self.purge_local_topic_state(org_id, topic)?;
+        if let Err(e) = purged.log_removed {
+            // The handles and the per-topic state are gone, the files are
+            // not. Not stamped and the bytes stay counted: the next open
+            // retries the purge and releases them then.
+            return Err(BusServiceError::PartitionUnavailable {
+                reason: format!(
+                    "the log of a deleted incarnation of topic '{topic}' could not be removed: {e}"
+                ),
+            });
+        }
+        self.sub_org_stored_bytes(org_id, released_bytes);
+        write_topic_incarnation(&self.bus_dir, org_id, topic, topic_generation).map_err(|e| {
+            BusServiceError::PartitionUnavailable {
+                reason: format!("recording the incarnation of topic '{topic}': {e}"),
+            }
+        })?;
+        self.topic_incarnations
+            .insert((org_id.to_string(), topic.to_string()), topic_generation);
+        tracing::info!(
+            org_id,
+            topic,
+            previous_generation = local,
+            topic_generation,
+            released_bytes,
+            offset_keys_purged = purged.offset_keys_purged,
+            producer_seq_keys_purged = purged.producer_seq_keys_purged,
+            groups_purged = purged.groups_purged,
+            "bus: dropped the local log of a deleted topic incarnation"
+        );
+        Ok(())
+    }
+
+    /// Stored bytes of every partition this topic has on disk, in the unit
+    /// the org's counter uses (`partition_stored_bytes`: logical segment
+    /// lengths — the files themselves can be preallocated past them). Read
+    /// from each partition directory that EXISTS rather than from the topic
+    /// row, which after a re-creation describes the new incarnation and may
+    /// have another partition count; an open handle is read in place, any
+    /// other directory is opened just long enough to read it.
+    fn topic_log_bytes(&self, org_id: &str, topic: &str) -> u64 {
+        let Ok(entries) = std::fs::read_dir(topics::topic_dir(&self.bus_dir, org_id, topic)) else {
+            return 0;
+        };
+        let mut total: u64 = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(p) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix('p'))
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let key = (org_id.to_string(), topic.to_string(), p);
+            let open = self
+                .partitions
+                .get(&key)
+                .map(|part| part.clone())
+                .or_else(|| {
+                    self.consumer_partitions
+                        .get(&key)
+                        .and_then(|weak_parts| weak_parts.iter().find_map(|w| w.upgrade()))
+                });
+            let bytes = match open {
+                Some(part) => partition_stored_bytes(&part),
+                None => match tentaflow_bus::Partition::open(
+                    &entry.path(),
+                    tentaflow_bus::RollPolicy::default(),
+                    tentaflow_bus::Durability::Os,
+                    256,
+                ) {
+                    Ok(part) => partition_stored_bytes(&part),
+                    Err(e) => {
+                        tracing::warn!(
+                            org_id, topic, partition = p, error = %e,
+                            "bus: partition unreadable; its bytes stay on the org's storage counter"
+                        );
+                        0
+                    }
+                },
+            };
+            total = total.saturating_add(bytes);
+        }
+        total
+    }
+
     /// Opens (or returns the already-open) `Partition` for `(org, topic,
     /// partition)`. Uses `DashMap::entry(..).or_try_insert_with`
     /// instead of a separate `get` + `insert` so two threads racing to
@@ -3232,6 +3631,15 @@ impl BusService {
         cfg: &topics::TopicConfig,
     ) -> Result<tentaflow_bus::Partition, BusServiceError> {
         let key = (org_id.to_string(), topic.to_string(), partition);
+        // Before the entry below is taken: the purge this may run walks
+        // `self.partitions` itself.
+        let checked = self
+            .topic_incarnations
+            .get(&(org_id.to_string(), topic.to_string()))
+            .map(|g| *g);
+        if checked != Some(cfg.generation) {
+            self.ensure_topic_incarnation(org_id, topic, cfg.generation)?;
+        }
         let part = {
             let entry = self.partitions.entry(key.clone()).or_try_insert_with(|| {
                 if let Some(live) = self
@@ -3670,16 +4078,22 @@ impl BusService {
     /// preflight resolves the leader through the registry, so every write
     /// to an unplaced partition is refused with `NotLeader
     /// (leader_node_id=None)`.
+    ///
+    /// Every placement names the incarnation it is for (`cfg.generation`,
+    /// `PartitionAssignment::topic_generation`): replicas admit it only
+    /// against the same incarnation of the topic row.
     fn propose_partition_assignments(
         &self,
         org_id: &str,
-        topic: &str,
+        cfg: &topics::TopicConfig,
         partitions: &[u32],
-        replication_factor: u32,
         local_node_id: &str,
         same_env: &[String],
     ) -> Option<(u32, Vec<String>)> {
         let store = self.assignment_store()?;
+        let topic = cfg.name.as_str();
+        let replication_factor = cfg.replication_factor;
+        let topic_generation = cfg.generation;
         let mut all_replicas: Vec<String> = Vec::new();
         let mut placed = 0u32;
         for &partition in partitions {
@@ -3700,6 +4114,7 @@ impl BusService {
                 replicas,
                 leader_epoch: 1,
                 updated_at_ms: now_ms(),
+                topic_generation,
             };
             match store.propose(&assignment) {
                 Ok(_) => placed += 1,
@@ -3757,6 +4172,9 @@ impl BusService {
             env,
             now_ms(),
         )?;
+        // Same reason as `create_topic_audited`: an existing incarnation
+        // passes straight through, a new one drops a deleted one's log first.
+        self.ensure_topic_incarnation(&ctx.org_id, name, cfg.generation)?;
         self.place_unplaced_partitions(&ctx.org_id, &cfg, env);
         Ok(cfg)
     }
@@ -3798,9 +4216,8 @@ impl BusService {
         }
         let placed = self.propose_partition_assignments(
             org_id,
-            &cfg.name,
+            cfg,
             &missing,
-            cfg.replication_factor,
             &placement.local_node_id,
             &placement.same_env,
         );
@@ -3990,15 +4407,20 @@ impl BusService {
         // Defensive: a delete+recreate of the same name must not resurrect a
         // stale cached config.
         self.invalidate_topic_config_cache(&ctx.org_id, name);
+        // Before anything else can touch the new incarnation: a log this node
+        // kept from a deleted one (it replicated it, and learned of the delete
+        // only through the ledger) goes now, not at the first open — by then
+        // a consumer group or a dedup store of the NEW incarnation may exist,
+        // and the purge would take it along.
+        self.ensure_topic_incarnation(&ctx.org_id, name, cfg.generation)?;
 
         let mut replicas_detail = String::new();
         if let Some((local_node_id, same_env)) = placement {
             let partitions: Vec<u32> = (0..cfg.partitions).collect();
             if let Some((placed, all_replicas)) = self.propose_partition_assignments(
                 &ctx.org_id,
-                name,
+                &cfg,
                 &partitions,
-                cfg.replication_factor,
                 &local_node_id,
                 &same_env,
             ) {
@@ -4185,49 +4607,30 @@ impl BusService {
                 0
             }
         };
-        self.partitions.retain(|k, v| {
-            if k.0 == ctx.org_id && k.1 == name {
-                v.detach();
-                false
-            } else {
-                true
+        let LocalTopicPurge {
+            offset_keys_purged,
+            producer_seq_keys_purged,
+            discarded_keys_purged,
+            groups_purged,
+            log_removed,
+        } = {
+            let _incarnation = self.topic_incarnation_lock.lock();
+            self.purge_local_topic_state(&ctx.org_id, name)?
+        };
+        // The row is gone and every handle is detached, so the delete has
+        // happened; files that could not be removed now are an orphan
+        // directory the next start's sweep (`sweep_orphan_topic_dirs`)
+        // removes, and a re-created topic purges before its first open.
+        let released_bytes = match log_removed {
+            Ok(()) => released_bytes,
+            Err(e) => {
+                tracing::warn!(
+                    org_id = %ctx.org_id, topic = name, error = %e,
+                    "delete_topic: log directory not removed"
+                );
+                released_bytes.saturating_sub(self.topic_log_bytes(&ctx.org_id, name))
             }
-        });
-        self.detach_consumer_partitions(&ctx.org_id, Some(name));
-        // Dedup stores are mmapped: dropping the `Arc` here unmaps the file
-        // before it is unlinked below, rather than leaving the mapping open
-        // against a deleted inode.
-        self.dedup_stores
-            .remove(&(ctx.org_id.clone(), name.to_string()));
-        self.invalidate_topic_config_cache(&ctx.org_id, name);
-        self.round_robin
-            .remove(&(ctx.org_id.clone(), name.to_string()));
-        self.group_state.remove_topic(&ctx.org_id, name);
-        let offset_keys_purged = self.offsets.purge_topic(&ctx.org_id, name)?;
-        let producer_seq_keys_purged = self.producer_seq.purge_topic(&ctx.org_id, name)?;
-        // A no-op scan (0 rows) when `name` never had any discard markers
-        // (i.e. it is not a DLQ topic, or is one nobody ever discarded a
-        // record on) — mirrors `offsets`/`producer_seq` above, which pay
-        // the same harmless empty-prefix-scan cost for every non-DLQ topic
-        // deleted (M1-R2 review N-5, coordinator decision 2).
-        let discarded_keys_purged = self.discarded.purge_topic(&ctx.org_id, name)?;
-        let groups_purged =
-            crate::db::repository::bus_groups_delete_by_topic(&self.local_db, &ctx.org_id, name)?;
-        // Best-effort: stale history of a deleted topic only ever shows up in
-        // a re-created topic of the same name, which pruning clears in 24 h.
-        // Under `lag_history_lock`, after the `bus_topics` row is gone: a
-        // sampling round either wrote before this delete or sees the topic
-        // missing and drops its rows (`sample_lag_history`).
-        {
-            let _history = self.lag_history_lock.lock();
-            if let Err(e) = lag_history::delete_topic(&self.local_db, &ctx.org_id, name) {
-                tracing::warn!(topic = %name, error = %e, "lag history: delete for topic failed");
-            }
-        }
-        self.lag_trends
-            .retain(|(org, _, topic), _| !(org == &ctx.org_id && topic == name));
-        let dir = topics::topic_dir(&self.bus_dir, &ctx.org_id, name);
-        let _ = std::fs::remove_dir_all(&dir);
+        };
         // The segments measured at the top of this call are gone now.
         self.sub_org_stored_bytes(&ctx.org_id, released_bytes);
         let _ = crate::db::repository::log_audit(
@@ -4559,12 +4962,19 @@ impl BusService {
         // `None` (no coordinator installed — M1, or a build that never
         // calls `set_replication`) skips this entirely: RF=1's publish path
         // is byte-for-byte the M1 path (PLAN-M2 §4.1 A1).
+        //
+        // The epoch each partition was admitted under travels to its append
+        // (`Partition::append_batch_as_leader`): leadership can move during
+        // the earlier partitions' quorum waits, and a write admitted in one
+        // term must not land in a log that meanwhile belongs to the next.
         let coordinator = self.replication();
+        let mut admitted_epochs: Vec<(u32, u32)> = Vec::new();
         if let Some(coordinator) = &coordinator {
             for (partition, _) in &groups {
-                coordinator
+                let epoch = coordinator
                     .preflight(&ctx.org_id, topic, *partition, cfg.acks)
                     .map_err(|e| map_repl_error(coordinator, &ctx.org_id, topic, *partition, e))?;
+                admitted_epochs.push((*partition, epoch));
             }
         }
 
@@ -4817,9 +5227,15 @@ impl BusService {
             // report and the same unit `run_retention_sweep` subtracts.
             // Read before `wire` is moved into the append.
             let appended_segment_bytes = wire.len() as u64;
-            let append = part
-                .append_batch(wire)
-                .map_err(|e| wrap_err(&acks, map_engine_error(e, topic, partition)))?;
+            let admitted = admitted_epochs
+                .iter()
+                .find(|(p, _)| *p == partition)
+                .map(|&(_, epoch)| epoch);
+            let append = match admitted {
+                Some(epoch) => part.append_batch_as_leader(wire, epoch),
+                None => part.append_batch(wire),
+            }
+            .map_err(|e| wrap_err(&acks, map_engine_error(e, topic, partition)))?;
             // Credited HERE, not after the loop: these bytes are durably on
             // this leader's disk from this point on, so a later failure in
             // this same call (`await_acks`, the producer-sequence record)
@@ -4996,6 +5412,23 @@ impl BusService {
         let cfg = self.authorized_topic(ctx, topic, "partition_stats")?;
         check_partition_in_range(topic, partition, &cfg)?;
         self.read_partition_stats(&ctx.org_id, topic, partition, &cfg)
+    }
+
+    /// This node's own handle on one partition of `topic`, whatever its
+    /// replication role, for reading the local replica's log directly —
+    /// comparing replicas byte for byte needs exactly that, and `peek` is
+    /// leader-only. Authorized like `partition_stats`. Opened through
+    /// `partition_handle`, so it checks the local log belongs to the topic
+    /// row's incarnation like every other open does.
+    pub fn local_partition(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+    ) -> Result<tentaflow_bus::Partition, BusServiceError> {
+        let cfg = self.authorized_topic(ctx, topic, "local_partition")?;
+        check_partition_in_range(topic, partition, &cfg)?;
+        self.partition_handle(&ctx.org_id, topic, partition, &cfg)
     }
 
     /// `partition_stats` for every partition of `topic`, authorized once —
@@ -6784,6 +7217,7 @@ impl BusService {
         self.detach_consumer_partitions(org_id, None);
         self.dedup_stores.retain(|k, _| k.0 != org_id);
         self.topic_config_cache.retain(|k, _| k.0 != org_id);
+        self.topic_incarnations.retain(|k, _| k.0 != org_id);
         self.round_robin.retain(|k, _| k.0 != org_id);
         self.publish_rates.retain(|k, _| k.0 != org_id);
         self.group_state.remove_org(org_id);
@@ -6933,10 +7367,26 @@ impl replication::glue::PartitionProvider for BusService {
         org: &str,
         topic: &str,
         partition: u32,
+        topic_generation: u64,
     ) -> Result<tentaflow_bus::Partition, ReplError> {
-        let cfg = self
+        let mut cfg = self
             .topic_config(org, topic)
             .map_err(|e| ReplError::Internal(e.to_string()))?;
+        if cfg.generation != topic_generation {
+            // A cached config can predate a re-creation this node has since
+            // materialized; the row is the reference, so read it again.
+            self.invalidate_topic_config_cache(org, topic);
+            cfg = self
+                .topic_config(org, topic)
+                .map_err(|e| ReplError::Internal(e.to_string()))?;
+        }
+        if cfg.generation != topic_generation {
+            return Err(ReplError::Internal(format!(
+                "placement of topic '{topic}' names incarnation {topic_generation}, \
+                 the topic row here is incarnation {}",
+                cfg.generation
+            )));
+        }
         self.partition_handle(org, topic, partition, &cfg)
             .map_err(|e| ReplError::Internal(e.to_string()))
     }
@@ -8638,7 +9088,7 @@ mod tests {
         // The topic row is written directly, before any engine exists, so
         // the whole of this org's on-disk data predates the `BusService`
         // whose seed is under test.
-        topics::create_topic(
+        let cfg = topics::create_topic(
             &db,
             test_instance_id().as_str(),
             "org-1",
@@ -8651,6 +9101,10 @@ mod tests {
             now_ms(),
         )
         .expect("create the topic row");
+        // What `BusService::create_topic` does next: the log directory
+        // belongs to this incarnation. Without it the log written below is
+        // indistinguishable from a deleted incarnation's leftovers.
+        write_topic_incarnation(&bus_dir, "org-1", "seeded.topic", cfg.generation).unwrap();
 
         // Pre-seal several segments straight through the engine, bypassing
         // the fixed `RollPolicy::default()` `partition_handle` uses in
@@ -8729,6 +9183,227 @@ mod tests {
             svc.org_stored_bytes("org-1"),
             partition_stored_bytes(&part),
             "counter and engine must still agree once the sweep is done"
+        );
+    }
+
+    /// A topic deleted through the ledger by a build before v172 left its
+    /// log directory behind without a row. The next start removes it — and
+    /// only it: a topic whose row exists keeps its log, and a directory that
+    /// is not a topic log (no partition, no marker) is not touched.
+    #[test]
+    fn startup_removes_the_log_of_a_topic_with_no_row_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let start = || {
+            BusService::new(BusInitConfig {
+                instance_id: test_instance_id(),
+                local_db: test_local_db(),
+                bus_dir: dir.path().join("bus"),
+                db: db.clone(),
+                authorizer: Arc::new(AllowAllAuthorizer),
+                retention_interval: None,
+                dedup_expected_rate_per_sec: 10_000,
+                partition_handle_lru: None,
+                publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            })
+            .expect("bus service")
+        };
+        let ctx = test_ctx("org-1");
+        {
+            let svc = start();
+            for name in ["keep.topic", "gone.topic"] {
+                svc.create_topic(
+                    &ctx,
+                    name,
+                    topics::TopicOptions {
+                        partitions: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                svc.publish(
+                    &ctx,
+                    name,
+                    PublishBatch {
+                        partition: Some(0),
+                        producer: None,
+                        records: vec![record("r")],
+                    },
+                )
+                .unwrap();
+            }
+            // What an earlier build's materializer did on a replica: the row
+            // goes, nothing else does.
+            crate::db::repository::bus_topic_delete(&db, svc.instance_id(), "org-1", "gone.topic")
+                .unwrap();
+        }
+        let bus_dir = dir.path().join("bus");
+        let stray = bus_dir.join("org-1").join("notes.dir");
+        std::fs::create_dir_all(stray.join("readme")).unwrap();
+
+        let svc = start();
+        assert!(!topics::topic_dir(&bus_dir, "org-1", "gone.topic").exists());
+        assert!(
+            stray.exists(),
+            "a directory that is not a topic log is left alone"
+        );
+        let stats = svc.partition_stats(&ctx, "keep.topic", 0).unwrap();
+        assert_eq!(stats.log_end_offset, 1, "a topic with a row keeps its log");
+    }
+
+    /// Swaps this node's `bus_topics` row for another incarnation of the
+    /// same name, the way the ledger does on a replica (the materializer
+    /// writes the row; nothing touches the log, the handles or the cache).
+    fn materialize_another_incarnation(svc: &BusService, org: &str, topic: &str) -> u64 {
+        let mut row = crate::db::repository::bus_topic_get(&svc.db, svc.instance_id(), org, topic)
+            .unwrap()
+            .expect("topic row");
+        row.generation += 1_000;
+        crate::db::repository::bus_topic_delete(&svc.db, svc.instance_id(), org, topic).unwrap();
+        crate::db::repository::bus_topic_create(&svc.db, &row).unwrap();
+        row.generation
+    }
+
+    /// A replica learns of a delete + re-create only through the ledger,
+    /// which never touches its log. Its first open of the new incarnation —
+    /// here a placement's replication handle, while the old incarnation's
+    /// handle is still cached from earlier writes — must find the old log,
+    /// its offsets and its stored bytes gone; the same incarnation later must
+    /// keep what it has written; and a placement of an older incarnation than
+    /// the row must be refused.
+    #[test]
+    fn a_placement_of_a_newer_topic_incarnation_drops_the_local_log_of_the_old_one() {
+        use replication::glue::PartitionProvider;
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.replica";
+        let first = svc
+            .create_topic(
+                &ctx,
+                topic,
+                topics::TopicOptions {
+                    partitions: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for i in 0..3 {
+            svc.publish(
+                &ctx,
+                topic,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record(&format!("old-{i}"))],
+                },
+            )
+            .unwrap();
+        }
+        svc.offsets
+            .commit("org-1", "workers", topic, 0, 3, 0)
+            .unwrap();
+        assert!(svc.org_stored_bytes("org-1") > 0);
+
+        let second = materialize_another_incarnation(&svc, "org-1", topic);
+        let part = PartitionProvider::partition(&svc, "org-1", topic, 0, second).unwrap();
+        assert_eq!(
+            part.log_end_offset(),
+            0,
+            "the old incarnation's log must be gone"
+        );
+        assert_eq!(svc.org_stored_bytes("org-1"), 0);
+        assert_eq!(
+            svc.offsets
+                .committed_offset("org-1", "workers", topic, 0)
+                .unwrap(),
+            0,
+            "the old incarnation's committed offset must not carry over"
+        );
+        assert_eq!(
+            read_topic_incarnation(&svc.bus_dir, "org-1", topic).unwrap(),
+            second
+        );
+
+        svc.publish(
+            &ctx,
+            topic,
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record("new-0")],
+            },
+        )
+        .unwrap();
+        let again = PartitionProvider::partition(&svc, "org-1", topic, 0, second).unwrap();
+        assert_eq!(
+            again.log_end_offset(),
+            1,
+            "the same incarnation keeps its log"
+        );
+
+        assert!(
+            PartitionProvider::partition(&svc, "org-1", topic, 0, first.generation).is_err(),
+            "a placement of an older incarnation must be refused"
+        );
+        assert_eq!(
+            PartitionProvider::partition(&svc, "org-1", topic, 0, second)
+                .unwrap()
+                .log_end_offset(),
+            1,
+            "a refused stale placement must not touch the current log"
+        );
+    }
+
+    /// The node that re-creates a topic deleted elsewhere still holds the
+    /// deleted incarnation's log from when it replicated it, and no
+    /// placement is involved in its own first write. That write must land in
+    /// an empty log, not after the deleted incarnation's records.
+    #[test]
+    fn the_first_local_write_of_a_new_incarnation_starts_an_empty_log() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.recreated";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..3 {
+            svc.publish(
+                &ctx,
+                topic,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record(&format!("old-{i}"))],
+                },
+            )
+            .unwrap();
+        }
+        materialize_another_incarnation(&svc, "org-1", topic);
+        svc.invalidate_topic_config_cache("org-1", topic);
+
+        let ack = svc
+            .publish(
+                &ctx,
+                topic,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record("new-0")],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ack.single_partition().map(|p| p.base_offset),
+            Some(0),
+            "the new incarnation must not append after the deleted one's records"
         );
     }
 
@@ -10141,7 +10816,7 @@ mod tests {
     fn two_phase_dedup_does_not_poison_store_on_failed_append() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
-        topics::create_topic(
+        let cfg = topics::create_topic(
             &svc.db,
             svc.instance_id(),
             &ctx.org_id,
@@ -10153,6 +10828,15 @@ mod tests {
             },
             NodeEnvironment::Prod,
             now_ms(),
+        )
+        .unwrap();
+        // What `BusService::create_topic` does next — see
+        // `org_stored_bytes_is_seeded_from_the_engine_and_debited_in_the_same_unit`.
+        write_topic_incarnation(
+            &svc.bus_dir,
+            &ctx.org_id,
+            "labs.dedup.failed-append",
+            cfg.generation,
         )
         .unwrap();
 
@@ -13434,6 +14118,15 @@ mod tests {
         }
     }
 
+    /// What a real leader handle does when it takes a partition over
+    /// (`Partition::open_leader_writes`): a `FakeCoordinator` admits writes
+    /// as leader, so the partition must accept them.
+    fn open_leader_writes(svc: &BusService, ctx: &BusCallContext, topic: &str, partition: u32) {
+        svc.local_partition(ctx, topic, partition)
+            .expect("partition")
+            .open_leader_writes();
+    }
+
     impl ReplicationCoordinator for FakeCoordinator {
         fn role(&self, _org: &str, _topic: &str, _partition: u32) -> PartitionRole {
             self.role.lock().clone()
@@ -13532,6 +14225,41 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// The partition moved on to term 4 — a newer leader's Hello fenced it,
+    /// or this node stepped down — after the coordinator admitted the
+    /// publish as leader of term 3. The write must be refused, not land in
+    /// a term-4 log stamped as if it belonged there.
+    #[test]
+    fn a_publish_admitted_in_an_older_term_than_the_partition_is_refused() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        one_partition_topic(&svc, &ctx, "orders.repl-fenced");
+        let coord = FakeCoordinator::leader(3);
+        svc.set_replication(coord);
+        let part = svc
+            .local_partition(&ctx, "orders.repl-fenced", 0)
+            .expect("partition");
+        part.open_leader_writes();
+        part.set_leader_epoch(4).unwrap();
+
+        let err = svc
+            .publish(
+                &ctx,
+                "orders.repl-fenced",
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record("stray")],
+                },
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("LeaderEpochStale"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(part.log_end_offset(), 0);
     }
 
     #[test]
@@ -13657,6 +14385,7 @@ mod tests {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         one_partition_topic(&svc, &ctx, "orders.repl-ack-timeout");
+        open_leader_writes(&svc, &ctx, "orders.repl-ack-timeout", 0);
         let coord = FakeCoordinator::leader(1);
         coord.set_await_outcome(AckOutcome {
             acked_nodes: 1,
@@ -13709,6 +14438,7 @@ mod tests {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         one_partition_topic(&svc, &ctx, "orders.repl-ack-ok");
+        open_leader_writes(&svc, &ctx, "orders.repl-ack-ok", 0);
         let coord = FakeCoordinator::leader(1);
         coord.set_await_outcome(AckOutcome {
             acked_nodes: 2,
@@ -14007,6 +14737,7 @@ mod tests {
             actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
             ..ctx.clone()
         };
+        open_leader_writes(&svc, &system_ctx, &dlq_name, 0);
         let res = svc
             .publish(
                 &system_ctx,
@@ -14049,6 +14780,7 @@ mod tests {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         one_partition_topic(&svc, &ctx, "orders.repl-commit-notify");
+        open_leader_writes(&svc, &ctx, "orders.repl-commit-notify", 0);
         let coord = FakeCoordinator::leader(1);
         svc.set_replication(coord.clone());
 
@@ -14360,6 +15092,7 @@ mod tests {
                 leader_epoch: 1,
                 environment: "dev".to_string(),
                 updated_at_ms: now_ms(),
+                topic_generation: 0,
             },
         )
         .unwrap();
@@ -14420,6 +15153,7 @@ mod tests {
                     leader_epoch: 1,
                     environment: "dev".to_string(),
                     updated_at_ms: now_ms(),
+                    topic_generation: 0,
                 },
             )
             .unwrap();

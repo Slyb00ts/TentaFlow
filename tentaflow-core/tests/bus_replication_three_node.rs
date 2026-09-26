@@ -129,6 +129,7 @@ use tentaflow_bus::{BatchBuilder, RecordInput};
 use tentaflow_protocol::environment::NodeEnvironment;
 
 use tentaflow_core::bus::replication::assignment::PartitionAssignment;
+use tentaflow_core::bus::replication::election::LogPosition;
 use tentaflow_core::bus::replication::follower::FollowerConfig;
 use tentaflow_core::bus::replication::frames::{self, ReplFrame, ReplHello, ReplReject};
 use tentaflow_core::bus::replication::glue::{
@@ -433,6 +434,7 @@ impl Transport for DuplexTransport {
 
 struct TestNode {
     id: String,
+    db: DbPool,
     svc: Arc<BusService>,
     manager: Arc<ReplicationManager>,
     ledger: Arc<SharedLedger>,
@@ -539,6 +541,7 @@ fn build_node(
 
     TestNode {
         id: id.to_string(),
+        db,
         svc,
         manager,
         ledger,
@@ -594,7 +597,22 @@ fn spawn_background_loops(node: &TestNode) {
     });
 }
 
-fn assignment(replicas: &[&str], leader: &str, epoch: u32, partition: u32) -> PartitionAssignment {
+/// The incarnation of the test topic `node` holds — what every placement of
+/// it must name (`PartitionAssignment::topic_generation`).
+fn topic_generation(node: &TestNode) -> u64 {
+    tentaflow_core::db::repository::bus_topic_get(&node.db, TEST_INSTANCE_ID, ORG, TOPIC)
+        .expect("read topic row")
+        .expect("topic row")
+        .generation
+}
+
+fn assignment(
+    generation: u64,
+    replicas: &[&str],
+    leader: &str,
+    epoch: u32,
+    partition: u32,
+) -> PartitionAssignment {
     PartitionAssignment {
         instance_id: TEST_INSTANCE_ID.to_string(),
         org_id: ORG.to_string(),
@@ -605,6 +623,7 @@ fn assignment(replicas: &[&str], leader: &str, epoch: u32, partition: u32) -> Pa
         isr: replicas.iter().map(|s| s.to_string()).collect(),
         leader_epoch: epoch,
         updated_at_ms: 0,
+        topic_generation: generation,
     }
 }
 
@@ -644,23 +663,33 @@ async fn build_cluster(
     );
     let nodes = vec![a, b, c];
 
-    for node in &nodes {
-        node.svc
-            .create_topic(
-                &ctx(),
-                TOPIC,
-                TopicOptions {
-                    partitions: Some(partitions),
-                    replication_factor: Some(3),
-                    acks: Some(acks),
-                    ..Default::default()
-                },
-            )
-            .expect("create_topic");
+    // Created once, on A, and its row copied to B and C the way the ledger
+    // replicates it: one incarnation, the one every placement names.
+    nodes[0]
+        .svc
+        .create_topic(
+            &ctx(),
+            TOPIC,
+            TopicOptions {
+                partitions: Some(partitions),
+                replication_factor: Some(3),
+                acks: Some(acks),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+    let row =
+        tentaflow_core::db::repository::bus_topic_get(&nodes[0].db, TEST_INSTANCE_ID, ORG, TOPIC)
+            .expect("read topic row")
+            .expect("topic row");
+    for node in &nodes[1..] {
+        tentaflow_core::db::repository::bus_topic_create(&node.db, &row)
+            .expect("replicate topic row");
     }
+    let generation = row.generation;
 
     for p in 0..partitions {
-        let a0 = assignment(&["A", "B", "C"], "A", 1, p);
+        let a0 = assignment(generation, &["A", "B", "C"], "A", 1, p);
         ledger.seed(a0.clone());
         for node in &nodes {
             node.manager.apply_assignment(a0.clone()).await;
@@ -699,9 +728,13 @@ async fn wait_for_hello_handshake(nodes: &[TestNode], partitions: u32, timeout: 
         let mut state = Vec::new();
         let leader_isr = a.manager.snapshot(ORG, Some(TOPIC)).partitions;
         for p in 0..partitions {
-            let b_epoch = PartitionProvider::partition(b.svc.as_ref(), ORG, TOPIC, p)
+            let b_epoch = b
+                .svc
+                .local_partition(&ctx(), TOPIC, p)
                 .map(|part| part.leader_epoch());
-            let c_epoch = PartitionProvider::partition(c.svc.as_ref(), ORG, TOPIC, p)
+            let c_epoch = c
+                .svc
+                .local_partition(&ctx(), TOPIC, p)
                 .map(|part| part.leader_epoch());
             let isr = leader_isr
                 .iter()
@@ -717,10 +750,12 @@ async fn wait_for_hello_handshake(nodes: &[TestNode], partitions: u32, timeout: 
     let ok = wait_until(timeout, || {
         let leader_isr = a.manager.snapshot(ORG, Some(TOPIC)).partitions;
         (0..partitions).all(|p| {
-            PartitionProvider::partition(b.svc.as_ref(), ORG, TOPIC, p)
+            b.svc
+                .local_partition(&ctx(), TOPIC, p)
                 .map(|part| part.leader_epoch() == 1)
                 .unwrap_or(false)
-                && PartitionProvider::partition(c.svc.as_ref(), ORG, TOPIC, p)
+                && c.svc
+                    .local_partition(&ctx(), TOPIC, p)
                     .map(|part| part.leader_epoch() == 1)
                     .unwrap_or(false)
                 && leader_isr
@@ -790,7 +825,9 @@ async fn publish_text(
 /// `peek` is leader-only, and this must also work on a follower to prove
 /// byte-identical replication).
 fn read_all_payloads(node: &TestNode, partition: u32) -> Vec<Vec<u8>> {
-    let part = PartitionProvider::partition(node.svc.as_ref(), ORG, TOPIC, partition)
+    let part = node
+        .svc
+        .local_partition(&ctx(), TOPIC, partition)
         .expect("partition handle");
     part.open_reader()
         .fetch_from_offset(0, 16 * 1024 * 1024)
@@ -817,13 +854,15 @@ fn committed_group_offset(node: &TestNode, group: &str, partition: u32) -> u64 {
 }
 
 fn log_end_offset(node: &TestNode, partition: u32) -> u64 {
-    PartitionProvider::partition(node.svc.as_ref(), ORG, TOPIC, partition)
+    node.svc
+        .local_partition(&ctx(), TOPIC, partition)
         .expect("partition handle")
         .log_end_offset()
 }
 
 fn high_watermark(node: &TestNode, partition: u32) -> u64 {
-    PartitionProvider::partition(node.svc.as_ref(), ORG, TOPIC, partition)
+    node.svc
+        .local_partition(&ctx(), TOPIC, partition)
         .expect("partition handle")
         .high_watermark()
 }
@@ -965,6 +1004,7 @@ async fn publish_refuses_with_not_enough_replicas_once_both_followers_are_down()
         isr: vec!["A".to_string()],
         leader_epoch: 2,
         updated_at_ms: 0,
+        topic_generation: topic_generation(a),
     });
 
     // The epoch-2 row keeps A as leader, so A re-stamps its entry in place
@@ -1079,6 +1119,7 @@ async fn z12_environment_mismatch_is_rejected_by_the_transport_gate_and_by_hello
             leader_epoch: 1,
             replicas: vec!["PROD".to_string(), "TEST".to_string()],
             environment: NodeEnvironment::Prod, // mismatches TEST's own local_env
+            topic_generation: Some(0),
         }),
     )
     .await
@@ -1509,7 +1550,10 @@ async fn a_replica_ahead_of_the_leader_is_truncated_back_when_its_stream_reopens
     let chain = read_all_payloads(a, 0);
 
     // C grows past the chain; B and A stay at 5.
-    let c_part = PartitionProvider::partition(c.svc.as_ref(), ORG, TOPIC, 0).expect("C partition");
+    let c_part = c
+        .svc
+        .local_partition(&ctx(), TOPIC, 0)
+        .expect("C partition");
     c_part
         .append_batch_async(one_text_batch("ghost-1"))
         .await
@@ -1526,7 +1570,7 @@ async fn a_replica_ahead_of_the_leader_is_truncated_back_when_its_stream_reopens
     // streams for it (the same path `apply_assignment_leader_dials_...`
     // covers).
     a.manager
-        .apply_assignment(assignment(&["A", "B", "C"], "A", 2, 0))
+        .apply_assignment(assignment(topic_generation(a), &["A", "B", "C"], "A", 2, 0))
         .await;
 
     assert!(
@@ -1946,6 +1990,31 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         ) -> Result<Box<dyn FollowerRunner>, ReplError> {
             unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
         }
+        fn undialed_lease(&self) -> Duration {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
+        fn leader_lease(&self) -> Duration {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
+        fn fence_to_epoch(
+            &self,
+            _assignment: &PartitionAssignment,
+            _epoch: u32,
+        ) -> Result<(), ReplError> {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
+        fn cut_to_committed(
+            &self,
+            _assignment: &PartitionAssignment,
+        ) -> Result<LogPosition, ReplError> {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
+        fn local_log_position(
+            &self,
+            _assignment: &PartitionAssignment,
+        ) -> Result<LogPosition, ReplError> {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
     }
 
     struct NoopAudit;
@@ -2011,6 +2080,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
             isr: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
             leader_epoch: 5,
             updated_at_ms: 0,
+            topic_generation: 0,
         })
         .await;
     mgr_b
@@ -2024,6 +2094,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
             isr: vec!["B_LOCAL".to_string(), "Y_LEADER".to_string()],
             leader_epoch: 9,
             updated_at_ms: 0,
+            topic_generation: 0,
         })
         .await;
 
@@ -2097,6 +2168,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         leader_epoch: 4,
         replicas: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
         environment: NodeEnvironment::Prod,
+        topic_generation: Some(0),
     })
     .await;
     assert!(!ack.accepted);
@@ -2124,6 +2196,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         leader_epoch: 8,
         replicas: vec!["B_LOCAL".to_string(), "Y_LEADER".to_string()],
         environment: NodeEnvironment::Prod,
+        topic_generation: Some(0),
     })
     .await;
     assert!(!ack.accepted);
@@ -2146,6 +2219,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         leader_epoch: 4,
         replicas: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
         environment: NodeEnvironment::Prod,
+        topic_generation: Some(0),
     })
     .await;
     assert!(!ack.accepted);

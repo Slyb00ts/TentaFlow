@@ -387,6 +387,10 @@ where
         .await;
     }
 
+    // The stamp fences older leaders; it says nothing about the records
+    // here, whose epoch (`Partition::log_epoch`) is what the leader
+    // reconciles by — and stays what it was until the leader's first batch
+    // or its Truncate lands, however often this stream is re-established.
     partition.set_leader_epoch(hello.leader_epoch)?;
     let ack = ReplHelloAck {
         accepted: true,
@@ -395,6 +399,8 @@ where
         follower_epoch: partition.leader_epoch(),
         environment: local_env,
         reject: None,
+        follower_log_epoch: Some(partition.log_epoch()),
+        follower_committed: Some(partition.committed_offset()),
     };
     write_frame(&mut writer, &ReplFrame::HelloAck(ack)).await?;
 
@@ -423,7 +429,12 @@ where
                 match frame {
                     ReplFrame::Batch { header, bytes } => {
                         match partition
-                            .append_replicated_async(bytes, header.base_offset, header.leader_epoch)
+                            .append_replicated_async(
+                                bytes,
+                                header.base_offset,
+                                header.leader_epoch,
+                                header.record_epoch.unwrap_or(header.leader_epoch),
+                            )
                             .await
                         {
                             Ok(_) => {}
@@ -470,11 +481,17 @@ where
                         }
 
                         partition.set_high_watermark(header.hw);
+                        if let Some(committed) = header.committed {
+                            partition.set_committed_offset(committed);
+                        }
                         follower.refresh_lease();
                         batches_since_ack += 1;
                     }
                     ReplFrame::Heartbeat(hb) => {
                         partition.set_high_watermark(hb.hw);
+                        if let Some(committed) = hb.committed {
+                            partition.set_committed_offset(committed);
+                        }
                         follower.refresh_lease();
                     }
                     ReplFrame::Truncate(t) => {
@@ -549,6 +566,21 @@ where
                                 Err(BusError::PartitionDetached) => {
                                     return Ok(FollowerExit::Detached)
                                 }
+                                Err(BusError::TruncateBelowCommitted { committed, to }) => {
+                                    // This leader lacks records a majority
+                                    // already holds. Obeying would lose them on
+                                    // every replica; refusing keeps them here
+                                    // and ends the stream, loudly.
+                                    tracing::error!(
+                                        target: "bus::replication::follower",
+                                        committed, to,
+                                        leader_epoch = t.leader_epoch,
+                                        "refused a leader Truncate below this replica's committed offset"
+                                    );
+                                    return Err(FollowerError::Engine(
+                                        BusError::TruncateBelowCommitted { committed, to },
+                                    ));
+                                }
                                 Err(BusError::TruncateBelowHighWatermark { hw, to }) => {
                                     // Unreachable from this call site — the
                                     // leader-authority truncate does not perform
@@ -572,6 +604,13 @@ where
                             hw: partition.high_watermark(),
                             leader_epoch: partition.leader_epoch(),
                             in_isr: true,
+                            log_epoch: Some(partition.log_epoch()),
+                            leading: false,
+                            ineligible: false,
+                            committed: Some(partition.committed_offset()),
+                            // Asked on the live stream itself: the leader is
+                            // the one asking.
+                            leader_alive: true,
                         };
                         write_frame(&mut writer, &ReplFrame::LeoReply(reply)).await?;
                     }
@@ -634,6 +673,8 @@ async fn reject_hello<W: AsyncWrite + Unpin>(
         follower_epoch: partition.leader_epoch(),
         environment: local_env,
         reject: Some(reject.clone()),
+        follower_log_epoch: None,
+        follower_committed: None,
     };
     write_frame(writer, &ReplFrame::HelloAck(ack)).await?;
     Ok(FollowerExit::HelloRejected {
@@ -789,6 +830,7 @@ mod tests {
             leader_epoch,
             replicas: vec![LEADER_NODE.to_string(), LOCAL_NODE.to_string()],
             environment,
+            topic_generation: Some(0),
         }
     }
 
@@ -806,6 +848,8 @@ mod tests {
                 batch_len: bytes.len() as u32,
                 producer: None,
                 dedup_keys: vec![],
+                committed: None,
+                record_epoch: None,
             },
             bytes,
         }
@@ -1075,6 +1119,171 @@ mod tests {
         );
     }
 
+    /// Accepts `hello_epoch` on a fresh stream over `partition` and returns
+    /// the ack together with the leader's end of the stream.
+    async fn accept(
+        partition: Arc<Partition>,
+        hello_epoch: u32,
+    ) -> (
+        ReplHelloAck,
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<FollowerExit, FollowerError>>,
+        TempDir,
+    ) {
+        let (store_dir, stores) = open_stores();
+        let (mut leader, follower_io) = tokio::io::duplex(64 * 1024);
+        let (follower_reader, follower_writer) = tokio::io::split(follower_io);
+        let handle = tokio::spawn(run_follower_stream(
+            follower_reader,
+            follower_writer,
+            partition,
+            stores,
+            NodeEnvironment::Prod,
+            expected(),
+            fast_config(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        ));
+        write_frame(
+            &mut leader,
+            &ReplFrame::Hello(hello(hello_epoch, NodeEnvironment::Prod)),
+        )
+        .await
+        .unwrap();
+        let ack = match read_frame(&mut leader).await.unwrap() {
+            ReplFrame::HelloAck(a) => a,
+            other => panic!("expected HelloAck, got {other:?}"),
+        };
+        (ack, leader, handle, store_dir)
+    }
+
+    /// A log holding an old leader's epoch-1 tail. Appended locally, the way
+    /// the old leader wrote it.
+    async fn epoch_one_tail(dir: &std::path::Path) -> Arc<Partition> {
+        let partition = open_partition(dir);
+        partition.set_hw_tracking(HwTracking::Manual);
+        partition.set_leader_epoch(1).unwrap();
+        for i in 0..3u64 {
+            let mut b = BatchBuilder::new(i, 1);
+            b.push(RecordInput::new(Bytes::from_static(b"tail"), 0))
+                .unwrap();
+            partition
+                .append_batch_async(b.build().unwrap())
+                .await
+                .unwrap();
+        }
+        partition.set_committed_offset(1);
+        partition
+    }
+
+    /// The leader's reconciling `Truncate` comes after the handshake. A
+    /// stream dropped in between must leave the log reporting the epoch its
+    /// records were written under, not the one the Hello stamped — or the
+    /// reconnect's handshake takes the old tail for this term's records and
+    /// keeps it for good.
+    #[tokio::test]
+    async fn a_dropped_handshake_leaves_the_log_epoch_where_the_records_put_it() {
+        let part_dir = tempfile::tempdir().unwrap();
+        let partition = epoch_one_tail(part_dir.path()).await;
+
+        let (ack, leader, handle, _stores) = accept(Arc::clone(&partition), 2).await;
+        assert!(ack.accepted, "{:?}", ack.reject);
+        assert_eq!(ack.follower_epoch, 2);
+        assert_eq!(ack.follower_log_epoch, Some(1));
+        assert_eq!(ack.follower_committed, Some(1));
+        drop(leader);
+        let _ = handle.await;
+
+        let (ack, mut leader, handle, _stores) = accept(Arc::clone(&partition), 2).await;
+        assert!(ack.accepted, "{:?}", ack.reject);
+        assert_eq!(
+            ack.follower_log_epoch,
+            Some(1),
+            "the stamp of the dropped handshake must not pass for epoch-2 records"
+        );
+
+        // The reconciling cut lands: what is left keeps the epoch its records
+        // were written in.
+        write_frame(
+            &mut leader,
+            &ReplFrame::Truncate(ReplTruncate {
+                leader_epoch: 2,
+                to_offset: 1,
+            }),
+        )
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while partition.log_end_offset() != 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the Truncate never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(partition.log_epoch(), 1);
+
+        // X1: the epoch-2 leader re-feeds a record of epoch 1. The stream's
+        // term (2) fences; the record stays an epoch-1 record.
+        let refed = with_record_epoch(batch_frame(1, 0, 2, "old-term"), 1);
+        write_frame(&mut leader, &refed).await.unwrap();
+        let own = with_record_epoch(batch_frame(2, 0, 2, "own-term"), 2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        write_frame(&mut leader, &own).await.unwrap();
+        while partition.log_end_offset() != 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the batches never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(partition.epoch_at(1), 1, "re-fed, still an epoch-1 record");
+        assert_eq!(partition.epoch_at(2), 2);
+        assert_eq!(partition.log_epoch(), 2);
+        handle.abort();
+    }
+
+    fn with_record_epoch(frame: ReplFrame, record_epoch: u32) -> ReplFrame {
+        match frame {
+            ReplFrame::Batch { mut header, bytes } => {
+                header.record_epoch = Some(record_epoch);
+                ReplFrame::Batch { header, bytes }
+            }
+            other => other,
+        }
+    }
+
+    /// Records at or below the committed offset are on a majority. A
+    /// `Truncate` reaching below it comes from a leader that lacks them;
+    /// the replica refuses, keeps them and ends the stream.
+    #[tokio::test]
+    async fn a_truncate_below_the_committed_offset_is_refused() {
+        let part_dir = tempfile::tempdir().unwrap();
+        let partition = epoch_one_tail(part_dir.path()).await;
+        let (_, mut leader, handle, _stores) = accept(Arc::clone(&partition), 2).await;
+        write_frame(
+            &mut leader,
+            &ReplFrame::Truncate(ReplTruncate {
+                leader_epoch: 2,
+                to_offset: 0,
+            }),
+        )
+        .await
+        .unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the stream must end")
+            .unwrap();
+        assert!(matches!(
+            exit,
+            Err(FollowerError::Engine(BusError::TruncateBelowCommitted {
+                committed: 1,
+                to: 0
+            }))
+        ));
+        assert_eq!(partition.log_end_offset(), 3);
+        assert_eq!(partition.log_epoch(), 1);
+    }
+
     #[tokio::test]
     async fn stale_epoch_hello_is_rejected() {
         let part_dir = tempfile::tempdir().unwrap();
@@ -1241,6 +1450,7 @@ mod tests {
                     leader_epoch: 1,
                     hw: 0,
                     leader_leo: 0,
+                    committed: None,
                 }),
             )
             .await
@@ -1651,6 +1861,7 @@ mod tests {
                 leader_epoch: 1,
                 hw: 0,
                 leader_leo: 0,
+                committed: None,
             }),
         )
         .await
@@ -1729,6 +1940,7 @@ mod tests {
                 leader_epoch: 1,
                 hw: 0,
                 leader_leo: 0,
+                committed: None,
             }),
         )
         .await
@@ -1896,6 +2108,8 @@ mod tests {
                         base_seq: 42,
                     }),
                     dedup_keys: vec![],
+                    committed: None,
+                    record_epoch: None,
                 },
                 bytes,
             },

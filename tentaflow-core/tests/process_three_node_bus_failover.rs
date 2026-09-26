@@ -654,6 +654,40 @@ fn create_topic_on(node: &mut ChildNode, acks: &str, durability: &str) {
     ));
 }
 
+/// `TOPIC_STATE`'s incarnation of the topic row `node` holds, `None`
+/// without a row.
+fn topic_row_generation(node: &mut ChildNode) -> Option<u64> {
+    let line = node.command(&format!("TOPIC_STATE {ORG_ID} {TOPIC}"));
+    // "TF3BUS OK TOPIC_STATE <row 0/1> <assignment rows> <generation>"
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    (parts.get(3) == Some(&"1")).then(|| parts.get(5).and_then(|g| g.parse().ok()))?
+}
+
+/// Creates the topic ONCE, on `creator`, and waits until every node in
+/// `others` holds the same row. A topic is one incarnation replicated to
+/// its replicas; creating it on every node instead made one incarnation
+/// per node, which the ledger then resolves to whichever create sorts last
+/// — dropping every placement proposed for the others.
+fn create_topic_everywhere(creator: &mut ChildNode, others: &mut [&mut ChildNode]) {
+    create_topic_on(creator, "quorum", "standard");
+    let generation = topic_row_generation(creator).expect("creator holds its own topic row");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for node in others.iter_mut() {
+        loop {
+            let seen = topic_row_generation(node);
+            if seen == Some(generation) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{}: the topic row never arrived (holds {seen:?}, creator {generation})",
+                node.name
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
 fn role_of(node: &mut ChildNode) -> String {
     node.command(&format!("ROLE {ORG_ID} {TOPIC} {PARTITION}"))
 }
@@ -674,18 +708,34 @@ fn live_isr(node: &mut ChildNode) -> Vec<String> {
     }
 }
 
-/// Blocks until the leader's live ISR covers every id in `want`, or the
-/// timeout is spent.
+/// Blocks until the leader's live ISR covers every id in `want` AND the
+/// leader would admit a quorum publish, or the timeout is spent.
+///
+/// The ISR alone is not that gate. While a same-node epoch bump swaps the
+/// leader handle, the entry already reads `Leader` at the new epoch but has
+/// no handle yet: `ISR` falls back to the assignment's static set (every
+/// replica), while `preflight` refuses publishes as `NotLeader { None, epoch
+/// }` — measured: the smoke test's first publish refused exactly so, with
+/// the roles and the ISR both converged, when the whole file ran at once.
+/// The swap is bounded (the old handle's `stop()` plus one spawn), so
+/// waiting it out is the harness's job, not a replication defect.
 fn wait_live_isr(node: &mut ChildNode, want: &[String], timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let isr = live_isr(node);
-        if want.iter().all(|n| isr.contains(n)) {
-            return;
-        }
+        let admits = if want.iter().all(|n| isr.contains(n)) {
+            let line = node.command(&format!("PREFLIGHT {ORG_ID} {TOPIC} {PARTITION}"));
+            if line.ends_with("PREFLIGHT OK") {
+                return;
+            }
+            line
+        } else {
+            String::new()
+        };
         assert!(
             Instant::now() < deadline,
-            "live ISR never covered {want:?} (last seen {isr:?}) within {timeout:?}"
+            "live ISR never covered {want:?} with a publish-ready leader \
+             (last seen {isr:?}, {admits}) within {timeout:?}"
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -815,14 +865,13 @@ fn assign_and_wait(
         if !replicas.contains(&n.node_id) {
             return true;
         }
-        // The role alone is not convergence: every node already holds a
-        // `leader = itself, epoch = 1` create-time placement, and the node
-        // with the lowest id wins that tie on every replica — the same
-        // Leader/Follower picture the ASSIGN produces, one term early. When
-        // the gate accepted it, the ASSIGN's own term landed during the
-        // steady-state phase and rebuilt every replica under a live
-        // publish (measured: `ROLE Leader { epoch: 1 }` accepted, then
-        // `acked=1, required=2` mid-phase-1). Wait for the assigned term.
+        // The role alone is not convergence: the creator's epoch-1
+        // create-time placement already shows the same Leader/Follower
+        // picture the ASSIGN produces, one term early. When the gate
+        // accepted it, the ASSIGN's own term landed during the steady-state
+        // phase and rebuilt every replica under a live publish (measured:
+        // `ROLE Leader { epoch: 1 }` accepted, then `acked=1, required=2`
+        // mid-phase-1). Wait for the assigned term.
         let want_leader = n.node_id == leader_node_id;
         let line = role_of(n);
         let term = format!("epoch: {ASSIGN_EPOCH}");
@@ -880,9 +929,7 @@ fn process_three_node_bus_failover_smoke() {
     connect_nodes(&mut a, &mut c);
     connect_nodes(&mut b, &mut c);
 
-    create_topic_on(&mut a, "quorum", "standard");
-    create_topic_on(&mut b, "quorum", "standard");
-    create_topic_on(&mut c, "quorum", "standard");
+    create_topic_everywhere(&mut a, &mut [&mut b, &mut c]);
 
     let leader_id = a.node_id.clone();
     let replicas = vec![a.node_id.clone(), b.node_id.clone(), c.node_id.clone()];
@@ -948,6 +995,158 @@ fn process_three_node_bus_failover_smoke() {
     );
 }
 
+// ===== Topic re-creation across nodes (non-ignored) =========================
+//
+// A topic deleted on one node and created again under the same name is a
+// new incarnation: every replica must apply the new incarnation's epoch-1
+// placement and replicate it, even though the deleted incarnation's
+// partition had reached a higher epoch. Real ledger, real materializer on
+// every node — the path the in-process fakes cannot exercise.
+#[test]
+fn process_three_node_bus_topic_recreated_after_delete_replicates_on_every_node() {
+    if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
+        return;
+    }
+    recreate_after_delete(Recreator::DeletingNode);
+}
+
+// The same, re-created on a node that learned of the delete only through the
+// ledger: that node still holds the deleted incarnation's log (it followed
+// it), and the new incarnation it leads must start from an empty one — not
+// serve the old records or carry the old persisted leader epoch.
+#[test]
+fn process_three_node_bus_topic_recreated_on_another_node_starts_an_empty_log() {
+    if std::env::var_os("TENTAFLOW_BUS_CHAOS_CHILD").is_some() {
+        return;
+    }
+    recreate_after_delete(Recreator::AnotherNode);
+}
+
+enum Recreator {
+    DeletingNode,
+    AnotherNode,
+}
+
+fn recreate_after_delete(recreator: Recreator) {
+    let root = tempfile::tempdir().expect("root");
+    let mut a = ChildNode::spawn("a", root.path().join("a"));
+    let mut b = ChildNode::spawn("b", root.path().join("b"));
+    let mut c = ChildNode::spawn("c", root.path().join("c"));
+    connect_nodes(&mut a, &mut b);
+    connect_nodes(&mut a, &mut c);
+    connect_nodes(&mut b, &mut c);
+
+    // First incarnation, driven to epoch 2 and written to.
+    create_topic_everywhere(&mut a, &mut [&mut b, &mut c]);
+    let replicas = vec![a.node_id.clone(), b.node_id.clone(), c.node_id.clone()];
+    let old_leader = a.node_id.clone();
+    assign_and_wait(
+        &mut a,
+        &mut [&mut b, &mut c],
+        &old_leader,
+        &replicas,
+        Duration::from_secs(30),
+    );
+    let (_, first_accepted, _) =
+        publish_batch(&mut a, Duration::from_secs(10)).expect("publish to the first incarnation");
+    for node in [&mut b, &mut c] {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while partition_stats(node).2 < u64::from(first_accepted) {
+            assert!(
+                Instant::now() < deadline,
+                "{} never replicated the first incarnation",
+                node.name
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    // Deleted on `a` only: the delete reaches `b`/`c` through the ledger,
+    // taking the topic row and its placements with it on every node, and the
+    // replication layer lets go of the partition everywhere.
+    a.command(&format!("DELETE_TOPIC {ORG_ID} {TOPIC}"));
+    for node in [&mut a, &mut b, &mut c] {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let state = node.command(&format!("TOPIC_STATE {ORG_ID} {TOPIC}"));
+            if state.contains("TOPIC_STATE 0 0 ") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{}: the delete never materialized: {state}",
+                node.name
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        wait_role(node, "Unavailable", Duration::from_secs(30));
+    }
+
+    // Second incarnation, created on one node only: its epoch-1 placement
+    // must reach and be applied by every replica, with its creator leading.
+    let (creator, others): (&mut ChildNode, [&mut ChildNode; 2]) = match recreator {
+        Recreator::DeletingNode => (&mut a, [&mut b, &mut c]),
+        Recreator::AnotherNode => (&mut b, [&mut a, &mut c]),
+    };
+    let [first, second] = others;
+    create_topic_on(creator, "quorum", "standard");
+    let new_leader = creator.node_id.clone();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let roles = [role_of(creator), role_of(first), role_of(second)];
+        let converged = roles[0].contains("Leader { epoch: 1 }")
+            && roles[1..].iter().all(|r| {
+                r.contains("Follower {") && r.contains(&new_leader) && r.contains("epoch: 1")
+            });
+        if converged {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the re-created topic's epoch-1 placement did not converge: {roles:?}"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    wait_live_isr(creator, &replicas, Duration::from_secs(20));
+    let (base, accepted, _) =
+        publish_batch(creator, Duration::from_secs(10)).expect("publish to the new incarnation");
+    assert_eq!(base, 0, "the new incarnation's log starts empty");
+    let total = u64::from(accepted);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for node in [&mut *first, &mut *second] {
+        while partition_stats(node).1 < total {
+            assert!(
+                Instant::now() < deadline,
+                "{} never replicated the new incarnation",
+                node.name
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let (hash_creator, count_creator) = hash_log(creator, total);
+    assert_eq!(count_creator, total);
+    for node in [first, second] {
+        let (hash, count) = hash_log(node, total);
+        assert_eq!(
+            (hash, count),
+            (hash_creator.clone(), count_creator),
+            "{} log differs",
+            node.name
+        );
+        let (_, _, leo) = partition_stats(node);
+        assert_eq!(
+            leo, total,
+            "{} kept records of the deleted incarnation",
+            node.name
+        );
+    }
+    let (_, _, creator_leo) = partition_stats(creator);
+    assert_eq!(
+        creator_leo, total,
+        "the creator kept records of the deleted incarnation"
+    );
+}
+
 // ===== Z12: environment fencing on the real ALPN (non-ignored, fast) ========
 //
 // Node C declares `node_environment = Test` while A/B are `Prod` (the
@@ -986,8 +1185,10 @@ fn process_three_node_bus_failover_z12_environment_fencing() {
     c.command(&format!("SET_PEER_ENV {} prod", a.node_id));
     c.command(&format!("SET_PEER_ENV {} prod", b.node_id));
 
-    create_topic_on(&mut a, "quorum", "standard");
-    create_topic_on(&mut b, "quorum", "standard");
+    // C is in another environment, so the ledger never carries A's topic row
+    // to it (ops are fenced by environment at admission). It gets a topic of
+    // its own, only so its stats can be read below.
+    create_topic_everywhere(&mut a, &mut [&mut b]);
     create_topic_on(&mut c, "quorum", "standard");
 
     let leader_id = a.node_id.clone();
@@ -1088,9 +1289,7 @@ fn process_three_node_bus_failover_chaos() {
     connect_nodes(&mut a, &mut c);
     connect_nodes(&mut b, &mut c);
 
-    create_topic_on(&mut a, "quorum", "standard");
-    create_topic_on(&mut b, "quorum", "standard");
-    create_topic_on(&mut c, "quorum", "standard");
+    create_topic_everywhere(&mut a, &mut [&mut b, &mut c]);
 
     let leader_id = a.node_id.clone();
     let replicas = vec![a.node_id.clone(), b.node_id.clone(), c.node_id.clone()];
@@ -1295,16 +1494,20 @@ fn process_three_node_bus_failover_chaos() {
     }
 
     // ---- Phase 6: byte-for-byte log comparison up to min(hw) ---------------
-    // A follower learns the leader's high watermark from the leader's next
-    // frame (a batch header or the heartbeat, `heartbeat_interval` = 500 ms
-    // in silence), so right after the last publish it can trail it by one
-    // batch with the records already in its log — measured: `STATS 0 628000
-    // 629000` on the other survivor, `629000` on the leader, read 0.8 s after
-    // that publish's ack; the same shape failed 5 of 10 runs of the tree
-    // before this patch. What must hold is that every replica REACHES the
-    // committed offset; a bound of ten heartbeat periods separates a lagging
-    // watermark from one that really regressed.
-    let hw_deadline = Instant::now() + Duration::from_secs(5);
+    // Every replica already holds the committed offset in its LOG (the
+    // restarted node was waited for above); this checks that each one also
+    // KNOWS it is committed. The leader pushes every `hw` advance to its
+    // followers at once (`run_follower_stream`'s `hw_changed` arm; before
+    // that a follower learned it only from the next heartbeat, measured at
+    // +501 ms, and this read trailed by a batch 0.8 s after the last ack).
+    // What is left is a stream that reconnects in between — its first
+    // heartbeat after the new `Hello` carries the watermark, at most one
+    // 500 ms `heartbeat_interval` — plus scheduling slack for three child
+    // processes and this 150 ms poll: four intervals, 2 s. Longer than that
+    // is not propagation delay but a watermark that went backwards or never
+    // arrives, which is what this loop exists to catch.
+    let hw_wait_started = Instant::now();
+    let hw_deadline = hw_wait_started + Duration::from_secs(2);
     let min_hw = loop {
         let (_, hw_leader, _) = partition_stats(new_leader);
         let (_, hw_other, _) = partition_stats(other_survivor);
@@ -1320,6 +1523,10 @@ fn process_three_node_bus_failover_chaos() {
         );
         std::thread::sleep(Duration::from_millis(150));
     };
+    eprintln!(
+        "chaos: every replica knew hw >= {total_acked} after {} ms",
+        hw_wait_started.elapsed().as_millis()
+    );
 
     let (hash_leader, count_leader) = hash_log(new_leader, min_hw);
     let (hash_other, count_other) = hash_log(other_survivor, min_hw);
@@ -1583,6 +1790,25 @@ async fn child_main() {
     // resolves through `bus::instance(&id)` rather than `bus::global()`.
     let instance_id = tentaflow_core::bus::instance::BusInstanceId::parse("tentabus-00000001")
         .expect("valid instance id");
+    // The instance is an installed app on every node, as in production. The
+    // bus materializers refuse ops for an instance a node does not host
+    // (`core_materializer::bus_instance_is_local`, `R4-9e-ledger-leak`), and
+    // without this row every bus op from a PEER was dropped there: topic
+    // rows, placements and deletes converged only through replication
+    // Hellos, never through the ledger this harness is meant to exercise
+    // (found reproducing topic re-creation — the delete never landed on the
+    // other nodes). `OR IGNORE`: a restarted child reopens the same home.
+    db.write()
+        .expect("db lock")
+        .execute(
+            "INSERT OR IGNORE INTO addons (addon_id, name, version, package_id, is_enabled) \
+             VALUES (?1, ?1, '1.0.0', ?2, 1)",
+            rusqlite::params![
+                instance_id.as_str(),
+                tentaflow_core::bus::instance::BusInstanceId::PACKAGE_ID
+            ],
+        )
+        .expect("register the tentabus instance as installed");
     let svc = bus::init(BusInitConfig {
         instance_id: instance_id.clone(),
         local_db,
@@ -1729,6 +1955,17 @@ async fn child_main() {
     }
 }
 
+fn harness_ctx(svc: &tentaflow_core::bus::BusService, org: &str) -> BusCallContext {
+    BusCallContext {
+        instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(svc.instance_id())
+            .expect("BusService::instance_id() is always a valid BusInstanceId"),
+        org_id: org.to_string(),
+        actor: Some("chaos-harness".to_string()),
+        correlation_id: None,
+        origin: "process_three_node_bus_failover".to_string(),
+    }
+}
+
 async fn handle_child_command(
     line: &str,
     db: &tentaflow_core::db::DbPool,
@@ -1816,14 +2053,7 @@ async fn handle_child_command(
             Ok("SET_PEER_ENV".to_string())
         }
         ["CREATE_TOPIC", org, topic, partitions, rf, acks, durability] => {
-            let ctx = BusCallContext {
-                instance_id: tentaflow_core::bus::instance::BusInstanceId::parse(svc.instance_id())
-                    .expect("BusService::instance_id() is always a valid BusInstanceId"),
-                org_id: org.to_string(),
-                actor: Some("chaos-harness".to_string()),
-                correlation_id: None,
-                origin: "process_three_node_bus_failover".to_string(),
-            };
+            let ctx = harness_ctx(svc, org);
             let opts = TopicOptions {
                 partitions: Some(partitions.parse()?),
                 replication_factor: Some(rf.parse()?),
@@ -1842,6 +2072,28 @@ async fn handle_child_command(
                 Err(e) => Err(anyhow::anyhow!("create_topic: {e}")),
             }
         }
+        ["TOPIC_STATE", org, topic] => {
+            let repo =
+                tentaflow_core::db::repository::bus_topic_get(db, svc.instance_id(), org, topic)?;
+            let rows = tentaflow_core::db::repository::bus_assignment_list_for_topic(
+                db,
+                svc.instance_id(),
+                org,
+                topic,
+            )?;
+            // The incarnation of the row this node holds, `0` without one.
+            let generation = repo.as_ref().map_or(0, |row| row.generation);
+            Ok(format!(
+                "TOPIC_STATE {} {} {generation}",
+                u8::from(repo.is_some()),
+                rows.len()
+            ))
+        }
+        ["DELETE_TOPIC", org, topic] => {
+            svc.delete_topic(&harness_ctx(svc, org), topic)
+                .map_err(|e| anyhow::anyhow!("delete_topic: {e}"))?;
+            Ok("DELETE_TOPIC".to_string())
+        }
         ["ASSIGN", org, topic, partition, leader_node_id, replica_csv] => {
             let replicas: Vec<String> = replica_csv.split(',').map(|s| s.to_string()).collect();
             let assignment = PartitionAssignment {
@@ -1852,23 +2104,26 @@ async fn handle_child_command(
                 leader_node_id: leader_node_id.to_string(),
                 isr: replicas.clone(),
                 replicas,
-                // Epoch 2, not 1: `create_topic_on` runs on ALL THREE nodes
-                // (each engine needs the topic locally), and
-                // `BusService::create_topic` places what it creates — so
-                // every node already holds a `leader = itself, epoch = 1`
-                // row it materialized locally. `core_materializer::
-                // apply_bus_partition_assignment` admits an incoming row
-                // only on a strictly higher epoch, or an equal epoch with a
-                // lexicographically lower leader id, so an epoch-1
-                // administrative assignment is REJECTED as a no-op by every
-                // node whose own id sorts below the one it names. Observed
-                // as all three nodes answering `ROLE Leader { epoch: 1 }`
-                // for the same partition. This is an administrative
-                // reassignment on top of create-time placement, so it
-                // outranks it by epoch — the same thing a real
-                // `transfer_leader` would do.
+                // Epoch 2, not 1: `BusService::create_topic` already placed
+                // the topic at epoch 1 with its creator leading, and
+                // `core_materializer::apply_bus_partition_assignment` admits
+                // an incoming row only on a strictly higher epoch, or an
+                // equal epoch with a lexicographically lower leader id. This
+                // is an administrative reassignment on top of create-time
+                // placement, so it outranks it by epoch — the same thing a
+                // real `transfer_leader` would do.
                 leader_epoch: ASSIGN_EPOCH,
                 updated_at_ms: now_ms(),
+                // The topic's current incarnation, as every real proposer
+                // stamps it (`PartitionAssignment::topic_generation`).
+                topic_generation: tentaflow_core::db::repository::bus_topic_get(
+                    db,
+                    svc.instance_id(),
+                    org,
+                    topic,
+                )?
+                .ok_or_else(|| anyhow::anyhow!("ASSIGN: topic {topic} not here"))?
+                .generation,
             };
             let op_id = assignment_store.propose(&assignment)?;
             // `propose` only appends to the ledger + queues this node's
@@ -1933,6 +2188,20 @@ async fn handle_child_command(
                 None => Ok("ISR 0".to_string()),
             }
         }
+        // The exact gate a quorum publish passes on this node (`preflight`),
+        // without writing anything.
+        ["PREFLIGHT", org, topic, partition] => {
+            let partition: u32 = partition.parse()?;
+            let coordinator = svc
+                .replication()
+                .ok_or_else(|| anyhow::anyhow!("no coordinator installed"))?;
+            Ok(
+                match coordinator.preflight(org, topic, partition, Acks::Quorum) {
+                    Ok(_) => "PREFLIGHT OK".to_string(),
+                    Err(e) => format!("PREFLIGHT REFUSED {e}"),
+                },
+            )
+        }
         ["PUBLISH_BATCH", org, topic, n_records, record_bytes] => {
             let n_records: usize = n_records.parse()?;
             let record_bytes: usize = record_bytes.parse()?;
@@ -1996,8 +2265,10 @@ async fn handle_child_command(
         ["HASH_LOG", org, topic, partition, upto_offset] => {
             let partition: u32 = partition.parse()?;
             let upto_offset: u64 = upto_offset.parse()?;
+            // Read-only: this node's own handle, whatever its role — never
+            // the replication provider, which may purge and restamp.
             let part = svc
-                .partition(org, topic, partition)
+                .local_partition(&harness_ctx(svc, org), topic, partition)
                 .map_err(|e| anyhow::anyhow!("partition: {e:?}"))?;
             let reader = part.open_reader();
             let mut hasher = Sha256::new();

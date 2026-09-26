@@ -727,6 +727,12 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
 ///
 /// Does NOT remove `<data dir>/log/` itself — the platform removes it with
 /// the rest of the data dir right after this call returns.
+///
+/// Topic incarnations need no step of their own: the incarnation is a
+/// column of the `bus_topics` row (step 3; `purge_org` deletes the same
+/// rows for one org) and of each placement row, and the per-topic
+/// `incarnation` marker file lives in the log directory the platform
+/// removes. No other table records topic names past their deletion.
 pub fn native_teardown(ctx: &NativeAppContext) -> Result<()> {
     native_on_disable(ctx);
     crate::addon::app_db::close(ctx.addon_id);
@@ -983,6 +989,7 @@ mod tests {
                 created_at_ms: 0,
                 updated_at_ms: 0,
                 durability_class: None,
+                generation: 0,
             },
         )
         .expect("create topic");
@@ -1108,6 +1115,7 @@ mod tests {
                     created_at_ms: 0,
                     updated_at_ms: 0,
                     durability_class: None,
+                    generation: 0,
                 },
             )
             .expect("create topic");
@@ -1531,6 +1539,7 @@ mod tests {
                     leader_epoch: 1,
                     replicas: vec!["l".to_string()],
                     environment: tentaflow_protocol::environment::NodeEnvironment::Prod,
+                    topic_generation: Some(0),
                 },
             ),
         )

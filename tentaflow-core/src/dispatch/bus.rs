@@ -6655,6 +6655,12 @@ mod tests {
         let bctx = bus_ctx(ctx, &g);
         let topic = topic.to_string();
         tokio::task::spawn_blocking(move || {
+            // Another test in this module may have installed a fake
+            // coordinator on the shared instance, which admits writes as
+            // leader; open them the way a real leader handle would.
+            svc.local_partition(&bctx, &topic, 0)
+                .expect("partition")
+                .open_leader_writes();
             svc.publish(
                 &bctx,
                 &topic,

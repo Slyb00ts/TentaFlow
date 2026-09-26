@@ -76,6 +76,21 @@ pub struct ReplHello {
     pub leader_epoch: u32,
     pub replicas: Vec<String>,
     pub environment: NodeEnvironment,
+    /// The topic incarnation the leader leads
+    /// (`PartitionAssignment::topic_generation`). Epochs restart at 1 when a
+    /// topic is deleted and re-created, so without it a leader still serving
+    /// the deleted incarnation at epoch 3 outranks a follower of the new one
+    /// at epoch 1: the follower adopts the dead claim and appends the old
+    /// incarnation's records into the new log. `accept_hello` refuses a
+    /// Hello whose incarnation differs from the one it holds.
+    ///
+    /// `None` is a leader built before this field (appended with
+    /// `#[serde(default)]`, no `SCHEMA_VERSION` bump): its incarnation is
+    /// unknown and the Hello is judged by epoch alone, exactly as that build
+    /// did. The protection therefore holds between upgraded nodes; a fleet
+    /// is only fully covered once every node runs a build that sends it.
+    #[serde(default)]
+    pub topic_generation: Option<u64>,
 }
 
 /// Follower's response to `ReplHello`. `accepted = false` always carries a
@@ -89,6 +104,19 @@ pub struct ReplHelloAck {
     pub follower_epoch: u32,
     pub environment: NodeEnvironment,
     pub reject: Option<ReplReject>,
+    /// The epoch the follower's log was last written under, read BEFORE it
+    /// stamped this Hello's epoch (`follower_epoch` is after). A log of
+    /// another epoch than the leader's may diverge from the leader's chain
+    /// below the leader's `leo` too, so the leader cuts it back to its `hw`
+    /// (`election::LogPosition::kept_end`). Appended: `None` from a follower
+    /// that predates it, which is judged by offsets alone as before.
+    #[serde(default)]
+    pub follower_log_epoch: Option<u32>,
+    /// The follower's `Partition::committed_offset`, the bound a log of
+    /// another epoch is cut back to. Appended: `None` from a follower that
+    /// predates it, which is judged by `follower_hw`.
+    #[serde(default)]
+    pub follower_committed: Option<u64>,
 }
 
 /// Why a follower refused a `ReplHello` (PLAN-M2 §1b). `Deserialize` is
@@ -123,6 +151,21 @@ pub enum ReplReject {
     EpochAheadOfLedger {
         ledger_epoch: u32,
     },
+    /// The `Hello` leads a different incarnation of the topic than the one
+    /// this node holds (`ReplHello::topic_generation`): a leader of a deleted
+    /// incarnation, or of one this node has not materialized yet. An older
+    /// peer decodes it as `Unknown`, which ends the stream the same way.
+    TopicIncarnationMismatch {
+        theirs: u64,
+        ours: u64,
+    },
+    /// This node is cutting its own log back to its committed offset after
+    /// stepping down from a term that is over. A stream accepted mid-cut
+    /// would be fed and acknowledged past the cut, and the cut would then
+    /// drop records the leader already counted; the leader retries on its
+    /// normal backoff. An older peer decodes it as `Unknown`, which ends the
+    /// stream the same way.
+    Reconciling,
     /// A reason this build does not know, because the peer that sent it
     /// runs a NEWER TentaBus that added the variant after this binary was
     /// compiled. `reason` is the name that was on the wire, so a log line
@@ -184,6 +227,11 @@ impl<'de> Deserialize<'de> for ReplReject {
             ledger_epoch: u32,
         }
         #[derive(Deserialize)]
+        struct TopicIncarnationMismatchFields {
+            theirs: u64,
+            ours: u64,
+        }
+        #[derive(Deserialize)]
         struct UnknownFields {
             reason: String,
         }
@@ -197,6 +245,7 @@ impl<'de> Deserialize<'de> for ReplReject {
                 "Detached" => ReplReject::Detached,
                 "UnknownInstance" => ReplReject::UnknownInstance,
                 "LeaderIdentityMismatch" => ReplReject::LeaderIdentityMismatch,
+                "Reconciling" => ReplReject::Reconciling,
                 other => ReplReject::Unknown {
                     reason: other.to_string(),
                 },
@@ -228,6 +277,14 @@ impl<'de> Deserialize<'de> for ReplReject {
                             payload.deserialized().map_err(D::Error::custom)?;
                         Ok(ReplReject::EpochAheadOfLedger {
                             ledger_epoch: f.ledger_epoch,
+                        })
+                    }
+                    "TopicIncarnationMismatch" => {
+                        let f: TopicIncarnationMismatchFields =
+                            payload.deserialized().map_err(D::Error::custom)?;
+                        Ok(ReplReject::TopicIncarnationMismatch {
+                            theirs: f.theirs,
+                            ours: f.ours,
                         })
                     }
                     // This build's OWN `Unknown`, round-tripped: a peer
@@ -263,6 +320,20 @@ pub struct ReplBatchHeader {
     /// engine's on-disk batch header carries no `producer_id` field and
     /// changing that would break M1 on-disk compatibility.
     pub producer: Option<ReplProducerMark>,
+    /// The leader's `Partition::committed_offset` — the offset below which
+    /// every record is on a majority of the replica set. Appended: `None`
+    /// from a leader that predates it.
+    #[serde(default)]
+    pub committed: Option<u64>,
+    /// The epoch this batch was first written in (`Partition::epoch_at` on
+    /// the leader) — distinct from `leader_epoch`, the sender's term, which
+    /// only fences. A leader re-elected in a new term re-feeds records of
+    /// the old one; the follower must record them as old-term records, or a
+    /// short copy of the old term outranks a full one. Appended: `None`
+    /// from a leader that predates it, which the follower takes as
+    /// `leader_epoch`, as that build did.
+    #[serde(default)]
+    pub record_epoch: Option<u32>,
     /// Reserved for layer-2 dedup (mmap `idempotency_key`, PLAN-M2 §4.1
     /// A7) — always empty until CEL is wired in M3a. Kept in the frame
     /// shape now so wiring it later does not change this wave's frozen
@@ -309,6 +380,10 @@ pub struct ReplHeartbeat {
     pub leader_epoch: u32,
     pub hw: u64,
     pub leader_leo: u64,
+    /// As `ReplBatchHeader::committed`. Appended; `None` from a leader that
+    /// predates it.
+    #[serde(default)]
+    pub committed: Option<u64>,
 }
 
 /// Leader -> follower tail truncation (PLAN-M2 §1a `Partition::
@@ -339,12 +414,57 @@ pub struct ReplLeoQuery {
     pub known_epoch: u32,
 }
 
+/// Everything after `in_isr` is appended. A peer on an older build omits it
+/// and is judged by what the old fields say — offsets, `hw` — so the
+/// guarantees those fields add (log-epoch ranking, committed-offset bounds,
+/// deferral to a live leader) hold only once every node of the cluster runs
+/// a build that sends them. The same holds for `ReplHelloAck`'s
+/// `follower_log_epoch`/`follower_committed` — a follower that sends no log
+/// epoch is taken to share the leader's, so its log is reconciled by offsets
+/// alone and an old-term tail below the leader's `leo` goes unnoticed — and
+/// for `ReplBatchHeader::committed`/`record_epoch` and
+/// `ReplHeartbeat::committed`: a leader on an older build sends no
+/// `record_epoch`, so the follower records every batch in the stream's term
+/// (its `leader_epoch`) — an old-term record it re-feeds after a re-election
+/// is then recorded as a record of the new term, and a short copy of the old
+/// term can outrank a full one. A `record_epoch` that is sent is checked
+/// against the stream's term (`BusError::RecordEpochAhead`); the protocol
+/// version is deliberately not bumped, since that would stop replication
+/// between old and new nodes during a rolling upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplLeoReply {
     pub leo: u64,
     pub hw: u64,
     pub leader_epoch: u32,
     pub in_isr: bool,
+    /// The leader epoch the replying node's log was last written under
+    /// (`election::LogPosition::epoch`). Appended: a peer that predates it
+    /// sends none, and the candidate falls back to `leader_epoch`, which is
+    /// never below it — an unknown log ranks as recent, never as stale.
+    #[serde(default)]
+    pub log_epoch: Option<u32>,
+    /// Whether the replying node currently leads the partition. Appended;
+    /// `false` from a peer that predates it.
+    #[serde(default)]
+    pub leading: bool,
+    /// The replying node will not stand for this partition itself: it holds
+    /// the leader role (serving or not), its log awaits reconciliation, or
+    /// it does not replicate the partition at all. Its log still counts for
+    /// truncation and the new ISR, but a candidate must not defer to it as
+    /// the winner. Appended; `false` from a peer that predates it.
+    #[serde(default)]
+    pub ineligible: bool,
+    /// The replying node's committed offset (`Partition::committed_offset`),
+    /// what `election::LogPosition::committed` is built from. Appended:
+    /// `None` from a peer that predates it, which is judged by `hw`.
+    #[serde(default)]
+    pub committed: Option<u64>,
+    /// The replying node follows a leader right now: a live stream whose
+    /// lease has not run out. A candidate that hears it defers — the leader
+    /// is alive, only not (yet) reaching the candidate. Appended; `false`
+    /// from a peer that predates it.
+    #[serde(default)]
+    pub leader_alive: bool,
 }
 
 /// K-M2-5: consumer-group offset/attempts/discard state, replicated
@@ -660,6 +780,7 @@ mod tests {
             leader_epoch: 7,
             replicas: vec!["node-a".into(), "node-b".into(), "node-c".into()],
             environment: NodeEnvironment::Prod,
+            topic_generation: Some(42),
         }
     }
 
@@ -671,6 +792,8 @@ mod tests {
             follower_epoch: 7,
             environment: NodeEnvironment::Prod,
             reject,
+            follower_log_epoch: None,
+            follower_committed: None,
         }
     }
 
@@ -688,6 +811,8 @@ mod tests {
                     base_seq: 100,
                 }),
                 dedup_keys: vec![],
+                committed: None,
+                record_epoch: None,
             },
             bytes: Bytes::from_static(b"hello"),
         }
@@ -700,8 +825,56 @@ mod tests {
         read_frame(&mut server).await.expect("read")
     }
 
+    /// A Hello from a build that predates `topic_generation` decodes with the
+    /// incarnation unknown (`None`), not as incarnation 0 — the two are judged
+    /// differently by `accept_hello`.
+    #[test]
+    fn a_hello_without_an_incarnation_decodes_as_unknown() {
+        #[derive(Serialize)]
+        struct HelloBeforeIncarnations {
+            instance_id: String,
+            org_id: String,
+            topic: String,
+            partition: u32,
+            leader_node_id: String,
+            leader_epoch: u32,
+            replicas: Vec<String>,
+            environment: NodeEnvironment,
+        }
+        let current = hello();
+        let old = HelloBeforeIncarnations {
+            instance_id: current.instance_id.clone(),
+            org_id: current.org_id.clone(),
+            topic: current.topic.clone(),
+            partition: current.partition,
+            leader_node_id: current.leader_node_id.clone(),
+            leader_epoch: current.leader_epoch,
+            replicas: current.replicas.clone(),
+            environment: current.environment,
+        };
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(&old, &mut cbor).unwrap();
+        match decode_frame(KIND_HELLO, &cbor, Bytes::new()).unwrap() {
+            ReplFrame::Hello(decoded) => assert_eq!(
+                decoded,
+                ReplHello {
+                    topic_generation: None,
+                    ..current
+                }
+            ),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn round_trips_every_frame_kind() {
+        let mut legacy_incarnation = hello();
+        legacy_incarnation.topic_generation = Some(0);
+        assert_eq!(
+            roundtrip(ReplFrame::Hello(legacy_incarnation.clone())).await,
+            ReplFrame::Hello(legacy_incarnation),
+            "a topic created before incarnations is incarnation 0, which is known, not absent"
+        );
         assert_eq!(
             roundtrip(ReplFrame::Hello(hello())).await,
             ReplFrame::Hello(hello())
@@ -758,6 +931,8 @@ mod tests {
         for reject in [
             ReplReject::LeaderIdentityMismatch,
             ReplReject::EpochAheadOfLedger { ledger_epoch: 4 },
+            ReplReject::TopicIncarnationMismatch { theirs: 7, ours: 9 },
+            ReplReject::Reconciling,
         ] {
             let frame = ReplFrame::HelloAck(hello_ack(Some(reject)));
             assert_eq!(roundtrip(frame.clone()).await, frame);
@@ -797,6 +972,7 @@ mod tests {
             leader_epoch: 7,
             hw: 90,
             leader_leo: 100,
+            committed: None,
         });
         assert_eq!(roundtrip(hb.clone()).await, hb);
 
@@ -820,6 +996,11 @@ mod tests {
             hw: 90,
             leader_epoch: 7,
             in_isr: true,
+            log_epoch: Some(6),
+            leading: false,
+            ineligible: true,
+            committed: None,
+            leader_alive: false,
         });
         assert_eq!(roundtrip(lr.clone()).await, lr);
 
@@ -980,6 +1161,8 @@ mod tests {
                 batch_len: huge.len() as u32,
                 producer: None,
                 dedup_keys: vec![],
+                committed: None,
+                record_epoch: None,
             },
             bytes: huge,
         };
@@ -1063,6 +1246,7 @@ mod tests {
         follower_epoch: u32,
         environment: NodeEnvironment,
         reject: Option<FutureReplReject>,
+        follower_log_epoch: Option<u32>,
     }
 
     async fn decode_future_hello_ack(reject: FutureReplReject) -> ReplHelloAck {
@@ -1073,6 +1257,7 @@ mod tests {
             follower_epoch: 7,
             environment: NodeEnvironment::Prod,
             reject: Some(reject),
+            follower_log_epoch: None,
         })
         .expect("encode a newer peer's HelloAck");
 
@@ -1177,5 +1362,44 @@ mod tests {
             }
             other => panic!("expected Hello, got {other:?}"),
         }
+    }
+
+    /// A peer built before `log_epoch`/`leading` existed still decodes, and
+    /// reads as "log epoch unknown, not leading, may stand".
+    #[test]
+    fn a_leo_reply_without_the_appended_fields_still_decodes() {
+        #[derive(Serialize)]
+        struct OlderLeoReply {
+            leo: u64,
+            hw: u64,
+            leader_epoch: u32,
+            in_isr: bool,
+        }
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(
+            &OlderLeoReply {
+                leo: 5,
+                hw: 4,
+                leader_epoch: 3,
+                in_isr: true,
+            },
+            &mut bytes,
+        )
+        .expect("encode");
+        let reply: ReplLeoReply = ciborium::de::from_reader(bytes.as_slice()).expect("decode");
+        assert_eq!(
+            reply,
+            ReplLeoReply {
+                leo: 5,
+                hw: 4,
+                leader_epoch: 3,
+                in_isr: true,
+                log_epoch: None,
+                leading: false,
+                ineligible: false,
+                committed: None,
+                leader_alive: false,
+            }
+        );
     }
 }

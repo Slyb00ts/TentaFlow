@@ -417,6 +417,7 @@ async fn build_replicated_trio(
         ],
         leader_epoch: 1,
         updated_at_ms: now_ms(),
+        topic_generation: 0,
     };
 
     let mut followers: HashMap<String, Arc<GlueFollowerFactory>> = HashMap::new();
@@ -1031,6 +1032,7 @@ fn gate_p9(_c: &mut Criterion) {
                 isr: vec!["node-a".to_string(), "node-b".to_string(), "node-c".to_string()],
                 leader_epoch: 1,
                 updated_at_ms: now_ms(),
+                topic_generation: 0,
             };
 
             let mut followers: HashMap<String, Arc<GlueFollowerFactory>> = HashMap::new();

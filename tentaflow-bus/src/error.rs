@@ -214,6 +214,34 @@ pub enum BusError {
     #[error("cannot truncate to offset {to}: below high watermark {hw}")]
     TruncateBelowHighWatermark { hw: u64, to: u64 },
 
+    /// A truncate would cut records a majority of the replica set already
+    /// holds (`Partition::committed_offset`). Refused for every caller,
+    /// leader-authority truncates included: the authority asking for it
+    /// lacks acknowledged writes, and obeying would lose them everywhere.
+    #[error("cannot truncate to offset {to}: below committed offset {committed}")]
+    TruncateBelowCommitted { committed: u64, to: u64 },
+
+    /// A record written in epoch `got` would follow records of the newer
+    /// epoch `last` (`epochs.rs`): this log is not a prefix of any leader's
+    /// chain, and appending would make its epoch table lie.
+    #[error("record epoch {got} at offset {offset} is older than this log's last epoch {last}")]
+    RecordEpochRegression { last: u32, got: u32, offset: u64 },
+
+    /// A replicated batch claims to have been written in a term later than
+    /// the sending leader's own. No leader holds such records; a peer on an
+    /// older build that sends none is taken at its own term instead.
+    #[error("record epoch {record_epoch} is later than the sending leader's epoch {leader_epoch}")]
+    RecordEpochAhead {
+        record_epoch: u32,
+        leader_epoch: u32,
+    },
+
+    /// A leader write reached a partition whose leader writes are closed:
+    /// the leadership stint that admitted it ended (a fence, a step-down, a
+    /// rebuild) or has not been opened (`Partition::open_leader_writes`).
+    #[error("leader writes to this partition are closed")]
+    LeaderWritesClosed,
+
     /// Reserved for the API surface frozen in wave 0 (PLAN-M2 §1a). Used by
     /// the wave-0 stub of `Partition::truncate_to_offset` for any request
     /// at/above `hw`; that stub has been replaced by the real

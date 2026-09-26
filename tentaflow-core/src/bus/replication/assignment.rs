@@ -93,6 +93,18 @@ pub struct PartitionAssignment {
     pub isr: Vec<String>,
     pub leader_epoch: u32,
     pub updated_at_ms: i64,
+    /// Which incarnation of the topic this placement belongs to: the
+    /// `generation` of the topic row it was proposed for
+    /// (`DbBusTopic::generation`, the packed HLC of that incarnation's
+    /// creation; `0` for topics created before incarnations existed). A topic
+    /// deleted and created again under the same name starts over at epoch 1,
+    /// so epochs alone cannot order its placements against the deleted
+    /// incarnation's; the generation does
+    /// (`core_materializer::apply_bus_partition_assignment`). Appended with a
+    /// default: a peer that predates the field sends `0`, which is judged as
+    /// that pre-incarnation generation.
+    #[serde(default)]
+    pub topic_generation: u64,
 }
 
 impl From<DbBusPartitionAssignment> for PartitionAssignment {
@@ -107,6 +119,7 @@ impl From<DbBusPartitionAssignment> for PartitionAssignment {
             isr: row.isr,
             leader_epoch: row.leader_epoch,
             updated_at_ms: row.updated_at_ms,
+            topic_generation: row.topic_generation,
         }
     }
 }
@@ -135,6 +148,7 @@ impl PartitionAssignment {
             leader_epoch: self.leader_epoch,
             environment: environment.into(),
             updated_at_ms: self.updated_at_ms,
+            topic_generation: self.topic_generation,
         }
     }
 }
@@ -344,6 +358,7 @@ mod tests {
             isr: vec!["node-a".to_string()],
             leader_epoch: 2,
             updated_at_ms: 5_000,
+            topic_generation: 0,
         };
         let row = assignment.to_db_row("prod");
         assert_eq!(row.instance_id, assignment.instance_id);
@@ -417,6 +432,7 @@ mod tests {
             isr: vec!["node-a".to_string(), "node-b".to_string()],
             leader_epoch: 1,
             updated_at_ms: 1_000,
+            topic_generation: 0,
         }
     }
 
@@ -454,6 +470,7 @@ mod tests {
                 created_at_ms: 1,
                 updated_at_ms: 1,
                 durability_class: None,
+                generation: 0,
             },
         )
         .expect("seed parent bus_topic");
@@ -496,6 +513,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             durability_class: None,
+            generation: 0,
         }
     }
 

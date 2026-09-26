@@ -30582,6 +30582,13 @@ pub struct DbBusTopic {
     /// other columns had their parameter positions — see the `BUS_TOPICS`
     /// comment in `db/migrations.rs` for why the column exists at all.
     pub durability_class: Option<String>,
+    /// The incarnation of this topic name (migration v172): the packed HLC
+    /// of its creation, stamped once and never changed by an update. It
+    /// replicates with the row, so every node agrees on it exactly as it
+    /// agrees on the row. `0` is every topic created before v172, and what a
+    /// peer on an older build sends.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 fn map_bus_topic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusTopic> {
@@ -30610,6 +30617,7 @@ fn map_bus_topic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusTopic> {
         created_at_ms: row.get(21)?,
         updated_at_ms: row.get(22)?,
         durability_class: row.get(23)?,
+        generation: row.get::<_, i64>(24)? as u64,
     })
 }
 
@@ -30617,7 +30625,7 @@ const BUS_TOPIC_COLUMNS: &str = "instance_id, org_id, name, partitions, retentio
     retention_bytes, cleanup_policy, delivery, idempotency_key, dedup_window_ms, \
     max_delivery_attempts, retry_backoff_ms, schema_id, validation, content_type, \
     replication_factor, acks, durability, max_inline_bytes, compression, environment, \
-    created_at_ms, updated_at_ms, durability_class";
+    created_at_ms, updated_at_ms, durability_class, generation";
 
 /// Builds the `core.bus_topic` capture for one `bus_topics` row: the composite
 /// resource id and the one-field `row_json` payload. Split out of
@@ -30719,13 +30727,25 @@ pub(crate) fn publish_bus_topic_capture(
     Ok(Some(recorded.op_id))
 }
 
+/// A topic incarnation's id: the packed HLC (`wall_time_ms << 16 | logical`)
+/// of an instant, so a later instant always yields a larger value and every
+/// node derives the same value from the same HLC. Used for a topic's
+/// creation stamp (`DbBusTopic::generation`) and to place the delete that
+/// ended an incarnation on the same scale
+/// (`core_materializer::apply_bus_partition_assignment`). A logical counter
+/// past 16 bits saturates — two such instants for one name inside the same
+/// millisecond at that depth are not a real case.
+pub fn bus_topic_generation_at(hlc: &crate::sync::ledger::HybridLogicalTimestamp) -> u64 {
+    ((hlc.wall_time_ms.max(0) as u64) << 16) | u64::from(hlc.logical.min(0xFFFF))
+}
+
 pub fn bus_topic_create(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
         &format!(
             "INSERT INTO bus_topics ({BUS_TOPIC_COLUMNS}) VALUES \
              (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,\
-              ?23,?24)"
+              ?23,?24,?25)"
         ),
         rusqlite::params![
             row.instance_id,
@@ -30752,6 +30772,7 @@ pub fn bus_topic_create(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
             row.created_at_ms,
             row.updated_at_ms,
             row.durability_class,
+            row.generation as i64,
         ],
     )?;
     // Released before the publish: `record_core_capture` reads and writes the
@@ -30847,23 +30868,36 @@ pub fn bus_topic_get(
 /// (the row this delete was keyed on no longer exists) while every OTHER
 /// node still carries the topic.
 pub fn bus_topic_delete(pool: &DbPool, instance_id: &str, org_id: &str, name: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    let row: Option<DbBusTopic> = conn
-        .query_row(
-            &format!(
-                "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics \
-                 WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3"
-            ),
+    // Row, delete and tombstone land together or not at all: a delete
+    // without the tombstone that orders it (`core_materializer::
+    // bus_topic_op_wins`) would let an older incarnation's late ops back in.
+    let row = with_writer_tx(pool, |tx| {
+        let row: Option<DbBusTopic> = tx
+            .query_row(
+                &format!(
+                    "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics \
+                     WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3"
+                ),
+                rusqlite::params![instance_id, org_id, name],
+                map_bus_topic_row,
+            )
+            .optional()?;
+        let Some(row) = row else { return Ok(None) };
+        tx.execute(
+            "DELETE FROM bus_topics WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
             rusqlite::params![instance_id, org_id, name],
-            map_bus_topic_row,
+        )?;
+        crate::sync::core_materializer::record_bus_topic_tombstone(
+            tx,
+            instance_id,
+            org_id,
+            name,
+            row.generation,
         )
-        .optional()?;
+        .map_err(|e| anyhow::anyhow!("bus topic tombstone: {e}"))?;
+        Ok(Some(row))
+    })?;
     let Some(row) = row else { return Ok(()) };
-    conn.execute(
-        "DELETE FROM bus_topics WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
-        rusqlite::params![instance_id, org_id, name],
-    )?;
-    drop(conn);
     if let Err(e) =
         publish_bus_topic_capture(pool, &row, crate::sync::runtime::SqlWriteAction::Delete)
     {
@@ -31180,6 +31214,10 @@ pub struct DbBusPartitionAssignment {
     pub leader_epoch: u32,
     pub environment: String,
     pub updated_at_ms: i64,
+    /// See `bus::replication::assignment::PartitionAssignment::
+    /// topic_generation`.
+    #[serde(default)]
+    pub topic_generation: u64,
 }
 
 fn decode_bus_assignment_node_list(raw: String, column: &str) -> rusqlite::Result<Vec<String>> {
@@ -31206,11 +31244,12 @@ fn map_bus_assignment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusPart
         leader_epoch: row.get(7)?,
         environment: row.get(8)?,
         updated_at_ms: row.get(9)?,
+        topic_generation: row.get::<_, i64>(10)? as u64,
     })
 }
 
 const BUS_ASSIGNMENT_COLUMNS: &str = "instance_id, org_id, topic, partition, leader_node_id, \
-    replicas, isr, leader_epoch, environment, updated_at_ms";
+    replicas, isr, leader_epoch, environment, updated_at_ms, topic_generation";
 
 pub fn bus_assignment_get(
     pool: &DbPool,
@@ -31317,11 +31356,12 @@ pub fn bus_assignment_upsert(pool: &DbPool, row: &DbBusPartitionAssignment) -> R
     conn.execute(
         &format!(
             "INSERT INTO bus_partition_assignments ({BUS_ASSIGNMENT_COLUMNS}) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
              ON CONFLICT(instance_id, org_id, topic, partition) DO UPDATE SET \
              leader_node_id = excluded.leader_node_id, replicas = excluded.replicas, \
              isr = excluded.isr, leader_epoch = excluded.leader_epoch, \
-             environment = excluded.environment, updated_at_ms = excluded.updated_at_ms"
+             environment = excluded.environment, updated_at_ms = excluded.updated_at_ms, \
+             topic_generation = excluded.topic_generation"
         ),
         rusqlite::params![
             row.instance_id,
@@ -31334,6 +31374,7 @@ pub fn bus_assignment_upsert(pool: &DbPool, row: &DbBusPartitionAssignment) -> R
             row.leader_epoch,
             row.environment,
             row.updated_at_ms,
+            row.topic_generation as i64,
         ],
     )?;
     Ok(())
@@ -32650,6 +32691,7 @@ pub mod bus_test_support {
                 environment TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
+                generation INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (instance_id, org_id, name)
             );
             CREATE TABLE IF NOT EXISTS bus_groups (
@@ -32673,6 +32715,7 @@ pub mod bus_test_support {
                 leader_epoch INTEGER NOT NULL,
                 environment TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
+                topic_generation INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (instance_id, org_id, topic, partition)
             );
             CREATE INDEX IF NOT EXISTS idx_bus_assign_node
@@ -32784,6 +32827,7 @@ mod bus_repository_tests {
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
             durability_class: None,
+            generation: 0,
         }
     }
 
@@ -33448,6 +33492,7 @@ mod bus_repository_tests {
                 leader_epoch: 1,
                 environment: "prod".to_string(),
                 updated_at_ms: 1,
+                topic_generation: 0,
             },
         )
         .expect("seed assignment");
@@ -33719,6 +33764,7 @@ mod bus_repository_tests {
             leader_epoch: 1,
             environment: "test".to_string(),
             updated_at_ms: 1_000,
+            topic_generation: 0,
         }
     }
 

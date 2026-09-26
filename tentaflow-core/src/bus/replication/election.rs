@@ -14,9 +14,11 @@
 //   K-M2-1: `hw` is monotonic/durable per partition. A newly promoted leader
 //           starts from ITS OWN persisted `hw`, never `min(leo of ISR)`
 //           (that would move `hw` backwards past records a consumer already
-//           read). `Truncate` targets only replicas whose `leo` is AHEAD of
-//           the new leader's own `leo` (in practice: the old leader,
-//           rejoining with an un-replicated tail).
+//           read). `Truncate` cuts a replica back only to what it keeps
+//           under the new leader (`LogPosition::kept_end`): a tail past the
+//           leader's `leo` in the leader's own epoch, everything above its
+//           own `hw` in any other (in practice: the old leader, rejoining
+//           with an un-replicated tail).
 //   K-M2-2: `min_isr_required(rf) = floor(rf/2)+1`, computed from the
 //           REPLICA SET, not the (fast-shrinking) ISR — so `acks=quorum`
 //           never silently degrades to `acks=leader` as ISR shrinks.
@@ -29,7 +31,7 @@
 //
 // Split-brain safety (M2-R2, PLAN-M2 §4.2) does NOT depend on any of the
 // above being followed correctly — it comes entirely from
-// `admitted_by_majority` (a majority of the REPLICA set must have
+// `admitted_by_quorum` (a majority of the REPLICA set must have
 // acknowledged the ledger operation, PLAN-M2 §1c) plus the materializer's
 // epoch-monotonic admission gate (agent L, `core_materializer.rs`, out of
 // this file's scope). LeoQuery/tie-break only improve which node wins and
@@ -44,7 +46,7 @@ use crate::sync::ledger::OperationId;
 /// K-M2-3: candidate's LeoQuery round trip budget.
 pub const LEO_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
 
-/// How long a candidate waits for `admitted_by_majority` after proposing,
+/// How long a candidate waits for `admitted_by_quorum` after proposing,
 /// before giving up and letting the caller retry later. PLAN-M2 does not
 /// pin an exact number for this step; 1.5 s is chosen so a majority that is
 /// merely slow to pull/ack the op — not genuinely unreachable — still has a
@@ -57,10 +59,36 @@ pub const MAJORITY_AWAIT_TIMEOUT: Duration = Duration::from_millis(1500);
 /// K-M2-2: minimum ISR size required to accept writes at `acks=quorum`,
 /// computed from the REPLICA SET (`replication_factor`), never from the
 /// current ISR size — see this module's header for why. The same formula
-/// (`floor(rf/2)+1`) is also the majority threshold `admitted_by_majority`
+/// (`floor(rf/2)+1`) is also the majority threshold `admitted_by_quorum`
 /// applies to the replica set for promotion admission (PLAN-M2 §1c).
 pub fn min_isr_required(replication_factor: usize) -> usize {
     replication_factor / 2 + 1
+}
+
+/// The smallest group of replicas that may act for a partition without the
+/// rest: elect a leader (`TooFewReplies`, `admitted_by_quorum`), keep one
+/// leading (`PartitionLeader::has_quorum_lease`), and accept an
+/// `acks=leader`/`acks=all` write.
+///
+/// A majority of the replica set for RF ≥ 3: two disjoint groups can never
+/// both act, so a network split never produces two leaders and a leader
+/// chosen from a majority of logs holds every committed record.
+///
+/// For RF ≤ 2 a majority is the whole set, and requiring it would let any
+/// single node failure take the partition down. The owner's decision is
+/// availability, Kafka-like: one in-sync replica may act alone. Accepted
+/// risk — a write acknowledged only by that replica is lost if it is lost
+/// too, and a plain network split between the two replicas (no failure at
+/// all) lets both lead at once until they reach each other again and a
+/// `Hello` fences one: the newer leadership wins, and the losing side's
+/// writes that never reached the winner are dropped. `acks=quorum` keeps
+/// its own contract at every RF (`min_isr_required`).
+pub fn availability_quorum(replication_factor: usize) -> usize {
+    if replication_factor >= 3 {
+        min_isr_required(replication_factor)
+    } else {
+        1
+    }
 }
 
 /// Next leader epoch. Saturates instead of wrapping: an epoch that has
@@ -71,32 +99,84 @@ pub fn next_epoch(current: u32) -> u32 {
     current.saturating_add(1)
 }
 
-/// K-M2-3: picks the promotion candidate from `leos` (one entry per replica
-/// that answered a `LeoQuery`, `(node_id, leo)`), restricted to members of
-/// `isr` (the last assignment's ISR — a replica outside it may be badly
-/// behind and must never win). Ties break on the lowest `node_id`.
+/// Where one replica's local log stands, as an election compares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogPosition {
+    /// The leader epoch the log was last written under
+    /// (`Partition::log_epoch`): the epoch of its last batch, or of the last
+    /// leader-authority truncate onto that leader's chain. Never the term a
+    /// `Hello` stamped without shipping anything.
+    pub epoch: u32,
+    pub leo: u64,
+    /// Every record below this offset is on a majority of the replica set
+    /// (`Partition::committed_offset`) — majority-derived whatever the
+    /// topic's `acks`, unlike `hw`.
+    pub committed: u64,
+}
+
+impl LogPosition {
+    /// Raft's "at least as up to date" order: the later epoch first, the
+    /// longer log only within one epoch. Offset alone is not an order at
+    /// all across terms — an old leader's unreplicated tail can outgrow a
+    /// newer term's committed records at the same offsets.
+    fn rank(&self) -> (u32, u64) {
+        (self.epoch, self.leo)
+    }
+
+    /// How much of this replica's log a new leader at `leader` keeps. A log
+    /// last written in the leader's own epoch is a prefix or an extension of
+    /// the leader's chain, so only a tail past the leader's `leo` goes. A log
+    /// of another epoch may diverge from the leader's anywhere above the
+    /// offset it knew committed, so it goes back to its own committed
+    /// offset: every record below it is on a majority, and a leader chosen
+    /// from a majority of replies that ranks at least as high as each of
+    /// them holds all of those (Raft's election restriction).
+    ///
+    /// Never below `self.committed` while `leader.leo` reaches it — which is
+    /// what an election guarantees (`PromotionState::step` abandons against
+    /// any reply committed past the winner's `leo`) and what a replica
+    /// enforces (`BusError::TruncateBelowCommitted`).
+    pub fn kept_end(&self, leader: &LogPosition) -> u64 {
+        if self.epoch == leader.epoch {
+            self.leo.min(leader.leo)
+        } else {
+            self.committed.min(self.leo).min(leader.leo)
+        }
+    }
+}
+
+/// K-M2-3: picks the promotion candidate from `logs` (one entry per replica
+/// that answered a `LeoQuery`), restricted to members of `isr` (the last
+/// assignment's ISR — a replica outside it may be badly behind and must
+/// never win). The most up-to-date log wins (`LogPosition::rank`: epoch,
+/// then `leo`); ties break on the lowest `node_id`.
 ///
-/// `self_id` is the deterministic fallback when `leos` carries no entries
+/// `self_id` is the deterministic fallback when `logs` carries no entries
 /// at all (nobody answered, or the ISR is just `[self]` and there was
-/// nobody to ask) — a candidate always knows its own `leo` without a
-/// network round trip, so an empty `leos` must not make an otherwise
-/// eligible sole-ISR-member candidate return `None`. When `leos` DOES carry
+/// nobody to ask) — a candidate always knows its own log without a
+/// network round trip, so an empty `logs` must not make an otherwise
+/// eligible sole-ISR-member candidate return `None`. When `logs` DOES carry
 /// entries, callers that want `self` considered against them include
-/// `(self_id, own_leo)` in `leos` themselves — `self_id` alone never wins a
+/// `(self_id, own)` in `logs` themselves — `self_id` alone never wins a
 /// non-empty comparison it did not enter.
-pub fn choose_candidate(isr: &[String], leos: &[(String, u64)], self_id: &str) -> Option<String> {
-    let mut best: Option<(&str, u64)> = None;
-    for (node_id, leo) in leos {
+pub fn choose_candidate(
+    isr: &[String],
+    logs: &[(String, LogPosition)],
+    self_id: &str,
+) -> Option<String> {
+    let mut best: Option<(&str, (u32, u64))> = None;
+    for (node_id, log) in logs {
         if !isr.iter().any(|m| m == node_id) {
             continue;
         }
+        let rank = log.rank();
         best = Some(match best {
-            None => (node_id.as_str(), *leo),
-            Some((best_id, best_leo)) => {
-                if *leo > best_leo || (*leo == best_leo && node_id.as_str() < best_id) {
-                    (node_id.as_str(), *leo)
+            None => (node_id.as_str(), rank),
+            Some((best_id, best_rank)) => {
+                if rank > best_rank || (rank == best_rank && node_id.as_str() < best_id) {
+                    (node_id.as_str(), rank)
                 } else {
-                    (best_id, best_leo)
+                    (best_id, best_rank)
                 }
             }
         });
@@ -108,16 +188,17 @@ pub fn choose_candidate(isr: &[String], leos: &[(String, u64)], self_id: &str) -
     }
 }
 
-/// PLAN-M2 §1c: "`admitted_by_majority(op_id, replicas)` = liczba wpisów
-/// `acknowledged == true` dla targetów z `replicas` ≥ `floor(|replicas|/2)+1`
-/// (licząc siebie)". `acked` is the set of node ids the ledger reports as
+/// PLAN-M2 §1c's admission rule — "liczba wpisów `acknowledged == true` dla
+/// targetów z `replicas` ≥ `floor(|replicas|/2)+1` (licząc siebie)" — with
+/// the threshold now `availability_quorum`: that majority at RF ≥ 3, one
+/// replica at RF ≤ 2 (see there for the accepted risk). `acked` is the set of node ids the ledger reports as
 /// having acknowledged the op (`LedgerAdmission::admitted_by`, outbox
 /// targets only — never includes `self_id`, since the op is local); self is
 /// counted whenever it is actually a member of `replicas` (a proposing node
 /// that is not even a replica is a caller bug, not a reason to inflate the
 /// count).
-pub fn admitted_by_majority(acked: &[String], replicas: &[String], self_id: &str) -> bool {
-    let required = min_isr_required(replicas.len());
+pub fn admitted_by_quorum(acked: &[String], replicas: &[String], self_id: &str) -> bool {
+    let required = availability_quorum(replicas.len());
     let mut admitted: HashSet<&str> = HashSet::new();
     if replicas.iter().any(|r| r == self_id) {
         admitted.insert(self_id);
@@ -171,6 +252,18 @@ pub enum AbandonReason {
     /// intended, not a bug: this candidate stays a follower and (per
     /// `manager.rs`) retries after its own lease expires again.
     NoMajority,
+    /// Fewer than a majority of the replica set (this candidate counted)
+    /// answered its `LeoQuery`. Ledger acks prove delivery of the proposal,
+    /// not what the acking replicas hold: only a majority of LOGS compared
+    /// intersects every majority that acknowledged a write, so only then
+    /// does winning the comparison mean holding every committed record.
+    TooFewReplies { answered: usize, required: usize },
+    /// A replier that will not stand — a leader, a log awaiting
+    /// reconciliation — ranks at least as high as this candidate, or has
+    /// records committed past its `leo`. Winning would cut committed records
+    /// out of that replier; it steps down and stands itself instead
+    /// (`manager.rs`'s quorum-lease step-down).
+    Outranked { by: String },
 }
 
 /// One action `PromotionState::step` asks the caller (`manager.rs`) to
@@ -213,14 +306,18 @@ pub enum PromotionState {
         org_id: String,
         topic: String,
         partition: u32,
+        topic_generation: u64,
         self_id: String,
         current_epoch: u32,
-        own_leo: u64,
-        own_hw: u64,
+        own: LogPosition,
         isr: Vec<String>,
         replicas: Vec<String>,
         /// `LeoReply`s accumulated so far; never contains `self_id`.
-        leos: Vec<(String, u64)>,
+        leos: Vec<(String, LogPosition)>,
+        /// Repliers that said they will not stand (`LeoReply::can_stand`):
+        /// their logs still decide truncation and the new ISR, but electing
+        /// one of them would elect nobody.
+        ineligible: Vec<String>,
         deadline: Instant,
     },
     Proposing {
@@ -261,10 +358,14 @@ pub enum PromotionEvent {
         org_id: String,
         topic: String,
         partition: u32,
+        /// The topic incarnation the partition belongs to
+        /// (`PartitionAssignment::topic_generation`), carried onto the
+        /// proposal so replicas admit it into the same incarnation.
+        topic_generation: u64,
         self_id: String,
         current_epoch: u32,
-        own_leo: u64,
-        own_hw: u64,
+        /// This node's own local log.
+        own: LogPosition,
         isr: Vec<String>,
         replicas: Vec<String>,
         /// When the resulting `Querying` state's own `LeoQuery` round trip
@@ -285,8 +386,14 @@ pub enum PromotionEvent {
     /// `new_isr` once caught up.
     LeoReply {
         node_id: String,
-        leo: u64,
+        log: LogPosition,
         in_isr: bool,
+        /// Whether the replying node would stand for this partition itself
+        /// (`ReplLeoReply::ineligible`, inverted). A leader that lost its
+        /// quorum lease, or a node whose log awaits reconciliation, never
+        /// runs an election: picking it as the winner would leave every
+        /// candidate deferring to a node that never proposes.
+        can_stand: bool,
     },
     /// A previously-scheduled deadline elapsed (or a poll tick fired before
     /// it — `step` re-checks `now` against the state's own deadline either
@@ -325,10 +432,10 @@ impl PromotionState {
                     org_id,
                     topic,
                     partition,
+                    topic_generation,
                     self_id,
                     current_epoch,
-                    own_leo,
-                    own_hw,
+                    own,
                     isr,
                     replicas,
                     leo_query_deadline,
@@ -354,13 +461,14 @@ impl PromotionState {
                         org_id,
                         topic,
                         partition,
+                        topic_generation,
                         self_id,
                         current_epoch,
-                        own_leo,
-                        own_hw,
+                        own,
                         isr,
                         replicas,
                         leos: Vec::new(),
+                        ineligible: Vec::new(),
                         deadline,
                     },
                     vec![PromotionAction::SendLeoQuery { to }],
@@ -373,19 +481,21 @@ impl PromotionState {
                     org_id,
                     topic,
                     partition,
+                    topic_generation,
                     self_id,
                     current_epoch,
-                    own_leo,
-                    own_hw,
+                    own,
                     isr,
                     replicas,
                     mut leos,
+                    mut ineligible,
                     deadline,
                 },
                 PromotionEvent::LeoReply {
                     node_id,
-                    leo,
+                    log,
                     in_isr: _,
+                    can_stand,
                 },
             ) => {
                 // Recorded regardless of the replying node's own `in_isr`
@@ -395,11 +505,15 @@ impl PromotionState {
                 // over-cautious self-report from the replying node must
                 // not hide a replica that is genuinely ahead of us and
                 // therefore needs a `Truncate` (K-M2-1), nor one that has
-                // caught back up to `own_hw` and belongs in `new_isr`.
+                // caught back up to `own.committed` and belongs in `new_isr`.
                 if replicas.iter().any(|r| r == &node_id) {
+                    ineligible.retain(|id| *id != node_id);
+                    if !can_stand {
+                        ineligible.push(node_id.clone());
+                    }
                     match leos.iter_mut().find(|(id, _)| *id == node_id) {
-                        Some(existing) => existing.1 = leo,
-                        None => leos.push((node_id, leo)),
+                        Some(existing) => existing.1 = log,
+                        None => leos.push((node_id, log)),
                     }
                 }
                 (
@@ -408,13 +522,14 @@ impl PromotionState {
                         org_id,
                         topic,
                         partition,
+                        topic_generation,
                         self_id,
                         current_epoch,
-                        own_leo,
-                        own_hw,
+                        own,
                         isr,
                         replicas,
                         leos,
+                        ineligible,
                         deadline,
                     },
                     Vec::new(),
@@ -427,13 +542,14 @@ impl PromotionState {
                     org_id,
                     topic,
                     partition,
+                    topic_generation,
                     self_id,
                     current_epoch,
-                    own_leo,
-                    own_hw,
+                    own,
                     isr,
                     replicas,
                     leos,
+                    ineligible,
                     deadline,
                 },
                 PromotionEvent::Timeout { now, now_ms },
@@ -445,51 +561,75 @@ impl PromotionState {
                             org_id,
                             topic,
                             partition,
+                            topic_generation,
                             self_id,
                             current_epoch,
-                            own_leo,
-                            own_hw,
+                            own,
                             isr,
                             replicas,
                             leos,
+                            ineligible,
                             deadline,
                         },
                         Vec::new(),
                     );
                 }
-                let mut all_leos = leos.clone();
-                all_leos.push((self_id.clone(), own_leo));
-                match choose_candidate(&isr, &all_leos, &self_id) {
+                let required = availability_quorum(replicas.len());
+                let answered = leos.len() + 1;
+                if answered < required {
+                    return (
+                        PromotionState::Abandoned {
+                            reason: AbandonReason::TooFewReplies { answered, required },
+                        },
+                        Vec::new(),
+                    );
+                }
+                let mut candidates: Vec<(String, LogPosition)> = leos
+                    .iter()
+                    .filter(|(id, _)| !ineligible.contains(id))
+                    .cloned()
+                    .collect();
+                candidates.push((self_id.clone(), own));
+                let outranking = leos.iter().find(|(id, log)| {
+                    (ineligible.contains(id) && log.rank() >= own.rank()) || log.committed > own.leo
+                });
+                match choose_candidate(&isr, &candidates, &self_id) {
+                    Some(winner) if winner == self_id && outranking.is_some() => (
+                        PromotionState::Abandoned {
+                            reason: AbandonReason::Outranked {
+                                by: outranking.map(|(id, _)| id.clone()).unwrap_or_default(),
+                            },
+                        },
+                        Vec::new(),
+                    ),
                     Some(winner) if winner == self_id => {
-                        // K-M2-1: ISR for the new assignment is self plus
-                        // every replica whose leo is caught up to (not
-                        // necessarily equal to) our own persisted hw — a
-                        // replica behind hw was never actually in sync.
+                        // ISR for the new assignment is self plus every
+                        // replica whose log, once reconciled with ours
+                        // (`LogPosition::kept_end`), still reaches our own
+                        // committed offset — one behind it was never in sync.
                         let mut new_isr: Vec<String> = leos
                             .iter()
-                            .filter(|(_, leo)| *leo >= own_hw)
+                            .filter(|(_, log)| log.kept_end(&own) >= own.committed)
                             .map(|(id, _)| id.clone())
                             .collect();
                         new_isr.push(self_id.clone());
                         new_isr.sort();
                         new_isr.dedup();
 
-                        // K-M2-1: truncate only replicas AHEAD of our own
-                        // leo (the old leader, rejoining with a longer
-                        // un-replicated tail) — never one behind it. The
-                        // target is OUR OWN `leo`, not the replying peer's:
-                        // a peer told to truncate to its own `leo` is a
-                        // silent no-op (`Partition::truncate_to_offset`
-                        // returns the unchanged `leo` for any request at or
-                        // above it, `truncate()`'s "nothing to discard"
-                        // early return), so carrying the reply's value
-                        // would leave the divergence exactly where it was
-                        // instead of cutting the replica back to the new
-                        // leader's authority.
+                        // K-M2-1: a replica is cut back to what it keeps of
+                        // its log under this leader — a tail past our `leo`
+                        // in our own epoch, everything above its committed
+                        // offset in any other. Never a replica already behind that point;
+                        // the target is always derived from OUR log, since a
+                        // peer told to truncate to its own `leo` is a silent
+                        // no-op (`Partition::truncate_to_offset` returns the
+                        // unchanged `leo` for any request at or above it).
                         let truncate_targets: Vec<(String, u64)> = leos
                             .iter()
-                            .filter(|(_, leo)| *leo > own_leo)
-                            .map(|(node, _)| (node.clone(), own_leo))
+                            .filter_map(|(node, log)| {
+                                let kept = log.kept_end(&own);
+                                (kept < log.leo).then(|| (node.clone(), kept))
+                            })
                             .collect();
 
                         let assignment = PartitionAssignment {
@@ -502,6 +642,7 @@ impl PromotionState {
                             isr: new_isr,
                             leader_epoch: next_epoch(current_epoch),
                             updated_at_ms: now_ms,
+                            topic_generation,
                         };
                         let action = PromotionAction::ProposeAssignment(assignment.clone());
                         (
@@ -561,7 +702,7 @@ impl PromotionState {
                 },
                 PromotionEvent::AckObserved { acked },
             ) => {
-                if admitted_by_majority(&acked, &replicas, &self_id) {
+                if admitted_by_quorum(&acked, &replicas, &self_id) {
                     let mut actions = vec![
                         PromotionAction::SetLeaderEpoch(epoch),
                         PromotionAction::StartFeeders,
@@ -668,7 +809,11 @@ mod tests {
     #[test]
     fn choose_candidate_picks_max_leo_in_isr() {
         let isr = ss(&["a", "b", "c"]);
-        let leos = vec![(s("a"), 10), (s("b"), 30), (s("c"), 20)];
+        let leos = vec![
+            (s("a"), log(1, 10, 0)),
+            (s("b"), log(1, 30, 0)),
+            (s("c"), log(1, 20, 0)),
+        ];
         assert_eq!(choose_candidate(&isr, &leos, "a"), Some(s("b")));
     }
 
@@ -676,14 +821,22 @@ mod tests {
     fn choose_candidate_ignores_non_isr_members() {
         let isr = ss(&["a", "b"]);
         // "c" has the highest leo but is not in the ISR (K-M2-3).
-        let leos = vec![(s("a"), 10), (s("b"), 20), (s("c"), 99)];
+        let leos = vec![
+            (s("a"), log(1, 10, 0)),
+            (s("b"), log(1, 20, 0)),
+            (s("c"), log(1, 99, 0)),
+        ];
         assert_eq!(choose_candidate(&isr, &leos, "a"), Some(s("b")));
     }
 
     #[test]
     fn choose_candidate_breaks_ties_on_lowest_node_id() {
         let isr = ss(&["node-b", "node-a", "node-c"]);
-        let leos = vec![(s("node-b"), 50), (s("node-a"), 50), (s("node-c"), 10)];
+        let leos = vec![
+            (s("node-b"), log(1, 50, 0)),
+            (s("node-a"), log(1, 50, 0)),
+            (s("node-c"), log(1, 10, 0)),
+        ];
         assert_eq!(choose_candidate(&isr, &leos, "node-a"), Some(s("node-a")));
     }
 
@@ -702,39 +855,39 @@ mod tests {
     #[test]
     fn choose_candidate_returns_none_when_no_isr_member_replied() {
         let isr = ss(&["a", "b"]);
-        let leos = vec![(s("c"), 100)];
+        let leos = vec![(s("c"), log(1, 100, 0))];
         assert_eq!(choose_candidate(&isr, &leos, "z"), None);
     }
 
-    // ---- admitted_by_majority ----------------------------------------------
+    // ---- admitted_by_quorum ----------------------------------------------
 
     #[test]
-    fn admitted_by_majority_counts_self_plus_acked_replicas() {
+    fn admitted_by_quorum_counts_self_plus_acked_replicas() {
         let replicas = ss(&["l", "f1", "f2"]);
-        assert!(!admitted_by_majority(&[], &replicas, "l")); // self only: 1 < 2
-        assert!(admitted_by_majority(&ss(&["f1"]), &replicas, "l")); // self+f1: 2 >= 2
+        assert!(!admitted_by_quorum(&[], &replicas, "l")); // self only: 1 < 2
+        assert!(admitted_by_quorum(&ss(&["f1"]), &replicas, "l")); // self+f1: 2 >= 2
     }
 
     #[test]
-    fn admitted_by_majority_ignores_acks_from_non_replicas() {
+    fn admitted_by_quorum_ignores_acks_from_non_replicas() {
         let replicas = ss(&["l", "f1", "f2"]);
-        assert!(!admitted_by_majority(&ss(&["stranger"]), &replicas, "l"));
+        assert!(!admitted_by_quorum(&ss(&["stranger"]), &replicas, "l"));
     }
 
     #[test]
-    fn admitted_by_majority_true_for_rf1_counting_only_self() {
+    fn admitted_by_quorum_true_for_rf1_counting_only_self() {
         let replicas = ss(&["solo"]);
-        assert!(admitted_by_majority(&[], &replicas, "solo"));
+        assert!(admitted_by_quorum(&[], &replicas, "solo"));
     }
 
     #[test]
-    fn admitted_by_majority_false_when_self_is_not_a_replica() {
+    fn admitted_by_quorum_false_when_self_is_not_a_replica() {
         // Caller bug guard: self isn't even in `replicas`, so it must not
         // get an extra free count on top of the genuine replica acks —
         // only "a" (one real ack, required is 2 for 3 replicas) is
         // counted, which is NOT yet a majority.
         let replicas = ss(&["a", "b", "c"]);
-        assert!(!admitted_by_majority(&ss(&["a"]), &replicas, "z"));
+        assert!(!admitted_by_quorum(&ss(&["a"]), &replicas, "z"));
     }
 
     // ---- should_start_election ----------------------------------------------
@@ -750,6 +903,17 @@ mod tests {
 
     // ---- PromotionState::step: happy path -----------------------------------
 
+    /// A log last written under `epoch`.
+    fn log(epoch: u32, leo: u64, committed: u64) -> LogPosition {
+        LogPosition {
+            epoch,
+            leo,
+            committed,
+        }
+    }
+
+    /// Builds a `LeaseExpired` whose own log was written under the current
+    /// epoch — the ordinary follower of the last leader.
     fn lease_expired(
         isr: &[&str],
         replicas: &[&str],
@@ -764,10 +928,10 @@ mod tests {
             org_id: s("org-1"),
             topic: s("orders"),
             partition: 0,
+            topic_generation: 7,
             self_id: s(self_id),
             current_epoch: epoch,
-            own_leo,
-            own_hw,
+            own: log(epoch, own_leo, own_hw),
             isr: ss(isr),
             replicas: ss(replicas),
             leo_query_deadline: now + LEO_QUERY_TIMEOUT,
@@ -801,8 +965,9 @@ mod tests {
         // never answers.
         let (state, actions) = state.step(PromotionEvent::LeoReply {
             node_id: s("f2"),
-            leo: 80,
+            log: log(5, 80, 80),
             in_isr: true,
+            can_stand: true,
         });
         assert!(actions.is_empty());
 
@@ -819,6 +984,10 @@ mod tests {
         assert_eq!(assignment.leader_node_id, "f1");
         assert_eq!(assignment.leader_epoch, 6);
         assert_eq!(assignment.updated_at_ms, 1_000);
+        assert_eq!(
+            assignment.topic_generation, 7,
+            "the proposal stays in the partition's topic incarnation"
+        );
         // f2's leo (80) < own_hw (90): not caught up, excluded from the new ISR.
         assert_eq!(assignment.isr, vec![s("f1")]);
         assert!(matches!(state, PromotionState::Proposing { .. }));
@@ -867,13 +1036,16 @@ mod tests {
         // "c" is behind and must not be truncated.
         let (state, _) = state.step(PromotionEvent::LeoReply {
             node_id: s("b"),
-            leo: 70,
+            // Its tail past 40 never reached a majority.
+            log: log(1, 70, 40),
             in_isr: false,
+            can_stand: true,
         });
         let (state, actions) = state.step(PromotionEvent::LeoReply {
             node_id: s("c"),
-            leo: 45,
+            log: log(1, 45, 45),
             in_isr: true,
+            can_stand: true,
         });
         assert!(actions.is_empty());
         let (state, actions) = state.step(PromotionEvent::Timeout {
@@ -947,8 +1119,9 @@ mod tests {
         ));
         let (state, _) = state.step(PromotionEvent::LeoReply {
             node_id: s("b"),
-            leo: 99,
+            log: log(1, 99, 99),
             in_isr: true,
+            can_stand: true,
         });
         let (state, actions) = state.step(PromotionEvent::Timeout {
             now: t0 + LEO_QUERY_TIMEOUT,
@@ -980,6 +1153,12 @@ mod tests {
             5,
             t0,
         ));
+        let (state, _) = state.step(PromotionEvent::LeoReply {
+            node_id: s("b"),
+            log: log(0, 5, 5),
+            in_isr: true,
+            can_stand: true,
+        });
         let (state, _) = state.step(PromotionEvent::Timeout {
             now: t0 + LEO_QUERY_TIMEOUT,
             now_ms: 1,
@@ -1057,8 +1236,9 @@ mod tests {
         let (state, actions) =
             PromotionState::Promoted { epoch: 4 }.step(PromotionEvent::LeoReply {
                 node_id: s("x"),
-                leo: 1,
+                log: log(4, 1, 1),
                 in_isr: true,
+                can_stand: true,
             });
         assert!(actions.is_empty());
         assert!(matches!(state, PromotionState::Promoted { epoch: 4 }));
@@ -1075,5 +1255,292 @@ mod tests {
         });
         assert!(actions.is_empty());
         assert!(matches!(state, PromotionState::Querying { .. }));
+    }
+
+    // ---- log epochs: an unreconciled tail never wins on offset alone ------
+
+    #[test]
+    fn choose_candidate_prefers_a_later_epoch_over_a_longer_log() {
+        let isr = ss(&["x", "y", "z"]);
+        let logs = vec![
+            (s("x"), log(1, 120, 90)),
+            (s("y"), log(2, 100, 100)),
+            (s("z"), log(2, 100, 100)),
+        ];
+        assert_eq!(choose_candidate(&isr, &logs, "x"), Some(s("y")));
+    }
+
+    /// The crashed old leader `x` rejoined with an unreplicated tail (leo
+    /// 120 under epoch 1) past the newer term's committed records (leo 100
+    /// under epoch 2). Its election must lose to the newer term.
+    #[test]
+    fn an_old_term_tail_loses_the_election_to_a_newer_term() {
+        let t0 = Instant::now();
+        let (state, _) = PromotionState::Idle.step(PromotionEvent::LeaseExpired {
+            instance_id: s("tentabus-00000001"),
+            org_id: s("org-1"),
+            topic: s("orders"),
+            partition: 0,
+            topic_generation: 7,
+            self_id: s("x"),
+            current_epoch: 2,
+            own: log(1, 120, 90),
+            isr: ss(&["x", "y", "z"]),
+            replicas: ss(&["x", "y", "z"]),
+            leo_query_deadline: t0 + LEO_QUERY_TIMEOUT,
+        });
+        let (state, _) = state.step(PromotionEvent::LeoReply {
+            node_id: s("z"),
+            log: log(2, 100, 100),
+            in_isr: true,
+            can_stand: true,
+        });
+        let (state, actions) = state.step(PromotionEvent::Timeout {
+            now: t0 + LEO_QUERY_TIMEOUT,
+            now_ms: 1,
+        });
+        assert!(actions.is_empty());
+        assert!(matches!(
+            state,
+            PromotionState::Abandoned {
+                reason: AbandonReason::LostElection {
+                    winner: Some(ref w)
+                }
+            } if w == "z"
+        ));
+    }
+
+    /// The newer term wins, and the old-term replica is cut back to its own
+    /// `hw` — not merely to the winner's `leo`, which would keep its
+    /// divergent records below that offset.
+    #[test]
+    fn a_replica_of_another_epoch_is_truncated_to_its_own_hw() {
+        let t0 = Instant::now();
+        let (state, _) = PromotionState::Idle.step(PromotionEvent::LeaseExpired {
+            instance_id: s("tentabus-00000001"),
+            org_id: s("org-1"),
+            topic: s("orders"),
+            partition: 0,
+            topic_generation: 7,
+            self_id: s("z"),
+            current_epoch: 2,
+            own: log(2, 100, 100),
+            isr: ss(&["x", "z"]),
+            replicas: ss(&["x", "y", "z"]),
+            leo_query_deadline: t0 + LEO_QUERY_TIMEOUT,
+        });
+        let (state, _) = state.step(PromotionEvent::LeoReply {
+            node_id: s("x"),
+            log: log(1, 95, 90),
+            in_isr: true,
+            can_stand: true,
+        });
+        let (state, actions) = state.step(PromotionEvent::Timeout {
+            now: t0 + LEO_QUERY_TIMEOUT,
+            now_ms: 1,
+        });
+        let assignment = match actions.as_slice() {
+            [PromotionAction::ProposeAssignment(a)] => a.clone(),
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        assert_eq!(assignment.leader_node_id, "z");
+        assert_eq!(
+            assignment.isr,
+            vec![s("z")],
+            "a replica cut back below the leader's hw is not in sync"
+        );
+        let (state, _) = state.step(PromotionEvent::Proposed {
+            op_id: op_id(4),
+            deadline: t0 + Duration::from_secs(1),
+        });
+        let (_, actions) = state.step(PromotionEvent::AckObserved {
+            acked: vec![s("x")],
+        });
+        assert_eq!(
+            actions,
+            vec![
+                PromotionAction::SetLeaderEpoch(3),
+                PromotionAction::StartFeeders,
+                PromotionAction::SendTruncate {
+                    node: s("x"),
+                    to: 90
+                },
+            ]
+        );
+    }
+
+    /// A replier that will not stand (a leader, a log awaiting
+    /// reconciliation) is never the winner — every candidate would defer to
+    /// a node that never proposes — yet its log is still reconciled with the
+    /// winner's: of another epoch, it goes back to its committed offset.
+    #[test]
+    fn a_replier_that_will_not_stand_is_truncated_but_never_chosen() {
+        let t0 = Instant::now();
+        let (state, _) = PromotionState::Idle.step(lease_expired(
+            &["f1", "f2", "l"],
+            &["l", "f1", "f2"],
+            "f1",
+            2,
+            50,
+            50,
+            t0,
+        ));
+        let (state, _) = state.step(PromotionEvent::LeoReply {
+            node_id: s("l"),
+            log: log(1, 48, 40),
+            in_isr: true,
+            can_stand: false,
+        });
+        let (state, actions) = state.step(PromotionEvent::Timeout {
+            now: t0 + LEO_QUERY_TIMEOUT,
+            now_ms: 1,
+        });
+        let assignment = match actions.as_slice() {
+            [PromotionAction::ProposeAssignment(a)] => a.clone(),
+            other => panic!("unexpected actions: {other:?}"),
+        };
+        assert_eq!(assignment.leader_node_id, "f1");
+        let (state, _) = state.step(PromotionEvent::Proposed {
+            op_id: op_id(5),
+            deadline: t0 + Duration::from_secs(1),
+        });
+        let (_, actions) = state.step(PromotionEvent::AckObserved {
+            acked: vec![s("f2")],
+        });
+        assert!(actions.contains(&PromotionAction::SendTruncate {
+            node: s("l"),
+            to: 40
+        }));
+    }
+
+    /// RF=3, acks=quorum: `l` and `f2` hold records to 100 (committed); `f1`
+    /// is at 90; `f2` is down and `l` lost its quorum lease. `l` will not
+    /// stand, and electing `f1` — its ledger ack is a majority — would cut
+    /// `l` below its committed offset and lose those records everywhere.
+    #[test]
+    fn a_shorter_candidate_never_wins_over_committed_records_of_a_replier_that_will_not_stand() {
+        let t0 = Instant::now();
+        let (state, _) = PromotionState::Idle.step(lease_expired(
+            &["f1", "f2", "l"],
+            &["l", "f1", "f2"],
+            "f1",
+            2,
+            90,
+            90,
+            t0,
+        ));
+        let (state, _) = state.step(PromotionEvent::LeoReply {
+            node_id: s("l"),
+            log: log(2, 100, 100),
+            in_isr: true,
+            can_stand: false,
+        });
+        let (state, actions) = state.step(PromotionEvent::Timeout {
+            now: t0 + LEO_QUERY_TIMEOUT,
+            now_ms: 1,
+        });
+        assert!(actions.is_empty());
+        assert!(matches!(
+            state,
+            PromotionState::Abandoned {
+                reason: AbandonReason::Outranked { ref by }
+            } if by == "l"
+        ));
+    }
+
+    /// Records committed past the candidate's `leo` on any replier — even
+    /// one of an older log epoch, which the rank comparison would place
+    /// below — stop the candidacy: winning would cut them.
+    #[test]
+    fn a_reply_committed_past_the_candidates_log_stops_the_candidacy() {
+        let t0 = Instant::now();
+        let (state, _) = PromotionState::Idle.step(lease_expired(
+            &["a", "b"],
+            &["a", "b", "c"],
+            "a",
+            3,
+            10,
+            10,
+            t0,
+        ));
+        let (state, _) = state.step(PromotionEvent::LeoReply {
+            node_id: s("b"),
+            log: log(1, 30, 20),
+            in_isr: true,
+            can_stand: true,
+        });
+        let (state, _) = state.step(PromotionEvent::Timeout {
+            now: t0 + LEO_QUERY_TIMEOUT,
+            now_ms: 1,
+        });
+        assert!(matches!(
+            state,
+            PromotionState::Abandoned {
+                reason: AbandonReason::Outranked { ref by }
+            } if by == "b"
+        ));
+    }
+
+    /// Only a majority of logs compared intersects every majority that
+    /// acknowledged a write: with fewer replies the candidacy stops before
+    /// proposing, however the ledger would ack.
+    #[test]
+    fn fewer_than_a_majority_of_replies_never_proposes() {
+        let t0 = Instant::now();
+        let (state, _) = PromotionState::Idle.step(lease_expired(
+            &["a", "b", "c"],
+            &["a", "b", "c"],
+            "a",
+            1,
+            5,
+            5,
+            t0,
+        ));
+        let (state, actions) = state.step(PromotionEvent::Timeout {
+            now: t0 + LEO_QUERY_TIMEOUT,
+            now_ms: 1,
+        });
+        assert!(actions.is_empty());
+        assert!(matches!(
+            state,
+            PromotionState::Abandoned {
+                reason: AbandonReason::TooFewReplies {
+                    answered: 1,
+                    required: 2
+                }
+            }
+        ));
+    }
+
+    /// Owner decision: majority at RF ≥ 3 (unchanged), one in-sync replica
+    /// at RF ≤ 2.
+    #[test]
+    fn the_availability_quorum_is_a_majority_from_three_replicas_and_one_below() {
+        assert_eq!(availability_quorum(1), 1);
+        assert_eq!(availability_quorum(2), 1);
+        assert_eq!(availability_quorum(3), 2);
+        assert_eq!(availability_quorum(5), 3);
+        let rf2 = ss(&["a", "b"]);
+        assert!(admitted_by_quorum(&[], &rf2, "b"), "a lone RF=2 survivor");
+        let rf3 = ss(&["a", "b", "c"]);
+        assert!(!admitted_by_quorum(&[], &rf3, "b"), "RF=3 still needs two");
+    }
+
+    /// RF=2: the leader is gone and nobody else answers; the surviving
+    /// in-sync replica stands alone.
+    #[test]
+    fn a_lone_rf2_survivor_proposes_without_any_reply() {
+        let t0 = Instant::now();
+        let (state, _) =
+            PromotionState::Idle.step(lease_expired(&["a", "b"], &["a", "b"], "b", 4, 10, 10, t0));
+        let (state, actions) = state.step(PromotionEvent::Timeout {
+            now: t0 + LEO_QUERY_TIMEOUT,
+            now_ms: 1,
+        });
+        assert!(matches!(state, PromotionState::Proposing { .. }));
+        assert!(matches!(
+            actions.as_slice(),
+            [PromotionAction::ProposeAssignment(a)] if a.leader_node_id == "b" && a.leader_epoch == 5
+        ));
     }
 }

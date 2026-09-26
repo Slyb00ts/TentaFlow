@@ -54,6 +54,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::Instant;
 
+use super::election::{availability_quorum, min_isr_required, LogPosition};
 use super::frames::{
     write_frame, FrameReader, ReplAck, ReplBatchHeader, ReplCodecError, ReplFrame, ReplHeartbeat,
     ReplHello, ReplOffsets, ReplProducerMark, ReplReject, ReplTruncate,
@@ -312,6 +313,10 @@ pub struct PartitionLeader {
     local_node_id: String,
     replicas: Vec<String>,
     epoch: AtomicU32,
+    /// The topic incarnation this leader serves
+    /// (`PartitionAssignment::topic_generation`), stamped onto every
+    /// `ReplHello` it sends.
+    topic_generation: u64,
     acks: Acks,
     environment: NodeEnvironment,
     min_isr: u32,
@@ -345,6 +350,7 @@ impl PartitionLeader {
         local_node_id: impl Into<String>,
         replicas: Vec<String>,
         epoch: u32,
+        topic_generation: u64,
         acks: Acks,
         environment: NodeEnvironment,
         partition: Partition,
@@ -365,6 +371,7 @@ impl PartitionLeader {
             local_node_id: local_node_id.into(),
             replicas,
             epoch: AtomicU32::new(epoch),
+            topic_generation,
             acks,
             environment,
             min_isr,
@@ -409,6 +416,10 @@ impl PartitionLeader {
         self.epoch.load(Ordering::Acquire)
     }
 
+    pub fn topic_generation(&self) -> u64 {
+        self.topic_generation
+    }
+
     pub fn acks(&self) -> Acks {
         self.acks
     }
@@ -427,6 +438,24 @@ impl PartitionLeader {
 
     pub fn high_watermark(&self) -> u64 {
         self.partition.high_watermark()
+    }
+
+    /// `Partition::committed_offset` — what `recompute_hw` last found on a
+    /// majority of the replica set.
+    pub fn committed_offset(&self) -> u64 {
+        self.partition.committed_offset()
+    }
+
+    /// `Partition::log_epoch` — the epoch this leader's own log was last
+    /// written under, which is not its term until it has appended in it.
+    pub fn log_epoch(&self) -> u32 {
+        self.partition.log_epoch()
+    }
+
+    /// `Partition::epoch_at`: the epoch the record at `offset` was first
+    /// written in — what a fed batch tells the follower to record.
+    pub fn epoch_at(&self, offset: u64) -> u32 {
+        self.partition.epoch_at(offset)
     }
 
     pub fn log_end_offset(&self) -> u64 {
@@ -471,6 +500,22 @@ impl PartitionLeader {
     /// `NotEnoughReplicas` instead of silently degrading durability.
     pub fn below_min_isr(&self) -> bool {
         self.isr_size() < self.min_isr
+    }
+
+    /// Whether a majority of the replica set — this leader counted — has
+    /// acknowledged within `replica_lag_max_ms`, judged at call time. Not
+    /// read off `in_isr`: only the per-follower stream tasks update that, so
+    /// a leader whose tasks are wedged would keep an ISR it no longer has.
+    /// Here the acks simply stop arriving and the lease lapses on its own.
+    pub fn has_quorum_lease(&self) -> bool {
+        let now = Instant::now();
+        let window = Duration::from_millis(self.config.replica_lag_max_ms);
+        let fresh = self
+            .followers
+            .iter()
+            .filter(|e| now.saturating_duration_since(e.last_ack_at) <= window)
+            .count();
+        1 + fresh >= availability_quorum(self.replicas.len())
     }
 
     pub fn follower_state(&self, node_id: &str) -> Option<FollowerState> {
@@ -667,12 +712,32 @@ impl PartitionLeader {
         v
     }
 
+    /// `Acks::All` asks for every in-sync replica, but never fewer than
+    /// `availability_quorum`: at RF ≥ 3 an ISR shrunk to the leader alone
+    /// would otherwise let `hw` — what consumers read — run ahead of
+    /// anything a failover keeps; at RF ≤ 2 one replica may act alone (the
+    /// owner's availability decision, see that function). `Acks::Leader` makes no such promise by definition:
+    /// its `hw` is the leader's own log, and a failover may take back what a
+    /// consumer read. Replica reconciliation never relies on `hw` for that
+    /// reason; it uses `committed_offset`, which is majority-derived for
+    /// every level (`recompute_hw`).
     fn required_for(&self, acks: Acks, isr_len: usize) -> u32 {
         match acks {
             Acks::Leader => 1,
             Acks::Quorum => self.min_isr,
-            Acks::All => isr_len as u32,
+            Acks::All => (isr_len as u32).max(availability_quorum(self.replicas.len()) as u32),
         }
+    }
+
+    /// The offset every record below which is on a majority of the replica
+    /// set — counting every follower's acknowledged `leo`, in the ISR or not
+    /// (an out-of-ISR follower is merely behind; what it acknowledged is
+    /// still on its disk). Independent of `acks`.
+    fn majority_offset(&self) -> u64 {
+        let mut leos = Vec::with_capacity(self.followers.len() + 1);
+        leos.push(self.partition.log_end_offset());
+        leos.extend(self.followers.iter().map(|e| e.leo));
+        Self::nth_largest(&leos, min_isr_required(self.replicas.len()) as u32)
     }
 
     /// The `n`-th largest value in `values` (1-based), or `0` if `n` is
@@ -702,6 +767,18 @@ impl PartitionLeader {
     /// Called after every state change that could move either quantity
     /// (`record_ack`, `reconcile_follower`, follower add/remove).
     fn recompute_hw(&self) {
+        // Raft's Figure 8: a majority holding records of an EARLIER term
+        // does not commit them — a node with a later-term log can still win
+        // an election over those replicas and replace them. Only once a
+        // majority holds a record of this leader's own term is everything
+        // before it safe; until then the committed offset stays where the
+        // earlier terms left it.
+        if let Some(start) = self.partition.epoch_start(self.epoch()) {
+            let majority = self.majority_offset();
+            if majority > start {
+                self.partition.set_committed_offset(majority);
+            }
+        }
         let candidate = self.commit_offset_for(self.acks);
         let before = self.partition.high_watermark();
         let after = self.partition.set_high_watermark(candidate);
@@ -731,15 +808,10 @@ impl PartitionLeader {
     ///
     /// `feed` now reads through `PartitionReader::fetch_raw_to_end_of_log`, so
     /// whatever is feedable is feedable the moment it is appended and
-    /// `Partition::subscribe_leo` is the wake that carries it. This sender is
-    /// therefore no longer needed for correctness; what it costs is one fetch
-    /// that returns empty per `hw` advance. It stays because the ACK/ISR
-    /// transitions that move `hw` are exactly the ones that change WHICH
-    /// replicas a stream owes a catch-up to, and because any future bound on the
-    /// feed that is commit-based rather than log-based (in-flight bytes gated at
-    /// `hw`, max-lag eviction) needs this wake back. Deleting it is a one-line
-    /// change here and in `run_follower_stream`'s select — do it if it ever
-    /// earns a place in a profile.
+    /// `Partition::subscribe_leo` is the wake that carries the RECORDS. This
+    /// wake carries the WATERMARK: an advance that no batch is left to carry
+    /// is pushed to every follower as a bare heartbeat right away
+    /// (`run_follower_stream`), instead of waiting up to a heartbeat interval.
     pub fn subscribe_hw(&self) -> watch::Receiver<u64> {
         self.hw_tx.subscribe()
     }
@@ -912,6 +984,7 @@ async fn feed<W: AsyncWrite + Unpin>(
     producer_mark: &Option<ProducerMarkLookup>,
     inflight: &mut InFlightTracker,
     last_frame_sent_at: &mut Instant,
+    hw_sent: &mut u64,
 ) -> Result<u64, FollowerStreamError> {
     loop {
         let batches = match reader
@@ -955,13 +1028,16 @@ async fn feed<W: AsyncWrite + Unpin>(
                 .as_ref()
                 .map(|f| f(base_offset))
                 .unwrap_or_default();
+            let header_hw = leader.high_watermark();
             let header = ReplBatchHeader {
                 leader_epoch: leader.epoch(),
                 base_offset,
-                hw: leader.high_watermark(),
+                hw: header_hw,
                 batch_len: wire_len as u32,
                 producer: meta.producer,
                 dedup_keys: Vec::new(),
+                committed: Some(leader.committed_offset()),
+                record_epoch: Some(leader.epoch_at(base_offset)),
             };
             write_frame(
                 writer,
@@ -974,15 +1050,35 @@ async fn feed<W: AsyncWrite + Unpin>(
             inflight.record_sent(raw.next_offset, wire_len);
             follower_cursor = raw.next_offset;
             *last_frame_sent_at = Instant::now();
+            *hw_sent = (*hw_sent).max(header_hw);
         }
     }
+}
+
+/// Sends a bare `Heartbeat` and returns the `hw` it carried.
+async fn send_heartbeat<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    leader: &PartitionLeader,
+) -> Result<u64, FollowerStreamError> {
+    let hw = leader.high_watermark();
+    write_frame(
+        writer,
+        &ReplFrame::Heartbeat(ReplHeartbeat {
+            leader_epoch: leader.epoch(),
+            hw,
+            leader_leo: leader.log_end_offset(),
+            committed: Some(leader.committed_offset()),
+        }),
+    )
+    .await?;
+    Ok(hw)
 }
 
 /// Drives one leader<->follower replication stream to completion (PLAN-M2
 /// §1b item 2): sends `Hello`, validates `HelloAck`, registers the
 /// follower with `leader`, then loops feeding batches (driven by
-/// `Partition::subscribe_leo`, with `PartitionLeader::subscribe_hw` as a
-/// second, no-longer-load-bearing wake — see that method's doc), reading
+/// `Partition::subscribe_leo`, with `PartitionLeader::subscribe_hw` pushing
+/// watermark advances no batch carries — see that method's doc), reading
 /// `Ack`s, sending heartbeats in
 /// silence, coalescing `ReplOffsets`, and forwarding `Truncate` requests
 /// from `truncate_rx` — plus cutting a replica that reports a `leo` ahead of
@@ -1022,6 +1118,7 @@ where
         leader_epoch: leader.epoch(),
         replicas: leader.replicas().to_vec(),
         environment: leader.environment(),
+        topic_generation: Some(leader.topic_generation()),
     };
     write_frame(&mut writer, &ReplFrame::Hello(hello)).await?;
 
@@ -1050,33 +1147,59 @@ where
     // AND answered the election's `LeoQuery` — which is precisely what the
     // plan's own motivating replica is NOT (the old leader, down during the
     // election, rejoining later). Its divergence instead first becomes
-    // visible here, in the `follower_leo` it reports: anything above our own
-    // `leo` is outside the chain this node is authoritative for, and feeding
-    // from it would fetch nothing while our next real append arrives there
-    // as an `OffsetGap` — an endless reconnect loop instead of a converged
-    // replica. Cut it back BEFORE the first feed and treat the cursor as the
-    // offset we just told it to keep.
+    // visible here, in what its ack reports, and it is cut back BEFORE the
+    // first feed by the election's own rule (`LogPosition::kept_end`):
     //
-    // A replica whose `hw` is ALSO past our `leo` is a genuine committed-data
-    // conflict; it refuses this `Truncate` as below-hw (K-M2-1: `hw` never
-    // regresses) and the stream fails on the gap as it would have anyway.
-    // Refusing to paper over that here is deliberate.
-    let authority_leo = leader.log_end_offset();
-    let follower_leo = if ack.follower_leo > authority_leo {
+    // - a log written under this leader's epoch is a prefix or an extension
+    //   of this chain; anything above our own `leo` is outside it, and
+    //   feeding from there would fetch nothing while our next real append
+    //   arrives as an `OffsetGap` — an endless reconnect loop;
+    // - a log written under ANOTHER epoch may differ from this chain below
+    //   our `leo` as well (an old leader's tail at the offsets this term
+    //   wrote its own records to), which no offset comparison can see, so it
+    //   goes back to its own committed offset — every record below that is
+    //   on a majority, this chain included — and is fed again from there.
+    //
+    // Epochs here are LOG epochs (`Partition::log_epoch`) on both sides, the
+    // epoch the records were written under — not the term a Hello stamped.
+    // A follower from before `follower_log_epoch` is judged by offsets alone,
+    // one from before `follower_committed` by its `hw`.
+    //
+    // A replica whose committed offset is past our `leo` holds acknowledged
+    // records this leader lacks. It refuses the `Truncate`
+    // (`BusError::TruncateBelowCommitted`, whatever its `hw`) and the stream
+    // ends; refusing to paper over that is deliberate — obeying would lose
+    // those records on every replica.
+    let authority = LogPosition {
+        epoch: leader.log_epoch(),
+        leo: leader.log_end_offset(),
+        committed: leader.committed_offset(),
+    };
+    let follower_log = LogPosition {
+        epoch: ack.follower_log_epoch.unwrap_or(authority.epoch),
+        leo: ack.follower_leo,
+        committed: ack.follower_committed.unwrap_or(ack.follower_hw),
+    };
+    let kept = follower_log.kept_end(&authority);
+    let follower_leo = if kept < ack.follower_leo {
         write_frame(
             &mut writer,
             &ReplFrame::Truncate(ReplTruncate {
                 leader_epoch: leader.epoch(),
-                to_offset: authority_leo,
+                to_offset: kept,
             }),
         )
         .await?;
-        authority_leo
+        kept
     } else {
         ack.follower_leo
     };
 
-    leader.register_follower(follower_node_id.clone(), follower_leo, ack.follower_hw);
+    leader.register_follower(
+        follower_node_id.clone(),
+        follower_leo,
+        ack.follower_hw.min(follower_leo),
+    );
 
     let reader_handle = leader.open_reader();
     let mut leo_rx = leader.subscribe_leo();
@@ -1086,6 +1209,9 @@ where
     let mut pending_commits: Vec<(String, u32, u64, u32)> = Vec::new();
     let mut pending_discards: Vec<(u32, u64)> = Vec::new();
     let mut last_frame_sent_at = Instant::now();
+    // The highest `hw` any frame on this stream has carried: the follower
+    // applies it monotonically, so anything at or below it is old news.
+    let mut hw_sent: u64 = 0;
     let mut truncate_open = true;
 
     let heartbeat_interval = leader.config().heartbeat_interval;
@@ -1108,6 +1234,7 @@ where
         &producer_mark,
         &mut inflight,
         &mut last_frame_sent_at,
+        &mut hw_sent,
     )
     .await?;
     leader.set_follower_lag_bytes(&follower_node_id, inflight.total());
@@ -1132,23 +1259,31 @@ where
                 }
                 follower_cursor = feed(
                     &leader, &reader_handle, &mut writer, follower_cursor,
-                    &producer_mark, &mut inflight, &mut last_frame_sent_at,
+                    &producer_mark, &mut inflight, &mut last_frame_sent_at, &mut hw_sent,
                 ).await?;
                 leader.set_follower_lag_bytes(&follower_node_id, inflight.total());
             }
 
-            // Belt-and-braces only since the leo-bounded feed fix: `feed` can
-            // no longer be waiting on an `hw` advance to make a batch sendable
-            // (its read is bounded by `log_end_offset` now), so this arm's fetch
-            // normally returns empty. See `subscribe_hw`'s doc for why the arm
-            // is still here.
+            // The advance is usually the quorum ack of the batch this stream
+            // just sent, so there is nothing new to feed and no frame would
+            // carry the new `hw` until the next heartbeat: measured in the
+            // three-process harness as leader `hw` 1000 at T, followers
+            // applying it via the heartbeat at T+501 ms. A follower's `hw`
+            // is what it may serve after a promotion and what it reports as
+            // committed, so it is pushed now as a bare heartbeat — only when
+            // no batch already carried it, so a stream that is still
+            // catching up sends nothing extra.
             hw_changed = hw_rx.changed() => {
                 if hw_changed.is_ok() {
                     follower_cursor = feed(
                         &leader, &reader_handle, &mut writer, follower_cursor,
-                        &producer_mark, &mut inflight, &mut last_frame_sent_at,
+                        &producer_mark, &mut inflight, &mut last_frame_sent_at, &mut hw_sent,
                     ).await?;
                     leader.set_follower_lag_bytes(&follower_node_id, inflight.total());
+                    if leader.high_watermark() > hw_sent {
+                        hw_sent = send_heartbeat(&mut writer, &leader).await?;
+                        last_frame_sent_at = Instant::now();
+                    }
                 }
             }
 
@@ -1211,11 +1346,7 @@ where
             // tick whenever a frame had gone out less than one interval ago
             // stretched real silences to almost two intervals.
             _ = tokio::time::sleep_until(heartbeat_due) => {
-                write_frame(&mut writer, &ReplFrame::Heartbeat(ReplHeartbeat {
-                    leader_epoch: leader.epoch(),
-                    hw: leader.high_watermark(),
-                    leader_leo: leader.log_end_offset(),
-                })).await?;
+                hw_sent = send_heartbeat(&mut writer, &leader).await?;
                 last_frame_sent_at = Instant::now();
             }
 
@@ -1283,6 +1414,7 @@ mod tests {
             "leader",
             replicas.iter().map(|s| s.to_string()).collect(),
             TEST_EPOCH,
+            0,
             acks,
             NodeEnvironment::Prod,
             part,
@@ -1345,6 +1477,8 @@ mod tests {
                 follower_epoch: TEST_EPOCH,
                 environment: NodeEnvironment::Prod,
                 reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
             }),
         )
         .await
@@ -1384,6 +1518,8 @@ mod tests {
                 follower_epoch: TEST_EPOCH,
                 environment: NodeEnvironment::Prod,
                 reject: Some(ReplReject::StaleEpoch { have: TEST_EPOCH }),
+                follower_log_epoch: None,
+                follower_committed: None,
             }),
         )
         .await
@@ -1430,6 +1566,8 @@ mod tests {
                 follower_epoch: TEST_EPOCH,
                 environment: NodeEnvironment::Prod,
                 reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
             }),
         )
         .await
@@ -1457,6 +1595,168 @@ mod tests {
         drop(foll_r);
         drop(foll_w);
         let _ = handle.await;
+    }
+
+    /// An old leader's tail sits BELOW this leader's `leo`: the follower's
+    /// log was written under another epoch, with records of its own at
+    /// offsets this term filled differently. Offsets alone see nothing to
+    /// cut; the log epoch sends it back to its own `hw`, to be fed again.
+    #[tokio::test]
+    async fn a_follower_of_another_epoch_is_cut_back_to_its_hw_even_below_the_leaders_leo() {
+        let part = temp_partition("rejoin-epoch");
+        for _ in 0..3 {
+            part.append_batch_async(one_record_batch(1)).await.unwrap();
+        }
+        assert_eq!(part.log_end_offset(), 3);
+
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, fast_config());
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+        });
+
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        write_frame(
+            &mut foll_w,
+            &ReplFrame::HelloAck(ReplHelloAck {
+                accepted: true,
+                follower_leo: 2,
+                follower_hw: 1,
+                follower_epoch: TEST_EPOCH,
+                environment: NodeEnvironment::Prod,
+                reject: None,
+                follower_log_epoch: Some(TEST_EPOCH - 1),
+                follower_committed: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut foll_r))
+            .await
+            .expect("timed out waiting for the divergence Truncate")
+            .unwrap();
+        match frame {
+            ReplFrame::Truncate(t) => {
+                assert_eq!(t.to_offset, 1, "cut back to the follower's own hw");
+                assert_eq!(t.leader_epoch, TEST_EPOCH);
+            }
+            other => panic!("expected Truncate, got {other:?}"),
+        }
+        let fs = leader
+            .follower_state("f1")
+            .expect("follower registered at handshake");
+        assert_eq!(fs.leo, 1);
+
+        drop(foll_r);
+        drop(foll_w);
+        let _ = handle.await;
+    }
+
+    /// The quorum lease lapses on its own once acks stop — no stream task
+    /// has to notice and shrink the ISR first.
+    #[tokio::test]
+    async fn the_quorum_lease_needs_a_majority_of_recent_acks() {
+        let part = temp_partition("quorum-lease");
+        let mut config = fast_config();
+        config.replica_lag_max_ms = 50;
+        let leader = make_leader(part, &["leader", "f1", "f2"], Acks::Quorum, config);
+        assert!(
+            !leader.has_quorum_lease(),
+            "the leader alone is not a majority of three"
+        );
+        leader.register_follower("f1", 0, 0);
+        assert!(leader.has_quorum_lease());
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !leader.has_quorum_lease(),
+            "a follower silent past the lag window no longer counts"
+        );
+    }
+
+    /// `acks=all` over an ISR shrunk to the leader alone must not let `hw`
+    /// — what consumers read — run past what a majority holds: a failover
+    /// keeps only that.
+    #[tokio::test]
+    async fn acks_all_never_advances_hw_past_a_majority() {
+        let part = temp_partition("acks-all-majority");
+        part.set_hw_tracking(HwTracking::Manual);
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
+        let leader = make_leader(
+            part.clone(),
+            &["leader", "f1", "f2"],
+            Acks::All,
+            fast_config(),
+        );
+        for _ in 0..3 {
+            part.append_batch_async(one_record_batch(1)).await.unwrap();
+        }
+        leader.register_follower("f1", 0, 0);
+        leader.remove_follower("f1", "stream ended");
+        assert_eq!(
+            leader.high_watermark(),
+            0,
+            "the leader alone is not a majority of three"
+        );
+    }
+
+    /// The committed offset is majority-derived whatever `acks` says:
+    /// `acks=leader` shows consumers everything the leader wrote, but only
+    /// what a follower acknowledged too is committed — the bound replicas
+    /// are reconciled to.
+    #[tokio::test]
+    async fn the_committed_offset_follows_a_majority_even_under_acks_leader() {
+        let part = temp_partition("committed-acks-leader");
+        part.set_hw_tracking(HwTracking::Manual);
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
+        let leader = make_leader(
+            part.clone(),
+            &["leader", "f1", "f2"],
+            Acks::Leader,
+            fast_config(),
+        );
+        for _ in 0..3 {
+            part.append_batch_async(one_record_batch(1)).await.unwrap();
+        }
+        leader.register_follower("f1", 1, 0);
+        assert_eq!(leader.high_watermark(), 3);
+        assert_eq!(leader.committed_offset(), 1);
+        leader.register_follower("f2", 3, 0);
+        assert_eq!(leader.committed_offset(), 3);
+    }
+
+    /// Figure 8: re-elected in a new term, this leader feeds a follower
+    /// records of the earlier term. A majority holding them does not make
+    /// them committed — a later-term log can still win over those replicas —
+    /// until a record of the leader's own term is on a majority too.
+    #[tokio::test]
+    async fn earlier_term_records_are_not_committed_until_a_current_term_record_is() {
+        let part = temp_partition("figure-eight");
+        part.set_hw_tracking(HwTracking::Manual);
+        part.set_leader_epoch(TEST_EPOCH - 1).unwrap();
+        for _ in 0..3 {
+            part.append_batch_async(one_record_batch(1)).await.unwrap();
+        }
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
+        let leader = make_leader(
+            part.clone(),
+            &["leader", "f1", "f2"],
+            Acks::Quorum,
+            fast_config(),
+        );
+        leader.register_follower("f1", 3, 0);
+        assert_eq!(
+            leader.committed_offset(),
+            0,
+            "earlier-term records on a majority are not committed by it"
+        );
+
+        part.append_batch_async(one_record_batch(1)).await.unwrap();
+        leader.register_follower("f1", 4, 0);
+        assert_eq!(leader.committed_offset(), 4);
     }
 
     // ===== feeding =====
@@ -1492,6 +1792,8 @@ mod tests {
                 follower_epoch: TEST_EPOCH,
                 environment: NodeEnvironment::Prod,
                 reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
             }),
         )
         .await
@@ -1563,6 +1865,8 @@ mod tests {
                 follower_epoch: TEST_EPOCH,
                 environment: NodeEnvironment::Prod,
                 reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
             }),
         )
         .await
@@ -2062,6 +2366,8 @@ mod tests {
                 follower_epoch: TEST_EPOCH,
                 environment: NodeEnvironment::Prod,
                 reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
             }),
         )
         .await
@@ -2075,6 +2381,81 @@ mod tests {
             ReplFrame::Heartbeat(hb) => assert_eq!(hb.leader_epoch, TEST_EPOCH),
             other => panic!("expected Heartbeat, got {other:?}"),
         }
+
+        drop(foll_r);
+        drop(foll_w);
+        let _ = handle.await;
+    }
+
+    /// A quorum ack commits the batch the stream just sent, and nothing else
+    /// is left to feed. The follower must learn the new `hw` at once, not a
+    /// heartbeat interval later (measured before this: +501 ms at the
+    /// production 500 ms interval). The interval here is a minute, so only
+    /// the advance itself can deliver it within the deadline.
+    #[tokio::test]
+    async fn a_high_watermark_advance_reaches_the_follower_without_waiting_for_a_heartbeat() {
+        let part = temp_partition("hw-push");
+        part.set_hw_tracking(HwTracking::Manual);
+        let config = LeaderConfig {
+            heartbeat_interval: Duration::from_secs(60),
+            ..fast_config()
+        };
+        let leader = make_leader(part.clone(), &["leader", "f1"], Acks::Quorum, config);
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+        });
+
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        write_frame(
+            &mut foll_w,
+            &ReplFrame::HelloAck(ReplHelloAck {
+                accepted: true,
+                follower_leo: 0,
+                follower_hw: 0,
+                follower_epoch: TEST_EPOCH,
+                environment: NodeEnvironment::Prod,
+                reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        part.append_batch_async(one_record_batch(1)).await.unwrap();
+        match tokio::time::timeout(Duration::from_secs(2), read_frame(&mut foll_r))
+            .await
+            .expect("timed out waiting for the batch")
+            .unwrap()
+        {
+            ReplFrame::Batch { header, .. } => assert_eq!(header.hw, 0),
+            other => panic!("expected Batch, got {other:?}"),
+        }
+
+        write_frame(
+            &mut foll_w,
+            &ReplFrame::Ack(ReplAck {
+                leader_epoch: TEST_EPOCH,
+                follower_leo: 1,
+                follower_hw: 0,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut foll_r))
+            .await
+            .expect("the committed hw never reached the follower before the next heartbeat")
+            .unwrap();
+        match frame {
+            ReplFrame::Heartbeat(hb) => assert_eq!(hb.hw, 1),
+            other => panic!("expected Heartbeat carrying hw 1, got {other:?}"),
+        }
+        assert_eq!(part.high_watermark(), 1);
 
         drop(foll_r);
         drop(foll_w);
@@ -2109,6 +2490,8 @@ mod tests {
                 follower_epoch: TEST_EPOCH,
                 environment: NodeEnvironment::Prod,
                 reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
             }),
         )
         .await
@@ -2187,6 +2570,8 @@ mod tests {
                 follower_epoch: TEST_EPOCH,
                 environment: NodeEnvironment::Prod,
                 reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
             }),
         )
         .await
@@ -2242,6 +2627,8 @@ mod tests {
                 follower_epoch: TEST_EPOCH,
                 environment: NodeEnvironment::Prod,
                 reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
             }),
         )
         .await
@@ -2291,6 +2678,8 @@ mod tests {
                 follower_epoch: TEST_EPOCH,
                 environment: NodeEnvironment::Prod,
                 reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
             }),
         )
         .await
@@ -2301,5 +2690,24 @@ mod tests {
             .expect("stream must end promptly, not loop")
             .unwrap();
         assert!(matches!(result, Err(FollowerStreamError::Detached)));
+    }
+
+    /// RF=2 availability: a leader whose only follower is gone keeps its
+    /// quorum lease and keeps committing `acks=all` writes on its own ISR.
+    /// RF=3 is unchanged (`the_quorum_lease_needs_a_majority_of_recent_acks`,
+    /// `acks_all_never_advances_hw_past_a_majority`).
+    #[tokio::test]
+    async fn an_rf2_leader_alone_keeps_its_lease_and_its_acks_all_writes() {
+        let part = temp_partition("rf2-alone");
+        part.set_hw_tracking(HwTracking::Manual);
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
+        let leader = make_leader(part.clone(), &["leader", "f1"], Acks::All, fast_config());
+        for _ in 0..3 {
+            part.append_batch_async(one_record_batch(1)).await.unwrap();
+        }
+        leader.register_follower("f1", 0, 0);
+        leader.remove_follower("f1", "stream ended");
+        assert!(leader.has_quorum_lease());
+        assert_eq!(leader.high_watermark(), 3);
     }
 }

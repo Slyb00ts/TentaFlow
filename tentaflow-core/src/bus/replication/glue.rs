@@ -46,6 +46,7 @@ use tokio::task::JoinHandle;
 use tentaflow_bus::{HwTracking, Partition};
 
 use crate::bus::replication::assignment::PartitionAssignment;
+use crate::bus::replication::election::LogPosition;
 use crate::bus::replication::follower::{
     self, ExpectedLeader, FollowerConfig, FollowerExit, FollowerStores,
 };
@@ -66,6 +67,11 @@ use crate::db::DbPool;
 /// a leader-side follower-stream supervisor task.
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+/// On top of a live leader's longest reconnect backoff, room for the dial
+/// itself to connect and hand-shake before a follower no leader has dialed
+/// calls its lease expired (`FollowerRunnerFactory::undialed_lease`).
+const UNDIALED_CONNECT_MARGIN: Duration = Duration::from_secs(2);
 
 /// Mirrors `dispatch/bus.rs`'s private `BUS_FAILOVER_AUDIT_ACTION` (agent
 /// P) byte-for-byte — that constant is not `pub` (it lives in a different
@@ -101,7 +107,18 @@ pub trait PartitionProvider: Send + Sync {
     /// (`tentaflow-bus`'s own doc) and `BusService` is expected to cache
     /// handles itself (PLAN-M2 §1e's `partition_handle_lru`), so this is
     /// never the first place a handle gets opened from cold.
-    fn partition(&self, org: &str, topic: &str, partition: u32) -> Result<Partition, ReplError>;
+    ///
+    /// `topic_generation` is the incarnation the placement belongs to
+    /// (`PartitionAssignment::topic_generation`): a local log left over from
+    /// a deleted incarnation of the same name is dropped before the handle
+    /// is opened, never replicated into or served from.
+    fn partition(
+        &self,
+        org: &str,
+        topic: &str,
+        partition: u32,
+        topic_generation: u64,
+    ) -> Result<Partition, ReplError>;
     /// The local group-offset/DLQ-discard/producer-sequence stores a
     /// follower stream applies `Offsets`/`Batch.producer` into
     /// (`follower::FollowerStores`'s own doc).
@@ -230,8 +247,12 @@ impl GlueLeaderFactory {
         let provider = self.provider.upgrade().ok_or_else(|| {
             ReplError::Internal("partition provider dropped — engine already stopped".to_string())
         })?;
-        let partition =
-            provider.partition(&assignment.org_id, &assignment.topic, assignment.partition)?;
+        let partition = provider.partition(
+            &assignment.org_id,
+            &assignment.topic,
+            assignment.partition,
+            assignment.topic_generation,
+        )?;
         // Becoming leader: this partition's `high_watermark` is now driven
         // by ack-quorum bookkeeping (`PartitionLeader::recompute_hw`), not
         // the engine's own M1 `FollowLeo` default (PLAN-M2 §1a's
@@ -276,6 +297,7 @@ impl GlueLeaderFactory {
             self.local_node_id.clone(),
             assignment.replicas.clone(),
             assignment.leader_epoch,
+            assignment.topic_generation,
             acks,
             self.local_env,
             partition.clone(),
@@ -285,6 +307,7 @@ impl GlueLeaderFactory {
 
         let shared = Arc::new(GlueLeaderShared {
             leader,
+            writes: Mutex::new(LeaderWrites::default()),
             partition,
             replica_count: assignment.replicas.len().max(1),
             stopped: AtomicBool::new(false),
@@ -352,8 +375,18 @@ impl GlueLeaderFactory {
     }
 }
 
+#[derive(Default)]
+struct LeaderWrites {
+    open: bool,
+    stopped: bool,
+}
+
 struct GlueLeaderShared {
     leader: Arc<PartitionLeader>,
+    /// Whether this handle opened leader writes and whether it was stopped,
+    /// under one lock: an open racing a stop must not leave writes open
+    /// after the stop returns.
+    writes: Mutex<LeaderWrites>,
     partition: Partition,
     replica_count: usize,
     stopped: AtomicBool,
@@ -586,6 +619,26 @@ impl LeaderHandle for GlueLeaderHandle {
         }
     }
 
+    fn holds_quorum_lease(&self) -> bool {
+        self.0.leader.has_quorum_lease()
+    }
+
+    fn open_writes(&self) {
+        let mut writes = self.0.writes.lock();
+        if !writes.stopped && !writes.open {
+            self.0.partition.open_leader_writes();
+            writes.open = true;
+        }
+    }
+
+    fn log_epoch(&self) -> u32 {
+        self.0.leader.log_epoch()
+    }
+
+    fn committed_offset(&self) -> u64 {
+        self.0.leader.committed_offset()
+    }
+
     /// T1's finding (4): every OTHER replica not currently in the live
     /// ISR, with a human-readable reason (K-M2-2/PLAN-M2 §1f's
     /// `BusReplicaLagWire`) — computed live from `PartitionLeader`'s own
@@ -674,6 +727,19 @@ impl LeaderHandle for GlueLeaderHandle {
 
     fn stop(&self) {
         self.0.stopped.store(true, Ordering::SeqCst);
+        // First: every demotion — a newer or equal-epoch leader's Hello, a
+        // step-down, a rebuild — ends here, and a publish admitted while this
+        // handle served must not land once it has. Only what `open_writes`
+        // opened, once.
+        {
+            let mut writes = self.0.writes.lock();
+            writes.stopped = true;
+            if std::mem::take(&mut writes.open) {
+                if let Err(e) = self.0.partition.close_leader_writes() {
+                    tracing::warn!(error = %e, "replication: closing leader writes on stop failed");
+                }
+            }
+        }
         for task in self.0.tasks.lock().drain(..) {
             task.abort();
         }
@@ -729,7 +795,68 @@ impl GlueFollowerFactory {
     }
 }
 
+impl GlueFollowerFactory {
+    fn open_partition(&self, assignment: &PartitionAssignment) -> Result<Partition, ReplError> {
+        let provider = self.provider.upgrade().ok_or_else(|| {
+            ReplError::Internal("partition provider dropped — engine already stopped".to_string())
+        })?;
+        provider.partition(
+            &assignment.org_id,
+            &assignment.topic,
+            assignment.partition,
+            assignment.topic_generation,
+        )
+    }
+}
+
+fn log_position(partition: &Partition) -> LogPosition {
+    LogPosition {
+        epoch: partition.log_epoch(),
+        leo: partition.log_end_offset(),
+        committed: partition.committed_offset(),
+    }
+}
+
 impl FollowerRunnerFactory for GlueFollowerFactory {
+    fn undialed_lease(&self) -> Duration {
+        self.config.leader_lease + RECONNECT_BACKOFF_MAX + UNDIALED_CONNECT_MARGIN
+    }
+
+    fn local_log_position(
+        &self,
+        assignment: &PartitionAssignment,
+    ) -> Result<LogPosition, ReplError> {
+        Ok(log_position(&self.open_partition(assignment)?))
+    }
+
+    fn leader_lease(&self) -> Duration {
+        self.config.leader_lease
+    }
+
+    fn fence_to_epoch(
+        &self,
+        assignment: &PartitionAssignment,
+        epoch: u32,
+    ) -> Result<(), ReplError> {
+        let partition = self.open_partition(assignment)?;
+        if partition.leader_epoch() >= epoch {
+            return Ok(());
+        }
+        partition.set_leader_epoch(epoch).map_err(|e| {
+            ReplError::Internal(format!("fencing the partition at epoch {epoch}: {e}"))
+        })
+    }
+
+    fn cut_to_committed(&self, assignment: &PartitionAssignment) -> Result<LogPosition, ReplError> {
+        let partition = self.open_partition(assignment)?;
+        partition
+            .truncate_to_offset_for_leader_authority(partition.committed_offset())
+            .map_err(|e| {
+                ReplError::Internal(format!("cutting the log to its committed offset: {e}"))
+            })?;
+        Ok(log_position(&partition))
+    }
+
     fn spawn(
         &self,
         assignment: &PartitionAssignment,
@@ -740,8 +867,12 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
         let provider = self.provider.upgrade().ok_or_else(|| {
             ReplError::Internal("partition provider dropped — engine already stopped".to_string())
         })?;
-        let partition =
-            provider.partition(&assignment.org_id, &assignment.topic, assignment.partition)?;
+        let partition = provider.partition(
+            &assignment.org_id,
+            &assignment.topic,
+            assignment.partition,
+            assignment.topic_generation,
+        )?;
         // Becoming (or staying) a follower: `high_watermark` follows the
         // leader's `Batch.hw`/`Heartbeat.hw`, never the engine's own local
         // `FollowLeo` auto-bump (PLAN-M2 §1a `HwTracking` contract).
@@ -818,7 +949,7 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
                 // election budget after A's own `shutdown()`.
                 //
                 // This is a wake-up, not a verdict: `check_leases` still gates
-                // on `role == Follower` + still-in-ISR + `PromotionState::Idle`,
+                // on `role == Follower` + still-in-ISR + no attempt in flight,
                 // and an intentional teardown never reaches here — `stop()`
                 // aborts this task before the match runs. `Detached`,
                 // `EpochFenced`, `HelloRejected` and `OffsetGap` stay
@@ -868,6 +999,14 @@ impl FollowerRunner for GlueFollowerRunner {
 
     fn lease_expired(&self) -> bool {
         self.lease_expired.load(Ordering::SeqCst)
+    }
+
+    fn log_epoch(&self) -> u32 {
+        self.partition.log_epoch()
+    }
+
+    fn committed(&self) -> u64 {
+        self.partition.committed_offset()
     }
 
     fn mark_leader_disconnected(&self) {
@@ -1083,6 +1222,7 @@ mod tests {
             org: &str,
             topic: &str,
             partition: u32,
+            _topic_generation: u64,
         ) -> Result<Partition, ReplError> {
             let key = (org.to_string(), topic.to_string(), partition);
             let mut guard = self.partitions.lock();
@@ -1159,6 +1299,7 @@ mod tests {
             isr: isr.iter().map(|s| s.to_string()).collect(),
             leader_epoch: epoch,
             updated_at_ms: 0,
+            topic_generation: 0,
         }
     }
 
@@ -1272,7 +1413,7 @@ mod tests {
         let ((f1_leader_side_recv, f1_leader_side_send), f1_follower_half) = duplex_pair();
         let ((f2_leader_side_recv, f2_leader_side_send), f2_follower_half) = duplex_pair();
 
-        let leader_partition = provider_l.partition("org-1", "orders", 0).unwrap();
+        let leader_partition = provider_l.partition("org-1", "orders", 0, 0).unwrap();
 
         // Every `*Factory::spawn` below stamps `Partition::set_leader_epoch`/
         // `flush_meta`, which round-trip through that partition's OWN
@@ -1378,8 +1519,8 @@ mod tests {
         // Byte-identical: both followers' own (independent) partitions
         // must show the exact same records the leader published, once
         // caught up.
-        let f1_part = provider_f1.partition("org-1", "orders", 0).unwrap();
-        let f2_part = provider_f2.partition("org-1", "orders", 0).unwrap();
+        let f1_part = provider_f1.partition("org-1", "orders", 0, 0).unwrap();
+        let f2_part = provider_f2.partition("org-1", "orders", 0, 0).unwrap();
         // The catch-up budget is DERIVED, not a magic constant — the fixed
         // 5 s window flaked under load (measured 25/100 and 48/100 at
         // expiry). Derivation: each batch's end-to-end cost is bounded by
@@ -1467,7 +1608,7 @@ mod tests {
             Arc::new(LeaderMetrics::new()),
         );
         let handle = factory.spawn(&a, vec![]).expect("spawn");
-        let part = cluster.partition("org-1", "orders", 0).unwrap();
+        let part = cluster.partition("org-1", "orders", 0, 0).unwrap();
         assert_eq!(part.leader_epoch(), 9);
         // RF=1: the leader IS the whole ISR, so a local append is already
         // committed and the engine's own `FollowLeo` must stay in force.
@@ -1492,7 +1633,7 @@ mod tests {
             Arc::new(LeaderMetrics::new()),
         );
         let handle = factory.spawn(&a, vec![]).expect("spawn");
-        let part = cluster.partition("org-1", "orders", 0).unwrap();
+        let part = cluster.partition("org-1", "orders", 0, 0).unwrap();
         assert_eq!(part.leader_epoch(), 9);
         assert_eq!(part.hw_tracking(), HwTracking::Manual);
 
@@ -1500,6 +1641,244 @@ mod tests {
         // set `Manual` itself (`stop()`'s own doc, PLAN-M2 §1e item 1).
         handle.stop();
         assert_eq!(part.hw_tracking(), HwTracking::Manual);
+    }
+
+    /// Equal-epoch fence between preflight and append: this node leads epoch
+    /// 5 and admitted a publish; a peer's Hello at the same epoch wins the
+    /// tie and this leader is stopped (`accept_hello`'s fence). The epoch
+    /// number is still 5, so only the end of the leadership stint can refuse
+    /// the admitted write — it would otherwise land at the follower log end,
+    /// stamped 5, beside the winner's own record at the same offset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_leader_handle_refuses_writes_it_admitted_at_the_same_epoch() {
+        let provider = FakeNodeProvider::new();
+        let mut a = assignment(&["l", "f1"], "l", &["l", "f1"], 5);
+        a.partition = 3;
+        let factory = GlueLeaderFactory::new(
+            "l",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider) as Arc<dyn PartitionProvider>,
+            Arc::new(DeadTransport) as Arc<dyn Transport>,
+            fast_leader_config(),
+            Arc::new(LeaderMetrics::new()),
+        );
+        let factory = Arc::new(factory);
+        let spawn = |factory: Arc<GlueLeaderFactory>, term: PartitionAssignment| {
+            tokio::task::spawn_blocking(move || factory.spawn(&term, Vec::new()))
+        };
+        let handle = spawn(Arc::clone(&factory), a.clone())
+            .await
+            .unwrap()
+            .expect("leader spawn");
+        // The serving handle: installed, so its writes open.
+        handle.open_writes();
+        // A promotion and the assignment poll can both spawn a handle for one
+        // term; the spare is never installed and never opens writes. Alive
+        // while the serving handle is fenced, it must not keep them open
+        // (M1: a count of spawned handles did).
+        let spare = spawn(Arc::clone(&factory), a.clone())
+            .await
+            .unwrap()
+            .expect("spare spawn");
+        let part = provider
+            .partition("org-1", "orders", 3, a.topic_generation)
+            .unwrap();
+        // `append_batch*` blocks its thread on the writer; off the runtime.
+        let append = |part: Partition| {
+            tokio::task::spawn_blocking(move || {
+                let mut b = tentaflow_bus::BatchBuilder::new(part.log_end_offset(), 1);
+                b.push(tentaflow_bus::RecordInput::new(
+                    bytes::Bytes::from_static(b"admitted"),
+                    0,
+                ))
+                .unwrap();
+                part.append_batch_as_leader(b.build().unwrap(), 5)
+            })
+        };
+        append(part.clone())
+            .await
+            .unwrap()
+            .expect("a live stint writes");
+
+        tokio::task::spawn_blocking(move || handle.stop())
+            .await
+            .unwrap();
+        assert_eq!(
+            part.leader_epoch(),
+            5,
+            "an equal-epoch fence keeps the number"
+        );
+        assert!(matches!(
+            append(part.clone()).await.unwrap(),
+            Err(tentaflow_bus::BusError::LeaderWritesClosed)
+        ));
+        tokio::task::spawn_blocking(move || spare.stop())
+            .await
+            .unwrap();
+        assert_eq!(part.log_end_offset(), 1);
+    }
+
+    /// X1, the RF=3 scenario end to end over real partitions and streams:
+    /// `a` wrote 0..20 in term 3 and `b` holds all of it; `c` fell behind at
+    /// 12. `a` is re-elected in term 4 with `c` and re-feeds it the term-3
+    /// records. Stamped with the stream's term, `c` recorded them as term-4
+    /// records and outranked `b` — winning, it would cut `b`'s acknowledged
+    /// records. Each record keeps the epoch it was written in, so `c` ranks
+    /// no higher than `b`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn records_re_fed_in_a_new_term_keep_the_term_they_were_written_in() {
+        let provider_a = FakeNodeProvider::new();
+        let provider_b = FakeNodeProvider::new();
+        let provider_c = FakeNodeProvider::new();
+        let old_term = assignment(&["a", "b", "c"], "a", &["a", "b", "c"], 3);
+        for (provider, records) in [(&provider_a, 20), (&provider_b, 20), (&provider_c, 12)] {
+            let part = provider.partition("org-1", "orders", 0, 0).unwrap();
+            part.set_hw_tracking(HwTracking::Manual);
+            part.set_leader_epoch(old_term.leader_epoch).unwrap();
+            publish_n(&part, records, "t3").await;
+        }
+
+        let new_term = assignment(&["a", "b", "c"], "a", &["a", "c"], 4);
+        let leader_factory = GlueLeaderFactory::new(
+            "a",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider_a) as Arc<dyn PartitionProvider>,
+            Arc::new(DeadTransport) as Arc<dyn Transport>,
+            fast_leader_config(),
+            Arc::new(LeaderMetrics::new()),
+        );
+        let factory_b = GlueFollowerFactory::new(
+            "b",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider_b) as Arc<dyn PartitionProvider>,
+            fast_follower_config(),
+        );
+        let factory_c = GlueFollowerFactory::new(
+            "c",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider_c) as Arc<dyn PartitionProvider>,
+            fast_follower_config(),
+        );
+        let ((leader_recv, leader_send), (mut c_recv, c_send)) = duplex_pair();
+        let term = new_term.clone();
+        let leader = tokio::task::spawn_blocking(move || {
+            leader_factory.spawn(&term, vec![("c".to_string(), leader_recv, leader_send)])
+        })
+        .await
+        .unwrap()
+        .expect("leader spawn");
+        let hello = match crate::bus::replication::frames::read_frame(&mut c_recv)
+            .await
+            .expect("c: read Hello")
+        {
+            crate::bus::replication::frames::ReplFrame::Hello(h) => h,
+            other => panic!("c: expected Hello, got {other:?}"),
+        };
+        let term = new_term.clone();
+        let runner = tokio::task::spawn_blocking(move || {
+            factory_c.spawn(&term, hello, Box::new(c_recv), Box::new(c_send))
+        })
+        .await
+        .unwrap()
+        .expect("c runner");
+
+        let c_part = provider_c.partition("org-1", "orders", 0, 0).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while c_part.log_end_offset() < 20 {
+            assert!(std::time::Instant::now() < deadline, "c was never fed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(c_part.leader_epoch(), 4, "the stream's term fences");
+        assert_eq!(
+            c_part.log_epoch(),
+            3,
+            "re-fed term-3 records are term-3 records"
+        );
+
+        let b = factory_b.local_log_position(&new_term).unwrap();
+        let c = factory_c_position(&provider_c, &new_term);
+        assert_eq!(
+            crate::bus::replication::election::choose_candidate(
+                &["b".to_string(), "c".to_string()],
+                &[("b".to_string(), b), ("c".to_string(), c)],
+                "c",
+            ),
+            Some("b".to_string()),
+            "c's copy of term 3 must not outrank b's: b={b:?} c={c:?}"
+        );
+        runner.stop();
+        leader.stop();
+    }
+
+    fn factory_c_position(
+        provider: &Arc<FakeNodeProvider>,
+        assignment: &PartitionAssignment,
+    ) -> LogPosition {
+        GlueFollowerFactory::new(
+            "c",
+            NodeEnvironment::Prod,
+            Arc::clone(provider) as Arc<dyn PartitionProvider>,
+            fast_follower_config(),
+        )
+        .local_log_position(assignment)
+        .unwrap()
+    }
+
+    /// A follower no leader has dialed must outwait a LIVE leader's longest
+    /// redial — the runner lease plus the leader's reconnect backoff and a
+    /// connect — or every follower restart would elect over a healthy one.
+    #[test]
+    fn the_undialed_lease_outlasts_a_live_leaders_longest_redial() {
+        let cluster = FakeNodeProvider::new();
+        let config = FollowerConfig::default();
+        let factory = GlueFollowerFactory::new(
+            "f1",
+            NodeEnvironment::Prod,
+            cluster as Arc<dyn PartitionProvider>,
+            config,
+        );
+        assert!(factory.undialed_lease() > config.leader_lease + RECONNECT_BACKOFF_MAX);
+    }
+
+    /// The local log a runner-less entry answers and stands with carries the
+    /// epoch its records were written under — not the epoch a later leader
+    /// stamped — and its committed offset; cutting it to that offset leaves
+    /// exactly the majority-held prefix.
+    #[tokio::test]
+    async fn the_local_log_reports_its_written_epoch_and_cuts_to_its_committed_offset() {
+        let cluster = FakeNodeProvider::new();
+        let mut a = assignment(&["l", "f1"], "l", &["l", "f1"], 4);
+        a.partition = 2;
+        let part = cluster
+            .partition("org-1", "orders", 2, a.topic_generation)
+            .unwrap();
+        part.set_hw_tracking(HwTracking::Manual);
+        part.set_leader_epoch(3).unwrap();
+        publish_n(&part, 5, "r").await;
+        part.set_committed_offset(2);
+        part.set_leader_epoch(4).unwrap();
+        let factory = GlueFollowerFactory::new(
+            "f1",
+            NodeEnvironment::Prod,
+            Arc::clone(&cluster) as Arc<dyn PartitionProvider>,
+            fast_follower_config(),
+        );
+        assert_eq!(
+            factory.local_log_position(&a).expect("local log"),
+            LogPosition {
+                epoch: 3,
+                leo: 5,
+                committed: 2,
+            }
+        );
+        assert_eq!(
+            factory.cut_to_committed(&a).expect("cut"),
+            LogPosition {
+                epoch: 3,
+                leo: 2,
+                committed: 2,
+            }
+        );
     }
 
     /// `GlueFollowerFactory::spawn` must set `HwTracking::Manual` on the
@@ -1533,6 +1912,7 @@ mod tests {
             leader_epoch: a.leader_epoch,
             replicas: a.replicas.clone(),
             environment: NodeEnvironment::Prod,
+            topic_generation: Some(0),
         };
         let runner = factory
             .spawn(&a, hello, Box::new(recv), Box::new(send))
@@ -1552,7 +1932,7 @@ mod tests {
             other => panic!("expected HelloAck, got {other:?}"),
         }
 
-        let part = cluster.partition("org-1", "orders", 1).unwrap();
+        let part = cluster.partition("org-1", "orders", 1, 0).unwrap();
         assert_eq!(part.hw_tracking(), HwTracking::Manual);
         assert!(!runner.lease_expired());
 

@@ -1076,6 +1076,21 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "code_workspaces_release_deleted_slugs",
             MigrationStep::Sql(CODE_WORKSPACES_RELEASE_DELETED_SLUGS),
         ),
+        (
+            172,
+            "bus_topic_incarnations",
+            MigrationStep::Sql(BUS_TOPIC_INCARNATIONS),
+        ),
+        (
+            173,
+            "bus_orphan_assignments",
+            MigrationStep::Rust(bus_delete_orphan_assignments),
+        ),
+        (
+            174,
+            "bus_topic_tombstones",
+            MigrationStep::Sql(BUS_TOPIC_TOMBSTONES),
+        ),
     ]
 }
 
@@ -1598,6 +1613,30 @@ CREATE TABLE IF NOT EXISTS map_device_sessions (
 );
 CREATE INDEX IF NOT EXISTS map_device_sessions_scene ON map_device_sessions(scene_id);
 "#;
+
+// v173 — placements whose topic is gone. Before v172 a topic delete that
+// reached a node through the ledger removed only the topic row: its
+// placements stayed, kept electing leaders for a topic that no longer
+// existed and outranked the next incarnation's epoch-1 placement. The
+// materializer now removes them with the topic; this clears what earlier
+// builds left behind. Placements of topics whose row exists are untouched.
+fn bus_delete_orphan_assignments(conn: &Connection) -> Result<()> {
+    let removed = conn.execute(
+        "DELETE FROM bus_partition_assignments \
+         WHERE NOT EXISTS (SELECT 1 FROM bus_topics t \
+                           WHERE t.instance_id = bus_partition_assignments.instance_id \
+                             AND t.org_id = bus_partition_assignments.org_id \
+                             AND t.name = bus_partition_assignments.topic)",
+        [],
+    )?;
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            "migration: removed partition placements of deleted TentaBus topics"
+        );
+    }
+    Ok(())
+}
 
 // v170 — who may see and change the map.
 //
@@ -9861,6 +9900,37 @@ CREATE INDEX IF NOT EXISTS idx_bus_topics_scope
     ON bus_topics(instance_id, org_id, environment);
 "#;
 
+/// v174 — which generation a topic delete removed. `core.bus_topic` ops are
+/// ordered by (generation concerned, HLC); for a deleted name the stored
+/// side of that key is the removed generation, which the delete's own HLC
+/// cannot stand in for (a re-creation stamped before a concurrent delete of
+/// the old incarnation would lose to it). A delete recorded before this
+/// table removed a topic from before incarnations: generation `0`
+/// (`core_materializer::topic_incarnation`).
+const BUS_TOPIC_TOMBSTONES: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_topic_tombstones (
+    instance_id TEXT NOT NULL,
+    org_id      TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    generation  INTEGER NOT NULL,
+    PRIMARY KEY (instance_id, org_id, name)
+);
+"#;
+
+/// A deleted and re-created topic is a new incarnation whose placements
+/// restart at epoch 1, so epochs alone cannot order them against the
+/// deleted incarnation's. `bus_topics.generation` names the incarnation:
+/// the packed HLC of its creation (`repository::bus_topic_generation_at`),
+/// stamped once on the row and replicated with it; the row's ops are ordered
+/// by it first and by the ledger's LWW stamp only within one incarnation
+/// (`core_materializer::bus_topic_op_wins`). Every placement records
+/// the incarnation it was proposed for (`topic_generation`). `0` on both is
+/// the incarnation of every topic created before this migration.
+const BUS_TOPIC_INCARNATIONS: &str = r#"
+ALTER TABLE bus_topics ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE bus_partition_assignments ADD COLUMN topic_generation INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// v142 — TentaBus M2 replication (`SUM/tentabus/PLAN-M2.md` §1c/§2,
 /// K-M2-4): `bus_partition_assignments` is a MATERIALIZATION of the sync
 /// ledger's `CoreSyncResourceKind::BusPartitionAssignment` resource, not a
@@ -13550,6 +13620,62 @@ mod tests {
         // Idempotent: re-running finds nothing left to touch.
         let reset_again = normalize_legacy_bus_topics_validation(&conn).unwrap();
         assert_eq!(reset_again, 0);
+    }
+
+    /// v173: a placement whose topic row is gone (deleted before v172, when
+    /// a ledger delete left placements behind) is removed; the placements of
+    /// a topic that exists — in this instance and org — are not, and neither
+    /// is a same-named topic's placement in another instance.
+    #[test]
+    fn migration_173_removes_only_placements_without_a_topic() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO bus_topics (\
+                instance_id, org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                acks, durability, max_inline_bytes, compression, environment, \
+                created_at_ms, updated_at_ms \
+             ) VALUES (\
+                'tentabus-00000001', 'org-1', 'orders.live', 1, 604800000, 10737418240, 'delete', \
+                'at_least_once', NULL, 86400000, 5, 1000, NULL, 'off', \
+                'application/octet-stream', 3, 'quorum', 'fsync_batch_full', 1048576, \
+                'lz4', 'prod', 1000, 1000 \
+             )",
+            [],
+        )
+        .unwrap();
+        for (instance, topic) in [
+            ("tentabus-00000001", "orders.live"),
+            ("tentabus-00000001", "orders.deleted"),
+            ("tentabus-00000002", "orders.live"),
+        ] {
+            conn.execute(
+                "INSERT INTO bus_partition_assignments \
+                 (instance_id, org_id, topic, partition, leader_node_id, replicas, isr, \
+                  leader_epoch, environment, updated_at_ms) \
+                 VALUES (?1, 'org-1', ?2, 0, 'node-a', '[\"node-a\"]', '[\"node-a\"]', 3, \
+                  'prod', 0)",
+                rusqlite::params![instance, topic],
+            )
+            .unwrap();
+        }
+
+        bus_delete_orphan_assignments(&conn).unwrap();
+
+        let mut left: Vec<(String, String)> = conn
+            .prepare("SELECT instance_id, topic FROM bus_partition_assignments ORDER BY 1, 2")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![("tentabus-00000001".to_string(), "orders.live".to_string())]
+        );
     }
 
     #[test]

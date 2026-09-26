@@ -13,10 +13,18 @@
 // only source of truth for it — this field is never read back into that
 // computation.
 //
-// Format (fixed 30 bytes, little-endian):
-// `[u32 magic][u16 ver][u64 hw][u32 leader_epoch][u64 leo_hint][u32 crc32c]`.
-// `crc32c` covers every byte before it. Written atomically: a temp file is
-// written and fsynced, then renamed over the real path (POSIX rename is
+// Format (little-endian): the fixed 30-byte v1 record
+// `[u32 magic][u16 ver=1][u64 hw][u32 leader_epoch][u64 leo_hint][u32 crc32c]`,
+// byte-identical to what every earlier build writes and reads, followed by
+// an extension `[u64 committed_offset][u32 crc32c]` (42 bytes in all). The
+// first CRC covers bytes 0..26, the second bytes 0..38. An older build reads
+// the first 30 bytes and ignores the rest, so a downgrade still finds its
+// `hw` and `leader_epoch` (reading "missing" instead would expose every
+// uncommitted record and disable epoch fencing); a newer build reading a
+// bare 30-byte file gets `committed_offset: None`.
+//
+// Written atomically: a temp file is written and fsynced, then renamed over
+// the real path (POSIX rename is
 // atomic within one filesystem), then the containing directory is fsynced
 // so the rename itself survives a crash — the same discipline
 // `segment::fsync_dir` uses for segment/roll durability (duplicated here
@@ -40,7 +48,8 @@ use crate::error::{BusError, Result};
 
 const MAGIC: u32 = 0x5442_4d31; // ASCII-ish "TBM1" — TentaBus partition Meta v1
 const VERSION: u16 = 1;
-const ENCODED_LEN: usize = 4 + 2 + 8 + 4 + 8 + 4; // 30 bytes
+const V1_LEN: usize = 4 + 2 + 8 + 4 + 8 + 4; // 30 bytes
+const ENCODED_LEN: usize = V1_LEN + 8 + 4; // 42 bytes
 
 pub fn meta_path(dir: &Path) -> PathBuf {
     dir.join("partition.meta")
@@ -57,6 +66,8 @@ pub struct PartitionMeta {
     pub high_watermark: u64,
     pub leader_epoch: u32,
     pub leo_hint: u64,
+    /// `Partition::committed_offset`; `None` when the file predates it.
+    pub committed_offset: Option<u64>,
 }
 
 impl PartitionMeta {
@@ -69,6 +80,9 @@ impl PartitionMeta {
         buf[18..26].copy_from_slice(&self.leo_hint.to_le_bytes());
         let crc = crc32c::crc32c(&buf[..26]);
         buf[26..30].copy_from_slice(&crc.to_le_bytes());
+        buf[30..38].copy_from_slice(&self.committed_offset.unwrap_or(0).to_le_bytes());
+        let crc = crc32c::crc32c(&buf[..38]);
+        buf[38..42].copy_from_slice(&crc.to_le_bytes());
         buf
     }
 
@@ -78,10 +92,16 @@ impl PartitionMeta {
     /// caller (`read_meta`) logs a warning in that case and falls back
     /// exactly as if the file did not exist at all.
     fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < ENCODED_LEN {
+        if buf.len() < V1_LEN {
             return None;
         }
-        let buf = &buf[..ENCODED_LEN];
+        let extension = buf
+            .get(..ENCODED_LEN)
+            .filter(|ext| {
+                crc32c::crc32c(&ext[..38]) == u32::from_le_bytes(ext[38..42].try_into().unwrap())
+            })
+            .map(|ext| u64::from_le_bytes(ext[30..38].try_into().unwrap()));
+        let buf = &buf[..V1_LEN];
         let magic = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         if magic != MAGIC {
             return None;
@@ -98,6 +118,7 @@ impl PartitionMeta {
             high_watermark: u64::from_le_bytes(buf[6..14].try_into().unwrap()),
             leader_epoch: u32::from_le_bytes(buf[14..18].try_into().unwrap()),
             leo_hint: u64::from_le_bytes(buf[18..26].try_into().unwrap()),
+            committed_offset: extension,
         })
     }
 }
@@ -173,6 +194,7 @@ mod tests {
             high_watermark: 42,
             leader_epoch: 7,
             leo_hint: 100,
+            committed_offset: Some(40),
         };
         write_meta(&dir, &meta).unwrap();
         assert_eq!(read_meta(&dir), Some(meta));
@@ -187,6 +209,7 @@ mod tests {
                 high_watermark: 1,
                 leader_epoch: 0,
                 leo_hint: 1,
+                committed_offset: Some(0),
             },
         )
         .unwrap();
@@ -196,6 +219,7 @@ mod tests {
                 high_watermark: 99,
                 leader_epoch: 3,
                 leo_hint: 99,
+                committed_offset: Some(0),
             },
         )
         .unwrap();
@@ -230,6 +254,7 @@ mod tests {
             high_watermark: 5,
             leader_epoch: 1,
             leo_hint: 5,
+            committed_offset: Some(0),
         };
         let mut bytes = meta.encode().to_vec();
         // Flip a byte inside the payload without touching the trailing CRC
@@ -246,11 +271,80 @@ mod tests {
             high_watermark: 1,
             leader_epoch: 1,
             leo_hint: 1,
+            committed_offset: Some(0),
         }
         .encode()
         .to_vec();
         bytes[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
         std::fs::write(meta_path(&dir), &bytes).unwrap();
         assert_eq!(read_meta(&dir), None);
+    }
+
+    /// The 30-byte record exactly as every earlier build writes it.
+    fn v1_bytes(hw: u64, leader_epoch: u32, leo_hint: u64) -> [u8; V1_LEN] {
+        let mut buf = [0u8; V1_LEN];
+        buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        buf[6..14].copy_from_slice(&hw.to_le_bytes());
+        buf[14..18].copy_from_slice(&leader_epoch.to_le_bytes());
+        buf[18..26].copy_from_slice(&leo_hint.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[..26]);
+        buf[26..30].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// The decoder of every build before the extension, verbatim in what it
+    /// checks: at least 30 bytes, magic, version 1, CRC over bytes 0..26.
+    fn decode_like_an_older_build(buf: &[u8]) -> Option<(u64, u32, u64)> {
+        if buf.len() < V1_LEN {
+            return None;
+        }
+        let buf = &buf[..V1_LEN];
+        if u32::from_le_bytes(buf[0..4].try_into().unwrap()) != MAGIC
+            || u16::from_le_bytes(buf[4..6].try_into().unwrap()) != 1
+            || crc32c::crc32c(&buf[..26]) != u32::from_le_bytes(buf[26..30].try_into().unwrap())
+        {
+            return None;
+        }
+        Some((
+            u64::from_le_bytes(buf[6..14].try_into().unwrap()),
+            u32::from_le_bytes(buf[14..18].try_into().unwrap()),
+            u64::from_le_bytes(buf[18..26].try_into().unwrap()),
+        ))
+    }
+
+    /// A downgraded binary must still read what this build wrote: reading it
+    /// as "missing" would open with `hw = leo` (every uncommitted record
+    /// visible) and `leader_epoch = 0` (no fencing).
+    #[test]
+    fn an_older_build_reads_the_extended_file_as_its_own_record() {
+        let meta = PartitionMeta {
+            high_watermark: 42,
+            leader_epoch: 7,
+            leo_hint: 100,
+            committed_offset: Some(40),
+        };
+        assert_eq!(
+            decode_like_an_older_build(&meta.encode()),
+            Some((42, 7, 100))
+        );
+        assert_eq!(&meta.encode()[..V1_LEN], &v1_bytes(42, 7, 100)[..]);
+    }
+
+    /// And this build reads what an older one wrote, without a committed
+    /// offset it never recorded.
+    #[test]
+    fn a_file_from_an_older_build_reads_without_a_committed_offset() {
+        let dir = temp_dir("meta-v1");
+        std::fs::write(meta_path(&dir), v1_bytes(42, 7, 100)).unwrap();
+        assert_eq!(
+            read_meta(&dir),
+            Some(PartitionMeta {
+                high_watermark: 42,
+                leader_epoch: 7,
+                leo_hint: 100,
+                committed_offset: None,
+            })
+        );
     }
 }

@@ -761,6 +761,12 @@ pub struct TopicConfig {
     pub environment: NodeEnvironment,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Which incarnation of this name the config belongs to
+    /// (`DbBusTopic::generation`): stamped by `from_options` at creation,
+    /// never changed by an update. Every placement of the topic carries it
+    /// (`PartitionAssignment::topic_generation`), and so does the local log
+    /// directory (`BusService::ensure_topic_incarnation`).
+    pub generation: u64,
 }
 
 /// Partial overrides for `create_topic`/`update_topic`; unset fields fall
@@ -872,6 +878,9 @@ impl TopicConfig {
             environment,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            // The creator's HLC is past every delete it has observed, so an
+            // incarnation created after a delete always sorts after it.
+            generation: repository::bus_topic_generation_at(&crate::sync::runtime::core_hlc_now()),
         };
         validate_ranges(&cfg)?;
         Ok(cfg)
@@ -1036,6 +1045,7 @@ impl From<&TopicConfig> for DbBusTopic {
             created_at_ms: c.created_at_ms,
             updated_at_ms: c.updated_at_ms,
             durability_class: c.durability_class.map(|k| k.as_str().to_string()),
+            generation: c.generation,
         }
     }
 }
@@ -1088,6 +1098,7 @@ impl TryFrom<DbBusTopic> for TopicConfig {
                 .ok_or_else(|| bad("environment", &row.environment))?,
             created_at_ms: row.created_at_ms,
             updated_at_ms: row.updated_at_ms,
+            generation: row.generation,
         })
     }
 }

@@ -6,6 +6,50 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **TentaBus replication safety needs every node on this release.** The
+  protection against losing acknowledged records holds only once every node of
+  a cluster runs it: an older node sends neither log epochs nor committed
+  offsets and is judged by offsets alone, as before. Partitions written by an
+  older release open with no recorded epochs and a committed offset of 0, so
+  the first leader to reach them re-feeds more than it would otherwise.
+
+### TentaBus
+
+- Fixed two leaders serving one partition at once: a node could accept another
+  leader's announcement and still promote itself (present in `0.3.0-beta`).
+- A topic deleted and created again under the same name is a new incarnation
+  on every node: a node wipes the old incarnation's data before opening the new
+  one, a leader of the old incarnation cannot take over a replica of the new
+  one, and nodes agree on the incarnation under concurrent create and delete.
+  Assignments and directories left by topics deleted before this release are
+  cleaned up at migration and startup.
+- A follower learns a raised commit offset immediately instead of at the next
+  heartbeat, removing a delay of up to one heartbeat (about 0.5 s) before a
+  record acknowledged without a following batch reaches followers' consumers.
+- Replication records, for every record, the leader epoch it was first written
+  in (a new `partition.epochs` file per partition) and ranks logs by the epoch
+  of their last record; a majority-derived committed offset (appended to
+  `partition.meta` after the unchanged 30-byte v1 record, so a downgraded
+  binary still reads its own fields) bounds every reconciliation, and an
+  election needs replies from a majority of replicas. A deposed or hung leader
+  can no longer win with an unreplicated tail, overwrite committed records, or
+  keep writing after it lost leadership; a node that lost an election stands
+  again when the winner fails.
+- Partitions with a replication factor of 2 now favour availability, like
+  Kafka: when one replica is down, the surviving in-sync replica keeps leading
+  (or is elected) and keeps accepting `acks=leader` and `acks=all` writes;
+  `acks=quorum` still needs both replicas. Accepted risk: a write acknowledged
+  only by the survivor is lost if the survivor is lost too; and a plain network
+  split between the two replicas — no node has to fail — lets both lead at once
+  until they reach each other again and one is fenced. The newer leadership
+  wins, and the losing side's writes that never reached the winner are dropped.
+  Partitions with three or more replicas keep requiring a majority.
+- `acks=all` waits for the live in-sync replicas (never fewer than a majority
+  at RF≥3) instead of the ISR recorded in the ledger, so a dead follower no
+  longer blocks `acks=all` writes.
+
 ## [0.3.0-beta] — 2026-09-24
 
 Changes since `0.2.0-beta`. That tag never produced a published release (its

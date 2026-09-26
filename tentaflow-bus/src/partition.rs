@@ -90,6 +90,7 @@ use std::sync::mpsc as std_mpsc;
 use tokio::sync::oneshot;
 
 use crate::batch::{BatchHeader, BatchView, BATCH_HEADER_LEN};
+use crate::epochs::{read_epochs, write_epochs, EpochTable};
 use crate::error::{BusError, Result};
 use crate::index::{
     floor_offset, floor_time, OffsetEntry, OffsetIndex, SharedEntries, TimeEntry, TimeIndex,
@@ -208,6 +209,7 @@ pub struct SealedSegmentInfo {
 enum WriterCommand {
     Append {
         batch: Bytes,
+        epoch: Option<u32>,
         resp: oneshot::Sender<Result<AppendResult>>,
     },
     /// Follower-side append (`Partition::append_replicated`): `batch` is
@@ -217,6 +219,7 @@ enum WriterCommand {
     AppendReplicated {
         batch: Bytes,
         leader_epoch: u32,
+        record_epoch: u32,
         resp: oneshot::Sender<Result<AppendResult>>,
     },
     /// `resp` is a plain `std::sync::mpsc::SyncSender`, not tokio's
@@ -232,24 +235,46 @@ enum WriterCommand {
         /// Lowers `high_watermark` to the post-truncate `log_end_offset`
         /// instead of refusing when the truncation point sits below it.
         ///
-        /// Set ONLY by `Partition::truncate_to_offset_for_leader_authority`,
-        /// i.e. by a follower applying a `Truncate` frame from the leader
-        /// whose `Hello` it has already accepted. Every other caller sends
-        /// `false` and keeps today's refusal semantics exactly.
+        /// Set ONLY by `Partition::truncate_to_offset_for_leader_authority`.
+        /// Every other caller sends `false` and keeps the refusal semantics.
         reset_hw: bool,
         resp: std_mpsc::SyncSender<Result<u64>>,
     },
     PersistMeta {
         resp: std_mpsc::SyncSender<Result<()>>,
     },
+    /// Changes that must be ordered against every append: they run on the
+    /// writer thread between two appends, never during one.
+    Fence {
+        op: FenceOp,
+        resp: std_mpsc::SyncSender<Result<()>>,
+    },
+}
+
+/// See `WriterCommand::Fence`.
+enum FenceOp {
+    /// `Partition::set_leader_epoch`.
+    RaiseEpoch(u32),
+    /// `Partition::close_leader_writes`.
+    CloseLeaderWrites,
 }
 
 /// What kind of append `append_one` is performing — the one place the
 /// "patch the placeholder header" (`Append`) and "write the bytes as
 /// received" (`Replicated`, zero-copy) paths diverge.
 enum AppendKind {
-    Fresh(Bytes),
-    Replicated { batch: Bytes, leader_epoch: u32 },
+    /// A local append. `epoch` is the term a replication coordinator
+    /// admitted it under (`Partition::append_batch_as_leader`); `None` for a
+    /// partition no coordinator drives.
+    Fresh { batch: Bytes, epoch: Option<u32> },
+    /// `leader_epoch` fences (the sender must not be an older leader than
+    /// the one this partition accepted); `record_epoch` is the epoch the
+    /// batch was first written in, which the epoch table records.
+    Replicated {
+        batch: Bytes,
+        leader_epoch: u32,
+        record_epoch: u32,
+    },
 }
 
 /// One `Append`/`AppendReplicated` command, converted out of
@@ -322,6 +347,42 @@ struct PartitionState {
     /// `set_leader_epoch`. Persisted to `partition.meta` — see
     /// `Partition::flush_meta`/`meta.rs`.
     leader_epoch: AtomicU32,
+    /// The epoch every record was first written in (`epochs.rs`): a local
+    /// append takes `leader_epoch`, a replicated one the epoch the leader
+    /// says the record was written in — never the term of a leader that
+    /// merely accepted or re-fed it. Only the writer thread changes it, and
+    /// always persisted first (see `epochs.rs` for the ordering).
+    epochs: RwLock<EpochTable>,
+    /// The in-memory epoch table is ahead of `partition.epochs` on disk: a
+    /// trim could not be written. Rewritten, and cleared, by the next
+    /// append or meta flush that can write it (`rewrite_epochs_if_dirty`).
+    epochs_dirty: AtomicBool,
+    /// Like `epochs_dirty`, for `partition.meta`: a write failed after the
+    /// state it records (a raised `leader_epoch`, above all) was already in
+    /// memory. Every command retries it before acting (`persist_meta_now`
+    /// sets and clears it).
+    meta_dirty: AtomicBool,
+    /// How many serving leader handles of this partition have leader writes
+    /// open: a handle opens them when the replication manager installs it as
+    /// the serving one (`Partition::open_leader_writes`; a spare is never
+    /// installed and never opens) and closes them once when stopped
+    /// (`Partition::close_leader_writes`, on the writer thread, so no write
+    /// it admitted lands after the close returns). `append_batch_as_leader`
+    /// lands only while one is open — the epoch number alone cannot tell two
+    /// leaders of one epoch apart. A count, not a flag: a promotion
+    /// switch-over opens the new handle before it stops the old one, and
+    /// that stop must not close the new handle's writes.
+    leader_writes: AtomicU64,
+    /// The offset below which every record is known to be on a majority
+    /// of the replica set: the leader computes it from its followers'
+    /// acknowledged offsets whatever the topic's `acks` level, and ships it
+    /// to followers with every batch and heartbeat. Unlike
+    /// `high_watermark` (the consumer-visibility bound, which `acks=leader`
+    /// lets run ahead of any majority) it is the bound a replica may be cut
+    /// back to without losing an acknowledged write, and the one bound a
+    /// leader-authority truncate refuses to go below. Monotonic within a
+    /// lineage, never above `log_end_offset`.
+    committed_offset: AtomicU64,
     /// M2 (PLAN-M2 §1a): wakes replication feeders (`subscribe_leo`)
     /// without polling. Published alongside `log_end_offset` in
     /// `process_group`, right after the atomic itself so a receiver that
@@ -352,6 +413,10 @@ struct PartitionState {
     /// Test-only fault injection: the next timer fsync reports failure.
     #[cfg(test)]
     fail_interval_fsync: AtomicBool,
+    /// Test-only: how long (ms) a leader write holds between reading the
+    /// partition's epoch and raising it, to make a racing raise land there.
+    #[cfg(test)]
+    epoch_raise_pause_ms: AtomicU64,
     /// Set once by `Partition::detach` (the owning topic/organization was
     /// deleted). Every read/write operation checks this before touching
     /// `segments`, which `detach` has cleared.
@@ -510,8 +575,22 @@ fn persist_meta_now(dir: &Path, state: &PartitionState) -> Result<()> {
         high_watermark: state.high_watermark.load(Ordering::Acquire),
         leader_epoch: state.leader_epoch.load(Ordering::Acquire),
         leo_hint: state.log_end_offset.load(Ordering::Acquire),
+        committed_offset: Some(state.committed_offset.load(Ordering::Acquire)),
     };
-    crate::meta::write_meta(dir, &meta)
+    let written = crate::meta::write_meta(dir, &meta);
+    state.meta_dirty.store(written.is_err(), Ordering::Release);
+    written
+}
+
+/// Before an append acts: whatever an earlier failed write left only in
+/// memory — the epoch table, `partition.meta` — goes to disk first, or the
+/// append fails. An append must not build on state a restart would lose.
+fn persist_if_dirty(dir: &Path, state: &PartitionState) -> Result<()> {
+    rewrite_epochs_if_dirty(dir, state)?;
+    if state.meta_dirty.load(Ordering::Acquire) {
+        persist_meta_now(dir, state)?;
+    }
+    Ok(())
 }
 
 /// One job's outcome after its positional write and index updates, but
@@ -569,20 +648,51 @@ fn append_one(
     if handles.active_segment.should_roll(roll_policy) {
         roll(dir, roll_policy, state, handles, base_offset)?;
     }
+    persist_if_dirty(dir, state)?;
 
-    let (header, patched, skip_hw) = match kind {
-        AppendKind::Fresh(batch) => {
+    let (header, patched, skip_hw, record_epoch) = match kind {
+        AppendKind::Fresh { batch, epoch } => {
             // Decoding against the whole buffer (not a pre-sliced
             // `&batch[..40]`) means a short buffer is rejected by
             // `BatchHeader::decode`'s own length check instead of
             // panicking at the slice expression itself.
             let header = BatchHeader::decode(&batch)?;
+            // A write admitted as leader of `epoch` lands only while this
+            // partition still recognizes that term. A newer leader's Hello
+            // or a step-down raised it meanwhile: the write would sit in a
+            // log that now belongs to another term, stamped as if it did.
+            if let Some(epoch) = epoch {
+                if state.leader_writes.load(Ordering::Acquire) == 0 {
+                    return Err(BusError::LeaderWritesClosed);
+                }
+                // Read, compared and raised on the writer thread, the only
+                // thread that changes `leader_epoch`: nothing can raise it
+                // between this check and the write below.
+                let have = state.leader_epoch.load(Ordering::Acquire);
+                if have > epoch {
+                    return Err(BusError::LeaderEpochStale { have, got: epoch });
+                }
+                if have < epoch {
+                    #[cfg(test)]
+                    std::thread::sleep(Duration::from_millis(
+                        state.epoch_raise_pause_ms.load(Ordering::Acquire),
+                    ));
+                    // The leader stamps its term on the partition after the
+                    // fact (`spawn_deferred`); a write admitted in that term
+                    // lands the stamp itself, here on the writer thread.
+                    state.leader_epoch.fetch_max(epoch, Ordering::AcqRel);
+                    // Failing, it leaves `meta_dirty` set: the next command
+                    // writes the raised epoch before acting.
+                    persist_meta_now(dir, state)?;
+                }
+            }
             let patched = patch_base_offset(batch, base_offset);
-            (header, patched, false)
+            (header, patched, false, epoch)
         }
         AppendKind::Replicated {
             batch,
             leader_epoch,
+            record_epoch,
         } => {
             let header = BatchHeader::decode(&batch)?;
             if header.base_offset != base_offset {
@@ -598,12 +708,32 @@ fn append_one(
                     got: leader_epoch,
                 });
             }
+            // No leader holds records of a term later than its own.
+            if record_epoch > leader_epoch {
+                return Err(BusError::RecordEpochAhead {
+                    record_epoch,
+                    leader_epoch,
+                });
+            }
             // Zero-copy: `batch` is written verbatim, no
             // `patch_base_offset` call — its header already carries the
             // exact `base_offset` the leader assigned, just verified above.
-            (header, batch, true)
+            (header, batch, true, Some(record_epoch))
         }
     };
+
+    // The first record of a new epoch: its table entry goes to disk BEFORE
+    // the record does (`epochs.rs`), so a crash in between claims at most
+    // the one record that was about to land.
+    let record_epoch = match record_epoch {
+        Some(epoch) => epoch,
+        None => state.leader_epoch.load(Ordering::Acquire),
+    };
+    let grown = state.epochs.read().with_record(record_epoch, base_offset)?;
+    if let Some(grown) = grown {
+        write_epochs(dir, &grown)?;
+        *state.epochs.write() = grown;
+    }
 
     let segment_base_offset = handles.active_segment.base_offset();
     let pos_before = handles.active_segment.len();
@@ -910,6 +1040,16 @@ fn process_group(
         }
     }
 
+    // Before any caller hears back: an entry for a new epoch whose record
+    // never landed (a failed job, a rolled-back group) must be gone by then.
+    let log_end = landed
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().ok())
+        .map(|l| l.next_offset)
+        .max()
+        .unwrap_or_else(|| state.log_end_offset.load(Ordering::Acquire));
+    trim_epochs_to(dir, state, log_end);
+
     for (resp, outcome) in landed {
         let result = outcome.map(|l| {
             // Segment length is published *before* the high watermark: a
@@ -936,6 +1076,11 @@ fn process_group(
                 state
                     .high_watermark
                     .fetch_max(l.next_offset, Ordering::AcqRel);
+                // No replication drives this partition: its own copy is the
+                // whole replica set.
+                state
+                    .committed_offset
+                    .fetch_max(l.next_offset, Ordering::AcqRel);
             }
             // Published regardless of `HwTracking`/`skip_hw`: `subscribe_leo`
             // tracks `log_end_offset`, not `high_watermark` — see its own
@@ -953,6 +1098,58 @@ fn process_group(
     }
 
     straddled_poison
+}
+
+/// Drops epoch entries past `log_end` — left by a failed or rolled-back
+/// append (`append_one` writes a new epoch's entry before its record) or by
+/// a cut that ended below its target. On disk too when possible;
+/// `Partition::open` trims whatever a failed write leaves.
+fn trim_epochs_to(dir: &Path, state: &PartitionState, log_end: u64) {
+    let trimmed = state.epochs.read().truncated_to(log_end);
+    if let Some(trimmed) = trimmed {
+        *state.epochs.write() = trimmed.clone();
+        if let Err(e) = write_epochs(dir, &trimmed) {
+            // Left on disk, the stale entry could outlive a restart that
+            // recovers no fewer records (the open-time trim only drops
+            // entries past the recovered log end).
+            state.epochs_dirty.store(true, Ordering::Release);
+            tracing::warn!(
+                path = %dir.display(), error = %e,
+                "failed to drop an epoch entry from partition.epochs; retrying on the next write"
+            );
+        }
+    }
+}
+
+/// Writes the in-memory epoch table when a trim could not be (`trim_epochs_to`).
+fn rewrite_epochs_if_dirty(dir: &Path, state: &PartitionState) -> Result<()> {
+    if !state.epochs_dirty.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let table = state.epochs.read().clone();
+    write_epochs(dir, &table)?;
+    state.epochs_dirty.store(false, Ordering::Release);
+    Ok(())
+}
+
+/// Runs one `WriterCommand::Fence` on the writer thread.
+fn handle_fence_command(dir: &Path, state: &PartitionState, op: FenceOp) -> Result<()> {
+    match op {
+        FenceOp::RaiseEpoch(epoch) => {
+            let have = state.leader_epoch.load(Ordering::Acquire);
+            if epoch < have {
+                return Err(BusError::LeaderEpochStale { have, got: epoch });
+            }
+            state.leader_epoch.fetch_max(epoch, Ordering::AcqRel);
+            persist_meta_now(dir, state)
+        }
+        FenceOp::CloseLeaderWrites => {
+            let _ = state
+                .leader_writes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+            Ok(())
+        }
+    }
 }
 
 /// `boundary.new_len` as a `u32` file position, for `OffsetIndex::
@@ -1017,10 +1214,29 @@ fn truncate(
             return Err(BusError::TruncateBelowHighWatermark { hw, to: to_offset });
         }
     }
+    // No authority reaches below what a majority already holds: a leader
+    // asking for that lacks acknowledged writes, and obeying would lose
+    // them everywhere (`PartitionState::committed_offset`).
+    let committed = state.committed_offset.load(Ordering::Acquire);
+    if to_offset < committed {
+        return Err(BusError::TruncateBelowCommitted {
+            committed,
+            to: to_offset,
+        });
+    }
     let leo = state.log_end_offset.load(Ordering::Acquire);
     if to_offset >= leo {
         // Nothing to discard — the request is already satisfied.
         return Ok(leo);
+    }
+    // The epoch table first (`epochs.rs`): a crash after this but before the
+    // cut leaves it describing fewer records than the log — an older last
+    // epoch, never one whose records are gone. A failed write refuses the
+    // truncate instead of cutting under a table that would overstate.
+    let trimmed = state.epochs.read().truncated_to(to_offset);
+    if let Some(trimmed) = trimmed {
+        write_epochs(dir, &trimmed)?;
+        *state.epochs.write() = trimmed;
     }
 
     let mut segments = state.segments.write();
@@ -1125,6 +1341,12 @@ fn truncate(
             .high_watermark
             .fetch_min(new_leo, Ordering::AcqRel);
     }
+    state.committed_offset.fetch_min(new_leo, Ordering::AcqRel);
+    // A batch straddling `to_offset` went whole, so the log may end below
+    // it. The cut is done by now, so a failed write is reported, not
+    // returned: the caller must not take a done cut for a refused one, and
+    // `Partition::open` trims the file on the next start.
+    trim_epochs_to(dir, state, new_leo);
 
     // Rare and critical, like a leader-epoch change (PLAN-M2 §1a: "fix leo
     // + index + watch, persist meta") — persisted synchronously rather
@@ -1211,16 +1433,17 @@ fn drain_append_group(
 ) -> Option<WriterCommand> {
     while jobs.len() < GROUP_COMMIT_MAX_JOBS && *group_bytes < GROUP_COMMIT_MAX_BYTES {
         match rx.try_recv() {
-            Ok(WriterCommand::Append { batch, resp }) => {
+            Ok(WriterCommand::Append { batch, epoch, resp }) => {
                 *group_bytes += batch.len();
                 jobs.push(AppendJob {
-                    kind: AppendKind::Fresh(batch),
+                    kind: AppendKind::Fresh { batch, epoch },
                     resp,
                 });
             }
             Ok(WriterCommand::AppendReplicated {
                 batch,
                 leader_epoch,
+                record_epoch,
                 resp,
             }) => {
                 *group_bytes += batch.len();
@@ -1228,6 +1451,7 @@ fn drain_append_group(
                     kind: AppendKind::Replicated {
                         batch,
                         leader_epoch,
+                        record_epoch,
                     },
                     resp,
                 });
@@ -1279,6 +1503,7 @@ fn persist_meta_and_track(
     last_meta_flush: &mut Instant,
     last_persisted_hw: &mut u64,
 ) -> Result<()> {
+    rewrite_epochs_if_dirty(dir, state)?;
     let result = persist_meta_now(dir, state);
     if result.is_ok() {
         *last_meta_flush = Instant::now();
@@ -1328,10 +1553,10 @@ fn writer_loop(
 
         let mut pending_control: Option<WriterCommand> = None;
         let control = match first {
-            WriterCommand::Append { batch, resp } => {
+            WriterCommand::Append { batch, epoch, resp } => {
                 let mut group_bytes = batch.len();
                 let mut jobs = vec![AppendJob {
-                    kind: AppendKind::Fresh(batch),
+                    kind: AppendKind::Fresh { batch, epoch },
                     resp,
                 }];
                 pending_control = drain_append_group(&rx, &mut jobs, &mut group_bytes);
@@ -1348,6 +1573,7 @@ fn writer_loop(
             WriterCommand::AppendReplicated {
                 batch,
                 leader_epoch,
+                record_epoch,
                 resp,
             } => {
                 let mut group_bytes = batch.len();
@@ -1355,6 +1581,7 @@ fn writer_loop(
                     kind: AppendKind::Replicated {
                         batch,
                         leader_epoch,
+                        record_epoch,
                     },
                     resp,
                 }];
@@ -1391,6 +1618,10 @@ fn writer_loop(
                 let _ = resp.send(result);
                 LoopControl::Continue
             }
+            WriterCommand::Fence { op, resp } => {
+                let _ = resp.send(handle_fence_command(&dir, &state, op));
+                LoopControl::Continue
+            }
         };
         if matches!(control, LoopControl::Stop) {
             break;
@@ -1424,6 +1655,10 @@ fn writer_loop(
                     let _ = resp.send(result);
                     LoopControl::Continue
                 }
+                WriterCommand::Fence { op, resp } => {
+                    let _ = resp.send(handle_fence_command(&dir, &state, op));
+                    LoopControl::Continue
+                }
                 WriterCommand::Append { .. } | WriterCommand::AppendReplicated { .. } => {
                     unreachable!("drain_append_group only ever hands back a non-append command")
                 }
@@ -1445,6 +1680,13 @@ fn writer_loop(
     // shutdown path, including the panicked and fsync-poisoned ones,
     // `break`s down to here), then fsync so a clean shutdown leaves data
     // durable even under `Durability::Os`.
+    if let Err(e) = rewrite_epochs_if_dirty(&dir, &state) {
+        tracing::warn!(
+            path = %dir.display(),
+            error = %e,
+            "failed to write partition.epochs on writer shutdown"
+        );
+    }
     if let Err(e) = persist_meta_now(&dir, &state) {
         tracing::warn!(
             path = %dir.display(),
@@ -1822,6 +2064,27 @@ impl Partition {
             None => log_end_offset,
         };
         let initial_leader_epoch = persisted_meta.map(|m| m.leader_epoch).unwrap_or(0);
+        // A file (or none) from before the committed offset existed says
+        // nothing about what a majority holds — `hw` does not, under
+        // `acks=leader` it is the leader's own log end. Zero only makes the
+        // next leader re-feed more; anything higher could refuse a legitimate
+        // reconciliation for good.
+        let initial_committed = persisted_meta
+            .and_then(|m| m.committed_offset)
+            .unwrap_or(0)
+            .min(log_end_offset);
+        // Records past the recovered log end are gone (a crash between a cut
+        // and the table's trim, or a torn tail); so are their epochs.
+        let mut epochs = read_epochs(&dir);
+        if let Some(trimmed) = epochs.truncated_to(log_end_offset) {
+            if let Err(e) = write_epochs(&dir, &trimmed) {
+                tracing::warn!(
+                    path = %dir.display(), error = %e,
+                    "failed to rewrite partition.epochs trimmed to the recovered log end"
+                );
+            }
+            epochs = trimmed;
+        }
 
         let (leo_watch_tx, _leo_watch_rx) = tokio::sync::watch::channel(log_end_offset);
         let state = Arc::new(PartitionState {
@@ -1830,6 +2093,11 @@ impl Partition {
             high_watermark: AtomicU64::new(initial_hw),
             hw_manual: AtomicBool::new(false),
             leader_epoch: AtomicU32::new(initial_leader_epoch),
+            epochs: RwLock::new(epochs),
+            epochs_dirty: AtomicBool::new(false),
+            meta_dirty: AtomicBool::new(false),
+            leader_writes: AtomicU64::new(0),
+            committed_offset: AtomicU64::new(initial_committed),
             leo_watch_tx,
             poisoned: AtomicBool::new(false),
             fsync_poisoned: AtomicBool::new(false),
@@ -1837,6 +2105,8 @@ impl Partition {
             truncations: AtomicU64::new(0),
             #[cfg(test)]
             fail_interval_fsync: AtomicBool::new(false),
+            #[cfg(test)]
+            epoch_raise_pause_ms: AtomicU64::new(0),
             detached: AtomicBool::new(false),
         });
 
@@ -1892,6 +2162,21 @@ impl Partition {
     /// last segment, so it naturally forgets the unpublished batch and
     /// resumes cleanly from the last group that was fully published.
     pub fn append_batch(&self, batch: Bytes) -> Result<AppendResult> {
+        self.append_blocking(batch, None)
+    }
+
+    /// `append_batch` for a write a replication coordinator admitted as the
+    /// leader of `epoch`: it lands only while this partition still
+    /// recognizes that term, and its records are recorded as written in it.
+    /// A newer leader's `Hello` or a step-down that raised the partition's
+    /// epoch between the admission and this append refuses it with
+    /// `BusError::LeaderEpochStale` — otherwise it would sit in a log that
+    /// now belongs to another term, stamped as if it did.
+    pub fn append_batch_as_leader(&self, batch: Bytes, epoch: u32) -> Result<AppendResult> {
+        self.append_blocking(batch, Some(epoch))
+    }
+
+    fn append_blocking(&self, batch: Bytes, epoch: Option<u32>) -> Result<AppendResult> {
         if self.inner.state.detached.load(Ordering::Acquire) {
             return Err(BusError::PartitionDetached);
         }
@@ -1905,6 +2190,7 @@ impl Partition {
         let (resp_tx, resp_rx) = oneshot::channel();
         match tx.try_send(WriterCommand::Append {
             batch,
+            epoch,
             resp: resp_tx,
         }) {
             Ok(()) => {}
@@ -1946,6 +2232,7 @@ impl Partition {
         let (resp_tx, resp_rx) = oneshot::channel();
         match tx.try_send(WriterCommand::Append {
             batch,
+            epoch: None,
             resp: resp_tx,
         }) {
             Ok(()) => {}
@@ -2048,6 +2335,45 @@ impl Partition {
         self.inner.state.leader_epoch.load(Ordering::Acquire)
     }
 
+    /// The epoch this log's last record was written in (`epochs.rs`); `0`
+    /// for a log with no recorded epoch.
+    pub fn log_epoch(&self) -> u32 {
+        self.inner.state.epochs.read().last_epoch()
+    }
+
+    /// The epoch the record at `offset` was first written in; `0` when
+    /// nothing is recorded for it.
+    pub fn epoch_at(&self, offset: u64) -> u32 {
+        self.inner.state.epochs.read().epoch_at(offset)
+    }
+
+    /// The offset of the first record written in `epoch`, if this log has
+    /// one.
+    pub fn epoch_start(&self, epoch: u32) -> Option<u64> {
+        self.inner.state.epochs.read().start_of(epoch)
+    }
+
+    /// The offset below which every record is on a majority of the replica
+    /// set — see `PartitionState::committed_offset`.
+    pub fn committed_offset(&self) -> u64 {
+        self.inner.state.committed_offset.load(Ordering::Acquire)
+    }
+
+    /// Raises `committed_offset`, never past `log_end_offset` and never
+    /// backwards. Returns the value in effect after the call. Same
+    /// postcondition dance as `set_high_watermark`, for the same truncate
+    /// interleaving.
+    pub fn set_committed_offset(&self, committed: u64) -> u64 {
+        let state = &self.inner.state;
+        state
+            .committed_offset
+            .fetch_max(committed.min(self.log_end_offset()), Ordering::AcqRel);
+        state
+            .committed_offset
+            .fetch_min(self.log_end_offset(), Ordering::AcqRel);
+        state.committed_offset.load(Ordering::Acquire)
+    }
+
     /// Advances the recognized leader epoch. Monotonic: rejects an `epoch`
     /// older than the one already stored with `LeaderEpochStale` instead of
     /// silently ignoring it, so a caller driving an election (wave 1, agent
@@ -2056,16 +2382,52 @@ impl Partition {
     /// so this persists meta immediately rather than waiting for the next
     /// periodic flush — `flush_meta`'s doc explains what "persist" means in
     /// this build.
+    ///
+    /// Compared and raised on the writer thread, like the raise a leader
+    /// write performs (`append_batch_as_leader`): two raises can never
+    /// interleave into a lower epoch, and no write admitted in an older term
+    /// can pass its check after this returns.
     pub fn set_leader_epoch(&self, epoch: u32) -> Result<()> {
-        let have = self.inner.state.leader_epoch.load(Ordering::Acquire);
-        if epoch < have {
-            return Err(BusError::LeaderEpochStale { have, got: epoch });
-        }
+        self.fence(FenceOp::RaiseEpoch(epoch))
+    }
+
+    /// A leader handle of this partition is live: leader writes are open
+    /// until every handle that opened them has closed them. Until then — and
+    /// after — `append_batch_as_leader` refuses with
+    /// `BusError::LeaderWritesClosed`.
+    pub fn open_leader_writes(&self) {
         self.inner
             .state
-            .leader_epoch
-            .store(epoch, Ordering::Release);
-        self.flush_meta()
+            .leader_writes
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// A leader handle stopped; call exactly once per `open_leader_writes`.
+    /// When it was the last one, no write admitted as leader lands once this
+    /// returns, whatever its epoch — a leader fenced by an equal-epoch claim
+    /// keeps its epoch number, so that alone cannot stop it.
+    pub fn close_leader_writes(&self) -> Result<()> {
+        self.fence(FenceOp::CloseLeaderWrites)
+    }
+
+    fn fence(&self, op: FenceOp) -> Result<()> {
+        if let FenceOp::RaiseEpoch(epoch) = op {
+            if self.inner.state.detached.load(Ordering::Acquire) {
+                // No writer to order against; the stamp only guards what a
+                // detached partition will never accept again.
+                self.inner
+                    .state
+                    .leader_epoch
+                    .fetch_max(epoch, Ordering::AcqRel);
+                return Ok(());
+            }
+        }
+        let tx = self.inner.tx.as_ref().ok_or(BusError::WriterClosed)?;
+        let (resp_tx, resp_rx) = std_mpsc::sync_channel(1);
+        send_and_wait_via_writer_thread(move || {
+            send_writer_command_blocking(tx, WriterCommand::Fence { op, resp: resp_tx })?;
+            resp_rx.recv().map_err(|_| BusError::WriterClosed)?
+        })
     }
 
     /// Follower-side append (PLAN-M2 §1a): the leader has already assigned
@@ -2090,6 +2452,7 @@ impl Partition {
         batch: Bytes,
         expected_base_offset: u64,
         leader_epoch: u32,
+        record_epoch: u32,
     ) -> Result<AppendResult> {
         self.check_replicated_preconditions(expected_base_offset, leader_epoch)?;
         let tx = self.inner.tx.as_ref().ok_or(BusError::WriterClosed)?;
@@ -2097,6 +2460,7 @@ impl Partition {
         match tx.try_send(WriterCommand::AppendReplicated {
             batch,
             leader_epoch,
+            record_epoch,
             resp: resp_tx,
         }) {
             Ok(()) => {}
@@ -2124,6 +2488,7 @@ impl Partition {
         batch: Bytes,
         expected_base_offset: u64,
         leader_epoch: u32,
+        record_epoch: u32,
     ) -> Result<AppendResult> {
         self.check_replicated_preconditions(expected_base_offset, leader_epoch)?;
         let tx = self.inner.tx.as_ref().ok_or(BusError::WriterClosed)?;
@@ -2131,6 +2496,7 @@ impl Partition {
         match tx.try_send(WriterCommand::AppendReplicated {
             batch,
             leader_epoch,
+            record_epoch,
             resp: resp_tx,
         }) {
             Ok(()) => {}
@@ -2238,10 +2604,16 @@ impl Partition {
         })
     }
 
-    /// `truncate_to_offset` for the ONE caller allowed to lower
+    /// `truncate_to_offset` for the callers allowed to lower
     /// `high_watermark`: `bus::replication::follower`, applying a
     /// `ReplFrame::Truncate` from the leader whose `Hello` this partition has
-    /// already accepted (`t.leader_epoch >= partition.leader_epoch()`).
+    /// already accepted, and a leader stepping down from a term a peer proved
+    /// over, cutting its own log back onto what a majority holds. What is
+    /// left keeps the epochs its records were written in (`epochs.rs`).
+    ///
+    /// It never goes below `committed_offset`
+    /// (`BusError::TruncateBelowCommitted`): those records are on a
+    /// majority, and a leader asking to cut them lacks acknowledged writes.
     ///
     /// K-M2-1 makes `high_watermark` monotonic, and everywhere else it stays
     /// so. Here it is qualified to "monotonic within a leadership lineage",
@@ -4043,7 +4415,14 @@ mod tests {
 
     /// A writer that never goes idle must still fsync on the interval — the
     /// deadline is checked before every receive, not only when a receive
-    /// times out.
+    /// times out. Back-to-back appends never let a receive time out, so a
+    /// writer that only fsynced on a timeout would fsync zero times here.
+    ///
+    /// Bounded by a count, not by a 300 ms window: one fsync alone can take
+    /// longer than that on a busy disk (measured: 2 fsyncs in a 300 ms window
+    /// that ran 0.6 s, 1 run in 20 under a parallel build), which says
+    /// nothing about the cadence. Ten seconds is where "slow" ends and
+    /// "never" begins.
     #[test]
     fn interval_fsync_keeps_its_cadence_under_back_to_back_appends() {
         let dir = temp_dir("partition-interval-busy");
@@ -4055,14 +4434,14 @@ mod tests {
         )
         .unwrap();
         let started = Instant::now();
-        while started.elapsed() < Duration::from_millis(300) {
+        while part.fsync_count() < 3 {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "10 s of continuous appends at a 20 ms interval fsynced only {} times",
+                part.fsync_count()
+            );
             part.append_batch(one_record_batch(0, 8)).unwrap();
         }
-        assert!(
-            part.fsync_count() >= 3,
-            "300 ms of continuous appends at a 20 ms interval fsynced only {} times",
-            part.fsync_count()
-        );
     }
 
     /// A failed interval fsync cannot be rolled back — the writes it covered
@@ -4331,7 +4710,7 @@ mod tests {
         part.set_leader_epoch(2).unwrap();
 
         let r0 = part
-            .append_replicated(one_record_batch_at(0, 0, 8), 0, 2)
+            .append_replicated(one_record_batch_at(0, 0, 8), 0, 2, 2)
             .unwrap();
         assert_eq!(r0.base_offset, 0);
         assert_eq!(part.log_end_offset(), 1);
@@ -4339,7 +4718,7 @@ mod tests {
         // Wrong offset: leo is now 1, not 0 (the batch's own header still
         // claims base_offset 0 too, so this exercises the fast pre-check).
         let err = part
-            .append_replicated(one_record_batch_at(0, 0, 8), 0, 2)
+            .append_replicated(one_record_batch_at(0, 0, 8), 0, 2, 2)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -4353,7 +4732,7 @@ mod tests {
         // Uses the correct base_offset (1) so only the epoch check can be
         // at fault.
         let err = part
-            .append_replicated(one_record_batch_at(1, 0, 8), 1, 1)
+            .append_replicated(one_record_batch_at(1, 0, 8), 1, 1, 1)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -4364,7 +4743,7 @@ mod tests {
         assert_eq!(part.log_end_offset(), 1);
 
         let r1 = part
-            .append_replicated(one_record_batch_at(1, 0, 8), 1, 2)
+            .append_replicated(one_record_batch_at(1, 0, 8), 1, 2, 2)
             .unwrap();
         assert_eq!(r1.base_offset, 1);
         assert_eq!(part.log_end_offset(), 2);
@@ -4402,7 +4781,7 @@ mod tests {
         .unwrap();
         follower.set_leader_epoch(1).unwrap();
         let follower_result = follower
-            .append_replicated(wire_bytes.clone(), 0, 1)
+            .append_replicated(wire_bytes.clone(), 0, 1, 1)
             .unwrap();
         assert_eq!(follower_result.base_offset, 0);
 
@@ -4495,7 +4874,7 @@ mod tests {
         follower.set_leader_epoch(1).unwrap();
         for rb in &raw_batches {
             let result = follower
-                .append_replicated(rb.bytes.clone(), rb.base_offset, 1)
+                .append_replicated(rb.bytes.clone(), rb.base_offset, 1, 1)
                 .unwrap();
             assert_eq!(result.base_offset, rb.base_offset);
         }
@@ -4566,7 +4945,7 @@ mod tests {
         let dir = temp_dir("partition-append-replicated-async");
         let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
 
-        let poll = poll_once(part.append_replicated_async(one_record_batch(0, 8), 5, 0));
+        let poll = poll_once(part.append_replicated_async(one_record_batch(0, 8), 5, 0, 0));
         assert!(matches!(
             poll,
             std::task::Poll::Ready(Err(BusError::OffsetMismatch {
@@ -4603,6 +4982,413 @@ mod tests {
         let part = Partition::open(dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
         part.set_hw_tracking(HwTracking::Manual);
         part
+    }
+
+    /// Every record keeps the epoch it was first written in. A leader
+    /// re-elected in term 2 that feeds a follower records of term 1 stamps
+    /// its term on the stream (fencing) but the records stay term-1 records:
+    /// ranked by the stamped term, the follower's short copy of the old term
+    /// would outrank a full one. Accepting a leader writes nothing either.
+    #[test]
+    fn the_log_epoch_is_the_epoch_records_were_written_in() {
+        let dir = temp_dir("partition-log-epoch");
+        {
+            let part = open_with_hw_pinned_at_zero(&dir);
+            part.set_leader_epoch(1).unwrap();
+            part.append_batch(one_record_batch(0, 8)).unwrap();
+            assert_eq!(part.log_epoch(), 1);
+
+            part.set_leader_epoch(2).unwrap();
+            assert_eq!(part.log_epoch(), 1, "a Hello alone writes no record");
+
+            part.append_replicated(one_record_batch_at(1, 1, 8), 1, 2, 1)
+                .unwrap();
+            assert_eq!(
+                part.log_epoch(),
+                1,
+                "an old-term record re-fed in term 2 is still a term-1 record"
+            );
+            part.append_replicated(one_record_batch_at(2, 1, 8), 2, 2, 2)
+                .unwrap();
+            assert_eq!(part.log_epoch(), 2);
+            assert_eq!(part.epoch_start(2), Some(2));
+            assert!(matches!(
+                part.append_replicated(one_record_batch_at(3, 1, 8), 3, 2, 1),
+                Err(BusError::RecordEpochRegression {
+                    last: 2,
+                    got: 1,
+                    offset: 3
+                })
+            ));
+        }
+        let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+        assert_eq!(
+            (part.leader_epoch(), part.log_epoch(), part.epoch_at(1)),
+            (2, 2, 1)
+        );
+    }
+
+    /// A write admitted as leader of term 3 lands in term 3 and says so; once
+    /// a newer leader's Hello (or a step-down) raised the partition to term
+    /// 4 in between, the same write is refused instead of landing in a log
+    /// that now belongs to term 4. A term the partition has not stamped yet
+    /// (the leader stamps after the fact) is stamped by the write.
+    #[test]
+    fn a_leader_append_lands_only_in_the_term_it_was_admitted_under() {
+        let dir = temp_dir("partition-fenced-append");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        part.open_leader_writes();
+        part.set_leader_epoch(2).unwrap();
+        part.append_batch_as_leader(one_record_batch(0, 8), 3)
+            .unwrap();
+        assert_eq!((part.leader_epoch(), part.log_epoch()), (3, 3));
+
+        part.set_leader_epoch(4).unwrap();
+        assert!(matches!(
+            part.append_batch_as_leader(one_record_batch(0, 8), 3),
+            Err(BusError::LeaderEpochStale { have: 4, got: 3 })
+        ));
+        assert_eq!(part.log_end_offset(), 1);
+        assert_eq!(part.log_epoch(), 3);
+    }
+
+    /// Two leaders of ONE epoch are real (simultaneous self-elections, the
+    /// RF=2 split): the one fenced by the other's Hello keeps the epoch
+    /// number, so the number cannot stop a write it already admitted. The
+    /// leadership stint can: once it is closed, its writes are refused at
+    /// that same epoch. Closing an older stint leaves a newer one open.
+    #[test]
+    fn a_closed_leadership_stint_refuses_its_writes_at_the_same_epoch() {
+        let dir = temp_dir("partition-leader-writes");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        part.set_leader_epoch(5).unwrap();
+        assert!(matches!(
+            part.append_batch_as_leader(one_record_batch(0, 8), 5),
+            Err(BusError::LeaderWritesClosed)
+        ));
+        part.open_leader_writes();
+        part.append_batch_as_leader(one_record_batch(0, 8), 5)
+            .unwrap();
+
+        // A spare handle for the same term (promotion and poll both spawned
+        // one): stopping it leaves the serving one's writes open.
+        part.open_leader_writes();
+        part.close_leader_writes().unwrap();
+        part.append_batch_as_leader(one_record_batch(0, 8), 5)
+            .unwrap();
+
+        part.close_leader_writes().unwrap();
+        assert!(matches!(
+            part.append_batch_as_leader(one_record_batch(0, 8), 5),
+            Err(BusError::LeaderWritesClosed)
+        ));
+        assert_eq!(part.log_end_offset(), 2);
+    }
+
+    /// A newer leader's raise lands while a write admitted one term earlier
+    /// is between reading the partition's epoch and raising it to its own
+    /// (widened here to 200 ms). The raise must not be lost — a write
+    /// stamping its term would lower the newer epoch, on disk too — so it
+    /// waits its turn on the writer thread and is refused nothing.
+    #[test]
+    fn a_racing_leader_write_never_lowers_a_newer_epoch() {
+        let dir = temp_dir("partition-epoch-race");
+        {
+            let part = open_with_hw_pinned_at_zero(&dir);
+            part.open_leader_writes();
+            part.set_leader_epoch(1).unwrap();
+            part.inner
+                .state
+                .epoch_raise_pause_ms
+                .store(200, Ordering::Release);
+            let writer = {
+                let part = part.clone();
+                std::thread::spawn(move || part.append_batch_as_leader(one_record_batch(0, 8), 2))
+            };
+            std::thread::sleep(Duration::from_millis(50));
+            part.set_leader_epoch(3).unwrap();
+            let written = writer.join().unwrap();
+            assert!(written.is_ok(), "{written:?}");
+            assert_eq!(part.log_epoch(), 2);
+            assert_eq!(part.leader_epoch(), 3);
+        }
+        let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+        assert_eq!(part.leader_epoch(), 3, "persisted");
+    }
+
+    /// A trim of the epoch table that cannot be written leaves the file
+    /// overstating what the log holds, and a restart only drops entries past
+    /// the recovered log end. The next flush that can write it does.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritten_epoch_trim_is_written_by_the_next_flush() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("partition-epochs-dirty");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        part.set_leader_epoch(1).unwrap();
+        part.append_batch(one_record_batch(0, 8)).unwrap();
+        part.append_batch(one_record_batch(1, 8)).unwrap();
+        part.set_leader_epoch(2).unwrap();
+        let mut two = crate::batch::BatchBuilder::new(0, 1);
+        two.push(RecordInput::new(Bytes::from_static(b"a"), 2))
+            .unwrap();
+        two.push(RecordInput::new(Bytes::from_static(b"b"), 2))
+            .unwrap();
+        part.append_batch(two.build().unwrap()).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let cut = part.truncate_to_offset_for_leader_authority(3);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(cut.unwrap(), 2);
+        assert_eq!(
+            crate::epochs::read_epochs(&dir).last_epoch(),
+            2,
+            "the unwritten trim"
+        );
+
+        part.flush_meta().unwrap();
+        assert_eq!(crate::epochs::read_epochs(&dir).last_epoch(), 1);
+    }
+
+    /// M2: an epoch table left dirty by a failed trim is written before the
+    /// next append acts, and that append fails when it still cannot be —
+    /// it must not build on a table a restart would lose.
+    #[cfg(unix)]
+    #[test]
+    fn an_append_fails_closed_while_the_epoch_table_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("partition-epochs-dirty-append");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        part.set_leader_epoch(1).unwrap();
+        part.append_batch(one_record_batch(0, 8)).unwrap();
+        part.append_batch(one_record_batch(1, 8)).unwrap();
+        part.set_leader_epoch(2).unwrap();
+        let mut two = crate::batch::BatchBuilder::new(0, 1);
+        two.push(RecordInput::new(Bytes::from_static(b"a"), 2))
+            .unwrap();
+        two.push(RecordInput::new(Bytes::from_static(b"b"), 2))
+            .unwrap();
+        part.append_batch(two.build().unwrap()).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let cut = part.truncate_to_offset_for_leader_authority(3);
+        // A record of epoch 1 — the table's last epoch after the cut — needs
+        // no new entry: only the pending rewrite can refuse it.
+        let refused = part.append_replicated(one_record_batch_at(2, 2, 8), 2, 2, 1);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(cut.unwrap(), 2);
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(part.log_end_offset(), 2);
+
+        part.append_replicated(one_record_batch_at(2, 2, 8), 2, 2, 1)
+            .unwrap();
+        assert_eq!(crate::epochs::read_epochs(&dir).last_epoch(), 1);
+    }
+
+    /// L4: a leader write raised the epoch in memory but could not persist
+    /// it. The next write of that same epoch — which has nothing to raise —
+    /// persists it before acting, instead of leaving disk behind until some
+    /// unrelated flush.
+    #[cfg(unix)]
+    #[test]
+    fn an_unpersisted_epoch_raise_is_persisted_by_the_next_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("partition-meta-dirty");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        part.open_leader_writes();
+        part.set_leader_epoch(1).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let raised = part.append_batch_as_leader(one_record_batch(0, 8), 2);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(raised.is_err(), "{raised:?}");
+        assert_eq!(part.leader_epoch(), 2);
+        assert_eq!(crate::meta::read_meta(&dir).unwrap().leader_epoch, 1);
+
+        part.append_batch_as_leader(one_record_batch(0, 8), 2)
+            .unwrap();
+        assert_eq!(crate::meta::read_meta(&dir).unwrap().leader_epoch, 2);
+    }
+
+    /// No leader holds records of a term later than its own.
+    #[test]
+    fn a_replicated_record_from_a_later_term_than_its_leader_is_refused() {
+        let dir = temp_dir("partition-record-epoch-ahead");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        assert!(matches!(
+            part.append_replicated(one_record_batch_at(0, 0, 8), 0, 2, 3),
+            Err(BusError::RecordEpochAhead {
+                record_epoch: 3,
+                leader_epoch: 2
+            })
+        ));
+        assert_eq!(part.log_epoch(), 0);
+    }
+
+    /// A new epoch's entry is written before its record; an append that then
+    /// fails must not leave it behind, in memory or on disk.
+    #[test]
+    fn an_epoch_entry_does_not_outlive_its_failed_append() {
+        let dir = temp_dir("partition-epoch-failed-append");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        part.set_leader_epoch(1).unwrap();
+        part.append_batch(one_record_batch(0, 8)).unwrap();
+        // What a failed append in epoch 9 at the log end leaves behind.
+        let stale = part
+            .inner
+            .state
+            .epochs
+            .read()
+            .with_record(9, 1)
+            .unwrap()
+            .unwrap();
+        crate::epochs::write_epochs(&dir, &stale).unwrap();
+        *part.inner.state.epochs.write() = stale;
+
+        assert!(part.append_batch(Bytes::from_static(b"short")).is_err());
+        assert_eq!(part.log_epoch(), 1);
+        assert_eq!(crate::epochs::read_epochs(&dir).last_epoch(), 1);
+    }
+
+    /// A leader-authority truncate leaves the records below the cut with the
+    /// epochs they were written in, and never cuts below what a majority
+    /// holds.
+    #[test]
+    fn a_leader_authority_truncate_keeps_record_epochs_and_stops_at_the_committed_offset() {
+        let dir = temp_dir("partition-authority-truncate");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        part.set_leader_epoch(1).unwrap();
+        for i in 0..3i64 {
+            part.append_batch(one_record_batch(i, 8)).unwrap();
+        }
+        part.set_leader_epoch(3).unwrap();
+        for i in 3..5i64 {
+            part.append_batch(one_record_batch(i, 8)).unwrap();
+        }
+        assert_eq!(part.log_epoch(), 3);
+        part.set_high_watermark(4);
+        part.set_committed_offset(2);
+        assert!(matches!(
+            part.truncate_to_offset_for_leader_authority(1),
+            Err(BusError::TruncateBelowCommitted {
+                committed: 2,
+                to: 1
+            })
+        ));
+        assert_eq!(part.log_end_offset(), 5);
+
+        assert_eq!(part.truncate_to_offset_for_leader_authority(3).unwrap(), 3);
+        assert_eq!(part.log_epoch(), 1, "the term-3 records are gone");
+        assert_eq!(part.high_watermark(), 3);
+        assert_eq!(part.committed_offset(), 2);
+    }
+
+    /// X3: the epoch table is trimmed on disk BEFORE records are cut. When
+    /// that write fails the truncate is refused and nothing is cut — the
+    /// other order left a cut log under a table naming the gone epoch.
+    #[cfg(unix)]
+    #[test]
+    fn a_truncate_whose_epoch_table_cannot_be_written_cuts_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("partition-truncate-epochs-first");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        part.set_leader_epoch(1).unwrap();
+        part.append_batch(one_record_batch(0, 8)).unwrap();
+        part.set_leader_epoch(2).unwrap();
+        part.append_batch(one_record_batch(1, 8)).unwrap();
+        part.append_batch(one_record_batch(2, 8)).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let refused = part.truncate_to_offset_for_leader_authority(1);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(part.log_end_offset(), 3);
+        assert_eq!(part.log_epoch(), 2);
+
+        assert_eq!(part.truncate_to_offset_for_leader_authority(1).unwrap(), 1);
+        assert_eq!(part.log_epoch(), 1);
+    }
+
+    /// A cut that already happened is reported as done even when the epoch
+    /// table's final trim cannot be written: the caller must not take a done
+    /// cut for a refused one. The table in memory is trimmed anyway, and
+    /// `Partition::open` trims the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_done_cut_is_not_reported_as_failed_when_the_final_trim_cannot_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("partition-truncate-final-trim");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        part.set_leader_epoch(1).unwrap();
+        part.append_batch(one_record_batch(0, 8)).unwrap();
+        part.append_batch(one_record_batch(1, 8)).unwrap();
+        part.set_leader_epoch(2).unwrap();
+        // One batch of two records at 2..4: a cut at 3 drops it whole.
+        let mut two = crate::batch::BatchBuilder::new(0, 1);
+        two.push(RecordInput::new(Bytes::from_static(b"a"), 2))
+            .unwrap();
+        two.push(RecordInput::new(Bytes::from_static(b"b"), 2))
+            .unwrap();
+        part.append_batch(two.build().unwrap()).unwrap();
+        assert_eq!((part.log_end_offset(), part.log_epoch()), (4, 2));
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let cut = part.truncate_to_offset_for_leader_authority(3);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(cut.unwrap(), 2);
+        assert_eq!(part.log_epoch(), 1);
+    }
+
+    /// A crash after a cut but before the table's final trim leaves entries
+    /// past the log end; reopening drops them with the records they named.
+    #[test]
+    fn reopening_drops_epochs_past_the_recovered_log_end() {
+        let dir = temp_dir("partition-epochs-recovery");
+        {
+            let part = open_with_hw_pinned_at_zero(&dir);
+            part.set_leader_epoch(1).unwrap();
+            part.append_batch(one_record_batch(0, 8)).unwrap();
+        }
+        let mut stale = crate::epochs::EpochTable::default();
+        stale = stale.with_record(1, 0).unwrap().unwrap();
+        stale = stale.with_record(4, 1).unwrap().unwrap();
+        crate::epochs::write_epochs(&dir, &stale).unwrap();
+
+        let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+        assert_eq!(part.log_end_offset(), 1);
+        assert_eq!(part.log_epoch(), 1);
+        assert_eq!(crate::epochs::read_epochs(&dir).last_epoch(), 1);
+    }
+
+    /// X2: an `acks=leader` leader's `hw` is its own log end, unreplicated
+    /// tail included. Upgraded from a file without a committed offset, that
+    /// `hw` must not become one — the next leader's reconciling truncate of
+    /// the tail would be refused as below-committed, forever.
+    #[test]
+    fn an_upgraded_acks_leader_log_can_still_be_reconciled() {
+        let dir = temp_dir("partition-v1-acks-leader");
+        {
+            let part =
+                Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+            for i in 0..5i64 {
+                part.append_batch(one_record_batch(i, 8)).unwrap();
+            }
+            assert_eq!(part.high_watermark(), 5);
+        }
+        let mut buf = [0u8; 30];
+        buf[0..4].copy_from_slice(&0x5442_4d31u32.to_le_bytes());
+        buf[4..6].copy_from_slice(&1u16.to_le_bytes());
+        buf[6..14].copy_from_slice(&5u64.to_le_bytes());
+        buf[14..18].copy_from_slice(&1u32.to_le_bytes());
+        buf[18..26].copy_from_slice(&5u64.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[..26]);
+        buf[26..30].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(crate::meta::meta_path(&dir), buf).unwrap();
+
+        let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+        assert_eq!(part.committed_offset(), 0);
+        assert_eq!(part.log_epoch(), 0);
+        assert_eq!(part.truncate_to_offset_for_leader_authority(3).unwrap(), 3);
     }
 
     /// Truncate inside the still-open active segment (no roll involved):
