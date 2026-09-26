@@ -408,3 +408,9 @@ test('every layout warning code the node produces has words in the wizard', () =
     assert.ok(words && !/tentanas\.|\{/.test(words), `${code}: ${words}`);
   }
 });
+
+test('the Elastic preview names a remote LUN as what it is (wave 12, R2-1)', async () => {
+  const { elasticRefusalText: words } = await import('./pool-wizard.js');
+  const out = words({ code: 'disk_in_use', diskName: 'sdz', params: { owner: 'remote', owner_name: '' }, detail: 'sdz is a remote disk' });
+  assert.equal(out.text, 'sdz to dysk zdalny (iSCSI/NVMe-oF) — nie może być członkiem macierzy.');
+});

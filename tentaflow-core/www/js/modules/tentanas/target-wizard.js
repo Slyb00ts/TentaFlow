@@ -25,6 +25,7 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, errMessage, jobKindLabel, nodeLabel, wordReasons, nodeTextTitle } from '/js/modules/tentanas/format.js';
+import { patchKeyedList } from '/js/lib/dom-patch.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -440,6 +441,8 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     secretSet: Boolean(target?.auth?.secretSet),
     mutualSecretSet: Boolean(target?.auth?.mutualSecretSet),
     hostNqnText: (target?.initiators || []).join('\n'),
+    // "Opis" per host NQN (wave 12), beside each NQN the field holds.
+    hostDescriptions: { ...(target?.initiatorDescriptions || {}) },
     confirmAll: editing ? !editPortal.interface : false,
     // Opt-IN, always. The portal of an existing target moves only because
     // somebody asked, and a drifted portal is the one case where the wizard
@@ -594,8 +597,40 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     return `
       <tf-input id="nas-tw-hosts" multiline rows="2" label="${escapeAttr(T('wizard_target.dhchap_hosts_label'))}" spellcheck="false" placeholder="nqn.2014-08.org.nvmexpress:uuid:…" value="${escapeAttr(state.hostNqnText)}" hint="${escapeAttr(T('wizard_target.dhchap_hosts_hint'))}"></tf-input>
       <div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T(state.method === 'none' ? 'wizard_target.dhchap_hosts_filter_note' : 'wizard_target.dhchap_hosts_note'))}</div></div>
-      <div id="nas-tw-hosts-warn">${hostAllowlistWarnings()}</div>`;
+      ${editing ? `<div class="wizard-warning" data-testid="nvmet-remove-note">${sprite('alert')}<div>${escapeHtml(T('targets.nvmet_remove_keeps_connection'))}</div></div>` : ''}
+      <div id="nas-tw-hosts-warn">${hostAllowlistWarnings()}</div>
+      <div id="nas-tw-host-descs" class="stack"></div>`;
   };
+
+  // One "Opis" field per NQN in the list (n19 allowlist "Opis", in the
+  // wizard too). Keyed by the NQN, so typing in the list above never rebuilds
+  // a description field that is already there — its value and caret stay.
+  const paintHostDescriptions = () => {
+    const host = win.querySelector('#nas-tw-host-descs');
+    if (!host) return;
+    const nqns = parseHostNqns(state.hostNqnText).filter((n) => !invalidHostNqns(n).length);
+    patchKeyedList(host, nqns.map((nqn) => ({
+      key: nqn,
+      // No `value` in the markup: it would change with every keystroke and
+      // make the list rebuild the very field being typed in. A NEW field gets
+      // its value from the state below — also after `draw()` rebuilt the step.
+      html: `<tf-input data-host="${escapeAttr(nqn)}" maxlength="80" label="${escapeAttr(T('wizard_target.host_description_label', { nqn }))}" placeholder="${escapeAttr(T('wizard_target.host_description_placeholder'))}"></tf-input>`,
+    })));
+    host.querySelectorAll('tf-input[data-host]').forEach((el) => {
+      if (el.dataset.wired) return;
+      el.dataset.wired = '1';
+      el.value = state.hostDescriptions[el.dataset.host] || '';
+      const store = () => { state.hostDescriptions[el.dataset.host] = String(el.value || ''); };
+      el.addEventListener('input', store);
+      el.addEventListener('change', store);
+    });
+  };
+
+  // The descriptions of the NQNs the request carries, trimmed; the node
+  // refuses one for an NQN that is not on the list.
+  const hostDescriptionsFor = (nqns) => Object.fromEntries(nqns
+    .map((n) => [n, String(state.hostDescriptions[n] || '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim()])
+    .filter(([, text]) => text));
 
   const authFields = () => {
     if (state.method === 'none') return '';
@@ -945,7 +980,9 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
       state.hostNqnText = v;
       const box = win.querySelector('#nas-tw-hosts-warn');
       if (box) box.innerHTML = hostAllowlistWarnings();
+      paintHostDescriptions();
     });
+    paintHostDescriptions();
     onText('nas-tw-user', (v) => { state.username = v.trim(); });
     onText('nas-tw-secret', (v) => { state.secret = v; });
     onText('nas-tw-muser', (v) => { state.mutualUsername = v.trim(); });
@@ -1006,6 +1043,9 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
         // nvmet keeps the keys on the host objects of the allowlist, so the
         // node refuses an authenticated subsystem with no host NQN.
         initiators: state.protocol === 'nvmet' ? parseHostNqns(state.hostNqnText) : (target.initiators || []),
+        // NVMe-oF edits its list here, so its "Opis" rides along; an iSCSI
+        // edit does not touch the list and sends none (the node keeps it).
+        ...(state.protocol === 'nvmet' ? { initiatorDescriptions: hostDescriptionsFor(parseHostNqns(state.hostNqnText)) } : {}),
         portGroups: target.portGroups || [],
         confirmAllInterfaces: state.confirmAll,
         enabled: state.enabled,
@@ -1021,6 +1061,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
       transports: transportsOf(state.transport),
       auth: auth(),
       initiators: state.protocol === 'nvmet' ? parseHostNqns(state.hostNqnText) : [],
+      initiatorDescriptions: state.protocol === 'nvmet' ? hostDescriptionsFor(parseHostNqns(state.hostNqnText)) : {},
       confirmAllInterfaces: state.confirmAll,
       enabled: state.enabled,
     };

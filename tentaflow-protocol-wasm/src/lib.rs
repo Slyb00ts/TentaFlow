@@ -23835,7 +23835,7 @@ mod elastic_codec_tests {
 
     #[test]
     fn elastic_encoders_roundtrip_actual_protocol_body() {
-        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 24] = [
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 26] = [
             ("ElasticCapabilitiesRequest", encode_tentanas_elastic_capabilities_request, "{}"),
             ("DiskWipePlanRequest", encode_tentanas_disk_wipe_plan_request,
                 r#"{"disk_id":"wwn-0x5000c500a1b2c3d4"}"#),
@@ -23888,6 +23888,12 @@ mod elastic_codec_tests {
                 r#"{"name":"dane","folder":"foto","cache_policy":"only"}"#),
             // Wave 10: the stop-sharing request has no field at all.
             ("SharingStopRequest", encode_tentanas_sharing_stop_request, r#"{}"#),
+            // Wave 12: "Rozłącz" names the initiator by its IQN, and the
+            // allowlist save carries the "Opis" map.
+            ("TargetSessionResetRequest", encode_tentanas_target_session_reset_request,
+                r#"{"target_id":"t1","initiator":"iqn.1994-05.com.redhat:vmhost-01","revoke":true}"#),
+            ("TargetUpdateRequest", encode_tentanas_target_update_request,
+                r#"{"target_id":"t1","initiators":["iqn.1994-05.com.redhat:vmhost-01"],"initiator_descriptions":{"iqn.1994-05.com.redhat:vmhost-01":"Proxmox vmhost-01"},"enabled":true}"#),
         ];
         for (variant, encode, fields) in cases {
             let bytes = encode(fields.to_owned()).unwrap();
@@ -24874,6 +24880,14 @@ pub fn encode_tentanas_targets_list_request(request_json: String) -> Result<Vec<
 #[wasm_bindgen(js_name = encodeTentaNasTargetUpdateRequest)]
 pub fn encode_tentanas_target_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("TargetUpdateRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(TargetSessionResetRequest) — n19 "Rozłącz" (wave 12): reset
+/// the iSCSI session of one allowlisted initiator, named by its IQN; `revoke` also takes it
+/// off the allowlist. No session id travels. Answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasTargetSessionResetRequest)]
+pub fn encode_tentanas_target_session_reset_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("TargetSessionResetRequest", &request_json)
 }
 
 /// MessageBody::TentaNasBody(TrimScheduleSetRequest) — the recurring trim of one pool.

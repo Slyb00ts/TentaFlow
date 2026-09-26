@@ -2291,7 +2291,7 @@ fn refusal_params(params: &[(&str, String)]) -> BTreeMap<String, String> {
 }
 
 /// `conflicting_owner` as a code the wizard words: the kind of owner
-/// ('spare' | 'pool' | 'md' | 'system' | 'mounted' | 'used') and the name it
+/// ('spare' | 'pool' | 'md' | 'system' | 'mounted' | 'used' | 'remote') and the name it
 /// goes by ('' when it has none). One rule, two spellings — kept beside the
 /// sentence so the two cannot drift.
 pub fn conflicting_owner_code(disk: &NasDisk) -> Option<(&'static str, String)> {
@@ -2305,6 +2305,8 @@ pub fn conflicting_owner_code(disk: &NasDisk) -> Option<(&'static str, String)> 
         "system" => Some(("system", String::new())),
         "mounted" => Some(("mounted", named(disk.mountpoints.first()))),
         "used" => Some(("used", String::new())),
+        // A LUN another target serves to this node (`disks::mark_remote`).
+        super::disks::ROLE_REMOTE => Some(("remote", String::new())),
         _ => None,
     }
 }
@@ -2329,6 +2331,7 @@ pub fn conflicting_owner(disk: &NasDisk) -> Option<String> {
         "md" => named(format!("a member of md array {name}"), "a member of an md array"),
         "system" => "carrying this node's running system".to_string(),
         "mounted" => named(format!("mounted at {name}"), "mounted"),
+        "remote" => "a remote disk (an iSCSI/NVMe-oF LUN this node reaches as a client)".to_string(),
         _ => "holding a filesystem or partitions".to_string(),
     })
 }

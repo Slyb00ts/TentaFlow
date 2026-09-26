@@ -1069,6 +1069,26 @@ fn since_24h() -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// The coded refusal of a remote LUN on any disk-accepting request.
+const DISK_REMOTE_REFUSAL: &str = "refusal:disk_remote";
+
+/// Disks by id for a read-only PREVIEW: unknown ids are refused, and every
+/// disk the node has comes back whatever its role — a remote LUN included —
+/// so the preview's own per-disk refusals can name it (critic wave 12 R2-1).
+fn disks_for_plan(disk_ids: &[String]) -> Result<Vec<NasDisk>, ProtocolError> {
+    let mut out = Vec::with_capacity(disk_ids.len());
+    for id in disk_ids {
+        out.push(
+            tentanas::disks::disk(id)
+                .ok_or_else(|| ProtocolError::not_found(format!("disk '{id}' not found on this node")))?,
+        );
+    }
+    if out.is_empty() {
+        return Err(ProtocolError::bad_request("no disks selected"));
+    }
+    Ok(out)
+}
+
 /// Disks by id, refusing anything this node does not have. `require_free`
 /// guards the destructive paths: a pool is never built on a disk that already
 /// belongs to a pool, an array or the running system.
@@ -1077,6 +1097,14 @@ fn disks_by_id(disk_ids: &[String], require_free: bool) -> Result<Vec<NasDisk>, 
     for id in disk_ids {
         let disk = tentanas::disks::disk(id)
             .ok_or_else(|| ProtocolError::not_found(format!("disk '{id}' not found on this node")))?;
+        // A LUN another target serves to this node (MAJOR 27 F4) is never a
+        // pool disk — on EVERY path, the ones that do not require a free disk
+        // included (`PoolReplaceDiskRequest` accepts a spare; critic wave 12).
+        // A pool on a node's own export reached over loopback is a pool
+        // inside itself.
+        if disk.role == tentanas::disks::ROLE_REMOTE {
+            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, DISK_REMOTE_REFUSAL));
+        }
         if require_free && disk.role != "free" {
             return Err(ProtocolError::bad_request(format!(
                 "disk {} is not free: {}",
@@ -3161,7 +3189,21 @@ async fn target_get(ctx: &HandlerContext, target_id: &str) -> Result<MessageBody
     } else {
         Default::default()
     };
-    let (sessions, known) = tentanas::targets::sessions_from(&row, &nvmet);
+    let (readings, known) = tentanas::targets::readings_from(&row, &nvmet);
+    // The sampler (MAJOR 27): iSCSI is sampled on the tick too, and again here
+    // so a session that began since the last tick has its first sighting now;
+    // NVMe-oF ONLY here — while a target view is open, at most once a minute
+    // (owner decision D3), from the reading this view took anyway.
+    if known {
+        if row.protocol == "iscsi" {
+            let _ = tentanas::targets::sample_sessions(&g.db, &row, &readings);
+        } else {
+            tentanas::targets::sample_nvmet_if_due(&g.db, &row, &readings, known);
+        }
+    }
+    let seen = store::target_seen(&g.db, &row.target_id).map_err(|e| internal("targets", e))?;
+    let sessions = tentanas::targets::with_connected_at(&row, &readings, &seen);
+    let seen_since = store::target_seen_since(&g.db).map_err(|e| internal("targets", e))?;
     // The preview is rendered from placeholder credentials and redacted on top
     // of that, so it can travel and be logged. A row the catalog's own rules
     // refuse cannot be rendered — and that is a fact about this target the
@@ -3175,6 +3217,16 @@ async fn target_get(ctx: &HandlerContext, target_id: &str) -> Result<MessageBody
         target: tentanas::targets::to_protocol(&row, sessions.len() as u32, known),
         sessions,
         config_preview,
+        initiators_seen: seen
+            .into_iter()
+            .map(|s| tentaflow_protocol::tentanas::NasTargetInitiatorSeen {
+                initiator: s.initiator,
+                last_seen_at: s.last_seen_at,
+                session_since: s.session_since,
+            })
+            .collect(),
+        seen_since,
+        listen: tentanas::targets::listen_states(&row),
     }))
 }
 
@@ -3363,6 +3415,7 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         transports,
         auth,
         initiators,
+        initiator_descriptions,
         confirm_all_interfaces,
         enabled,
         sudo_password,
@@ -3370,6 +3423,10 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     else {
         return Err(ProtocolError::bad_request("expected TargetCreateRequest"));
     };
+    // "Opis" (wave 12): judged before anything is read or written, and a key
+    // that is not on the list is refused rather than dropped.
+    let descriptions = tentanas::targets::clean_descriptions(initiators, initiator_descriptions)
+        .map_err(ProtocolError::bad_request)?;
     let g = gate_targets(ctx)?;
     // From the read of the volumes to the row: a pool destroy cannot run in
     // between (`pools::resources_lock`), and a running one refuses this.
@@ -3480,6 +3537,7 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         // for host NQNs on the NVMe-oF path (n14 leaves the iSCSI allowlist to
         // the target detail, and this stays empty there).
         initiators: initiators.clone(),
+        initiator_descriptions: descriptions,
         auth_method: method,
         auth_username: username,
         auth_secret: secret,
@@ -3546,6 +3604,7 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         repick_portal,
         auth,
         initiators,
+        initiator_descriptions,
         port_groups,
         confirm_all_interfaces,
         enabled,
@@ -3556,6 +3615,29 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     };
     let g = gate_targets(ctx)?;
     let mut row = target_row(&g, target_id)?;
+    // SECURITY (MAJOR 27 F2): the last entry never leaves the allowlist. An
+    // empty list is an OPEN target, so "revoke the last initiator" would let
+    // everybody in — the one it meant to shut out first (measured: back in
+    // 2.2 s). The coded refusal names what does cut everybody off: stopping
+    // the target.
+    if tentanas::targets::removes_last_initiator(&row.initiators, initiators) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            tentanas::targets::LAST_INITIATOR_REFUSAL,
+        ));
+    }
+    // "Opis": `None` (an older client) keeps what the initiators that stay
+    // already had; `Some` replaces it and is judged like the create's.
+    let descriptions = match initiator_descriptions {
+        Some(asked) => tentanas::targets::clean_descriptions(initiators, asked)
+            .map_err(ProtocolError::bad_request)?,
+        None => row
+            .initiator_descriptions
+            .iter()
+            .filter(|(initiator, _)| initiators.contains(initiator))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
     let existing = targets_seen_by(&g)?;
     let caps = block_capabilities(&g, &existing).await;
     let (method, username, secret, mutual_username, mutual_secret, hash, dhgroup) =
@@ -3585,6 +3667,7 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     )
     .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     row.initiators = initiators.clone();
+    row.initiator_descriptions = descriptions;
     if !port_groups.is_empty() {
         row.port_groups = port_groups.clone();
     }
@@ -3610,6 +3693,70 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     let name = row.name.clone();
     store::upsert_target(&g.db, &g.org_id, &row).map_err(|e| internal("targets", e))?;
     spawn_target_job(ctx, &g, "target_update", &name, target_id, sudo_password.as_ref())
+}
+
+/// n19 "Rozłącz" (wave 12, MAJOR 27 §L.7): reset the iSCSI session of ONE
+/// allowlisted initiator, or — with `revoke` — take it off the allowlist so
+/// it cannot come back.
+///
+/// The same gate as any other target write (PERM_TARGETS + admin, and the
+/// elevation the channel needs). Every refusal is CODED and comes before a
+/// job exists; the helper checks the kernel-side half once more as root.
+///
+/// `revoke` is no new helper command: the row loses the initiator and the
+/// ordinary apply runs, whose ACL `rmdir` drops the session at once
+/// (measured) — refused when it is the only entry, because an empty list
+/// opens the target (F2).
+async fn target_session_reset(ctx: &HandlerContext, req: &P) -> Result<MessageBody, ProtocolError> {
+    let P::TargetSessionResetRequest {
+        target_id,
+        initiator,
+        revoke,
+        sudo_password,
+    } = req
+    else {
+        return Err(ProtocolError::bad_request("expected TargetSessionResetRequest"));
+    };
+    let g = gate_targets(ctx)?;
+    let mut row = target_row(&g, target_id)?;
+    if let Some(code) = tentanas::targets::session_reset_refusal(&row, initiator, *revoke) {
+        return Err(ProtocolError::new(ProtocolErrorCode::Conflict, code));
+    }
+    if *revoke {
+        row.initiators.retain(|i| i != initiator);
+        row.initiator_descriptions.remove(initiator);
+        row.updated_at = store::now();
+        let name = row.name.clone();
+        store::upsert_target(&g.db, &g.org_id, &row).map_err(|e| internal("targets", e))?;
+        return spawn_target_job(ctx, &g, "target_update", &name, target_id, sudo_password.as_ref());
+    }
+    let explicit = sudo_password.as_ref().map(token);
+    let cipher = ctx.state.settings_cipher.clone();
+    let who = initiator.clone();
+    let subject = row.name.clone();
+    let job = tentanas::jobs::spawn_owned(
+        &g.db,
+        "target_session_reset",
+        &subject,
+        &g.user_id,
+        Some(g.org_id.as_str()),
+        None,
+        None,
+        move |h| async move {
+            let db = h.db().clone();
+            h.log(format!("{}: resetting the session of {who}", row.name));
+            let (lines, outcome) =
+                tentanas::targets::reset_session(&db, &cipher, &row, &who, explicit.as_deref()).await;
+            drop(explicit);
+            for line in lines {
+                h.log(line);
+            }
+            h.progress(100);
+            outcome
+        },
+    )
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response(ctx, job))
 }
 
 /// Deleting a target cuts a live client off from a raw disk mid-write, which
@@ -6205,6 +6352,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::TargetGetRequest { target_id } => target_get(ctx, target_id).await,
         P::TargetCreateRequest { .. } => target_create(ctx, payload).await,
         P::TargetUpdateRequest { .. } => target_update(ctx, payload).await,
+        P::TargetSessionResetRequest { .. } => target_session_reset(ctx, payload).await,
         P::TargetDeleteRequest {
             target_id,
             confirm_name,
@@ -6385,7 +6533,10 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 parity_disk_ids,
                 cache_disk_ids,
                 filesystem,
-                |ids| disks_by_id(ids, false),
+                // The PREVIEW names a remote LUN as a per-disk refusal
+                // (`conflicting_owner_code` → 'remote') instead of failing
+                // outright; the create path still refuses it coded.
+                disks_for_plan,
                 async {
                     let g = gate(ctx,PERM_READ)?;
                     root_claims(&g,"elastic namespace",(!name.is_empty()).then_some(name.as_str()),None).await
@@ -6690,6 +6841,7 @@ register_tentanas_variant!("TentaNasTargetsListRequest", "tentaflow_ws_handler_n
 register_tentanas_variant!("TentaNasTargetGetRequest", "tentaflow_ws_handler_nas_target_get");
 register_tentanas_variant!("TentaNasTargetCreateRequest", "tentaflow_ws_handler_nas_target_create");
 register_tentanas_variant!("TentaNasTargetUpdateRequest", "tentaflow_ws_handler_nas_target_update");
+register_tentanas_variant!("TentaNasTargetSessionResetRequest", "tentaflow_ws_handler_nas_target_session_reset");
 register_tentanas_variant!("TentaNasTargetDeleteRequest", "tentaflow_ws_handler_nas_target_delete");
 register_tentanas_variant!(
     "TentaNasElasticCapabilitiesRequest",
@@ -7341,7 +7493,7 @@ mod registration_tests {
         let target = P::TargetCreateRequest {
             name: "lockcheck".into(), protocol: "iscsi".into(), source: "tank/lockcheck".into(),
             create_size_bytes: 0, thin: false, portal_interface: String::new(), transports: Vec::new(),
-            auth: None, initiators: Vec::new(), confirm_all_interfaces: false, enabled: false, sudo_password: None,
+            auth: None, initiators: Vec::new(), initiator_descriptions: Default::default(), confirm_all_interfaces: false, enabled: false, sudo_password: None,
         };
         let bound = tentanas::pools::RESOURCES_LOCK_WAIT + std::time::Duration::from_secs(5);
         let held = tentanas::pools::resources_lock(&g.db).lock_owned().await;
@@ -7528,6 +7680,125 @@ mod registration_tests {
         assert_eq!(store::share_user_owner(&g.db, "obcy").unwrap().as_deref(), Some("org-other"));
         assert_eq!(store::list_share_users(&g.db, "org-other").unwrap()[0].description, "kadry");
         assert!(store::list_jobs(&g.db, 100).unwrap().is_empty());
+    }
+
+    /// Wave 12 (MAJOR 27): the allowlist edits and "Rozłącz" are refused
+    /// with a CODE before any probe, row write or job. The last initiator
+    /// never leaves the list (an empty list OPENS the target — F2), a
+    /// description for an unlisted initiator is refused, and a reset needs an
+    /// allowlisted iSCSI initiator with a live session (D2, D4).
+    #[tokio::test]
+    async fn the_last_initiator_descriptions_and_the_session_reset_are_refused_with_codes() {
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        crate::dispatch::app_gate::test_support::set_permission(
+            &fixture.ctx.state,
+            &fixture.addon_id,
+            "user",
+            &fixture.ctx.org_context.as_ref().unwrap().user_id,
+            PERM_TARGETS,
+            "allow",
+        );
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let who = "iqn.1994-05.com.redhat:vmhost-01";
+        let row = store::TargetRow {
+            target_id: "t-w12".into(),
+            name: "vm-w12".into(),
+            protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.local.tentaflow:n.vm-w12".into(),
+            enabled: true,
+            initiators: vec![who.into()],
+            auth_method: "none".into(),
+            state: "active".into(),
+            created_at: store::now(),
+            updated_at: store::now(),
+            ..Default::default()
+        };
+        store::upsert_target(&g.db, &g.org_id, &row).unwrap();
+        let update = |initiators: Vec<String>, descriptions: Option<std::collections::BTreeMap<String, String>>| P::TargetUpdateRequest {
+            target_id: "t-w12".into(),
+            portals: Vec::new(),
+            repick_portal: false,
+            auth: None,
+            initiators,
+            initiator_descriptions: descriptions,
+            port_groups: Vec::new(),
+            confirm_all_interfaces: false,
+            enabled: true,
+            sudo_password: None,
+        };
+        // F2: emptying the list is refused, coded.
+        let refused = target_update(&fixture.ctx, &update(Vec::new(), None)).await.unwrap_err();
+        assert_eq!(refused.code, ProtocolErrorCode::Conflict);
+        assert_eq!(refused.message, "refusal:target_last_initiator");
+        // "Opis" for an initiator that is not on the list.
+        let stray = std::collections::BTreeMap::from([("iqn.x:stray".to_string(), "x".to_string())]);
+        let refused = target_update(&fixture.ctx, &update(vec![who.into()], Some(stray))).await.unwrap_err();
+        assert_eq!(refused.message, "refusal:target_description_unlisted");
+        // Nothing changed behind the refusals.
+        assert_eq!(store::target(&g.db, &g.org_id, "t-w12").unwrap().unwrap().initiators, vec![who.to_string()]);
+
+        let reset = |initiator: &str, revoke: bool| P::TargetSessionResetRequest {
+            target_id: "t-w12".into(),
+            initiator: initiator.into(),
+            revoke,
+            sudo_password: None,
+        };
+        let code = |e: ProtocolError| e.message;
+        // D2: not on the allowlist.
+        assert_eq!(
+            code(target_session_reset(&fixture.ctx, &reset("iqn.x:stranger", false)).await.unwrap_err()),
+            "refusal:target_session_reset_not_allowlisted"
+        );
+        // Revoking the only entry would open the target.
+        assert_eq!(
+            code(target_session_reset(&fixture.ctx, &reset(who, true)).await.unwrap_err()),
+            "refusal:target_last_initiator"
+        );
+        // This host has no LIO object for the target: no live session.
+        assert_eq!(
+            code(target_session_reset(&fixture.ctx, &reset(who, false)).await.unwrap_err()),
+            "refusal:target_session_none"
+        );
+        // NVMe-oF has no per-host disconnect.
+        let mut nvme = row.clone();
+        nvme.target_id = "t-w12n".into();
+        nvme.name = "vm-w12n".into();
+        nvme.protocol = "nvmet".into();
+        nvme.wwn = "nqn.2026-09.local.tentaflow:n.vm-w12n".into();
+        store::upsert_target(&g.db, &g.org_id, &nvme).unwrap();
+        let refused = target_session_reset(
+            &fixture.ctx,
+            &P::TargetSessionResetRequest { target_id: "t-w12n".into(), initiator: who.into(), revoke: false, sudo_password: None },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.message, "refusal:target_session_reset_nvmet");
+        assert!(store::list_jobs(&g.db, 100).unwrap().is_empty(), "no job behind any refusal");
+    }
+
+    /// Critic wave 12: a remote LUN is refused, coded, by every path that
+    /// takes a disk id — the replace path, which does not require a free disk,
+    /// included.
+    #[test]
+    fn a_remote_lun_is_refused_by_every_disk_accepting_path() {
+        let id = "dev-sdz-w12-remote";
+        tentanas::disks::insert_live_for_test(NasDisk {
+            disk_id: id.into(),
+            name: "sdz".into(),
+            role: tentanas::disks::ROLE_REMOTE.into(),
+            ..Default::default()
+        });
+        for require_free in [false, true] {
+            let refused = disks_by_id(&[id.to_string()], require_free).expect_err("remote");
+            assert_eq!(refused.code, ProtocolErrorCode::Conflict);
+            assert_eq!(refused.message, "refusal:disk_remote");
+        }
+        // The Elastic PREVIEW reads it and names it per disk instead (R2-1).
+        let read = disks_for_plan(&[id.to_string()]).expect("the preview reads it");
+        assert_eq!(tentanas::elastic::conflicting_owner_code(&read[0]), Some(("remote", String::new())));
+        assert!(disks_for_plan(&["nope".to_string()]).is_err());
+        tentanas::disks::remove_live_for_test(id);
     }
 
     /// A legacy account migration 20 gave to this organisation because it

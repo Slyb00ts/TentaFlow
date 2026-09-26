@@ -315,7 +315,9 @@ fn command_label(command: &HelperCommand) -> &'static str {
         HelperCommand::FleetMount { .. } | HelperCommand::FleetUmount { .. } => "mount",
         HelperCommand::ArcLimitSet { .. } | HelperCommand::ArcLimitClear {} => "the ARC limit",
         HelperCommand::BlockModulesLoad { .. } => "the kernel target modules",
-        HelperCommand::IscsiTargetApply {} | HelperCommand::IscsiTargetRemove { .. } => {
+        HelperCommand::IscsiTargetApply {}
+        | HelperCommand::IscsiTargetRemove { .. }
+        | HelperCommand::IscsiSessionReset { .. } => {
             "the iSCSI target"
         }
         HelperCommand::NvmetSubsystemApply {} | HelperCommand::NvmetSubsystemRemove { .. } => {

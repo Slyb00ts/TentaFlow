@@ -1201,6 +1201,7 @@ pub fn parse_smbstatus(text: &str) -> BTreeMap<String, Vec<NasShareSession>> {
                     .get("connected_at")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                ..Default::default()
             });
     }
     out
@@ -1225,6 +1226,7 @@ pub fn parse_nfs_client_info(text: &str) -> Option<NasShareSession> {
         client: address?,
         user: name.unwrap_or_default(),
         connected_at: None,
+        ..Default::default()
     })
 }
 

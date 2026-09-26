@@ -6819,6 +6819,10 @@
         "sharing_share_not_resumed": {
           "title": "Udział {share} nie wrócił po wznowieniu udostępniania",
           "detail": "Stan udziału mówi dlaczego. Węzeł ponawia z rosnącym odstępem; alert zamknie się, gdy udział znów zacznie działać."
+        },
+        "target_session_not_reset": {
+          "title": "Target {target}: klient spoza nowej listy dozwolonych wciąż jest połączony",
+          "detail": "Lista dozwolonych jest zapisana, ale klient spoza niej wciąż jest zalogowany, a sesji targetu nie udało się zerwać (przełączenie enable zawiodło). Zatrzymaj target, aby odciąć wszystkich klientów."
         }
       },
       "node_text": "Treść węzła",
@@ -6855,7 +6859,8 @@
       "array_cache": "Cache",
       "array_parity": "Parzystość",
       "other_org_array": "W macierzy innej organizacji",
-      "mounted": "Zamontowany"
+      "mounted": "Zamontowany",
+      "remote": "dysk zdalny (iSCSI/NVMe-oF)"
     },
     "disks": {
       "search": "Szukaj: urządzenie, model, serial…",
@@ -7102,7 +7107,8 @@
         "shares": "Udziały SMB/NFS",
         "targets": "Targety iSCSI/NVMe-oF",
         "disable": "Wyłączenie TentaNas"
-      }
+      },
+      "kind_target_session_reset": "Rozłączenie sesji targetu"
     },
     "elevation": {
       "title": "Kanał uprawnień systemowych",
@@ -7800,7 +7806,8 @@
         "system": "zawiera system tego węzła",
         "mounted": "jest zamontowany",
         "mounted_named": "jest zamontowany w {name}",
-        "used": "zawiera system plików lub partycje"
+        "used": "zawiera system plików lub partycje",
+        "remote": "dysk zdalny (iSCSI/NVMe-oF)"
       },
       "elastic_refusal": {
         "too_many_cache_disks": "Elastic dopuszcza najwyżej jeden dysk cache.",
@@ -7815,7 +7822,8 @@
         "parity_too_small": "{disk} ({size}) nie może być parity — jest mniejszy niż największy dysk danych ({largest}).",
         "filesystem_invalid": "„{filesystem}” nie jest systemem plików, który tworzy ta aplikacja: dysk danych Elastic ma xfs albo ext4, żeby pozostał czytelny osobno.",
         "filesystem_unavailable": "mkfs.{filesystem} nie jest zainstalowany na tym węźle, więc żadnego dysku tej macierzy nie da się przygotować.",
-        "plan_failed": "Z tego układu nie da się zbudować planu — szczegóły w podpowiedzi."
+        "plan_failed": "Z tego układu nie da się zbudować planu — szczegóły w podpowiedzi.",
+        "disk_remote": "{disk} to dysk zdalny (iSCSI/NVMe-oF) — nie może być członkiem macierzy."
       },
       "elastic_warning": {
         "no_parity": "Bez dysku parity: ta macierz nie ma żadnej ochrony, a utrata jednego dysku danych oznacza utratę jego plików.",
@@ -8035,7 +8043,8 @@
       "journal_ack": "Rozumiem, że macierz {name} przestanie być odtwarzalna importem, i zwalniam rezerwację jej dziennika.",
       "retype": "Przepisz nazwę urządzenia, aby potwierdzić:",
       "confirm": "Wyczyść {name}",
-      "done": "Przyjęto czyszczenie dysku {name}. Sprawdź wynik zadania."
+      "done": "Przyjęto czyszczenie dysku {name}. Sprawdź wynik zadania.",
+      "refusal_remote": "{name} to dysk zdalny (iSCSI/NVMe-oF), który ten węzeł widzi jako klient — jego dane należą do targetu, który go udostępnia. Wyloguj się z targetu zamiast czyścić dysk."
     },
     "destroy_pool": {
       "title": "Zniszcz pulę {name}",
@@ -8956,7 +8965,6 @@
       "sessions_unmeasured": "Nie wiadomo — to nie znaczy zero",
       "host_shared": "Używany też przez",
       "context_changed": "Kontekst noda lub targetu zmienił się. Otwórz detal ponownie.",
-      "session_identity": "Klient / initiator",
       "edit_initiators": "Dodaj lub edytuj hosty",
       "initiators_draft": "Zmiany listy zatwierdza przycisk Zapisz.",
       "remove_initiator": "Usuń z listy",
@@ -9082,7 +9090,43 @@
       "host_state": "Stan",
       "host_connected": "Połączony",
       "host_not_connected": "Niepołączony",
-      "state_suspended": "wstrzymany"
+      "state_suspended": "wstrzymany",
+      "col_initiator_iqn": "IQN initiatora",
+      "col_host_nqn": "NQN hosta",
+      "col_description": "Opis",
+      "col_last_seen": "Ostatnie połączenie",
+      "last_now": "teraz",
+      "last_none": "brak zapisu",
+      "last_none_hint": "Jądro nie przechowuje dat połączeń; TentaNas zapisuje je sam od {date}. Od tego czasu ten initiator się nie połączył.",
+      "edit_description": "Edytuj opis",
+      "description_title": "Opis initiatora",
+      "description_hint": "Do {n} znaków, np. „Proxmox vmhost-01”. Zmianę zatwierdza przycisk Zapisz.",
+      "description_apply": "Ustaw opis",
+      "allowlist_last_warning": "Lista dozwolonych nie może zostać pusta: pusta lista otworzyłaby target dla każdego, kto dosięgnie portalu. Aby odciąć wszystkich, zatrzymaj target.",
+      "nvmet_remove_keeps_connection": "Usunięcie hosta z listy nie rozłącza hosta, który jest już połączony — zachowuje on pełny dostęp do czasu ponownego połączenia. Aby odciąć go od razu, zatrzymaj target.",
+      "listen_listening": "Nasłuch aktywny",
+      "listen_target_disabled": "Port otwarty, target wyłączony — logowania odrzucane",
+      "listen_not_listening": "Brak nasłuchu",
+      "listen_rdma": "Nie zmierzono (RDMA)",
+      "listen_unknown": "Nie zmierzono",
+      "col_session_initiator": "Initiator",
+      "col_session_address": "Adres",
+      "col_session_duration": "Czas trwania",
+      "col_session_state": "Stan",
+      "session_unnamed": "host bez nazwy",
+      "duration_hint": "Co najmniej — liczone od pierwszego odczytu tej sesji ({since}); jądro nie podaje czasu logowania.",
+      "disconnect": "Rozłącz sesję",
+      "disconnect_title": "Rozłącz sesję",
+      "disconnect_lead": "Initiator:",
+      "disconnect_reset_text": "Sesja zostanie zerwana. Klient zwykle łączy się ponownie w ciągu ok. 2 s; w tym czasie jego operacje dyskowe czekają. Klient nie traci dostępu.",
+      "disconnect_revoke_label": "i usuń z listy dozwolonych",
+      "disconnect_revoke_text": "Klient zostanie rozłączony i nie będzie mógł wrócić. Będzie próbował co ok. 2 s (każda próba to wpis w dzienniku systemu tego węzła), a po ok. 2 minutach jego operacje dyskowe zakończą się błędem. Aby przestał próbować, wyloguj target po stronie klienta. Ponowne dodanie go do listy przywraca dostęp automatycznie, dopóki klient próbuje.",
+      "disconnect_confirm": "Rozłącz",
+      "disconnect_done": "Przyjęto rozłączenie sesji — wynik w logu zadania.",
+      "reset_no_allowlist": "Rozłączenie pojedynczej sesji wymaga listy dozwolonych initiatorów: bez niej klient loguje się ponownie od razu, a jądro nie podaje adresu ani stanu sesji.",
+      "reset_nvmet_no_debugfs": "Rozłączenie pojedynczego hosta NVMe-oF jest niedostępne na tym węźle: jądro nie publikuje kontrolerów (brak CONFIG_NVME_TARGET_DEBUGFS), a usunięcie hosta z listy go nie rozłącza.",
+      "reset_nvmet_unmeasured": "Rozłączenie pojedynczego hosta NVMe-oF nie jest jeszcze dostępne: mechanizm nie został zmierzony, a usunięcie hosta z listy go nie rozłącza.",
+      "last_seen_hint": "{ago} — z dokładnością do ok. minuty: węzeł odświeża ten czas co najwyżej raz na minutę."
     },
     "wizard_target": {
       "title": "Nowy target",
@@ -9193,7 +9237,9 @@
         "dhchap_not_built": "to jądro zbudowano bez CONFIG_NVME_TARGET_AUTH ({path})",
         "dhchap_not_mentioned": "{path} nie wspomina o CONFIG_NVME_TARGET_AUTH",
         "kernel_config_missing": "to jądro nie publikuje swojej konfiguracji (brak /proc/config.gz i /boot/config-*), więc obsługi DH-HMAC-CHAP nie da się potwierdzić — kreator nie oferuje tego, czego nie może potwierdzić"
-      }
+      },
+      "host_description_label": "Opis — {nqn}",
+      "host_description_placeholder": "np. orion (compute)"
     },
     "journal_owner": {
       "this_instance": "ta instancja TentaNas",
@@ -9247,7 +9293,17 @@
       "sharing_stop_busy": "Udostępnianie na tym węźle jest już zatrzymywane albo zatrzymane — nic nie zmieniono.",
       "sharing_stop_author_gone": "Autor tej prośby nie jest już administratorem platformy w tej organizacji — nie można jej zatwierdzić; odrzuć ją.",
       "sharing_resume_partial": "Udostępnianie wróciło, ale nie w całości — linie zadania wymieniają, co jeszcze nie działa; węzeł ponawia próbę.",
-      "sharing_stop_pending_elsewhere": "Na tym węźle czeka już na zatwierdzenie zatrzymanie udostępniania zgłoszone w innej organizacji. Administrator platformy widzi je w TentaNas → Zadania i może je odrzucić."
+      "sharing_stop_pending_elsewhere": "Na tym węźle czeka już na zatwierdzenie zatrzymanie udostępniania zgłoszone w innej organizacji. Administrator platformy widzi je w TentaNas → Zadania i może je odrzucić.",
+      "target_last_initiator": "To jedyny wpis na liście dozwolonych — jego usunięcie otworzyłoby target dla wszystkich. Zatrzymaj target albo najpierw dodaj inny wpis.",
+      "target_description_unlisted": "Opis dotyczy initiatora, którego nie ma na liście dozwolonych — dodaj go do listy albo usuń opis",
+      "target_description_too_long": "Opis może mieć najwyżej 80 znaków",
+      "target_description_invalid": "Opis nie może zawierać znaków sterujących (np. nowej linii)",
+      "target_session_reset_nvmet": "Rozłączenie pojedynczego hosta NVMe-oF nie jest dostępne — usunięcie hosta z listy go nie rozłącza, a osobny mechanizm nie został jeszcze zmierzony",
+      "target_session_reset_not_allowlisted": "Rozłączyć można tylko initiatora z listy dozwolonych — bez listy klient loguje się ponownie od razu",
+      "target_session_none": "Ten initiator nie ma teraz sesji — nie ma czego rozłączyć",
+      "target_session_reset_not_serving": "Target jest zatrzymany — nie ma sesji do rozłączenia",
+      "disk_remote": "To dysk zdalny (iSCSI/NVMe-oF), który ten węzeł widzi jako klient — nie może wejść do puli ani macierzy",
+      "target_session_reset_not_app_target": "Tego targetu nie utworzyła ta aplikacja — nie rozłączy jego sesji"
     },
     "unreachable": {
       "title": "Węzeł {node} niedostępny",

@@ -95,6 +95,7 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         HelperCommand::IscsiTargetRemove { iqn } => {
             block::remove_iscsi(Path::new(block::TARGET_CONFIGFS), iqn).map(|log| log.join("\n"))
         }
+        HelperCommand::IscsiSessionReset { initiator } => iscsi_session_reset(initiator, payload),
         HelperCommand::NvmetSubsystemApply {} => nvmet_subsystem_apply(payload),
         HelperCommand::NvmetSubsystemRemove { nqn } => {
             block::remove_nvmet(Path::new(block::NVMET_CONFIGFS), nqn).map(|log| log.join("\n"))
@@ -1123,15 +1124,40 @@ fn iscsi_target_apply(payload: &[u8]) -> Result<String, String> {
     // into the job log ABOVE the summary line, because a key that stayed
     // world-readable is the one thing about this apply an admin has to act on.
     let warnings = block::apply_plan(&plan)?;
+    // The post-condition of an allowlist (MAJOR 27 F3): no excluded client is
+    // still logged in. Re-read AFTER the plan, and the TPG toggled when one
+    // is — see `block::enforce_allowlist`. Only a failed toggle fails the apply.
+    let enforced = block::enforce_allowlist(Path::new(block::TARGET_CONFIGFS), &spec)?;
     // The rendered plan goes into the job log — `render` is the only rendering
     // there is and it prints `***` for every secret.
     Ok(format!(
-        "{}\n{}iSCSI target {} applied ({} configfs steps)",
+        "{}\n{}{}iSCSI target {} applied ({} configfs steps)",
         block::render(&plan).trim_end(),
         warnings.iter().map(|w| format!("{w}\n")).collect::<String>(),
+        enforced.map(|line| format!("{line}\n")).unwrap_or_default(),
         spec.iqn,
         block::kernel_step_count(&plan)
     ))
+}
+
+/// "Rozłącz" for one allowlisted initiator: drop its ACL, re-create it at
+/// once (`block::plan_session_reset`, L1 measured on rig11).
+///
+/// Observed HERE, as root, right before acting — the core checked the same
+/// preconditions a moment ago, but the session it saw may be gone, and the
+/// refusal must describe the kernel this process is about to change.
+///
+/// The two halves are applied and reported apart. A failed DROP means nothing
+/// happened to the client that matters; a failed RE-CREATE after a successful
+/// drop means the initiator has LOST ACCESS until the ACL is back, and the
+/// error says exactly that, so the core re-applies the target instead of
+/// treating it as a failed button press. Only the steps taken are reported —
+/// the rendered plan, which redacts every secret; no session id anywhere.
+fn iscsi_session_reset(initiator: &str, payload: &[u8]) -> Result<String, String> {
+    let spec: block::IscsiTargetSpec =
+        serde_json::from_slice(payload).map_err(|e| format!("iSCSI target spec: {e}"))?;
+    require_configfs(block::TARGET_CONFIGFS)?;
+    block::execute_session_reset(Path::new(block::TARGET_CONFIGFS), &spec, initiator)
 }
 
 fn nvmet_subsystem_apply(payload: &[u8]) -> Result<String, String> {

@@ -785,6 +785,24 @@ pub enum HelperCommand {
     /// and backstores back out of configfs. Only the named target — a
     /// hand-made target on the same node is left alone.
     IscsiTargetRemove { iqn: String },
+    /// Builtin: "Rozłącz" for ONE allowlisted initiator of one app-created
+    /// iSCSI target — a session RESET (MAJOR 27, L1 measured on rig11): the
+    /// initiator's ACL and its mapped LUNs are removed, which drops the
+    /// session within ~50 ms, and re-created at once exactly as the apply
+    /// would (`block::plan_session_reset`). The client logs back in by itself
+    /// (measured 2.1 s) and keeps its access; revoking it is the allowlist
+    /// edit, not this.
+    ///
+    /// The `block::IscsiTargetSpec` travels on stdin for the same reason as
+    /// `IscsiTargetApply {}`: re-creating the ACL writes its CHAP secrets, and
+    /// a secret never becomes an argv word. The only argument is the
+    /// initiator IQN — a name the admin reads on the screen. No session id,
+    /// ISID or TSIH crosses the channel: the helper finds the session itself.
+    ///
+    /// Refused before any write, with a stable `refused:<code>` head the core
+    /// maps: `not_app_target`, `not_allowlisted` (no reset on a target
+    /// without an allowlist, owner decision D2), `no_session`.
+    IscsiSessionReset { initiator: String },
     /// Builtin: the same contract for one NVMe-oF subsystem from the
     /// `block::NvmetSubsystemSpec` on stdin (namespaces, ANA groups, the NQN
     /// allowlist, the ports and the DH-HMAC-CHAP keys, which are also secrets
@@ -2218,6 +2236,7 @@ impl HelperCommand {
             Self::BlockModulesLoad { .. } => Some("block_modules_load"),
             Self::IscsiTargetApply {} => Some("iscsi_target_apply"),
             Self::IscsiTargetRemove { .. } => Some("iscsi_target_remove"),
+            Self::IscsiSessionReset { .. } => Some("iscsi_session_reset"),
             Self::NvmetSubsystemApply {} => Some("nvmet_subsystem_apply"),
             Self::NvmetSubsystemRemove { .. } => Some("nvmet_subsystem_remove"),
             Self::NvmetSessionsRead {} => Some("nvmet_sessions_read"),
@@ -2400,6 +2419,9 @@ impl HelperCommand {
                 other => Err(invalid(format!("'{other}' is not a block protocol"))),
             },
             Self::IscsiTargetRemove { iqn } => block::validate_iqn(iqn),
+            // The initiator becomes a configfs directory name inside the
+            // target's `acls/`, so it dies here if it could aim anywhere else.
+            Self::IscsiSessionReset { initiator } => block::validate_iqn(initiator),
             Self::NvmetSubsystemRemove { nqn } => block::validate_nqn(nqn),
             // No arguments at all, so there is nothing a caller could aim
             // somewhere else: the path it reads is a constant of this crate.
@@ -3007,6 +3029,7 @@ impl HelperCommand {
             // The target specs carry CHAP / DH-HMAC-CHAP secrets, so they take
             // the same road every other secret does: stdin, never argv.
             | Self::IscsiTargetApply {}
+            | Self::IscsiSessionReset { .. }
             | Self::NvmetSubsystemApply {}
             | Self::BwrapProfileWrite {} => true,
             _ => false,
@@ -3194,6 +3217,10 @@ impl HelperCommand {
             Self::IscsiTargetApply {} => (
                 "builtin",
                 "Serve one iSCSI target from configfs: backstores, LUNs, ALUA groups, the IQN allowlist, portals and CHAP.",
+            ),
+            Self::IscsiSessionReset { .. } => (
+                "builtin",
+                "Reset one allowlisted initiator's iSCSI session: drop its ACL and re-create it at once (the client reconnects and keeps its access).",
             ),
             Self::IscsiTargetRemove { .. } => (
                 "builtin",
@@ -3435,6 +3462,9 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::IscsiTargetApply {},
         HelperCommand::IscsiTargetRemove {
             iqn: String::from("iqn.x"),
+        },
+        HelperCommand::IscsiSessionReset {
+            initiator: String::from("iqn.x"),
         },
         HelperCommand::NvmetSubsystemApply {},
         HelperCommand::NvmetSubsystemRemove {
@@ -4556,6 +4586,28 @@ mod tests {
         };
         assert_eq!(remove.plan(), Ok(Plan::Builtin("iscsi_target_remove")));
         assert!(!remove.reads_key_from_stdin());
+        // The per-session reset re-creates an ACL with its CHAP secrets, so it
+        // takes the spec on stdin too; its one argument is the initiator IQN,
+        // which becomes a directory name and is validated like one.
+        let reset = HelperCommand::IscsiSessionReset {
+            initiator: "iqn.1994-05.com.redhat:vmhost-01".into(),
+        };
+        assert_eq!(reset.plan(), Ok(Plan::Builtin("iscsi_session_reset")));
+        assert!(reset.reads_key_from_stdin());
+        for bad in ["../../etc", "iqn.x/../../y", "", "IQN.UPPER"] {
+            assert!(
+                matches!(
+                    HelperCommand::IscsiSessionReset { initiator: bad.into() }.plan(),
+                    Err(CatalogError::InvalidArgument(_))
+                ),
+                "{bad}"
+            );
+        }
+        let line = reset.to_json_line();
+        assert_eq!(
+            line,
+            "{\"cmd\":\"iscsi_session_reset\",\"initiator\":\"iqn.1994-05.com.redhat:vmhost-01\"}\n"
+        );
         // The name becomes a configfs directory, so a bad one dies in the
         // catalog rather than in a root-side `mkdir`.
         assert!(matches!(

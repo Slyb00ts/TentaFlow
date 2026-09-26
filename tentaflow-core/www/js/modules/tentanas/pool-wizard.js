@@ -60,14 +60,14 @@ export function anyraidCardText(environment, fallbackVersion = '') {
 // sentence becomes the tooltip. A code this build has no words for — or a
 // node too old to send codes — shows the node's sentence as it came.
 const ELASTIC_ROLE_WORDS = new Set(['data', 'parity', 'cache']);
-const ELASTIC_OWNERS = new Set(['elastic', 'spare', 'pool', 'md', 'system', 'mounted', 'used']);
+const ELASTIC_OWNERS = new Set(['elastic', 'spare', 'pool', 'md', 'system', 'mounted', 'used', 'remote']);
 const elasticRole = (role) => (ELASTIC_ROLE_WORDS.has(role) ? T('wizard_pool.elastic_role_' + role) : '');
 const bytesParam = (value) => (Number.isFinite(Number(value)) && String(value) !== '' ? fmtBytes(Number(value)) : '');
 
 function elasticOwner(p) {
   if (!ELASTIC_OWNERS.has(p.owner)) return '';
   const named = String(p.owner_name || '');
-  return named && p.owner !== 'elastic' && p.owner !== 'system' && p.owner !== 'used'
+  return named && p.owner !== 'elastic' && p.owner !== 'system' && p.owner !== 'used' && p.owner !== 'remote'
     ? T('wizard_pool.elastic_owner.' + p.owner + '_named', { name: named })
     : T('wizard_pool.elastic_owner.' + p.owner);
 }
@@ -92,6 +92,9 @@ const ELASTIC_REFUSAL_WORDS = new Map([
   }],
   ['data_disks_same_device', (p, disk) => (disk && p.other ? T('wizard_pool.elastic_refusal.data_disks_same_device', { disk, other: p.other }) : null)],
   ['disk_in_use', (p, disk) => {
+    // A LUN another target serves to this node (MAJOR 27 F4): named as what
+    // it is rather than as an owner the disk would be shared with.
+    if (p.owner === 'remote') return disk ? T('wizard_pool.elastic_refusal.disk_remote', { disk }) : null;
     const owner = elasticOwner(p);
     return disk && owner ? T('wizard_pool.elastic_refusal.disk_in_use', { disk, owner }) : null;
   }],

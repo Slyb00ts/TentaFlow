@@ -1092,6 +1092,28 @@ the next reconcile replaces this with the current count'
     // target that asks for the access lines later receives the lines
     // collected from then on, not the whole retained log (critic MINOR 1).
     "ALTER TABLE nas_forward_cursors ADD COLUMN access_enabled_at TEXT NOT NULL DEFAULT '';",
+), (
+    29,
+    // Wave 12 (MAJOR 27, n19): "Opis" per allowlisted initiator, and the
+    // session sampler behind "Ostatnie połączenie" and the session duration.
+    // The kernel keeps no login or connection date anywhere (measured), so
+    // the node records its own sightings: `session_key` is internal (the LIO
+    // Session ID, which increments on every login; nvmet: cntlid@address;
+    // empty for a generated iSCSI session) and never leaves the node.
+    // `target_seen_since` is when recording started: before it there is no
+    // record, and the screen says so instead of "never".
+    "ALTER TABLE nas_target_initiators ADD COLUMN description TEXT NOT NULL DEFAULT '';
+    CREATE TABLE nas_target_initiator_seen (
+        target_id TEXT NOT NULL,
+        initiator TEXT NOT NULL,
+        session_key TEXT NOT NULL,
+        session_since TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        last_address TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (target_id, initiator)
+    ) WITHOUT ROWID;
+    INSERT OR IGNORE INTO nas_settings (key, value, updated_at)
+    VALUES ('target_seen_since', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
 )];
 
 /// The owner migration 20 gives a legacy share, target or account it cannot
@@ -6489,6 +6511,9 @@ pub struct TargetRow {
     pub portals: Vec<NasTargetPortal>,
     pub port_groups: Vec<NasTargetPortGroup>,
     pub initiators: Vec<String>,
+    /// "Opis" per initiator (migration 29): non-empty entries, keys on
+    /// `initiators`.
+    pub initiator_descriptions: BTreeMap<String, String>,
     pub auth_method: String,
     pub auth_username: String,
     pub auth_secret: String,
@@ -6522,6 +6547,7 @@ fn target_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
         portals: spec.portals,
         port_groups: spec.port_groups,
         initiators: Vec::new(),
+        initiator_descriptions: BTreeMap::new(),
         auth_method: r.get(6)?,
         auth_username: r.get(7)?,
         auth_secret: r.get(8)?,
@@ -6552,6 +6578,153 @@ pub fn target_initiators(pool: &DbPool, target_id: &str) -> Result<Vec<String>> 
     Ok(rows)
 }
 
+/// The "Opis" of every initiator of one target that has one.
+pub fn target_initiator_descriptions(pool: &DbPool, target_id: &str) -> Result<BTreeMap<String, String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT initiator, description FROM nas_target_initiators
+         WHERE target_id = ?1 AND description <> '' ORDER BY initiator",
+    )?;
+    let rows = stmt
+        .query_map(params![target_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+    Ok(rows)
+}
+
+fn fill_allowlist(pool: &DbPool, target: &mut TargetRow) -> Result<()> {
+    target.initiators = target_initiators(pool, &target.target_id)?;
+    target.initiator_descriptions = target_initiator_descriptions(pool, &target.target_id)?;
+    Ok(())
+}
+
+/// One row of the session sampler (migration 29). `session_key` is internal
+/// and never leaves the node.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetSeenRow {
+    pub initiator: String,
+    pub session_key: String,
+    pub session_since: String,
+    pub last_seen_at: String,
+    pub last_address: String,
+}
+
+/// Every initiator the sampler has seen on one target.
+pub fn target_seen(pool: &DbPool, target_id: &str) -> Result<Vec<TargetSeenRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT initiator, session_key, session_since, last_seen_at, last_address
+         FROM nas_target_initiator_seen WHERE target_id = ?1 ORDER BY initiator",
+    )?;
+    let rows = stmt
+        .query_map(params![target_id], |r| {
+            Ok(TargetSeenRow {
+                initiator: r.get(0)?,
+                session_key: r.get(1)?,
+                session_since: r.get(2)?,
+                last_seen_at: r.get(3)?,
+                last_address: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The `session_key` of a row whose session ENDED: the initiator was absent
+/// from a measured reading. No real key is ever this string (keys are a boot
+/// id plus a number, or empty for a generated session), so the next sighting
+/// always starts a new session.
+pub const SEEN_SESSION_CLOSED: &str = "-";
+
+/// How far `last_seen_at` may lag behind a session that is still up before
+/// the sampler writes it again. The tick reads every 20 s; writing each read
+/// was one transaction per target per tick for a date the screen shows to
+/// the minute (critic wave 12, MINOR 10).
+pub const SEEN_REFRESH_SECS: i64 = 60;
+
+/// One sampler pass over one target: `seen` is EVERY session the node just
+/// read — a MEASURED reading, the caller never calls with an unknown one — as
+/// `(initiator, session key, address)`. Returns how many rows it wrote.
+///
+/// The rules (§4.2, and critic wave 12 MAJOR 2):
+///   * a new initiator, a different key, or a key after a CLOSED row → a new
+///     session: `session_since` = now;
+///   * the same key → the same session; `last_seen_at` moves only when it is
+///     at least `SEEN_REFRESH_SECS` old, or the address changed;
+///   * an initiator with an open row that is NOT in the reading has
+///     disconnected: its row is closed (`SEEN_SESSION_CLOSED`), `last_seen_at`
+///     stays — which is what makes it "Ostatnie połączenie". Without this a
+///     client that came back after a gap under the same key (a reboot of the
+///     node restarts LIO's session ids at 1; an open target's key is always
+///     empty) kept its first-ever start as the "at least" of a session minutes
+///     old.
+///
+/// Nothing is written when nothing changed.
+pub fn record_target_seen(pool: &DbPool, target_id: &str, seen: &[(String, String, String)], at: &str) -> Result<usize> {
+    let existing = target_seen(pool, target_id)?;
+    let now = chrono::DateTime::parse_from_rfc3339(at).ok();
+    let stale = |last: &str| match (now, chrono::DateTime::parse_from_rfc3339(last).ok()) {
+        (Some(now), Some(last)) => (now - last).num_seconds() >= SEEN_REFRESH_SECS,
+        _ => true,
+    };
+    // (initiator, key, since, last, address) to upsert, and initiators to close.
+    let mut upserts: Vec<(&str, &str, String, &str, String)> = Vec::new();
+    for (initiator, key, address) in seen {
+        match existing.iter().find(|r| r.initiator == *initiator) {
+            Some(row) if row.session_key != SEEN_SESSION_CLOSED && row.session_key == *key => {
+                let moved = !address.is_empty() && *address != row.last_address;
+                if moved || stale(&row.last_seen_at) {
+                    let address = if address.is_empty() { row.last_address.clone() } else { address.clone() };
+                    upserts.push((initiator, key, row.session_since.clone(), at, address));
+                }
+            }
+            Some(row) => {
+                let address = if address.is_empty() { row.last_address.clone() } else { address.clone() };
+                upserts.push((initiator, key, at.to_string(), at, address));
+            }
+            None => upserts.push((initiator, key, at.to_string(), at, address.clone())),
+        }
+    }
+    let closes: Vec<&str> = existing
+        .iter()
+        .filter(|r| r.session_key != SEEN_SESSION_CLOSED)
+        .filter(|r| !seen.iter().any(|(i, _, _)| *i == r.initiator))
+        .map(|r| r.initiator.as_str())
+        .collect();
+    if upserts.is_empty() && closes.is_empty() {
+        return Ok(0);
+    }
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO nas_target_initiator_seen
+                (target_id, initiator, session_key, session_since, last_seen_at, last_address)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(target_id, initiator) DO UPDATE SET
+                session_key = excluded.session_key,
+                session_since = excluded.session_since,
+                last_seen_at = excluded.last_seen_at,
+                last_address = excluded.last_address",
+        )?;
+        for (initiator, key, since, last, address) in &upserts {
+            stmt.execute(params![target_id, initiator, key, since, last, address])?;
+        }
+        let mut close = tx.prepare_cached(
+            "UPDATE nas_target_initiator_seen SET session_key = ?3 WHERE target_id = ?1 AND initiator = ?2",
+        )?;
+        for initiator in &closes {
+            close.execute(params![target_id, initiator, SEEN_SESSION_CLOSED])?;
+        }
+    }
+    tx.commit()?;
+    Ok(upserts.len() + closes.len())
+}
+
+/// When this node started recording block-target sessions (migration 29).
+pub fn target_seen_since(pool: &DbPool) -> Result<String> {
+    Ok(setting(pool, "target_seen_since")?.unwrap_or_default())
+}
+
 /// EVERY target of the node, whoever owns it. For the node's own work only —
 /// the configfs reconcile, the restore after a reboot, the zvol and host-NQN
 /// collision checks — which must see every object in the kernel. Anything
@@ -6567,7 +6740,7 @@ pub fn list_targets(pool: &DbPool) -> Result<Vec<TargetRow>> {
         rows
     };
     for target in targets.iter_mut() {
-        target.initiators = target_initiators(pool, &target.target_id)?;
+        fill_allowlist(pool, target)?;
     }
     Ok(targets)
 }
@@ -6612,7 +6785,7 @@ pub fn list_targets_of_org(pool: &DbPool, org_id: &str) -> Result<Vec<TargetRow>
         rows
     };
     for target in targets.iter_mut() {
-        target.initiators = target_initiators(pool, &target.target_id)?;
+        fill_allowlist(pool, target)?;
     }
     Ok(targets)
 }
@@ -6640,7 +6813,7 @@ pub fn target(pool: &DbPool, org_id: &str, target_id: &str) -> Result<Option<Tar
     };
     match row {
         Some(mut target) => {
-            target.initiators = target_initiators(pool, &target.target_id)?;
+            fill_allowlist(pool, &mut target)?;
             Ok(Some(target))
         }
         None => Ok(None),
@@ -6720,10 +6893,16 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
     )?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT OR REPLACE INTO nas_target_initiators (target_id, initiator) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO nas_target_initiators (target_id, initiator, description)
+             VALUES (?1, ?2, ?3)",
         )?;
         for initiator in &target.initiators {
-            stmt.execute(params![target.target_id, initiator])?;
+            let description = target
+                .initiator_descriptions
+                .get(initiator)
+                .map(String::as_str)
+                .unwrap_or("");
+            stmt.execute(params![target.target_id, initiator, description])?;
         }
     }
     tx.commit()?;
@@ -6753,6 +6932,12 @@ pub fn delete_target(pool: &DbPool, org_id: &str, target_id: &str) -> Result<boo
     if removed == 1 {
         tx.execute(
             "DELETE FROM nas_target_initiators WHERE target_id = ?1",
+            params![target_id],
+        )?;
+        // The sampler's rows go with the target (§4.2): a target created later
+        // under the same id must not inherit a "last seen".
+        tx.execute(
+            "DELETE FROM nas_target_initiator_seen WHERE target_id = ?1",
             params![target_id],
         )?;
     }
@@ -9773,8 +9958,9 @@ mod tests {
         // schema13 harmonogramy Elastic i ustawienia movera (E2-10),
         // a schema16 polityki cache folderów, schema25 the known pools,
         // schema26 the disk lines of a multi-disk job, schema27 the
-        // forwarding cursors (schema28 only adds a column).
-        assert_eq!(n, 29);
+        // forwarding cursors (schema28 only adds a column), schema29 the
+        // block-target session sampler.
+        assert_eq!(n, 30);
     }
 
     #[test]
@@ -9813,6 +9999,7 @@ mod tests {
                 "iqn.1998-01.com.vmware:esx02".into(),
                 "iqn.1998-01.com.vmware:esx01".into(),
             ],
+            initiator_descriptions: Default::default(),
             auth_method: "mutual-chap".into(),
             auth_username: "vmware01".into(),
             auth_secret: "encb:ciphertext-one".into(),

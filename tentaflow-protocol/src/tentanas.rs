@@ -526,6 +526,9 @@ pub struct NasAlert {
     ///   text, a tooltip only, and absent when it names another
     ///   organisation's object;
     /// - 'target_still_in_kernel' {target, error?} — as the one above;
+    /// - 'target_session_not_reset' {target} — the allowlist of a target is
+    ///   written, but a client it excludes is still logged in and the TPG
+    ///   enable toggle that resets the target's sessions failed (wave 12);
     /// - 'elevation_unarmed' {};
     /// - 'targets_sweep_failing' {count, alerted, sweep_failed} — `alerted`
     ///   is how many of `count` have an alert their organisation can read,
@@ -1345,7 +1348,22 @@ pub struct NasMountStatus {
 pub struct NasShareSession {
     pub client: String,
     pub user: String,
+    /// Block targets: the first sighting of THIS session by the node's
+    /// sampler (MAJOR 27) — the kernel keeps no login time, so a duration
+    /// shown from it is "at least".
     pub connected_at: Option<String>,
+    /// Block targets (wave 12): the peer address the KERNEL reports for the
+    /// session — LIO's `info` `Address` line, nvmet's `host_traddr`. Empty
+    /// where it publishes none (a generated iSCSI session, owner decision D2)
+    /// — never guessed from sockets (D5).
+    #[serde(default)]
+    pub address: String,
+    /// Block targets (wave 12): the session state as the kernel names it,
+    /// iSCSI with `TARG_SESS_STATE_` stripped (`LOGGED_IN`), nvmet verbatim
+    /// (`ready`). Empty where it publishes none. No session id, ISID, TSIH or
+    /// cntlid is ever carried.
+    #[serde(default)]
+    pub state: String,
 }
 
 /// A file share of this node as the Sharing tab lists it. Exactly one of
@@ -1606,6 +1624,11 @@ pub struct NasTarget {
     /// authentication and the wizard says so.
     #[serde(default)]
     pub initiators: Vec<String>,
+    /// "Opis" per allowlisted initiator (wave 12, migration 29): IQN/NQN →
+    /// the admin's own words ("Proxmox vmhost-01"). Non-empty entries only,
+    /// every key on `initiators`.
+    #[serde(default)]
+    pub initiator_descriptions: std::collections::BTreeMap<String, String>,
     pub port_groups: Vec<NasTargetPortGroup>,
     pub sessions: u32,
     /// Whether `sessions` is a MEASUREMENT or just a zero.
@@ -1636,6 +1659,34 @@ pub struct NasTarget {
     /// sentence is then all there is.
     #[serde(default)]
     pub state_reasons: Vec<NasHealthReason>,
+}
+
+/// "Ostatnie połączenie" of one initiator of a target (wave 12): what the
+/// node's session sampler recorded. The kernel keeps no such date, so it is
+/// the LAST time the node saw a session of this initiator, and there is none
+/// for a time before the recording started (`seen_since`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasTargetInitiatorSeen {
+    pub initiator: String,
+    pub last_seen_at: String,
+    /// When the session seen last began, as far as the sampler knows.
+    #[serde(default)]
+    pub session_since: String,
+}
+
+/// "Nasłuch targetu" for one portal (wave 12), read by the node itself from
+/// configfs and `/proc/net/tcp{,6}`.
+///
+/// `state`: 'listening' (the portal is bound and logins are accepted) |
+/// 'target_disabled' (iSCSI: the port is open and the TPG is disabled, so
+/// logins are refused — measured) | 'not_listening' | 'rdma' (an RDMA portal:
+/// not measured, D6) | 'unknown' (a read failed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasTargetListen {
+    pub address: String,
+    pub port: u32,
+    pub transport: String,
+    pub state: String,
 }
 
 /// One interface the portal picker of the wizard offers (n14 step 2).
@@ -3238,6 +3289,16 @@ pub enum TentaNasPayload {
         /// is the only render there is.
         #[serde(default)]
         config_preview: String,
+        /// "Ostatnie połączenie" per initiator the sampler has seen (wave 12).
+        #[serde(default)]
+        initiators_seen: Vec<NasTargetInitiatorSeen>,
+        /// When this node started recording sessions — before it there is
+        /// no record, and the screen says "brak zapisu", never "nigdy".
+        #[serde(default)]
+        seen_since: String,
+        /// "Nasłuch targetu", one entry per portal (wave 12).
+        #[serde(default)]
+        listen: Vec<NasTargetListen>,
     },
     /// Wizard "create" (n14). `source` is the zvol as ZFS names it;
     /// `create_size_bytes` > 0 creates it first (n14's "+ Nowy zvol").
@@ -3264,6 +3325,10 @@ pub enum TentaNasPayload {
         /// NVMe-oF subsystem cannot be created without at least one host NQN.
         #[serde(default)]
         initiators: Vec<String>,
+        /// "Opis" per entry of `initiators` (wave 12). Every key must be on
+        /// the list; an entry for an unlisted one is refused, not dropped.
+        #[serde(default)]
+        initiator_descriptions: std::collections::BTreeMap<String, String>,
         /// The admin confirmed the target binds every interface. Without it a
         /// portal on `0.0.0.0` is refused, so it can never be the default.
         #[serde(default)]
@@ -3303,11 +3368,31 @@ pub enum TentaNasPayload {
         auth: Option<NasTargetAuth>,
         #[serde(default)]
         initiators: Vec<String>,
+        /// "Opis" per entry of `initiators` (wave 12). `None` (an older
+        /// client) keeps the stored descriptions of the initiators that stay;
+        /// `Some` replaces them. A key not on `initiators` is refused.
+        #[serde(default)]
+        initiator_descriptions: Option<std::collections::BTreeMap<String, String>>,
         #[serde(default)]
         port_groups: Vec<NasTargetPortGroup>,
         #[serde(default)]
         confirm_all_interfaces: bool,
         enabled: bool,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// n19 "Rozłącz" (wave 12): resets the iSCSI session of ONE allowlisted
+    /// initiator. The client logs back in by itself (~2 s, measured) and
+    /// keeps its access; `revoke` also takes it off the allowlist, which
+    /// drops it for good and is refused when it is the only entry (an empty
+    /// list would open the target). The initiator is named by its IQN — the
+    /// name the screen shows; no session id travels. iSCSI only; refused on a
+    /// target without an allowlist (D2). Answers with `JobResponse`.
+    TargetSessionResetRequest {
+        target_id: String,
+        initiator: String,
+        #[serde(default)]
+        revoke: bool,
         #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
@@ -4542,6 +4627,7 @@ mod tests {
                 transports: Vec::new(),
                 auth: None,
                 initiators: Vec::new(),
+                initiator_descriptions: Default::default(),
                 confirm_all_interfaces: false,
                 enabled: false,
                 sudo_password: None,
@@ -4563,6 +4649,7 @@ mod tests {
                 repick_portal: false,
                 auth: None,
                 initiators: Vec::new(),
+                initiator_descriptions: None,
                 port_groups: Vec::new(),
                 confirm_all_interfaces: false,
                 enabled: true,
@@ -4624,6 +4711,7 @@ mod tests {
                 dhchap_dhgroup: String::new(),
             },
             initiators: vec!["iqn.1998-01.com.vmware:esx01".to_string()],
+            initiator_descriptions: Default::default(),
             port_groups: vec![NasTargetPortGroup {
                 group_id: 7,
                 state: "non-optimized".to_string(),
@@ -4643,9 +4731,13 @@ mod tests {
                 client: "192.168.10.24".to_string(),
                 user: "iqn.1998-01.com.vmware:esx01".to_string(),
                 connected_at: Some("2026-09-03T11:00:00Z".to_string()),
+                ..Default::default()
             }],
             config_preview: "write /sys/kernel/config/target/iscsi/x/tpgt_1/auth/password = ***\n"
                 .to_string(),
+            initiators_seen: Vec::new(),
+            seen_since: String::new(),
+            listen: Vec::new(),
         });
         let bytes = crate::cbor::encode(&body).expect("encode");
         let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");
@@ -4666,6 +4758,86 @@ mod tests {
         assert!(decoded.auth.secret_set && decoded.auth.mutual_secret_set);
         assert!(decoded.auth.secret.is_none() && decoded.auth.mutual_secret.is_none());
         assert!(config_preview.contains("***"));
+    }
+
+    /// Wave 12 (MAJOR 27): the session fields, "Opis", the sampler's dates,
+    /// "Nasłuch" and "Rozłącz" round-trip through CBOR, and an older peer's
+    /// messages without them still decode (every field is `serde(default)`).
+    #[test]
+    fn the_wave12_target_fields_round_trip_and_default_when_absent() {
+        let body = MessageBody::TentaNasBody(TentaNasPayload::TargetGetResponse {
+            target: NasTarget {
+                initiators: vec!["iqn.1994-05.com.redhat:vmhost-01".into()],
+                initiator_descriptions: std::collections::BTreeMap::from([(
+                    "iqn.1994-05.com.redhat:vmhost-01".to_string(),
+                    "Proxmox vmhost-01".to_string(),
+                )]),
+                ..Default::default()
+            },
+            sessions: vec![NasShareSession {
+                client: "iqn.1994-05.com.redhat:vmhost-01".into(),
+                user: "iqn.1994-05.com.redhat:vmhost-01".into(),
+                connected_at: Some("2026-09-26T10:00:00Z".into()),
+                address: "10.10.0.21".into(),
+                state: "LOGGED_IN".into(),
+            }],
+            config_preview: String::new(),
+            initiators_seen: vec![NasTargetInitiatorSeen {
+                initiator: "iqn.1994-05.com.redhat:vmhost-01".into(),
+                last_seen_at: "2026-09-26T10:05:00Z".into(),
+                session_since: "2026-09-26T10:00:00Z".into(),
+            }],
+            seen_since: "2026-09-26T09:00:00Z".into(),
+            listen: vec![NasTargetListen {
+                address: "10.10.0.5".into(),
+                port: 3260,
+                transport: "tcp".into(),
+                state: "target_disabled".into(),
+            }],
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode")).expect("decode");
+        assert_eq!(back, body);
+
+        // An older node's answer: no session address/state, no Opis, no dates.
+        let old: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "TargetGetResponse": {
+                "target": serde_json::to_value(NasTarget::default()).unwrap(),
+                "sessions": [{ "client": "iqn.a:x", "user": "iqn.a:x", "connected_at": null }]
+            }
+        }))
+        .expect("an older answer decodes");
+        let TentaNasPayload::TargetGetResponse { sessions, listen, initiators_seen, seen_since, .. } = old else {
+            panic!("variant");
+        };
+        assert_eq!((sessions[0].address.as_str(), sessions[0].state.as_str()), ("", ""));
+        assert!(listen.is_empty() && initiators_seen.is_empty() && seen_since.is_empty());
+
+        // "Rozłącz": the initiator by its IQN, `revoke` false unless asked.
+        let reset: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "TargetSessionResetRequest": { "target_id": "t1", "initiator": "iqn.1994-05.com.redhat:vmhost-01" }
+        }))
+        .expect("decode");
+        assert_eq!(
+            reset,
+            TentaNasPayload::TargetSessionResetRequest {
+                target_id: "t1".into(),
+                initiator: "iqn.1994-05.com.redhat:vmhost-01".into(),
+                revoke: false,
+                sudo_password: None,
+            }
+        );
+        let back: TentaNasPayload = crate::cbor::decode(&crate::cbor::encode(&reset).expect("encode")).expect("decode");
+        assert_eq!(back, reset);
+
+        // An allowlist save from an older client carries no "Opis" map at
+        // all — `None`, which keeps the stored ones, never an empty map that
+        // would wipe them.
+        let update: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "TargetUpdateRequest": { "target_id": "t1", "enabled": true }
+        }))
+        .expect("decode");
+        let TentaNasPayload::TargetUpdateRequest { initiator_descriptions, .. } = update else { panic!("variant") };
+        assert_eq!(initiator_descriptions, None);
     }
 
     /// An Elastic Array answer round-trips, and — the point of the test — the

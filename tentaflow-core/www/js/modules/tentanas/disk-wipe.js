@@ -67,6 +67,9 @@ function lossListHtml(plan) {
 // no array on purpose — so the wording here must not either.
 const REFUSAL_KEYS = {
   journal_other_org: 'wipe_disk.refusal_journal_other_org',
+  // A LUN this node reaches as a CLIENT (iSCSI/NVMe-oF, MAJOR 27 F4): its
+  // data belongs to the target that exports it.
+  remote: 'wipe_disk.refusal_remote',
 };
 
 function refusalText(refusal, plan) {

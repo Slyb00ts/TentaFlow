@@ -10004,6 +10004,8 @@ export const encode = {
       // the very first request — dropping them here would make every
       // authenticated NVMe-oF target impossible to create.
       initiators: csTextList(payload.initiators),
+      // "Opis" per entry (wave 12); a key off the list is refused by the node.
+      initiator_descriptions: csTextMap(payload.initiatorDescriptions ?? payload.initiator_descriptions) ?? {},
       confirm_all_interfaces: Boolean(payload.confirmAllInterfaces ?? payload.confirm_all_interfaces),
       enabled: payload.enabled == null ? true : Boolean(payload.enabled),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
@@ -10030,12 +10032,30 @@ export const encode = {
       repick_portal: Boolean(payload.repickPortal ?? payload.repick_portal),
       auth: csTargetAuth(payload.auth),
       initiators: csTextList(payload.initiators),
+      // "Opis" (wave 12): absent → null, which the node reads as "keep the
+      // stored descriptions"; a map replaces them.
+      initiator_descriptions: csTextMap(payload.initiatorDescriptions ?? payload.initiator_descriptions),
       port_groups: csTargetPortGroups(payload.portGroups ?? payload.port_groups),
       confirm_all_interfaces: Boolean(payload.confirmAllInterfaces ?? payload.confirm_all_interfaces),
       enabled: payload.enabled == null ? true : Boolean(payload.enabled),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
     const body = _wasm.encodeTentaNasTargetUpdateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(TargetSessionResetRequest) — n19 "Rozłącz" (wave 12): reset
+   *  the iSCSI session of ONE allowlisted initiator, named by its IQN (no session id
+   *  exists on the wire); `revoke` also takes it off the allowlist. JobResponse. */
+  tentaNasTargetSessionResetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      target_id: csText(payload.targetId ?? payload.target_id),
+      initiator: csText(payload.initiator),
+      revoke: Boolean(payload.revoke),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasTargetSessionResetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10860,6 +10880,12 @@ function csOptText(value) {
 
 function csTextList(value) {
   return Array.isArray(value) ? value.map((v) => String(v)) : [];
+}
+
+/** Optional string→string map: absent becomes JSON null (serde `None`). */
+function csTextMap(value) {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) return null;
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [String(k), v == null ? '' : String(v)]));
 }
 
 /** Optional numeric field: absent becomes JSON null, which serde reads as None. */

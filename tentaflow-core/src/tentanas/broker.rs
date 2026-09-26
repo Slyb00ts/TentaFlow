@@ -755,6 +755,9 @@ pub mod test_channel {
     #[derive(Default)]
     pub struct Recorder {
         pub calls: Mutex<Vec<(String, Option<String>)>>,
+        /// Commands (by `cmd` name) that answer as a FAILED helper run with
+        /// this stderr instead of success — how a test drives an error path.
+        pub failing: Mutex<HashMap<String, String>>,
     }
 
     impl Recorder {
@@ -764,8 +767,21 @@ pub mod test_channel {
                 .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(str::to_string))
                 .unwrap_or_default();
             let payload = payload.map(|p| String::from_utf8_lossy(p).into_owned());
-            self.calls.lock().unwrap().push((name, payload));
-            CommandOutput { code: 0, stdout: String::new(), stderr: String::new() }
+            self.calls.lock().unwrap().push((name.clone(), payload));
+            match self.failing.lock().unwrap().get(&name) {
+                Some(stderr) => CommandOutput { code: 69, stdout: String::new(), stderr: stderr.clone() },
+                None => CommandOutput { code: 0, stdout: String::new(), stderr: String::new() },
+            }
+        }
+
+        /// Makes every later call named `command` fail with `stderr`.
+        pub fn fail(&self, command: &str, stderr: &str) {
+            self.failing.lock().unwrap().insert(command.to_string(), stderr.to_string());
+        }
+
+        /// The names of the calls made so far, in order.
+        pub fn names(&self) -> Vec<String> {
+            self.calls.lock().unwrap().iter().map(|(n, _)| n.clone()).collect()
         }
 
         /// The payload of the last call named `command`.

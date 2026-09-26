@@ -119,6 +119,10 @@ pub struct TargetConfig {
     pub port_groups: Vec<NasTargetPortGroup>,
     #[serde(default)]
     pub initiators: Vec<String>,
+    /// "Opis" per initiator (wave 12). Plain text, not a secret, so it
+    /// travels; absent from an older document.
+    #[serde(default)]
+    pub initiator_descriptions: std::collections::BTreeMap<String, String>,
     pub auth_method: String,
     #[serde(default)]
     pub auth_username: String,
@@ -302,6 +306,7 @@ async fn export_scoped(db: &DbPool, org_id: Option<&str>) -> Result<ConfigDocume
             portals: t.portals,
             port_groups: t.port_groups,
             initiators: t.initiators,
+            initiator_descriptions: t.initiator_descriptions,
             auth_method: t.auth_method,
             auth_username: t.auth_username,
             auth_mutual_username: t.auth_mutual_username,
@@ -1145,6 +1150,19 @@ pub async fn apply_with(
             portals: target.portals.clone(),
             port_groups: target.port_groups.clone(),
             initiators: target.initiators.clone(),
+            // Only the descriptions of listed initiators, judged by the same
+            // rule as a save: an edited document cannot smuggle in text the
+            // editor would refuse.
+            initiator_descriptions: super::targets::clean_descriptions(
+                &target.initiators,
+                &target
+                    .initiator_descriptions
+                    .iter()
+                    .filter(|(k, _)| target.initiators.contains(k))
+                    .map(|(k, v)| (k.clone(), v.chars().filter(|c| !c.is_control()).take(super::targets::DESCRIPTION_MAX_CHARS).collect()))
+                    .collect(),
+            )
+            .unwrap_or_default(),
             auth_method: target.auth_method.clone(),
             auth_username: target.auth_username.clone(),
             auth_secret: String::new(),
@@ -1970,6 +1988,7 @@ mod tests {
             }],
             port_groups: super::super::targets::default_port_groups(),
             initiators: vec![esx.to_string()],
+            initiator_descriptions: Default::default(),
             auth_method: method.to_string(),
             auth_username: String::new(),
             auth_mutual_username: String::new(),
@@ -2085,6 +2104,7 @@ mod tests {
             }],
             port_groups: super::super::targets::default_port_groups(),
             initiators: vec!["nqn.2014-08.org.nvmexpress:uuid:esx01".to_string()],
+            initiator_descriptions: Default::default(),
             auth_method: "dhchap".to_string(),
             auth_username: String::new(),
             auth_mutual_username: String::new(),

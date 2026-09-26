@@ -272,15 +272,23 @@ test('an nvmet node that DID read debugfs lists the host NQNs and counts them', 
       // Measured on a node: nvmet publishes `host_traddr` next to `hostnqn`,
       // so the session carries an address AND an identity — the detail shows
       // both, because only the first one is not client-declared.
-      sessions: [{ client: '192.168.10.24', user: 'nqn.2014-08.org.nvmexpress:uuid:esx01', connectedAt: null }],
+      sessions: [{ client: '192.168.10.24', user: 'nqn.2014-08.org.nvmexpress:uuid:esx01', connectedAt: null, address: '192.168.10.24', state: 'ready' }],
       configPreview: '',
     },
   });
   const win = openTargetDetail(screen, 't2', { body: document.body, capabilities });
   await flush();
   await flush();
-  assert.equal(win.querySelector('#nas-td-sessions').rows[0].client, '192.168.10.24');
+  // n19 sessions table: Initiator | Adres | Czas trwania | Stan.
+  assert.match(win.querySelector('#nas-td-sessions').rows[0].address, /192\.168\.10\.24/);
   assert.match(win.querySelector('#nas-td-sessions').rows[0].identity, /nqn\.2014-08\.org\.nvmexpress:uuid:esx01/);
+  assert.match(win.querySelector('#nas-td-sessions').rows[0].state, /label="ready"/);
+  // D4: no per-host "Rozłącz" for NVMe-oF, and the card says why.
+  const sessionsTable = win.querySelector('#nas-td-sessions');
+  // `=== null` rather than `assert.equal(node, null)`: happy-dom's node
+  // comparison in a failure message hangs the runner.
+  assert.ok(sessionsTable.rowActions(sessionsTable.rows[0], 0, () => sessionsTable.rows[0]) === null, 'no Rozłącz for NVMe-oF');
+  assert.match(win.querySelector('[data-testid="reset-note"]').textContent, /nie jest jeszcze dostępne/);
   assert.equal(sessionsCountLabel(target), '1');
   // A MEASURED zero is a zero, and says so with the ordinary sentence.
   assert.match(sessionsEmptyText(nvmetTarget({ sessionsKnown: true })), /Brak zalogowanych/);
@@ -1113,4 +1121,241 @@ test('the target detail paints the allowlist state column', async () => {
   } finally {
     screen.dispose();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Wave 12 (MAJOR 27, n19): Opis, Ostatnie połączenie, Nasłuch, sessions, Rozłącz
+// ---------------------------------------------------------------------------
+
+const VMHOST1 = 'iqn.1994-05.com.redhat:vmhost-01';
+const VMHOST2 = 'iqn.1994-05.com.redhat:vmhost-02';
+const liveSession = (user, over = {}) => ({ client: user, user, connectedAt: '2026-09-20T07:00:00Z', address: '10.10.0.21', state: 'LOGGED_IN', ...over });
+const actionsOf = (table, i = 0) => table.rowActions(table.rows[i], i, () => table.rows[i]);
+
+test('the iSCSI allowlist follows n19a: IQN, Opis, Stan and Ostatnie połączenie', async () => {
+  const target = iscsiTarget({ initiators: [VMHOST1, VMHOST2, 'iqn.1994-05.com.redhat:vmhost-03'], initiatorDescriptions: { [VMHOST1]: 'Proxmox vmhost-01' } });
+  const screen = detailScreen([{
+    target,
+    sessions: [liveSession(VMHOST1)],
+    configPreview: '',
+    initiatorsSeen: [{ initiator: VMHOST2, lastSeenAt: '2026-09-25T18:00:00Z', sessionSince: '2026-09-25T09:00:00Z' }],
+    seenSince: '2026-09-26T16:00:00Z',
+    listen: [{ address: '10.10.0.5', port: 3260, transport: 'tcp', state: 'listening' }],
+  }]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const hosts = win.querySelector('#nas-td-hosts');
+    assert.deepEqual([...hosts.querySelectorAll('tf-column')].map((c) => c.getAttribute('key')), ['shown', 'description', 'connected', 'last']);
+    assert.equal(hosts.querySelector('tf-column[key="shown"]').getAttribute('label'), 'IQN initiatora');
+    assert.equal(hosts.querySelector('tf-column[key="last"]').getAttribute('label'), 'Ostatnie połączenie');
+    assert.equal(hosts.rows[0].description, 'Proxmox vmhost-01');
+    assert.match(hosts.rows[1].description, /—/);
+    // Connected now, last seen yesterday, never seen since recording began.
+    assert.equal(hosts.rows[0].last, 'teraz');
+    assert.match(hosts.rows[1].last, new RegExp(fmtDate('2026-09-25T18:00:00Z').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.match(hosts.rows[2].last, /brak zapisu/);
+    assert.match(hosts.rows[2].last, /od /, 'the tooltip names when recording started');
+    assert.ok(!/nigdy/.test(hosts.rows[2].last), 'never "never"');
+    // "Nasłuch targetu" is the node's reading, not "Nie zmierzono" any more.
+    assert.equal(win.querySelector('[data-testid="portal_exposure"]').textContent, 'Nasłuch aktywny');
+    // No NVMe-oF note on an iSCSI target.
+    assert.equal(win.querySelector('[data-testid="nvmet-remove-note"]'), null);
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('the NVMe-oF allowlist follows n19b and says a removed host stays connected (D8)', async () => {
+  const target = nvmetTarget({ initiators: ['nqn.2014-08.org.nvmexpress:uuid:9f2c0000-0000-0000-0000-00000000a17b'], initiatorDescriptions: { 'nqn.2014-08.org.nvmexpress:uuid:9f2c0000-0000-0000-0000-00000000a17b': 'orion (compute)' } });
+  const screen = fakeScreen({ tentaNasTargetGetRequest: { target, sessions: [], configPreview: '', listen: [{ address: '10.10.0.5', port: 4420, transport: 'tcp', state: 'not_listening' }, { address: '10.10.0.5', port: 4420, transport: 'rdma', state: 'rdma' }] } });
+  const win = openTargetDetail(screen, 't2', { body: document.body, capabilities });
+  await flush();
+  await flush();
+  const hosts = win.querySelector('#nas-td-hosts');
+  assert.deepEqual([...hosts.querySelectorAll('tf-column')].map((c) => c.getAttribute('key')), ['shown', 'description', 'auth', 'shared']);
+  assert.equal(hosts.rows[0].description, 'orion (compute)');
+  // The UUID is cut in the middle as n19 shows it.
+  assert.match(hosts.rows[0].shown, /uuid:9f2c…a17b/);
+  assert.match(win.querySelector('[data-testid="nvmet-remove-note"]').textContent, /nie rozłącza hosta, który jest już połączony/);
+  // Two portals name themselves; RDMA is not measured (D6).
+  const listen = win.querySelector('[data-testid="portal_exposure"]').textContent;
+  assert.match(listen, /4420 \(TCP\) — Brak nasłuchu/);
+  assert.match(listen, /RDMA \(RoCE\)\) — Nie zmierzono \(RDMA\)/);
+  // Without debugfs the reset note names the missing kernel option.
+  assert.match(win.querySelector('[data-testid="reset-note"]').textContent, /CONFIG_NVME_TARGET_DEBUGFS/);
+  screen.dispose();
+});
+
+test('an edited Opis is a draft the save sends, only for initiators still on the list', async () => {
+  let sent = null;
+  const target = iscsiTarget({ initiators: [VMHOST1, VMHOST2], initiatorDescriptions: { [VMHOST2]: 'stary opis' } });
+  const screen = fakeScreen({
+    tentaNasTargetGetRequest: { target, sessions: [], configPreview: '' },
+    tentaNasTargetUpdateRequest: (payload) => { sent = payload; return { job: { jobId: 'j1', kind: 'target_update', subject: 'vm-store' } }; },
+  });
+  const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+  await flush();
+  await flush();
+  const hosts = win.querySelector('#nas-td-hosts');
+  click(actionsOf(hosts, 0).querySelector('[data-act="edit-description"]'));
+  await flush();
+  const dialog = document.querySelector('tf-window.nas-modal');
+  assert.ok(dialog, 'the description window is open');
+  const input = dialog.querySelector('#nas-td-description');
+  input.value = '  Proxmox\tvmhost-01  ';
+  click(dialog.querySelector('[data-action="confirm"]'));
+  await flush();
+  // The tab is folded to a space, the text trimmed, and it is a draft on screen.
+  assert.equal(hosts.rows[0].description, 'Proxmox vmhost-01');
+  assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasTargetUpdateRequest').length, 0, 'nothing sent before Zapisz');
+  // Drop vmhost-02: its description must not travel.
+  click(actionsOf(hosts, 1).querySelector('[data-act="remove-initiator"]'));
+  await flush();
+  click(win.querySelector('[data-act="save"]'));
+  await flush();
+  await flush();
+  assert.deepEqual(sent.initiators, [VMHOST1]);
+  assert.deepEqual(sent.initiatorDescriptions, { [VMHOST1]: 'Proxmox vmhost-01' });
+  screen.dispose();
+});
+
+test('the last initiator cannot be saved away: the editor warns and no request is sent', async () => {
+  const screen = fakeScreen({
+    tentaNasTargetGetRequest: { target: iscsiTarget({ initiators: [VMHOST1] }), sessions: [], configPreview: '' },
+    tentaNasTargetUpdateRequest: () => { throw new Error('must not be sent'); },
+  });
+  const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+  await flush();
+  await flush();
+  assert.equal(win.querySelector('[data-testid="allowlist-last-warning"]'), null);
+  click(actionsOf(win.querySelector('#nas-td-hosts'), 0).querySelector('[data-act="remove-initiator"]'));
+  await flush();
+  assert.match(win.querySelector('[data-testid="allowlist-last-warning"]').textContent, /otworzyłaby target dla każdego/);
+  click(win.querySelector('[data-act="save"]'));
+  await flush();
+  await flush();
+  assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasTargetUpdateRequest').length, 0);
+  screen.dispose();
+});
+
+test('the iSCSI sessions table follows n19 and Rozłącz resets or revokes by the IQN', async () => {
+  const requests = [];
+  const target = iscsiTarget({ initiators: [VMHOST1, VMHOST2], sessions: 1 });
+  const screen = fakeScreen({
+    tentaNasTargetGetRequest: { target, sessions: [liveSession(VMHOST1)], configPreview: '' },
+    tentaNasTargetSessionResetRequest: (payload) => { requests.push(payload); return { job: { jobId: `j${requests.length}`, kind: 'target_session_reset', subject: 'vm-store' } }; },
+  });
+  const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+  await flush();
+  await flush();
+  const table = win.querySelector('#nas-td-sessions');
+  assert.deepEqual([...table.querySelectorAll('tf-column')].map((c) => c.getAttribute('label')), ['Initiator', 'Adres', 'Czas trwania', 'Stan']);
+  const row = table.rows[0];
+  assert.match(row.identity, /vmhost-01/);
+  assert.match(row.address, /10\.10\.0\.21/);
+  assert.match(row.duration, /co najmniej|Co najmniej/i, 'the duration says it is an "at least"');
+  assert.match(row.state, /LOGGED_IN/);
+  // Session ids never reach the screen.
+  assert.ok(!/Session ID|TSIH|ISID/.test(JSON.stringify(table.rows)));
+  assert.equal(win.querySelector('[data-testid="reset-note"]'), null, 'Rozłącz is offered, so nothing explains its absence');
+
+  // Reset only.
+  click(actionsOf(table));
+  await flush();
+  let dialog = document.querySelector('tf-window.nas-modal');
+  assert.match(dialog.textContent, /Klient nie traci dostępu/);
+  assert.match(dialog.textContent, /vmhost-01/);
+  click(dialog.querySelector('[data-action="confirm"]'));
+  await flush();
+  await flush();
+  assert.deepEqual(requests[0], { targetId: 't1', initiator: VMHOST1, revoke: false, sudoPassword: 'hunter2' });
+  assert.equal(screen.jobLogs.at(-1).jobId, 'j1');
+
+  // Reset + remove from the allowlist.
+  click(actionsOf(table));
+  await flush();
+  dialog = [...document.querySelectorAll('tf-window.nas-modal')].at(-1);
+  const box = dialog.querySelector('#nas-td-revoke');
+  box.checked = true;
+  box.dispatchEvent(new window.CustomEvent('change', { detail: { checked: true }, bubbles: true }));
+  assert.match(dialog.textContent, /nie będzie mógł wrócić/);
+  click(dialog.querySelector('[data-action="confirm"]'));
+  await flush();
+  await flush();
+  assert.equal(requests[1].revoke, true);
+  screen.dispose();
+});
+
+test('Rozłącz on the only entry cannot revoke, and a target without an allowlist offers no Rozłącz (D2)', async () => {
+  const requests = [];
+  const screen = fakeScreen({
+    tentaNasTargetGetRequest: { target: iscsiTarget({ initiators: [VMHOST1] }), sessions: [liveSession(VMHOST1)], configPreview: '' },
+    tentaNasTargetSessionResetRequest: (payload) => { requests.push(payload); return { job: { jobId: 'j1', kind: 'target_session_reset', subject: 'vm-store' } }; },
+  });
+  const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+  await flush();
+  await flush();
+  click(actionsOf(win.querySelector('#nas-td-sessions')));
+  await flush();
+  const dialog = document.querySelector('tf-window.nas-modal');
+  assert.ok(dialog.querySelector('#nas-td-revoke').hasAttribute('disabled'));
+  assert.match(dialog.querySelector('[data-testid="revoke-only-entry"]').textContent, /jedyny wpis/);
+  const box = dialog.querySelector('#nas-td-revoke');
+  box.dispatchEvent(new window.CustomEvent('change', { detail: { checked: true }, bubbles: true }));
+  click(dialog.querySelector('[data-action="confirm"]'));
+  await flush();
+  await flush();
+  assert.equal(requests[0].revoke, false, 'the only entry is never revoked from here');
+  screen.dispose();
+
+  // An open target: a generated session has no address or state, and no button.
+  const open = fakeScreen({
+    tentaNasTargetGetRequest: { target: iscsiTarget({ initiators: [] }), sessions: [{ client: VMHOST2, user: VMHOST2, connectedAt: null, address: '', state: '' }], configPreview: '' },
+  });
+  const win2 = openTargetDetail(open, 't1', { body: document.body, capabilities });
+  await flush();
+  await flush();
+  const table = win2.querySelector('#nas-td-sessions');
+  assert.ok(actionsOf(table) === null, 'no Rozłącz without an allowlist');
+  assert.match(table.rows[0].address, /—/);
+  assert.match(table.rows[0].state, /—/);
+  assert.match(win2.querySelector('[data-testid="reset-note"]').textContent, /wymaga listy dozwolonych/);
+  open.dispose();
+});
+
+test('a poll that only moves a session duration patches the rows, not the tables', async () => {
+  const target = iscsiTarget({ initiators: [VMHOST1] });
+  const first = { target, sessions: [liveSession(VMHOST1)], configPreview: '', listen: [{ address: '10.10.0.5', port: 3260, transport: 'tcp', state: 'listening' }] };
+  const second = { ...first, listen: [{ address: '10.10.0.5', port: 3260, transport: 'tcp', state: 'target_disabled' }] };
+  const screen = detailScreen([first, second]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const sessions = win.querySelector('#nas-td-sessions');
+    const hosts = win.querySelector('#nas-td-hosts');
+    const exposure = win.querySelector('[data-testid="portal_exposure"]');
+    await runPoll(screen);
+    assert.ok(win.querySelector('#nas-td-sessions') === sessions, 'the sessions table survives the poll');
+    assert.ok(win.querySelector('#nas-td-hosts') === hosts, 'the allowlist table survives the poll');
+    assert.ok(win.querySelector('[data-testid="portal_exposure"]') === exposure, 'the Nasłuch row is patched in place');
+    assert.equal(exposure.textContent, 'Port otwarty, target wyłączony — logowania odrzucane');
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('the Nasłuch words, the last-seen cell and the reset reasons are total functions', async () => {
+  const { listenText, lastSeenHtml, resetUnavailableText, sessionStateHtml } = await import('./targets.js');
+  assert.equal(listenText([]), 'Nie zmierzono');
+  assert.equal(listenText(undefined), 'Nie zmierzono');
+  assert.equal(listenText([{ state: 'something-new' }]), 'Nie zmierzono', 'an unknown state is never guessed');
+  assert.equal(listenText([{ state: 'rdma' }]), 'Nie zmierzono (RDMA)');
+  assert.match(lastSeenHtml(nvmetTarget(), [], [], '', 'x'), /—/, 'unmeasured sessions: a dash, not "brak zapisu"');
+  assert.equal(resetUnavailableText(iscsiTarget()), '');
+  assert.match(resetUnavailableText(iscsiTarget({ initiators: [] })), /listy dozwolonych/);
+  assert.match(sessionStateHtml('FAILED'), /status="warn"/);
+  assert.match(sessionStateHtml(''), /—/);
 });

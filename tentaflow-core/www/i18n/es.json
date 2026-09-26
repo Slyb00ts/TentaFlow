@@ -5536,7 +5536,8 @@
         "shares": "Recursos compartidos SMB/NFS",
         "targets": "Destinos iSCSI/NVMe-oF",
         "disable": "Desactivar TentaNas"
-      }
+      },
+      "kind_target_session_reset": "Desconexión de sesión del target"
     },
     "danger": {
       "retype": "Escribe {name} para confirmar:",
@@ -5944,7 +5945,8 @@
         "system": "contiene el sistema en ejecución de este nodo",
         "mounted": "está montado",
         "mounted_named": "está montado en {name}",
-        "used": "contiene un sistema de archivos o particiones"
+        "used": "contiene un sistema de archivos o particiones",
+        "remote": "un disco remoto (iSCSI/NVMe-oF)"
       },
       "elastic_refusal": {
         "too_many_cache_disks": "Elastic admite como máximo un disco de caché.",
@@ -5959,7 +5961,8 @@
         "parity_too_small": "{disk} ({size}) no puede ser de paridad — es más pequeño que el mayor disco de datos ({largest}).",
         "filesystem_invalid": "«{filesystem}» no es un sistema de archivos que cree esta aplicación: un disco de datos Elastic lleva xfs o ext4 para seguir siendo legible por sí solo.",
         "filesystem_unavailable": "mkfs.{filesystem} no está instalado en este nodo, así que no se puede preparar ningún disco de este array.",
-        "plan_failed": "Esta disposición no puede convertirse en un plan: los detalles están en la información emergente."
+        "plan_failed": "Esta disposición no puede convertirse en un plan: los detalles están en la información emergente.",
+        "disk_remote": "{disk} es un disco remoto (iSCSI/NVMe-oF) — no puede ser miembro de una matriz."
       },
       "elastic_warning": {
         "no_parity": "Sin disco de paridad: este array no tiene ninguna protección, y perder un disco de datos pierde sus archivos.",
@@ -6179,7 +6182,8 @@
       "journal_ack": "Entiendo que la matriz {name} dejará de poder recuperarse mediante importación y libero la reserva de su diario.",
       "retype": "Vuelve a escribir el nombre del dispositivo para confirmar:",
       "confirm": "Borrar {name}",
-      "done": "Se aceptó el borrado del disco {name}. Comprueba el resultado de la tarea."
+      "done": "Se aceptó el borrado del disco {name}. Comprueba el resultado de la tarea.",
+      "refusal_remote": "{name} es un disco remoto (iSCSI/NVMe-oF) que este nodo ve como cliente — sus datos pertenecen al target que lo exporta. Cierra la sesión en el target en lugar de borrar el disco."
     },
     "destroy_pool": {
       "title": "Destruir el pool {name}",
@@ -7042,6 +7046,10 @@
         "sharing_share_not_resumed": {
           "title": "El recurso compartido {share} no volvió al reanudar la compartición",
           "detail": "El estado del recurso indica por qué. El nodo reintenta con un intervalo creciente; la alerta se cierra cuando el recurso vuelve a servir."
+        },
+        "target_session_not_reset": {
+          "title": "Target {target}: un cliente fuera de la nueva lista de permitidos sigue conectado",
+          "detail": "La lista de permitidos está escrita, pero un cliente que no figura en ella sigue conectado y no se pudieron cortar las sesiones del target (falló el cambio de enable). Detén el target para cortar a todos los clientes."
         }
       },
       "node_text": "Texto del nodo",
@@ -7078,7 +7086,8 @@
       "array_cache": "Caché",
       "array_parity": "Paridad",
       "other_org_array": "En un array de otra organización",
-      "mounted": "Montado"
+      "mounted": "Montado",
+      "remote": "disco remoto (iSCSI/NVMe-oF)"
     },
     "disks": {
       "search": "Buscar: dispositivo, modelo, número de serie…",
@@ -7689,7 +7698,6 @@
       "sessions_unmeasured": "Desconocido no significa cero",
       "host_shared": "También usado por",
       "context_changed": "El contexto del nodo o target ha cambiado. Abre de nuevo los detalles.",
-      "session_identity": "Cliente / iniciador",
       "edit_initiators": "Añadir o editar hosts",
       "initiators_draft": "Confirma los cambios de la lista con Guardar.",
       "remove_initiator": "Quitar de la lista",
@@ -7815,7 +7823,43 @@
       "host_state": "Estado",
       "host_connected": "Conectado",
       "host_not_connected": "No conectado",
-      "state_suspended": "en pausa"
+      "state_suspended": "en pausa",
+      "col_initiator_iqn": "IQN del iniciador",
+      "col_host_nqn": "NQN del host",
+      "col_description": "Descripción",
+      "col_last_seen": "Última conexión",
+      "last_now": "ahora",
+      "last_none": "sin registro",
+      "last_none_hint": "El kernel no guarda fechas de conexión; TentaNas las registra por su cuenta desde {date}. Este iniciador no se ha conectado desde entonces.",
+      "edit_description": "Editar descripción",
+      "description_title": "Descripción del iniciador",
+      "description_hint": "Hasta {n} caracteres, p. ej. «Proxmox vmhost-01». El botón Guardar aplica el cambio.",
+      "description_apply": "Establecer descripción",
+      "allowlist_last_warning": "La lista de permitidos no puede quedar vacía: una lista vacía abriría el target a cualquiera que llegue al portal. Para cortar a todos, detén el target.",
+      "nvmet_remove_keeps_connection": "Quitar un host de la lista no desconecta a un host que ya está conectado — conserva el acceso completo hasta que vuelva a conectarse. Para cortarlo al instante, detén el target.",
+      "listen_listening": "Escuchando",
+      "listen_target_disabled": "Puerto abierto, target desactivado — los inicios de sesión se rechazan",
+      "listen_not_listening": "Sin escucha",
+      "listen_rdma": "No medido (RDMA)",
+      "listen_unknown": "No medido",
+      "col_session_initiator": "Iniciador",
+      "col_session_address": "Dirección",
+      "col_session_duration": "Duración",
+      "col_session_state": "Estado",
+      "session_unnamed": "host sin nombre",
+      "duration_hint": "Como mínimo — contado desde la primera lectura de esta sesión ({since}); el kernel no da la hora de inicio de sesión.",
+      "disconnect": "Desconectar sesión",
+      "disconnect_title": "Desconectar sesión",
+      "disconnect_lead": "Iniciador:",
+      "disconnect_reset_text": "La sesión se cortará. El cliente suele reconectarse en unos 2 s; mientras tanto sus operaciones de disco esperan. El cliente no pierde el acceso.",
+      "disconnect_revoke_label": "y quitarlo de la lista de permitidos",
+      "disconnect_revoke_text": "El cliente se desconectará y no podrá volver. Seguirá reintentando cada 2 s aproximadamente (cada intento es una línea en el registro del sistema de este nodo) y, tras unos 2 minutos, sus operaciones de disco fallarán. Para que deje de intentarlo, cierra la sesión del target en el cliente. Volver a añadirlo a la lista restablece el acceso automáticamente mientras el cliente siga reintentando.",
+      "disconnect_confirm": "Desconectar",
+      "disconnect_done": "Desconexión de la sesión aceptada — el resultado está en el registro del trabajo.",
+      "reset_no_allowlist": "Desconectar una única sesión requiere una lista de iniciadores permitidos: sin ella el cliente vuelve a iniciar sesión al instante, y el kernel no da la dirección ni el estado de la sesión.",
+      "reset_nvmet_no_debugfs": "Desconectar un único host NVMe-oF no es posible en este nodo: el kernel no publica sus controladores (sin CONFIG_NVME_TARGET_DEBUGFS), y quitar el host de la lista no lo desconecta.",
+      "reset_nvmet_unmeasured": "Desconectar un único host NVMe-oF todavía no es posible: el mecanismo no se ha medido, y quitar el host de la lista no lo desconecta.",
+      "last_seen_hint": "{ago} — con una precisión de un minuto aproximadamente: el nodo actualiza esta hora como mucho una vez por minuto."
     },
     "wizard_target": {
       "title": "Nuevo destino",
@@ -7926,7 +7970,9 @@
         "dhchap_not_built": "este kernel se compiló sin CONFIG_NVME_TARGET_AUTH ({path})",
         "dhchap_not_mentioned": "{path} no menciona CONFIG_NVME_TARGET_AUTH",
         "kernel_config_missing": "este kernel no publica su configuración (no hay /proc/config.gz ni /boot/config-*), así que no se puede confirmar DH-HMAC-CHAP: el asistente no ofrece lo que no puede confirmar"
-      }
+      },
+      "host_description_label": "Descripción — {nqn}",
+      "host_description_placeholder": "p. ej. orion (compute)"
     },
     "journal_owner": {
       "this_instance": "esta instancia de TentaNas",
@@ -7980,7 +8026,17 @@
       "sharing_stop_busy": "La compartición en este nodo ya se está deteniendo o está detenida — no se cambió nada.",
       "sharing_stop_author_gone": "El autor de esta solicitud ya no es administrador de la plataforma en esta organización — no se puede aprobar; recházela.",
       "sharing_resume_partial": "La compartición ha vuelto, pero no del todo — las líneas de la tarea indican lo que aún no sirve; el nodo lo reintenta.",
-      "sharing_stop_pending_elsewhere": "En este nodo ya espera aprobación una detención de la compartición solicitada en otra organización. Un administrador de la plataforma la ve en TentaNas → Tareas y puede rechazarla."
+      "sharing_stop_pending_elsewhere": "En este nodo ya espera aprobación una detención de la compartición solicitada en otra organización. Un administrador de la plataforma la ve en TentaNas → Tareas y puede rechazarla.",
+      "target_last_initiator": "Es la única entrada de la lista de permitidos — quitarla abriría el target a todo el mundo. Detén el target o añade antes otra entrada.",
+      "target_description_unlisted": "La descripción es de un iniciador que no está en la lista de permitidos — añádelo a la lista o quita la descripción",
+      "target_description_too_long": "Una descripción puede tener como máximo 80 caracteres",
+      "target_description_invalid": "Una descripción no puede contener caracteres de control (como un salto de línea)",
+      "target_session_reset_nvmet": "Desconectar un único host NVMe-oF no está disponible — quitarlo de la lista no lo desconecta y todavía no se ha medido un mecanismo propio",
+      "target_session_reset_not_allowlisted": "Solo se puede desconectar un iniciador de la lista de permitidos — sin lista, el cliente vuelve a iniciar sesión al instante",
+      "target_session_none": "Este iniciador no tiene ninguna sesión ahora — no hay nada que desconectar",
+      "target_session_reset_not_serving": "El target está detenido — no hay ninguna sesión que desconectar",
+      "disk_remote": "Es un disco remoto (iSCSI/NVMe-oF) que este nodo ve como cliente — no puede unirse a un pool ni a una matriz",
+      "target_session_reset_not_app_target": "Este target no lo creó esta aplicación — no desconectará sus sesiones"
     },
     "unreachable": {
       "title": "Nodo {node} inaccesible",

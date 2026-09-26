@@ -5536,7 +5536,8 @@
         "shares": "SMB/NFS-Freigaben",
         "targets": "iSCSI/NVMe-oF-Targets",
         "disable": "TentaNas deaktivieren"
-      }
+      },
+      "kind_target_session_reset": "Target-Sitzung trennen"
     },
     "danger": {
       "retype": "Zur Bestätigung {name} eingeben:",
@@ -5944,7 +5945,8 @@
         "system": "trägt das laufende System dieses Knotens",
         "mounted": "ist eingehängt",
         "mounted_named": "ist unter {name} eingehängt",
-        "used": "enthält ein Dateisystem oder Partitionen"
+        "used": "enthält ein Dateisystem oder Partitionen",
+        "remote": "eine entfernte Platte (iSCSI/NVMe-oF)"
       },
       "elastic_refusal": {
         "too_many_cache_disks": "Elastic erlaubt höchstens einen Cache-Datenträger.",
@@ -5959,7 +5961,8 @@
         "parity_too_small": "{disk} ({size}) kann keine Parität sein — er ist kleiner als der größte Datenträger ({largest}).",
         "filesystem_invalid": "„{filesystem}“ ist kein Dateisystem, das diese App anlegt: Ein Elastic-Datenträger trägt xfs oder ext4, damit er allein lesbar bleibt.",
         "filesystem_unavailable": "mkfs.{filesystem} ist auf diesem Knoten nicht installiert, daher kann kein Datenträger dieses Arrays vorbereitet werden.",
-        "plan_failed": "Aus diesem Layout lässt sich kein Plan erstellen — Details im Tooltip."
+        "plan_failed": "Aus diesem Layout lässt sich kein Plan erstellen — Details im Tooltip.",
+        "disk_remote": "{disk} ist eine entfernte Platte (iSCSI/NVMe-oF) — sie kann kein Mitglied eines Arrays sein."
       },
       "elastic_warning": {
         "no_parity": "Kein Paritätsdatenträger: Dieses Array hat keinerlei Schutz, und der Verlust eines Datenträgers verliert dessen Dateien.",
@@ -6179,7 +6182,8 @@
       "journal_ack": "Mir ist klar, dass Array {name} nicht mehr per Import wiederherstellbar ist, und ich gebe seine Journal-Reservierung frei.",
       "retype": "Gerätenamen zur Bestätigung erneut eingeben:",
       "confirm": "{name} löschen",
-      "done": "Das Löschen von Datenträger {name} wurde angenommen. Prüfen Sie das Auftragsergebnis."
+      "done": "Das Löschen von Datenträger {name} wurde angenommen. Prüfen Sie das Auftragsergebnis.",
+      "refusal_remote": "{name} ist eine entfernte Platte (iSCSI/NVMe-oF), die dieser Knoten als Client sieht — ihre Daten gehören dem Target, das sie bereitstellt. Melde dich vom Target ab, statt die Platte zu löschen."
     },
     "destroy_pool": {
       "title": "Pool {name} zerstören",
@@ -7042,6 +7046,10 @@
         "sharing_share_not_resumed": {
           "title": "Freigabe {share} ist nach dem Fortsetzen nicht zurückgekehrt",
           "detail": "Der Zustand der Freigabe nennt den Grund. Der Knoten versucht es mit wachsendem Abstand erneut; der Alarm schließt sich, sobald die Freigabe wieder läuft."
+        },
+        "target_session_not_reset": {
+          "title": "Target {target}: ein Client außerhalb der neuen Zulassungsliste ist noch verbunden",
+          "detail": "Die Zulassungsliste ist geschrieben, aber ein Client außerhalb davon ist noch angemeldet, und die Sitzungen des Targets ließen sich nicht trennen (das Umschalten von enable schlug fehl). Halte das Target an, um alle Clients zu trennen."
         }
       },
       "node_text": "Text des Knotens",
@@ -7078,7 +7086,8 @@
       "array_cache": "Cache",
       "array_parity": "Parität",
       "other_org_array": "Im Array einer anderen Organisation",
-      "mounted": "Eingehängt"
+      "mounted": "Eingehängt",
+      "remote": "entfernte Platte (iSCSI/NVMe-oF)"
     },
     "disks": {
       "search": "Suchen: Gerät, Modell, Seriennummer…",
@@ -7689,7 +7698,6 @@
       "sessions_unmeasured": "Unbekannt bedeutet nicht null",
       "host_shared": "Auch verwendet von",
       "context_changed": "Der Knoten- oder Target-Kontext wurde geändert. Öffnen Sie die Details erneut.",
-      "session_identity": "Client / Initiator",
       "edit_initiators": "Hosts hinzufügen oder bearbeiten",
       "initiators_draft": "Listenänderungen mit Speichern bestätigen.",
       "remove_initiator": "Aus Liste entfernen",
@@ -7815,7 +7823,43 @@
       "host_state": "Status",
       "host_connected": "Verbunden",
       "host_not_connected": "Nicht verbunden",
-      "state_suspended": "angehalten"
+      "state_suspended": "angehalten",
+      "col_initiator_iqn": "Initiator-IQN",
+      "col_host_nqn": "Host-NQN",
+      "col_description": "Beschreibung",
+      "col_last_seen": "Letzte Verbindung",
+      "last_now": "jetzt",
+      "last_none": "kein Eintrag",
+      "last_none_hint": "Der Kernel speichert keine Verbindungsdaten; TentaNas zeichnet sie selbst seit {date} auf. Seitdem hat sich dieser Initiator nicht verbunden.",
+      "edit_description": "Beschreibung bearbeiten",
+      "description_title": "Beschreibung des Initiators",
+      "description_hint": "Bis zu {n} Zeichen, z. B. „Proxmox vmhost-01“. Die Änderung übernimmt die Schaltfläche Speichern.",
+      "description_apply": "Beschreibung setzen",
+      "allowlist_last_warning": "Die Zulassungsliste darf nicht leer werden: Eine leere Liste würde das Target für jeden öffnen, der das Portal erreicht. Um alle zu trennen, halte das Target an.",
+      "nvmet_remove_keeps_connection": "Einen Host aus der Liste zu entfernen trennt einen bereits verbundenen Host nicht — er behält vollen Zugriff bis zur nächsten Verbindung. Um ihn sofort zu trennen, halte das Target an.",
+      "listen_listening": "Lauscht",
+      "listen_target_disabled": "Port offen, Target deaktiviert — Anmeldungen werden abgelehnt",
+      "listen_not_listening": "Lauscht nicht",
+      "listen_rdma": "Nicht gemessen (RDMA)",
+      "listen_unknown": "Nicht gemessen",
+      "col_session_initiator": "Initiator",
+      "col_session_address": "Adresse",
+      "col_session_duration": "Dauer",
+      "col_session_state": "Zustand",
+      "session_unnamed": "Host ohne Namen",
+      "duration_hint": "Mindestens — gezählt ab der ersten Lesung dieser Sitzung ({since}); der Kernel nennt keine Anmeldezeit.",
+      "disconnect": "Sitzung trennen",
+      "disconnect_title": "Sitzung trennen",
+      "disconnect_lead": "Initiator:",
+      "disconnect_reset_text": "Die Sitzung wird getrennt. Der Client verbindet sich meist innerhalb von etwa 2 s neu; so lange warten seine Plattenzugriffe. Der Client verliert den Zugriff nicht.",
+      "disconnect_revoke_label": "und aus der Zulassungsliste entfernen",
+      "disconnect_revoke_text": "Der Client wird getrennt und kann nicht zurück. Er versucht es etwa alle 2 s erneut (jeder Versuch ist ein Eintrag im Systemprotokoll dieses Knotens), und nach etwa 2 Minuten schlagen seine Plattenzugriffe fehl. Damit er aufhört, melde das Target auf dem Client ab. Ihn wieder in die Liste aufzunehmen stellt den Zugriff automatisch wieder her, solange der Client es noch versucht.",
+      "disconnect_confirm": "Trennen",
+      "disconnect_done": "Trennen der Sitzung angenommen — das Ergebnis steht im Auftragsprotokoll.",
+      "reset_no_allowlist": "Eine einzelne Sitzung zu trennen erfordert eine Zulassungsliste: Ohne sie meldet sich der Client sofort wieder an, und der Kernel nennt weder Adresse noch Zustand der Sitzung.",
+      "reset_nvmet_no_debugfs": "Einen einzelnen NVMe-oF-Host zu trennen ist auf diesem Knoten nicht möglich: Der Kernel veröffentlicht seine Controller nicht (kein CONFIG_NVME_TARGET_DEBUGFS), und den Host aus der Liste zu entfernen trennt ihn nicht.",
+      "reset_nvmet_unmeasured": "Einen einzelnen NVMe-oF-Host zu trennen ist noch nicht möglich: Der Mechanismus ist nicht vermessen, und den Host aus der Liste zu entfernen trennt ihn nicht.",
+      "last_seen_hint": "{ago} — auf etwa eine Minute genau: der Knoten aktualisiert diese Zeit höchstens einmal pro Minute."
     },
     "wizard_target": {
       "title": "Neues Target",
@@ -7926,7 +7970,9 @@
         "dhchap_not_built": "dieser Kernel wurde ohne CONFIG_NVME_TARGET_AUTH gebaut ({path})",
         "dhchap_not_mentioned": "{path} erwähnt CONFIG_NVME_TARGET_AUTH nicht",
         "kernel_config_missing": "dieser Kernel veröffentlicht keine Konfiguration (kein /proc/config.gz, kein /boot/config-*), daher lässt sich DH-HMAC-CHAP nicht bestätigen — der Assistent bietet nichts an, was er nicht bestätigen kann"
-      }
+      },
+      "host_description_label": "Beschreibung — {nqn}",
+      "host_description_placeholder": "z. B. orion (compute)"
     },
     "journal_owner": {
       "this_instance": "diese TentaNas-Instanz",
@@ -7980,7 +8026,17 @@
       "sharing_stop_busy": "Die Freigabe auf diesem Knoten wird bereits gestoppt oder ist gestoppt — nichts wurde geändert.",
       "sharing_stop_author_gone": "Der Autor dieser Anfrage ist in dieser Organisation kein Plattformadministrator mehr — sie kann nicht genehmigt werden; lehnen Sie sie ab.",
       "sharing_resume_partial": "Die Freigabe ist zurück, aber nicht vollständig — die Auftragszeilen nennen, was noch nicht läuft; der Knoten versucht es erneut.",
-      "sharing_stop_pending_elsewhere": "Auf diesem Knoten wartet bereits ein in einer anderen Organisation angefordertes Stoppen der Freigabe auf Genehmigung. Ein Plattformadministrator sieht es unter TentaNas → Aufgaben und kann es ablehnen."
+      "sharing_stop_pending_elsewhere": "Auf diesem Knoten wartet bereits ein in einer anderen Organisation angefordertes Stoppen der Freigabe auf Genehmigung. Ein Plattformadministrator sieht es unter TentaNas → Aufgaben und kann es ablehnen.",
+      "target_last_initiator": "Das ist der einzige Eintrag der Zulassungsliste — ihn zu entfernen würde das Target für alle öffnen. Halte das Target an oder füge zuerst einen anderen Eintrag hinzu.",
+      "target_description_unlisted": "Die Beschreibung gilt einem Initiator, der nicht auf der Zulassungsliste steht — nimm ihn in die Liste auf oder entferne die Beschreibung",
+      "target_description_too_long": "Eine Beschreibung darf höchstens 80 Zeichen lang sein",
+      "target_description_invalid": "Eine Beschreibung darf keine Steuerzeichen (etwa einen Zeilenumbruch) enthalten",
+      "target_session_reset_nvmet": "Einen einzelnen NVMe-oF-Host zu trennen ist nicht verfügbar — ihn aus der Liste zu entfernen trennt ihn nicht, und ein eigener Mechanismus ist noch nicht vermessen",
+      "target_session_reset_not_allowlisted": "Trennen lässt sich nur ein Initiator der Zulassungsliste — ohne Liste meldet sich der Client sofort wieder an",
+      "target_session_none": "Dieser Initiator hat gerade keine Sitzung — es gibt nichts zu trennen",
+      "target_session_reset_not_serving": "Das Target ist angehalten — es gibt keine Sitzung zu trennen",
+      "disk_remote": "Das ist eine entfernte Platte (iSCSI/NVMe-oF), die dieser Knoten als Client sieht — sie kann keinem Pool und keinem Array beitreten",
+      "target_session_reset_not_app_target": "Dieses Target wurde nicht von dieser App angelegt — sie trennt seine Sitzungen nicht"
     },
     "unreachable": {
       "title": "Knoten {node} nicht erreichbar",

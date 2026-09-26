@@ -6768,6 +6768,10 @@
         "sharing_share_not_resumed": {
           "title": "Share {share} did not come back when sharing was resumed",
           "detail": "The share's state says why. The node retries with a growing interval; the alert closes once the share serves again."
+        },
+        "target_session_not_reset": {
+          "title": "Target {target}: a client outside the new allowlist is still connected",
+          "detail": "The allowlist is written, but a client that is not on it is still logged in and the target's sessions could not be reset (the enable toggle failed). Stop the target to cut every client off."
         }
       },
       "node_text": "The node's text",
@@ -6804,7 +6808,8 @@
       "array_cache": "Cache",
       "array_parity": "Parity",
       "other_org_array": "In another organisation's array",
-      "mounted": "Mounted"
+      "mounted": "Mounted",
+      "remote": "remote disk (iSCSI/NVMe-oF)"
     },
     "disks": {
       "search": "Search: device, model, serial…",
@@ -7051,7 +7056,8 @@
         "shares": "SMB/NFS shares",
         "targets": "iSCSI/NVMe-oF targets",
         "disable": "Disable TentaNas"
-      }
+      },
+      "kind_target_session_reset": "Target session reset"
     },
     "elevation": {
       "title": "System privilege channel",
@@ -7749,7 +7755,8 @@
         "system": "carries this node’s running system",
         "mounted": "is mounted",
         "mounted_named": "is mounted at {name}",
-        "used": "holds a filesystem or partitions"
+        "used": "holds a filesystem or partitions",
+        "remote": "a remote disk (iSCSI/NVMe-oF)"
       },
       "elastic_refusal": {
         "too_many_cache_disks": "Elastic allows at most one cache disk.",
@@ -7764,7 +7771,8 @@
         "parity_too_small": "{disk} ({size}) cannot be parity — it is smaller than the largest data disk ({largest}).",
         "filesystem_invalid": "“{filesystem}” is not a filesystem this app makes: an Elastic data disk carries xfs or ext4 so it stays readable on its own.",
         "filesystem_unavailable": "mkfs.{filesystem} is not installed on this node, so no disk of this array can be prepared.",
-        "plan_failed": "This layout cannot be turned into a plan — the details are in the tooltip."
+        "plan_failed": "This layout cannot be turned into a plan — the details are in the tooltip.",
+        "disk_remote": "{disk} is a remote disk (iSCSI/NVMe-oF) — it cannot be a member of an array."
       },
       "elastic_warning": {
         "no_parity": "No parity disk: this array has no protection at all, and losing one data disk loses that disk’s files.",
@@ -7984,7 +7992,8 @@
       "journal_ack": "I understand that array {name} will no longer be recoverable by import, and I release its journal claim.",
       "retype": "Retype the device name to confirm:",
       "confirm": "Clear {name}",
-      "done": "Clearing disk {name} was accepted. Check the job result."
+      "done": "Clearing disk {name} was accepted. Check the job result.",
+      "refusal_remote": "{name} is a remote disk (iSCSI/NVMe-oF) this node sees as a client — its data belongs to the target that exports it. Log out of the target instead of wiping the disk."
     },
     "destroy_pool": {
       "title": "Destroy pool {name}",
@@ -8905,7 +8914,6 @@
       "sessions_unmeasured": "Unknown does not mean zero",
       "host_shared": "Also used by",
       "context_changed": "The node or target context changed. Open the detail again.",
-      "session_identity": "Client / initiator",
       "edit_initiators": "Add or edit hosts",
       "initiators_draft": "Confirm list changes with Save.",
       "remove_initiator": "Remove from list",
@@ -9031,7 +9039,43 @@
       "host_state": "State",
       "host_connected": "Connected",
       "host_not_connected": "Not connected",
-      "state_suspended": "paused"
+      "state_suspended": "paused",
+      "col_initiator_iqn": "Initiator IQN",
+      "col_host_nqn": "Host NQN",
+      "col_description": "Description",
+      "col_last_seen": "Last connection",
+      "last_now": "now",
+      "last_none": "no record",
+      "last_none_hint": "The kernel keeps no connection dates; TentaNas records them itself since {date}. This initiator has not connected since then.",
+      "edit_description": "Edit description",
+      "description_title": "Initiator description",
+      "description_hint": "Up to {n} characters, e.g. “Proxmox vmhost-01”. The Save button applies the change.",
+      "description_apply": "Set description",
+      "allowlist_last_warning": "The allowlist cannot become empty: an empty list would open the target to anyone who reaches the portal. To cut everyone off, stop the target.",
+      "nvmet_remove_keeps_connection": "Removing a host from the list does not disconnect a host that is already connected — it keeps full access until it reconnects. To cut it off at once, stop the target.",
+      "listen_listening": "Listening",
+      "listen_target_disabled": "Port open, target disabled — logins are refused",
+      "listen_not_listening": "Not listening",
+      "listen_rdma": "Not measured (RDMA)",
+      "listen_unknown": "Not measured",
+      "col_session_initiator": "Initiator",
+      "col_session_address": "Address",
+      "col_session_duration": "Duration",
+      "col_session_state": "State",
+      "session_unnamed": "unnamed host",
+      "duration_hint": "At least — counted from the first reading of this session ({since}); the kernel gives no login time.",
+      "disconnect": "Disconnect session",
+      "disconnect_title": "Disconnect session",
+      "disconnect_lead": "Initiator:",
+      "disconnect_reset_text": "The session will be dropped. The client usually reconnects within about 2 s; its disk operations wait meanwhile. The client does not lose access.",
+      "disconnect_revoke_label": "and remove it from the allowlist",
+      "disconnect_revoke_text": "The client will be disconnected and cannot come back. It keeps retrying about every 2 s (each attempt is a line in this node’s system log), and after about 2 minutes its disk operations fail. To make it stop, log out of the target on the client. Adding it back to the list restores access automatically while the client is still retrying.",
+      "disconnect_confirm": "Disconnect",
+      "disconnect_done": "Session disconnect accepted — the outcome is in the job log.",
+      "reset_no_allowlist": "Disconnecting a single session needs an initiator allowlist: without one the client logs straight back in, and the kernel gives no session address or state.",
+      "reset_nvmet_no_debugfs": "Disconnecting a single NVMe-oF host is not available on this node: the kernel does not publish its controllers (no CONFIG_NVME_TARGET_DEBUGFS), and removing the host from the list does not disconnect it.",
+      "reset_nvmet_unmeasured": "Disconnecting a single NVMe-oF host is not available yet: the mechanism has not been measured, and removing the host from the list does not disconnect it.",
+      "last_seen_hint": "{ago} — accurate to about a minute: the node refreshes this time at most once a minute."
     },
     "wizard_target": {
       "title": "New target",
@@ -9142,7 +9186,9 @@
         "dhchap_not_built": "this kernel was built without CONFIG_NVME_TARGET_AUTH ({path})",
         "dhchap_not_mentioned": "{path} does not mention CONFIG_NVME_TARGET_AUTH",
         "kernel_config_missing": "this kernel publishes no configuration (no /proc/config.gz, no /boot/config-*), so DH-HMAC-CHAP support cannot be confirmed — the wizard does not offer what it cannot confirm"
-      }
+      },
+      "host_description_label": "Description — {nqn}",
+      "host_description_placeholder": "e.g. orion (compute)"
     },
     "journal_owner": {
       "this_instance": "this TentaNas instance",
@@ -9196,7 +9242,17 @@
       "sharing_stop_busy": "Sharing on this node is already being stopped or is stopped — nothing was changed.",
       "sharing_stop_author_gone": "The author of this request is no longer a platform administrator in this organisation — it cannot be approved; reject it.",
       "sharing_resume_partial": "Sharing is back, but not all of it — the job lines list what does not serve yet; the node retries.",
-      "sharing_stop_pending_elsewhere": "A stop of sharing requested in another organisation is already waiting for approval on this node. A platform administrator sees it in TentaNas → Tasks and can reject it."
+      "sharing_stop_pending_elsewhere": "A stop of sharing requested in another organisation is already waiting for approval on this node. A platform administrator sees it in TentaNas → Tasks and can reject it.",
+      "target_last_initiator": "This is the only entry on the allowlist — removing it would open the target to everyone. Stop the target or add another entry first.",
+      "target_description_unlisted": "The description is for an initiator that is not on the allowlist — add it to the list or drop the description",
+      "target_description_too_long": "A description can be at most 80 characters long",
+      "target_description_invalid": "A description cannot contain control characters (such as a line break)",
+      "target_session_reset_nvmet": "Disconnecting a single NVMe-oF host is not available — removing the host from the list does not disconnect it, and a separate mechanism has not been measured yet",
+      "target_session_reset_not_allowlisted": "Only an initiator on the allowlist can be disconnected — without a list the client logs straight back in",
+      "target_session_none": "This initiator has no session right now — there is nothing to disconnect",
+      "target_session_reset_not_serving": "The target is stopped — there is no session to disconnect",
+      "disk_remote": "This is a remote disk (iSCSI/NVMe-oF) this node sees as a client — it cannot join a pool or an array",
+      "target_session_reset_not_app_target": "This target was not created by this app — it will not disconnect its sessions"
     },
     "unreachable": {
       "title": "Node {node} unreachable",

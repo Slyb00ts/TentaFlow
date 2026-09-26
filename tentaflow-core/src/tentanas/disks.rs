@@ -13,6 +13,7 @@
 // =============================================================================
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -462,6 +463,17 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
         // this disk before the plan): refused like its journal would be, and
         // without the name the `elastic_member` sentence above would print.
         ROLE_OTHER_ORG_ARRAY => refusals.push(refuse_other_org(name)),
+        // A LUN another target serves to this node (`mark_remote`). Clearing
+        // it from here erases the target's volume — possibly this node's own
+        // export reached over loopback — under the clients that use it.
+        ROLE_REMOTE => refusals.push(refuse(
+            ROLE_REMOTE,
+            format!(
+                "{name}: to dysk zdalny (iSCSI/NVMe-oF), który ten node widzi jako klient — \
+                 jego dane należą do targetu, który go udostępnia; wyloguj się z targetu \
+                 zamiast czyścić dysk"
+            ),
+        )),
         "mounted" => refusals.push(refuse(
             "mounted",
             format!(
@@ -936,7 +948,186 @@ async fn inventory() -> Result<Vec<NasDisk>> {
     if !out.success() {
         return Err(anyhow!("lsblk exited with {}: {}", out.code, out.stderr.trim()));
     }
-    disks_from_lsblk_json(&out.stdout)
+    let mut disks = disks_from_lsblk_json(&out.stdout)?;
+    mark_remote(&mut disks, Path::new(SYSFS_ROOT));
+    Ok(disks)
+}
+
+// ----- remote LUNs (iSCSI / NVMe-oF) -------------------------------------------------
+
+/// Where the kernel publishes its block devices and NVMe controllers.
+const SYSFS_ROOT: &str = "/sys";
+
+/// The role of a disk that is a LUN another target serves to this node.
+pub const ROLE_REMOTE: &str = "remote";
+
+/// NVMe controller transports that reach a namespace over a fabric. Anything
+/// else (`pcie`, `apple-nvme`, a transport this build does not know) is a
+/// local controller.
+const NVME_FABRIC_TRANSPORTS: &[&str] = &["tcp", "rdma", "fc", "loop"];
+
+/// Whether `disk` is a LUN served by a target — this node's own export over
+/// loopback included — rather than a device in this machine, and over what.
+///
+/// MEASURED on rig11 (MAJOR 27, 2026-09-26): an iSCSI login to a LIO fileio
+/// LUN appeared as `sdz`, model `LIO-ORG FILEIO`, no serial and no WWN, and
+/// an `nvme connect` over TCP as `nvme4n1`, model `Linux`, WWN `uuid.…`.
+/// Both were inventoried as local disks and would have been offered as pool
+/// members. A pool on a node's own exported zvol reached over loopback is a
+/// pool inside itself.
+///
+/// The transport is read from sysfs first, because the model string is the
+/// target's to choose (LIO and nvmet both let an admin rename it):
+///   * iSCSI: lsblk's `TRAN=iscsi`, or the device path under an iSCSI host's
+///     session (`…/host7/session1/target7:0:0/7:0:0:0/block/sdz`) — the
+///     layout `scsi_transport_iscsi` creates, iSER included;
+///   * NVMe: the controller's `transport` (`tcp`, `rdma`, `fc`, `loop`), read
+///     from the namespace's controller, from every controller of its
+///     subsystem (native multipath: `device` is the `nvme-subsystem`), or from
+///     `class/nvme/<ctrl>`.
+///
+/// The target's default model is the second signal: `LIO-ORG` as vendor, and
+/// nvmet's `Linux` model with a `uuid.` WWN.
+pub fn remote_transport(sys_root: &Path, disk: &NasDisk) -> Option<&'static str> {
+    let name = disk.name.as_str();
+    if name.is_empty() || name.contains('/') || name.starts_with('.') {
+        return None;
+    }
+    // The TRANSPORT decides whenever sysfs gives one (critic wave 12,
+    // MINOR 5): the model string is only a fallback for a device whose
+    // transport this node could not read. A LIO LUN handed to a VM through
+    // vhost-scsi reads `LIO-ORG` inside the guest and is that guest's LOCAL
+    // disk — its transport (virtio_scsi) says so, and it must stay a
+    // candidate; the same for an nvmet-backed namespace behind a PCIe
+    // controller.
+    if name.starts_with("nvme") {
+        let transports = nvme_transports(sys_root, name);
+        if !transports.is_empty() {
+            return transports
+                .iter()
+                .any(|t| NVME_FABRIC_TRANSPORTS.contains(&t.as_str()))
+                .then_some("nvme-of");
+        }
+        let uuid_wwn = disk.wwn.as_deref().is_some_and(|w| w.starts_with("uuid."));
+        if disk.model.trim() == "Linux" && uuid_wwn {
+            return Some("nvme-of");
+        }
+        return None;
+    }
+    if disk.transport == "iscsi" || under_iscsi_session(sys_root, name) {
+        return Some("iscsi");
+    }
+    if let Some(driver) = scsi_host_driver(sys_root, name) {
+        return ISCSI_HOST_DRIVERS.contains(&driver.as_str()).then_some("iscsi");
+    }
+    let tran_known = !matches!(disk.transport.as_str(), "" | "unknown");
+    if !tran_known && disk.model.trim_start().starts_with("LIO-ORG") {
+        return Some("iscsi");
+    }
+    None
+}
+
+/// The SCSI host drivers that are iSCSI initiators (`scsi_host/hostN/proc_name`).
+const ISCSI_HOST_DRIVERS: &[&str] = &[
+    "iscsi_tcp", "iser", "ib_iser", "bnx2i", "cxgb3i", "cxgb4i", "qla4xxx", "be2iscsi", "qedi",
+];
+
+/// The driver of the SCSI host a block device hangs off
+/// (`class/scsi_host/hostN/proc_name`), or `None` when sysfs does not say.
+fn scsi_host_driver(sys_root: &Path, name: &str) -> Option<String> {
+    let real = std::fs::canonicalize(sys_root.join("block").join(name)).ok()?;
+    let host = real.components().find_map(|part| {
+        let part = part.as_os_str().to_string_lossy().into_owned();
+        part.strip_prefix("host")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .then_some(part)
+    })?;
+    std::fs::read_to_string(sys_root.join("class").join("scsi_host").join(host).join("proc_name"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether `<sys_root>/block/<name>` resolves below an iSCSI session: a
+/// `hostN` component followed, further down, by a `sessionN` one.
+fn under_iscsi_session(sys_root: &Path, name: &str) -> bool {
+    let Ok(real) = std::fs::canonicalize(sys_root.join("block").join(name)) else {
+        return false;
+    };
+    let numbered = |s: &str, prefix: &str| {
+        s.strip_prefix(prefix)
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut seen_host = false;
+    for part in real.components() {
+        let part = part.as_os_str().to_string_lossy();
+        if numbered(&part, "host") {
+            seen_host = true;
+        } else if seen_host && numbered(&part, "session") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Every controller transport this namespace can be reached through.
+fn nvme_transports(sys_root: &Path, name: &str) -> Vec<String> {
+    let read = |p: PathBuf| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let device = sys_root.join("block").join(name).join("device");
+    if let Some(t) = read(device.join("transport")) {
+        return vec![t];
+    }
+    let mut out: Vec<String> = std::fs::read_dir(&device)
+        .map(|dir| {
+            dir.flatten()
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.strip_prefix("nvme")
+                        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .filter_map(|e| read(e.path().join("transport")))
+                .collect()
+        })
+        .unwrap_or_default();
+    if out.is_empty() {
+        if let Some(ctrl) = nvme_controller_of(name) {
+            out.extend(read(sys_root.join("class").join("nvme").join(ctrl).join("transport")));
+        }
+    }
+    out
+}
+
+/// `nvme4n1` → `nvme4`: the name without its `n<nsid>` suffix.
+fn nvme_controller_of(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("nvme")?;
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let tail = &rest[digits..];
+    let nsid = tail.strip_prefix('n')?;
+    (digits > 0 && !nsid.is_empty() && nsid.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| &name[..4 + digits])
+}
+
+/// Gives every remote LUN of the inventory the role `remote`, so no candidate
+/// list (pool, vdev, spare, Elastic, wipe) offers it.
+///
+/// Only the catch-all roles are replaced. `system`, `pool_member` and an
+/// array's membership are evidence ON the disk, and a pool somebody already
+/// built on a remote LUN has to stay visible as the member it is.
+pub fn mark_remote(disks: &mut [NasDisk], sys_root: &Path) {
+    for d in disks.iter_mut() {
+        if !matches!(d.role.as_str(), "free" | "used" | "mounted") {
+            continue;
+        }
+        if remote_transport(sys_root, d).is_some() {
+            d.role = ROLE_REMOTE.to_string();
+            d.member_of = None;
+        }
+    }
 }
 
 // ----- /proc/diskstats ------------------------------------------------------------
@@ -2712,6 +2903,9 @@ pub async fn refresh_smart(db: &DbPool) -> Result<()> {
         .read()
         .disks
         .values()
+        // A remote LUN has no SMART of its own (LIO and nvmet answer for the
+        // file or zvol behind it), so it is neither read nor graded.
+        .filter(|l| l.disk.role != ROLE_REMOTE)
         .map(|l| (l.disk.disk_id.clone(), l.disk.path.clone(), l.disk.kind.clone()))
         .collect();
     let mut failures = Vec::new();
@@ -5955,5 +6149,215 @@ mod tests {
         assert!(replacement_advice(&member_warning, Some(&aged_since), None, false).is_some(), "the advice itself holds");
         write_health_alert(&db, id, "warning", "2 reallocated sectors", &[], Some(&member_warning)).expect("refresh");
         assert_eq!(param(&alert(&db), "advice"), None, "no replacement suffix for an Elastic member");
+    }
+
+    // ----- remote LUNs (MAJOR 27 F4) ------------------------------------------------
+
+    /// The two LUNs the rig11 loopback session attached (2026-09-26), in the
+    /// shape lsblk printed them, next to a local PCIe NVMe and a SATA disk.
+    const REMOTE_LSBLK: &str = r#"{"blockdevices":[
+      {"name":"sdz","path":"/dev/sdz","type":"disk","model":"FILEIO","serial":null,"wwn":null,"size":67108864,"tran":"iscsi","rota":true,"rm":false,"rev":"4.0","vendor":"LIO-ORG ","mountpoints":[null],"fstype":null,"label":null,"uuid":null},
+      {"name":"nvme4n1","path":"/dev/nvme4n1","type":"disk","model":"Linux","serial":"8f1c2a0d3e4b5a69","wwn":"uuid.bc8f0135-5d0e-4f53-9a3c-2b7f1e6d4c21","size":67108864,"tran":"nvme","rota":false,"rm":false,"rev":"7.0.0-34","vendor":null,"mountpoints":[null],"fstype":null,"label":null,"uuid":null},
+      {"name":"nvme0n1","path":"/dev/nvme0n1","type":"disk","model":"Samsung 980","serial":"S1","wwn":"eui.0025385b21b0f2e1","size":1000204886016,"tran":"nvme","rota":false,"rm":false,"rev":null,"vendor":null,"mountpoints":[null],"fstype":null,"label":null,"uuid":null},
+      {"name":"sda","path":"/dev/sda","type":"disk","model":"WDC WD80EFZZ","serial":"WD-1","wwn":"0x5000cca","size":8001563222016,"tran":"sata","rota":true,"rm":false,"rev":"81.00","vendor":"ATA     ","mountpoints":[null],"fstype":null,"label":null,"uuid":null}
+    ]}"#;
+
+    fn remote_inventory() -> Vec<NasDisk> {
+        disks_from_lsblk_json(REMOTE_LSBLK).expect("lsblk json")
+    }
+
+    fn remote_named<'a>(disks: &'a [NasDisk], name: &str) -> &'a NasDisk {
+        disks.iter().find(|d| d.name == name).unwrap_or_else(|| panic!("{name} in the inventory"))
+    }
+
+    /// A sysfs tree: `block/<name>` as a symlink into `devices/<path>`, the
+    /// way the kernel lays it out.
+    struct FakeSys(tempfile::TempDir);
+
+    impl FakeSys {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            std::fs::create_dir_all(dir.path().join("block")).expect("block dir");
+            Self(dir)
+        }
+
+        fn root(&self) -> &Path {
+            self.0.path()
+        }
+
+        fn block(&self, name: &str, device_path: &str) -> PathBuf {
+            let real = self.root().join("devices").join(device_path).join(name);
+            std::fs::create_dir_all(&real).expect("device dir");
+            std::os::unix::fs::symlink(&real, self.root().join("block").join(name)).expect("block link");
+            real
+        }
+
+        fn file(&self, rel: &Path, text: &str) {
+            std::fs::create_dir_all(rel.parent().expect("parent")).expect("dirs");
+            std::fs::write(rel, text).expect("write");
+        }
+    }
+
+    /// A text-only disk: no model or tran hint, so only sysfs can tell.
+    fn plain(name: &str) -> NasDisk {
+        NasDisk {
+            name: name.to_string(),
+            role: "free".to_string(),
+            transport: if name.starts_with("nvme") { "nvme".into() } else { "unknown".into() },
+            model: "Generic".to_string(),
+            ..NasDisk::default()
+        }
+    }
+
+    #[test]
+    fn an_iscsi_lun_is_found_under_its_session_in_sysfs() {
+        let sys = FakeSys::new();
+        sys.block("sdz", "platform/host7/session1/target7:0:0/7:0:0:0/block");
+        sys.block("sda", "pci0000:00/0000:00:17.0/ata1/host0/target0:0:0/0:0:0:0/block");
+        assert_eq!(remote_transport(sys.root(), &plain("sdz")), Some("iscsi"));
+        // A local SCSI host without a session is not remote.
+        assert_eq!(remote_transport(sys.root(), &plain("sda")), None);
+        // A `session` component BEFORE any host proves nothing.
+        sys.block("sdy", "session3/host9/target9:0:0/9:0:0:0/block");
+        assert_eq!(remote_transport(sys.root(), &plain("sdy")), None);
+    }
+
+    #[test]
+    fn an_nvme_namespace_over_a_fabric_is_found_by_its_controller_transport() {
+        let sys = FakeSys::new();
+        // nvme-tcp without native multipath: `device` is the controller.
+        let ns = sys.block("nvme4n1", "virtual/nvme-fabrics/ctl/nvme4");
+        std::os::unix::fs::symlink(ns.parent().expect("ctrl"), ns.join("device")).expect("device link");
+        sys.file(&ns.parent().expect("ctrl").join("transport"), "tcp\n");
+        assert_eq!(remote_transport(sys.root(), &plain("nvme4n1")), Some("nvme-of"));
+
+        // Native multipath: `device` is the subsystem, the controllers are
+        // children of it.
+        let head = sys.block("nvme5n1", "virtual/nvme-subsystem/nvme-subsys5");
+        let subsys = head.parent().expect("subsys").to_path_buf();
+        std::os::unix::fs::symlink(&subsys, head.join("device")).expect("device link");
+        sys.file(&subsys.join("nvme5").join("transport"), "rdma\n");
+        assert_eq!(remote_transport(sys.root(), &plain("nvme5n1")), Some("nvme-of"));
+
+        // A local PCIe drive, both through `device` and through class/nvme.
+        let local = sys.block("nvme0n1", "pci0000:00/0000:00:01.2/0000:04:00.0/nvme/nvme0");
+        std::os::unix::fs::symlink(local.parent().expect("ctrl"), local.join("device")).expect("device link");
+        sys.file(&local.parent().expect("ctrl").join("transport"), "pcie\n");
+        assert_eq!(remote_transport(sys.root(), &plain("nvme0n1")), None);
+        sys.file(&sys.root().join("class/nvme/nvme6/transport"), "loop\n");
+        sys.block("nvme6n1", "virtual/nvme-fabrics/ctl/nvme6");
+        assert_eq!(remote_transport(sys.root(), &plain("nvme6n1")), Some("nvme-of"), "class/nvme fallback");
+        sys.file(&sys.root().join("class/nvme/nvme7/transport"), "apple-nvme\n");
+        sys.block("nvme7n1", "platform/nvme7");
+        assert_eq!(remote_transport(sys.root(), &plain("nvme7n1")), None, "a local non-PCIe controller");
+    }
+
+    #[test]
+    fn the_target_default_models_mark_a_lun_even_without_sysfs() {
+        let empty = FakeSys::new();
+        let mut disks = remote_inventory();
+        // lsblk's `TRAN=iscsi` alone is enough for the SCSI LUN; strip it to
+        // prove the LIO vendor is a second, independent signal.
+        let mut lio = remote_named(&disks, "sdz").clone();
+        assert_eq!(lio.model, "LIO-ORG FILEIO");
+        lio.transport = "unknown".into();
+        assert_eq!(remote_transport(empty.root(), &lio), Some("iscsi"));
+        // nvmet's default model with its uuid WWN.
+        assert_eq!(remote_transport(empty.root(), remote_named(&disks, "nvme4n1")), Some("nvme-of"));
+        // "Linux" without a uuid WWN is not enough.
+        let mut linux = remote_named(&disks, "nvme4n1").clone();
+        linux.wwn = Some("eui.0000000000000001".into());
+        assert_eq!(remote_transport(empty.root(), &linux), None);
+
+        mark_remote(&mut disks, empty.root());
+        assert_eq!(remote_named(&disks, "sdz").role, ROLE_REMOTE);
+        assert_eq!(remote_named(&disks, "nvme4n1").role, ROLE_REMOTE);
+        assert_eq!(remote_named(&disks, "nvme0n1").role, "free", "a local PCIe NVMe stays free");
+        assert_eq!(remote_named(&disks, "sda").role, "free", "a SATA disk stays free");
+    }
+
+    #[test]
+    fn a_known_transport_wins_over_the_model_string() {
+        // Critic wave 12, MINOR 5: a LIO LUN handed to a VM through
+        // vhost-scsi reads `LIO-ORG` inside the guest, where it is a LOCAL
+        // disk on a virtio_scsi host — and must stay a candidate.
+        let sys = FakeSys::new();
+        sys.block("sdb", "pci0000:00/0000:00:04.0/virtio1/host0/target0:0:1/0:0:1:0/block");
+        sys.file(&sys.root().join("class/scsi_host/host0/proc_name"), "virtio_scsi\n");
+        let mut vm_disk = remote_named(&remote_inventory(), "sdz").clone();
+        vm_disk.name = "sdb".into();
+        vm_disk.transport = "unknown".into();
+        assert_eq!(vm_disk.model, "LIO-ORG FILEIO");
+        assert_eq!(remote_transport(sys.root(), &vm_disk), None, "virtio_scsi says local");
+        let mut disks = vec![vm_disk.clone()];
+        mark_remote(&mut disks, sys.root());
+        assert_eq!(disks[0].role, "free");
+        // The same device on an iSCSI host driver is remote.
+        sys.block("sdc", "platform/host5/target5:0:0/5:0:0:0/block");
+        sys.file(&sys.root().join("class/scsi_host/host5/proc_name"), "iscsi_tcp\n");
+        let iscsi = NasDisk { name: "sdc".into(), ..vm_disk.clone() };
+        assert_eq!(remote_transport(sys.root(), &iscsi), Some("iscsi"));
+        // A lsblk transport that is not iSCSI wins over the model as well.
+        let sas = NasDisk { name: "sdq".into(), transport: "sas".into(), ..vm_disk.clone() };
+        assert_eq!(remote_transport(sys.root(), &sas), None);
+        // nvmet's default model behind a PCIe controller is local.
+        let nvme = sys.block("nvme7n1", "pci0000:00/0000:00:05.0/nvme/nvme7");
+        sys.file(&nvme.join("device/transport"), "pcie\n");
+        let linux = NasDisk { name: "nvme7n1".into(), ..remote_named(&remote_inventory(), "nvme4n1").clone() };
+        assert_eq!(remote_transport(sys.root(), &linux), None, "pcie says local");
+    }
+
+    #[test]
+    fn only_the_catch_all_roles_become_remote() {
+        let empty = FakeSys::new();
+        for (role, member_of, expected) in [
+            ("free", None, ROLE_REMOTE),
+            ("used", None, ROLE_REMOTE),
+            ("mounted", None, ROLE_REMOTE),
+            ("pool_member", Some("tank"), "pool_member"),
+            ("system", None, "system"),
+            ("array_member", Some("media"), "array_member"),
+            (ROLE_OTHER_ORG_ARRAY, None, ROLE_OTHER_ORG_ARRAY),
+        ] {
+            let mut disks = vec![NasDisk {
+                role: role.to_string(),
+                member_of: member_of.map(str::to_string),
+                ..remote_named(&remote_inventory(), "sdz").clone()
+            }];
+            mark_remote(&mut disks, empty.root());
+            assert_eq!(disks[0].role, expected, "{role}");
+            assert_eq!(disks[0].member_of.as_deref(), if expected == ROLE_REMOTE { None } else { member_of }, "{role}");
+        }
+    }
+
+    #[test]
+    fn a_remote_lun_is_no_candidate_anywhere() {
+        let empty = FakeSys::new();
+        let mut disks = remote_inventory();
+        mark_remote(&mut disks, empty.root());
+        // An Elastic Array record naming the LUN would still make it a member
+        // (evidence the admin has to see), so the membership pass runs after
+        // and is exercised with an empty index here.
+        apply_membership(&mut disks, &HashMap::new(), &HashMap::new());
+        assert_eq!(remote_named(&disks, "sdz").role, ROLE_REMOTE, "the membership pass keeps it remote");
+        // The pool wizard's list (`pools_list` keeps role == "free").
+        let pool_candidates: Vec<&str> =
+            disks.iter().filter(|d| d.role == "free").map(|d| d.name.as_str()).collect();
+        assert_eq!(pool_candidates, vec!["nvme0n1", "sda"]);
+        // The Elastic wizard's list.
+        let elastic: Vec<String> =
+            super::super::elastic::free_disks(&disks, &BTreeSet::new()).into_iter().map(|d| d.name).collect();
+        assert_eq!(elastic, vec!["nvme0n1".to_string(), "sda".to_string()]);
+        assert_eq!(
+            super::super::elastic::conflicting_owner_code(remote_named(&disks, "nvme4n1")),
+            Some(("remote", String::new()))
+        );
+        // Clearing it is refused, with the reason.
+        let plan = plan_wipe(remote_named(&disks, "sdz"), None);
+        assert!(!plan.allowed);
+        assert_eq!(plan.refusals.len(), 1);
+        assert_eq!(plan.refusals[0].code, ROLE_REMOTE);
+        assert!(plan.refusals[0].detail.contains("dysk zdalny"), "{}", plan.refusals[0].detail);
+        assert!(plan_wipe(remote_named(&disks, "sda"), None).allowed, "a free local disk may be cleared");
     }
 }

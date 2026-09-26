@@ -1397,3 +1397,47 @@ test('the addresses of an interface are a list, and the primary is the first of 
   assert.equal(ALL_INTERFACES_ADDRESS, '0.0.0.0');
   assert.deepEqual(bindableAddresses(withAlias, ''), []);
 });
+
+test('each host NQN gets an Opis field that survives typing and rides along with the save (wave 12)', async () => {
+  let sent = null;
+  const target = {
+    targetId: 't2',
+    name: 'scratch',
+    protocol: 'nvmet',
+    wwn: 'nqn.2026-09.local.tentaflow:helios.scratch',
+    enabled: true,
+    luns: [{ index: 1, source: 'fast/scratch', sizeBytes: 1099511627776, thin: true, groupId: 1, sourceKind: 'zvol' }],
+    portals: [{ interface: 'storage0', address: '10.10.0.5', port: 4420, transport: 'tcp' }],
+    auth: { method: 'dhchap', secretSet: true },
+    initiators: ['nqn.2014-08.org.nvmexpress:uuid:stary'],
+    initiatorDescriptions: { 'nqn.2014-08.org.nvmexpress:uuid:stary': 'orion (compute)' },
+    portGroups: [{ groupId: 1, state: 'optimized', preferred: false }],
+  };
+  const screen = fakeScreen({
+    tentaNasTargetUpdateRequest: (payload) => { sent = payload; return { job: { jobId: 'j9', kind: 'target_update', subject: 'scratch' } }; },
+  });
+  const win = openTargetWizard(screen, { target, capabilities: caps() });
+  await flush();
+  // D8: editing the host list says a removed host stays connected.
+  assert.match(win.querySelector('[data-testid="nvmet-remove-note"]').textContent, /nie rozłącza hosta, który jest już połączony/);
+  const stored = win.querySelector('tf-input[data-host="nqn.2014-08.org.nvmexpress:uuid:stary"]');
+  assert.equal(stored.value, 'orion (compute)', 'the stored Opis is pre-filled');
+  typeInto(win.querySelector('#nas-tw-hosts'), 'nqn.2014-08.org.nvmexpress:uuid:stary\nnqn.2014-08.org.nvmexpress:uuid:nowy');
+  await flush();
+  assert.ok(win.querySelector('tf-input[data-host="nqn.2014-08.org.nvmexpress:uuid:stary"]') === stored, 'an existing Opis field is not rebuilt by typing the list');
+  const fresh = win.querySelector('tf-input[data-host="nqn.2014-08.org.nvmexpress:uuid:nowy"]');
+  typeInto(fresh, '  vega (backup) ');
+  await flush();
+  click(nextButton(win));
+  await flush();
+  click(nextButton(win));
+  await flush();
+  await flush();
+  assert.deepEqual(sent.initiators, ['nqn.2014-08.org.nvmexpress:uuid:stary', 'nqn.2014-08.org.nvmexpress:uuid:nowy']);
+  assert.deepEqual(sent.initiatorDescriptions, {
+    'nqn.2014-08.org.nvmexpress:uuid:stary': 'orion (compute)',
+    'nqn.2014-08.org.nvmexpress:uuid:nowy': 'vega (backup)',
+  });
+  await settled();
+  screen.dispose();
+});

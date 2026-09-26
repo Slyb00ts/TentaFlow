@@ -707,6 +707,11 @@ const ALERT_WORDS = new Map([
   }],
   ['target_not_applied', targetFailure('target_not_applied')],
   ['target_still_in_kernel', targetFailure('target_still_in_kernel')],
+  // Wave 12: an allowlist refused because an excluded client cannot be reset.
+  ['target_session_not_reset', (p) => {
+    const t = textParams(p, ['target']);
+    return t ? { title: T('alerts.code.target_session_not_reset.title', t), detail: T('alerts.code.target_session_not_reset.detail') } : null;
+  }],
   ['elevation_unarmed', () => ({ title: T('alerts.code.elevation_unarmed.title'), detail: T('alerts.code.elevation_unarmed.detail') })],
   // Raised by tentanas/sharing.rs (wave 10): the resume of a node's sharing.
   ['sharing_resume_failed', (p) => {
