@@ -3293,22 +3293,6 @@ export const encode = {
   },
 
   /**
-   * BusPayload::ReassignRequest (Admin — M06 replica-set change). payload: { topic,
-   * partition?, replicas }. `partition` omitted/null targets every partition of `topic`;
-   * a number targets one. `replicas` is the new replica node_id set.
-   */
-  busReassignRequest(correlationId, payload = {}, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeBusReassignRequest(
-      encode._busInstanceId(payload),
-      String(payload.topic ?? ''),
-      payload.partition == null ? undefined : Number(payload.partition),
-      (payload.replicas ?? []).map(String),
-    );
-    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
-  },
-
-  /**
    * BusPayload::LeaderTransferRequest (Admin — M03/M06 "Przenieś lidera"). payload:
    * { topic, partition, targetNodeId }.
    */

@@ -360,6 +360,12 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
     // topic op, whose create/delete removes the topic's entries here — moves
     // it like a local write does, or a deny set on another node would not
     // reach a consumer already reading on this one.
+    // Every node caches the topic configs its publishes and deliveries read;
+    // a replicated change retires those entries, or the node would keep
+    // enforcing the old settings until it restarts.
+    if rows > 0 && descriptor.kind == CoreSyncResourceKind::BusTopic {
+        crate::bus::topics::bump_config_generation();
+    }
     if descriptor.kind == CoreSyncResourceKind::BusTopic
         || (descriptor.kind == CoreSyncResourceKind::ResourcePermission
             && field_string(operation, "resource_type").is_ok_and(|t| t == "topic"))
@@ -7622,6 +7628,33 @@ mod tests {
             repository::bus_topic_get(&db, "tentabus-bbbbbbbb", "org-1", "shipments.created")
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// A topic setting changed on another node must reach the configs this
+    /// node's bus engines cache, and only an applied row may retire them.
+    #[test]
+    fn applied_bus_topic_retires_cached_topic_configs() {
+        let db = bus_db();
+        let mut row = bus_topic_row("org-1", "orders.retry");
+        let before = crate::bus::topics::config_generation();
+        assert_eq!(
+            apply_core_operation(&db, &bus_topic_op(&row, ActionType::Insert)).unwrap(),
+            1
+        );
+        let after_insert = crate::bus::topics::config_generation();
+        assert!(after_insert > before, "an applied topic insert must move the generation");
+
+        row.max_delivery_attempts = 3;
+        row.updated_at_ms += 1;
+        assert_eq!(
+            apply_core_operation(&db, &at(bus_topic_op(&row, ActionType::Update), 2_000_000_000_000))
+                .unwrap(),
+            1
+        );
+        assert!(
+            crate::bus::topics::config_generation() > after_insert,
+            "an applied topic update must move the generation"
         );
     }
 

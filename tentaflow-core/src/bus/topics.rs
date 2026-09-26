@@ -21,6 +21,26 @@ use super::payload_format::PayloadFormat;
 use super::schema_registry::SchemaType;
 use super::BusServiceError;
 
+/// Moves whenever a topic row changes under this node without passing
+/// through its own `BusService` — a create, update or delete another node
+/// made, applied by `sync::core_materializer`. `BusService::topic_config`
+/// keeps a cached config only while this is still the value it read before
+/// loading that config, so a setting changed on one node reaches every node
+/// that hosts a copy instead of waiting for a restart there.
+static CONFIG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current value of [`CONFIG_GENERATION`].
+pub fn config_generation() -> u64 {
+    CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Invalidates every cached topic config of every instance on this node.
+/// Called after the row change is committed: a reader that loaded the old row
+/// before the commit cached it under the previous value and reloads.
+pub fn bump_config_generation() {
+    CONFIG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 /// PLAN §7.1 `name`: `^[a-z0-9]([a-z0-9.\-]{1,126})$`. Internal topics
 /// (`__dlq.<topic>`, `__bus.metrics`) deliberately fall outside this and use
 /// `validate_internal_topic_name` instead — the leading `__` is a reserved

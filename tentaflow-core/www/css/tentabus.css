@@ -1,14 +1,10 @@
 /* =============================================================================
-   File: tentabus.css — TentaBus M1 (topics, consumer groups, DLQ, message
-   preview) + M2 (replication & failover, PLAN-M2.md §1f, mockup
-   m06-replikacja-failover.html: node cards, role matrix, current-lag state
-   list, failover history — see "M06 replication & failover" section below;
-   also feeds M03's partitions table and M02's node picker). Only --tf-*
-   tokens (scripts/ci-gates.sh Gate 5a); classes tb-*. Layout/spacing
-   patterns mirror analytics.css (an-*) so the module fits the rest of the
-   admin shell without inventing a new visual language. Animations use
-   transform/opacity only; prefers-reduced-motion is neutralized globally by
-   controls.css.
+   File: tentabus.css — the TentaBus screen: the shell and Przegląd (U0),
+   Topiki with the creator, delete and preview windows (U1), a topic's page
+   and Kopie i nody (U2), and the M1/M2 Odbiorcy and Nieprzetworzone views
+   until U3–U4 replace them. Only --tf-* tokens (scripts/ci-gates.sh Gate 5a);
+   classes tb-*. Animations use transform/opacity only; prefers-reduced-motion
+   is neutralized globally by controls.css.
    ============================================================================= */
 
 .tb-root { min-width: 0; display: flex; flex-direction: column; gap: 16px; }
@@ -210,44 +206,9 @@
 }
 .tb-gap-note svg { width: 14px; height: 14px; flex-shrink: 0; margin-top: 1px; }
 
-/* ----- Breadcrumb / back ----- */
-.tb-back { margin-bottom: 12px; }
-
-/* ----- Detail hero ----- */
-.tb-hero { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-.tb-hero-ident { min-width: 0; }
-.tb-hero-name {
-  display: flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 800;
-  font-family: var(--tf-font-mono, ui-monospace, monospace);
-}
-.tb-hero-meta { display: flex; gap: 8px; margin-top: 7px; flex-wrap: wrap; }
-.tb-mini-kpis { display: flex; gap: 24px; margin-left: auto; text-align: right; flex-wrap: wrap; }
-/* M03 overview tiles (msg/s, bytes/s, disk, lag, DLQ depth) reuse .tb-mk but
-   sit inside a plain card, left-aligned and evenly spaced, not pinned right
-   next to the hero title like the two hero mini-KPIs above. */
-.tb-mini-kpis--wrap { margin-left: 0; text-align: left; justify-content: flex-start; gap: 28px; }
-.tb-mk b { display: block; font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.tb-mk span { font-size: 10.5px; color: var(--tf-text-3); text-transform: uppercase; letter-spacing: 0.06em; }
-
 /* ----- Per-partition earliest/high-watermark summary (M08/M05 paging) ----- */
 .tb-partition-summary { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
 .tb-partition-summary .tf-chip { font-variant-numeric: tabular-nums; }
-
-/* ----- Key/value config table ----- */
-.tb-kv { display: grid; grid-template-columns: minmax(160px, 260px) 1fr; gap: 0; }
-.tb-kv-row {
-  display: contents;
-}
-.tb-kv-row > .tb-kv-key, .tb-kv-row > .tb-kv-val {
-  padding: 9px 4px; border-bottom: 1px solid var(--tf-border); font-size: 12.5px;
-}
-.tb-kv-key { color: var(--tf-text-3); }
-.tb-kv-val { color: var(--tf-text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.tb-kv-val.mono { font-family: var(--tf-font-mono, ui-monospace, monospace); }
-/* Owner decision B (durability class): the config tab's durability-class row
-   stacks the chip above its resolved-policy secondary text instead of the
-   default inline flow every other kv-val uses. */
-.tb-kv-val .tf-chip + .tb-field-hint { display: block; margin-top: 4px; }
 
 /* ----- Lag bar ----- */
 .tb-lagbar { position: relative; width: 100%; min-width: 80px; height: 6px; border-radius: 4px; background: var(--tf-bg-3); overflow: hidden; }
@@ -255,10 +216,8 @@
 .tb-lagbar.tb-lagbar--warn > span { background: var(--tf-warning); }
 .tb-lagbar.tb-lagbar--danger > span { background: var(--tf-danger); }
 
-/* ----- Dialog forms (offset reset, leader transfer, reassign) ----- */
+/* ----- Dialog forms (offset reset) ----- */
 .tb-wizard-form { display: flex; flex-direction: column; gap: 14px; min-width: 420px; }
-.tb-wizard-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.tb-wizard-grid--3 { grid-template-columns: repeat(3, 1fr); }
 .tb-field-hint { font-size: 11px; color: var(--tf-text-3); margin-top: 2px; }
 
 .tb-modal-footer { display: flex; gap: 8px; align-items: center; width: 100%; }
@@ -310,63 +269,6 @@
    meeting-live.css's own `body:has(...)`) that also fixes the identical gap
    for every OTHER module's modals, not just TentaBus's. */
 body:has(tf-modal[open]) .toast-container { z-index: 10000; }
-
-/* ----- M06 replication & failover ----- */
-.tb-repl-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
-
-.tb-node-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-.tb-node-card {
-  background: var(--tf-bg-3); border: 1px solid var(--tf-border); border-radius: var(--tf-radius);
-  padding: 14px; min-width: 0;
-}
-.tb-node-card--degraded { border-color: var(--tf-warning); background: color-mix(in srgb, var(--tf-warning) 8%, var(--tf-bg-3)); }
-.tb-node-card-head { display: flex; align-items: center; gap: 8px; font-weight: 800; font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 13px; flex-wrap: wrap; }
-.tb-node-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--tf-text-3); }
-.tb-node-dot--live { background: var(--tf-success); }
-.tb-node-dot--warn { background: var(--tf-warning); }
-.tb-node-dot--down { background: var(--tf-danger); }
-.tb-node-stats { display: flex; gap: 16px; margin-top: 10px; }
-.tb-node-stats b { display: block; font-size: 16px; font-weight: 800; font-variant-numeric: tabular-nums; }
-.tb-node-stats span { font-size: 9.5px; color: var(--tf-text-3); text-transform: uppercase; letter-spacing: 0.05em; }
-.tb-node-sub { margin-top: 8px; font-size: 11px; color: var(--tf-text-3); }
-.tb-node-card--degraded .tb-node-sub { color: var(--tf-warning); }
-
-/* ----- Role matrix ----- */
-.tb-role-matrix th, .tb-role-matrix td { padding: 8px 10px; border-bottom: 1px solid var(--tf-border); text-align: center; }
-.tb-role-matrix th:first-child, .tb-role-matrix td:first-child { text-align: left; }
-.tb-role-pill { display: inline-block; padding: 2px 8px; border-radius: var(--tf-radius-pill); font-size: 10px; font-weight: 700; }
-.tb-role-pill--leader { background: color-mix(in srgb, var(--tf-accent-2) 18%, transparent); color: var(--tf-accent-2); }
-.tb-role-pill--isr { background: color-mix(in srgb, var(--tf-success) 16%, transparent); color: var(--tf-success); }
-.tb-role-pill--lagging { background: color-mix(in srgb, var(--tf-warning) 16%, transparent); color: var(--tf-warning); }
-.tb-role-cell-empty { color: var(--tf-text-3); }
-.tb-role-unavailable-chip { margin-top: 4px; }
-/* Shared by M06's matrix and M03's partitions table — a partition-level
-   STATE (PLAN-M2.md §4.1 A4: "niedostępna" is a state, not a producer
-   error), never an error-red row treatment. */
-.tb-row-unavailable { background: color-mix(in srgb, var(--tf-warning) 6%, transparent); }
-
-/* ----- Current lag state list (module-doc gap #10: no shrink/expand
-   HISTORY on the wire — this is a flat "right now" list, not a timeline) ----- */
-.tb-lag-list { display: flex; flex-direction: column; gap: 10px; }
-.tb-lag-item { padding: 10px 12px; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-3); }
-.tb-lag-item-head { font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 12px; font-weight: 700; }
-.tb-lag-item-body { font-size: 11.5px; color: var(--tf-warning); margin-top: 3px; }
-
-/* ----- Node picker (M06's "Zmień repliki" dialog) ----- */
-.tb-node-picker {
-  display: flex; flex-direction: column; gap: 8px; border: none; margin: 0; padding: 0; min-width: 0;
-  max-height: 220px; overflow-y: auto;
-}
-.tb-node-picker-item {
-  display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer;
-  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-3);
-  font-size: 12px;
-}
-.tb-node-picker-item:has(input:checked) { border-color: var(--tf-accent-1); background: var(--tf-bg-card-hover); }
-.tb-node-picker-item.is-foreign { opacity: 0.55; cursor: not-allowed; text-decoration: line-through; }
-.tb-node-picker-item input[type="checkbox"] { flex-shrink: 0; cursor: pointer; }
-.tb-node-picker-item.is-foreign input[type="checkbox"] { cursor: not-allowed; }
-.tb-node-picker-name { font-weight: 700; }
 
 /* =============================================================================
    U1 Topiki (T02/T04): the topic list, and the windows opened over it — the
@@ -507,19 +409,97 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
    page: tf-table's flush variant scrolls horizontally inside its own card.
    ============================================================================= */
 @media (max-width: 1024px) {
-  .tb-wizard-grid, .tb-wizard-grid--3 { grid-template-columns: 1fr; }
   .tb-wizard-form { min-width: 0; }
-  .tb-mini-kpis { margin-left: 0; width: 100%; justify-content: flex-start; }
-  .tb-repl-grid-2 { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 720px) {
   .tb-toolbar { row-gap: 8px; }
   .tb-toolbar > tf-searchbox, .tb-toolbar > tf-select { flex: 1 1 100%; max-width: none; }
-  .tb-kv { grid-template-columns: 1fr; }
-  .tb-kv-row > .tb-kv-key { padding-bottom: 0; border-bottom: none; }
-  .tb-mini-kpis { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; text-align: left; }
   .tb-header-list { grid-template-columns: 1fr; }
-  .tb-node-grid { grid-template-columns: 1fr; }
-  .tb-node-stats { gap: 12px; }
+}
+
+/* =============================================================================
+   U2 a topic's page (PROJEKT-SZCZEGOLOW.md): "← Wszystkie topiki", the title
+   with one line of what the topic carries, the vertical section menu beside
+   one section, and on a phone a "Sekcja: …" list under the title instead.
+   Values read as "label — value" rows; locks say why a value stays.
+   ============================================================================= */
+.tb-detail { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.tb-back { display: flex; }
+.tb-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px 16px; flex-wrap: wrap; }
+.tb-title-main { min-width: 0; }
+.tb-title { margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.tb-title-desc { font-size: 13px; color: var(--tf-text-2); margin-top: 4px; }
+.tb-title-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.tb-title-note { font-size: 11.5px; color: var(--tf-text-3); text-align: right; max-width: 320px; }
+.tb-section-pick { display: none; }
+.tb-drill { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 20px; align-items: start; }
+.tb-drill > * { min-width: 0; }
+.tb-section-nav { position: sticky; top: 12px; }
+.tb-section > [data-section] { display: flex; flex-direction: column; gap: 16px; }
+.tb-section > [data-section][hidden] { display: none; }
+/* A slot with nothing to say (no notice, no lock line) must not add a gap. */
+.tb-section > [data-section] > [data-role]:empty { display: none; }
+
+.tb-root .tb-vrows { display: flex; flex-direction: column; }
+.tb-root .tb-vrow { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 4px 16px; padding: 10px 0; border-bottom: 1px solid var(--tf-border); }
+.tb-root .tb-vrow:last-child { border-bottom: 0; }
+.tb-root .tb-vr-label { font-size: 12.5px; color: var(--tf-text-2); }
+.tb-root .tb-vr-value { font-size: 13px; font-weight: 700; color: var(--tf-text); overflow-wrap: anywhere; }
+.tb-root .tb-vr-hint { font-size: 11.5px; color: var(--tf-text-3); margin-top: 2px; line-height: 1.5; }
+.tb-vr-lock { display: flex; align-items: flex-start; gap: 6px; font-size: 11.5px; color: var(--tf-text-3); margin-top: 2px; line-height: 1.5; }
+.tb-vr-lock .icon { width: 12px; height: 12px; margin-top: 2px; flex-shrink: 0; }
+.tb-who-can { display: flex; gap: 10px; align-items: center; padding: 10px 14px; border-radius: var(--tf-radius-sm); background: var(--tf-bg-3); border: 1px solid var(--tf-border); font-size: 12.5px; color: var(--tf-text-2); }
+.tb-who-can .icon { color: var(--tf-text-3); width: 15px; height: 15px; }
+.tb-danger-zone { border: 1px solid rgba(239, 68, 68, 0.4); border-radius: var(--tf-radius); padding: 16px 18px; background: rgba(239, 68, 68, 0.04); }
+.tb-danger-zone h4 { margin: 0 0 8px; color: var(--tf-danger); font-size: 13px; font-weight: 800; display: flex; gap: 8px; align-items: center; }
+.tb-danger-zone h4 .icon { width: 15px; height: 15px; }
+.tb-dz-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.tb-dz-desc { font-size: 12px; color: var(--tf-text-2); line-height: 1.55; }
+.tb-dz-desc b { color: var(--tf-text); }
+.tb-dz-row tf-button { flex-shrink: 0; }
+
+.tb-root .tb-consumer-row .tb-lag-cell { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; width: 170px; flex: 0 0 auto; }
+.tb-root .tb-consumer-row .tb-lag-cell .v { font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tb-root .tb-consumer-row .tb-lag-cell tf-progress-bar { display: block; width: 100%; }
+.tb-root .tb-consumer-row > .icon { color: var(--tf-text-3); }
+.tb-warn-text { color: var(--tf-warning); }
+
+/* Kopie i nody (T10) */
+.tb-node-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.tb-node-card { background: var(--tf-bg-card); border: 1px solid var(--tf-border); border-radius: var(--tf-radius); padding: 14px 16px; min-width: 0; }
+.tb-node-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.tb-node-card-head .icon { color: var(--tf-accent-2); }
+.tb-node-card-head tf-chip { margin-left: auto; }
+.tb-node-name { font-weight: 800; font-size: 14px; overflow-wrap: anywhere; min-width: 0; }
+.tb-root .tb-stat-rows .sr { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--tf-border); font-size: 12.5px; }
+.tb-root .tb-stat-rows .sr:last-child { border-bottom: 0; }
+.tb-root .tb-stat-rows .k { color: var(--tf-text-2); }
+.tb-root .tb-stat-rows .v { font-weight: 700; font-variant-numeric: tabular-nums; font-family: var(--tf-font-mono, ui-monospace, monospace); text-align: right; }
+.tb-root .tb-stat-rows .v.is-warn { color: var(--tf-warning); }
+[data-tb-view-slot="replication"] { display: flex; flex-direction: column; gap: 16px; }
+[data-tb-view-slot="replication"][hidden] { display: none; }
+
+/* The "Zmień …" and "Przenieś prowadzenie" windows */
+.tb-change-window .stack, .tb-transfer-window .stack { display: flex; flex-direction: column; gap: 14px; }
+.tb-window .tb-will-happen { display: flex; gap: 10px; align-items: flex-start; padding: 11px 14px; border-radius: var(--tf-radius-sm); background: rgba(96, 165, 250, 0.07); border: 1px solid rgba(96, 165, 250, 0.3); font-size: 12.5px; color: var(--tf-text-2); line-height: 1.55; }
+.tb-window .tb-will-happen .icon { color: var(--tf-info); width: 16px; height: 16px; margin-top: 1px; flex-shrink: 0; }
+.tb-window .tb-will-happen b { color: var(--tf-text); }
+.tb-window .tb-vr-lock .icon { width: 12px; height: 12px; }
+.tb-window [slot="footer"] .tb-foot-note { margin-right: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--tf-text-3); }
+.tb-window [slot="footer"] .tb-foot-note .icon { width: 13px; height: 13px; }
+.tb-change-window .tb-window-error, .tb-transfer-window .tb-window-error { margin-top: 0; }
+
+@media (max-width: 767px) {
+  .tb-title { font-size: 19px; }
+  .tb-title-actions { align-items: flex-start; }
+  .tb-title-note { text-align: left; }
+  .tb-drill { grid-template-columns: minmax(0, 1fr); }
+  .tb-drill > tf-tabs.tb-section-nav { display: none; }
+  .tb-section-pick { display: block; }
+  .tb-root .tb-vrow { grid-template-columns: minmax(0, 1fr); }
+  .tb-dz-row { flex-direction: column; align-items: flex-start; }
+  .tb-root .tb-consumer-row .tb-lag-cell { width: 110px; }
+  .tb-node-grid { grid-template-columns: minmax(0, 1fr); }
+  .tb-window [slot="footer"] .tb-foot-note { flex-basis: 100%; }
 }

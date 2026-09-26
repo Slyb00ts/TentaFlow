@@ -26,6 +26,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 - New Topics screen: a filterable list, a three-step creator (content kind,
   partitions, message pattern), deletion that asks for the name to be retyped
   and says what goes with the topic, and a message preview.
+- A topic now has its own page: Stan (traffic, what waits, what needs
+  attention and who reads it), Ustawienia (every setting read out, each group
+  changed in its own window that says what the change will do) and Partycje i
+  kopie (which node leads each partition, its copies, moving the leadership).
+  The Kopie i nody tab shows the nodes, the partitions that need attention and
+  the leadership changes; changing a partition's copies by hand is gone.
+- Partitions added to an existing topic now get a leader like the ones it was
+  created with, and so does any partition left without one; any settings
+  change of the topic places them. Before, on a node with replication every
+  write to such a partition was refused.
+- A topic setting changed on one node now takes effect on the other nodes
+  right away, and on the node itself even when a read raced the change.
+  Before, they could keep serving the old settings until restarted.
+- Moving a partition's leadership or changing which nodes hold its copies now
+  needs the right to administer that topic, like changing its settings.
+- The Kopie i nody view leaves out the partitions, message numbers and
+  leadership history of topics the user may not read, with and without
+  replication; asking for such a topic alone is refused. Before, a replicated
+  node showed them to anyone with access to the bus, and a single node showed
+  an empty tab to a user refused one topic.
+- The retry and retention windows no longer promise what the server does not
+  do: pauses between attempts are handed to the consumer's program (TentaFlow
+  flows retry at once), attempts count only for consumers that report
+  failures, and the organisation's compliance rules can keep old messages
+  longer.
+- Tables with row lines keep them on a phone, and card-style tables on a
+  phone no longer overflow their card or draw stray lines.
+- A permission granted or refused in an application's permission table now
+  applies at once. Before, it could take up to five minutes to take effect.
 - Deleting a topic now removes its access entries, its data-hiding rules and
   its unprocessed-messages topic on every node, so a topic created again under
   the same name inherits none of them. Previously they survived and applied to

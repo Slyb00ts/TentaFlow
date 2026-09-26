@@ -2403,26 +2403,6 @@ pub fn encode_bus_replica_list_request(
     .map_err(|e| JsError::new(&e))
 }
 
-/// Admin-triggered replica-set change (M06 "Zmień repliki"). `partition:
-/// None` targets every partition of `topic`; `Some(n)` targets one.
-#[wasm_bindgen(js_name = encodeBusReassignRequest)]
-pub fn encode_bus_reassign_request(
-    instance_id: String,
-    topic: String,
-    partition: Option<u32>,
-    replicas: Vec<String>,
-) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
-        instance_id,
-        payload: tentaflow_protocol::BusPayload::ReassignRequest {
-            topic,
-            partition,
-            replicas,
-        },
-    }))
-    .map_err(|e| JsError::new(&e))
-}
-
 /// Admin-triggered leader transfer for one partition (M03/M06 "Przenieś
 /// lidera").
 #[wasm_bindgen(js_name = encodeBusLeaderTransferRequest)]

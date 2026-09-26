@@ -2163,8 +2163,11 @@ pub struct BusService {
     /// message at any real throughput would serialize on the single shared
     /// application database. Invalidated (removed) by `update_topic`/
     /// `delete_topic` so a config change is visible on the very next
-    /// `publish`, never stale-forever.
-    topic_config_cache: DashMap<TopicKey, Arc<topics::TopicConfig>>,
+    /// `publish`, never stale-forever. Each entry also carries the
+    /// `topics::config_generation()` read before it was loaded: a change
+    /// another node made, applied here by the sync materializer, moves that
+    /// counter and retires every entry at once.
+    topic_config_cache: DashMap<TopicKey, (u64, Arc<topics::TopicConfig>)>,
     /// PLAN-F3 §4.2: compiled-validator cache, keyed `(org_id, subject)`.
     /// `resolve_validator` treats an entry as stale (and recompiles) as soon
     /// as its captured `ResolvedSchema::generation` no longer matches
@@ -3359,8 +3362,13 @@ impl BusService {
         topic: &str,
     ) -> Result<topics::TopicConfig, BusServiceError> {
         let key = (org_id.to_string(), topic.to_string());
+        // Read before the row: a replicated change committed after this load
+        // bumps past it, so the entry cached below is retired on the next call.
+        let generation = topics::config_generation();
         if let Some(cached) = self.topic_config_cache.get(&key) {
-            return Ok((**cached).clone());
+            if cached.0 == generation {
+                return Ok((*cached.1).clone());
+            }
         }
         self.topic_config_db_loads.fetch_add(1, Ordering::Relaxed);
         let cfg =
@@ -3369,7 +3377,8 @@ impl BusService {
                     name: topic.to_string(),
                 }
             })?;
-        self.topic_config_cache.insert(key, Arc::new(cfg.clone()));
+        self.topic_config_cache
+            .insert(key, (generation, Arc::new(cfg.clone())));
         Ok(cfg)
     }
 
@@ -3377,7 +3386,13 @@ impl BusService {
     /// call re-reads SQLite. Called from `update_topic`/`delete_topic`
     /// — the only two admin paths that change what `bus_topics`
     /// holds for an existing topic.
+    ///
+    /// Removing the entry alone is not enough: a concurrent `topic_config`
+    /// that read the old row before the change committed would insert it
+    /// back after this removal. Bumping the generation retires that
+    /// late-inserted entry too, since it carries the generation it read.
     fn invalidate_topic_config_cache(&self, org_id: &str, topic: &str) {
+        topics::bump_config_generation();
         self.topic_config_cache
             .remove(&(org_id.to_string(), topic.to_string()));
     }
@@ -4119,10 +4134,11 @@ impl BusService {
             match store.propose(&assignment) {
                 Ok(_) => placed += 1,
                 Err(e) => {
-                    // Best-effort: a failed placement leaves the topic
-                    // usable at RF=1-on-this-node (M1 behavior for that
-                    // partition) rather than failing topic creation
-                    // outright — an operator can `reassign` later.
+                    // Best-effort: a failed placement does not fail topic
+                    // creation. The partition stays without a leader until
+                    // it is placed again: `update_topic` places every
+                    // unplaced partition, so the topic's next settings
+                    // change does.
                     tracing::warn!(
                         org_id, topic, partition, error = %e,
                         "failed to propose partition assignment"
@@ -4179,9 +4195,11 @@ impl BusService {
         Ok(cfg)
     }
 
-    /// Proposes assignments for every partition of `cfg` that has none.
-    /// Best-effort and silent on success — a broker-internal topic has no
-    /// audit row of its own to carry the placement detail.
+    /// Proposes assignments for every partition of `cfg` that has none —
+    /// a broker-internal topic's, the partitions `update_topic` added, or
+    /// one whose proposal failed earlier.
+    /// Best-effort and silent on success: the caller's own audit row (or,
+    /// for an internal topic, none) carries what changed.
     fn place_unplaced_partitions(
         &self,
         org_id: &str,
@@ -4202,7 +4220,7 @@ impl BusService {
             Err(e) => {
                 tracing::warn!(
                     org_id, topic = %cfg.name, error = %e,
-                    "internal topic: cannot read existing partition assignments; \
+                    "topic placement: cannot read existing partition assignments; \
                      leaving placement alone"
                 );
                 return;
@@ -4224,7 +4242,7 @@ impl BusService {
         if let Some((placed, _)) = placed {
             tracing::info!(
                 org_id, topic = %cfg.name, placed, missing = missing.len(),
-                "placed partitions of a broker-owned internal topic"
+                "placed partitions that had no assignment"
             );
         }
     }
@@ -4492,9 +4510,19 @@ impl BusService {
         // Must happen before the config is stale-read by a concurrent
         // `publish`: the cache holds the OLD config, not this one.
         self.invalidate_topic_config_cache(&ctx.org_id, name);
+        // Every partition needs a leader: without an assignment `publish`'s
+        // preflight refuses every write to it (`NotLeader`, no leader
+        // known). Added partitions have none yet, and one whose proposal
+        // failed when the topic was made has none either — any settings
+        // change of the topic is the moment to place them all.
+        let env = crate::services::environment::get_node_environment(&self.db);
+        self.place_unplaced_partitions(&ctx.org_id, &cfg, env);
         let durability_detail = match before {
             Some(b) => format!(
-                "durability={}->{} durability_class={}->{} durability_explicit={}->{}",
+                "partitions={}->{} durability={}->{} durability_class={}->{} \
+                 durability_explicit={}->{}",
+                b.partitions,
+                cfg.partitions,
                 b.durability.to_wire_string(),
                 cfg.durability.to_wire_string(),
                 b.durability_class().as_str(),
@@ -14694,6 +14722,201 @@ mod tests {
             assert_eq!(row.replicas, vec!["self-node".to_string()]);
             assert_eq!(row.leader_epoch, 1);
         }
+    }
+
+    /// Partitions an update adds are placed like the ones the topic was
+    /// created with: an added partition with no assignment has no leader, and
+    /// `publish` refuses every write to it.
+    #[test]
+    fn update_topic_places_the_partitions_it_adds() {
+        let _guard = locked_ledger_fixture();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let conn = rusqlite::Connection::open_in_memory().expect("open db");
+        crate::db::migrations::run(&conn).expect("run migrations");
+        let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+        let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir: dir.path().join("bus"),
+            db: db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service");
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("self-node");
+        coord.set_snapshot(ReplicationSnapshot::default());
+        svc.set_replication(coord);
+        svc.set_assignment_store(Arc::new(
+            replication::assignment::SqliteLedgerAssignmentStore::new(db.clone()),
+        ));
+
+        let ctx = test_ctx("org-grow");
+        svc.create_topic(
+            &ctx,
+            "wyniki.grow",
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+        svc.update_topic(
+            &ctx,
+            "wyniki.grow",
+            topics::TopicOptions {
+                partitions: Some(4),
+                ..Default::default()
+            },
+        )
+        .expect("update_topic");
+
+        let store = replication::assignment::SqliteLedgerAssignmentStore::new(db);
+        let mut placed: Vec<u32> = store
+            .list_for_topic(svc.instance_id(), "org-grow", "wyniki.grow")
+            .expect("list_for_topic")
+            .iter()
+            .map(|a| a.partition)
+            .collect();
+        placed.sort_unstable();
+        assert_eq!(
+            placed,
+            vec![0, 1, 2, 3],
+            "the two added partitions must be placed too"
+        );
+    }
+
+    /// A partition whose placement did not happen when the topic was made
+    /// (here: no assignment store yet, as when the proposal failed) gets
+    /// its leader at the topic's next settings change, whatever it changes.
+    #[test]
+    fn update_topic_places_a_partition_left_without_a_leader() {
+        let _guard = locked_ledger_fixture();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let conn = rusqlite::Connection::open_in_memory().expect("open db");
+        crate::db::migrations::run(&conn).expect("run migrations");
+        let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+        let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir: dir.path().join("bus"),
+            db: db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service");
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("self-node");
+        coord.set_snapshot(ReplicationSnapshot::default());
+        svc.set_replication(coord);
+
+        let ctx = test_ctx("org-unplaced");
+        svc.create_topic(
+            &ctx,
+            "wizyty.unplaced",
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+        svc.set_assignment_store(Arc::new(
+            replication::assignment::SqliteLedgerAssignmentStore::new(db.clone()),
+        ));
+        let store = replication::assignment::SqliteLedgerAssignmentStore::new(db);
+        let placed = |store: &replication::assignment::SqliteLedgerAssignmentStore| {
+            let mut p: Vec<u32> = store
+                .list_for_topic(svc.instance_id(), "org-unplaced", "wizyty.unplaced")
+                .expect("list_for_topic")
+                .iter()
+                .map(|a| a.partition)
+                .collect();
+            p.sort_unstable();
+            p
+        };
+        assert!(placed(&store).is_empty(), "nothing placed at creation");
+
+        svc.update_topic(
+            &ctx,
+            "wizyty.unplaced",
+            topics::TopicOptions {
+                max_delivery_attempts: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("update_topic");
+        assert_eq!(placed(&store), vec![0, 1]);
+    }
+
+    /// A reader that loaded the row before this node's own update committed
+    /// may put the old config back into the cache after the update removed
+    /// it; that entry must not be served.
+    #[test]
+    fn topic_config_does_not_serve_an_entry_read_before_this_nodes_update() {
+        let (_dir, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "wizyty.race", topics::TopicOptions::default())
+            .expect("create_topic");
+        let generation_seen = topics::config_generation();
+        let old = topics::get_topic(&svc.db, svc.instance_id(), "org-1", "wizyty.race")
+            .expect("read row")
+            .expect("row exists");
+
+        svc.update_topic(
+            &ctx,
+            "wizyty.race",
+            topics::TopicOptions {
+                max_delivery_attempts: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("update_topic");
+        // The late reader finishes now, inserting what it read.
+        svc.topic_config_cache.insert(
+            ("org-1".to_string(), "wizyty.race".to_string()),
+            (generation_seen, Arc::new(old)),
+        );
+
+        let served = svc.topic_config("org-1", "wizyty.race").expect("config");
+        assert_eq!(served.max_delivery_attempts, 3);
+    }
+
+    /// A topic row another node changed reaches this node through the sync
+    /// materializer, not through `update_topic`; the cached config must not
+    /// outlive it.
+    #[test]
+    fn topic_config_follows_a_row_changed_outside_this_engine() {
+        let (_dir, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "wizyty.cache", topics::TopicOptions::default())
+            .expect("create_topic");
+        let cached = svc.topic_config("org-1", "wizyty.cache").expect("config");
+        assert_eq!(cached.max_delivery_attempts, topics::DEFAULT_MAX_DELIVERY_ATTEMPTS);
+
+        let mut row = crate::db::repository::bus_topic_get(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "wizyty.cache",
+        )
+        .expect("read row")
+        .expect("row exists");
+        row.max_delivery_attempts = 2;
+        crate::db::repository::bus_topic_update(&svc.db, &row).expect("write row");
+        topics::bump_config_generation();
+
+        assert_eq!(
+            svc.topic_config("org-1", "wizyty.cache")
+                .expect("config")
+                .max_delivery_attempts,
+            2
+        );
     }
 
     /// The same defect one layer down, found on a live node 06.09.2026:

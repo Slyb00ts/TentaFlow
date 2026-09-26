@@ -11,7 +11,10 @@
 //   bottom navigation bar),
 //   scroll-align (center — an overflowing strip keeps the active tab centred,
 //   also after a resize or a counter widening the tabs, as the phone main
-//   tabs do; the default only scrolls it just inside the edge).
+//   tabs do; the default only scrolls it just inside the edge),
+//   orientation (vertical — a section menu: one tab per row, full width, the
+//   active one marked on its leading edge; arrows Up/Down move along it and
+//   the strip never scrolls sideways).
 //
 // <tf-tab> attributes: label (overrides the light-DOM text), icon (sprite id),
 //   count (trailing pill) + count-tone (hot), disabled, dirty (unsaved-content
@@ -225,7 +228,7 @@ const CHEV_RIGHT_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><polyline po
 
 class TfTabs extends HTMLElement {
   static get observedAttributes() {
-    return ['variant', 'value', 'layout', 'indicator', 'scroll-align'];
+    return ['variant', 'value', 'layout', 'indicator', 'scroll-align', 'orientation'];
   }
 
   constructor() {
@@ -317,7 +320,7 @@ class TfTabs extends HTMLElement {
 
   attributeChangedCallback(name) {
     if (!this._scroller) return;
-    if (name === 'variant') this._applyVariant();
+    if (name === 'variant' || name === 'orientation') this._applyVariant();
     if (name === 'value') this._syncActive();
     // layout drives the indicator inset (stacked bars underline only the middle),
     // indicator drives which edge it rides — both need a re-measure.
@@ -415,7 +418,15 @@ class TfTabs extends HTMLElement {
       this._indicator.className = 'tf-tab-indicator';
     }
     this._scroller.dataset.indicator = '';
+    const vertical = this._isVertical();
+    this._scroller.classList.toggle('tf-tabs--vertical', vertical);
+    if (vertical) this._scroller.setAttribute('aria-orientation', 'vertical');
+    else this._scroller.removeAttribute('aria-orientation');
     this._syncActive();
+  }
+
+  _isVertical() {
+    return (this.getAttribute('orientation') || '').toLowerCase() === 'vertical';
   }
 
   _getTabs() {
@@ -475,7 +486,8 @@ class TfTabs extends HTMLElement {
 
   _syncIndicator() {
     const active = this._scroller.querySelector('tf-tab > .tf-tab.active');
-    if (!active) {
+    // A vertical menu marks the active row itself; there is no strip to slide along.
+    if (!active || this._isVertical()) {
       this._indicator.removeAttribute('data-ready');
       return;
     }
@@ -503,7 +515,7 @@ class TfTabs extends HTMLElement {
   }
 
   _scrollActiveIntoView(tab, smooth = true) {
-    if (!tab) return;
+    if (!tab || this._isVertical()) return;
     const s = this._scroller;
     const tabEl = tab.querySelector('.tf-tab') || tab;
     const tabRect = tabEl.getBoundingClientRect();
@@ -525,8 +537,9 @@ class TfTabs extends HTMLElement {
   _updateFades() {
     const s = this._scroller;
     if (!s) return;
-    const hasLeft = s.scrollLeft > 4;
-    const hasRight = s.scrollLeft + s.clientWidth < s.scrollWidth - 4;
+    const sideways = !this._isVertical();
+    const hasLeft = sideways && s.scrollLeft > 4;
+    const hasRight = sideways && s.scrollLeft + s.clientWidth < s.scrollWidth - 4;
     this._fadeLeft.classList.toggle('visible', hasLeft);
     this._fadeRight.classList.toggle('visible', hasRight);
     this._chevLeft.classList.toggle('visible', hasLeft);
@@ -550,7 +563,10 @@ class TfTabs extends HTMLElement {
   // their natural tab order — no roving tabindex — so Tab still walks every tab
   // exactly as it did before this handler existed.
   _onKeyDown(e) {
-    const keys = ['ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp', 'Home', 'End'];
+    // A vertical menu answers the arrows of its own axis only (WAI-ARIA tabs).
+    const keys = this._isVertical()
+      ? ['ArrowDown', 'ArrowUp', 'Home', 'End']
+      : ['ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp', 'Home', 'End'];
     if (!keys.includes(e.key)) return;
     const current = e.target.closest ? e.target.closest('.tf-tab') : null;
     if (!current || !this._scroller.contains(current)) return;
@@ -588,7 +604,9 @@ class TfTabs extends HTMLElement {
 
   _onWheel(e) {
     // Translate dominant-vertical wheel into horizontal scroll so mouse users
-    // on non-touch devices can swipe the tab strip with a regular wheel.
+    // on non-touch devices can swipe the tab strip with a regular wheel. A
+    // vertical menu leaves the wheel to the page.
+    if (this._isVertical()) return;
     if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
       e.preventDefault();
       this._scroller.scrollBy({ left: e.deltaY, behavior: 'auto' });

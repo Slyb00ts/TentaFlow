@@ -3410,11 +3410,15 @@ fn parse_audit_kv(details: &str) -> std::collections::HashMap<&str, &str> {
 /// A row without `instance_id` (written before the field existed, or by an
 /// instance-anonymous `AuditLogReplAudit::new`, which writes `-`) cannot be
 /// attributed to an instance and is left out.
+///
+/// `readable` answers whether the caller may read a topic: a row of a topic
+/// they may not read is left out, like the topic's offsets in the partition
+/// list, so the timeline does not show what moves inside it.
 fn failover_events_from_audit(
     db: &crate::db::DbPool,
     instance_id: &str,
     org_id: &str,
-    topic: Option<&str>,
+    readable: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<BusFailoverEventWire>, ProtocolError> {
     let mut rows = Vec::new();
     for action in [BUS_FAILOVER_AUDIT_ACTION, BUS_LEADER_TRANSFER_AUDIT_ACTION] {
@@ -3445,15 +3449,11 @@ fn failover_events_from_audit(
         let Some(row_topic) = row.resource.clone() else {
             continue;
         };
-        if let Some(want_topic) = topic {
-            if row_topic != want_topic {
-                continue;
-            }
-        }
         let details = row.details.unwrap_or_default();
         let kv = parse_audit_kv(&details);
         if kv.get("org_id").copied() != Some(org_id)
             || kv.get("instance_id").copied() != Some(instance_id)
+            || !readable(&row_topic)
         {
             continue;
         }
@@ -3529,9 +3529,15 @@ fn failover_events_from_audit(
 /// instead of an empty one: this node is the sole replica of every
 /// partition it owns (`leader_epoch=0`, `isr=[this node]`), which is
 /// exactly M1's real, unreplicated behavior, so the M06 screen has
-/// something truthful to show on a single node. `failovers` is ALWAYS
-/// read straight from `audit_log` (see `failover_events_from_audit`'s
-/// doc), independent of whether a coordinator is installed.
+/// something truthful to show on a single node. `failovers` is read
+/// straight from `audit_log` (see `failover_events_from_audit`'s doc),
+/// independent of whether a coordinator is installed, and only for the
+/// instance-wide call (`topic: None`): the screen polls one call per topic,
+/// and each would otherwise rescan the audit log for a history nobody reads.
+///
+/// Reading is per topic: asking for a topic the caller may not read is
+/// refused, and the instance-wide answer leaves such a topic's partitions
+/// and leadership history out on both paths.
 async fn replica_list_v1(
     ctx: &HandlerContext,
     instance_id: &str,
@@ -3539,6 +3545,14 @@ async fn replica_list_v1(
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
     let bctx = bus_ctx(ctx, &g);
+    if let Some(name) = topic.as_deref() {
+        if !g.svc.topic_access(&bctx, name).0 {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                format!("bus.permission_denied: read on '{name}'"),
+            ));
+        }
+    }
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let local_node_id = ctx.state.local_node_id.to_string();
@@ -3566,6 +3580,7 @@ async fn replica_list_v1(
             let partitions: Vec<BusPartitionReplicaWire> = snapshot
                 .partitions
                 .iter()
+                .filter(|p| svc.topic_access(&bctx_for_snapshot, &p.topic).0)
                 .map(partition_replica_wire)
                 .collect();
             return Ok((nodes, partitions));
@@ -3589,6 +3604,13 @@ async fn replica_list_v1(
         let mut partition_count = 0u32;
         let mut partitions_wire = Vec::new();
         for cfg in &topics_in_scope {
+            // The node-wide view must not fail for a caller refused reading
+            // one topic: that topic's offsets are left out, its partitions
+            // still count towards what this node leads.
+            if topic_for_snapshot.is_none() && !svc.topic_access(&bctx_for_snapshot, &cfg.name).0 {
+                partition_count += cfg.partitions;
+                continue;
+            }
             for partition in 0..cfg.partitions {
                 partition_count += 1;
                 let stats = svc
@@ -3622,10 +3644,17 @@ async fn replica_list_v1(
     })
     .await?;
 
-    let instance = g.instance.as_str().to_string();
-    let failovers =
-        run_blocking(move || failover_events_from_audit(&db, &instance, &org_id, topic.as_deref()))
-            .await?;
+    let failovers = if topic.is_some() {
+        Vec::new()
+    } else {
+        let instance = g.instance.as_str().to_string();
+        let svc = g.svc.clone();
+        run_blocking(move || {
+            let readable = |name: &str| svc.topic_access(&bctx, name).0;
+            failover_events_from_audit(&db, &instance, &org_id, &readable)
+        })
+        .await?
+    };
 
     Ok(BusPayload::ReplicaListResponse {
         nodes,
@@ -3676,6 +3705,19 @@ async fn replica_reassign_v1(
         .map(|_| ())
     })
     .await?;
+    // Choosing which nodes hold a topic's copies is administration of that
+    // topic, as moving its leadership is (`leader_transfer_v1`).
+    let svc = g.svc.clone();
+    let bctx = bus_ctx(ctx, &g);
+    let topic_for_access = topic.clone();
+    let (_, _, topic_admin) =
+        run_blocking(move || Ok(svc.topic_access(&bctx, &topic_for_access))).await?;
+    if !topic_admin {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!("bus.permission_denied: admin on '{topic}'"),
+        ));
+    }
 
     let topic_for_call = topic.clone();
     let org_id_for_call = org_id.clone();
@@ -3768,6 +3810,20 @@ async fn leader_transfer_v1(
         .map(|_| ())
     })
     .await?;
+    // Moving a partition's leader is administration OF THIS TOPIC, like
+    // changing its settings (`update_topic` authorizes `Admin` on it): a
+    // topic ACL that denies someone administration must deny this too.
+    let svc = g.svc.clone();
+    let bctx = bus_ctx(ctx, &g);
+    let topic_for_access = topic.clone();
+    let (_, _, topic_admin) =
+        run_blocking(move || Ok(svc.topic_access(&bctx, &topic_for_access))).await?;
+    if !topic_admin {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!("bus.permission_denied: admin on '{topic}'"),
+        ));
+    }
 
     let topic_for_call = topic.clone();
     let org_id_for_call = org_id.clone();
@@ -5755,9 +5811,65 @@ mod tests {
         .unwrap_err();
         assert!(err.message.contains("bus.topic_not_found"));
 
+        // A second topic this caller is refused reading: the coordinator
+        // reports its partition and its leadership history like any other,
+        // and the answer must leave both out.
+        let closed_topic = format!("closed.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            closed_topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("closed topic create");
+        acl_set_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            closed_topic.clone(),
+            "user".to_string(),
+            user_id.clone(),
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("deny read on the closed topic");
+        for name in [&topic_name, &closed_topic] {
+            repository::log_audit(
+                &db,
+                None,
+                None,
+                BUS_FAILOVER_AUDIT_ACTION,
+                Some(name),
+                Some(&format!(
+                    "instance_id={} org_id={org_id} partition=0 from_node=- from_epoch=0 \
+                     to_epoch=1 duration_ms=40 reason=lease_expired",
+                    fixture_instance_id().as_str()
+                )),
+                None,
+                Some("node-d"),
+            )
+            .unwrap();
+        }
+
         // ---- 4. Install the coordinator — every assertion from here on
         // depends on it, and nothing above this line may run again in this
         // process. ----
+        let closed_partition = bus::PartitionReplicaInfo {
+            topic: closed_topic.clone(),
+            partition: 0,
+            leader_node_id: Some("gcm-core-01".to_string()),
+            leader_epoch: 1,
+            replicas: vec!["gcm-core-01".to_string()],
+            isr: vec!["gcm-core-01".to_string()],
+            lagging: vec![],
+            high_watermark: 9_000,
+            log_end_offset: 9_000,
+            unavailable_reason: None,
+        };
         let fake_snapshot = bus::ReplicationSnapshot {
             nodes: vec![bus::ReplicaNodeInfo {
                 node_id: "gcm-core-01".to_string(),
@@ -5786,9 +5898,10 @@ mod tests {
                 high_watermark: 42,
                 log_end_offset: 44,
                 unavailable_reason: None,
-            }],
+            }, closed_partition],
             failovers: vec![],
         };
+        rf1_replica_list_leaves_out_a_topic_the_caller_may_not_read(&db).await;
         let coordinator = std::sync::Arc::new(FakeCoordinator {
             reassign_applied: 3,
             transfer_epoch: 7,
@@ -5832,7 +5945,7 @@ mod tests {
             "must be the coordinator's own return value"
         );
 
-        let (nodes, partitions) = match replica_list_v1(
+        let (nodes, partitions, topic_failovers) = match replica_list_v1(
             &ctx,
             fixture_instance_id().as_str(),
             Some(topic_name.clone()),
@@ -5841,10 +5954,15 @@ mod tests {
         .expect("replica list via coordinator")
         {
             BusPayload::ReplicaListResponse {
-                nodes, partitions, ..
-            } => (nodes, partitions),
+                nodes,
+                partitions,
+                failovers,
+            } => (nodes, partitions, failovers),
             other => panic!("unexpected response: {other:?}"),
         };
+        // The per-topic call carries no history: the screen reads it from
+        // the instance-wide one, and polls this one for every topic.
+        assert!(topic_failovers.is_empty());
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, "gcm-core-01");
         assert_eq!(nodes[0].environment, "prod");
@@ -5870,6 +5988,25 @@ mod tests {
             };
         assert!(other_nodes.is_empty());
         assert!(other_partitions.is_empty());
+
+        // The instance-wide history keeps the readable topic's failover and
+        // leaves out the one of the topic this caller may not read.
+        let failovers = match replica_list_v1(&ctx, fixture_instance_id().as_str(), None)
+            .await
+            .expect("replica list, no topic filter")
+        {
+            BusPayload::ReplicaListResponse { failovers, .. } => failovers,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(failovers.iter().any(|f| f.topic == topic_name), "{failovers:?}");
+        assert!(failovers.iter().all(|f| f.topic != closed_topic), "{failovers:?}");
+
+        // Asking for the refused topic itself is refused, as without a
+        // coordinator.
+        let refused = replica_list_v1(&ctx, fixture_instance_id().as_str(), Some(closed_topic))
+            .await
+            .expect_err("no read on the closed topic");
+        assert_eq!(refused.code, ProtocolErrorCode::PolicyDenied);
     }
 
     // ---- SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): field policy CRUD ----
@@ -7547,7 +7684,8 @@ mod tests {
             "node-e",
         );
 
-        let events = failover_events_from_audit(&db, inst_a, &org_id, Some(&topic)).unwrap();
+        let all = |_: &str| true;
+        let events = failover_events_from_audit(&db, inst_a, &org_id, &all).unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
         let event = &events[0];
         assert_eq!(event.to_node, "node-b");
@@ -7558,7 +7696,7 @@ mod tests {
         assert_eq!(event.reason, LEADER_TRANSFER_REASON);
         assert_eq!(event.actor_label.as_deref(), Some("Piotr Admin"));
 
-        let events_b = failover_events_from_audit(&db, inst_b, &org_id, Some(&topic)).unwrap();
+        let events_b = failover_events_from_audit(&db, inst_b, &org_id, &all).unwrap();
         let mut to_nodes: Vec<&str> = events_b.iter().map(|e| e.to_node.as_str()).collect();
         to_nodes.sort();
         assert_eq!(to_nodes, vec!["node-c", "node-d"]);
@@ -7611,6 +7749,159 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    /// Leadership of a topic's partitions is administration of that topic: a
+    /// topic ACL that denies its administration refuses the transfer before
+    /// anything reaches the replication layer, and one that allows it gets
+    /// that far.
+    #[tokio::test]
+    async fn leader_transfer_needs_administration_of_the_topic() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, admin_id) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("wyniki.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+
+        let allowed = leader_transfer_v1(&ctx, inst.as_str(), topic.clone(), 0, "node-b".to_string())
+            .await
+            .expect_err("no replication in this fixture");
+        assert!(
+            !allowed.message.contains("bus.permission_denied"),
+            "an allowed administrator must get past the topic check: {}",
+            allowed.message
+        );
+
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            admin_id,
+            "deny".to_string(),
+            "admin".to_string(),
+        )
+        .await
+        .expect("acl set");
+        let denied = leader_transfer_v1(&ctx, inst.as_str(), topic, 0, "node-b".to_string())
+            .await
+            .expect_err("denied administration");
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+        assert!(denied.message.contains("bus.permission_denied"), "{}", denied.message);
+    }
+
+    /// Choosing which nodes hold a topic's copies is administration of that
+    /// topic too: denied there, the reassignment never reaches the
+    /// replication layer; allowed, it gets that far.
+    #[tokio::test]
+    async fn replica_reassign_needs_administration_of_the_topic() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, admin_id) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("wizyty.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+
+        // Without a coordinator the call then stops at "replication
+        // disabled"; with the one another test in this binary installs
+        // (a one-way door) it succeeds. Either way it passed the topic check.
+        if let Err(allowed) =
+            replica_reassign_v1(&ctx, inst.as_str(), topic.clone(), None, vec!["node-b".to_string()]).await
+        {
+            assert!(
+                !allowed.message.contains("bus.permission_denied"),
+                "an allowed administrator must get past the topic check: {}",
+                allowed.message
+            );
+        }
+
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            admin_id,
+            "deny".to_string(),
+            "admin".to_string(),
+        )
+        .await
+        .expect("acl set");
+        let denied = replica_reassign_v1(&ctx, inst.as_str(), topic, None, vec!["node-b".to_string()])
+            .await
+            .expect_err("denied administration");
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+        assert!(denied.message.contains("bus.permission_denied"), "{}", denied.message);
+    }
+
+    /// The RF=1 node-wide replica view answers a caller refused reading one
+    /// topic: that topic's offsets are left out, while the node still counts
+    /// its partitions among the ones it leads. Run from
+    /// `replica_dispatch_rf1_fallback_then_coordinator_path` before it
+    /// installs a coordinator, for the reason given there.
+    async fn rf1_replica_list_leaves_out_a_topic_the_caller_may_not_read(db: &DbPool) {
+        let (ctx, _org_id, admin_id) = admin_session(db);
+        let inst = fixture_instance_id();
+        let open = format!("wizyty.{}", uuid::Uuid::new_v4().simple());
+        let closed = format!("faktury.{}", uuid::Uuid::new_v4().simple());
+        for (name, partitions) in [(&open, 1u32), (&closed, 2u32)] {
+            topic_create_v1(
+                &ctx,
+                inst.as_str(),
+                name.clone(),
+                BusTopicOptionsWire {
+                    partitions: Some(partitions),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("topic create");
+        }
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            closed.clone(),
+            "user".to_string(),
+            admin_id,
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("acl set");
+
+        let BusPayload::ReplicaListResponse { nodes, partitions, .. } =
+            replica_list_v1(&ctx, inst.as_str(), None)
+                .await
+                .expect("the node-wide view answers")
+        else {
+            panic!("expected ReplicaListResponse");
+        };
+        assert_eq!(partitions.len(), 1, "only the readable topic's partition");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].leader_count, 3);
+
+        let refused = replica_list_v1(&ctx, inst.as_str(), Some(closed))
+            .await
+            .expect_err("asking for the refused topic itself stays refused");
+        assert_eq!(refused.code, ProtocolErrorCode::PolicyDenied);
     }
 
     /// plan-app-platform §4.3's enforcement test (modelled on `ml_studio.

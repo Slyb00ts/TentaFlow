@@ -1,9 +1,9 @@
 // =============================================================================
 // File: modules/tentabus.request-builders.test.js
 // Description: Unit tests for tentabus.js's pure helpers — request builders
-//       (replica list, reassign, leader transfer, the per-partition
+//       (replica list, leader transfer, the per-partition
 //       `buildFromOffsetsForNextPage` cursor), formatters
-//       (`datetimeLocalToTsMs`), lag math (`sumGroupLag`, `computeLagRatio`,
+//       (`datetimeLocalToTsMs`), lag math (`computeLagRatio`,
 //       `lagSeverityClass`), the stats join (`findTopicStats`) and the
 //       server-error-code mapper (`busErrorCode`/`mapBusErrorMessage`).
 //       tentabus.js imports DOM-only custom-element modules at load time
@@ -74,7 +74,7 @@ const CONSTS = ['DLQ_RETRY_ALL_MAX', 'NO_CAPABILITIES'];
 
 const NAMES = [
   'requireInstanceId',
-  'clampInt', 'clampDlqRetryAllMax', 'deriveDurabilityClass', 'sumGroupLag',
+  'clampInt', 'clampDlqRetryAllMax',
   'computeLagRatio', 'lagSeverityClass', 'dlqSourceTopicOptions',
   'busErrorCode', 'mapBusErrorMessage', 'findTopicStats', 'buildFromOffsetsForNextPage',
   'datetimeLocalToTsMs', 'unwrapCapabilities', 'isValidExplicitOffset',
@@ -85,22 +85,10 @@ const NAMES = [
   // R3-1 (KRYTYK-M1-R3.md, P1: DLQ tab empty on entry) — the single, pure
   // state-transition helper `ensureDlqTabReady` acts on:
   'resolveDlqEntrySource',
-  // Fala post-R5 (KRYTYK-M1-R5.md b.7) — the "(polityka jawna)"
-  // secondary-label predicate the M03 chip helper calls.
-  'shouldShowDurabilityExplicitLabel',
-  // Incremental-repaint fala (owner requirement: charts/tiles/tables only
-  // swap values on a poll, never a full re-render) — `patchText`
-  // (no-op-on-equal DOM writes), `pushWindowSample` (the live chart's ring
-  // buffer), `diffRowsByKey` (M04 table poll-skip gate) and
-  // `prefersReducedMotion` (the live chart's entrance-animation gate).
-  'patchText', 'pushWindowSample', 'diffRowsByKey', 'prefersReducedMotion',
-  // M2 (PLAN-M2.md §1f) — M06 replication/failover and M03's partitions
-  // tab. Request builders, the SPEC D4 env check, the role-matrix builder,
-  // lag/ISR-degraded math and the `not_leader` hint extractor.
-  'buildReplicaListRequest', 'buildReassignRequest', 'buildLeaderTransferRequest',
-  'isSameEnvironment',
-  'computeReplicationLag', 'isIsrDegraded', 'roleForNode', 'buildRoleMatrix',
-  'leaderTransferCandidates', 'nodeDegradedReason', 'unavailableReasonI18nKey',
+  // The consumer table's poll-skip gate.
+  'diffRowsByKey',
+  // Replication request builders and the `not_leader` hint extractor.
+  'buildReplicaListRequest', 'buildLeaderTransferRequest',
   'extractNotLeaderHint',
 ];
 
@@ -147,69 +135,6 @@ test('clampDlqRetryAllMax stays within the server-enforced [1,500] bound', () =>
   assert.equal(helpers.clampDlqRetryAllMax(10000), 500);
   assert.equal(helpers.clampDlqRetryAllMax(undefined), 100);
 });
-
-// ---------------------------------------------------------------------------
-// deriveDurabilityClass — owner decision B's defensive fallback for a topic
-// response that predates the wire's `durabilityClass` field: derive it from
-// the always-present, already-resolved `durability` policy string.
-// ---------------------------------------------------------------------------
-
-test('deriveDurabilityClass trusts an already-resolved durabilityClass from the wire', () => {
-  assert.equal(helpers.deriveDurabilityClass({ durabilityClass: 'standard', durability: 'fsync_batch_full' }), 'standard');
-  assert.equal(helpers.deriveDurabilityClass({ durabilityClass: 'critical', durability: 'os' }), 'critical');
-});
-
-test('deriveDurabilityClass classifies fsync_batch/fsync_batch_full as critical when durabilityClass is missing', () => {
-  assert.equal(helpers.deriveDurabilityClass({ durability: 'fsync_batch' }), 'critical');
-  assert.equal(helpers.deriveDurabilityClass({ durability: 'fsync_batch_full' }), 'critical');
-});
-
-test('deriveDurabilityClass classifies os / fsync_interval:<ms> as standard when durabilityClass is missing', () => {
-  assert.equal(helpers.deriveDurabilityClass({ durability: 'os' }), 'standard');
-  assert.equal(helpers.deriveDurabilityClass({ durability: 'fsync_interval:50' }), 'standard');
-});
-
-test('deriveDurabilityClass degrades to standard for null/undefined/garbage input', () => {
-  assert.equal(helpers.deriveDurabilityClass(null), 'standard');
-  assert.equal(helpers.deriveDurabilityClass(undefined), 'standard');
-  assert.equal(helpers.deriveDurabilityClass({}), 'standard');
-  assert.equal(helpers.deriveDurabilityClass({ durabilityClass: 'bogus', durability: 42 }), 'standard');
-});
-
-// ---------------------------------------------------------------------------
-// shouldShowDurabilityExplicitLabel — the "(polityka jawna)" secondary-label
-// predicate (KRYTYK-M1-R5.md b.7: the report calls this label impossible
-// without a stored class-vs-override distinction; `durabilityExplicit` on
-// the wire is exactly that distinction).
-// ---------------------------------------------------------------------------
-
-test('shouldShowDurabilityExplicitLabel is true only when durabilityExplicit is strictly true', () => {
-  assert.equal(helpers.shouldShowDurabilityExplicitLabel({ durabilityExplicit: true }), true);
-  assert.equal(helpers.shouldShowDurabilityExplicitLabel({ durabilityExplicit: false }), false);
-  assert.equal(helpers.shouldShowDurabilityExplicitLabel({}), false);
-  assert.equal(helpers.shouldShowDurabilityExplicitLabel(null), false);
-  assert.equal(helpers.shouldShowDurabilityExplicitLabel({ durabilityExplicit: 'true' }), false, 'not coerced from a truthy non-boolean');
-});
-
-// ---------------------------------------------------------------------------
-// clampFsyncIntervalMs / formatFsyncIntervalDurability — the wizard's new
-// `fsync_interval` advanced-durability option (KRYTYK-M1-R5.md b.3, P2: the
-// select had no way to express Prod/Test's own default policy family).
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// buildMessagesBrowseRequest — first page uses the legacy scalar
-// `fromOffset`; subsequent pages use per-partition `fromOffsets` (tor U
-// task 1) once a previous response's `partitions[]` is known. `partition`
-// (task 2, M08's partition filter) is additive — see the function's own doc
-// comment on why sending it is safe before the backend honors it.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// M08 partition filter (task 2, KRYTYK-M1-R2.md's N-3) — client-side
-// filtering/paging helpers layered on top of the existing `partitions[]` +
-// `fromOffsets` plumbing (tor U task 1).
-// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Groups KPI = list (task 3, KRYTYK-M1-R2.md's N-2/N-7) — the client-side
@@ -368,12 +293,6 @@ test('unwrapCapabilities fails closed to NO_CAPABILITIES for null/undefined/garb
 // ---------------------------------------------------------------------------
 // Lag math
 // ---------------------------------------------------------------------------
-
-test('sumGroupLag adds lagTotal (camelCase) across every group', () => {
-  assert.equal(helpers.sumGroupLag([{ lagTotal: 10 }, { lagTotal: 5 }]), 15);
-  assert.equal(helpers.sumGroupLag([]), 0);
-  assert.equal(helpers.sumGroupLag(null), 0);
-});
 
 test('computeLagRatio is lag/highWatermark clamped to [0,1], 0 when hw<=0', () => {
   assert.equal(helpers.computeLagRatio(50, 100), 0.5);
@@ -537,30 +456,9 @@ test('mapBusErrorMessage falls back to errors.generic for a non-"bus." message',
 });
 
 // ---------------------------------------------------------------------------
-// Incremental-repaint helpers (owner requirement: "the chart must not draw
-// from zero every time … all other data must only swap values, not
-// re-render the page") — `pushWindowSample` (ring buffer), `diffRowsByKey`
-// (M01/M04 table poll-skip gate), `patchText` (no-op-on-equal DOM
-// writes) and `prefersReducedMotion` (the live chart's animation gate).
+// `diffRowsByKey` — the consumer table's poll-skip gate: a poll that read the
+// same rows leaves the table alone.
 // ---------------------------------------------------------------------------
-
-test('pushWindowSample keeps only the last maxLen samples, oldest evicted first (ring buffer)', () => {
-  const arr = [];
-  for (let i = 0; i < 5; i += 1) helpers.pushWindowSample(arr, { x: i, y: i * 10 }, 3);
-  assert.deepEqual(arr, [{ x: 2, y: 20 }, { x: 3, y: 30 }, { x: 4, y: 40 }]);
-});
-
-test('pushWindowSample mutates and returns the SAME array reference — an in-place scroll, not a fresh series the chart would redraw from zero', () => {
-  const arr = [];
-  const returned = helpers.pushWindowSample(arr, { x: 1, y: 1 }, 40);
-  assert.equal(returned, arr);
-});
-
-test('pushWindowSample is a plain append while under the window size', () => {
-  const arr = [{ x: 0, y: 0 }];
-  helpers.pushWindowSample(arr, { x: 1, y: 1 }, 40);
-  assert.deepEqual(arr, [{ x: 0, y: 0 }, { x: 1, y: 1 }]);
-});
 
 test('diffRowsByKey reports changed:false when every row is byte-for-byte identical to the last paint', () => {
   const prev = [{ id: 'a', v: 1 }, { id: 'b', v: 2 }];
@@ -602,31 +500,6 @@ test('diffRowsByKey treats a missing/null prevRows as "everything added"', () =>
   assert.deepEqual(helpers.diffRowsByKey(undefined, next, (r) => r.id).added, ['a']);
 });
 
-test('patchText writes textContent only when the value actually changed', () => {
-  let writes = 0;
-  const el = {
-    _text: 'old',
-    get textContent() { return this._text; },
-    set textContent(v) { writes += 1; this._text = v; },
-  };
-  helpers.patchText(el, 'old');
-  assert.equal(writes, 0, 'no write for an equal value — avoids layout churn on a flat poll');
-  helpers.patchText(el, 'new');
-  assert.equal(writes, 1);
-  assert.equal(el.textContent, 'new');
-});
-
-test('patchText coerces null/undefined values to an empty string and tolerates a null element', () => {
-  const el = { textContent: 'x' };
-  helpers.patchText(el, null);
-  assert.equal(el.textContent, '');
-  assert.doesNotThrow(() => helpers.patchText(null, 'x'));
-});
-
-test('prefersReducedMotion defaults to false when matchMedia is unavailable (this non-browser test env)', () => {
-  assert.equal(helpers.prefersReducedMotion(), false);
-});
-
 // ---------------------------------------------------------------------------
 // M2 (PLAN-M2.md §1f) — M06 replication/failover request builders
 // ---------------------------------------------------------------------------
@@ -637,19 +510,6 @@ test('buildReplicaListRequest omits an empty/falsy topic (org-wide scope)', () =
   assert.deepEqual(helpers.buildReplicaListRequest(IID, 'pacs.badania.nowe'), { instanceId: IID, topic: 'pacs.badania.nowe' });
 });
 
-test('buildReassignRequest carries a copy of the replicas array and a numeric partition', () => {
-  const replicas = ['gcm-core-01', 'gczd-edge-02'];
-  const req = helpers.buildReassignRequest(IID, 'pacs.badania.nowe', '5', replicas);
-  assert.deepEqual(req, { instanceId: IID, topic: 'pacs.badania.nowe', partition: 5, replicas: ['gcm-core-01', 'gczd-edge-02'] });
-  replicas.push('scchs-edge-03');
-  assert.equal(req.replicas.length, 2, 'the request holds its OWN copy, not a live reference');
-});
-
-test('buildReassignRequest omits partition when null/undefined (whole-topic reassign)', () => {
-  assert.equal(helpers.buildReassignRequest(IID, 't', null, []).partition, undefined);
-  assert.equal(helpers.buildReassignRequest(IID, 't', undefined, []).partition, undefined);
-});
-
 test('buildLeaderTransferRequest shapes {instanceId, topic, partition, targetNodeId}', () => {
   assert.deepEqual(
     helpers.buildLeaderTransferRequest(IID, 'pacs.badania.nowe', '5', 'gcm-core-01'),
@@ -657,149 +517,9 @@ test('buildLeaderTransferRequest shapes {instanceId, topic, partition, targetNod
   );
 });
 
-test('buildReplicaListRequest/buildReassignRequest/buildLeaderTransferRequest throw without an instance id (W9)', () => {
+test('buildReplicaListRequest/buildLeaderTransferRequest throw without an instance id (W9)', () => {
   assert.throws(() => helpers.buildReplicaListRequest('', 't'));
-  assert.throws(() => helpers.buildReassignRequest(undefined, 't', null, []));
   assert.throws(() => helpers.buildLeaderTransferRequest(null, 't', 0, 'node-1'));
-});
-
-// ---------------------------------------------------------------------------
-// SPEC D4 — env-filter for the M02/M06 node multiselects
-// ---------------------------------------------------------------------------
-
-const NODES_MIXED_ENV = [
-  { nodeId: 'gcm-core-01', environment: 'prod', reachable: true },
-  { nodeId: 'gczd-edge-02', environment: 'prod', reachable: true },
-  { nodeId: 'scchs-edge-03', environment: 'prod', reachable: false },
-  { nodeId: 'mesh-test-01', environment: 'test', reachable: true },
-];
-
-test('isSameEnvironment is false when localEnv is falsy (fail-closed — no node selectable until known)', () => {
-  assert.equal(helpers.isSameEnvironment(NODES_MIXED_ENV[0], null), false);
-  assert.equal(helpers.isSameEnvironment(NODES_MIXED_ENV[0], ''), false);
-});
-
-test('isSameEnvironment matches on the node\'s own environment field', () => {
-  assert.equal(helpers.isSameEnvironment(NODES_MIXED_ENV[0], 'prod'), true);
-  assert.equal(helpers.isSameEnvironment(NODES_MIXED_ENV[3], 'prod'), false);
-});
-
-// ---------------------------------------------------------------------------
-// M03 lag/ISR-degraded math
-// ---------------------------------------------------------------------------
-
-test('computeReplicationLag is leo - hw, clamped to 0', () => {
-  assert.equal(helpers.computeReplicationLag(100, 110), 10);
-  assert.equal(helpers.computeReplicationLag(110, 110), 0);
-  assert.equal(helpers.computeReplicationLag(110, 100), 0, 'hw can never legitimately exceed leo — clamp, do not go negative');
-});
-
-test('computeReplicationLag treats non-numeric input as 0', () => {
-  assert.equal(helpers.computeReplicationLag(undefined, undefined), 0);
-  assert.equal(helpers.computeReplicationLag(null, 50), 50);
-});
-
-test('isIsrDegraded is true iff isrCount < replicaCount', () => {
-  assert.equal(helpers.isIsrDegraded(2, 3), true);
-  assert.equal(helpers.isIsrDegraded(3, 3), false);
-  assert.equal(helpers.isIsrDegraded(1, 1), false);
-});
-
-// ---------------------------------------------------------------------------
-// M06 role-matrix builder
-// ---------------------------------------------------------------------------
-
-const PARTITION_P5 = {
-  partition: 5,
-  leaderNodeId: 'gcm-core-01',
-  leaderEpoch: 4,
-  replicas: ['gcm-core-01', 'gczd-edge-02', 'scchs-edge-03'],
-  isr: ['gcm-core-01', 'gczd-edge-02'],
-  lagging: [{ nodeId: 'scchs-edge-03', lagBytes: 91226112, lagMs: 4200, reason: 'lag 87 MiB > 64 MiB' }],
-  highWatermark: 1000,
-  logEndOffset: 1005,
-  unavailableReason: null,
-};
-
-test('roleForNode: leader wins over isr/lagging for the leader\'s own id', () => {
-  assert.equal(helpers.roleForNode(PARTITION_P5, 'gcm-core-01'), 'leader');
-});
-
-test('roleForNode: lagging wins over isr membership (mockup m06 p5: scchs-edge-03)', () => {
-  assert.equal(helpers.roleForNode(PARTITION_P5, 'scchs-edge-03'), 'lagging');
-});
-
-test('roleForNode: isr for a non-leader, non-lagging replica in isr[]', () => {
-  assert.equal(helpers.roleForNode(PARTITION_P5, 'gczd-edge-02'), 'isr');
-});
-
-test('roleForNode: none for an unrelated node id, and for null partition/nodeId', () => {
-  assert.equal(helpers.roleForNode(PARTITION_P5, 'mesh-test-01'), 'none');
-  assert.equal(helpers.roleForNode(null, 'gcm-core-01'), 'none');
-  assert.equal(helpers.roleForNode(PARTITION_P5, null), 'none');
-});
-
-test('buildRoleMatrix builds one row per partition with a cell per requested node id', () => {
-  const rows = helpers.buildRoleMatrix([PARTITION_P5], ['gcm-core-01', 'gczd-edge-02', 'scchs-edge-03']);
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].partition, 5);
-  assert.equal(rows[0].leaderEpoch, 4);
-  assert.deepEqual(rows[0].cells, { 'gcm-core-01': 'leader', 'gczd-edge-02': 'isr', 'scchs-edge-03': 'lagging' });
-});
-
-test('buildRoleMatrix tolerates a missing/non-array partitions or nodeIds input', () => {
-  assert.deepEqual(helpers.buildRoleMatrix(null, ['a']), []);
-  assert.deepEqual(helpers.buildRoleMatrix([PARTITION_P5], null)[0].cells, {});
-});
-
-test('leaderTransferCandidates is ISR minus the current leader (PLAN-M2 K-M2-3)', () => {
-  assert.deepEqual(helpers.leaderTransferCandidates(PARTITION_P5), ['gczd-edge-02']);
-});
-
-test('leaderTransferCandidates is empty when the only ISR member is the leader itself', () => {
-  const soleLeader = { ...PARTITION_P5, isr: ['gcm-core-01'] };
-  assert.deepEqual(helpers.leaderTransferCandidates(soleLeader), []);
-});
-
-// ---------------------------------------------------------------------------
-// M06 node-card degraded state
-// ---------------------------------------------------------------------------
-
-test('nodeDegradedReason: unreachable wins regardless of lagging data', () => {
-  const node = { nodeId: 'scchs-edge-03', reachable: false };
-  assert.deepEqual(helpers.nodeDegradedReason(node, [PARTITION_P5]), { kind: 'unreachable' });
-});
-
-test('nodeDegradedReason: lagging when the node appears in some partition\'s lagging[]', () => {
-  const node = { nodeId: 'scchs-edge-03', reachable: true };
-  const reason = helpers.nodeDegradedReason(node, [PARTITION_P5]);
-  assert.equal(reason.kind, 'lagging');
-  assert.equal(reason.partition, 5);
-  assert.equal(reason.lag.nodeId, 'scchs-edge-03');
-});
-
-test('nodeDegradedReason is null for a healthy, non-lagging node', () => {
-  const node = { nodeId: 'gcm-core-01', reachable: true };
-  assert.equal(helpers.nodeDegradedReason(node, [PARTITION_P5]), null);
-});
-
-// ---------------------------------------------------------------------------
-// unavailableReasonI18nKey — PascalCase/snake_case tolerant
-// ---------------------------------------------------------------------------
-
-test('unavailableReasonI18nKey converts PascalCase Rust variant names to a snake_case i18n key', () => {
-  assert.equal(helpers.unavailableReasonI18nKey('NoIsr'), 'replication.unavailable_no_isr');
-  assert.equal(helpers.unavailableReasonI18nKey('EpochFenced'), 'replication.unavailable_epoch_fenced');
-  assert.equal(helpers.unavailableReasonI18nKey('NoAssignment'), 'replication.unavailable_no_assignment');
-});
-
-test('unavailableReasonI18nKey passes an already-snake_case reason through unchanged', () => {
-  assert.equal(helpers.unavailableReasonI18nKey('no_isr'), 'replication.unavailable_no_isr');
-});
-
-test('unavailableReasonI18nKey returns null for a falsy reason (the common, available case)', () => {
-  assert.equal(helpers.unavailableReasonI18nKey(null), null);
-  assert.equal(helpers.unavailableReasonI18nKey(''), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -955,7 +675,7 @@ test('no control in tentabus.js is gated on isSiteAdmin', () => {
 // The double lock (the instance's admin permission AND the org admin role),
 // said in plain words rather than as a raw permission id.
 test('the admin-required notes name both roles the double lock needs, in every locale', () => {
-  const keys = ['acl_admin_required', 'group_detail_admin_required'];
+  const keys = ['group_detail_admin_required'];
   const words = {
     pl: ['administrator instancji', 'administratorem organizacji'],
     en: ['instance administrator', 'organisation administrator'],

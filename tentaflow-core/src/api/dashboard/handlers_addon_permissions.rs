@@ -50,6 +50,14 @@ fn is_admin(ctx: &HandlerContext) -> bool {
     )
 }
 
+/// A matrix row takes effect at once: every gate answers from the checker's
+/// cache, which otherwise catches up only on its 5-minute background refresh.
+fn refresh_checker(ctx: &HandlerContext, addon_id: &str) {
+    if let Some(checker) = ctx.state.permission_checker.as_ref() {
+        checker.refresh_addon(addon_id);
+    }
+}
+
 /// Krotki helper do emitowania wpisow audytowych — severity decyduje kto widzi alert.
 fn audit(
     ctx: &HandlerContext,
@@ -531,6 +539,7 @@ pub fn addon_permission_set(
         updated_by.as_deref(),
     )
     .map_err(db_err)?;
+    refresh_checker(ctx, &payload.addon_id);
     let severity = if matches!(risk.as_str(), "high" | "critical") {
         "warning"
     } else {
@@ -606,6 +615,7 @@ pub fn addon_permission_default_set(
         updated_by.as_deref(),
     )
     .map_err(db_err)?;
+    refresh_checker(ctx, &payload.addon_id);
     audit(
         ctx,
         "addon_permission_default_set",
@@ -737,4 +747,86 @@ pub fn addon_show_in_catalog_set(
             show_in_catalog: payload.show_in_catalog,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::app_gate::test_support;
+    use crate::dispatch::state::AppState;
+    use std::sync::Arc;
+    use tentaflow_protocol::{AddonPermissionDefaultSetRequest, AddonPermissionSetRequest};
+
+    /// `updated_by` references the account, so the admin must be a real one.
+    fn admin_ctx(state: &Arc<AppState>) -> HandlerContext {
+        let admin_id = repository::create_user_account(&state.db, "boss", "$test$hash", "boss", "")
+            .expect("admin account");
+        let admin_id = uuid::Uuid::parse_str(&admin_id).expect("account id is a uuid");
+        HandlerContext {
+            origin: crate::dispatch::RequestOrigin::Local,
+            session: SessionAuth::UserSession {
+                user_id: *admin_id.as_bytes(),
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: state.clone(),
+            org_context: None,
+        }
+    }
+
+    fn reader(state: &Arc<AppState>) -> String {
+        repository::create_user_account(&state.db, "reader", "$test$hash", "reader", "")
+            .expect("test user")
+    }
+
+    fn granted(state: &Arc<AppState>, addon_id: &str, user_id: &str) -> bool {
+        state
+            .permission_checker
+            .as_ref()
+            .expect("test state has a checker")
+            .check(addon_id, user_id, "benchmark.read", None)
+            .is_granted()
+    }
+
+    #[test]
+    fn a_matrix_grant_applies_without_waiting_for_the_background_refresh() {
+        let state = AppState::for_test();
+        let addon_id = test_support::install_app_instance(&state, "benchmark-studio", "a", &[]);
+        let user_id = reader(&state);
+        assert!(!granted(&state, &addon_id, &user_id));
+
+        addon_permission_set(
+            &MessageBody::AddonPermissionSetRequestBody(AddonPermissionSetRequest {
+                addon_id: addon_id.clone(),
+                subject_type: "user".to_string(),
+                subject_id: user_id.clone(),
+                permission_id: "benchmark.read".to_string(),
+                grant_mode: "allow".to_string(),
+            }),
+            &admin_ctx(&state),
+        )
+        .expect("grant");
+        assert!(granted(&state, &addon_id, &user_id));
+    }
+
+    #[test]
+    fn a_default_grant_applies_without_waiting_for_the_background_refresh() {
+        let state = AppState::for_test();
+        let addon_id = test_support::install_app_instance(&state, "benchmark-studio", "a", &[]);
+        let user_id = reader(&state);
+        assert!(!granted(&state, &addon_id, &user_id));
+
+        addon_permission_default_set(
+            &MessageBody::AddonPermissionDefaultSetRequestBody(AddonPermissionDefaultSetRequest {
+                addon_id: addon_id.clone(),
+                permission_id: "benchmark.read".to_string(),
+                grant_mode: "allow".to_string(),
+            }),
+            &admin_ctx(&state),
+        )
+        .expect("default grant");
+        assert!(granted(&state, &addon_id, &user_id));
+    }
 }

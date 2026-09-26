@@ -1,98 +1,32 @@
 // =============================================================================
 // File: modules/tentabus.js — the TentaBus screen shell (SUM/tentabus/
-// PLAN-UI-20260923.md U0, mockups SUM/mockups/tentabus-20260923 T01/T11/T12):
-// breadcrumb, the TentaBus header card with the instance picker, the six
-// underlined main tabs (Przegląd / Topiki / Odbiorcy / Nieprzetworzone /
-// Wzory wiadomości / Kopie i nody) with their counters, the address
-// (`#/tentabus?instance=…&tab=…&topic=…&group=…`, see modules/tentabus/
-// routes.js) and the polling every tab reads. Przegląd, Topiki (with the
-// topic creator, the delete window and the message preview) and Wzory
-// wiadomości live in modules/tentabus/*. The topic detail, Odbiorcy,
-// Nieprzetworzone and Kopie i nody bodies below are the M1/M2 views (topic
-// detail, consumer groups + offset reset, unprocessed messages per topic,
-// replication) until their U2–U4 packages replace them.
+// PLAN-UI-20260923 U0–U2, mockups SUM/mockups/tentabus-20260923): breadcrumb,
+// the TentaBus header card with the instance picker, the six underlined main
+// tabs (Przegląd / Topiki / Odbiorcy / Nieprzetworzone / Wzory wiadomości /
+// Kopie i nody) with their counters, the address (`#/tentabus?instance=…&tab=
+// …&topic=…&section=…&group=…`, see modules/tentabus/routes.js) and the
+// polling every tab reads. Przegląd, Topiki with a topic's page (Stan,
+// Ustawienia, Partycje i kopie), Wzory wiadomości and Kopie i nody live in
+// modules/tentabus/*. Odbiorcy and Nieprzetworzone below are the M1/M2 views
+// (consumer groups with offset reset, unprocessed messages per topic) until
+// their U3–U4 packages replace them.
 //
-// PROTOCOL GAPS (M1 wire vs. the accepted mockups/PLAN — each one is called
-// out again at its exact render site so a reviewer does not have to trust
-// this comment alone). Follow-up "tor U" narrowed this list — see the
-// resolved items marked below:
-//  1. RESOLVED (tor U): `BusStatsSnapshotWire` now carries org-wide
-//     `totalMsgsInPerSec`/`totalBytesInPerSec`/`totalBytesOnDisk`/`totalLag`/
-//     `totalDlqDepth` plus a per-topic `topics[]` breakdown — the per-topic
-//     numbers below are real. STILL OPEN: the topic detail's chart reads only
-//     this polling snapshot (3s cadence), rendered
-//     as a rolling in-memory window of the last `MAX_CHART_POINTS` polls,
-//     labelled "ostatnie N minut" (i18n `chart_live_window_note`), reset on
-//     unmount/remount. There is also no "out"/ack rate, only "in".
-//  2. RESOLVED (tor U + M2): `BusPartitionInfoWire` now also carries
-//     `earliestOffset`/`sizeBytes`/`segments` (read-only introspection, no
-//     throwaway consumer needed) AND, since M2 (PLAN-M2.md §1f),
-//     `leaderNodeId`/`leaderEpoch`/`isrCount`/`replicaCount`/`highWatermark`
-//     — the partitions tab below shows all of these, plus a computed
-//     `leo - hw` lag and an `unavailableReason` state chip (PLAN-M2 §4.1
-//     A4: "partycja niedostępna" is a partition STATE, never a producer
-//     error) instead of the old static "—" placeholders.
-//  4. RESOLVED (tor U): `BusOffsetResetMode` gained a 4th `Timestamp{ts_ms}`
-//     variant — the reset modal below offers all 4 mockup modes, including
-//     a datetime-local picker converted to epoch ms.
-//  6. ACL only models `subject_type/subject_id/access_level(allow|deny)` —
-//     no `produce`/`consume`/`admin` per-action column exists on
-//     `resource_permissions` (see `dispatch/bus.rs`'s module doc). The ACL
-//     tab below uses allow/deny per subject, not per-action checkboxes.
-//  7. RESOLVED (tor U): `MessagesBrowse`/`DlqList` responses now carry a
-//     `partitions[]` breakdown (`earliestOffset`/`highWatermark`/
-//     `nextOffset`/`hasMore`, per partition) and the matching requests
-//     accept `fromOffsets` (per-partition cursors) — the unprocessed-message
-//     list below pages each partition independently.
-//  8. RESOLVED (tor U): `BusCapabilitiesRequest` (`canRead`/`canWrite`/
-//     `canAdmin`/`isSiteAdmin`) is fetched once on mount and gates every
-//     control below — every mutating action needs `canAdmin`, and a
-//     read-only session (`canRead` only) sees the same screens with every
-//     action button hidden instead of the earlier `me.role === 'admin'`
-//     client-side guess. Offset reset, ACL writes, reassignment and leader
-//     transfer used to need `isSiteAdmin` on top; that separate tier no
-//     longer exists in `dispatch/bus.rs` and the gate moved to `canAdmin`.
-//  9. No quota UI: `BusQuotaGetRequest`/`QuotaSetRequest` are wired in
-//     `codec.js`, but `SPEC.md` (§4, the mockup map) has no quota screen or
-//     "Limity org" card in any of the 8 accepted mockups — deliberately not
-//     built here to avoid inventing UI the mockups never asked for.
-//  10. M2 (PLAN-M2.md §1f, mockup m06): new M06 "Replikacja i failover" view
-//      (`busReplicaListRequest`/`ReplicaListResponse{nodes,partitions,
-//      failovers}`), "Przenieś lidera" (`busLeaderTransferRequest`) and
-//      "Zmień repliki" (`busReassignRequest`) — both gated `canAdmin()`.
-//      They were on `isSiteAdmin()` while `dispatch/bus.rs` still had a
-//      separate `bus_dispatch_admin` `#[policy(Admin)]` tier; that tier was
-//      removed and both handlers now open with `gate_admin` (`bus.admin` in
-//      the instance matrix AND the `org.admin` role), which is what
-//      `can_admin` reports. NOT built: a real "ISR shrink/expand" HISTORY timeline —
-//      PLAN-M2 §1e is explicit that there is no per-shrink/expand audit
-//      entry, "tylko metryka + zdarzenie UI" — so M06's lag card below
-//      shows the partitions' CURRENT `lagging[]` state only (mirrors A4:
-//      a state, not an event log), not the mockup's illustrative multi-
-//      entry timeline (m06:119-129), which has no wire source to read back.
-//  11. W9 (SUM/tentabus/PLAN-APP-PLATFORM.md §6.1/§9i): TentaBus became a
-//      non-singleton native app — every request now names the instance it
-//      addresses (`BusEnvelope.instance_id` on the wire). `mount(params)`
-//      resolves `state.instanceId` from `#/tentabus?instance=<addonId>`
-//      (falling back to a same-screen picker/empty-state gate per
-//      `resolveInstanceGate`'s doc when the param is missing/unknown, never
-//      guessing one) and every request builder below threads it through
-//      `requireInstanceId` so a call reaching the wire without it throws
-//      instead of silently addressing whichever bus the server defaults to.
-//      Deliberately UNCHANGED (owner-accepted mockups,
-//      `SUM/mockups/tentabus-app-20260903/SPEC.md`): the groups/DLQ/
-//      replication tables — this wave only threads the instance id
-//      through, it does not redraw any of those existing views.
+// Every request names its instance (`BusEnvelope.instance_id`): `mount`
+// resolves `state.instanceId` from `?instance=` (or the same-screen instance
+// gate, never a guess) and every request goes through `requireInstanceId`.
+// Controls that change something are gated on the server's own answer —
+// `BusCapabilitiesRequest` for the instance, `TopicDetailResponse.access` on
+// a topic's page — and fail closed until it arrives.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, escapeAttr, toast, formatBytes, fmtCompact } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { setAttr, setText, patchHtml, setClass } from '/js/lib/dom-patch.js';
-import { fmtCount, fmtElapsed, fmtRetention, loadErrorKind } from '/js/modules/tentabus/format.js';
-import { MAIN_TABS, DEFAULT_TAB, parseRoute, routeParams } from '/js/modules/tentabus/routes.js';
-import { shellCounts, userTopics, userRate, nodeRows } from '/js/modules/tentabus/model.js';
+import { fmtCount, fmtElapsed, loadErrorKind } from '/js/modules/tentabus/format.js';
+import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, parseRoute, routeParams } from '/js/modules/tentabus/routes.js';
+import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
 import { drawSchemas } from '/js/modules/tentabus/schemas.js';
@@ -100,6 +34,10 @@ import { drawTopics } from '/js/modules/tentabus/topics.js';
 import { openTopicCreator } from '/js/modules/tentabus/topic-creator.js';
 import { openTopicDelete } from '/js/modules/tentabus/topic-delete.js';
 import { openMessagePreview } from '/js/modules/tentabus/message-preview.js';
+import { drawTopicDetail, effectiveSection, topicDetailLoader } from '/js/modules/tentabus/topic-detail.js';
+import { openSettingsWindow } from '/js/modules/tentabus/topic-settings.js';
+import { openLeaderTransfer, transferChoices } from '/js/modules/tentabus/partitions.js';
+import { drawReplication } from '/js/modules/tentabus/replication.js';
 import { bytesToPreviewText, headerText } from '/js/modules/tentabus/payload.js';
 import { confirmDialog } from '/js/lib/confirm-dialog.js';
 import '/js/components/tf-breadcrumb.js';
@@ -108,7 +46,6 @@ import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-input.js';
-import '/js/components/tf-line-chart.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-modal.js';
 import '/js/components/tf-spinner.js';
@@ -133,12 +70,6 @@ const TAB_ICONS = { overview: 'gauge', topics: 'share', groups: 'users', dlq: 'i
 const VIEW_SLOTS = ['overview', 'topics', 'groups', 'dlq', 'schemas', 'detail', 'replication'];
 const DLQ_RETRY_ALL_MAX = 500;
 const COMMIT_MODES = ['auto_after_success', 'explicit', 'at_most_once'];
-// Rolling in-memory window for the topic detail's live chart — there is no
-// history/time-series endpoint (module-doc gap #1), so this is the last
-// N polls kept only while the screen stays mounted, not real 24h history.
-const MAX_CHART_POINTS = 40;
-const CHART_WINDOW_MINUTES = Math.round((MAX_CHART_POINTS * STATS_POLL_MS) / 60_000);
-
 // =============================================================================
 // Pure helpers — no DOM, no ApiBinary. Unit-tested from
 // `tentabus.request-builders.test.js` by brace-extraction (services.js-style),
@@ -169,37 +100,6 @@ function requireInstanceId(instanceId) {
     throw new Error('tentabus: request requires an instance id — screen not mounted with ?instance=');
   }
   return instanceId;
-}
-
-// Owner decision B (durability class UI): a topic response carries a
-// resolved `durabilityClass` ("standard"|"critical") once the backend wire
-// ships it, but this reads a topic/topic-list row that MAY still predate
-// that field (rolling deploy, or an older cached snapshot) — in that case
-// it derives the class defensively from the already-resolved `durability`
-// policy string the server has always sent: `fsync_batch`/`fsync_batch_full`
-// fsync the whole batch before ACK (critical), everything else — including
-// `os` (Dev's page cache) and `fsync_interval:<ms>` (Prod/Test's at-most-
-// every-N-ms policy) — acks after the write without waiting on that fsync
-// (standard). This mirrors the server's own fallback so a client that has
-// not redeployed yet still classifies every topic correctly.
-function deriveDurabilityClass(topic) {
-  const t = topic || {};
-  if (t.durabilityClass === 'standard' || t.durabilityClass === 'critical') return t.durabilityClass;
-  const durability = typeof t.durability === 'string' ? t.durability : '';
-  return durability.startsWith('fsync_batch') ? 'critical' : 'standard';
-}
-
-// The topic detail's "(polityka jawna)" secondary label (KRYTYK-M1-R5.md b.7): a
-// tiny pure predicate so the paint-time chip helper and its unit tests share
-// one definition of "show the explicit-override label" instead of the chip
-// re-deriving it inline.
-function shouldShowDurabilityExplicitLabel(topic) {
-  return topic?.durabilityExplicit === true;
-}
-
-function sumGroupLag(groups) {
-  if (!Array.isArray(groups)) return 0;
-  return groups.reduce((acc, g) => acc + (Number(g.lagTotal ?? g.lag_total ?? 0) || 0), 0);
 }
 
 function computeLagRatio(lag, highWatermark) {
@@ -393,33 +293,9 @@ function unwrapCapabilities(resp) {
 }
 
 // =============================================================================
-// Incremental-repaint helpers (owner requirement: "the chart must not draw
-// from zero every time … all other data must only swap values, not
-// re-render the page"). Pure, DOM-shape-agnostic (an element-like object with
-// `textContent`/`getAttribute`/`setAttribute` is enough), so these are
-// unit-tested directly from `tentabus.request-builders.test.js` alongside the
-// rest of this file's pure helpers.
+// Incremental repaint: a poll only swaps values, it never re-renders a table
+// whose rows did not change. Unit-tested from `tentabus.request-builders.test.js`.
 // =============================================================================
-
-// Writes `value` into `el.textContent` only when it actually changed — the
-// generic "swap the value, do not touch layout" primitive every KPI
-// tile/chip/stat patch below is built from.
-function patchText(el, value) {
-  if (!el) return;
-  const next = value == null ? '' : String(value);
-  if (el.textContent !== next) el.textContent = next;
-}
-
-// Ring-buffer append for the "live last N samples" chart (the topic detail
-// overview): keeps at most `maxLen` points, oldest evicted first,
-// so the series scrolls left sample by sample instead of resetting to empty
-// and redrawing from zero. Mutates and returns `arr` (the caller's
-// long-lived series array) rather than allocating a new one every poll.
-function pushWindowSample(arr, point, maxLen) {
-  arr.push(point);
-  if (arr.length > maxLen) arr.splice(0, arr.length - maxLen);
-  return arr;
-}
 
 // Key-based diff between two row-array snapshots (the M04
 // groups table): which keys were added/updated/removed, and whether ANYTHING
@@ -447,152 +323,20 @@ function diffRowsByKey(prevRows, nextRows, keyFn) {
   return { added, updated, removed, changed: added.length > 0 || updated.length > 0 || removed.length > 0 };
 }
 
-// `tf-line-chart`'s entrance draw-in animation already checks this itself
-// (`TfCartesianChart._motionAllowed()`) before animating a redraw, but the
-// chart is also told explicitly once per mount (`ensureLiveChart`) so a
-// reduced-motion session never even flags a pending entrance animation for a
-// series update that is about to be a same-instance data swap, not a fresh
-// paint.
-function prefersReducedMotion() {
-  if (typeof globalThis.matchMedia !== 'function') return false;
-  try { return globalThis.matchMedia('(prefers-reduced-motion: reduce)').matches; } catch { return false; }
-}
-
 // =============================================================================
-// M2 replication/failover (M06, plus M03's "Partycje i repliki" tab and
-// M02's node picker) — pure helpers. Wire shapes read here are
-// `ReplicaListResponse{nodes,partitions,failovers}` (PLAN-M2.md §1f):
-// `nodes[{nodeId,label,environment,isLocal,reachable,lastHeartbeatMsAgo,
-// leaderCount,followerCount,isrCount}]`, `partitions[{partition,
-// leaderNodeId,leaderEpoch,replicas,isr,lagging[{nodeId,lagBytes,lagMs,
-// reason}],highWatermark,logEndOffset,unavailableReason}]`,
-// `failovers[{atMs,topic,partition,fromNode,toNode,fromEpoch,toEpoch,
-// durationMs,reason}]`.
+// Replication requests (`ReplicaListResponse{nodes,partitions,failovers}`,
+// `LeaderTransferRequest`).
 // =============================================================================
 
-// `ApiBinary.one('busReplicaListRequest', ...)` payload builder — `topic`
-// omitted (`undefined`, not `''`) fetches the org-wide node roster +
-// failover history with no per-partition role matrix (M06's "Wszystkie
-// topiki" scope); a concrete topic name scopes `partitions[]` to it.
+// `topic` omitted (`undefined`, not `''`) asks for the whole instance — the
+// node roster and the leadership changes; a topic name adds its partitions.
 function buildReplicaListRequest(instanceId, topic) {
   return { instanceId: requireInstanceId(instanceId), topic: topic || undefined };
 }
 
-// "Zmień repliki" (M06) request builder. `partition` stays a plain number —
-// PLAN-M2's `ReassignRequest.partition: Option<u32>` allows a whole-topic
-// reassign, but this module's dialog always targets one row of the matrix,
-// so `partition` is required here (never sent as "every partition").
-function buildReassignRequest(instanceId, topic, partition, replicaNodeIds) {
-  return {
-    instanceId: requireInstanceId(instanceId),
-    topic,
-    partition: partition == null ? undefined : Number(partition),
-    replicas: Array.isArray(replicaNodeIds) ? [...replicaNodeIds] : [],
-  };
-}
-
-// "Przenieś lidera" (M06) request builder.
+// "Przenieś prowadzenie" request builder.
 function buildLeaderTransferRequest(instanceId, topic, partition, targetNodeId) {
   return { instanceId: requireInstanceId(instanceId), topic, partition: Number(partition), targetNodeId };
-}
-
-// SPEC D4 (mockup m02-kreator-topiku.html): a node from a DIFFERENT
-// environment than this session's OWN node is shown but never selectable —
-// Z12 fencing surfaced as a UI blocker, not only a backend one. `localEnv`
-// is this session's own `environmentGetKindRequest().kind` ('dev'|'test'|
-// 'prod'); `null`/unresolved treats every node as foreign (fail-closed: no
-// node is selectable until the local environment is actually known).
-function isSameEnvironment(node, localEnv) {
-  return !!localEnv && node?.environment === localEnv;
-}
-
-// M03's "Lag" column: how far the leader's own log-end-offset has run ahead
-// of the (safely acknowledged, replicated) high watermark. This is a
-// LEADER-side figure, distinct from a specific follower's replication lag
-// (`ReplicaLagWire.lagBytes`/`lagMs` in `partitions[].lagging[]`, read
-// directly where needed rather than through this helper).
-function computeReplicationLag(highWatermark, logEndOffset) {
-  const hw = Number(highWatermark) || 0;
-  const leo = Number(logEndOffset) || 0;
-  return Math.max(0, leo - hw);
-}
-
-// M01/M03's ISR-health predicate: fewer in-sync replicas than the replica
-// set itself means the partition has already lost redundancy. This is a
-// coarser, UI-only "worth a warning chip" signal — the stricter
-// write-availability gate (`min_isr = floor(RF/2)+1`, PLAN-M2.md §0
-// K-M2-2) lives server-side and surfaces here only via
-// `bus.not_enough_replicas`/`unavailableReason`, never re-derived
-// client-side from a guessed RF.
-function isIsrDegraded(isrCount, replicaCount) {
-  return Number(isrCount) < Number(replicaCount);
-}
-
-// M06's role-matrix cell (mockup m06:104-113). `leader` wins over `isr`
-// (the wire's own `isr[]` conventionally includes the leader too, but the
-// pill must show the more specific role); `lagging` only for a replica
-// `partitions[].lagging[]` names explicitly (never guessed from offsets);
-// `none` covers both "not a replica of this partition" and a foreign-env
-// node rendered in the same matrix for context.
-function roleForNode(partition, nodeId) {
-  if (!partition || !nodeId) return 'none';
-  if (partition.leaderNodeId === nodeId) return 'leader';
-  if (Array.isArray(partition.lagging) && partition.lagging.some((l) => l.nodeId === nodeId)) return 'lagging';
-  if (Array.isArray(partition.isr) && partition.isr.includes(nodeId)) return 'isr';
-  return 'none';
-}
-
-// Builds one row per partition, one cell per `nodeIds` entry — the pure
-// "shape" `paintReplMatrix` diffs (`diffRowsByKey`) and renders; no DOM.
-function buildRoleMatrix(partitions, nodeIds) {
-  const ids = Array.isArray(nodeIds) ? nodeIds : [];
-  return (Array.isArray(partitions) ? partitions : []).map((p) => ({
-    partition: p.partition,
-    leaderEpoch: p.leaderEpoch,
-    highWatermark: p.highWatermark,
-    logEndOffset: p.logEndOffset,
-    unavailableReason: p.unavailableReason ?? null,
-    cells: Object.fromEntries(ids.map((id) => [id, roleForNode(p, id)])),
-  }));
-}
-
-// "Przenieś lidera" dialog (M06): only a replica ALREADY in ISR may be
-// promoted (mirrors `bus/replication/election.rs`'s `choose_candidate`
-// hard constraint, PLAN-M2.md §1b K-M2-3 — "kandydatem może być wyłącznie
-// węzeł należący do ISR z ostatniego przypisania") and never the current
-// leader itself, which is trivially already the leader.
-function leaderTransferCandidates(partition) {
-  const isr = Array.isArray(partition?.isr) ? partition.isr : [];
-  return isr.filter((id) => id !== partition?.leaderNodeId);
-}
-
-// M06 node card degraded state (mockup m06:94-98): unreachable wins over
-// everything else; otherwise a node is degraded when the CURRENTLY loaded
-// (topic-scoped) `partitions[]` names it in some `lagging[]` — see this
-// file's module-doc gap #10 for why this can only ever reflect the one
-// topic M06 has loaded, not a true cross-topic aggregate.
-function nodeDegradedReason(node, partitions) {
-  if (!node) return null;
-  if (node.reachable === false) return { kind: 'unreachable' };
-  for (const p of (Array.isArray(partitions) ? partitions : [])) {
-    const lag = (Array.isArray(p.lagging) ? p.lagging : []).find((l) => l.nodeId === node.nodeId);
-    if (lag) return { kind: 'lagging', partition: p.partition, lag };
-  }
-  return null;
-}
-
-// `UnavailableReason` (PLAN-M2.md §1e: `NoIsr | NoAssignment | EpochFenced`)
-// travels over the wire as whatever `serde`'s default (de)serialization
-// picks for a unit-variant enum on `BusPartitionReplicaWire` — this
-// tolerates BOTH a snake_case string (`no_isr`) and a bare PascalCase Rust
-// variant name (`NoIsr`) landing here, converting either shape into this
-// module's own `tentabus.replication.unavailable_<snake>` i18n key so a
-// small serde-representation choice on the Rust side (fala 2, not yet
-// built when this file was written) cannot silently blank the chip.
-function unavailableReasonI18nKey(reason) {
-  if (!reason) return null;
-  const snake = String(reason).replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
-  return `replication.unavailable_${snake}`;
 }
 
 // `bus.not_leader`'s server message MAY carry the current leader's node id
@@ -621,8 +365,7 @@ const state = {
   instanceLabel: '',
   capabilities: NO_CAPABILITIES,
   tab: DEFAULT_TAB,
-  view: null, // null | { kind: 'topic-detail', name }
-  detailTab: 'overview',
+  view: null, // null | { kind: 'topic-detail', name, section }
 
   topics: [],
   topicsLoaded: false,
@@ -634,19 +377,18 @@ const state = {
   stats: null,
   statsTimer: null,
 
-  detail: null, // { topic, partitions, groups } for state.view.name
-  detailLoading: false,
-  // Bumped every time `state.detail` is replaced by a REAL fetch (new topic
-  // opened, or the same topic's detail reloaded after an edit) — never by a
-  // stats poll. `renderDetailBody` compares this against a version stamped
-  // on the hero/overview DOM to tell "genuine context change, full rebuild
-  // needed" apart from "poll tick, patch values in place only".
-  detailVersion: 0,
-  // Rolling live window for M03's overview tab, keyed to state.view.name —
-  // reset whenever a different topic's detail is opened.
-  detailChartSeries: null,
-  aclEntries: null,
-  aclLoading: false,
+  // `TopicDetailResponse` of the open topic (config, partitions, access,
+  // administrators), `null` until it answers; the failed load, if any.
+  detail: null,
+  detailError: null,
+  // "Zapisano …" / "Przeniesiono prowadzenie" over the section it concerns
+  // (`{ section, title, text }`), until the reader moves to another section.
+  detailNotice: null,
+  // Partitions whose leadership was moved from this page: marked "zmieniono
+  // przed chwilą" and not offered again until the reader refreshes. Numbers
+  // on a topic's page, `topic:partition` on Kopie i nody.
+  justMoved: new Set(),
+  replicationNotice: null,
 
   groups: [],
   groupsLoaded: false,
@@ -665,31 +407,10 @@ const state = {
   // same way `dlqRecords == null` used to (a silently empty container).
   dlqError: null,
 
-  // M06 (PLAN-M2.md §1f). `topic`: '' = org-wide scope (node cards +
-  // failover history, no role matrix — `ReplicaListResponse.partitions` is
-  // only meaningful for a concrete topic); otherwise the topic the role
-  // matrix/lag card are scoped to. `localEnv` caches this session's own
-  // `environmentGetKindRequest().kind` — fetched lazily (SPEC D4's env
-  // fencing needs it for BOTH M06's reassign dialog and M02's node picker,
-  // so it is cached at module scope rather than fetched twice).
-  repl: {
-    topic: '',
-    loaded: false,
-    loading: false,
-    error: null,
-    data: null, // ReplicaListResponse { nodes, partitions, failovers }
-    localEnv: null,
-  },
-
-  // Last-painted table rows, cached to diff against the next poll's freshly
-  // computed rows (`diffRowsByKey`) so an unchanged poll skips `tf-table`'s
-  // `rows = …` write instead of rebuilding every row's action-cell for
-  // nothing (see `diffRowsByKey`'s own doc comment). `nodeCards`/`roleMatrix`
-  // are M06's own diff caches (same convention); `failoverKeys` is the
-  // append-only timeline's "already rendered" set (see `paintReplFailovers`).
+  // Last-painted rows of the consumer table, diffed against the next poll's
+  // (`diffRowsByKey`) so an unchanged poll leaves the table alone.
   dom: {
     groupsTableRows: null,
-    nodeCards: null, roleMatrix: null, failoverKeys: null,
   },
 
   // What the frame (header card, tab counters) and Przegląd read beside the
@@ -710,28 +431,20 @@ function freshShellState() {
     ratePoints: [],
     nodes: null,
     replicaTopics: null,
+    failovers: [],
     replicaLags: [],
     lagSeries: new Map(),
-    replicaTimer: null,
+    replicaPoll: null,
   };
 }
 
-// `canAdmin` gates EVERY mutating admin action in this module: topic CRUD,
-// pause/resume, DLQ retry/discard, offset reset, ACL writes, partition
-// reassignment and leader transfer. It fails closed to `false` before the
-// first `busCapabilitiesRequest` resolves.
-//
-// The four heaviest of those used to be gated on `isSiteAdmin` instead, back
-// when `dispatch/bus.rs` registered them on a separate, coarser
-// `#[policy(Admin)]` tier (`bus_dispatch_admin`). That tier is gone: all
-// eleven former admin variants now sit on the plain `UserSession` dispatch and
-// every one of the four opens with `gate_admin`, which is `bus.admin` in the
-// instance permission matrix AND the `org.admin` role — exactly what
-// `capabilities_v1` folds into `can_admin`. Keeping the old gate here hid four
-// working controls from the delegated org operator the double lock was built
-// for, and showed them to a site admin acting in an org where `gate_admin`
-// would refuse. `isSiteAdmin` is deliberately not read any more; the wire field
-// survives for compatibility and no handler consults it either.
+// `canAdmin` gates every instance-level change: creating and deleting topics,
+// pause/resume, retry/discard of unprocessed messages, offset reset and moving
+// a partition's leadership from Kopie i nody. It is `bus.admin` in the
+// instance matrix AND the org Admin role — what every such handler's
+// `gate_admin` checks — and fails closed before `busCapabilitiesRequest`
+// answers. A topic's page gates on the topic's own `access.canAdmin`, which
+// also honours the topic's ACL.
 function canAdmin() {
   return state.capabilities?.canAdmin === true;
 }
@@ -876,7 +589,7 @@ const TentaBusScreen = {
     wireShell(root);
 
     renderPanel();
-    if (route.topic) openTopicDetail(route.topic);
+    if (route.topic) openTopicDetail(route.topic, route.section);
     else if (route.group && route.groupTopic) openGroupDetail(route.group, route.groupTopic);
     loadShellMeta();
     startStatsPolling();
@@ -895,16 +608,16 @@ const TentaBusScreen = {
     state.capabilities = NO_CAPABILITIES;
     state.tab = DEFAULT_TAB;
     state.view = null;
-    state.detailTab = 'overview';
     state.topics = [];
     state.topicsLoaded = false;
     state.topicsError = null;
     state.topicsNotice = null;
     state.stats = null;
     state.detail = null;
-    state.detailVersion = 0;
-    state.detailChartSeries = null;
-    state.aclEntries = null;
+    state.detailError = null;
+    state.detailNotice = null;
+    state.justMoved = new Set();
+    state.replicationNotice = null;
     state.groups = [];
     state.groupsLoaded = false;
     state.groupDetail = null;
@@ -913,12 +626,8 @@ const TentaBusScreen = {
     state.dlqPartitions = [];
     state.dlqLoading = false;
     state.dlqError = null;
-    state.repl = { topic: '', loaded: false, loading: false, error: null, data: null, localEnv: null };
     state.shell = freshShellState();
-    state.dom = {
-      groupsTableRows: null,
-      nodeCards: null, roleMatrix: null, failoverKeys: null,
-    };
+    state.dom = { groupsTableRows: null };
   },
 };
 
@@ -1006,16 +715,24 @@ function paintCrumbs() {
   if (bar._nav && typeof bar._render === 'function') bar._render();
 }
 
-// The address names the view (instance, tab, open topic or consumer) through
+// The address names the view (instance, tab, open topic and its section, or
+// consumer) through
 // the router's own `replaceParams`: no history entry per click, and the
 // router's notion of the current params stays true for a language repaint.
 function syncLocation() {
   if (!state.instanceId) return;
+  // An address the reader has just typed or pasted, which the router has not
+  // handled yet, differs from the one it last wrote: a repaint must not write
+  // over it, or the router never sees the move.
+  const key = (params) => new URLSearchParams(Object.entries(params || {}).sort()).toString();
+  const inBar = Router.fromHash();
+  if (inBar && key(inBar.params) !== key(Router.currentParams())) return;
   const gd = state.tab === 'groups' ? state.groupDetail : null;
   Router.replaceParams(routeParams({
     instance: state.instanceId,
     tab: state.tab,
     topic: state.view?.kind === 'topic-detail' ? state.view.name : null,
+    section: state.view?.kind === 'topic-detail' ? currentSection() : null,
     group: gd?.group || null,
     groupTopic: gd?.topic || null,
     dlqTopic: state.tab === 'dlq' ? state.dlqSource || null : null,
@@ -1121,15 +838,18 @@ async function loadSubjects() {
 }
 
 // "Odśwież": asks every source again and repaints the open tab.
+// A moved leadership can be moved again from here on: the next replica
+// answer shows where it went.
 async function refreshAll() {
+  state.justMoved = new Set();
   refreshStats();
   refreshReplicas();
   loadSubjects();
   await Promise.all([loadTopics(), loadGroups()]);
   if (state.view?.kind === 'topic-detail') loadTopicDetail(state.view.name);
   else if (state.tab === 'dlq') loadDlqRecords(true);
-  else if (state.tab === 'replication') { state.repl.loaded = false; renderPanel(); }
   else if (state.tab === 'groups' && state.groupDetail) openGroupDetail(state.groupDetail.group, state.groupDetail.topic);
+  renderPanel();
 }
 
 // What Przegląd and Wzory wiadomości read, and where their buttons lead.
@@ -1153,7 +873,7 @@ const tabContext = {
   },
   go(action) {
     if (action.kind === 'tab' && TABS.includes(action.tab)) setTab(action.tab);
-    else if (action.kind === 'topic') { setTab('topics'); openTopicDetail(action.topic); }
+    else if (action.kind === 'topic') { setTab('topics'); openTopicDetail(action.topic, DEFAULT_SECTION); }
     else if (action.kind === 'group') { setTab('groups'); openGroupDetail(action.group, action.topic); }
     else if (action.kind === 'dlq') {
       // Chosen BEFORE the tab opens, so the tab's own default pick does not
@@ -1185,15 +905,14 @@ const schemasContext = {
 };
 
 function setTab(id) {
-  if (state.view) state.view = null;
+  if (state.view) closeTopicDetail();
   if (id !== 'groups') state.groupDetail = null;
   if (id !== 'topics') state.topicsNotice = null;
+  if (id !== 'replication') { state.replicationNotice = null; state.justMoved = new Set(); }
   state.tab = id;
   renderPanel();
   if (id === 'groups' && !state.groupsLoaded) loadGroups();
   if (id === 'dlq') ensureDlqTabReady();
-  // 'replication' needs no entry here — `renderPanel()` above already ran
-  // `renderReplicationTab`, which triggers its own load.
 }
 
 // Persistent per-view container inside `#tb-panel`, keyed by `VIEW_SLOTS`
@@ -1227,19 +946,16 @@ function renderPanel() {
   if (!activeEl) return;
   if (activeKey === 'overview') { drawOverview(activeEl, tabContext); return; }
   if (activeKey === 'schemas') { drawSchemas(activeEl, schemasContext); return; }
-  if (activeKey === 'detail') { renderTopicDetail(activeEl); return; }
+  if (activeKey === 'detail') { drawTopicDetail(activeEl, detailContext); return; }
   if (activeKey === 'topics') { drawTopics(activeEl, topicsContext); return; }
   if (activeKey === 'groups') { renderGroupsTab(activeEl); return; }
   if (activeKey === 'dlq') { renderDlqTab(activeEl); return; }
-  if (activeKey === 'replication') { renderReplicationTab(activeEl); return; }
+  if (activeKey === 'replication') { drawReplication(activeEl, replicationContext); return; }
 }
 
 // Rebuilds `panel`'s skeleton only when switching CONTEXT within a view
 // (preserves focus/scroll/typed-but-not-yet-debounced input across data
-// refreshes that call back into the same view's paint function) — e.g. M03
-// opening a different topic still needs a full rebuild (`viewId` includes
-// the topic name), but a stats poll re-entering the same topic's overview
-// does not.
+// refreshes that call back into the same view's paint function).
 function ensureSkeleton(panel, viewId, buildFn) {
   if (panel.dataset.tbView === viewId) return false;
   panel.innerHTML = buildFn();
@@ -1249,8 +965,8 @@ function ensureSkeleton(panel, viewId, buildFn) {
 
 // =============================================================================
 // Polling — BusStatsSnapshotRequest every 3 s (the header, the tab counters,
-// Przegląd and the legacy tab strips all read it) and ReplicaListRequest every
-// 10 s (node state and lagging replicas). Plain polls, not push
+// Przegląd and the legacy tab strips all read it) and ReplicaListRequest 10 s
+// after the previous cycle answered (node state and lagging replicas). Plain polls, not push
 // subscriptions; started once in mount(), stopped in unmount(). A failed poll
 // keeps the last data on screen and turns the header to "Brak połączenia"
 // with the age of that data (T12) — it never blanks the numbers.
@@ -1261,14 +977,27 @@ function startStatsPolling() {
   refreshStats();
   refreshReplicas();
   state.statsTimer = setInterval(refreshStats, STATS_POLL_MS);
-  state.shell.replicaTimer = setInterval(refreshReplicas, REPLICA_POLL_MS);
+  // Chained, not an interval: one cycle asks once per topic, and a slow
+  // node must not have the next cycle start before the last one answered.
+  const poll = { timer: null };
+  state.shell.replicaPoll = poll;
+  const next = () => {
+    poll.timer = setTimeout(async () => {
+      try {
+        await refreshReplicas();
+      } finally {
+        if (state.shell.replicaPoll === poll) next();
+      }
+    }, REPLICA_POLL_MS);
+  };
+  next();
 }
 
 function stopStatsPolling() {
   if (state.statsTimer) clearInterval(state.statsTimer);
   state.statsTimer = null;
-  if (state.shell.replicaTimer) clearInterval(state.shell.replicaTimer);
-  state.shell.replicaTimer = null;
+  if (state.shell.replicaPoll) clearTimeout(state.shell.replicaPoll.timer);
+  state.shell.replicaPoll = null;
 }
 
 async function refreshStats() {
@@ -1298,17 +1027,7 @@ async function refreshStats() {
   }
   if (state.tab === 'topics' && !state.view) renderPanel();
   if (state.tab === 'groups' && !state.view && state.groupsLoaded) paintGroupsTable();
-  // M06 patches its own DOM in place on the same cadence while visible.
-  if (state.tab === 'replication' && !state.view) {
-    pollReplication();
-  }
-  if (state.view?.kind === 'topic-detail' && state.detail?.topic) {
-    // Sample the OPEN topic's own series every poll so switching back to its
-    // overview does not lose the window already collected.
-    const ts = findTopicStats(state.stats?.topics, state.detail.topic.name);
-    if (ts && state.detailChartSeries) pushChartSample(state.detailChartSeries, ts.msgsInPerSec, ts.bytesInPerSec, ts.totalLag);
-    if (state.detailTab === 'overview') renderDetailBody();
-  }
+  if (state.view?.kind === 'topic-detail') renderPanel();
 }
 
 // Keeps the live-chart window as epoch-ms points, so a chart built later
@@ -1356,79 +1075,22 @@ async function refreshReplicas() {
   const nodes = all?.nodes || [];
   state.shell.nodes = nodes;
   state.shell.replicaTopics = perTopic;
+  state.shell.failovers = all?.failovers || [];
   state.shell.replicaLags = laggingReplicas(perTopic, nodes);
   await refreshLagSeries(instanceId);
   if (state.instanceId !== instanceId) return;
   paintShell();
-  if (state.tab === 'overview' && !state.view) renderPanel();
-}
-
-// Appends one sample to a rolling `{msgsIn, bytesIn, lag}` window, trimmed to
-// `MAX_CHART_POINTS` via `pushWindowSample` — the "live last N minutes"
-// replacement for the mockup's unavailable 24h history (module-doc gap #1).
-// `x` is a plain HH:MM:SS label (category axis), not an epoch, since
-// `tf-line-chart`'s category scale expects display-ready ticks.
-function pushChartSample(series, msgsIn, bytesIn, lag) {
-  const x = new Date().toLocaleTimeString(undefined, { hour12: false });
-  const push = (arr, y) => pushWindowSample(arr, { x, y: Number(y) || 0 }, MAX_CHART_POINTS);
-  push(series.msgsIn, msgsIn);
-  push(series.bytesIn, bytesIn);
-  push(series.lag, lag);
+  if (state.view?.kind === 'topic-detail') {
+    // The page's partition numbers and sizes move with the log; they come
+    // with the topic's own answer, asked again on the replica cadence.
+    loadTopicDetail(state.view.name);
+    return;
+  }
+  if (!state.view && (state.tab === 'overview' || state.tab === 'replication')) renderPanel();
 }
 
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
-}
-
-// The "live window" line chart of
-// M03's per-topic overview (fed by `pushChartSample` above) — msgs/s in
-// on the primary axis, lag total as a second series so a reviewer sees both
-// "is the topic busy" and "is a consumer falling behind" at once.
-//
-// Split in two on purpose (owner requirement: "the chart must not draw from
-// zero every time — it must work incrementally and scroll"):
-// `ensureLiveChart` sets the STATIC config (axes/legend/reduced-motion) once,
-// right after the `<tf-line-chart>` element is created; `updateLiveChartSeries`
-// runs on every poll and touches ONLY the `series` property, on that SAME
-// element instance. `tf-line-chart` now exposes a public `updateSeries(
-// series)` (`tf-line-chart.js`'s `TfCartesianChart`) that patches the
-// existing `<polyline>`/point attributes and plays a translateX scroll
-// transition instead of tearing down and rebuilding the SVG — the browser
-// element is never destroyed/recreated (unlike the pre-fix M03 overview,
-// which rebuilt `<tf-line-chart id="tb-detail-chart">` via
-// `body.innerHTML = …` on every 3s poll), the x-axis category scale is fed
-// the SAME window array reference `pushWindowSample` scrolls in place, and
-// `ensureLiveChart` sets `animate` from `prefersReducedMotion()` once so a
-// reduced-motion session never gets a transition on a data swap.
-function ensureLiveChart(hostId) {
-  const chart = byId(hostId);
-  if (!chart) return;
-  chart.xAxis = { scale: 'category', min: null, max: null, ticks: null, format: null };
-  chart.yAxis = { scale: 'linear', min: 0, max: null, ticks: 4, format: null };
-  chart.legend = { position: 'bottom', alignment: 'start' };
-  chart.animate = !prefersReducedMotion();
-}
-
-function updateLiveChartSeries(hostId, series) {
-  const chart = byId(hostId);
-  if (!chart) return;
-  const nextSeries = [
-    {
-      id: 'msgsIn', name: T('chart_series_msgs_in'), tone: 'primary', style: 'solid',
-      showInLegend: true, points: series.msgsIn.map((p) => ({ x: p.x, y: p.y })),
-    },
-    {
-      id: 'lag', name: T('chart_series_lag'), tone: 'warning', style: 'dashed',
-      showInLegend: true, points: series.lag.map((p) => ({ x: p.x, y: p.y })),
-    },
-  ];
-  // Defensive: `updateSeries` is the incremental path (smooth scroll,
-  // no SVG teardown) on a current `tf-line-chart`; the plain `series =`
-  // setter is still a correct fallback (same shape → it now takes the same
-  // incremental path internally anyway) if an older component build ever
-  // ends up loaded without it.
-  if (typeof chart.updateSeries === 'function') chart.updateSeries(nextSeries);
-  else chart.series = nextSeries;
 }
 
 // =============================================================================
@@ -1559,7 +1221,7 @@ function openTopicDeleteWindow(name) {
     onDeleted: async () => {
       if (state.instanceId !== instanceId) return;
       state.topicsNotice = { tone: 'success', title: T('topics.deleted_title', { name }), text: T('topics.deleted_text') };
-      if (state.view?.name === name) state.view = null;
+      if (state.view?.name === name) closeTopicDetail();
       state.tab = 'topics';
       renderPanel();
       await loadTopics();
@@ -1573,8 +1235,7 @@ function openTopicDeleteWindow(name) {
 // component (tentaflow-core/www/js/components/tf-table.js, out of this
 // module's file scope) marks no `<tr>` focusable and only emits `row-click`
 // from a mouse click, so a keyboard-only user could reach every OTHER
-// control in M01/M04 but never open M03 (partitions/config/ACL/edit) or a
-// group's detail panel. This is a progressive-enhancement layer added from
+// control in the consumer table but never open a group's detail panel. This is a progressive-enhancement layer added from
 // outside the component instead: re-applied after every `table.rows = ...`
 // (tf-table RECYCLES `<tr>` elements in place across paints — see its own
 // `_renderTbody` comment — so this only needs to touch newly-created rows
@@ -1640,40 +1301,6 @@ function wireRowKeyboardActivation(table) {
   });
 }
 
-function envChip(env) {
-  const status = env === 'prod' ? 'err' : env === 'test' ? 'warn' : 'ok';
-  return { status, variant: 'outline', label: T(`env_${env}`) || env };
-}
-
-// Owner decision B: the M03 config tab renders
-// a chip for a topic's durability class — critical highlighted (err
-// tone, the same one the lag column already uses for "hot"), standard muted
-// — with the resolved `durability` policy string (e.g. `fsync_interval:50`,
-// `fsync_batch_full`, `os`) as its tooltip so an operator can see both "how
-// safe" (the class) and "how, exactly" (the policy) without a second tab.
-//
-// R5-1/R5-7 fix (KRYTYK-M1-R5.md b.1/b.7): `deriveDurabilityClass` above
-// already trusted a wire-supplied `durabilityClass` first and only fell back
-// to deriving one from `durability` when it was absent — the R5 "dead
-// column" bug was that the LIST wire (`TopicList` rows) never carried either
-// field yet, so every row hit the fallback with an empty `durability` string
-// and defaulted to "standard" regardless of the real policy. The backend
-// contract now sends `durability`/`durabilityClass`/`durabilityExplicit` on
-// both the list and the detail wire, so this needs no change on the
-// derivation side — only the NEW "(polityka jawna)" secondary label below,
-// which the R5 report flagged as impossible without a stored
-// class-vs-override distinction (`durabilityExplicit` is exactly that).
-function durabilityClassChipHtml(topic) {
-  const cls = deriveDurabilityClass(topic);
-  const status = cls === 'critical' ? 'err' : 'neutral';
-  const label = T(`durability_class_chip_${cls}`);
-  const durability = topic?.durability;
-  const title = durability ? escapeAttr(T('durability_class_policy_title', { durability })) : '';
-  const chip = `<span class="tf-chip tf-chip--outline ${status}"${title ? ` title="${title}"` : ''}>${escapeHtml(label)}</span>`;
-  if (!shouldShowDurabilityExplicitLabel(topic)) return chip;
-  return `${chip} <span class="tb-field-hint tb-durability-explicit">${escapeHtml(T('durability_class_explicit_suffix'))}</span>`;
-}
-
 function msToDate(ms) {
   if (ms == null) return '—';
   const d = new Date(Number(ms));
@@ -1705,9 +1332,8 @@ function closeModal(modal) {
 // has none — Tab cycles out into the page behind the dialog and focus never
 // moves into the dialog on open, WCAG 2.1.1/2.4.3). `tf-modal.js` is a
 // shared component outside this file's change scope, so every dialog THIS
-// module builds traps focus itself instead: `openOffsetResetModal`,
-// `openLeaderTransferModal` and `openReassignModal` call `trapModalFocus`
-// directly.
+// module builds traps focus itself instead: `openOffsetResetModal` calls
+// `trapModalFocus` directly.
 // =============================================================================
 
 // `tf-button`/`tf-input`/`tf-select` (the controls every dialog in this
@@ -1768,9 +1394,8 @@ function trapModalFocus(modal) {
 
   // Watches the `open` ATTRIBUTE rather than the `close` EVENT: `tf-modal`
   // only dispatches `close` from its own Escape/backdrop/X dismissal path
-  // (`_dismiss()`); every close button THIS module wires (offset-reset,
-  // leader-transfer and reassign Cancel/confirm)
-  // calls `closeModal()`/`finish()` directly, which just removes the `open`
+  // (`_dismiss()`); every close button THIS module wires (offset-reset
+  // Cancel/confirm) calls `closeModal()` directly, which just removes the `open`
   // attribute without dispatching that event — a `close`-event-only cleanup
   // would leak the document keydown listener and skip focus restoration on
   // every one of those button paths.
@@ -1786,427 +1411,177 @@ function trapModalFocus(modal) {
 }
 
 // =============================================================================
-// Topic detail (M03) — overview / partitions / config / ACL
+// A topic's page (Topiki › <topic>): its sections, the settings windows and
+// moving a partition's leadership. The page itself is modules/tentabus/
+// topic-detail.js; the shell loads the topic and says where each move leads.
 // =============================================================================
 
-function openTopicDetail(name) {
-  state.view = { kind: 'topic-detail', name };
-  state.detailTab = 'overview';
-  state.detail = null;
-  state.aclEntries = null;
-  // A fresh rolling window per topic — the previous topic's samples would
-  // otherwise leak into this one's overview chart (module-doc gap #1).
-  state.detailChartSeries = { msgsIn: [], bytesIn: [], lag: [] };
+function openTopicDetail(name, section = DEFAULT_SECTION) {
+  if (state.view?.name !== name) {
+    state.detail = null;
+    state.detailError = null;
+    state.detailNotice = null;
+    state.justMoved = new Set();
+  }
+  state.view = { kind: 'topic-detail', name, section: TOPIC_SECTIONS.includes(section) ? section : DEFAULT_SECTION };
   renderPanel();
   loadTopicDetail(name);
 }
 
-async function loadTopicDetail(name) {
-  state.detailLoading = true;
-  renderDetailBody();
-  try {
-    state.detail = await ApiBinary.one('busTopicDetailRequest', { instanceId: requireInstanceId(state.instanceId), name });
-  } catch (err) {
-    toast(mapBusErrorMessage(err?.message, T), 'error');
-    state.detail = null;
-    state.view = null;
-    renderPanel();
-    return;
-  }
-  state.detailLoading = false;
-  // A REAL context change (new/refreshed topic snapshot) — never bumped by a
-  // stats poll — so `renderDetailBody` can tell "rebuild the hero/overview
-  // DOM" apart from "just patch the numbers in place".
-  state.detailVersion += 1;
-  renderDetailBody();
+function closeTopicDetail() {
+  state.view = null;
+  state.detail = null;
+  state.detailError = null;
+  state.detailNotice = null;
+  state.justMoved = new Set();
 }
 
-function renderTopicDetail(panel) {
-  const viewName = state.view.name;
-  const rebuilt = ensureSkeleton(panel, `detail:${viewName}`, () => detailSkeletonHtml(viewName));
-  if (rebuilt) wireDetailSkeleton(panel, viewName);
-  renderDetailBody();
-}
-
-function detailSkeletonHtml(name) {
-  return `
-    <div class="tb-back">
-      <tf-button variant="ghost" icon="chevron-left" id="tb-detail-back">${escapeHtml(T('detail_back'))}</tf-button>
-    </div>
-    <div class="tb-card">
-      <div class="tb-c-body" id="tb-detail-hero"></div>
-    </div>
-    <tf-tabs id="tb-detail-tabs" value="${escapeAttr(state.detailTab)}" variant="solid">
-      <tf-tab id="overview">${escapeHtml(T('detail_tab_overview'))}</tf-tab>
-      <tf-tab id="partitions">${escapeHtml(T('detail_tab_partitions'))}</tf-tab>
-      <tf-tab id="config">${escapeHtml(T('detail_tab_config'))}</tf-tab>
-      <tf-tab id="acl">${escapeHtml(T('detail_tab_acl'))}</tf-tab>
-    </tf-tabs>
-    <div id="tb-detail-panel"></div>
-  `;
-}
-
-function wireDetailSkeleton(panel, name) {
-  panel.querySelector('#tb-detail-back')?.addEventListener('click', () => {
-    state.view = null;
-    renderPanel();
-  });
-  panel.querySelector('#tb-detail-tabs')?.addEventListener('change', (e) => {
-    const id = e.detail?.value;
-    if (!id) return;
-    state.detailTab = id;
-    if (id === 'acl' && state.aclEntries == null) loadAcl(name);
-    renderDetailBody();
-  });
-}
-
-// Renders the topic-detail hero+body. Called both on a REAL context change
-// (topic opened/edited — `wireDetailSkeleton`'s tab switch, `loadTopicDetail`)
-// AND on every 3s stats poll while the overview tab is visible
-// (`refreshStats`) — the two used to be indistinguishable, so a poll tick
-// re-ran the SAME full `hero.innerHTML =` / `body.innerHTML =` rebuild as a
-// real topic switch, destroying and recreating `<tf-line-chart
-// id="tb-detail-chart">` (and the groups-lag list, and the hero's own
-// buttons) every 3 seconds — the owner-reported "chart draws from zero"
-// bug. `state.detailVersion` (bumped only by `loadTopicDetail`, never by
-// `refreshStats`) now tells the two apart: hero/overview markup is only
-// rebuilt when the stamped version on the DOM is stale; a same-version call
-// (a poll tick, or re-entering the overview tab) only patches the KPI tile
-// text and the chart's `series` — never touches the groups-lag list or the
-// hero at all, matching task 5 ("groups lag … change only on user action —
-// ensure they are not repainted by the stats poll").
-function renderDetailBody() {
-  const hero = byId('tb-detail-hero');
-  const body = byId('tb-detail-panel');
-  if (!hero || !body) return;
-  if (state.detailLoading || !state.detail) {
-    hero.innerHTML = `<div class="tb-state"><tf-spinner size="sm"></tf-spinner>${escapeHtml(T('loading'))}</div>`;
-    body.innerHTML = '';
-    delete hero.dataset.tbHeroVersion;
-    delete body.dataset.tbOverviewVersion;
-    return;
-  }
-  const { topic, partitions } = state.detail;
-  const versionKey = String(state.detailVersion);
-
-  if (hero.dataset.tbHeroVersion !== versionKey) {
-    // N-7 (KRYTYK-M1-R2.md): M03's "Lag grup konsumentów"/mini-KPI has the
-    // exact same `tf-system-probe` leak as the M04 KPI strip (task 3) — this
-    // topic-detail response carries its own, separate `groups[]` breakdown,
-    // so it needs the same client-side filter applied independently.
-    const groups = filterVisibleGroups(state.detail.groups);
-    hero.innerHTML = heroHtml(topic, groups);
-    hero.dataset.tbHeroVersion = versionKey;
-    byId('tb-detail-preview')?.addEventListener('click', () => openTopicPreview(topic.name));
-    byId('tb-detail-delete')?.addEventListener('click', () => openTopicDeleteWindow(topic.name));
-  }
-
-  if (state.detailTab === 'overview') {
-    if (body.dataset.tbOverviewVersion !== versionKey) {
-      const groups = filterVisibleGroups(state.detail.groups);
-      body.innerHTML = detailOverviewHtml(groups);
-      body.dataset.tbOverviewVersion = versionKey;
-      ensureLiveChart('tb-detail-chart');
+// A failed reload keeps the page it already shows (the header says the data
+// is old); only a topic never loaded, or one deleted since, shows the failure.
+const loadTopicDetail = topicDetailLoader({
+  fetch: (instanceId, name) => ApiBinary.one('busTopicDetailRequest', { instanceId: requireInstanceId(instanceId), name }),
+  context: () => ({ instanceId: state.instanceId, name: state.view?.name }),
+  apply({ detail, error }) {
+    if (!error) {
+      state.detail = detail;
+      state.detailError = null;
+    } else {
+      const missing = busErrorCode(error?.message) === 'topic_not_found';
+      // A failed reload keeps the page it had; only "gone" replaces it.
+      if (state.detail && !missing) return;
+      if (missing) state.detail = null;
+      state.detailError = error;
     }
-    patchDetailOverviewKpis(findTopicStats(state.stats?.topics, topic.name));
-    updateLiveChartSeries('tb-detail-chart', state.detailChartSeries);
-  } else {
-    delete body.dataset.tbOverviewVersion;
-    if (state.detailTab === 'partitions') {
-      body.innerHTML = detailPartitionsHtml(partitions, topic.name);
-      body.querySelector('#tb-detail-open-replication')?.addEventListener('click', () => openReplicationForTopic(topic.name));
-    } else if (state.detailTab === 'config') body.innerHTML = detailConfigHtml(topic);
-    else if (state.detailTab === 'acl') renderAclTab(body, topic.name);
-  }
+    renderPanel();
+  },
+});
+
+/** The section the open topic's page shows (a closed one falls back). */
+function currentSection() {
+  // Until the topic answers (or when it is gone) nothing is known to be
+  // closed, so the address keeps the section that was asked for.
+  if (!state.detail) return state.view.section;
+  return effectiveSection(state.view.section, state.detail.access);
 }
+
+const detailContext = {
+  view() {
+    const sh = state.shell;
+    return {
+      name: state.view.name,
+      detail: state.detail,
+      error: state.detailError,
+      errorKind: state.detailError ? loadErrorKind(state.detailError) : null,
+      section: state.view.section,
+      stats: state.stats,
+      subjects: sh.subjectsError ? null : sh.subjects,
+      capabilities: state.capabilities,
+      nodes: sh.nodes || [],
+      replicaTopics: sh.replicaTopics,
+      replicaLags: sh.replicaLags,
+      lagSeries: sh.lagSeries,
+      notice: state.detailNotice,
+      justMoved: state.justMoved,
+      instanceLabel: state.instanceLabel,
+      nowMs: Date.now(),
+    };
+  },
+  go(action) {
+    const name = state.view?.name;
+    if (!name) return;
+    if (action.kind === 'back') { setTab('topics'); return; }
+    if (action.kind === 'section') {
+      if (!TOPIC_SECTIONS.includes(action.section) || action.section === state.view.section) return;
+      state.view.section = action.section;
+      state.detailNotice = null;
+      renderPanel();
+    } else if (action.kind === 'preview') openTopicPreview(name);
+    else if (action.kind === 'delete') openTopicDeleteWindow(name);
+    else if (action.kind === 'change') openTopicSettings(name, action.card);
+    else if (action.kind === 'transfer') openPartitionTransfer(name, action.partition, 'topic');
+    else if (action.kind === 'group') { setTab('groups'); openGroupDetail(action.group, name); }
+    else if (action.kind === 'dlq') tabContext.go({ kind: 'dlq', topic: name });
+    else if (action.kind === 'retry') { state.detailError = null; renderPanel(); loadTopicDetail(name); }
+  },
+};
+
+function openTopicSettings(name, card) {
+  const detail = state.detail;
+  if (!detail?.access?.canAdmin) return;
+  const instanceId = state.instanceId;
+  openSettingsWindow(card, {
+    instanceId: requireInstanceId(instanceId),
+    view: { ...detailContext.view(), topic: detail.topic, partitions: detail.partitions || [] },
+    update: (request) => ApiBinary.action('busTopicUpdateRequest', request),
+    describeError: describeBusError,
+    onSaved: async (notice) => {
+      if (state.instanceId !== instanceId || state.view?.name !== name) return;
+      state.detailNotice = { section: 'settings', tone: 'success', title: notice.title, text: notice.text };
+      await loadTopicDetail(name);
+      loadTopics();
+      if (card === 'write') refreshReplicas();
+    },
+  });
+}
+
+// "Przenieś prowadzenie" from a topic's Partycje i kopie (`from = 'topic'`)
+// or from Kopie i nody (`from = 'replication'`): the same window over the
+// replica list the shell polls; the result lands as a note where it started.
+function openPartitionTransfer(topic, partition, from) {
+  const allowed = from === 'topic' ? state.detail?.access?.canAdmin === true : canAdmin();
+  if (!allowed) return;
+  const replica = (state.shell.replicaTopics || []).find((r) => r.topic === topic)?.partitions?.find((p) => Number(p.partition) === Number(partition));
+  if (!replica) return;
+  const instanceId = state.instanceId;
+  openLeaderTransfer({
+    topic,
+    partition,
+    choices: transferChoices(replica, state.shell.nodes || []),
+    transfer: (target) => ApiBinary.action('busLeaderTransferRequest', buildLeaderTransferRequest(instanceId, topic, partition, target)),
+    describeError: describeBusError,
+    onDone: async ({ label }) => {
+      if (state.instanceId !== instanceId) return;
+      const text = T('partitions.moved_text', { partition: fmtCount(partition), topic, node: label });
+      if (from === 'topic' && state.view?.name === topic) {
+        state.justMoved.add(Number(partition));
+        state.detailNotice = { section: 'partitions', tone: 'success', title: T('partitions.moved_title'), text };
+      } else if (from === 'replication') {
+        state.justMoved.add(`${topic}:${partition}`);
+        state.replicationNotice = { title: T('partitions.moved_title'), text };
+      }
+      renderPanel();
+      await refreshReplicas();
+    },
+  });
+}
+
+// =============================================================================
+// Kopie i nody (T10): modules/tentabus/replication.js over the replica lists
+// the shell polls.
+// =============================================================================
+
+const replicationContext = {
+  view() {
+    const sh = state.shell;
+    return {
+      nodes: sh.nodes,
+      replicaTopics: sh.replicaTopics,
+      failovers: sh.failovers,
+      topics: state.topics,
+      canAdmin: canAdmin(),
+      notice: state.replicationNotice,
+      justMoved: state.justMoved,
+      nowMs: Date.now(),
+    };
+  },
+  go(action) {
+    if (action.kind === 'topic') { setTab('topics'); openTopicDetail(action.topic, 'partitions'); }
+    else if (action.kind === 'transfer') openPartitionTransfer(action.topic, action.partition, 'replication');
+  },
+};
 
 function chipHtml(chip) {
   return `<tf-chip variant="outline" status="${escapeAttr(chip.status)}">${escapeHtml(chip.label)}</tf-chip>`;
-}
-
-function heroHtml(topic, groups) {
-  return `
-    <div class="tb-hero">
-      <div class="tb-hero-ident">
-        <div class="tb-hero-name">${escapeHtml(topic.name)}${topic.name.startsWith('__dlq.') ? ` <tf-chip variant="outline" status="warn">${escapeHtml(T('badge_dlq'))}</tf-chip>` : ''}</div>
-        <div class="tb-hero-meta">
-          ${chipHtml(envChip(topic.environment))}
-          <tf-chip variant="outline" status="info">${escapeHtml(topic.delivery)}</tf-chip>
-          <tf-chip variant="outline" status="info">${escapeHtml(topic.acks)}</tf-chip>
-        </div>
-      </div>
-      <div class="tb-mini-kpis">
-        <div class="tb-mk"><b>${topic.partitions}</b><span>${escapeHtml(T('detail_mk_partitions'))}</span></div>
-        <div class="tb-mk"><b>${sumGroupLag(groups)}</b><span>${escapeHtml(T('detail_mk_groups_lag'))}</span></div>
-      </div>
-      <div class="tb-head-actions">
-        <tf-button variant="ghost" icon="eye" id="tb-detail-preview">${escapeHtml(T('detail_preview_messages'))}</tf-button>
-        ${canAdmin() ? `<tf-button variant="danger" icon="trash" id="tb-detail-delete">${escapeHtml(T('detail_delete'))}</tf-button>` : ''}
-      </div>
-    </div>
-  `;
-}
-
-// Built once per `state.detailVersion` (see `renderDetailBody`) — the KPI
-// tile values start as "—" placeholders with STABLE ids and are patched live
-// every poll by `patchDetailOverviewKpis`, the chart element is created here
-// and fed by `ensureLiveChart`/`updateLiveChartSeries` (never recreated), and
-// the groups-lag list is a plain snapshot of `groups` at build time — it does
-// NOT update on its own between rebuilds, by design (task 5: the groups-lag
-// list changes only on user action, e.g. re-opening the topic or an offset
-// reset, never on a stats poll).
-function detailOverviewHtml(groups) {
-  const rows = (groups || []).map((g) => `
-    <div class="tb-kv-row">
-      <div class="tb-kv-key">${escapeHtml(g.group)}</div>
-      <div class="tb-kv-val">${g.lagTotal}</div>
-    </div>
-  `).join('');
-  const tile = (id, label) => `<div class="tb-mk"><b id="${id}">—</b><span>${escapeHtml(label)}</span></div>`;
-  const tiles = [
-    tile('tb-ov-msgs-in', T('detail_ov_msgs_in')),
-    tile('tb-ov-bytes-in', T('detail_ov_bytes_in')),
-    tile('tb-ov-disk', T('detail_ov_disk')),
-    tile('tb-ov-lag', T('detail_ov_lag')),
-    tile('tb-ov-dlq-depth', T('detail_ov_dlq_depth')),
-  ].join('');
-  return `
-    <div class="tb-card"><div class="tb-c-body"><div class="tb-mini-kpis tb-mini-kpis--wrap">${tiles}</div></div></div>
-    <div class="tb-card">
-      <div class="tb-c-head"><h3>${escapeHtml(T('chart_throughput_title'))}</h3><div class="tb-hint">${escapeHtml(T('chart_live_window_note', { minutes: CHART_WINDOW_MINUTES }))}</div></div>
-      <div class="tb-c-body"><tf-line-chart id="tb-detail-chart"></tf-line-chart></div>
-    </div>
-    <div class="tb-card">
-      <div class="tb-c-head"><h3>${escapeHtml(T('detail_groups_lag_title'))}</h3></div>
-      <div class="tb-c-body">
-        ${groups?.length ? `<div class="tb-kv">${rows}</div>` : `<div class="tb-state tb-empty">${escapeHtml(T('empty_topics'))}</div>`}
-      </div>
-    </div>
-  `;
-}
-
-// Poll-driven patch for the overview mini-KPI tiles — text-only, keyed by
-// the stable ids `detailOverviewHtml` gives each `<b>`, via `patchText`'s
-// no-op-on-equal write.
-function patchDetailOverviewKpis(ts) {
-  patchText(byId('tb-ov-msgs-in'), ts ? `${fmtCompact(ts.msgsInPerSec)} /s` : '—');
-  patchText(byId('tb-ov-bytes-in'), ts ? `${formatBytes(ts.bytesInPerSec)}/s` : '—');
-  patchText(byId('tb-ov-disk'), ts ? formatBytes(ts.totalBytesOnDisk) : '—');
-  patchText(byId('tb-ov-lag'), ts ? fmtCompact(ts.totalLag) : '—');
-  patchText(byId('tb-ov-dlq-depth'), ts ? fmtCompact(ts.dlqDepth) : '—');
-}
-
-// M2 (PLAN-M2.md §1f, module-doc gap #2 RESOLVED): `partitions[]` now
-// carries `leaderNodeId`/`leaderEpoch`/`isrCount`/`replicaCount`/
-// `highWatermark` alongside M1's `earliestOffset`/`logEndOffset`/
-// `sizeBytes`/`segments` — the old static "—" leader/ISR columns are real
-// now. `unavailableReason` renders as a STATE chip (PLAN-M2 §4.1 A4: not a
-// producer error) rather than an error box.
-function detailPartitionsHtml(partitions, topicName) {
-  const rows = (partitions || []).map((p) => {
-    const isrCount = p.isrCount ?? (Array.isArray(p.isr) ? p.isr.length : null);
-    const replicaCount = p.replicaCount ?? (Array.isArray(p.replicas) ? p.replicas.length : null);
-    const degraded = isrCount != null && replicaCount != null && isIsrDegraded(isrCount, replicaCount);
-    const lag = computeReplicationLag(p.highWatermark, p.logEndOffset);
-    const reasonKey = unavailableReasonI18nKey(p.unavailableReason);
-    return `
-      <tr class="${p.unavailableReason ? 'tb-row-unavailable' : ''}">
-        <td>${p.partition}</td>
-        <td class="mono">${p.leaderNodeId ? escapeHtml(p.leaderNodeId) : '—'}</td>
-        <td class="mono">${p.leaderEpoch != null ? escapeHtml(T('replication.epoch_value', { n: p.leaderEpoch })) : '—'}</td>
-        <td>${isrCount != null && replicaCount != null ? `${isrCount}/${replicaCount}` : '—'}${degraded ? ` <span class="tf-chip tf-chip--outline warn">${escapeHtml(T('detail_isr_degraded'))}</span>` : ''}</td>
-        <td class="mono">${p.earliestOffset}</td>
-        <td class="mono">${p.logEndOffset}</td>
-        <td class="mono">${p.highWatermark != null ? p.highWatermark : '—'}</td>
-        <td class="mono">${p.highWatermark != null ? lag : '—'}</td>
-        <td>${formatBytes(p.sizeBytes)}</td>
-        <td>${p.segments}</td>
-        <td>${reasonKey ? `<span class="tf-chip tf-chip--outline err" title="${escapeAttr(T(reasonKey))}">${escapeHtml(T('detail_partition_unavailable'))}</span>` : ''}</td>
-      </tr>
-    `;
-  }).join('');
-  return `
-    <div class="tb-card">
-      <div class="tb-c-head">
-        <h3>${escapeHtml(T('detail_tab_partitions'))}</h3>
-        <tf-button variant="ghost" size="sm" icon="external-link" id="tb-detail-open-replication">${escapeHtml(T('detail_partitions_open_replication'))}</tf-button>
-      </div>
-      <div class="tb-c-body tb-c-body--table">
-        ${partitions?.length ? `
-          <table style="width:100%;border-collapse:collapse;font-size:12.5px">
-            <thead><tr>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_partition'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_leader'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_epoch'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_isr'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_earliest_offset'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_log_end_offset'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_hw'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_lag'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_size'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_segments'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('detail_col_state'))}</th>
-            </tr></thead>
-            <tbody>${rows}</tbody>
-          </table>
-        ` : `<div class="tb-state tb-empty">${escapeHtml(T('empty_topics'))}</div>`}
-      </div>
-    </div>
-  `;
-}
-
-function detailConfigHtml(topic) {
-  const rowsDef = [
-    ['name', topic.name, true],
-    ['partitions', topic.partitions],
-    ['retention_ms', fmtRetention(topic.retentionMs)],
-    ['retention_bytes', formatBytes(topic.retentionBytesPerPartition)],
-    ['cleanup_policy', topic.cleanupPolicy],
-    ['delivery', topic.delivery],
-    ['idempotency_key', topic.idempotencyKey || T('na')],
-    ['dedup_window_ms', `${Math.round(topic.dedupWindowMs / 3_600_000)} h`],
-    ['max_delivery_attempts', topic.maxDeliveryAttempts],
-    ['retry_backoff_ms', topic.retryBackoffMs],
-    ['schema_id', topic.schemaId || T('schema_none')],
-    ['validation', topic.validation],
-    ['content_type', topic.contentType, true],
-    ['replication_factor', topic.replicationFactor],
-    ['acks', topic.acks],
-    ['durability', topic.durability],
-    ['max_inline_bytes', formatBytes(topic.maxInlineBytes)],
-    ['compression', topic.compression],
-    ['environment', topic.environment],
-  ];
-  const renderRow = ([key, val, mono]) => `
-    <div class="tb-kv-row">
-      <div class="tb-kv-key">${escapeHtml(T(`config_row_${key}`))}</div>
-      <div class="tb-kv-val${mono ? ' mono' : ''}">${escapeHtml(String(val))}</div>
-    </div>
-  `;
-  // Owner decision B: the durability-class chip sits right above the
-  // existing raw `durability` row (untouched, still the resolved policy
-  // string as-is) rather than replacing it — the chip is the "how safe"
-  // summary, this row stays the "how, exactly" detail, and the chip's own
-  // tooltip/secondary text repeats the same policy string for a reader who
-  // lands on this row without the chip's hover state.
-  const durabilityClassRow = `
-    <div class="tb-kv-row">
-      <div class="tb-kv-key">${escapeHtml(T('config_row_durability_class'))}</div>
-      <div class="tb-kv-val">
-        ${durabilityClassChipHtml(topic)}
-        ${topic.durability ? `<span class="tb-field-hint">${escapeHtml(T('durability_class_policy_title', { durability: topic.durability }))}</span>` : ''}
-      </div>
-    </div>
-  `;
-  const acksIdx = rowsDef.findIndex(([key]) => key === 'acks');
-  const rows = rowsDef.slice(0, acksIdx + 1).map(renderRow).join('')
-    + durabilityClassRow
-    + rowsDef.slice(acksIdx + 1).map(renderRow).join('');
-  return `
-    <div class="tb-card">
-      <div class="tb-c-body">
-        <div class="tb-kv">${rows}
-          <div class="tb-kv-row">
-            <div class="tb-kv-key">${escapeHtml(T('config_row_encryption_at_rest'))}</div>
-            <div class="tb-kv-val">off <span class="tb-field-hint">(${escapeHtml(T('config_not_in_api'))})</span></div>
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-async function loadAcl(topicName) {
-  state.aclLoading = true;
-  try {
-    const resp = await ApiBinary.one('busAclListRequest', { instanceId: requireInstanceId(state.instanceId), topic: topicName });
-    state.aclEntries = resp.entries || [];
-  } catch (err) {
-    toast(mapBusErrorMessage(err?.message, T), 'error');
-    state.aclEntries = [];
-  }
-  state.aclLoading = false;
-  if (state.view?.kind === 'topic-detail' && state.detailTab === 'acl') {
-    const body = byId('tb-detail-panel');
-    if (body) renderAclTab(body, topicName);
-  }
-}
-
-function renderAclTab(body, topicName) {
-  if (state.aclEntries == null) {
-    body.innerHTML = `<div class="tb-state"><tf-spinner size="sm"></tf-spinner>${escapeHtml(T('loading'))}</div>`;
-    return;
-  }
-  const admin = canAdmin();
-  const rows = state.aclEntries.map((e) => `
-    <tr>
-      <td>${escapeHtml(e.subjectType)}</td>
-      <td>${escapeHtml(e.subjectId)}</td>
-      <td>${chipHtml({ status: e.accessLevel === 'allow' ? 'ok' : 'err', label: T(`acl_access_${e.accessLevel}`) })}</td>
-      <td>${admin ? `<tf-button variant="ghost" size="sm" icon="close" class="tb-acl-clear" data-subject-type="${escapeAttr(e.subjectType)}" data-subject-id="${escapeAttr(e.subjectId)}">${escapeHtml(T('acl_action_clear'))}</tf-button>` : ''}</td>
-    </tr>
-  `).join('');
-  body.innerHTML = `
-    <div class="tb-gap-note">${sprite('info')}${escapeHtml(T('acl_gap_note'))}</div>
-    ${admin ? '' : `<div class="tb-gap-note">${sprite('info')}${escapeHtml(T('acl_admin_required'))}</div>`}
-    <div class="tb-card">
-      <div class="tb-c-head"><h3>${escapeHtml(T('acl_title'))}</h3></div>
-      <div class="tb-c-body">
-        <table class="tb-acl-table" style="width:100%;border-collapse:collapse;font-size:12.5px">
-          <thead><tr>
-            <th style="text-align:left;padding:6px 4px">${escapeHtml(T('acl_col_subject_type'))}</th>
-            <th style="text-align:left;padding:6px 4px">${escapeHtml(T('acl_col_subject_id'))}</th>
-            <th style="text-align:left;padding:6px 4px">${escapeHtml(T('acl_col_access'))}</th>
-            <th></th>
-          </tr></thead>
-          <tbody>${rows || `<tr><td colspan="4">${escapeHtml(T('acl_empty'))}</td></tr>`}</tbody>
-        </table>
-        ${admin ? aclAddFormHtml() : ''}
-      </div>
-    </div>
-  `;
-  if (admin) {
-    body.querySelector('#tb-acl-add-btn')?.addEventListener('click', () => submitAclSet(body, topicName));
-    body.querySelectorAll('.tb-acl-clear').forEach((btn) => {
-      btn.addEventListener('click', () => setAcl(topicName, btn.dataset.subjectType, btn.dataset.subjectId, 'clear'));
-    });
-  }
-}
-
-function aclAddFormHtml() {
-  return `
-    <div class="tb-wizard-grid--3" style="margin-top:12px">
-      <tf-select id="tb-acl-subject-type" label="${escapeAttr(T('acl_col_subject_type'))}" value="user">
-        <option value="user">user</option>
-        <option value="group">group</option>
-        <option value="api_key">api_key</option>
-      </tf-select>
-      <tf-input id="tb-acl-subject-id" label="${escapeAttr(T('acl_col_subject_id'))}"></tf-input>
-      <tf-select id="tb-acl-access" label="${escapeAttr(T('acl_col_access'))}" value="allow">
-        <option value="allow">${escapeHtml(T('acl_access_allow'))}</option>
-        <option value="deny">${escapeHtml(T('acl_access_deny'))}</option>
-      </tf-select>
-    </div>
-    <tf-button id="tb-acl-add-btn" variant="secondary" icon="plus" style="margin-top:10px">${escapeHtml(T('acl_add'))}</tf-button>
-  `;
-}
-
-async function submitAclSet(body, topicName) {
-  const subjectType = body.querySelector('#tb-acl-subject-type')?.value || 'user';
-  const subjectId = body.querySelector('#tb-acl-subject-id')?.value?.trim();
-  const accessLevel = body.querySelector('#tb-acl-access')?.value || 'allow';
-  if (!subjectId) { toast(T('acl_subject_required'), 'error'); return; }
-  await setAcl(topicName, subjectType, subjectId, accessLevel);
-}
-
-async function setAcl(topicName, subjectType, subjectId, accessLevel) {
-  try {
-    await ApiBinary.action('busAclSetRequest', { instanceId: requireInstanceId(state.instanceId), topic: topicName, subjectType, subjectId, accessLevel });
-    toast(T('saved'), 'success');
-    await loadAcl(topicName);
-  } catch (err) {
-    toast(mapBusErrorMessage(err?.message, T), 'error');
-  }
 }
 
 // Per-partition summary chips above the unprocessed-message table: which
@@ -2771,600 +2146,6 @@ async function confirmDlqRetryAll() {
   } catch (err) {
     toast(mapBusErrorMessage(err?.message, T), 'error');
   }
-}
-
-// =============================================================================
-// Replication & failover (M06, PLAN-M2.md §1f, mockup m06-replikacja-
-// failover.html) — node health per environment, a per-partition role matrix
-// (leader/ISR/lagging), the partitions' CURRENT lag state (see module-doc
-// gap #10 for why this is a state list, not a history timeline) and the
-// failover audit history. Same persistent-container / diff-in-place
-// discipline as the other 4 views: `renderReplicationTab` only rebuilds the
-// skeleton on a genuine context change (`ensureSkeleton`), `paintRepl*`
-// functions patch already-painted DOM in place on a poll tick
-// (`pollReplication`), and node cards / the role matrix are diffed by key
-// exactly like M01's topics table / M04's groups table
-// (`diffRowsByKey`) so an unchanged poll never touches the action buttons.
-// =============================================================================
-
-async function getLocalEnvironment() {
-  if (state.repl.localEnv) return state.repl.localEnv;
-  try {
-    const resp = await ApiBinary.one('environmentGetKindRequest');
-    state.repl.localEnv = resp?.kind || null;
-  } catch {
-    state.repl.localEnv = null;
-  }
-  return state.repl.localEnv;
-}
-
-function replicationTopicOptions(topics) {
-  return [{ value: '', label: T('replication.topic_all') }, ...dlqSourceTopicOptions(topics)];
-}
-
-function renderReplicationTab(panel) {
-  const rebuilt = ensureSkeleton(panel, 'replication', replicationSkeletonHtml);
-  if (rebuilt) wireReplicationSkeleton(panel);
-  paintReplTopicSelect();
-  paintReplNodeCards();
-  paintReplMatrix();
-  paintReplLagState();
-  paintReplFailovers();
-  // Self-sufficient regardless of HOW this view became visible — a real tab
-  // click (`setTab`'s own guard) or M03's "otwórz w Replikacji" button
-  // (`openReplicationForTopic`, which only sets state + calls `renderPanel`,
-  // never `setTab`). Both guards check the SAME `loaded`/`loading` flags, so
-  // this never double-fetches when `setTab`'s own call already started one.
-  if (!state.repl.loaded && !state.repl.loading) loadReplication(state.repl.topic);
-}
-
-function replicationSkeletonHtml() {
-  return `
-    <div class="tb-toolbar">
-      <tf-select id="tb-repl-topic" label="${escapeAttr(T('replication.topic_label'))}"></tf-select>
-    </div>
-    <div class="tb-card">
-      <div class="tb-c-head">
-        <h3>${escapeHtml(T('replication.nodes_title'))}</h3>
-        <div class="tb-hint">${escapeHtml(T('replication.nodes_hint'))}</div>
-      </div>
-      <div class="tb-c-body" id="tb-repl-nodes"></div>
-    </div>
-    <div class="tb-card">
-      <div class="tb-c-head">
-        <h3 id="tb-repl-matrix-title">${escapeHtml(T('replication.matrix_title_generic'))}</h3>
-        <div class="tb-hint">${escapeHtml(T('replication.matrix_hint'))}</div>
-      </div>
-      <div class="tb-c-body tb-c-body--table" id="tb-repl-matrix-body"></div>
-    </div>
-    <div class="tb-repl-grid-2">
-      <div class="tb-card">
-        <div class="tb-c-head"><h3>${escapeHtml(T('replication.lag_state_title'))}</h3><div class="tb-hint">${escapeHtml(T('replication.lag_state_hint'))}</div></div>
-        <div class="tb-c-body" id="tb-repl-lag-state"></div>
-      </div>
-      <div class="tb-card">
-        <div class="tb-c-head">
-          <h3>${escapeHtml(T('replication.failover_title'))}</h3>
-          <div class="tb-hint">${escapeHtml(T('replication.failover_hint'))}</div>
-        </div>
-        <div class="tb-c-body tb-c-body--table">
-          <table class="tb-fo-table" style="width:100%;border-collapse:collapse;font-size:12px">
-            <thead><tr>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('replication.failover_col_partition'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('replication.failover_col_epoch'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('replication.failover_col_nodes'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('replication.failover_col_duration'))}</th>
-              <th style="text-align:left;padding:6px 4px">${escapeHtml(T('replication.failover_col_when'))}</th>
-            </tr></thead>
-            <tbody id="tb-repl-failover-body"></tbody>
-          </table>
-          <div class="tb-state tb-empty" id="tb-repl-failover-empty" hidden>${escapeHtml(T('replication.failover_empty'))}</div>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function wireReplicationSkeleton(panel) {
-  panel.querySelector('#tb-repl-topic')?.addEventListener('change', (e) => {
-    state.repl.topic = e.detail?.value || '';
-    state.repl.loaded = false;
-    loadReplication(state.repl.topic);
-  });
-}
-
-function paintReplTopicSelect() {
-  const select = byId('tb-repl-topic');
-  if (!select) return;
-  select.setOptions(replicationTopicOptions(state.topics), state.repl.topic);
-}
-
-async function loadReplication(topic) {
-  state.repl.loading = true;
-  paintReplNodeCards();
-  try {
-    state.repl.data = await ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(state.instanceId, topic));
-    state.repl.error = null;
-  } catch (err) {
-    state.repl.error = mapBusErrorMessage(err?.message, T);
-    toast(state.repl.error, 'error');
-    state.repl.data = null;
-  }
-  state.repl.loading = false;
-  state.repl.loaded = true;
-  // A topic switch (or the very first load) starts every diff cache and the
-  // failover "already rendered" set fresh — a stale key from a DIFFERENT
-  // topic's partitions must never suppress a real row for the new one.
-  state.dom.roleMatrix = null;
-  state.dom.failoverKeys = null;
-  const body = byId('tb-repl-matrix-body');
-  if (body) body.innerHTML = '';
-  const foBody = byId('tb-repl-failover-body');
-  if (foBody) foBody.innerHTML = '';
-  paintReplNodeCards();
-  paintReplMatrix();
-  paintReplLagState();
-  paintReplFailovers();
-}
-
-// Poll tick (3s cadence, reused from `refreshStats` — task requirement).
-// Re-fetches the SAME scope and re-runs the SAME paint functions as a real
-// load, but WITHOUT resetting the diff caches first — `diffRowsByKey`/the
-// failover key set are exactly what make this a patch instead of a rebuild.
-async function pollReplication() {
-  try {
-    state.repl.data = await ApiBinary.one('busReplicaListRequest', buildReplicaListRequest(state.instanceId, state.repl.topic));
-    state.repl.error = null;
-  } catch {
-    // Silent — matches `refreshStats`'s own convention: keep the last known
-    // state on the screen rather than blanking it or toasting on every
-    // missed poll.
-    return;
-  }
-  paintReplNodeCards();
-  paintReplMatrix();
-  paintReplLagState();
-  paintReplFailovers();
-}
-
-// Counts per node over the reader's topics — the same `nodeRows` Przegląd
-// uses, so both screens say the same. "Wszystkie topiki" reads the shell's
-// per-topic snapshots; a chosen topic reads its own answer. The node summary
-// on the wire also counts the broker's `__*` topics, so it only names nodes.
-function nodeCardRows(data) {
-  const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
-  const partitions = Array.isArray(data?.partitions) ? data.partitions : [];
-  const perTopic = state.repl.topic
-    ? [{ topic: state.repl.topic, partitions }]
-    : state.shell.replicaTopics;
-  const counts = new Map((nodeRows(nodes, perTopic) || []).map((r) => [r.nodeId, r]));
-  return nodes.map((n) => {
-    const c = counts.get(n.nodeId);
-    return {
-      _key: n.nodeId,
-      nodeId: n.nodeId,
-      label: n.label || n.nodeId,
-      environment: n.environment,
-      isLocal: !!n.isLocal,
-      reachable: n.reachable !== false,
-      lastHeartbeatMsAgo: n.lastHeartbeatMsAgo,
-      leaderCount: c ? c.leads : null,
-      followerCount: c ? c.holds : null,
-      isrCount: c ? c.inSync : null,
-      degraded: nodeDegradedReason(n, partitions),
-    };
-  });
-}
-
-// The node this screen runs on has no "last signal" worth printing — it is
-// the one answering.
-function nodeCardSubText(r) {
-  if (!r.reachable) return T('replication.node_unreachable');
-  const heartbeat = r.isLocal ? '' : T('replication.node_heartbeat', { ms: fmtCompact(Number(r.lastHeartbeatMsAgo) || 0) });
-  if (!r.degraded || r.degraded.kind !== 'lagging') return heartbeat;
-  const lag = r.degraded.lag || {};
-  return [heartbeat, T('replication.node_lagging_note', {
-    partition: r.degraded.partition,
-    reason: lag.reason || T('replication.node_lagging_reason_unknown'),
-  })].filter(Boolean).join(' · ');
-}
-
-function nodeCardHtml(r) {
-  const cls = ['tb-node-card'];
-  if (r.degraded) cls.push('tb-node-card--degraded');
-  const dotCls = !r.reachable ? 'tb-node-dot--down' : (r.degraded ? 'tb-node-dot--warn' : 'tb-node-dot--live');
-  const key = escapeAttr(r._key);
-  return `
-    <div class="${cls.join(' ')}" id="tb-repl-node-${key}">
-      <div class="tb-node-card-head">
-        <span class="tb-node-dot ${dotCls}"></span>
-        <span class="tb-node-name">${escapeHtml(r.label)}</span>
-        ${chipHtml(envChip(r.environment))}
-        ${r.isLocal ? `<span class="tf-chip tf-chip--outline info">${escapeHtml(T('replication.node_local_badge'))}</span>` : ''}
-      </div>
-      <div class="tb-node-stats">
-        <div><b id="tb-repl-node-${key}-leader">${r.leaderCount ?? '—'}</b><span>${escapeHtml(T('replication.node_stat_leader'))}</span></div>
-        <div><b id="tb-repl-node-${key}-follower">${r.followerCount ?? '—'}</b><span>${escapeHtml(T('replication.node_stat_follower'))}</span></div>
-        <div><b id="tb-repl-node-${key}-isr">${r.isrCount ?? '—'}</b><span>${escapeHtml(T('replication.node_stat_isr'))}</span></div>
-      </div>
-      <div class="tb-node-sub" id="tb-repl-node-${key}-sub">${escapeHtml(nodeCardSubText(r))}</div>
-    </div>
-  `;
-}
-
-function patchNodeCard(host, r) {
-  const key = CSS.escape(r._key);
-  const card = host.querySelector(`#tb-repl-node-${key}`);
-  if (!card) return;
-  card.classList.toggle('tb-node-card--degraded', !!r.degraded);
-  const dot = card.querySelector('.tb-node-dot');
-  if (dot) dot.className = `tb-node-dot ${!r.reachable ? 'tb-node-dot--down' : (r.degraded ? 'tb-node-dot--warn' : 'tb-node-dot--live')}`;
-  patchText(card.querySelector(`#tb-repl-node-${key}-leader`), r.leaderCount ?? '—');
-  patchText(card.querySelector(`#tb-repl-node-${key}-follower`), r.followerCount ?? '—');
-  patchText(card.querySelector(`#tb-repl-node-${key}-isr`), r.isrCount ?? '—');
-  patchText(card.querySelector(`#tb-repl-node-${key}-sub`), nodeCardSubText(r));
-}
-
-function paintReplNodeCards() {
-  const host = byId('tb-repl-nodes');
-  if (!host) return;
-  if (state.repl.loading && !state.repl.data) {
-    host.innerHTML = `<div class="tb-state"><tf-spinner size="sm"></tf-spinner>${escapeHtml(T('loading'))}</div>`;
-    state.dom.nodeCards = null;
-    return;
-  }
-  const rows = nodeCardRows(state.repl.data);
-  if (!rows.length) {
-    host.innerHTML = `<div class="tb-state tb-empty">${escapeHtml(T('replication.nodes_empty'))}</div>`;
-    state.dom.nodeCards = null;
-    return;
-  }
-  const diff = diffRowsByKey(state.dom.nodeCards, rows, (r) => r._key);
-  if (state.dom.nodeCards == null || diff.added.length || diff.removed.length) {
-    host.innerHTML = `<div class="tb-node-grid">${rows.map(nodeCardHtml).join('')}</div>`;
-    state.dom.nodeCards = rows;
-    return;
-  }
-  if (diff.updated.length) {
-    rows.forEach((r) => patchNodeCard(host, r));
-    state.dom.nodeCards = rows;
-  }
-}
-
-function roleCellHtml(role) {
-  if (role === 'none' || !role) return '<span class="tb-role-cell-empty">—</span>';
-  return `<span class="tb-role-pill tb-role-pill--${escapeAttr(role)}">${escapeHtml(T(`replication.role_${role}`))}</span>`;
-}
-
-function roleMatrixRowHtml(row, nodes) {
-  const key = row._key;
-  const cells = nodes.map((n) => `<td id="tb-repl-cell-${key}-${escapeAttr(n.nodeId)}">${roleCellHtml(row.cells[n.nodeId])}</td>`).join('');
-  const reasonKey = unavailableReasonI18nKey(row.unavailableReason);
-  const actions = canAdmin() ? `
-    <td class="tb-row-actions">
-      <tf-button variant="ghost" size="sm" class="tb-repl-transfer-leader" data-partition="${row.partition}">${escapeHtml(T('replication.action_transfer_leader'))}</tf-button>
-      <tf-button variant="ghost" size="sm" class="tb-repl-reassign" data-partition="${row.partition}">${escapeHtml(T('replication.action_reassign'))}</tf-button>
-    </td>` : '';
-  return `
-    <tr class="${row.unavailableReason ? 'tb-row-unavailable' : ''}" id="tb-repl-row-${key}">
-      <td>
-        ${escapeHtml(T('partition_label', { n: row.partition }))}
-        ${reasonKey ? `<div class="tf-chip tf-chip--outline warn tb-role-unavailable-chip">${escapeHtml(T(reasonKey))}</div>` : ''}
-      </td>
-      ${cells}
-      <td class="mono" id="tb-repl-epoch-${key}">${escapeHtml(T('replication.epoch_value', { n: row.leaderEpoch }))}</td>
-      ${actions}
-    </tr>
-  `;
-}
-
-function roleMatrixTableHtml(rows, nodes) {
-  const nodeCols = nodes.map((n) => `<th>${escapeHtml(n.label || n.nodeId)}</th>`).join('');
-  return `
-    <table class="tb-role-matrix" id="tb-repl-matrix-table" style="width:100%;border-collapse:collapse;font-size:12px">
-      <thead><tr>
-        <th>${escapeHtml(T('replication.matrix_col_partition'))}</th>
-        ${nodeCols}
-        <th>${escapeHtml(T('replication.matrix_col_epoch'))}</th>
-        ${canAdmin() ? `<th>${escapeHtml(T('replication.matrix_col_actions'))}</th>` : ''}
-      </tr></thead>
-      <tbody>${rows.map((r) => roleMatrixRowHtml(r, nodes)).join('')}</tbody>
-    </table>
-  `;
-}
-
-function patchRoleMatrixRow(body, row, nodeIds) {
-  const key = CSS.escape(row._key);
-  const tr = body.querySelector(`#tb-repl-row-${key}`);
-  if (!tr) return;
-  tr.classList.toggle('tb-row-unavailable', !!row.unavailableReason);
-  nodeIds.forEach((id) => {
-    const cell = tr.querySelector(`#tb-repl-cell-${key}-${CSS.escape(id)}`);
-    if (cell) cell.innerHTML = roleCellHtml(row.cells[id]);
-  });
-  patchText(tr.querySelector(`#tb-repl-epoch-${key}`), T('replication.epoch_value', { n: row.leaderEpoch }));
-}
-
-function wireRoleMatrixActions(body, topic) {
-  body.querySelectorAll('.tb-repl-transfer-leader').forEach((btn) => {
-    btn.addEventListener('click', () => openLeaderTransferModal(topic, Number(btn.dataset.partition)));
-  });
-  body.querySelectorAll('.tb-repl-reassign').forEach((btn) => {
-    btn.addEventListener('click', () => openReassignModal(topic, Number(btn.dataset.partition)));
-  });
-}
-
-// Without a chosen topic a card asks for one — unless there is none to choose.
-function replNoTopicKey(pickKey) {
-  return state.topicsLoaded && state.topics.length === 0 ? 'replication.no_topics' : pickKey;
-}
-
-function paintReplMatrix() {
-  const titleEl = byId('tb-repl-matrix-title');
-  const body = byId('tb-repl-matrix-body');
-  if (!body) return;
-  const topic = state.repl.topic;
-  if (!topic) {
-    patchText(titleEl, T('replication.matrix_title_generic'));
-    body.innerHTML = `<div class="tb-state tb-empty">${escapeHtml(T(replNoTopicKey('replication.matrix_select_topic')))}</div>`;
-    state.dom.roleMatrix = null;
-    return;
-  }
-  patchText(titleEl, T('replication.matrix_title', { topic }));
-  const partitions = state.repl.data?.partitions || [];
-  const nodes = state.repl.data?.nodes || [];
-  const nodeIds = nodes.map((n) => n.nodeId);
-  const rows = buildRoleMatrix(partitions, nodeIds).map((row) => ({ ...row, _key: String(row.partition) }));
-  if (!rows.length) {
-    body.innerHTML = `<div class="tb-state tb-empty">${escapeHtml(T('empty_topics'))}</div>`;
-    state.dom.roleMatrix = null;
-    return;
-  }
-  const diff = diffRowsByKey(state.dom.roleMatrix, rows, (r) => r._key);
-  if (state.dom.roleMatrix == null || diff.added.length || diff.removed.length) {
-    body.innerHTML = roleMatrixTableHtml(rows, nodes);
-    state.dom.roleMatrix = rows;
-    wireRoleMatrixActions(body, topic);
-    return;
-  }
-  if (diff.updated.length) {
-    rows.forEach((row) => patchRoleMatrixRow(body, row, nodeIds));
-    state.dom.roleMatrix = rows;
-  }
-}
-
-// Module-doc gap #10: no shrink/expand HISTORY exists on the wire (PLAN-M2
-// §1e — only a metric + a UI event, never an audit row), so this renders
-// the partitions' CURRENT `lagging[]` entries as a flat state list, not the
-// mockup's illustrative timeline.
-function paintReplLagState() {
-  const host = byId('tb-repl-lag-state');
-  if (!host) return;
-  const topic = state.repl.topic;
-  if (!topic) {
-    host.innerHTML = `<div class="tb-state tb-empty">${escapeHtml(T(replNoTopicKey('replication.lag_state_select_topic')))}</div>`;
-    return;
-  }
-  const nodes = state.repl.data?.nodes || [];
-  const items = [];
-  for (const p of (state.repl.data?.partitions || [])) {
-    for (const lag of (Array.isArray(p.lagging) ? p.lagging : [])) {
-      items.push({ partition: p.partition, ...lag });
-    }
-  }
-  const gapNote = `<div class="tb-gap-note">${sprite('info')}${escapeHtml(T('replication.lag_state_gap_note'))}</div>`;
-  if (!items.length) {
-    host.innerHTML = `${gapNote}<div class="tb-state tb-empty">${escapeHtml(T('replication.lag_state_empty'))}</div>`;
-    return;
-  }
-  const list = items.map((it) => `
-    <div class="tb-lag-item">
-      <div class="tb-lag-item-head">${escapeHtml(T('replication.partition_on_node', { partition: it.partition, node: nodeLabelById(nodes, it.nodeId) }))}</div>
-      <div class="tb-lag-item-body">${escapeHtml(T('replication.lag_item_reason', {
-        reason: it.reason || T('replication.node_lagging_reason_unknown'),
-        bytes: formatBytes(it.lagBytes),
-        ms: fmtCompact(Number(it.lagMs) || 0),
-      }))}</div>
-    </div>
-  `).join('');
-  host.innerHTML = `${gapNote}<div class="tb-lag-list">${list}</div>`;
-}
-
-function failoverKey(e) {
-  return `${e.topic}|${e.partition}|${e.atMs}`;
-}
-
-function failoverRowHtml(e) {
-  return `
-    <tr>
-      <td class="mono">${escapeHtml(e.topic)} · ${escapeHtml(T('partition_label', { n: e.partition }))}</td>
-      <td><span class="tf-chip tf-chip--outline">${escapeHtml(T('replication.epoch_change', { from: e.fromEpoch, to: e.toEpoch }))}</span></td>
-      <td class="mono">${escapeHtml(e.fromNode)} → ${escapeHtml(e.toNode)}</td>
-      <td>${fmtCompact((Number(e.durationMs) || 0) / 1000)} s</td>
-      <td>${escapeHtml(msToDate(e.atMs))}</td>
-    </tr>
-  `;
-}
-
-// Append-only (task requirement: "timeline appended"). Newest-first per the
-// mockup's own ordering (m06:135-143); sorted defensively rather than
-// trusting the server already returns that order. A poll that brought back
-// NO new event (the common case) never touches `tbody` at all — only genuinely
-// new keys get a `<tr>` inserted, at the top.
-function paintReplFailovers() {
-  const body = byId('tb-repl-failover-body');
-  const emptyEl = byId('tb-repl-failover-empty');
-  if (!body) return;
-  const events = Array.isArray(state.repl.data?.failovers) ? state.repl.data.failovers : [];
-  if (!events.length) {
-    body.innerHTML = '';
-    state.dom.failoverKeys = new Set();
-    if (emptyEl) emptyEl.hidden = false;
-    return;
-  }
-  if (emptyEl) emptyEl.hidden = true;
-  const sorted = [...events].sort((a, b) => (Number(b.atMs) || 0) - (Number(a.atMs) || 0));
-  const known = state.dom.failoverKeys instanceof Set ? state.dom.failoverKeys : new Set();
-  const newOnes = sorted.filter((e) => !known.has(failoverKey(e)));
-  if (body.children.length === 0 || newOnes.length === sorted.length) {
-    body.innerHTML = sorted.map(failoverRowHtml).join('');
-  } else if (newOnes.length) {
-    // Insert as ONE chunk (not one `insertAdjacentHTML('afterbegin', …)` per
-    // row) — `newOnes` is already newest-first; inserting row-by-row at
-    // 'afterbegin' would reverse THEIR relative order whenever a single poll
-    // brings back more than one new failover at once.
-    body.insertAdjacentHTML('afterbegin', newOnes.map(failoverRowHtml).join(''));
-  }
-  state.dom.failoverKeys = new Set(sorted.map(failoverKey));
-}
-
-function nodeLabelById(nodes, nodeId) {
-  const n = (Array.isArray(nodes) ? nodes : []).find((x) => x.nodeId === nodeId);
-  return n?.label || nodeId || '—';
-}
-
-// "Przenieś lidera" (mockup's action on a role-matrix row) — target list is
-// ISR-only (`leaderTransferCandidates`), same confirm-dialog/focus-trap
-// shape as `openOffsetResetModal` above (this module has no shared
-// "dialog with one <tf-select>" builder to call into).
-function openLeaderTransferModal(topic, partition) {
-  const row = (state.repl.data?.partitions || []).find((p) => p.partition === partition);
-  if (!row) return;
-  const candidates = leaderTransferCandidates(row);
-  if (!candidates.length) {
-    toast(T('replication.transfer_no_candidates'), 'error');
-    return;
-  }
-  const nodes = state.repl.data?.nodes || [];
-  const body = document.createElement('div');
-  body.className = 'tb-wizard-form tb-reset-form';
-  body.innerHTML = `
-    <p>${escapeHtml(T('replication.transfer_modal_body', { topic, partition }))}</p>
-    <tf-select id="tb-transfer-target" label="${escapeAttr(T('replication.transfer_field_target'))}" value="${escapeAttr(candidates[0])}">
-      ${candidates.map((id) => `<option value="${escapeAttr(id)}">${escapeHtml(nodeLabelById(nodes, id))}</option>`).join('')}
-    </tf-select>
-    <p class="tb-field-hint">${escapeHtml(T('replication.transfer_hint'))}</p>
-  `;
-
-  const modal = document.createElement('tf-modal');
-  modal.setAttribute('title', T('replication.transfer_title'));
-  modal.setAttribute('variant', 'modal');
-  modal.setAttribute('size', 'sm');
-  const bodySlot = document.createElement('div');
-  bodySlot.setAttribute('slot', 'body');
-  bodySlot.appendChild(body);
-  modal.appendChild(bodySlot);
-  const footer = document.createElement('div');
-  footer.setAttribute('slot', 'footer');
-  footer.className = 'tb-modal-footer';
-  const cancel = document.createElement('tf-button');
-  cancel.setAttribute('variant', 'secondary');
-  cancel.textContent = T('common_cancel');
-  cancel.addEventListener('click', () => closeModal(modal));
-  const confirm = document.createElement('tf-button');
-  confirm.setAttribute('variant', 'primary');
-  confirm.textContent = T('replication.transfer_confirm');
-  confirm.addEventListener('click', async () => {
-    const targetNodeId = body.querySelector('#tb-transfer-target')?.value;
-    if (!targetNodeId) return;
-    try {
-      await ApiBinary.action('busLeaderTransferRequest', buildLeaderTransferRequest(state.instanceId, topic, partition, targetNodeId));
-      toast(T('replication.transfer_done'), 'success');
-      closeModal(modal);
-      await loadReplication(state.repl.topic);
-    } catch (err) {
-      toast(mapBusErrorMessage(err?.message, T), 'error');
-    }
-  });
-  footer.append(cancel, confirm);
-  modal.appendChild(footer);
-  document.body.appendChild(modal);
-  modal.setAttribute('open', '');
-  trapModalFocus(modal);
-  modal.addEventListener('close', () => closeModal(modal), { once: true });
-}
-
-// "Zmień repliki" — multiselect of nodes, filtered to the session's own
-// environment (SPEC D4); a foreign-env node renders disabled with a
-// tooltip instead of being omitted, exactly like M02's node picker below
-// (`wireNodePicker`'s doc), reusing the same `.tb-node-picker`/
-// `.tb-node-picker-item` markup and CSS.
-async function openReassignModal(topic, partition) {
-  const localEnv = await getLocalEnvironment();
-  const nodes = state.repl.data?.nodes || [];
-  const row = (state.repl.data?.partitions || []).find((p) => p.partition === partition);
-  const currentReplicas = new Set(row?.replicas || []);
-
-  const body = document.createElement('div');
-  body.className = 'tb-wizard-form';
-  const items = nodes.map((n) => {
-    const foreign = !isSameEnvironment(n, localEnv);
-    return `
-      <label class="tb-node-picker-item${foreign ? ' is-foreign' : ''}"${foreign ? ` title="${escapeAttr(T('replication.reassign_foreign_tooltip'))}"` : ''}>
-        <input type="checkbox" value="${escapeAttr(n.nodeId)}" ${foreign ? 'disabled' : ''} ${currentReplicas.has(n.nodeId) ? 'checked' : ''} />
-        <span class="tb-node-picker-name">${escapeHtml(n.label || n.nodeId)}</span>
-        ${chipHtml(envChip(n.environment))}
-      </label>
-    `;
-  }).join('');
-  body.innerHTML = `
-    <p>${escapeHtml(T('replication.reassign_modal_body', { topic, partition }))}</p>
-    <fieldset class="tb-node-picker" id="tb-reassign-nodes" aria-labelledby="tb-reassign-nodes-legend">
-      <legend id="tb-reassign-nodes-legend">${escapeHtml(T('replication.reassign_field_nodes'))}</legend>
-      ${items || `<p class="tb-field-hint">${escapeHtml(T('replication.nodes_empty'))}</p>`}
-    </fieldset>
-    <p class="tb-field-hint">${escapeHtml(T('replication.reassign_hint'))}</p>
-  `;
-
-  const modal = document.createElement('tf-modal');
-  modal.setAttribute('title', T('replication.reassign_title'));
-  modal.setAttribute('variant', 'modal');
-  modal.setAttribute('size', 'sm');
-  const bodySlot = document.createElement('div');
-  bodySlot.setAttribute('slot', 'body');
-  bodySlot.appendChild(body);
-  modal.appendChild(bodySlot);
-  const footer = document.createElement('div');
-  footer.setAttribute('slot', 'footer');
-  footer.className = 'tb-modal-footer';
-  const cancel = document.createElement('tf-button');
-  cancel.setAttribute('variant', 'secondary');
-  cancel.textContent = T('common_cancel');
-  cancel.addEventListener('click', () => closeModal(modal));
-  const confirm = document.createElement('tf-button');
-  confirm.setAttribute('variant', 'primary');
-  confirm.textContent = T('replication.reassign_confirm');
-  confirm.addEventListener('click', async () => {
-    const replicas = Array.from(body.querySelectorAll('input[type="checkbox"]:checked')).map((c) => c.value);
-    if (!replicas.length) {
-      toast(T('replication.reassign_empty_error'), 'error');
-      return;
-    }
-    try {
-      await ApiBinary.action('busReassignRequest', buildReassignRequest(state.instanceId, topic, partition, replicas));
-      toast(T('replication.reassign_done'), 'success');
-      closeModal(modal);
-      await loadReplication(state.repl.topic);
-    } catch (err) {
-      toast(mapBusErrorMessage(err?.message, T), 'error');
-    }
-  });
-  footer.append(cancel, confirm);
-  modal.appendChild(footer);
-  document.body.appendChild(modal);
-  modal.setAttribute('open', '');
-  trapModalFocus(modal);
-  modal.addEventListener('close', () => closeModal(modal), { once: true });
-}
-
-// M03's "otwórz w M06" button: switches straight to the replication tab
-// with this topic pre-selected, same as a real tab click.
-function openReplicationForTopic(topicName) {
-  state.view = null;
-  state.tab = 'replication';
-  state.repl.topic = topicName;
-  state.repl.loaded = false;
-  renderPanel();
 }
 
 export default TentaBusScreen;

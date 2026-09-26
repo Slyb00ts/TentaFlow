@@ -83,6 +83,26 @@ export function fmtRetention(ms) {
 }
 
 /**
+ * A short span of time as a setting states it: "500 ms", "2 s", "1 min",
+ * "1 godz.". Uneven values fall back to the unit below (90 s stays "90 s").
+ */
+export function fmtDuration(ms) {
+  const value = Math.max(0, Math.round(Number(ms) || 0));
+  if (value < 1000) return T('fmt.millis', { count: fmtCount(value) });
+  if (value % 3_600_000 === 0) return T('fmt.hours', { count: fmtCount(value / 3_600_000), n: value / 3_600_000 });
+  if (value % 60_000 === 0) return T('fmt.minutes', { count: fmtCount(value / 60_000), n: value / 60_000 });
+  const secs = Math.round(value / 1000);
+  return T('fmt.seconds', { count: fmtCount(secs), n: secs });
+}
+
+/** A calendar date in the reader's locale: "24.08.2026". `—` for no value. */
+export function fmtDate(ms) {
+  const at = new Date(Number(ms));
+  if (ms == null || !Number.isFinite(at.getTime())) return '—';
+  return new Intl.DateTimeFormat(I18n.getLanguage(), { day: '2-digit', month: '2-digit', year: 'numeric' }).format(at);
+}
+
+/**
  * When a message was written, the way the preview says it: "dziś 14:09:59",
  * "wczoraj 22:03:11", otherwise the date and the time.
  */

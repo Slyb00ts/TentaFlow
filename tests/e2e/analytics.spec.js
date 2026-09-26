@@ -226,7 +226,12 @@ function scenarios({ mobile }) {
     await expect(page.locator('#an-users-table tbody')).toContainText(MARTA_NAME);
     await expectCellTitlesAreNames(page, '#an-users-table');
     await expect(page.locator('#an-users-card-foot')).not.toBeEmpty();
-    if (mobile) await expectNoOverflow(page, 'users');
+    if (mobile) {
+      await expectNoOverflow(page, 'users');
+      // A flush table keeps the line between its rows on a phone.
+      const secondRowCell = page.locator('#an-users-table tbody tr').nth(1).locator('td').first();
+      expect(await secondRowCell.evaluate((el) => getComputedStyle(el).borderTopWidth)).toBe('1px');
+    }
     await expectNoRawControls(page);
 
     // Groups sub-view: keyed by group id, rendered by name with a member count.
