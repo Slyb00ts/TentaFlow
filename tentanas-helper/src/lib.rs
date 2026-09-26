@@ -742,6 +742,18 @@ pub enum HelperCommand {
     /// go away with the last audited export and with the uninstall.
     AuditRulesClear {},
 
+    // ----- process sandbox: user namespaces for bwrap -----
+    /// Writes [`BWRAP_APPARMOR_PROFILE`] to [`BWRAP_APPARMOR_PATH`] from stdin.
+    /// A kernel with `apparmor_restrict_unprivileged_userns=1` (Ubuntu 23.10+)
+    /// denies `bwrap` the user namespace the agent sandbox is built on unless a
+    /// profile grants `userns`; this is that profile, the same shape Ubuntu
+    /// ships for flatpak. The payload is checked against the constant before
+    /// anything runs, so the entry can write exactly one document.
+    BwrapProfileWrite {},
+    /// Loads the written profile into the running kernel, so the sandbox works
+    /// without a reboot.
+    BwrapProfileLoad {},
+
     // ----- block targets: iSCSI (LIO) and NVMe-oF (nvmet), §5.5 -----
     /// Builtin: loads the kernel target modules and makes sure configfs is
     /// mounted, so `/sys/kernel/config/{target,nvmet}` exist.
@@ -879,6 +891,19 @@ const ZFS: &[&str] = &["/usr/sbin/zfs", "/usr/bin/zfs", "/sbin/zfs"];
 /// and so a reader of the catalog can see there is no command that drops it.
 pub const PROTECTED_HOLD_TAG: &str = "tentanas:protected";
 const SMBSTATUS: &[&str] = &["/usr/bin/smbstatus", "/usr/sbin/smbstatus", "/sbin/smbstatus"];
+const TEE: &[&str] = &["/usr/bin/tee", "/bin/tee"];
+const APPARMOR_PARSER: &[&str] = &["/usr/sbin/apparmor_parser", "/sbin/apparmor_parser"];
+
+/// Where the bwrap profile lives: the name Ubuntu's own documentation uses for
+/// it, in the directory the AppArmor service loads at boot.
+pub const BWRAP_APPARMOR_PATH: &str = "/etc/apparmor.d/bwrap";
+/// The ABI the profile declares. The `userns` rule exists from AppArmor 4 on,
+/// which is also the first release that restricts unprivileged namespaces — a
+/// host without it has nothing to lift.
+const APPARMOR_ABI_4: &str = "/etc/apparmor.d/abi/4.0";
+/// The whole profile. Unconfined apart from naming the program, so it grants
+/// `bwrap` the namespaces and nothing else; `bwrap` itself is what confines.
+pub const BWRAP_APPARMOR_PROFILE: &str = "abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap /usr/bin/bwrap flags=(unconfined) {\n  userns,\n\n  include if exists <local/bwrap>\n}\n";
 /// The access log is read from the journal, which is where a systemd host's
 /// syslog lands. A host whose syslog is elsewhere has no journalctl, and the
 /// collector reports that instead of quietly reading a second source it cannot
@@ -2117,6 +2142,16 @@ fn encryption_flags(flag: &str, args: &mut Vec<String>) {
     }
 }
 
+/// AppArmor 4 on this host, which both bwrap entries need: its ABI file is what
+/// the profile declares, and without it the kernel is not restricting anything.
+fn apparmor_4() -> Result<(), CatalogError> {
+    if Path::new(APPARMOR_ABI_4).is_file() {
+        Ok(())
+    } else {
+        Err(CatalogError::ToolMissing("AppArmor 4"))
+    }
+}
+
 fn find_tool(tool: &'static str, candidates: &[&str]) -> Result<PathBuf, CatalogError> {
     candidates
         .iter()
@@ -2921,7 +2956,35 @@ impl HelperCommand {
                     env: env_c,
                 })
             }
+            Self::BwrapProfileWrite {} => {
+                apparmor_4()?;
+                Ok(Resolved {
+                    program: find_tool("tee", TEE)?,
+                    args: vec![BWRAP_APPARMOR_PATH.into()],
+                    env: env_c,
+                })
+            }
+            Self::BwrapProfileLoad {} => {
+                apparmor_4()?;
+                Ok(Resolved {
+                    program: find_tool("apparmor_parser", APPARMOR_PARSER)?,
+                    args: vec!["-r".into(), BWRAP_APPARMOR_PATH.into()],
+                    env: env_c,
+                })
+            }
             other => Err(invalid(format!("{other:?} has no exec form"))),
+        }
+    }
+
+    /// Checks what a stdin-reading entry is about to be given, where the
+    /// catalog can say what it has to be. Only the bwrap profile has one
+    /// possible document; the others validate their payload in their builtin.
+    pub fn validate_payload(&self, payload: &[u8]) -> Result<(), CatalogError> {
+        match self {
+            Self::BwrapProfileWrite {} if payload != BWRAP_APPARMOR_PROFILE.as_bytes() => Err(
+                invalid("the bwrap profile write takes only the catalog's own profile".to_string()),
+            ),
+            _ => Ok(()),
         }
     }
 
@@ -2944,7 +3007,8 @@ impl HelperCommand {
             // The target specs carry CHAP / DH-HMAC-CHAP secrets, so they take
             // the same road every other secret does: stdin, never argv.
             | Self::IscsiTargetApply {}
-            | Self::NvmetSubsystemApply {} => true,
+            | Self::NvmetSubsystemApply {}
+            | Self::BwrapProfileWrite {} => true,
             _ => false,
         }
     }
@@ -3118,6 +3182,11 @@ impl HelperCommand {
                 "Install auditd watches on the audited NFS export paths.",
             ),
             Self::AuditRulesClear {} => ("builtin", "Remove the app-owned auditd watches."),
+            Self::BwrapProfileWrite {} => (
+                "tee",
+                "Write the AppArmor profile that lets bwrap create the agent sandbox's user namespace.",
+            ),
+            Self::BwrapProfileLoad {} => ("apparmor_parser", "Load the bwrap AppArmor profile into the kernel."),
             Self::BlockModulesLoad { .. } => (
                 "builtin",
                 "Load the kernel target modules (LIO / nvmet) and mount configfs — nothing else on the node does it.",
@@ -3358,6 +3427,8 @@ fn catalog_examples() -> Vec<HelperCommand> {
         },
         HelperCommand::AuditRulesWrite {},
         HelperCommand::AuditRulesClear {},
+        HelperCommand::BwrapProfileWrite {},
+        HelperCommand::BwrapProfileLoad {},
         HelperCommand::BlockModulesLoad {
             protocol: String::from("iscsi"),
         },
@@ -3395,6 +3466,28 @@ pub fn catalog() -> Vec<CatalogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bwrap entries write exactly one document to exactly one path and
+    /// load it; any other payload is refused before a process starts.
+    #[test]
+    fn bwrap_profile_entries_take_only_the_catalog_profile() {
+        let write = HelperCommand::BwrapProfileWrite {};
+        assert!(write.reads_key_from_stdin());
+        assert!(!HelperCommand::BwrapProfileLoad {}.reads_key_from_stdin());
+        assert_eq!(write.validate_payload(BWRAP_APPARMOR_PROFILE.as_bytes()), Ok(()));
+        assert!(write.validate_payload(b"profile bwrap /usr/bin/bwrap {}\n").is_err());
+        assert!(write.validate_payload(b"").is_err());
+        assert!(BWRAP_APPARMOR_PROFILE.contains("userns,"));
+        assert!(BWRAP_APPARMOR_PROFILE.contains("profile bwrap /usr/bin/bwrap"));
+
+        // The resolved argv, where this host has the tools to resolve it.
+        if let Ok(Plan::Exec(resolved)) = write.plan() {
+            assert_eq!(resolved.args, vec![BWRAP_APPARMOR_PATH.to_string()]);
+        }
+        if let Ok(Plan::Exec(resolved)) = (HelperCommand::BwrapProfileLoad {}).plan() {
+            assert_eq!(resolved.args, vec!["-r".to_string(), BWRAP_APPARMOR_PATH.to_string()]);
+        }
+    }
 
     #[test]
     fn whole_disk_names_only() {

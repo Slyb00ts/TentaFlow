@@ -229,6 +229,11 @@ pub struct RuntimeNodeInfo {
     /// picker already carries one.
     #[serde(default)]
     pub is_local: bool,
+    /// Why `sandbox_capable` is false, so the matrix can offer the one repair
+    /// a node can do for itself (`user_namespaces_denied`). Measured by the
+    /// answering node for its own row only, like `sandbox_capable`.
+    #[serde(default)]
+    pub sandbox_cause: Option<crate::code_studio::ProcessSandboxCause>,
 }
 
 /// One cell of the node matrix: the state of one engine on one node.

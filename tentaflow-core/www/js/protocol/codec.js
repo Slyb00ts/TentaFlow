@@ -8520,6 +8520,18 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /**
+   * MessageBody::CodeStudioBody(ProcessSandboxRepairRequest). payload:
+   * { sudoPassword }. Runs on the node the request is addressed to
+   * (`targetNodeId` option), so a peer is repaired by its own root.
+   */
+  codeStudioProcessSandboxRepairRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { sudo_password: String(payload.sudoPassword ?? payload.sudo_password ?? '') };
+    const body = _wasm.encodeCodeStudioProcessSandboxRepairRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   // -------------------------------------------------------------------------
   // Node environment identity + manual config-bundle pull (ROADMAP Z12)
   // -------------------------------------------------------------------------

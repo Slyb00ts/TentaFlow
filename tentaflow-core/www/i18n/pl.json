@@ -12209,5 +12209,19 @@
       "sharing_stop_frozen_targets": "Na tym węźle działa target z przeniesionym portalem — zatrzymanie nie mogłoby go potem przywrócić. Najpierw wybierz ponownie interfejs portalu (TentaNas → Udostępnianie).",
       "sharing_stop_pending_elsewhere": "Na tym węźle czeka już na zatwierdzenie zatrzymanie udostępniania zgłoszone w innej organizacji. Administrator platformy widzi je w TentaNas → Zadania i może je odrzucić."
     }
+  },
+  "sudo_dialog": {
+    "password_label": "Hasło sudo",
+    "password_label_node": "Hasło sudo na nodzie {node}",
+    "password_required": "Podaj hasło sudo.",
+    "not_stored": "Hasło zostanie użyte tylko do tej operacji i nie jest nigdzie zapisywane."
+  },
+  "sandbox_repair": {
+    "title": "Napraw piaskownicę agentów",
+    "action": "Napraw",
+    "problem_userns": "Piaskownica agentów nie działa na {node}: system (AppArmor) nie pozwala bubblewrap tworzyć przestrzeni nazw użytkownika. Bez niej agent nie uruchomi się ani nie zaloguje.",
+    "explain": "TentaFlow zainstaluje na tym nodzie profil AppArmor /etc/apparmor.d/bwrap, który zezwala bubblewrap na przestrzenie nazw użytkownika, i od razu go załaduje. Potrzebne jest jednorazowo hasło sudo.",
+    "done": "Piaskownica agentów działa.",
+    "still_broken": "Profil został zainstalowany, ale piaskownica nadal nie działa: {reason}"
   }
 }

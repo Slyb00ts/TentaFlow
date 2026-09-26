@@ -10974,5 +10974,19 @@
       "sharing_stop_frozen_targets": "Auf diesem Knoten läuft ein Target mit verschobenem Portal — ein Stopp könnte es danach nicht wiederherstellen. Wählen Sie zuerst die Schnittstelle des Portals neu (TentaNas → Freigaben).",
       "sharing_stop_pending_elsewhere": "Auf diesem Knoten wartet bereits ein in einer anderen Organisation angefordertes Stoppen der Freigabe auf Genehmigung. Ein Plattformadministrator sieht es unter TentaNas → Aufgaben und kann es ablehnen."
     }
+  },
+  "sudo_dialog": {
+    "password_label": "sudo-Passwort",
+    "password_label_node": "sudo-Passwort auf Node {node}",
+    "password_required": "Gib das sudo-Passwort ein.",
+    "not_stored": "Das Passwort wird nur für diesen Vorgang verwendet und nirgends gespeichert."
+  },
+  "sandbox_repair": {
+    "title": "Agenten-Sandbox reparieren",
+    "action": "Reparieren",
+    "problem_userns": "Die Agenten-Sandbox funktioniert auf {node} nicht: Das System (AppArmor) erlaubt bubblewrap keine User-Namespaces. Ohne sie kann ein Agent weder laufen noch sich anmelden.",
+    "explain": "TentaFlow installiert auf diesem Node das AppArmor-Profil /etc/apparmor.d/bwrap, das bubblewrap User-Namespaces erlaubt, und lädt es sofort. Dafür wird einmalig das sudo-Passwort benötigt.",
+    "done": "Die Agenten-Sandbox funktioniert.",
+    "still_broken": "Das Profil wurde installiert, aber die Sandbox funktioniert weiterhin nicht: {reason}"
   }
 }

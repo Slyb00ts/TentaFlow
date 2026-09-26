@@ -10974,5 +10974,19 @@
       "sharing_stop_frozen_targets": "En este nodo sigue sirviendo un destino cuyo portal cambió de dirección — una detención no podría restablecerlo después. Elija primero de nuevo la interfaz del portal (TentaNas → Compartición).",
       "sharing_stop_pending_elsewhere": "En este nodo ya espera aprobación una detención de la compartición solicitada en otra organización. Un administrador de la plataforma la ve en TentaNas → Tareas y puede rechazarla."
     }
+  },
+  "sudo_dialog": {
+    "password_label": "Contraseña de sudo",
+    "password_label_node": "Contraseña de sudo en el nodo {node}",
+    "password_required": "Introduce la contraseña de sudo.",
+    "not_stored": "La contraseña se usa solo para esta operación y no se guarda en ningún sitio."
+  },
+  "sandbox_repair": {
+    "title": "Reparar el sandbox de agentes",
+    "action": "Reparar",
+    "problem_userns": "El sandbox de agentes no funciona en {node}: el sistema (AppArmor) no permite a bubblewrap crear espacios de nombres de usuario. Sin él, un agente no puede ejecutarse ni iniciar sesión.",
+    "explain": "TentaFlow instalará en este nodo el perfil de AppArmor /etc/apparmor.d/bwrap, que permite a bubblewrap usar espacios de nombres de usuario, y lo cargará de inmediato. Se necesita la contraseña de sudo una vez.",
+    "done": "El sandbox de agentes funciona.",
+    "still_broken": "El perfil se instaló, pero el sandbox sigue sin funcionar: {reason}"
   }
 }

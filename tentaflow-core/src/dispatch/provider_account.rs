@@ -1102,6 +1102,8 @@ fn runtime_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let configured: HashMap<&str, &crate::provider_accounts::RuntimeNodeRecord> =
         rows.iter().map(|row| (row.node_id.as_str(), row)).collect();
 
+    // Probed once for the whole matrix: the probe starts a process.
+    let local_sandbox = crate::code_studio::process_sandbox::ProcessSandbox::check_available();
     let nodes = order
         .iter()
         .map(|node_id| {
@@ -1116,9 +1118,10 @@ fn runtime_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
                 // Only a node can probe its own process isolation, so a remote
                 // one stays unknown until it reports — the same rule the Code
                 // Studio node picker already applies.
-                sandbox_capable: (node_id == &local_id).then(|| {
-                    crate::code_studio::process_sandbox::ProcessSandbox::check_available().is_ok()
-                }),
+                sandbox_capable: (node_id == &local_id).then(|| local_sandbox.is_ok()),
+                sandbox_cause: (node_id == &local_id)
+                    .then(|| local_sandbox.err().map(|e| crate::code_studio::sandbox_cause(&e)))
+                    .flatten(),
                 // Same rule, same reason: this process knows what IT runs on,
                 // and a peer's operating system is its own report to make.
                 os: (node_id == &local_id)

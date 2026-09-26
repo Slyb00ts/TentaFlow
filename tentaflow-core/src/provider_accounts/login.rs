@@ -229,6 +229,11 @@ pub async fn start(
             "this account authenticates with a key, so there is nothing to sign in to"
         ));
     }
+    // The CLI signs in inside the agent sandbox. On a node that cannot build
+    // one it died before printing anything, and the person was told only that
+    // no address appeared; the cause is known here, so it is said here.
+    crate::code_studio::process_sandbox::ProcessSandbox::check_available()
+        .map_err(|error| anyhow!("this node cannot isolate an agent process: {error:#}"))?;
     // The bridge's sign-in home starts from whatever credential this node
     // already holds, so a re-login of a replicated account continues the same
     // provider session instead of looking like a first one.

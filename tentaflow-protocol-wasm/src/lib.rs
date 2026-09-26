@@ -23196,6 +23196,15 @@ pub fn encode_code_studio_repo_tree_request(request_json: String) -> Result<Vec<
     encode_code_studio_json_request("RepoTreeRequest", &request_json)
 }
 
+/// MessageBody::CodeStudioBody(ProcessSandboxRepairRequest) — carries the
+/// executing node's sudo password for this one repair.
+#[wasm_bindgen(js_name = encodeCodeStudioProcessSandboxRepairRequest)]
+pub fn encode_code_studio_process_sandbox_repair_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("ProcessSandboxRepairRequest", &request_json)
+}
+
 // =============================================================================
 // Agent provider accounts — `MessageBody::ProviderAccountBody`. Built from a
 // JSON object of the variant's fields, exactly like Code Studio and TentaNas:

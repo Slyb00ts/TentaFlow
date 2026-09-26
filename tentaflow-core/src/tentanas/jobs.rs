@@ -304,6 +304,7 @@ fn command_label(command: &HelperCommand) -> &'static str {
         | HelperCommand::SmbStatus {} => "samba",
         HelperCommand::SmbAuditRead { .. } => "the access audit",
         HelperCommand::AuditRulesWrite {} | HelperCommand::AuditRulesClear {} => "auditd",
+        HelperCommand::BwrapProfileWrite {} | HelperCommand::BwrapProfileLoad {} => "AppArmor",
         HelperCommand::KsmbdConfigWrite {}
         | HelperCommand::KsmbdConfigClear {}
         | HelperCommand::KsmbdUserSet { .. }

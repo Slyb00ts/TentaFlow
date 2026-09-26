@@ -10974,5 +10974,19 @@
       "sharing_stop_frozen_targets": "Une cible dont le portail a changé d'adresse sert encore sur ce nœud — un arrêt ne pourrait pas la rétablir ensuite. Choisissez d'abord à nouveau l'interface du portail (TentaNas → Partage).",
       "sharing_stop_pending_elsewhere": "Un arrêt du partage demandé dans une autre organisation attend déjà son approbation sur ce nœud. Un administrateur de la plateforme le voit dans TentaNas → Tâches et peut le rejeter."
     }
+  },
+  "sudo_dialog": {
+    "password_label": "Mot de passe sudo",
+    "password_label_node": "Mot de passe sudo sur le nœud {node}",
+    "password_required": "Saisissez le mot de passe sudo.",
+    "not_stored": "Le mot de passe sert uniquement à cette opération et n'est enregistré nulle part."
+  },
+  "sandbox_repair": {
+    "title": "Réparer le bac à sable des agents",
+    "action": "Réparer",
+    "problem_userns": "Le bac à sable des agents ne fonctionne pas sur {node} : le système (AppArmor) n'autorise pas bubblewrap à créer des espaces de noms utilisateur. Sans lui, un agent ne peut ni s'exécuter ni se connecter.",
+    "explain": "TentaFlow va installer sur ce nœud le profil AppArmor /etc/apparmor.d/bwrap, qui autorise bubblewrap à utiliser les espaces de noms utilisateur, et le charger immédiatement. Le mot de passe sudo est nécessaire une seule fois.",
+    "done": "Le bac à sable des agents fonctionne.",
+    "still_broken": "Le profil a été installé, mais le bac à sable ne fonctionne toujours pas : {reason}"
   }
 }

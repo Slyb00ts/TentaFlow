@@ -225,6 +225,7 @@ async fn run_with_stdin(
     // Validate against the catalog BEFORE choosing a channel: a bad device
     // name must fail the same way whether or not the node is armed.
     let plan = command.plan().map_err(catalog)?;
+    command.validate_payload(payload.unwrap_or_default()).map_err(catalog)?;
     if let Some(out) = recorded(db, command, payload) {
         return Ok((out, Channel::Helper));
     }
@@ -240,12 +241,7 @@ async fn run_with_stdin(
     // system, so it is not an invocation.
     if let Some(token) = explicit {
         record_invocation(db);
-        let out = match exec {
-            Some(resolved) => sudo_argv(token, resolved, payload, timeout).await?,
-            None => {
-                through_helper(&helper_binary()?, Some(token), command, payload, timeout).await?
-            }
-        };
+        let out = explicit_channel(command, exec, payload, token, timeout).await?;
         return Ok((out, Channel::Explicit));
     }
     match super::elevation::mode(db) {
@@ -276,6 +272,46 @@ async fn run_with_stdin(
             Ok((out, Channel::Interactive))
         }
         super::elevation::Mode::Unset => Err(BrokerError::Unarmed("privilege mode not configured")),
+    }
+}
+
+/// Runs one catalog command as root with a password the operator has just
+/// typed, for a surface outside TentaNas (the agent sandbox repair). There is
+/// no TentaNas instance behind it, so there is no configured channel to fall
+/// back on and no instance tally to count it in — the catalog, the payload
+/// check and `sudo -S` are exactly the TentaNas explicit path.
+pub async fn run_with_password(
+    command: &HelperCommand,
+    payload: Option<&[u8]>,
+    token: &ElevationToken,
+    timeout: Duration,
+) -> Result<CommandOutput, BrokerError> {
+    let plan = command.plan().map_err(catalog)?;
+    command.validate_payload(payload.unwrap_or_default()).map_err(catalog)?;
+    if payload.is_some() != command.reads_key_from_stdin() {
+        return Err(BrokerError::InvalidArgument(
+            "stdin payload does not match what the command takes".to_string(),
+        ));
+    }
+    let exec = match &plan {
+        Plan::Exec(resolved) => Some(resolved),
+        Plan::Builtin(_) => None,
+    };
+    explicit_channel(command, exec, payload, token, timeout).await
+}
+
+/// The explicit channel: an exec entry straight under `sudo -S`, a builtin
+/// through the helper binary under the same password.
+async fn explicit_channel(
+    command: &HelperCommand,
+    exec: Option<&tentanas_helper::Resolved>,
+    payload: Option<&[u8]>,
+    token: &ElevationToken,
+    timeout: Duration,
+) -> Result<CommandOutput, BrokerError> {
+    match exec {
+        Some(resolved) => sudo_argv(token, resolved, payload, timeout).await,
+        None => through_helper(&helper_binary()?, Some(token), command, payload, timeout).await,
     }
 }
 
@@ -597,7 +633,7 @@ mod tests {
         // A NEWER helper is refused for the same reason: neither build speaks
         // this core's sequence.
         assert!(matches!(
-            version_gate(&elastic, Some("0.16.0")),
+            version_gate(&elastic, Some("99.0.0")),
             Err(BrokerError::HelperVersion(_))
         ));
 

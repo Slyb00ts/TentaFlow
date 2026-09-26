@@ -967,6 +967,100 @@ fn route_target(payload: &CodeStudioPayload) -> Option<(&str, &str)> {
     }
 }
 
+/// Repairs THIS node's process sandbox where root can: a kernel that denies
+/// `bwrap` user namespaces gets the AppArmor profile that grants them, written
+/// and loaded through the helper catalog under the password the operator just
+/// typed. Any other cause is not something a password fixes, so it is answered
+/// with the sandbox as it stands.
+///
+/// Root on the node is the operator's: the org Admin ROLE is required, not a
+/// Code Studio permission the matrix could delegate — the same line TentaNas
+/// draws for its privilege channel. The answer is the probe run AFTER the
+/// repair, so the caller shows what is true now.
+async fn process_sandbox_repair_v1(
+    ctx: &HandlerContext,
+    sudo_password: &tentaflow_protocol::tentanas::SudoSecret,
+) -> Result<MessageBody, ProtocolError> {
+    let is_org_admin = ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin"));
+    if !is_org_admin {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "org Admin role required",
+        ));
+    }
+    use crate::code_studio::process_sandbox::{ProcessSandbox, SandboxUnavailable};
+    if ProcessSandbox::check_available() == Err(SandboxUnavailable::UserNamespacesDenied) {
+        if sudo_password.0.is_empty() {
+            return Err(ProtocolError::bad_request("sudo password required"));
+        }
+        let token = crate::profiling::collectors::elevation::ElevationToken::new_sudo(
+            sudo_password.0.clone(),
+        );
+        // Checked on its own first, so a mistyped password reads as one and
+        // not as a failed profile write.
+        crate::profiling::elevation_runner::ElevationRunner::validate_sudo(&token)
+            .await
+            .map_err(|e| {
+                ProtocolError::new(
+                    ProtocolErrorCode::PolicyDenied,
+                    format!("sudo rejected the password: {e}"),
+                )
+            })?;
+        let steps: [(tentanas_helper::HelperCommand, Option<&[u8]>); 2] = [
+            (
+                tentanas_helper::HelperCommand::BwrapProfileWrite {},
+                Some(tentanas_helper::BWRAP_APPARMOR_PROFILE.as_bytes()),
+            ),
+            (tentanas_helper::HelperCommand::BwrapProfileLoad {}, None),
+        ];
+        for (command, payload) in &steps {
+            let out = crate::tentanas::broker::run_with_password(
+                command,
+                *payload,
+                &token,
+                std::time::Duration::from_secs(60),
+            )
+            .await
+            .map_err(sandbox_repair_error)?;
+            if !out.success() {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::NotAvailable,
+                    format!(
+                        "{} failed: {}",
+                        command.variant_name(),
+                        out.stderr.trim().lines().last().unwrap_or("no output")
+                    ),
+                ));
+            }
+        }
+        ProcessSandbox::forget_availability_probe();
+        tracing::info!("process sandbox: installed the bwrap AppArmor profile");
+    }
+    let refusal = ProcessSandbox::check_available().err();
+    Ok(MessageBody::CodeStudioBody(
+        CodeStudioPayload::ProcessSandboxRepairResponse {
+            supports_process_sandbox: refusal.is_none(),
+            process_sandbox_cause: refusal.as_ref().map(crate::code_studio::sandbox_cause),
+            process_sandbox_reason: refusal.as_ref().map(ToString::to_string),
+        },
+    ))
+}
+
+/// A refused repair in words the operator can act on. A wrong password and a
+/// host without AppArmor 4 are the two they will meet; both are said as they
+/// are rather than folded into "internal error".
+fn sandbox_repair_error(error: crate::tentanas::broker::BrokerError) -> ProtocolError {
+    use crate::tentanas::broker::BrokerError;
+    match error {
+        BrokerError::ToolMissing(tool) => ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            format!("{tool} is not installed on this node"),
+        ),
+        BrokerError::InvalidArgument(detail) => ProtocolError::bad_request(detail),
+        other => ProtocolError::new(ProtocolErrorCode::NotAvailable, other.to_string()),
+    }
+}
+
 /// Forwards a call whose workspace lives on another node, or `None` when this
 /// node owns it.
 ///
@@ -1499,6 +1593,9 @@ pub async fn code_studio_dispatch(
             path_prefix,
             limit,
         } => repo_tree_v1(ctx, workspace_id, project_id, commit, path_prefix, *limit),
+        P::ProcessSandboxRepairRequest { sudo_password } => {
+            process_sandbox_repair_v1(ctx, sudo_password).await
+        }
 
         // The `*Stream*` family is answered by `stream_handlers.rs` through a
         // subscription, not here: a request/response dispatcher has nowhere to
@@ -1570,7 +1667,8 @@ pub async fn code_studio_dispatch(
         | P::WorkspaceMemberCandidatesResponse { .. }
         | P::IndexStreamProgress { .. }
         | P::ProjectLinkListResponse { .. }
-        | P::RepoTreeResponse { .. } => Err(ProtocolError::bad_request(
+        | P::RepoTreeResponse { .. }
+        | P::ProcessSandboxRepairResponse { .. } => Err(ProtocolError::bad_request(
             "variant is not a supported code studio request",
         )),
     }
@@ -8620,6 +8718,10 @@ register_code_studio_variant!(
     "CodeStudioRepoTreeRequest",
     "tentaflow_ws_handler_cs_repo_tree"
 );
+register_code_studio_variant!(
+    "CodeStudioProcessSandboxRepairRequest",
+    "tentaflow_ws_handler_cs_process_sandbox_repair"
+);
 
 #[cfg(test)]
 mod tests {
@@ -9282,6 +9384,9 @@ mod tests {
                 path_prefix: String::new(),
                 limit: 10,
             },
+            P::ProcessSandboxRepairRequest {
+                sudo_password: tentaflow_protocol::tentanas::SudoSecret("x".into()),
+            },
         ]
     }
 
@@ -9366,6 +9471,7 @@ mod tests {
                 payload,
                 CodeStudioPayload::WorkspaceCreateRequest { .. }
                     | CodeStudioPayload::WorkspaceCreatorGrantSetRequest { .. }
+                    | CodeStudioPayload::ProcessSandboxRepairRequest { .. }
             );
             let error = code_studio_dispatch(&cs(payload), &fx.ctx)
                 .await

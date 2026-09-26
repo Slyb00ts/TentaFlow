@@ -2348,6 +2348,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Cs::ProjectLinkSetRequest { .. } => "CodeStudioProjectLinkSetRequest",
                 Cs::RepoTreeRequest { .. } => "CodeStudioRepoTreeRequest",
                 Cs::RepoTreeResponse { .. } => "CodeStudioRepoTreeResponse",
+                Cs::ProcessSandboxRepairRequest { .. } => "CodeStudioProcessSandboxRepairRequest",
+                Cs::ProcessSandboxRepairResponse { .. } => "CodeStudioProcessSandboxRepairResponse",
             }
         }
         MessageBody::BusBody(env) => {

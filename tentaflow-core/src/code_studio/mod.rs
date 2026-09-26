@@ -70,6 +70,7 @@ pub fn sandbox_cause(
     use tentaflow_protocol::code_studio::ProcessSandboxCause as Cause;
     match unavailable {
         Unavailable::NoSandboxBinary => Cause::NoSandboxBinary,
+        Unavailable::UserNamespacesDenied => Cause::UserNamespacesDenied,
         Unavailable::SupervisorNotInitialized => Cause::SupervisorNotInitialized,
         Unavailable::MissingCoalition => Cause::MissingCoalition,
         Unavailable::GuiSessionRequired => Cause::GuiSessionRequired,

@@ -12209,5 +12209,19 @@
       "sharing_stop_frozen_targets": "A target whose portal moved still serves on this node — a stop could not put it back afterwards. Re-pick the portal's interface first (TentaNas → Sharing).",
       "sharing_stop_pending_elsewhere": "A stop of sharing requested in another organisation is already waiting for approval on this node. A platform administrator sees it in TentaNas → Tasks and can reject it."
     }
+  },
+  "sudo_dialog": {
+    "password_label": "sudo password",
+    "password_label_node": "sudo password on node {node}",
+    "password_required": "Enter the sudo password.",
+    "not_stored": "The password is used for this operation only and is not stored anywhere."
+  },
+  "sandbox_repair": {
+    "title": "Repair the agent sandbox",
+    "action": "Repair",
+    "problem_userns": "The agent sandbox does not work on {node}: the system (AppArmor) does not let bubblewrap create user namespaces. Without it an agent can neither run nor sign in.",
+    "explain": "TentaFlow will install the AppArmor profile /etc/apparmor.d/bwrap on this node, which allows bubblewrap to use user namespaces, and load it right away. This needs the sudo password once.",
+    "done": "The agent sandbox works.",
+    "still_broken": "The profile was installed, but the sandbox still does not work: {reason}"
   }
 }
