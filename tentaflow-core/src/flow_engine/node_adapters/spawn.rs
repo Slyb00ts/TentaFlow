@@ -108,6 +108,36 @@ impl SpawnNodeAdapter {
         }
     }
 
+    /// What earlier rounds said, for a child that has to act on it. `feedback`
+    /// maps a flow variable (usually an `await_subagents` output) to the heading
+    /// it is shown under; an absent or empty variable adds nothing, so the first
+    /// round of a loop spawns with the plain context.
+    ///
+    /// Every round of a review loop is a fresh run. Without this the planner
+    /// rewrote a plan it was never told had been rejected, the implementer was
+    /// asked to fix objections it could not see, and the critic reviewed from
+    /// zero each time — a loop built that way does not converge, it drifts.
+    fn resolve_feedback(node: &FlowNode, envelope: &FlowEnvelope) -> Option<String> {
+        let entries = node.config.get("feedback")?.as_object()?;
+        let sections: Vec<String> = entries
+            .iter()
+            .filter_map(|(variable, label)| {
+                let variable = variable.trim();
+                let label = label
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(variable);
+                let text = envelope
+                    .variables
+                    .get(variable)
+                    .map(delegated_answer_text)?;
+                (!text.trim().is_empty()).then(|| format!("{label}:\n\n{}", text.trim()))
+            })
+            .collect();
+        (!sections.is_empty()).then(|| sections.join("\n\n"))
+    }
+
     fn output_variable(node: &FlowNode) -> String {
         node.config
             .get("output_variable")
@@ -130,7 +160,13 @@ impl SpawnNodeAdapter {
     ) -> Result<FlowEnvelope> {
         let agent_name = self.resolve_agent_name(node)?;
         let task = Self::resolve_task(node, envelope)?;
-        let context = Self::resolve_context(node, envelope);
+        let context = match (
+            Self::resolve_context(node, envelope),
+            Self::resolve_feedback(node, envelope),
+        ) {
+            (Some(base), Some(feedback)) => Some(format!("{base}\n\n{feedback}")),
+            (base, feedback) => base.or(feedback),
+        };
         let output_variable = Self::output_variable(node);
 
         // §2.5 — the run inherits the flow context's provenance verbatim; nothing
@@ -160,6 +196,40 @@ impl SpawnNodeAdapter {
         out.variables
             .insert(output_variable, FlowValue::Json(run_ids));
         Ok(out)
+    }
+}
+
+/// The answers of delegated runs as one text. An `await_subagents` variable maps
+/// each run id to `{status, result, error}`; only the answers matter to the next
+/// round, and a run that failed contributes its reason instead. Plain text is
+/// taken as it is.
+fn delegated_answer_text(value: &FlowValue) -> String {
+    fn answers(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|item| answers(item, out)),
+            // One run's entry: its answer, else why it has none.
+            Value::Object(map) if map.contains_key("status") => {
+                if let Some(text) = ["result", "error"]
+                    .iter()
+                    .find_map(|key| map.get(*key).and_then(Value::as_str))
+                {
+                    out.push(text.to_string());
+                }
+            }
+            Value::Object(map) => map.values().for_each(|item| answers(item, out)),
+            _ => {}
+        }
+    }
+    match value {
+        FlowValue::Text(text) => text.clone(),
+        FlowValue::Json(json) => {
+            let mut out = Vec::new();
+            answers(json, &mut out);
+            out.retain(|s| !s.trim().is_empty());
+            out.join("\n\n")
+        }
+        _ => String::new(),
     }
 }
 
@@ -315,6 +385,43 @@ mod tests {
         )
         .await
         .expect("spawn parent")
+    }
+
+    /// The first round of a loop has no earlier answers, so nothing is added.
+    #[test]
+    fn feedback_is_empty_before_the_first_round() {
+        let node = node(json!({"feedback": {"plan_verdict": "Uwagi"}}));
+        assert_eq!(SpawnNodeAdapter::resolve_feedback(&node, &FlowEnvelope::empty()), None);
+    }
+
+    /// A later round sees what the critic answered, under its label, and a
+    /// failed run contributes its reason; bookkeeping fields are left out.
+    #[test]
+    fn feedback_carries_the_answers_of_the_previous_round() {
+        let node = node(json!({"feedback": {
+            "plan_verdict": "Uwagi krytyka",
+            "te_result": "Raport testera",
+            "missing": "Nic"
+        }}));
+        let mut env = FlowEnvelope::empty();
+        env.variables.insert(
+            "plan_verdict".into(),
+            FlowValue::Json(json!({"run-1": {
+                "status": "completed", "result": "1. Brak testu poziomu.", "error": null
+            }})),
+        );
+        env.variables.insert(
+            "te_result".into(),
+            FlowValue::Json(json!({"run-2": {
+                "status": "failed", "result": null, "error": "model offline"
+            }})),
+        );
+        let text = SpawnNodeAdapter::resolve_feedback(&node, &env).expect("feedback");
+        assert_eq!(
+            text,
+            "Uwagi krytyka:\n\n1. Brak testu poziomu.\n\nRaport testera:\n\nmodel offline"
+        );
+        assert!(!text.contains("completed"));
     }
 
     #[tokio::test]
