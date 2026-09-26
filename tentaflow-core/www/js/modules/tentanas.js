@@ -20,7 +20,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, sprite, channelMode, liveChannelMode, nodeChannelMode, armedExpiryMs, channelIsUnarmed, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
   parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, errCode, jobTone, jobKindLabel,
-  layoutLabel, stateChipHtml, stateTone, stateLabel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
+  layoutLabel, stateChipHtml, stateTone, stateLabel, fmtSchedule, nodeLabel, jobAuthor,
   firstDiskReasonWord, diskReasonsText, diskHealthChipLabel, replacementAdviceText, ADVICE_KINDS, alertText, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { featureDetail } from '/js/modules/tentanas/feature-words.js';
@@ -31,7 +31,7 @@ import { isOpaqueId, isDiskIdShape, scrubIds } from '/js/modules/tentanas/machin
 import { drawPools, poolDescription } from '/js/modules/tentanas/pools.js';
 import { drawPoolDetail, openReplaceWizard } from '/js/modules/tentanas/pool-detail.js';
 import { openPoolWizard } from '/js/modules/tentanas/pool-wizard.js';
-import { drawTasks, openSmartScheduleEditor, jobSubject, jobRowSkeleton, paintJobRow } from '/js/modules/tentanas/tasks.js';
+import { drawTasks, openSmartScheduleEditor, jobSubject, jobRowSkeleton, paintJobRow, paintJobDisks, jobErrorText, SMART_BATCH_KIND } from '/js/modules/tentanas/tasks.js';
 import { drawShares, protocolChipHtml, mountStateLabel } from '/js/modules/tentanas/shares.js';
 import { warningHtml } from '/js/modules/tentanas/dialogs.js';
 import { openDiskWipeDialog } from '/js/modules/tentanas/disk-wipe.js';
@@ -2395,28 +2395,25 @@ const TentaNasScreen = {
     setAttr(btn, 'disabled', n ? null : true);
   },
 
-  // One password for the whole batch: the prompt appears once and every
-  // selected disk starts its short self-test with it. A disk-specific
-  // refusal (busy, a test already runs, the disk rejects the command) does
-  // not stop the batch; a privilege/credential error does, at once, instead
-  // of replaying the same rejected password against sudo once per remaining
-  // disk (`runDiskBatch` / `isBatchHaltError` in format.js — shared with the
-  // "SMART all disks" schedule action in tasks.js).
+  // The selected disks are ONE request and ONE job on the node: one password
+  // for all of them, a line per disk in the job, and the node stops at the
+  // first privilege/credential error instead of replaying a rejected
+  // password once per disk (`jobs::smart_self_test_batch`). A disk-specific
+  // refusal (busy, a test already runs) is its own line and the job goes on.
   async startSmartTestBulk() {
     const targets = (this.disks || []).filter((d) => this.diskSelection.has(d.diskId));
     if (!targets.length) return;
-    const outcome = await this.withSudo((sudoPassword) => runDiskBatch(targets, (d) => this.nas(
-      'tentaNasDiskSmartTestRequest', { diskId: d.diskId, kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS },
-    )), T('disks.smart_selected_title', { n: targets.length }));
-    // `outcome` is null both when the prompt was cancelled and when the
-    // batch halted on a privilege/credential error — `withSudo`'s own catch
-    // already toasted that one error.
-    if (!outcome) return;
-    if (outcome.started.length) toast(T('disks.smart_selected_done', { n: outcome.started.length }), 'success');
-    if (outcome.refused.length) toast(T('jobs.smart_batch_refused', { n: outcome.refused.length, disks: refusedBatchNames(outcome.refused) }), 'warning');
+    const res = await this.withSudo((sudoPassword) => this.nas(
+      'tentaNasDiskSmartTestBatchRequest', { diskIds: targets.map((d) => d.diskId), kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS },
+    ), T('disks.smart_selected_title', { n: targets.length }));
+    // `res` is null when the prompt was cancelled or the request refused —
+    // `withSudo`'s own catch already said why.
+    if (!res?.job) return;
+    toast(T('disks.smart_selected_done', { n: targets.length }), 'success');
     this.diskSelection.clear();
     this.applyDiskRows();
     this.refreshJobsBadge();
+    this.openJobLog(res.job.jobId);
   },
 
   async refreshDisks(body) {
@@ -3970,7 +3967,7 @@ const TentaNasScreen = {
     win.setAttribute('width', '720');
     win.setAttribute('initial-x', 'center');
     win.setAttribute('initial-y', 'center');
-    win.innerHTML = `<div slot="body" class="stack"><div id="nas-joblog-head" class="muted">${escapeHtml(I18n.t('common.loading'))}</div><pre class="job-log mono" id="nas-joblog"></pre></div>
+    win.innerHTML = `<div slot="body" class="stack"><div id="nas-joblog-head" class="muted">${escapeHtml(I18n.t('common.loading'))}</div><div class="job-disks" id="nas-joblog-disks"></div><pre class="job-log mono" id="nas-joblog"></pre></div>
       <div slot="footer"><tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.close'))}</tf-button></div>`;
     document.body.appendChild(win);
     let timer = null;
@@ -3987,7 +3984,10 @@ const TentaNasScreen = {
         const head = win.querySelector('#nas-joblog-head');
         const pre = win.querySelector('#nas-joblog');
         if (!head || !pre) return;
-        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span${subject.words ? '' : ' class="mono"'}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${j.error ? `<div class="num-err mt-sm">${escapeHtml(errMessage(j.error))}</div>` : ''}`);
+        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind, j.subject))} <span${subject.words ? '' : ' class="mono"'}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${jobErrorText(j) ? `<div class="num-err mt-sm">${escapeHtml(jobErrorText(j))}</div>` : ''}`);
+        // A multi-disk job's lines, each disk by name with its own state —
+        // patched line by line, like the running-job row.
+        if (j.kind === SMART_BATCH_KIND) paintJobDisks(win.querySelector('#nas-joblog-disks'), j);
         paintJobLog(pre, jobLogLines(j.log, this.nodeNameOf()));
         if (j.status === 'running' || j.status === 'queued') timer = setTimeout(poll, POLL_JOB_MODAL_MS);
         else if (onFinish && !notified) { notified = true; onFinish(j); }

@@ -495,8 +495,12 @@ test('an Elastic Array member is named by its array and the part it plays (n03:2
   Screen.unmount();
 });
 
-test('the bulk SMART button starts a short test for every selected disk', async () => {
-  stubTransport({ ...fixtures, tentaNasDiskSmartTestRequest: { job: { jobId: 'j2', kind: 'smart_test', subject: 'sda', status: 'queued', log: [] } } });
+test('the bulk SMART button sends ONE request for every selected disk and follows the one job', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasDiskSmartTestBatchRequest: { job: { jobId: 'jb', kind: 'smart_test_batch', subject: 'sda, nvme0n1', status: 'running', log: [], disks: [] } },
+    tentaNasJobGetRequest: { job: { jobId: 'jb', kind: 'smart_test_batch', subject: 'sda, nvme0n1', status: 'running', startedBy: 'admin', startedAt: '2026-09-26 10:00:00', log: [], disks: [] } },
+  });
   const root = await mountScreen({ node: LOCAL, tab: 'disks' });
   const table = root.querySelector('#nas-disk-table');
   const btn = root.querySelector('[data-act="smart-bulk"]');
@@ -510,66 +514,23 @@ test('the bulk SMART button starts a short test for every selected disk', async 
 
   await Screen.startSmartTestBulk();
   await flush();
-  const sent = kinds('tentaNasDiskSmartTestRequest');
-  assert.deepEqual(sent.map((c) => c.payload.diskId), ['sda', 'nvme0n1']);
-  assert.ok(sent.every((c) => c.payload.kind === 'short'), 'short self-test');
-  assert.equal(Screen.diskSelection.size, 0, 'the selection is cleared after the batch');
+  const sent = kinds('tentaNasDiskSmartTestBatchRequest');
+  assert.equal(sent.length, 1, 'one request for the whole selection');
+  assert.deepEqual(sent[0].payload.diskIds, ['sda', 'nvme0n1']);
+  assert.equal(sent[0].payload.kind, 'short');
+  assert.equal(kinds('tentaNasDiskSmartTestRequest').length, 0, 'never one request per disk');
+  assert.equal(Screen.diskSelection.size, 0, 'the selection is cleared after the start');
+  document.querySelectorAll('tf-window').forEach((w) => w.remove());
   Screen.unmount();
 });
 
-// n03's own bulk SMART used to abort on the first refusal of ANY kind, which
-// made it behave differently from the "SMART all disks" schedule action in
-// tasks.js (MINOR 5 of the round-1 review). Both now share `runDiskBatch`
-// (format.js): a disk-specific refusal does not stop the batch.
-test('the bulk SMART button continues past a disk-specific refusal in the middle', async () => {
+// A refused credential is the one request's one error: nothing is replayed
+// per disk (the node stops a job at the first privilege error itself), and
+// the selection stays so the admin can try again with the right password.
+test('the bulk SMART button keeps the selection when the one request is refused', async () => {
   stubTransport({
     ...fixtures,
-    tentaNasDisksListRequest: {
-      disks: [disk({}), disk({ diskId: 'sdb', name: 'sdb' }), disk({ diskId: 'sdc', name: 'sdc' })],
-      telemetry: fixtures.tentaNasDisksListRequest.telemetry,
-    },
-    tentaNasDiskSmartTestRequest: (payload) => (payload.diskId === 'sdb'
-      ? Promise.reject(new Error('dysk zajęty'))
-      : Promise.resolve({ job: { jobId: `j-${payload.diskId}`, kind: 'smart_test', subject: payload.diskId, status: 'queued', log: [] } })),
-  });
-  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
-  const table = root.querySelector('#nas-disk-table');
-  for (const row of table.rows) {
-    table.dispatchEvent(new window.CustomEvent('row-select', { detail: { row, index: 0, selected: true } }));
-  }
-  // Every toast, recorded at the append: utils.js keeps its container in a
-  // module variable that an earlier test's teardown may have detached.
-  const toasts = [];
-  const append = window.Node.prototype.appendChild;
-  window.Node.prototype.appendChild = function (child) {
-    const kind = /(?:^|\s)toast-(\w+)/.exec(child?.className || '')?.[1];
-    if (kind && kind !== 'container') toasts.push({ kind, text: child.textContent });
-    return append.call(this, child);
-  };
-  try {
-    await Screen.startSmartTestBulk();
-    await flush();
-  } finally {
-    window.Node.prototype.appendChild = append;
-  }
-  const sent = kinds('tentaNasDiskSmartTestRequest');
-  assert.deepEqual(sent.map((c) => c.payload.diskId), ['sda', 'sdb', 'sdc'], 'sdc is still tried after sdb refuses — the batch does not stop');
-  // The refusal is a translated sentence around the node's per-disk reason.
-  assert.match(toasts.filter((t) => t.kind === 'warning').map((t) => t.text).join('\n'), /Test SMART nie ruszył na 1 dysku: sdb: dysk zajęty/);
-  Screen.unmount();
-});
-
-// M1: a privilege/credential error must stop the WHOLE batch at once — the
-// same rejected password (or the same unarmed channel) would otherwise be
-// replayed against sudo once per remaining disk.
-test('the bulk SMART button stops at once on a privilege/credential error and sends exactly one request', async () => {
-  stubTransport({
-    ...fixtures,
-    tentaNasDisksListRequest: {
-      disks: [disk({}), disk({ diskId: 'sdb', name: 'sdb' }), disk({ diskId: 'sdc', name: 'sdc' })],
-      telemetry: fixtures.tentaNasDisksListRequest.telemetry,
-    },
-    tentaNasDiskSmartTestRequest: () => Promise.reject(Object.assign(
+    tentaNasDiskSmartTestBatchRequest: () => Promise.reject(Object.assign(
       new Error('Kanał uprawnień systemowych nie jest dostępny (sudo rejected the password)'), { code: 'NotAvailable' },
     )),
   });
@@ -580,9 +541,8 @@ test('the bulk SMART button stops at once on a privilege/credential error and se
   }
   await Screen.startSmartTestBulk();
   await flush();
-  const sent = kinds('tentaNasDiskSmartTestRequest');
-  assert.equal(sent.length, 1, 'sda fails with a credential error — sdb and sdc are never sent');
-  assert.equal(sent[0].payload.diskId, 'sda');
+  assert.equal(kinds('tentaNasDiskSmartTestBatchRequest').length, 1);
+  assert.equal(Screen.diskSelection.size, 2, 'nothing started, nothing cleared');
   Screen.unmount();
 });
 

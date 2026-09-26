@@ -604,6 +604,11 @@ pub struct NasForwardSettings {
     pub last_sent_at: Option<String>,
     /// Why the last attempt failed, empty when it succeeded.
     pub last_error: String,
+    /// The stored webhook predates the https-only rule (`http://`) and is not
+    /// used until it is changed; the masked address is still shown so the
+    /// admin sees which one. Appended, `#[serde(default)]`.
+    #[serde(default)]
+    pub webhook_needs_migration: bool,
 }
 
 /// "Wymień, dopóki dysk jeszcze żyje" (§5.10, research R5): a proactive
@@ -793,6 +798,30 @@ pub struct NasJob {
     /// `sdq` would point the admin at the wrong drive in the shelf.
     #[serde(default)]
     pub subject_last_known: bool,
+    /// One line per disk of a multi-disk job (`smart_test_batch`), in the
+    /// order the job runs them; empty for every other kind. Appended,
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub disks: Vec<NasJobDisk>,
+}
+
+/// One disk of a multi-disk job, named — never by its id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasJobDisk {
+    /// Kernel name (`sdb`, `nvme0n1`); the last-known one when the disk has
+    /// left the inventory (`last_known`).
+    pub name: String,
+    #[serde(default)]
+    pub last_known: bool,
+    /// 'pending' | 'running' | 'passed' | 'failed' | 'refused' | 'skipped'
+    /// (never reached: the job stopped at a privilege error before it) |
+    /// 'cancelled'.
+    pub state: String,
+    pub progress_pct: Option<u8>,
+    /// Why, as codes the screen words (`jobs.disk_reason.<code>`); empty
+    /// when the state says it all.
+    #[serde(default)]
+    pub reasons: Vec<NasHealthReason>,
 }
 
 // =============================================================================
@@ -2418,6 +2447,19 @@ pub enum TentaNasPayload {
         #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
+    /// One SMART self-test job over several disks ('short' | 'long'). The
+    /// job starts the disks in order with one credential and STOPS at the
+    /// first privilege/credential error (a rejected password, an unarmed
+    /// channel, a helper mismatch) — replaying that credential per disk could
+    /// lock the account (`pam_faillock`); any other per-disk refusal is
+    /// recorded on that disk's line and the job goes on. Answers with
+    /// `JobResponse`.
+    DiskSmartTestBatchRequest {
+        disk_ids: Vec<String>,
+        kind: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
     DiskLocateRequest {
         disk_id: String,
         enable: bool,
@@ -3120,10 +3162,18 @@ pub enum TentaNasPayload {
         shares: Vec<String>,
         users: Vec<String>,
         operations: Vec<String>,
+        /// The ASKING organisation's own forwarding target: its alerts, the
+        /// node-wide alerts every organisation may read, and — when
+        /// `include_access` — the access lines of its own shares.
         forward: NasForwardSettings,
+        /// The node-wide target kept from before targets were per
+        /// organisation: node-wide alerts only, never an organisation's row
+        /// and never an access line. Appended, `#[serde(default)]`.
+        #[serde(default)]
+        forward_node: NasForwardSettings,
     },
-    /// Sets where this node forwards the alert pipeline and the access log.
-    /// Answers with `AccessLogResponse` so the card repaints from one answer.
+    /// Sets a forwarding target. Answers with `AccessLogResponse` so the card
+    /// repaints from one answer.
     AlertForwardSetRequest {
         enabled: bool,
         #[serde(default)]
@@ -3132,6 +3182,10 @@ pub enum TentaNasPayload {
         webhook_url: String,
         #[serde(default)]
         include_access: bool,
+        /// false: the asking organisation's own target. true: the node-wide
+        /// target (node-wide alerts only; `include_access` is ignored).
+        #[serde(default)]
+        node_wide: bool,
     },
 
     // ----- zpool trim (§5.10, research R7) -----
@@ -4340,6 +4394,18 @@ mod tests {
                 syslog_target: String::new(),
                 webhook_url: String::new(),
                 include_access: false,
+                node_wide: false,
+            }
+        );
+
+        let json = serde_json::json!({ "DiskSmartTestBatchRequest": { "disk_ids": ["sn-a", "sn-b"], "kind": "short" } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::DiskSmartTestBatchRequest {
+                disk_ids: vec!["sn-a".to_string(), "sn-b".to_string()],
+                kind: "short".to_string(),
+                sudo_password: None,
             }
         );
 
@@ -4404,6 +4470,12 @@ mod tests {
                 pending: 0,
                 last_sent_at: Some("2026-09-03T12:00:31Z".to_string()),
                 last_error: String::new(),
+                webhook_needs_migration: true,
+            },
+            forward_node: NasForwardSettings {
+                enabled: true,
+                syslog_target: "legacy.local:514".to_string(),
+                ..Default::default()
             },
         });
         let bytes = crate::cbor::encode(&body).expect("encode");

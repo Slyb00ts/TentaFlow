@@ -5599,7 +5599,13 @@ export const encode = {
   /** MessageBody::AddonUninstallRequest — odinstalowuje addon. */
   addonUninstallRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonUninstallRequest(String(payload.addonId ?? ''));
+    // `acknowledgedNodes`: the peers the admin proceeds without, each with
+    // its name retyped (wave-9b critic, MAJOR A).
+    const acks = Array.isArray(payload.acknowledgedNodes) ? payload.acknowledgedNodes : [];
+    const body = _wasm.encodeAddonUninstallRequestJson(JSON.stringify({
+      addon_id: String(payload.addonId ?? ''),
+      acknowledged_nodes: acks.map((a) => ({ node_id: String(a.nodeId ?? ''), confirm_name: String(a.confirmName ?? '') })),
+    }));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -5612,6 +5618,58 @@ export const encode = {
   addonTeardownPlanRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeAddonTeardownPlanRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonTeardownStatusRequest — where the uninstall stands on the node that answers (forwarded per node). */
+  addonTeardownStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonTeardownStatusRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonTeardownArmRequest — arms the answering node's privilege channel for its teardown (n18a, mode B). payload: { addonId, sudoPassword } */
+  addonTeardownArmRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      addon_id: csText(payload.addonId ?? payload.addon_id),
+      sudo_password: csText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeAddonTeardownArmRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonTeardownDisarmRequest — drops the teardown password the answering node holds. payload: { addonId } */
+  addonTeardownDisarmRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonTeardownDisarmRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonDisablePreviewRequest — what disabling the instance does on the answering node (n18d). */
+  addonDisablePreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonDisablePreviewRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -9352,6 +9410,19 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaNasBody(DiskSmartTestBatchRequest). payload: { diskIds: string[], kind: 'short'|'long', sudoPassword? } — one job over every disk; answers with JobResponse. */
+  tentaNasDiskSmartTestBatchRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const ids = payload.diskIds ?? payload.disk_ids;
+    const request = {
+      disk_ids: csTextList(ids),
+      kind: csText(payload.kind, 'short'),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasDiskSmartTestBatchRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaNasBody(DiskLocateRequest). payload: { diskId, enable } */
   tentaNasDiskLocateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
@@ -10088,7 +10159,7 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::TentaNasBody(AlertForwardSetRequest). payload: { enabled, syslogTarget?, webhookUrl?, includeAccess? } */
+  /** MessageBody::TentaNasBody(AlertForwardSetRequest). payload: { enabled, syslogTarget?, webhookUrl?, includeAccess?, nodeWide? } — nodeWide false sets the asking organisation's own target. */
   tentaNasAlertForwardSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = {
@@ -10096,6 +10167,7 @@ export const encode = {
       syslog_target: csText(payload.syslogTarget ?? payload.syslog_target),
       webhook_url: csText(payload.webhookUrl ?? payload.webhook_url),
       include_access: Boolean(payload.includeAccess ?? payload.include_access),
+      node_wide: Boolean(payload.nodeWide ?? payload.node_wide),
     };
     const body = _wasm.encodeTentaNasAlertForwardSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);

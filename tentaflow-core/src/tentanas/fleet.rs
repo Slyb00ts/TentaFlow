@@ -547,43 +547,11 @@ fn prefixed_map(db: &DbPool, addon_id: &str, prefix: &str) -> HashMap<String, St
         .collect()
 }
 
-/// THE PEER STORE NEVER HOLDS THIS NODE. `seed_discovered_peer` returns early
-/// on `node_id == local_node_id`, so asking it for the local hostname always
-/// answers `None` and the fallback used to publish the 64-hex node id as the
-/// node's NAME — on every install, in every fleet view. The machine's own
-/// hostname is what the rest of the core already shows for itself, so it is
-/// what this asks first for the local row.
-///
-/// A peer the store has no hostname for (paired, offline since this node
-/// started) falls back to the name the sync registry recorded for it, and
-/// then to NOTHING. An empty name is deliberate: the 64-hex node id used to
-/// fill that gap and was printed as the node's name on every fleet surface,
-/// while the screen has one helper (`nodeLabel`) that says "Węzeł bez nazwy"
-/// and keeps the id in a tooltip.
+/// A node's name for the screen — the platform rule
+/// (`dispatch::app_route::node_display_name`), which every fleet surface
+/// shares with the app platform's own node lists.
 pub(crate) fn node_name(ctx: &HandlerContext, node_id: &str) -> String {
-    if node_id == ctx.state.local_node_id.to_string() {
-        let local = crate::mesh::node_info_collector::local_hostname();
-        if !local.is_empty() && local != "unknown" {
-            return local;
-        }
-    }
-    ctx.state
-        .mesh_peer_store
-        .get_hostname(node_id)
-        .filter(|n| !n.is_empty())
-        .or_else(|| registry_name(ctx, node_id))
-        .unwrap_or_default()
-}
-
-/// `sync_nodes.display_name` of one node, when the registry has a non-empty
-/// one. Asked only after the peer store came up empty, so a healthy fleet
-/// never pays for it.
-fn registry_name(ctx: &HandlerContext, node_id: &str) -> Option<String> {
-    crate::db::repository::lookup_sync_node_info(&ctx.state.db, &[node_id.to_string()])
-        .ok()?
-        .remove(node_id)
-        .map(|(name, _)| name.trim().to_string())
-        .filter(|name| !name.is_empty())
+    crate::dispatch::app_route::node_display_name(ctx, node_id)
 }
 
 /// This node plus every trust-paired peer, each with its instance status

@@ -352,7 +352,10 @@ async fn tick(main_db: &DbPool, db: &DbPool) {
         super::disks::snapshot()
             .0
             .into_iter()
-            .map(|d| (d.disk_id, d.path))
+            // `(disk_id, kernel name)`: a line of the one job is named, and
+            // only a disk that reports SMART can take a self-test.
+            .filter(|d| d.smart_available)
+            .map(|d| (d.disk_id, d.name))
             .collect(),
     )
     .await;
@@ -872,6 +875,7 @@ async fn run_due_snapshots(db: &DbPool, now: DateTime<Local>) {
 /// schedule. That refusal IS the serialisation this needs — for the scheduled
 /// and the manual start alike — and a second lock here would only be able to
 /// disagree with it.
+/// `disks` is `(disk_id, kernel name)` of every disk that reports SMART.
 async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>, disks: Vec<(String, String)>) {
     let mut smart = match store::smart_schedule(db) {
         Ok(s) => s,
@@ -926,19 +930,25 @@ async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>, disks: Vec<(Stri
             smart.next_short_at = next;
         }
         changed = true;
+        // ONE job for the whole pass (owner decision 2026-09-26, wave 9b):
+        // n15's "SMART short — wszystkie · 18/18 OK" row, a line per disk. A
+        // disk a self-test already runs on is its own refused line
+        // (`store::insert_job_full`); a pass where EVERY disk is busy starts
+        // no job at all, rather than a job whose every line is refused.
+        let free = disks.iter().any(|(disk_id, _)| !store::self_test_busy(db, disk_id).unwrap_or(true));
         let mut started_any = false;
-        for (disk_id, device) in disks.iter().cloned() {
-            match super::jobs::spawn(db, "smart_test", &disk_id, STARTED_BY, None, None, move |h| {
-                super::jobs::smart_self_test(h, device, kind, None)
+        if free {
+            let subject = store::smart_batch_subject(long, None);
+            match super::jobs::spawn_smart_batch(db, &subject, STARTED_BY, &disks, move |h| {
+                super::jobs::smart_self_test_batch(h, kind, None)
             }) {
                 Ok(_) => started_any = true,
-                // Logged at info, not warn: on a node whose long test is still
-                // running this is the expected answer for every disk, and the
-                // message carries the reason the refusal gave.
-                Err(e) => tracing::info!(
-                    "tentanas scheduler: SMART test for {disk_id} not started: {e}"
-                ),
+                Err(e) => tracing::warn!("tentanas scheduler: SMART job not started: {e}"),
             }
+        } else {
+            // Logged at info, not warn: on a node whose long test is still
+            // running this is the expected answer for every disk.
+            tracing::info!("tentanas scheduler: SMART pass found every disk already testing");
         }
         // A pass that started NOTHING did not run, so it does not stamp
         // `last_*_at`. The Tasks tab renders that field as the schedule's
@@ -2570,29 +2580,43 @@ mod tests {
         store::insert_job(p, &job, None).expect("occupy the disk");
     }
 
-    fn smart_test_subjects(p: &DbPool) -> Vec<String> {
-        let mut subjects: Vec<String> = store::list_jobs(p, 500)
+    /// The multi-disk SMART jobs the passes started, each as its subject and
+    /// its lines `(kernel name, state)`.
+    fn smart_batches(p: &DbPool) -> Vec<(String, Vec<(String, String)>)> {
+        let mut jobs: Vec<(String, Vec<(String, String)>)> = store::list_jobs(p, 500)
             .expect("jobs")
             .into_iter()
-            .filter(|j| j.kind == "smart_test")
-            .map(|j| j.subject)
+            .filter(|j| j.kind == store::SMART_BATCH_KIND)
+            .map(|j| {
+                let lines = store::job_disks(p, &j.job_id)
+                    .expect("lines")
+                    .into_iter()
+                    .map(|l| (l.name, l.state))
+                    .collect();
+                (j.subject, lines)
+            })
             .collect();
-        subjects.sort();
-        subjects
+        jobs.sort();
+        jobs
     }
 
     fn two_disks() -> Vec<(String, String)> {
         vec![
-            ("disk-a".to_string(), "/dev/sda".to_string()),
-            ("disk-b".to_string(), "/dev/sdb".to_string()),
+            ("disk-a".to_string(), "sda".to_string()),
+            ("disk-b".to_string(), "sdb".to_string()),
         ]
     }
 
-    /// A second self-test on one disk ABORTS the first, so a disk that is
-    /// already under test is left alone — and the disks beside it still get
-    /// theirs, because one refusal must not end the pass.
+    fn line(name: &str, state: &str) -> (String, String) {
+        (name.to_string(), state.to_string())
+    }
+
+    /// A scheduled pass is ONE job over every disk (owner decision, wave 9b;
+    /// n15 "SMART short — wszystkie"). A second self-test on one disk ABORTS
+    /// the first, so a disk already under test is its own refused line — and
+    /// the disks beside it still get theirs.
     #[tokio::test]
-    async fn a_disk_already_running_a_self_test_gets_no_second_one() {
+    async fn a_pass_is_one_job_and_a_busy_disk_is_its_own_refused_line() {
         let p = db();
         occupy_disk(&p, "disk-a");
         let now = at(2026, 9, 1, 3, 0);
@@ -2605,9 +2629,9 @@ mod tests {
         run_due_smart_tests(&p, now, two_disks()).await;
 
         assert_eq!(
-            smart_test_subjects(&p),
-            ["disk-a", "disk-b"],
-            "disk-a keeps the ONE test it was already running and disk-b gets its first"
+            smart_batches(&p),
+            vec![("short|all".to_string(), vec![line("sda", "refused"), line("sdb", "pending")])],
+            "one job; disk-a keeps the ONE test it was already running and disk-b gets its first"
         );
         let after = store::smart_schedule(&p).expect("schedule");
         assert!(after.last_short_at.is_some(), "disk-b did start, so the pass ran");
@@ -2615,10 +2639,9 @@ mod tests {
     }
 
     /// Both cadences due in the same tick: the LONG pass takes the disks and
-    /// the short pass is refused on every one of them. Reversing the two loop
-    /// passes would make a daily short test cut every long test short — and
-    /// the only thing that records WHICH pass got the disks is `last_*_at`,
-    /// because the job row says "smart_test" for both.
+    /// the short pass finds every one of them testing, so it starts no job.
+    /// Reversing the two passes would make a daily short test cut every long
+    /// test short.
     #[tokio::test]
     async fn the_long_pass_takes_the_disks_before_the_short_pass_sees_them() {
         let p = db();
@@ -2629,9 +2652,9 @@ mod tests {
         run_due_smart_tests(&p, now, two_disks()).await;
 
         assert_eq!(
-            smart_test_subjects(&p),
-            ["disk-a", "disk-b"],
-            "one test per disk, not one per pass"
+            smart_batches(&p),
+            vec![("long|all".to_string(), vec![line("sda", "pending"), line("sdb", "pending")])],
+            "one long job over both disks and no short one"
         );
         let after = store::smart_schedule(&p).expect("schedule");
         assert!(after.last_long_at.is_some(), "the long pass is the one that ran");
@@ -2664,11 +2687,7 @@ mod tests {
 
         run_due_smart_tests(&p, now, two_disks()).await;
 
-        assert_eq!(
-            smart_test_subjects(&p),
-            ["disk-a", "disk-b"],
-            "only the two tests that were already running"
-        );
+        assert!(smart_batches(&p).is_empty(), "every disk was testing: no job whose every line is refused");
         let after = store::smart_schedule(&p).expect("schedule");
         assert!(
             after.last_short_at.is_none(),

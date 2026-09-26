@@ -411,6 +411,16 @@ fn path_size(path: &std::path::Path) -> u64 {
 /// instancji (orgs/<org>/addons/<addon_id>/), bo instancja jest wlascicielem
 /// swoich danych. Nie rusza wspoldzielonego store'u pakietow.
 pub fn uninstall_instance(addon_id: &str, db: &DbPool) -> Result<()> {
+    // The uninstall dialog follows every node's teardown (MAJOR 22); this
+    // node's record starts here and ends with the outcome, in the step it
+    // had reached when it failed.
+    crate::addon::native_apps::teardown_status::begin(addon_id);
+    let outcome = uninstall_instance_steps(addon_id, db);
+    crate::addon::native_apps::teardown_status::finish(addon_id, outcome.is_ok());
+    outcome
+}
+
+fn uninstall_instance_steps(addon_id: &str, db: &DbPool) -> Result<()> {
     let org_id = crate::services::org::DEFAULT_ORG_ID;
     // Native apps run their teardown hook FIRST: the plan goes to the log
     // (audit of what is removed vs kept), then the hook cleans app state
@@ -446,6 +456,7 @@ pub fn uninstall_instance(addon_id: &str, db: &DbPool) -> Result<()> {
     // mozliwy) zamiast zniknac z listy zostawiajac dane-widmo na dysku.
     // Czysci tylko katalog instancji (orgs/<org>/addons/<addon_id>/), nigdy
     // wspoldzielonego store'u pakietow.
+    crate::addon::native_apps::teardown_status::phase(addon_id, "data_dir");
     crate::addon::storage_sql::close_addon_db(org_id, addon_id);
     // B2 (RAG): jawny cleanup grafu PRZED `remove_dir_all(addon_data_dir)` —
     // zamyka backendy sled, kasuje wiersze `addon_graph_collections` i pliki

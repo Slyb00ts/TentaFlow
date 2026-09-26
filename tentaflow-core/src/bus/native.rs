@@ -699,6 +699,7 @@ pub fn native_teardown_plan(ctx: &NativeAppContext) -> Result<Vec<TeardownEntry>
         kind: "tentabus_data_dir",
         description: description.into(),
         removed: true,
+        blocks: false,
         count_vars,
     }])
 }

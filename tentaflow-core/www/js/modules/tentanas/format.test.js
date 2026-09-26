@@ -1,79 +1,17 @@
 // =============================================================================
 // File: modules/tentanas/format.test.js
-// Description: The per-disk batch helper shared by "SMART all disks"
-// (tasks.js) and "SMART selected" (tentanas.js): `runDiskBatch` keeps going
-// past a disk-specific refusal but stops the whole batch at once on a
-// privilege/credential error (`ProtocolErrorCode::NotAvailable`, the code
-// `broker_error` in dispatch/tentanas.rs gives a rejected sudo password, an
-// unarmed channel or a helper/core version mismatch), plus `refusedBatchNames`
-// naming the disks a batch refused; and `replacementAdviceText`, the
-// replacement advice rebuilt in the reader's language.
+// Description: `jobAuthor`; the disk, pool, alert and refusal codes worded
+// in every locale; and `replacementAdviceText`, the replacement advice
+// rebuilt in the reader's language. (The per-disk SMART batch helper that
+// lived here is gone: a multi-disk SMART test is ONE request and one job on
+// the node since wave 9b, which stops at the first privilege error itself.)
 // =============================================================================
 
 import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { isBatchHaltError, runDiskBatch, refusedBatchNames, jobAuthor } = await import('./format.js');
-
-const disk = (diskId) => ({ diskId, name: diskId });
-
-// A rejected/expired sudo password and an unarmed channel are both
-// `BrokerError::Unarmed`; a helper/core version mismatch is
-// `BrokerError::HelperVersion`. `broker_error` maps every one of them to
-// `ProtocolErrorCode::NotAvailable`, and `api-binary-shim.js` copies that
-// code onto the thrown Error as `.code` — this is the one marker the front
-// classifies on, never the (partly Polish) message text.
-const credentialError = (message = 'sudo rejected the password') => Object.assign(new Error(message), { code: 'NotAvailable' });
-// A per-disk refusal the node reports with no such code (e.g. the disk
-// vanished from the live inventory: `ProtocolErrorCode::NotFound`), or a
-// bare Error the way the disk-busy fixtures in tasks.test.js / tentanas.test.js
-// use it.
-const perDiskError = (message = 'dysk zajęty') => new Error(message);
-
-test('isBatchHaltError is true only for the NotAvailable code, never guessed from text', () => {
-  assert.equal(isBatchHaltError(credentialError()), true);
-  assert.equal(isBatchHaltError(perDiskError('unarmed privilege channel')), false, 'text alone is never enough');
-  assert.equal(isBatchHaltError(perDiskError()), false);
-  assert.equal(isBatchHaltError(Object.assign(new Error('disk not found'), { code: 'NotFound' })), false);
-  assert.equal(isBatchHaltError(null), false);
-  assert.equal(isBatchHaltError(undefined), false);
-});
-
-test('runDiskBatch tries every disk when refusals are per-disk', async () => {
-  const attempted = [];
-  const { started, refused } = await runDiskBatch([disk('sda'), disk('sdb'), disk('sdc')], async (d) => {
-    attempted.push(d.diskId);
-    if (d.diskId === 'sdb') throw perDiskError('dysk zajęty');
-  });
-  assert.deepEqual(attempted, ['sda', 'sdb', 'sdc'], 'sdc is still tried after sdb refuses');
-  assert.deepEqual(started.map((d) => d.diskId), ['sda', 'sdc']);
-  assert.equal(refused.length, 1);
-  assert.equal(refused[0].disk.diskId, 'sdb');
-  assert.equal(refused[0].error.message, 'dysk zajęty');
-});
-
-test('runDiskBatch stops at the first privilege/credential error and sends no further request', async () => {
-  const attempted = [];
-  const halt = credentialError('sudo rejected the password');
-  await assert.rejects(
-    runDiskBatch([disk('sda'), disk('sdb'), disk('sdc')], async (d) => {
-      attempted.push(d.diskId);
-      if (d.diskId === 'sda') throw halt;
-    }),
-    (e) => e === halt,
-  );
-  assert.deepEqual(attempted, ['sda'], 'exactly one request — sdb and sdc are never tried');
-});
-
-test('refusedBatchNames names the disks, never a disk id', () => {
-  const text = refusedBatchNames([
-    { disk: { diskId: 'wwn-0x5000c500a1b2c3d4', name: 'sdb' }, error: perDiskError('dysk zajęty') },
-    { disk: { diskId: 'wwn-0x5000c500a1b2c3d5', name: 'sdc' }, error: perDiskError('test już trwa') },
-  ]);
-  assert.equal(text, 'sdb: dysk zajęty · sdc: test już trwa');
-  assert.doesNotMatch(text, /wwn-/, 'no disk id leaks into the toast');
-});
+const { jobAuthor } = await import('./format.js');
 
 // `startedBy` is always a user id or a system token, never a name that could
 // collide with a disk-id prefix, so `jobAuthor` uses the opaque rule alone

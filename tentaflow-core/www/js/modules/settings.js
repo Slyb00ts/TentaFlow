@@ -19,6 +19,7 @@ import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { renderMeshTab, bindMeshTab } from '/js/modules/settings-network.js';
+import { renderAlertCollectorsCard, bindAlertCollectorsCard, ALLOWLIST_SETTING } from '/js/modules/settings-alert-collectors.js';
 import {
   loadEnvironmentTab,
   renderEnvironmentTab,
@@ -828,10 +829,14 @@ function renderExternalAccessTab() {
         </table>
       </div>
     </div>
+    ${renderAlertCollectorsCard(getSetting(ALLOWLIST_SETTING, ''))}
   `;
 }
 
 function bindExternalAccessTab() {
+  bindAlertCollectorsCard(byId('settings-tab-body') || document, (value) => {
+    settings[ALLOWLIST_SETTING] = { value, isSecret: false };
+  });
   bindConfiguredSecretInput('hf-token', hasConfiguredSetting('hf_token'));
   bindConfiguredSecretInput('ngc-key', hasConfiguredSetting('ngc_api_key'));
 

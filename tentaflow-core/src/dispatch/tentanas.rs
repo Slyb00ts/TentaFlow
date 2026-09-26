@@ -388,6 +388,20 @@ fn name_jobs(
         if job.kind == "config_import" {
             job.subject = config_import_subject(&job.subject, |id| tentanas::fleet::node_name(ctx, id));
         }
+        // A multi-disk job's lines, each named by the same rule, and its
+        // subject rebuilt from them — never the stored ids.
+        if job.kind == tentanas::db::SMART_BATCH_KIND {
+            if let Some(db) = db {
+                job.disks = job_disk_lines(db, &job.job_id);
+                // The test kind and "all" stay; a chosen set is named by its
+                // lines as they are now.
+                let (kind, rest) = job.subject.split_once('|').unwrap_or(("short", ""));
+                if rest != "all" && !job.disks.is_empty() {
+                    let names: Vec<String> = job.disks.iter().map(|d| d.name.clone()).collect();
+                    job.subject = tentanas::db::smart_batch_subject(kind == "long", Some(&names));
+                }
+            }
+        }
         if job.kind == "smart_test" {
             if let Some((name, last_known)) = smart_subject_name(&job.subject, |id| {
                 match db {
@@ -456,6 +470,30 @@ fn config_import_subject(subject: &str, name_of: impl FnOnce(&str) -> String) ->
 /// only REMEMBERED: `(live name, false)`, or `(last-seen name, true)` once the
 /// disk has left the inventory. `None` keeps the stored subject (a disk the
 /// node never named).
+/// The lines of a multi-disk job for the screen: each disk by its live name,
+/// else the name it was last seen under (flagged), else the name stored when
+/// the job started — flagged too, it is no longer the device as it is now.
+fn job_disk_lines(db: &DbPool, job_id: &str) -> Vec<tentaflow_protocol::tentanas::NasJobDisk> {
+    tentanas::db::job_disks(db, job_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            let (name, last_known) = match tentanas::disks::shown_disk_name(db, &row.disk_id, None) {
+                tentanas::disks::ShownDiskName::Live(name) => (name, false),
+                tentanas::disks::ShownDiskName::LastKnown(name) => (name, true),
+                tentanas::disks::ShownDiskName::Unknown => (row.name.clone(), true),
+            };
+            tentaflow_protocol::tentanas::NasJobDisk {
+                name,
+                last_known,
+                state: row.state,
+                progress_pct: row.progress_pct,
+                reasons: row.reasons,
+            }
+        })
+        .collect()
+}
+
 fn smart_subject_name(
     disk_id: &str,
     shown: impl FnOnce(&str) -> tentanas::disks::ShownDiskName,
@@ -748,6 +786,56 @@ async fn disk_smart_test(
     })
     .map_err(|e| internal("job", e))?;
     Ok(job_response(ctx, job))
+}
+
+/// Most disks one batch may name — a bound on the request, far above any
+/// shelf this product manages.
+const SMART_BATCH_MAX_DISKS: usize = 256;
+
+/// One SMART self-test job over several disks (`jobs::smart_self_test_batch`):
+/// one request, one job row with a line per disk, one credential, and a stop
+/// at the first privilege/credential error instead of one refusal per disk.
+async fn disk_smart_test_batch(
+    ctx: &HandlerContext,
+    disk_ids: &[String],
+    kind: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_POOLS)?;
+    let kind = match kind {
+        "short" => SelfTestKind::Short,
+        "long" => SelfTestKind::Long,
+        other => return Err(ProtocolError::bad_request(format!("unknown self-test kind '{other}'"))),
+    };
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<&String> = disk_ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+    if ids.is_empty() {
+        return Err(ProtocolError::bad_request("no disk to test"));
+    }
+    if ids.len() > SMART_BATCH_MAX_DISKS {
+        return Err(ProtocolError::bad_request(format!(
+            "at most {SMART_BATCH_MAX_DISKS} disks per self-test job"
+        )));
+    }
+    // Every line is named when the job is written: the kernel name now, or the
+    // name the node last saw the disk under. A disk the node never knew is
+    // refused here rather than written as a line with no name to show.
+    let mut disks = Vec::with_capacity(ids.len());
+    for id in ids {
+        let name = match tentanas::disks::shown_disk_name(&g.db, id, None) {
+            tentanas::disks::ShownDiskName::Live(name) | tentanas::disks::ShownDiskName::LastKnown(name) => name,
+            tentanas::disks::ShownDiskName::Unknown => return Err(ProtocolError::not_found("disk not found")),
+        };
+        disks.push((id.clone(), name));
+    }
+    let names: Vec<String> = disks.iter().map(|(_, name)| name.clone()).collect();
+    let subject = tentanas::db::smart_batch_subject(kind == SelfTestKind::Long, Some(&names));
+    let explicit = secret.map(token);
+    let job = tentanas::jobs::spawn_smart_batch(&g.db, &subject, &g.user_id, &disks, move |h| {
+        tentanas::jobs::smart_self_test_batch(h, kind, explicit)
+    })
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response_in(ctx, Some(&g.db), job))
 }
 
 async fn disk_locate(ctx: &HandlerContext, disk_id: &str, enable: bool) -> Result<MessageBody, ProtocolError> {
@@ -3943,6 +4031,7 @@ async fn access_log(
         store::access_events(&g.db, &g.org_id, filter).map_err(|e| internal("access log", e))?;
     let (shares, users, operations) =
         store::access_facets(&g.db, &g.org_id).map_err(|e| internal("access log", e))?;
+    let viewer = forward_viewer(ctx);
     Ok(tn(P::AccessLogResponse {
         events,
         total,
@@ -3950,31 +4039,73 @@ async fn access_log(
         shares,
         users,
         operations,
-        forward: tentanas::forward::settings(&ctx.state.db, &g.db, &g.addon_id),
+        forward: tentanas::forward::settings(
+            &ctx.state.db,
+            &g.db,
+            &g.addon_id,
+            tentanas::forward::Target::Org(&g.org_id),
+            viewer,
+        ),
+        forward_node: tentanas::forward::settings(
+            &ctx.state.db,
+            &g.db,
+            &g.addon_id,
+            tentanas::forward::Target::Node,
+            viewer,
+        ),
     }))
 }
 
-/// Where this node forwards its alert pipeline (§5.9). Fleet-wide, so it needs
-/// the same gate the four-eyes switch does.
+/// Who may see the forwarding targets' addresses: the caller's organisation's
+/// admins (the same gate that sets them), and even they only masked; every
+/// other reader of the log sees whether forwarding is on, never where to
+/// (critic wave 9b, MAJOR 5: a webhook URL is a bearer secret).
+fn forward_viewer(ctx: &HandlerContext) -> tentanas::forward::Viewer {
+    if gate_admin(ctx).is_ok() {
+        tentanas::forward::Viewer::Admin
+    } else {
+        tentanas::forward::Viewer::Reader
+    }
+}
+
+/// Where the alert pipeline goes (§5.9): the asking organisation's own
+/// target, or — `node_wide` — the deletion of the retired node-wide one.
+/// Both are fleet-wide settings, so they need the same gate the four-eyes
+/// switch does. The organisation is the caller's own, never one the request
+/// names.
+#[allow(clippy::too_many_arguments)]
 async fn alert_forward_set(
     ctx: &HandlerContext,
     enabled: bool,
     syslog_target: &str,
     webhook_url: &str,
     include_access: bool,
+    node_wide: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_admin(ctx)?;
-    tentanas::forward::set_settings(
-        &ctx.state.db,
-        &g.db,
-        &g.addon_id,
-        &g.user_id,
-        enabled,
-        syslog_target,
-        webhook_url,
-        include_access,
-    )
-    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if node_wide {
+        // Retired (owner decision 2026-09-26): deleting it is the one change
+        // left — an "off, no address" request — and nothing edits or creates
+        // one.
+        if enabled || !syslog_target.trim().is_empty() || !webhook_url.trim().is_empty() {
+            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, tentanas::forward::FORWARD_NODE_RETIRED));
+        }
+        tentanas::forward::delete_node_target(&ctx.state.db, &g.db, &g.addon_id)
+            .map_err(|e| internal("forwarding", e))?;
+    } else {
+        tentanas::forward::set_settings(
+            &ctx.state.db,
+            &g.db,
+            &g.addon_id,
+            &g.user_id,
+            &g.org_id,
+            enabled,
+            syslog_target,
+            webhook_url,
+            include_access,
+        )
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    }
     access_log(
         ctx,
         &store::AccessFilter {
@@ -5534,6 +5665,9 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::DiskSmartTestRequest { disk_id, kind, sudo_password } => {
             disk_smart_test(ctx, disk_id, kind, sudo_password.as_ref()).await
         }
+        P::DiskSmartTestBatchRequest { disk_ids, kind, sudo_password } => {
+            disk_smart_test_batch(ctx, disk_ids, kind, sudo_password.as_ref()).await
+        }
         P::DiskLocateRequest { disk_id, enable } => disk_locate(ctx, disk_id, *enable).await,
         P::DiskWipePlanRequest { disk_id, sudo_password } => {
             disk_wipe_plan(ctx, disk_id, sudo_password.as_ref()).await
@@ -5947,7 +6081,8 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             syslog_target,
             webhook_url,
             include_access,
-        } => alert_forward_set(ctx, *enabled, syslog_target, webhook_url, *include_access).await,
+            node_wide,
+        } => alert_forward_set(ctx, *enabled, syslog_target, webhook_url, *include_access, *node_wide).await,
         P::PoolTrimRequest {
             name,
             action,
@@ -6144,6 +6279,10 @@ register_tentanas_variant!("TentaNasDiskGetRequest", "tentaflow_ws_handler_nas_d
 register_tentanas_variant!(
     "TentaNasDiskSmartTestRequest",
     "tentaflow_ws_handler_nas_disk_smart_test"
+);
+register_tentanas_variant!(
+    "TentaNasDiskSmartTestBatchRequest",
+    "tentaflow_ws_handler_nas_disk_smart_test_batch"
 );
 register_tentanas_variant!("TentaNasDiskLocateRequest", "tentaflow_ws_handler_nas_disk_locate");
 register_tentanas_variant!(
@@ -6720,6 +6859,62 @@ mod registration_tests {
             crate::dispatch::app_gate::test_support::set_permission(&fixture.ctx.state,&fixture.addon_id,
                 "user",&fixture.ctx.org_context.as_ref().unwrap().user_id,permission,"allow");
         }
+    }
+
+    /// Round 4 (critic C2): the platform admin's list of internal collectors
+    /// names internal hosts and networks — only a platform admin gets it
+    /// from the settings list.
+    #[tokio::test]
+    async fn only_a_platform_admin_reads_the_collector_allowlist() {
+        let state = crate::dispatch::state::AppState::for_test();
+        crate::db::repository::set_setting(&state.db, tentanas::forward::ALLOWLIST_SETTING, r#"[{"entry":"siem.lan"}]"#).unwrap();
+        let listed = |role: &str| {
+            let ctx = crate::dispatch::test_handler_context(state.clone(), Some(role), None);
+            let MessageBody::SettingsListResponse { entries } = crate::dispatch::handlers::settings_list(&MessageBody::SettingsListRequest, &ctx).unwrap() else {
+                panic!("a settings list")
+            };
+            entries.iter().any(|e| e.key == tentanas::forward::ALLOWLIST_SETTING)
+        };
+        assert!(listed("admin"));
+        assert!(!listed("user"), "an ordinary user gets nothing of it");
+    }
+
+    /// MAJOR 5 of the wave-9b critic, through the real dispatcher: the
+    /// retired node-wide target cannot be edited or recreated — only deleted
+    /// — and a reader of the access log never receives a target's address.
+    #[tokio::test]
+    async fn the_node_wide_target_is_retired_and_a_reader_gets_no_address() {
+        let mut fixture = dispatch_fixture();
+        let set = |enabled: bool, syslog: &str, webhook: &str, node_wide: bool| tn(P::AlertForwardSetRequest {
+            enabled,
+            syslog_target: syslog.to_string(),
+            webhook_url: webhook.to_string(),
+            include_access: false,
+            node_wide,
+        });
+        // A reader first: it may read the log, never set a target.
+        let (response, error) = crate::dispatch::dispatch(&set(true, "", "https://siem.example.com/in/SECRET", false), &fixture.ctx).await;
+        assert!(error, "{response:?}");
+        elastic_admin(&mut fixture);
+        let (response, error) = crate::dispatch::dispatch(&set(true, "", "https://siem.example.com/in/SECRET", false), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::AccessLogResponse { forward, .. }) = response else { panic!("an access log") };
+        assert_eq!(forward.webhook_url, "https://siem.example.com/…", "the admin reads it masked");
+        // Creating or editing a node-wide target is refused; deleting is not.
+        let (response, error) = crate::dispatch::dispatch(&set(true, "legacy.example.com:514", "", true), &fixture.ctx).await;
+        assert!(error);
+        assert!(matches!(&response, MessageBody::Error(e) if e.message == tentanas::forward::FORWARD_NODE_RETIRED), "{response:?}");
+        let (response, error) = crate::dispatch::dispatch(&set(false, "", "", true), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        // A reader of the same organisation: on, and nothing about where.
+        fixture.ctx.org_context.as_mut().unwrap().permissions.remove("org.admin");
+        let (response, error) = crate::dispatch::dispatch(&tn(P::AccessLogRequest {
+            share: String::new(), user: String::new(), operation: String::new(), result: String::new(), since: String::new(), limit: 0,
+        }), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::AccessLogResponse { forward, .. }) = response else { panic!("an access log") };
+        assert!(forward.enabled);
+        assert_eq!((forward.webhook_url.as_str(), forward.syslog_target.as_str()), ("", ""));
     }
 
     #[tokio::test]
@@ -9100,6 +9295,55 @@ mod registration_tests {
         assert!(tentanas::disks::disk_name(gone).is_none());
         let named = smart_subject_name(gone, |id| tentanas::disks::shown_disk_name(&db, id, None));
         assert_eq!(named, Some(("sdq".to_string(), true)), "gone, so the name is flagged as last-known");
+    }
+
+    /// Wave 9b: the lines of a multi-disk SMART job reach the screen named
+    /// by the one disk-naming rule — the live kernel name; a disk that left
+    /// the inventory by the name it was last seen under, flagged; and one the
+    /// node never recorded by the name stored when the job started, flagged
+    /// too. The stored disk ids never leave the node.
+    #[test]
+    fn a_batch_job_lines_are_named_and_never_carry_an_id() {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        tentanas::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let live = "wwn-wave9b-lines-live-5000cca2";
+        let gone = "wwn-wave9b-lines-gone-5000cca3";
+        let never = "wwn-wave9b-lines-never-5000cca4";
+        tentanas::disks::insert_live_for_test(tentaflow_protocol::tentanas::NasDisk {
+            disk_id: live.into(),
+            name: "sdlv".into(),
+            path: "/dev/sdlv".into(),
+            ..Default::default()
+        });
+        tentanas::db::upsert_disk_seen(
+            &db,
+            &tentanas::db::DiskIdentity { disk_id: gone, name: "sdq", model: "HGST", serial: "S9", wwn: None, size_bytes: 1, kind: "hdd" },
+        )
+        .expect("record the disk");
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: tentanas::db::SMART_BATCH_KIND.into(),
+            subject: "short|sdlv, sdq, sdx".into(),
+            status: "running".into(),
+            started_by: "test".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        tentanas::db::insert_job_full(
+            &db,
+            &job,
+            None,
+            None,
+            &[(live.into(), "sdlv".into()), (gone.into(), "sdq".into()), (never.into(), "sdx".into())],
+        )
+        .expect("batch");
+        let lines = job_disk_lines(&db, &job.job_id);
+        let shown: Vec<(&str, bool, &str)> = lines.iter().map(|d| (d.name.as_str(), d.last_known, d.state.as_str())).collect();
+        assert_eq!(shown, vec![("sdlv", false, "pending"), ("sdq", true, "pending"), ("sdx", true, "pending")]);
+        let wire = serde_json::to_string(&lines).expect("json");
+        assert!(!wire.contains("wwn-"), "no disk id in the lines: {wire}");
+        tentanas::disks::remove_live_for_test(live);
     }
 
     #[test]

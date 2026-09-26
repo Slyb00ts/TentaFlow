@@ -6337,6 +6337,31 @@ pub struct AddonInstallResponse {
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AddonUninstallRequest {
     pub addon_id: String,
+    /// Peers the admin chose to proceed without (wave-9b critic, MAJOR A): a
+    /// node that never published what its teardown would refuse, or whose
+    /// last published plan refuses, and that the admin declares lost for
+    /// this app — each confirmed by retyping the node's NAME. Appended,
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub acknowledged_nodes: Vec<AddonUninstallAck>,
+}
+
+/// One node the uninstall proceeds without: `confirm_name` is the node's name
+/// retyped (or `LOST` for a node without a name — its id is never shown).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize, Default)]
+pub struct AddonUninstallAck {
+    pub node_id: String,
+    pub confirm_name: String,
+}
+
+/// Drops the teardown password an earlier `AddonTeardownArmRequest` handed
+/// the answering node — sent by the dialog whenever the flow stops before
+/// the uninstall (another node refused its password, the node refused the
+/// uninstall, the dialog was closed). Answers `AddonTeardownArmResponse`
+/// with an empty `armed_until`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownDisarmRequest {
+    pub addon_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -6362,6 +6387,120 @@ pub struct AddonTeardownEntry {
     /// `kind` that has no per-instance counts to render.
     #[serde(default)]
     pub count_vars: std::collections::BTreeMap<String, i64>,
+    /// The app's teardown on this node REFUSES while this entry holds (e.g.
+    /// TentaNas with Elastic Arrays under its supervision): the dialog says
+    /// so and does not offer the uninstall. Appended, `#[serde(default)]`.
+    #[serde(default)]
+    pub blocks: bool,
+}
+
+/// One fleet node the instance lives on, as the uninstall dialog lists it:
+/// the uninstall runs on every node (the local one at once, the others when
+/// the replicated removal reaches them), so each gets its own row, progress
+/// and result. `node_id` addresses the node (routing) and is never shown;
+/// `name` is what the screen prints, empty when the node never told its name.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize, Default)]
+pub struct AddonTeardownNode {
+    pub node_id: String,
+    pub name: String,
+    /// The node answering the plan (the dashboard's own node).
+    pub local: bool,
+    /// Whether the mesh currently reaches the node.
+    pub online: bool,
+    /// The node's own reconcile outcome: 'ready' | 'unsupported' |
+    /// 'init_error' | 'unknown' (the node never reported one).
+    pub status: String,
+    /// Whether this node's LAST KNOWN teardown blockers are known: the node
+    /// published them (an app whose teardown can refuse does, through the
+    /// synced config), or the app's teardown never refuses. An offline node
+    /// with nothing known must not be torn down blind. Appended,
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub last_known: bool,
+    /// What the node last published as refusing its teardown (empty when it
+    /// refuses nothing). Appended, `#[serde(default)]`.
+    #[serde(default)]
+    pub last_blocks: Vec<AddonTeardownEntry>,
+    /// The node recorded a status for the instance but is no longer a
+    /// trusted peer: the removal cannot reach it, and it does not hold the
+    /// uninstall back. Appended, `#[serde(default)]`.
+    #[serde(default)]
+    pub unpaired: bool,
+}
+
+/// Arms the answering node's privilege channel for the teardown the admin is
+/// about to start (n18a: a node without an unattended channel gets its own
+/// password prompt, so its pools are exported cleanly). The password is only
+/// validated and held for the teardown; it never leaves the node.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownArmRequest {
+    pub addon_id: String,
+    pub sudo_password: crate::tentanas::SudoSecret,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize, Default)]
+pub struct AddonTeardownArmResponse {
+    pub addon_id: String,
+    /// Until when the channel stays armed (RFC 3339), empty when unknown.
+    pub armed_until: String,
+}
+
+/// Where the uninstall stands on ONE node, answered by that node (the
+/// dashboard forwards the request to it). Polled by the uninstall dialog
+/// after the admin confirmed.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonTeardownStatusRequest {
+    pub addon_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize, Default)]
+pub struct AddonTeardownStatusResponse {
+    pub addon_id: String,
+    /// 'installed' (the removal has not reached this node yet) | 'running' |
+    /// 'done' | 'failed' | 'absent' (no instance here and no record of a
+    /// teardown in this process — e.g. the node restarted since).
+    pub state: String,
+    /// The step running now (or the step that failed): a stable code the
+    /// dashboard words (`addon_uninstall.phases.<code>`).
+    pub phase: String,
+    /// What the teardown could not do although it finished (e.g. pools that
+    /// stayed imported): stable codes (`addon_uninstall.warnings.<code>`).
+    pub warnings: Vec<String>,
+}
+
+/// One consequence of DISABLING an instance on the node that answers, for the
+/// confirmation the dashboard shows before the toggle goes off (n18d).
+/// Computed by the app from its real state; the dashboard words `kind`
+/// (`addon_disable.consequences.<kind>`) with `count_vars` and `names`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize, Default)]
+pub struct AddonDisableConsequence {
+    pub kind: String,
+    /// 'continues' (keeps working while disabled) | 'stops' | 'kept' (state
+    /// that simply stays as it is, e.g. a mounted array).
+    pub effect: String,
+    #[serde(default)]
+    pub count_vars: std::collections::BTreeMap<String, i64>,
+    /// Real names the sentence lists (arrays, pools) — never ids.
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AddonDisablePreviewRequest {
+    pub addon_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize, Default)]
+pub struct AddonDisablePreviewResponse {
+    pub addon_id: String,
+    pub display_name: String,
+    /// The answering node's name, for "on node X"; empty when unknown.
+    pub node_name: String,
+    /// The manifest declares work that goes on while the app is disabled.
+    pub background_on_disable: bool,
+    /// Empty when the app supplies no consequence provider — the dashboard
+    /// then disables without a dialog, as before.
+    pub consequences: Vec<AddonDisableConsequence>,
 }
 
 /// Another installed instance that declares `[[uses_app]]` on the package
@@ -6387,6 +6526,21 @@ pub struct AddonTeardownPlanResponse {
     pub display_name: String,
     pub entries: Vec<AddonTeardownEntry>,
     pub dependents: Vec<AddonTeardownDependent>,
+    /// Every node the uninstall reaches (this one first). Appended,
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub nodes: Vec<AddonTeardownNode>,
+    /// How the teardown on the ANSWERING node gets root (n18a's mode chip):
+    /// '' (the app needs none) | 'helper' (mode A, unattended) | 'password'
+    /// (mode B: the dialog asks for this node's sudo password first).
+    /// Appended, `#[serde(default)]`.
+    #[serde(default)]
+    pub privilege: String,
+    /// The configuration backup the teardown writes on the answering node
+    /// (n18a's backup column), as the file name pattern; empty when the app
+    /// writes none. Appended, `#[serde(default)]`.
+    #[serde(default)]
+    pub backup_file: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -8145,6 +8299,13 @@ pub enum MessageBody {
     AddonUninstallResponseBody(AddonUninstallResponse),
     AddonTeardownPlanRequestBody(AddonTeardownPlanRequest),
     AddonTeardownPlanResponseBody(AddonTeardownPlanResponse),
+    AddonTeardownStatusRequestBody(AddonTeardownStatusRequest),
+    AddonTeardownStatusResponseBody(AddonTeardownStatusResponse),
+    AddonTeardownArmRequestBody(AddonTeardownArmRequest),
+    AddonTeardownArmResponseBody(AddonTeardownArmResponse),
+    AddonTeardownDisarmRequestBody(AddonTeardownDisarmRequest),
+    AddonDisablePreviewRequestBody(AddonDisablePreviewRequest),
+    AddonDisablePreviewResponseBody(AddonDisablePreviewResponse),
     AddonReloadRequestBody(AddonReloadRequest),
     AddonReloadResponseBody(AddonReloadResponse),
     AddonConfigGetRequestBody(AddonConfigGetRequest),

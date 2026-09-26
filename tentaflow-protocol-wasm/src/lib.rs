@@ -34,6 +34,8 @@ use tentaflow_protocol::{
         AddonPermissionMatrixRequest, AddonPermissionSetRequest, AddonReloadRequest,
         AddonResourcesGetRequest, AddonResourcesSetRequest, AddonShowInCatalogSetRequest,
         AddonStoragePayload, AddonStorageStatsRequest, AddonTeardownPlanRequest,
+        AddonTeardownStatusRequest, AddonDisablePreviewRequest, AddonTeardownArmRequest,
+        AddonTeardownDisarmRequest,
         AddonToggleRequest, AddonToolsRequest, AddonUninstallRequest, AddonVectorConfig,
         AddonVectorGetConfigRequest, AddonVectorPayload, AddonVectorServiceRef,
         AddonVectorSetConfigRequest, AddonVisibilityListRequest, AddonVisibilitySetRequest,
@@ -10031,9 +10033,27 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::AddonUninstallRequestBody(r) => {
             set(&obj, "variant", "AddonUninstallRequest".into());
             set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "acknowledgedCount", (r.acknowledged_nodes.len() as f64).into());
         }
         MessageBody::AddonTeardownPlanRequestBody(r) => {
             set(&obj, "variant", "AddonTeardownPlanRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+        }
+        MessageBody::AddonTeardownStatusRequestBody(r) => {
+            set(&obj, "variant", "AddonTeardownStatusRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+        }
+        MessageBody::AddonDisablePreviewRequestBody(r) => {
+            set(&obj, "variant", "AddonDisablePreviewRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+        }
+        MessageBody::AddonTeardownDisarmRequestBody(r) => {
+            set(&obj, "variant", "AddonTeardownDisarmRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+        }
+        MessageBody::AddonTeardownArmRequestBody(r) => {
+            // The password is never echoed back into a JS object.
+            set(&obj, "variant", "AddonTeardownArmRequest".into());
             set(&obj, "addonId", r.addon_id.into());
         }
         MessageBody::AddonConfigGetRequestBody(r) => {
@@ -10118,6 +10138,13 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&eo, "description", e.description.into());
                 set(&eo, "removed", e.removed.into());
                 set(&eo, "sizeBytes", (e.size_bytes as f64).into());
+                set(&eo, "blocks", e.blocks.into());
+                // The named counts a kind's translation interpolates
+                // (`addon_uninstall.entries.<kind>`); `undefined` when the
+                // kind has none, which the dialog treats as "no vars".
+                if !e.count_vars.is_empty() {
+                    set(&eo, "countVars", count_vars_object(&e.count_vars).into());
+                }
                 entries.push(&eo.into());
             }
             set(&obj, "entries", entries.into());
@@ -10130,6 +10157,70 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 dependents.push(&dobj.into());
             }
             set(&obj, "dependents", dependents.into());
+            let nodes = js_sys::Array::new();
+            for n in r.nodes {
+                let no = js_sys::Object::new();
+                set(&no, "nodeId", n.node_id.into());
+                set(&no, "name", n.name.into());
+                set(&no, "local", n.local.into());
+                set(&no, "online", n.online.into());
+                set(&no, "status", n.status.into());
+                set(&no, "lastKnown", n.last_known.into());
+                let blocks = js_sys::Array::new();
+                for e in n.last_blocks {
+                    let eo = js_sys::Object::new();
+                    set(&eo, "kind", e.kind.into());
+                    set(&eo, "description", e.description.into());
+                    set(&eo, "blocks", true.into());
+                    if !e.count_vars.is_empty() {
+                        set(&eo, "countVars", count_vars_object(&e.count_vars).into());
+                    }
+                    blocks.push(&eo.into());
+                }
+                set(&no, "lastBlocks", blocks.into());
+                set(&no, "unpaired", n.unpaired.into());
+                nodes.push(&no.into());
+            }
+            set(&obj, "nodes", nodes.into());
+            set(&obj, "privilege", r.privilege.into());
+            set(&obj, "backupFile", r.backup_file.into());
+        }
+        MessageBody::AddonTeardownArmResponseBody(r) => {
+            set(&obj, "variant", "AddonTeardownArmResponse".into());
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "armedUntil", r.armed_until.into());
+        }
+        MessageBody::AddonTeardownStatusResponseBody(r) => {
+            set(&obj, "variant", "AddonTeardownStatusResponse".into());
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "state", r.state.into());
+            set(&obj, "phase", r.phase.into());
+            let warnings = js_sys::Array::new();
+            for w in r.warnings {
+                warnings.push(&w.into());
+            }
+            set(&obj, "warnings", warnings.into());
+        }
+        MessageBody::AddonDisablePreviewResponseBody(r) => {
+            set(&obj, "variant", "AddonDisablePreviewResponse".into());
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "displayName", r.display_name.into());
+            set(&obj, "nodeName", r.node_name.into());
+            set(&obj, "backgroundOnDisable", r.background_on_disable.into());
+            let consequences = js_sys::Array::new();
+            for c in r.consequences {
+                let co = js_sys::Object::new();
+                set(&co, "kind", c.kind.into());
+                set(&co, "effect", c.effect.into());
+                set(&co, "countVars", count_vars_object(&c.count_vars).into());
+                let names = js_sys::Array::new();
+                for n in c.names {
+                    names.push(&n.into());
+                }
+                set(&co, "names", names.into());
+                consequences.push(&co.into());
+            }
+            set(&obj, "consequences", consequences.into());
         }
         MessageBody::AddonConfigGetResponseBody(r) => {
             set(&obj, "variant", "AddonConfigGetResponse".into());
@@ -17061,7 +17152,54 @@ pub fn encode_suggest_service_port_request(payload_json: String) -> Result<Vec<u
 #[wasm_bindgen(js_name = encodeAddonUninstallRequest)]
 pub fn encode_addon_uninstall_request(addon_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonUninstallRequestBody(
-        AddonUninstallRequest { addon_id },
+        AddonUninstallRequest { addon_id, acknowledged_nodes: Vec::new() },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `payload_json`: `{ "addon_id": …, "acknowledged_nodes": [{ "node_id", "confirm_name" }] }`.
+#[wasm_bindgen(js_name = encodeAddonUninstallRequestJson)]
+pub fn encode_addon_uninstall_request_json(payload_json: String) -> Result<Vec<u8>, JsError> {
+    let payload: AddonUninstallRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("payload parse: {e}")))?;
+    encode_body_inner(&MessageBody::AddonUninstallRequestBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAddonTeardownDisarmRequest)]
+pub fn encode_addon_teardown_disarm_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonTeardownDisarmRequestBody(AddonTeardownDisarmRequest { addon_id }))
+        .map_err(|e| JsError::new(&e))
+}
+
+/// `{ name: count }` as a plain JS object, the shape `I18n.t` interpolates.
+fn count_vars_object(vars: &std::collections::BTreeMap<String, i64>) -> js_sys::Object {
+    let out = js_sys::Object::new();
+    for (k, v) in vars {
+        set(&out, k, (*v as f64).into());
+    }
+    out
+}
+
+#[wasm_bindgen(js_name = encodeAddonTeardownStatusRequest)]
+pub fn encode_addon_teardown_status_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonTeardownStatusRequestBody(
+        AddonTeardownStatusRequest { addon_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `payload_json`: `{ "addon_id": …, "sudo_password": … }`.
+#[wasm_bindgen(js_name = encodeAddonTeardownArmRequest)]
+pub fn encode_addon_teardown_arm_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    let payload: AddonTeardownArmRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("payload parse: {e}")))?;
+    encode_body_inner(&MessageBody::AddonTeardownArmRequestBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAddonDisablePreviewRequest)]
+pub fn encode_addon_disable_preview_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonDisablePreviewRequestBody(
+        AddonDisablePreviewRequest { addon_id },
     ))
     .map_err(|e| JsError::new(&e))
 }
@@ -23928,6 +24066,12 @@ pub fn encode_tentanas_disk_get_request(request_json: String) -> Result<Vec<u8>,
 #[wasm_bindgen(js_name = encodeTentaNasDiskSmartTestRequest)]
 pub fn encode_tentanas_disk_smart_test_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("DiskSmartTestRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(DiskSmartTestBatchRequest) — one SMART self-test job over several disks; answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasDiskSmartTestBatchRequest)]
+pub fn encode_tentanas_disk_smart_test_batch_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DiskSmartTestBatchRequest", &request_json)
 }
 
 /// MessageBody::TentaNasBody(DiskLocateRequest) — blink the bay LED (`enable` toggles).

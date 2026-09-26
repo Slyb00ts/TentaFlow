@@ -1500,3 +1500,99 @@ tf-chip.addon-badge.state-off > .tf-chip {
 .network-declared-row .quick-action {
   margin-left: auto;
 }
+
+/* n18d — the confirmation before an app is disabled (modules/addons/disable-dialog.js). */
+.addon-disable-window .disable-intro {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 8px);
+  padding: 12px 14px;
+  font-size: 13px;
+  color: var(--text-2);
+  margin-bottom: 12px;
+}
+.addon-disable-window .disable-intro b { color: var(--text); }
+.addon-disable-window .disable-background {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+.addon-disable-window .disable-consequences-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 6px;
+}
+.addon-disable-window .disable-consequence-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.addon-disable-window .disable-consequence {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm, 8px);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  background: var(--bg-2);
+  font-size: 12.5px;
+  color: var(--text);
+}
+.addon-disable-window .disable-consequence.continues { border-left-color: var(--success); }
+.addon-disable-window .disable-consequence.stops { border-left-color: var(--warning); }
+.addon-disable-window .disable-consequence.kept { border-left-color: var(--info, var(--border)); }
+.addon-disable-window .disable-consequence .icon { width: 14px; height: 14px; flex: 0 0 auto; color: var(--text-3); }
+.addon-disable-window .disable-consequence-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+
+/* MAJOR 22 — the per-node table of a fleet-wide uninstall (modules/addons/uninstall-dialog.js). */
+.addon-uninstall-window .uninstall-nodes {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  margin-bottom: 12px;
+}
+.addon-uninstall-window .uninstall-nodes th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-3);
+  font-size: 11.5px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.addon-uninstall-window .uninstall-nodes td {
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.addon-uninstall-window .uninstall-node-name { font-family: var(--font-mono); font-weight: 600; }
+.addon-uninstall-window .uninstall-node-meta { margin-top: 4px; }
+.addon-uninstall-window .uninstall-node-scope { display: flex; flex-direction: column; gap: 2px; color: var(--text-2); }
+.addon-uninstall-window .uninstall-node-scope .blocked { color: var(--danger); }
+.addon-uninstall-window .uninstall-node-state { display: flex; flex-direction: column; gap: 4px; }
+.addon-uninstall-window .uninstall-node-state .detail { font-size: 11.5px; color: var(--text-3); }
+.addon-uninstall-window .uninstall-blocked { color: var(--danger); font-size: 12px; margin-bottom: 8px; }
+.addon-uninstall-window .uninstall-node-backup { display: flex; flex-direction: column; gap: 4px; }
+.addon-uninstall-window .uninstall-node-backup .detail { font-size: 11px; color: var(--text-3); overflow-wrap: anywhere; }
+.addon-uninstall-window .uninstall-node-password { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; font-size: 12px; color: var(--warning); }
+.addon-uninstall-window .uninstall-node-password .input { max-width: 260px; }
+.addon-uninstall-window .uninstall-node-password .detail { color: var(--danger); font-size: 11.5px; }
+.addon-uninstall-window .uninstall-node-password .detail:empty { display: none; }
+.addon-uninstall-window .uninstall-single-password { margin-bottom: 12px; }
+
+/* The platform admin's list of internal alert collectors (settings, "Dostępy zewnętrzne"; modules/settings-alert-collectors.js). */
+#alert-collectors-card .alert-collector-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+#alert-collectors-card .alert-collector-row tf-input { flex: 1 1 220px; min-width: 0; }
+#alert-collectors-card .alert-collector-port { flex: 0 0 110px; }
+#alert-collectors-card .alert-collector-http { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-2); }
+#alert-collectors-card .num-err { color: var(--danger); font-weight: 600; font-size: 12px; margin-top: 8px; }
+.addon-uninstall-window .uninstall-node-ack { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; font-size: 12px; color: var(--danger); }
+.addon-uninstall-window .uninstall-node-ack .input { max-width: 260px; }
+

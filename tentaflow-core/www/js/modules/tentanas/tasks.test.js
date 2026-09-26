@@ -342,7 +342,7 @@ test('"Uruchom teraz" starts a scrub through sudo and a SMART short test on ever
   const screen = fakeScreen(fixtures({
     tentaNasPoolScrubRequest: { job: { jobId: 'job-s', kind: 'pool_scrub', status: 'running' } },
     tentaNasDisksListRequest: { disks: [{ diskId: 'sda', name: 'sda', smartAvailable: true }, { diskId: 'sdb', name: 'sdb', smartAvailable: false }, { diskId: 'nvme0n1', name: 'nvme0n1', smartAvailable: true }], telemetry: null },
-    tentaNasDiskSmartTestRequest: { ok: true },
+    tentaNasDiskSmartTestBatchRequest: { job: { jobId: 'job-b', kind: 'smart_test_batch', status: 'running', disks: [] } },
   }));
   const body = mount();
   await drawTasks(screen, body);
@@ -361,11 +361,12 @@ test('"Uruchom teraz" starts a scrub through sudo and a SMART short test on ever
   await flush();
   await flush();
   await flush();
-  const tests = screen.calls.filter((c) => c.kind === 'tentaNasDiskSmartTestRequest').map((c) => c.payload);
-  assert.deepEqual(tests, [
-    { diskId: 'sda', kind: 'short', sudoPassword: 'hunter2' },
-    { diskId: 'nvme0n1', kind: 'short', sudoPassword: 'hunter2' },
-  ], 'one short test per disk that reports SMART');
+  const batches = screen.calls.filter((c) => c.kind === 'tentaNasDiskSmartTestBatchRequest').map((c) => c.payload);
+  assert.deepEqual(batches, [
+    { diskIds: ['sda', 'nvme0n1'], kind: 'short', sudoPassword: 'hunter2' },
+  ], 'ONE request for every disk that reports SMART, with one password');
+  assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasDiskSmartTestRequest').length, 0, 'no request per disk');
+  assert.deepEqual(screen.jobLogs.map((j) => j.jobId), ['job-s', 'job-b'], 'the one SMART job opens its log');
   screen.dispose();
 });
 
@@ -626,56 +627,91 @@ test('the SMART protection row shows the real failure when the wire ever carries
   screen.dispose();
 });
 
-// A6 (critic real-functionality): a refused disk used to abort the whole
-// "SMART all disks" batch — the `for` loop's bare `await` threw on the first
-// rejection and every later disk was silently never tested.
-test('"Uruchom teraz" on SMART all-disks continues past a refused disk in the middle and reports it', async () => {
-  const screen = fakeScreen(fixtures({
-    tentaNasDisksListRequest: {
-      disks: [
-        { diskId: 'sda', name: 'sda', smartAvailable: true },
-        { diskId: 'sdb', name: 'sdb', smartAvailable: true },
-        { diskId: 'sdc', name: 'sdc', smartAvailable: true },
-      ],
-    },
-    tentaNasDiskSmartTestRequest: (payload) => {
-      if (payload.diskId === 'sdb') return Promise.reject(new Error('dysk zajęty'));
-      return Promise.resolve({ ok: true });
-    },
-  }));
+// Wave 9b: "SMART all disks" is ONE job on the node with a line per disk.
+// The per-disk rules — go on past a refused disk, stop at the first
+// privilege error without replaying the password — are the node's now
+// (`jobs::smart_self_test_batch`, tested there); the screen shows each line
+// by name with its own worded state, and a refused credential ends the one
+// request with the one error.
+test('"Uruchom teraz" on SMART all-disks shows the job\'s disk lines, each by name with its worded state', async () => {
+  const batch = {
+    jobId: 'job-b', kind: 'smart_test_batch', subject: 'short|sda, sdb, sdc', status: 'running', progressPct: 30,
+    startedBy: 'admin', startedAt: '2026-09-26 10:00:00', log: [],
+    disks: [
+      { name: 'sda', lastKnown: false, state: 'running', progressPct: 60, reasons: [] },
+      { name: 'sdb', lastKnown: false, state: 'refused', progressPct: null, reasons: [{ code: 'self_test_running', params: {} }] },
+      { name: 'sdq', lastKnown: true, state: 'pending', progressPct: null, reasons: [] },
+    ],
+  };
+  const screen = fakeScreen(fixtures({ tentaNasJobsListRequest: { jobs: [batch] } }));
   const body = mount();
   await drawTasks(screen, body);
   await flush();
-  click(scheduleRows(body)[3].querySelector('[data-act="run"]'));
-  await flush();
-  await flush();
-  await flush();
-
-  const tests = screen.calls.filter((c) => c.kind === 'tentaNasDiskSmartTestRequest').map((c) => c.payload.diskId);
-  assert.deepEqual(tests, ['sda', 'sdb', 'sdc'], 'sdc is still tried after sdb refuses — the batch does not stop');
-  // The refusal is reported in a translated sentence around the node's
-  // per-disk reasons — not the bare "sdb: …" list.
-  const warned = toasts.filter((t) => t.kind === 'warning').map((t) => t.text).join('\n');
-  assert.match(warned, /Test SMART nie ruszył na 1 dysku: sdb: dysk zajęty/);
+  const lines = [...body.querySelectorAll('#nas-jobs-running .job-disk')];
+  assert.equal(lines.length, 3, 'one line per disk');
+  assert.match(body.querySelector('#nas-jobs-running .job-name').textContent, /SMART short\s+sda, sdb, sdc/, 'a chosen set is named by its disks');
+  assert.equal(lines[0].querySelector('[data-role="name"]').textContent, 'sda');
+  assert.equal(lines[0].querySelector('[data-role="state"]').getAttribute('label'), 'w toku 60%');
+  assert.equal(lines[1].querySelector('[data-role="detail"]').textContent, 'na tym dysku trwa już test SMART');
+  assert.equal(lines[1].querySelector('[data-role="state"]').getAttribute('status'), 'warn');
+  assert.equal(lines[2].querySelector('[data-role="name"]').textContent, 'ostatnio widziany jako sdq', 'a remembered name is marked');
+  assert.doesNotMatch(body.querySelector('#nas-jobs-running').textContent, /wwn-|sn-|tentanas\./, 'no id and no raw key');
   screen.dispose();
 });
 
-// M1: a privilege/credential error (a rejected sudo password, an unarmed
-// channel, a helper/core version mismatch — anything `broker_error` maps to
-// `ProtocolErrorCode::NotAvailable`) is the OPPOSITE of a per-disk refusal:
-// it will fail identically for every remaining disk, so it must stop the
-// whole batch at once rather than replay the same password against sudo
-// once per disk (pam_faillock can then lock the account the core runs as).
-test('"Uruchom teraz" on SMART all-disks stops at once on a privilege/credential error and sends exactly one request', async () => {
+test('a batch line that moves is patched in place: the other lines keep their elements', async () => {
+  const line = (name, state, pct = null) => ({ name, lastKnown: false, state, progressPct: pct, reasons: [] });
+  let jobs = [{ jobId: 'job-b', kind: 'smart_test_batch', subject: 'sda, sdb', status: 'running', progressPct: 10, startedBy: 'admin', startedAt: '2026-09-26 10:00:00', log: [], disks: [line('sda', 'running', 10), line('sdb', 'pending')] }];
+  const screen = fakeScreen(fixtures({ tentaNasJobsListRequest: () => ({ jobs }) }));
+  const scheduled = [];
+  screen.later = (fn) => { scheduled.push(fn); };
+  const body = mount();
+  await drawTasks(screen, body);
+  await flush();
+  const before = [...body.querySelectorAll('#nas-jobs-running .job-disk')];
+  jobs = [{ ...jobs[0], progressPct: 40, disks: [line('sda', 'running', 40), line('sdb', 'pending')] }];
+  for (const fn of scheduled.splice(0)) await fn();
+  await flush();
+  const after = [...body.querySelectorAll('#nas-jobs-running .job-disk')];
+  assert.equal(after[0], before[0], 'the moving line is the same element');
+  assert.equal(after[1], before[1], 'the unchanged line is the same element');
+  assert.equal(after[0].querySelector('[data-role="state"]').getAttribute('label'), 'w toku 40%');
+  screen.dispose();
+});
+
+test('a finished batch reads "N/M OK" in the history and names the disks that did not pass', async () => {
+  const done = {
+    jobId: 'job-h', kind: 'smart_test_batch', subject: 'short|all', status: 'failed', startedBy: 'scheduler',
+    startedAt: '2026-09-26 10:00:00', finishedAt: '2026-09-26 10:04:00', log: [], error: 'the self-test did not pass on 1 of 2 disks',
+    disks: [
+      { name: 'sda', lastKnown: false, state: 'passed', progressPct: null, reasons: [] },
+      { name: 'sdb', lastKnown: false, state: 'failed', progressPct: null, reasons: [{ code: 'test_failed', params: { detail: 'Completed: read failure' } }] },
+    ],
+  };
+  const screen = fakeScreen(fixtures({ tentaNasJobsListRequest: { jobs: [done] } }));
+  const body = mount();
+  await drawTasks(screen, body);
+  await flush();
+  const row = body.querySelector('#nas-jobs-table').rows.find((r) => r._job.jobId === 'job-h');
+  assert.match(row.result, /label="1\/2 OK"/);
+  // n15: "SMART short — wszystkie · 18/18 OK" — the test kind in the label,
+  // "all disks" as the subject, never the list of every kernel name.
+  assert.match(row.task, /SMART short/);
+  assert.match(row.task, /— wszystkie dyski/);
+  assert.match(row.result, /sdb: nie przeszedł — dysk nie przeszedł testu: Completed: read failure/);
+  assert.doesNotMatch(row.result, /did not pass on/, 'the node\'s English summary is not the text');
+  screen.dispose();
+});
+
+test('a refused credential ends the one SMART request with its one error and no job', async () => {
   const screen = fakeScreen(fixtures({
     tentaNasDisksListRequest: {
       disks: [
         { diskId: 'sda', name: 'sda', smartAvailable: true },
         { diskId: 'sdb', name: 'sdb', smartAvailable: true },
-        { diskId: 'sdc', name: 'sdc', smartAvailable: true },
       ],
     },
-    tentaNasDiskSmartTestRequest: () => Promise.reject(Object.assign(new Error('Kanał uprawnień systemowych nie jest dostępny (sudo rejected the password)'), { code: 'NotAvailable' })),
+    tentaNasDiskSmartTestBatchRequest: () => Promise.reject(Object.assign(new Error('Kanał uprawnień systemowych nie jest dostępny (sudo rejected the password)'), { code: 'NotAvailable' })),
   }));
   const body = mount();
   await drawTasks(screen, body);
@@ -684,10 +720,10 @@ test('"Uruchom teraz" on SMART all-disks stops at once on a privilege/credential
   await flush();
   await flush();
   await flush();
-
-  const tests = screen.calls.filter((c) => c.kind === 'tentaNasDiskSmartTestRequest');
-  assert.equal(tests.length, 1, 'sda fails with a credential error — sdb and sdc are never sent');
-  assert.equal(tests[0].payload.diskId, 'sda');
+  const sent = screen.calls.filter((c) => c.kind === 'tentaNasDiskSmartTestBatchRequest');
+  assert.equal(sent.length, 1, 'exactly one request, never one per disk');
+  assert.deepEqual(sent[0].payload.diskIds, ['sda', 'sdb']);
+  assert.deepEqual(screen.jobLogs, [], 'no job log opens for a refused request');
   screen.dispose();
 });
 
@@ -1136,5 +1172,45 @@ test('"Uruchom teraz" on a Sync that needs the confirm opens the array screen', 
     assert.deepEqual(opened, redirected ? ['media'] : [], refusal);
     assert.equal(screen.jobLogs.length, 0, refusal);
     screen.dispose();
+  }
+});
+
+// Every code a multi-disk job line can carry, read from the Rust that writes
+// it (tentanas/jobs.rs: the batch body and its verdicts; tentanas/db.rs: the
+// busy disk the insert refuses), and every state it can be in: each has words
+// in every locale, so a code added there without words here fails this test
+// instead of showing a bare state on screen.
+test('every disk-line code and state of a multi-disk job is worded in every locale', async () => {
+  const { readFileSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { WWW_ROOT } = await import('./_test-setup.js');
+  const { diskLineReason } = await import('./tasks.js');
+  const production = (file) => {
+    const src = readFileSync(join(WWW_ROOT, '..', 'src', 'tentanas', file), 'utf8');
+    const cut = src.indexOf('#[cfg(test)]\nmod tests');
+    return cut >= 0 ? src.slice(0, cut) : src;
+  };
+  const jobs = readFileSync(join(WWW_ROOT, '..', 'src', 'tentanas', 'jobs.rs'), 'utf8');
+  const from = jobs.indexOf('fn line_verdict');
+  const batch = jobs.slice(from, jobs.indexOf('\n}\n', jobs.indexOf('pub async fn smart_self_test_batch', from)));
+  const codes = new Set([...batch.matchAll(/(?:coded_reason|reason)\(\s*"(\w+)"/g)].map((m) => m[1]));
+  for (const m of production('db.rs').matchAll(/"refused", vec!\[super::disks::coded_reason\("(\w+)"/g)) codes.add(m[1]);
+  assert.ok(codes.size >= 11, `the scan found the codes (${[...codes].join(', ')})`);
+  const states = ['pending', 'running', 'passed', 'failed', 'incomplete', 'refused', 'skipped', 'interrupted', 'cancelled'];
+  try {
+    for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(lang);
+      for (const code of codes) {
+        const words = diskLineReason({ reasons: [{ code, params: { detail: 'Completed: read failure', min: '30' } }] });
+        assert.ok(words, `${code} has words in ${lang}`);
+        assert.doesNotMatch(words, /tentanas\.|\{/, `${code} in ${lang}: ${words}`);
+      }
+      for (const state of states) {
+        const words = I18n.t('tentanas.jobs.disk_state.' + state);
+        assert.notEqual(words, 'tentanas.jobs.disk_state.' + state, `${state} in ${lang}`);
+      }
+    }
+  } finally {
+    await I18n.setLanguage('pl');
   }
 });

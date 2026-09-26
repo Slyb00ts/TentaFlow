@@ -914,62 +914,6 @@ export function errMessage(e, nameOf = () => '') {
   return words === 'tentanas.' + key ? message : words;
 }
 
-// ----- Per-disk batches (SMART "all disks" / SMART "selected") -------------
-//
-// Both batches send the same request once per disk with one sudo password
-// for the whole run. Two very different things can make one of those
-// requests fail, and they need OPPOSITE handling:
-//   - a refusal specific to THIS disk (busy, a test already runs, the disk
-//     rejects the command) — record it, try the next disk.
-//   - a privilege/credential failure (a rejected or expired sudo password,
-//     an unarmed privilege channel, a helper/core version mismatch) — this
-//     will fail identically for every remaining disk, so retrying it per
-//     disk only replays the same password (or the same unarmed channel)
-//     against sudo once per disk. On a distro with `pam_faillock` that can
-//     lock the account the core runs as.
-//
-// The server tells the two apart with one stable code: `broker_error` in
-// dispatch/tentanas.rs maps `BrokerError::Unarmed` (rejected/expired
-// password, unarmed channel), `BrokerError::HelperVersion` (helper/core
-// version mismatch, `HELPER_VERSION_MARKER`) and `BrokerError::ToolMissing`
-// all to `ProtocolErrorCode::NotAvailable` — never left to a guess from the
-// (partly Polish, partly English) error text. `api-binary-shim.js` copies
-// that code onto the thrown `Error` as `.code`.
-const BATCH_HALT_CODE = 'NotAvailable';
-
-/** True for the one error shape that must stop a whole per-disk batch. */
-export function isBatchHaltError(e) {
-  return Boolean(e) && e.code === BATCH_HALT_CODE;
-}
-
-/**
- * Runs `request(disk)` once per disk in `disks`, in order, with one shared
- * sudo password closed over by the caller. A per-disk refusal is recorded in
- * `refused` and the loop continues; a privilege/credential error
- * (`isBatchHaltError`) is rethrown immediately, so the caller's `withSudo`
- * stops the batch and surfaces that one error instead of every disk's copy
- * of it.
- */
-export async function runDiskBatch(disks, request) {
-  const started = [];
-  const refused = [];
-  for (const disk of disks) {
-    try {
-      await request(disk);
-      started.push(disk);
-    } catch (e) {
-      if (isBatchHaltError(e)) throw e;
-      refused.push({ disk, error: e });
-    }
-  }
-  return { started, refused };
-}
-
-/** The disks a batch refused, named — never a disk id — for one toast. */
-export function refusedBatchNames(refused) {
-  return refused.map((r) => `${r.disk.name}: ${errMessage(r.error)}`).join(' · ');
-}
-
 export function jobTone(status) {
   return status === 'succeeded' || status === 'done' ? 'ok' : status === 'failed' || status === 'blocked' ? 'err' : status === 'cancelled' ? 'warn' : status === 'running' ? 'accent' : 'info';
 }
@@ -977,7 +921,13 @@ export function jobTone(status) {
 // Job kinds are snake_case on the wire ("pool_scrub") and map 1:1 onto
 // `jobs.kind_*` keys. A kind without a label shows its wire name so a new
 // backend job is still readable in the list.
-export function jobKindLabel(kind) {
+export function jobKindLabel(kind, subject = '') {
+  // A multi-disk SMART job carries its test kind in its subject
+  // (`<short|long>|…`, `db::smart_batch_subject`): n15 reads "SMART short".
+  if (kind === 'smart_test_batch') {
+    const test = String(subject || '').split('|')[0];
+    return T(test === 'long' ? 'jobs.kind_smart_batch_long' : 'jobs.kind_smart_batch_short');
+  }
   const key = 'jobs.kind_' + String(kind || '');
   const label = T(key);
   return label === 'tentanas.' + key ? String(kind || '—') : label;

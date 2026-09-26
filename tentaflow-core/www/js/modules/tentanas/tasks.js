@@ -11,7 +11,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage,
-  jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames, nodeTextTitle, jobLogLines,
+  jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, nodeTextTitle, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, setClass, patchHtml, patchKeyedList } from '/js/lib/dom-patch.js';
 import { isOpaqueId, isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
@@ -60,10 +60,102 @@ const TRIM_ONLY = ['weekly', 'monthly'];
 export function jobSubject(j) {
   const subject = String(j?.subject || '').trim();
   if (!subject) return { text: '', words: false };
+  // A multi-disk SMART job: `<short|long>|all` or `<short|long>|<names>`;
+  // the test kind is in its label (`jobKindLabel`).
+  if (j?.kind === SMART_BATCH_KIND) {
+    const rest = subject.includes('|') ? subject.slice(subject.indexOf('|') + 1) : subject;
+    if (rest === 'all') return { text: T('jobs.subject_all_disks'), words: true };
+    return { text: rest, words: false };
+  }
   const smart = j?.kind === 'smart_test';
   if (smart ? isDiskIdShape(subject) : isOpaqueId(subject)) return { text: smart ? T('jobs.subject_unknown_disk') : '', words: true };
   if (j.subjectLastKnown) return { text: T('jobs.subject_last_known', { name: subject }), words: true };
   return { text: subject, words: false };
+}
+
+// ===== The disk lines of a multi-disk job (`smart_test_batch`, wave 9b).
+//
+// One SMART test over several disks is ONE job on the node, and each disk is
+// a line of it (`NasJob.disks`): its name — the kernel name, never an id; a
+// remembered one marked as such — its state, its progress and, when it did
+// not pass, why, worded from the node's code. Shared by the running-job row,
+// the history's result cell and the job-log window.
+export const SMART_BATCH_KIND = 'smart_test_batch';
+
+const DISK_LINE_TONE = {
+  pending: 'info', running: 'accent', passed: 'ok', failed: 'err', incomplete: 'warn',
+  refused: 'warn', skipped: 'neutral', interrupted: 'warn', cancelled: 'warn',
+};
+
+function diskLineName(d) {
+  const name = String(d?.name || '').trim();
+  if (!name) return T('jobs.subject_unknown_disk');
+  return d.lastKnown ? T('jobs.subject_last_known', { name }) : name;
+}
+
+/** Why a line did not pass, in the reader's language ('' when the state says it all). */
+export function diskLineReason(d) {
+  const reason = Array.isArray(d?.reasons) ? d.reasons[0] : null;
+  if (!reason?.code) return '';
+  const key = 'jobs.disk_reason.' + reason.code;
+  const words = T(key, { ...(reason.params || {}) });
+  return words === 'tentanas.' + key ? '' : words;
+}
+
+function diskLineState(d) {
+  const key = 'jobs.disk_state.' + String(d?.state || '');
+  const words = T(key);
+  return words === 'tentanas.' + key ? String(d?.state || '') : words;
+}
+
+/** "sdb: nie przeszedł — …" — one line of plain text, for a table cell. */
+export function diskLineText(d) {
+  const reason = diskLineReason(d);
+  const pct = d?.state === 'running' && d.progressPct != null ? ` ${Number(d.progressPct)}%` : '';
+  return `${diskLineName(d)}: ${diskLineState(d)}${pct}${reason ? ' — ' + reason : ''}`;
+}
+
+const DISK_LINE_SKELETON = `<div class="job-disk"><span class="mono" data-role="name"></span> <tf-chip size="sm" data-role="state"></tf-chip> <span class="job-disk-detail" data-role="detail"></span></div>`;
+
+/**
+ * Paints the lines into `host`, patching only what moved: one element per
+ * line, kept across polls (keyed by position — the order the job runs them
+ * in never changes), and only a text or an attribute that changed is written.
+ */
+export function paintJobDisks(host, j) {
+  if (!host) return;
+  const disks = Array.isArray(j?.disks) ? j.disks : [];
+  patchKeyedList(host, disks.map((d, i) => ({ key: String(i), html: DISK_LINE_SKELETON })));
+  disks.forEach((d, i) => {
+    const line = host.children[i];
+    if (!line) return;
+    setText(line.querySelector('[data-role="name"]'), diskLineName(d));
+    const chip = line.querySelector('[data-role="state"]');
+    setAttr(chip, 'status', DISK_LINE_TONE[d.state] || 'neutral');
+    setAttr(chip, 'label', diskLineState(d) + (d.state === 'running' && d.progressPct != null ? ` ${Number(d.progressPct)}%` : ''));
+    setText(line.querySelector('[data-role="detail"]'), diskLineReason(d));
+  });
+}
+
+/**
+ * The error a job row shows under its status, in the reader's words. A
+ * multi-disk job's own summary (`the self-test did not pass on 2 of 3
+ * disks`) is the node's English and says less than its lines, so it is not
+ * shown; the one error such a job shows is a privilege stop, which is the
+ * request's own.
+ */
+export function jobErrorText(j) {
+  if (!j?.error) return '';
+  if (j.kind === SMART_BATCH_KIND && Array.isArray(j.disks) && j.disks.length
+    && !j.disks.some((d) => (d.reasons || []).some((r) => r.code === 'privilege'))) return '';
+  return errMessage(j.error);
+}
+
+/** The history's result words of a multi-disk job: "18/18 OK" (n15). */
+function batchResultLabel(j) {
+  const disks = Array.isArray(j?.disks) ? j.disks : [];
+  const passed = disks.filter((d) => d.state === 'passed').length;
+  return T('jobs.batch_passed', { ok: passed, n: disks.length });
 }
 
 // ===== A schedule's last outcome (n15 B2, wave 6 B).
@@ -184,9 +276,10 @@ export function jobRowSkeleton(j, subject = jobSubject(j)) {
     <div class="job-row" data-job="${escapeAttr(j.jobId)}">
       <div class="job-ico" data-role="ico"></div>
       <div class="job-main">
-        <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="${subject.words ? '' : 'mono '}text-2">${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
+        <div class="job-name">${escapeHtml(jobKindLabel(j.kind, j.subject))} <span class="${subject.words ? '' : 'mono '}text-2">${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
         <div class="job-sub" data-role="sub"></div>
         ${j.progressPct != null ? `<tf-progress-bar data-role="progress" size="sm" tone="accent"></tf-progress-bar>` : ''}
+        ${j.kind === SMART_BATCH_KIND ? `<div class="job-disks" data-role="disks"></div>` : ''}
       </div>
       <div class="job-actions">
         <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
@@ -212,12 +305,29 @@ export function paintJobRow(row, j) {
   const sub = row.querySelector('[data-role="sub"]');
   setText(sub, T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }) + (last ? ' · ' + last : ''));
   if (j.progressPct != null) setAttr(row.querySelector('[data-role="progress"]'), 'value', Number(j.progressPct));
+  if (j.kind === SMART_BATCH_KIND) paintJobDisks(row.querySelector('[data-role="disks"]'), j);
+}
+
+// The history table's result cell. A multi-disk job reads "18/18 OK" and
+// lists the disks that did not pass, each with its own worded reason — the
+// node's summary sentence (`the self-test did not pass on 2 of 3 disks`) is
+// English and says less than the lines do. A privilege stop is the job's own
+// error and is shown as such.
+function historyResultHtml(j) {
+  if (j.kind === SMART_BATCH_KIND && Array.isArray(j.disks) && j.disks.length) {
+    const bad = j.disks.filter((d) => d.state !== 'passed');
+    const error = jobErrorText(j);
+    return `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(j.status === 'running' ? T('jobs.status_running') : batchResultLabel(j))}"></tf-chip>`
+      + (error ? `<div class="tf-table__cell-sub">${escapeHtml(error)}</div>` : '')
+      + (j.status !== 'running' && bad.length ? `<div class="tf-table__cell-sub">${escapeHtml(bad.map(diskLineText).join(' · '))}</div>` : '');
+  }
+  return `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub">${escapeHtml(errMessage(j.error))}</div>` : ''}`;
 }
 
 // The history table's task cell: the kind, and the subject under it.
 function historyTaskHtml(j) {
   const subject = jobSubject(j);
-  return `<span class="tf-table__cell-title">${escapeHtml(jobKindLabel(j.kind))}</span><div class="tf-table__cell-sub${subject.words ? '' : ' tf-table__cell-sub--mono'}">${escapeHtml(subject.text)}</div>`;
+  return `<span class="tf-table__cell-title">${escapeHtml(jobKindLabel(j.kind, j.subject))}</span><div class="tf-table__cell-sub${subject.words ? '' : ' tf-table__cell-sub--mono'}">${escapeHtml(subject.text)}</div>`;
 }
 
 export async function drawTasks(screen, body) {
@@ -345,7 +455,7 @@ export async function drawTasks(screen, body) {
       node: `<span class="tf-table__cell--mono">${escapeHtml(nodeLabel(node))}</span>`,
       startedAt: `<span class="tf-table__cell--mono">${escapeHtml(fmtDate(j.startedAt))}</span>`,
       duration: `<span class="tf-table__cell--mono">${escapeHtml(jobDuration(j))}</span>`,
-      result: `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub">${escapeHtml(errMessage(j.error))}</div>` : ''}`,
+      result: historyResultHtml(j),
     }));
   };
 
@@ -701,16 +811,13 @@ export async function drawTasks(screen, body) {
       followResponse(screen, res, refreshJobs, T('schedules.run_started', { name: it.name }));
       return;
     }
-    // "All disks" means one short test per disk that reports SMART; a single
-    // sudo prompt covers the whole batch. A disk that refuses per se (busy,
-    // a test already runs, the disk rejects the command) must not stop the
-    // batch: the old loop's bare `await` inside the `for` threw on the FIRST
-    // rejection, which aborted the whole callback and left every later disk
-    // silently untested (A6). A privilege/credential error is the opposite
-    // case — it will fail identically for every remaining disk, so it must
-    // stop the batch at once rather than replay the same rejected password
-    // against sudo once per disk (see `runDiskBatch` / `isBatchHaltError` in
-    // format.js, shared with the n03 bulk SMART action in tentanas.js).
+    // "All disks" is ONE request and ONE job on the node: every disk that
+    // reports SMART gets its short self-test, one sudo prompt covers them
+    // all, and the job has a line per disk. A disk that refuses (busy, a
+    // test already runs, the disk rejects the command) is a line of its own
+    // and the job goes on; a privilege/credential error stops the job at
+    // that disk — the node never replays a rejected password once per disk
+    // (`jobs::smart_self_test_batch`).
     let disks;
     try {
       disks = (await screen.nas('tentaNasDisksListRequest', {})).disks || [];
@@ -720,26 +827,21 @@ export async function drawTasks(screen, body) {
     }
     const targets = disks.filter((d) => d.smartAvailable);
     if (!targets.length) { toast(T('schedules.smart_no_disks'), 'warning'); return; }
-    let outcome;
+    let res;
     try {
-      outcome = await screen.withSudo((sudoPassword) => runDiskBatch(targets, (d) => screen.nas(
-        'tentaNasDiskSmartTestRequest', { diskId: d.diskId, kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS },
-      )), title);
+      res = await screen.withSudo((sudoPassword) => screen.nas(
+        'tentaNasDiskSmartTestBatchRequest', { diskIds: targets.map((d) => d.diskId), kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS },
+      ), title);
     } catch (e) {
-      // `withSudo` itself already catches and toasts every rejection from
-      // its callback — this is a defensive backstop, not the normal path.
+      // `withSudo` itself catches and toasts every rejection from its
+      // callback — this is a defensive backstop, not the normal path.
       toast(errMessage(e), 'error');
       return;
     }
-    // `outcome` is null both when the prompt was cancelled and when
-    // `runDiskBatch` halted the batch on a privilege/credential error —
-    // `withSudo`'s own catch already toasted that one error.
-    if (outcome === null) return;
-    if (outcome.started.length) toast(T('schedules.smart_started', { n: outcome.started.length }), 'success');
-    // The refusals are real per-disk data — each disk by name with the
-    // node's own reason — so they are listed, never dropped; the sentence
-    // around them is ours and translated.
-    if (outcome.refused.length) toast(T('jobs.smart_batch_refused', { n: outcome.refused.length, disks: refusedBatchNames(outcome.refused) }), 'warning');
+    // `res` is null when the prompt was cancelled or the request refused —
+    // `withSudo`'s own catch already said why.
+    if (!res) return;
+    followResponse(screen, res, refreshJobs, T('schedules.smart_started', { n: targets.length }));
     refreshJobs();
   };
 

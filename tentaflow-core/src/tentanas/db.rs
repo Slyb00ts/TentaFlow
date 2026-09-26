@@ -1035,6 +1035,63 @@ the next reconcile replaces this with the current count'
         first_seen_at TEXT NOT NULL,
         last_seen_at TEXT NOT NULL
     );",
+), (
+    26,
+    // Wave 9b: one SMART job over several disks (`smart_test_batch`). Each
+    // disk is a line of its job, in the order the job runs them. The line is
+    // also what keeps a second self-test off a disk the batch is testing:
+    // `insert_job_full` refuses a `smart_test` on a disk whose line is
+    // pending or running in a running job, and a batch marks such a disk
+    // 'refused' in the same transaction that claims the others. `name` is
+    // the kernel name when the job was started, the fallback the screen
+    // shows marked as last-known once the disk has left the inventory.
+    "CREATE TABLE nas_job_disks (
+        job_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        disk_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        state TEXT NOT NULL,
+        progress_pct INTEGER,
+        reasons TEXT NOT NULL DEFAULT '[]',
+        PRIMARY KEY (job_id, position)
+    );
+    CREATE INDEX nas_job_disks_disk ON nas_job_disks(disk_id, state);",
+), (
+    27,
+    // Wave 9b: alert forwarding per organisation. The queue is no longer one
+    // `forwarded_at` mark per row — a node-wide alert now goes to EVERY
+    // organisation's target — but one cursor per target over the rows' own
+    // monotonic keys (`nas_alerts.rowid`: alerts are never deleted;
+    // `nas_access_events.event_id`: AUTOINCREMENT). `target` is the
+    // organisation id, or '' for the node-wide target kept from before.
+    // `enabled_at` is the switch-on the cursor was placed for: forwarding
+    // sends what was raised while it was on, and a target switched on again
+    // starts from that moment instead of replaying the pause.
+    //
+    // The node-wide cursor starts where the old queue stood — after the last
+    // node-wide alert already sent, so nothing is sent twice and nothing
+    // waiting is dropped. `forwarded_at` stays in the schema, unused.
+    "CREATE TABLE nas_forward_cursors (
+        target TEXT PRIMARY KEY,
+        enabled_at TEXT NOT NULL,
+        alert_rowid INTEGER NOT NULL,
+        access_id INTEGER NOT NULL,
+        last_sent_at TEXT,
+        last_error TEXT NOT NULL DEFAULT ''
+    );
+    INSERT INTO nas_forward_cursors (target, enabled_at, alert_rowid, access_id, last_sent_at, last_error)
+    SELECT '', '',
+           COALESCE((SELECT MIN(rowid) - 1 FROM nas_alerts WHERE forwarded_at IS NULL AND org_id IS NULL),
+                    (SELECT MAX(rowid) FROM nas_alerts), 0),
+           COALESCE((SELECT MAX(event_id) FROM nas_access_events), 0),
+           (SELECT value FROM nas_settings WHERE key = 'forward_last_sent_at'),
+           COALESCE((SELECT value FROM nas_settings WHERE key = 'forward_last_error'), '');",
+), (
+    28,
+    // Wave 9b round 2: the access half of a cursor has its own start. A
+    // target that asks for the access lines later receives the lines
+    // collected from then on, not the whole retained log (critic MINOR 1).
+    "ALTER TABLE nas_forward_cursors ADD COLUMN access_enabled_at TEXT NOT NULL DEFAULT '';",
 )];
 
 /// The owner migration 20 gives a legacy share, target or account it cannot
@@ -1956,6 +2013,7 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasJob> {
         // Stored subjects are what the job was spawned on; whether a shown
         // name is only remembered is decided on the way out (`name_jobs`).
         subject_last_known: false,
+        disks: Vec::new(),
     })
 }
 
@@ -2222,6 +2280,39 @@ pub fn insert_job_owned(
     intent: Option<&ElasticJobIntent>,
     owner: Option<&str>,
 ) -> Result<()> {
+    insert_job_full(pool, job, intent, owner, &[])
+}
+
+/// Whether a SMART self-test runs on this disk now: a `smart_test` job on it,
+/// or its line in a multi-disk job that has not finished with it yet. A
+/// second self-test would ABORT the first (see `insert_job_full`).
+fn self_test_running_on(conn: &Connection, disk_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nas_jobs
+                        WHERE kind = 'smart_test' AND subject = ?1 AND status = 'running')
+             OR EXISTS(SELECT 1 FROM nas_job_disks d JOIN nas_jobs j ON j.job_id = d.job_id
+                        WHERE d.disk_id = ?1 AND j.status = 'running'
+                          AND d.state IN ('pending', 'running'))",
+        params![disk_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// `insert_job_owned` plus the disk lines of a multi-disk job
+/// (`smart_test_batch`, migration 26): `disks` is `(disk_id, kernel name)` in
+/// the order the job will run them. A disk a self-test already runs on is
+/// written 'refused' with the code `self_test_running`, in the SAME
+/// transaction that claims the others — so two batches, or a batch and a
+/// single test, can never both start a test on one disk.
+pub fn insert_job_full(
+    pool: &DbPool,
+    job: &NasJob,
+    intent: Option<&ElasticJobIntent>,
+    owner: Option<&str>,
+    disks: &[(String, String)],
+) -> Result<()> {
+    anyhow::ensure!(disks.is_empty() || job.kind == SMART_BATCH_KIND,
+        "Linie dysków ma tylko zadanie {SMART_BATCH_KIND}");
     anyhow::ensure!(owner.is_none() || !job.kind.starts_with("elastic_"),
         "Zadanie Elastic należy do organizacji swojej macierzy; jawny właściciel jest odrzucany");
     anyhow::ensure!(owner.is_none_or(|org| !org.is_empty()),
@@ -2241,14 +2332,10 @@ pub fn insert_job_owned(
     // transaction, and only here are the check and the insert one atomic step.
     // Scoped to `smart_test` because no other kind serialises on its subject
     // this way — a pool takes two scrubs, a dataset two snapshots.
+    // A multi-disk job's line counts as well (`self_test_running_on`).
     if job.kind == "smart_test" {
-        let running: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM nas_jobs
-             WHERE kind = 'smart_test' AND subject = ?1 AND status = 'running')",
-            params![job.subject],
-            |r| r.get(0),
-        )?;
-        anyhow::ensure!(!running, "Na tym dysku trwa już autotest SMART; odmowa drugiego");
+        anyhow::ensure!(!self_test_running_on(&tx, &job.subject)?,
+            "Na tym dysku trwa już autotest SMART; odmowa drugiego");
     }
     tx.execute(
         "INSERT INTO nas_jobs (job_id, kind, subject, status, progress_pct, started_by,
@@ -2266,6 +2353,18 @@ pub fn insert_job_owned(
             owner
         ],
     )?;
+    for (position, (disk_id, name)) in disks.iter().enumerate() {
+        let (state, reasons) = if self_test_running_on(&tx, disk_id)? {
+            ("refused", vec![super::disks::coded_reason("self_test_running", &[])])
+        } else {
+            ("pending", Vec::new())
+        };
+        tx.execute(
+            "INSERT INTO nas_job_disks (job_id, position, disk_id, name, state, reasons)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![job.job_id, position as i64, disk_id, name, state, serde_json::to_string(&reasons)?],
+        )?;
+    }
     if let Some(intent) = intent {
         let (array_id, operation_id, kind, request) = match intent {
             ElasticJobIntent::Create(spec) => {
@@ -2476,6 +2575,83 @@ pub fn insert_job_owned(
     // After the intent: a create's array row is written above, in this tx.
     stamp_elastic_job_org(&tx, &job.job_id, &job.kind, &job.subject)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// The job kind of one SMART self-test run over several disks.
+pub const SMART_BATCH_KIND: &str = "smart_test_batch";
+
+/// A multi-disk SMART job's subject: `<short|long>|all` for the scheduled
+/// run over every disk (n15 "SMART short — wszystkie"), `<short|long>|<kernel
+/// names>` for a chosen set. The screen words the test kind and "all"; the
+/// names are rebuilt from the job's lines when it is shown.
+pub fn smart_batch_subject(long: bool, names: Option<&[String]>) -> String {
+    let kind = if long { "long" } else { "short" };
+    match names {
+        None => format!("{kind}|all"),
+        Some(names) => format!("{kind}|{}", names.join(", ")),
+    }
+}
+
+/// Whether a self-test runs on this disk now (see `self_test_running_on`).
+/// A read, on the read connection (critic R4): the scheduler asks it once per
+/// disk per pass, and the claim itself stays in `insert_job_full`'s write
+/// transaction.
+pub fn self_test_busy(pool: &DbPool, disk_id: &str) -> Result<bool> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    self_test_running_on(&conn, disk_id)
+}
+
+/// One disk line of a multi-disk job as stored (migration 26). `disk_id` is
+/// the node's key for the disk and never leaves it; the screen gets a name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobDiskRow {
+    pub position: i64,
+    pub disk_id: String,
+    pub name: String,
+    pub state: String,
+    pub progress_pct: Option<u8>,
+    pub reasons: Vec<NasHealthReason>,
+}
+
+/// The disk lines of one job, in run order. Empty for every other kind.
+pub fn job_disks(pool: &DbPool, job_id: &str) -> Result<Vec<JobDiskRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT position, disk_id, name, state, progress_pct, reasons
+           FROM nas_job_disks WHERE job_id = ?1 ORDER BY position",
+    )?;
+    let rows = stmt
+        .query_map(params![job_id], |r| {
+            let reasons: String = r.get(5)?;
+            Ok(JobDiskRow {
+                position: r.get(0)?,
+                disk_id: r.get(1)?,
+                name: r.get(2)?,
+                state: r.get(3)?,
+                progress_pct: r.get::<_, Option<i64>>(4)?.map(|v| v.clamp(0, 100) as u8),
+                reasons: serde_json::from_str(&reasons).unwrap_or_default(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Moves one line of a multi-disk job on.
+pub fn set_job_disk(
+    pool: &DbPool,
+    job_id: &str,
+    position: i64,
+    state: &str,
+    progress_pct: Option<u8>,
+    reasons: &[NasHealthReason],
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_job_disks SET state = ?3, progress_pct = ?4, reasons = ?5
+          WHERE job_id = ?1 AND position = ?2",
+        params![job_id, position, state, progress_pct.map(i64::from), serde_json::to_string(reasons)?],
+    )?;
     Ok(())
 }
 
@@ -3054,6 +3230,14 @@ pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
         tx.execute("UPDATE nas_elastic_operations SET state='needs_attention',
         error=?3, finished_at=?1
         WHERE state='running' AND job_id=?2", params![now(),job_id,ORPHANED_OPERATION_ERROR])?;
+        // A multi-disk job's unfinished lines end with it: nothing follows
+        // those disks any more, and a line left 'running' would keep refusing
+        // every later self-test on its disk (`self_test_running_on`).
+        tx.execute(
+            "UPDATE nas_job_disks SET state = 'interrupted'
+              WHERE job_id = ?1 AND state IN ('pending', 'running')",
+            params![job_id],
+        )?;
         changed += tx.execute(
         "UPDATE nas_jobs SET status = 'failed', error = 'interrupted by core restart',
                 finished_at = ?1
@@ -4956,6 +5140,18 @@ fn elastic_snapraid_config(
 /// Every array of every owner on this node, for the scheduler — which has a
 /// database and no request, so it cannot be handed an `ElasticOwner` the way
 /// a handler is.
+/// Every Elastic Array of the node as `(name, owning organisation, state)`,
+/// by name — what the disable confirmation needs to name the asking
+/// organisation's arrays and only count the others.
+pub fn elastic_array_owners(pool: &DbPool) -> Result<Vec<(String, String, String)>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT name, org_id, state FROM nas_elastic_arrays ORDER BY name")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 pub fn elastic_arrays_all(pool: &DbPool) -> Result<Vec<super::elastic::ElasticArrayRow>> {
     let owners = {
         let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
@@ -5524,9 +5720,9 @@ pub const SETTING_AUDIT_DETAIL: &str = "access_audit_detail";
 /// share edit does not reload the host's audit rules (same trick as the ksmbd
 /// and exports documents).
 pub const SETTING_AUDIT_RULES: &str = "audit_rules_document";
-/// When the forwarder last delivered a batch, and why it last failed.
-pub const SETTING_FORWARD_SENT_AT: &str = "forward_last_sent_at";
-pub const SETTING_FORWARD_ERROR: &str = "forward_last_error";
+// `forward_last_sent_at` / `forward_last_error` were the single target's
+// outcome before wave 9b; migration 27 moved them onto the node-wide cursor
+// (`nas_forward_cursors`), which is where every target keeps its own.
 
 const ACCESS_COLUMNS: &str =
     "event_id, at, share, user, client, operation, result, target, detail";
@@ -5710,13 +5906,16 @@ pub fn prune_access_events(pool: &DbPool) -> Result<usize> {
 
 // ----- forwarding the alert pipeline outwards (§5.9) -------------------------------
 
-/// One row waiting to leave this node: an alert or an audited access, already
+/// One row leaving this node: an alert or an audited access, already
 /// flattened into what both transports send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardRow {
     /// 'alert' | 'access'.
     pub kind: &'static str,
     pub id: String,
+    /// The row's monotonic key (`nas_alerts.rowid`, `nas_access_events.event_id`),
+    /// which the target's cursor advances over.
+    pub seq: i64,
     pub at: String,
     /// 'info' | 'warning' | 'critical'.
     pub severity: String,
@@ -5725,108 +5924,234 @@ pub struct ForwardRow {
     pub detail: String,
 }
 
-/// NODE-WIDE alerts (`org_id IS NULL`) that have not been forwarded yet,
-/// oldest first. An alert is forwarded when it is RAISED, so a row already
-/// acknowledged is still sent: the external collector's job is to see what
-/// happened, not what the admin has since read.
-///
-/// An organisation's alert (an Elastic Array's, a parked request's, or ''
-/// for an owner that is gone — migration 18) never reaches the shared
-/// target, and the filter is part of THIS query on purpose: the owner is
-/// stamped in the statement that inserts the row (`raise_alert`), so no row
-/// can be selected here without its owner. Reading the owned ids first and
-/// the batch second let an owned alert raised in between slip into the batch.
-pub fn unforwarded_alerts(pool: &DbPool, limit: u32) -> Result<Vec<ForwardRow>> {
-    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    let mut stmt = conn.prepare_cached(
-        "SELECT alert_id, raised_at, severity, subject_kind, subject_id, title, detail
-           FROM nas_alerts WHERE forwarded_at IS NULL AND org_id IS NULL
-          ORDER BY raised_at LIMIT ?1",
-    )?;
-    let rows = stmt
-        .query_map(params![limit], |r| {
-            Ok(ForwardRow {
-                kind: "alert",
-                id: r.get(0)?,
-                at: r.get(1)?,
-                severity: r.get(2)?,
-                subject: format!("{}:{}", r.get::<_, String>(3)?, r.get::<_, String>(4)?),
-                summary: r.get(5)?,
-                detail: r.get(6)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+/// Where one forwarding target stands on this node (migration 27). `target`
+/// is an organisation id, or `FORWARD_NODE_TARGET` for the node-wide target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardCursor {
+    /// The switch-on this cursor was placed for (the stored setting's).
+    pub enabled_at: String,
+    /// Every alert up to this rowid has been sent — or was not this target's.
+    pub alert_rowid: i64,
+    /// Likewise for the access lines, by `event_id`.
+    pub access_id: i64,
+    pub last_sent_at: Option<String>,
+    pub last_error: String,
+    /// When the access lines this cursor follows were asked for ('' before
+    /// they ever were, migration 28).
+    pub access_enabled_at: String,
 }
 
-/// Marks what actually left the node. Called AFTER a successful send, so a
-/// crash in between replays a row instead of dropping it.
-pub fn mark_forwarded(pool: &DbPool, rows: &[ForwardRow]) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let mut conn = write(pool)?;
-    let tx = conn.transaction()?;
-    let stamp = now();
-    for row in rows {
-        let sql = if row.kind == "alert" {
-            "UPDATE nas_alerts SET forwarded_at = ?2 WHERE alert_id = ?1"
-        } else {
-            "UPDATE nas_access_events SET forwarded_at = ?2 WHERE event_id = ?1"
-        };
-        tx.execute(sql, params![row.id, stamp])?;
-    }
-    tx.commit()?;
+/// The cursor key of the node-wide target kept from before targets were per
+/// organisation. No organisation id is empty, so it cannot collide.
+pub const FORWARD_NODE_TARGET: &str = "";
+
+pub fn forward_cursor(pool: &DbPool, target: &str) -> Result<Option<ForwardCursor>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT enabled_at, alert_rowid, access_id, last_sent_at, last_error, access_enabled_at
+               FROM nas_forward_cursors WHERE target = ?1",
+            params![target],
+            |r| {
+                Ok(ForwardCursor {
+                    enabled_at: r.get(0)?,
+                    alert_rowid: r.get(1)?,
+                    access_id: r.get(2)?,
+                    last_sent_at: r.get(3)?,
+                    last_error: r.get(4)?,
+                    access_enabled_at: r.get(5)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Places a target's cursor for the switch-on at `enabled_at`: what was
+/// raised BEFORE it is not this target's to send. Forwarding sends what
+/// happens while it is on — a target switched on for the first time does not
+/// receive the node's whole history, and one switched on again does not
+/// receive what happened while it was off.
+pub fn place_forward_cursor(pool: &DbPool, target: &str, enabled_at: &str) -> Result<ForwardCursor> {
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_forward_cursors (target, enabled_at, alert_rowid, access_id, last_sent_at, last_error)
+         VALUES (?1, ?2,
+                 COALESCE((SELECT MAX(rowid) FROM nas_alerts WHERE raised_at < ?2), 0),
+                 COALESCE((SELECT MAX(event_id) FROM nas_access_events WHERE at < ?2), 0),
+                 NULL, '')
+         ON CONFLICT(target) DO UPDATE SET enabled_at = excluded.enabled_at,
+                 alert_rowid = excluded.alert_rowid, access_id = excluded.access_id,
+                 last_error = '', access_enabled_at = ''",
+        params![target, enabled_at],
+    )?;
+    drop(conn);
+    forward_cursor(pool, target)?.ok_or_else(|| anyhow!("forward cursor vanished"))
+}
+
+/// The last access line collected before `since`: where the access half of
+/// a cursor starts when the lines are asked for at `since`.
+pub fn access_floor(pool: &DbPool, since: &str) -> Result<i64> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM nas_access_events WHERE at < ?1",
+        params![since],
+        |r| r.get(0),
+    )?)
+}
+
+/// Places the ACCESS half of `target`'s cursor for access lines asked for at
+/// `since` (critic wave 9b, MINOR 1): the retained log from before is not
+/// this target's to receive.
+pub fn place_forward_access(pool: &DbPool, target: &str, since: &str) -> Result<ForwardCursor> {
+    let floor = access_floor(pool, since)?;
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_forward_cursors SET access_id = ?2, access_enabled_at = ?3 WHERE target = ?1",
+        params![target, floor, since],
+    )?;
+    drop(conn);
+    forward_cursor(pool, target)?.ok_or_else(|| anyhow!("forward cursor vanished"))
+}
+
+/// Forgets a target's cursor (the retired node-wide target, deleted).
+pub fn delete_forward_cursor(pool: &DbPool, target: &str) -> Result<()> {
+    write(pool)?.execute("DELETE FROM nas_forward_cursors WHERE target = ?1", params![target])?;
     Ok(())
 }
 
-/// Settles every organisation's alert still in the queue, in one statement:
-/// they are never sent (`unforwarded_alerts`), and left unmarked they would
-/// sit in the queue for good. Returns how many were settled.
-///
-/// Every file-access line is settled here too. Since migration 20 each one
-/// belongs to the organisation that owns its share — it names that tenant's
-/// share, account, client address and file — and the forwarding target is
-/// ONE fleet-wide setting any organisation's admin may point at its own
-/// collector, so an access line is withheld exactly like an owned alert
-/// until targets are per organisation (backlog). No
-/// `unforwarded_access_events` exists any more for the same reason
-/// `unforwarded_alerts` filters in its own statement: a query that can hand
-/// out a tenant's line is one caller away from sending it.
-pub fn settle_withheld_alerts(pool: &DbPool) -> Result<usize> {
-    let mut conn = write(pool)?;
-    let tx = conn.transaction()?;
-    let stamp = now();
-    let alerts = tx.execute(
-        "UPDATE nas_alerts SET forwarded_at = ?1 WHERE forwarded_at IS NULL AND org_id IS NOT NULL",
-        params![stamp],
-    )?;
-    let access = tx.execute(
-        "UPDATE nas_access_events SET forwarded_at = ?1 WHERE forwarded_at IS NULL",
-        params![stamp],
-    )?;
-    tx.commit()?;
-    Ok(alerts + access)
+/// The alert rows one target receives: the node-wide target only node-wide
+/// alerts (`org_id IS NULL`); an organisation's target exactly what that
+/// organisation may READ (`VISIBLE_TO_ORG_SQL`): its own alerts and the
+/// node-wide ones. Never another organisation's, never the '' rows whose
+/// owner is gone — the sole-organisation reading of those is a screen rule
+/// and is not extended to a collector outside the product.
+fn alert_scope_sql(target: &str) -> &'static str {
+    if target == FORWARD_NODE_TARGET {
+        "org_id IS NULL"
+    } else {
+        "(org_id IS NULL OR (org_id = ?3 AND ?3 <> ''))"
+    }
 }
 
-/// How many rows still wait to be SENT, so the settings card can show a
-/// backlog instead of a silent stall.
-///
-/// An organisation's alert is never sent, so it is not pending: counting it
-/// would show every tenant a backlog of other tenants' alerts that never
-/// drains while forwarding is off. Counted here, in SQL, rather than by
-/// loading every such id — a set that grew without bound for as long as
-/// forwarding stayed off. File-access lines are never pending for the same
-/// reason (each belongs to an organisation, `settle_withheld_alerts`), so the
-/// access switch no longer adds anything to this figure.
-pub fn forward_pending(pool: &DbPool) -> Result<u32> {
+/// The next rows `target` has not been sent, oldest first: alerts past its
+/// alert cursor and — for an organisation that asked for them — the access
+/// lines of its OWN shares past its access cursor. The owner filter is part
+/// of the query itself: the owner is stamped by the statement that inserts a
+/// row, so no row can be selected here without it.
+pub fn forward_batch(
+    pool: &DbPool,
+    target: &str,
+    include_access: bool,
+    cursor: &ForwardCursor,
+    limit: u32,
+) -> Result<Vec<ForwardRow>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM nas_alerts WHERE forwarded_at IS NULL AND org_id IS NULL",
-        [],
-        |r| r.get(0),
+    let mut stmt = conn.prepare(&format!(
+        "SELECT rowid, alert_id, raised_at, severity, subject_kind, subject_id, title, detail
+           FROM nas_alerts WHERE rowid > ?1 AND {}
+          ORDER BY rowid LIMIT ?2",
+        alert_scope_sql(target)
+    ))?;
+    let map = |r: &rusqlite::Row<'_>| {
+        Ok(ForwardRow {
+            kind: "alert",
+            seq: r.get(0)?,
+            id: r.get(1)?,
+            at: r.get(2)?,
+            severity: r.get(3)?,
+            subject: format!("{}:{}", r.get::<_, String>(4)?, r.get::<_, String>(5)?),
+            summary: r.get(6)?,
+            detail: r.get(7)?,
+        })
+    };
+    let mut rows = if target == FORWARD_NODE_TARGET {
+        stmt.query_map(params![cursor.alert_rowid, limit], map)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        stmt.query_map(params![cursor.alert_rowid, limit, target], map)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if include_access && target != FORWARD_NODE_TARGET {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {ACCESS_COLUMNS} FROM nas_access_events
+              WHERE event_id > ?1 AND org_id = ?3 AND ?3 <> ''
+              ORDER BY event_id LIMIT ?2"
+        ))?;
+        let access = stmt
+            .query_map(params![cursor.access_id, limit, target], access_event_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|e| ForwardRow {
+                kind: "access",
+                id: e.event_id.to_string(),
+                seq: e.event_id as i64,
+                at: e.at,
+                // A refused access is the one worth waking a collector for.
+                severity: if e.result == "fail" { "warning" } else { "info" }.to_string(),
+                subject: format!("share:{}", e.share),
+                summary: format!("{} {} {} on {} by {}", e.operation, e.result, e.target, e.share, e.user),
+                detail: e.detail,
+            })
+            .collect::<Vec<_>>();
+        rows.extend(access);
+    }
+    Ok(rows)
+}
+
+/// Moves `target`'s cursor past what actually left the node. Called AFTER a
+/// successful send, so a crash in between repeats a row instead of dropping
+/// it (at least once, on purpose).
+pub fn advance_forward_cursor(pool: &DbPool, target: &str, sent: &[ForwardRow]) -> Result<()> {
+    let alert = sent.iter().filter(|r| r.kind == "alert").map(|r| r.seq).max();
+    let access = sent.iter().filter(|r| r.kind == "access").map(|r| r.seq).max();
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_forward_cursors
+            SET alert_rowid = MAX(alert_rowid, COALESCE(?2, alert_rowid)),
+                access_id = MAX(access_id, COALESCE(?3, access_id)),
+                last_sent_at = CASE WHEN ?2 IS NULL AND ?3 IS NULL THEN last_sent_at ELSE ?4 END,
+                last_error = ''
+          WHERE target = ?1",
+        params![target, alert, access, now()],
     )?;
-    Ok(total.max(0) as u32)
+    Ok(())
+}
+
+/// Why the last attempt for `target` failed ('' clears it).
+pub fn record_forward_error(pool: &DbPool, target: &str, error: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_forward_cursors SET last_error = ?2 WHERE target = ?1",
+        params![target, error],
+    )?;
+    Ok(())
+}
+
+/// How many rows still wait to be sent to `target`, so the settings card can
+/// show a backlog instead of a silent stall. Counted in SQL over the same
+/// scope `forward_batch` hands out — another organisation's rows are never
+/// in it.
+pub fn forward_pending(pool: &DbPool, target: &str, include_access: bool, cursor: &ForwardCursor) -> Result<u32> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let sql = format!(
+        "SELECT COUNT(*) FROM nas_alerts WHERE rowid > ?1 AND {}",
+        alert_scope_sql(target).replace("?3", "?2")
+    );
+    let alerts: i64 = if target == FORWARD_NODE_TARGET {
+        conn.query_row(&sql, params![cursor.alert_rowid], |r| r.get(0))?
+    } else {
+        conn.query_row(&sql, params![cursor.alert_rowid, target], |r| r.get(0))?
+    };
+    let access: i64 = if include_access && target != FORWARD_NODE_TARGET {
+        conn.query_row(
+            "SELECT COUNT(*) FROM nas_access_events WHERE event_id > ?1 AND org_id = ?2 AND ?2 <> ''",
+            params![cursor.access_id, target],
+            |r| r.get(0),
+        )?
+    } else {
+        0
+    };
+    Ok((alerts + access).max(0) as u32)
 }
 
 // ----- shares --------------------------------------------------------------------
@@ -9415,8 +9740,10 @@ mod tests {
             .unwrap();
         // Migracje 1–8 mają 19 tabel; schema9 dodaje cztery tabele Elastic,
         // schema13 harmonogramy Elastic i ustawienia movera (E2-10),
-        // a schema16 polityki cache folderów, schema25 the known pools.
-        assert_eq!(n, 27);
+        // a schema16 polityki cache folderów, schema25 the known pools,
+        // schema26 the disk lines of a multi-disk job, schema27 the
+        // forwarding cursors (schema28 only adds a column).
+        assert_eq!(n, 29);
     }
 
     #[test]
@@ -9685,6 +10012,7 @@ mod tests {
             error: None,
             log: vec![],
             subject_last_known: false,
+            disks: Vec::new(),
         };
         insert_job(&p, &j, None).unwrap();
         append_job_log(&p, "j1", "first").unwrap();
@@ -11376,5 +11704,100 @@ mod tests {
         write(&p).unwrap().execute("UPDATE nas_jobs SET org_id = 'org-b' WHERE job_id = ?1", params![theirs.job_id]).unwrap();
         assert!(job_for_org(&p, sole, &theirs.job_id).unwrap().is_none());
         assert!(ack_alert_for_org(&p, sole, &list_alerts_for_org(&p, sole, false).unwrap()[0].alert_id).unwrap());
+    }
+
+    // ----- wave 9b: the disk lines of a multi-disk SMART job ---------------
+
+    fn batch_job() -> NasJob {
+        plain_job(SMART_BATCH_KIND, "sda, sdb")
+    }
+
+    /// A second self-test on a disk would ABORT the first. A batch's line is
+    /// a self-test on its disk exactly like a `smart_test` job: a batch that
+    /// names a disk already testing marks it refused in the transaction that
+    /// claims the others, and a single test on a disk a running batch holds
+    /// is refused — until that job has finished with it.
+    #[test]
+    fn a_batch_line_keeps_a_second_self_test_off_its_disk() {
+        let p = pool();
+        let single = plain_job("smart_test", "sn-a");
+        insert_job(&p, &single, None).unwrap();
+        let batch = batch_job();
+        insert_job_full(&p, &batch, None, None, &[("sn-a".into(), "sda".into()), ("sn-b".into(), "sdb".into())]).unwrap();
+        let lines = job_disks(&p, &batch.job_id).unwrap();
+        assert_eq!(lines.iter().map(|l| (l.name.as_str(), l.state.as_str())).collect::<Vec<_>>(),
+            vec![("sda", "refused"), ("sdb", "pending")]);
+        assert_eq!(lines[0].reasons[0].code, "self_test_running");
+
+        // sdb is the batch's now: a single test on it is refused.
+        assert!(insert_job(&p, &plain_job("smart_test", "sn-b"), None).is_err());
+        // So is a second batch's line — refused, not claimed twice.
+        let second = batch_job();
+        insert_job_full(&p, &second, None, None, &[("sn-b".into(), "sdb".into())]).unwrap();
+        assert_eq!(job_disks(&p, &second.job_id).unwrap()[0].state, "refused");
+
+        // The line finished: the disk is free again.
+        set_job_disk(&p, &batch.job_id, 1, "passed", None, &[]).unwrap();
+        insert_job(&p, &plain_job("smart_test", "sn-b"), None).unwrap();
+        // Lines belong to the multi-disk kind only.
+        assert!(insert_job_full(&p, &plain_job("pool_scrub", "tank"), None, None, &[("sn-c".into(), "sdc".into())]).is_err());
+    }
+
+    /// A restarted core fails the jobs it lost, and their unfinished lines
+    /// with them: a line left running would refuse every later self-test on
+    /// its disk for good.
+    #[test]
+    fn an_orphaned_batch_releases_its_disks() {
+        let p = pool();
+        let batch = batch_job();
+        insert_job_full(&p, &batch, None, None, &[("sn-a".into(), "sda".into()), ("sn-b".into(), "sdb".into())]).unwrap();
+        set_job_disk(&p, &batch.job_id, 0, "passed", None, &[]).unwrap();
+        set_job_disk(&p, &batch.job_id, 1, "running", Some(40), &[]).unwrap();
+        fail_orphaned_jobs(&p).unwrap();
+        let states: Vec<String> = job_disks(&p, &batch.job_id).unwrap().into_iter().map(|l| l.state).collect();
+        assert_eq!(states, vec!["passed", "interrupted"]);
+        insert_job(&p, &plain_job("smart_test", "sn-b"), None).unwrap();
+    }
+
+    // ----- wave 9b: the forwarding cursors -----------------------------------
+
+    /// Migration 27 places the node-wide cursor where the old single queue
+    /// stood: after the node-wide alerts already sent, before the first one
+    /// still waiting — so the upgrade neither repeats nor drops a line — and
+    /// carries the last outcome over. Run against a database that holds the
+    /// pre-27 state, the way an upgraded node does.
+    #[test]
+    fn migration_27_continues_the_node_wide_queue_where_it_stood() {
+        let p = pool();
+        {
+            let conn = write(&p).unwrap();
+            conn.execute_batch(
+                "DROP TABLE nas_forward_cursors;
+                 INSERT INTO nas_alerts (alert_id,severity,subject_kind,subject_id,title,detail,raised_at,dedupe_key,forwarded_at,org_id) VALUES
+                   ('a1','warning','disk','a','Disk sda','','2026-09-01T00:00:00Z','k1','2026-09-01T00:01:00Z',NULL),
+                   ('a2','warning','elastic-array','x','Macierz x','','2026-09-01T00:02:00Z','k2',NULL,'org-a'),
+                   ('a3','warning','disk','b','Disk sdb','','2026-09-01T00:03:00Z','k3',NULL,NULL),
+                   ('a4','warning','disk','c','Disk sdc','','2026-09-01T00:04:00Z','k4',NULL,NULL);
+                 INSERT INTO nas_settings (key,value,updated_at) VALUES
+                   ('forward_last_sent_at','2026-09-01T00:01:00Z','2026-09-01T00:01:00Z'),
+                   ('forward_last_error','the webhook answered 502','2026-09-01T00:05:00Z');",
+            )
+            .unwrap();
+            for version in [27, 28] {
+                let sql = MIGRATIONS.iter().find(|(v, _)| *v == version).map(|(_, sql)| *sql).unwrap();
+                conn.execute_batch(sql).unwrap();
+            }
+        }
+        let cursor = forward_cursor(&p, FORWARD_NODE_TARGET).unwrap().unwrap();
+        let a3: i64 = p.read().unwrap()
+            .query_row("SELECT rowid FROM nas_alerts WHERE alert_id = 'a3'", [], |r| r.get(0)).unwrap();
+        assert_eq!(cursor.alert_rowid, a3 - 1, "the first node-wide alert still waiting is next");
+        assert_eq!(cursor.enabled_at, "", "the stored setting from before has no switch-on of its own");
+        assert_eq!(cursor.last_sent_at.as_deref(), Some("2026-09-01T00:01:00Z"));
+        assert_eq!(cursor.last_error, "the webhook answered 502");
+        let batch = forward_batch(&p, FORWARD_NODE_TARGET, true, &cursor, 10).unwrap();
+        assert_eq!(batch.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["a3", "a4"],
+            "the sent one is not repeated and the organisation's one never was the node's");
+        assert_eq!(forward_pending(&p, FORWARD_NODE_TARGET, true, &cursor).unwrap(), 2);
     }
 }

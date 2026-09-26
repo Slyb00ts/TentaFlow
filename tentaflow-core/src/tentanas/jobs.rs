@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
-use tentaflow_protocol::tentanas::{NasJob, NasSmartSelfTest};
+use tentaflow_protocol::tentanas::{NasHealthReason, NasJob, NasSmartSelfTest};
 use tentanas_helper::{HelperCommand, PackageManager, SelfTestKind};
 use tokio_util::sync::CancellationToken;
 
@@ -121,6 +121,7 @@ impl JobHandle {
                 error: None,
                 log: Vec::new(),
                 subject_last_known: false,
+                disks: Vec::new(),
             },
             None,
         );
@@ -355,6 +356,32 @@ where
     F: FnOnce(JobHandle) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
+    spawn_inner(db, kind, subject, started_by, owner, intent, completion, &[], body)
+}
+
+/// One SMART self-test job over several disks (`store::SMART_BATCH_KIND`).
+/// `disks` is `(disk_id, kernel name)` in run order; the lines are written by
+/// the same transaction as the job row (`store::insert_job_full`), which is
+/// where a disk that is already testing is marked refused.
+pub fn spawn_smart_batch<F, Fut>(db: &DbPool, subject: &str, started_by: &str,
+    disks: &[(String, String)], body: F) -> Result<NasJob>
+where
+    F: FnOnce(JobHandle) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    spawn_inner(db, store::SMART_BATCH_KIND, subject, started_by, None, None, None, disks, body)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_inner<F, Fut>(db: &DbPool, kind: &str, subject: &str, started_by: &str,
+    owner: Option<&str>,
+    intent: Option<ElasticJobIntent>, completion: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+    disks: &[(String, String)],
+    body: F) -> Result<NasJob>
+where
+    F: FnOnce(JobHandle) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
     let job = NasJob {
         job_id: uuid::Uuid::now_v7().to_string(),
         kind: kind.to_string(),
@@ -367,6 +394,7 @@ where
         error: None,
         log: Vec::new(),
         subject_last_known: false,
+        disks: Vec::new(),
     };
     // `intent.is_none()` alone made the one IRREVERSIBLE job of this family the
     // only cancellable one: a disk wipe carries no elastic intent, so it got a
@@ -394,7 +422,7 @@ where
         )
     );
     let mut registry = running().lock().unwrap_or_else(|p| p.into_inner());
-    store::insert_job_owned(db, &job, intent.as_ref(), owner)?;
+    store::insert_job_full(db, &job, intent.as_ref(), owner, disks)?;
     let cancel = CancellationToken::new();
     registry.insert(job.job_id.clone(), RunningJob { cancel: cancel.clone(), cancellable });
     drop(registry);
@@ -1500,6 +1528,66 @@ mod tests {
         ]));
         assert!(self_test_log_advanced(&grown, &before));
     }
+
+    /// Wave 9b: one SMART job over several disks, through a real `spawn`
+    /// and the real broker. The node has no privilege channel configured, so
+    /// the first disk that reaches the broker meets the real
+    /// `BrokerError::Unarmed` — and the job stops THERE: that disk's line
+    /// says so, the disk after it is never started ('skipped'), and the job
+    /// fails with that one error. A per-disk refusal BEFORE it (a disk that
+    /// left the inventory) is its own line, and the job went on past it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_smart_batch_stops_at_the_first_privilege_error_and_goes_on_past_a_disk_refusal() {
+        // The catalog resolves `smartctl` before any channel is chosen; a host
+        // without it answers ToolMissing first and has nothing to prove here.
+        if let Err(tentanas_helper::CatalogError::ToolMissing(_)) =
+            (HelperCommand::SmartctlInfo { device: "/dev/sda".into() }).plan()
+        {
+            eprintln!("smartctl is not installed on this host — skipped");
+            return;
+        }
+        let db = database();
+        for (id, name) in [("sn-wave9b-batch-a", "sdwa"), ("sn-wave9b-batch-b", "sdwb")] {
+            super::super::disks::insert_live_for_test(tentaflow_protocol::tentanas::NasDisk {
+                disk_id: id.into(),
+                name: name.into(),
+                path: format!("/dev/{name}"),
+                ..Default::default()
+            });
+        }
+        let disks = vec![
+            ("sn-wave9b-gone".to_string(), "sdwg".to_string()),
+            ("sn-wave9b-batch-a".to_string(), "sdwa".to_string()),
+            ("sn-wave9b-batch-b".to_string(), "sdwb".to_string()),
+        ];
+        let job = spawn_smart_batch(&db, "sdwg, sdwa, sdwb", "test", &disks, |h| {
+            smart_self_test_batch(h, SelfTestKind::Short, None)
+        })
+        .unwrap();
+        let done = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let job = store::job(&db, &job.job_id).unwrap().unwrap();
+                if job.finished_at.is_some() { return job; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("the batch finished");
+        let lines = store::job_disks(&db, &job.job_id).unwrap();
+        let shown: Vec<(&str, &str, &str)> = lines
+            .iter()
+            .map(|l| (l.name.as_str(), l.state.as_str(), l.reasons.first().map(|r| r.code.as_str()).unwrap_or("")))
+            .collect();
+        assert_eq!(shown, vec![
+            ("sdwg", "refused", "disk_gone"),
+            ("sdwa", "refused", "privilege"),
+            ("sdwb", "skipped", ""),
+        ]);
+        assert_eq!(done.status, "failed");
+        assert!(done.error.as_deref().unwrap_or("").contains("privilege channel not available"), "{:?}", done.error);
+        assert!(done.log.iter().any(|l| l.contains("the remaining disks are not started")), "{:?}", done.log);
+        for id in ["sn-wave9b-batch-a", "sn-wave9b-batch-b"] {
+            super::super::disks::remove_live_for_test(id);
+        }
+    }
 }
 
 // ----- job bodies ----------------------------------------------------------------
@@ -1960,57 +2048,119 @@ fn classify_self_test_poll(doc: &Value, baseline: &[NasSmartSelfTest]) -> SelfTe
     }
 }
 
-/// Starts a SMART self-test and follows it through `smartctl` polls until
-/// the disk reports completion. Progress is what the disk reports.
-pub async fn smart_self_test(
-    h: JobHandle,
-    device: String,
+/// A self-test the disk accepted: what the poll loop needs to follow it.
+struct StartedSelfTest {
+    /// The self-test log as it stood BEFORE the start.
+    baseline: Vec<NasSmartSelfTest>,
+    window: Duration,
+    channel: &'static str,
+}
+
+/// Why a self-test did not start. `Privilege` is the one shape that stops a
+/// multi-disk job at once: the credential or the channel is what failed, so
+/// it fails identically for every disk still to come, and replaying a
+/// rejected password once per disk can lock the account (`pam_faillock`).
+enum StartError {
+    Privilege(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+impl StartError {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Privilege(e) | Self::Other(e) => e,
+        }
+    }
+}
+
+/// A broker refusal that is about the credential or the privilege channel,
+/// not about the disk: a rejected or expired password, an unarmed channel, a
+/// helper of another build than this core.
+fn privilege_error(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<super::broker::BrokerError>(),
+        Some(super::broker::BrokerError::Unarmed(_) | super::broker::BrokerError::HelperVersion(_))
+    )
+}
+
+/// Reads the self-test log and starts the test.
+///
+/// The self-test log carries nothing that identifies a run, so what it held
+/// BEFORE the start is the only way to tell this run's entry from one an
+/// earlier test left behind. It is read with the same credential the start
+/// uses, and it happens before the start, so a failure here cannot stop the
+/// test. An unreadable baseline no longer degrades to "the newest entry is
+/// this run's": with nothing to compare against, no entry is attributed to
+/// this run at all, and the job ends at the window rather than repeating a
+/// previous test's verdict as if it were this one's. The one exception is a
+/// PRIVILEGE failure of that read: the start would meet the same credential,
+/// so it is not attempted.
+async fn start_self_test(
+    db: &DbPool,
+    device: &str,
     kind: SelfTestKind,
-    explicit: Option<Arc<ElevationToken>>,
-) -> Result<()> {
-    // The self-test log carries nothing that identifies a run, so what it held
-    // BEFORE the start is the only way to tell this run's entry from one an
-    // earlier test left behind. It is read with the same credential the start
-    // uses, and it happens before the start, so a failure here cannot stop the
-    // test. An unreadable baseline no longer degrades to "the newest entry is
-    // this run's": with nothing to compare against, no entry is attributed to
-    // this run at all, and the job ends at the window rather than repeating a
-    // previous test's verdict as if it were this one's.
-    let before = super::disks::read_smart_document(h.db(), &device, explicit.as_deref())
-        .await
-        .unwrap_or_else(|e| {
-            h.log(format!("could not read the self-test log before the start: {e}"));
+    explicit: Option<&ElevationToken>,
+    log: &(dyn Fn(String) + Sync),
+) -> std::result::Result<StartedSelfTest, StartError> {
+    let before = match super::disks::read_smart_document(db, device, explicit).await {
+        Ok(doc) => doc,
+        Err(e) if privilege_error(&e) => return Err(StartError::Privilege(e)),
+        Err(e) => {
+            log(format!("could not read the self-test log before the start: {e}"));
             Value::Null
-        });
+        }
+    };
     let baseline = super::disks::smart_self_tests(&before);
-    let mut window = self_test_window(&before, kind);
+    let window = self_test_window(&before, kind);
     let start = HelperCommand::SmartctlSelfTest {
-        device: device.clone(),
+        device: device.to_string(),
         kind,
     };
-    let (out, channel) = super::broker::run_privileged(
-        h.db(),
-        &start,
-        explicit.as_deref(),
-        Duration::from_secs(60),
-    )
-    .await?;
+    let (out, channel) = match super::broker::run_privileged(db, &start, explicit, Duration::from_secs(60)).await {
+        Ok(ran) => ran,
+        Err(e) => {
+            let e = anyhow::Error::from(e);
+            return Err(if privilege_error(&e) { StartError::Privilege(e) } else { StartError::Other(e) });
+        }
+    };
     // Bit 2 stays in the mask here, unlike the document read: this run issues a
     // command instead of printing a report, so "a SMART command failed" means
     // the test did not start. The helper starts the test with `--json=c`, so
     // stderr is empty by design and the reason has to come out of the document.
     if out.code & 0b111 != 0 {
-        return Err(anyhow!(
+        return Err(StartError::Other(anyhow!(
             "smartctl could not start the test ({}): {}",
             out.code,
             super::disks::smartctl_failure_detail(&out)
-        ));
+        )));
     }
-    h.log(format!("self-test started via {}", channel.as_str()));
-    // The one-shot password is consumed by the start; polling uses the
-    // node's channel. An interactive node whose TTL expires mid-test leaves
-    // the job "running" until the next arm — the disk keeps testing.
-    drop(explicit);
+    Ok(StartedSelfTest { baseline, window, channel: channel.as_str() })
+}
+
+/// How following a started self-test ended.
+enum Followed {
+    /// The run produced this entry (or none that could be attributed).
+    Done(Option<NasSmartSelfTest>),
+    /// One of the two bounds ran out.
+    Expired(SelfTestTimeout, Duration),
+    Cancelled,
+}
+
+/// Follows a started self-test through `smartctl` polls until the disk
+/// reports completion or a bound runs out. Progress is what the disk reports.
+///
+/// Polling uses the node's channel: the one-shot password was consumed by the
+/// start. An interactive node whose TTL expires mid-test leaves the job
+/// "running" until the next arm — the disk keeps testing.
+async fn follow_self_test(
+    h: &JobHandle,
+    device: &str,
+    kind: SelfTestKind,
+    started: StartedSelfTest,
+    log: &(dyn Fn(String) + Sync),
+    progress: &(dyn Fn(u8) + Sync),
+) -> Followed {
+    let StartedSelfTest { baseline, mut window, .. } = started;
     let poll = Duration::from_secs(if kind == SelfTestKind::Short { 20 } else { 120 });
     // `started` is fixed for the whole run and nothing below may touch it: it
     // is what bounds the loop absolutely. `last_sign` is the rolling half, and
@@ -2023,21 +2173,21 @@ pub async fn smart_self_test(
     loop {
         tokio::time::sleep(poll).await;
         if h.cancelled() {
-            return Err(anyhow!("cancelled"));
+            return Followed::Cancelled;
         }
         // A read that failed is kept as `None` rather than `continue`d past:
         // every path out of this loop has to reach the bound check below.
-        let doc = match super::disks::read_smart_document(h.db(), &device, None).await {
+        let doc = match super::disks::read_smart_document(h.db(), device, None).await {
             Ok(d) => Some(d),
             Err(e) => {
-                h.log(format!("poll failed: {e}"));
+                log(format!("poll failed: {e}"));
                 None
             }
         };
         if let Some(doc) = doc.as_ref() {
             if !window_rederived {
                 if let Some(w) = rederived_self_test_window(window, doc, kind, &baseline) {
-                    h.log(format!(
+                    log(format!(
                         "the disk advertises a longer duration than the pre-start read gave: window {} min -> {} min",
                         window.as_secs() / 60,
                         w.as_secs() / 60
@@ -2051,20 +2201,199 @@ pub async fn smart_self_test(
         match self_test_step(polled, window, started.elapsed(), last_sign.elapsed()) {
             SelfTestStep::Progress(pct) => {
                 if let Some(pct) = pct {
-                    h.progress(pct);
+                    progress(pct);
                 }
                 last_sign = tokio::time::Instant::now();
             }
             SelfTestStep::Wait => {}
-            SelfTestStep::Done(latest) => {
-                super::disks::request_smart_refresh();
-                h.log(self_test_outcome(latest.as_ref())?);
-                return Ok(());
+            SelfTestStep::Done(latest) => return Followed::Done(latest),
+            SelfTestStep::Expired(timeout, bound) => return Followed::Expired(timeout, bound),
+        }
+    }
+}
+
+/// Starts a SMART self-test and follows it through `smartctl` polls until
+/// the disk reports completion. Progress is what the disk reports.
+pub async fn smart_self_test(
+    h: JobHandle,
+    device: String,
+    kind: SelfTestKind,
+    explicit: Option<Arc<ElevationToken>>,
+) -> Result<()> {
+    let log = |line: String| h.log(line);
+    let started = start_self_test(h.db(), &device, kind, explicit.as_deref(), &log)
+        .await
+        .map_err(StartError::into_error)?;
+    h.log(format!("self-test started via {}", started.channel));
+    // The one-shot password is consumed by the start; polling uses the
+    // node's channel.
+    drop(explicit);
+    let progress = |pct: u8| h.progress(pct);
+    match follow_self_test(&h, &device, kind, started, &log, &progress).await {
+        Followed::Done(latest) => {
+            super::disks::request_smart_refresh();
+            h.log(self_test_outcome(latest.as_ref())?);
+            Ok(())
+        }
+        Followed::Expired(timeout, bound) => {
+            super::disks::request_smart_refresh();
+            Err(timeout.error(bound))
+        }
+        Followed::Cancelled => Err(anyhow!("cancelled")),
+    }
+}
+
+/// A finished line of a multi-disk job: its state and the code that says
+/// why, from the entry the run produced. The same two questions as
+/// `self_test_outcome` — did the disk fail the test, did the run complete —
+/// kept apart: 'failed' is the disk's verdict, 'incomplete' is a run that
+/// says nothing about the disk.
+fn line_verdict(latest: Option<&NasSmartSelfTest>) -> (&'static str, Vec<NasHealthReason>) {
+    let reason = |code: &str, detail: &str| {
+        vec![super::disks::coded_reason(code, &[("detail", detail.to_string())])]
+    };
+    match latest {
+        None => ("incomplete", reason("test_no_entry", "")),
+        Some(t) => match t.status.as_str() {
+            "passed" => ("passed", Vec::new()),
+            "failed" => ("failed", reason("test_failed", &t.detail)),
+            "aborted" => ("incomplete", reason("test_aborted", &t.detail)),
+            "running" => ("incomplete", reason("test_still_running", &t.detail)),
+            _ => ("incomplete", reason("test_no_result", &t.detail)),
+        },
+    }
+}
+
+/// The line of a run one of the two bounds ended.
+fn expired_reason(timeout: SelfTestTimeout, bound: Duration) -> NasHealthReason {
+    let min = (bound.as_secs() / 60).to_string();
+    match timeout {
+        SelfTestTimeout::Stall => super::disks::coded_reason("test_stalled", &[("min", min)]),
+        SelfTestTimeout::Cap => super::disks::coded_reason("test_overran", &[("min", min)]),
+    }
+}
+
+/// One SMART self-test job over several disks (`store::SMART_BATCH_KIND`).
+///
+/// The disks are STARTED one after another with the one credential the
+/// request carried, and the first privilege/credential error stops the
+/// starting there: that disk's line says why, every disk after it is
+/// 'skipped', and the job fails with that one error — the password is never
+/// replayed against sudo once per disk. Any other refusal (a disk that left,
+/// a disk that rejects the command) is recorded on its own line and the job
+/// goes on. The started tests then run side by side — each drive tests in its
+/// own firmware — and are followed together; the job succeeds only when
+/// every line passed.
+pub async fn smart_self_test_batch(
+    h: JobHandle,
+    kind: SelfTestKind,
+    explicit: Option<Arc<ElevationToken>>,
+) -> Result<()> {
+    let lines = store::job_disks(h.db(), &h.job_id)?;
+    let set = |line: &store::JobDiskRow, state: &str, pct: Option<u8>, reasons: &[NasHealthReason]| {
+        if let Err(e) = store::set_job_disk(h.db(), &h.job_id, line.position, state, pct, reasons) {
+            tracing::warn!("tentanas job {}: disk line write failed: {e}", h.job_id);
+        }
+    };
+    h.log(format!(
+        "{} self-test on {} disks: {}",
+        match kind {
+            SelfTestKind::Short => "short",
+            SelfTestKind::Long => "long",
+        },
+        lines.len(),
+        lines.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ")
+    ));
+    for line in lines.iter().filter(|l| l.state == "refused") {
+        h.log(format!("{}: a self-test already runs on this disk", line.name));
+    }
+    let mut halted: Option<anyhow::Error> = None;
+    let mut started = Vec::new();
+    for line in lines.iter().filter(|l| l.state == "pending") {
+        if halted.is_some() || h.cancelled() {
+            set(line, "skipped", None, &[]);
+            continue;
+        }
+        let Some(device) = super::disks::device_path(&line.disk_id) else {
+            h.log(format!("{}: the disk is no longer in this node's inventory", line.name));
+            set(line, "refused", None, &[super::disks::coded_reason("disk_gone", &[])]);
+            continue;
+        };
+        let name = line.name.clone();
+        let log = |text: String| h.log(format!("{name}: {text}"));
+        match start_self_test(h.db(), &device, kind, explicit.as_deref(), &log).await {
+            Ok(run) => {
+                h.log(format!("{}: self-test started via {}", line.name, run.channel));
+                set(line, "running", None, &[]);
+                started.push((line.clone(), device, run));
             }
-            SelfTestStep::Expired(timeout, bound) => {
-                super::disks::request_smart_refresh();
-                return Err(timeout.error(bound));
+            Err(StartError::Privilege(e)) => {
+                h.log(format!("{}: {e} — the remaining disks are not started", line.name));
+                set(line, "refused", None, &[super::disks::coded_reason("privilege", &[])]);
+                halted = Some(e);
+            }
+            Err(StartError::Other(e)) => {
+                h.log(format!("{}: {e}", line.name));
+                set(line, "refused", None, &[super::disks::coded_reason("start_failed", &[])]);
             }
         }
     }
+    // The one-shot password was for the starts; polling uses the channel.
+    drop(explicit);
+
+    let total = started.len().max(1) as u32;
+    let percents: Arc<Mutex<HashMap<i64, u8>>> = Arc::default();
+    let report = |position: i64, pct: u8| {
+        let mut map = percents.lock().unwrap_or_else(|p| p.into_inner());
+        map.insert(position, pct);
+        let sum: u32 = map.values().map(|p| u32::from(*p)).sum();
+        h.progress((sum / total).min(100) as u8);
+    };
+    let outcomes = futures::future::join_all(started.into_iter().map(|(line, device, run)| {
+        let h = &h;
+        let set = &set;
+        let report = &report;
+        async move {
+            let name = line.name.clone();
+            let log = |text: String| h.log(format!("{name}: {text}"));
+            let progress = |pct: u8| {
+                set(&line, "running", Some(pct), &[]);
+                report(line.position, pct);
+            };
+            let (state, reasons) = match follow_self_test(h, &device, kind, run, &log, &progress).await {
+                Followed::Done(latest) => {
+                    if let Ok(text) = self_test_outcome(latest.as_ref()) {
+                        log(text);
+                    }
+                    line_verdict(latest.as_ref())
+                }
+                Followed::Expired(timeout, bound) => {
+                    log(timeout.error(bound).to_string());
+                    ("incomplete", vec![expired_reason(timeout, bound)])
+                }
+                Followed::Cancelled => ("cancelled", Vec::new()),
+            };
+            set(&line, state, None, &reasons);
+            report(line.position, 100);
+            state
+        }
+    }))
+    .await;
+    super::disks::request_smart_refresh();
+
+    if let Some(e) = halted {
+        return Err(e);
+    }
+    if outcomes.iter().any(|s| *s == "cancelled") {
+        return Err(anyhow!("cancelled"));
+    }
+    let lines = store::job_disks(h.db(), &h.job_id)?;
+    let not_passed = lines.iter().filter(|l| l.state != "passed").count();
+    if not_passed > 0 {
+        return Err(anyhow!(
+            "the self-test did not pass on {not_passed} of {} disks",
+            lines.len()
+        ));
+    }
+    Ok(())
 }

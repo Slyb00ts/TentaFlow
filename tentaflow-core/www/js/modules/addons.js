@@ -24,6 +24,7 @@ import { ResourcesTab } from '/js/modules/addons/resources.js';
 import { NetworkTab } from '/js/modules/addons/network.js';
 import { BindingsTab } from '/js/modules/addons/bindings.js';
 import { openUninstallDialog } from '/js/modules/addons/uninstall-dialog.js';
+import { confirmDisable } from '/js/modules/addons/disable-dialog.js';
 import { openRobotCloudDialog, robotCloudFieldValues, robotCloudVendorName } from '/js/modules/addons/robot-cloud-dialog.js';
 // `openInstallWizard` reserved for the future "Install from ZIP" flow on the
 // addons list page; it is no longer triggered from the per-addon header.
@@ -351,6 +352,17 @@ function renderList() {
       const addonId = card?.dataset.addonCard;
       if (!addonId) return;
       const enabled = !!(e.detail?.checked ?? t.hasAttribute('checked'));
+      // n18d: switching an app OFF first says what that does on this node —
+      // the app's own consequences, from its real state. Dismissing the
+      // dialog puts the switch back and sends nothing.
+      if (!enabled) {
+        const entry = addonsList.find((a) => (a.addonId ?? a.addon_id) === addonId);
+        const ok = await confirmDisable({ addonId, displayName: entry?.displayName ?? entry?.display_name ?? '' });
+        if (!ok) {
+          t.setAttribute('checked', '');
+          return;
+        }
+      }
       try {
         await ApiBinary.action('addonToggleRequest', { addonId, enabled });
         toast(I18n.t(enabled ? 'addon_toggle.success_enabled' : 'addon_toggle.success_disabled'), 'success');

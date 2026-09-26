@@ -990,6 +990,9 @@ pub const SHARED_SETTING_KEYS: &[&str] = &[
     "mesh.advertise_prefer_same_subnet",
     "oauth_redirect_base_url",
     "jwt_expiry_hours",
+    // TentaNas: the platform admin's list of internal alert collectors every
+    // node's forwarding may reach (`tentanas::forward::ALLOWLIST_SETTING`).
+    "tentanas.forward_allowlist",
 ];
 
 pub fn is_shared_setting_key(key: &str) -> bool {

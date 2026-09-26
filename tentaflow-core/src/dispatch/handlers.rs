@@ -2670,8 +2670,16 @@ pub fn settings_list(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let settings = repository::list_settings(&ctx.state.db).map_err(db_err)?;
+    // The platform admin's list of internal alert collectors names the
+    // operator's internal hosts and networks: only a platform admin reads it
+    // (wave-9b critic, round 3, C2).
+    let platform_admin = matches!(
+        &ctx.session,
+        tentaflow_protocol::SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
+    );
     let entries: Vec<SettingEntry> = settings
         .into_iter()
+        .filter(|s| platform_admin || s.key != crate::tentanas::forward::ALLOWLIST_SETTING)
         .map(|s| {
             let is_secret = crate::crypto::SettingsCipher::should_encrypt(&s.key);
             let value = if is_secret && !s.value.is_empty() {
@@ -2718,6 +2726,17 @@ pub fn settings_update(
         return Err(ProtocolError::bad_request(
             "data_dir/sync_dir zmienia sie przez Magazyn danych (StorageMigrateRequest), nie przez settings",
         ));
+    }
+
+    // The platform admin's list of internal alert collectors (TentaNas): a
+    // malformed entry, or one no target may ever reach (loopback, link-local,
+    // metadata), refuses the whole request rather than being stored.
+    for entry in &payload.entries {
+        if entry.key == crate::tentanas::forward::ALLOWLIST_SETTING {
+            if let Err(e) = crate::tentanas::forward::parse_allowlist(&entry.value) {
+                return Err(ProtocolError::bad_request(e.to_string()));
+            }
+        }
     }
 
     // Walidacja PRZED zapisem: niepusta sciezka musi byc tworzalna. Inaczej

@@ -2048,6 +2048,19 @@ pub fn shown_disk_name(db: &DbPool, disk_id: &str, observed_now: Option<&str>) -
     })
 }
 
+/// Puts one disk into the live inventory, for tests that drive a job body
+/// over a disk (`jobs::smart_self_test_batch`). The inventory is one per
+/// process: a test uses ids no other test uses and removes them after.
+#[cfg(test)]
+pub(crate) fn insert_live_for_test(disk: NasDisk) {
+    state().write().disks.insert(disk.disk_id.clone(), live_from_persisted(disk, None));
+}
+
+#[cfg(test)]
+pub(crate) fn remove_live_for_test(disk_id: &str) {
+    state().write().disks.remove(disk_id);
+}
+
 pub fn device_path(disk_id: &str) -> Option<String> {
     state().read().disks.get(disk_id).map(|l| l.disk.path.clone())
 }
@@ -3015,6 +3028,9 @@ pub fn start_sampler(main_db: DbPool, addon_id: String, db: DbPool) {
     handle.spawn(async move {
         loop {
             tick(&db).await;
+            // What this node's teardown would refuse, for every other node to
+            // know while this one is offline (written only when it changed).
+            super::publish_teardown_blocks(&main_db, &addon_id, &db);
             if stale(state().read().last_summary, SUMMARY_EVERY) {
                 super::fleet::publish_local_summary(&main_db, &addon_id, &db).await;
                 state().write().last_summary = Some(Instant::now());
