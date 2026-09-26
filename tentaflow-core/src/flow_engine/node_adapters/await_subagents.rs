@@ -146,9 +146,8 @@ impl AwaitSubagentsNodeAdapter {
 
     /// Stops the flow when nothing it waited for succeeded. A review loop reads
     /// a failed child as "not approved yet" and spawns it again, so a child that
-    /// cannot run at all (a model missing on this node) was retried until the
-    /// session's run budget ran out, and the turn ended naming the budget
-    /// instead of the cause.
+    /// cannot run at all (a model missing on this node) was retried round after
+    /// round, and the turn never named the cause.
     fn refuse_all_failed(results: &Value) -> Result<()> {
         let Some(map) = results.as_object().filter(|m| !m.is_empty()) else {
             return Ok(());

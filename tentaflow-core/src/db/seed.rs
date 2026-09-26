@@ -2611,9 +2611,6 @@ fn seed_code_studio_agents(conn: &Connection) -> Result<()> {
             // only one whose fan-out numbers mean anything: ten specialists in
             // parallel, three levels deep (an orchestrator may delegate to
             // another orchestrator, which is where depth beyond one comes from).
-            // The tree is bounded by the session run budget
-            // (`code_studio.max_session_runs`), not by these two — width times
-            // depth alone would allow four figures of runs per turn.
             40, 3600, 10, 3,
             Some(
                 r#"["code-planner","code-implementer","code-searcher","code-reviewer","code-tester","code-critic"]"#,

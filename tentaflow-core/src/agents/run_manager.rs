@@ -437,9 +437,8 @@ impl AgentRunManager {
     /// Same spawn, under a run id the caller minted.
     ///
     /// The sub-agent path needs the id BEFORE the run exists: a Code Studio
-    /// session claims its run budget by inserting the run's own row, and a
-    /// claim that could not name the run it claims for would have to count
-    /// first and insert later — the exact race the budget is there to close.
+    /// session registers the run's row and timeline entry before it starts, so
+    /// the run can never report into a session that does not know it.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_with_run_id(
         &self,
@@ -616,9 +615,9 @@ impl AgentRunManager {
             serde_json::from_str(&parent.tools_json).unwrap_or_default();
 
         // Every child is resolved before any of them starts, because the
-        // session budget below is claimed for the whole batch at once and a
-        // claim for a task that turns out to name no agent would burn budget on
-        // a run that can never exist.
+        // session rows below are registered for the whole batch at once and a
+        // row for a task that turns out to name no agent would describe a run
+        // that can never exist.
         // The caller's roster, if it declared one. `None` = unrestricted, which is
         // what every agent did before the column existed; an empty list means the
         // agent may delegate to nobody. Parsed once for the whole batch.
@@ -660,13 +659,9 @@ impl AgentRunManager {
             });
         }
 
-        // Session budget (§15): depth bounds one branch and max_subagents
-        // bounds one parent — neither bounds the tree, so a Code Studio session
-        // also carries an absolute count over ALL of its runs, nested ones
-        // included. The refusal stops this SPAWN and nothing else: the runs
-        // already working keep working and the caller sees a recoverable tool
-        // error naming the budget.
-        let session = self.claim_session_runs(caller, &planned)?;
+        // The rows go in before the launch: a child that reports before its row
+        // exists would have nowhere to land on the session's timeline.
+        let session = self.register_session_runs(caller, &planned)?;
 
         // The Code Studio binding travels with the delegation: a child that
         // reviews or tests must land in the parent's worktree, and passing it
@@ -700,7 +695,7 @@ impl AgentRunManager {
             match spawned {
                 Ok(run_id) => run_ids.push(run_id),
                 Err(e) => {
-                    // The slot was claimed before the launch, so a child that
+                    // The row was registered before the launch, so a child that
                     // never started is closed as failed rather than left
                     // "running" on the session's timeline for ever.
                     if let Some((pool, session_id)) = &session {
@@ -731,12 +726,11 @@ impl AgentRunManager {
         Ok(json!({ "run_ids": run_ids }))
     }
 
-    /// Claims one session run slot per planned child when the caller runs
-    /// inside a Code Studio session, returning the session's runtime pool so a
-    /// later failure can close the rows it just wrote. `None` for a caller with
-    /// no session binding — an ordinary background agent has no session to
-    /// budget.
-    fn claim_session_runs(
+    /// Registers one session run per planned child when the caller runs inside
+    /// a Code Studio session, returning the session's runtime pool so a later
+    /// failure can close the rows it just wrote. `None` for a caller with no
+    /// session binding.
+    fn register_session_runs(
         &self,
         caller: &CallerRun,
         planned: &[PlannedChild],
@@ -745,12 +739,11 @@ impl AgentRunManager {
             return Ok(None);
         };
         // The binding is server-minted; a malformed one means this run's meta
-        // was corrupted, and guessing "then there is no budget" is exactly the
+        // was corrupted, and guessing "then there is no session" is exactly the
         // wrong way to resolve that.
         let binding = crate::code_studio::tools::binding_from_value(value)
             .ok_or_else(|| anyhow!("agent_spawn: the session binding of this run is malformed"))?;
         let pool = crate::code_studio::workspace_db::open(&binding.workspace_id)?;
-        let budget = crate::code_studio::session::max_session_runs(&self.db);
         let runs: Vec<crate::code_studio::session::SubagentRun<'_>> = planned
             .iter()
             .map(|child| crate::code_studio::session::SubagentRun {
@@ -759,12 +752,7 @@ impl AgentRunManager {
                 agent_id: &child.agent_id,
             })
             .collect();
-        crate::code_studio::session::claim_subagent_runs(
-            &pool,
-            &binding.session_id,
-            &runs,
-            budget,
-        )?;
+        crate::code_studio::session::register_subagent_runs(&pool, &binding.session_id, &runs)?;
         Ok(Some((pool, binding.session_id)))
     }
 
@@ -1219,8 +1207,8 @@ pub struct CallerRun {
 }
 
 /// One child of a delegation, resolved and given its run id before anything is
-/// launched. The id exists this early so a Code Studio session can claim the
-/// run's budget slot by inserting that run's own row.
+/// launched. The id exists this early so a Code Studio session can register
+/// the run's own row before it starts.
 struct PlannedChild {
     run_id: String,
     agent_id: String,
