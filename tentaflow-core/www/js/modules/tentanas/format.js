@@ -28,13 +28,31 @@ export const channelMode = (mode) => (!mode || mode === 'unset' ? 'unarmed' : mo
 // therefore reads as not armed, which asks for a password rather than
 // promising one is held. Answers 'helper' | 'interactive' |
 // 'interactive_unarmed' | 'unarmed'.
+// `armedUntil` is the node's instant (RFC 3339) or an expiry already on this
+// browser's clock in ms (`armedExpiryMs`).
 export function liveChannelMode(mode, armedUntil, now = Date.now()) {
   const m = channelMode(mode);
   if (m !== 'interactive') return m;
-  const until = Date.parse(String(armedUntil || ''));
+  const until = typeof armedUntil === 'number' ? armedUntil : Date.parse(String(armedUntil || ''));
   return Number.isFinite(until) && until > now ? 'interactive' : 'interactive_unarmed';
 }
-export const nodeChannelMode = (n, now = Date.now()) => liveChannelMode(n?.elevationMode, n?.armedUntil, now);
+
+// When a mode-B password expires, on THIS browser's clock (critic wave 7,
+// MINOR 11): the moment the answer arrived (`receivedAt`, stamped where it is
+// read) plus the seconds the node said were left by its own clock
+// (`armedSecsLeft`). Comparing the node's instant with the browser's clock
+// read a node near expiry wrongly by however far the two clocks disagree.
+// An older node sends no seconds: its instant is all there is. NaN when
+// neither says anything.
+export function armedExpiryMs(src) {
+  const left = src?.armedSecsLeft;
+  if (left !== null && left !== undefined && Number.isFinite(Number(left)) && Number.isFinite(src?.receivedAt)) {
+    return src.receivedAt + Number(left) * 1000;
+  }
+  return Date.parse(String(src?.armedUntil || ''));
+}
+
+export const nodeChannelMode = (n, now = Date.now()) => liveChannelMode(n?.elevationMode, armedExpiryMs(n), now);
 // Both "no channel" and "mode B with no password held" leave the node unable
 // to run a privileged step without someone typing a password.
 export const channelIsUnarmed = (m) => m === 'unarmed' || m === 'interactive_unarmed';
@@ -981,4 +999,21 @@ export function leafDisplayName(d, inv, position = 0) {
   const remembered = String(d.lastKnownName || '').trim();
   if (remembered && !isDiskIdShape(remembered)) return T('pool.leaf_last_known', { name: remembered });
   return position ? T('pool.leaf_missing_at', { n: position }) : T('elastic.disk_absent');
+}
+
+/** The same leaf for a sentence that already says "disk" before the name
+ *  ("Wymień dysk {device}", "Nie wyciągaj dysku {device}"): "brak dysku
+ *  (ostatnio sdk)" read "Wymień dysk brak dysku (ostatnio sdk)" there
+ *  (critic wave 5, MINOR 9), so a leaf with no current name is named
+ *  noun-free by its position — "nr 2 (ostatnio sdk)", "nr 2". A leaf with a
+ *  name, or with no position to give, reads as `leafDisplayName` does. */
+export function leafEmbeddedName(d, inv, position = 0) {
+  const shown = leafDisplayName(d, inv, position);
+  if (!isDiskIdShape(d?.name) || !position) return shown;
+  const kernelName = inv && inv.name && !isDiskIdShape(inv.name) ? inv.name : null;
+  if (kernelName) return shown;
+  const remembered = String(d.lastKnownName || '').trim();
+  return remembered && !isDiskIdShape(remembered)
+    ? T('pool.leaf_embedded_last_known', { n: position, name: remembered })
+    : T('pool.leaf_embedded_at', { n: position });
 }

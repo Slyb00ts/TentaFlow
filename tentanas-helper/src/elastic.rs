@@ -745,7 +745,8 @@ pub const USAGE_FOLDERS_MAX: usize = 256;
 /// 0.27-0.49 s warm, 0.9-1.6 µs per entry — the same as `du -s`. At that rate
 /// this cap is 5-10 s of a warm walk; its real job is to bound the memory the
 /// walk holds (one open directory's names per level, and the inodes of every
-/// file with more than one link).
+/// file with more than one link). Names are charged as each directory is
+/// read (`folder_usage::list`), so one huge directory is bounded too.
 pub const USAGE_ENTRY_LIMIT: u64 = 5_000_000;
 
 /// The wall-clock bound of one usage measurement. A cold walk of HDD branches
@@ -3851,9 +3852,35 @@ pub(crate) mod execution {
             // we did not write is not a journal and is never deleted.
             private_file(&target, self.uid)?;
             std::fs::remove_file(&target).map_err(|e| format!("usunięcie dziennika: {e}"))?;
+            self.remove_walk_registration(array_id);
             File::open(&self.path)
                 .and_then(|f| f.sync_all())
                 .map_err(|e| e.to_string())
+        }
+
+        /// Removes the folder-walk registration (`<id>.walk`) of an array
+        /// whose journal is gone (critic wave 7, R2-2 c): nothing can walk
+        /// that array again. Best effort, and only a file that is ours and
+        /// not held: the node lock is held, so no walk can register
+        /// meanwhile (a walk registers under it), and a walk that still holds
+        /// the file keeps it.
+        fn remove_walk_registration(&self, array_id: &str) {
+            let path = self.path.join(format!("{array_id}.walk"));
+            let Ok(file) = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+            else {
+                return;
+            };
+            let Ok(metadata) = file.metadata() else { return };
+            if !metadata.is_file() || metadata.uid() != self.uid || metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600 {
+                return;
+            }
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                let _ = std::fs::remove_file(&path);
+            }
         }
 
         /// Rewrites ONE field of a persisted spec: the owner.
@@ -7362,7 +7389,14 @@ pub(crate) mod execution {
                 // The worker is what holds the branches: its pid is what a
                 // stopping command kills.
                 record_walker(walk_fd)?;
-                probe_folder_usage(&spec, folders).map(PrivateResponse::FolderUsage)
+                let measured = probe_folder_usage(&spec, folders).map(PrivateResponse::FolderUsage);
+                // The pid is blanked before the worker ends (critic wave 7,
+                // R2-2 b): the parent still holds the registration for a
+                // moment after this process is gone, and in that window a
+                // stopping command must not find a pid the kernel may already
+                // have given to someone else.
+                forget_walker(walk_fd);
+                measured
             },
             |_| Err("pomiar folderów nie publikuje unii".into()),
         )?;
@@ -7388,6 +7422,11 @@ pub(crate) mod execution {
             return Err(format!("rejestracja pomiaru: {}", std::io::Error::last_os_error()));
         }
         Ok(())
+    }
+
+    /// Blanks the pid in the walk registration (in the worker, as it ends).
+    fn forget_walker(fd: RawFd) {
+        unsafe { libc::ftruncate(fd, 0) };
     }
 
     /// How long a stopping command waits for a killed walk to let go.
@@ -7452,11 +7491,28 @@ pub(crate) mod execution {
     }
 
     /// Whether `pid` runs the same binary as this process.
+    ///
+    /// After an in-place helper upgrade a walk started by the old binary
+    /// reads `<path> (deleted)` (critic wave 7, R2-2 a): it is still this
+    /// helper at this path, and it must be stopped like any other walk, or
+    /// every array command would be refused as busy until it ends.
     fn same_executable(pid: libc::pid_t) -> bool {
         match (std::fs::read_link(format!("/proc/{pid}/exe")), std::fs::read_link("/proc/self/exe")) {
-            (Ok(theirs), Ok(ours)) => theirs == ours,
+            (Ok(theirs), Ok(ours)) => same_binary_path(&theirs, &ours),
             _ => false,
         }
+    }
+
+    /// `theirs` names the binary `ours` does, also when the kernel marks it
+    /// replaced on disk with its ` (deleted)` suffix.
+    fn same_binary_path(theirs: &Path, ours: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        const REPLACED: &str = " (deleted)";
+        let bare = |path: &Path| -> std::ffi::OsString {
+            let bytes = path.as_os_str().as_bytes();
+            std::ffi::OsStr::from_bytes(bytes.strip_suffix(REPLACED.as_bytes()).unwrap_or(bytes)).to_os_string()
+        };
+        bare(theirs) == bare(ours)
     }
 
     fn mover(
@@ -10966,16 +11022,16 @@ pub(crate) mod execution {
             return Err("wykonawca Elastic wymaga root".into());
         }
         let root = Root::open(Path::new(ROOT), 0)?;
-        // Everything that may change or unmount an array stops that array's
-        // running folder walk first (MAJOR 1, wave 7); the reads do not.
+        // Everything that may unmount, replace, add, remove or dissolve a
+        // branch stops that array's running folder walk first (MAJOR 1,
+        // wave 7); the reads do not, and neither do Sync, Scrub, Fix and the
+        // mover (critic wave 7, R2-5): they work on the mounted branches and
+        // never unmount one, so a walk beside them meets no `EBUSY`, and
+        // killing it for them would let a busy mover starve the measurement.
         match command {
             crate::HelperCommand::ElasticEnterService { array_id, .. }
             | crate::HelperCommand::ElasticResume { array_id, .. }
-            | crate::HelperCommand::ElasticMover { array_id, .. }
             | crate::HelperCommand::ElasticReplaceDisk { array_id, .. }
-            | crate::HelperCommand::ElasticSync { array_id, .. }
-            | crate::HelperCommand::ElasticScrub { array_id, .. }
-            | crate::HelperCommand::ElasticFix { array_id, .. }
             | crate::HelperCommand::ElasticAddDisk { array_id, .. }
             | crate::HelperCommand::ElasticAddDiskAbort { array_id, .. }
             | crate::HelperCommand::ElasticDestroy { array_id, .. }
@@ -14589,6 +14645,43 @@ Nothing to do
             unsafe { libc::waitpid(holder, &mut status, 0) };
             let _ = other.kill();
             let _ = other.wait();
+        }
+
+        /// Critic wave 7, R2-2 a: after an in-place upgrade the kernel names a
+        /// walk's binary `<path> (deleted)`; it is still this helper and is
+        /// stopped. Another binary, deleted or not, never is.
+        #[test]
+        fn a_walk_of_the_replaced_binary_is_still_this_helper() {
+            let ours = Path::new("/usr/local/lib/tentanas/tentanas-helper");
+            assert!(same_binary_path(ours, ours));
+            assert!(same_binary_path(Path::new("/usr/local/lib/tentanas/tentanas-helper (deleted)"), ours));
+            assert!(!same_binary_path(Path::new("/usr/bin/sleep"), ours));
+            assert!(!same_binary_path(Path::new("/usr/bin/sleep (deleted)"), ours));
+            assert!(!same_binary_path(Path::new("/usr/local/lib/tentanas/tentanas-helper-old (deleted)"), ours));
+        }
+
+        /// Critic wave 7, R2-2 b/c: a finished walk leaves no pid behind, and
+        /// the registration file goes with the array's journal — unless a
+        /// walk still holds it.
+        #[test]
+        fn a_finished_walk_leaves_no_pid_and_a_released_array_no_registration() {
+            let dir = Temp::new();
+            let uid = unsafe { libc::geteuid() };
+            let id = "22222222-2222-4222-8222-222222222222";
+            let walk = walk_lock(&dir.0, id, uid).expect("registration");
+            record_walker(walk.as_raw_fd()).expect("pid");
+            assert_eq!(registered_walker(&walk), Some(std::process::id() as libc::pid_t));
+            forget_walker(walk.as_raw_fd());
+            assert_eq!(registered_walker(&walk), None, "the pid is blanked as the worker ends");
+
+            let root = Root::open(&dir.0, uid).expect("root");
+            let registration = dir.0.join(format!("{id}.walk"));
+            root.remove_walk_registration(id);
+            assert!(registration.exists(), "a walk that still holds its registration keeps it");
+            drop(walk);
+            root.remove_walk_registration(id);
+            assert!(!registration.exists(), "a released array leaves no registration behind");
+            root.remove_walk_registration(id);
         }
 
         #[test]
@@ -23302,27 +23395,51 @@ mod folder_usage_catalog_tests {
     }
 
     /// MAJOR 1 (wave 7): every Elastic command that names an array stops its
-    /// running folder walk first, except the ones that only read. A command
+    /// running folder walk first, except the ones that only read or never
+    /// unmount (R2-5). A command
     /// added to the catalog later lands on the wrong side of this list only
     /// if someone decides so here.
     #[test]
     fn every_changing_array_command_stops_the_folder_walk() {
-        const READS: [&str; 3] = ["ElasticFolderUsage", "ElasticInspect", "ElasticCacheAge"];
+        // The reads, and the commands that work on the mounted branches
+        // without ever unmounting one (critic wave 7, R2-5).
+        const READS: [&str; 7] = [
+            "ElasticFolderUsage",
+            "ElasticInspect",
+            "ElasticCacheAge",
+            "ElasticSync",
+            "ElasticScrub",
+            "ElasticFix",
+            "ElasticMover",
+        ];
         let catalog = include_str!("lib.rs");
         let body = catalog.split_once("pub enum HelperCommand {").expect("enum").1;
         let body = body.split_once("\n}\n").expect("enum end").0;
-        let with_array: Vec<&str> = body
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                let name = line.split([' ', '{']).next()?;
-                (name.starts_with("Elastic") && line.contains("array_id")).then_some(name)
-            })
+        // A variant is the text from its name at the enum's own indentation
+        // to the next one: `ElasticSync {` and `ElasticReplaceDisk {` spread
+        // their fields over several lines, and a one-line filter missed them.
+        let mut variants: Vec<(&str, String)> = Vec::new();
+        for line in body.lines() {
+            let starts_variant = line.starts_with("    ") && !line.starts_with("     ") && !line.trim_start().starts_with("//") && !line.trim_start().starts_with("#[");
+            if starts_variant {
+                let name = line.trim().split([' ', '{', ',', '(']).next().unwrap_or_default();
+                variants.push((name, line.to_string()));
+            } else if let Some((_, text)) = variants.last_mut() {
+                text.push_str(line);
+            }
+        }
+        let with_array: Vec<&str> = variants
+            .iter()
+            .filter(|(name, text)| name.starts_with("Elastic") && text.contains("array_id"))
+            .map(|(name, _)| *name)
             .collect();
         assert!(with_array.len() >= 12, "{with_array:?}");
+        for multi_line in ["ElasticSync", "ElasticReplaceDisk"] {
+            assert!(with_array.contains(&multi_line), "{multi_line} is read: {with_array:?}");
+        }
         let source = include_str!("elastic.rs");
         let stops = source
-            .split_once("// running folder walk first (MAJOR 1, wave 7); the reads do not.")
+            .split_once("// branch stops that array's running folder walk first (MAJOR 1,")
             .expect("the stop")
             .1;
         let stops = stops.split_once("stop_folder_walk(").expect("the call").0;

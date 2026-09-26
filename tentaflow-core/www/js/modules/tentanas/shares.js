@@ -7,7 +7,8 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage, transportLabel, transportChipHtml, nodeLabel } from '/js/modules/tentanas/format.js';
+import { T, sprite, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, fmtAgo, errMessage, transportLabel, transportChipHtml, nodeLabel, wordReasons, nodeTextTitle } from '/js/modules/tentanas/format.js';
+import { FEATURE_DETAIL_WORDS } from '/js/modules/tentanas/feature-words.js';
 import { setAttr, patchHtml } from '/js/lib/dom-patch.js';
 import { scrubIds } from '/js/modules/tentanas/machine-id.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
@@ -300,22 +301,45 @@ export async function setShareEnabled(screen, share, enabled, onDone) {
   followResponse(screen, res, onDone, enabled ? T('shares.resumed_done', { name: share.name }) : T('shares.paused_done', { name: share.name }));
 }
 
+// A share's state detail in the reader's language (wave 8): the node sends
+// it as codes (`shares::share_state`, `NasShare::state_reasons`) beside its
+// own English sentence. An SMB Direct refusal carries the node's ksmbd
+// reasons after its own code, worded as the Environment row words them. A
+// row judged before the codes — or an older node — has only the sentence,
+// shown with its ids taken out (critic wave 5, MINOR 14); the sentence is
+// the tooltip of the words.
+const SHARE_STATE_WORDS = new Map([
+  ['share_source_invalid', () => T('shares.state_reason.source_invalid')],
+  ['share_source_unmounted', () => T('shares.state_reason.source_unmounted')],
+  ['share_service_missing', (p) => (p.package ? T('shares.state_reason.service_missing', { package: p.package }) : null)],
+  ['smb_direct_not_served', () => T('shares.state_reason.smb_direct_not_served')],
+  ...FEATURE_DETAIL_WORDS,
+]);
+
+export function shareStateText(s) {
+  const own = String(s?.stateDetail || '');
+  const worded = wordReasons(s?.stateReasons, SHARE_STATE_WORDS);
+  return worded ? { text: worded, title: nodeTextTitle(own) } : { text: nodeTextTitle(own), title: '' };
+}
+
 function shareRow(s) {
   const fleet = fleetSummary(s);
+  const detail = shareStateText(s);
+  const titled = (inner) => (detail.title || detail.text ? `<span title="${escapeAttr(detail.title || detail.text)}">${inner}</span>` : inner);
   // An ACTIVE share with a detail is a warning the node reported while
   // applying — today only the SMB Direct refusal of §5.4b. It gets its own
   // chip: an option the admin turned on that did not take effect must never
   // read the same as one that did.
   const stateChip = s.state === 'error'
-    ? `<span title="${escapeAttr(s.stateDetail || '')}"><tf-chip size="sm" status="err" dot label="${escapeAttr(T('shares.state_error'))}"></tf-chip></span>`
+    ? titled(`<tf-chip size="sm" status="err" dot label="${escapeAttr(T('shares.state_error'))}"></tf-chip>`)
     : !s.enabled || s.state === 'disabled'
       ? `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.state_disabled'))}"></tf-chip>`
-      : s.stateDetail
-        ? `<span title="${escapeAttr(s.stateDetail)}"><tf-chip size="sm" status="warn" dot label="${escapeAttr(T('shares.state_warning'))}"></tf-chip></span>`
+      : detail.text
+        ? titled(`<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('shares.state_warning'))}"></tf-chip>`)
         : '';
   return {
     _share: s,
-    name: `<div class="tf-table__cell-row">${sprite('share')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(s.name)}</span></span>${stateChip}</div>${s.stateDetail ? `<div class="tf-table__cell-sub">${escapeHtml(s.stateDetail)}</div>` : ''}`,
+    name: `<div class="tf-table__cell-row">${sprite('share')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(s.name)}</span></span>${stateChip}</div>${detail.text ? `<div class="tf-table__cell-sub"${detail.title ? ` title="${escapeAttr(detail.title)}"` : ''}>${escapeHtml(detail.text)}</div>` : ''}`,
     // The transport chip only marks the non-default: every share serves TCP,
     // and the detail window names both for whichever one is open.
     protocol: `${protocolChipHtml(s.protocol)}${s.nfs?.rdma ? ` ${transportChipHtml('rdma')}` : ''}${s.smb?.smbDirect ? ` ${smbDirectChipHtml(s)}` : ''}`,
@@ -370,7 +394,7 @@ export function openShareDetail(screen, shareId, { mountRoot = '/mnt/tentanas', 
           ${protocolChipHtml(s.protocol)}
           ${smbDirectChipHtml(s)}
           ${s.state === 'error' ? `<tf-chip size="sm" status="err" dot label="${escapeAttr(T('shares.state_error'))}"></tf-chip>` : s.enabled ? `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('shares.state_active'))}"></tf-chip>` : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('shares.state_disabled'))}"></tf-chip>`}
-          ${s.stateDetail ? `<span class="text-3">${escapeHtml(s.stateDetail)}</span>` : ''}
+          ${(() => { const d = shareStateText(s); return d.text ? `<span class="text-3"${d.title ? ` title="${escapeAttr(d.title)}"` : ''}>${escapeHtml(d.text)}</span>` : ''; })()}
         </div>
         <div class="stat-rows">
           <div class="sr"><span class="k">${escapeHtml(T('shares.col_source'))}</span><span class="v mono">${escapeHtml(s.sourcePath)}${s.dataset ? ` <tf-chip size="sm" status="info" label="${escapeAttr(s.dataset)}"></tf-chip>` : ''}</span></div>

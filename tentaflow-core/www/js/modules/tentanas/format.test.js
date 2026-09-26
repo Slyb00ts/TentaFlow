@@ -531,10 +531,11 @@ const { errMessage } = await import('./format.js');
 
 test('every refusal code the node sends is worded in every locale, an unknown one is shown as sent', async () => {
   const codes = new Set();
-  for (const file of ['db.rs', 'approvals.rs']) {
-    const source = readFileSync(join(WWW_ROOT, '..', 'src', 'tentanas', file), 'utf8');
+  for (const file of ['tentanas/db.rs', 'tentanas/approvals.rs', 'tentanas/jobs.rs', 'tentanas/elastic.rs', 'dispatch/tentanas.rs']) {
+    const source = readFileSync(join(WWW_ROOT, '..', 'src', file), 'utf8');
     for (const m of source.matchAll(/"refusal:([a-z0-9_]+)"/g)) codes.add(m[1]);
   }
+  assert.ok(codes.has('elastic_one_cache_disk') && codes.has('pool_detach_not_allowed'), 'the dispatcher\'s own refusals are scanned too');
   assert.ok(codes.has('share_user_in_use_elsewhere') && codes.has('approval_own_request'), `the scan found the codes (${[...codes].join(', ')})`);
   assert.ok(codes.size >= 8, [...codes].join(', '));
   try {

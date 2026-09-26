@@ -674,6 +674,31 @@ test('withSudo skips the prompt on a provisioned helper and asks for a password 
   Screen.unmount();
 });
 
+// Critic wave 5 round 2, MINOR 4: a refusal the node forwards from zpool
+// names the leaf as the request did — its GUID for a missing disk. The toast
+// names it as the cell does, and any id nobody maps stays hidden.
+test('a withSudo refusal names a leaf by the name the screen shows, never by its GUID', async () => {
+  stubTransport(fixtures);
+  await mountScreen({ node: LOCAL });
+  await flush();
+  const guid = '12156453278383891134';
+  const refused = async () => { throw new Error(`protocol error BadRequest: cannot offline ${guid}: no valid replicas`); };
+  const rec = recordToasts();
+  try {
+    assert.equal(await Screen.withSudo(refused, 'x', undefined, (id) => (id === guid ? 'brak dysku (ostatnio sdk)' : '')), null);
+    assert.equal(await Screen.withSudo(refused, 'x'), null);
+    const errors = rec.toasts.filter((t) => t.kind === 'error').map((t) => t.text);
+    assert.equal(errors.length, 2, errors.join(' | '));
+    assert.match(errors[0], /cannot offline brak dysku \(ostatnio sdk\): no valid replicas/);
+    assert.doesNotMatch(errors[1], new RegExp(guid), 'an id nobody names stays hidden');
+  } finally {
+    rec.restore();
+    // Unmounted even when an assertion fails: a mounted screen keeps timers
+    // that hold the test process open.
+    Screen.unmount();
+  }
+});
+
 // A remote node with no known hostname: the prompt must not say "do węzła
 // Węzeł bez nazwy" or "tentaflow@Węzeł bez nazwy".
 test('the sudo prompt for a nameless remote node reads naturally', async () => {
@@ -734,7 +759,9 @@ test('"Uzbrój kanał" stays on the arm-channel prompt and never labels a one-sh
 test('zakładka Pule liczy pule ZFS RAZEM z macierzami, pozostałe badge pozostają pomiarami noda', async () => {
   stubTransport({ ...fixtures, tentaNasNodesListRequest: { localNodeId: LOCAL,
     nodes: [node({ poolsTotal: 0, arraysTotal: 2 }), node({ nodeId: REMOTE, isLocal: false, poolsTotal: 7, disksTotal: 9, sharesTotal: 3 })] } });
-  const root = await mountScreen({ node: LOCAL, tab: 'pools' });
+  // Opened on Disks: the badge is the local row's own figure until a read of
+  // both lists (Overview, Pools) replaces it.
+  const root = await mountScreen({ node: LOCAL, tab: 'disks' });
   try {
     assert.equal(root.querySelector('tf-tab#pools').getAttribute('count'), '2',
       'no ZFS pool, two arrays — the node is not storage-less');
@@ -746,8 +773,11 @@ test('zakładka Pule liczy pule ZFS RAZEM z macierzami, pozostałe badge pozosta
     await flush();
     await flush();
     const pools = root.querySelector('tf-tab#pools');
-    assert.equal(pools.getAttribute('count'), '—', 'the ZFS half is not passed off as pools + arrays');
-    assert.match(pools.getAttribute('title'), /nie są tu liczone/);
+    // The published row counts ZFS alone (7); the Pools tab asked the node
+    // itself for both lists, and that answer is the badge (critic wave 5,
+    // MINOR 5) — never the published ZFS half.
+    assert.equal(pools.getAttribute('count'), '1', 'the pools and arrays the node itself answered');
+    assert.equal(pools.hasAttribute('title'), false);
     assert.equal(root.querySelector('tf-tab#disks').getAttribute('count'), '9');
     assert.ok(kinds('tentaNasSharesListRequest').some((c) => c.options.targetNodeId === REMOTE), 'the remote node was asked for its shares');
     assert.equal(root.querySelector('tf-tab#shares').getAttribute('count'), '1', 'what the node itself answered, not the published figure');
@@ -775,6 +805,28 @@ test('a remote node view counts its Pools tab from the lists the node itself ans
     tentaNasElasticArraysListRequest: () => { throw new Error('array probe failed'); } });
   root = await mountScreen({ node: REMOTE });
   try {
+    await flush();
+    assert.equal(root.querySelector('tf-tab#pools').getAttribute('count'), '—', 'half an answer is no count');
+  } finally { Screen.unmount(); }
+});
+
+// Critic wave 5, MINOR 5: opened on another tab, a remote node's Pools badge
+// is counted from its own lists at once — not only after a visit to the
+// Overview — and stays a dash when half the answer is missing.
+test('a remote node opened on another tab counts its Pools badge at once', async () => {
+  const remote = { localNodeId: LOCAL, nodes: [node({}), node({ nodeId: REMOTE, nodeName: 'vega', isLocal: false, poolsTotal: 5, arraysTotal: 0 })] };
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: remote, tentaNasElasticArraysListRequest: { arrays: [elasticArray()] } });
+  let root = await mountScreen({ node: REMOTE, tab: 'disks' });
+  try {
+    await flush();
+    await flush();
+    assert.equal(root.querySelector('tf-tab#pools').getAttribute('count'), '2');
+    assert.ok(kinds('tentaNasPoolsListRequest').some((c) => c.options.targetNodeId === REMOTE));
+  } finally { Screen.unmount(); }
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: remote, tentaNasElasticArraysListRequest: () => { throw new Error('array probe failed'); } });
+  root = await mountScreen({ node: REMOTE, tab: 'disks' });
+  try {
+    await flush();
     await flush();
     assert.equal(root.querySelector('tf-tab#pools').getAttribute('count'), '—', 'half an answer is no count');
   } finally { Screen.unmount(); }
@@ -1308,12 +1360,57 @@ test('n02: a conflict row copies the other version\'s path on request and never 
     click(buttons[0]);
     await flush();
     assert.deepEqual(copied, [kept], 'the click copies the other version\'s path');
-    assert.match(rec.toasts.map((t) => t.text).join('\n'), /Skopiowano ścieżkę drugiej wersji pliku docs\/a\.odt/);
+    assert.match(rec.toasts.map((t) => t.text).join('\n'), /Skopiowano ścieżkę drugiej wersji pliku docs\/a\.odt — to ścieżka na węźle orion/, 'the node the path is on is named');
     assert.doesNotMatch(rec.toasts.map((t) => t.text).join('\n'), new RegExp(uuid));
+
+    // Critic wave 5, MINOR 7: over plain HTTP there is no clipboard API; the
+    // copy command still copies the path, through a textarea that does not
+    // stay in the page.
+    Object.defineProperty(globalThis.navigator, 'clipboard', { configurable: true, value: undefined });
+    const execCommand = document.execCommand;
+    const viaCommand = [];
+    document.execCommand = (cmd) => { viaCommand.push([cmd, document.activeElement?.value ?? document.querySelector('textarea[readonly]')?.value]); return true; };
+    try {
+      click(row.querySelector('[data-copy]'));
+      await flush();
+    } finally {
+      document.execCommand = execCommand;
+    }
+    assert.equal(viaCommand.length, 1);
+    assert.equal(viaCommand[0][0], 'copy');
+    assert.equal(document.querySelector('textarea[readonly]'), null, 'the helper textarea is gone');
+    assert.doesNotMatch(root.innerHTML, new RegExp(uuid));
   } finally {
     rec.restore();
     if (clipboard) Object.defineProperty(globalThis.navigator, 'clipboard', clipboard);
     else delete globalThis.navigator.clipboard;
+    Screen.unmount();
+  }
+});
+
+// Critic wave 5, MINOR 7: past three files the copy controls fold behind one
+// line — none is dropped, and the row is not a wall of buttons.
+test('n02: a conflict row with many files folds the copy controls past the first three', async () => {
+  const reasons = Array.from({ length: 5 }, (_, i) => ({ code: 'conflict_file', params: { path: `docs/f${i}.odt`, visible: `/mnt/media/docs/f${i}.odt`, kept_kind: 'quarantine', kept_disk: 'nvme2n1', kept_path: `/mnt/tentanas-branches/media/cache/nvme2n1/f${i}` } }));
+  const alert = {
+    alertId: 'c5', severity: 'warning', subjectKind: 'elastic-array', subjectId: 'media', title: 't', detail: '',
+    code: 'elastic_conflict', params: { array: 'media', count: '5' }, reasons,
+    raisedAt: '2026-09-01 10:00:00', ackedAt: null, resolvedAt: null,
+  };
+  stubTransport({ ...fixtures, tentaNasAlertsListRequest: () => ({ alerts: [alert] }) });
+  const root = await mountScreen({ node: LOCAL });
+  await flush();
+  try {
+    const row = root.querySelector('#nas-ov-alerts .alert-row[data-alert="c5"]');
+    const copy = row.querySelector('[data-role="copy"]');
+    assert.equal(copy.querySelectorAll(':scope > [data-copy]').length, 3, 'three on the row');
+    const more = copy.querySelector('details.a-copy-more');
+    assert.equal(more.querySelector('summary').textContent, 'i 2 kolejne pliki');
+    assert.deepEqual([...more.querySelectorAll('[data-copy]')].map((b) => b.dataset.copy), ['3', '4'], 'the rest keep their controls');
+    await Screen.refreshOverview(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.ok(copy.querySelector('details.a-copy-more') === more, 'the fold survives a poll');
+  } finally {
     Screen.unmount();
   }
 });
@@ -1757,10 +1854,12 @@ test('a job row marks a last-known subject and keeps a disk id out of the text',
   const wwn = 'wwn-0x5000cca27dc7a4c6';
   const job = (jobId, subject, extra = {}) => ({ jobId, kind: 'smart_test', subject, status: 'succeeded', startedBy: 'Anna', startedAt: '2026-09-01 10:00:00', log: [], ...extra });
   [job('a', 'sdq', { subjectLastKnown: true }), job('b', wwn), job('c', 'sdd')].forEach((j) => buildJobRow(host, j));
-  const subject = (id) => host.querySelector(`.job-row[data-job="${id}"] .job-name .mono`);
+  const subject = (id) => host.querySelector(`.job-row[data-job="${id}"] .job-name > span`);
   assert.equal(subject('a').textContent, 'ostatnio widziany jako sdq');
   assert.equal(subject('b').textContent, 'nieznany dysk');
   assert.equal(subject('c').textContent, 'sdd');
+  // Words are not set in the monospace face a device name gets.
+  assert.deepEqual(['a', 'b', 'c'].map((id) => subject(id).classList.contains('mono')), [false, false, true]);
   assert.doesNotMatch(host.innerHTML, /wwn-/, 'not even as a tooltip');
   host.remove();
   Screen.unmount();
@@ -2804,6 +2903,45 @@ test('n16: the ARC card follows the node without rebuilding and keeps an unsaved
     await flush();
     assert.equal(slider.getAttribute('value'), '50', 'an unsaved choice stays');
     assert.match(host.querySelector('#nas-arc-val').textContent, /30%/);
+
+    // Critic wave 5, MINOR 6: a read that FAILS keeps the card — and the
+    // unsaved choice — instead of replacing it with "unavailable".
+    let failing = true;
+    stubTransport({ ...fixtures, tentaNasArcStatsRequest: () => { if (failing) throw new Error('mesh timeout'); return { arc: current }; } });
+    await Screen.paintArcSettings(root.querySelector('#nas-tab-body'));
+    await flush();
+    assert.ok(host.querySelector('#nas-arc-slider') === slider, 'the card survives a failed read');
+    assert.match(host.querySelector('#nas-arc-val').textContent, /30%/, 'and so does the unsaved choice');
+    failing = false;
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// Critic wave 5, MINOR 6: once "apply" succeeds, the applied cap is the one
+// the slider is judged against until the next read shows it — moving back
+// to the old cap is a change to apply, not "nothing changed".
+test('n16: after apply, the slider is judged against the cap just applied', async () => {
+  stubTransport({ ...fixtures, tentaNasArcStatsRequest: () => ({ arc }), tentaNasArcLimitSetRequest: {} });
+  const root = await mountScreen({ node: LOCAL, tab: 'environment' });
+  await flush();
+  await flush();
+  try {
+    const host = root.querySelector('#nas-env-arc');
+    const slider = host.querySelector('#nas-arc-slider');
+    const apply = host.querySelector('[data-act="arc-apply"]');
+    assert.equal(slider.getAttribute('value'), '25');
+    slider.value = 40;
+    slider.dispatchEvent(new CustomEvent('input', { detail: { value: 40 } }));
+    assert.equal(apply.hasAttribute('disabled'), false);
+    click(apply);
+    for (let i = 0; i < 4; i += 1) await flush();
+    assert.equal(kinds('tentaNasArcLimitSetRequest').length, 1);
+    assert.equal(apply.hasAttribute('disabled'), true, 'applied: nothing left to apply');
+    slider.dispatchEvent(new CustomEvent('input', { detail: { value: 25 } }));
+    assert.equal(apply.hasAttribute('disabled'), false, 'back to the old cap is a change again');
+    slider.dispatchEvent(new CustomEvent('input', { detail: { value: 40 } }));
+    assert.equal(apply.hasAttribute('disabled'), true, 'the applied cap itself is not');
   } finally {
     Screen.unmount();
   }
@@ -3961,8 +4099,68 @@ test('an unreachable node shows "—" sessions in the fleet resources, not 0', a
     await flush();
     await flush();
     const rows = root.querySelector('#nas-fleet-res-table').rows;
-    assert.equal(rows[0].sessions, 14);
+    assert.equal(rows[0].sessions, '14');
     assert.equal(rows[1].sessions, '—');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// Critic wave 7, MINOR 10: a node that answers its shares but fails its
+// target list is up — its row says which read failed, never "offline".
+test('a node whose target list fails is a read failure in the fleet, not "offline"', async () => {
+  stubTransport({
+    ...fixtures,
+    tentaNasTargetsListRequest: (payload, options) => {
+      if (options.targetNodeId === REMOTE) throw new Error('database is locked');
+      return fixtures.tentaNasTargetsListRequest;
+    },
+  });
+  try {
+    const root = await mountScreen();
+    await flush();
+    await flush();
+    const row = root.querySelector('#nas-fleet-res-table').rows.find((r) => r._node?.nodeId === REMOTE && !r._share && !r._target);
+    assert.ok(row, 'the node has a row of its own');
+    assert.match(row.protocol, /label="błąd odczytu"/);
+    assert.doesNotMatch(row.protocol, /offline/);
+    assert.equal(row.source, 'Node odpowiada, ale nie udało się odczytać listy targetów: database is locked');
+    assert.equal(row.sessions, '—');
+  } finally {
+    Screen.unmount();
+  }
+});
+
+// Critic wave 7, MINOR 9 and R2-1: a block target's fleet row reads as n01
+// writes it — the source on one line, the NVMe-oF transports in brackets (an
+// iSCSI target keeps its auth method) — and an NVMe-oF session count says it
+// may be up to five minutes old, beside a live iSCSI one that says nothing.
+test('fleet target rows follow n01 and an NVMe-oF session count says how old it may be', async () => {
+  const lun = (source, sizeBytes) => [{ lun: 0, source, sizeBytes, thin: false }];
+  const iscsi = {
+    targetId: 't1', name: 'vm-store', protocol: 'iscsi', wwn: 'iqn.2026-09.local.tentaflow:orion.vm-store', enabled: true,
+    luns: lun('tank/vm-store', 2e12), portals: [{ address: '10.0.0.1', port: 3260, transport: 'tcp' }], auth: { method: 'chap' },
+    initiators: ['iqn.a', 'iqn.b'], portGroups: [], sessions: 2, sessionsKnown: true, state: 'active', stateDetail: '',
+  };
+  const nvmet = {
+    ...iscsi, targetId: 't2', name: 'scratch', protocol: 'nvmet', wwn: 'nqn.2026-09.local.tentaflow:orion.scratch',
+    luns: lun('fast/scratch', 500 * 2 ** 30), portals: [{ address: '10.0.0.1', port: 4420, transport: 'tcp' }, { address: '10.1.0.1', port: 4420, transport: 'rdma' }],
+    auth: { method: 'dhchap' }, initiators: ['nqn.host'], sessions: 1,
+  };
+  stubTransport({ ...fixtures, tentaNasTargetsListRequest: { ...fixtures.tentaNasTargetsListRequest, targets: [iscsi, nvmet] } });
+  try {
+    const root = await mountScreen();
+    await flush();
+    await flush();
+    const rows = root.querySelector('#nas-fleet-res-table').rows;
+    const row = (name) => rows.find((r) => r._target?.name === name);
+    assert.match(row('scratch').source, />zvol fast\/scratch · 500 GiB</, 'the source on one line');
+    assert.doesNotMatch(row('scratch').source, /cell-sub/);
+    assert.match(row('scratch').mounts, /class="tf-table__cell-sub">1 host NQN \(TCP\+RDMA\)</);
+    assert.match(row('vm-store').mounts, />2 initiatory \(CHAP\)</);
+    assert.equal(row('scratch').sessions, '<span title="Liczba sesji NVMe-oF z odczytu sprzed najwyżej 5 min">1</span>');
+    assert.equal(row('vm-store').sessions, '2', 'a live iSCSI count carries no age');
+    assert.ok(root.querySelector('#nas-fleet-res-table tf-column[key="sessions"][renderer="html"][align="num"]'));
   } finally {
     Screen.unmount();
   }
@@ -4379,8 +4577,9 @@ test('M7: a remote node card and the fleet resources count its block targets wit
     assert.match(vm.protocol, /label="iSCSI"/);
     assert.match(scratch.protocol, /label="NVMe-oF"/);
     assert.match(vm.source, /zvol tank\/vm-store/);
-    assert.equal(vm.mounts, '<span class="text-xs">2 initiatory (CHAP)</span>');
-    assert.equal(scratch.mounts, '<span class="text-xs">1 host NQN</span>');
+    assert.equal(vm.mounts, '<span class="tf-table__cell-sub">2 initiatory (CHAP)</span>');
+    // n01: an NVMe-oF row names its transports (critic wave 7, MINOR 9).
+    assert.equal(scratch.mounts, '<span class="tf-table__cell-sub">1 host NQN (TCP)</span>');
     assert.equal(vm.sessions, '2');
     assert.equal(scratch.sessions, '—', 'an unmeasured NVMe-oF session count is a dash, never 0');
     const kpi = root.querySelector('[data-kpi="resources"]');

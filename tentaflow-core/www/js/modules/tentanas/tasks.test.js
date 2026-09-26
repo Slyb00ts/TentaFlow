@@ -185,7 +185,7 @@ test('a job subject is marked when last-known and never shows a disk id', async 
   await flush();
 
   const running = body.querySelector('#nas-jobs-running');
-  const name = (id) => running.querySelector(`.job-row[data-job="${id}"] .job-name .mono`);
+  const name = (id) => running.querySelector(`.job-row[data-job="${id}"] .job-name > span`);
   assert.equal(name('r1').textContent, 'ostatnio widziany jako sdq');
   assert.equal(name('r2').textContent, 'nieznany dysk', 'the id is not visible text');
   assert.doesNotMatch(running.innerHTML, /wwn-/, 'nor a tooltip');
@@ -212,7 +212,7 @@ test('a pool/share/target/dataset name is never hidden as an id, even in a disk-
   for (const kind of ['pool_scrub', 'snapshot_destroy', 'pool_replace', 'elastic_mover', 'share_create']) {
     for (const name of names) {
       const subject = jobSubject({ kind, subject: name });
-      assert.deepEqual(subject, { text: name }, `${kind} subject "${name}" must stay visible`);
+      assert.deepEqual(subject, { text: name, words: false }, `${kind} subject "${name}" must stay visible`);
     }
   }
 });
@@ -222,8 +222,21 @@ test('a pool/share/target/dataset name is never hidden as an id, even in a disk-
 // other kind, because that kind's subject is never a disk id.
 test('a wwn- shaped subject is hidden for a SMART test, but shown for every other job kind', () => {
   const wwn = 'wwn-0x5000c500a1b2c3d4';
-  assert.deepEqual(jobSubject({ kind: 'smart_test', subject: wwn }), { text: 'nieznany dysk' }, 'hidden for a SMART test');
-  assert.deepEqual(jobSubject({ kind: 'pool_scrub', subject: wwn }), { text: wwn }, 'shown for a pool subject of the same shape');
+  assert.deepEqual(jobSubject({ kind: 'smart_test', subject: wwn }), { text: 'nieznany dysk', words: true }, 'hidden for a SMART test');
+  assert.deepEqual(jobSubject({ kind: 'pool_scrub', subject: wwn }), { text: wwn, words: false }, 'shown for a pool subject of the same shape');
+});
+
+// Critic wave 5, MINOR 10: "nieznany dysk" / "ostatnio sdk" are words, not
+// a device name — the row sets them in the normal face, a real name in mono.
+test('a worded job subject is not set in monospace; a real name is', () => {
+  const row = (j) => { const el = document.createElement('div'); el.innerHTML = jobRowSkeleton(j); return el.querySelector('.job-name span'); };
+  const unknown = row({ jobId: 'j1', kind: 'smart_test', subject: 'wwn-0x5000c500a1b2c3d4', status: 'running' });
+  assert.equal(unknown.textContent, 'nieznany dysk');
+  assert.equal(unknown.classList.contains('mono'), false);
+  const remembered = row({ jobId: 'j2', kind: 'smart_test', subject: 'sdk', subjectLastKnown: true, status: 'running' });
+  assert.equal(remembered.classList.contains('mono'), false);
+  const named = row({ jobId: 'j3', kind: 'pool_scrub', subject: 'tank', status: 'running' });
+  assert.equal(named.classList.contains('mono'), true);
 });
 
 // Opaque ids (UUID, a long-enough digit-run GUID, a 64-hex id) are never a
@@ -233,7 +246,7 @@ test('an opaque id is hidden for every job kind, not only smart_test', () => {
   const uuid = '3fa85f64-5717-4562-b3fc-2c963f66afa6';
   for (const kind of ['pool_scrub', 'snapshot_destroy', 'smart_test']) {
     const subject = jobSubject({ kind, subject: uuid });
-    assert.deepEqual(subject, { text: kind === 'smart_test' ? 'nieznany dysk' : '' }, `${kind} subject must hide the opaque id, tooltip included`);
+    assert.deepEqual(subject, { text: kind === 'smart_test' ? 'nieznany dysk' : '', words: true }, `${kind} subject must hide the opaque id, tooltip included`);
   }
 });
 

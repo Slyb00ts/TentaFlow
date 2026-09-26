@@ -45,6 +45,21 @@ export const operationLabel = (op) => T('approvals.op_' + (OPERATIONS.includes(o
 // every other older detail is its sentence, shown as written. A code this
 // build has no words for shows the sentence too, rather than nothing.
 const CODED_DETAIL = /^text:([a-z0-9_]+)$/;
+
+// The schedules a config import overwrites, in the reader's language (critic
+// wave 6, MINOR 10): the node sends them as `[task, subject]` pairs
+// (`config_io::overwritten_schedules_json`) beside its own "scrub tank,
+// smart". The pairs are used only when they are every overwritten item and
+// every task has words here; otherwise the node's list is shown as sent.
+const IMPORT_TASKS = new Set(['scrub', 'trim', 'snapshot', 'smart']);
+function configImportItems(p) {
+  let pairs;
+  try { pairs = JSON.parse(String(p.schedules || '')); } catch { pairs = null; }
+  const whole = Array.isArray(pairs) && pairs.length > 0 && pairs.length === Number(p.count)
+    && pairs.every((x) => Array.isArray(x) && IMPORT_TASKS.has(x[0]) && (x[0] === 'smart' || x[1]));
+  if (!whole) return p.items;
+  return pairs.map(([task, subject]) => T('approvals.detail.config_import_task.' + task, { subject })).join(', ');
+}
 const SCHEDULE_TASKS = new Set(['mover', 'sync', 'scrub']);
 const yesNo = (v) => (v === 'true' ? T('approvals.detail.yes') : v === 'false' ? T('approvals.detail.no') : null);
 const DETAIL_WORDS = new Map([
@@ -58,7 +73,10 @@ const DETAIL_WORDS = new Map([
       ? T('approvals.detail.snapshot_release_reason', { snapshot: p.snapshot, reason: p.reason })
       : T('approvals.detail.snapshot_release', { snapshot: p.snapshot });
   }],
-  ['config_import', (p) => (p.count && p.items ? T('approvals.detail.config_import', { count: p.count, items: p.items }) : null)],
+  ['config_import', (p) => {
+    if (!p.count || !p.items) return null;
+    return T('approvals.detail.config_import', { count: p.count, items: configImportItems(p) });
+  }],
   ['elastic_create', (p) => (p.array ? T('approvals.detail.elastic_create', { array: p.array }) : null)],
   ['elastic_sync', () => T('approvals.detail_elastic_sync')],
   ['elastic_sync_over_fault', () => T('approvals.detail_elastic_sync_over_fault')],

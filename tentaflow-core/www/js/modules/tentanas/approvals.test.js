@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const { approvalsCardHtml, wireApprovals, operationLabel, reportParked } = await import('./approvals.js');
+const { approvalsCardHtml, wireApprovals, operationLabel, reportParked, approvalDetail } = await import('./approvals.js');
 const { followResponse } = await import('./dialogs.js');
 
 const inAnHour = () => new Date(Date.now() + 3600_000).toISOString();
@@ -511,6 +511,34 @@ test('a parked detail is worded from its code in all five locales, the English o
       assert.equal(sub(2).textContent, 'an older sentence', 'a sentence without codes is shown as written');
       assert.equal(sub(2).getAttribute('title'), null);
       screen.dispose();
+    }
+  } finally { await I18n.setLanguage('pl'); }
+});
+
+// Critic wave 6, MINOR 10: the config-import approval words the schedules it
+// overwrites from the node's `[task, subject]` pairs — never the plan's own
+// "scrub tank, smart" — and falls back on the node's list when the pairs do
+// not cover every overwritten item.
+test('a config-import approval words the overwritten schedules in the reader\'s language', async () => {
+  const { I18n } = await import('./_test-setup.js');
+  const approval = (schedules, count = '3') => ({
+    detail: 'overwrites 3: scrub tank, snapshot tank/x, smart',
+    detailReasons: [{ code: 'config_import', params: { count, items: 'scrub tank, snapshot tank/x, smart', schedules } }],
+  });
+  const pairs = JSON.stringify([['scrub', 'tank'], ['snapshot', 'tank/x'], ['smart', '']]);
+  try {
+    for (const [language, expected] of [
+      ['pl', 'Nadpisuje istniejące elementy (3): harmonogram scrub puli tank, harmonogram snapshotów datasetu tank/x, harmonogram testów SMART.'],
+      ['de', 'Überschreibt vorhandene Einträge (3): Scrub-Zeitplan des Pools tank, Snapshot-Zeitplan des Datasets tank/x, SMART-Testzeitplan.'],
+    ]) {
+      await I18n.setLanguage(language);
+      assert.equal(approvalDetail(approval(pairs)).text, expected, language);
+    }
+    await I18n.setLanguage('pl');
+    // An older node (no pairs), pairs that miss an item, or a task with no
+    // words here: the node's own list, as sent.
+    for (const fallback of [approval(undefined), approval(pairs, '4'), approval(JSON.stringify([['scrub', 'tank'], ['defrag', 'x'], ['smart', '']]))]) {
+      assert.match(approvalDetail(fallback).text, /: scrub tank, snapshot tank\/x, smart\.$/);
     }
   } finally { await I18n.setLanguage('pl'); }
 });

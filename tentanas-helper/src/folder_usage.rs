@@ -24,6 +24,12 @@
 //! An entry removed while the walk runs is simply gone — the measurement is a
 //! point-in-time reading of a live tree, as `du`'s is.
 //!
+//! Every name is charged as its directory is READ, so one huge directory
+//! cannot be listed whole before the budget sees it, and the deadline is
+//! read with the budget. What the deadline cannot end is one system call
+//! that never returns (an `fstatat` on a dying disk): that is bounded only
+//! by whoever runs the helper giving up on it.
+//!
 //! Descent is FD-relative and never follows a symlink, so a user who swaps a
 //! directory for a link while the walk runs cannot make root count, or even
 //! stat, anything outside the branch.
@@ -122,20 +128,33 @@ fn open_directory_at(fd: i32, name: &CString) -> Result<OwnedFd, std::io::Error>
     Ok(unsafe { OwnedFd::from_raw_fd(child) })
 }
 
+/// Why a directory could not be listed.
+enum ListGap {
+    Io,
+    /// The budget ran out while the names were read.
+    OverBudget,
+}
+
 /// Every name in the directory `fd`, `.` and `..` left out.
-fn list(fd: i32) -> Result<Vec<CString>, std::io::Error> {
+///
+/// Each name is charged to `budget` AS IT IS READ (critic wave 7, MINOR 7):
+/// one huge directory would otherwise be read whole — unbounded in memory
+/// and time — before the walk charged a single entry. A name charged here is
+/// not charged again when the walk visits it. The deadline is read with the
+/// budget, so a directory the size of the budget cannot outlast it either.
+fn list(fd: i32, budget: &mut Budget) -> Result<Vec<CString>, ListGap> {
     let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
-        return Err(last_error());
+        return Err(ListGap::Io);
     }
     let directory = unsafe { libc::fdopendir(duplicate) };
     if directory.is_null() {
-        let error = last_error();
         unsafe { libc::close(duplicate) };
-        return Err(error);
+        return Err(ListGap::Io);
     }
     unsafe { *libc::__errno_location() = 0 };
     let mut names = Vec::new();
+    let mut spent = false;
     loop {
         let entry = unsafe { libc::readdir(directory) };
         if entry.is_null() {
@@ -144,15 +163,39 @@ fn list(fd: i32) -> Result<Vec<CString>, std::io::Error> {
         let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
         let bytes = name.to_bytes();
         if bytes != b"." && bytes != b".." {
+            if !budget.take() {
+                spent = true;
+                break;
+            }
             names.push(name.to_owned());
         }
     }
     let read_error = unsafe { *libc::__errno_location() };
     unsafe { libc::closedir(directory) };
+    if spent {
+        return Err(ListGap::OverBudget);
+    }
     if read_error != 0 {
-        return Err(std::io::Error::from_raw_os_error(read_error));
+        return Err(ListGap::Io);
     }
     Ok(names)
+}
+
+impl From<ListGap> for Gap {
+    fn from(gap: ListGap) -> Self {
+        match gap {
+            ListGap::Io => Gap::Unreadable,
+            ListGap::OverBudget => Gap::OverBudget,
+        }
+    }
+}
+
+/// Whether the directory just opened is the entry `stat` described: the
+/// same device and inode. A directory swapped (or a filesystem mounted over
+/// it) between the `fstatat` and the `openat` is not the one that was judged
+/// to be on this branch.
+fn same_entry(opened: &OwnedFd, stat: &libc::stat) -> bool {
+    stat_fd(opened.as_raw_fd()).is_ok_and(|now| now.st_dev == stat.st_dev && now.st_ino == stat.st_ino)
 }
 
 fn allocated(stat: &libc::stat) -> u64 {
@@ -212,7 +255,12 @@ pub(crate) fn folder_bytes(branch: &Path, folder: &str, budget: &mut Budget) -> 
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(0),
         Err(_) => return Err(Gap::Unreadable),
     };
-    let names = list(opened.as_raw_fd()).map_err(|_| Gap::Unreadable)?;
+    if !same_entry(&opened, &top) {
+        // Swapped between the two calls: what was measured is gone, and
+        // what is there now was never judged to be on this branch.
+        return Err(Gap::Unreadable);
+    }
+    let names = list(opened.as_raw_fd(), budget)?;
     let mut linked: HashSet<(u64, u64)> = HashSet::new();
     // One frame per open directory: its descriptor and the names still to visit.
     let mut stack: Vec<(OwnedFd, Vec<CString>)> = vec![(opened, names)];
@@ -222,9 +270,7 @@ pub(crate) fn folder_bytes(branch: &Path, folder: &str, budget: &mut Budget) -> 
             continue;
         };
         let dir = fd.as_raw_fd();
-        if !budget.take() {
-            return Err(Gap::OverBudget);
-        }
+        // The name was charged when its directory was listed (`list`).
         let stat = match stat_at(dir, &name) {
             Ok(stat) => stat,
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
@@ -243,7 +289,13 @@ pub(crate) fn folder_bytes(branch: &Path, folder: &str, budget: &mut Budget) -> 
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
                 Err(_) => return Err(Gap::Unreadable),
             };
-            let names = list(child.as_raw_fd()).map_err(|_| Gap::Unreadable)?;
+            if !same_entry(&child, &stat) {
+                // Swapped for another directory, or mounted over, after it
+                // was judged: never descended into (defence in depth; the
+                // branches are invisible from the host namespace).
+                continue;
+            }
+            let names = list(child.as_raw_fd(), budget)?;
             stack.push((child, names));
             continue;
         }
@@ -353,6 +405,57 @@ mod tests {
         }
         let mut budget = Budget::new(u64::MAX, Instant::now());
         assert_eq!(folder_bytes(&branch, "foto", &mut budget), Err(Gap::OverBudget));
+    }
+
+    /// Critic wave 7, MINOR 7: a directory is charged while it is READ, so a
+    /// huge one stops at the budget instead of being listed whole first, and
+    /// each name is charged once — listed, not again when visited.
+    #[test]
+    fn a_huge_directory_is_charged_while_it_is_read() {
+        let branch = scratch("huge");
+        let folder = branch.join("foto");
+        fs::create_dir_all(&folder).unwrap();
+        for i in 0..50 {
+            fs::File::create(folder.join(format!("f{i}"))).unwrap();
+        }
+        let open = |path: &Path| {
+            let path = CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+            assert!(fd >= 0);
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        };
+        let dir = open(&folder);
+        let mut tight = Budget::new(5, Instant::now() + Duration::from_secs(60));
+        assert!(matches!(list(dir.as_raw_fd(), &mut tight), Err(ListGap::OverBudget)));
+        assert!(tight.spent());
+        // A fresh descriptor: a listed one has its offset at the end.
+        let dir = open(&folder);
+        let mut exact = Budget::new(50, Instant::now() + Duration::from_secs(60));
+        assert_eq!(list(dir.as_raw_fd(), &mut exact).ok().map(|names| names.len()), Some(50));
+        // The folder's own entry and its 50 names: nothing is charged twice.
+        assert!(folder_bytes(&branch, "foto", &mut Budget::new(51, Instant::now() + Duration::from_secs(60))).is_ok());
+        assert_eq!(
+            folder_bytes(&branch, "foto", &mut Budget::new(50, Instant::now() + Duration::from_secs(60))),
+            Err(Gap::OverBudget)
+        );
+    }
+
+    /// Critic wave 7, MINOR 7: a descriptor is used only if it is the entry
+    /// that was judged — same device and inode as its `fstatat`.
+    #[test]
+    fn a_directory_is_entered_only_if_it_is_the_one_judged() {
+        let branch = scratch("same");
+        fs::create_dir_all(branch.join("a")).unwrap();
+        fs::create_dir_all(branch.join("b")).unwrap();
+        let root = {
+            let path = CString::new(std::os::unix::ffi::OsStrExt::as_bytes(branch.as_os_str())).unwrap();
+            unsafe { OwnedFd::from_raw_fd(libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)) }
+        };
+        let a = CString::new("a").unwrap();
+        let b = CString::new("b").unwrap();
+        let judged = stat_at(root.as_raw_fd(), &a).unwrap();
+        assert!(same_entry(&open_directory_at(root.as_raw_fd(), &a).unwrap(), &judged));
+        assert!(!same_entry(&open_directory_at(root.as_raw_fd(), &b).unwrap(), &judged), "a swapped directory is not entered");
     }
 
     /// A directory root cannot list is a folder with no figure, not a smaller one.

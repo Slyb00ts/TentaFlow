@@ -12,7 +12,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, errMessage, errCode, wordReasons, nodeTextTitle } from '/js/modules/tentanas/format.js';
+import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, fmtDate, parseServerTs, errMessage, errCode, wordReasons, nodeTextTitle } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, warningHtml, NAS_DIALOG, nasRetypeLabel } from '/js/modules/tentanas/dialogs.js';
@@ -84,6 +84,34 @@ export function sourceCellHtml(target) {
 }
 
 /**
+ * The fleet table's "Źródło" of a target (n01): one line, "zvol fast/scratch ·
+ * 500 GB", where the Sharing tab stacks the size under the source.
+ */
+export function fleetSourceHtml(target) {
+  const lun = (target.luns || [])[0];
+  if (!lun) return '—';
+  const line = [`zvol ${lun.source}`, fmtBytes(lun.sizeBytes), lun.thin ? 'thin' : ''].filter(Boolean).join(' · ');
+  return `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(line)}</span></span>`;
+}
+
+/** The transports of a target's portals as n01 writes them: "TCP+RDMA" —
+ *  the bare acronyms, where the detail's `transportLabel` adds "(RoCE)". */
+export const transportsText = (target) => [...new Set((target.portals || []).map((p) => String(p.transport || 'tcp').toUpperCase()))].join('+');
+
+/**
+ * The fleet's "Sesje" cell of a target. The node counts NVMe-oF sessions for
+ * the fleet at most every five minutes (`targets::FLEET_SESSIONS_MAX_AGE`),
+ * while an iSCSI count is read live: the tooltip says how old an NVMe-oF
+ * count may be, so two counts of different freshness do not look alike.
+ */
+export const FLEET_NVMET_SESSIONS_MAX_AGE_MIN = 5;
+export function fleetSessionsHtml(target) {
+  const label = escapeHtml(sessionsCountLabel(target));
+  if (target.protocol !== 'nvmet' || target.sessionsKnown !== true) return label;
+  return `<span title="${escapeAttr(T('fleet.sessions_nvmet_age', { minutes: FLEET_NVMET_SESSIONS_MAX_AGE_MIN }))}">${label}</span>`;
+}
+
+/**
  * The count next to "Zalogowane initiatory", and the sentence under it when
  * the list is empty.
  *
@@ -123,12 +151,15 @@ const TARGET_STATE_WORDS = new Map([
     else if (state === 'no_address') head = T('targets.state_reason.portal_moved_head_no_address', { address: p.address, interface: p.interface });
     else if (state === 'missing') head = T('targets.state_reason.portal_moved_head_gone', { address: p.address, interface: p.interface });
     else return null;
-    const where = !p.elsewhere
-      ? T('targets.state_reason.portal_moved_nowhere')
-      : p.in_kernel === 'true'
-        ? T('targets.state_reason.portal_moved_reachable', { elsewhere: p.elsewhere })
-        : T('targets.state_reason.portal_moved_silent', { elsewhere: p.elsewhere });
-    return `${head} ${where} ${T('targets.state_reason.portal_moved_tail')}`;
+    // Since WHEN the address is elsewhere (critic wave 6, MINOR 11): the
+    // node's drift alert was raised at the first tick that saw the move.
+    const since = p.since && parseServerTs(p.since) ? fmtDate(p.since) : '';
+    const sinceKey = since ? '_since' : '';
+    if (!p.elsewhere) return `${head} ${T('targets.state_reason.portal_moved_nowhere')} ${T('targets.state_reason.portal_moved_tail')}`;
+    // N19b's case — nothing listens there — ends as the mockup does: the
+    // export "will not be moved there automatically".
+    if (p.in_kernel !== 'true') return `${head} ${T('targets.state_reason.portal_moved_silent' + sinceKey, { elsewhere: p.elsewhere, since })}`;
+    return `${head} ${T('targets.state_reason.portal_moved_reachable' + sinceKey, { elsewhere: p.elsewhere, since })} ${T('targets.state_reason.portal_moved_tail')}`;
   }],
   ['target_not_exported', () => T('targets.state_reason.not_exported')],
   ['target_no_auth', () => T('targets.state_reason.no_auth')],
@@ -385,8 +416,23 @@ export const groupStateLabel = (state) => (GROUP_STATE_LABEL[state] ? T(GROUP_ST
  * and only one is printed.
  */
 export const sessionLine = (s) => (s.client && s.user && s.user !== s.client
-  ? `${escapeHtml(s.client)} · ${escapeHtml(s.user)}`
-  : escapeHtml(s.client || s.user || '—'));
+  ? `${escapeHtml(s.client)} · ${hostIdentityHtml(s.user)}`
+  : hostIdentityHtml(s.client || s.user || '—'));
+
+// A host NQN built from a UUID (`nqn.2014-08.org.nvmexpress:uuid:<uuid>`,
+// what `nvme gen-hostnqn` writes) is one opaque string of 36 characters
+// after its prefix. n19 shows it with the UUID cut in the middle
+// ("…:uuid:9f2c…a17b"); the whole identity stays in the tooltip, because the
+// admin compares it with the client's own `/etc/nvme/hostnqn`.
+const UUID_HOST_NQN = /^(.*:uuid:)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+/** An allowlisted or logged-in IQN/NQN as a cell shows it (see above). */
+export function hostIdentityHtml(identity) {
+  const text = String(identity || '');
+  const m = UUID_HOST_NQN.exec(text);
+  if (!m) return escapeHtml(text || '—');
+  return `<span title="${escapeAttr(text)}">${escapeHtml(`${m[1]}${m[2].slice(0, 4)}…${m[2].slice(-4)}`)}</span>`;
+}
 
 /**
  * The allowlist's "Stan" cell (n19, MAJOR 27 front slice): whether this
@@ -550,6 +596,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     if (!t || !hostsTable) return;
     setRowsIfChanged(hostsTable, parseInitiators(state.initiatorsText).map((identity) => ({
       identity,
+      shown: hostIdentityHtml(identity),
       connected: hostConnectionHtml(t, state.sessions, identity),
       auth: authChipHtml(t.auth),
       shared: state.capabilities ? state.siblings.filter((other) => other.targetId !== t.targetId && other.protocol === t.protocol && (other.initiators || []).includes(identity)).map((other) => other.name).join(', ') || '—' : T('targets.portal_unknown'),
@@ -841,7 +888,7 @@ function targetDetailHtml(admin) {
     </section>
     <section class="nas-target-card">
     <div class="section-card-head"><h3 class="title">${sprite('shield')} ${escapeHtml(T('targets.initiators'))}</h3></div>
-    <tf-table id="nas-td-hosts" empty-message="${escapeAttr(T('targets.no_initiators'))}"><tf-column key="identity" label="IQN / NQN" fill></tf-column><tf-column key="connected" label="${escapeAttr(T('targets.host_state'))}" renderer="html"></tf-column><tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html"></tf-column><tf-column key="shared" label="${escapeAttr(T('targets.host_shared'))}"></tf-column></tf-table>
+    <tf-table id="nas-td-hosts" empty-message="${escapeAttr(T('targets.no_initiators'))}"><tf-column key="shown" label="IQN / NQN" renderer="html" fill></tf-column><tf-column key="connected" label="${escapeAttr(T('targets.host_state'))}" renderer="html"></tf-column><tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html"></tf-column><tf-column key="shared" label="${escapeAttr(T('targets.host_shared'))}"></tf-column></tf-table>
     ${admin ? `<details><summary>${escapeHtml(T('targets.edit_initiators'))}</summary>
       <tf-input id="nas-td-initiators" multiline rows="3" spellcheck="false" hint="${escapeAttr(T('targets.initiators_hint'))}"></tf-input>
       </details><p class="muted" data-testid="initiators-draft-hint">${escapeHtml(T('targets.initiators_draft'))}</p>` : ''}

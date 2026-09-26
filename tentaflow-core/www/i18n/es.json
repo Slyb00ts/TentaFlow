@@ -5568,7 +5568,7 @@
       "mover_restricted": "El traslado está limitado a la ventana de programación: fuera de ella los archivos esperan en la caché, salvo que empiece a faltar espacio.",
       "mover_settings": "Ajustes",
       "mover_name_note": "En el historial de tareas y en los registros del nodo aparece como «Mover».",
-      "cache_pending": "En el disco de caché, aún sin protección",
+      "cache_pending": "En la caché sin paridad",
       "sync_schedule": "Programación del sync",
       "scrub_schedule": "Programación del scrub",
       "sync_schedule_title": "Editar programación: Sync {name}",
@@ -5628,7 +5628,7 @@
       "next_steps": "Siguientes pasos",
       "step_repair": "Repare desde la paridad los bloques que el scrub marcó como erróneos.",
       "step_scrub": "Ejecute un scrub para comprobar si queda algo por reparar.",
-      "step_sync": "Ejecute una sincronización — requiere confirmación, porque registra el estado actual de los archivos eliminados o modificados desde la última sincronización.",
+      "step_sync": "Ejecute una sincronización — requiere confirmación, porque entre los archivos eliminados o modificados desde la última sincronización puede haber archivos dañados, y la sincronización los registra como nuevo estado.",
       "sync_fault_title": "Sincronización pese a un error sin corregir en la matriz {name}",
       "sync_fault_warning": "La matriz {name} tiene un error de scrub o de reparación sin corregir. La sincronización escribe igualmente un nuevo punto de control de paridad.",
       "sync_fault_loses": "Los archivos eliminados o modificados desde la última sincronización, también los dañados, quedarán registrados en su nuevo estado — sus versiones anteriores ya no podrán restaurarse desde la paridad.",
@@ -5692,8 +5692,10 @@
         "helper_failed": "El helper informó de un error al leer este array: los detalles están en la información emergente.",
         "operation_failed": "La operación «{operation}» no se completó: los detalles están en la información emergente.",
         "operation_failed_unnamed": "Una operación en este array no se completó: los detalles están en la información emergente.",
-        "supervision_lost": "El nodo perdió el seguimiento de una operación de este array (un reinicio); su estado no demuestra que las escrituras en los discos terminaran."
-      }
+        "supervision_lost": "El nodo perdió el seguimiento de una operación de este array (un reinicio); su estado no demuestra que las escrituras en los discos terminaran.",
+        "uncoded": "El nodo describió el estado de esta matriz solo con sus propias palabras; detalles en la información emergente."
+      },
+      "sync_fault_unmeasured": "Dos casos no se han medido: un archivo que el scrub no pudo leer y que también ha cambiado, y un disco que empieza a fallar durante la sincronización — cuente con una pérdida en ambos."
     },
     "wizard_pool": {
       "elastic_data": "Discos de datos",
@@ -5811,7 +5813,7 @@
         "same_device": "{other} ({other_role}) y {disk} ({role}) son el mismo dispositivo: un dispositivo no puede ocupar dos lugares en un array.",
         "data_disks_same_device": "{other} y {disk} son el mismo dispositivo: un dispositivo no puede ser dos discos de datos.",
         "disk_in_use": "{disk} {owner}: un disco pertenece a uno de ellos, no a ambos (este array lo borraría).",
-        "parity_too_small": "{disk} tiene {size} y el mayor disco de datos {largest}: un disco de paridad debe ser al menos tan grande como el mayor disco de datos, o no puede cubrirlo.",
+        "parity_too_small": "{disk} ({size}) no puede ser de paridad — es más pequeño que el mayor disco de datos ({largest}).",
         "filesystem_invalid": "«{filesystem}» no es un sistema de archivos que cree esta aplicación: un disco de datos Elastic lleva xfs o ext4 para seguir siendo legible por sí solo.",
         "filesystem_unavailable": "mkfs.{filesystem} no está instalado en este nodo, así que no se puede preparar ningún disco de este array.",
         "plan_failed": "Esta disposición no puede convertirse en un plan: los detalles están en la información emergente."
@@ -5990,7 +5992,9 @@
       "leaf_missing_at": "falta el disco n.º {n}",
       "disk_detach": "Desconectar el disco antiguo",
       "disk_detach_confirm": "El disco {device} se desconectará del pool {pool} (zpool detach). El disco de repuesto que queda en el pool en su lugar ya tiene sus datos. Una vez desconectado, {device} se puede retirar con seguridad.",
-      "disk_detach_done": "Disco {device} desconectado — se puede retirar"
+      "disk_detach_done": "Disco {device} desconectado — se puede retirar",
+      "leaf_embedded_last_known": "n.º {n} (visto por última vez como {name})",
+      "leaf_embedded_at": "n.º {n}"
     },
     "props": {
       "title": "Propiedades del pool",
@@ -6045,7 +6049,11 @@
       "explain_others": " y los vdev {roles}",
       "retype": "Vuelve a escribir el nombre del pool para confirmar:",
       "share_stops": "el recurso compartido {protocol} «{name}» dejará de funcionar",
-      "target_stops": "el target {protocol} «{name}» dejará de funcionar"
+      "target_stops": "el target {protocol} «{name}» dejará de funcionar",
+      "share_stops_fleet": "el recurso compartido {protocol} «{name}» dejará de funcionar en {n} {n|nodo|nodos} de la flota",
+      "shares_unchecked": "No se pudo comprobar qué recursos compartidos están en este pool: la lista puede estar incompleta.",
+      "targets_unchecked": "No se pudo comprobar qué destinos usan este pool: la lista puede estar incompleta.",
+      "dependents_scope": "Se enumeran los recursos compartidos y destinos de esta organización; los de otras organizaciones de este nodo no aparecen aquí."
     },
     "add_vdev": {
       "title": "Añadir vdev a {name}",
@@ -6524,7 +6532,13 @@
       "audit_smb_direct": "La ruta SMB Direct (RDMA) no se audita.",
       "audit_nothing": "no se audita nada",
       "audit_auditd": "vigilancias de auditd",
-      "audit_auditd_note": "Eventos en el registro de auditoría del sistema (ausearch -k tentanas), no en el «Registro de acceso»."
+      "audit_auditd_note": "Eventos en el registro de auditoría del sistema (ausearch -k tentanas), no en el «Registro de acceso».",
+      "state_reason": {
+        "source_invalid": "El origen del recurso compartido no es un directorio válido en un pool o una matriz de este nodo; detalles en la información emergente",
+        "source_unmounted": "El origen del recurso compartido no está montado: el recurso queda fuera de la configuración",
+        "service_missing": "Falta el paquete {package} en este nodo",
+        "smb_direct_not_served": "SMB Direct no se sirve en este nodo (el recurso compartido sigue funcionando por la LAN)"
+      }
     },
     "wizard_share": {
       "title": "Nuevo recurso",
@@ -6783,8 +6797,8 @@
         },
         "elastic_sync_held": {
           "title": "Matriz {array}: Sync programado detenido, la paridad informa de errores",
-          "detail": "Un scrub informó de errores que nada ha reparado todavía. Un Sync programado registraría el estado actual de los archivos eliminados o modificados desde el último Sync, también los dañados, y sus versiones anteriores ya no podrían restaurarse desde la paridad. Ejecuta la reparación desde la paridad y después un scrub; el Sync manual sigue disponible.",
-          "detail_fault": "El scrub no terminó correctamente o una reparación falló. La sincronización programada registraría el estado actual de los archivos eliminados o modificados desde la última sincronización, también los dañados, así que requiere confirmación en la pantalla de la matriz. Ejecute un scrub o la reparación desde la paridad; la sincronización manual sigue disponible tras la confirmación."
+          "detail": "El scrub informó de errores que aún nada ha reparado. Entre los archivos eliminados o modificados desde la última sincronización puede haber archivos dañados — la sincronización programada los registraría como nuevo estado y sus versiones anteriores ya no podrían restaurarse desde la paridad. Ejecute la reparación desde la paridad y después un scrub; la sincronización manual sigue disponible.",
+          "detail_fault": "El scrub no terminó correctamente o una reparación falló, así que no se sabe si entre los archivos eliminados o modificados desde la última sincronización hay archivos dañados — la sincronización programada los registraría como nuevo estado, por lo que requiere confirmación en la pantalla de la matriz. Ejecute un scrub o la reparación desde la paridad; la sincronización manual sigue disponible tras la confirmación."
         },
         "elastic_mover_settle_stopped": {
           "title": "Matriz {array}: finalización automática del movimiento en pausa",
@@ -6807,7 +6821,10 @@
           "file_branch": "{path}: versión visible {visible}, la otra está en uno de los discos de la matriz",
           "copy_kept": "Copiar la ruta de la otra versión: {path}",
           "copied": "Se copió la ruta de la otra versión de {path}",
-          "copy_failed": "No se pudo copiar la ruta: el navegador no permitió el acceso al portapapeles"
+          "copy_failed": "No se pudo copiar la ruta: el navegador no permitió el acceso al portapapeles",
+          "copied_on": "Se copió la ruta de la otra versión de {path}: es una ruta en el nodo {node}",
+          "copied_on_unnamed": "Se copió la ruta de la otra versión de {path}: es una ruta en el nodo sin nombre",
+          "copy_more": "y {n} {n|archivo más|archivos más}"
         },
         "elastic_needs_attention": {
           "title": "La matriz {array} requiere intervención",
@@ -7273,7 +7290,11 @@
       "not_answered_hint": "Desconocido: no se pudo leer la lista de recursos compartidos o de targets de este nodo (sin respuesta o con error). El número aparecerá cuando el nodo responda.",
       "target_any_client": "cualquier cliente del portal",
       "target_initiators": "{n} {n|iniciador|iniciadores}",
-      "target_hosts": "{n} {n|NQN de host|NQN de hosts}"
+      "target_hosts": "{n} {n|NQN de host|NQN de hosts}",
+      "sessions_nvmet_age": "Número de sesiones NVMe-oF de una lectura de hace como máximo {minutes} min",
+      "node_read_failed": "error de lectura",
+      "targets_unreadable": "El nodo responde, pero no se pudo leer su lista de targets: {error}",
+      "shares_unreadable": "El nodo responde, pero no se pudo leer su lista de recursos compartidos: {error}"
     },
     "node": {
       "head_sub_node": "nodo {name}",
@@ -7401,7 +7422,13 @@
         "task_mover": "mover",
         "task_sync": "sincronización de paridad",
         "task_scrub": "scrub de paridad",
-        "elastic_fix_unnamed": "Reescribe desde la paridad los bloques marcados por el último scrub, en archivos sin cambios desde la última sincronización, en un disco de datos del array."
+        "elastic_fix_unnamed": "Reescribe desde la paridad los bloques marcados por el último scrub, en archivos sin cambios desde la última sincronización, en un disco de datos del array.",
+        "config_import_task": {
+          "scrub": "programación del scrub del pool {subject}",
+          "trim": "programación del TRIM del pool {subject}",
+          "snapshot": "programación de instantáneas del dataset {subject}",
+          "smart": "programación de las pruebas SMART"
+        }
       }
     },
     "access": {
@@ -7585,13 +7612,15 @@
         "portal_moved_head_gone": "El portal del destino ya no está donde se fijó. La dirección {address} pertenecía a la interfaz {interface}, que ya no existe en este nodo.",
         "portal_moved_nowhere": "Ninguna interfaz de este nodo tiene ya esa dirección.",
         "portal_moved_reachable": "Ahora está en {elsewhere}, que nadie eligió para este destino: la exportación es accesible allí.",
-        "portal_moved_silent": "Ahora está en {elsewhere}. El destino no está en el kernel, así que nada escucha en esa dirección: la exportación no es accesible en {elsewhere}.",
+        "portal_moved_silent": "Ahora está en {elsewhere}. El destino no está en el kernel, así que nada escucha en esa dirección: la exportación no es accesible en {elsewhere} y no se trasladará allí automáticamente.",
         "portal_moved_tail": "El destino se queda como está hasta que un administrador vuelva a elegir el portal.",
         "not_exported": "Guardado, pero este nodo aún no lo exporta: la próxima reconciliación lo aplica.",
         "no_auth": "Sin autenticación: la lista de permitidos IQN/NQN es un filtro, no un inicio de sesión.",
         "import_secret_needed": "El secreto de autenticación debe introducirse de nuevo tras una importación.",
         "import_all_interfaces": "Este destino se exportaba en todas las interfaces (0.0.0.0): elija una interfaz de este nodo antes de activarlo.",
-        "portal_moved_head_no_address": "El portal del destino ya no está donde se fijó. La dirección {address} pertenecía a la interfaz {interface}, que está en este nodo pero ahora no tiene ninguna dirección (enlace caído o concesión DHCP perdida)."
+        "portal_moved_head_no_address": "El portal del destino ya no está donde se fijó. La dirección {address} pertenecía a la interfaz {interface}, que está en este nodo pero ahora no tiene ninguna dirección (enlace caído o concesión DHCP perdida).",
+        "portal_moved_silent_since": "Desde {since} está en {elsewhere}. El destino no está en el kernel, así que nada escucha en esa dirección: la exportación no es accesible en {elsewhere} y no se trasladará allí automáticamente.",
+        "portal_moved_reachable_since": "Desde {since} está en {elsewhere}, que nadie eligió para este destino: la exportación es accesible allí."
       },
       "host_state": "Estado",
       "host_connected": "Conectado",
@@ -7742,7 +7771,8 @@
       "elastic_undo_stopped": "Deshacer la adición se detuvo tras su primer paso — la adición sigue sin terminar",
       "elastic_disk_absent": "El disco que se borraría no está presente en este nodo — vuelva a conectarlo e inténtelo de nuevo",
       "job_not_cancellable": "Esta tarea no se puede cancelar: detenerla no pararía el trabajo ya iniciado",
-      "pool_detach_not_allowed": "Este disco no se puede desconectar ahora: solo se puede desconectar un disco sustituido por un disco de repuesto sano, y solo cuando el resilver haya terminado."
+      "pool_detach_not_allowed": "Este disco no se puede desconectar ahora: solo se puede desconectar un disco sustituido por un disco de repuesto sano, y solo cuando el resilver haya terminado sin errores y el pool no informe de errores de datos permanentes.",
+      "elastic_one_cache_disk": "Una matriz Elastic puede tener como máximo un disco de caché"
     },
     "unreachable": {
       "title": "Nodo {node} inaccesible",
@@ -7767,7 +7797,8 @@
       "log_mesh_offline_unnamed": "la mesh no ve este nodo — está desconectado",
       "log_lost": "{node} dejó de responder",
       "log_lost_unnamed": "el nodo dejó de responder",
-      "error": "El nodo no responde — se perdió la conexión mesh"
+      "error": "El nodo no responde — se perdió la conexión mesh",
+      "retry_in": "Próximo intento en {seconds} s"
     }
   },
   "agent_accounts": {

@@ -287,12 +287,12 @@ test('the array state is worded from its codes on the card and the pane, the Eng
     await poll();
     assert.equal(body.querySelector('[data-f="state-detail"]'), line, 'the same line, patched');
     assert.match(line.textContent, /^Brak na tym węźle: dysk danych sdh\. Unia pozostaje odmontowana/);
-    // A sentence the node stored without codes is shown as it came, with no
-    // tooltip repeating it.
+    // A sentence the node stored without codes is said generically, in the
+    // reader's language, with the sentence as its tooltip.
     current = array({ state: 'disabled', enabled: false, stateDetail: 'switched off by the import: the cache disk is not on this node' });
     await poll();
-    assert.equal(line.textContent, 'switched off by the import: the cache disk is not on this node');
-    assert.equal(line.getAttribute('title'), null);
+    assert.equal(line.textContent, 'Węzeł opisał stan tej macierzy tylko własnymi słowami — szczegóły w podpowiedzi.');
+    assert.equal(line.getAttribute('title'), 'switched off by the import: the cache disk is not on this node');
   } finally {
     screen.dispose();
   }
@@ -318,8 +318,9 @@ test('a stored array sentence is worded from its code, and an uncoded one never 
   const unknownOp = renderedElasticCard(array({ state: 'needs_attention', stateDetail: 'x', stateReasons: [{ code: 'operation_failed', params: { operation: 'replace_disk' } }] })).querySelector('.pc-reason');
   assert.equal(unknownOp.textContent, 'Operacja na tej macierzy nie powiodła się — szczegóły w podpowiedzi.');
   const old = renderedElasticCard(array({ state: 'needs_attention', stateDetail: wwn })).querySelector('.pc-reason');
-  assert.doesNotMatch(old.textContent, /wwn-0x5000/, 'an uncoded stored sentence goes through the id filter');
-  assert.match(old.textContent, /^mkfs\.xfs failed on /);
+  assert.equal(old.textContent, 'Węzeł opisał stan tej macierzy tylko własnymi słowami — szczegóły w podpowiedzi.', 'an uncoded stored sentence is said generically');
+  assert.doesNotMatch(old.getAttribute('title'), /wwn-0x5000/, 'and its tooltip goes through the id filter');
+  assert.match(old.getAttribute('title'), /^mkfs\.xfs failed on /);
 });
 
 test('odpowiedź obcej macierzy i HTML w diagnostyce są bezpiecznie odrzucane/renderowane', async () => {
@@ -329,7 +330,8 @@ test('odpowiedź obcej macierzy i HTML w diagnostyce są bezpiecznie odrzucane/r
   wrong.screen.dispose();
   const safe = await mount(array({ stateDetail: '<img src=x onerror=alert(1)>' }));
   assert.equal(safe.body.querySelector('img'), null);
-  assert.match(safe.body.textContent, /<img/);
+  // Uncoded, so said generically; the markup is the tooltip's TEXT.
+  assert.match(safe.body.querySelector('[data-f="state-detail"]').getAttribute('title'), /<img/);
   safe.screen.dispose();
 });
 
@@ -851,7 +853,7 @@ test('widok główny nie mówi „Mover” i pokazuje jedną linię o danych cze
   assert.ok(details.querySelector('.mover-hist'), 'historia pozostaje osiągalna');
   const lines = body.querySelectorAll('.nas-cache-pending .sr');
   assert.equal(lines.length, 1);
-  assert.equal(lines[0].querySelector('.k').textContent, 'Na dysku cache, jeszcze bez ochrony');
+  assert.equal(lines[0].querySelector('.k').textContent, 'Na cache bez parity');
   assert.equal(lines[0].querySelector('.v').textContent, '18 GiB');
   // Nothing else in the main view is a control for moving files.
   for (const act of ['mover', 'mover-schedule']) {
@@ -1043,6 +1045,8 @@ test('nieudany scrub i naprawa bez zapisu zostawiają Sync i Scrub do uruchomien
     if (fault) {
       const win = document.querySelector('tf-window');
       assert.ok(win, `${history[0].outcome}: the confirm opens`);
+      // Critic wave 5, MINOR 3: the confirm says what was never measured.
+      assert.match(win.querySelector('.explain-box').textContent, /Dwóch przypadków nie zmierzono: pliku, którego scrub nie mógł odczytać, a który też się zmienił, oraz dysku, który zacznie zawodzić w trakcie Sync/);
       typeInto(win.querySelector('#retype-input'), 'media');
       confirmWindow(win);
       await flush();
@@ -1547,8 +1551,8 @@ test('bajty na cache poza parity prowadzą kafel Ochrona i mają wiersz na karci
     assert.equal(tile.getAttribute('value'), '18 GiB');
     assert.equal(tile.getAttribute('accent'), 'warning');
     assert.equal(tile.getAttribute('delta-type'), 'warn');
-    assert.equal(tile.getAttribute('delta'), 'Na dysku cache, jeszcze bez ochrony');
-    const rowOf = () => moverRow(body.querySelector('.nas-snapraid > .stat-rows'), 'Na dysku cache, jeszcze bez ochrony');
+    assert.equal(tile.getAttribute('delta'), 'Na cache bez parity');
+    const rowOf = () => moverRow(body.querySelector('.nas-snapraid > .stat-rows'), 'Na cache bez parity');
     assert.ok(rowOf(), 'the SnapRAID card has the cache row');
     assert.equal(rowOf().querySelector('.v').textContent, '18 GiB');
     assert.ok(rowOf().querySelector('.v').classList.contains('num-warn'));

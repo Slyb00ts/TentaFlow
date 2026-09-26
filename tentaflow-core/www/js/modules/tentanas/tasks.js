@@ -53,14 +53,17 @@ const TRIM_ONLY = ['weekly', 'monthly'];
 // that must not be hidden just because it starts with `dev-`/`usb-`/`pci-`/…
 // or is all digits (a share named `dev-backups`, a pool `2024`).
 //
-// Returns `{ text }`, a plain string escaped by the caller.
+// Returns `{ text, words }`: a plain string escaped by the caller, and
+// whether it is WORDS ("nieznany dysk", "ostatnio sdk") rather than a name as
+// the node spells it — words are not set in the monospace face a device or
+// dataset name gets (critic wave 5, MINOR 10).
 export function jobSubject(j) {
   const subject = String(j?.subject || '').trim();
-  if (!subject) return { text: '' };
+  if (!subject) return { text: '', words: false };
   const smart = j?.kind === 'smart_test';
-  if (smart ? isDiskIdShape(subject) : isOpaqueId(subject)) return { text: smart ? T('jobs.subject_unknown_disk') : '' };
-  if (j.subjectLastKnown) return { text: T('jobs.subject_last_known', { name: subject }) };
-  return { text: subject };
+  if (smart ? isDiskIdShape(subject) : isOpaqueId(subject)) return { text: smart ? T('jobs.subject_unknown_disk') : '', words: true };
+  if (j.subjectLastKnown) return { text: T('jobs.subject_last_known', { name: subject }), words: true };
+  return { text: subject, words: false };
 }
 
 // ===== A schedule's last outcome (n15 B2, wave 6 B).
@@ -181,7 +184,7 @@ export function jobRowSkeleton(j, subject = jobSubject(j)) {
     <div class="job-row" data-job="${escapeAttr(j.jobId)}">
       <div class="job-ico" data-role="ico"></div>
       <div class="job-main">
-        <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="mono text-2">${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
+        <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="${subject.words ? '' : 'mono '}text-2">${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
         <div class="job-sub" data-role="sub"></div>
         ${j.progressPct != null ? `<tf-progress-bar data-role="progress" size="sm" tone="accent"></tf-progress-bar>` : ''}
       </div>
@@ -214,7 +217,7 @@ export function paintJobRow(row, j) {
 // The history table's task cell: the kind, and the subject under it.
 function historyTaskHtml(j) {
   const subject = jobSubject(j);
-  return `<span class="tf-table__cell-title">${escapeHtml(jobKindLabel(j.kind))}</span><div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(subject.text)}</div>`;
+  return `<span class="tf-table__cell-title">${escapeHtml(jobKindLabel(j.kind))}</span><div class="tf-table__cell-sub${subject.words ? '' : ' tf-table__cell-sub--mono'}">${escapeHtml(subject.text)}</div>`;
 }
 
 export async function drawTasks(screen, body) {

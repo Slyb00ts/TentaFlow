@@ -33,6 +33,7 @@ use tentaflow_protocol::tentanas::{
 use tentanas_helper::HelperCommand;
 
 use super::db::{self as store, ShareRow};
+use super::CodedText;
 use super::elastic::ElasticArrayRow;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
@@ -633,38 +634,45 @@ fn service_installed(protocol: &str) -> bool {
 /// stays ACTIVE — Samba keeps exporting it over the LAN, which is most of what
 /// it is for — but carries the reason, so the UI shows a warning instead of
 /// the option looking as if it took effect.
+///
+/// The detail comes as codes beside the sentence (wave 8, the pattern of
+/// `targets::target_state`): the screen words the codes in the reader's
+/// language, and the sentence — which may name a path — is the log's and
+/// the tooltip's.
 pub fn share_state(
     share: &ShareRow,
     source: &Result<Source>,
     installed: &dyn Fn(&str) -> bool,
-    smb_direct_refusal: Option<&str>,
-) -> (&'static str, String) {
+    smb_direct_refusal: Option<&CodedText>,
+) -> (&'static str, CodedText) {
     if !share.enabled {
-        return ("disabled", String::new());
+        return ("disabled", CodedText::default());
     }
+    let missing = |package: &str| {
+        CodedText::new("share_service_missing", &[("package", package.to_string())], format!("{package} missing"))
+    };
     match source {
-        Err(e) => ("error", e.to_string()),
+        Err(e) => ("error", CodedText::new("share_source_invalid", &[], e.to_string())),
         Ok(s) if !s.mounted => (
             "error",
-            "source path is not mounted — the share stays out of the config".to_string(),
+            CodedText::new(
+                "share_source_unmounted",
+                &[],
+                "source path is not mounted — the share stays out of the config",
+            ),
         ),
         Ok(_) => {
             if !installed(&share.protocol) {
-                let missing = if share.protocol == "smb" {
-                    "samba missing"
-                } else {
-                    "nfs-kernel-server missing"
-                };
-                return ("error", missing.to_string());
+                return ("error", missing(if share.protocol == "smb" { "samba" } else { "nfs-kernel-server" }));
             }
             // A fleet mount is always served over NFS, whatever the share's
             // own protocol is — see fleet_mounts.rs.
             if share.fleet_mount && !installed("nfs") {
-                return ("error", "nfs-kernel-server missing".to_string());
+                return ("error", missing("nfs-kernel-server"));
             }
             match smb_direct_refusal.filter(|_| super::ksmbd::smb_direct(share)) {
-                Some(reason) => ("active", reason.to_string()),
-                None => ("active", String::new()),
+                Some(reason) => ("active", reason.clone()),
+                None => ("active", CodedText::default()),
             }
         }
     }
@@ -713,7 +721,7 @@ pub fn readable_datasets(
 /// The refusal an unattended rewrite answers with when this reading of the
 /// node would drop a share that was serving: the shares that would leave
 /// `active`, named. `None` when nothing working would be lost.
-pub fn transient_reading(shares: &[ShareRow], computed: &[(&'static str, String)]) -> Option<String> {
+pub fn transient_reading<D>(shares: &[ShareRow], computed: &[(&'static str, D)]) -> Option<String> {
     let dropped: Vec<&str> = shares
         .iter()
         .zip(computed)
@@ -757,11 +765,11 @@ pub async fn apply(
 
     // Every state is computed BEFORE anything is persisted or written: an
     // unattended rewrite that would drop a serving share acts on nothing.
-    let computed: Vec<(&'static str, String)> = shares
+    let computed: Vec<(&'static str, CodedText)> = shares
         .iter()
         .map(|share| {
             let source = resolve_source(&datasets, &arrays, &[], &share.source_path);
-            share_state(share, &source, &service_installed, refusal.as_deref())
+            share_state(share, &source, &service_installed, refusal.as_ref())
         })
         .collect();
     if trigger == ApplyTrigger::Startup {
@@ -771,11 +779,14 @@ pub async fn apply(
     }
 
     for (share, (state, detail)) in shares.iter_mut().zip(computed) {
-        if share.state != state || share.state_detail != detail {
-            store::set_share_state(db, &share.share_id, state, &detail)?;
+        // The codes count as a change: a row judged before migration 24 has
+        // the sentence and no codes, and this is what gives it them.
+        if share.state != state || share.state_detail != detail.text || share.state_reasons != detail.reasons {
+            store::set_share_state(db, &share.share_id, state, &detail.text, &detail.reasons)?;
         }
         share.state = state.to_string();
-        share.state_detail = detail;
+        share.state_detail = detail.text;
+        share.state_reasons = detail.reasons;
         // An active share with a detail is the SMB Direct refusal: never
         // silent, so it goes into the job log next to the hard errors.
         if !share.state_detail.is_empty() {
@@ -1438,6 +1449,7 @@ pub fn to_protocol(share: &ShareRow) -> NasShare {
         sessions: 0,
         state: share.state.clone(),
         state_detail: share.state_detail.clone(),
+        state_reasons: share.state_reasons.clone(),
         created_at: share.created_at.clone(),
         updated_at: share.updated_at.clone(),
     }
@@ -1519,6 +1531,7 @@ mod tests {
             nfs: None,
             state: "active".into(),
             state_detail: String::new(),
+            state_reasons: Vec::new(),
             created_at: "2026-09-01T14:00:00Z".into(),
             updated_at: "2026-09-01T14:00:00Z".into(),
         }
@@ -2365,16 +2378,29 @@ mod tests {
             share_state(&disabled, &Ok(Source::default_for_test()), &|_| true, None).0,
             "disabled"
         );
-        assert_eq!(
-            share_state(&share, &Err(anyhow!("'/etc' is not under a pool mountpoint")), &|_| true, None),
-            ("error", "'/etc' is not under a pool mountpoint".to_string())
-        );
+        let (state, detail) = share_state(&share, &Err(anyhow!("'/etc' is not under a pool mountpoint")), &|_| true, None);
+        assert_eq!((state, detail.text.as_str()), ("error", "'/etc' is not under a pool mountpoint"));
+        assert_eq!(codes(&detail), ["share_source_invalid"], "the path stays in the sentence, the code is worded");
         let unmounted = Source {
             path: "/mnt/tank/projekty".into(),
             dataset: Some("tank/projekty".into()),
             mounted: false,
         };
-        assert_eq!(share_state(&share, &Ok(unmounted), &|_| true, None).0, "error");
+        let (state, detail) = share_state(&share, &Ok(unmounted), &|_| true, None);
+        assert_eq!(state, "error");
+        assert_eq!(codes(&detail), ["share_source_unmounted"]);
+        // A missing server names its package as a parameter.
+        let (state, detail) = share_state(&share, &Ok(Source::default_for_test()), &|p| p != "smb", None);
+        assert_eq!((state, detail.text.as_str()), ("error", "samba missing"));
+        assert_eq!(codes(&detail), ["share_service_missing"]);
+        assert_eq!(detail.reasons[0].params.get("package").map(String::as_str), Some("samba"));
+        let fleet = ShareRow { fleet_mount: true, ..share.clone() };
+        let (_, detail) = share_state(&fleet, &Ok(Source::default_for_test()), &|p| p != "nfs", None);
+        assert_eq!(detail.reasons[0].params.get("package").map(String::as_str), Some("nfs-kernel-server"));
+    }
+
+    fn codes(detail: &CodedText) -> Vec<&str> {
+        detail.reasons.iter().map(|r| r.code.as_str()).collect()
     }
 
     #[test]
@@ -2559,23 +2585,27 @@ mod tests {
             ..Default::default()
         });
         let plain = smb_share(NasSmbOptions::default());
-        let refusal = "SMB Direct is not served on this node: enp3s0 192.168.1.20 also carries the default gateway";
+        let refusal = &CodedText::new(
+            "smb_direct_not_served",
+            &[],
+            "SMB Direct is not served on this node: enp3s0 192.168.1.20 also carries the default gateway",
+        );
 
         // Samba keeps exporting it — the LAN half of the share is unaffected —
         // but the option that did not take effect is never silent.
         let (state, detail) = share_state(&direct, &Ok(Source::default_for_test()), &|_| true, Some(refusal));
         assert_eq!(state, "active");
-        assert_eq!(detail, refusal);
+        assert_eq!(&detail, refusal);
 
         // A share that never asked for SMB Direct is untouched by the refusal.
         assert_eq!(
             share_state(&plain, &Ok(Source::default_for_test()), &|_| true, Some(refusal)),
-            ("active", String::new())
+            ("active", CodedText::default())
         );
         // And a node that can serve it reports nothing.
         assert_eq!(
             share_state(&direct, &Ok(Source::default_for_test()), &|_| true, None),
-            ("active", String::new())
+            ("active", CodedText::default())
         );
         // A hard error still wins: an unmounted source keeps the share out of
         // BOTH configs, which is a different and worse problem.

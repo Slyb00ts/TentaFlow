@@ -156,6 +156,16 @@ pub fn armed_until() -> Option<String> {
         .map(|a| a.until_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
+/// Seconds left until `until` (RFC 3339) by this node's clock, now: what a
+/// reader adds to the moment it received the answer (critic wave 7, MINOR 11:
+/// the browser's own clock is not the node's). 0 once the instant has passed;
+/// `None` when there is no instant or it does not parse.
+pub fn armed_secs_left(until: Option<&str>) -> Option<u64> {
+    let until = chrono::DateTime::parse_from_rfc3339(until?).ok()?;
+    let left = until.with_timezone(&chrono::Utc) - chrono::Utc::now();
+    Some(left.num_seconds().max(0) as u64)
+}
+
 // ----- helper mode: state of the installed wrapper --------------------------------
 
 /// What `helper_state` reports (§3.1). "ok" is the only state in which mode A
@@ -370,6 +380,7 @@ pub async fn status(db: &DbPool) -> NasElevation {
     // was built from a different catalog would accept commands this core does
     // not know it can send, so it is treated as incompatible, not as working.
     let core_compatible = helper.version.as_deref() == Some(tentanas_helper::VERSION);
+    let armed = armed_until();
     NasElevation {
         mode: mode(db).as_str().to_string(),
         helper_state: helper.state.to_string(),
@@ -378,7 +389,8 @@ pub async fn status(db: &DbPool) -> NasElevation {
         sudoers_path: tentanas_helper::SUDOERS_INSTALL_PATH.to_string(),
         core_user: core_user().await,
         core_version: tentanas_helper::VERSION.to_string(),
-        armed_until: armed_until(),
+        armed_secs_left: armed_secs_left(armed.as_deref()),
+        armed_until: armed,
         ttl_secs: ttl_secs(db),
         provisioned_at: provisioning_value(db, SETTING_PROVISIONED_AT),
         provisioned_by: provisioning_value(db, SETTING_PROVISIONED_BY),

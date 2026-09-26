@@ -549,11 +549,14 @@ async fn run_due_elastic_tasks(
                     &array.name,
                     &store::AlertText::new(
                         "elastic_sync_held",
-                        "Zaplanowany Sync wstrzymany: parity zgłasza błędy",
-                        "Scrub tej macierzy zgłosił błędy, których nic jeszcze nie naprawiło. Node nie uruchamia \
-                         zaplanowanego Sync, bo zapisałby obecny stan plików usuniętych lub zmienionych od ostatniego \
-                         Sync, także uszkodzonych, i ich wcześniejszych wersji nie dałoby się już odtworzyć z parity. \
-                         Uruchom naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
+                        // The node's English, the tooltip of the worded
+                        // alert (critic wave 6, MINOR 5: it was Polish).
+                        "Scheduled Sync held: parity reports errors",
+                        "The scrub of this array reported errors nothing has repaired yet. Files deleted or \
+                         changed since the previous Sync may be among the damaged ones, and a Sync would record \
+                         them as the new state: their earlier versions could no longer be restored from parity. \
+                         The node does not run the scheduled Sync; run the repair from parity, then a scrub. A \
+                         manual Sync stays available.",
                     )
                     .param("array", &array.name)
                     // Which fault holds it: counted scrub errors, or a fault
@@ -1379,11 +1382,14 @@ mod tests {
         let alert = store::list_alerts(&p, true)
             .expect("alerts")
             .into_iter()
-            .find(|alert| alert.subject_id == "media" && alert.title.contains("Sync wstrzymany"))
+            .find(|alert| alert.subject_id == "media" && alert.code == "elastic_sync_held")
             .expect("the skip raises an alert");
         assert_eq!(alert.severity, "warning");
         assert_eq!(alert.subject_kind, "elastic-array");
-        assert!(alert.detail.contains("naprawę"), "{}", alert.detail);
+        // The node's English, the tooltip: the fault-specific reason and the
+        // remedy (critic wave 6, MINOR 5 — it used to be Polish).
+        assert!(alert.title.contains("Sync held"), "{}", alert.title);
+        assert!(alert.detail.contains("may be among the damaged ones") && alert.detail.contains("repair"), "{}", alert.detail);
         assert_eq!(alert.code, "elastic_sync_held", "worded by the screen, not by this text");
         assert_eq!(alert.params.get("array").map(String::as_str), Some("media"));
         assert_eq!(alert.params.get("cause").map(String::as_str), Some("scrub_errors"));
@@ -1451,7 +1457,7 @@ mod tests {
             store::list_alerts(&p, true)
                 .expect("alerts")
                 .into_iter()
-                .all(|alert| !alert.title.contains("Sync wstrzymany")),
+                .all(|alert| alert.code != "elastic_sync_held"),
             "and the alert is resolved"
         );
     }
@@ -1795,6 +1801,70 @@ mod tests {
                 "failed={failed}: an array whose create did not finish is not scrubbed"
             );
         }
+    }
+
+    /// Critic wave 6, MINOR 14: a create that failed is made whole by a
+    /// Restore that SUCCEEDED after it — and from then on the default scrub
+    /// fires again (`CREATION_UNFINISHED`'s `(created_at, operation_id)`
+    /// comparison). A Restore still running, or one that failed, is not that.
+    #[tokio::test]
+    async fn the_default_scrub_fires_again_once_a_restore_made_a_failed_create_whole() {
+        let p = db();
+        let spec = crate::tentanas::elastic::tests::create_spec("media");
+        let job = |kind: &str| tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: kind.to_string(),
+            subject: spec.name.clone(),
+            status: "running".to_string(),
+            started_by: "test".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        let create = job("elastic_create");
+        store::insert_job(&p, &create, Some(&crate::tentanas::jobs::ElasticJobIntent::Create(spec.clone()))).expect("create job");
+        store::fail_elastic_job(&p, &create.job_id, "mkfs.xfs failed on sdb").expect("fail the create");
+        store::finish_job(&p, &create.job_id, "failed", Some("mkfs.xfs failed on sdb")).expect("job");
+        // The create is from an earlier minute, as a real Restore of it is.
+        p.write()
+            .expect("db")
+            .execute("UPDATE nas_elastic_operations SET created_at = '2026-09-01T00:00:00Z' WHERE kind = 'create'", [])
+            .expect("backdate");
+        let unfinished = || store::elastic_arrays_all(&p).expect("arrays")[0].creation_unfinished;
+        assert!(unfinished());
+
+        // A Restore that is still running does not make the create whole.
+        let restore = job("elastic_restore");
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        store::insert_job(&p, &restore, Some(&crate::tentanas::jobs::ElasticJobIntent::Restore {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: operation_id.clone(),
+        }))
+        .expect("restore job");
+        assert!(unfinished(), "a running Restore is not a finished one");
+        store::finish_elastic_operation(&p, &spec.owner, &operation_id, Ok(&crate::tentanas::elastic::tests::ready_result(&spec)))
+            .expect("the restore succeeds");
+        store::finish_job(&p, &restore.job_id, "succeeded", None).expect("job");
+        assert!(!unfinished(), "a succeeded Restore after the failed create makes it whole");
+
+        let armed_at = Some("2026-09-01T00:00:00Z");
+        let default = store::default_elastic_scrub_schedule();
+        store::set_elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub, true, &default, armed_at).expect("due");
+        let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        assert_eq!(arrays[0].state, "active");
+        run_due_elastic_tasks(&p, &arrays, at(2026, 9, 2, 10, 0)).await;
+        let row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub).expect("read").expect("row");
+        assert_ne!(
+            ScheduleOutcome::parse(&row.last_result),
+            Some(ScheduleOutcome::skipped("array_not_created")),
+            "{}",
+            row.last_result
+        );
+        assert!(
+            store::list_jobs(&p, 100).expect("jobs").iter().any(|job| job.kind == "elastic_scrub"),
+            "the scrub fires again: {:?}",
+            row.last_result
+        );
     }
 
     /// The stored outcome is JSON this build reads back, and the sentence an
@@ -2715,6 +2785,54 @@ mod tests {
         cache.age_for_test(array.array_id().unwrap(), FOLDER_USAGE_EVERY);
         run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
         assert_eq!(walks.count(), 2, "the period passed: measured again");
+    }
+
+    /// Critic wave 7, MINOR 8: a restart (a fresh cache over the same node
+    /// database) keeps the last reading and its date, and does not walk the
+    /// array again before `FOLDER_USAGE_EVERY` counted from that date. A
+    /// dissolved array leaves no reading behind.
+    #[tokio::test]
+    async fn a_restart_keeps_the_last_folder_reading_and_its_pacing() {
+        let p = db();
+        let array = array_with_folders(&p, "media");
+        let id = array.array_id().unwrap().to_string();
+        let walks = Walks::answering(Some(vec![bytes("filmy", 4_000), gap("foto", ElasticFolderGap::OverBudget)]));
+        let before_restart = FolderUsageCache::new();
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &before_restart, &walks).await;
+        assert_eq!(walks.count(), 1);
+        let measured_at = wire_folders(&array, &before_restart)[0].used_measured_at.clone();
+        assert!(measured_at.is_some());
+
+        let restarted = FolderUsageCache::new();
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &restarted, &walks).await;
+        assert_eq!(walks.count(), 1, "a restart does not walk an array measured within the period");
+        let wire = wire_folders(&array, &restarted);
+        assert_eq!(wire[0].used_bytes, Some(4_000), "the figure survives the restart");
+        assert_eq!(wire[0].used_measured_at, measured_at, "with the date it was measured");
+        assert_eq!(codes(&wire[1]), ["folder_usage_over_budget"]);
+
+        // A reading older than the period is measured again after a restart.
+        let key = format!("folder_usage:{id}");
+        let old = (chrono::Utc::now() - chrono::Duration::hours(7)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let text = store::setting(&p, &key).unwrap().expect("stored");
+        let aged = text.replace(measured_at.as_deref().unwrap(), &old);
+        assert_ne!(aged, text);
+        store::set_setting(&p, &key, &aged).unwrap();
+        let restarted_late = FolderUsageCache::new();
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &restarted_late, &walks).await;
+        assert_eq!(walks.count(), 2, "an old reading is measured again");
+
+        // A reading from the future (a clock step) is not trusted.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        store::set_setting(&p, &key, &aged.replace(&old, &future)).unwrap();
+        let stepped = FolderUsageCache::new();
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &stepped, &walks).await;
+        assert_eq!(walks.count(), 3, "a reading dated in the future is measured again");
+
+        let spec = array.persisted_spec().unwrap().clone();
+        assert!(store::setting(&p, &key).unwrap().is_some());
+        assert!(store::delete_elastic_array(&p, &spec.owner, &spec.array_id).expect("delete"));
+        assert_eq!(store::setting(&p, &key).unwrap(), None, "a dissolved array leaves no reading");
     }
 
     /// A helper that refuses the command (an older build) leaves the folders

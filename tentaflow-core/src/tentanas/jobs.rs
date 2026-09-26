@@ -494,7 +494,7 @@ mod tests {
     fn only_a_scrub_is_cancellable_on_request() {
         assert!(user_cancellable("pool_scrub"));
         for kind in ["smart_test", "pool_trim", "pool_create", "pool_replace", "dataset_destroy", "snapshot_destroy",
-            "disk_wipe", "config_import", "elastic_create", "elastic_sync", ""] {
+            "disk_wipe", "config_import", "elastic_create", "elastic_restore", "elastic_sync", ""] {
             assert!(!user_cancellable(kind), "{kind}");
         }
     }

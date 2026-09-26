@@ -282,9 +282,13 @@ pub fn has_user_database() -> bool {
 /// The refusal the apply reports and pins on every share that asked for SMB
 /// Direct, when the node cannot serve it. Never silent: §5.4b says a warning,
 /// never a quiet start and never a quiet skip.
-pub fn refusal(probe: &Probe) -> String {
-    let (_, detail) = describe(probe);
-    format!("SMB Direct is not served on this node: {detail}")
+pub fn refusal(probe: &Probe) -> CodedText {
+    let (_, detail) = describe_coded(probe);
+    // The code says what happened to the share; the probe's own reasons say
+    // why, worded by the screen exactly as the Environment row words them.
+    let mut reasons = vec![super::disks::coded_reason("smb_direct_not_served", &[])];
+    reasons.extend(detail.reasons);
+    CodedText { text: format!("SMB Direct is not served on this node: {}", detail.text), reasons }
 }
 
 // =============================================================================
@@ -472,6 +476,7 @@ mod tests {
             nfs: None,
             state: "active".into(),
             state_detail: String::new(),
+            state_reasons: Vec::new(),
             created_at: "2026-09-03T10:00:00Z".into(),
             updated_at: "2026-09-03T10:00:00Z".into(),
         }

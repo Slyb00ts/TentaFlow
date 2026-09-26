@@ -218,8 +218,14 @@ const STATE_WORDS = new Map([
 // An uncoded sentence (a row stored before migration 23 that no rule
 // recognised, an older node) is shown only through the id filter: a stored
 // error may name a by-id path or a WWN.
+// A sentence the node STORED without codes (an error no operation row holds,
+// a row older than migration 23) is one language and may name a path: it is
+// said generically, and the sentence — ids taken out — is the tooltip, the
+// way `helper_failed` is (wave-6 critic MINOR 4, left open in wave 6).
 export function elasticStateDetail(array) {
-  return attentionText(array) || wordReasons(array?.stateReasons, STATE_WORDS) || nodeTextTitle(array?.stateDetail);
+  const worded = attentionText(array) || wordReasons(array?.stateReasons, STATE_WORDS);
+  if (worded) return worded;
+  return nodeTextTitle(array?.stateDetail) ? T('elastic.state_reason.uncoded') : '';
 }
 
 // The node's own sentence, as the tooltip of the worded one — '' when the
@@ -755,7 +761,7 @@ export function openSyncOverFaultDialog(screen, array, onDone) {
       <li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('elastic.sync_fault_loses'))}</span></li>
       <li class="ll">${sprite('shield')}<span>${escapeHtml(T('elastic.sync_fault_keeps'))}</span></li>
     </ul>
-    <div class="explain-box">${escapeHtml(T('elastic.sync_fault_explain'))}</div>`;
+    <div class="explain-box">${escapeHtml(T('elastic.sync_fault_explain'))} ${escapeHtml(T('elastic.sync_fault_unmeasured'))}</div>`;
   const win = openRetypeDialog({
     title: T('elastic.sync_fault_title', { name: array.name }),
     icon: 'alert',

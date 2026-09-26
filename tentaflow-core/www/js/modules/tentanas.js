@@ -18,7 +18,7 @@ import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import {
-  T, sprite, channelMode, liveChannelMode, nodeChannelMode, channelIsUnarmed, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
+  T, sprite, channelMode, liveChannelMode, nodeChannelMode, armedExpiryMs, channelIsUnarmed, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
   parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, errCode, jobTone, jobKindLabel,
   layoutLabel, stateChipHtml, stateTone, stateLabel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
   firstDiskReasonWord, diskReasonsText, diskHealthChipLabel, replacementAdviceText, ADVICE_KINDS, alertText,
@@ -60,7 +60,7 @@ import '/js/components/tf-line-chart.js';
 import '/js/components/tf-stream-chart.js';
 import {
   openTargetDetail, protocolLabel as targetProtocolLabel, protocolChipHtml as targetProtocolChipHtml,
-  sourceCellHtml as targetSourceCellHtml, sessionsCountLabel as targetSessionsLabel, authLabel as targetAuthLabel,
+  fleetSourceHtml as targetFleetSourceHtml, fleetSessionsHtml, transportsText as targetTransportsText, authLabel as targetAuthLabel,
 } from '/js/modules/tentanas/targets.js';
 import { drawElasticDetail, elasticState, elasticProtection, elasticCapacity, cacheWaitingBytes } from '/js/modules/tentanas/elastic-detail.js';
 
@@ -296,24 +296,68 @@ function paintAlertRow(row, a, nameOf) {
   // A conflict's "copy path" controls: one per file, labelled by the file's
   // path in the array. The other version's own path never enters the
   // markup — the click reads it from the alert (`copyConflictPath`).
-  patchKeyedList(row.querySelector('[data-role="copy"]'), text.copies.map((c, i) => ({
-    key: `${i}:${c.path}`,
-    html: `<tf-button size="sm" variant="ghost" icon="copy" data-copy="${i}">${escapeHtml(T('alerts.code.elastic_conflict.copy_kept', { path: c.path }))}</tf-button>`,
-  })));
+  // The first few are buttons on the row; the rest fold behind one line, so
+  // a stuck mover that left fifty files does not bury the n02 card in
+  // buttons (critic wave 5, MINOR 7). Nothing is dropped: every file keeps
+  // its control.
+  const copyButton = (c, i) => `<tf-button size="sm" variant="ghost" icon="copy" data-copy="${i}">${escapeHtml(T('alerts.code.elastic_conflict.copy_kept', { path: c.path }))}</tf-button>`;
+  const shownCopies = text.copies.slice(0, CONFLICT_COPIES_SHOWN);
+  const foldedCopies = text.copies.slice(CONFLICT_COPIES_SHOWN);
+  patchKeyedList(row.querySelector('[data-role="copy"]'), [
+    ...shownCopies.map((c, i) => ({ key: `${i}:${c.path}`, html: copyButton(c, i) })),
+    ...(foldedCopies.length ? [{
+      key: `more:${foldedCopies.map((c) => c.path).join('\n')}`,
+      html: `<details class="a-copy-more"><summary>${escapeHtml(T('alerts.code.elastic_conflict.copy_more', { n: foldedCopies.length }))}</summary><div class="row">${foldedCopies.map((c, i) => copyButton(c, i + CONFLICT_COPIES_SHOWN)).join('')}</div></details>`,
+    }] : []),
+  ]);
   setAttr(row.querySelector('[data-role="node"]'), 'hidden', !text.nodeText);
   setText(row.querySelector('[data-role="node-text"]'), text.nodeText ? text.tooltip : '');
+}
+
+/** How many conflict "copy path" buttons an n02 alert row shows before the
+ *  rest fold behind one line. */
+const CONFLICT_COPIES_SHOWN = 3;
+
+// Writes `text` to the clipboard. `navigator.clipboard` exists only in a
+// secure context, and a node reached over plain HTTP on the LAN is the common
+// case here (critic wave 5, MINOR 7): there — or when the API refuses — the
+// older copy command is used, through a textarea that exists for the length
+// of the call, off screen.
+async function writeClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch { /* fall back to the copy command below */ }
+  }
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.left = '-9999px';
+  area.style.opacity = '0';
+  document.body.appendChild(area);
+  try {
+    area.select();
+    if (!document.execCommand || !document.execCommand('copy')) throw new Error('copy refused');
+  } finally {
+    area.remove();
+  }
 }
 
 // Copies the other version of a conflicted file to the clipboard — the one
 // deliberate way to find a quarantined copy, whose name carries its
 // operation's uuid and is never shown. The toast names the file by its path
-// in the array, never by the copied path.
-async function copyConflictPath(alert, index) {
+// in the array, never by the copied path, and the node the file is on: the
+// path means nothing on another machine.
+async function copyConflictPath(alert, index, node) {
   const copy = alert ? alertText(alert).copies[index] : null;
   if (!copy) return;
   try {
-    await navigator.clipboard.writeText(copy.kept);
-    toast(T('alerts.code.elastic_conflict.copied', { path: copy.path }), 'success');
+    await writeClipboard(copy.kept);
+    toast(node
+      ? nodeT('alerts.code.elastic_conflict.copied_on', node, { path: copy.path })
+      : T('alerts.code.elastic_conflict.copied', { path: copy.path }), 'success');
   } catch {
     toast(T('alerts.code.elastic_conflict.copy_failed'), 'error');
   }
@@ -674,9 +718,17 @@ const TentaNasScreen = {
   },
 
   // Nodes that did not answer the share or the target list, with what they said.
+  // `failed` names the one list that failed when the node answered the other
+  // (critic wave 7, MINOR 10): such a node is up, and "offline" would be the
+  // wrong word for it; null when neither list came back.
   fleetUnanswered() {
+    const answered = (x, key) => Boolean(x && typeof x === 'object' && Array.isArray(x[key]));
     return (this.fleet?.rows || []).filter((r) => !fleetRowAnswered(r))
-      .map((r) => ({ node: r.node, error: typeof r.shares === 'string' ? r.shares : typeof r.targets === 'string' ? r.targets : '' }));
+      .map((r) => ({
+        node: r.node,
+        error: typeof r.shares === 'string' ? r.shares : typeof r.targets === 'string' ? r.targets : '',
+        failed: answered(r.shares, 'shares') ? 'targets' : answered(r.targets, 'targets') ? 'shares' : null,
+      }));
   },
 
   // Every reachable node's services, and every node that did not answer.
@@ -744,7 +796,7 @@ const TentaNasScreen = {
           <tf-column key="protocol" label="${escapeAttr(T('fleet.col_protocol'))}" renderer="html" nowrap></tf-column>
           <tf-column key="source" label="${escapeAttr(T('fleet.col_source'))}" renderer="html"></tf-column>
           <tf-column key="mounts" label="${escapeAttr(T('fleet.col_mounts'))}" renderer="html" nowrap width="140"></tf-column>
-          <tf-column key="sessions" label="${escapeAttr(T('fleet.col_sessions'))}" renderer="num" width="90"></tf-column>
+          <tf-column key="sessions" label="${escapeAttr(T('fleet.col_sessions'))}" renderer="html" align="num" width="90"></tf-column>
         </tf-table>
       </div>`;
 
@@ -1030,7 +1082,7 @@ const TentaNasScreen = {
         protocol: protocolChipHtml(share.protocol),
         source: `<span class="mono">${escapeHtml(share.dataset || share.sourcePath)}</span>`,
         mounts: share.fleetMount ? mountDotsHtml(share.mounts, this.nodes) : `<span class="text-3 text-xs">${escapeHtml(T('shares.fleet_off'))}</span>`,
-        sessions: share.sessions,
+        sessions: escapeHtml(String(share.sessions ?? 0)),
       } : {
         // A block target is not mounted by the fleet: its clients are
         // initiators / hosts, so the column says who may connect and how
@@ -1039,16 +1091,17 @@ const TentaNasScreen = {
         _node: node,
         resource: `<span class="fw-700">${escapeHtml(target.name)}</span>`,
         protocol: targetProtocolChipHtml(target.protocol),
-        source: targetSourceCellHtml(target),
-        mounts: `<span class="text-xs">${escapeHtml(targetClientsText(target))}</span>`,
-        // Unknown is a dash, never a confident zero (`sessionsKnown`).
-        sessions: targetSessionsLabel(target),
+        source: targetFleetSourceHtml(target),
+        mounts: `<span class="tf-table__cell-sub">${escapeHtml(targetClientsText(target))}</span>`,
+        // Unknown is a dash, never a confident zero (`sessionsKnown`); an
+        // NVMe-oF count says how old it may be (`fleetSessionsHtml`).
+        sessions: fleetSessionsHtml(target),
       })),
       ...this.fleetUnanswered().map((r) => ({
         _node: r.node,
         resource: `<span class="mono">${escapeHtml(nodeLabel(r.node))}</span>`,
-        protocol: `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T('fleet.node_offline'))}"></tf-chip>`,
-        source: escapeHtml(T('fleet.node_unreachable', { error: scrubIds(r.error, T('alerts.id_hidden'), nameOf) })),
+        protocol: `<tf-chip size="sm" status="warn" dot label="${escapeAttr(T(r.failed ? 'fleet.node_read_failed' : 'fleet.node_offline'))}"></tf-chip>`,
+        source: escapeHtml(T(r.failed ? `fleet.${r.failed}_unreadable` : 'fleet.node_unreachable', { error: scrubIds(r.error, T('alerts.id_hidden'), nameOf) })),
         mounts: '—',
         // Unknown, not zero: the node did not answer, so nobody counted.
         sessions: '—',
@@ -1174,7 +1227,34 @@ const TentaNasScreen = {
     await this.refreshHeader();
     if (this.disposed || !this.root.isConnected) return;
     this.refreshJobsBadge();
+    // A node whose fleet row does not count its arrays (a remote one) gets
+    // its Pools badge from its own lists now, whichever tab opens first —
+    // not only once the Overview has been visited (critic wave 5, MINOR 5).
+    if (nodeTabCounts(node, this.fleet?.rows).pools === '—' && this.tab !== 'overview' && this.tab !== 'pools') this.countPools();
     this.drawTab();
+  },
+
+  // The Pools badge: ZFS pools plus Elastic Arrays, as the node itself
+  // answered them for this organisation. Written by every read that has both
+  // lists (Overview, the Pools tab after a create or a destroy, `countPools`).
+  setPoolsCount(n) {
+    const poolsTab = this.root?.querySelector('#nas-tabs tf-tab#pools');
+    setAttr(poolsTab, 'count', String(n));
+    setAttr(poolsTab, 'title', null);
+  },
+
+  // One read of both lists for the badge. A failure leaves the dash and its
+  // hint: an unknown count is not zero.
+  async countPools() {
+    const nodeId = this.nodeId;
+    try {
+      const [poolsRes, arraysRes] = await Promise.all([
+        this.nas('tentaNasPoolsListRequest', {}),
+        this.nas('tentaNasElasticArraysListRequest', {}),
+      ]);
+      if (this.disposed || this.nodeId !== nodeId || !Array.isArray(arraysRes?.arrays)) return;
+      this.setPoolsCount((poolsRes?.pools || []).length + arraysRes.arrays.length);
+    } catch { /* the badge keeps its dash */ }
   },
 
   // The ONE breadcrumb of the node view (m26, n04:125-134). It used to say
@@ -1234,6 +1314,8 @@ const TentaNasScreen = {
       // and must not depend on whether the header happened to still be on
       // screen when the probe came back.
       this.environment = res.environment;
+      // The channel's remaining seconds count from now (`armedExpiryMs`).
+      if (this.environment?.elevation) this.environment.elevation.receivedAt = Date.now();
       this.environmentError = null;
       if (!this.root.querySelector('#nas-head-badges')) return;
       const env = res.environment;
@@ -1249,7 +1331,7 @@ const TentaNasScreen = {
       ].join('');
       const badges = [
         zfs && zfs.version ? `<tf-chip status="accent" label="${escapeAttr(T('node.badge_zfs', { v: zfs.version }))}"></tf-chip>` : `<tf-chip status="warn" label="${escapeAttr(T('env.no_zfs'))}"></tf-chip>`,
-        `<tf-chip status="${channelIsUnarmed(liveChannelMode(env.elevation.mode, env.elevation.armedUntil)) ? 'warn' : 'ok'}" icon="${channelIsUnarmed(liveChannelMode(env.elevation.mode, env.elevation.armedUntil)) ? 'lock' : 'shield'}" label="${escapeAttr(T('node.badge_channel', { mode: T('elevation.short_' + liveChannelMode(env.elevation.mode, env.elevation.armedUntil)) }))}"></tf-chip>`,
+        `<tf-chip status="${channelIsUnarmed(liveChannelMode(env.elevation.mode, armedExpiryMs(env.elevation))) ? 'warn' : 'ok'}" icon="${channelIsUnarmed(liveChannelMode(env.elevation.mode, armedExpiryMs(env.elevation))) ? 'lock' : 'shield'}" label="${escapeAttr(T('node.badge_channel', { mode: T('elevation.short_' + liveChannelMode(env.elevation.mode, armedExpiryMs(env.elevation))) }))}"></tf-chip>`,
         `<tf-chip status="info" icon="network" label="${escapeAttr(T('fleet.badge_mesh', { n: this.nodes.length }))}"></tf-chip>`,
       ];
       this.root.querySelector('#nas-head-badges').innerHTML = badges.join('');
@@ -1712,11 +1794,7 @@ const TentaNasScreen = {
     // Pools tab has — also for a remote node, whose fleet row counts no
     // arrays (`nodeTabCounts`). Only when both halves answered: a failed
     // array list would pass the ZFS half off as the whole.
-    if (!arraysRes.failed) {
-      const poolsTab = this.root?.querySelector('#nas-tabs tf-tab#pools');
-      setAttr(poolsTab, 'count', String((poolsRes.pools || []).length + (arraysRes.arrays || []).length));
-      setAttr(poolsTab, 'title', null);
-    }
+    if (!arraysRes.failed) this.setPoolsCount((poolsRes.pools || []).length + (arraysRes.arrays || []).length);
 
     const disks = disksRes.disks || [];
     // Split, because collapsing them is what made this screen lie: the disks
@@ -2140,7 +2218,7 @@ const TentaNasScreen = {
         const copyBtn = e.target.closest('[data-copy]');
         if (copyBtn) {
           const a = el.__tfAlertsByKey?.get(copyBtn.closest('[data-alert]')?.dataset.alert);
-          await copyConflictPath(a, Number(copyBtn.dataset.copy));
+          await copyConflictPath(a, Number(copyBtn.dataset.copy), this.currentNode());
           return;
         }
         const gotoBtn = e.target.closest('[data-goto]');
@@ -3145,7 +3223,7 @@ const TentaNasScreen = {
     const env = this.environment;
     const el = env.elevation;
     const admin = this.isAdmin;
-    const armed = el.armedUntil && parseServerTs(el.armedUntil) && parseServerTs(el.armedUntil).getTime() > Date.now();
+    const armed = armedExpiryMs(el) > Date.now();
 
     const channelChip = el.mode === 'helper'
       ? `<tf-chip status="${el.helperState === 'ok' ? 'ok' : 'warn'}" dot label="${escapeAttr(T('elevation.chip_helper'))}"></tf-chip>`
@@ -3363,10 +3441,17 @@ const TentaNasScreen = {
   async paintArcSettings(body, env) {
     const host = body.querySelector('#nas-env-arc');
     if (!host) return;
-    const res = await this.nas('tentaNasArcStatsRequest', {}).catch(() => ({ arc: null }));
+    // A read that FAILED says nothing about the ARC: a card already on
+    // screen stays as it is — the admin's unsaved slider with it — until the
+    // next read (critic wave 5, MINOR 6). Only an answer that has no ARC to
+    // show replaces it.
+    let failed = false;
+    const res = await this.nas('tentaNasArcStatsRequest', {}).catch(() => { failed = true; return { arc: null }; });
     if (this.disposed || !host.isConnected) return;
     const arc = res.arc;
-    if (!arc || !arc.ramBytes) {
+    if (failed && host.__arc) {
+      // kept; asked again below
+    } else if (!arc || !arc.ramBytes) {
       host.__arc = null;
       patchHtml(host, `<div class="muted">${escapeHtml(T('arc.unavailable'))}</div>`);
     } else {
@@ -3415,7 +3500,10 @@ const TentaNasScreen = {
       const ok = await this.withSudo((sudoPassword) => this.nas('tentaNasArcLimitSetRequest', { maxBytes: Math.round(state.ram * p / 100), sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('arc.settings_title'));
       if (!ok) return;
       toast(T('arc.applied'), 'success');
-      // The node's cap is the admin's choice now: the next read shows it.
+      // The node's cap is the admin's choice now: the next read shows it, and
+      // until then the slider is judged against it — moving back to the OLD
+      // cap is a change again, not "nothing to apply".
+      state.current = p;
       state.dirty = false;
       setAttr(apply, 'disabled', true);
     });
@@ -3521,7 +3609,10 @@ const TentaNasScreen = {
   // otherwise a password from the prompt. "Remember" arms the channel first
   // (the core keeps the secret in RAM for the node's TTL) and the action then
   // runs without a password. Returns the action's response or null.
-  async withSudo(fn, title, isCurrent = () => true) {
+  // `nameOf` (id -> the name the screen shows for it) lets a refusal that
+  // names a machine id — zpool's "cannot offline <leaf GUID>: …" — read as
+  // that name in the toast; any other id stays hidden (`errMessage`).
+  async withSudo(fn, title, isCurrent = () => true, nameOf = undefined) {
     const sourceNodeId = this.nodeId;
     const checkContext = () => {
       if (this.disposed || this.nodeId !== sourceNodeId || !isCurrent()) throw new Error(T('targets.context_changed'));
@@ -3531,7 +3622,7 @@ const TentaNasScreen = {
       if (!this.environment) await this.refreshHeader(false);
       checkContext();
       const el = this.environment?.elevation;
-      const armed = el && el.armedUntil && parseServerTs(el.armedUntil) && parseServerTs(el.armedUntil).getTime() > Date.now();
+      const armed = Boolean(el) && armedExpiryMs(el) > Date.now();
       const needsPassword = !el || channelMode(el.mode) === 'unarmed' || (el.mode === 'interactive' && !armed) || (el.mode === 'helper' && el.helperState !== 'ok');
       if (!needsPassword) return await fn(undefined);
       const creds = await this.promptSudo(title);
@@ -3545,7 +3636,7 @@ const TentaNasScreen = {
       }
       return await fn(creds.password);
     } catch (e) {
-      toast(errMessage(e), 'error');
+      toast(errMessage(e, nameOf), 'error');
       return null;
     }
   },
@@ -3890,7 +3981,7 @@ const TentaNasScreen = {
         const head = win.querySelector('#nas-joblog-head');
         const pre = win.querySelector('#nas-joblog');
         if (!head || !pre) return;
-        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span class="mono">${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${j.error ? `<div class="num-err mt-sm">${escapeHtml(errMessage(j.error))}</div>` : ''}`);
+        patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span${subject.words ? '' : ' class="mono"'}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${j.error ? `<div class="num-err mt-sm">${escapeHtml(errMessage(j.error))}</div>` : ''}`);
         paintJobLog(pre, j.log);
         if (j.status === 'running' || j.status === 'queued') timer = setTimeout(poll, POLL_JOB_MODAL_MS);
         else if (onFinish && !notified) { notified = true; onFinish(j); }
@@ -4120,6 +4211,9 @@ function trendHtml(now, weekAgo) {
 function normalizeNode(n) {
   return {
     ...n,
+    // The moment this row arrived: its `armedSecsLeft` counts from here
+    // (`armedExpiryMs`).
+    receivedAt: Date.now(),
     disksTotal: Number(n.disksTotal) || 0,
     disksWarning: Number(n.disksWarning) || 0,
     disksCritical: Number(n.disksCritical) || 0,
@@ -4156,13 +4250,19 @@ function fleetRowAnswered(r) {
 }
 
 // Who may connect to a block target, for the fleet's "Montowania" column: the
-// allowlist size in the protocol's own noun and the authentication method
-// (n01: "2 initiatory (CHAP)", "1 host NQN"). An empty allowlist is "anyone
-// who reaches the portal", said as such.
+// allowlist size in the protocol's own noun, and in brackets what n01 puts
+// there — an iSCSI target's authentication method ("2 initiatory (CHAP)"),
+// an NVMe-oF target's transports ("1 host NQN (TCP+RDMA)", critic wave 7,
+// MINOR 9). An empty allowlist is "anyone who reaches the portal", said as
+// such.
 function targetClientsText(t) {
   const n = Array.isArray(t?.initiators) ? t.initiators.length : 0;
   const who = !n ? T('fleet.target_any_client')
     : T(t.protocol === 'nvmet' ? 'fleet.target_hosts' : 'fleet.target_initiators', { n });
+  if (t?.protocol === 'nvmet') {
+    const transports = targetTransportsText(t);
+    return transports ? `${who} (${transports})` : who;
+  }
   const method = t?.auth?.method || 'none';
   return method === 'none' ? who : `${who} (${targetAuthLabel(method)})`;
 }

@@ -338,8 +338,16 @@ fn apply_config_row(report: &mut StatusReport, row: &ConfigRow<'_>, role: &mut S
 /// spare is the member the `spares` section also lists), (b) the spare beside
 /// it is ONLINE, and (c) no resilver is running: detaching the old disk
 /// before the spare holds the data would take redundancy the pool still
-/// needs. Anything else keeps `detachable` false, and the node refuses a
-/// detach of it whatever a screen sends (`PoolDetachRequest`).
+/// needs. (d) The resilver onto the spare did not end with errors and the
+/// pool reports no permanent data errors (critic wave 7, R2-3 a): the
+/// action's promise is that the data is already on the spare, and a resilver
+/// that could not rebuild every block does not keep it — the kernel's own
+/// check would still refuse a detach that drops the last copy, but the
+/// screen must not offer one it cannot honour. (e) The group holds no nested
+/// container (`replacing-N` inside `spare-N`, R2-3 b): the parser reads such
+/// a row as a leaf, and neither it nor its children are a disk the spare
+/// simply replaced. Anything else keeps `detachable` false, and the node
+/// refuses a detach of it whatever a screen sends (`PoolDetachRequest`).
 fn mark_detachable(report: &mut StatusReport) {
     let spares: std::collections::BTreeSet<String> = report
         .vdevs
@@ -348,6 +356,8 @@ fn mark_detachable(report: &mut StatusReport) {
         .flat_map(|v| v.disks.iter().map(|d| d.name.clone()))
         .collect();
     let resilvering = report.scan.kind == "resilver" && report.scan.status == "running";
+    let resilver_failed = report.scan.kind == "resilver" && report.scan.errors > 0;
+    let settled = !resilvering && !resilver_failed && report.data_errors == 0;
     let members = std::mem::take(&mut report.spare_members);
     for (vdev, _, container) in &members {
         let group: Vec<usize> = members
@@ -359,13 +369,14 @@ fn mark_detachable(report: &mut StatusReport) {
         let spare_ready = group
             .iter()
             .any(|&i| spares.contains(&disks[i].name) && disks[i].state == "online");
+        let nested = group.iter().any(|&i| group_kind(&disks[i].name).is_some());
         let marks: Vec<usize> = group
             .iter()
             .copied()
             .filter(|&i| !spares.contains(&disks[i].name))
             .collect();
         for i in marks {
-            report.vdevs[*vdev].disks[i].detachable = spare_ready && !resilvering;
+            report.vdevs[*vdev].disks[i].detachable = spare_ready && settled && !nested;
         }
     }
 }
@@ -435,8 +446,29 @@ pub(crate) fn last_name_by_link(db: &DbPool, link: &str) -> Option<String> {
         let id = format!("wwn-{}", hex.trim_start_matches("0x"));
         return store::disk_last_name(db, &id).ok().flatten();
     }
-    let (_, serial) = link.rsplit_once('_')?;
-    store::disk_last_name_by_serial(db, serial).ok().flatten()
+    store::disk_last_name_by_serial(db, link_serial(link)?).ok().flatten()
+}
+
+/// The serial a `<bus>-<model>_<serial>` by-id link ends with.
+///
+/// An NVMe namespace link adds the namespace number after the serial
+/// (`nvme-<model>_<serial>_1`, critic wave 5, MINOR 12): a short trailing
+/// digit run there is the namespace, not the serial, and the serial is the
+/// token before it. A "serial" shorter than four characters names nothing a
+/// record can be trusted to match.
+fn link_serial(link: &str) -> Option<&str> {
+    let tokens: Vec<&str> = link.split('_').collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let last = tokens[tokens.len() - 1];
+    let namespace = link.starts_with("nvme-")
+        && tokens.len() >= 3
+        && !last.is_empty()
+        && last.len() <= 3
+        && last.bytes().all(|b| b.is_ascii_digit());
+    let serial = if namespace { tokens[tokens.len() - 2] } else { last };
+    (serial.len() >= 4).then_some(serial)
 }
 
 /// The kernel name a leaf zpool can no longer find was last seen under, for
@@ -819,10 +851,22 @@ pub fn recommended_layout(disks: usize) -> Option<&'static str> {
     }
 }
 
+/// The wizard's layout step for a picked set of disks (`plan`).
+pub struct LayoutPlan {
+    /// What each layout would give.
+    pub options: Vec<NasPoolLayoutOption>,
+    /// The warnings as codes (`plan_warning_codes`)…
+    pub warning_codes: Vec<NasHealthReason>,
+    /// …and the same warnings in English, for an older screen and the log.
+    pub warnings: Vec<String>,
+    pub smallest_disk_bytes: u64,
+}
+
 /// The wizard's layout step for a picked set of disks: what each layout would
 /// give, plus the warnings that make a selection a bad idea rather than an
-/// impossible one.
-pub fn plan(disks: &[NasDisk]) -> (Vec<NasPoolLayoutOption>, Vec<String>, u64) {
+/// impossible one — computed once, as codes, and spelled in English from
+/// those same codes (critic wave 5, MINOR 15).
+pub fn plan(disks: &[NasDisk]) -> LayoutPlan {
     let n = disks.len();
     let smallest = disks.iter().map(|d| d.size_bytes).min().unwrap_or(0);
     let recommended = recommended_layout(n);
@@ -856,8 +900,9 @@ pub fn plan(disks: &[NasDisk]) -> (Vec<NasPoolLayoutOption>, Vec<String>, u64) {
         })
         .collect();
 
-    let warnings = plan_warning_codes(disks).iter().map(plan_warning_sentence).collect();
-    (options, warnings, smallest)
+    let warning_codes = plan_warning_codes(disks);
+    let warnings = warning_codes.iter().map(plan_warning_sentence).collect();
+    LayoutPlan { options, warning_codes, warnings, smallest_disk_bytes: smallest }
 }
 
 /// The warnings of the layout step as CODES the wizard words in the reader's
@@ -1671,6 +1716,37 @@ errors: No known data errors\n";
         assert!(detachable(DEGRADED_RAIDZ2).is_empty());
     }
 
+    /// Critic wave 7, R2-3: the spare is ONLINE, but the resilver onto it
+    /// could not rebuild every block, or the pool has permanent data errors —
+    /// "its data is already on the spare" would be a false promise, so the
+    /// old disk is not offered. A container nested in the group is no disk
+    /// the spare simply replaced either.
+    #[test]
+    fn a_resilver_that_ended_with_errors_offers_no_detach() {
+        let detachable = |text: &str| -> Vec<String> {
+            parse_status(text)
+                .vdevs
+                .iter()
+                .flat_map(|v| v.disks.iter())
+                .filter(|d| d.detachable)
+                .map(|d| d.name.clone())
+                .collect()
+        };
+        let with_errors = spare_in_use("resilvered 1.2T in 03:10:00 with 3 errors on Tue Sep  1 12:00:00 2026", "ONLINE");
+        assert_eq!(parse_status(&with_errors).scan.errors, 3);
+        assert!(detachable(&with_errors).is_empty(), "{:?}", detachable(&with_errors));
+        let lost = spare_in_use("resilvered 1.2T in 03:10:00 with 0 errors on Tue Sep  1 12:00:00 2026", "ONLINE")
+            .replace("errors: No known data errors", "errors: 4 data errors, use '-v' for a list");
+        assert_eq!(parse_status(&lost).data_errors, 4);
+        assert!(detachable(&lost).is_empty(), "{:?}", detachable(&lost));
+        let nested = spare_in_use("resilvered 1.2T in 03:10:00 with 0 errors on Tue Sep  1 12:00:00 2026", "ONLINE").replace(
+            "\t      /dev/sdb  FAULTED      9    40     0  too many errors\n",
+            "\t      replacing-0  DEGRADED  0     0     0\n\t        /dev/sdb  FAULTED      9    40     0  too many errors\n\t        /dev/sdn  ONLINE       0     0     0\n",
+        );
+        assert!(nested.contains("replacing-0"));
+        assert!(detachable(&nested).is_empty(), "{:?}", detachable(&nested));
+    }
+
     #[test]
     fn degraded_raidz2_reports_the_resilver_and_the_replacing_container() {
         let s = parse_status(DEGRADED_RAIDZ2);
@@ -1850,7 +1926,7 @@ errors: No known data errors\n";
     fn layout_plan_matches_the_wizard_rules() {
         const TB8: u64 = 8_001_563_222_016;
         let two = vec![disk("sdl", TB8, true, "ok"), disk("sdm", TB8, true, "ok")];
-        let (options, warnings, smallest) = plan(&two);
+        let LayoutPlan { options, warnings, smallest_disk_bytes: smallest, .. } = plan(&two);
         assert_eq!(smallest, TB8);
         assert!(warnings.is_empty(), "{warnings:?}");
         let by = |l: &str| options.iter().find(|o| o.layout == l).unwrap().clone();
@@ -1865,7 +1941,7 @@ errors: No known data errors\n";
         let six: Vec<NasDisk> = (0..6)
             .map(|i| disk(&format!("sd{i}"), TB8, true, "ok"))
             .collect();
-        let (options, _, _) = plan(&six);
+        let LayoutPlan { options, .. } = plan(&six);
         assert!(options.iter().find(|o| o.layout == "raidz2").unwrap().recommended);
         assert_eq!(
             options.iter().find(|o| o.layout == "raidz2").unwrap().usable_bytes,
@@ -1886,7 +1962,7 @@ errors: No known data errors\n";
             disk("sdc", 4_000_787_030_016, true, "ok"),
             disk("nvme0n1", TB8, false, "ok"),
         ];
-        let (options, warnings, smallest) = plan(&four);
+        let LayoutPlan { options, warnings, smallest_disk_bytes: smallest, .. } = plan(&four);
         assert_eq!(smallest, 4_000_787_030_016);
         assert!(options.iter().find(|o| o.layout == "raidz1").unwrap().recommended);
         assert!(warnings.iter().any(|w| w.contains("mixed disk sizes")));
@@ -2184,5 +2260,18 @@ errors: No known data errors\n";
         assert_eq!(last_name_by_link(&db, "ata-WDC_WD40_WD-7788-part1").as_deref(), Some("sdm"));
         assert_eq!(last_name_by_link(&db, "ata-WDC_WD40_WD-0000"), None);
         assert_eq!(last_name_by_link(&db, "wwn-0x1111"), None);
+    }
+
+    /// Critic wave 5, MINOR 12: an NVMe namespace link carries the namespace
+    /// number after the serial; the serial is the token before it, never "1".
+    #[test]
+    fn an_nvme_namespace_link_is_read_by_its_serial_not_its_namespace() {
+        assert_eq!(link_serial("nvme-Samsung_SSD_980_PRO_1TB_S5GXNF0R123456"), Some("S5GXNF0R123456"));
+        assert_eq!(link_serial("nvme-Samsung_SSD_980_PRO_1TB_S5GXNF0R123456_1"), Some("S5GXNF0R123456"));
+        assert_eq!(link_serial("ata-WDC_WD40_WD-7788"), Some("WD-7788"));
+        // A SATA serial that happens to be digits is still the serial.
+        assert_eq!(link_serial("ata-ST4000_1234"), Some("1234"));
+        assert_eq!(link_serial("ata-ST4000_12"), None, "too short to name a disk");
+        assert_eq!(link_serial("nvme-eui.0025388b91c1a2b3"), None);
     }
 }

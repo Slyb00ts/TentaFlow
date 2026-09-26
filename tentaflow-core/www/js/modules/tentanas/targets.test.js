@@ -17,8 +17,9 @@ const {
   mountTargetsSection, openTargetDetail, openTargetDeleteDialog, setTargetEnabled,
   authChipHtml, authLabel, portalCellHtml, sourceCellHtml, protocolLabel, parseInitiators,
   groupStateLabel, targetRow, sessionsCountLabel, sessionsEmptyText,
-  sessionLine, protocolChipHtml, transportLabel, hostConnectionHtml,
+  sessionLine, protocolChipHtml, transportLabel, hostConnectionHtml, hostIdentityHtml,
 } = await import('./targets.js');
+const { fmtDate } = await import('./format.js');
 
 const iscsiTarget = (over = {}) => ({
   targetId: 't1',
@@ -955,7 +956,7 @@ test('the drift banner words the portal drift from its codes, N19b', async () =>
     const detail = win.querySelector('[data-part="drift-detail"] p') || win.querySelector('[data-part="drift-detail"]');
     const text = () => win.querySelector('[data-testid="portal-drift-banner"]').textContent;
     assert.match(text(), /Portal targetu nie jest już tam, gdzie go przypięto\. Adres 10\.10\.0\.99 należał do interfejsu storage0 \(który ma teraz 10\.10\.0\.5\)\./);
-    assert.match(text(), /Target nie jest w jądrze, więc pod tym adresem nic nie nasłuchuje — eksport nie jest osiągalny na bond0\./);
+    assert.match(text(), /Target nie jest w jądrze, więc pod tym adresem nic nie nasłuchuje — eksport nie jest osiągalny na bond0 i nie zostanie tam przepięty automatycznie\./);
     assert.doesNotMatch(text(), /is not on storage0/);
     assert.ok(win.querySelector(`[title="${english}"]`), 'the English is the tooltip');
 
@@ -966,6 +967,26 @@ test('the drift banner words the portal drift from its codes, N19b', async () =>
   } finally {
     screen.dispose();
   }
+});
+
+// Critic wave 6, MINOR 11: N19b says since when the address has been
+// elsewhere (the node's drift alert `raised_at`), and ends as the mockup does.
+test('the drift words say since when the address is elsewhere', () => {
+  const drift = (params) => targetRow(iscsiTarget({
+    state: 'error',
+    stateDetail: 'portal moved',
+    stateReasons: [{ code: 'target_portal_moved', params: { address: '10.10.0.7', interface: 'storage1', interface_state: 'addressed', current: '10.10.0.9', elsewhere: 'bond0', ...params } }],
+  })).name;
+  const since = '2026-09-06T11:42:00Z';
+  const silent = drift({ in_kernel: 'false', since });
+  assert.match(silent, new RegExp(`Od ${fmtDate(since).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} znajduje się na bond0\\. Target nie jest w jądrze`));
+  assert.match(silent, /nie jest osiągalny na bond0 i nie zostanie tam przepięty automatycznie\.</);
+  assert.doesNotMatch(silent, /dopóki administrator/, 'the mockup\'s tail, not a second one');
+  const reachable = drift({ in_kernel: 'true', since });
+  assert.match(reachable, /Od [^<]+ jest na bond0, którego nikt nie wybrał [^<]* eksport jest tam osiągalny\. Target pozostaje bez zmian/);
+  // A node before the parameter: no date, and nothing made up.
+  assert.match(drift({ in_kernel: 'false' }), /Teraz jest na bond0\./);
+  assert.match(drift({ in_kernel: 'false', since: 'garbage' }), /Teraz jest na bond0\./);
 });
 
 // Wave-4 critic minor 9. For an NVMe-oF target TargetGet and TargetsList each
@@ -1052,6 +1073,31 @@ test('the allowlist marks each host connected or not from the session list, and 
   assert.match(unknown, /^<span class="text-3" title="[^"]+">—<\/span>$/);
   assert.ok(unknown.includes(sessionsEmptyText({ sessionsKnown: false }).replace(/"/g, '&quot;').slice(0, 20)));
   assert.doesNotMatch(unknown, /Niepołączony/, 'unmeasured is never "not connected"');
+});
+
+// Critic wave 7, R2-4: a host NQN built from a UUID is shown as n19 shows it
+// — the UUID cut in the middle — with the whole identity in the tooltip; an
+// IQN or a named NQN is shown as it is.
+test('a UUID host NQN is shortened as n19 shows it, everything else is shown whole', async () => {
+  const nqn = 'nqn.2014-08.org.nvmexpress:uuid:9f2c4b1e-0d3a-4c55-8e21-7c6d5b40a17b';
+  assert.equal(hostIdentityHtml(nqn), `<span title="${nqn}">nqn.2014-08.org.nvmexpress:uuid:9f2c…a17b</span>`);
+  assert.equal(hostIdentityHtml('iqn.1998-01.com.vmware:esx01'), 'iqn.1998-01.com.vmware:esx01');
+  assert.equal(hostIdentityHtml('nqn.2026-09.local:orion'), 'nqn.2026-09.local:orion');
+  assert.match(sessionLine({ client: '10.10.0.21', user: nqn }), /^10\.10\.0\.21 · <span title="[^"]+">nqn\.2014-08\.org\.nvmexpress:uuid:9f2c…a17b<\/span>$/);
+
+  const target = iscsiTarget({ protocol: 'nvmet', initiators: [nqn] });
+  const screen = detailScreen([{ target, sessions: [], configPreview: '' }]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const rows = win.querySelector('#nas-td-hosts').rows;
+    assert.equal(rows[0].identity, nqn, 'the row still carries the identity the remove action takes out');
+    assert.match(rows[0].shown, /uuid:9f2c…a17b</);
+    assert.ok(win.querySelector('#nas-td-hosts tf-column[key="shown"][renderer="html"]'));
+  } finally {
+    screen.dispose();
+  }
 });
 
 test('the target detail paints the allowlist state column', async () => {

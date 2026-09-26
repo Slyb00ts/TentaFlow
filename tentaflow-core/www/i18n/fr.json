@@ -5568,7 +5568,7 @@
       "mover_restricted": "Le déplacement est limité à la fenêtre de planification : en dehors, les fichiers attendent sur le cache, sauf si l'espace commence à y manquer.",
       "mover_settings": "Paramètres",
       "mover_name_note": "Dans l'historique des tâches et les journaux du nœud, ce processus apparaît sous le nom « Mover ».",
-      "cache_pending": "Sur le disque cache, pas encore protégé",
+      "cache_pending": "Sur le cache sans parité",
       "sync_schedule": "Planification du sync",
       "scrub_schedule": "Planification du scrub",
       "sync_schedule_title": "Modifier la planification : Sync {name}",
@@ -5628,7 +5628,7 @@
       "next_steps": "Étapes suivantes",
       "step_repair": "Réparez depuis la parité les blocs que le scrub a marqués comme défectueux.",
       "step_scrub": "Lancez un scrub pour vérifier s’il reste quelque chose à réparer.",
-      "step_sync": "Lancez une synchronisation — elle exige une confirmation, car elle enregistre l’état actuel des fichiers supprimés ou modifiés depuis la dernière synchronisation.",
+      "step_sync": "Lancez une synchronisation — elle exige une confirmation, car des fichiers endommagés peuvent figurer parmi ceux supprimés ou modifiés depuis la dernière synchronisation, et elle les enregistre comme nouvel état.",
       "sync_fault_title": "Synchronisation malgré une erreur non corrigée dans la grappe {name}",
       "sync_fault_warning": "La grappe {name} a une erreur de scrub ou de réparation non corrigée. La synchronisation écrit malgré tout un nouveau point de contrôle de parité.",
       "sync_fault_loses": "Les fichiers supprimés ou modifiés depuis la dernière synchronisation, y compris les fichiers endommagés, seront enregistrés dans leur nouvel état — leurs versions antérieures ne pourront plus être restaurées depuis la parité.",
@@ -5692,8 +5692,10 @@
         "helper_failed": "Le helper a signalé une erreur en lisant cet array — les détails sont dans l’infobulle.",
         "operation_failed": "L’opération « {operation} » n’a pas abouti — les détails sont dans l’infobulle.",
         "operation_failed_unnamed": "Une opération sur cet array n’a pas abouti — les détails sont dans l’infobulle.",
-        "supervision_lost": "Le nœud a perdu le suivi d’une opération de cet array (redémarrage) ; son état ne prouve pas que les écritures sur les disques sont terminées."
-      }
+        "supervision_lost": "Le nœud a perdu le suivi d’une opération de cet array (redémarrage) ; son état ne prouve pas que les écritures sur les disques sont terminées.",
+        "uncoded": "Le nœud n’a décrit l’état de cette grappe qu’avec ses propres mots — détails dans l’infobulle."
+      },
+      "sync_fault_unmeasured": "Deux cas n’ont pas été mesurés : un fichier que le scrub n’a pas pu lire et qui a aussi changé, et un disque qui commence à défaillir pendant la synchronisation — comptez sur une perte dans les deux."
     },
     "wizard_pool": {
       "elastic_data": "Disques de données",
@@ -5811,7 +5813,7 @@
         "same_device": "{other} ({other_role}) et {disk} ({role}) sont le même périphérique : un périphérique ne peut pas occuper deux places dans un array.",
         "data_disks_same_device": "{other} et {disk} sont le même périphérique : un périphérique ne peut pas être deux disques de données.",
         "disk_in_use": "{disk} {owner} — un disque appartient à l’un d’eux, pas aux deux (cet array l’effacerait).",
-        "parity_too_small": "{disk} fait {size} et le plus grand disque de données {largest} : un disque de parité doit être au moins aussi grand que le plus grand disque de données, sinon il ne peut pas le couvrir.",
+        "parity_too_small": "{disk} ({size}) ne peut pas être de parité — il est plus petit que le plus grand disque de données ({largest}).",
         "filesystem_invalid": "« {filesystem} » n’est pas un système de fichiers que cette application crée : un disque de données Elastic porte xfs ou ext4 pour rester lisible seul.",
         "filesystem_unavailable": "mkfs.{filesystem} n’est pas installé sur ce nœud, aucun disque de cet array ne peut donc être préparé.",
         "plan_failed": "Cette disposition ne peut pas devenir un plan — les détails sont dans l’infobulle."
@@ -5990,7 +5992,9 @@
       "leaf_missing_at": "disque absent n° {n}",
       "disk_detach": "Détacher l’ancien disque",
       "disk_detach_confirm": "Le disque {device} sera détaché du pool {pool} (zpool detach). Le disque de secours qui reste dans le pool à sa place détient déjà ses données. Une fois détaché, {device} peut être retiré sans risque.",
-      "disk_detach_done": "Disque {device} détaché — il peut être retiré"
+      "disk_detach_done": "Disque {device} détaché — il peut être retiré",
+      "leaf_embedded_last_known": "n° {n} (vu en dernier comme {name})",
+      "leaf_embedded_at": "n° {n}"
     },
     "props": {
       "title": "Propriétés du pool",
@@ -6045,7 +6049,11 @@
       "explain_others": " ainsi que les vdev {roles}",
       "retype": "Retapez le nom du pool pour confirmer :",
       "share_stops": "le partage {protocol} « {name} » cessera de fonctionner",
-      "target_stops": "la cible {protocol} « {name} » cessera de fonctionner"
+      "target_stops": "la cible {protocol} « {name} » cessera de fonctionner",
+      "share_stops_fleet": "le partage {protocol} « {name} » cessera de fonctionner sur {n} {n|nœud|nœuds} de la flotte",
+      "shares_unchecked": "Impossible de vérifier quels partages se trouvent sur ce pool — la liste peut être incomplète.",
+      "targets_unchecked": "Impossible de vérifier quelles cibles utilisent ce pool — la liste peut être incomplète.",
+      "dependents_scope": "Les partages et cibles listés sont ceux de cette organisation ; ceux des autres organisations de ce nœud n’apparaissent pas ici."
     },
     "add_vdev": {
       "title": "Ajouter un vdev à {name}",
@@ -6524,7 +6532,13 @@
       "audit_smb_direct": "Le chemin SMB Direct (RDMA) n'est pas audité.",
       "audit_nothing": "rien n'est audité",
       "audit_auditd": "surveillances auditd",
-      "audit_auditd_note": "Événements dans le journal d'audit de l'hôte (ausearch -k tentanas), pas dans le « Journal d'accès »."
+      "audit_auditd_note": "Événements dans le journal d'audit de l'hôte (ausearch -k tentanas), pas dans le « Journal d'accès ».",
+      "state_reason": {
+        "source_invalid": "La source du partage n’est pas un répertoire valide sur un pool ou une grappe de ce nœud — détails dans l’infobulle",
+        "source_unmounted": "La source du partage n’est pas montée — le partage reste hors de la configuration",
+        "service_missing": "Le paquet {package} manque sur ce nœud",
+        "smb_direct_not_served": "SMB Direct n’est pas servi sur ce nœud (le partage continue de fonctionner via le LAN)"
+      }
     },
     "wizard_share": {
       "title": "Nouveau partage",
@@ -6783,8 +6797,8 @@
         },
         "elastic_sync_held": {
           "title": "Matrice {array} : Sync planifié suspendu, la parité signale des erreurs",
-          "detail": "Un scrub a signalé des erreurs que rien n'a encore réparées. Un Sync planifié enregistrerait l'état actuel des fichiers supprimés ou modifiés depuis le dernier Sync, y compris les fichiers endommagés, et leurs versions antérieures ne pourraient plus être restaurées depuis la parité. Lancez la réparation depuis la parité, puis un scrub ; le Sync manuel reste disponible.",
-          "detail_fault": "Le scrub ne s’est pas terminé correctement ou une réparation a échoué. La synchronisation planifiée enregistrerait l’état actuel des fichiers supprimés ou modifiés depuis la dernière synchronisation, y compris les fichiers endommagés ; elle exige donc une confirmation sur l’écran de la grappe. Lancez un scrub ou la réparation depuis la parité ; une synchronisation manuelle reste disponible après confirmation."
+          "detail": "Le scrub a signalé des erreurs que rien n’a encore réparées. Parmi les fichiers supprimés ou modifiés depuis la dernière synchronisation peuvent se trouver des fichiers endommagés — la synchronisation planifiée les enregistrerait comme nouvel état, et leurs versions antérieures ne pourraient plus être restaurées depuis la parité. Lancez la réparation depuis la parité, puis un scrub ; une synchronisation manuelle reste disponible.",
+          "detail_fault": "Le scrub ne s’est pas terminé correctement ou une réparation a échoué : on ne sait donc pas si des fichiers endommagés figurent parmi ceux supprimés ou modifiés depuis la dernière synchronisation — la synchronisation planifiée les enregistrerait comme nouvel état, elle exige donc une confirmation sur l’écran de la grappe. Lancez un scrub ou la réparation depuis la parité ; une synchronisation manuelle reste disponible après confirmation."
         },
         "elastic_mover_settle_stopped": {
           "title": "Matrice {array} : achèvement automatique du déplacement suspendu",
@@ -6807,7 +6821,10 @@
           "file_branch": "{path} : version visible {visible}, l’autre est sur l’un des disques de la matrice",
           "copy_kept": "Copier le chemin de l’autre version : {path}",
           "copied": "Chemin de l’autre version de {path} copié",
-          "copy_failed": "Impossible de copier le chemin — le navigateur n’a pas autorisé l’accès au presse-papiers"
+          "copy_failed": "Impossible de copier le chemin — le navigateur n’a pas autorisé l’accès au presse-papiers",
+          "copied_on": "Chemin de l’autre version de {path} copié — un chemin sur le nœud {node}",
+          "copied_on_unnamed": "Chemin de l’autre version de {path} copié — un chemin sur le nœud sans nom",
+          "copy_more": "et {n} {n|autre fichier|autres fichiers}"
         },
         "elastic_needs_attention": {
           "title": "La matrice {array} nécessite une intervention",
@@ -7273,7 +7290,11 @@
       "not_answered_hint": "Inconnu : la liste des partages ou des cibles de ce nœud n’a pas pu être lue (pas de réponse ou une erreur). Le nombre apparaîtra dès que le nœud répondra.",
       "target_any_client": "tout client du portail",
       "target_initiators": "{n} {n|initiateur|initiateurs}",
-      "target_hosts": "{n} {n|NQN d’hôte|NQN d’hôtes}"
+      "target_hosts": "{n} {n|NQN d’hôte|NQN d’hôtes}",
+      "sessions_nvmet_age": "Nombre de sessions NVMe-oF issu d’une lecture datant d’au plus {minutes} min",
+      "node_read_failed": "échec de lecture",
+      "targets_unreadable": "Le nœud répond, mais sa liste de cibles n’a pas pu être lue : {error}",
+      "shares_unreadable": "Le nœud répond, mais sa liste de partages n’a pas pu être lue : {error}"
     },
     "node": {
       "head_sub_node": "nœud {name}",
@@ -7401,7 +7422,13 @@
         "task_mover": "mover",
         "task_sync": "synchronisation de parité",
         "task_scrub": "scrub de parité",
-        "elastic_fix_unnamed": "Réécrit depuis la parité les blocs marqués par le dernier scrub, dans les fichiers inchangés depuis la dernière synchronisation, sur un disque de données de l’array."
+        "elastic_fix_unnamed": "Réécrit depuis la parité les blocs marqués par le dernier scrub, dans les fichiers inchangés depuis la dernière synchronisation, sur un disque de données de l’array.",
+        "config_import_task": {
+          "scrub": "planification du scrub du pool {subject}",
+          "trim": "planification du TRIM du pool {subject}",
+          "snapshot": "planification des instantanés du dataset {subject}",
+          "smart": "planification des tests SMART"
+        }
       }
     },
     "access": {
@@ -7585,13 +7612,15 @@
         "portal_moved_head_gone": "Le portail de la cible n’est plus là où il a été épinglé. L’adresse {address} appartenait à l’interface {interface}, qui n’existe plus sur ce nœud.",
         "portal_moved_nowhere": "Aucune interface de ce nœud n’a plus cette adresse.",
         "portal_moved_reachable": "Elle est maintenant sur {elsewhere}, que personne n’a choisie pour cette cible — l’export y est accessible.",
-        "portal_moved_silent": "Elle est maintenant sur {elsewhere}. La cible n’est pas dans le noyau, rien n’écoute donc à cette adresse — l’export n’est pas accessible sur {elsewhere}.",
+        "portal_moved_silent": "Elle est maintenant sur {elsewhere}. La cible n’est pas dans le noyau, rien n’écoute donc à cette adresse — l’export n’est pas accessible sur {elsewhere} et n’y sera pas rebasculé automatiquement.",
         "portal_moved_tail": "La cible reste telle quelle jusqu’à ce qu’un administrateur choisisse à nouveau le portail.",
         "not_exported": "Enregistrée, mais ce nœud ne l’exporte pas encore — la prochaine réconciliation l’applique.",
         "no_auth": "Pas d’authentification — la liste d’autorisation IQN/NQN est un filtre, pas une connexion.",
         "import_secret_needed": "Le secret d’authentification doit être saisi à nouveau après une importation.",
         "import_all_interfaces": "Cette cible était exportée sur toutes les interfaces (0.0.0.0) — choisissez une interface de ce nœud avant de l’activer.",
-        "portal_moved_head_no_address": "Le portail de la cible n’est plus là où il a été épinglé. L’adresse {address} appartenait à l’interface {interface}, présente sur ce nœud mais sans aucune adresse pour l’instant (lien coupé ou bail DHCP perdu)."
+        "portal_moved_head_no_address": "Le portail de la cible n’est plus là où il a été épinglé. L’adresse {address} appartenait à l’interface {interface}, présente sur ce nœud mais sans aucune adresse pour l’instant (lien coupé ou bail DHCP perdu).",
+        "portal_moved_silent_since": "Depuis {since}, elle est sur {elsewhere}. La cible n’est pas dans le noyau, rien n’écoute donc à cette adresse — l’export n’est pas accessible sur {elsewhere} et n’y sera pas rebasculé automatiquement.",
+        "portal_moved_reachable_since": "Depuis {since}, elle est sur {elsewhere}, que personne n’a choisie pour cette cible — l’export y est accessible."
       },
       "host_state": "État",
       "host_connected": "Connecté",
@@ -7742,7 +7771,8 @@
       "elastic_undo_stopped": "L’annulation de l’ajout s’est arrêtée après sa première étape — l’ajout reste inachevé",
       "elastic_disk_absent": "Le disque qui serait effacé n’est pas présent sur ce nœud — rebranchez-le et réessayez",
       "job_not_cancellable": "Cette tâche ne peut pas être annulée — l’arrêter n’arrêterait pas le travail déjà commencé",
-      "pool_detach_not_allowed": "Ce disque ne peut pas être détaché maintenant : seul un disque remplacé par un disque de secours sain peut être détaché, et seulement une fois le resilver terminé."
+      "pool_detach_not_allowed": "Ce disque ne peut pas être détaché maintenant : seul un disque remplacé par un disque de secours sain peut être détaché, et seulement une fois le resilver terminé sans erreur et si le pool ne signale aucune erreur de données permanente.",
+      "elastic_one_cache_disk": "Une matrice Elastic peut avoir au plus un disque de cache"
     },
     "unreachable": {
       "title": "Nœud {node} injoignable",
@@ -7767,7 +7797,8 @@
       "log_mesh_offline_unnamed": "le mesh ne voit pas ce nœud — il est déconnecté",
       "log_lost": "{node} ne répond plus",
       "log_lost_unnamed": "le nœud ne répond plus",
-      "error": "Le nœud ne répond pas — la connexion mesh est perdue"
+      "error": "Le nœud ne répond pas — la connexion mesh est perdue",
+      "retry_in": "Prochaine tentative dans {seconds} s"
     }
   },
   "agent_accounts": {

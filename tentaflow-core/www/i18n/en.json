@@ -6570,8 +6570,8 @@
         },
         "elastic_sync_held": {
           "title": "Array {array}: scheduled Sync held, parity reports errors",
-          "detail": "A scrub reported errors nothing has repaired yet. A scheduled Sync would record the current state of files deleted or changed since the last Sync, damaged ones included, and their earlier versions could no longer be restored from parity. Run the repair from parity, then a scrub; a manual Sync stays available.",
-          "detail_fault": "The scrub did not finish correctly or a repair failed. The scheduled Sync would record the current state of files deleted or changed since the last Sync, damaged ones included, so it needs a confirmation on the array screen. Run a scrub or the repair from parity; a manual Sync stays available after the confirmation."
+          "detail": "The scrub reported errors nothing has repaired yet. Files deleted or changed since the last Sync may be among the damaged ones — the scheduled Sync would record them as the new state, and their earlier versions could no longer be restored from parity. Run the repair from parity, then a scrub; a manual Sync stays available.",
+          "detail_fault": "The scrub did not finish correctly or a repair failed, so it is not known whether damaged files are among those deleted or changed since the last Sync — the scheduled Sync would record them as the new state, so it needs a confirmation on the array screen. Run a scrub or the repair from parity; a manual Sync stays available after the confirmation."
         },
         "elastic_mover_settle_stopped": {
           "title": "Array {array}: automatic move completion paused",
@@ -6594,7 +6594,10 @@
           "file_branch": "{path}: visible version {visible}, the other is on one of the array's disks",
           "copy_kept": "Copy the other version's path: {path}",
           "copied": "Copied the path of the other version of {path}",
-          "copy_failed": "Could not copy the path — the browser did not allow clipboard access"
+          "copy_failed": "Could not copy the path — the browser did not allow clipboard access",
+          "copied_on": "Copied the path of the other version of {path} — a path on node {node}",
+          "copied_on_unnamed": "Copied the path of the other version of {path} — a path on the unnamed node",
+          "copy_more": "and {n} more {n|file|files}"
         },
         "elastic_needs_attention": {
           "title": "Array {array} needs intervention",
@@ -7347,7 +7350,7 @@
       "mover_restricted": "Moving is restricted to the schedule window: outside it files wait on the cache unless it starts running out of space.",
       "mover_settings": "Settings",
       "mover_name_note": "In the job history and the node logs this appears as “Mover”.",
-      "cache_pending": "On the cache disk, not yet protected",
+      "cache_pending": "On the cache without parity",
       "sync_schedule": "Sync schedule",
       "scrub_schedule": "Scrub schedule",
       "sync_schedule_title": "Edit schedule: Sync {name}",
@@ -7407,7 +7410,7 @@
       "next_steps": "What next",
       "step_repair": "Repair the blocks the scrub marked as bad from parity.",
       "step_scrub": "Run a scrub to check whether anything is left to repair.",
-      "step_sync": "Run a Sync — it needs a confirmation, because it records the current state of files deleted or changed since the last Sync.",
+      "step_sync": "Run a Sync — it needs a confirmation, because damaged files may be among those deleted or changed since the last Sync, and the Sync records them as the new state.",
       "sync_fault_title": "Sync despite an unrepaired fault in array {name}",
       "sync_fault_warning": "Array {name} has an unrepaired scrub or repair fault. The Sync writes a new parity checkpoint despite it.",
       "sync_fault_loses": "Files deleted or changed since the last Sync, damaged ones included, are recorded in their new state — their earlier versions can no longer be restored from parity.",
@@ -7471,8 +7474,10 @@
         "helper_failed": "The helper reported an error reading this array — the details are in the tooltip.",
         "operation_failed": "The operation “{operation}” did not succeed — the details are in the tooltip.",
         "operation_failed_unnamed": "An operation on this array did not succeed — the details are in the tooltip.",
-        "supervision_lost": "The node lost track of an operation of this array (a restart); its state does not prove that the disk writes finished."
-      }
+        "supervision_lost": "The node lost track of an operation of this array (a restart); its state does not prove that the disk writes finished.",
+        "uncoded": "The node described this array’s state only in its own words — details in the tooltip."
+      },
+      "sync_fault_unmeasured": "Two cases were not measured: a file the scrub could not read that has also changed, and a disk that starts failing during the Sync — count on a loss in both."
     },
     "wizard_pool": {
       "elastic_data": "Data disks",
@@ -7590,7 +7595,7 @@
         "same_device": "{other} ({other_role}) and {disk} ({role}) are the same device: one device cannot take two places in an array.",
         "data_disks_same_device": "{other} and {disk} are the same device: one device cannot be two data disks.",
         "disk_in_use": "{disk} {owner} — a disk belongs to one of them, not both (this array would erase it).",
-        "parity_too_small": "{disk} holds {size} and the largest data disk holds {largest}: a parity disk must be at least as large as the largest data disk, or it cannot cover it.",
+        "parity_too_small": "{disk} ({size}) cannot be parity — it is smaller than the largest data disk ({largest}).",
         "filesystem_invalid": "“{filesystem}” is not a filesystem this app makes: an Elastic data disk carries xfs or ext4 so it stays readable on its own.",
         "filesystem_unavailable": "mkfs.{filesystem} is not installed on this node, so no disk of this array can be prepared.",
         "plan_failed": "This layout cannot be turned into a plan — the details are in the tooltip."
@@ -7769,7 +7774,9 @@
       "leaf_missing_at": "disk missing, no. {n}",
       "disk_detach": "Detach old disk",
       "disk_detach_confirm": "Disk {device} will be detached from pool {pool} (zpool detach). The hot spare that stays in the pool in its place already holds its data. Once detached, {device} can be removed safely.",
-      "disk_detach_done": "Disk {device} detached — it can be removed"
+      "disk_detach_done": "Disk {device} detached — it can be removed",
+      "leaf_embedded_last_known": "no. {n} (last seen as {name})",
+      "leaf_embedded_at": "no. {n}"
     },
     "props": {
       "title": "Pool properties",
@@ -7824,7 +7831,11 @@
       "explain_others": " and the {roles} vdevs",
       "retype": "Retype the pool name to confirm:",
       "share_stops": "{protocol} share “{name}” stops working",
-      "target_stops": "{protocol} target “{name}” stops working"
+      "target_stops": "{protocol} target “{name}” stops working",
+      "share_stops_fleet": "{protocol} share “{name}” stops working on {n} {n|fleet node|fleet nodes}",
+      "shares_unchecked": "Could not check which shares live on this pool — the list may be incomplete.",
+      "targets_unchecked": "Could not check which targets use this pool — the list may be incomplete.",
+      "dependents_scope": "The shares and targets listed are this organisation’s; other organisations on this node are not shown here."
     },
     "add_vdev": {
       "title": "Add vdev to {name}",
@@ -8236,7 +8247,13 @@
       "audit_smb_direct": "The SMB Direct (RDMA) path is not audited.",
       "audit_nothing": "nothing is audited",
       "audit_auditd": "auditd watches",
-      "audit_auditd_note": "Events in the host's audit log (ausearch -k tentanas), not in the “Access log”."
+      "audit_auditd_note": "Events in the host's audit log (ausearch -k tentanas), not in the “Access log”.",
+      "state_reason": {
+        "source_invalid": "The share source is not a valid directory on a pool or array of this node — details in the tooltip",
+        "source_unmounted": "The share source is not mounted — the share stays out of the configuration",
+        "service_missing": "The {package} package is missing on this node",
+        "smb_direct_not_served": "SMB Direct is not served on this node (the share keeps working over the LAN)"
+      }
     },
     "wizard_share": {
       "title": "New share",
@@ -8489,7 +8506,11 @@
       "not_answered_hint": "Unknown: this node's share or target list could not be read (no answer or an error). The count appears once the node answers.",
       "target_any_client": "any portal client",
       "target_initiators": "{n} {n|initiator|initiators}",
-      "target_hosts": "{n} {n|host NQN|host NQNs}"
+      "target_hosts": "{n} {n|host NQN|host NQNs}",
+      "sessions_nvmet_age": "NVMe-oF session count from a reading at most {minutes} min old",
+      "node_read_failed": "read failed",
+      "targets_unreadable": "The node answers, but its target list could not be read: {error}",
+      "shares_unreadable": "The node answers, but its share list could not be read: {error}"
     },
     "node": {
       "head_sub_node": "node {name}",
@@ -8617,7 +8638,13 @@
         "task_mover": "mover",
         "task_sync": "parity Sync",
         "task_scrub": "parity scrub",
-        "elastic_fix_unnamed": "Writes back from parity the blocks the last scrub marked, in files unchanged since the last Sync, on a data disk of the array."
+        "elastic_fix_unnamed": "Writes back from parity the blocks the last scrub marked, in files unchanged since the last Sync, on a data disk of the array.",
+        "config_import_task": {
+          "scrub": "scrub schedule of pool {subject}",
+          "trim": "TRIM schedule of pool {subject}",
+          "snapshot": "snapshot schedule of dataset {subject}",
+          "smart": "SMART test schedule"
+        }
       }
     },
     "access": {
@@ -8801,13 +8828,15 @@
         "portal_moved_head_gone": "The target’s portal is no longer where it was pinned. The address {address} belonged to interface {interface}, which is gone from this node.",
         "portal_moved_nowhere": "No interface of this node has that address now.",
         "portal_moved_reachable": "It is now on {elsewhere}, which nobody picked for this target — the export is reachable there.",
-        "portal_moved_silent": "It is now on {elsewhere}. The target is not in the kernel, so nothing listens at that address — the export is not reachable on {elsewhere}.",
+        "portal_moved_silent": "It is now on {elsewhere}. The target is not in the kernel, so nothing listens at that address — the export is not reachable on {elsewhere} and will not be moved there automatically.",
         "portal_moved_tail": "The target stays as it is until an admin re-picks the portal.",
         "not_exported": "Saved, but this node is not exporting it yet — the next reconcile applies it.",
         "no_auth": "No authentication — the IQN/NQN allowlist is a filter, not a login.",
         "import_secret_needed": "The authentication secret has to be entered again after an import.",
         "import_all_interfaces": "This target was exported on every interface (0.0.0.0) — pick an interface of this node before enabling it.",
-        "portal_moved_head_no_address": "The target’s portal is no longer where it was pinned. The address {address} belonged to interface {interface}, which is on this node but has no address now (link down or a lost DHCP lease)."
+        "portal_moved_head_no_address": "The target’s portal is no longer where it was pinned. The address {address} belonged to interface {interface}, which is on this node but has no address now (link down or a lost DHCP lease).",
+        "portal_moved_silent_since": "Since {since} it has been on {elsewhere}. The target is not in the kernel, so nothing listens at that address — the export is not reachable on {elsewhere} and will not be moved there automatically.",
+        "portal_moved_reachable_since": "Since {since} it has been on {elsewhere}, which nobody picked for this target — the export is reachable there."
       },
       "host_state": "State",
       "host_connected": "Connected",
@@ -8958,7 +8987,8 @@
       "elastic_undo_stopped": "Undoing the addition stopped after its first step — the addition stays unfinished",
       "elastic_disk_absent": "The disk that would be erased is not present on this node — reconnect it and try again",
       "job_not_cancellable": "This job cannot be cancelled — stopping it would not stop the work already under way",
-      "pool_detach_not_allowed": "This disk cannot be detached now: only a disk replaced by a healthy hot spare can be detached, and only once the resilver has finished."
+      "pool_detach_not_allowed": "This disk cannot be detached now: only a disk replaced by a healthy hot spare can be detached, and only once the resilver has finished without errors and the pool reports no permanent data errors.",
+      "elastic_one_cache_disk": "An Elastic Array can have at most one cache disk"
     },
     "unreachable": {
       "title": "Node {node} unreachable",
@@ -8983,7 +9013,8 @@
       "log_mesh_offline_unnamed": "the mesh does not see this node — it is disconnected",
       "log_lost": "{node} stopped answering",
       "log_lost_unnamed": "the node stopped answering",
-      "error": "The node does not answer — the mesh connection was lost"
+      "error": "The node does not answer — the mesh connection was lost",
+      "retry_in": "Next attempt in {seconds} s"
     }
   },
   "agent_accounts": {

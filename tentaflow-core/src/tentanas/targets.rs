@@ -1542,21 +1542,13 @@ fn evaluate_rows(
             .luns
             .iter()
             .all(|lun| Path::new(&lun.device_path).exists());
-        let (state, detail, verdict) = target_state(
+        let (state, mut detail, verdict) = target_state(
             target,
             volume_exists,
             installed,
             &addresses,
             object_in_kernel(target),
         );
-        // The codes count as a change: a row stored before migration 23 has
-        // the sentence and no codes, and this is what gives it them.
-        let changed = target.state != state
-            || target.state_detail != detail.text
-            || target.state_reasons != detail.reasons;
-        if changed {
-            store::set_target_state(db, &target.target_id, state, &detail, &detail.reasons)?;
-        }
         // The drift alert (§5.5, owner decision 2026-09-04). The admin who
         // picked an interface has to HEAR that the portal is no longer on it,
         // and a state chip on a tab nobody is looking at is not hearing it —
@@ -1592,6 +1584,26 @@ fn evaluate_rows(
                 "{}: the drift alert was not written: {e}",
                 target.name
             ));
+        }
+        // N19b says since WHEN the address has been elsewhere: the open drift
+        // alert's `raised_at`, stamped at the first tick that saw the move
+        // and kept by every later one (critic wave 6, MINOR 11). A parameter
+        // of the drift code only; an alert that could not be read leaves the
+        // sentence without it rather than guessing.
+        if verdict == Disposition::Freeze {
+            if let Ok(Some(since)) = store::open_alert_raised_at(db, &key) {
+                if let Some(reason) = detail.reasons.iter_mut().find(|r| r.code == "target_portal_moved") {
+                    reason.params.insert("since".to_string(), since);
+                }
+            }
+        }
+        // The codes count as a change: a row stored before migration 23 has
+        // the sentence and no codes, and this is what gives it them.
+        let changed = target.state != state
+            || target.state_detail != detail.text
+            || target.state_reasons != detail.reasons;
+        if changed {
+            store::set_target_state(db, &target.target_id, state, &detail, &detail.reasons)?;
         }
         // Since WHEN the backing volume has been missing. Recorded here
         // because this is the one place that already asks — and recorded as a
@@ -5426,6 +5438,14 @@ mod tests {
             "{:?}",
             open[0]
         );
+        // N19b "since": the drift code carries the open alert's `raised_at`,
+        // and a later tick keeps the same instant (critic wave 6, MINOR 11).
+        let since = stored.state_reasons.iter().find(|r| r.code == "target_portal_moved")
+            .and_then(|r| r.params.get("since").cloned());
+        assert_eq!(since.as_deref(), Some(open[0].raised_at.as_str()));
+        evaluate_rows(&db, &mut rows, &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
+        let again = store::target_by_name(&db, &row.name).expect("read").expect("row");
+        assert_eq!(again.state_reasons, stored.state_reasons, "a later tick keeps the first instant");
 
         // The address comes back (here: the portal stops naming an interface,
         // which is the deliberate 0.0.0.0 case) — the same tick closes it.

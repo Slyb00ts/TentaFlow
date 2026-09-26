@@ -1072,7 +1072,7 @@ impl BranchNames {
             out.push_str(&rest[..at]);
             let tail = &rest[at..];
             let known = self.members.iter().find(|(path, _)| {
-                tail.starts_with(path.as_str()) && !tail[path.len()..].starts_with(|c: char| c.is_ascii_alphanumeric())
+                tail.starts_with(path.as_str()) && !continues_path_segment(&tail[path.len()..])
             });
             let (label, used) = match known {
                 Some((path, label)) => (label.clone(), path.len()),
@@ -1086,6 +1086,19 @@ impl BranchNames {
         }
         out.push_str(rest);
         out
+    }
+}
+
+/// Whether `rest` (what follows a matched branch path) goes on in the same
+/// path segment — `…/data/d1_old`, `…/data/d1-bak`, `…/data/d1.bak` — so the
+/// match was a PREFIX of another directory, not the branch (critic wave 7,
+/// MINOR 12). A '.' ending a sentence does not continue it.
+fn continues_path_segment(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '-' => true,
+        Some('.') => chars.next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        _ => false,
     }
 }
 
@@ -1886,8 +1899,10 @@ pub const FOLDER_USAGE_RETRY: Duration = Duration::from_secs(30 * 60);
 const FOLDER_USAGE_TIMEOUT: Duration =
     Duration::from_secs(tentanas_helper::elastic::USAGE_DEADLINE_SECS + 120);
 
-/// One folder's figure from a measurement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One folder's figure from a measurement. Serialized only into the node's
+/// own settings (`FOLDER_USAGE_SETTING`), never onto the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FolderFigure {
     Bytes(u64),
     Gap(tentanas_helper::elastic::ElasticFolderGap),
@@ -1908,13 +1923,36 @@ struct FolderUsageReading {
     failed_at: Option<Instant>,
 }
 
+/// The settings key the last successful measurement of an array is kept
+/// under (critic wave 7, MINOR 8), followed by the array id.
+const FOLDER_USAGE_SETTING: &str = "folder_usage:";
+
+/// The persisted form of a successful measurement: its date and figures.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoredFolderUsage {
+    measured_at: String,
+    figures: BTreeMap<String, FolderFigure>,
+}
+
+/// Whether a reading holds a gap that says a branch was not mounted — a
+/// passing state, measured again after `FOLDER_USAGE_RETRY` (MINOR 5).
+fn has_unmounted_gap(figures: &BTreeMap<String, FolderFigure>) -> bool {
+    figures
+        .values()
+        .any(|f| *f == FolderFigure::Gap(tentanas_helper::elastic::ElasticFolderGap::NotMounted))
+}
+
 /// The per-array folder measurements of this process, keyed by array id (a
 /// name can be reused by a new array; its id cannot).
 ///
-/// Held in memory, like `MoverClock`: a restart measures again on the first
-/// pass, which costs one walk. A READ NEVER MEASURES — `fill_folder_usage`
-/// only copies what is here onto the wire, and only the scheduler's pass
-/// (`run_folder_usage_pass`) walks, at most once per `FOLDER_USAGE_EVERY`.
+/// Held in memory, and each successful measurement is also written to the
+/// node's settings (critic wave 7, MINOR 8): a restart would otherwise walk
+/// every array again on its first pass — each deploy spinning up every HDD
+/// branch. The pass seeds an array it has no reading of from that record
+/// (`seed`), with the record's own age, so the six-hour pacing survives the
+/// restart. A READ NEVER MEASURES — `fill_folder_usage` only copies what is
+/// here onto the wire, and only the scheduler's pass (`run_folder_usage_pass`)
+/// walks, at most once per `FOLDER_USAGE_EVERY`.
 #[derive(Debug, Default)]
 pub struct FolderUsageCache {
     readings: Mutex<BTreeMap<String, FolderUsageReading>>,
@@ -1952,8 +1990,10 @@ impl FolderUsageCache {
         }
     }
 
-    fn record(&self, array_id: &str, outcome: Result<BTreeMap<String, FolderFigure>, ()>) {
-        let Ok(mut readings) = self.readings.lock() else { return };
+    /// Records a pass's outcome; a successful one is returned in its
+    /// persisted form for the caller to store.
+    fn record(&self, array_id: &str, outcome: Result<BTreeMap<String, FolderFigure>, ()>) -> Option<StoredFolderUsage> {
+        let Ok(mut readings) = self.readings.lock() else { return None };
         let reading = readings.entry(array_id.to_string()).or_default();
         match outcome {
             Ok(figures) => {
@@ -1961,13 +2001,38 @@ impl FolderUsageCache {
                 // Restore, a disk being replaced), not a measurement: the
                 // folders it covered are measured again after
                 // `FOLDER_USAGE_RETRY`, not after six hours (MINOR 5).
-                let unmounted = figures
-                    .values()
-                    .any(|f| *f == FolderFigure::Gap(tentanas_helper::elastic::ElasticFolderGap::NotMounted));
-                reading.measured = Some((Instant::now(), super::db::now(), figures));
+                let unmounted = has_unmounted_gap(&figures);
+                let measured_at = super::db::now();
+                let stored = StoredFolderUsage { measured_at: measured_at.clone(), figures: figures.clone() };
+                reading.measured = Some((Instant::now(), measured_at, figures));
                 reading.failed_at = unmounted.then(Instant::now);
+                Some(stored)
             }
-            Err(()) => reading.failed_at = Some(Instant::now()),
+            Err(()) => {
+                reading.failed_at = Some(Instant::now());
+                None
+            }
+        }
+    }
+
+    /// Gives an array this process has no reading of the last measurement
+    /// the node stored, aged by its date. Nothing when the process already
+    /// has a reading, the record is missing or unreadable, or its date is in
+    /// the future (a clock step): the array is then simply measured.
+    fn seed(&self, db: &DbPool, array_id: &str) {
+        if self.readings.lock().map_or(true, |readings| readings.contains_key(array_id)) {
+            return;
+        }
+        let Ok(Some(text)) = store::setting(db, &format!("{FOLDER_USAGE_SETTING}{array_id}")) else { return };
+        let Ok(stored) = serde_json::from_str::<StoredFolderUsage>(&text) else { return };
+        let Ok(at) = chrono::DateTime::parse_from_rfc3339(&stored.measured_at) else { return };
+        let Ok(age) = (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).to_std() else { return };
+        let Some(instant) = Instant::now().checked_sub(age) else { return };
+        let Ok(mut readings) = self.readings.lock() else { return };
+        let reading = readings.entry(array_id.to_string()).or_default();
+        if reading.measured.is_none() && reading.failed_at.is_none() {
+            reading.failed_at = has_unmounted_gap(&stored.figures).then_some(instant);
+            reading.measured = Some((instant, stored.measured_at, stored.figures));
         }
     }
 
@@ -2117,6 +2182,7 @@ pub(crate) async fn run_folder_usage_pass(
         {
             continue;
         }
+        cache.seed(db, array_id);
         let all: Vec<String> = array.folders.iter().map(|f| f.name.clone()).collect();
         let set: BTreeSet<String> = all.iter().cloned().collect();
         // A name the helper would refuse is asked about by nobody: one such
@@ -2152,7 +2218,14 @@ pub(crate) async fn run_folder_usage_pass(
                 Err(())
             }
         };
-        cache.record(array_id, outcome);
+        if let Some(stored) = cache.record(array_id, outcome) {
+            let stored = serde_json::to_string(&stored).map_err(anyhow::Error::from).and_then(|text| {
+                store::set_setting(db, &format!("{FOLDER_USAGE_SETTING}{array_id}"), &text)
+            });
+            if let Err(e) = stored {
+                tracing::warn!("tentanas folder usage: reading of {} not stored: {e}", array.name);
+            }
+        }
     }
 }
 
@@ -2306,7 +2379,7 @@ pub fn layout_refusals(
     if cache.len() > 1 {
         out.push(NasElasticRefusal {
             code: "too_many_cache_disks".to_string(),
-            detail: "Elastic dopuszcza najwyżej jeden dysk cache".to_string(),
+            detail: "an Elastic Array takes at most one cache disk".to_string(),
             params: refusal_params(&[("count", cache.len().to_string())]),
             ..Default::default()
         });
@@ -2411,8 +2484,8 @@ pub fn layout_refusals(
                     ("role", b_role.to_string()),
                 ],
                 format!(
-                    "{} ({a_role}) i {} ({b_role}) wskazują ten sam nośnik ({shared}): \
-                     jeden nośnik nie może zajmować dwóch miejsc w macierzy",
+                    "{} ({a_role}) and {} ({b_role}) are the same device ({shared}): \
+                     one device cannot take two places in an array",
                     a.name, b.name
                 ),
             ));
@@ -5747,7 +5820,7 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
                             || result.union_readonly != Some(false)
                     })
                 {
-                    Some(CodedText::new("service_not_online", &[], "Service nie potwierdził trybu Online RW"))
+                    Some(CodedText::new("service_not_online", &[], "the service did not confirm online read-write mode"))
                 } else {
                     None
                 }
@@ -5760,9 +5833,9 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
                     Some(detail) => CodedText::new(
                         "restart_required",
                         &[],
-                        format!("Wymagany restart noda: {}", detail.text),
+                        format!("the node has to be restarted: {}", detail.text),
                     ),
-                    None => CodedText::new("restart_required", &[], "Wymagany restart noda"),
+                    None => CodedText::new("restart_required", &[], "the node has to be restarted"),
                 });
             }
             let service_safe = result.service.as_ref().is_none_or(|service| {
@@ -5784,7 +5857,7 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
         if stage != ElasticStage::Ready {
             state = "needs_attention";
             detail = failure.unwrap_or_else(|| {
-                CodedText::new("checkpoint_unfinished", &[], "Nieukończony checkpoint helpera")
+                CodedText::new("checkpoint_unfinished", &[], "the helper left a checkpoint unfinished")
             });
         } else if array.state != "active" {
             state = if array.state == "creating" { "creating" } else { "needs_attention" };
@@ -5794,7 +5867,7 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
                 CodedText::new(
                     "awaiting_confirmation",
                     &[],
-                    "Oczekuje na trwałe potwierdzenie operacji w bazie instancji",
+                    "waiting for the operation to be durably confirmed in the instance database",
                 )
             } else {
                 // Stored with its codes since migration 23 (an operation's
@@ -6982,7 +7055,7 @@ pub(crate) mod tests {
         row.create_spec = Some(spec);
         let wire = observed_protocol(&row, &BTreeMap::new(), Ok(result.clone()), &[]);
         assert_eq!(wire.state, "needs_attention");
-        assert_eq!(wire.state_detail, "Wymagany restart noda: mount: Input/output error");
+        assert_eq!(wire.state_detail, "the node has to be restarted: mount: Input/output error");
         // The prefix comes from the flag, never from recognising a word in the
         // helper's own sentence: a cause that happens to mention a restart is
         // still prefixed exactly once.
@@ -6991,7 +7064,7 @@ pub(crate) mod tests {
         let wire = observed_protocol(&row, &BTreeMap::new(), Ok(mentions), &[]);
         assert_eq!(
             wire.state_detail,
-            "Wymagany restart noda: restart demona mergerfs nie powiódł się"
+            "the node has to be restarted: restart demona mergerfs nie powiódł się"
         );
     }
 
@@ -11200,6 +11273,13 @@ pub(crate) mod tests {
         }
         // A sentence without a branch path is returned as it is.
         assert_eq!(names.name("mkfs.xfs failed on sdb"), "mkfs.xfs failed on sdb");
+        // Critic wave 7, MINOR 12: a directory that merely starts like a
+        // branch is not that branch; a sentence's full stop ends one.
+        assert_eq!(
+            names.name("left /mnt/tentanas-branches/media/data/d1_old/x and /mnt/tentanas-branches/media/data/d1.bak"),
+            "left a data disk of media:/x and a data disk of media"
+        );
+        assert_eq!(names.name("mounted /mnt/tentanas-branches/media/data/d1."), "mounted data disk no. 1.");
 
         // What this read observed names the member first, as in the state
         // sentence.

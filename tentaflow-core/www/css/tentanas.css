@@ -164,6 +164,9 @@
 .nas-root .alert-row .a-node { font-size: 12px; color: var(--text-3); margin-top: 2px; }
 .nas-root .alert-row .a-node summary { cursor: pointer; }
 .nas-root .alert-row .a-node-text { overflow-wrap: anywhere; }
+/* Conflict copy controls past the first few, folded (n02). */
+.nas-root .alert-row .a-copy-more { font-size: 12px; color: var(--text-3); }
+.nas-root .alert-row .a-copy-more summary { cursor: pointer; }
 
 /* Disk detail (n04): the physical-identification card — badge, fields, actions. */
 .nas-root .id-grid { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
@@ -432,6 +435,8 @@
 .nas-modal .loss-list .ll .icon { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 1px; }
 .nas-modal .loss-list .ll.bad .icon { color: var(--danger); }
 .nas-modal .loss-list .ll.good .icon { color: var(--success); }
+/* A list that could not be checked (n17a: "none" and "unknown" differ). */
+.nas-modal .loss-list .ll.warn .icon { color: var(--warning); }
 
 /* Snapshot schedules (n10) and the tasks tab (n15). */
 /* n15 protection status: two stat-row columns side by side. */
@@ -539,9 +544,11 @@
 
 /* n18c — the selected node stopped answering (tentanas/node-link.js). The card
    is the shared connection overlay; this is only its TentaNas variant. The
-   screen behind it blurs (the mockup's `app-blurred`), and the platform
-   overlay (9999) stays above it: losing the daemon outranks losing a node. */
-.nas-root.nas-link-lost {
+   whole app behind it blurs (the mockup's `.app-blurred` on `#app-root`), and
+   the platform overlay (9999) stays above it: losing the daemon outranks
+   losing a node. A class of its own, so the platform overlay's `app-blurred`
+   and this one never remove each other's. */
+.nas-link-lost {
   filter: blur(4px) saturate(0.7);
   pointer-events: none;
   transition: filter 0.3s ease;

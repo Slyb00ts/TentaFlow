@@ -12,7 +12,7 @@ import { KERNEL_SUPPORT_WORDS } from '/js/modules/tentanas/target-wizard.js';
 
 const need = (...values) => values.every((v) => typeof v === 'string' && v !== '');
 
-const FEATURE_DETAIL_WORDS = new Map([
+export const FEATURE_DETAIL_WORDS = new Map([
   ...KERNEL_SUPPORT_WORDS,
   ['feature_binaries_missing', (p) => (need(p.binaries) ? T('env.detail.feature_binaries_missing', { binaries: p.binaries }) : null)],
   ['feature_version_too_low', (p) => (need(p.found, p.required) ? T('env.detail.feature_version_too_low', { found: p.found, required: p.required }) : null)],

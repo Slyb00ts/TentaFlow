@@ -110,6 +110,15 @@ pub struct NasNodeInfo {
     /// compares it with the clock, since a past instant means "not armed".
     #[serde(default)]
     pub armed_until: Option<String>,
+    /// Seconds left of `armed_until`, counted by the ANSWERING node's clock
+    /// when it built this answer (0 once past). A browser judges the channel
+    /// by it — the time it received the answer plus these seconds — so a
+    /// browser clock off by minutes cannot read an armed node as unarmed or
+    /// the other way round (critic wave 7, MINOR 11). `None` when nothing is
+    /// armed, and from an older node, whose reader falls back on
+    /// `armed_until`.
+    #[serde(default)]
+    pub armed_secs_left: Option<u64>,
 }
 
 // =============================================================================
@@ -131,6 +140,11 @@ pub struct NasElevation {
     pub core_user: String,
     pub core_version: String,
     pub armed_until: Option<String>,
+    /// Seconds left of `armed_until` by this node's clock when it answered
+    /// (see `NasNodeInfo::armed_secs_left`). `None` when nothing is armed or
+    /// the node is older.
+    #[serde(default)]
+    pub armed_secs_left: Option<u64>,
     pub ttl_secs: u32,
     /// When mode A was provisioned on this node, and by whom (the display name
     /// of the admin who ran it). Both are written at provisioning time and
@@ -1319,6 +1333,14 @@ pub struct NasShare {
     pub state_detail: String,
     pub created_at: String,
     pub updated_at: String,
+    /// `state_detail` as codes the screen words in the reader's language
+    /// (wave 8; the pattern of `NasTarget::state_reasons`):
+    /// `share_source_invalid` {}, `share_source_unmounted` {},
+    /// `share_service_missing` {package}, `smb_direct_not_served` {} followed
+    /// by the node's SMB Direct (ksmbd) reasons. Empty from an older node and
+    /// for a row judged before the codes: the sentence is then all there is.
+    #[serde(default)]
+    pub state_reasons: Vec<NasHealthReason>,
 }
 
 /// One protocol service of the node (smbd / nfsd).
@@ -3870,6 +3892,7 @@ mod tests {
         assert_eq!(elevation.provisioned_by, None);
         assert_eq!(elevation.audit_entries, 0);
         assert!(!elevation.core_compatible);
+        assert_eq!(elevation.armed_secs_left, None, "an older node sends no remaining seconds");
 
         // A disk row and a disks answer from a node that predates the vdev
         // columns and the IOPS baseline decode with them at the neutral value.

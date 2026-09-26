@@ -803,6 +803,26 @@ test('the replace wizard never shows a by-id leaf\'s raw path: window title and 
   screen.dispose();
 });
 
+// Critic wave 5, MINOR 9: a sentence that already says "disk" names a leaf
+// with no current name without the noun again — "Wymień dysk nr 3 (ostatnio
+// sdk)", never "Wymień dysk brak dysku (ostatnio sdk)".
+test('the replace wizard names a missing leaf noun-free inside its own sentences', async () => {
+  const guid = '12156453278383891134';
+  const missing = disk(guid, { name: guid, diskId: undefined, state: 'unavail', note: '', lastKnownName: 'sdk' });
+  const screen = fakeScreen({});
+  const pool = { ...poolGet.pool, vdevs: [{ id: 'raidz1-0', role: 'data', kind: 'raidz1', state: 'degraded', faultTolerance: 1, disks: [disk('sda'), disk('sdb'), missing] }] };
+  const win = openReplaceWizard(screen, { pool, vdev: pool.vdevs[0], disk: missing, freeDisks: [disk('sdd', { role: 'free' })], disks: [] });
+  await flush();
+  const titleText = win.shadowRoot.querySelector('.tf-window-title-text').textContent;
+  assert.match(titleText, /^Wymień dysk nr 3 \(ostatnio sdk\) \(tank · /);
+  const warning = win.querySelector('.wizard-warning').textContent;
+  assert.match(warning, /Nie wyciągaj fizycznie dysku nr 3 \(ostatnio sdk\),/);
+  assert.doesNotMatch(`${titleText} ${win.textContent}`, /dysk(u)? brak dysku/);
+  assert.doesNotMatch(`${titleText} ${win.innerHTML}`, new RegExp(guid));
+  win.remove();
+  screen.dispose();
+});
+
 // ---------------------------------------------------------------------------
 // A paint step must not silently stop n06 from polling (MINOR 7).
 // ---------------------------------------------------------------------------
@@ -958,6 +978,36 @@ test('the replace result says a disk can be pulled only when the old leaf really
   assert.match(spare, /pozostaje w konfiguracji puli\. Odłącz go akcją „Odłącz stary dysk”/);
   assert.doesNotMatch(spare, /można bezpiecznie wyjąć/);
   assert.match(await done(false), /można bezpiecznie wyjąć/);
+});
+
+// Critic wave 5 round 2, MINOR 6: the `offline` confirm names a leaf the
+// inventory cannot bind as its cell does ("brak dysku (ostatnio sdk)"), never
+// by the by-id name the request carries.
+test('the offline confirm names a leaf by its shown name, never by its by-id name', async () => {
+  const { TfWindow } = await import('/js/components/tf-window.js');
+  const byId = 'wwn-0x5000c500a1b2c3d4-part1';
+  const missing = disk(byId, { name: byId, diskId: undefined, state: 'online', note: '', lastKnownName: 'sdk' });
+  const pool = { ...poolGet.pool, vdevs: [{ id: 'raidz1-0', role: 'data', kind: 'raidz1', state: 'degraded', faultTolerance: 1, disks: [disk('sda'), missing] }] };
+  const screen = makeScreen({ tentaNasPoolGetRequest: { ...poolGet, pool }, tentaNasPoolDeviceStateRequest: {} });
+  const confirm = TfWindow.confirm;
+  const asked = [];
+  TfWindow.confirm = async (opts) => { asked.push(opts); return false; };
+  try {
+    const body = document.createElement('div');
+    document.body.appendChild(body);
+    await drawPoolDetail(screen, body);
+    await flush();
+    click(body.querySelector(`.disk-cell[data-device="${byId}"] [data-act="offline"]`));
+    for (let i = 0; i < 4; i += 1) await flush();
+    assert.equal(asked.length, 1);
+    assert.match(asked[0].message, /^Przełączyć brak dysku \(ostatnio sdk\) w stan offline\?/);
+    assert.doesNotMatch(`${asked[0].title} ${asked[0].message}`, /wwn-|0x5000/);
+    assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasPoolDeviceStateRequest').length, 0, 'a declined confirm sends nothing');
+    body.remove();
+  } finally {
+    TfWindow.confirm = confirm;
+    screen.dispose();
+  }
 });
 
 // Owner decision (wave 7): the disk a hot spare replaced gets "Odłącz stary

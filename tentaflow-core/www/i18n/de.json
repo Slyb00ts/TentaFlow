@@ -3112,8 +3112,8 @@
     "title": "Flow-Variablen",
     "button": "Variablen",
     "button_title": "Flow-Variablen deklarieren",
-    "hint": "Deklarieren Sie Flow-Variablen. Bloecke koennen nur dann ueber output_mapping darauf schreiben, wenn sie hier aufgefuehrt sind.",
-    "add": "Variable hinzufuegen",
+    "hint": "Deklarieren Sie Flow-Variablen. Blöcke können nur dann über output_mapping darauf schreiben, wenn sie hier aufgeführt sind.",
+    "add": "Variable hinzufügen",
     "remove": "Entfernen",
     "save": "Speichern",
     "cancel": "Abbrechen",
@@ -3127,7 +3127,7 @@
     "description_placeholder": "optional",
     "saved": "Variablen gespeichert ({count})",
     "err_empty_name": "Der Variablenname darf nicht leer sein.",
-    "err_bad_name": "Ungueltiger Name '{name}' — Kleinbuchstaben, Ziffern und Unterstriche verwenden (mit Buchstaben beginnen).",
+    "err_bad_name": "Ungültiger Name '{name}' — Kleinbuchstaben, Ziffern und Unterstriche verwenden (mit Buchstaben beginnen).",
     "err_duplicate": "Doppelter Variablenname '{name}'."
   },
   "flows_palette": {
@@ -3949,10 +3949,10 @@
     "qr_scan_invalid": "Dieser QR-Code ist kein gültiger TentaFlow-Code",
     "qr_scan_failed": "QR-Scan fehlgeschlagen",
     "qr_scanner_waiting": "Kamerazugriff angefragt...",
-    "qr_scan_denied": "Kamerazugriff verweigert. Pruefen Sie die Browserberechtigungen.",
-    "qr_scan_no_camera": "Keine Kamera auf diesem Gerat gefunden.",
+    "qr_scan_denied": "Kamerazugriff verweigert. Prüfen Sie die Browserberechtigungen.",
+    "qr_scan_no_camera": "Keine Kamera auf diesem Gerät gefunden.",
     "qr_scan_busy": "Die Kamera wird von einer anderen App verwendet.",
-    "qr_scan_insecure": "Scannen erfordert HTTPS. Oeffnen Sie die App ueber https://",
+    "qr_scan_insecure": "Scannen erfordert HTTPS. Öffnen Sie die App über https://",
     "iface": "Schnittstelle",
     "last_fetch": "Letzter Abruf",
     "resources": "Ressourcennutzung",
@@ -4232,22 +4232,22 @@
     "save_failed": "Speichern fehlgeschlagen",
     "created": "Benutzer angelegt",
     "saved": "Gespeichert",
-    "deleted": "Benutzer geloescht",
+    "deleted": "Benutzer gelöscht",
     "group_created": "Gruppe angelegt",
     "group_saved": "Gruppe gespeichert",
-    "group_deleted": "Gruppe geloescht",
-    "reset_password": "Passwort zuruecksetzen",
+    "group_deleted": "Gruppe gelöscht",
+    "reset_password": "Passwort zurücksetzen",
     "reset_prompt": "Neues Passwort:",
-    "password_reset": "Passwort zurueckgesetzt",
+    "password_reset": "Passwort zurückgesetzt",
     "edit": "Bearbeiten",
-    "delete": "Loeschen",
-    "confirm_delete_user": "Benutzer {name} loeschen?",
-    "confirm_delete_group": "Gruppe {name} loeschen?",
+    "delete": "Löschen",
+    "confirm_delete_user": "Benutzer {name} löschen?",
+    "confirm_delete_group": "Gruppe {name} löschen?",
     "tab_info": "Info",
     "tab_members": "Mitglieder",
     "tab_perms": "Berechtigungen",
     "no_members": "Keine Mitglieder",
-    "perm_hint": "Berechtigungen dieser Gruppe fuer Ressourcen. Auto = Standard, Allow = explicit, Deny = explicit.",
+    "perm_hint": "Berechtigungen dieser Gruppe für Ressourcen. Auto = Standard, Allow = explicit, Deny = explicit.",
     "perm_models": "Modelle",
     "perm_flows": "Flows",
     "perm_addons": "Addons",
@@ -4693,9 +4693,9 @@
     "gpu_list_hint": "Verfügbare GPUs ({n})",
     "cluster": {
       "ready_timeout": "Modell-Ladebudget (s)",
-      "ready_timeout_hint": "Zeit bis die Gewichte geladen sind und /v1/models antwortet. Bei Ueberschreitung wird der ganze Cluster abgebaut.",
-      "vllm_args": "Zusaetzliche vLLM-Argumente",
-      "vllm_args_hint": "Werden nach den Engine-Argumenten angehaengt und ueberschreiben deren Vorgaben."
+      "ready_timeout_hint": "Zeit bis die Gewichte geladen sind und /v1/models antwortet. Bei Überschreitung wird der ganze Cluster abgebaut.",
+      "vllm_args": "Zusätzliche vLLM-Argumente",
+      "vllm_args_hint": "Werden nach den Engine-Argumenten angehängt und überschreiben deren Vorgaben."
     }
   },
   "category": {
@@ -5568,7 +5568,7 @@
       "mover_restricted": "Das Verschieben ist auf das Zeitplanfenster beschränkt: außerhalb davon warten Dateien auf dem Cache, es sei denn, dort wird der Platz knapp.",
       "mover_settings": "Einstellungen",
       "mover_name_note": "Im Auftragsverlauf und in den Knotenprotokollen erscheint dies als „Mover“.",
-      "cache_pending": "Auf dem Cache-Datenträger, noch ungeschützt",
+      "cache_pending": "Im Cache ohne Parität",
       "sync_schedule": "Sync-Zeitplan",
       "scrub_schedule": "Scrub-Zeitplan",
       "sync_schedule_title": "Zeitplan bearbeiten: Sync {name}",
@@ -5628,7 +5628,7 @@
       "next_steps": "Nächste Schritte",
       "step_repair": "Reparieren Sie die vom Scrub als fehlerhaft markierten Blöcke aus der Parität.",
       "step_scrub": "Führen Sie einen Scrub aus, um zu prüfen, ob noch etwas zu reparieren ist.",
-      "step_sync": "Führen Sie einen Sync aus — er erfordert eine Bestätigung, weil er den aktuellen Zustand der seit dem letzten Sync gelöschten oder geänderten Dateien festhält.",
+      "step_sync": "Führen Sie einen Sync aus — er erfordert eine Bestätigung, weil unter den seit dem letzten Sync gelöschten oder geänderten Dateien beschädigte sein können und der Sync sie als neuen Zustand festhält.",
       "sync_fault_title": "Sync trotz eines nicht behobenen Fehlers im Array {name}",
       "sync_fault_warning": "Das Array {name} hat einen nicht behobenen Scrub- oder Reparaturfehler. Der Sync schreibt trotzdem einen neuen Paritäts-Checkpoint.",
       "sync_fault_loses": "Dateien, die seit dem letzten Sync gelöscht oder geändert wurden, auch beschädigte, werden in ihrem neuen Zustand festgehalten — ihre früheren Versionen lassen sich danach nicht mehr aus der Parität wiederherstellen.",
@@ -5658,13 +5658,13 @@
       "add_disk_undo_unavailable": "Der Datenträger ist möglicherweise bereits der Freigabe beigetreten — das Hinzufügen kann nur abgeschlossen werden.",
       "repair_add_pending": "das Array hat ein nicht abgeschlossenes Hinzufügen eines Datenträgers: schließen Sie es zuerst ab oder machen Sie es rückgängig",
       "repair_needs_restore": "das Array wartet auf die Wiederherstellung seiner Einhängungen: verwenden Sie zuerst „Mounts wiederherstellen“",
-      "create_policy_mfs": "meister freier Speicher",
-      "create_policy_epmfs": "meister freier Speicher auf vorhandenem Pfad",
+      "create_policy_mfs": "am meisten freier Speicher",
+      "create_policy_epmfs": "am meisten freier Speicher auf vorhandenem Pfad",
       "create_policy_ff": "erster Datenträger mit Platz",
-      "create_policy_lfs": "wenigster freier Speicher",
+      "create_policy_lfs": "am wenigsten freier Speicher",
       "create_policy_epff": "erster Datenträger mit vorhandenem Pfad",
       "create_policy_rand": "zufälliger Datenträger",
-      "create_policy_msplfs": "wenigster freier Speicher auf dem längsten vorhandenen Pfad",
+      "create_policy_msplfs": "am wenigsten freier Speicher auf dem längsten vorhandenen Pfad",
       "card_mover": "Verschieben aus dem Cache",
       "card_cache_waiting": "{size} im Cache ohne Parität",
       "state_member": {
@@ -5692,8 +5692,10 @@
         "helper_failed": "Der Helper hat beim Lesen dieses Arrays einen Fehler gemeldet — Details im Tooltip.",
         "operation_failed": "Der Vorgang „{operation}“ ist nicht gelungen — Details im Tooltip.",
         "operation_failed_unnamed": "Ein Vorgang an diesem Array ist nicht gelungen — Details im Tooltip.",
-        "supervision_lost": "Der Knoten hat die Kontrolle über einen Vorgang dieses Arrays verloren (Neustart); sein Zustand beweist nicht, dass die Schreibvorgänge abgeschlossen sind."
-      }
+        "supervision_lost": "Der Knoten hat die Kontrolle über einen Vorgang dieses Arrays verloren (Neustart); sein Zustand beweist nicht, dass die Schreibvorgänge abgeschlossen sind.",
+        "uncoded": "Der Knoten hat den Zustand dieses Arrays nur mit eigenen Worten beschrieben — Details im Tooltip."
+      },
+      "sync_fault_unmeasured": "Zwei Fälle wurden nicht gemessen: eine Datei, die der Scrub nicht lesen konnte und die sich ebenfalls geändert hat, und ein Datenträger, der während des Sync auszufallen beginnt — rechnen Sie in beiden mit einem Verlust."
     },
     "wizard_pool": {
       "elastic_data": "Datenträger",
@@ -5811,7 +5813,7 @@
         "same_device": "{other} ({other_role}) und {disk} ({role}) sind dasselbe Gerät: Ein Gerät kann nicht zwei Plätze in einem Array belegen.",
         "data_disks_same_device": "{other} und {disk} sind dasselbe Gerät: Ein Gerät kann nicht zwei Datenträger sein.",
         "disk_in_use": "{disk} {owner} — ein Datenträger gehört zu einem davon, nicht zu beiden (dieses Array würde ihn löschen).",
-        "parity_too_small": "{disk} fasst {size}, der größte Datenträger {largest}: Ein Paritätsdatenträger muss mindestens so groß sein wie der größte Datenträger, sonst kann er ihn nicht abdecken.",
+        "parity_too_small": "{disk} ({size}) kann keine Parität sein — er ist kleiner als der größte Datenträger ({largest}).",
         "filesystem_invalid": "„{filesystem}“ ist kein Dateisystem, das diese App anlegt: Ein Elastic-Datenträger trägt xfs oder ext4, damit er allein lesbar bleibt.",
         "filesystem_unavailable": "mkfs.{filesystem} ist auf diesem Knoten nicht installiert, daher kann kein Datenträger dieses Arrays vorbereitet werden.",
         "plan_failed": "Aus diesem Layout lässt sich kein Plan erstellen — Details im Tooltip."
@@ -5990,7 +5992,9 @@
       "leaf_missing_at": "Datenträger fehlt, Nr. {n}",
       "disk_detach": "Alten Datenträger abtrennen",
       "disk_detach_confirm": "Der Datenträger {device} wird vom Pool {pool} abgetrennt (zpool detach). Seine Daten liegen bereits auf dem Hot Spare, der an seiner Stelle im Pool bleibt. Nach dem Abtrennen kann {device} sicher entfernt werden.",
-      "disk_detach_done": "Datenträger {device} abgetrennt — er kann entfernt werden"
+      "disk_detach_done": "Datenträger {device} abgetrennt — er kann entfernt werden",
+      "leaf_embedded_last_known": "Nr. {n} (zuletzt als {name})",
+      "leaf_embedded_at": "Nr. {n}"
     },
     "props": {
       "title": "Pool-Eigenschaften",
@@ -6045,7 +6049,11 @@
       "explain_others": " sowie den vdevs {roles}",
       "retype": "Gib den Pool-Namen erneut ein, um zu bestätigen:",
       "share_stops": "{protocol}-Freigabe „{name}“ funktioniert nicht mehr",
-      "target_stops": "{protocol}-Target „{name}“ funktioniert nicht mehr"
+      "target_stops": "{protocol}-Target „{name}“ funktioniert nicht mehr",
+      "share_stops_fleet": "{protocol}-Freigabe „{name}“ funktioniert auf {n} {n|Flottenknoten|Flottenknoten} nicht mehr",
+      "shares_unchecked": "Es konnte nicht geprüft werden, welche Freigaben auf diesem Pool liegen — die Liste kann unvollständig sein.",
+      "targets_unchecked": "Es konnte nicht geprüft werden, welche Targets diesen Pool nutzen — die Liste kann unvollständig sein.",
+      "dependents_scope": "Aufgeführt sind die Freigaben und Targets dieser Organisation; andere Organisationen auf diesem Knoten zeigt diese Liste nicht."
     },
     "add_vdev": {
       "title": "Vdev zu {name} hinzufügen",
@@ -6524,7 +6532,13 @@
       "audit_smb_direct": "Der SMB-Direct-Pfad (RDMA) wird nicht auditiert.",
       "audit_nothing": "nichts wird auditiert",
       "audit_auditd": "auditd-Watches",
-      "audit_auditd_note": "Ereignisse im Audit-Log des Hosts (ausearch -k tentanas), nicht im „Zugriffsprotokoll“."
+      "audit_auditd_note": "Ereignisse im Audit-Log des Hosts (ausearch -k tentanas), nicht im „Zugriffsprotokoll“.",
+      "state_reason": {
+        "source_invalid": "Die Quelle der Freigabe ist kein gültiges Verzeichnis auf einem Pool oder Array dieses Knotens — Details im Tooltip",
+        "source_unmounted": "Die Quelle der Freigabe ist nicht eingehängt — die Freigabe bleibt außerhalb der Konfiguration",
+        "service_missing": "Auf diesem Knoten fehlt das Paket {package}",
+        "smb_direct_not_served": "SMB Direct wird auf diesem Knoten nicht bereitgestellt (die Freigabe funktioniert weiter über das LAN)"
+      }
     },
     "wizard_share": {
       "title": "Neue Freigabe",
@@ -6783,8 +6797,8 @@
         },
         "elastic_sync_held": {
           "title": "Array {array}: geplanter Sync angehalten, Parity meldet Fehler",
-          "detail": "Ein Scrub hat Fehler gemeldet, die noch nichts repariert hat. Ein geplanter Sync würde den aktuellen Zustand der seit dem letzten Sync gelöschten oder geänderten Dateien festhalten, auch beschädigter, und ihre früheren Versionen ließen sich nicht mehr aus der Parität wiederherstellen. Führen Sie die Reparatur aus der Parität und danach einen Scrub aus; ein manueller Sync bleibt verfügbar.",
-          "detail_fault": "Der Scrub wurde nicht korrekt beendet oder eine Reparatur ist fehlgeschlagen. Der geplante Sync würde den aktuellen Zustand der seit dem letzten Sync gelöschten oder geänderten Dateien festhalten, auch beschädigter, und erfordert daher eine Bestätigung in der Array-Ansicht. Führen Sie einen Scrub oder die Reparatur aus der Parität aus; ein manueller Sync bleibt nach der Bestätigung verfügbar."
+          "detail": "Der Scrub hat Fehler gemeldet, die noch nichts repariert hat. Unter den seit dem letzten Sync gelöschten oder geänderten Dateien können beschädigte sein — der geplante Sync würde sie als neuen Zustand festhalten, und ihre früheren Versionen ließen sich nicht mehr aus der Parität wiederherstellen. Führen Sie die Reparatur aus der Parität und danach einen Scrub aus; ein manueller Sync bleibt verfügbar.",
+          "detail_fault": "Der Scrub wurde nicht korrekt beendet oder eine Reparatur ist fehlgeschlagen, daher ist nicht bekannt, ob unter den seit dem letzten Sync gelöschten oder geänderten Dateien beschädigte sind — der geplante Sync würde sie als neuen Zustand festhalten und erfordert daher eine Bestätigung in der Array-Ansicht. Führen Sie einen Scrub oder die Reparatur aus der Parität aus; ein manueller Sync bleibt nach der Bestätigung verfügbar."
         },
         "elastic_mover_settle_stopped": {
           "title": "Array {array}: automatischer Abschluss des Verschiebens pausiert",
@@ -6807,7 +6821,10 @@
           "file_branch": "{path}: sichtbare Version {visible}, die andere liegt auf einem der Laufwerke des Arrays",
           "copy_kept": "Pfad der zweiten Version kopieren: {path}",
           "copied": "Pfad der zweiten Version von {path} kopiert",
-          "copy_failed": "Der Pfad konnte nicht kopiert werden — der Browser hat den Zugriff auf die Zwischenablage nicht erlaubt"
+          "copy_failed": "Der Pfad konnte nicht kopiert werden — der Browser hat den Zugriff auf die Zwischenablage nicht erlaubt",
+          "copied_on": "Pfad der zweiten Version von {path} kopiert — ein Pfad auf dem Knoten {node}",
+          "copied_on_unnamed": "Pfad der zweiten Version von {path} kopiert — ein Pfad auf dem Knoten ohne Namen",
+          "copy_more": "und {n} {n|weitere Datei|weitere Dateien}"
         },
         "elastic_needs_attention": {
           "title": "Array {array} erfordert einen Eingriff",
@@ -7273,7 +7290,11 @@
       "not_answered_hint": "Unbekannt: Die Freigabe- oder Target-Liste dieses Nodes konnte nicht gelesen werden (keine Antwort oder ein Fehler). Die Zahl erscheint, sobald der Node antwortet.",
       "target_any_client": "jeder Portal-Client",
       "target_initiators": "{n} {n|Initiator|Initiatoren}",
-      "target_hosts": "{n} {n|Host-NQN|Host-NQNs}"
+      "target_hosts": "{n} {n|Host-NQN|Host-NQNs}",
+      "sessions_nvmet_age": "Anzahl der NVMe-oF-Sitzungen aus einer höchstens {minutes} Min. alten Messung",
+      "node_read_failed": "Lesefehler",
+      "targets_unreadable": "Der Knoten antwortet, aber seine Target-Liste konnte nicht gelesen werden: {error}",
+      "shares_unreadable": "Der Knoten antwortet, aber seine Freigabeliste konnte nicht gelesen werden: {error}"
     },
     "node": {
       "head_sub_node": "Knoten {name}",
@@ -7401,7 +7422,13 @@
         "task_mover": "Mover",
         "task_sync": "Paritäts-Sync",
         "task_scrub": "Paritäts-Scrub",
-        "elastic_fix_unnamed": "Schreibt aus der Parität die vom letzten Scrub markierten Blöcke zurück, in seit dem letzten Sync unveränderten Dateien, auf einen Datenträger des Arrays."
+        "elastic_fix_unnamed": "Schreibt aus der Parität die vom letzten Scrub markierten Blöcke zurück, in seit dem letzten Sync unveränderten Dateien, auf einen Datenträger des Arrays.",
+        "config_import_task": {
+          "scrub": "Scrub-Zeitplan des Pools {subject}",
+          "trim": "TRIM-Zeitplan des Pools {subject}",
+          "snapshot": "Snapshot-Zeitplan des Datasets {subject}",
+          "smart": "SMART-Testzeitplan"
+        }
       }
     },
     "access": {
@@ -7585,13 +7612,15 @@
         "portal_moved_head_gone": "Das Portal des Targets ist nicht mehr dort, wo es festgelegt wurde. Die Adresse {address} gehörte zur Schnittstelle {interface}, die es auf diesem Knoten nicht mehr gibt.",
         "portal_moved_nowhere": "Keine Schnittstelle dieses Knotens hat diese Adresse noch.",
         "portal_moved_reachable": "Sie liegt jetzt auf {elsewhere}, das niemand für dieses Target gewählt hat — der Export ist dort erreichbar.",
-        "portal_moved_silent": "Sie liegt jetzt auf {elsewhere}. Das Target ist nicht im Kernel, daher lauscht unter dieser Adresse nichts — der Export ist auf {elsewhere} nicht erreichbar.",
+        "portal_moved_silent": "Sie liegt jetzt auf {elsewhere}. Das Target ist nicht im Kernel, daher lauscht unter dieser Adresse nichts — der Export ist auf {elsewhere} nicht erreichbar und wird dort nicht automatisch neu gebunden.",
         "portal_moved_tail": "Das Target bleibt unverändert, bis ein Admin das Portal neu wählt.",
         "not_exported": "Gespeichert, aber dieser Knoten exportiert es noch nicht — der nächste Abgleich wendet es an.",
         "no_auth": "Keine Authentifizierung — die IQN/NQN-Zulassungsliste ist ein Filter, keine Anmeldung.",
         "import_secret_needed": "Das Authentifizierungsgeheimnis muss nach einem Import erneut eingegeben werden.",
         "import_all_interfaces": "Dieses Target wurde auf allen Schnittstellen (0.0.0.0) exportiert — wählen Sie eine Schnittstelle dieses Knotens, bevor Sie es aktivieren.",
-        "portal_moved_head_no_address": "Das Portal des Targets ist nicht mehr dort, wo es festgelegt wurde. Die Adresse {address} gehörte zur Schnittstelle {interface}, die auf diesem Knoten vorhanden ist, aber derzeit keine Adresse hat (Link getrennt oder DHCP-Lease verloren)."
+        "portal_moved_head_no_address": "Das Portal des Targets ist nicht mehr dort, wo es festgelegt wurde. Die Adresse {address} gehörte zur Schnittstelle {interface}, die auf diesem Knoten vorhanden ist, aber derzeit keine Adresse hat (Link getrennt oder DHCP-Lease verloren).",
+        "portal_moved_silent_since": "Seit {since} liegt sie auf {elsewhere}. Das Target ist nicht im Kernel, daher lauscht unter dieser Adresse nichts — der Export ist auf {elsewhere} nicht erreichbar und wird dort nicht automatisch neu gebunden.",
+        "portal_moved_reachable_since": "Seit {since} liegt sie auf {elsewhere}, das niemand für dieses Target gewählt hat — der Export ist dort erreichbar."
       },
       "host_state": "Status",
       "host_connected": "Verbunden",
@@ -7742,7 +7771,8 @@
       "elastic_undo_stopped": "Das Rückgängigmachen wurde nach seinem ersten Schritt angehalten — das Hinzufügen bleibt unvollständig",
       "elastic_disk_absent": "Der Datenträger, der gelöscht würde, ist auf diesem Knoten nicht vorhanden — schließen Sie ihn an und versuchen Sie es erneut",
       "job_not_cancellable": "Dieser Auftrag kann nicht abgebrochen werden — ein Abbruch würde die bereits begonnene Arbeit nicht anhalten",
-      "pool_detach_not_allowed": "Dieser Datenträger kann jetzt nicht abgetrennt werden: Abtrennen lässt sich nur ein Datenträger, den ein funktionierender Hot Spare ersetzt hat, und erst nach Abschluss des Resilvers."
+      "pool_detach_not_allowed": "Dieser Datenträger kann jetzt nicht abgetrennt werden: Abtrennen lässt sich nur ein Datenträger, den ein funktionierender Hot Spare ersetzt hat, und erst wenn der Resilver ohne Fehler abgeschlossen ist und der Pool keine dauerhaften Datenfehler meldet.",
+      "elastic_one_cache_disk": "Ein Elastic Array kann höchstens ein Cache-Laufwerk haben"
     },
     "unreachable": {
       "title": "Knoten {node} nicht erreichbar",
@@ -7767,7 +7797,8 @@
       "log_mesh_offline_unnamed": "das Mesh sieht diesen Knoten nicht — er ist getrennt",
       "log_lost": "{node} antwortet nicht mehr",
       "log_lost_unnamed": "der Knoten antwortet nicht mehr",
-      "error": "Der Knoten antwortet nicht — die Mesh-Verbindung ist verloren"
+      "error": "Der Knoten antwortet nicht — die Mesh-Verbindung ist verloren",
+      "retry_in": "Nächster Versuch in {seconds} s"
     }
   },
   "agent_accounts": {

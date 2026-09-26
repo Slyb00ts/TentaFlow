@@ -40,6 +40,7 @@ const { elasticRefusalText, elasticPlanWarnings } = await import('./pool-wizard.
 const { targetStateText, targetStateTitle } = await import('./targets.js');
 const { kernelSupportText } = await import('./target-wizard.js');
 const { elasticStateDetail, elasticStateTitle } = await import('./elastic-detail.js');
+const { shareStateText } = await import('./shares.js');
 
 // See refusal-wire.test.js: the app's own transport starts retrying a socket
 // that is not there once the codec is ready; it is closed so the run ends.
@@ -193,7 +194,7 @@ test('an Elastic preview keeps its coded refusals and warnings through the real 
   const [refusal] = body.plan.refusals;
   assert.deepEqual({ ...refusal.params }, { size: '4000000000000', largest: '8000000000000' });
   const worded = elasticRefusalText(refusal);
-  assert.match(worded.text, /^sde ma 3\.6 TiB, a największy dysk danych 7\.3 TiB/);
+  assert.match(worded.text, /^sde \(3\.6 TiB\) nie może być parity — jest mniejszy niż największy dysk danych \(7\.3 TiB\)\.$/);
   assert.ok(!worded.text.includes('wwn-'), worded.text);
   assert.equal(worded.title, refusal.detail);
   assert.deepEqual(elasticPlanWarnings(body.plan), ['Bez dysku cache: mover nie ma nic do roboty, a nowe pliki trafiają od razu na dyski danych.']);
@@ -228,7 +229,7 @@ test('a target, its services and the capabilities keep their coded reasons throu
   // N19b in the reader's language, the node's English as the tooltip.
   const text = targetStateText(t);
   assert.match(text, /^Portal targetu nie jest już tam, gdzie go przypięto\. Adres 10\.10\.0\.7 należał do interfejsu storage1 \(który ma teraz 10\.10\.0\.9\)\./);
-  assert.match(text, /Target nie jest w jądrze, więc pod tym adresem nic nie nasłuchuje — eksport nie jest osiągalny na bond0\./);
+  assert.match(text, /Target nie jest w jądrze, więc pod tym adresem nic nie nasłuchuje — eksport nie jest osiągalny na bond0 i nie zostanie tam przepięty automatycznie\./);
   assert.equal(targetStateTitle(t), t.stateDetail);
 
   const [service] = body.services;
@@ -258,4 +259,36 @@ test('an Elastic Array keeps its coded state through the real decoder, members b
   assert.equal(a.stateReasons[0].code, 'branches_mountable');
   assert.equal(elasticStateDetail(a), 'Obecne i jeszcze niezamontowane: dysk danych nr 1, dysk danych sdh, dysk parity sdj. Następne uzgodnienie zamontuje je, a potem unię.');
   assert.equal(elasticStateTitle(a), a.stateDetail);
+});
+
+// Wave 8: a share's state detail travels as codes too (`NasShare.state_reasons`,
+// `#[serde(default)]`). Through the real decoder: an unmounted source and an
+// SMB Direct refusal with the node's own ksmbd reasons, both worded; the
+// English — with its path — only in the tooltip.
+test('a share keeps its coded state through the real decoder and is worded from it', { skip }, async () => {
+  const share = (name, state, detail, reasons) => ({
+    share_id: `s-${name}`, name, protocol: 'smb', source_path: `/mnt/tank/${name}`, dataset: `tank/${name}`, enabled: true,
+    smb: null, nfs: null, fleet_mount: false, mounts: [], sessions: 0, state, state_detail: detail,
+    created_at: '2026-09-01T00:00:00Z', updated_at: '2026-09-01T00:00:00Z', state_reasons: reasons,
+  });
+  const body = await throughTheClient('tentaNasSharesListRequest', {}, 'SharesListResponse', {
+    shares: [
+      share('projekty', 'error', 'source path is not mounted — the share stays out of the config', [reason('share_source_unmounted')]),
+      share('media', 'active', 'SMB Direct is not served on this node: no RDMA interface with an address · EXPERIMENTAL (kernel docs)',
+        [reason('smb_direct_not_served'), reason('ksmbd_no_interface'), reason('ksmbd_experimental')]),
+      share('stary', 'error', "'/mnt/tank/stary' is not a directory on this node", []),
+    ],
+    services: [], users: [], mount_root: '/mnt/tentanas',
+  });
+  const [unmounted, direct, old] = body.shares;
+  assert.equal(unmounted.stateReasons[0].code, 'share_source_unmounted', 'the field survives the decoder');
+  assert.deepEqual(shareStateText(unmounted), {
+    text: 'Źródło udziału nie jest zamontowane — udział nie trafia do konfiguracji',
+    title: 'source path is not mounted — the share stays out of the config',
+  });
+  const worded = shareStateText(direct).text;
+  assert.match(worded, /^SMB Direct nie jest obsługiwany na tym węźle \(udział działa dalej przez sieć LAN\) · /);
+  assert.doesNotMatch(worded, /is not served|no RDMA interface/, 'no English outside the tooltip');
+  // A row judged before the codes: the sentence, as it came.
+  assert.deepEqual(shareStateText(old), { text: "'/mnt/tank/stary' is not a directory on this node", title: '' });
 });

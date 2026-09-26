@@ -117,6 +117,28 @@ test('a fleet row keeps armed_until through the real decoder, and the channel is
   assert.equal(armed.capacityBytes, 32_000_000_000_000);
 });
 
+// Critic wave 7, MINOR 11: the node counts the seconds left by its own clock,
+// and the screen adds them to the moment the row arrived — a browser clock
+// hours off can neither expire an armed node nor keep an expired one armed.
+test('a fleet row keeps armed_secs_left through the real decoder, and it outranks the browser clock', { skip }, async () => {
+  const body = await throughTheClient('tentaNasNodesListRequest', {}, 'NodesListResponse', {
+    local_node_id: 'n-0',
+    nodes: [
+      // By this browser's clock the instant is long past; by the node's own
+      // clock ten minutes are left.
+      nodeRow({ armed_until: '2000-01-01T00:10:00Z', armed_secs_left: 600 }),
+      // The instant is far ahead by this browser's clock; the node says it is over.
+      nodeRow({ node_id: 'n-2', node_name: 'atlas', armed_until: ARMED_UNTIL, armed_secs_left: 0 }),
+    ],
+  });
+  const [armed, expired] = body.nodes;
+  assert.equal(Number(armed.armedSecsLeft), 600, 'the field survives the decoder');
+  const receivedAt = Date.now();
+  assert.equal(nodeChannelMode({ ...armed, receivedAt }), 'interactive');
+  assert.equal(nodeChannelMode({ ...armed, receivedAt }, receivedAt + 601_000), 'interactive_unarmed', 'and it ends when the node said it would');
+  assert.equal(nodeChannelMode({ ...expired, receivedAt }), 'interactive_unarmed');
+});
+
 // MAJOR 2 (wave 7): the fleet asks for the LIGHT target list. The flag must
 // survive codec.js and the wasm encoder, or every fleet tick silently pays for
 // the full Sharing-tab answer again.

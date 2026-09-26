@@ -880,6 +880,24 @@ pub fn overwritten(items: &[NasConfigImportItem]) -> Vec<String> {
         .collect()
 }
 
+/// The same overwritten schedules as `[task, subject]` pairs — `["scrub",
+/// "tank"]`, `["snapshot", "tank/x"]`, `["smart", ""]` — as JSON, for the
+/// approval's params: a screen words the task in the reader's language
+/// instead of printing the plan's own "scrub tank" (critic wave 6, MINOR 10).
+/// The plan names a schedule `<task> <subject>` (`plan`), a task being one
+/// word, so the first space splits them.
+pub fn overwritten_schedules_json(items: &[NasConfigImportItem]) -> String {
+    let pairs: Vec<[&str; 2]> = items
+        .iter()
+        .filter(|i| i.action == "update" && i.kind == "schedule")
+        .map(|i| {
+            let (task, subject) = i.name.split_once(' ').unwrap_or((i.name.as_str(), ""));
+            [task, subject]
+        })
+        .collect();
+    serde_json::to_string(&pairs).unwrap_or_else(|_| "[]".to_string())
+}
+
 // =============================================================================
 // import apply
 // =============================================================================
@@ -1045,6 +1063,7 @@ pub async fn apply_with(
             nfs: share.nfs.clone(),
             state: "disabled".to_string(),
             state_detail: String::new(),
+            state_reasons: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         };
@@ -1667,6 +1686,10 @@ mod tests {
         assert_eq!(find(&items, "share", "elsewhere").action, "conflict");
 
         assert_eq!(find(&items, "schedule", "scrub tank").action, "update");
+        // The approval's structured form of the same overwrite.
+        let pairs: Vec<[String; 2]> = serde_json::from_str(&overwritten_schedules_json(&items)).expect("json");
+        assert!(pairs.contains(&["scrub".to_string(), "tank".to_string()]), "{pairs:?}");
+        assert!(pairs.iter().all(|[task, _]| !task.contains(' ')));
         assert_eq!(
             find(&items, "schedule", "snapshot tank/projekty").action,
             "create"

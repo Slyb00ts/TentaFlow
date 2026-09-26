@@ -614,6 +614,10 @@ pub fn nodes(ctx: &HandlerContext, addon_id: &str) -> Vec<NasNodeInfo> {
                 .get(&node_id)
                 .and_then(|v| serde_json::from_str::<NodeSummary>(v).ok())
                 .unwrap_or_default();
+            // This node answers from its own slot, which is exact; a peer's is
+            // what its last summary said (republished within a tick of an arm
+            // or a disarm, `disks::request_summary_refresh`).
+            let armed = if node_id == local_id { super::elevation::armed_until() } else { s.armed_until.clone() };
             NasNodeInfo {
                 node_name: node_name(ctx, &node_id),
                 is_local: node_id == local_id,
@@ -638,10 +642,12 @@ pub fn nodes(ctx: &HandlerContext, addon_id: &str) -> Vec<NasNodeInfo> {
                 arrays_unmeasured: s.arrays_unmeasured,
                 // Set by `scope_local_org_figures`, on this node's row only.
                 per_org_counted: false,
-                // This node answers from its own slot, which is exact; a peer's
-                // is what its last summary said (republished within a tick of
-                // an arm or a disarm, `disks::request_summary_refresh`).
-                armed_until: if node_id == local_id { super::elevation::armed_until() } else { s.armed_until },
+                armed_until: armed.clone(),
+                // Counted here, by the answering node's clock, so the browser
+                // never compares an instant with its own (MINOR 11). A peer's
+                // instant is judged by this node's clock — nodes of one mesh
+                // keep time far closer than an arbitrary browser does.
+                armed_secs_left: super::elevation::armed_secs_left(armed.as_deref()),
                 updated_at: (!s.updated_at.is_empty()).then_some(s.updated_at),
                 node_id,
             }
@@ -805,6 +811,21 @@ mod tests {
         )
         .expect("an older fleet row decodes");
         assert_eq!(row.armed_until, None);
+        assert_eq!(row.armed_secs_left, None, "an older row sends no remaining seconds");
+    }
+
+    /// Critic wave 7, MINOR 11: the seconds left are counted by the node's
+    /// clock when it answers — a browser adds them to the moment it received
+    /// the answer instead of comparing the instant with its own clock.
+    #[test]
+    fn the_seconds_left_of_an_armed_channel_are_counted_by_the_node() {
+        use super::super::elevation::armed_secs_left;
+        let at = |secs: i64| (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let left = armed_secs_left(Some(&at(600))).expect("armed");
+        assert!((598..=600).contains(&left), "{left}");
+        assert_eq!(armed_secs_left(Some(&at(-30))), Some(0), "a past instant has nothing left");
+        assert_eq!(armed_secs_left(None), None);
+        assert_eq!(armed_secs_left(Some("garbage")), None);
     }
 
     /// The published row carries pools only; THIS node's row gets the asking
@@ -985,7 +1006,7 @@ mod tests {
         super::super::db::upsert_share(&db, "org-a", &share("a1", "projekty")).unwrap();
         super::super::db::upsert_share(&db, "org-b", &share("b1", "kadry")).unwrap();
         super::super::db::upsert_share(&db, "org-b", &share("b2", "place")).unwrap();
-        super::super::db::set_share_state(&db, "b2", "error", "source path is not mounted").unwrap();
+        super::super::db::set_share_state(&db, "b2", "error", "source path is not mounted", &[]).unwrap();
 
         let rows = || {
             vec![

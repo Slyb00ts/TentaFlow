@@ -51,6 +51,21 @@ export function isNodeUnreachable(err) {
   return /^protocol error NodeUnreachable\b/.test(String(err.message || ''));
 }
 
+/**
+ * Whether a failed probe was nevertheless ANSWERED by the node: a protocol
+ * refusal (`protocol error <Code>: …` or a `code` on the error) other than
+ * `NodeUnreachable`. A bare transport error (a closed socket, a timeout)
+ * carries no code and is no answer.
+ */
+export function isNodeAnswer(err) {
+  if (!err || isNodeUnreachable(err)) return false;
+  if (typeof err.code === 'string' && err.code) return true;
+  return /^protocol error [A-Za-z]+\b/.test(String(err.message || ''));
+}
+
+/** How long one probe waits for the node before counting as no answer. */
+export const PROBE_TIMEOUT_MS = 10000;
+
 const CHECK_ICON = '<polyline points="20 6 9 17 4 12"/>';
 
 /**
@@ -76,7 +91,7 @@ export function lostNodeError(node) {
  * `NodeUnreachable` raises the overlay (only for the node the screen shows —
  * the fleet view lists an unreachable node as a row of its own).
  */
-export function createNodeLink(screen, { transport = ApiBinary, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+export function createNodeLink(screen, { transport = ApiBinary, setTimer = setTimeout, clearTimer = clearTimeout, platformDown = isPlatformDown } = {}) {
   let lost = null; // { nodeId, attempt, timer, parked: [{ run, resolve, reject }], probing }
   let overlay = null;
   let keepEl = null;
@@ -92,7 +107,11 @@ export function createNodeLink(screen, { transport = ApiBinary, setTimer = setTi
       iconTone: 'danger',
       withExtra: true,
       withLog: true,
-      dim: { resolve: () => document.getElementById('nas-root'), className: 'nas-link-lost' },
+      // n18c blurs the whole app (the mockup's `.app-blurred`), not only the
+      // TentaNas pane; the card is on <body>, outside what it blurs.
+      dim: { resolve: () => document.getElementById('app-root') || document.getElementById('nas-root'), className: 'nas-link-lost' },
+      // n18c line 1: "Kolejna próba za 7 s", following the ring.
+      countdownLine: (seconds) => T('unreachable.retry_in', { seconds }),
       actions: [
         { id: 'fleet', label: T('unreachable.btn_fleet'), variant: 'ghost', icon: 'chevron-left' },
         { spacer: true },
@@ -138,13 +157,28 @@ export function createNodeLink(screen, { transport = ApiBinary, setTimer = setTi
     keepEl.textContent = nodeT('unreachable.keep', node);
     card.setRetryVisible(true);
     card.setFootVisible(true);
-    // The platform overlay outranks this one: "the daemon is gone" covers
-    // "one node is gone", and the two never stack.
-    if (!isPlatformDown()) card.show();
+    showUnlessPlatformDown();
   }
+
+  // The platform overlay outranks this one: "the daemon is gone" covers "one
+  // node is gone", and the two never stack. A node lost while the platform
+  // was down gets its card as soon as the platform is back (critic wave 7,
+  // MINOR 3) — from the platform's own "open", or at the latest from the next
+  // scheduled probe — never parked requests with nothing on screen.
+  function showUnlessPlatformDown() {
+    if (lost && overlay && !overlay.isVisible() && !platformDown()) overlay.show();
+  }
+  const offLifecycle = typeof transport.onLifecycle === 'function'
+    ? transport.onLifecycle((ev) => {
+      if (ev?.type !== 'open' || !lost || screen.disposed) return;
+      showUnlessPlatformDown();
+      probe();
+    })
+    : () => {};
 
   function schedule() {
     if (!lost) return;
+    showUnlessPlatformDown();
     lost.attempt += 1;
     const delay = retryDelayMs(lost.attempt);
     overlay.setRetryLines(T('unreachable.retry_line'), T('unreachable.retry_attempt', { attempt: lost.attempt, max: RETRY_MAX_MS / 1000 }));
@@ -154,20 +188,26 @@ export function createNodeLink(screen, { transport = ApiBinary, setTimer = setTi
   }
 
   // One cheap read, sent straight to the transport so it is never parked
-  // behind itself. Any answer — a refusal included — means the node is back.
+  // behind itself. Only an ANSWER from the node means it is back: a success,
+  // or a protocol refusal it sent (critic wave 7, MINOR 4). A transport
+  // failure — the platform socket down, a timeout — says nothing about the
+  // node, and releasing the parked requests into it would only fail them.
+  // The probe waits at most `PROBE_TIMEOUT_MS`, so a connected but silent
+  // node does not hold the card on "…" for the forwarder's 45 s.
   async function probe() {
     if (!lost || lost.probing) return;
     const current = lost;
     current.probing = true;
     clearTimer(current.timer);
     overlay.stopCountdown();
+    overlay.setRetryLines(T('unreachable.retry_line'), T('unreachable.retry_attempt', { attempt: current.attempt, max: RETRY_MAX_MS / 1000 }));
     try {
-      await transport.action('tentaNasEnvironmentRequest', { refresh: false }, { targetNodeId: current.nodeId });
+      await transport.action('tentaNasEnvironmentRequest', { refresh: false }, { targetNodeId: current.nodeId, timeoutMs: PROBE_TIMEOUT_MS });
       if (lost === current) recovered();
     } catch (err) {
       if (lost !== current) return;
       current.probing = false;
-      if (!isNodeUnreachable(err)) { recovered(); return; }
+      if (isNodeAnswer(err)) { recovered(); return; }
       overlay.log('warn', nodeT('unreachable.log_no_answer', nodeOf(current.nodeId), { attempt: current.attempt }));
       schedule();
     }
@@ -245,6 +285,7 @@ export function createNodeLink(screen, { transport = ApiBinary, setTimer = setTi
 
     destroy() {
       leave();
+      offLifecycle();
       if (overlay) { overlay.destroy(); overlay = null; keepEl = null; }
     },
   };
@@ -254,7 +295,7 @@ export function createNodeLink(screen, { transport = ApiBinary, setTimer = setTi
 // language, so a missing key fails a test instead of printing itself.
 export const NODE_LINK_KEYS = [
   'unreachable.title', 'unreachable.title_unnamed', 'unreachable.heading', 'unreachable.desc', 'unreachable.desc_unnamed',
-  'unreachable.keep', 'unreachable.keep_unnamed', 'unreachable.retry_line', 'unreachable.retry_attempt',
+  'unreachable.keep', 'unreachable.keep_unnamed', 'unreachable.retry_line', 'unreachable.retry_in', 'unreachable.retry_attempt',
   'unreachable.btn_fleet', 'unreachable.btn_refresh', 'unreachable.btn_retry', 'unreachable.log_manual',
   'unreachable.error', 'unreachable.log_lost', 'unreachable.log_lost_unnamed',
   'unreachable.log_no_answer', 'unreachable.log_no_answer_unnamed', 'unreachable.log_restored',

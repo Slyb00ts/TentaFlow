@@ -75,6 +75,10 @@ export function createConnectionOverlay(config = {}) {
     actions = [],
     dim = null,
     onAction = null,
+    // `(seconds) => text`: the first retry line follows the countdown ("Next
+    // attempt in 7 s"), written with the digits it matches. Without it the
+    // line stays what `setRetryLines` wrote.
+    countdownLine = null,
   } = config;
 
   const el = document.createElement('div');
@@ -170,6 +174,7 @@ export function createConnectionOverlay(config = {}) {
     if (seconds === lastSecondsShown) return;
     lastSecondsShown = seconds;
     countdownEl.textContent = seconds > 0 ? `${seconds}s` : '…';
+    if (countdownLine && seconds > 0) line1El.textContent = String(countdownLine(seconds) ?? '');
   }
 
   function stopCountdown() {

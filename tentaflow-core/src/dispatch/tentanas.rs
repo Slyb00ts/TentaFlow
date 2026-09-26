@@ -639,12 +639,11 @@ fn job_cancel(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, Protoco
     let job = store::job_for_org(&g.db, org_viewer(ctx, &g), job_id)
         .map_err(|e| internal("jobs", e))?
         .ok_or_else(|| ProtocolError::not_found("job not found"))?;
-    if matches!(job.kind.as_str(), "elastic_create" | "elastic_restore") {
-        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,
-            "Przyjęte tworzenie/przywracanie macierzy nie jest anulowalne"));
-    }
     // Only a kind whose cancel really stops the work (`jobs::user_cancellable`):
-    // anything else would read "cancelled" while its command runs on.
+    // anything else would read "cancelled" while its command runs on. An
+    // accepted Elastic create or restore is one of those, refused with the
+    // same code the screen words (critic wave 5, MINOR 13: it used to get a
+    // Polish sentence of its own first).
     if !tentanas::jobs::user_cancellable(&job.kind) {
         return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable, JOB_NOT_CANCELLABLE));
     }
@@ -1033,12 +1032,12 @@ async fn pools_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> 
 fn pool_plan(ctx: &HandlerContext, disk_ids: &[String]) -> Result<MessageBody, ProtocolError> {
     gate(ctx, PERM_READ)?;
     let disks = disks_by_id(disk_ids, false)?;
-    let (options, warnings, smallest_disk_bytes) = tentanas::pools::plan(&disks);
+    let plan = tentanas::pools::plan(&disks);
     Ok(tn(P::PoolPlanResponse {
-        options,
-        warnings,
-        smallest_disk_bytes,
-        warning_codes: tentanas::pools::plan_warning_codes(&disks),
+        options: plan.options,
+        warnings: plan.warnings,
+        smallest_disk_bytes: plan.smallest_disk_bytes,
+        warning_codes: plan.warning_codes,
     }))
 }
 
@@ -2496,6 +2495,7 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
         // in any config, and "disabled" is what that is.
         state: "disabled".to_string(),
         state_detail: String::new(),
+        state_reasons: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
     };
@@ -3612,7 +3612,11 @@ async fn config_import_apply(
                 &shown,
                 CodedText::new(
                     "config_import",
-                    &[("count", overwritten.len().to_string()), ("items", overwritten.join(", "))],
+                    &[
+                        ("count", overwritten.len().to_string()),
+                        ("items", overwritten.join(", ")),
+                        ("schedules", tentanas::config_io::overwritten_schedules_json(&items)),
+                    ],
                     format!("overwrites {}: {}", overwritten.len(), overwritten.join(", ")),
                 ),
                 &P::ConfigImportApplyRequest {
@@ -5306,7 +5310,9 @@ async fn elastic_array_plan(
     // the request outright would leave the wizard with a red error box and no
     // idea which disk to unpick.
     if cache_disk_ids.len() > 1 {
-        return Err(ProtocolError::bad_request("Elastic dopuszcza najwyżej jeden dysk cache"));
+        // A code the screen words in the reader's language, never a Polish
+        // sentence in an English toast (critic wave 6, MINOR 5).
+        return Err(ProtocolError::bad_request("refusal:elastic_one_cache_disk"));
     }
     let data = read_disks(data_disk_ids)?;
     let parity = optional_disks(parity_disk_ids, &read_disks)?;
@@ -7471,6 +7477,7 @@ mod registration_tests {
                 nfs: None,
                 state: "active".into(),
                 state_detail: String::new(),
+                state_reasons: Vec::new(),
                 created_at: store::now(),
                 updated_at: store::now(),
             },

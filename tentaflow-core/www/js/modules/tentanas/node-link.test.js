@@ -25,7 +25,7 @@ const NODE_ID = 'a'.repeat(64);
 const lostError = () => Object.assign(new Error(`node '${NODE_ID}' did not answer: timeout`), { code: 'NodeUnreachable' });
 const wordedLoss = (err) => err.code === 'NodeUnreachable' && err.message === 'Węzeł vega niedostępny' && !err.message.includes(NODE_ID);
 
-function harness(probeAnswers) {
+function harness(probeAnswers, { lifecycle = null, platformDown = () => false } = {}) {
   const timers = [];
   const probes = [];
   const screen = {
@@ -39,10 +39,12 @@ function harness(probeAnswers) {
       return next instanceof Error ? Promise.reject(next) : Promise.resolve(next);
     },
   };
+  if (lifecycle) transport.onLifecycle = (cb) => { lifecycle.push(cb); return () => lifecycle.splice(lifecycle.indexOf(cb), 1); };
   const link = createNodeLink(screen, {
     transport,
     setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
     clearTimer: () => {},
+    platformDown: () => platformDown(),
   });
   return { link, screen, timers, probes };
 }
@@ -99,6 +101,76 @@ test('a probe answered with a refusal means the node is back', async () => {
   document.querySelector('.conn-overlay.nas-conn [data-action="retry"]').click();
   assert.equal(await waiting, 'ok');
   link.destroy();
+});
+
+// Critic wave 7, MINOR 4: only an ANSWER from the node — a success or a
+// protocol refusal — is recovery. A transport error (the platform socket
+// down, a probe timeout) carries no code: the parked requests stay parked and
+// the next probe is scheduled. The probe itself waits at most 10 s.
+test('a probe that fails in the transport is no answer: nothing is released and the next probe is scheduled', async () => {
+  const { link, timers, probes } = harness([new Error('socket closed'), new Error('request tentaNasEnvironmentRequest timed out after 10000ms'), { environment: {} }]);
+  await link.send(REMOTE, () => Promise.reject(lostError())).catch(() => {});
+  let sent = 0;
+  const waiting = link.send(REMOTE, () => { sent += 1; return Promise.resolve('ok'); });
+  timers.at(-1).fn();
+  await tick();
+  assert.equal(link.isLost(REMOTE.nodeId), true, 'a closed socket is not the node answering');
+  assert.equal(sent, 0, 'the parked request is not released into a dead socket');
+  assert.equal(timers.at(-1).ms, 4000, 'the next probe is scheduled');
+  timers.at(-1).fn();
+  await tick();
+  assert.equal(link.isLost(REMOTE.nodeId), true, 'a timeout is no answer either');
+  assert.equal(probes[0].opts.timeoutMs, 10000, 'a probe waits 10 s, not the forwarder\'s 45 s');
+  timers.at(-1).fn();
+  assert.equal(await waiting, 'ok');
+  assert.equal(sent, 1);
+  link.destroy();
+});
+
+// Critic wave 7, MINOR 1: n18c line 1 is "Kolejna próba za 7 s", following
+// the ring, and the whole app is blurred, not only the TentaNas pane.
+test('the card counts down to the next attempt in words and blurs the whole app', async () => {
+  const app = document.createElement('div');
+  app.id = 'app-root';
+  document.body.appendChild(app);
+  const { link } = harness([]);
+  try {
+    await link.send(REMOTE, () => Promise.reject(lostError())).catch(() => {});
+    const card = document.querySelector('.conn-overlay.nas-conn');
+    assert.equal(card.querySelector('.conn-retry-info .line-1').textContent, 'Kolejna próba za 2 s');
+    assert.equal(card.querySelector('.conn-retry-info .line-2').textContent, 'próba 1 · backoff do 30 s');
+    assert.ok(app.classList.contains('nas-link-lost'), 'the app root carries the blur');
+    const css = readFileSync(new URL('../../../css/tentanas.css', import.meta.url), 'utf8');
+    assert.match(css, /\n\.nas-link-lost \{\s*filter: blur/, 'the blur applies wherever the class lands');
+  } finally {
+    link.destroy();
+    app.remove();
+  }
+  assert.equal(app.classList.contains('nas-link-lost'), false);
+});
+
+// Critic wave 7, MINOR 3: a node lost while its card could not be shown (the
+// platform overlay was up) gets its card when the platform's socket opens
+// again, and a probe at once — never parked requests with nothing on screen.
+test('when the platform comes back, a lost node\'s card is shown and the node is probed at once', async () => {
+  const lifecycle = [];
+  let down = true;
+  const { link, probes } = harness([lostError()], { lifecycle, platformDown: () => down });
+  await link.send(REMOTE, () => Promise.reject(lostError())).catch(() => {});
+  const card = document.querySelector('.conn-overlay.nas-conn');
+  const shown = () => card.classList.contains('visible');
+  assert.equal(shown(), false, 'the platform overlay outranks the node card');
+  assert.equal(lifecycle.length, 1, 'the link listens to the platform socket');
+  lifecycle[0]({ type: 'reconnect-scheduled' });
+  assert.equal(probes.length, 0, 'only an open socket is news');
+  down = false;
+  lifecycle[0]({ type: 'open' });
+  assert.equal(shown(), true, 'the card is shown as soon as the platform is back');
+  await tick();
+  assert.equal(probes.length, 1, 'and the node is probed at once');
+  assert.equal(link.isLost(REMOTE.nodeId), true, 'still lost: the probe got no answer');
+  link.destroy();
+  assert.equal(lifecycle.length, 0, 'destroy stops listening');
 });
 
 test('leaving the lost node releases every parked request with the error that parked it', async () => {

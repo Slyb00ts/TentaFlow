@@ -1014,6 +1014,13 @@ the next reconcile replaces this with the current count'
      WHERE state_detail <> '' AND state_reasons = '[]'
        AND EXISTS (SELECT 1 FROM nas_elastic_operations o
                     WHERE o.array_id = nas_elastic_arrays.array_id AND o.error = nas_elastic_arrays.state_detail);"),
+), (
+    24,
+    // Wave 8: a share's state detail as codes too (`shares::share_state`),
+    // beside the sentence the log and the tooltip keep. An old row keeps '[]'
+    // until the next apply judges it again, and its sentence is shown as it
+    // is meanwhile.
+    "ALTER TABLE nas_shares ADD COLUMN state_reasons TEXT NOT NULL DEFAULT '[]';",
 )];
 
 /// The owner migration 20 gives a legacy share, target or account it cannot
@@ -1725,6 +1732,20 @@ pub fn open_alert_severity(pool: &DbPool, dedupe_key: &str) -> Result<Option<Str
     Ok(conn
         .query_row(
             "SELECT severity FROM nas_alerts WHERE dedupe_key = ?1 AND resolved_at IS NULL",
+            params![dedupe_key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// When the OPEN alert under `dedupe_key` was raised, `None` when none is
+/// open. A target's portal drift says since when the address has been
+/// elsewhere from it (N19b).
+pub fn open_alert_raised_at(pool: &DbPool, dedupe_key: &str) -> Result<Option<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT raised_at FROM nas_alerts WHERE dedupe_key = ?1 AND resolved_at IS NULL",
             params![dedupe_key],
             |row| row.get(0),
         )
@@ -3984,6 +4005,8 @@ pub fn delete_elastic_array(pool: &DbPool, owner: &ElasticOwner, array_id: &str)
         "DELETE FROM nas_elastic_mover_settings WHERE array_id=?1",
         "DELETE FROM nas_elastic_folder_cache WHERE array_id=?1",
         "DELETE FROM nas_elastic_operations WHERE array_id=?1",
+        // The folder-usage reading kept across restarts (`elastic::FolderUsageCache`).
+        "DELETE FROM nas_settings WHERE key = 'folder_usage:' || ?1",
     ] {
         tx.execute(statement, params![array_id])?;
     }
@@ -5730,12 +5753,15 @@ pub struct ShareRow {
     pub nfs: Option<NasNfsOptions>,
     pub state: String,
     pub state_detail: String,
+    /// `state_detail` as codes (`shares::share_state`, migration 24).
+    pub state_reasons: Vec<NasHealthReason>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const SHARE_COLUMNS: &str = "share_id, name, protocol, source_path, dataset, enabled, \
-                             fleet_mount, options_json, state, state_detail, created_at, updated_at";
+                             fleet_mount, options_json, state, state_detail, created_at, updated_at, \
+                             state_reasons";
 
 fn share_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRow> {
     let protocol: String = r.get(2)?;
@@ -5758,6 +5784,7 @@ fn share_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRow> {
         state_detail: r.get(9)?,
         created_at: r.get(10)?,
         updated_at: r.get(11)?,
+        state_reasons: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
         protocol,
     })
 }
@@ -5907,13 +5934,14 @@ pub fn upsert_share(pool: &DbPool, org_id: &str, share: &ShareRow) -> Result<()>
     let written = tx.execute(
         "INSERT INTO nas_shares (share_id, name, protocol, source_path, dataset, enabled,
                                  fleet_mount, options_json, state, state_detail, created_at,
-                                 updated_at, org_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                 updated_at, org_id, state_reasons)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(share_id) DO UPDATE SET
             source_path = excluded.source_path, dataset = excluded.dataset,
             enabled = excluded.enabled, fleet_mount = excluded.fleet_mount,
             options_json = excluded.options_json, state = excluded.state,
-            state_detail = excluded.state_detail, updated_at = excluded.updated_at
+            state_detail = excluded.state_detail, state_reasons = excluded.state_reasons,
+            updated_at = excluded.updated_at
          WHERE nas_shares.org_id = excluded.org_id",
         params![
             share.share_id,
@@ -5928,7 +5956,8 @@ pub fn upsert_share(pool: &DbPool, org_id: &str, share: &ShareRow) -> Result<()>
             share.state_detail,
             share.created_at,
             share.updated_at,
-            org_id
+            org_id,
+            serde_json::to_string(&share.state_reasons)?
         ],
     )?;
     // Dropping the transaction rolls it back: nothing of the refused write
@@ -5950,11 +5979,11 @@ pub fn upsert_share(pool: &DbPool, org_id: &str, share: &ShareRow) -> Result<()>
     Ok(())
 }
 
-pub fn set_share_state(pool: &DbPool, share_id: &str, state: &str, detail: &str) -> Result<()> {
+pub fn set_share_state(pool: &DbPool, share_id: &str, state: &str, detail: &str, reasons: &[NasHealthReason]) -> Result<()> {
     let conn = write(pool)?;
     conn.execute(
-        "UPDATE nas_shares SET state = ?2, state_detail = ?3 WHERE share_id = ?1",
-        params![share_id, state, detail],
+        "UPDATE nas_shares SET state = ?2, state_detail = ?3, state_reasons = ?4 WHERE share_id = ?1",
+        params![share_id, state, detail, serde_json::to_string(reasons)?],
     )?;
     Ok(())
 }
@@ -9454,6 +9483,7 @@ mod tests {
             nfs: None,
             state: "active".into(),
             state_detail: String::new(),
+            state_reasons: Vec::new(),
             created_at: now(),
             updated_at: now(),
         };
@@ -9488,7 +9518,16 @@ mod tests {
         assert!(share_grants(&p, "s1").unwrap().is_empty());
         assert!(!delete_share_user(&p, "org-a", "anna").unwrap());
 
-        set_share_state(&p, "s1", "error", "source path is not mounted").unwrap();
+        // Wave 8 (migration 24): the state's codes are kept beside the
+        // sentence and read back with the row.
+        let unmounted = [super::super::disks::coded_reason("share_source_unmounted", &[])];
+        set_share_state(&p, "s1", "error", "source path is not mounted", &unmounted).unwrap();
+        let judged = share_by_name(&p, "projekty").unwrap().expect("row");
+        assert_eq!(judged.state_reasons, unmounted);
+        assert_eq!(judged.state_detail, "source path is not mounted");
+        // An admin's rewrite of the share carries them too.
+        upsert_share(&p, "org-a", &judged).unwrap();
+        assert_eq!(share_by_name(&p, "projekty").unwrap().expect("row").state_reasons, unmounted);
         assert_eq!(share_counts(&p, "org-a").unwrap(), (1, 1));
         assert!(delete_share(&p, "org-a", "s1").unwrap());
         assert_eq!(share_counts(&p, "org-a").unwrap(), (0, 0));
