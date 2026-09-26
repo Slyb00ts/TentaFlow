@@ -255,6 +255,8 @@ enum WriterCommand {
 enum FenceOp {
     /// `Partition::set_leader_epoch`.
     RaiseEpoch(u32),
+    /// `Partition::confirm_epoch`.
+    ClaimEpoch { epoch: u32, at: u64 },
     /// `Partition::close_leader_writes`.
     CloseLeaderWrites,
 }
@@ -930,6 +932,7 @@ fn process_group(
     jobs: Vec<AppendJob>,
 ) -> bool {
     let mut cursor = state.log_end_offset.load(Ordering::Acquire);
+    let claim_before = state.epochs.read().claim_at(cursor);
     let mut landed: Vec<(oneshot::Sender<Result<AppendResult>>, Result<Landed>)> =
         Vec::with_capacity(jobs.len());
     for job in jobs {
@@ -1042,13 +1045,16 @@ fn process_group(
 
     // Before any caller hears back: an entry for a new epoch whose record
     // never landed (a failed job, a rolled-back group) must be gone by then.
+    // A claim the log already carried stays when nothing landed over it — a
+    // refused job must not take back what this replica told its leader.
     let log_end = landed
         .iter()
         .filter_map(|(_, r)| r.as_ref().ok())
         .map(|l| l.next_offset)
         .max()
         .unwrap_or_else(|| state.log_end_offset.load(Ordering::Acquire));
-    trim_epochs_to(dir, state, log_end);
+    let restored_claim = claim_before.filter(|&(_, start)| start == log_end);
+    trim_epochs_to(dir, state, log_end, restored_claim);
 
     for (resp, outcome) in landed {
         let result = outcome.map(|l| {
@@ -1100,12 +1106,22 @@ fn process_group(
     straddled_poison
 }
 
-/// Drops epoch entries past `log_end` — left by a failed or rolled-back
-/// append (`append_one` writes a new epoch's entry before its record) or by
-/// a cut that ended below its target. On disk too when possible;
-/// `Partition::open` trims whatever a failed write leaves.
-fn trim_epochs_to(dir: &Path, state: &PartitionState, log_end: u64) {
-    let trimmed = state.epochs.read().truncated_to(log_end);
+/// Drops epoch entries at or past `log_end` — left by a failed or
+/// rolled-back append (`append_one` writes a new epoch's entry before its
+/// record) or by a cut that ended below its target — then puts back `claim`,
+/// the claim at `log_end` the log carried before a group that landed
+/// nothing. On disk too when possible; `Partition::open` trims whatever a
+/// failed write leaves.
+fn trim_epochs_to(dir: &Path, state: &PartitionState, log_end: u64, claim: Option<(u32, u64)>) {
+    let trimmed = {
+        let table = state.epochs.read();
+        let cut = table.truncated_to(log_end);
+        let next = match claim {
+            None => cut,
+            Some((epoch, at)) => cut.as_ref().unwrap_or(&table).with_claim(epoch, at).or(cut),
+        };
+        next.filter(|next| *next != *table)
+    };
     if let Some(trimmed) = trimmed {
         *state.epochs.write() = trimmed.clone();
         if let Err(e) = write_epochs(dir, &trimmed) {
@@ -1142,6 +1158,26 @@ fn handle_fence_command(dir: &Path, state: &PartitionState, op: FenceOp) -> Resu
             }
             state.leader_epoch.fetch_max(epoch, Ordering::AcqRel);
             persist_meta_now(dir, state)
+        }
+        FenceOp::ClaimEpoch { epoch, at } => {
+            // Checked here, between two appends: a record that landed since
+            // the caller looked means the log no longer ends where the leader
+            // said its term begins, and a newer Hello or leadership stamped
+            // since means what was fed up to `at` may be another leader's
+            // chain — only the term the partition recognizes right now may
+            // name it.
+            if state.log_end_offset.load(Ordering::Acquire) != at
+                || epoch != state.leader_epoch.load(Ordering::Acquire)
+            {
+                return Ok(());
+            }
+            let claimed = state.epochs.read().with_claim(epoch, at);
+            if let Some(claimed) = claimed {
+                write_epochs(dir, &claimed)?;
+                *state.epochs.write() = claimed;
+                state.epochs_dirty.store(false, Ordering::Release);
+            }
+            Ok(())
         }
         FenceOp::CloseLeaderWrites => {
             let _ = state
@@ -1346,7 +1382,7 @@ fn truncate(
     // it. The cut is done by now, so a failed write is reported, not
     // returned: the caller must not take a done cut for a refused one, and
     // `Partition::open` trims the file on the next start.
-    trim_epochs_to(dir, state, new_leo);
+    trim_epochs_to(dir, state, new_leo, None);
 
     // Rare and critical, like a leader-epoch change (PLAN-M2 §1a: "fix leo
     // + index + watch, persist meta") — persisted synchronously rather
@@ -2074,9 +2110,10 @@ impl Partition {
             .unwrap_or(0)
             .min(log_end_offset);
         // Records past the recovered log end are gone (a crash between a cut
-        // and the table's trim, or a torn tail); so are their epochs.
+        // and the table's trim, or a torn tail); so are their epochs. A claim
+        // at the log end stays (`epochs.rs`).
         let mut epochs = read_epochs(&dir);
-        if let Some(trimmed) = epochs.truncated_to(log_end_offset) {
+        if let Some(trimmed) = epochs.recovered_to(log_end_offset) {
             if let Err(e) = write_epochs(&dir, &trimmed) {
                 tracing::warn!(
                     path = %dir.display(), error = %e,
@@ -2335,10 +2372,34 @@ impl Partition {
         self.inner.state.leader_epoch.load(Ordering::Acquire)
     }
 
-    /// The epoch this log's last record was written in (`epochs.rs`); `0`
-    /// for a log with no recorded epoch.
+    /// The epoch this log's last record was written in, or of the claim it
+    /// ends in (`epochs.rs`) — what elections rank logs by; `0` for a log
+    /// with no recorded epoch.
     pub fn log_epoch(&self) -> u32 {
         self.inner.state.epochs.read().last_epoch()
+    }
+
+    /// The epoch of this log's last record — `log_epoch` without a claim
+    /// (`epochs.rs`); `0` for an empty log. Two logs whose last records
+    /// share an epoch agree up to the shorter one's end, which is what a
+    /// leader reconciling a follower's log compares.
+    pub fn record_epoch(&self) -> u32 {
+        match self.log_end_offset() {
+            0 => 0,
+            leo => self.epoch_at(leo - 1),
+        }
+    }
+
+    /// Stamps a claim (`epochs.rs`) that this log is a prefix of the chain
+    /// of `epoch`'s leader and ends where that leader's own records begin,
+    /// at `at`. Only a replica that knows it: the serving leader of `epoch`
+    /// for its own log, or a follower whose log that leader has reconciled
+    /// and fed up to `at`. A no-op unless the log ends at `at`, `epoch` is
+    /// exactly the recognized leader epoch and the log names no epoch at or
+    /// past it. Returns whether the log now names `epoch` or a later one.
+    pub fn confirm_epoch(&self, epoch: u32, at: u64) -> Result<bool> {
+        self.fence(FenceOp::ClaimEpoch { epoch, at })?;
+        Ok(self.log_epoch() >= epoch)
     }
 
     /// The epoch the record at `offset` was first written in; `0` when
@@ -5225,29 +5286,85 @@ mod tests {
         assert_eq!(part.log_epoch(), 0);
     }
 
-    /// A new epoch's entry is written before its record; an append that then
-    /// fails must not leave it behind, in memory or on disk.
+    /// A new epoch's entry is written before its record; a group whose
+    /// append then fails must not leave it behind, in memory or on disk.
     #[test]
     fn an_epoch_entry_does_not_outlive_its_failed_append() {
         let dir = temp_dir("partition-epoch-failed-append");
         let part = open_with_hw_pinned_at_zero(&dir);
         part.set_leader_epoch(1).unwrap();
         part.append_batch(one_record_batch(0, 8)).unwrap();
-        // What a failed append in epoch 9 at the log end leaves behind.
-        let stale = part
-            .inner
-            .state
-            .epochs
-            .read()
-            .with_record(9, 1)
-            .unwrap()
-            .unwrap();
-        crate::epochs::write_epochs(&dir, &stale).unwrap();
-        *part.inner.state.epochs.write() = stale;
+        // What an epoch-2 append leaves when its record then fails to land.
+        let state = &part.inner.state;
+        let written = state.epochs.read().with_record(2, 1).unwrap().unwrap();
+        crate::epochs::write_epochs(&dir, &written).unwrap();
+        *state.epochs.write() = written;
 
-        assert!(part.append_batch(Bytes::from_static(b"short")).is_err());
+        trim_epochs_to(&dir, state, 1, None);
         assert_eq!(part.log_epoch(), 1);
         assert_eq!(crate::epochs::read_epochs(&dir).last_epoch(), 1);
+    }
+
+    /// A claim is what this replica told its leader it holds; a job refused
+    /// at the log end lands nothing over it and must not take it back.
+    #[test]
+    fn a_claim_outlives_an_append_refused_at_its_offset() {
+        let dir = temp_dir("partition-claim-refused-append");
+        let part = open_with_hw_pinned_at_zero(&dir);
+        part.set_leader_epoch(1).unwrap();
+        part.append_batch(one_record_batch(0, 8)).unwrap();
+        part.set_leader_epoch(3).unwrap();
+        assert!(part.confirm_epoch(3, 1).unwrap());
+
+        assert!(part.append_batch(Bytes::from_static(b"short")).is_err());
+        assert!(part
+            .append_replicated(one_record_batch_at(5, 1, 8), 5, 3, 3)
+            .is_err());
+        assert_eq!(part.log_epoch(), 3);
+        assert_eq!(crate::epochs::read_epochs(&dir).last_epoch(), 3);
+    }
+
+    /// A claim names the leader's term without a record: it ranks the log,
+    /// changes no record's epoch, needs the log to end where the leader said
+    /// and an admitted epoch, and survives a restart.
+    #[test]
+    fn a_confirmed_epoch_ranks_the_log_and_survives_a_restart() {
+        let dir = temp_dir("partition-confirm-epoch");
+        {
+            let part = open_with_hw_pinned_at_zero(&dir);
+            part.set_leader_epoch(1).unwrap();
+            part.append_batch(one_record_batch(0, 8)).unwrap();
+            part.append_batch(one_record_batch(1, 8)).unwrap();
+            part.set_leader_epoch(4).unwrap();
+
+            assert!(!part.confirm_epoch(4, 1).unwrap(), "the log ends at 2");
+            assert!(
+                !part.confirm_epoch(5, 2).unwrap(),
+                "epoch 5 is not admitted"
+            );
+            // A leader of term 3 whose claim was queued before the term-4
+            // Hello stamped the partition: what was fed up to 2 since may be
+            // term 4's chain, not term 3's.
+            assert!(!part.confirm_epoch(3, 2).unwrap(), "epoch 3 is superseded");
+            assert_eq!(part.log_epoch(), 1);
+
+            assert!(part.confirm_epoch(4, 2).unwrap());
+            assert_eq!(part.log_epoch(), 4);
+            assert_eq!(part.record_epoch(), 1);
+            assert_eq!(part.epoch_at(1), 1);
+            assert_eq!(part.epoch_start(4), Some(2));
+        }
+        let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+        assert_eq!(
+            part.log_epoch(),
+            4,
+            "a claim at the log end is not a lost record"
+        );
+        assert_eq!(part.record_epoch(), 1);
+
+        part.append_replicated(one_record_batch_at(2, 1, 8), 2, 4, 4)
+            .unwrap();
+        assert_eq!((part.log_epoch(), part.epoch_start(4)), (4, Some(2)));
     }
 
     /// A leader-authority truncate leaves the records below the cut with the
@@ -5339,6 +5456,36 @@ mod tests {
         assert_eq!(part.log_epoch(), 1);
     }
 
+    /// An append that crashed between its epoch entry and its record leaves
+    /// an entry exactly at the recovered log end. It names the chain of the
+    /// leader whose record was about to land, over this very prefix, so a
+    /// reopen keeps it as a claim — and the first record at its offset
+    /// replaces it.
+    #[test]
+    fn reopening_keeps_a_crash_left_entry_at_the_log_end_as_a_claim() {
+        let dir = temp_dir("partition-epochs-crash-claim");
+        {
+            let part = open_with_hw_pinned_at_zero(&dir);
+            part.set_leader_epoch(1).unwrap();
+            part.append_batch(one_record_batch(0, 8)).unwrap();
+            part.set_leader_epoch(2).unwrap();
+        }
+        let mut left = crate::epochs::EpochTable::default();
+        left = left.with_record(1, 0).unwrap().unwrap();
+        left = left.with_record(2, 1).unwrap().unwrap();
+        crate::epochs::write_epochs(&dir, &left).unwrap();
+
+        let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();
+        assert_eq!(part.log_end_offset(), 1);
+        assert_eq!((part.log_epoch(), part.record_epoch()), (2, 1));
+        assert_eq!(crate::epochs::read_epochs(&dir), left);
+
+        part.append_replicated(one_record_batch_at(1, 1, 8), 1, 3, 3)
+            .unwrap();
+        assert_eq!(part.log_epoch(), 3);
+        assert_eq!(part.epoch_start(2), None, "the record replaced the claim");
+    }
+
     /// A crash after a cut but before the table's final trim leaves entries
     /// past the log end; reopening drops them with the records they named.
     #[test]
@@ -5351,7 +5498,7 @@ mod tests {
         }
         let mut stale = crate::epochs::EpochTable::default();
         stale = stale.with_record(1, 0).unwrap().unwrap();
-        stale = stale.with_record(4, 1).unwrap().unwrap();
+        stale = stale.with_record(4, 2).unwrap().unwrap();
         crate::epochs::write_epochs(&dir, &stale).unwrap();
 
         let part = Partition::open(&dir, RollPolicy::default(), Durability::FsyncBatch, 8).unwrap();

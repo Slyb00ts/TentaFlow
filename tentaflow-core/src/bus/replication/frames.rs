@@ -104,12 +104,15 @@ pub struct ReplHelloAck {
     pub follower_epoch: u32,
     pub environment: NodeEnvironment,
     pub reject: Option<ReplReject>,
-    /// The epoch the follower's log was last written under, read BEFORE it
-    /// stamped this Hello's epoch (`follower_epoch` is after). A log of
-    /// another epoch than the leader's may diverge from the leader's chain
-    /// below the leader's `leo` too, so the leader cuts it back to its `hw`
-    /// (`election::LogPosition::kept_end`). Appended: `None` from a follower
-    /// that predates it, which is judged by offsets alone as before.
+    /// The epoch of the follower's last record (`Partition::record_epoch`),
+    /// read BEFORE it stamped this Hello's epoch (`follower_epoch` is
+    /// after). A log of another epoch than the leader's may diverge from the
+    /// leader's chain below the leader's `leo` too, so the leader cuts it
+    /// back to its `hw` (`election::LogPosition::kept_end`). A claim
+    /// (`tentaflow_bus::epochs`) is left out: it holds no record, and the
+    /// first record the leader feeds at its offset replaces it. Appended:
+    /// `None` from a follower that predates it, which is judged by offsets
+    /// alone as before.
     #[serde(default)]
     pub follower_log_epoch: Option<u32>,
     /// The follower's `Partition::committed_offset`, the bound a log of
@@ -370,6 +373,14 @@ pub struct ReplAck {
     pub leader_epoch: u32,
     pub follower_leo: u64,
     pub follower_hw: u64,
+    /// The follower's `Partition::log_epoch`, claim included: once it names
+    /// the leader's own term, the follower's log is that leader's chain up
+    /// to where the term began (`ReplHeartbeat::epoch_start`), and counts
+    /// toward committing the earlier-term records below it. Appended: `None`
+    /// from a follower that predates it, which counts only once it holds a
+    /// record of the leader's term.
+    #[serde(default)]
+    pub follower_log_epoch: Option<u32>,
 }
 
 /// Leader -> follower keep-alive in the absence of real traffic (PLAN-M2
@@ -384,6 +395,14 @@ pub struct ReplHeartbeat {
     /// predates it.
     #[serde(default)]
     pub committed: Option<u64>,
+    /// Where the leader's own term begins in its log (`Partition::
+    /// epoch_start` of `leader_epoch`). A follower whose log ends exactly
+    /// there confirms the term (`Partition::confirm_epoch`) and acks it, so
+    /// a re-elected leader commits the earlier-term records it re-fed
+    /// without writing a record of its own. Appended: `None` from a leader
+    /// that predates it.
+    #[serde(default)]
+    pub epoch_start: Option<u64>,
 }
 
 /// Leader -> follower tail truncation (PLAN-M2 §1a `Partition::
@@ -825,6 +844,63 @@ mod tests {
         read_frame(&mut server).await.expect("read")
     }
 
+    /// The epoch-confirmation fields cross a mixed fleet both ways: an Ack or
+    /// Heartbeat from a build that predates them decodes with `None`, and
+    /// that build decodes ours, ignoring what it does not know.
+    #[test]
+    fn epoch_confirmation_fields_decode_across_versions() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct AckBefore {
+            leader_epoch: u32,
+            follower_leo: u64,
+            follower_hw: u64,
+        }
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct HeartbeatBefore {
+            leader_epoch: u32,
+            hw: u64,
+            leader_leo: u64,
+            committed: Option<u64>,
+        }
+        let old_ack = AckBefore {
+            leader_epoch: 4,
+            follower_leo: 9,
+            follower_hw: 8,
+        };
+        match decode_frame(KIND_ACK, &encode_cbor(&old_ack).unwrap(), Bytes::new()).unwrap() {
+            ReplFrame::Ack(a) => assert_eq!(a.follower_log_epoch, None),
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        let old_hb = HeartbeatBefore {
+            leader_epoch: 4,
+            hw: 8,
+            leader_leo: 9,
+            committed: Some(8),
+        };
+        match decode_frame(KIND_HEARTBEAT, &encode_cbor(&old_hb).unwrap(), Bytes::new()).unwrap() {
+            ReplFrame::Heartbeat(hb) => assert_eq!(hb.epoch_start, None),
+            other => panic!("expected Heartbeat, got {other:?}"),
+        }
+
+        let ack = encode_cbor(&ReplAck {
+            leader_epoch: 4,
+            follower_leo: 9,
+            follower_hw: 8,
+            follower_log_epoch: Some(4),
+        })
+        .unwrap();
+        assert_eq!(decode_cbor::<AckBefore>(&ack).unwrap(), old_ack);
+        let hb = encode_cbor(&ReplHeartbeat {
+            leader_epoch: 4,
+            hw: 8,
+            leader_leo: 9,
+            committed: Some(8),
+            epoch_start: Some(9),
+        })
+        .unwrap();
+        assert_eq!(decode_cbor::<HeartbeatBefore>(&hb).unwrap(), old_hb);
+    }
+
     /// A Hello from a build that predates `topic_generation` decodes with the
     /// incarnation unknown (`None`), not as incarnation 0 — the two are judged
     /// differently by `accept_hello`.
@@ -965,6 +1041,7 @@ mod tests {
             leader_epoch: 7,
             follower_leo: 100,
             follower_hw: 90,
+            follower_log_epoch: Some(7),
         });
         assert_eq!(roundtrip(ack.clone()).await, ack);
 
@@ -973,6 +1050,7 @@ mod tests {
             hw: 90,
             leader_leo: 100,
             committed: None,
+            epoch_start: Some(100),
         });
         assert_eq!(roundtrip(hb.clone()).await, hb);
 
@@ -1021,6 +1099,7 @@ mod tests {
                 leader_epoch: 1,
                 follower_leo: 1,
                 follower_hw: 1,
+                follower_log_epoch: None,
             }),
         )
         .await
@@ -1046,6 +1125,7 @@ mod tests {
             leader_epoch: 3,
             follower_leo: 1_000,
             follower_hw: 990,
+            follower_log_epoch: None,
         })
     }
 
@@ -1206,6 +1286,7 @@ mod tests {
             leader_epoch: 1,
             follower_leo: 1,
             follower_hw: 1,
+            follower_log_epoch: None,
         })
         .unwrap();
         client.write_u32(cbor.len() as u32).await.unwrap();

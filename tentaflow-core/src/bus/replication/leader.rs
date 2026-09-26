@@ -146,6 +146,10 @@ pub struct FollowerState {
     pub in_isr: bool,
     /// See the module doc's "LAG-BYTES TRADE-OFF" note.
     pub lag_bytes: u64,
+    /// Last `Partition::log_epoch` this follower reported via `Ack`, claim
+    /// included; `None` until one arrives or from a follower that predates
+    /// the field.
+    pub log_epoch: Option<u32>,
 }
 
 /// Why `reconcile_follower` shrank a follower out of the ISR (PLAN-M2 §1b).
@@ -452,6 +456,19 @@ impl PartitionLeader {
         self.partition.log_epoch()
     }
 
+    /// `Partition::record_epoch` — the epoch of this leader's last record,
+    /// what a follower's log is reconciled against.
+    pub fn record_epoch(&self) -> u32 {
+        self.partition.record_epoch()
+    }
+
+    /// Where this leader's own term begins in its log: its first record in
+    /// that term, or the claim it stamped on starting to serve
+    /// (`GlueLeaderHandle::open_writes`). `None` before either.
+    pub fn term_start(&self) -> Option<u64> {
+        self.partition.epoch_start(self.epoch())
+    }
+
     /// `Partition::epoch_at`: the epoch the record at `offset` was first
     /// written in — what a fed batch tells the follower to record.
     pub fn epoch_at(&self, offset: u64) -> u32 {
@@ -544,6 +561,7 @@ impl PartitionLeader {
                 last_ack_at: Instant::now(),
                 in_isr: true,
                 lag_bytes: 0,
+                log_epoch: None,
             },
         );
         let isr_size = self.isr_size();
@@ -607,6 +625,9 @@ impl PartitionLeader {
             fs.hw = fs.hw.max(ack.follower_hw.min(own_hw));
             fs.last_ack_at = Instant::now();
             fs.lag_bytes = lag_bytes;
+            if ack.follower_log_epoch.is_some() {
+                fs.log_epoch = ack.follower_log_epoch;
+            }
         }
         self.reconcile_follower(node_id);
         self.recompute_hw();
@@ -740,6 +761,22 @@ impl PartitionLeader {
         Self::nth_largest(&leos, min_isr_required(self.replicas.len()) as u32)
     }
 
+    /// Whether a majority of the replica set — this leader included — has
+    /// logs naming this leader's term (`Partition::log_epoch`) that reach
+    /// `start`, where the term begins: each is then this leader's chain up
+    /// to `start`, and ranks above any log of an earlier term. Exactly this
+    /// term: a log naming a later one follows another leader's chain.
+    fn term_confirmed_by_majority(&self, start: u64) -> bool {
+        let epoch = self.epoch();
+        let own = usize::from(self.partition.log_epoch() == epoch);
+        let followers = self
+            .followers
+            .iter()
+            .filter(|f| f.leo >= start && f.log_epoch == Some(epoch))
+            .count();
+        own + followers >= min_isr_required(self.replicas.len())
+    }
+
     /// The `n`-th largest value in `values` (1-based), or `0` if `n` is
     /// `0` or exceeds `values.len()` — "not enough replicas have reported
     /// anything yet" is representable as offset `0`, which is always safe
@@ -770,16 +807,33 @@ impl PartitionLeader {
         // Raft's Figure 8: a majority holding records of an EARLIER term
         // does not commit them — a node with a later-term log can still win
         // an election over those replicas and replace them. Only once a
-        // majority holds a record of this leader's own term is everything
-        // before it safe; until then the committed offset stays where the
-        // earlier terms left it.
-        if let Some(start) = self.partition.epoch_start(self.epoch()) {
+        // majority's logs name this leader's own term — a record of it, or
+        // the claim a follower confirms when its log reaches where the term
+        // begins — is everything before it safe; until then the committed
+        // offset stays where the earlier terms left it.
+        let term_start = self.term_start();
+        if let Some(start) = term_start {
             let majority = self.majority_offset();
-            if majority > start {
+            if majority > start || self.term_confirmed_by_majority(start) {
                 self.partition.set_committed_offset(majority);
             }
         }
-        let candidate = self.commit_offset_for(self.acks);
+        let mut candidate = self.commit_offset_for(self.acks);
+        // The same rule for what consumers see. `acks=quorum|all` promise a
+        // record read is a record kept; an earlier-term record on a majority
+        // is not kept yet — the stale later-term log that can still win would
+        // retract it after a consumer read it. So `hw` stays at the committed
+        // offset until everything below this term's start is committed.
+        // `acks=leader` promises nothing of the kind; at RF = 2 a lone
+        // replica acts alone (`availability_quorum`), where waiting for a
+        // majority would hide every record for as long as it is alone; and at
+        // RF = 1 there is no other log to lose a race to.
+        if self.acks != Acks::Leader
+            && self.replicas.len() >= 3
+            && term_start.is_none_or(|start| self.partition.committed_offset() < start)
+        {
+            candidate = candidate.min(self.partition.committed_offset());
+        }
         let before = self.partition.high_watermark();
         let after = self.partition.set_high_watermark(candidate);
         // Only a real advance wakes anyone: `set_high_watermark` is a monotonic
@@ -1068,6 +1122,7 @@ async fn send_heartbeat<W: AsyncWrite + Unpin>(
             hw,
             leader_leo: leader.log_end_offset(),
             committed: Some(leader.committed_offset()),
+            epoch_start: leader.term_start(),
         }),
     )
     .await?;
@@ -1160,10 +1215,12 @@ where
     //   goes back to its own committed offset — every record below that is
     //   on a majority, this chain included — and is fed again from there.
     //
-    // Epochs here are LOG epochs (`Partition::log_epoch`) on both sides, the
-    // epoch the records were written under — not the term a Hello stamped.
-    // A follower from before `follower_log_epoch` is judged by offsets alone,
-    // one from before `follower_committed` by its `hw`.
+    // Epochs here are RECORD epochs (`Partition::record_epoch`) on both
+    // sides, the epoch the last record was written under — not the term a
+    // Hello stamped, and not a claim (`tentaflow_bus::epochs`): a claim holds
+    // no record to diverge, and the first record fed at its offset replaces
+    // it. A follower from before `follower_log_epoch` is judged by offsets
+    // alone, one from before `follower_committed` by its `hw`.
     //
     // A replica whose committed offset is past our `leo` holds acknowledged
     // records this leader lacks. It refuses the `Truncate`
@@ -1171,7 +1228,7 @@ where
     // ends; refusing to paper over that is deliberate — obeying would lose
     // those records on every replica.
     let authority = LogPosition {
-        epoch: leader.log_epoch(),
+        epoch: leader.record_epoch(),
         leo: leader.log_end_offset(),
         committed: leader.committed_offset(),
     };
@@ -1374,6 +1431,7 @@ mod tests {
 
     use tokio::io::AsyncWriteExt;
 
+    use super::super::election::choose_candidate;
     use super::super::frames::{read_frame, ReplHelloAck};
 
     static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1656,6 +1714,61 @@ mod tests {
         let _ = handle.await;
     }
 
+    /// A re-elected leader's claim on its term holds no record: a follower
+    /// whose last record shares the leader's last record's epoch is its
+    /// chain as far as it goes and keeps every record. Reconciled against
+    /// the claim instead, it would be cut back to its committed offset on
+    /// every failover. The heartbeat then tells it where the term begins.
+    #[tokio::test]
+    async fn the_leaders_claim_does_not_cut_a_follower_on_its_chain() {
+        // Sync appends block on the writer; off the runtime.
+        let (part, leader) = tokio::task::spawn_blocking(re_elected_over_a_stale_later_term)
+            .await
+            .unwrap();
+        leader.remove_follower("f2", "handshake below");
+        assert_eq!(
+            (part.log_epoch(), part.record_epoch()),
+            (TEST_EPOCH, TEST_EPOCH - 2)
+        );
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(leader2, "f2".into(), leader_r, leader_w, None, rx).await
+        });
+
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        write_frame(
+            &mut foll_w,
+            &ReplFrame::HelloAck(ReplHelloAck {
+                accepted: true,
+                follower_leo: 3,
+                follower_hw: 0,
+                follower_epoch: TEST_EPOCH,
+                environment: NodeEnvironment::Prod,
+                reject: None,
+                follower_log_epoch: Some(TEST_EPOCH - 2),
+                follower_committed: Some(0),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut foll_r))
+            .await
+            .expect("timed out waiting for the first frame")
+            .unwrap();
+        match frame {
+            ReplFrame::Heartbeat(hb) => assert_eq!(hb.epoch_start, Some(3)),
+            other => panic!("expected a Heartbeat, got {other:?}"),
+        }
+        assert_eq!(leader.follower_state("f2").expect("registered").leo, 3);
+
+        drop(foll_r);
+        drop(foll_w);
+        let _ = handle.await;
+    }
+
     /// The quorum lease lapses on its own once acks stop — no stream task
     /// has to notice and shrink the ISR first.
     #[tokio::test]
@@ -1759,6 +1872,170 @@ mod tests {
         assert_eq!(leader.committed_offset(), 4);
     }
 
+    /// Term 5 wrote 0..3 on the leader and on f2 but committed none of it;
+    /// f1 was elected in term 6 while they were away and wrote records of
+    /// its own at those offsets, then went away itself. The leader, back and
+    /// re-elected in term 7 with f2, has written nothing in its term: a
+    /// majority holds 0..3 and a follower acknowledges all of it.
+    fn re_elected_over_a_stale_later_term() -> (Partition, Arc<PartitionLeader>) {
+        let part = temp_partition("figure-eight-visibility");
+        part.set_hw_tracking(HwTracking::Manual);
+        part.set_leader_epoch(TEST_EPOCH - 2).unwrap();
+        for _ in 0..3 {
+            part.append_batch(one_record_batch(1)).unwrap();
+        }
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
+        let leader = make_leader(
+            part.clone(),
+            &["leader", "f1", "f2"],
+            Acks::Quorum,
+            fast_config(),
+        );
+        // What the serving handle stamps when it starts serving.
+        assert!(part.confirm_epoch(TEST_EPOCH, 3).unwrap());
+        leader.register_follower("f2", 0, 0);
+        (part, leader)
+    }
+
+    fn position(epoch: u32, leo: u64, committed: u64) -> LogPosition {
+        LogPosition {
+            epoch,
+            leo,
+            committed,
+        }
+    }
+
+    fn elect(logs: &[(&str, LogPosition)]) -> Option<String> {
+        let isr: Vec<String> = logs.iter().map(|(id, _)| id.to_string()).collect();
+        let logs: Vec<(String, LogPosition)> = logs
+            .iter()
+            .map(|(id, log)| (id.to_string(), *log))
+            .collect();
+        choose_candidate(&isr, &logs, "none")
+    }
+
+    /// The reviewer's scenario: were `hw` to cover 0..3 now, a consumer
+    /// would read them, the leader could die before a record of its own
+    /// term reached a majority, and f1's term-6 log would win over f2's
+    /// term-5 one and cut them. `acks=quorum` promises a record read is a
+    /// record kept, so they stay hidden until committed.
+    #[test]
+    fn earlier_term_records_on_a_majority_stay_hidden_until_committed() {
+        let (_part, leader) = re_elected_over_a_stale_later_term();
+        leader.record_ack(
+            "f2",
+            &ReplAck {
+                leader_epoch: TEST_EPOCH,
+                follower_leo: 3,
+                follower_hw: 0,
+                follower_log_epoch: Some(TEST_EPOCH - 2),
+            },
+            0,
+        );
+        assert_eq!(leader.committed_offset(), 0);
+        let visible = leader.high_watermark();
+
+        // The leader dies; f1 and f2 elect.
+        let f1 = position(TEST_EPOCH - 1, 5, 0);
+        let f2 = position(TEST_EPOCH - 2, 3, 0);
+        assert_eq!(elect(&[("f1", f1), ("f2", f2)]).as_deref(), Some("f1"));
+        let kept_on_f2 = f2.kept_end(&f1);
+        assert!(
+            visible <= kept_on_f2,
+            "consumers saw offsets below {visible}, the winner keeps only {kept_on_f2} of them"
+        );
+    }
+
+    /// The same partition left idle: nobody publishes, so no record of the
+    /// leader's term ever lands. f2 confirming the term (its log ends where
+    /// the term begins) is what commits 0..3 — and then f2 outranks f1, so
+    /// what consumers now read is what any next leader keeps.
+    #[test]
+    fn a_majority_confirming_the_term_shows_earlier_term_records_without_a_publish() {
+        let (_part, leader) = re_elected_over_a_stale_later_term();
+        leader.record_ack(
+            "f2",
+            &ReplAck {
+                leader_epoch: TEST_EPOCH,
+                follower_leo: 3,
+                follower_hw: 0,
+                follower_log_epoch: Some(TEST_EPOCH),
+            },
+            0,
+        );
+        assert_eq!(leader.committed_offset(), 3);
+        assert_eq!(leader.high_watermark(), 3);
+
+        let f1 = position(TEST_EPOCH - 1, 5, 0);
+        let f2 = position(TEST_EPOCH, 3, 3);
+        assert_eq!(elect(&[("f1", f1), ("f2", f2)]).as_deref(), Some("f2"));
+    }
+
+    /// A confirmation below where the term begins, of another term — an
+    /// earlier one, or a later leader's — or from a follower that predates
+    /// the field is no confirmation.
+    #[test]
+    fn only_a_confirmation_of_this_term_at_its_start_commits() {
+        let (_part, leader) = re_elected_over_a_stale_later_term();
+        for (leo, log_epoch) in [
+            (2, Some(TEST_EPOCH)),
+            (3, Some(TEST_EPOCH - 1)),
+            (3, Some(TEST_EPOCH + 1)),
+            (3, None),
+        ] {
+            leader.register_follower("f2", 0, 0);
+            leader.record_ack(
+                "f2",
+                &ReplAck {
+                    leader_epoch: TEST_EPOCH,
+                    follower_leo: leo,
+                    follower_hw: 0,
+                    follower_log_epoch: log_epoch,
+                },
+                0,
+            );
+            assert_eq!(
+                (leader.committed_offset(), leader.high_watermark()),
+                (0, 0),
+                "leo {leo}, log epoch {log_epoch:?}"
+            );
+        }
+    }
+
+    /// `acks=leader` shows consumers the leader's own log by definition, and
+    /// an RF=2 leader alone must not wait for a majority it cannot have.
+    #[test]
+    fn earlier_term_records_are_not_held_back_where_no_majority_is_promised() {
+        let old_term_log = |label: &str| {
+            let part = temp_partition(label);
+            part.set_hw_tracking(HwTracking::Manual);
+            part.set_leader_epoch(TEST_EPOCH - 2).unwrap();
+            for _ in 0..3 {
+                part.append_batch(one_record_batch(1)).unwrap();
+            }
+            part.set_leader_epoch(TEST_EPOCH).unwrap();
+            part
+        };
+        let leader = make_leader(
+            old_term_log("figure-eight-acks-leader"),
+            &["leader", "f1", "f2"],
+            Acks::Leader,
+            fast_config(),
+        );
+        leader.register_follower("f2", 0, 0);
+        assert_eq!(leader.high_watermark(), 3);
+
+        let leader = make_leader(
+            old_term_log("figure-eight-rf2"),
+            &["leader", "f1"],
+            Acks::All,
+            fast_config(),
+        );
+        leader.register_follower("f1", 0, 0);
+        leader.remove_follower("f1", "stream ended");
+        assert_eq!(leader.high_watermark(), 3, "the lone RF=2 survivor serves");
+    }
+
     // ===== feeding =====
 
     #[tokio::test]
@@ -1838,6 +2115,8 @@ mod tests {
     async fn a_leader_appended_record_is_fed_before_any_high_watermark_advance() {
         let part = temp_partition("quorum-feed");
         part.set_hw_tracking(HwTracking::Manual);
+        // Records of this leader's own term, as it writes them.
+        part.set_leader_epoch(TEST_EPOCH).unwrap();
         // `Acks::Quorum` over 3 replicas: `min_isr` is 2, and with only the
         // leader holding data `nth_largest([leo, ..zeros], 2)` is 0 — nothing
         // this test does before the ACK can commit anything.
@@ -1917,6 +2196,7 @@ mod tests {
                 leader_epoch: TEST_EPOCH,
                 follower_leo: 2,
                 follower_hw: 0,
+                follower_log_epoch: None,
             }),
         )
         .await
@@ -1987,6 +2267,7 @@ mod tests {
                 leader_epoch: TEST_EPOCH,
                 follower_leo: 1,
                 follower_hw: 0,
+                follower_log_epoch: None,
             },
             0,
         );
@@ -2008,6 +2289,7 @@ mod tests {
                 leader_epoch: TEST_EPOCH,
                 follower_leo: 1,
                 follower_hw: 0,
+                follower_log_epoch: None,
             },
             0,
         );
@@ -2023,6 +2305,7 @@ mod tests {
                 leader_epoch: TEST_EPOCH,
                 follower_leo: 1,
                 follower_hw: 0,
+                follower_log_epoch: None,
             },
             0,
         );
@@ -2048,6 +2331,7 @@ mod tests {
                     leader_epoch: TEST_EPOCH,
                     follower_leo: 1,
                     follower_hw: 0,
+                    follower_log_epoch: None,
                 },
                 0,
             );
@@ -2105,6 +2389,7 @@ mod tests {
                         leader_epoch: TEST_EPOCH,
                         follower_leo: round,
                         follower_hw: 0,
+                        follower_log_epoch: None,
                     },
                     0,
                 );
@@ -2239,6 +2524,7 @@ mod tests {
                 leader_epoch: TEST_EPOCH,
                 follower_leo: 0,
                 follower_hw: 0,
+                follower_log_epoch: None,
             },
             0, // caught up again
         );
@@ -2300,6 +2586,7 @@ mod tests {
                 leader_epoch: TEST_EPOCH,
                 follower_leo: 0,
                 follower_hw: 0,
+                follower_log_epoch: None,
             },
             0, // caught up: no bytes in flight anymore
         );
@@ -2442,6 +2729,7 @@ mod tests {
                 leader_epoch: TEST_EPOCH,
                 follower_leo: 1,
                 follower_hw: 0,
+                follower_log_epoch: None,
             }),
         )
         .await
@@ -2507,6 +2795,7 @@ mod tests {
                 leader_epoch: TEST_EPOCH,
                 follower_leo: 1,
                 follower_hw: 0,
+                follower_log_epoch: None,
             }),
         )
         .await

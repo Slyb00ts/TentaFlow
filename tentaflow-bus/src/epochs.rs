@@ -27,6 +27,19 @@
 // A missing or corrupt file reads as an empty table: every record then has
 // epoch 0, which ranks this log below every term and makes the next leader
 // reconcile it to its committed offset — the conservative reading.
+//
+// CLAIMS. An entry may start exactly at the log end, with no record behind
+// it yet: "this log is a prefix of that epoch's leader chain, and that
+// chain's records from here on are all of that epoch or later". It is Raft's
+// no-op entry without an offset. A leader stamps one for its own term when it
+// starts serving and a follower copies it once its log reaches that point
+// (`Partition::confirm_epoch`), so a majority can rank above a stale
+// later-term log without the leader writing a record consumers would see.
+// The same shape is what an append that crashed between the entry and its
+// record leaves, and it is true there too: the record was that epoch
+// leader's, at that offset, over this very prefix. So a claim survives a
+// restart; only a cut below it (`truncated_to`) or the first record at its
+// offset (`with_record`) replaces it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -73,7 +86,17 @@ impl EpochTable {
         self.entries.last().map(|&(epoch, _)| epoch).unwrap_or(0)
     }
 
-    /// The offset of the first record written in `epoch`, if any is.
+    /// The claim at `log_end` (an entry starting there), if the log ends in
+    /// one.
+    pub fn claim_at(&self, log_end: u64) -> Option<(u32, u64)> {
+        self.entries
+            .last()
+            .copied()
+            .filter(|&(_, start)| start == log_end)
+    }
+
+    /// The offset of the first record written in `epoch` — or of its claim,
+    /// when the log ends in one — if any.
     pub fn start_of(&self, epoch: u32) -> Option<u64> {
         self.entries
             .iter()
@@ -81,30 +104,70 @@ impl EpochTable {
             .map(|&(_, start)| start)
     }
 
-    /// The table after a record of `epoch` lands at `offset`, or `None`
-    /// when the table does not change (same epoch as the last record). An
-    /// epoch below the last one is refused: records of an older leader
-    /// after records of a newer one mean this log is not a prefix of any
-    /// leader's chain.
+    /// The table after a record of `epoch` lands at `offset` (the log
+    /// end), or `None` when the table does not change (same epoch as the
+    /// last entry). An epoch below the last record's is refused: records of
+    /// an older leader after records of a newer one mean this log is not a
+    /// prefix of any leader's chain. A claim at `offset` holds no record, so
+    /// the record written there replaces it whatever its epoch: the leader
+    /// sending it is the authority on what its chain holds at that offset.
     pub fn with_record(&self, epoch: u32, offset: u64) -> Result<Option<Self>> {
-        let last = self.last_epoch();
-        if !self.entries.is_empty() && epoch == last {
+        if !self.entries.is_empty() && epoch == self.last_epoch() {
             return Ok(None);
         }
-        if !self.entries.is_empty() && epoch < last {
+        let mut next = self.clone();
+        while next
+            .entries
+            .last()
+            .is_some_and(|&(_, start)| start >= offset)
+        {
+            next.entries.pop();
+        }
+        let last = next.last_epoch();
+        if !next.entries.is_empty() && epoch < last {
             return Err(BusError::RecordEpochRegression {
                 last,
                 got: epoch,
                 offset,
             });
         }
-        let mut next = self.clone();
         next.entries.push((epoch, offset));
         Ok(Some(next))
     }
 
-    /// The table describing only records below `log_end`, or `None` when
-    /// nothing changes.
+    /// The table with a claim for `epoch` at `log_end` (see the module
+    /// doc), or `None` when the log already names `epoch` or a later one.
+    pub fn with_claim(&self, epoch: u32, log_end: u64) -> Option<Self> {
+        if !self.entries.is_empty() && epoch <= self.last_epoch() {
+            return None;
+        }
+        let mut next = self.clone();
+        while next
+            .entries
+            .last()
+            .is_some_and(|&(_, start)| start >= log_end)
+        {
+            next.entries.pop();
+        }
+        next.entries.push((epoch, log_end));
+        Some(next)
+    }
+
+    /// The table of a log recovered with `log_end` records: entries past
+    /// it named records that are gone, while one starting exactly there is a
+    /// claim and stays. `None` when nothing changes.
+    pub fn recovered_to(&self, log_end: u64) -> Option<Self> {
+        let keep = self.entries.partition_point(|&(_, start)| start <= log_end);
+        if keep == self.entries.len() {
+            return None;
+        }
+        Some(Self {
+            entries: self.entries[..keep].to_vec(),
+        })
+    }
+
+    /// The table describing only records below `log_end`, claims at it
+    /// included in the cut, or `None` when nothing changes.
     pub fn truncated_to(&self, log_end: u64) -> Option<Self> {
         let keep = self.entries.partition_point(|&(_, start)| start < log_end);
         if keep == self.entries.len() {
@@ -245,6 +308,45 @@ mod tests {
                 offset: 5
             })
         ));
+    }
+
+    #[test]
+    fn a_record_replaces_a_claim_at_its_offset_whatever_its_epoch() {
+        let claimed = table(&[(3, 0), (5, 4)]);
+        assert_eq!(claimed.with_record(5, 4).unwrap(), None, "fills the claim");
+        assert_eq!(
+            claimed.with_record(4, 4).unwrap(),
+            Some(table(&[(3, 0), (4, 4)])),
+            "the serving leader's chain holds an epoch-4 record there"
+        );
+        assert_eq!(
+            claimed.with_record(6, 4).unwrap(),
+            Some(table(&[(3, 0), (6, 4)]))
+        );
+        assert!(matches!(
+            claimed.with_record(2, 4),
+            Err(BusError::RecordEpochRegression {
+                last: 3,
+                got: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_claim_needs_a_later_epoch_and_survives_recovery_but_not_a_cut() {
+        let t = table(&[(3, 0)]);
+        assert_eq!(t.with_claim(3, 4), None);
+        assert_eq!(t.with_claim(2, 4), None);
+        let claimed = t.with_claim(5, 4).unwrap();
+        assert_eq!(claimed, table(&[(3, 0), (5, 4)]));
+        assert_eq!(claimed.last_epoch(), 5);
+        assert_eq!(claimed.epoch_at(3), 3, "no record changes its epoch");
+        assert_eq!(claimed.with_claim(6, 4), Some(table(&[(3, 0), (6, 4)])));
+
+        assert_eq!(claimed.recovered_to(4), None);
+        assert_eq!(claimed.recovered_to(3), Some(t.clone()));
+        assert_eq!(claimed.truncated_to(4), Some(t));
     }
 
     #[test]

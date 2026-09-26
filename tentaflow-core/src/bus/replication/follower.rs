@@ -399,7 +399,7 @@ where
         follower_epoch: partition.leader_epoch(),
         environment: local_env,
         reject: None,
-        follower_log_epoch: Some(partition.log_epoch()),
+        follower_log_epoch: Some(partition.record_epoch()),
         follower_committed: Some(partition.committed_offset()),
     };
     write_frame(&mut writer, &ReplFrame::HelloAck(ack)).await?;
@@ -426,6 +426,7 @@ where
                 // leader reads.
                 let cadence_frame =
                     matches!(frame, ReplFrame::Batch { .. } | ReplFrame::Heartbeat(_));
+                let mut term_confirmed = false;
                 match frame {
                     ReplFrame::Batch { header, bytes } => {
                         match partition
@@ -491,6 +492,16 @@ where
                         partition.set_high_watermark(hb.hw);
                         if let Some(committed) = hb.committed {
                             partition.set_committed_offset(committed);
+                        }
+                        if let Some(start) = hb.epoch_start {
+                            term_confirmed =
+                                match confirm_leader_term(&partition, hb.leader_epoch, start) {
+                                    Ok(confirmed) => confirmed,
+                                    Err(BusError::PartitionDetached) => {
+                                        return Ok(FollowerExit::Detached)
+                                    }
+                                    Err(e) => return Err(FollowerError::Engine(e)),
+                                };
                         }
                         follower.refresh_lease();
                     }
@@ -621,8 +632,12 @@ where
                         })
                     }
                 }
+                // A confirmed term is acked at once: until a majority's acks
+                // say so, the leader keeps the earlier-term records it re-fed
+                // from consumers.
                 let ack_owed = cadence_frame
-                    && (batches_since_ack >= follower.config.ack_every_n_batches
+                    && (term_confirmed
+                        || batches_since_ack >= follower.config.ack_every_n_batches
                         || last_ack_at.elapsed() >= follower.config.ack_interval
                         || (batches_since_ack > 0 && !frames.frame_ready()?));
                 if ack_owed {
@@ -654,6 +669,27 @@ where
             }
         }
     }
+}
+
+/// Confirms the leader's term on this replica's log (`Partition::
+/// confirm_epoch`) when the log ends exactly where that term begins in the
+/// leader's (`ReplHeartbeat::epoch_start`). Only frames of the stream the
+/// accepted `Hello` opened reach here, after the leader's reconciling
+/// `Truncate`, so everything below `start` was fed by this leader: the log
+/// is its chain up to there. A heartbeat of a leader since superseded
+/// confirms nothing. Returns whether this call confirmed the term.
+fn confirm_leader_term(
+    partition: &Partition,
+    leader_epoch: u32,
+    start: u64,
+) -> Result<bool, BusError> {
+    if partition.leader_epoch() != leader_epoch
+        || partition.log_epoch() >= leader_epoch
+        || partition.log_end_offset() != start
+    {
+        return Ok(false);
+    }
+    partition.confirm_epoch(leader_epoch, start)
 }
 
 /// Sends the reject `HelloAck` for one of the four `Hello` validation
@@ -696,6 +732,7 @@ async fn send_ack<W: AsyncWrite + Unpin>(
         leader_epoch,
         follower_leo: partition.log_end_offset(),
         follower_hw: partition.high_watermark(),
+        follower_log_epoch: Some(partition.log_epoch()),
     };
     write_frame(writer, &ReplFrame::Ack(ack)).await?;
     *batches_since_ack = 0;
@@ -1242,6 +1279,81 @@ mod tests {
         handle.abort();
     }
 
+    fn term_heartbeat(leader_epoch: u32, epoch_start: u64) -> ReplFrame {
+        ReplFrame::Heartbeat(ReplHeartbeat {
+            leader_epoch,
+            hw: 0,
+            leader_leo: epoch_start,
+            committed: None,
+            epoch_start: Some(epoch_start),
+        })
+    }
+
+    /// Reads frames until an `Ack` reporting `log_epoch` arrives.
+    async fn ack_with_log_epoch(leader: &mut tokio::io::DuplexStream, log_epoch: u32) -> ReplAck {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(left, read_frame(leader)).await {
+                Ok(Ok(ReplFrame::Ack(a))) if a.follower_log_epoch == Some(log_epoch) => return a,
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("stream failed: {e}"),
+                Err(_) => panic!("no Ack reported log epoch {log_epoch}"),
+            }
+        }
+    }
+
+    /// A log that ends exactly where the leader's term begins is that
+    /// leader's chain up to there: the follower claims the term and acks it,
+    /// so the leader can commit the earlier-term records below it. A log
+    /// ending anywhere else, or a heartbeat of a superseded leader, claims
+    /// nothing. The claim ranks the log (`log_epoch`) but is no record: the
+    /// next handshake still reports the epoch of the last record.
+    #[tokio::test]
+    async fn a_follower_confirms_the_term_only_where_it_begins() {
+        let part_dir = tempfile::tempdir().unwrap();
+        let partition = epoch_one_tail(part_dir.path()).await;
+        let (ack, mut leader, handle, _stores) = accept(Arc::clone(&partition), 2).await;
+        assert!(ack.accepted, "{:?}", ack.reject);
+
+        write_frame(&mut leader, &term_heartbeat(2, 2))
+            .await
+            .unwrap();
+        ack_with_log_epoch(&mut leader, 1).await;
+        assert_eq!(partition.log_epoch(), 1, "the log does not end at 2");
+
+        // Another leader's Hello raised the epoch: this stream's leader is
+        // superseded.
+        partition.set_leader_epoch(3).unwrap();
+        write_frame(&mut leader, &term_heartbeat(2, 3))
+            .await
+            .unwrap();
+        ack_with_log_epoch(&mut leader, 1).await;
+        assert_eq!(
+            partition.log_epoch(),
+            1,
+            "a superseded leader confirms nothing"
+        );
+        drop(leader);
+        let _ = handle.await;
+
+        let (ack, mut leader, handle, _stores) = accept(Arc::clone(&partition), 3).await;
+        assert!(ack.accepted, "{:?}", ack.reject);
+        write_frame(&mut leader, &term_heartbeat(3, 3))
+            .await
+            .unwrap();
+        let confirmed = ack_with_log_epoch(&mut leader, 3).await;
+        assert_eq!(confirmed.follower_leo, 3);
+        assert_eq!((partition.log_epoch(), partition.record_epoch()), (3, 1));
+        assert_eq!(partition.epoch_at(2), 1, "no record changed its epoch");
+        drop(leader);
+        let _ = handle.await;
+
+        let (ack, _leader, handle, _stores) = accept(Arc::clone(&partition), 4).await;
+        assert_eq!(ack.follower_log_epoch, Some(1), "a claim is not a record");
+        handle.abort();
+    }
+
     fn with_record_epoch(frame: ReplFrame, record_epoch: u32) -> ReplFrame {
         match frame {
             ReplFrame::Batch { mut header, bytes } => {
@@ -1451,6 +1563,7 @@ mod tests {
                     hw: 0,
                     leader_leo: 0,
                     committed: None,
+                    epoch_start: None,
                 }),
             )
             .await
@@ -1862,6 +1975,7 @@ mod tests {
                 hw: 0,
                 leader_leo: 0,
                 committed: None,
+                epoch_start: None,
             }),
         )
         .await
@@ -1941,6 +2055,7 @@ mod tests {
                 hw: 0,
                 leader_leo: 0,
                 committed: None,
+                epoch_start: None,
             }),
         )
         .await

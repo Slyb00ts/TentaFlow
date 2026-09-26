@@ -14,6 +14,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   offsets and is judged by offsets alone, as before. Partitions written by an
   older release open with no recorded epochs and a committed offset of 0, so
   the first leader to reach them re-feeds more than it would otherwise.
+- **Upgrade TentaBus followers before leaders.** At RF≥3 with `acks=quorum` or
+  `acks=all`, an upgraded leader shows consumers the records it re-fed after a
+  failover only once a majority confirms its term, and an older follower never
+  confirms. During a rolling upgrade an idle partition whose majority still
+  runs the older release keeps those records hidden until the next publish
+  reaches a majority.
 
 ### TentaBus
 
@@ -49,6 +55,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 - `acks=all` waits for the live in-sync replicas (never fewer than a majority
   at RF≥3) instead of the ISR recorded in the ledger, so a dead follower no
   longer blocks `acks=all` writes.
+- At RF≥3 with `acks=quorum` or `acks=all`, consumers no longer read records
+  of an earlier leader term that a re-elected leader re-fed to a majority
+  before they were committed; a stale later-term replica could still win the
+  next election and replace them. A new leader claims its term when it starts
+  serving and followers confirm the claim once their logs reach it (an entry
+  in `partition.epochs` that holds no record, so consumers see no extra
+  message and offsets are unchanged); a majority confirming makes those
+  records visible within about one heartbeat, with no publish needed. While
+  fewer than a majority of nodes run this release, the records stay hidden
+  until a record of the new leader's term reaches a majority.
 
 ## [0.3.0-beta] — 2026-09-24
 

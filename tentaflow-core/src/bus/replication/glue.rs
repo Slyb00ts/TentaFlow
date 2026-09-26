@@ -432,7 +432,7 @@ impl GlueLeaderShared {
     /// every supervisor: the first caller performs the (blocking) engine
     /// round trip on a blocking-pool thread, concurrent callers wait on
     /// the lock and then observe `stamped`.
-    async fn ensure_leader_epoch_stamped(&self) {
+    async fn ensure_leader_epoch_stamped(self: &Arc<Self>) {
         if self.stamped.load(Ordering::SeqCst) {
             return;
         }
@@ -457,13 +457,48 @@ impl GlueLeaderShared {
         })
         .await;
         match result {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                let shared = Arc::clone(self);
+                let _ = tokio::task::spawn_blocking(move || shared.claim_term()).await;
+            }
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "replication: deferred set_leader_epoch failed");
             }
             Err(e) => {
                 tracing::warn!(error = %e, "replication: deferred epoch stamp task failed");
             }
+        }
+    }
+
+    /// Claims this leader's term on its own log (`Partition::confirm_epoch`)
+    /// at the log end: from here on its chain holds only records of this
+    /// term. Its heartbeats then carry where the term begins, followers that
+    /// reach it confirm it, and a majority confirming commits the
+    /// earlier-term records below it without a record consumers would see
+    /// (`PartitionLeader::recompute_hw`). Only the serving handle claims,
+    /// once the partition recognizes the term — whichever of the two comes
+    /// last runs this; a spare never serves, and the partition refuses any
+    /// term but the one it has stamped. Blocking (a writer round trip and an
+    /// fsync), so always on a blocking thread, never under the registry
+    /// guard.
+    ///
+    /// Held under the `writes` lock: a `stop()` either ran before (nothing
+    /// is claimed) or waits until the claim is on disk, so a stopped handle
+    /// never claims afterwards.
+    fn claim_term(&self) {
+        let writes = self.writes.lock();
+        if !writes.open || writes.stopped {
+            return;
+        }
+        let epoch = self.leader.epoch();
+        let at = self.partition.log_end_offset();
+        if let Err(e) = self.partition.confirm_epoch(epoch, at) {
+            tracing::warn!(
+                org_id = %self.leader.org_id(), topic = %self.leader.topic(),
+                partition = self.leader.partition_id(), epoch, error = %e,
+                "replication: failed to claim the leader's term; earlier-term records stay \
+                 hidden until a record of this term is on a majority"
+            );
         }
     }
 }
@@ -629,6 +664,11 @@ impl LeaderHandle for GlueLeaderHandle {
             self.0.partition.open_leader_writes();
             writes.open = true;
         }
+    }
+
+    fn claim_term(&self) {
+        let shared = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || shared.claim_term());
     }
 
     fn log_epoch(&self) -> u32 {
@@ -1718,6 +1758,85 @@ mod tests {
         assert_eq!(part.log_end_offset(), 1);
     }
 
+    /// The claim runs on a blocking thread after the manager released its
+    /// guard, so a `stop()` or a newer leader's Hello can land in between.
+    /// A stopped handle claims nothing, and neither does one whose term the
+    /// partition no longer recognizes: what a newer leader fed since may be
+    /// its chain, not this one's. The serving handle's claim is the control
+    /// that the wait below is long enough to see one land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_racing_a_stop_or_a_newer_term_claims_nothing() {
+        let provider = FakeNodeProvider::new();
+        let factory = Arc::new(GlueLeaderFactory::new(
+            "l",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider) as Arc<dyn PartitionProvider>,
+            Arc::new(DeadTransport) as Arc<dyn Transport>,
+            fast_leader_config(),
+            Arc::new(LeaderMetrics::new()),
+        ));
+        let serve = |partition: u32| {
+            let factory = Arc::clone(&factory);
+            let mut a = assignment(&["l", "f1", "f2"], "l", &["l", "f1", "f2"], 5);
+            a.partition = partition;
+            async move {
+                let handle = tokio::task::spawn_blocking(move || {
+                    let handle = factory.spawn(&a, Vec::new()).expect("leader spawn");
+                    handle.open_writes();
+                    handle
+                })
+                .await
+                .unwrap();
+                Arc::new(handle)
+            }
+        };
+        let part = |p: u32| provider.partition("org-1", "orders", p, 0).unwrap();
+        let claimed_within = |part: Partition, wait: Duration| async move {
+            let deadline = std::time::Instant::now() + wait;
+            while std::time::Instant::now() < deadline {
+                if part.log_epoch() == 5 {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            false
+        };
+        let stop = |handle: Arc<Box<dyn LeaderHandle>>| async move {
+            tokio::task::spawn_blocking(move || handle.stop())
+                .await
+                .unwrap();
+        };
+
+        let serving = serve(0).await;
+        serving.claim_term();
+        assert!(
+            claimed_within(part(0), Duration::from_secs(5)).await,
+            "the serving handle's claim never landed"
+        );
+
+        let stopped = serve(1).await;
+        stop(Arc::clone(&stopped)).await;
+        stopped.claim_term();
+        assert!(
+            !claimed_within(part(1), Duration::from_millis(300)).await,
+            "a stopped handle claimed its term"
+        );
+
+        let superseded = serve(2).await;
+        let newer = part(2);
+        tokio::task::spawn_blocking(move || newer.set_leader_epoch(6).unwrap())
+            .await
+            .unwrap();
+        superseded.claim_term();
+        assert!(
+            !claimed_within(part(2), Duration::from_millis(300)).await,
+            "a superseded term claimed a log a newer leader may have fed"
+        );
+
+        stop(serving).await;
+        stop(superseded).await;
+    }
+
     /// X1, the RF=3 scenario end to end over real partitions and streams:
     /// `a` wrote 0..20 in term 3 and `b` holds all of it; `c` fell behind at
     /// 12. `a` is re-elected in term 4 with `c` and re-feeds it the term-3
@@ -1808,6 +1927,140 @@ mod tests {
         );
         runner.stop();
         leader.stop();
+    }
+
+    /// The reviewer's scenario end to end, over real partitions and streams.
+    /// Term 3 wrote 0..3 on `a` and `c` and committed none of it; `b` led
+    /// term 4 alone and wrote 0..5 of its own. `a` is re-elected in term 5
+    /// with `c` and nobody publishes. A majority holds 0..3, but `b`'s later
+    /// term still outranks `c`'s log: shown to consumers now, 0..3 would be
+    /// cut the moment `a` died and `b` won. They stay hidden until `a`
+    /// serves, claims its term and `c` confirms it — after which `c`
+    /// outranks `b`, and 0..3 are visible without anyone publishing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_fed_earlier_term_records_are_shown_only_once_a_later_term_cannot_retract_them() {
+        let provider_a = FakeNodeProvider::new();
+        let provider_b = FakeNodeProvider::new();
+        let provider_c = FakeNodeProvider::new();
+        for (provider, epoch, records) in [
+            (&provider_a, 3, 3),
+            (&provider_b, 4, 5),
+            (&provider_c, 3, 3),
+        ] {
+            let part = provider.partition("org-1", "orders", 0, 0).unwrap();
+            part.set_hw_tracking(HwTracking::Manual);
+            part.set_leader_epoch(epoch).unwrap();
+            publish_n(&part, records, "old").await;
+        }
+
+        let new_term = assignment(&["a", "b", "c"], "a", &["a", "c"], 5);
+        let leader_factory = GlueLeaderFactory::new(
+            "a",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider_a) as Arc<dyn PartitionProvider>,
+            Arc::new(DeadTransport) as Arc<dyn Transport>,
+            fast_leader_config(),
+            Arc::new(LeaderMetrics::new()),
+        );
+        let factory_b = GlueFollowerFactory::new(
+            "b",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider_b) as Arc<dyn PartitionProvider>,
+            fast_follower_config(),
+        );
+        let factory_c = GlueFollowerFactory::new(
+            "c",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider_c) as Arc<dyn PartitionProvider>,
+            fast_follower_config(),
+        );
+        let ((leader_recv, leader_send), (mut c_recv, c_send)) = duplex_pair();
+        let term = new_term.clone();
+        let leader = Arc::new(
+            tokio::task::spawn_blocking(move || {
+                leader_factory.spawn(&term, vec![("c".to_string(), leader_recv, leader_send)])
+            })
+            .await
+            .unwrap()
+            .expect("leader spawn"),
+        );
+        let hello = match crate::bus::replication::frames::read_frame(&mut c_recv)
+            .await
+            .expect("c: read Hello")
+        {
+            crate::bus::replication::frames::ReplFrame::Hello(h) => h,
+            other => panic!("c: expected Hello, got {other:?}"),
+        };
+        let term = new_term.clone();
+        let runner = tokio::task::spawn_blocking(move || {
+            factory_c.spawn(&term, hello, Box::new(c_recv), Box::new(c_send))
+        })
+        .await
+        .unwrap()
+        .expect("c runner");
+
+        let a_part = provider_a.partition("org-1", "orders", 0, 0).unwrap();
+        let c_part = provider_c.partition("org-1", "orders", 0, 0).unwrap();
+        let elect = |c: LogPosition| {
+            let b = factory_b.local_log_position(&new_term).unwrap();
+            let winner = crate::bus::replication::election::choose_candidate(
+                &["b".to_string(), "c".to_string()],
+                &[("b".to_string(), b), ("c".to_string(), c)],
+                "c",
+            );
+            (winner, c.kept_end(&b))
+        };
+
+        // Several ack rounds with `c` holding all of 0..3.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(c_part.log_end_offset(), 3);
+        let visible = a_part.high_watermark();
+        let (winner, kept_on_c) = elect(factory_c_position(&provider_c, &new_term));
+        assert_eq!(
+            winner.as_deref(),
+            Some("b"),
+            "b's term 4 outranks c's term 3"
+        );
+        assert!(
+            visible <= kept_on_c,
+            "consumers of `a` saw offsets below {visible}; were `a` to die, `b` wins and `c` keeps {kept_on_c}"
+        );
+
+        // What the manager does once it installed the handle as the serving
+        // one: open writes under its guard, claim the term after it.
+        let serving = Arc::clone(&leader);
+        tokio::task::spawn_blocking(move || serving.open_writes())
+            .await
+            .unwrap();
+        leader.claim_term();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while a_part.high_watermark() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "0..3 never became visible: hw {} committed {} c log epoch {}",
+                a_part.high_watermark(),
+                a_part.committed_offset(),
+                c_part.log_epoch()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            a_part.log_end_offset(),
+            3,
+            "no record was written to get there"
+        );
+        assert_eq!((c_part.log_epoch(), c_part.record_epoch()), (5, 3));
+        let (winner, _) = elect(factory_c_position(&provider_c, &new_term));
+        assert_eq!(
+            winner.as_deref(),
+            Some("c"),
+            "c's confirmed term 5 outranks b"
+        );
+
+        runner.stop();
+        tokio::task::spawn_blocking(move || leader.stop())
+            .await
+            .unwrap();
     }
 
     fn factory_c_position(

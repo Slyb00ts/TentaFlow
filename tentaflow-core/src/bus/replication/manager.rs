@@ -303,6 +303,13 @@ pub trait LeaderHandle: Send + Sync {
     /// stopping the serving handle closes them however many spares linger.
     /// `stop()` closes what this opened.
     fn open_writes(&self);
+    /// Claims this handle's term on the led partition's log
+    /// (`tentaflow_bus::epochs`), so a majority of followers can confirm it
+    /// and commit the earlier-term records below it without a record of this
+    /// term. Called after `open_writes`, OUTSIDE the registry guard: the
+    /// claim is a write to the partition's writer thread, queued behind its
+    /// appends, and ends in an fsync.
+    fn claim_term(&self);
     /// `Partition::log_epoch` of the led partition.
     fn log_epoch(&self) -> u32;
     /// `Partition::committed_offset` of the led partition.
@@ -1589,18 +1596,17 @@ impl ReplicationManager {
                 // its own task. `spawn_deferred` keeps the engine's
                 // writer-thread epoch stamp off this call path too.
                 match self.leader_factory.spawn_deferred(&assignment, Vec::new()) {
-                    Ok(handle) => {
-                        if let Some(orphan) = self.attach_leader(&key, &assignment, handle) {
-                            // Either a handle another task attached while this
-                            // one was blocked, or — when the entry has since
-                            // moved on — the handle just spawned here. Stopping
-                            // it is not optional: neither `GlueLeaderHandle` nor
-                            // `GlueFollowerRunner` implements `Drop`, so a
-                            // handle that is merely dropped leaves its feeder
-                            // tasks running and still writing to the partition.
-                            orphan.stop();
-                        }
-                    }
+                    Ok(handle) => match self.attach_leader(&key, &assignment, handle) {
+                        Ok(serving) => serving.claim_term(),
+                        // Either a handle another task attached while this
+                        // one was blocked, or — when the entry has since
+                        // moved on — the handle just spawned here. Stopping
+                        // it is not optional: neither `GlueLeaderHandle` nor
+                        // `GlueFollowerRunner` implements `Drop`, so a
+                        // handle that is merely dropped leaves its feeder
+                        // tasks running and still writing to the partition.
+                        Err(orphan) => orphan.stop(),
+                    },
                     Err(e) => {
                         // The re-stamp above may have left this key holding a
                         // Leader entry with no handle. Drop it — but only if it
@@ -1788,8 +1794,9 @@ impl ReplicationManager {
     }
 
     /// Puts the leader handle `apply_assignment` just spawned into the
-    /// registry entry that same call re-stamped, and returns whatever handle
-    /// must be stopped instead of kept — `None` when nothing is left over.
+    /// registry entry that same call re-stamped. `Ok` is the handle now
+    /// serving, whose term the caller claims once the guard is gone; `Err`
+    /// is the handle that must be stopped instead of kept.
     ///
     /// A whole-value `insert` cannot be used here. The re-stamp deliberately
     /// leaves the entry present and writable for the 124-302 ms the old
@@ -1820,7 +1827,7 @@ impl ReplicationManager {
         key: &PartitionKey,
         assignment: &PartitionAssignment,
         handle: Box<dyn LeaderHandle>,
-    ) -> Option<Arc<dyn LeaderHandle>> {
+    ) -> Result<Arc<dyn LeaderHandle>, Arc<dyn LeaderHandle>> {
         let handle: Arc<dyn LeaderHandle> = Arc::from(handle);
         match self.registry.get_mut(key) {
             Some(mut e) => {
@@ -1831,10 +1838,10 @@ impl ReplicationManager {
                     && e.assignment.leader_epoch == assignment.leader_epoch
                 {
                     handle.open_writes();
-                    e.leader = Some(handle);
-                    None
+                    e.leader = Some(Arc::clone(&handle));
+                    Ok(handle)
                 } else {
-                    Some(handle)
+                    Err(handle)
                 }
             }
             None => {
@@ -1849,7 +1856,7 @@ impl ReplicationManager {
                         role: LocalRole::Leader,
                         leader: Some({
                             handle.open_writes();
-                            handle
+                            Arc::clone(&handle)
                         }),
                         follower: None,
                         unfollowed_since: Instant::now(),
@@ -1862,7 +1869,7 @@ impl ReplicationManager {
                         leadership: self.next_leadership(),
                     },
                 );
-                None
+                Ok(handle)
             }
         }
     }
@@ -2607,6 +2614,7 @@ impl ReplicationManager {
                 let mut old_follower = None;
                 let mut old_leader = None;
                 let mut spare = None;
+                let mut claim = None;
                 let serving = match self.registry.get_mut(key) {
                     Some(mut e) => {
                         let same_term = e.role == LocalRole::Leader
@@ -2645,6 +2653,7 @@ impl ReplicationManager {
                                 old_follower = e.follower.take();
                                 e.unfollowed_since = Instant::now();
                                 handle.open_writes();
+                                claim = Some(Arc::clone(&handle));
                                 old_leader = e.leader.replace(Arc::clone(&handle));
                                 if e.role != LocalRole::Leader {
                                     e.leadership = self.next_leadership();
@@ -2668,7 +2677,11 @@ impl ReplicationManager {
                 for (node, to) in &truncates {
                     serving.send_truncate(node, *to);
                 }
-                // Outside the guard: every `stop()` blocks on the engine.
+                // Outside the guard: every `stop()` and the claim block on the
+                // engine.
+                if let Some(serving) = claim {
+                    serving.claim_term();
+                }
                 for stale in [spare, old_leader].into_iter().flatten() {
                     stale.stop();
                 }
@@ -3542,6 +3555,12 @@ mod tests {
         writes_opened: AtomicBool,
         /// Runs inside `stop()` — a hook to observe what `stop()` runs under.
         on_stop: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// `claim_term` ran.
+        claimed: AtomicBool,
+        /// Runs inside `claim_term()`, like `on_stop`; set from the factory's
+        /// `claim_hook` at spawn, since the manager claims right after it
+        /// installs the handle.
+        on_claim: Option<ClaimHook>,
     }
 
     impl FakeLeaderHandle {
@@ -3562,6 +3581,8 @@ mod tests {
                 acked_override: Mutex::new(None),
                 writes_opened: AtomicBool::new(false),
                 on_stop: Mutex::new(None),
+                claimed: AtomicBool::new(false),
+                on_claim: None,
             }
         }
 
@@ -3629,6 +3650,12 @@ mod tests {
         fn open_writes(&self) {
             self.writes_opened.store(true, Ordering::SeqCst);
         }
+        fn claim_term(&self) {
+            self.claimed.store(true, Ordering::SeqCst);
+            if let Some(hook) = &self.on_claim {
+                hook();
+            }
+        }
         fn log_epoch(&self) -> u32 {
             self.log_epoch.load(Ordering::SeqCst)
         }
@@ -3643,7 +3670,11 @@ mod tests {
         }
     }
 
+    type ClaimHook = Arc<dyn Fn() + Send + Sync>;
+
     struct FakeLeaderFactory {
+        /// Handed to every handle spawned from now on (`on_claim`).
+        claim_hook: Mutex<Option<ClaimHook>>,
         spawned: Mutex<Vec<PartitionAssignment>>,
         fail: AtomicBool,
         // `Arc`, not the `Box<dyn LeaderHandle>` `spawn` hands to the
@@ -3659,6 +3690,7 @@ mod tests {
     impl FakeLeaderFactory {
         fn new() -> Arc<Self> {
             Arc::new(Self {
+                claim_hook: Mutex::new(None),
                 spawned: Mutex::new(Vec::new()),
                 fail: AtomicBool::new(false),
                 handles: Mutex::new(Vec::new()),
@@ -3705,6 +3737,9 @@ mod tests {
         fn open_writes(&self) {
             self.0.open_writes()
         }
+        fn claim_term(&self) {
+            self.0.claim_term()
+        }
         fn log_epoch(&self) -> u32 {
             self.0.log_epoch()
         }
@@ -3726,11 +3761,14 @@ mod tests {
                 return Err(ReplError::Internal("forced leader spawn failure".into()));
             }
             self.spawned.lock().push(assignment.clone());
-            let handle = Arc::new(FakeLeaderHandle::new(
-                assignment.isr.clone(),
-                0,
-                self.spawn_leo.load(Ordering::SeqCst),
-            ));
+            let handle = Arc::new(FakeLeaderHandle {
+                on_claim: self.claim_hook.lock().clone(),
+                ..FakeLeaderHandle::new(
+                    assignment.isr.clone(),
+                    0,
+                    self.spawn_leo.load(Ordering::SeqCst),
+                )
+            });
             handle.truncations.store(
                 self.spawn_truncations.load(Ordering::SeqCst),
                 Ordering::SeqCst,
@@ -7281,6 +7319,120 @@ mod tests {
         assert!(
             !locked.load(Ordering::SeqCst),
             "stop() ran under the registry entry's guard"
+        );
+    }
+
+    /// Arms the factory so every spawned handle's `claim_term` records
+    /// whether `key`'s registry entry was locked while it ran.
+    fn observe_claims(fx: &Fixture, key: &PartitionKey) -> Arc<AtomicBool> {
+        let locked = Arc::new(AtomicBool::new(false));
+        let manager = Arc::downgrade(&fx.manager);
+        let seen = Arc::clone(&locked);
+        let key = key.clone();
+        *fx.leader_factory.claim_hook.lock() = Some(Arc::new(move || {
+            if let Some(manager) = manager.upgrade() {
+                if manager.registry.try_get(&key).is_locked() {
+                    seen.store(true, Ordering::SeqCst);
+                }
+            }
+        }));
+        locked
+    }
+
+    /// A leader handle installed by the assignment path claims its term, and
+    /// not under the registry guard it was installed under: the claim is a
+    /// write to the partition's writer, queued behind its appends and ending
+    /// in an fsync, and the guard's shard serves every other partition on
+    /// it, `accept_hello` and the lease tick.
+    #[tokio::test]
+    async fn an_installed_leader_claims_its_term_outside_the_registry_guard() {
+        let fx = build("x");
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        let locked = observe_claims(&fx, &key);
+        // Following first, so the leader handle is attached to the entry the
+        // call re-stamps rather than inserted as a new one.
+        let follows = assignment(
+            "org",
+            "orders",
+            0,
+            "y",
+            &["x", "y", "z"],
+            &["x", "y", "z"],
+            1,
+        );
+        fx.manager.apply_assignment(follows).await;
+        let leads = assignment(
+            "org",
+            "orders",
+            0,
+            "x",
+            &["x", "y", "z"],
+            &["x", "y", "z"],
+            2,
+        );
+        fx.assignments.seed(leads.clone());
+        fx.manager.apply_assignment(leads).await;
+        let handle = Arc::clone(&fx.leader_factory.handles.lock()[0]);
+        assert!(handle.writes_opened.load(Ordering::SeqCst));
+        assert!(
+            handle.claimed.load(Ordering::SeqCst),
+            "the term was never claimed"
+        );
+        assert!(
+            !locked.load(Ordering::SeqCst),
+            "claim_term ran under the registry entry's guard"
+        );
+    }
+
+    /// The same for a handle a won election installs.
+    #[tokio::test]
+    async fn a_promoted_leader_claims_its_term_outside_the_registry_guard() {
+        let fx = build("f1");
+        let key = ("org".to_string(), "orders".to_string(), 0u32);
+        let a = assignment(
+            "org",
+            "orders",
+            0,
+            "l",
+            &["l", "f1", "f2"],
+            &["l", "f1", "f2"],
+            5,
+        );
+        fx.assignments.seed(a.clone());
+        fx.manager.apply_assignment(a).await;
+        fx.transport.set_script(
+            "f2",
+            PeerScript::LeoReply {
+                leo: 0,
+                in_isr: true,
+            },
+        );
+        for raw in 1u8..=4 {
+            fx.ledger
+                .set_acked(OperationId::from_hash([raw; 32]), vec!["f2".to_string()]);
+        }
+        let locked = observe_claims(&fx, &key);
+        fx.manager.run_election(key.clone()).await;
+        assert!(matches!(
+            fx.manager.role("org", "orders", 0),
+            PartitionRole::Leader { .. }
+        ));
+        let serving: Vec<_> = fx
+            .leader_factory
+            .handles
+            .lock()
+            .iter()
+            .filter(|h| h.writes_opened.load(Ordering::SeqCst))
+            .cloned()
+            .collect();
+        assert!(!serving.is_empty(), "no handle was installed as serving");
+        assert!(
+            serving.iter().all(|h| h.claimed.load(Ordering::SeqCst)),
+            "a serving handle never claimed its term"
+        );
+        assert!(
+            !locked.load(Ordering::SeqCst),
+            "claim_term ran under the registry entry's guard"
         );
     }
 
