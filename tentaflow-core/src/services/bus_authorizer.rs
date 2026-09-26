@@ -82,10 +82,13 @@ use crate::db::DbPool;
 /// doc ("bump on any permission/ACL change").
 static ACL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Called by the `BusAclSetRequest` dispatch handler after
-/// `resource_permissions::set`/`clear` commits. Never called from this
-/// file itself — this module only READS `resource_permissions`, the
-/// dispatch handler owns the write + this bump as one sequence.
+/// Called after every committed change to a topic's access entries — a local
+/// write (`resource_permissions::set_topic_rule`, the clears in
+/// `dispatch/bus.rs` and `dispatch/handlers.rs`), a topic create/delete that
+/// removed entries, and a replicated change applied by
+/// `sync::core_materializer`. One counter for every instance and topic: an
+/// open consumer re-checks its own topics when it moves. Never called from
+/// this file itself — this module only READS `resource_permissions`.
 pub fn bump_acl_generation() {
     ACL_GENERATION.fetch_add(1, Ordering::AcqRel);
 }

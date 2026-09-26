@@ -1287,7 +1287,7 @@ pub fn create_topic(
     opts: TopicOptions,
     environment: NodeEnvironment,
     now_ms: i64,
-) -> Result<TopicConfig, BusServiceError> {
+) -> Result<(TopicConfig, repository::RemovedTopicRules), BusServiceError> {
     validate_user_topic_name(name)?;
     reject_idempotency_key(&opts)?;
     reject_fire_and_forget(&opts)?;
@@ -1308,8 +1308,8 @@ pub fn create_topic(
         validation_touched,
         None,
     )?;
-    repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
-    Ok(cfg)
+    let removed = repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
+    Ok((cfg, removed))
 }
 
 /// Internal variant for broker-owned topics (`__dlq.<topic>`), bypassing the
@@ -1328,7 +1328,20 @@ pub fn create_internal_topic(
         return TopicConfig::try_from(existing);
     }
     let cfg = TopicConfig::from_options(instance_id, org_id, name, opts, environment, now_ms)?;
-    repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
+    match name.strip_prefix(crate::bus::dlq::DLQ_TOPIC_PREFIX) {
+        // A dead-letter topic exists only beside its source: a delivery that
+        // read the source before it was deleted must not bring the DLQ back.
+        Some(source) => {
+            if !repository::bus_dlq_topic_create(db, &DbBusTopic::from(&cfg), source)? {
+                return Err(BusServiceError::TopicNotFound {
+                    name: source.to_string(),
+                });
+            }
+        }
+        None => {
+            repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
+        }
+    }
     Ok(cfg)
 }
 
@@ -1425,19 +1438,20 @@ pub fn update_topic(
     Ok(cfg)
 }
 
+/// Deletes the topic row with its access entries and data-hiding rules;
+/// returns what went with it.
 pub fn delete_topic(
     db: &DbPool,
     instance_id: &str,
     org_id: &str,
     name: &str,
-) -> Result<(), BusServiceError> {
+) -> Result<repository::RemovedTopicRules, BusServiceError> {
     if repository::bus_topic_get(db, instance_id, org_id, name)?.is_none() {
         return Err(BusServiceError::TopicNotFound {
             name: name.to_string(),
         });
     }
-    repository::bus_topic_delete(db, instance_id, org_id, name)?;
-    Ok(())
+    Ok(repository::bus_topic_delete(db, instance_id, org_id, name)?)
 }
 
 pub fn list_topics(
@@ -2320,7 +2334,7 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("at_least_once must stay accepted");
+        .expect("at_least_once must stay accepted").0;
         assert_eq!(cfg.delivery, DeliveryMode::AtLeastOnce);
     }
 
@@ -2338,7 +2352,7 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("create topic");
+        .expect("create topic").0;
 
         let err = update_topic(
             &db,
@@ -2475,7 +2489,7 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("delete must stay accepted");
+        .expect("delete must stay accepted").0;
         assert_eq!(cfg.cleanup_policy, CleanupPolicy::Delete);
     }
 
@@ -2491,7 +2505,7 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("create topic");
+        .expect("create topic").0;
 
         let err = update_topic(
             &db,

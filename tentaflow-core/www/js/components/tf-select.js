@@ -5,12 +5,13 @@
 // Przyklad: <tf-select value="rr"><option value="fa">First</option>...</tf-select>
 // Atrybuty: value, disabled, name, label (etykieta NAD polem), prefix (krotki
 //   podpis WEWNATRZ pola, przed wybrana wartoscia — np. "Instancja" w wyborze
-//   instancji aplikacji), dot (ok|warn|err — kropka stanu przed podpisem).
+//   instancji aplikacji), dot (ok|warn|err — kropka stanu przed podpisem),
+//   hint (one explanatory line UNDER the field, same look as tf-input's hint).
 // =============================================================================
 
 class TfSelect extends HTMLElement {
   static get observedAttributes() {
-    return ['value', 'disabled', 'name', 'label', 'prefix', 'dot'];
+    return ['value', 'disabled', 'name', 'label', 'prefix', 'dot', 'hint'];
   }
 
   constructor() {
@@ -134,7 +135,11 @@ class TfSelect extends HTMLElement {
     wrap.appendChild(prefix);
     wrap.appendChild(select);
     group.appendChild(wrap);
+    const hint = document.createElement('span');
+    hint.className = 'tf-hint';
+    group.appendChild(hint);
     this.appendChild(group);
+    this._hintEl = hint;
 
     this._group = group;
     this._labelEl = label;
@@ -153,6 +158,9 @@ class TfSelect extends HTMLElement {
     const labelText = this.getAttribute('label') || '';
     this._labelEl.textContent = labelText;
     this._labelEl.style.display = labelText ? '' : 'none';
+    const hintText = this.getAttribute('hint') || '';
+    this._hintEl.textContent = hintText;
+    this._hintEl.style.display = hintText ? '' : 'none';
     this._updatePrefix();
   }
 

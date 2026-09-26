@@ -2960,12 +2960,11 @@ export const encode = {
 
   /**
    * BusPayload::TopicCreateRequest. payload: { name, options: {...BusTopicOptionsWire} }
-   * (M02 creator). `options` is normally already SNAKE_CASE
-   * (`buildTopicOptionsWire` in `modules/tentabus.js`), but `camelToSnakePayload`
-   * is applied first so a caller using the friendlier `durabilityClass` payload
-   * key (owner decision B's `durability_class` option, 'standard' | 'critical')
-   * — or any other camelCase key — still reaches
-   * `serde_json::from_str::<BusTopicOptionsWire>` correctly; an already-
+   * (the topic creator, `buildTopicCreateRequest` in
+   * `modules/tentabus/topic-creator.js`, sends camelCase keys).
+   * `camelToSnakePayload` turns every camelCase key (`durabilityClass`,
+   * `retentionMs`, …) into the snake_case one
+   * `serde_json::from_str::<BusTopicOptionsWire>` expects; an already-
    * snake_case key round-trips unchanged.
    *
    * `options.durability` accepts one more value on TOP of the concrete

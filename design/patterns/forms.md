@@ -155,9 +155,11 @@ akcja („Usuń"), nie „Tak"/„OK”.
 - Stan wizardu żyje w module-scoped zmiennych (nie w komponencie) i jest
   resetowany explicite w `open()` — wizard nie jest reużywalnym komponentem
   `tf-*`, jest funkcją modułu budującą `<tf-window>` programowo.
-- Zamknięcie: `close()` czyści subskrypcję probe (`probeUnsub()`), usuwa
-  `winEl`/`backdropEl` z DOM. Klik na backdrop = zamknięcie (`backdropEl
-  .addEventListener('click', () => close())`).
+- Zamknięcie: okno ma atrybut `modal`, więc `tf-window` sam dodaje tło i
+  zabiera je razem z oknem; klik w tło nie zamyka wizardu. `close()` usuwa
+  okno, a zdarzenie `closed` (okno opuściło dokument: `close()`, Escape,
+  router czyszczący ekran) uruchamia `release()`, które kończy subskrypcję
+  probe (`probeUnsub()`) i zeruje `probeInProgress`/`winEl`.
 
 ## Submit klawiaturą
 

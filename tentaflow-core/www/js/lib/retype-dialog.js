@@ -26,6 +26,8 @@ const defaultDescribeError = (err) => String(err?.message || err || '');
  * (nothing ran, the window stays open unchanged). `secondary` adds a middle
  * footer button (`{ label, icon, onClick }`) for a safer alternative.
  *
+ * `modal` dims the screen behind the window while it is open.
+ *
  * `alsoArmed()` is a SECOND condition the confirm button waits for, on top of
  * the retyped name — for an action with a second victim the name does not
  * mention. Callers that pass it must re-run `syncButton` (handed to `wire`)
@@ -34,10 +36,11 @@ const defaultDescribeError = (err) => String(err?.message || err || '');
 export function openRetypeDialog({
   title, subtitle = '', icon = 'trash', name, bodyHtml = '', retypeLabel,
   confirmLabel, confirmIcon = 'trash', width = 560, className = '',
-  describeError = defaultDescribeError, wire = null, secondary = null, alsoArmed = null, onConfirm,
+  describeError = defaultDescribeError, wire = null, secondary = null, alsoArmed = null, modal = false, onConfirm,
 }) {
   const win = document.createElement('tf-window');
   if (className) win.className = className;
+  if (modal) win.setAttribute('modal', '');
   win.setAttribute('title', title);
   if (subtitle) win.setAttribute('subtitle', subtitle);
   win.setAttribute('icon', icon);
@@ -66,19 +69,24 @@ export function openRetypeDialog({
   document.body.appendChild(win);
   const input = win.querySelector('#retype-input');
   const btn = win.querySelector('[data-action="confirm"]');
+  const cancelBtn = win.querySelector('[data-action="cancel"]');
   if (secondary) win.querySelector('[data-act="secondary"]').addEventListener('click', () => { win.close(true); secondary.onClick(); });
   let busy = false;
   const armed = () => input.value.trim() === name && (!alsoArmed || alsoArmed() === true);
   const syncButton = () => {
     if (armed() && !busy) btn.removeAttribute('disabled');
     else btn.setAttribute('disabled', '');
+    cancelBtn.toggleAttribute('disabled', busy);
   };
   input.addEventListener('input', syncButton);
   input.addEventListener('change', syncButton);
   input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && armed() && !busy) btn.click(); });
   if (wire) wire(win, syncButton);
+  // While the action is out the window stays (Escape, the close button):
+  // closed, it could not show the answer — a refusal would go unseen.
+  win.addEventListener('close-request', (e) => { if (busy) e.preventDefault(); });
   win.addEventListener('action', async (e) => {
-    if (e.detail?.action === 'cancel') { win.close(true); return; }
+    if (e.detail?.action === 'cancel') { if (!busy) win.close(true); return; }
     if (e.detail?.action !== 'confirm') return;
     e.preventDefault();
     if (busy || !armed()) return;

@@ -415,6 +415,29 @@ tf-window [slot="footer"] {
 .tf-input-prefix { margin-right: 6px; }
 .tf-input-suffix { margin-left: 6px; }
 
+/* Stepper: [−][value][+] — the buttons sit at the field's edges and the value
+   is centred between them. */
+.tf-input-wrap.tf-input-wrap-stepper { padding: 0; }
+.tf-input-wrap-stepper .tf-input { text-align: center; -moz-appearance: textfield; }
+.tf-input-wrap-stepper .tf-input::-webkit-outer-spin-button,
+.tf-input-wrap-stepper .tf-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.tf-input-step {
+  flex: 0 0 38px;
+  align-self: stretch;
+  border: none;
+  background: transparent;
+  color: var(--tf-text-2);
+  font: inherit;
+  font-size: 16px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.tf-input-step--dec { order: -1; border-right: 1px solid var(--tf-border); border-radius: var(--tf-radius) 0 0 var(--tf-radius); }
+.tf-input-step--inc { order: 5; border-left: 1px solid var(--tf-border); border-radius: 0 var(--tf-radius) var(--tf-radius) 0; }
+.tf-input-step:hover:not(:disabled) { background: var(--tf-bg-card-hover); color: var(--tf-text); }
+.tf-input-step:focus-visible { outline: 2px solid var(--tf-accent-1); outline-offset: -2px; }
+.tf-input-step:disabled { opacity: 0.4; cursor: not-allowed; }
+
 /* =============================================================================
    tf-searchbox
    ============================================================================= */

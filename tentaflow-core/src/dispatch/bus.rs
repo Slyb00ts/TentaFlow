@@ -2441,16 +2441,22 @@ async fn acl_set_v1(
                     "bus.invalid_argument: access_level must be 'allow', 'deny' or 'clear'",
                 ));
             }
-            repository::resource_permissions::set_with_action(
+            // An entry belongs to a topic that exists, like a data-hiding rule
+            // (`field_policies::set_policy`); see `set_topic_rule`.
+            let written = repository::resource_permissions::set_topic_rule(
                 &db,
-                "topic",
                 &resource_id,
                 &subject_type2,
                 &subject_id2,
                 &action2,
                 &access_level2,
             )
-            .map_err(|e| db_err("resource_permissions::set_with_action", e))
+            .map_err(|e| db_err("resource_permissions::set_topic_rule", e))?;
+            if written {
+                Ok(())
+            } else {
+                Err(map_bus_error(BusServiceError::TopicNotFound { name: topic2 }))
+            }
         }
     })
     .await?;
@@ -5907,6 +5913,14 @@ mod tests {
         let ctx = handler_ctx(db, org);
         let instance = fixture_instance_id();
         let topic = "acl.actions.topic".to_string();
+        topic_create_v1(
+            &ctx,
+            instance.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
 
         acl_set_v1(
             &ctx,
@@ -6009,6 +6023,41 @@ mod tests {
         .await
         .expect_err("an unknown action must be rejected");
         assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+    }
+
+    /// An access entry cannot be written ahead of its topic: nothing would
+    /// order it against the topic's creation on other nodes. Clearing one
+    /// stays possible, so a leftover row can always be removed.
+    #[tokio::test]
+    async fn acl_set_refuses_a_topic_that_does_not_exist() {
+        let (_guard, db) = bus_fixture();
+        let user_id = "u-acl-admin3".to_string();
+        let org_id = seed_membership(&db, &user_id, "org.admin");
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let ctx = handler_ctx(db, org);
+        let instance = fixture_instance_id();
+        let topic = format!("jeszcze.nie.ma.{}", uuid::Uuid::new_v4().simple());
+        let set = |level: &str| {
+            acl_set_v1(
+                &ctx,
+                instance.as_str(),
+                topic.clone(),
+                "user".to_string(),
+                "u-target".to_string(),
+                level.to_string(),
+                "read".to_string(),
+            )
+        };
+        let err = set("deny").await.expect_err("no topic, no entry");
+        assert!(err.message.contains("topic_not_found"), "{err:?}");
+        set("clear").await.expect("clearing needs no topic");
+        match acl_list_v1(&ctx, instance.as_str(), topic.clone())
+            .await
+            .expect("list")
+        {
+            BusPayload::AclListResponse { entries } => assert!(entries.is_empty()),
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     #[tokio::test]

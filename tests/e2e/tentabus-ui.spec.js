@@ -1,12 +1,18 @@
 // =============================================================================
 // File: tests/e2e/tentabus-ui.spec.js
-// Description: TentaBus screen shell and Przegląd (PLAN-UI-20260923 U0) on a
+// Description: TentaBus screen shell, Przegląd (PLAN-UI-20260923 U0) and
+//              Topiki with the topic creator, delete and preview (U1) on a
 //              real node seeded with the "Przychodnia Zdrowie" world
 //              (`seed_clinic_data` in tentaflow-core/tests/bus_demo_seed.rs):
 //              boot once to migrate, seed offline, boot again. Drives T01 at
 //              1440x900 and 390x844, the six main tabs, the alerts' buttons,
 //              reload of a tab and of a topic, and switching to the empty
-//              instance (T11). Stateful: run the whole project, never `-g`.
+//              instance (T11); then T02/T04: the topic list, its filters and
+//              footer, the creator (validation, three steps, the new row),
+//              the message preview, delete with the retyped name, the phone
+//              layout, the empty instance's creator and, last because it
+//              stops the node, the list kept under the connection notice (T12). Stateful: run the whole
+//              project, never `-g`.
 //              The runtime lives under the repo's `.runtime/` — on macOS a
 //              rig under /tmp (a symlink to /private/tmp) is not reliable.
 // =============================================================================
@@ -149,6 +155,7 @@ async function openInstance(page, name) {
 
 const tab = (page, id) => page.locator(`#tb-tabs tf-tab#${id} > button`);
 const overview = (page) => page.locator('#tb-panel > [data-tb-view-slot="overview"]');
+const topicsSlot = (page) => page.locator('#tb-panel > [data-tb-view-slot="topics"]');
 const hashParams = (page) => Object.fromEntries(new URLSearchParams(new URL(page.url()).hash.split('?')[1] || ''));
 const norm = (s) => String(s).replace(/[\u00a0\u202f]/g, ' ').replace(/\s+/g, ' ').trim();
 
@@ -375,9 +382,8 @@ test('main tabs: each one shows its content, the address and the breadcrumb foll
   const instance = await openInstance(page, 'Produkcja');
   const expectations = {
     topics: async () => {
-      await expect(page.locator('#tb-topics-table tbody tr')).toHaveCount(3, { timeout: 15000 });
-      await expect(page.locator('#tb-kpi-topics')).toHaveAttribute('value', '3');
-      await expect(page.locator('#tb-kpi-partitions')).toHaveAttribute('value', '8');
+      await expect(topicsSlot(page).locator('[data-role="table"] tbody tr')).toHaveCount(3, { timeout: 15000 });
+      await expect(topicsSlot(page).locator('[data-role="footer"]')).toContainText('8 partycji');
     },
     groups: async () => {
       const rows = page.locator('#tb-groups-table tbody tr');
@@ -537,4 +543,328 @@ test('switching to the empty instance: T11 empty states, counters at zero, no al
   await assertNoOverflow(page);
   await page.screenshot({ path: path.join(SHOTS, 't11-szkolenia-przeglad-telefon.png'), fullPage: true });
   expect(errors, errors.join('\n')).toEqual([]);
+});
+
+// ----------------------------------------------------------------------------
+// U1 — Topiki (T02), the topic creator (T04), delete and the message preview.
+// ----------------------------------------------------------------------------
+
+const topicsTable = (page) => topicsSlot(page).locator('[data-role="table"]');
+const topicRow = (page, name) => topicsTable(page).locator('tbody tr', { hasText: name });
+const creator = (page) => page.locator('tf-window.tb-creator');
+const nextButton = (page) => creator(page).locator('[data-act="next"]');
+
+async function openTopics(page, instanceName = 'Produkcja') {
+  await openInstance(page, instanceName);
+  await tab(page, 'topics').click();
+  await expect(tab(page, 'topics')).toHaveAttribute('aria-selected', 'true');
+}
+
+test('T02 at 1440x900: rows with content and pattern, filters with counts, footer, row actions', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openTopics(page);
+  const rows = topicsTable(page).locator('tbody tr');
+  await expect(rows).toHaveCount(3, { timeout: 15000 });
+  // What each topic carries and what checks it, from the server's own list.
+  await expect(topicRow(page, 'wyniki-badan')).toContainText('HL7 v2 · bez wzoru');
+  await expect(topicRow(page, 'wizyty')).toContainText('JSON · wzór wizyta');
+  await expect(topicRow(page, 'faktury')).toContainText('XML · bez wzoru');
+  // A consumer that falls behind or is paused makes its topic "opóźniony":
+  // the waiting count turns into a chip, and the unprocessed messages are counted.
+  await expect(topicRow(page, 'wyniki-badan').locator('.tf-chip', { hasText: 'czeka' })).toBeVisible();
+  await expect(topicRow(page, 'faktury').locator('.tf-chip', { hasText: 'czeka' })).toBeVisible();
+  await expect(topicRow(page, 'wizyty').locator('.tf-chip', { hasText: 'czeka' })).toHaveCount(0);
+  expect(norm(await topicRow(page, 'wyniki-badan').innerText())).toContain('14');
+  const filter = topicsSlot(page).locator('[data-role="filter"] .tf-seg-opt');
+  await expect(filter).toHaveText(['Wszystkie 3', 'Opóźnione 2', 'Nieprzetworzone 1']);
+  await expect(topicsSlot(page).locator('[data-role="count"]')).toHaveAttribute('label', '3');
+  await expect(topicsSlot(page).locator('[data-role="footer"]')).toContainText('3 topiki');
+  await expect(topicsSlot(page).locator('[data-role="footer"]')).toContainText('8 partycji');
+  await expect(topicsSlot(page).locator('.section-card-head')).toContainText('Kliknij wiersz, aby otworzyć topik.');
+
+  // Filters and search narrow the rows and the footer with them.
+  await filter.filter({ hasText: 'Opóźnione' }).click();
+  await expect(rows).toHaveCount(2);
+  await expect(topicsSlot(page).locator('[data-role="footer"]')).toContainText('2 topiki');
+  await filter.filter({ hasText: 'Nieprzetworzone' }).click();
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText('wyniki-badan');
+  await filter.filter({ hasText: 'Wszystkie' }).click();
+  await topicsSlot(page).locator('[data-role="search"] input').fill('fakt');
+  await expect(rows).toHaveCount(1);
+  await expect(rows.first()).toContainText('faktury');
+  await topicsSlot(page).locator('[data-role="search"] input').fill('nic-takiego');
+  await expect(topicsSlot(page).locator('[data-role="no-match"]')).toBeVisible();
+  await topicsSlot(page).locator('[data-role="search"] input').fill('');
+  await expect(rows).toHaveCount(3);
+
+  // Each row: the eye and the bin act on their own, the arrow and the row open it.
+  const actions = await topicRow(page, 'wizyty').locator('tf-button').evaluateAll((els) => els.map((b) => b.dataset.act));
+  expect(actions).toEqual(['preview', 'delete', 'open']);
+  await assertNoOverflow(page);
+  await assertNoBannedWords(page);
+  await assertNoInternalTopics(page);
+  await assertSentenceCaseChips(page);
+  await page.screenshot({ path: path.join(SHOTS, 't02-topiki.png'), fullPage: true });
+
+  await topicRow(page, 'faktury').click();
+  await expect(page.locator('#tb-crumbs .tf-breadcrumb-item')).toHaveText(['TentaBus', 'Produkcja', 'Topiki', 'faktury']);
+  expect(hashParams(page)).toMatchObject({ tab: 'topics', topic: 'faktury' });
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('T04 creator: name checks, three steps, pattern for the chosen content, the new row', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openTopics(page);
+  await expect(topicsTable(page).locator('tbody tr')).toHaveCount(3, { timeout: 15000 });
+  await topicsSlot(page).locator('tf-button[data-go="create"]').click();
+  await expect(creator(page).locator(".install-header")).toBeVisible();
+  await expect(page.locator('.tf-window-backdrop')).toHaveCount(1);
+
+  // Step 1: Dalej stays locked until the name can be used.
+  await expect(nextButton(page)).toHaveAttribute('disabled', '');
+  const name = creator(page).locator('#tb-cr-name');
+  await name.locator('input').fill('wyniki-badan');
+  await expect(name.locator('.tf-error-text')).toHaveText('Topik o tej nazwie już jest w tej instancji.');
+  await expect(nextButton(page)).toHaveAttribute('disabled', '');
+  await name.locator('input').fill('Wyniki Nowe');
+  await expect(name.locator('.tf-error-text')).toContainText('małe litery');
+  await name.locator('input').fill('__wewnetrzny');
+  await expect(name.locator('.tf-error-text')).toContainText('„__”');
+  await name.locator('input').fill('wyniki-z-pracowni');
+  await expect(name.locator('.tf-error-text')).toBeHidden();
+  await expect(creator(page).locator('[data-role="heading"]')).toHaveText('wyniki-z-pracowni');
+  await expect(creator(page).locator('#tb-cr-kind tf-choice-card')).toHaveCount(3);
+  await creator(page).locator('#tb-cr-kind tf-choice-card[value="application/json"]').click();
+  await creator(page).locator('#tb-cr-partitions .tf-input-step--inc').click();
+  await expect(creator(page).locator('#tb-cr-partitions input')).toHaveValue('4');
+  await page.screenshot({ path: path.join(SHOTS, 't04-krok1.png') });
+  await nextButton(page).click();
+
+  // Step 2: the copies sentence is the server's own resolution (one node here).
+  await expect(creator(page).locator('.install-step.done')).toHaveCount(1);
+  await expect(creator(page).locator('.tb-copies-box')).toContainText('1 kopia, bo ta instancja ma jeden node');
+  await expect(creator(page).locator('.tb-stat-rows')).toContainText('usuwaj stare wiadomości');
+  await creator(page).locator('#tb-cr-retention select').selectOption('90');
+  await creator(page).locator('#tb-cr-durability tf-choice-card[value="critical"]').click();
+  await page.screenshot({ path: path.join(SHOTS, 't04-krok2.png') });
+  await nextButton(page).click();
+
+  // Step 3: only JSON patterns that are not withdrawn, checking on, the summary.
+  await expect(creator(page).locator('#tb-cr-validate')).toHaveAttribute('checked', '');
+  const options = await creator(page).locator('#tb-cr-schema select option').allTextContents();
+  expect(options.map(norm)).toEqual(['wizyta · JSON Schema']);
+  const summary = norm(await creator(page).locator('.tb-kv-grid').innerText());
+  expect(summary).toContain('wyniki-z-pracowni');
+  expect(summary).toContain('90 dni, usuwaj stare wiadomości');
+  expect(summary).toContain('1, bo ta instancja ma jeden node');
+  expect(summary).toContain('krytyczna');
+  expect(summary).toContain('wizyta, najnowsza wersja');
+  await page.screenshot({ path: path.join(SHOTS, 't04-krok3.png') });
+  // Wstecz keeps what was chosen.
+  await creator(page).locator('[data-act="back"]').click();
+  await expect(creator(page).locator('#tb-cr-retention select')).toHaveValue('90');
+  await nextButton(page).click();
+  await expect(nextButton(page)).toContainText('Utwórz topik');
+  await nextButton(page).click();
+
+  // The result: window gone, the note above the list, the new row from the server.
+  await expect(creator(page)).toHaveCount(0);
+  await expect(page.locator('.tf-window-backdrop')).toHaveCount(0);
+  const notice = topicsSlot(page).locator('[data-role="notice"] tf-alert');
+  await expect(notice).toHaveAttribute('title', 'Utworzono topik wyniki-z-pracowni.');
+  await expect(notice).toHaveAttribute('message', /sprawdza je wzór wizyta/);
+  await expect(topicsTable(page).locator('tbody tr')).toHaveCount(4, { timeout: 15000 });
+  const row = topicRow(page, 'wyniki-z-pracowni');
+  await expect(row).toContainText('JSON · wzór wizyta');
+  await expect(row).toContainText('90 dni');
+  await expect(page.locator('#tb-tabs tf-tab#topics')).toHaveAttribute('count', '4', { timeout: 15000 });
+  await assertNoOverflow(page);
+  await page.screenshot({ path: path.join(SHOTS, 't04-utworzono.png'), fullPage: true });
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('message preview: the busiest partition at its newest page, the newest message open, audit note', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openTopics(page);
+  await topicRow(page, 'wyniki-badan').locator('tf-button[data-act="preview"]').click();
+  const win = page.locator('tf-window.tb-preview-window');
+  await expect(win.locator(".tb-audit-banner")).toBeVisible();
+  await expect(win.locator('.tb-audit-banner')).toContainText('Ten podgląd zapisuje się w dzienniku audytu.');
+  await expect(win.locator('[data-role="table"] tbody tr').first()).toBeVisible({ timeout: 15000 });
+  const count = await win.locator('[data-role="table"] tbody tr').count();
+  expect(count).toBeGreaterThan(0);
+  expect(count).toBeLessThanOrEqual(50);
+  await expect(win.locator('[data-role="range"]')).toHaveText(/^od \d[\d\s\u00a0\u202f]* do \d[\d\s\u00a0\u202f]*$/);
+  await expect(win.locator('.tb-payload')).toContainText('MSH|');
+  await expect(win.locator('.tb-preview-record-head')).toContainText(/wiadomość \d[\d\s\u00a0\u202f]* · partycja \d · zapisana/i);
+  await expect(win.locator('[data-role="note"]')).toContainText('Od najstarszej do najnowszej.');
+  // Another partition from its first message, then a row opens its content.
+  await win.locator('[data-role="partition"] select').selectOption('0');
+  await win.locator('[data-role="from"] input').fill('0');
+  await win.locator('[data-role="from"] input').press('Enter');
+  await expect(win.locator('[data-role="table"] tbody tr').first()).toContainText('Partycja 0', { timeout: 15000 });
+  await win.locator('[data-role="table"] tbody tr').first().click();
+  await expect(win.locator('.tb-preview-record-head')).toContainText('Wiadomość 0 · partycja 0');
+  await expect(win.locator('[data-role="more"]')).toBeVisible();
+  const before = await win.locator('[data-role="table"] tbody tr').count();
+  await win.locator('[data-role="more"]').click();
+  await expect.poll(() => win.locator('[data-role="table"] tbody tr').count()).toBeGreaterThan(before);
+  await page.screenshot({ path: path.join(SHOTS, 't02-podglad.png') });
+  await win.locator('tf-button', { hasText: 'Zamknij' }).click();
+  await expect(win).toHaveCount(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+// One binary-protocol call from the page, as the screen itself makes it.
+function busCall(page, kind, payload) {
+  return page.evaluate(async ([k, p]) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    return k.endsWith('ListRequest') ? ApiBinary.one(k, p) : ApiBinary.action(k, p);
+  }, [kind, payload]);
+}
+
+test('delete with the retyped name: what goes, what stays, the list without it', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openTopics(page);
+  await expect(topicRow(page, 'wyniki-z-pracowni')).toHaveCount(1, { timeout: 15000 });
+  const instanceId = hashParams(page).instance;
+  const topic = 'wyniki-z-pracowni';
+  await busCall(page, 'busAclSetRequest', { instanceId, topic, subjectType: 'user', subjectId: 'e2e-dawny-odbiorca', accessLevel: 'deny', action: 'read' });
+  await topicRow(page, 'wyniki-z-pracowni').locator('tf-button[data-act="delete"]').click();
+  const win = page.locator('tf-window.tb-delete-window');
+  await expect(win.locator(".tb-danger-box")).toBeVisible();
+  await expect(win.locator('.tb-danger-box')).toContainText('Tej operacji nie da się cofnąć.');
+  await expect(win.locator('.tb-impact-list')).toContainText('4 puste partycje');
+  await expect(win.locator('.tb-impact-list')).toContainText('1 wpis dostępu');
+  await expect(win.locator('.tb-kept-box')).toContainText('wzór wiadomości wizyta');
+  const confirm = win.locator('tf-button[data-action="confirm"]');
+  await expect(confirm).toHaveAttribute('disabled', '');
+  await win.locator('#retype-input input').fill('wyniki-z');
+  await expect(confirm).toHaveAttribute('disabled', '');
+  await win.locator('#retype-input input').fill('wyniki-z-pracowni');
+  await expect(confirm).not.toHaveAttribute('disabled', '');
+  await page.screenshot({ path: path.join(SHOTS, 't02-usun.png') });
+  await confirm.click();
+  await expect(win).toHaveCount(0);
+  const notice = topicsSlot(page).locator('[data-role="notice"] tf-alert');
+  await expect(notice).toHaveAttribute('title', 'Usunięto topik wyniki-z-pracowni.');
+  await expect(topicsTable(page).locator('tbody tr')).toHaveCount(3, { timeout: 15000 });
+  await expect(topicRow(page, 'wyniki-z-pracowni')).toHaveCount(0);
+  await expect(page.locator('#tb-tabs tf-tab#topics')).toHaveAttribute('count', '3', { timeout: 15000 });
+  // A topic created again under the same name starts with no access entries
+  // and no data-hiding rules of the deleted one.
+  await busCall(page, 'busTopicCreateRequest', { instanceId, name: topic, options: { partitions: 1 } });
+  const acl = await busCall(page, 'busAclListRequest', { instanceId, topic });
+  expect(acl?.entries || []).toEqual([]);
+  const policies = await busCall(page, 'busFieldPolicyListRequest', { instanceId, topic });
+  expect(policies?.policies || []).toEqual([]);
+  await busCall(page, 'busTopicDeleteRequest', { instanceId, name: topic });
+  // Leaving the tab drops the note.
+  await tab(page, 'overview').click();
+  await tab(page, 'topics').click();
+  await expect(topicsSlot(page).locator('[data-role="notice"] tf-alert')).toHaveCount(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('T02/T04 at 390x844: cards, no horizontal scroll, the creator and the preview fit the phone', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(PHONE);
+  await login(page);
+  await openTopics(page);
+  await expect(topicsTable(page).locator('tbody tr')).toHaveCount(3, { timeout: 15000 });
+  await assertNoOverflow(page);
+  const clipped = await topicsTable(page).evaluate((host) => [...host.shadowRoot.querySelectorAll('td')].filter((td) => td.getBoundingClientRect().width > 0 && td.scrollWidth > td.clientWidth + 1).length);
+  expect(clipped).toBe(0);
+  const buttons = topicRow(page, 'faktury').locator('tf-button');
+  for (let i = 0; i < await buttons.count(); i += 1) {
+    const box = await buttons.nth(i).boundingBox();
+    expect(box.x).toBeGreaterThanOrEqual(0);
+    expect(box.x + box.width).toBeLessThanOrEqual(PHONE.width);
+  }
+  await page.screenshot({ path: path.join(SHOTS, 't02-topiki-telefon.png'), fullPage: true });
+
+  const fits = async (sel) => {
+    const box = await page.locator(sel).evaluate((w) => {
+      const r = (w.shadowRoot?.querySelector('.tf-window') || w).getBoundingClientRect();
+      return { left: r.left, right: r.right };
+    });
+    expect(box.left).toBeGreaterThanOrEqual(0);
+    expect(box.right).toBeLessThanOrEqual(PHONE.width);
+    const overflow = await page.locator(sel).evaluate((w) => {
+      const out = [];
+      for (const el of w.querySelectorAll('tf-input, tf-select, tf-choice-card, .tb-copies-box, .tb-kv-grid, .install-step, tf-button, tf-table')) {
+        const b = el.getBoundingClientRect();
+        if (b.width && (b.left < -1 || b.right > window.innerWidth + 1)) out.push(el.tagName + '.' + el.className);
+      }
+      return out;
+    });
+    expect(overflow, overflow.join('\n')).toEqual([]);
+  };
+  await topicsSlot(page).locator('tf-button[data-go="create"]').click();
+  await expect(creator(page).locator(".install-header")).toBeVisible();
+  await fits('tf-window.tb-creator');
+  await creator(page).locator('#tb-cr-name input').fill('telefon-test');
+  await nextButton(page).click();
+  await fits('tf-window.tb-creator');
+  await page.screenshot({ path: path.join(SHOTS, 't04-krok2-telefon.png') });
+  await creator(page).locator('[data-act="cancel"]').click();
+  await expect(creator(page)).toHaveCount(0);
+  await expect(topicsTable(page).locator('tbody tr')).toHaveCount(3);
+
+  await topicRow(page, 'wizyty').locator('tf-button[data-act="preview"]').click();
+  await expect(page.locator('tf-window.tb-preview-window .tb-payload')).toBeVisible({ timeout: 15000 });
+  await fits('tf-window.tb-preview-window');
+  await page.screenshot({ path: path.join(SHOTS, 't02-podglad-telefon.png') });
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('T11 Szkolenia: the empty list leads to the creator with one copy and no patterns', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openTopics(page, 'Szkolenia');
+  const empty = topicsSlot(page).locator('tf-empty-state');
+  await expect(empty).toHaveAttribute('title', 'Nie ma jeszcze żadnego topiku', { timeout: 15000 });
+  await empty.locator('tf-button[data-go="create"]').click();
+  await creator(page).locator('#tb-cr-name input').fill('wyniki-z-pracowni');
+  await nextButton(page).click();
+  await expect(creator(page).locator('.tb-copies-box')).toContainText('1 kopia, bo ta instancja ma jeden node. Gdy dołączysz kolejne nody');
+  await nextButton(page).click();
+  await expect(creator(page).locator('.tb-explain-box')).toContainText('W instancji Szkolenia nie ma jeszcze wzorów wiadomości');
+  await expect(creator(page).locator('.tb-kv-grid')).toContainText('bez wzoru');
+  await page.screenshot({ path: path.join(SHOTS, 't11-szkolenia-nowy-krok3.png') });
+  // Closing leaves the instance as empty as it was.
+  await page.keyboard.press('Escape');
+  await expect(creator(page)).toHaveCount(0);
+  await expect(empty).toBeVisible();
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('T12: when the node stops, the list keeps its last data under the connection notice', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openTopics(page);
+  await expect(topicsTable(page).locator('tbody tr')).toHaveCount(3, { timeout: 15000 });
+  await stopAndWait(server);
+  server = null;
+  // The whole dashboard lost its node: the platform's connection notice takes
+  // over, and the screen underneath keeps what it last showed instead of
+  // blanking it. (A failed list load with a live node — the tab's own error
+  // card — is covered by topics.test.js.)
+  await expect(page.locator('.conn-overlay.visible')).toBeVisible({ timeout: 30000 });
+  await expect(topicsTable(page).locator('tbody tr')).toHaveCount(3);
+  await expect(topicRow(page, 'wyniki-badan')).toContainText('HL7 v2');
+  await page.screenshot({ path: path.join(SHOTS, 't12-topiki-bez-polaczenia.png'), fullPage: true });
+  // Transport noise of the stopped node is the point of this test, not a defect.
+  expect(errors.filter((e) => !/WebSocket|WebTransport|net::|ERR_CONNECTION|Failed to fetch|socket|timed out|protocol error/i.test(e)), errors.join('\n')).toEqual([]);
 });

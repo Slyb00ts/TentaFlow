@@ -11,7 +11,7 @@ import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { fmtCount, fmtBytes, fmtElapsed, fmtSince, fmtLagSeconds, contentTypeLabel, loadErrorKind } = await import('./format.js');
+const { fmtCount, fmtBytes, fmtElapsed, fmtSince, fmtLagSeconds, fmtRetention, fmtWhen, contentTypeLabel, contentKind, loadErrorKind } = await import('./format.js');
 
 // Intl groups with a no-break space; the screen prints exactly that.
 const sp = (s) => s.replace(/\u00a0|\u202f/g, ' ');
@@ -69,4 +69,26 @@ test('load errors are classified on the protocol code first', () => {
   assert.equal(loadErrorKind(Object.assign(new Error('the bus is not running on this node'), { code: 'AppUnavailable' })), 'unavailable');
   assert.equal(loadErrorKind(new Error('request busStatsSnapshotRequest timed out after 15000ms')), 'timeout');
   assert.equal(loadErrorKind(new Error('socket closed')), 'lost');
+});
+
+test('retention in whole days, anything uneven in hours', () => {
+  assert.equal(fmtRetention(30 * 86_400_000), '30 dni');
+  assert.equal(fmtRetention(86_400_000), '1 dzień');
+  assert.equal(fmtRetention(365 * 86_400_000), '365 dni');
+  assert.equal(fmtRetention(36 * 3_600_000), '36 godz.');
+  assert.equal(fmtRetention(0), '—');
+});
+
+test('a write time says today / yesterday, else the date', () => {
+  const now = new Date(2026, 8, 23, 15, 0, 0).getTime();
+  assert.equal(fmtWhen(new Date(2026, 8, 23, 14, 9, 59).getTime(), now), 'dziś 14:09:59');
+  assert.equal(fmtWhen(new Date(2026, 8, 22, 22, 3, 11).getTime(), now), 'wczoraj 22:03:11');
+  assert.equal(fmtWhen(new Date(2026, 8, 19, 8, 0, 0).getTime(), now), '19.09.2026 08:00:00');
+  assert.equal(fmtWhen(Number.NaN, now), '—');
+});
+
+test('content kinds behind the plain-word labels', () => {
+  assert.equal(contentKind('application/hl7-v2'), 'hl7v2');
+  assert.equal(contentKind('APPLICATION/JSON'), 'json');
+  assert.equal(contentKind('application/x-unknown'), '');
 });

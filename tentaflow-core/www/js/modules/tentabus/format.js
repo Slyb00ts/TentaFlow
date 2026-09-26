@@ -66,6 +66,39 @@ export function fmtSince(sinceMs, nowMs) {
   return T('fmt.hours_minutes', { hours: fmtCount(hours), minutes: fmtCount(rest) });
 }
 
+/**
+ * How long a topic keeps its messages: whole days as "30 dni", anything
+ * shorter or uneven in hours. `—` for no value.
+ */
+export function fmtRetention(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return '—';
+  const day = 86_400_000;
+  if (value % day === 0) {
+    const days = value / day;
+    return T('fmt.days', { count: fmtCount(days), n: days });
+  }
+  const hours = Math.max(1, Math.round(value / 3_600_000));
+  return T('fmt.hours', { count: fmtCount(hours), n: hours });
+}
+
+/**
+ * When a message was written, the way the preview says it: "dziś 14:09:59",
+ * "wczoraj 22:03:11", otherwise the date and the time.
+ */
+export function fmtWhen(ms, nowMs = Date.now()) {
+  const at = new Date(Number(ms));
+  if (!Number.isFinite(at.getTime())) return '—';
+  const lang = I18n.getLanguage();
+  const time = new Intl.DateTimeFormat(lang, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(at);
+  const startOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((startOf(new Date(nowMs)) - startOf(at)) / 86_400_000);
+  if (days === 0) return T('fmt.today', { time });
+  if (days === 1) return T('fmt.yesterday', { time });
+  const date = new Intl.DateTimeFormat(lang, { day: '2-digit', month: '2-digit', year: 'numeric' }).format(at);
+  return `${date} ${time}`;
+}
+
 /** Seconds a replica trails its leader, rounded UP: "do 4 s" is a bound. */
 export function fmtLagSeconds(ms) {
   const secs = Math.max(1, Math.ceil(Number(ms) / 1000) || 0);
@@ -87,8 +120,13 @@ const CONTENT_TYPE_KEYS = {
  * the caller then leaves that part of the line out instead of guessing.
  */
 export function contentTypeLabel(contentType) {
-  const key = CONTENT_TYPE_KEYS[String(contentType || '').trim().toLowerCase()];
+  const key = contentKind(contentType);
   return key ? T(`fmt.content.${key}`) : '';
+}
+
+/** The payload kind of a content type (`json` / `xml` / `hl7v2` / `binary`), or '' when unknown. */
+export function contentKind(contentType) {
+  return CONTENT_TYPE_KEYS[String(contentType || '').trim().toLowerCase()] || '';
 }
 
 /**

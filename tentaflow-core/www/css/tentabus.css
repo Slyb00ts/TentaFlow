@@ -131,18 +131,6 @@
   .tb-root .legend-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
-/* ----- KPI strip ----- */
-.tb-kpi-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 12px; margin-bottom: 12px;
-}
-.tb-kpi-grid tf-stat-card { animation: tb-rise 0.4s cubic-bezier(0.22, 1, 0.36, 1) both; }
-.tb-kpi-note {
-  font-size: 11px; color: var(--tf-text-3); margin: -4px 0 16px; display: flex;
-  align-items: center; gap: 6px;
-}
-.tb-kpi-note svg { width: 13px; height: 13px; flex-shrink: 0; }
-
 /* ----- Toolbar ----- */
 .tb-toolbar {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -267,94 +255,11 @@
 .tb-lagbar.tb-lagbar--warn > span { background: var(--tf-warning); }
 .tb-lagbar.tb-lagbar--danger > span { background: var(--tf-danger); }
 
-/* ----- Wizard (topic creator) ----- */
+/* ----- Dialog forms (offset reset, leader transfer, reassign) ----- */
 .tb-wizard-form { display: flex; flex-direction: column; gap: 14px; min-width: 420px; }
 .tb-wizard-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .tb-wizard-grid--3 { grid-template-columns: repeat(3, 1fr); }
 .tb-field-hint { font-size: 11px; color: var(--tf-text-3); margin-top: 2px; }
-.tb-field-error { font-size: 11px; color: var(--tf-danger); margin-top: 2px; }
-
-.tb-adv-toggle {
-  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
-  background: var(--tf-bg-3); border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm);
-  padding: 10px 12px; color: var(--tf-text); font-size: 12.5px; font-weight: 700; cursor: pointer;
-}
-.tb-adv-toggle:hover { border-color: var(--tf-border-hover); }
-.tb-adv-toggle .tb-adv-chevron { margin-left: auto; transition: transform 0.15s ease; width: 14px; height: 14px; }
-.tb-adv-toggle[aria-expanded="true"] .tb-adv-chevron { transform: rotate(180deg); }
-.tb-adv-sub { font-weight: 400; color: var(--tf-text-3); margin-left: 6px; }
-.tb-adv-body {
-  display: flex; flex-direction: column; gap: 14px; padding: 14px; margin-top: 8px;
-  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-2);
-}
-.tb-adv-body[hidden] { display: none; }
-
-/* P1-3: without `flex-wrap`, the RF=1 warning chip (`white-space: nowrap`,
-   tf-chip) shared one unwrapped flex row with the label and the stepper and
-   squeezed the stepper's `−`/`+` buttons down to ~9px wide — narrower than
-   the chip's own content demanded, so `elementFromPoint` at the buttons'
-   nominal center hit the chip instead and a user who dropped to RF=1 could
-   no longer click `+` to raise it back. `flex-wrap: wrap` lets the chip
-   drop to its own line instead of compressing its siblings; `flex: 0 0 auto`
-   on the label/stepper keeps them at their natural size no matter how much
-   room the chip wants. */
-.tb-rf-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.tb-rf-row > span { flex: 0 0 auto; }
-.tb-rf-stepper { display: inline-flex; align-items: center; gap: 0; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); overflow: hidden; flex: 0 0 auto; }
-.tb-rf-stepper button {
-  /* 32px meets the common ~32px minimum touch-target guidance; the previous
-     30px was not itself the P1-3 bug (missing flex-wrap crushing it below
-     that to ~9px was), but there is no reason to sit right at the edge. */
-  width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
-  background: var(--tf-bg-3); border: none; color: var(--tf-text); cursor: pointer; font-size: 15px;
-  flex: 0 0 auto;
-}
-.tb-rf-stepper button:hover:not(:disabled) { background: var(--tf-bg-card-hover); }
-.tb-rf-stepper button:disabled { opacity: 0.4; cursor: not-allowed; }
-.tb-rf-stepper output {
-  width: 34px; text-align: center; font-weight: 800; font-variant-numeric: tabular-nums;
-}
-.tb-rf-warning { display: none; flex: 1 1 220px; min-width: 200px; }
-.tb-rf-warning.show { display: inline-flex; }
-
-/* ----- Durability class radios (KRYTYK-M1-R5.md b.4, P2) -----
-   Native <input type="radio"> instead of <tf-radio-group>/<tf-radio>
-   (tentaflow-core/www/js/components/tf-radio.js, shared/out-of-scope for
-   this fala): that component's roving tabindex has no arrow-key handling
-   (the second option was unreachable by keyboard) and its `role="radio"`
-   lives on an empty <span> with the label as an unassociated sibling (no
-   accessible name). Native radios inside a <fieldset>/<legend>, each wrapped
-   in its own <label for>, get the full APG group pattern — Tab enters/
-   leaves the group once, arrow keys move AND select, Space selects, every
-   option has a real accessible name — from the platform, for free. */
-.tb-radio-native-group { display: flex; flex-direction: column; gap: 10px; border: none; margin: 0; padding: 0; min-width: 0; }
-.tb-radio-native {
-  display: flex; align-items: flex-start; gap: 10px; cursor: pointer;
-  padding: 10px 12px; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm);
-  background: var(--tf-bg-3);
-}
-.tb-radio-native:hover { border-color: var(--tf-border-hover); }
-.tb-radio-native:has(input:checked) { border-color: var(--tf-accent-1); background: var(--tf-bg-card-hover); }
-.tb-radio-native input[type="radio"] {
-  appearance: none; -webkit-appearance: none; margin: 2px 0 0; flex: 0 0 auto;
-  width: 16px; height: 16px; border-radius: 50%; position: relative; cursor: pointer;
-  border: 1.5px solid var(--tf-border-hover); background: var(--tf-bg-input);
-}
-.tb-radio-native input[type="radio"]:checked { border-color: var(--tf-accent-1); background: var(--tf-accent-1); }
-.tb-radio-native input[type="radio"]:checked::after {
-  content: ''; position: absolute; inset: 3px; border-radius: 50%; background: var(--tf-bg-card);
-}
-.tb-radio-native input[type="radio"]:focus-visible { box-shadow: 0 0 0 3px var(--tf-accent-glow); }
-.tb-radio-native-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.tb-radio-native-label { font-size: 12.5px; font-weight: 700; color: var(--tf-text); }
-.tb-radio-native-hint { font-size: 11px; color: var(--tf-text-3); }
-
-/* Same show/hide-by-class pattern as `.tb-rf-warning` above (native
-   `[hidden]` on `<tf-chip>` has no author rule turning it back into
-   `display:none` in this stylesheet, so this reuses the established
-   convention instead of adding a `tf-chip[hidden]` gate for one control). */
-.tb-durability-explicit-warn { display: none; margin-top: 10px; }
-.tb-durability-explicit-warn.show { display: inline-flex; }
 
 .tb-modal-footer { display: flex; gap: 8px; align-items: center; width: 100%; }
 
@@ -369,8 +274,8 @@
    including "Najwcześniejszy"/"Najnowszy" where neither applies. */
 .tb-wizard-form tf-input[hidden] { display: none; }
 
-/* N-4: this form reuses `.tb-wizard-form`'s 420px `min-width` (sized for the
-   topic wizard's `size="lg"` modal), but the reset dialog itself opens at
+/* N-4: this form reuses `.tb-wizard-form`'s 420px `min-width`, but the
+   reset dialog itself opens at
    `size="sm"` — the mismatch pushed the fields ~20px past the card's own
    right edge and forced a horizontal scrollbar in the modal body. The
    reset form has only one field visible at a time (mode + one conditional
@@ -378,7 +283,6 @@
 .tb-reset-form { min-width: 0; }
 
 /* ----- DLQ ----- */
-.tb-dlq-reason-legend { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
 .tb-dlq-detail { padding: 12px 16px; background: var(--tf-bg-2); border-top: 1px solid var(--tf-border); display: flex; flex-direction: column; gap: 10px; }
 .tb-header-list { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: 4px 10px; font-size: 11.5px; }
 .tb-header-list dt { color: var(--tf-text-3); font-family: var(--tf-font-mono, ui-monospace, monospace); }
@@ -448,10 +352,7 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 .tb-lag-item-head { font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 12px; font-weight: 700; }
 .tb-lag-item-body { font-size: 11.5px; color: var(--tf-warning); margin-top: 3px; }
 
-/* ----- Node picker (M02 wizard "informational" multiselect + M06's
-   "Zmień repliki" dialog) — same fieldset/label shape as
-   `.tb-radio-native-group` above, checkbox instead of radio. ----- */
-.tb-node-picker-wrap { margin-top: 10px; }
+/* ----- Node picker (M06's "Zmień repliki" dialog) ----- */
 .tb-node-picker {
   display: flex; flex-direction: column; gap: 8px; border: none; margin: 0; padding: 0; min-width: 0;
   max-height: 220px; overflow-y: auto;
@@ -466,6 +367,137 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 .tb-node-picker-item input[type="checkbox"] { flex-shrink: 0; cursor: pointer; }
 .tb-node-picker-item.is-foreign input[type="checkbox"] { cursor: not-allowed; }
 .tb-node-picker-name { font-weight: 700; }
+
+/* =============================================================================
+   U1 Topiki (T02/T04): the topic list, and the windows opened over it — the
+   topic creator, the delete window and the message preview. A tf-window is
+   appended to <body>, outside `.tb-root`, so window rules are scoped by
+   `.tb-window` instead.
+   ============================================================================= */
+.tb-root .tb-topics-toolbar { margin: 0; }
+.tb-root .tb-admin-note { display: flex; align-items: center; gap: 6px; margin: -4px 0 10px; }
+.tb-root .tb-admin-note .icon { width: 13px; height: 13px; flex-shrink: 0; }
+.tb-root .tb-table-footer {
+  display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px;
+  font-size: 12px; color: var(--tf-text-3);
+}
+.tb-root .tb-table-footer b { color: var(--tf-text-2); font-weight: 600; }
+.tb-root [data-role="notice"] tf-alert { display: block; }
+
+.tb-window [hidden] { display: none !important; }
+.tb-window .mono { font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
+.tb-window .mt-md { margin-top: 16px; }
+.tb-window .muted { color: var(--tf-text-3); font-size: 12px; }
+.tb-window .install-header-meta { flex: 1; min-width: 0; }
+.tb-window .install-header h1 { overflow-wrap: anywhere; }
+.tb-window .install-header + .install-progress { margin-top: 12px; }
+.tb-window .form-grid-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+.tb-window .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+/* Same caption as the tf-input / tf-select labels beside it. */
+.tb-window .field > label, .tb-window .tb-preview-range .k { font-size: 11px; font-weight: 600; color: var(--tf-text-2); letter-spacing: 0.04em; text-transform: uppercase; }
+.tb-window .tb-mono-input input { font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
+
+.tb-window .tb-stat-rows .sr {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 0; border-bottom: 1px solid var(--tf-border); font-size: 13px;
+}
+.tb-window .tb-stat-rows .sr:last-child { border-bottom: 0; }
+.tb-window .tb-stat-rows .k { display: inline-flex; align-items: center; gap: 6px; color: var(--tf-text-2); }
+.tb-window .tb-stat-rows .k .icon { width: 13px; height: 13px; }
+.tb-window .tb-stat-rows .v { color: var(--tf-text); text-align: right; }
+
+.tb-window .tb-copies-box {
+  display: flex; align-items: center; gap: 14px; padding: 12px 16px;
+  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-2);
+}
+.tb-window .tb-copies-box .cb-num { flex: 0 0 auto; font-size: 26px; font-weight: 800; color: var(--tf-accent-1); line-height: 1; }
+.tb-window .tb-copies-box .cb-num .icon { width: 22px; height: 22px; }
+.tb-window .tb-copies-box .cb-txt { font-size: 13px; color: var(--tf-text-2); }
+.tb-window .tb-copies-box .cb-txt b { color: var(--tf-text); }
+
+.tb-window .tb-toggle-card {
+  display: flex; align-items: center; gap: 12px; padding: 12px 14px;
+  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-2);
+}
+.tb-window .tb-toggle-card .tc-name { font-size: 13px; font-weight: 600; color: var(--tf-text); }
+.tb-window .tb-toggle-card .tc-sub { font-size: 12px; color: var(--tf-text-3); }
+.tb-window .tb-explain-box {
+  padding: 12px 14px; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm);
+  background: var(--tf-bg-2); font-size: 13px; color: var(--tf-text-2);
+}
+.tb-window .tb-explain-box--error {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  border-color: var(--tf-danger); color: var(--tf-text);
+}
+.tb-window .tb-kv-grid {
+  display: grid; grid-template-columns: minmax(120px, 34%) minmax(0, 1fr);
+  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); overflow: hidden; font-size: 13px;
+}
+.tb-window .tb-kv-grid > div { padding: 9px 12px; border-bottom: 1px solid var(--tf-border); min-width: 0; overflow-wrap: anywhere; }
+.tb-window .tb-kv-grid > div:nth-last-child(-n+2) { border-bottom: 0; }
+.tb-window .tb-kv-grid .k { color: var(--tf-text-3); background: var(--tf-bg-2); }
+.tb-window .tb-kv-grid .v { color: var(--tf-text); }
+.tb-window .tb-window-error {
+  display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; padding: 10px 12px;
+  border: 1px solid var(--tf-danger); border-radius: var(--tf-radius-sm);
+  background: var(--tf-bg-2); color: var(--tf-text); font-size: 13px;
+}
+.tb-window .tb-window-error .icon { width: 15px; height: 15px; flex-shrink: 0; color: var(--tf-danger); margin-top: 1px; }
+
+/* Delete window */
+.tb-window .tb-danger-box {
+  display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px;
+  border: 1px solid var(--tf-danger); border-radius: var(--tf-radius-sm);
+  background: var(--tf-bg-2); font-size: 13px; color: var(--tf-text-2);
+}
+.tb-window .tb-danger-box .icon { width: 16px; height: 16px; flex-shrink: 0; color: var(--tf-danger); margin-top: 1px; }
+.tb-window .tb-danger-box b { color: var(--tf-text); }
+.tb-window .tb-impact-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--tf-text-2); }
+.tb-window .tb-impact-list li { display: flex; align-items: flex-start; gap: 8px; }
+.tb-window .tb-impact-list .icon { width: 14px; height: 14px; flex-shrink: 0; color: var(--tf-danger); margin-top: 2px; }
+.tb-window .tb-kept-box {
+  margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--tf-border-hover);
+  border-radius: var(--tf-radius-sm); font-size: 12.5px; color: var(--tf-text-2);
+}
+.tb-window .confirm-type { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--tf-text-2); }
+/* The name to retype is shown exactly as it must be typed — never upper-cased. */
+.tb-window .confirm-type .field > label { font-size: 13px; letter-spacing: 0; text-transform: none; }
+.tb-window .tb-retype-name { font-family: var(--tf-font-mono, ui-monospace, monospace); color: var(--tf-danger); font-weight: 700; white-space: nowrap; }
+.tb-window .num-err { color: var(--tf-danger); font-size: 12px; font-weight: 600; }
+.tb-delete-window .stack { display: flex; flex-direction: column; gap: 14px; }
+
+/* Message preview */
+.tb-window .tb-preview { display: flex; flex-direction: column; gap: 14px; }
+.tb-window .tb-audit-banner { display: flex; align-items: flex-start; gap: 10px; padding: 11px 14px; border-radius: var(--tf-radius-sm); background: var(--tf-bg-3); border: 1px solid var(--tf-border); font-size: 12px; color: var(--tf-text-2); }
+.tb-window .tb-audit-banner .icon { width: 16px; height: 16px; flex-shrink: 0; margin-top: 1px; color: var(--tf-warning); }
+.tb-window .tb-audit-banner b { color: var(--tf-text); }
+.tb-window .tb-preview-controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: end; }
+.tb-window .tb-preview-range .k { margin-bottom: 8px; }
+.tb-window .tb-preview-list { max-height: 300px; overflow: auto; }
+.tb-window .tb-preview-range .v { font-size: 13px; color: var(--tf-text); min-height: 40px; display: flex; align-items: center; }
+.tb-window .tb-state { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--tf-text-2); padding: 12px 0; }
+.tb-window .tb-state .icon { width: 15px; height: 15px; color: var(--tf-danger); }
+.tb-window .tb-preview-more { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.tb-window .tb-preview-record-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; color: var(--tf-text); margin-bottom: 8px; }
+.tb-window .tb-payload {
+  margin: 0; padding: 12px 14px; max-height: 280px; overflow: auto;
+  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-2);
+  font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px;
+  color: var(--tf-text); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .tb-window .form-grid-2, .tb-window .tb-preview-controls { grid-template-columns: minmax(0, 1fr); }
+  .tb-window .install-progress { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .tb-window .install-progress .install-step { min-width: 0; }
+  .tb-window .install-progress .label { white-space: normal; overflow-wrap: anywhere; }
+  .tb-window .tb-kv-grid { grid-template-columns: minmax(0, 1fr); }
+  .tb-window .tb-kv-grid .k { border-bottom: 0; padding-bottom: 2px; }
+  .tb-window .tb-stat-rows .sr { flex-wrap: wrap; }
+  /* The topic name keeps its own line whole; the instance tag goes under it. */
+  .tb-window .install-header h1 [data-role="heading"] { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tb-window .install-header h1 .version { display: inline-block; margin: 4px 0 0; }
+}
 
 /* ----- Animations ----- */
 @keyframes tb-rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
@@ -484,7 +516,6 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 @media (max-width: 720px) {
   .tb-toolbar { row-gap: 8px; }
   .tb-toolbar > tf-searchbox, .tb-toolbar > tf-select { flex: 1 1 100%; max-width: none; }
-  .tb-kpi-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
   .tb-kv { grid-template-columns: 1fr; }
   .tb-kv-row > .tb-kv-key { padding-bottom: 0; border-bottom: none; }
   .tb-mini-kpis { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; text-align: left; }

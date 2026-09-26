@@ -1,10 +1,9 @@
 // =============================================================================
 // File: modules/tentabus.request-builders.test.js
 // Description: Unit tests for tentabus.js's pure helpers — request builders
-//       (`buildTopicOptionsWire`, `buildMessagesBrowseRequest` incl. tor U's
-//       per-partition `fromOffsets`/`buildFromOffsetsForNextPage`),
-//       formatters (`retentionPresetFromMs`, `bytesToPreviewText`,
-//       `datetimeLocalToTsMs`), lag math (`sumGroupLag`, `computeLagRatio`,
+//       (replica list, reassign, leader transfer, the per-partition
+//       `buildFromOffsetsForNextPage` cursor), formatters
+//       (`datetimeLocalToTsMs`), lag math (`sumGroupLag`, `computeLagRatio`,
 //       `lagSeverityClass`), the stats join (`findTopicStats`) and the
 //       server-error-code mapper (`busErrorCode`/`mapBusErrorMessage`).
 //       tentabus.js imports DOM-only custom-element modules at load time
@@ -71,23 +70,14 @@ function cutConst(src, name) {
   return src.slice(start, semi + 1);
 }
 
-const CONSTS = [
-  'DLQ_RETRY_ALL_MAX', 'TOPIC_NAME_RE', 'RETENTION_PRESETS_MS', 'NO_CAPABILITIES',
-  'DURABILITY_CLASSES',
-];
+const CONSTS = ['DLQ_RETRY_ALL_MAX', 'NO_CAPABILITIES'];
 
 const NAMES = [
   'requireInstanceId',
-  'clampInt', 'clampReplicationFactor', 'clampDlqRetryAllMax', 'isValidTopicName',
-  'defaultAcksForRf', 'retentionPresetFromMs', 'deriveDurabilityClass',
-  'buildTopicOptionsWire', 'sumGroupLag',
-  'computeLagRatio', 'lagSeverityClass', 'dlqSourceTopicOptions', 'bytesToPreviewText',
-  'findHeader', 'headerText', 'parseBlobRefJson', 'busErrorCode', 'mapBusErrorMessage',
-  'buildMessagesBrowseRequest', 'findTopicStats', 'buildFromOffsetsForNextPage',
+  'clampInt', 'clampDlqRetryAllMax', 'deriveDurabilityClass', 'sumGroupLag',
+  'computeLagRatio', 'lagSeverityClass', 'dlqSourceTopicOptions',
+  'busErrorCode', 'mapBusErrorMessage', 'findTopicStats', 'buildFromOffsetsForNextPage',
   'datetimeLocalToTsMs', 'unwrapCapabilities', 'isValidExplicitOffset',
-  // task 2 (M08 partition filter, KRYTYK-M1-R2.md's N-3):
-  'filterRecordsByPartition', 'fromOffsetsForPartitionSelection',
-  'hasMoreForPartitionSelection', 'partitionFilterOptions',
   // task 3 (Groups KPI = list, N-2/N-7):
   'isInternalGroupId', 'filterVisibleGroups',
   // task 4 (P3-14, DLQ header date formatting):
@@ -95,22 +85,20 @@ const NAMES = [
   // R3-1 (KRYTYK-M1-R3.md, P1: DLQ tab empty on entry) — the single, pure
   // state-transition helper `ensureDlqTabReady` acts on:
   'resolveDlqEntrySource',
-  // Fala post-R5 (KRYTYK-M1-R5.md b.2/b.3/b.7) — the wizard's `fsync_interval`
-  // option formatter/clamp and the "(polityka jawna)" secondary-label
-  // predicate the M01/M03 chip helper now calls.
-  'clampFsyncIntervalMs', 'formatFsyncIntervalDurability', 'shouldShowDurabilityExplicitLabel',
+  // Fala post-R5 (KRYTYK-M1-R5.md b.7) — the "(polityka jawna)"
+  // secondary-label predicate the M03 chip helper calls.
+  'shouldShowDurabilityExplicitLabel',
   // Incremental-repaint fala (owner requirement: charts/tiles/tables only
-  // swap values on a poll, never a full re-render) — `patchText`/`patchAttr`
+  // swap values on a poll, never a full re-render) — `patchText`
   // (no-op-on-equal DOM writes), `pushWindowSample` (the live chart's ring
-  // buffer), `diffRowsByKey` (M01/M04 table poll-skip gate) and
+  // buffer), `diffRowsByKey` (M04 table poll-skip gate) and
   // `prefersReducedMotion` (the live chart's entrance-animation gate).
-  'patchText', 'patchAttr', 'pushWindowSample', 'diffRowsByKey', 'prefersReducedMotion',
-  // M2 (PLAN-M2.md §1f) — M06 replication/failover, M03's partitions tab
-  // and M02's node picker. Request builders, the SPEC D4 env-filter, the
-  // role-matrix builder, lag/ISR-degraded math and the `not_leader` hint
-  // extractor.
+  'patchText', 'pushWindowSample', 'diffRowsByKey', 'prefersReducedMotion',
+  // M2 (PLAN-M2.md §1f) — M06 replication/failover and M03's partitions
+  // tab. Request builders, the SPEC D4 env check, the role-matrix builder,
+  // lag/ISR-degraded math and the `not_leader` hint extractor.
   'buildReplicaListRequest', 'buildReassignRequest', 'buildLeaderTransferRequest',
-  'isSameEnvironment', 'filterSameEnvNodes', 'autoReplicationFactor',
+  'isSameEnvironment',
   'computeReplicationLag', 'isIsrDegraded', 'roleForNode', 'buildRoleMatrix',
   'leaderTransferCandidates', 'nodeDegradedReason', 'unavailableReasonI18nKey',
   'extractNotLeaderHint',
@@ -153,173 +141,11 @@ test('clampInt clamps within [min,max] and falls back on non-finite input', () =
   assert.equal(helpers.clampInt(3.9, 1, 10, 0), 3, 'truncates toward zero, does not round');
 });
 
-test('clampReplicationFactor stays within PLAN §7.1 range 1-7, defaults to 3', () => {
-  assert.equal(helpers.clampReplicationFactor(0), 1);
-  assert.equal(helpers.clampReplicationFactor(1), 1);
-  assert.equal(helpers.clampReplicationFactor(7), 7);
-  assert.equal(helpers.clampReplicationFactor(42), 7);
-  assert.equal(helpers.clampReplicationFactor(undefined), 3);
-});
-
 test('clampDlqRetryAllMax stays within the server-enforced [1,500] bound', () => {
   assert.equal(helpers.clampDlqRetryAllMax(0), 1);
   assert.equal(helpers.clampDlqRetryAllMax(500), 500);
   assert.equal(helpers.clampDlqRetryAllMax(10000), 500);
   assert.equal(helpers.clampDlqRetryAllMax(undefined), 100);
-});
-
-// ---------------------------------------------------------------------------
-// isValidTopicName — mirrors bus::topics::validate_user_topic_name's shape
-// ---------------------------------------------------------------------------
-
-test('isValidTopicName accepts the PLAN §7.1 shape', () => {
-  assert.equal(helpers.isValidTopicName('pacs.badania.nowe'), true);
-  assert.equal(helpers.isValidTopicName('orders-created'), true);
-  assert.equal(helpers.isValidTopicName('a1'), true);
-});
-
-test('isValidTopicName rejects the reserved "__" prefix and empty/short names', () => {
-  assert.equal(helpers.isValidTopicName('__dlq.orders'), false);
-  assert.equal(helpers.isValidTopicName(''), false);
-  assert.equal(helpers.isValidTopicName('a'), false, 'needs at least 2 chars per the regex');
-  assert.equal(helpers.isValidTopicName('Orders'), false, 'uppercase not allowed');
-  assert.equal(helpers.isValidTopicName('orders_created'), false, 'underscore not in the char class');
-});
-
-// ---------------------------------------------------------------------------
-// defaultAcksForRf — mirrors bus::topics::Acks::default_for_rf
-// ---------------------------------------------------------------------------
-
-test('defaultAcksForRf matches the server default (quorum at RF>=3, else leader)', () => {
-  assert.equal(helpers.defaultAcksForRf(1), 'leader');
-  assert.equal(helpers.defaultAcksForRf(2), 'leader');
-  assert.equal(helpers.defaultAcksForRf(3), 'quorum');
-  assert.equal(helpers.defaultAcksForRf(7), 'quorum');
-});
-
-// ---------------------------------------------------------------------------
-// retentionPresetFromMs
-// ---------------------------------------------------------------------------
-
-test('retentionPresetFromMs recognizes every PLAN §7.1 preset', () => {
-  assert.equal(helpers.retentionPresetFromMs(86_400_000), '24h');
-  assert.equal(helpers.retentionPresetFromMs(604_800_000), '7d');
-  assert.equal(helpers.retentionPresetFromMs(2_592_000_000), '30d');
-  assert.equal(helpers.retentionPresetFromMs(7_776_000_000), '90d');
-  assert.equal(helpers.retentionPresetFromMs(31_536_000_000), '365d');
-});
-
-test('retentionPresetFromMs falls back to "custom" for any other value', () => {
-  assert.equal(helpers.retentionPresetFromMs(123456), 'custom');
-});
-
-// ---------------------------------------------------------------------------
-// buildTopicOptionsWire — the exact snake_case boundary the wasm encoder
-// passes straight to `serde_json::from_str::<BusTopicOptionsWire>` (see
-// tentabus.js's own doc comment on this function for the "why").
-// ---------------------------------------------------------------------------
-
-test('buildTopicOptionsWire emits snake_case keys matching BusTopicOptionsWire', () => {
-  const wire = helpers.buildTopicOptionsWire({
-    partitions: 8,
-    retentionMs: 604_800_000,
-    cleanupPolicy: 'delete',
-    delivery: 'at_least_once',
-    dedupWindowMs: 86_400_000,
-    maxDeliveryAttempts: 5,
-    retryBackoffMs: 1000,
-    schemaId: 'cmc-wynik-v2',
-    validation: 'off',
-    contentType: 'application/json',
-    replicationFactor: 3,
-    acks: 'quorum',
-    durability: 'fsync_batch_full',
-    durabilityClass: 'critical',
-    maxInlineBytes: 1_048_576,
-    compression: 'lz4',
-  });
-  assert.deepEqual(wire, {
-    partitions: 8,
-    retention_ms: 604_800_000,
-    cleanup_policy: 'delete',
-    delivery: 'at_least_once',
-    dedup_window_ms: 86_400_000,
-    max_delivery_attempts: 5,
-    retry_backoff_ms: 1000,
-    schema_id: 'cmc-wynik-v2',
-    validation: 'off',
-    content_type: 'application/json',
-    replication_factor: 3,
-    acks: 'quorum',
-    durability: 'fsync_batch_full',
-    durabilityClass: 'critical',
-    max_inline_bytes: 1_048_576,
-    compression: 'lz4',
-  });
-});
-
-test('buildTopicOptionsWire omits unset fields so the server default / "leave unchanged" applies', () => {
-  assert.deepEqual(helpers.buildTopicOptionsWire({}), {});
-  assert.deepEqual(helpers.buildTopicOptionsWire({ partitions: '' }), {});
-});
-
-test('buildTopicOptionsWire omits acks/durability when the wizard leaves them on "auto"', () => {
-  const wire = helpers.buildTopicOptionsWire({ acks: 'auto', durability: 'auto', replicationFactor: 3 });
-  assert.deepEqual(wire, { replication_factor: 3 });
-});
-
-// R5-2 fix (KRYTYK-M1-R5.md b.2, P1: "critical → standard is a silent
-// no-op"). CONTRACT: "sending `durabilityClass` WITHOUT `durability`
-// switches the topic to the class-derived policy" — a class-only edit (the
-// radio alone, advanced select left untouched) must put ONLY
-// `durabilityClass` on the wire, never a `durability` key, explicit or not.
-test('buildTopicOptionsWire sends only durabilityClass for a class-only downgrade (R5-2)', () => {
-  const wire = helpers.buildTopicOptionsWire({ durability: 'auto', durabilityClass: 'standard' });
-  assert.deepEqual(wire, { durabilityClass: 'standard' });
-  assert.equal('durability' in wire, false);
-});
-
-// CONTRACT's second half: "sending `durability: 'auto'` clears an explicit
-// policy and resolves from the class" — the wizard only sets this flag when
-// the topic being edited already had `durabilityExplicit: true` AND the
-// operator deliberately re-selected "Automatycznie (wg klasy)".
-test('buildTopicOptionsWire sends the literal durability:"auto" clearing signal only when durabilityAutoClear is set', () => {
-  assert.deepEqual(
-    helpers.buildTopicOptionsWire({ durability: 'auto', durabilityAutoClear: true }),
-    { durability: 'auto' },
-  );
-  assert.deepEqual(
-    helpers.buildTopicOptionsWire({ durability: 'auto', durabilityAutoClear: false }),
-    {},
-    'without the flag, "auto" still means "left alone" — omitted, not sent',
-  );
-});
-
-test('buildTopicOptionsWire sets an explicit durability policy string as-is regardless of durabilityAutoClear', () => {
-  const wire = helpers.buildTopicOptionsWire({ durability: 'os', durabilityAutoClear: true });
-  assert.deepEqual(wire, { durability: 'os' });
-});
-
-test('buildTopicOptionsWire never emits idempotency_key — the wizard does not offer it (fail-closed, PLAN M3a)', () => {
-  const wire = helpers.buildTopicOptionsWire({ idempotencyKey: 'msg.run_id', partitions: 8 });
-  assert.equal('idempotency_key' in wire, false);
-  assert.deepEqual(wire, { partitions: 8 });
-});
-
-// Owner decision B (durability class UI): unlike every neighboring option,
-// `durabilityClass` is sent camelCase, as-is — this is the one deliberate
-// exception to this function's snake_case boundary (see its doc comment).
-test('buildTopicOptionsWire emits durabilityClass camelCase for "standard"/"critical"', () => {
-  assert.deepEqual(helpers.buildTopicOptionsWire({ durabilityClass: 'standard' }), { durabilityClass: 'standard' });
-  assert.deepEqual(helpers.buildTopicOptionsWire({ durabilityClass: 'critical' }), { durabilityClass: 'critical' });
-});
-
-test('buildTopicOptionsWire omits durabilityClass when unset or not a recognized class', () => {
-  assert.deepEqual(helpers.buildTopicOptionsWire({}), {});
-  assert.deepEqual(helpers.buildTopicOptionsWire({ durabilityClass: undefined }), {});
-  assert.deepEqual(helpers.buildTopicOptionsWire({ durabilityClass: '' }), {});
-  assert.deepEqual(helpers.buildTopicOptionsWire({ durabilityClass: 'auto' }), {});
-  assert.deepEqual(helpers.buildTopicOptionsWire({ durabilityClass: 'CRITICAL' }), {}, 'case-sensitive, not normalized');
 });
 
 // ---------------------------------------------------------------------------
@@ -371,28 +197,6 @@ test('shouldShowDurabilityExplicitLabel is true only when durabilityExplicit is 
 // select had no way to express Prod/Test's own default policy family).
 // ---------------------------------------------------------------------------
 
-test('clampFsyncIntervalMs stays within the server-enforced [1,1000] bound, defaults to 50', () => {
-  assert.equal(helpers.clampFsyncIntervalMs(50), 50);
-  assert.equal(helpers.clampFsyncIntervalMs(0), 1);
-  assert.equal(helpers.clampFsyncIntervalMs(-5), 1);
-  assert.equal(helpers.clampFsyncIntervalMs(5000), 1000);
-  assert.equal(helpers.clampFsyncIntervalMs(1000), 1000);
-  assert.equal(helpers.clampFsyncIntervalMs('abc'), 50);
-  assert.equal(helpers.clampFsyncIntervalMs(undefined), 50);
-  assert.equal(helpers.clampFsyncIntervalMs(12.9), 12, 'truncates toward zero, does not round');
-});
-
-test('formatFsyncIntervalDurability builds the fsync_interval:<ms> wire string the server parses', () => {
-  assert.equal(helpers.formatFsyncIntervalDurability(50), 'fsync_interval:50');
-  assert.equal(helpers.formatFsyncIntervalDurability('120'), 'fsync_interval:120');
-  // `Number('')` is 0 — a finite number, same as `clampInt`'s own convention
-  // elsewhere in this file — so an empty field clamps into range like any
-  // other too-small value; it does not fall back to the 50 ms default (only
-  // genuinely non-numeric input, e.g. 'abc', does that).
-  assert.equal(helpers.formatFsyncIntervalDurability(''), 'fsync_interval:1');
-  assert.equal(helpers.formatFsyncIntervalDurability('abc'), 'fsync_interval:50', 'non-numeric input falls back to the default, not fsync_interval:NaN');
-});
-
 // ---------------------------------------------------------------------------
 // buildMessagesBrowseRequest — first page uses the legacy scalar
 // `fromOffset`; subsequent pages use per-partition `fromOffsets` (tor U
@@ -401,136 +205,11 @@ test('formatFsyncIntervalDurability builds the fsync_interval:<ms> wire string t
 // comment on why sending it is safe before the backend honors it.
 // ---------------------------------------------------------------------------
 
-test('buildMessagesBrowseRequest builds the first-page (global fromOffset) request shape', () => {
-  assert.deepEqual(helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', null, 50), {
-    instanceId: IID,
-    topic: 'pacs.badania.nowe',
-    fromOffset: undefined,
-    limit: 50,
-    fromOffsets: undefined,
-    partition: undefined,
-  });
-  assert.deepEqual(helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', 10, 50), {
-    instanceId: IID,
-    topic: 'pacs.badania.nowe',
-    fromOffset: 10,
-    limit: 50,
-    fromOffsets: undefined,
-    partition: undefined,
-  });
-});
-
-test('buildMessagesBrowseRequest builds a per-partition fromOffsets request for a follow-up page', () => {
-  const fromOffsets = [{ partition: 0, offset: 120 }, { partition: 2, offset: 45 }];
-  assert.deepEqual(helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', null, 50, fromOffsets), {
-    instanceId: IID,
-    topic: 'pacs.badania.nowe',
-    fromOffset: undefined,
-    limit: 50,
-    fromOffsets,
-    partition: undefined,
-  });
-});
-
-test('buildMessagesBrowseRequest treats an empty fromOffsets array as absent', () => {
-  const req = helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', null, 50, []);
-  assert.equal(req.fromOffsets, undefined);
-});
-
-test('buildMessagesBrowseRequest carries an explicit partition filter (task 2, M08)', () => {
-  const req = helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', null, 50, undefined, 3);
-  assert.equal(req.partition, 3);
-});
-
-test('buildMessagesBrowseRequest treats partition 0 as a real value, not "unset"', () => {
-  // `0 ?? undefined` must stay `0` — a `||`-based implementation would have
-  // coerced the very first partition to "all partitions".
-  const req = helpers.buildMessagesBrowseRequest(IID, 'pacs.badania.nowe', null, 50, undefined, 0);
-  assert.equal(req.partition, 0);
-});
-
-test('buildMessagesBrowseRequest emits instanceId and throws when called without one (W9)', () => {
-  assert.equal(helpers.buildMessagesBrowseRequest(IID, 't', null, 50).instanceId, IID);
-  assert.throws(() => helpers.buildMessagesBrowseRequest('', 't', null, 50));
-  assert.throws(() => helpers.buildMessagesBrowseRequest(undefined, 't', null, 50));
-});
-
 // ---------------------------------------------------------------------------
 // M08 partition filter (task 2, KRYTYK-M1-R2.md's N-3) — client-side
 // filtering/paging helpers layered on top of the existing `partitions[]` +
 // `fromOffsets` plumbing (tor U task 1).
 // ---------------------------------------------------------------------------
-
-test('filterRecordsByPartition returns every record when no partition is selected ("all")', () => {
-  const records = [{ partition: 0, offset: 1 }, { partition: 3, offset: 2 }];
-  assert.deepEqual(helpers.filterRecordsByPartition(records, null), records);
-});
-
-test('filterRecordsByPartition keeps only the selected partition\'s records', () => {
-  const records = [{ partition: 0, offset: 1 }, { partition: 3, offset: 2 }, { partition: 3, offset: 3 }];
-  assert.deepEqual(helpers.filterRecordsByPartition(records, 3), [
-    { partition: 3, offset: 2 },
-    { partition: 3, offset: 3 },
-  ]);
-});
-
-test('filterRecordsByPartition tolerates a non-array input', () => {
-  assert.deepEqual(helpers.filterRecordsByPartition(null, 0), []);
-  assert.deepEqual(helpers.filterRecordsByPartition(undefined, null), []);
-});
-
-test('fromOffsetsForPartitionSelection delegates to buildFromOffsetsForNextPage for "all partitions"', () => {
-  const partitions = [
-    { partition: 0, nextOffset: 50, hasMore: true },
-    { partition: 1, nextOffset: 10, hasMore: false },
-  ];
-  assert.deepEqual(
-    helpers.fromOffsetsForPartitionSelection(partitions, null),
-    helpers.buildFromOffsetsForNextPage(partitions),
-  );
-});
-
-test('fromOffsetsForPartitionSelection returns only the selected partition\'s own cursor', () => {
-  const partitions = [
-    { partition: 0, nextOffset: 50, hasMore: true },
-    { partition: 3, nextOffset: 120, hasMore: true },
-  ];
-  assert.deepEqual(helpers.fromOffsetsForPartitionSelection(partitions, 3), [{ partition: 3, offset: 120 }]);
-});
-
-test('fromOffsetsForPartitionSelection returns [] once the selected partition is exhausted or unknown', () => {
-  const partitions = [{ partition: 3, nextOffset: 120, hasMore: false }];
-  assert.deepEqual(helpers.fromOffsetsForPartitionSelection(partitions, 3), []);
-  assert.deepEqual(helpers.fromOffsetsForPartitionSelection(partitions, 7), []);
-  assert.deepEqual(helpers.fromOffsetsForPartitionSelection(null, 3), []);
-});
-
-test('hasMoreForPartitionSelection is the aggregate ("any partition") for "all partitions"', () => {
-  const partitions = [{ partition: 0, hasMore: false }, { partition: 1, hasMore: true }];
-  assert.equal(helpers.hasMoreForPartitionSelection(partitions, null), true);
-  assert.equal(helpers.hasMoreForPartitionSelection([{ partition: 0, hasMore: false }], null), false);
-});
-
-test('hasMoreForPartitionSelection reads only the selected partition\'s own flag', () => {
-  const partitions = [{ partition: 0, hasMore: true }, { partition: 1, hasMore: false }];
-  assert.equal(helpers.hasMoreForPartitionSelection(partitions, 1), false);
-  assert.equal(helpers.hasMoreForPartitionSelection(partitions, 0), true);
-  assert.equal(helpers.hasMoreForPartitionSelection(partitions, 9), false, 'a partition never seen yet has no known "more"');
-});
-
-test('partitionFilterOptions builds "all" plus one option per partition, 0-indexed', () => {
-  assert.deepEqual(helpers.partitionFilterOptions(3, 'All partitions', (i) => `partition ${i}`), [
-    { value: '', label: 'All partitions' },
-    { value: '0', label: 'partition 0' },
-    { value: '1', label: 'partition 1' },
-    { value: '2', label: 'partition 2' },
-  ]);
-});
-
-test('partitionFilterOptions degrades to just "all" for an unknown/zero partition count', () => {
-  assert.deepEqual(helpers.partitionFilterOptions(0, 'All', String), [{ value: '', label: 'All' }]);
-  assert.deepEqual(helpers.partitionFilterOptions(undefined, 'All', String), [{ value: '', label: 'All' }]);
-});
 
 // ---------------------------------------------------------------------------
 // Groups KPI = list (task 3, KRYTYK-M1-R2.md's N-2/N-7) — the client-side
@@ -752,36 +431,6 @@ test('resolveDlqEntrySource degrades to "" when no source topic exists yet (topi
   assert.equal(helpers.resolveDlqEntrySource('', [{ name: '__dlq.x', isDlq: true }]), '');
 });
 
-test('bytesToPreviewText decodes valid UTF-8 as text', () => {
-  const bytes = new TextEncoder().encode('{"ok":true}');
-  assert.equal(helpers.bytesToPreviewText(bytes), '{"ok":true}');
-});
-
-test('bytesToPreviewText falls back to a hex dump for invalid UTF-8', () => {
-  const bytes = new Uint8Array([0xff, 0xfe, 0x00, 0x01]);
-  assert.equal(helpers.bytesToPreviewText(bytes), 'ff fe 00 01');
-});
-
-test('findHeader/headerText locate a header by key and decode its bytes', () => {
-  const headers = [{ key: 'dlq.reason', value: new TextEncoder().encode('consumer_error') }];
-  assert.equal(helpers.findHeader(headers, 'dlq.reason').key, 'dlq.reason');
-  assert.equal(helpers.findHeader(headers, 'missing'), null);
-  assert.equal(helpers.headerText(headers, 'dlq.reason'), 'consumer_error');
-  assert.equal(helpers.headerText(headers, 'missing'), null);
-});
-
-test('parseBlobRefJson recognizes the flow_engine::blob_store::BlobRef shape', () => {
-  const blobRef = { id: 'blob-1', size_bytes: 2048, mime: 'application/dicom', sha256: 'abc123' };
-  const bytes = new TextEncoder().encode(JSON.stringify(blobRef));
-  assert.deepEqual(helpers.parseBlobRefJson(bytes), blobRef);
-});
-
-test('parseBlobRefJson returns null for a plain (non-BlobRef) payload', () => {
-  const bytes = new TextEncoder().encode(JSON.stringify({ hello: 'world' }));
-  assert.equal(helpers.parseBlobRefJson(bytes), null);
-  assert.equal(helpers.parseBlobRefJson(new Uint8Array([0xff, 0x00])), null);
-});
-
 // ---------------------------------------------------------------------------
 // Server error code mapping (dispatch/bus.rs::map_bus_error's "bus.<code>"
 // convention) — every code this test exercises must have a translation in
@@ -874,72 +523,6 @@ for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], [
   });
 }
 
-// Owner decision B (durability class UI, M02/M03/M01) — 5-locale parity for
-// the new "Klasa trwałości" wizard section, the M01/M03 chip and its
-// resolved-policy tooltip, and the advanced-`durability`-wins-server-side
-// hint. Same guard shape as the block above.
-const DURABILITY_CLASS_KEYS = [
-  'col_durability_class', 'durability_class_chip_standard', 'durability_class_chip_critical',
-  'wizard_section_durability_class', 'wizard_durability_class_standard',
-  'wizard_durability_class_standard_hint', 'wizard_durability_class_critical',
-  'wizard_durability_class_critical_hint', 'wizard_durability_class_latency_note',
-  'wizard_durability_override_hint', 'config_row_durability_class',
-  // Fala post-R5 (KRYTYK-M1-R5.md b.2/b.3/b.4/b.6/b.7): the "(polityka
-  // jawna)" secondary label, the wizard's "Automatycznie (wg klasy)"/
-  // `fsync_interval` advanced options, and the live "class inactive" /
-  // DLQ notes added by this fala.
-  'durability_class_explicit_suffix', 'wizard_durability_auto',
-  'wizard_durability_fsync_interval', 'wizard_field_fsync_interval_ms',
-  'wizard_field_fsync_interval_ms_hint', 'wizard_durability_class_inactive_warning',
-  'wizard_durability_class_dlq_note',
-];
-for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
-  test(`tentabus.${locName}.json has every durability-class key non-empty`, () => {
-    for (const key of DURABILITY_CLASS_KEYS) {
-      assert.ok(dict.tentabus[key]?.length > 0, `${locName} is missing tentabus.${key}`);
-    }
-  });
-
-  test(`tentabus.${locName}.json's durability_class_policy_title keeps the {durability} placeholder`, () => {
-    assert.ok(
-      dict.tentabus.durability_class_policy_title.includes('{durability}'),
-      `${locName} durability_class_policy_title lost {durability}`,
-    );
-  });
-}
-
-// R5-6 fix (KRYTYK-M1-R5.md b.6, P2: "help texts stay silent about the loss
-// window"). PLAN §11's decision is literally "an up-to-50-ms window of
-// already-acknowledged messages lost on a simultaneous power loss with no
-// replica" — the pre-fala hint described only the fsync MECHANISM ("fsync at
-// most every 50 ms"), never that CONSEQUENCE. Only PL is asserted verbatim
-// (the exact wording the fala brief specifies); every locale's own
-// translation is checked for the same substance: a "50" ms figure in the
-// standard hint, "no loss window" wording in the critical hint.
-test('pl.json\'s standard/critical durability hints state the loss-window consequence in plain words', () => {
-  assert.equal(
-    pl.tentabus.wizard_durability_class_standard_hint,
-    'Wiadomości trafiają na dysk co najwyżej co 50 ms. Przy nagłym braku zasilania i bez kopii na innym nodzie można stracić wiadomości z ostatnich 50 ms.',
-  );
-  assert.equal(
-    pl.tentabus.wizard_durability_class_critical_hint,
-    'Każda wiadomość trafia na dysk, zanim wysyłający dostanie potwierdzenie. Nic nie ginie, ale zapis jest wolniejszy (zwykle 10–30 ms na wiadomość na jednym dysku).',
-  );
-});
-
-const LOSS_WINDOW_CRITICAL_PHRASE = {
-  pl: 'Nic nie ginie', en: 'Nothing is lost', de: 'Nichts geht verloren',
-  es: 'No se pierde nada', fr: 'Rien ne se perd',
-};
-for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
-  test(`tentabus.${locName}.json's standard durability hint names the 50 ms loss window`, () => {
-    assert.ok(dict.tentabus.wizard_durability_class_standard_hint.includes('50'));
-  });
-  test(`tentabus.${locName}.json's critical durability hint states there is no loss window`, () => {
-    assert.ok(dict.tentabus.wizard_durability_class_critical_hint.includes(LOSS_WINDOW_CRITICAL_PHRASE[locName]));
-  });
-}
-
 test('mapBusErrorMessage falls back to the raw server message for an unknown code', () => {
   const translate = makeTranslate(pl);
   assert.equal(
@@ -957,8 +540,8 @@ test('mapBusErrorMessage falls back to errors.generic for a non-"bus." message',
 // Incremental-repaint helpers (owner requirement: "the chart must not draw
 // from zero every time … all other data must only swap values, not
 // re-render the page") — `pushWindowSample` (ring buffer), `diffRowsByKey`
-// (M01/M04 table poll-skip gate), `patchText`/`patchAttr` (no-op-on-equal
-// DOM writes) and `prefersReducedMotion` (the live chart's animation gate).
+// (M01/M04 table poll-skip gate), `patchText` (no-op-on-equal DOM
+// writes) and `prefersReducedMotion` (the live chart's animation gate).
 // ---------------------------------------------------------------------------
 
 test('pushWindowSample keeps only the last maxLen samples, oldest evicted first (ring buffer)', () => {
@@ -1040,24 +623,6 @@ test('patchText coerces null/undefined values to an empty string and tolerates a
   assert.doesNotThrow(() => helpers.patchText(null, 'x'));
 });
 
-test('patchAttr writes the attribute only when the value actually changed', () => {
-  let writes = 0;
-  const attrs = { value: '5' };
-  const el = {
-    getAttribute: (name) => attrs[name] ?? null,
-    setAttribute: (name, v) => { writes += 1; attrs[name] = v; },
-  };
-  helpers.patchAttr(el, 'value', '5');
-  assert.equal(writes, 0, 'no write for an equal value');
-  helpers.patchAttr(el, 'value', '6');
-  assert.equal(writes, 1);
-  assert.equal(attrs.value, '6');
-});
-
-test('patchAttr tolerates a null element (paint call racing an unmounted panel)', () => {
-  assert.doesNotThrow(() => helpers.patchAttr(null, 'value', '1'));
-});
-
 test('prefersReducedMotion defaults to false when matchMedia is unavailable (this non-browser test env)', () => {
   assert.equal(helpers.prefersReducedMotion(), false);
 });
@@ -1117,28 +682,6 @@ test('isSameEnvironment is false when localEnv is falsy (fail-closed — no node
 test('isSameEnvironment matches on the node\'s own environment field', () => {
   assert.equal(helpers.isSameEnvironment(NODES_MIXED_ENV[0], 'prod'), true);
   assert.equal(helpers.isSameEnvironment(NODES_MIXED_ENV[3], 'prod'), false);
-});
-
-test('filterSameEnvNodes keeps only nodes matching localEnv (SPEC D4: mesh-test-01 excluded for a prod session)', () => {
-  const same = helpers.filterSameEnvNodes(NODES_MIXED_ENV, 'prod');
-  assert.deepEqual(same.map((n) => n.nodeId), ['gcm-core-01', 'gczd-edge-02', 'scchs-edge-03']);
-});
-
-test('filterSameEnvNodes returns an empty array for a null/empty node list', () => {
-  assert.deepEqual(helpers.filterSameEnvNodes(null, 'prod'), []);
-  assert.deepEqual(helpers.filterSameEnvNodes([], 'prod'), []);
-});
-
-test('autoReplicationFactor is min(3, healthy same-env nodes), clamped to at least 1', () => {
-  // 3 prod nodes, one unreachable -> 2 healthy -> RF 2.
-  assert.equal(helpers.autoReplicationFactor(NODES_MIXED_ENV, 'prod'), 2);
-  // No prod nodes at all healthy/matching for a dev session -> clamps to 1, never 0.
-  assert.equal(helpers.autoReplicationFactor(NODES_MIXED_ENV, 'dev'), 1);
-});
-
-test('autoReplicationFactor caps at 3 even with many healthy same-env nodes', () => {
-  const many = Array.from({ length: 6 }, (_, i) => ({ nodeId: `n${i}`, environment: 'prod', reachable: true }));
-  assert.equal(helpers.autoReplicationFactor(many, 'prod'), 3);
 });
 
 // ---------------------------------------------------------------------------

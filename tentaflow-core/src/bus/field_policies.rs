@@ -409,7 +409,13 @@ pub fn set_policy(
         created_at_ms,
         updated_at_ms: now,
     };
-    repository::bus_field_policy_set(pool, &row)?;
+    // The topic is checked again where the rule is written: it may have been
+    // deleted since it was read above.
+    if !repository::bus_field_policy_set(pool, &row)? {
+        return Err(BusServiceError::TopicNotFound {
+            name: topic.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -559,6 +565,17 @@ mod tests {
     fn set_policy_rejects_a_reserved_topic() {
         let db = test_db();
         let topic = "__dlq.orders.created";
+        // A dead-letter topic exists only beside its source.
+        topics::create_topic_bypassing_guards(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            "orders.created",
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create source topic");
         topics::create_internal_topic(
             &db,
             TEST_INSTANCE,
@@ -654,7 +671,7 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("create source topic");
+        .expect("create source topic").0;
         let dlq_topic = dlq::dlq_topic_name(source);
         topics::create_internal_topic(
             &db,
@@ -723,7 +740,7 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("create source topic");
+        .expect("create source topic").0;
         let dlq_topic = dlq::dlq_topic_name(source);
         topics::create_internal_topic(
             &db,

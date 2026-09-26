@@ -23,6 +23,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- New Topics screen: a filterable list, a three-step creator (content kind,
+  partitions, message pattern), deletion that asks for the name to be retyped
+  and says what goes with the topic, and a message preview.
+- Deleting a topic now removes its access entries, its data-hiding rules and
+  its unprocessed-messages topic on every node, so a topic created again under
+  the same name inherits none of them. Previously they survived and applied to
+  the new topic.
+- A topic access entry can only be set for an existing topic, on every path
+  (TentaBus, API-key scopes, key creation); the generic permission editor no
+  longer accepts topics. Before, a deny set ahead of the topic silently
+  disappeared when the topic was created.
+- An access change received from another node now also stops consumers
+  already reading on this node; before, only a local change was re-checked.
 - Fixed two leaders serving one partition at once: a node could accept another
   leader's announcement and still promote itself (present in `0.3.0-beta`).
 - A topic deleted and created again under the same name is a new incarnation

@@ -655,6 +655,13 @@ pub fn create_api_key_with_scopes(
         None,
     )?;
     for (resource_type, resource_id, action) in scopes {
+        // A topic scope is written only while its topic exists, like every
+        // other topic rule (`resource_permissions::set_topic_rule`).
+        if resource_type == "topic"
+            && !resource_permissions::topic_rule_target_exists(&tx, resource_id)?
+        {
+            anyhow::bail!("scope resource_id names no existing TentaBus topic");
+        }
         resource_permissions::set_with_action_tx(
             &tx,
             resource_type,
@@ -22000,6 +22007,61 @@ pub mod resource_permissions {
         Ok(())
     }
 
+    /// The one write path for a TentaBus topic rule (`resource_type =
+    /// 'topic'`, `resource_id` = `bus_authorizer::topic_acl_resource_id`):
+    /// written only while that topic exists, checked in the same writer
+    /// transaction a topic delete takes. A rule written ahead of its topic
+    /// would be removed when the topic is created (`bus_topic_create`) and on
+    /// every node that receives it, silently — so it is refused instead.
+    /// `Ok(false)` when the id names no existing topic (nothing written).
+    pub fn set_topic_rule(
+        pool: &DbPool,
+        resource_id: &str,
+        subject_type: &str,
+        subject_id: &str,
+        action: &str,
+        access_level: &str,
+    ) -> Result<bool> {
+        let written = super::with_writer_tx(pool, |tx| {
+            if !topic_rule_target_exists(tx, resource_id)? {
+                return Ok(false);
+            }
+            set_with_action_tx(
+                tx,
+                "topic",
+                resource_id,
+                subject_type,
+                subject_id,
+                action,
+                access_level,
+            )?;
+            Ok(true)
+        })?;
+        if written {
+            crate::services::bus_authorizer::bump_acl_generation();
+        }
+        Ok(written)
+    }
+
+    /// Whether a topic rule's `resource_id` (`(instance_id, org_id, topic)`
+    /// composite) names a topic that exists — read inside the transaction that
+    /// writes the rule. An id of any other shape names no topic.
+    pub(crate) fn topic_rule_target_exists(
+        conn: &rusqlite::Connection,
+        resource_id: &str,
+    ) -> Result<bool> {
+        let segments = crate::sync::resource_id::decode_segments(resource_id).unwrap_or_default();
+        let [instance_id, org_id, topic] = segments.as_slice() else {
+            return Ok(false);
+        };
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bus_topics \
+             WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3)",
+            rusqlite::params![instance_id, org_id, topic],
+            |row| row.get(0),
+        )?)
+    }
+
     pub(crate) fn set_with_action_tx(
         tx: &rusqlite::Transaction<'_>,
         resource_type: &str,
@@ -22168,6 +22230,54 @@ pub mod resource_permissions {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Removes every row of one resource inside the caller's transaction, each
+    /// replicated as its own Delete tombstone — used when the resource itself
+    /// is deleted, so a later resource under the same id starts with no rules.
+    /// Returns how many rows were removed.
+    pub(crate) fn delete_resource_tx(
+        tx: &rusqlite::Transaction<'_>,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<usize> {
+        let removed: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "DELETE FROM resource_permissions
+                 WHERE resource_type = ?1 AND resource_id = ?2
+                 RETURNING subject_type, subject_id, action",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![resource_type, resource_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (subject_type, subject_id, action) in &removed {
+            super::record_core_capture_tx(
+                tx,
+                crate::sync::core_registry::CoreSyncResourceKind::ResourcePermission,
+                super::resource_permission_resource_id_for_action(
+                    resource_type,
+                    resource_id,
+                    subject_type,
+                    subject_id,
+                    action,
+                ),
+                crate::sync::runtime::SqlWriteAction::Delete,
+                super::resource_permission_changed_fields(
+                    resource_type,
+                    resource_id,
+                    subject_type,
+                    subject_id,
+                    action,
+                    None,
+                ),
+                None,
+            )?;
+        }
+        Ok(removed.len())
     }
 
     /// Lista wszystkich wpisow dla konkretnego zasobu — dla UI
@@ -30740,48 +30850,137 @@ pub fn bus_topic_generation_at(hlc: &crate::sync::ledger::HybridLogicalTimestamp
     ((hlc.wall_time_ms.max(0) as u64) << 16) | u64::from(hlc.logical.min(0xFFFF))
 }
 
-pub fn bus_topic_create(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        &format!(
-            "INSERT INTO bus_topics ({BUS_TOPIC_COLUMNS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,\
-              ?23,?24,?25)"
-        ),
-        rusqlite::params![
-            row.instance_id,
-            row.org_id,
-            row.name,
-            row.partitions,
-            row.retention_ms,
-            row.retention_bytes,
-            row.cleanup_policy,
-            row.delivery,
-            row.idempotency_key,
-            row.dedup_window_ms,
-            row.max_delivery_attempts,
-            row.retry_backoff_ms,
-            row.schema_id,
-            row.validation,
-            row.content_type,
-            row.replication_factor,
-            row.acks,
-            row.durability,
-            row.max_inline_bytes,
-            row.compression,
-            row.environment,
-            row.created_at_ms,
-            row.updated_at_ms,
-            row.durability_class,
-            row.generation as i64,
-        ],
-    )?;
-    // Released before the publish: `record_core_capture` reads and writes the
-    // same pool through the sync runtime, and holding a connection across it
-    // would put two borrowers against one pool slot on a small rig.
-    drop(conn);
+/// Creates a topic row. A new topic starts with no access entries and no
+/// data-hiding rules: rows still keyed by its name (left from a build that let
+/// them be written ahead of the topic, or from an incarnation whose delete
+/// never removed them here) are removed in the same transaction, each
+/// replicated as its own Delete — the same cleanup `bus_topic_delete` does,
+/// so the node that creates the topic and the nodes that receive it
+/// (`core_materializer::apply_bus_topic`) start from the same empty rules.
+/// Returns what was removed, for the caller's audit row.
+pub fn bus_topic_create(pool: &DbPool, row: &DbBusTopic) -> Result<RemovedTopicRules> {
+    Ok(bus_topic_insert(pool, row, None)?.unwrap_or_default())
+}
+
+/// `bus_topic_create` for a dead-letter topic: the row is written only while
+/// its `source` topic exists, checked in the same writer transaction a topic
+/// delete takes — a delivery that read its source's config before the delete
+/// cannot re-create the DLQ of a topic that is gone. `Ok(false)` when the
+/// source is missing (nothing written).
+pub fn bus_dlq_topic_create(pool: &DbPool, row: &DbBusTopic, source: &str) -> Result<bool> {
+    Ok(bus_topic_insert(pool, row, Some(source))?.is_some())
+}
+
+/// `None` when `parent` is named and missing (nothing written).
+fn bus_topic_insert(
+    pool: &DbPool,
+    row: &DbBusTopic,
+    parent: Option<&str>,
+) -> Result<Option<RemovedTopicRules>> {
+    let created = with_writer_tx(pool, |tx| {
+        if let Some(parent) = parent {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM bus_topics \
+                 WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3)",
+                rusqlite::params![row.instance_id, row.org_id, parent],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Ok(None);
+            }
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO bus_topics ({BUS_TOPIC_COLUMNS}) VALUES \
+                 (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,\
+                  ?23,?24,?25)"
+            ),
+            rusqlite::params![
+                row.instance_id,
+                row.org_id,
+                row.name,
+                row.partitions,
+                row.retention_ms,
+                row.retention_bytes,
+                row.cleanup_policy,
+                row.delivery,
+                row.idempotency_key,
+                row.dedup_window_ms,
+                row.max_delivery_attempts,
+                row.retry_backoff_ms,
+                row.schema_id,
+                row.validation,
+                row.content_type,
+                row.replication_factor,
+                row.acks,
+                row.durability,
+                row.max_inline_bytes,
+                row.compression,
+                row.environment,
+                row.created_at_ms,
+                row.updated_at_ms,
+                row.durability_class,
+                row.generation as i64,
+            ],
+        )?;
+        let removed = delete_topic_rules_tx(tx, &row.instance_id, &row.org_id, &row.name)?;
+        Ok(Some(removed))
+    })?;
+    let Some(removed) = created else {
+        return Ok(None);
+    };
+    publish_removed_field_policies(pool, &removed.field_policies);
+    if removed.acl_entries > 0 {
+        crate::services::bus_authorizer::bump_acl_generation();
+    }
     let _ = publish_bus_topic_capture(pool, row, crate::sync::runtime::SqlWriteAction::Insert)?;
-    Ok(())
+    Ok(Some(removed))
+}
+
+/// What a topic took with it (`bus_topic_delete`) or found left behind and
+/// removed (`bus_topic_create`).
+#[derive(Debug, Default)]
+pub struct RemovedTopicRules {
+    pub acl_entries: usize,
+    pub field_policies: Vec<DbBusFieldPolicy>,
+}
+
+/// Removes every access entry and data-hiding rule keyed by one topic inside
+/// the caller's transaction. Access entries replicate from here (their Deletes
+/// are journaled in `tx`); the removed data-hiding rules are returned for
+/// `publish_removed_field_policies` once `tx` has committed.
+fn delete_topic_rules_tx(
+    tx: &rusqlite::Transaction<'_>,
+    instance_id: &str,
+    org_id: &str,
+    topic: &str,
+) -> Result<RemovedTopicRules> {
+    let acl_entries = resource_permissions::delete_resource_tx(
+        tx,
+        "topic",
+        &crate::services::bus_authorizer::topic_acl_resource_id(instance_id, org_id, topic),
+    )?;
+    let field_policies = bus_field_policies_delete_for_topic_tx(tx, instance_id, org_id, topic)?;
+    Ok(RemovedTopicRules {
+        acl_entries,
+        field_policies,
+    })
+}
+
+fn publish_removed_field_policies(pool: &DbPool, policies: &[DbBusFieldPolicy]) {
+    for policy in policies {
+        if let Err(e) = publish_bus_field_policy_capture(
+            pool,
+            policy,
+            crate::sync::runtime::SqlWriteAction::Delete,
+        ) {
+            tracing::warn!(
+                instance_id = %policy.instance_id, org_id = %policy.org_id, topic = %policy.topic,
+                error = %e,
+                "field policy delete capture publish failed; already deleted locally"
+            );
+        }
+    }
 }
 
 pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
@@ -30868,11 +31067,28 @@ pub fn bus_topic_get(
 /// call; the caller would see an error for an operation it cannot retry
 /// (the row this delete was keyed on no longer exists) while every OTHER
 /// node still carries the topic.
-pub fn bus_topic_delete(pool: &DbPool, instance_id: &str, org_id: &str, name: &str) -> Result<()> {
-    // Row, delete and tombstone land together or not at all: a delete
-    // without the tombstone that orders it (`core_materializer::
-    // bus_topic_op_wins`) would let an older incarnation's late ops back in.
-    let row = with_writer_tx(pool, |tx| {
+///
+/// The topic's access entries (`resource_permissions`, `resource_type =
+/// 'topic'`) and data-hiding rules (`bus_field_policies`) go with it: neither
+/// table is keyed by incarnation, so rows left behind would silently apply to
+/// a topic re-created under the same name. Each removed row replicates as its
+/// own Delete, minted BEFORE the topic's Delete so that a node which re-creates
+/// the name (and therefore has seen the topic's Delete) writes its new rules
+/// with a later HLC than every cleanup op.
+///
+/// Returns what went with the topic (nothing when the row was already gone),
+/// for the caller's audit row — the replicated removals carry no actor.
+pub fn bus_topic_delete(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    name: &str,
+) -> Result<RemovedTopicRules> {
+    // Row, delete, tombstone and the rules keyed by the topic land together
+    // or not at all: a delete without the tombstone that orders it
+    // (`core_materializer::bus_topic_op_wins`) would let an older
+    // incarnation's late ops back in.
+    let removed = with_writer_tx(pool, |tx| {
         let row: Option<DbBusTopic> = tx
             .query_row(
                 &format!(
@@ -30896,9 +31112,16 @@ pub fn bus_topic_delete(pool: &DbPool, instance_id: &str, org_id: &str, name: &s
             row.generation,
         )
         .map_err(|e| anyhow::anyhow!("bus topic tombstone: {e}"))?;
-        Ok(Some(row))
+        let rules = delete_topic_rules_tx(tx, instance_id, org_id, name)?;
+        Ok(Some((row, rules)))
     })?;
-    let Some(row) = row else { return Ok(()) };
+    let Some((row, rules)) = removed else {
+        return Ok(RemovedTopicRules::default());
+    };
+    publish_removed_field_policies(pool, &rules.field_policies);
+    if rules.acl_entries > 0 {
+        crate::services::bus_authorizer::bump_acl_generation();
+    }
     if let Err(e) =
         publish_bus_topic_capture(pool, &row, crate::sync::runtime::SqlWriteAction::Delete)
     {
@@ -30907,7 +31130,7 @@ pub fn bus_topic_delete(pool: &DbPool, instance_id: &str, org_id: &str, name: &s
             "bus_topic_delete: capture publish failed; already deleted locally"
         );
     }
-    Ok(())
+    Ok(rules)
 }
 
 /// Backs `bus::topics::list_topics`, which nothing calls yet — kept for the
@@ -31649,35 +31872,55 @@ pub(crate) fn publish_bus_field_policy_capture(
 /// like `resource_permissions::set`, the materializer's own `INSERT ... ON
 /// CONFLICT DO UPDATE` treats Insert and Update identically, so the
 /// insert-vs-update distinction carries no information a replica needs.
-pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        &format!(
-            "INSERT INTO bus_field_policies ({BUS_FIELD_POLICY_COLUMNS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
-             ON CONFLICT(instance_id, org_id, topic, subject_type, subject_id, direction) \
-             DO UPDATE SET \
-             fields_json = excluded.fields_json, \
-             required_fields_json = excluded.required_fields_json, \
-             updated_at_ms = excluded.updated_at_ms"
-        ),
-        rusqlite::params![
-            row.instance_id,
-            row.org_id,
-            row.topic,
-            row.subject_type,
-            row.subject_id,
-            row.direction,
-            row.fields_json,
-            row.required_fields_json,
-            row.created_at_ms,
-            row.updated_at_ms,
-        ],
-    )?;
-    drop(conn);
-    let _ =
-        publish_bus_field_policy_capture(pool, row, crate::sync::runtime::SqlWriteAction::Update)?;
-    Ok(())
+///
+/// Written only while the topic exists, checked in the same writer
+/// transaction a topic delete takes (`bus_topic_delete`), so a delete cannot
+/// land between the check and the write and leave the rule behind.
+/// `Ok(false)` when the topic is missing (nothing written).
+pub fn bus_field_policy_set(pool: &DbPool, row: &DbBusFieldPolicy) -> Result<bool> {
+    let written = with_writer_tx(pool, |tx| {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM bus_topics \
+             WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3)",
+            rusqlite::params![row.instance_id, row.org_id, row.topic],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            return Ok(false);
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO bus_field_policies ({BUS_FIELD_POLICY_COLUMNS}) VALUES \
+                 (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                 ON CONFLICT(instance_id, org_id, topic, subject_type, subject_id, direction) \
+                 DO UPDATE SET \
+                 fields_json = excluded.fields_json, \
+                 required_fields_json = excluded.required_fields_json, \
+                 updated_at_ms = excluded.updated_at_ms"
+            ),
+            rusqlite::params![
+                row.instance_id,
+                row.org_id,
+                row.topic,
+                row.subject_type,
+                row.subject_id,
+                row.direction,
+                row.fields_json,
+                row.required_fields_json,
+                row.created_at_ms,
+                row.updated_at_ms,
+            ],
+        )?;
+        Ok(true)
+    })?;
+    if written {
+        let _ = publish_bus_field_policy_capture(
+            pool,
+            row,
+            crate::sync::runtime::SqlWriteAction::Update,
+        )?;
+    }
+    Ok(written)
 }
 
 pub fn bus_field_policy_get(
@@ -31776,6 +32019,28 @@ pub fn bus_field_policy_delete(
     let _ =
         publish_bus_field_policy_capture(pool, &row, crate::sync::runtime::SqlWriteAction::Delete)?;
     Ok(())
+}
+
+/// Deletes every `bus_field_policies` row of one topic inside the caller's
+/// transaction and returns them, so the caller can publish one Delete per row
+/// once that transaction has committed (`bus_topic_delete`).
+fn bus_field_policies_delete_for_topic_tx(
+    tx: &rusqlite::Transaction<'_>,
+    instance_id: &str,
+    org_id: &str,
+    topic: &str,
+) -> Result<Vec<DbBusFieldPolicy>> {
+    let mut stmt = tx.prepare(&format!(
+        "DELETE FROM bus_field_policies WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 \
+         RETURNING {BUS_FIELD_POLICY_COLUMNS}"
+    ))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![instance_id, org_id, topic],
+            map_bus_field_policy_row,
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Deletes every `bus_field_policies` row for `(instance_id, org_id)`,
@@ -32854,9 +33119,24 @@ mod bus_repository_tests {
         }
     }
 
+    /// A data-hiding rule is written only while its topic exists, checked
+    /// with the write so a topic delete cannot land in between.
+    #[test]
+    fn field_policy_set_refuses_a_missing_topic() {
+        let db = fresh_db();
+        let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write");
+        assert!(!bus_field_policy_set(&db, &row).unwrap());
+        assert!(bus_field_policy_list_for_topic(&db, T1, "org-1", "patients.updated")
+            .unwrap()
+            .is_empty());
+        bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
+        assert!(bus_field_policy_set(&db, &row).unwrap());
+    }
+
     #[test]
     fn field_policy_set_get_list_delete_round_trip() {
         let db = fresh_db();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "patients.updated")).unwrap();
         let row = field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write");
         bus_field_policy_set(&db, &row).unwrap();
 
@@ -33282,6 +33562,39 @@ mod bus_repository_tests {
             .is_none());
     }
 
+    /// A new topic starts with no access entries and no data-hiding rules,
+    /// even when rows keyed by its name are still here (written ahead of the
+    /// topic by an older build): the receiving nodes drop such rows at the
+    /// topic's creation, so the creating node must too.
+    #[test]
+    fn a_created_topic_starts_without_rules_left_under_its_name() {
+        let db = fresh_db();
+        let acl =
+            crate::services::bus_authorizer::topic_acl_resource_id(T1, "org-1", "orders.created");
+        resource_permissions::set_with_action(&db, "topic", &acl, "user", "anna", "read", "deny")
+            .unwrap();
+        // Written straight into the table: every writer refuses a rule for a
+        // topic that does not exist now.
+        acquire(&db)
+            .unwrap()
+            .execute(
+                &format!(
+                    "INSERT INTO bus_field_policies ({BUS_FIELD_POLICY_COLUMNS}) VALUES \
+                     (?1, 'org-1', 'orders.created', 'user', 'anna', 'read', '[\"pesel\"]', \
+                      NULL, 1, 1)"
+                ),
+                rusqlite::params![T1],
+            )
+            .unwrap();
+        bus_topic_create(&db, &topic_row(T1, "org-1", "orders.created")).unwrap();
+        assert!(resource_permissions::list_for_resource(&db, "topic", &acl)
+            .unwrap()
+            .is_empty());
+        assert!(bus_field_policy_list_for_topic(&db, T1, "org-1", "orders.created")
+            .unwrap()
+            .is_empty());
+    }
+
     /// plan-app-platform §1.4/W3: the SAME topic name in the SAME org must
     /// exist independently under two different instances — proves the
     /// repository layer (not just the raw migration DDL, `db::migrations`'
@@ -33642,6 +33955,13 @@ mod bus_repository_tests {
     #[test]
     fn field_policy_and_schema_delete_by_org_removes_only_the_target_orgs_rows() {
         let db = fresh_db();
+        for (org, topic) in [
+            ("org-1", "patients.updated"),
+            ("org-1", "labs.results"),
+            ("org-2", "invoices.created"),
+        ] {
+            bus_topic_create(&db, &topic_row(T1, org, topic)).unwrap();
+        }
         bus_field_policy_set(
             &db,
             &field_policy_row(T1, "org-1", "patients.updated", "any", "*", "write"),

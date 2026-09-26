@@ -4395,7 +4395,7 @@ impl BusService {
             }
         }
 
-        let cfg = topics::create_topic(
+        let (cfg, removed_rules) = topics::create_topic(
             &self.db,
             &self.instance_id,
             &ctx.org_id,
@@ -4442,7 +4442,8 @@ impl BusService {
                 &ctx.org_id,
                 Some(&format!(
                     "partitions={} retention_ms={} environment={} durability={} \
-                     durability_class={} durability_explicit={} replication_factor={}{replicas_detail}",
+                     durability_class={} durability_explicit={} replication_factor={}{replicas_detail} \
+                     acl_entries_removed={} field_policies_removed={}",
                     cfg.partitions,
                     cfg.retention_ms,
                     cfg.environment.as_str(),
@@ -4450,6 +4451,8 @@ impl BusService {
                     cfg.durability_class().as_str(),
                     cfg.durability_explicit(),
                     cfg.replication_factor,
+                    removed_rules.acl_entries,
+                    removed_rules.field_policies.len(),
                 )),
             )),
             None,
@@ -4540,12 +4543,58 @@ impl BusService {
     /// new log without ever seeing its first N records) or have its first
     /// batch rejected as a producer-sequence `Duplicate` from the deleted
     /// topic's previous incarnation.
+    ///
+    /// A source topic takes its dead-letter topic (`__dlq.<name>`) with it —
+    /// the messages parked there belong to the deleted topic, and a topic
+    /// re-created under the name must not start with them. The DLQ goes
+    /// FIRST, while the source still exists, so a failure leaves a delete
+    /// the caller can simply repeat; a DLQ re-created in between by a
+    /// delivery that ran out of attempts is removed after the source.
+    /// The topic's access entries and data-hiding rules are removed with its
+    /// row (`repository::bus_topic_delete`).
     pub fn delete_topic(&self, ctx: &BusCallContext, name: &str) -> Result<(), BusServiceError> {
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, name)
             .map_err(|_| deny(BusAction::Admin, name))?;
+        if name.starts_with(dlq::DLQ_TOPIC_PREFIX) {
+            return self.remove_topic(ctx, name);
+        }
+        let dlq_name = dlq::dlq_topic_name(name);
+        let dlq_exists = |svc: &Self| -> Result<bool, BusServiceError> {
+            let row = crate::db::repository::bus_topic_get(
+                &svc.db,
+                &svc.instance_id,
+                &ctx.org_id,
+                &dlq_name,
+            )?;
+            Ok(row.is_some())
+        };
+        if dlq_exists(self)? {
+            self.remove_topic(ctx, &dlq_name)?;
+        }
+        self.remove_topic(ctx, name)?;
+        match dlq_exists(self) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) = self.remove_topic(ctx, &dlq_name) {
+                    tracing::warn!(
+                        org_id = %ctx.org_id, topic = name, error = %e,
+                        "delete_topic: dead-letter topic re-created during the delete was not removed"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                org_id = %ctx.org_id, topic = name, error = %e,
+                "delete_topic: could not check for a re-created dead-letter topic"
+            ),
+        }
+        Ok(())
+    }
+
+    /// `delete_topic` for one topic, after the caller has been authorized.
+    fn remove_topic(&self, ctx: &BusCallContext, name: &str) -> Result<(), BusServiceError> {
         // PLAN §7.1 `max_bytes`: measured BEFORE the `bus_topics` row goes,
         // while `topic_config` can still say how many partitions to sum, and
         // before the handles are detached below. SUBTRACTED, not "drop the
@@ -4568,7 +4617,7 @@ impl BusService {
                 0
             }
         };
-        topics::delete_topic(&self.db, &self.instance_id, &ctx.org_id, name)?;
+        let removed_rules = topics::delete_topic(&self.db, &self.instance_id, &ctx.org_id, name)?;
         // M2 (PLAN-M2 §1e): stop replication and drop this topic's
         // assignments BEFORE detaching local handles/removing the
         // directory below — a feeder/follower stream still running against
@@ -4642,7 +4691,9 @@ impl BusService {
             Some(&audit_details(
                 &ctx.org_id,
                 Some(&format!(
-                    "offset_keys_purged={offset_keys_purged} producer_seq_keys_purged={producer_seq_keys_purged} discarded_keys_purged={discarded_keys_purged} groups_purged={groups_purged} assignments_deleted={assignments_deleted}"
+                    "offset_keys_purged={offset_keys_purged} producer_seq_keys_purged={producer_seq_keys_purged} discarded_keys_purged={discarded_keys_purged} groups_purged={groups_purged} assignments_deleted={assignments_deleted} acl_entries_removed={} field_policies_removed={}",
+                    removed_rules.acl_entries,
+                    removed_rules.field_policies.len(),
                 )),
             )),
             None,
@@ -9100,7 +9151,7 @@ mod tests {
             crate::services::environment::get_node_environment(&db),
             now_ms(),
         )
-        .expect("create the topic row");
+        .expect("create the topic row").0;
         // What `BusService::create_topic` does next: the log directory
         // belongs to this incarnation. Without it the log written below is
         // indistinguishable from a deleted incarnation's leftovers.
@@ -10829,7 +10880,7 @@ mod tests {
             NodeEnvironment::Prod,
             now_ms(),
         )
-        .unwrap();
+        .unwrap().0;
         // What `BusService::create_topic` does next — see
         // `org_stored_bytes_is_seeded_from_the_engine_and_debited_in_the_same_unit`.
         write_topic_incarnation(
@@ -17997,5 +18048,133 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The delete window promises that a topic's access entries, its
+    /// data-hiding rules and its unprocessed messages go with it. None of
+    /// them is keyed by the topic's incarnation, so anything left behind
+    /// would silently apply to a topic re-created under the same name.
+    #[test]
+    fn a_topic_recreated_under_the_same_name_inherits_no_access_rules_or_dead_letters() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let source = svc
+            .create_topic(&ctx, "faktury", topics::TopicOptions::default())
+            .unwrap();
+        svc.ensure_dlq_topic(&ctx, "faktury", &source).unwrap();
+        publish_to(&svc, &ctx, "__dlq.faktury", vec![record("{}"), record("{}")]);
+        let acl_id = crate::services::bus_authorizer::topic_acl_resource_id(
+            svc.instance_id(),
+            "org-1",
+            "faktury",
+        );
+        crate::db::repository::resource_permissions::set_with_action(
+            &svc.db, "topic", &acl_id, "user", "anna", "read", "deny",
+        )
+        .unwrap();
+        crate::db::repository::resource_permissions::set_with_action(
+            &svc.db, "topic", &acl_id, "group", "ksiegowosc", "*", "allow",
+        )
+        .unwrap();
+        let other_acl = crate::services::bus_authorizer::topic_acl_resource_id(
+            svc.instance_id(),
+            "org-1",
+            "zamowienia",
+        );
+        crate::db::repository::resource_permissions::set_with_action(
+            &svc.db, "topic", &other_acl, "user", "anna", "read", "deny",
+        )
+        .unwrap();
+        crate::db::repository::bus_field_policy_set(
+            &svc.db,
+            &crate::db::repository::DbBusFieldPolicy {
+                instance_id: svc.instance_id().to_string(),
+                org_id: "org-1".to_string(),
+                topic: "faktury".to_string(),
+                subject_type: "user".to_string(),
+                subject_id: "anna".to_string(),
+                direction: "read".to_string(),
+                fields_json: r#"["pesel"]"#.to_string(),
+                required_fields_json: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+
+        svc.delete_topic(&ctx, "faktury").unwrap();
+        let details: String = svc
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT details FROM audit_log WHERE action = 'bus.topic.delete' \
+                 AND resource = 'faktury' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            details.contains("acl_entries_removed=2 field_policies_removed=1"),
+            "the audit row says what went with the topic: {details}"
+        );
+        assert!(
+            svc.topic_config("org-1", "__dlq.faktury").is_err(),
+            "the dead-letter topic goes with its source"
+        );
+        assert!(!topics::topic_dir(&svc.bus_dir, "org-1", "__dlq.faktury").exists());
+
+        let source = svc
+            .create_topic(&ctx, "faktury", topics::TopicOptions::default())
+            .unwrap();
+        let entries = |id: &str| {
+            crate::db::repository::resource_permissions::list_for_resource(&svc.db, "topic", id)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(
+            entries(&acl_id),
+            0,
+            "no access entry of the deleted topic applies to the new one"
+        );
+        assert!(crate::db::repository::bus_field_policy_list_for_topic(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "faktury"
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(entries(&other_acl), 1, "another topic's entries stay");
+        svc.ensure_dlq_topic(&ctx, "faktury", &source).unwrap();
+        assert_eq!(
+            svc.dlq_recency(&ctx, "__dlq.faktury", 0).unwrap().waiting,
+            0,
+            "the new topic starts with no unprocessed messages"
+        );
+    }
+
+    /// A delivery that read its source topic's config before the topic was
+    /// deleted must not bring the topic's dead-letter topic back.
+    #[test]
+    fn a_dead_letter_topic_is_not_created_for_a_deleted_source() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let source = svc
+            .create_topic(&ctx, "faktury", topics::TopicOptions::default())
+            .unwrap();
+        svc.delete_topic(&ctx, "faktury").unwrap();
+        assert!(matches!(
+            svc.ensure_dlq_topic(&ctx, "faktury", &source),
+            Err(BusServiceError::TopicNotFound { .. })
+        ));
+        assert!(crate::db::repository::bus_topic_get(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "__dlq.faktury"
+        )
+        .unwrap()
+        .is_none());
     }
 }
