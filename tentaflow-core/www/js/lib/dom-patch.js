@@ -30,9 +30,14 @@ export function setAttr(el, name, value) {
 /// thing must not assign at all. The rows are compared as JSON, which is why
 /// they must be plain data (an object kept for a row action, like pool-detail's
 /// `_prop`, is plain too).
-export function setRowsIfChanged(table, rows) {
+///
+/// `volatile` names keys whose value changes on every read without the row
+/// changing — a receive timestamp stamped on each poll's objects. They are
+/// left out of the comparison (at any depth), or every poll would count as a
+/// change and re-render the whole table.
+export function setRowsIfChanged(table, rows, volatile = null) {
   if (!table) return false;
-  const sig = JSON.stringify(rows);
+  const sig = volatile ? JSON.stringify(rows, (key, value) => (volatile.has(key) ? undefined : value)) : JSON.stringify(rows);
   if (table.__tfRowsSig === sig) return false;
   table.__tfRowsSig = sig;
   table.rows = rows;

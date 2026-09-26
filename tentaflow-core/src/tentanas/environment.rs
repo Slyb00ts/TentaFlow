@@ -227,6 +227,22 @@ const FEATURES: &[FeatureSpec] = &[
         pacman: &["snapraid"],
         zypper: &["snapraid"],
     },
+    // n16's "ZFS AnyRAID" row. Not a package: whether the pool feature
+    // exists is a property of the OpenZFS build the `zfs` row already
+    // installs, and the answer comes from `zpool upgrade -v` (`anyraid_refine`),
+    // never from a version number — a distribution may backport the feature
+    // or build without it.
+    FeatureSpec {
+        id: ANYRAID_FEATURE_ID,
+        binaries: &[],
+        kernel_module: None,
+        required_version: None,
+        optional: true,
+        apt: &[],
+        dnf: &[],
+        pacman: &[],
+        zypper: &[],
+    },
     FeatureSpec {
         id: "mdadm",
         binaries: &["mdadm"],
@@ -239,6 +255,160 @@ const FEATURES: &[FeatureSpec] = &[
         zypper: &["mdadm"],
     },
 ];
+
+/// The Environment row, and the wizard card, of ZFS AnyRAID.
+pub const ANYRAID_FEATURE_ID: &str = "anyraid";
+
+/// The pool feature `zpool upgrade -v` lists when this OpenZFS can create
+/// AnyRAID vdevs.
+const ANYRAID_POOL_FEATURE: &str = "anyraid";
+
+/// What `zpool upgrade -v` says about one pool feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolFeatureListing {
+    Listed,
+    NotListed,
+    /// The document is not the one this parser knows (truncated, another
+    /// layout, an error message): nothing can be said either way.
+    Unreadable,
+}
+
+/// Whether `feature` is in the feature table of `zpool upgrade -v`.
+///
+/// MEASURED (rig11, 2026-09-26, OpenZFS 2.4.1): the table starts after "The
+/// following features are supported:", a `FEAT DESCRIPTION` header and a
+/// line of dashes; each feature is a line starting in column 0 with its
+/// short name (optionally followed by "(read-only compatible)"), and its
+/// description is the next, indented line. The table ends at "The following
+/// legacy versions are also supported:".
+///
+/// "Not listed" is only ever said about a COMPLETE table: the header, at
+/// least one feature and the closing legacy section must all be there, and
+/// every name line must look like a feature name. Anything else is
+/// `Unreadable` — a truncated document must never read as "this ZFS has no
+/// AnyRAID". A name qualified with its GUID-style prefix
+/// (`org.openzfs:anyraid`) matches on the part after the colon.
+pub fn pool_feature_listed(text: &str, feature: &str) -> PoolFeatureListing {
+    let mut lines = text.lines();
+    if !lines.by_ref().any(|l| l.trim() == "The following features are supported:") {
+        return PoolFeatureListing::Unreadable;
+    }
+    let mut header = false;
+    for line in lines.by_ref() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !header {
+            if !t.starts_with("FEAT") {
+                return PoolFeatureListing::Unreadable;
+            }
+            header = true;
+            continue;
+        }
+        if !t.chars().all(|c| c == '-') {
+            return PoolFeatureListing::Unreadable;
+        }
+        break;
+    }
+    if !header {
+        return PoolFeatureListing::Unreadable;
+    }
+    let mut names = 0usize;
+    let mut found = false;
+    for line in lines {
+        if line.trim().is_empty() || line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        if line.starts_with("The following legacy versions") {
+            return match (names, found) {
+                (0, _) => PoolFeatureListing::Unreadable,
+                (_, true) => PoolFeatureListing::Listed,
+                (_, false) => PoolFeatureListing::NotListed,
+            };
+        }
+        let name = line.split_whitespace().next().unwrap_or_default();
+        let valid = name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | ':'));
+        if !valid {
+            return PoolFeatureListing::Unreadable;
+        }
+        names += 1;
+        if name == feature || name.rsplit(':').next() == Some(feature) {
+            found = true;
+        }
+    }
+    PoolFeatureListing::Unreadable
+}
+
+/// The AnyRAID row's verdict from what `zpool upgrade -v` printed.
+/// `zfs_version` is the `zfs` row's version, named in every sentence so the
+/// admin reads which ZFS the answer is about. `output` is `None` when the
+/// command could not be run at all.
+///
+/// The row is never "ok": this build has no AnyRAID creation, so a ZFS that
+/// knows the feature is `not_offered` — a grey chip, never a green OK (critic
+/// wave 9a, MINOR 8) — and the wizard keeps its card disabled with that
+/// sentence (owner decision 2026-09-26).
+fn anyraid_verdict(
+    output: Option<(&str, &str)>,
+    zfs_version: Option<&str>,
+) -> (&'static str, CodedText) {
+    let version = zfs_version.unwrap_or_default().to_string();
+    let listing = output.map_or(PoolFeatureListing::Unreadable, |(stdout, stderr)| {
+        match pool_feature_listed(stdout, ANYRAID_POOL_FEATURE) {
+            PoolFeatureListing::Unreadable => pool_feature_listed(stderr, ANYRAID_POOL_FEATURE),
+            known => known,
+        }
+    });
+    let named = if version.is_empty() { "ZFS".to_string() } else { format!("ZFS {version}") };
+    match listing {
+        PoolFeatureListing::Listed => (
+            "not_offered",
+            CodedText::new(
+                "anyraid_supported_not_offered",
+                &[("version", version)],
+                format!("{named} supports AnyRAID; TentaNas cannot create AnyRAID pools yet"),
+            ),
+        ),
+        PoolFeatureListing::NotListed => (
+            "unsupported",
+            CodedText::new(
+                "anyraid_not_in_zfs",
+                &[("version", version)],
+                format!("{named} on this node does not support AnyRAID"),
+            ),
+        ),
+        PoolFeatureListing::Unreadable => (
+            "unknown",
+            CodedText::new(
+                "anyraid_unreadable",
+                &[("version", version)],
+                format!("could not read whether {named} on this node supports AnyRAID"),
+            ),
+        ),
+    }
+}
+
+/// Fills the AnyRAID row: `zpool upgrade -v` is an unprivileged read.
+async fn anyraid_refine(feature: &mut FeatureState, zfs: Option<&FeatureState>) -> Vec<NasHealthReason> {
+    let zfs_version = zfs.filter(|z| z.status != "missing").and_then(|z| z.version.clone());
+    let out = match find_binary("zpool") {
+        Some(zpool) => run_unprivileged(&zpool, &["upgrade", "-v"], Duration::from_secs(10)).await.ok(),
+        None => None,
+    };
+    let (status, detail) = anyraid_verdict(
+        out.as_ref().map(|o| (o.stdout.as_str(), o.stderr.as_str())),
+        zfs_version.as_deref(),
+    );
+    feature.status = status.to_string();
+    // The version is in the detail ("ZFS 2.4.1 …"); a version column beside
+    // it would say it twice (n16 shows it once).
+    feature.version = None;
+    feature.detail = detail.text;
+    detail.reasons
+}
 
 /// The absolute path of a system binary on the known tool directories, or None
 /// when this node does not have it. The share layer asks the same question the
@@ -532,6 +702,10 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
             {
                 reasons = super::targets::refine_coded(&mut feature);
             }
+            if spec.id == ANYRAID_FEATURE_ID {
+                let zfs = features.iter().find(|f: &&FeatureState| f.id == "zfs");
+                reasons = anyraid_refine(&mut feature, zfs).await;
+            }
             if !reasons.is_empty() {
                 feature_reasons.insert(feature.id.clone(), reasons);
             }
@@ -796,6 +970,103 @@ mod tests {
         assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "nie usuwaj");
     }
 
+    /// MEASURED on rig11 (2026-09-26, OpenZFS 2.4.1-1ubuntu5.1), shortened
+    /// in the middle of the table: the layout `pool_feature_listed` reads.
+    const ZPOOL_UPGRADE_V_2_4_1: &str = "This system supports ZFS pool feature flags.
+
+The following features are supported:
+
+FEAT DESCRIPTION
+-------------------------------------------------------------
+async_destroy                         (read-only compatible)
+     Destroy filesystems asynchronously.
+empty_bpobj                           (read-only compatible)
+     Snapshots use less space.
+lz4_compress                         
+     LZ4 compression algorithm support.
+draid                                
+     Support for distributed spare RAID
+raidz_expansion                      
+     Support for raidz expansion
+fast_dedup                            (read-only compatible)
+     Support for advanced deduplication
+physical_rewrite                      (read-only compatible)
+     Support for preserving logical birth time during rewrite.
+
+The following legacy versions are also supported:
+
+VER  DESCRIPTION
+---  --------------------------------------------------------
+ 1   Initial ZFS version
+ 2   Ditto blocks (replicated metadata)
+";
+
+    fn with_anyraid(text: &str, line: &str) -> String {
+        text.replace("draid     ", &format!("{line}\n     Support for any-sized RAID\ndraid     "))
+    }
+
+    #[test]
+    fn zpool_upgrade_v_answers_whether_anyraid_is_listed() {
+        assert_eq!(pool_feature_listed(ZPOOL_UPGRADE_V_2_4_1, "anyraid"), PoolFeatureListing::NotListed);
+        assert_eq!(pool_feature_listed(ZPOOL_UPGRADE_V_2_4_1, "raidz_expansion"), PoolFeatureListing::Listed);
+        let listed = with_anyraid(ZPOOL_UPGRADE_V_2_4_1, "anyraid                              ");
+        assert_eq!(pool_feature_listed(&listed, "anyraid"), PoolFeatureListing::Listed);
+        let qualified = with_anyraid(ZPOOL_UPGRADE_V_2_4_1, "org.openzfs:anyraid");
+        assert_eq!(pool_feature_listed(&qualified, "anyraid"), PoolFeatureListing::Listed);
+        // A description that merely MENTIONS the word is not the feature.
+        let mentioned = ZPOOL_UPGRADE_V_2_4_1.replace("Support for raidz expansion", "anyraid is not this");
+        assert_eq!(pool_feature_listed(&mentioned, "anyraid"), PoolFeatureListing::NotListed);
+        // A feature whose name only starts the same is not it either.
+        let longer = with_anyraid(ZPOOL_UPGRADE_V_2_4_1, "anyraid_v2");
+        assert_eq!(pool_feature_listed(&longer, "anyraid"), PoolFeatureListing::NotListed);
+    }
+
+    /// "Not listed" is said only about a complete table: anything else is
+    /// unknown, never "this ZFS has no AnyRAID".
+    #[test]
+    fn a_zpool_upgrade_v_document_that_is_not_whole_is_unreadable() {
+        let cut = ZPOOL_UPGRADE_V_2_4_1.split("The following legacy").next().unwrap();
+        for (why, text) in [
+            ("empty", String::new()),
+            ("an error instead of the document", "The ZFS modules are not loaded.\nTry running 'modprobe zfs' as root to load them.\n".to_string()),
+            ("truncated before the legacy section", cut.to_string()),
+            ("no header", ZPOOL_UPGRADE_V_2_4_1.replace("FEAT DESCRIPTION\n", "")),
+            ("no separator", ZPOOL_UPGRADE_V_2_4_1.replace("-------------------------------------------------------------\n", "")),
+            (
+                "an empty table",
+                "The following features are supported:\n\nFEAT DESCRIPTION\n----\n\nThe following legacy versions are also supported:\n".to_string(),
+            ),
+            ("a line that is no feature name", ZPOOL_UPGRADE_V_2_4_1.replace("draid     ", "Draid!    ")),
+        ] {
+            assert_eq!(pool_feature_listed(&text, "anyraid"), PoolFeatureListing::Unreadable, "{why}");
+        }
+    }
+
+    #[test]
+    fn the_anyraid_row_names_the_zfs_version_and_never_calls_a_failed_read_supported() {
+        let (status, detail) = anyraid_verdict(Some((ZPOOL_UPGRADE_V_2_4_1, "")), Some("2.4.1"));
+        assert_eq!(status, "unsupported");
+        assert_eq!(detail.text, "ZFS 2.4.1 on this node does not support AnyRAID");
+        assert_eq!(detail.reasons[0].code, "anyraid_not_in_zfs");
+        assert_eq!(detail.reasons[0].params.get("version").map(String::as_str), Some("2.4.1"));
+
+        let listed = with_anyraid(ZPOOL_UPGRADE_V_2_4_1, "anyraid");
+        let (status, detail) = anyraid_verdict(Some((&listed, "")), Some("2.5.0"));
+        assert_eq!(status, "not_offered", "never a green OK for what TentaNas cannot create");
+        assert_eq!(detail.reasons[0].code, "anyraid_supported_not_offered");
+
+        // The command could not be run, or printed something else: unknown.
+        for output in [None, Some(("", "cannot open /dev/zfs")), Some(("garbage", ""))] {
+            let (status, detail) = anyraid_verdict(output, Some("2.4.1"));
+            assert_eq!(status, "unknown", "{output:?}");
+            assert_eq!(detail.reasons[0].code, "anyraid_unreadable");
+        }
+        // A version the `zfs` row could not read is left out, not invented.
+        let (_, detail) = anyraid_verdict(Some((ZPOOL_UPGRADE_V_2_4_1, "")), None);
+        assert_eq!(detail.text, "ZFS on this node does not support AnyRAID");
+        assert_eq!(detail.reasons[0].params.get("version").map(String::as_str), Some(""));
+    }
+
     #[test]
     fn version_comparison_is_numeric() {
         assert!(version_at_least("2.3.1", "2.3.0"));
@@ -845,7 +1116,11 @@ mod tests {
     /// nothing installable answers "was this kernel built with
     /// `CONFIG_NVME_TARGET_AUTH`". An install button there would promise
     /// something no package manager can deliver.
-    const NO_PACKAGE_FEATURES: &[&str] = &["iscsi", "nvmet", super::super::targets::DHCHAP_FEATURE_ID];
+    ///
+    /// `anyraid` has nothing to install either: the feature comes with the
+    /// OpenZFS build the `zfs` row installs, or it does not.
+    const NO_PACKAGE_FEATURES: &[&str] =
+        &["iscsi", "nvmet", super::super::targets::DHCHAP_FEATURE_ID, ANYRAID_FEATURE_ID];
 
     /// Wave 7: the generic probe's detail travels as codes too, and the
     /// English it always wrote stays the tooltip.
@@ -893,7 +1168,7 @@ mod tests {
         // no `targetcli-fb` package read as "missing".
         for spec in FEATURES.iter().filter(|s| NO_PACKAGE_FEATURES.contains(&s.id)) {
             assert!(spec.binaries.is_empty(), "{} declares a binary", spec.id);
-            if spec.id == super::super::targets::DHCHAP_FEATURE_ID {
+            if spec.id == super::super::targets::DHCHAP_FEATURE_ID || spec.id == ANYRAID_FEATURE_ID {
                 // The one row whose answer is not a module at all: DH-HMAC-CHAP
                 // is a kernel BUILD option (`CONFIG_NVME_TARGET_AUTH`), so
                 // naming a module here would make the probe look for something

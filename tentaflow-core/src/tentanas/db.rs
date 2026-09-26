@@ -1021,6 +1021,20 @@ the next reconcile replaces this with the current count'
     // until the next apply judges it again, and its sentence is shown as it
     // is meanwhile.
     "ALTER TABLE nas_shares ADD COLUMN state_reasons TEXT NOT NULL DEFAULT '[]';",
+), (
+    25,
+    // Wave 9a round 2: the pools this node has seen imported. Only such a
+    // pool is waited for at boot, and alerted when it does not come back
+    // (`disks::pool_import_alerts`): a label left on a disk by a destroyed
+    // pool, or carried in on a foreign disk, is no pool of this node. The
+    // GUID is kept to tell a pool from a later one of the same name; it is
+    // never shown. A destroy or export by TentaNas removes the row.
+    "CREATE TABLE nas_known_pools (
+        name TEXT PRIMARY KEY,
+        guid TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+    );",
 )];
 
 /// The owner migration 20 gives a legacy share, target or account it cannot
@@ -1053,6 +1067,68 @@ pub fn now() -> String {
 
 fn write(pool: &DbPool) -> Result<parking_lot::MutexGuard<'_, Connection>> {
     pool.write().map_err(|e| anyhow!("tentanas db lock: {e}"))
+}
+
+// ----- pools this node has imported -----------------------------------------------
+
+/// Records every pool `zpool list` shows imported (name → GUID). A pool of
+/// the same name with a new GUID replaces the old record. Written only when
+/// something changed, so a pass over unchanged pools is one read.
+pub fn remember_pools(pool: &DbPool, imported: &std::collections::HashMap<String, String>) -> Result<()> {
+    if imported.is_empty() {
+        return Ok(());
+    }
+    let known: std::collections::HashMap<String, String> = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        let mut stmt = conn.prepare_cached("SELECT name, guid FROM nas_known_pools")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let changed: Vec<(&String, &String)> =
+        imported.iter().filter(|(name, guid)| known.get(*name) != Some(*guid)).collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let conn = write(pool)?;
+    let at = now();
+    for (name, guid) in changed {
+        conn.execute(
+            "INSERT INTO nas_known_pools (name, guid, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(name) DO UPDATE SET guid = excluded.guid, last_seen_at = excluded.last_seen_at",
+            params![name, guid, at],
+        )?;
+    }
+    Ok(())
+}
+
+/// The names of the pools this node has seen imported.
+pub fn known_pool_names(pool: &DbPool) -> Result<std::collections::HashSet<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT name FROM nas_known_pools")?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(names)
+}
+
+/// Every known pool (name → GUID), for naming a pool GUID in a log line.
+pub fn known_pools(pool: &DbPool) -> Result<Vec<(String, String)>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT name, guid FROM nas_known_pools")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// TentaNas destroyed or exported the pool: it is meant to be absent, and a
+/// label it left behind is waited for by nobody.
+pub fn forget_pool(pool: &DbPool, name: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute("DELETE FROM nas_known_pools WHERE name = ?1", params![name])?;
+    Ok(())
 }
 
 // ----- settings ---------------------------------------------------------------
@@ -3385,6 +3461,25 @@ pub fn elastic_array_names_of_org(pool: &DbPool, org_id: &str) -> Result<std::co
         .query_map(params![org_id], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
     Ok(names)
+}
+
+/// Every organisation that owns something on this node: an Elastic Array, a
+/// share or a block target. The set the sole-organisation rule for rows
+/// whose owner is gone is judged against (dispatch `org_viewer`, owner
+/// decision 2026-09-26). A ZFS pool has no owner record — `zpool create`
+/// runs node-wide — so it counts for nobody. A failed read is an error,
+/// never an empty set: an empty set would make the asker "the only one".
+pub fn orgs_with_resources(pool: &DbPool) -> Result<std::collections::BTreeSet<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT org_id FROM nas_elastic_arrays WHERE org_id <> ''
+         UNION SELECT org_id FROM nas_shares WHERE org_id <> ''
+         UNION SELECT org_id FROM nas_targets WHERE org_id <> ''",
+    )?;
+    let orgs = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
+    Ok(orgs)
 }
 
 pub fn elastic_claims(pool: &DbPool) -> Result<Vec<ElasticClaim>> {
@@ -6119,6 +6214,33 @@ pub fn list_targets(pool: &DbPool) -> Result<Vec<TargetRow>> {
         target.initiators = target_initiators(pool, &target.target_id)?;
     }
     Ok(targets)
+}
+
+/// The shares and block targets NOT owned by `org_id` — every other
+/// organisation's, and any row nobody owns. For the one check that has to
+/// see them without naming them: whether a pool about to be destroyed holds
+/// another tenant's resources (`pools::holds_resources`, dispatch
+/// `pool_destroy`). The rows never leave the node.
+pub fn resources_of_other_orgs(pool: &DbPool, org_id: &str) -> Result<(Vec<ShareRow>, Vec<TargetRow>)> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let shares = conn
+        .prepare_cached(&format!("SELECT {SHARE_COLUMNS} FROM nas_shares WHERE NOT ({OWNED_BY_SQL})"))?
+        .query_map(params![org_id], share_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let targets = conn
+        .prepare_cached(&format!("SELECT {TARGET_COLUMNS} FROM nas_targets WHERE NOT ({OWNED_BY_SQL})"))?
+        .query_map(params![org_id], target_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // `target_from_row` reads a spec it cannot parse as "no LUNs", which is
+    // right for a list and wrong here: a target whose LUNs are unknown may be
+    // on the pool. Such a row makes the whole answer unreadable (critic wave
+    // 9a, MINOR 6).
+    let mut specs = conn.prepare_cached(&format!("SELECT spec_json FROM nas_targets WHERE NOT ({OWNED_BY_SQL})"))?;
+    for spec in specs.query_map(params![org_id], |r| r.get::<_, String>(0))? {
+        serde_json::from_str::<TargetSpec>(&spec?)
+            .map_err(|e| anyhow!("the record of another organisation's target is unreadable ({e})"))?;
+    }
+    Ok((shares, targets))
 }
 
 /// The targets `org_id` owns — the only list a tenant is ever shown.
@@ -9293,8 +9415,8 @@ mod tests {
             .unwrap();
         // Migracje 1–8 mają 19 tabel; schema9 dodaje cztery tabele Elastic,
         // schema13 harmonogramy Elastic i ustawienia movera (E2-10),
-        // a schema16 polityki cache folderów.
-        assert_eq!(n, 26);
+        // a schema16 polityki cache folderów, schema25 the known pools.
+        assert_eq!(n, 27);
     }
 
     #[test]

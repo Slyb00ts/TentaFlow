@@ -25,7 +25,8 @@
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { createConnectionOverlay, isPlatformDown, OFFLINE_ICON } from '/js/modules/connection-overlay.js';
-import { T } from '/js/modules/tentanas/format.js';
+import { T, errMessage } from '/js/modules/tentanas/format.js';
+import { toast } from '/js/utils.js';
 import { nodeT } from '/js/modules/tentanas/node-phrase.js';
 
 // n18c: "próba 3 · backoff do 30 s" with a 7 s countdown — doubling from 2 s,
@@ -52,10 +53,15 @@ export function isNodeUnreachable(err) {
 }
 
 /**
- * Whether a failed probe was nevertheless ANSWERED by the node: a protocol
- * refusal (`protocol error <Code>: …` or a `code` on the error) other than
- * `NodeUnreachable`. A bare transport error (a closed socket, a timeout)
- * carries no code and is no answer.
+ * Whether a failed probe was nevertheless ANSWERED: a protocol refusal
+ * (`protocol error <Code>: …` or a `code` on the error) other than
+ * `NodeUnreachable`. Only TRANSPORT loss keeps the node "unreachable" — a
+ * bare transport error (a closed socket, a timeout) carries no code. A node
+ * that answers with an application error (its environment read failing, a
+ * gate refusing) is not unreachable, and holding the whole screen blurred on
+ * "unreachable" would misstate what is happening: the lost state ends and
+ * the error is shown as an error (critic wave 9a, MINOR 9 — this replaces the
+ * wave-8 rule that kept every code the forwarder can also send as "lost").
  */
 export function isNodeAnswer(err) {
   if (!err || isNodeUnreachable(err)) return false;
@@ -207,7 +213,12 @@ export function createNodeLink(screen, { transport = ApiBinary, setTimer = setTi
     } catch (err) {
       if (lost !== current) return;
       current.probing = false;
-      if (isNodeAnswer(err)) { recovered(); return; }
+      if (isNodeAnswer(err)) {
+        recovered();
+        // Answered, but with an error: shown as that error, in words.
+        toast(errMessage(err, (id) => (screen.nodes || []).find((n) => n.nodeId === id)?.nodeName || ''), 'error');
+        return;
+      }
       overlay.log('warn', nodeT('unreachable.log_no_answer', nodeOf(current.nodeId), { attempt: current.attempt }));
       schedule();
     }

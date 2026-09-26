@@ -11,7 +11,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, poolCrumbTail, sprite, POLL_POOLS_MS, POLL_JOB_MODAL_MS, IO_WINDOW_SECS, ADMIN_TIMEOUT_MS, parseServerTs,
   fmtDate, fmtIn, fmtDuration, fmtBytes, fmtMBps, fmtRatio, pct, healthClass, errMessage,
-  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel, firstDiskReasonWord, leafDisplayName, leafEmbeddedName,
+  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel, firstDiskReasonWord, leafDisplayName, leafEmbeddedName, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, SLOT, slotEl, setClass, setRowsIfChanged } from '/js/lib/dom-patch.js';
@@ -1533,7 +1533,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
     const log = stepBody.querySelector('.job-log');
     if (log) {
       setAttr(log, 'hidden', !state.job);
-      paintJobLog(log, state.job?.log);
+      paintJobLog(log, jobLogLines(state.job?.log));
     }
 
     // Footer buttons are keyed: "Anuluj" and "Wstecz" are the same nodes for

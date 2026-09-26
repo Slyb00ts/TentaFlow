@@ -503,8 +503,10 @@ async fn elevation_plan(ctx: &HandlerContext) -> Result<MessageBody, ProtocolErr
 }
 
 /// The name the Environment tab shows next to "provisioned by". The account's
-/// display name when the platform knows one, its id otherwise — the point is
-/// that an admin reading the node months later can tell who armed it.
+/// display name when the platform knows one — the point is that an admin
+/// reading the node months later can tell who armed it. Nothing when the
+/// platform knows no name: an account id is not a name, and the tab and the
+/// job log never show one (owner's rule).
 fn admin_display_name(ctx: &HandlerContext, g: &Gate) -> String {
     crate::db::repository::lookup_user_names(&ctx.state.db, std::slice::from_ref(&g.user_id))
         .ok()
@@ -517,7 +519,7 @@ fn admin_display_name(ctx: &HandlerContext, g: &Gate) -> String {
             }
         })
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| g.user_id.clone())
+        .unwrap_or_default()
 }
 
 async fn elevation_provision(ctx: &HandlerContext, secret: &SudoSecret) -> Result<MessageBody, ProtocolError> {
@@ -1193,6 +1195,60 @@ fn require_confirm(name: &str, confirm_name: &str) -> Result<(), ProtocolError> 
     }
 }
 
+/// A pool that holds another organisation's shares or block targets is not
+/// this organisation's to destroy (owner decision 2026-09-26). The refusal
+/// names nobody: which tenant, and what, stays that tenant's business.
+const POOL_DESTROY_FOREIGN: &str = "refusal:pool_destroy_foreign_resources";
+/// The pool's datasets or the other tenants' rows could not be read, so the
+/// check above could not be made — refused, never assumed clear.
+const POOL_DESTROY_UNVERIFIED: &str = "refusal:pool_destroy_unverified";
+
+/// The destroy guard: `Ok` when nothing of another organisation lives on
+/// `pool`. `mountpoints` is `None` when the pool's datasets could not be
+/// listed. Resources of the asking organisation are not looked at here —
+/// they follow the existing flow (the dialog lists them, the destroy takes
+/// them with it).
+fn pool_destroy_guard(
+    db: &DbPool,
+    org_id: &str,
+    pool: &str,
+    mountpoints: Option<&[String]>,
+) -> Result<(), ProtocolError> {
+    let unverified = || ProtocolError::new(ProtocolErrorCode::NotAvailable, POOL_DESTROY_UNVERIFIED);
+    let (shares, targets) = store::resources_of_other_orgs(db, org_id).map_err(|_| unverified())?;
+    // By dataset and zvol name first: that answer needs no mountpoint, so a
+    // pool whose datasets cannot be listed is still refused as FOREIGN when
+    // the rows alone say so.
+    if tentanas::pools::holds_resources(pool, mountpoints.unwrap_or_default(), &shares, &targets) {
+        return Err(ProtocolError::new(ProtocolErrorCode::Conflict, POOL_DESTROY_FOREIGN));
+    }
+    if mountpoints.is_none() {
+        return Err(unverified());
+    }
+    Ok(())
+}
+
+/// `pools::try_resources_lock`, or the coded refusal of a creation that met a
+/// pool destroy in progress.
+async fn resources_or_refuse(g: &Gate) -> Result<tokio::sync::OwnedMutexGuard<()>, ProtocolError> {
+    tentanas::pools::try_resources_lock(&g.db)
+        .await
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::Conflict, POOL_DESTROY_IN_PROGRESS))
+}
+
+/// See `pools::POOL_DESTROY_IN_PROGRESS` (the literal is here too, where the
+/// screen's refusal scan reads the dispatcher's codes).
+const POOL_DESTROY_IN_PROGRESS: &str = "refusal:pool_destroy_in_progress";
+
+/// The pool's mountpoints for `pool_destroy_guard`, `None` when its datasets
+/// cannot be listed.
+async fn pool_mountpoints(pool: &str) -> Option<Vec<String>> {
+    tentanas::datasets::list(pool)
+        .await
+        .ok()
+        .map(|datasets| datasets.into_iter().filter_map(|d| d.mountpoint).collect())
+}
+
 async fn pool_destroy(
     ctx: &HandlerContext,
     name: &str,
@@ -1202,6 +1258,11 @@ async fn pool_destroy(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name, confirm_name)?;
+    tentanas_helper::validate_pool_name(name).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    // Checked when the request is made AND again when an approved one runs:
+    // another tenant may have exported something from the pool in between.
+    let mountpoints = pool_mountpoints(name).await;
+    pool_destroy_guard(&g.db, &g.org_id, name, mountpoints.as_deref())?;
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
         return park(
             ctx,
@@ -1220,20 +1281,42 @@ async fn pool_destroy(
             },
         );
     }
-    let answer = spawn_destroy_job(
-        ctx,
-        &g,
-        "pool_destroy",
-        name,
-        HelperCommand::ZpoolDestroy {
-            pool: name.to_string(),
-        },
-        true,
-        secret,
-    )?;
-    // The schedule of a pool that no longer exists would keep firing.
-    let _ = store::delete_pool_schedules(&g.db, name);
-    Ok(answer)
+    // The check above answers the request at once; the job checks again
+    // under `resources_lock` and holds it through `zpool destroy`, so no
+    // share or target of another organisation can land on the pool between
+    // the last check and the destroy.
+    let command = HelperCommand::ZpoolDestroy { pool: name.to_string() };
+    command.plan().map_err(|e| broker_error("pool_destroy", catalog_error(e)))?;
+    let explicit = secret.map(token);
+    let (db, org_id, addon_id, pool) = (g.db.clone(), g.org_id.clone(), g.addon_id.clone(), name.to_string());
+    let job = tentanas::jobs::spawn(&g.db, "pool_destroy", name, &g.user_id, None, None, move |h| {
+        pool_destroy_job(h, db, org_id, addon_id, pool, command, explicit)
+    })
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response(ctx, job))
+}
+
+/// The body of a pool destroy job: the last check of other organisations'
+/// resources and `zpool destroy`, both under `resources_lock`.
+async fn pool_destroy_job(
+    h: tentanas::jobs::JobHandle,
+    db: DbPool,
+    org_id: String,
+    addon_id: String,
+    pool: String,
+    command: HelperCommand,
+    explicit: Option<Arc<ElevationToken>>,
+) -> anyhow::Result<()> {
+    let _serialised = tentanas::pools::resources_lock(&db).lock_owned().await;
+    let mountpoints = pool_mountpoints(&pool).await;
+    pool_destroy_guard(&db, &org_id, &pool, mountpoints.as_deref())
+        .map_err(|refusal| anyhow::anyhow!(refusal.message))?;
+    tentanas::datasets::destroy_job(h, command, addon_id, pool.clone(), true, explicit).await?;
+    // Only now: a destroy the re-check refused, or one that failed, leaves a
+    // pool that still needs its scrub and trim schedules (critic wave 9a,
+    // R2-MINOR 2).
+    let _ = store::delete_pool_schedules(&db, &pool);
+    Ok(())
 }
 
 async fn pool_scrub(
@@ -2451,6 +2534,10 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     let g = gate_shares(ctx)?;
     tentanas_helper::validate_share_name(name)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    // From the read of the datasets to the row: a pool destroy cannot run in
+    // between (`pools::resources_lock`) — and one that is running refuses
+    // this after a short wait, never an unbounded one.
+    let _serialised = resources_or_refuse(&g).await?;
     let (rdma_ok, smb_direct_ok) = transport_gates(&g).await;
     tentanas::shares::validate_options(protocol, smb, nfs, rdma_ok, smb_direct_ok)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
@@ -3151,6 +3238,9 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         return Err(ProtocolError::bad_request("expected TargetCreateRequest"));
     };
     let g = gate_targets(ctx)?;
+    // From the read of the volumes to the row: a pool destroy cannot run in
+    // between (`pools::resources_lock`), and a running one refuses this.
+    let _serialised = resources_or_refuse(&g).await?;
     // Checked before anything else is read or written: the host segment is
     // part of the target's permanent identity, and a node whose hostname is
     // empty (or holds nothing an IQN may carry) would publish `iqn.…:.name`.
@@ -4086,18 +4176,43 @@ fn orgs_on_node(ctx: &HandlerContext) -> Result<std::collections::BTreeSet<Strin
 }
 
 /// Who reads the job and alert lists (`store::OrgViewer`): the caller's
-/// organisation, and whether it is the ONLY organisation of this node — then
-/// the rows whose owner is gone (a dissolved array's jobs and alerts,
-/// migration 18) are its to see (owner decision, wave 5). A failed read of
-/// the organisations answers "not the only one": hidden, never leaked.
+/// organisation, and whether it is the sole organisation here — then the
+/// rows whose owner is gone (a dissolved array's jobs and alerts, migration
+/// 18) are its to see (owner decisions, wave 5 and 2026-09-26). A failed
+/// read of either set answers "not the sole one": hidden, never leaked.
 fn org_viewer<'a>(ctx: &HandlerContext, g: &'a Gate) -> store::OrgViewer<'a> {
-    let sole_org = orgs_on_node_of(ctx).is_ok_and(|orgs| is_sole_org(&orgs, &g.org_id));
+    let sole_org = match (org_statuses_of(ctx), store::orgs_with_resources(&g.db)) {
+        (Ok(statuses), Ok(owning)) => is_sole_org(&statuses, &owning, &g.org_id),
+        _ => false,
+    };
     store::OrgViewer { org_id: &g.org_id, sole_org }
 }
 
-/// Whether `org_id` is the one and only organisation in `orgs`.
-fn is_sole_org(orgs: &std::collections::BTreeSet<String>, org_id: &str) -> bool {
-    !org_id.is_empty() && orgs.len() == 1 && orgs.contains(org_id)
+/// Whether `org_id` is "the sole organisation": itself `active`, and no
+/// OTHER organisation that still exists owns resources on this node
+/// (`owning`). Only a soft-deleted organisation (`deleted`) is ignored; a
+/// suspended one is still present — a suspension is reversible, and its
+/// rows must not become another tenant's to see meanwhile (critic wave 9a) —
+/// and so is an owner id no organisation row names (nothing says it is gone).
+/// The viewer need not own anything here: an organisation that dissolved its
+/// only array still sees that array's rows. `statuses` is org id → status.
+fn is_sole_org(
+    statuses: &std::collections::BTreeMap<String, String>,
+    owning: &std::collections::BTreeSet<String>,
+    org_id: &str,
+) -> bool {
+    !org_id.is_empty()
+        && statuses.get(org_id).is_some_and(|status| status == "active")
+        && !owning
+            .iter()
+            .any(|org| org != org_id && statuses.get(org).is_none_or(|status| status != "deleted"))
+}
+
+/// Every organisation's status, by id.
+fn org_statuses_of(ctx: &HandlerContext) -> Result<std::collections::BTreeMap<String, String>, ProtocolError> {
+    crate::services::org::list_organizations(&ctx.state.db, None)
+        .map(|orgs| orgs.into_iter().map(|org| (org.org_id, org.status)).collect())
+        .map_err(|e| internal("organisations", e))
 }
 
 fn orgs_on_node_of(ctx: &HandlerContext) -> Result<std::collections::BTreeSet<String>, ProtocolError> {
@@ -6626,16 +6741,223 @@ mod registration_tests {
         assert_eq!(tentanas::elevation::audit_entries(&g.db),0);
     }
 
-    /// Owner decision (wave 5): the orphaned rows are one viewer's only when it
-    /// is the node's single organisation.
+    /// Owner decision 2026-09-26: a pool holding another organisation's
+    /// share or target is not destroyed, and the refusal names neither the
+    /// organisation nor the resource. The asking organisation's own
+    /// resources still follow the existing flow (listed by the dialog, taken
+    /// with the pool). A check that could not be made refuses.
     #[test]
-    fn a_viewer_is_the_sole_organisation_only_when_the_node_has_no_other() {
+    fn pool_destroy_refuses_while_another_organisation_uses_the_pool() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::migrate(&conn).unwrap();
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let mounts = vec!["/tank".to_string(), "/tank/projekty".to_string()];
+        let share = |org: &str, name: &str, path: &str, dataset: Option<&str>| {
+            store::upsert_share(&db, org, &store::ShareRow {
+                share_id: format!("s-{name}"),
+                name: name.into(),
+                protocol: "smb".into(),
+                source_path: path.into(),
+                dataset: dataset.map(str::to_string),
+                enabled: true,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                ..Default::default()
+            }).unwrap();
+        };
+        let target = |org: &str, name: &str, kind: &str, source: &str| {
+            store::upsert_target(&db, org, &store::TargetRow {
+                target_id: format!("t-{name}"),
+                name: name.into(),
+                protocol: "iscsi".into(),
+                wwn: format!("iqn.2026-09.test:{name}"),
+                enabled: true,
+                luns: vec![tentaflow_protocol::tentanas::NasTargetLun {
+                    source: source.into(),
+                    source_kind: kind.into(),
+                    ..Default::default()
+                }],
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                ..Default::default()
+            }).unwrap();
+        };
+        let guard = |mounts: Option<&[String]>| pool_destroy_guard(&db, "org-a", "tank", mounts);
+
+        // The asking organisation's own share and zvol: the existing flow.
+        share("org-a", "projekty", "/tank/projekty", Some("tank/projekty"));
+        target("org-a", "vm-a", "zvol", "tank/vm-a");
+        assert!(guard(Some(&mounts)).is_ok(), "same-organisation resources follow the existing flow");
+        // Another organisation's, but on another pool: not this pool's business.
+        share("org-b", "media", "/srv/media/x", None);
+        target("org-b", "vm-other", "zvol", "tankard/vm");
+        assert!(guard(Some(&mounts)).is_ok(), "`tankard` is not `tank`");
+
+        for (why, add) in [
+            ("a share by path", Box::new(|| share("org-b", "b-docs", "/tank/projekty/b", None)) as Box<dyn Fn()>),
+            ("a share on a dataset", Box::new(|| share("org-b", "b-root", "/elsewhere", Some("tank")))),
+            ("a zvol LUN", Box::new(|| target("org-b", "b-vm", "zvol", "tank/b-vm"))),
+            ("a file LUN", Box::new(|| target("org-b", "b-file", "file", "/tank/images/b.img"))),
+        ] {
+            add();
+            let refused = guard(Some(&mounts)).expect_err(why);
+            assert_eq!(refused.code, ProtocolErrorCode::Conflict, "{why}");
+            assert_eq!(refused.message, POOL_DESTROY_FOREIGN, "{why}: coded, and it names nobody");
+            db.write().unwrap().execute_batch(
+                "DELETE FROM nas_shares WHERE name LIKE 'b-%'; DELETE FROM nas_targets WHERE name LIKE 'b-%';",
+            ).unwrap();
+            assert!(guard(Some(&mounts)).is_ok(), "{why}: clean again");
+        }
+
+        let unverified = guard(None).expect_err("datasets unreadable");
+        assert_eq!(unverified.message, POOL_DESTROY_UNVERIFIED);
+        // With the datasets unreadable, a foreign zvol by name is still FOREIGN.
+        target("org-b", "b-zvol", "zvol", "tank/b-zvol");
+        assert_eq!(guard(None).expect_err("zvol by name").message, POOL_DESTROY_FOREIGN);
+        db.write().unwrap().execute_batch("DELETE FROM nas_targets WHERE name = 'b-zvol';").unwrap();
+
+        // Critic wave 9a, MINOR 6: another organisation's target whose record
+        // cannot be read may be on the pool — unverified, never "no LUNs".
+        target("org-b", "b-corrupt", "zvol", "elsewhere/x");
+        db.write().unwrap().execute_batch("UPDATE nas_targets SET spec_json = '{not json' WHERE name = 'b-corrupt';").unwrap();
+        assert_eq!(guard(Some(&mounts)).expect_err("corrupt record").message, POOL_DESTROY_UNVERIFIED);
+        db.write().unwrap().execute_batch("DELETE FROM nas_targets WHERE name = 'b-corrupt';").unwrap();
+        // The asking organisation's own corrupt record is not this check's.
+        target("org-a", "a-corrupt", "zvol", "elsewhere/y");
+        db.write().unwrap().execute_batch("UPDATE nas_targets SET spec_json = '{not json' WHERE name = 'a-corrupt';").unwrap();
+        assert!(guard(Some(&mounts)).is_ok());
+        db.write().unwrap().execute_batch("ALTER TABLE nas_targets RENAME TO nas_targets_gone").unwrap();
+        assert_eq!(guard(Some(&mounts)).expect_err("rows unreadable").message, POOL_DESTROY_UNVERIFIED);
+    }
+
+    /// Critic wave 9a, R2-MINOR 2: a destroy the job's own re-check refuses
+    /// leaves the pool's schedules in place — they go only with a destroy
+    /// that ran.
+    #[tokio::test]
+    async fn a_destroy_refused_by_the_job_keeps_the_pool_schedules() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::migrate(&conn).unwrap();
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let schedule = tentaflow_protocol::tentanas::NasSchedule::default();
+        store::set_pool_schedule(&db, store::PoolTask::Scrub, "tank", true, &schedule, None).unwrap();
+        store::upsert_share(&db, "org-b", &store::ShareRow {
+            share_id: "s-b".into(), name: "b".into(), protocol: "smb".into(), source_path: "/tank/b".into(),
+            dataset: Some("tank/b".into()), enabled: true, created_at: "now".into(), updated_at: "now".into(),
+            ..Default::default()
+        }).unwrap();
+        let h = tentanas::jobs::JobHandle::for_test(&db, "job-destroy-refused");
+        let refused = pool_destroy_job(h, db.clone(), "org-a".into(), "nas".into(), "tank".into(),
+            HelperCommand::ZpoolDestroy { pool: "tank".into() }, None).await.expect_err("refused");
+        assert_eq!(refused.to_string(), POOL_DESTROY_FOREIGN);
+        assert!(store::pool_schedule(&db, store::PoolTask::Scrub, "tank").unwrap().is_some(), "the schedule stays");
+    }
+
+    /// Critic wave 9a, MINOR 10: the approved execution of a parked pool
+    /// destroy runs the guard too, before any job exists — through
+    /// `execute_approved`, so a reorder that put the guard behind the
+    /// `origin` check, or after the spawn, fails here.
+    #[tokio::test]
+    async fn an_approved_pool_destroy_is_refused_while_another_organisation_uses_the_pool() {
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        store::upsert_share(&g.db, "org-other", &store::ShareRow {
+            share_id: "s-theirs".into(),
+            name: "theirs".into(),
+            protocol: "smb".into(),
+            source_path: "/tank/theirs".into(),
+            dataset: Some("tank/theirs".into()),
+            enabled: true,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            ..Default::default()
+        }).unwrap();
+        let parked = P::PoolDestroyRequest { name: "tank".into(), confirm_name: "tank".into(), sudo_password: None };
+        let refused = execute_approved(&fixture.ctx, &parked, None).await.expect_err("refused");
+        assert_eq!(refused.code, ProtocolErrorCode::Conflict);
+        assert_eq!(refused.message, POOL_DESTROY_FOREIGN, "coded, naming nobody");
+        assert!(store::list_jobs(&g.db, 100).unwrap().is_empty(), "no destroy job was started");
+    }
+
+    /// Critic wave 9a, MINOR 5 and R2-MAJOR 1: a creation never lands on a
+    /// pool between a destroy's last check and `zpool destroy`, and never
+    /// waits for the destroy without limit: while the lock is held it is
+    /// refused (coded) after a short wait, and it runs once the lock is free.
+    #[tokio::test]
+    async fn share_and_target_creation_are_refused_while_a_pool_destroy_holds_the_lock() {
+        assert_eq!(POOL_DESTROY_IN_PROGRESS, tentanas::pools::POOL_DESTROY_IN_PROGRESS);
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        for permission in [PERM_SHARES, PERM_TARGETS] {
+            crate::dispatch::app_gate::test_support::set_permission(&fixture.ctx.state, &fixture.addon_id,
+                "user", &fixture.ctx.org_context.as_ref().unwrap().user_id, permission, "allow");
+        }
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let share = P::ShareCreateRequest {
+            name: "lockcheck".into(), protocol: "smb".into(), source_path: "/tank/lockcheck".into(),
+            smb: None, nfs: None, fleet_mount: false, enabled: false, sudo_password: None,
+        };
+        let target = P::TargetCreateRequest {
+            name: "lockcheck".into(), protocol: "iscsi".into(), source: "tank/lockcheck".into(),
+            create_size_bytes: 0, thin: false, portal_interface: String::new(), transports: Vec::new(),
+            auth: None, initiators: Vec::new(), confirm_all_interfaces: false, enabled: false, sudo_password: None,
+        };
+        let bound = tentanas::pools::RESOURCES_LOCK_WAIT + std::time::Duration::from_secs(5);
+        let held = tentanas::pools::resources_lock(&g.db).lock_owned().await;
+        for (what, answer) in [
+            ("share", tokio::time::timeout(bound, share_create(&fixture.ctx, &share)).await.expect("bounded wait")),
+            ("target", tokio::time::timeout(bound, target_create(&fixture.ctx, &target)).await.expect("bounded wait")),
+        ] {
+            let refused = answer.expect_err(what);
+            assert_eq!(refused.code, ProtocolErrorCode::Conflict, "{what}");
+            assert_eq!(refused.message, POOL_DESTROY_IN_PROGRESS, "{what}: coded");
+        }
+        assert!(store::share_by_name(&g.db, "lockcheck").unwrap().is_none(), "nothing was created behind the refusal");
+        drop(held);
+        // Free again: the creation runs (its own checks decide the rest).
+        for (what, answer) in [
+            ("share", tokio::time::timeout(bound, share_create(&fixture.ctx, &share)).await.expect("runs")),
+            ("target", tokio::time::timeout(bound, target_create(&fixture.ctx, &target)).await.expect("runs")),
+        ] {
+            if let Err(e) = answer {
+                assert_ne!(e.message, POOL_DESTROY_IN_PROGRESS, "{what} is not refused once the lock is free");
+            }
+        }
+    }
+
+    /// Owner decision 2026-09-26: the orphaned rows are one viewer's when it
+    /// is active and no OTHER active organisation has resources on this node
+    /// (the viewer itself need own nothing here).
+    #[test]
+    fn a_viewer_is_the_sole_organisation_only_when_no_other_active_one_owns_anything_here() {
         let set = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>();
-        assert!(is_sole_org(&set(&["org-a"]), "org-a"));
-        assert!(!is_sole_org(&set(&["org-a", "org-b"]), "org-a"), "two organisations: nobody sees the orphans");
-        assert!(!is_sole_org(&set(&["org-b"]), "org-a"), "not the one organisation there is");
-        assert!(!is_sole_org(&set(&[""]), ""), "an empty org id is no tenant");
-        assert!(!is_sole_org(&set(&[]), "org-a"));
+        let orgs = |rows: &[(&str, &str)]| {
+            rows.iter().map(|(id, status)| (id.to_string(), status.to_string())).collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let statuses = orgs(&[("org-a", "active"), ("org-b", "active"), ("org-default", "active"), ("org-gone", "deleted"), ("org-paused", "suspended")]);
+        assert!(is_sole_org(&statuses, &set(&["org-a"]), "org-a"));
+        assert!(!is_sole_org(&statuses, &set(&["org-a", "org-b"]), "org-a"), "two owners: nobody sees the orphans");
+        assert!(!is_sole_org(&statuses, &set(&["org-b"]), "org-a"), "another organisation is the owner here");
+        assert!(is_sole_org(&statuses, &set(&["org-a", "org-gone"]), "org-a"), "a soft-deleted owner does not count");
+        assert!(
+            !is_sole_org(&statuses, &set(&["org-a", "org-paused"]), "org-a"),
+            "a suspended owner is still present: its rows stay hidden"
+        );
+        assert!(!is_sole_org(&statuses, &set(&["org-paused"]), "org-a"), "the same with the viewer owning nothing");
+        assert!(
+            is_sole_org(&statuses, &set(&["org-a"]), "org-a"),
+            "an active organisation without resources here does not count"
+        );
+        assert!(
+            is_sole_org(&statuses, &set(&[]), "org-a"),
+            "the viewer owns nothing here and nobody else does: it sees the orphans"
+        );
+        assert!(is_sole_org(&statuses, &set(&["org-gone"]), "org-a"), "only a soft-deleted owner besides it");
+        assert!(!is_sole_org(&statuses, &set(&["org-unknown"]), "org-a"), "an owner nothing says is gone still counts");
+        assert!(!is_sole_org(&statuses, &set(&[]), "org-gone"), "a soft-deleted viewer");
+        assert!(!is_sole_org(&statuses, &set(&[]), "org-paused"), "a suspended viewer");
+        assert!(!is_sole_org(&statuses, &set(&[]), "org-x"), "a viewer no organisation row knows");
+        assert!(!is_sole_org(&orgs(&[("", "active")]), &set(&[""]), ""), "an empty org id is no tenant");
     }
 
     /// The set an Elastic journal's owner is judged against: every
@@ -8863,6 +9185,13 @@ mod registration_tests {
     /// modal, the alert list and the FleetView badge must all show the orphan
     /// on a one-organisation node — the badge counting exactly what the list
     /// shows — and all hide it once a second organisation exists.
+    fn db_status(ctx: &HandlerContext, org_id: &str, status: &str) {
+        ctx.state.db.write().unwrap().execute(
+            "UPDATE organizations SET status = ?2 WHERE org_id = ?1",
+            rusqlite::params![org_id, status],
+        ).unwrap();
+    }
+
     #[tokio::test]
     async fn the_handlers_show_a_dissolved_arrays_rows_only_to_the_sole_organisation() {
         let mut fixture = dispatch_fixture();
@@ -8900,18 +9229,62 @@ mod registration_tests {
             nodes.iter().find(|n| n.is_local).map(|n| n.alerts_active).unwrap()
         };
 
+        // Owner decision 2026-09-26: "sole" means no OTHER active
+        // organisation has resources on this node; the viewer need own none.
+        let share = |org: &str, name: &str| {
+            g.db.write().unwrap().execute(
+                "INSERT INTO nas_shares (share_id, name, protocol, source_path, created_at, updated_at, org_id) \
+                 VALUES (?1, ?1, 'smb', '/tank/x', 'now', 'now', ?2)",
+                rusqlite::params![name, org],
+            ).unwrap();
+        };
+        // The viewer owns nothing here, and no other active organisation
+        // does: its dissolved array's rows are its to see.
+        let (in_list, in_modal, orphan_alerts, _) = seen(&fixture.ctx);
+        assert!(in_list && in_modal && orphan_alerts == 1, "a viewer without resources, alone on the node, sees them");
+        share("org-default", "projekty");
+
         let (in_list, in_modal, orphan_alerts, listed) = seen(&fixture.ctx);
         assert!(in_list && in_modal, "the sole organisation sees its dissolved array's job");
         assert_eq!(orphan_alerts, 1, "and its alert");
         let (answer, _) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
         assert_eq!(local_badge(answer), listed, "the FleetView badge counts what the list shows");
 
-        crate::services::org::create_organization(&fixture.ctx.state.db, "Tenant B", "tenant-b", None, None, None, None).unwrap();
+        // A second organisation that owns nothing here does not count.
+        let other = crate::services::org::create_organization(&fixture.ctx.state.db, "Tenant B", "tenant-b", None, None, None, None).unwrap();
+        let (in_list, in_modal, orphan_alerts, _) = seen(&fixture.ctx);
+        assert!(in_list && in_modal && orphan_alerts == 1, "an organisation without resources here is nobody to leak to");
+
+        // It owns a target here now: nobody sees the orphans.
+        g.db.write().unwrap().execute(
+            "INSERT INTO nas_targets (target_id, name, protocol, wwn, created_at, updated_at, org_id) \
+             VALUES ('t-b', 'vm-b', 'iscsi', 'iqn.2026-09.test:vm-b', 'now', 'now', ?1)",
+            rusqlite::params![other.org_id],
+        ).unwrap();
         let (in_list, in_modal, orphan_alerts, listed) = seen(&fixture.ctx);
-        assert!(!in_list && !in_modal, "two organisations: nobody sees it");
+        assert!(!in_list && !in_modal, "two organisations with resources: nobody sees it");
         assert_eq!(orphan_alerts, 0);
         let (answer, _) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
         assert_eq!(local_badge(answer), listed, "and the badge still agrees with the list");
+
+        // Suspended: still present (reversible), so its resources still count.
+        db_status(&fixture.ctx, &other.org_id, "suspended");
+        let (in_list, in_modal, orphan_alerts, _) = seen(&fixture.ctx);
+        assert!(!in_list && !in_modal && orphan_alerts == 0, "a suspended organisation still counts");
+        db_status(&fixture.ctx, &other.org_id, "active");
+
+        // Soft-deleted, its rows kept under retention: it counts no more.
+        assert!(crate::services::org::delete_organization(&fixture.ctx.state.db, &other.org_id).unwrap());
+        let (in_list, in_modal, orphan_alerts, listed) = seen(&fixture.ctx);
+        assert!(in_list && in_modal && orphan_alerts == 1, "a soft-deleted organisation does not count");
+        let (answer, _) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
+        assert_eq!(local_badge(answer), listed);
+
+        // A read of the owners that fails hides the rows again.
+        g.db.write().unwrap().execute_batch("ALTER TABLE nas_targets RENAME TO nas_targets_gone").unwrap();
+        let (in_list, in_modal, orphan_alerts, _) = seen(&fixture.ctx);
+        assert!(!in_list && !in_modal && orphan_alerts == 0, "a failed read never leaks");
+        g.db.write().unwrap().execute_batch("ALTER TABLE nas_targets_gone RENAME TO nas_targets").unwrap();
     }
 
     /// A job another tenant's user started on SHARED hardware stays on the

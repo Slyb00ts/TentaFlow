@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 
-const { openPoolWizard, poolNameValid, planWarnings } = await import('./pool-wizard.js');
+const { openPoolWizard, poolNameValid, planWarnings, anyraidCardText } = await import('./pool-wizard.js');
 
 const TB = 1024 ** 4;
 const disk = (id, overrides = {}) => ({ diskId: id, name: id, kind: 'hdd', model: 'WD Red', serial: `WD-${id}`, sizeBytes: 4 * TB, health: 'ok', healthReason: '', ...overrides });
@@ -38,6 +38,32 @@ function checkDisk(win, id) {
   cb.checked = true;
   cb.dispatchEvent(new window.CustomEvent('change', { bubbles: true, detail: { checked: true } }));
 }
+
+// Owner decision 2026-09-26: the AnyRAID card is disabled in every case and
+// says why in the node's own terms — its ZFS version and what its
+// `zpool upgrade -v` said. A failed read, or a node too old to send the row,
+// is "could not check", never "supported".
+test('the AnyRAID card is always disabled and names the node’s ZFS and the reason', async () => {
+  const env = (anyraid) => ({ features: [{ id: 'zfs', status: 'ok', version: '2.4.1' }, ...(anyraid ? [{ id: 'anyraid', ...anyraid }] : [])] });
+  assert.equal(anyraidCardText(env({ status: 'unsupported', version: '2.4.1' })).description, 'ZFS 2.4.1 na tym węźle nie obsługuje AnyRAID');
+  assert.equal(anyraidCardText(env({ status: 'not_offered' })).description, 'AnyRAID obsługiwane przez ZFS 2.4.1, jeszcze niedostępne w TentaNas');
+  assert.equal(anyraidCardText(env({ status: 'unknown', version: '2.4.1' })).description, 'Nie udało się sprawdzić, czy ZFS 2.4.1 na tym węźle obsługuje AnyRAID');
+  assert.equal(anyraidCardText(env(null)).description, 'Nie udało się sprawdzić, czy ZFS 2.4.1 na tym węźle obsługuje AnyRAID', 'an older node sends no row');
+  assert.equal(anyraidCardText({ features: [] }, '—').description, 'Nie udało się sprawdzić, czy ZFS na tym węźle obsługuje AnyRAID');
+  assert.equal(anyraidCardText(env({ status: 'unsupported', version: '2.4.1' })).title, 'ZFS 2.4.1 na tym węźle nie obsługuje AnyRAID — zobacz Środowisko');
+
+  for (const status of ['not_offered', 'unsupported', 'unknown']) {
+    const screen = fakeScreen({ tentaNasPoolPlanRequest: plan });
+    screen.environment = env({ status, version: '2.4.1' });
+    const win = openPoolWizard(screen, { freeDisks });
+    await flush();
+    const card = win.querySelector('tf-choice-card[value="anyraid"]');
+    assert.ok(card.hasAttribute('disabled'), `${status}: the card cannot be picked`);
+    assert.equal(card.getAttribute('description'), anyraidCardText(screen.environment).description);
+    win.remove();
+    screen.dispose();
+  }
+});
 
 test('pool names follow the zpool rules', () => {
   assert.ok(poolNameValid('tank'));

@@ -530,6 +530,9 @@ pub struct NasAlert {
     /// - 'targets_sweep_failing' {count, alerted, sweep_failed} — `alerted`
     ///   is how many of `count` have an alert their organisation can read,
     ///   `sweep_failed` is 'true' | 'false'.
+    /// - 'pool_not_imported' {pool, disks, minutes} — a pool whose disks were
+    ///   held for its import at boot is still not imported `minutes` after
+    ///   the core started; `disks` of this node carry its label.
     ///
     /// Every parameter is a string, as in `NasHealthReason`.
     #[serde(default)]

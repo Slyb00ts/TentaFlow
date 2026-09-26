@@ -5736,7 +5736,6 @@
       "kind_title": "Pool-Typ",
       "kind_sub": "Die Wahl ist für diesen Pool unumkehrbar — sie bestimmt Funktionen und Erweiterungsweg.",
       "kind_zfs_desc": "Snapshots, Kompression, selbstheilende Daten",
-      "kind_anyraid_desc": "Nicht verfügbar — dein OpenZFS unterstützt AnyRAID nicht",
       "kind_elastic_desc": "Beliebige Laufwerksgrößen, Erweiterung um je eins",
       "disks_title": "Laufwerke",
       "disks_sub": "Nur Laufwerke, die kein anderer Pool nutzt, sind verfügbar.",
@@ -5773,7 +5772,7 @@
       "sub_layout": "Das Layout bestimmt, wie die gewählten Laufwerke Kapazität und Toleranz ergeben.",
       "header_sub_layout": "Wähle das Datenlayout und die Grundoptionen des Pools.",
       "sub_summary": "Prüfe die Konfiguration, bevor der Pool angelegt wird.",
-      "kind_anyraid_title": "OpenZFS {v} unterstützt AnyRAID nicht — siehe Umgebung",
+      "kind_anyraid_title": "{reason} — siehe Umgebung",
       "kind_hint": "Gleiche Laufwerke und maximale Sicherheit → ZFS · verschiedene Größen und einzeln nachrüsten → Elastic Array.",
       "occupied_title": "im Pool {pool} ({layout}) — nicht verfügbar",
       "occupied_sub": "belegt: Pool {pool}",
@@ -6880,6 +6879,10 @@
         "elastic_add_disk_abort_unconfirmed": {
           "title": "Array {array}: Rückgängigmachen des Hinzufügens nicht bestätigt",
           "detail": "Das Rückgängigmachen wurde nach seinem ersten Schritt angehalten; das Hinzufügen bleibt unvollständig und kann abgeschlossen oder erneut rückgängig gemacht werden. Der Fehler des Schritts steht im Knotentext"
+        },
+        "pool_not_imported": {
+          "title": "Pool {pool} wurde nicht importiert",
+          "detail": "{n} {n|Datenträger dieses Knotens trägt|Datenträger dieses Knotens tragen} das Label dieses Pools, doch der Knoten hat ihn {minutes} Min. nach dem Start von TentaNas nicht importiert. Importieren Sie den Pool (ein verschlüsselter Pool wartet eventuell auf seinen Schlüssel); existiert er nicht mehr, können seine Datenträger gelöscht werden."
         }
       },
       "node_text": "Text des Knotens",
@@ -7149,7 +7152,10 @@
         "ksmbd_experimental": "EXPERIMENTELL (laut Kernel-Dokumentation)",
         "module_loaded": "{module} geladen",
         "module_on_demand": "{module} verfügbar, wird bei der ersten Nutzung geladen",
-        "module_absent": "{module} fehlt im Modulbaum dieses Kernels"
+        "module_absent": "{module} fehlt im Modulbaum dieses Kernels",
+        "anyraid_not_in_zfs": "{zfs} auf diesem Knoten unterstützt AnyRAID nicht",
+        "anyraid_supported_not_offered": "AnyRAID wird von {zfs} unterstützt, ist in TentaNas aber noch nicht verfügbar",
+        "anyraid_unreadable": "Konnte nicht prüfen, ob {zfs} auf diesem Knoten AnyRAID unterstützt"
       }
     },
     "feature": {
@@ -7166,7 +7172,8 @@
       "ledmon": "ledmon (Gehäuse-LEDs)",
       "mdadm": "mdadm",
       "rdma": "RDMA (InfiniBand / RoCE)",
-      "ksmbd": "ksmbd (SMB Direct über RDMA)"
+      "ksmbd": "ksmbd (SMB Direct über RDMA)",
+      "anyraid": "ZFS AnyRAID"
     },
     "feature_status": {
       "ok": "OK",
@@ -7179,7 +7186,9 @@
       "outdated": "veraltet",
       "missing": "fehlt",
       "no_device": "kein Gerät",
-      "exposed": "Schnittstelle mit Standardgateway"
+      "exposed": "Schnittstelle mit Standardgateway",
+      "unsupported": "nicht unterstützt",
+      "not_offered": "noch nicht in TentaNas"
     },
     "sudo": {
       "title": "sudo-Passwort — {node}",
@@ -7772,7 +7781,10 @@
       "elastic_disk_absent": "Der Datenträger, der gelöscht würde, ist auf diesem Knoten nicht vorhanden — schließen Sie ihn an und versuchen Sie es erneut",
       "job_not_cancellable": "Dieser Auftrag kann nicht abgebrochen werden — ein Abbruch würde die bereits begonnene Arbeit nicht anhalten",
       "pool_detach_not_allowed": "Dieser Datenträger kann jetzt nicht abgetrennt werden: Abtrennen lässt sich nur ein Datenträger, den ein funktionierender Hot Spare ersetzt hat, und erst wenn der Resilver ohne Fehler abgeschlossen ist und der Pool keine dauerhaften Datenfehler meldet.",
-      "elastic_one_cache_disk": "Ein Elastic Array kann höchstens ein Cache-Laufwerk haben"
+      "elastic_one_cache_disk": "Ein Elastic Array kann höchstens ein Cache-Laufwerk haben",
+      "pool_destroy_foreign_resources": "Dieser Pool kann nicht zerstört werden: Freigaben oder Targets einer anderen Organisation nutzen ihn.",
+      "pool_destroy_unverified": "Es konnte nicht geprüft werden, ob andere Organisationen diesen Pool nutzen, daher wurde er nicht zerstört. Versuchen Sie es erneut.",
+      "pool_destroy_in_progress": "Auf diesem Knoten wird gerade ein Pool zerstört; versuchen Sie es gleich noch einmal."
     },
     "unreachable": {
       "title": "Knoten {node} nicht erreichbar",

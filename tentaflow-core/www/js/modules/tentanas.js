@@ -21,7 +21,7 @@ import {
   T, sprite, channelMode, liveChannelMode, nodeChannelMode, armedExpiryMs, channelIsUnarmed, POLL_DISKS_MS, POLL_OVERVIEW_MS, IO_WINDOW_SECS, TEMP_WINDOW_SECS, POLL_FLEET_MS, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
   parseServerTs, fmtDate, fmtAgo, fmtDuration, fmtWindow, fmtBytes, fmtOptionalBytes, fmtMBps, pct, healthClass, healthChip, errMessage, errCode, jobTone, jobKindLabel,
   layoutLabel, stateChipHtml, stateTone, stateLabel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
-  firstDiskReasonWord, diskReasonsText, diskHealthChipLabel, replacementAdviceText, ADVICE_KINDS, alertText,
+  firstDiskReasonWord, diskReasonsText, diskHealthChipLabel, replacementAdviceText, ADVICE_KINDS, alertText, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { featureDetail } from '/js/modules/tentanas/feature-words.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, setRowsIfChanged } from '/js/lib/dom-patch.js';
@@ -1065,7 +1065,7 @@ const TentaNasScreen = {
       node: `<span class="mono">${escapeHtml(nodeLabel(r.node))}</span>`,
       alert: fleetAlertCellHtml(r.alert, nameOf),
       since: fmtAgo(r.alert.raisedAt),
-    })));
+    })), NODE_VOLATILE_KEYS);
   },
 
   paintFleetResources() {
@@ -1106,7 +1106,7 @@ const TentaNasScreen = {
         // Unknown, not zero: the node did not answer, so nobody counted.
         sessions: '—',
       })),
-    ]);
+    ], NODE_VOLATILE_KEYS);
   },
 
   // n01 node card: health dot + identity + status chip, the fill bar, four
@@ -3245,7 +3245,10 @@ const TentaNasScreen = {
       // leaves the file in place when `visudo -c` accepted it, so a present
       // sudoers file IS the OK. The path lives in the <details> block below.
       [T('elevation.row_sudoers'), el.mode === 'helper' && el.helperState !== 'sudoers_missing' ? escapeHtml(T('elevation.sudoers_value')) : '—'],
-      [T('elevation.row_provisioning'), el.provisionedAt ? escapeHtml(T('elevation.provisioning_value', { date: fmtDate(el.provisionedAt), user: el.provisionedBy || '—' })) : escapeHtml(T('elevation.provisioning_none'))],
+      // "Provisioned by" is a name; a node provisioned before wave 9a by an
+      // account with no display name stored its user id — never shown
+      // (owner's rule), the neutral dash instead.
+      [T('elevation.row_provisioning'), el.provisionedAt ? escapeHtml(T('elevation.provisioning_value', { date: fmtDate(el.provisionedAt), user: el.provisionedBy && !isOpaqueId(el.provisionedBy) ? el.provisionedBy : '—' })) : escapeHtml(T('elevation.provisioning_none'))],
       [T('elevation.row_audit'), `${escapeHtml(T('elevation.audit_value', { n: Number(el.auditEntries) || 0 }))} · <a data-act="audit-log">${escapeHtml(T('elevation.audit_link'))}</a>`],
       ...(el.mode === 'helper' ? [] : [
         [T('elevation.row_user'), `<span class="mono">${escapeHtml(el.coreUser)}</span>`],
@@ -3359,7 +3362,10 @@ const TentaNasScreen = {
       // 'exposed' is a warning, not an absence: the node HAS the hardware and
       // the tools, and its RDMA interface also routes the world — a network
       // the admin can fix, which installing a package never would (§5.4b).
-      status: { status: f.status === 'ok' ? 'ok' : f.status === 'broken' ? 'err' : ['outdated', 'version_too_low', 'exposed', 'unknown'].includes(f.status) ? 'warn' : f.optional ? 'info' : 'err', label: T('feature_status.' + f.status), dot: true },
+      // A feature this OpenZFS lacks, or has but TentaNas does not offer yet
+      // (AnyRAID), is neither a fault nor something to install: the grey
+      // chip of n16 (`neutral`).
+      status: { status: f.status === 'ok' ? 'ok' : f.status === 'broken' ? 'err' : ['unsupported', 'not_offered'].includes(f.status) ? 'neutral' : ['outdated', 'version_too_low', 'exposed', 'unknown'].includes(f.status) ? 'warn' : f.optional ? 'info' : 'err', label: T('feature_status.' + f.status), dot: true },
       // The detail in the reader's language (`featureDetail`), the node's
       // own sentence as the tooltip.
       version: ((detail) => `<span class="mono"${detail.title ? ` title="${escapeAttr(detail.title)}"` : ''}>${escapeHtml([
@@ -3759,12 +3765,12 @@ const TentaNasScreen = {
       if (state.result) {
         const ok = state.result.ok;
         return `<div class="result-box ${ok ? 'ok' : 'err'}">${sprite(ok ? 'check-circle' : 'alert')}<h3>${escapeHtml(ok ? T('wizard.done_title') : T('wizard.failed_title'))}</h3><p>${escapeHtml(state.result.detail || '')}</p></div>
-          ${state.job ? `<pre class="job-log mono">${escapeHtml((state.job.log || []).join('\n'))}</pre>` : ''}`;
+          ${state.job ? `<pre class="job-log mono">${escapeHtml(jobLogLines(state.job.log).join('\n'))}</pre>` : ''}`;
       }
       return `
         <h2 class="wizard-section-title">${escapeHtml(T('wizard.run_title'))}</h2>
         <p class="wizard-section-sub">${escapeHtml(state.mode === 'helper' ? T('wizard.run_sub_helper') : T('wizard.run_sub_interactive'))}</p>
-        ${state.job ? `<tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar><pre class="job-log mono mt-sm">${escapeHtml((state.job.log || []).join('\n'))}</pre>` : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
+        ${state.job ? `<tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar><pre class="job-log mono mt-sm">${escapeHtml(jobLogLines(state.job.log).join('\n'))}</pre>` : `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`}`;
     };
 
     const stepRestore = () => `
@@ -3982,7 +3988,7 @@ const TentaNasScreen = {
         const pre = win.querySelector('#nas-joblog');
         if (!head || !pre) return;
         patchHtml(head, `${escapeHtml(jobKindLabel(j.kind))} <span${subject.words ? '' : ' class="mono"'}>${escapeHtml(subject.text)}</span> <tf-chip status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip> · <span>${escapeHtml(T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }))}</span>${j.error ? `<div class="num-err mt-sm">${escapeHtml(errMessage(j.error))}</div>` : ''}`);
-        paintJobLog(pre, j.log);
+        paintJobLog(pre, jobLogLines(j.log, this.nodeNameOf()));
         if (j.status === 'running' || j.status === 'queued') timer = setTimeout(poll, POLL_JOB_MODAL_MS);
         else if (onFinish && !notified) { notified = true; onFinish(j); }
       } catch (e) {
@@ -4205,6 +4211,12 @@ function trendHtml(now, weekAgo) {
   const up = a > b;
   return `<span class="${up ? 'num-warn' : ''}">${up ? '▲' : '▼'} ${escapeHtml(String(Math.abs(a - b)))}</span>`;
 }
+
+// Keys of a normalized node that change on every poll without the node
+// changing (`receivedAt`, stamped per answer): the fleet tables leave them out
+// of their change check (critic wave 8, MINOR 1), or every 10 s poll would
+// re-render both tables.
+const NODE_VOLATILE_KEYS = new Set(['receivedAt']);
 
 // A node that never published a summary has its counters absent; the card
 // math wants zeros, not NaN.

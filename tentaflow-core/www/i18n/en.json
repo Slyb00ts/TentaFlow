@@ -6653,6 +6653,10 @@
         "elastic_add_disk_abort_unconfirmed": {
           "title": "Array {array}: undoing the disk addition is unconfirmed",
           "detail": "The undo stopped after its first step; the disk addition stays unfinished and can be finished or undone again. The step error is in the node text"
+        },
+        "pool_not_imported": {
+          "title": "Pool {pool} was not imported",
+          "detail": "{n} {n|disk of this node carries|disks of this node carry} this pool's label, and the node has not imported it within {minutes} min of TentaNas starting. Import the pool (an encrypted pool may be waiting for its key); if the pool is gone for good, its disks can be wiped."
         }
       },
       "node_text": "The node's text",
@@ -6995,7 +6999,10 @@
         "ksmbd_experimental": "EXPERIMENTAL (per the kernel documentation)",
         "module_loaded": "{module} loaded",
         "module_on_demand": "{module} available, loaded on first use",
-        "module_absent": "{module} is not in this kernel’s module tree"
+        "module_absent": "{module} is not in this kernel’s module tree",
+        "anyraid_not_in_zfs": "{zfs} on this node does not support AnyRAID",
+        "anyraid_supported_not_offered": "AnyRAID supported by {zfs}, not yet available in TentaNas",
+        "anyraid_unreadable": "Could not check whether {zfs} on this node supports AnyRAID"
       }
     },
     "feature": {
@@ -7012,7 +7019,8 @@
       "ledmon": "ledmon (enclosure LEDs)",
       "mdadm": "mdadm",
       "rdma": "RDMA (InfiniBand / RoCE)",
-      "ksmbd": "ksmbd (SMB Direct over RDMA)"
+      "ksmbd": "ksmbd (SMB Direct over RDMA)",
+      "anyraid": "ZFS AnyRAID"
     },
     "feature_status": {
       "ok": "OK",
@@ -7025,7 +7033,9 @@
       "outdated": "outdated",
       "missing": "missing",
       "no_device": "no device",
-      "exposed": "interface carries the default gateway"
+      "exposed": "interface carries the default gateway",
+      "unsupported": "not supported",
+      "not_offered": "not in TentaNas yet"
     },
     "sudo": {
       "title": "Sudo password — {node}",
@@ -7518,7 +7528,6 @@
       "kind_title": "Pool type",
       "kind_sub": "The choice is irreversible for this pool — it determines the features and how it can be expanded.",
       "kind_zfs_desc": "Snapshots, compression, self-healing data",
-      "kind_anyraid_desc": "Unavailable — your OpenZFS does not support AnyRAID",
       "kind_elastic_desc": "Any disk sizes, grow one disk at a time",
       "disks_title": "Disks",
       "disks_sub": "Only disks not used by other pools are available.",
@@ -7555,7 +7564,7 @@
       "sub_layout": "The layout turns the selected disks into capacity and tolerance.",
       "header_sub_layout": "Pick the data layout and the basic pool options.",
       "sub_summary": "Review the configuration before creating the pool.",
-      "kind_anyraid_title": "OpenZFS {v} does not support AnyRAID — see Environment",
+      "kind_anyraid_title": "{reason} — see Environment",
       "kind_hint": "Equal disks and maximum safety → ZFS · mixed sizes and adding one at a time → Elastic Array.",
       "occupied_title": "in pool {pool} ({layout}) — unavailable",
       "occupied_sub": "in use: pool {pool}",
@@ -8988,7 +8997,10 @@
       "elastic_disk_absent": "The disk that would be erased is not present on this node — reconnect it and try again",
       "job_not_cancellable": "This job cannot be cancelled — stopping it would not stop the work already under way",
       "pool_detach_not_allowed": "This disk cannot be detached now: only a disk replaced by a healthy hot spare can be detached, and only once the resilver has finished without errors and the pool reports no permanent data errors.",
-      "elastic_one_cache_disk": "An Elastic Array can have at most one cache disk"
+      "elastic_one_cache_disk": "An Elastic Array can have at most one cache disk",
+      "pool_destroy_foreign_resources": "This pool cannot be destroyed: another organisation's shares or targets use it.",
+      "pool_destroy_unverified": "Could not check whether other organisations use this pool, so it was not destroyed. Try again.",
+      "pool_destroy_in_progress": "A pool is being destroyed on this node; try again in a moment."
     },
     "unreachable": {
       "title": "Node {node} unreachable",

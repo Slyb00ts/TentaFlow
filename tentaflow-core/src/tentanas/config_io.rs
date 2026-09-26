@@ -915,6 +915,13 @@ pub async fn apply(
     explicit: Option<&ElevationToken>,
 ) -> Result<()> {
     let db = handle.db().clone();
+    // An import creates shares and targets: from its read of the pools to its
+    // last row, a pool destroy cannot run in between, and a running one
+    // refuses the import after a short wait (`pools::resources_lock`, critic
+    // wave 9a R2-MINOR 1).
+    let _serialised = super::pools::try_resources_lock(&db)
+        .await
+        .ok_or_else(|| anyhow::anyhow!(super::pools::POOL_DESTROY_IN_PROGRESS))?;
     let live = live_state(&db, owner).await?;
     apply_with(handle, main_db, &owner.addon_id, document, explicit, live, None).await
 }
@@ -1610,6 +1617,34 @@ mod tests {
         assert_eq!(planned("/mnt/bravo/filmy"), foreign);
         assert_eq!(foreign.1, "<path> is under neither a pool mountpoint nor an Elastic Array union of this node");
         assert_eq!(planned("/mnt/bravo-old").0, "create", "a real directory of the pool");
+    }
+
+    /// Critic wave 9a, R2-MINOR 1: an import takes the same lock a pool
+    /// destroy holds; while it is held the import is refused (coded) after a
+    /// short wait and creates nothing, and once it is free the import runs.
+    #[tokio::test]
+    async fn an_import_is_refused_while_a_pool_destroy_holds_the_lock() {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let handle = super::super::jobs::JobHandle::for_test(&db, "job-import-locked");
+        let owner = tentanas_helper::elastic::ElasticOwner { org_id: "org-a".into(), addon_id: "nas".into() };
+        let mut doc = document();
+        doc.pools.clear();
+        doc.datasets.clear();
+        doc.targets.clear();
+        // Nothing in it the second (successful) run could apply to this host.
+        doc.shares.clear();
+        doc.share_users.clear();
+        let held = super::super::pools::resources_lock(&db).lock_owned().await;
+        let refused = apply(&handle, &db, &owner, doc.clone(), None).await.expect_err("refused while held");
+        assert_eq!(refused.to_string(), super::super::pools::POOL_DESTROY_IN_PROGRESS);
+        drop(held);
+        // Free: the import gets past the lock (the rest is its own business —
+        // without zfs here, its live read may fail, but never with this).
+        if let Err(e) = apply(&handle, &db, &owner, doc, None).await {
+            assert_ne!(e.to_string(), super::super::pools::POOL_DESTROY_IN_PROGRESS);
+        }
     }
 
     /// Everything an import creates belongs to the importing organisation,

@@ -5736,7 +5736,6 @@
       "kind_title": "Type de pool",
       "kind_sub": "Le choix est irréversible pour ce pool — il détermine les fonctionnalités et le mode d’extension.",
       "kind_zfs_desc": "Snapshots, compression, auto-réparation des données",
-      "kind_anyraid_desc": "Indisponible — votre OpenZFS ne prend pas en charge AnyRAID",
       "kind_elastic_desc": "Disques de toutes tailles, extension un par un",
       "disks_title": "Disques",
       "disks_sub": "Seuls les disques non utilisés par d’autres pools sont disponibles.",
@@ -5773,7 +5772,7 @@
       "sub_layout": "La disposition traduit les disques choisis en capacité et en tolérance.",
       "header_sub_layout": "Choisissez la disposition des données et les options de base du pool.",
       "sub_summary": "Vérifiez la configuration avant de créer le pool.",
-      "kind_anyraid_title": "OpenZFS {v} ne prend pas en charge AnyRAID — voir Environnement",
+      "kind_anyraid_title": "{reason} — voir Environnement",
       "kind_hint": "Disques identiques et sécurité maximale → ZFS · tailles variées et ajout un par un → Elastic Array.",
       "occupied_title": "dans le pool {pool} ({layout}) — indisponible",
       "occupied_sub": "occupé : pool {pool}",
@@ -6880,6 +6879,10 @@
         "elastic_add_disk_abort_unconfirmed": {
           "title": "Grappe {array} : annulation de l’ajout de disque non confirmée",
           "detail": "L’annulation s’est arrêtée après sa première étape ; l’ajout du disque reste inachevé et peut être terminé ou annulé à nouveau. L’erreur de l’étape figure dans le texte du nœud"
+        },
+        "pool_not_imported": {
+          "title": "Le pool {pool} n'a pas été importé",
+          "detail": "{n} {n|disque de ce nœud porte|disques de ce nœud portent} l'étiquette de ce pool, mais le nœud ne l'a pas importé dans les {minutes} min suivant le démarrage de TentaNas. Importez le pool (un pool chiffré peut attendre sa clé) ; s'il n'existe plus, ses disques peuvent être effacés."
         }
       },
       "node_text": "Texte du nœud",
@@ -7149,7 +7152,10 @@
         "ksmbd_experimental": "EXPÉRIMENTAL (selon la documentation du noyau)",
         "module_loaded": "{module} chargé",
         "module_on_demand": "{module} disponible, chargé à la première utilisation",
-        "module_absent": "{module} est absent de l’arborescence des modules de ce noyau"
+        "module_absent": "{module} est absent de l’arborescence des modules de ce noyau",
+        "anyraid_not_in_zfs": "{zfs} sur ce nœud ne prend pas en charge AnyRAID",
+        "anyraid_supported_not_offered": "AnyRAID pris en charge par {zfs}, pas encore disponible dans TentaNas",
+        "anyraid_unreadable": "Impossible de vérifier si {zfs} sur ce nœud prend en charge AnyRAID"
       }
     },
     "feature": {
@@ -7166,7 +7172,8 @@
       "ledmon": "ledmon (LED du boîtier)",
       "mdadm": "mdadm",
       "rdma": "RDMA (InfiniBand / RoCE)",
-      "ksmbd": "ksmbd (SMB Direct via RDMA)"
+      "ksmbd": "ksmbd (SMB Direct via RDMA)",
+      "anyraid": "ZFS AnyRAID"
     },
     "feature_status": {
       "ok": "OK",
@@ -7179,7 +7186,9 @@
       "outdated": "obsolète",
       "missing": "absent",
       "no_device": "aucun périphérique",
-      "exposed": "interface portant la passerelle par défaut"
+      "exposed": "interface portant la passerelle par défaut",
+      "unsupported": "non pris en charge",
+      "not_offered": "pas encore dans TentaNas"
     },
     "sudo": {
       "title": "Mot de passe sudo — {node}",
@@ -7772,7 +7781,10 @@
       "elastic_disk_absent": "Le disque qui serait effacé n’est pas présent sur ce nœud — rebranchez-le et réessayez",
       "job_not_cancellable": "Cette tâche ne peut pas être annulée — l’arrêter n’arrêterait pas le travail déjà commencé",
       "pool_detach_not_allowed": "Ce disque ne peut pas être détaché maintenant : seul un disque remplacé par un disque de secours sain peut être détaché, et seulement une fois le resilver terminé sans erreur et si le pool ne signale aucune erreur de données permanente.",
-      "elastic_one_cache_disk": "Une matrice Elastic peut avoir au plus un disque de cache"
+      "elastic_one_cache_disk": "Une matrice Elastic peut avoir au plus un disque de cache",
+      "pool_destroy_foreign_resources": "Ce pool ne peut pas être détruit : des partages ou des cibles d’une autre organisation l’utilisent.",
+      "pool_destroy_unverified": "Impossible de vérifier si d’autres organisations utilisent ce pool ; il n’a donc pas été détruit. Réessayez.",
+      "pool_destroy_in_progress": "Un pool est en cours de destruction sur ce nœud ; réessayez dans un instant."
     },
     "unreachable": {
       "title": "Nœud {node} injoignable",

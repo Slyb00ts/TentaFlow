@@ -56,6 +56,7 @@ pub mod forward;
 pub mod jobs;
 pub mod keystore;
 pub mod ksmbd;
+pub mod log_ids;
 pub mod pools;
 pub mod rdma;
 pub mod scheduler;

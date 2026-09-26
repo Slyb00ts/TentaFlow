@@ -12,6 +12,8 @@ import { KERNEL_SUPPORT_WORDS } from '/js/modules/tentanas/target-wizard.js';
 
 const need = (...values) => values.every((v) => typeof v === 'string' && v !== '');
 
+const zfsNamed = (p) => (need(p.version) ? `ZFS ${p.version}` : 'ZFS');
+
 export const FEATURE_DETAIL_WORDS = new Map([
   ...KERNEL_SUPPORT_WORDS,
   ['feature_binaries_missing', (p) => (need(p.binaries) ? T('env.detail.feature_binaries_missing', { binaries: p.binaries }) : null)],
@@ -33,6 +35,11 @@ export const FEATURE_DETAIL_WORDS = new Map([
   ['ksmbd_experimental', () => T('env.detail.ksmbd_experimental')],
   ['module_loaded', (p) => (need(p.module) ? T('env.detail.module_loaded', { module: p.module }) : null)],
   ['module_on_demand', (p) => (need(p.module) ? T('env.detail.module_on_demand', { module: p.module }) : null)],
+  // The AnyRAID row (environment.rs `anyraid_verdict`): the node's ZFS by
+  // its version when the `zfs` row read one.
+  ['anyraid_not_in_zfs', (p) => T('env.detail.anyraid_not_in_zfs', { zfs: zfsNamed(p) })],
+  ['anyraid_supported_not_offered', (p) => T('env.detail.anyraid_supported_not_offered', { zfs: zfsNamed(p) })],
+  ['anyraid_unreadable', (p) => T('env.detail.anyraid_unreadable', { zfs: zfsNamed(p) })],
   ['module_absent', (p) => (need(p.module) ? T('env.detail.module_absent', { module: p.module }) : null)],
 ]);
 

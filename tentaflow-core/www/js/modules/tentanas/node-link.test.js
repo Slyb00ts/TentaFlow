@@ -4,8 +4,9 @@
 // did not answer", the backoff (doubling from 2 s, capped at 30 s as the
 // mockup says), that the request which FAILED is never re-sent (it may have
 // run on the node) while the ones issued afterwards are parked and sent once
-// the probe gets an answer, that a probe answered with a refusal still
-// counts as "the node is back", that leaving releases what waited, and that
+// the probe gets an answer, that a probe answered with a refusal of the
+// remote node still counts as "the node is back" (only transport loss is
+// "unreachable"), that leaving releases what waited, and that
 // every word of the card exists in all five locales with the same
 // placeholders. Runs under happy-dom.
 // =============================================================================
@@ -94,13 +95,55 @@ test('the failed request is not re-sent; later ones wait and go once the node an
   link.destroy();
 });
 
-test('a probe answered with a refusal means the node is back', async () => {
-  const { link } = harness([Object.assign(new Error('not allowed'), { code: 'PolicyDenied' })]);
+test('a probe answered with a refusal of the remote node means the node is back', async () => {
+  const { link } = harness([Object.assign(new Error('the TentaNas app is not available'), { code: 'AppUnavailable' })]);
   await link.send(REMOTE, () => Promise.reject(lostError())).catch(() => {});
   const waiting = link.send(REMOTE, () => Promise.resolve('ok'));
   document.querySelector('.conn-overlay.nas-conn [data-action="retry"]').click();
-  assert.equal(await waiting, 'ok');
-  link.destroy();
+  try {
+    const parked = new Promise((_, reject) => setTimeout(() => reject(new Error('still parked as unreachable')), 500));
+    assert.equal(await Promise.race([waiting, parked]), 'ok');
+  } finally {
+    link.destroy();
+  }
+});
+
+// Critic wave 9a, MINOR 9: only TRANSPORT loss is "unreachable". A node
+// that answers with an application error — its environment read failing
+// (`Internal`), a gate refusing (`PolicyDenied`) — ends the lost state, the
+// parked requests go out (each to be shown with its own error), and the
+// probe's error is shown as an error rather than an endless blurred card.
+test('a node that answers with an application error is not left blurred as unreachable', async () => {
+  // Every toast, recorded as it is appended (its container may be detached).
+  const toasts = [];
+  const append = window.Node.prototype.appendChild;
+  window.Node.prototype.appendChild = function (child) {
+    if (child?.classList?.contains('toast')) toasts.push(child.textContent);
+    return append.call(this, child);
+  };
+  const { link, timers } = harness([
+    new Error('socket closed'),
+    Object.assign(new Error('environment probe: database is locked'), { code: 'Internal' }),
+  ]);
+  try {
+    await link.send(REMOTE, () => Promise.reject(lostError())).catch(() => {});
+    let sent = 0;
+    const waiting = link.send(REMOTE, () => { sent += 1; return Promise.resolve('ok'); });
+    timers.at(-1).fn();
+    await tick();
+    assert.equal(link.isLost(REMOTE.nodeId), true, 'a transport error is loss');
+    assert.equal(sent, 0);
+    timers.at(-1).fn();
+    const parked = new Promise((_, reject) => setTimeout(() => reject(new Error('still parked as unreachable')), 500));
+    assert.equal(await Promise.race([waiting, parked]), 'ok', 'the node answered: the parked request goes out');
+    assert.equal(link.isLost(REMOTE.nodeId), false, 'not held blurred on "unreachable"');
+    assert.equal(document.querySelector('#app-root.nas-link-lost, .nas-link-lost'), null, 'nothing stays blurred');
+    await tick();
+    assert.ok(toasts.some((t) => t.includes('database is locked')), `the error is shown: ${JSON.stringify(toasts)}`);
+  } finally {
+    window.Node.prototype.appendChild = append;
+    link.destroy();
+  }
 });
 
 // Critic wave 7, MINOR 4: only an ANSWER from the node — a success or a

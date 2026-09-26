@@ -99,6 +99,10 @@ test('the Environment rows keep their coded details through the real decoder and
         feature('nvmet', 'ok', '/sys/kernel/config/nvmet present · nvmet-rdma available'),
         feature('dhchap', 'missing_module', 'this kernel was built without CONFIG_NVME_TARGET_AUTH (/proc/config.gz)'),
         feature('ksmbd', 'no_device', 'no RDMA interface with an address · EXPERIMENTAL (kernel docs) · ksmbd is not in this kernel\'s module tree'),
+        // The version is the `zfs` row's; the AnyRAID row names it only in
+        // its detail (n16 shows it once).
+        { ...feature('zfs', 'ok', ''), version: '2.4.1' },
+        feature('anyraid', 'unsupported', 'ZFS 2.4.1 on this node does not support AnyRAID'),
       ],
       elevation: {
         mode: 'helper', helper_state: 'ok', helper_path: '', helper_version: null, sudoers_path: '', core_user: '', core_version: '',
@@ -110,6 +114,7 @@ test('the Environment rows keep their coded details through the real decoder and
         nvmet: [reason('configfs_present', { path: '/sys/kernel/config/nvmet' }), reason('module_on_demand', { module: 'nvmet-rdma' })],
         dhchap: [reason('dhchap_not_built', { path: '/proc/config.gz' })],
         ksmbd: [reason('ksmbd_no_interface'), reason('ksmbd_experimental'), reason('module_absent', { module: 'ksmbd' })],
+        anyraid: [reason('anyraid_not_in_zfs', { version: '2.4.1' })],
       },
     },
   });
@@ -121,6 +126,10 @@ test('the Environment rows keep their coded details through the real decoder and
   assert.equal(rows.nvmet.text, '/sys/kernel/config/nvmet jest obecny · nvmet-rdma dostępny, ładowany przy pierwszym użyciu');
   assert.equal(rows.dhchap.text, 'to jądro zbudowano bez CONFIG_NVME_TARGET_AUTH (/proc/config.gz)');
   assert.equal(rows.ksmbd.text, 'brak interfejsu RDMA z adresem · EKSPERYMENTALNE (wg dokumentacji jądra) · modułu ksmbd nie ma w drzewie modułów jądra');
+  assert.equal(rows.anyraid.text, 'ZFS 2.4.1 na tym węźle nie obsługuje AnyRAID');
+  // The pool wizard's AnyRAID card reads the same decoded row.
+  const { anyraidCardText } = await import('./pool-wizard.js');
+  assert.equal(anyraidCardText(env).description, 'ZFS 2.4.1 na tym węźle nie obsługuje AnyRAID');
   for (const row of Object.values(rows)) assert.ok(!/\b(missing|loaded|present|available)\b/.test(row.text), row.text);
 });
 

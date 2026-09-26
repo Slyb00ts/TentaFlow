@@ -5736,7 +5736,6 @@
       "kind_title": "Tipo de pool",
       "kind_sub": "La elección es irreversible para este pool: determina sus capacidades y cómo se amplía.",
       "kind_zfs_desc": "Snapshots, compresión, autorreparación de datos",
-      "kind_anyraid_desc": "No disponible: tu OpenZFS no admite AnyRAID",
       "kind_elastic_desc": "Discos de cualquier tamaño, ampliación de uno en uno",
       "disks_title": "Discos",
       "disks_sub": "Solo están disponibles los discos que no usa otro pool.",
@@ -5773,7 +5772,7 @@
       "sub_layout": "La disposición convierte los discos elegidos en capacidad y tolerancia.",
       "header_sub_layout": "Elige la disposición de datos y las opciones básicas del pool.",
       "sub_summary": "Revisa la configuración antes de crear el pool.",
-      "kind_anyraid_title": "OpenZFS {v} no admite AnyRAID: ver Entorno",
+      "kind_anyraid_title": "{reason}: ver Entorno",
       "kind_hint": "Discos iguales y máxima seguridad → ZFS · tamaños distintos y añadir de uno en uno → Elastic Array.",
       "occupied_title": "en el pool {pool} ({layout}): no disponible",
       "occupied_sub": "ocupado: pool {pool}",
@@ -6880,6 +6879,10 @@
         "elastic_add_disk_abort_unconfirmed": {
           "title": "Matriz {array}: deshacer la adición del disco sin confirmar",
           "detail": "Deshacer se detuvo tras su primer paso; la adición del disco sigue sin terminar y puede terminarse o deshacerse de nuevo. El error del paso está en el texto del nodo"
+        },
+        "pool_not_imported": {
+          "title": "El pool {pool} no se ha importado",
+          "detail": "{n} {n|disco de este nodo lleva|discos de este nodo llevan} la etiqueta de este pool, pero el nodo no lo ha importado en los {minutes} min posteriores al inicio de TentaNas. Importa el pool (un pool cifrado puede estar esperando su clave); si ya no existe, sus discos se pueden borrar."
         }
       },
       "node_text": "Texto del nodo",
@@ -7149,7 +7152,10 @@
         "ksmbd_experimental": "EXPERIMENTAL (según la documentación del kernel)",
         "module_loaded": "{module} cargado",
         "module_on_demand": "{module} disponible, se carga en el primer uso",
-        "module_absent": "{module} no está en el árbol de módulos de este kernel"
+        "module_absent": "{module} no está en el árbol de módulos de este kernel",
+        "anyraid_not_in_zfs": "{zfs} en este nodo no admite AnyRAID",
+        "anyraid_supported_not_offered": "AnyRAID compatible con {zfs}, aún no disponible en TentaNas",
+        "anyraid_unreadable": "No se pudo comprobar si {zfs} en este nodo admite AnyRAID"
       }
     },
     "feature": {
@@ -7166,7 +7172,8 @@
       "ledmon": "ledmon (LED del chasis)",
       "mdadm": "mdadm",
       "rdma": "RDMA (InfiniBand / RoCE)",
-      "ksmbd": "ksmbd (SMB Direct por RDMA)"
+      "ksmbd": "ksmbd (SMB Direct por RDMA)",
+      "anyraid": "ZFS AnyRAID"
     },
     "feature_status": {
       "ok": "OK",
@@ -7179,7 +7186,9 @@
       "outdated": "obsoleta",
       "missing": "falta",
       "no_device": "sin dispositivo",
-      "exposed": "interfaz con la puerta de enlace predeterminada"
+      "exposed": "interfaz con la puerta de enlace predeterminada",
+      "unsupported": "no compatible",
+      "not_offered": "aún no en TentaNas"
     },
     "sudo": {
       "title": "Contraseña sudo — {node}",
@@ -7293,7 +7302,7 @@
       "target_hosts": "{n} {n|NQN de host|NQN de hosts}",
       "sessions_nvmet_age": "Número de sesiones NVMe-oF de una lectura de hace como máximo {minutes} min",
       "node_read_failed": "error de lectura",
-      "targets_unreadable": "El nodo responde, pero no se pudo leer su lista de targets: {error}",
+      "targets_unreadable": "El nodo responde, pero no se pudo leer su lista de destinos: {error}",
       "shares_unreadable": "El nodo responde, pero no se pudo leer su lista de recursos compartidos: {error}"
     },
     "node": {
@@ -7772,7 +7781,10 @@
       "elastic_disk_absent": "El disco que se borraría no está presente en este nodo — vuelva a conectarlo e inténtelo de nuevo",
       "job_not_cancellable": "Esta tarea no se puede cancelar: detenerla no pararía el trabajo ya iniciado",
       "pool_detach_not_allowed": "Este disco no se puede desconectar ahora: solo se puede desconectar un disco sustituido por un disco de repuesto sano, y solo cuando el resilver haya terminado sin errores y el pool no informe de errores de datos permanentes.",
-      "elastic_one_cache_disk": "Una matriz Elastic puede tener como máximo un disco de caché"
+      "elastic_one_cache_disk": "Una matriz Elastic puede tener como máximo un disco de caché",
+      "pool_destroy_foreign_resources": "Este pool no se puede destruir: lo usan recursos compartidos o destinos de otra organización.",
+      "pool_destroy_unverified": "No se pudo comprobar si otras organizaciones usan este pool, así que no se destruyó. Inténtalo de nuevo.",
+      "pool_destroy_in_progress": "Se está destruyendo un pool en este nodo; inténtalo de nuevo en un momento."
     },
     "unreachable": {
       "title": "Nodo {node} inaccesible",

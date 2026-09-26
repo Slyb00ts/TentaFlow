@@ -691,6 +691,15 @@ const ALERT_WORDS = new Map([
     const t = textParams(p, ['array']);
     return t ? { title: T('alerts.code.elastic_restore_waiting.title', t), detail: T('alerts.code.elastic_restore_waiting.detail') } : null;
   }],
+  // Raised by tentanas/disks.rs when the boot window closes on a pool that
+  // is still not imported (owner decision 2026-09-26).
+  ['pool_not_imported', (p) => {
+    const t = textParams(p, ['pool']);
+    const n = numParams(p, ['disks', 'minutes']);
+    return t && n
+      ? { title: T('alerts.code.pool_not_imported.title', t), detail: T('alerts.code.pool_not_imported.detail', { n: n.disks, minutes: n.minutes }) }
+      : null;
+  }],
   // Raised by tentanas/targets.rs.
   ['target_portal_moved', (p) => {
     const t = textParams(p, ['target']);
@@ -718,6 +727,24 @@ const ALERT_WORDS = new Map([
   // and migration 21 leave it: no count this process has measured.
   ['targets_sweep_stale', () => ({ title: T('alerts.code.targets_sweep_stale.title'), detail: T('alerts.code.targets_sweep_stale.detail') })],
 ]);
+
+// A job's log lines as a screen paints them. The node writes them with every
+// id named or hidden already (tentanas/log_ids.rs, owner decision
+// 2026-09-26); this is the backstop for rows an older node wrote, and for
+// any id a writer let through: every line goes through `scrubIds`.
+export function jobLogLines(lines, nameOf = () => '') {
+  const hidden = T('alerts.id_hidden');
+  return (Array.isArray(lines) ? lines : []).map((line) => scrubIds(wordIdTokens(line), hidden, nameOf, { guidDigits: true }));
+}
+
+// The node writes a hidden id as a language-neutral token (`⟦id⟧`,
+// tentanas/log_ids.rs `HIDDEN`); rows written before it carry the English
+// `[identifier]`, and a screen's own scrub the Polish `[identyfikator]`.
+// Each reads in the reader's language.
+const ID_TOKENS = /⟦id⟧|\[identifier\]|\[identyfikator\]/g;
+export function wordIdTokens(text) {
+  return String(text ?? '').replace(ID_TOKENS, () => T('alerts.id_hidden'));
+}
 
 // The node's own sentence for the tooltip: title, then detail — and the raw
 // text a composer kept off the line, when the node's detail does not already
@@ -880,7 +907,7 @@ export function errMessage(e, nameOf = () => '') {
   const code = REFUSAL.exec(message.trim().replace(WIRE_ERROR_PREFIX, ''))?.[1];
   if (!code) {
     const hidden = T('alerts.id_hidden');
-    return scrubIds(message, hidden, nameOf).replace(HEX_ID, (id) => String(nameOf(id) || '').trim() || hidden);
+    return scrubIds(wordIdTokens(message), hidden, nameOf).replace(HEX_ID, (id) => String(nameOf(id) || '').trim() || hidden);
   }
   const key = 'refusal.' + code;
   const words = T(key);

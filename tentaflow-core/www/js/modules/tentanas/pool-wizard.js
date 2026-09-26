@@ -12,7 +12,7 @@ import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
   fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel, diskReasonsText,
-  wordReasons, nodeTextTitle,
+  wordReasons, nodeTextTitle, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, paintJobLog } from '/js/lib/dom-patch.js';
 import { elasticCapabilitiesDetail } from '/js/modules/tentanas/feature-words.js';
@@ -36,6 +36,23 @@ export const elasticNameValid = (name) => /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,63}$/.t
 const COMPRESSION_OPTIONS = ['zstd', 'lz4', 'off'];
 
 const KIND_LABELS = { zfs: 'ZFS', anyraid: 'ZFS AnyRAID', elastic: 'Elastic Array' };
+
+// Why the AnyRAID card is disabled, from the node's own `zpool upgrade -v`
+// read (the Environment row `anyraid`, environment.rs `anyraid_refine`) and
+// the node's ZFS version. The card stays disabled even when ZFS knows the
+// feature: this build cannot create an AnyRAID pool yet (owner decision
+// 2026-09-26), and a card that can be picked and then does nothing would be a
+// lie. A node too old to send the row, or a read that failed, is "not
+// checked" — never "supported".
+export function anyraidCardText(environment, fallbackVersion = '') {
+  const features = environment?.features || [];
+  const row = features.find((f) => f.id === 'anyraid');
+  const version = row?.version || features.find((f) => f.id === 'zfs')?.version || (fallbackVersion !== '—' ? fallbackVersion : '') || '';
+  const zfs = version ? `ZFS ${version}` : 'ZFS';
+  const key = row?.status === 'not_offered' ? 'anyraid_supported_not_offered' : row?.status === 'unsupported' ? 'anyraid_not_in_zfs' : 'anyraid_unreadable';
+  const reason = T('env.detail.' + key, { zfs });
+  return { description: reason, title: T('wizard_pool.kind_anyraid_title', { reason }) };
+}
 
 // The Elastic preview's refusals and warnings in the reader's language (wave
 // 6): the node sends each with a code and its parameters beside its own
@@ -260,12 +277,13 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   };
 
   // Dostępność Elastic pochodzi z aktualnego węzła, nie z obecności ZFS.
+  const anyraid = anyraidCardText(screen.environment, zfsVersion);
   const stepKind = () => `
     <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.kind_title'))}</h2>
     <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.kind_sub'))}</p>
     <tf-choice-group id="nas-pw-kind" value="${escapeAttr(state.kind)}" columns="3">
       <tf-choice-card value="zfs" icon="layers" heading="ZFS" description="${escapeAttr(T('wizard_pool.kind_zfs_desc'))}"></tf-choice-card>
-      <tf-choice-card value="anyraid" icon="layers" heading="ZFS AnyRAID" description="${escapeAttr(T('wizard_pool.kind_anyraid_desc'))}" title="${escapeAttr(T('wizard_pool.kind_anyraid_title', { v: zfsVersion }))}" disabled></tf-choice-card>
+      <tf-choice-card value="anyraid" icon="layers" heading="ZFS AnyRAID" description="${escapeAttr(anyraid.description)}" title="${escapeAttr(anyraid.title)}" disabled></tf-choice-card>
       <tf-choice-card value="elastic" icon="cylinder" heading="Elastic Array" description="${escapeAttr(T('wizard_pool.kind_elastic_desc'))}" ${elasticAvailable() ? '' : 'disabled'}></tf-choice-card>
     </tf-choice-group>
     <div class="text-xs text-3 mt-md">${escapeHtml(T('wizard_pool.kind_hint'))}</div>
@@ -425,14 +443,14 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
       const ok = state.result.ok;
       if (state.outcome?.outcome === 'approval' || state.outcome?.outcome === 'unknown') return `<div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(state.result.detail)}</div></div>`;
       return `<div class="result-box ${ok ? 'ok' : 'err'}">${sprite(ok ? 'check-circle' : 'alert')}<h3>${escapeHtml(ok ? T('wizard_pool.done_title', { name: state.name }) : T('wizard_pool.failed_title'))}</h3><p>${escapeHtml(state.result.detail || '')}</p></div>
-        ${state.job ? `<pre class="job-log mono">${escapeHtml((state.job.log || []).join('\n'))}</pre>` : ''}`;
+        ${state.job ? `<pre class="job-log mono">${escapeHtml(jobLogLines(state.job.log).join('\n'))}</pre>` : ''}`;
     }
     if (state.job) {
       return `
         <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.creating_title', { name: state.name }))}</h2>
         <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.creating_sub'))}</p>
         <tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar>
-        <pre class="job-log mono mt-sm">${escapeHtml((state.job.log || []).join('\n'))}</pre>`;
+        <pre class="job-log mono mt-sm">${escapeHtml(jobLogLines(state.job.log).join('\n'))}</pre>`;
     }
     if (state.kind === 'elastic') return elasticSummary();
     const plan = state.plan;
@@ -727,7 +745,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
       if (bar && log) {
         setAttr(bar, 'value', String(Number(state.job.progressPct) || 0));
         setAttr(bar, 'label', T('jobs.status_' + state.job.status));
-        paintJobLog(log, state.job.log);
+        paintJobLog(log, jobLogLines(state.job.log));
       } else {
         draw();
       }

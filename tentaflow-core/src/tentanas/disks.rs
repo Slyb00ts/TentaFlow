@@ -12,7 +12,7 @@
 //       view can show 24 h / 7 d history and the attribute trend.
 // =============================================================================
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -645,23 +645,28 @@ pub async fn wipe_job(
     let out = super::jobs::run_step(&h, &command, explicit.as_deref(), WIPE_TIMEOUT).await?;
     drop(explicit);
     let result: tentanas_helper::elastic::DiskWipeResult = serde_json::from_str(&out.stdout)?;
+    // The released journal's file is named by the array's id, and the array
+    // row is gone by now: its step names the array the admin acknowledged.
+    if let (HelperCommand::DiskWipe { release_journal: Some(array_id), .. }, Some(name)) =
+        (&command, &result.journal_released)
+    {
+        h.name_id(array_id, name);
+    }
     for step in &result.steps {
         h.log(step);
     }
+    // The signature's kind, place and label — a label is a name somebody
+    // chose. Its UUID is an id and is not written (owner decision
+    // 2026-09-26: job logs carry no ids).
     for signature in &result.removed {
         h.log(format!(
-            "usunięto sygnaturę {} na {}{}{}",
+            "usunięto sygnaturę {} na {}{}",
             signature.kind,
             signature.offset,
             signature
                 .label
                 .as_deref()
                 .map(|l| format!(" (label {l})"))
-                .unwrap_or_default(),
-            signature
-                .uuid
-                .as_deref()
-                .map(|u| format!(" (uuid {u})"))
                 .unwrap_or_default(),
         ));
     }
@@ -780,22 +785,23 @@ pub fn journal_claim_of(
 /// as healthy would close a faulted disk's alert on one failed `zpool
 /// status` and re-raise it — with a new timestamp — on the next.
 ///
-/// The third answer is the names of the pools that ARE imported — what tells
+/// The third answer is the pools that ARE imported, name → GUID — what tells
 /// "this disk left every pool" from "its pool is not imported yet"
-/// (`awaiting_pool_import`).
-async fn vdev_membership() -> (HashMap<String, (String, String)>, Option<HashMap<String, String>>, HashSet<String>) {
+/// (`awaiting_pool_import`), and what the node remembers as its pools
+/// (`store::remember_pools`).
+async fn vdev_membership() -> (HashMap<String, (String, String)>, Option<HashMap<String, String>>, HashMap<String, String>) {
     if !super::zfs::available() {
         // No ZFS, no pool, no leaf: that is a complete answer.
-        return (HashMap::new(), Some(HashMap::new()), HashSet::new());
+        return (HashMap::new(), Some(HashMap::new()), HashMap::new());
     }
     let rows = match super::pools::list_rows().await {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("tentanas: pool list for disk roles failed: {e}");
-            return (HashMap::new(), None, HashSet::new());
+            return (HashMap::new(), None, HashMap::new());
         }
     };
-    let imported: HashSet<String> = rows.iter().map(|row| row.name.clone()).collect();
+    let imported: HashMap<String, String> = rows.iter().map(|row| (row.name.clone(), row.guid.clone())).collect();
     let mut index = HashMap::new();
     let mut states = Some(HashMap::new());
     for row in rows {
@@ -1846,8 +1852,17 @@ struct State {
     last_prune: Option<Instant>,
     last_summary: Option<Instant>,
     /// When this process's disk state began: the boot window
-    /// (`BOOT_IMPORT_GRACE`) is counted from here.
+    /// (`BOOT_IMPORT_GRACE`) is counted from here (`boot_elapsed`).
     started: Instant,
+    /// Added to the time since `started`: zero in production, set by tests
+    /// to put the process past the boot window whatever the host's uptime
+    /// (an `Instant` cannot be moved before the host booted).
+    boot_clock_shift: Duration,
+    /// Pools whose disks this process held back inside the boot window
+    /// because the pool was not imported yet (`awaiting_pool_import`). Past
+    /// the window, one still not imported raises `pool_not_imported` instead
+    /// of its disks settling in silence (`pool_import_alerts`).
+    boot_held_pools: BTreeSet<String>,
     telemetry: NasTelemetryState,
     inventory_error: Option<String>,
 }
@@ -1874,7 +1889,25 @@ fn health_gate() -> &'static tokio::sync::Mutex<()> {
     GATE.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// Forgets a pool TentaNas destroyed or exported (`store::forget_pool`)
+/// under the health gate an inventory pass holds from its `zpool list` to
+/// its `store::remember_pools`: a pass that read the pool still imported
+/// finishes recording it BEFORE this forgets it, never after.
+pub async fn forget_known_pool(db: &DbPool, pool: &str) -> Result<()> {
+    forget_known_pool_gated(db, health_gate(), pool).await
+}
+
+async fn forget_known_pool_gated(db: &DbPool, gate: &tokio::sync::Mutex<()>, pool: &str) -> Result<()> {
+    let _pass = gate.lock().await;
+    store::forget_pool(db, pool)
+}
+
 impl State {
+    /// How long this process's disk state has run, as the boot window counts.
+    fn boot_elapsed(&self) -> Duration {
+        self.started.elapsed() + self.boot_clock_shift
+    }
+
     fn new() -> Self {
         State {
             disks: BTreeMap::new(),
@@ -1887,6 +1920,8 @@ impl State {
             last_prune: None,
             last_summary: None,
             started: Instant::now(),
+            boot_clock_shift: Duration::ZERO,
+            boot_held_pools: BTreeSet::new(),
             telemetry: NasTelemetryState {
                 sampled_at: None,
                 smart_read_at: None,
@@ -2042,20 +2077,22 @@ pub async fn refresh_inventory(db: &DbPool) -> Result<()> {
 }
 
 /// What one inventory pass reads off the node: lsblk's disks, then
-/// `vdev_membership`'s vdev index, leaf states and imported pools.
+/// `vdev_membership`'s vdev index, leaf states and imported pools
+/// (name → GUID).
 type InventoryRead = (
     Vec<NasDisk>,
     HashMap<String, (String, String)>,
     Option<HashMap<String, String>>,
-    HashSet<String>,
+    HashMap<String, String>,
 );
 
 /// How long after this process started a disk whose pool is not imported
 /// yet keeps the health alert the previous process left (see
 /// `awaiting_pool_import`). Pools import within seconds to a few minutes of
-/// a boot; past this window an unimported pool is taken as gone for good
-/// (exported, destroyed with its labels left on the disks), and its disks
-/// settle like any disk with no leaf.
+/// a boot. Only a pool this node has imported before is waited for (a
+/// destroyed pool's leftover labels and a foreign disk's are not); past this
+/// window such a pool that is still missing raises `pool_not_imported`, and
+/// its disks settle like any disk with no leaf.
 const BOOT_IMPORT_GRACE: Duration = Duration::from_secs(10 * 60);
 
 /// Whether a disk's alert must wait for its pool to be imported.
@@ -2071,19 +2108,128 @@ const BOOT_IMPORT_GRACE: Duration = Duration::from_secs(10 * 60);
 /// not in `zpool list` is one this node has not imported YET — its leaf
 /// state is unknown, not healthy.
 ///
-/// Only on first sight (`alert_settled` false: a restart, a hot-plug), and
-/// only inside `BOOT_IMPORT_GRACE`: a disk this process has already settled
-/// follows its leaf as always, and labels left behind on a destroyed pool's
-/// disks do not hold an alert for ever.
-fn awaiting_pool_import(live: &Live, imported: &HashSet<String>, in_boot_grace: bool) -> bool {
+/// Only on first sight (`alert_settled` false: a restart, a hot-plug), only
+/// inside `BOOT_IMPORT_GRACE`, and only for a pool this node has imported
+/// before (`known`, `store::known_pool_names`): a disk this process has
+/// already settled follows its leaf as always, and a label left behind by a
+/// pool TentaNas destroyed or exported, or carried in on a foreign disk,
+/// holds nothing. `known` is `None` when the record could not be read: the
+/// disk is then held as before (an alert kept a few minutes longer), but
+/// never alerted about (`pool_import_alerts`).
+fn awaiting_pool_import(
+    live: &Live,
+    imported: &HashMap<String, String>,
+    known: Option<&HashSet<String>>,
+    in_boot_grace: bool,
+) -> bool {
     in_boot_grace
         && !live.alert_settled
         && live.disk.role == "pool_member"
-        && live
-            .disk
-            .member_of
-            .as_deref()
-            .is_some_and(|pool| !pool.is_empty() && !imported.contains(pool))
+        && live.disk.member_of.as_deref().is_some_and(|pool| {
+            !pool.is_empty() && !imported.contains_key(pool) && known.is_none_or(|known| known.contains(pool))
+        })
+}
+
+/// What one complete inventory pass says about pools on the disks that are
+/// not imported: the ones to raise `pool_not_imported` for (with how many
+/// disks carry them), and every pool some disk still names.
+#[derive(Debug, Default, PartialEq)]
+struct PoolImportAlerts {
+    raise: Vec<(String, usize)>,
+    named: BTreeSet<String>,
+}
+
+/// THE END OF THE BOOT WINDOW (owner decision 2026-09-26). A pool whose disks
+/// were held for its import (`awaiting_pool_import`) and that is still not
+/// imported when the window closes used to leave nothing behind: its disks
+/// settled as "no leaf", and a FAULTED disk's alert closed in silence. Now
+/// the pool itself is alerted — "pool X was not imported" — for as long as
+/// it stays unimported and some disk still carries its label; its disks
+/// settle as before (a destroyed pool's leftover labels hold no disk alert
+/// for ever). A pool that imports, or whose disks no longer name it, drops
+/// out of `held`.
+fn pool_import_alerts<'a>(
+    held: &mut BTreeSet<String>,
+    disks: impl Iterator<Item = &'a NasDisk>,
+    imported: &HashMap<String, String>,
+    known: Option<&HashSet<String>>,
+    in_boot_grace: bool,
+) -> PoolImportAlerts {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for disk in disks {
+        if disk.role != "pool_member" {
+            continue;
+        }
+        if let Some(pool) = disk.member_of.as_deref().filter(|p| !p.is_empty() && !imported.contains_key(*p)) {
+            *counts.entry(pool.to_string()).or_default() += 1;
+        }
+    }
+    held.retain(|pool| counts.contains_key(pool));
+    // Only a pool this node is KNOWN to have imported is missing; with the
+    // record unreadable nothing is claimed.
+    let raise = match known {
+        Some(known) if !in_boot_grace => held
+            .iter()
+            .filter(|pool| known.contains(*pool))
+            .map(|pool| (pool.clone(), counts[pool]))
+            .collect(),
+        _ => Vec::new(),
+    };
+    PoolImportAlerts { raise, named: counts.into_keys().collect() }
+}
+
+fn pool_import_alert_key(pool: &str) -> String {
+    format!("pool:{pool}:not_imported")
+}
+
+/// Raises what `pool_import_alerts` found and resolves every open
+/// `pool_not_imported` whose pool imported or is named by no disk any more —
+/// one a previous process raised included. A failed write is retried by the
+/// next pass, which computes the same answer.
+fn write_pool_import_alerts(
+    db: &DbPool,
+    alerts: &PoolImportAlerts,
+    imported: &HashMap<String, String>,
+    known: Option<&HashSet<String>>,
+) {
+    let grace_min = BOOT_IMPORT_GRACE.as_secs() / 60;
+    for (pool, disks) in &alerts.raise {
+        let text = store::AlertText::new(
+            "pool_not_imported",
+            format!("Pool {pool} was not imported"),
+            format!(
+                "{disks} disk(s) of this node carry the label of pool {pool}, and the node has not imported it \
+                 {grace_min} minutes after TentaNas started. Import the pool (an encrypted pool may be waiting \
+                 for its key); if it is gone for good, its disks can be wiped."
+            ),
+        )
+        .param("pool", pool)
+        .param("disks", disks)
+        .param("minutes", grace_min);
+        if let Err(e) = store::raise_coded_alert(db, &pool_import_alert_key(pool), "critical", "pool", pool, &text) {
+            tracing::warn!("tentanas: pool-not-imported alert of {pool} not written, retried next pass: {e}");
+        }
+    }
+    let open = match store::open_alert_keys_like(db, "pool:%:not_imported") {
+        Ok(open) => open,
+        Err(e) => {
+            tracing::warn!("tentanas: open pool-not-imported alerts unreadable: {e}");
+            return;
+        }
+    };
+    for key in open {
+        let Some(pool) = key.strip_prefix("pool:").and_then(|k| k.strip_suffix(":not_imported")) else {
+            continue;
+        };
+        // Imported, named by no disk, or no longer this node's pool (TentaNas
+        // destroyed or exported it since): nothing is missing.
+        let forgotten = known.is_some_and(|known| !known.contains(pool));
+        if imported.contains_key(pool) || !alerts.named.contains(pool) || forgotten {
+            if let Err(e) = store::resolve_alert(db, &key) {
+                tracing::warn!("tentanas: pool-not-imported alert of {pool} not resolved: {e}");
+            }
+        }
+    }
 }
 
 /// The disks of an inventory read that the live state does not hold yet —
@@ -2151,9 +2297,24 @@ where
             persisted.insert(d.disk_id.clone(), row);
         }
     }
+    // The pools this node has imported: learnt from every read that saw the
+    // pools, then read back (a failed read is `None`, see
+    // `awaiting_pool_import`).
+    if leaf_states.is_some() {
+        if let Err(e) = store::remember_pools(db, &imported) {
+            tracing::warn!("tentanas: the imported pools were not recorded: {e}");
+        }
+    }
+    let known = match store::known_pool_names(db) {
+        Ok(known) => Some(known),
+        Err(e) => {
+            tracing::warn!("tentanas: the known pools are unreadable: {e}");
+            None
+        }
+    };
     let mut st = cell.write();
     let mut next = BTreeMap::new();
-    let in_boot_grace = st.started.elapsed() < BOOT_IMPORT_GRACE;
+    let in_boot_grace = st.boot_elapsed() < BOOT_IMPORT_GRACE;
     // Leaf-state changes, whose alerts are written once the lock is released:
     // `sync_health_alert` writes the database.
     let mut regrades = Vec::new();
@@ -2191,12 +2352,23 @@ where
         // (`regrade_leaf`); one that saw them all holds a disk whose pool is
         // not imported yet, and leaves it unsettled for the pass that sees it.
         live.awaiting_import =
-            leaf_states.is_some() && awaiting_pool_import(&live, &imported, in_boot_grace);
+            leaf_states.is_some() && awaiting_pool_import(&live, &imported, known.as_ref(), in_boot_grace);
+        if live.awaiting_import {
+            if let Some(pool) = live.disk.member_of.clone() {
+                st.boot_held_pools.insert(pool);
+            }
+        }
         if !live.awaiting_import {
             regrades.extend(regrade_leaf(&mut live, leaf_states.as_ref()));
         }
         next.insert(live.disk.disk_id.clone(), live);
     }
+    // Only a read that saw every pool can say one is not imported.
+    let pool_alerts = leaf_states
+        .is_some()
+        .then(|| {
+            pool_import_alerts(&mut st.boot_held_pools, next.values().map(|l| &l.disk), &imported, known.as_ref(), in_boot_grace)
+        });
     st.disks = next;
     st.inventory_error = None;
     st.last_inventory = Some(Instant::now());
@@ -2205,6 +2377,9 @@ where
     // its leaf state is put back, so the next pass sees the same change and
     // writes the alert again. Until then the shown grade is the one its
     // alert says, not one no alert was ever raised for.
+    if let Some(pool_alerts) = &pool_alerts {
+        write_pool_import_alerts(db, pool_alerts, &imported, known.as_ref());
+    }
     let failed = settle_leaf_alerts(db, regrades);
     if !failed.is_empty() {
         let mut st = cell.write();
@@ -4259,7 +4434,7 @@ mod tests {
         let gate = tokio::sync::Mutex::new(());
         let found = disk.clone();
         inventory_pass(&db, &cell, &gate, move || async move {
-            Ok::<InventoryRead, anyhow::Error>((vec![found], HashMap::new(), None, HashSet::new()))
+            Ok::<InventoryRead, anyhow::Error>((vec![found], HashMap::new(), None, HashMap::new()))
         })
         .await
         .unwrap();
@@ -4546,7 +4721,7 @@ mod tests {
                 vec![tank_member()],
                 HashMap::new(),
                 Some(states),
-                pools.iter().map(|p| p.to_string()).collect(),
+                pools.iter().map(|p| (p.to_string(), format!("guid-{p}"))).collect(),
             )))
         }
     }
@@ -4567,6 +4742,8 @@ mod tests {
         )
         .unwrap();
         store::store_smart(db, "wwn-leaf", "{}", "ok", &[]).unwrap();
+        // `tank` is this node's pool: an earlier process saw it imported.
+        store::remember_pools(db, &HashMap::from([("tank".to_string(), "guid-tank".to_string())])).unwrap();
     }
 
     /// C1 (wave 6): after a boot this process can read `zpool list` before
@@ -4620,10 +4797,7 @@ mod tests {
             .unwrap();
         let cell = RwLock::new(State::new());
         let gate = tokio::sync::Mutex::new(());
-        let Some(long_ago) = Instant::now().checked_sub(BOOT_IMPORT_GRACE + Duration::from_secs(1)) else {
-            return;
-        };
-        cell.write().started = long_ago;
+        end_the_boot_window(&cell);
         inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
         assert!(open_health_alert(&db).is_none(), "past the boot window the disk settles as no leaf");
         assert!(!cell.read().disks["wwn-leaf"].awaiting_import);
@@ -4637,6 +4811,221 @@ mod tests {
         assert!(open_health_alert(&db).is_some());
         inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
         assert!(open_health_alert(&db).is_none(), "an exported pool's disk has no leaf");
+    }
+
+    fn open_pool_alert(db: &DbPool) -> Option<tentaflow_protocol::tentanas::NasAlert> {
+        store::alerts_for_subject(db, "pool", "tank")
+            .unwrap()
+            .into_iter()
+            .find(|a| a.resolved_at.is_none())
+    }
+
+    /// Puts the process past the boot window through the injected clock,
+    /// whatever the host's uptime.
+    fn end_the_boot_window(cell: &RwLock<State>) {
+        cell.write().boot_clock_shift = BOOT_IMPORT_GRACE + Duration::from_secs(1);
+    }
+
+    /// Owner decision 2026-09-26 (wave-6 MINOR 13): a pool whose disks were
+    /// held for its import and that is still not imported when the boot
+    /// window closes raises "pool tank was not imported" — coded, critical —
+    /// instead of its FAULTED disk's alert closing in silence. The alert
+    /// stands while the pool stays unimported and is resolved by the import.
+    #[tokio::test]
+    async fn a_pool_still_not_imported_after_the_boot_window_is_alerted_until_it_imports() {
+        let db = leaf_db(true);
+        seen_ok(&db);
+        store::raise_alert(&db, "disk:wwn-leaf:health", "critical", "disk", "wwn-leaf", "Disk sde: critical", "ZFS reports this disk FAULTED")
+            .unwrap();
+        let cell = RwLock::new(State::new());
+        let gate = tokio::sync::Mutex::new(());
+
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        assert!(open_pool_alert(&db).is_none(), "inside the window the pool is only late");
+        end_the_boot_window(&cell);
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        let alert = open_pool_alert(&db).expect("the missing pool is alerted when the window closes");
+        assert_eq!(alert.code, "pool_not_imported");
+        assert_eq!(alert.severity, "critical");
+        assert_eq!(alert.params.get("pool").map(String::as_str), Some("tank"));
+        assert_eq!(alert.params.get("disks").map(String::as_str), Some("1"));
+        assert_eq!(alert.params.get("minutes").map(String::as_str), Some("10"));
+        assert!(alert.title.contains("tank"), "{}", alert.title);
+
+        // Further passes keep the one row.
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        assert_eq!(open_pool_alert(&db).unwrap().alert_id, alert.alert_id);
+
+        // The import resolves it.
+        inventory_pass(&db, &cell, &gate, tank_read(Some("online"), &["tank"])).await.unwrap();
+        assert!(open_pool_alert(&db).is_none(), "an imported pool is not missing");
+        // And an unreadable pool list decides nothing either way.
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        assert!(open_pool_alert(&db).is_none(), "the pool left the held set when it imported");
+    }
+
+    /// The other cases: a pool that imports inside the window raises
+    /// nothing; a pool whose disks stop naming it (wiped) resolves the
+    /// alert; and a disk first seen after the window — no boot hold — raises
+    /// none. An alert a previous process left open is resolved by the import.
+    #[tokio::test]
+    async fn only_a_pool_held_through_the_whole_window_is_alerted_and_its_alert_follows_the_disks() {
+        let gate = tokio::sync::Mutex::new(());
+
+        let db = leaf_db(true);
+        seen_ok(&db);
+        let cell = RwLock::new(State::new());
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        inventory_pass(&db, &cell, &gate, tank_read(Some("online"), &["tank"])).await.unwrap();
+        end_the_boot_window(&cell);
+        inventory_pass(&db, &cell, &gate, tank_read(Some("online"), &["tank"])).await.unwrap();
+        assert!(open_pool_alert(&db).is_none(), "imported in time: nothing to say");
+
+        let db = leaf_db(true);
+        seen_ok(&db);
+        let cell = RwLock::new(State::new());
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        end_the_boot_window(&cell);
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        assert!(open_pool_alert(&db).is_some());
+        let wiped = || {
+            std::future::ready(Ok((
+                vec![NasDisk { role: "free".to_string(), member_of: None, ..tank_member() }],
+                HashMap::new(),
+                Some(HashMap::new()),
+                HashMap::new(),
+            )))
+        };
+        inventory_pass(&db, &cell, &gate, wiped).await.unwrap();
+        assert!(open_pool_alert(&db).is_none(), "no disk carries the pool any more");
+
+        let db = leaf_db(true);
+        seen_ok(&db);
+        let cell = RwLock::new(State::new());
+        end_the_boot_window(&cell);
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        assert!(open_pool_alert(&db).is_none(), "a disk first seen after the window was never held");
+
+        // Left open by the previous process: the import closes it.
+        store::raise_coded_alert(&db, "pool:tank:not_imported", "critical", "pool", "tank", &store::AlertText::new("pool_not_imported", "Pool tank was not imported", ""))
+            .unwrap();
+        inventory_pass(&db, &cell, &gate, tank_read(Some("online"), &["tank"])).await.unwrap();
+        assert!(open_pool_alert(&db).is_none());
+    }
+
+    /// Critic wave 9a, MAJOR 1: labels outlive their pool. Only a pool this
+    /// node has imported before is waited for and alerted about — not a pool
+    /// TentaNas destroyed (its labels left on the disks) and not a foreign
+    /// disk's pool — and the record follows a destroy or export by TentaNas.
+    #[tokio::test]
+    async fn only_a_pool_this_node_imported_before_is_alerted_as_missing() {
+        let gate = tokio::sync::Mutex::new(());
+        let after_a_restart = |db: &DbPool| {
+            let cell = RwLock::new(State::new());
+            (db.clone(), cell)
+        };
+
+        // A known pool that does not come back: the alert.
+        let db = leaf_db(true);
+        seen_ok(&db);
+        let (db, cell) = after_a_restart(&db);
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        end_the_boot_window(&cell);
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        assert!(open_pool_alert(&db).is_some(), "a known pool that is missing is alerted");
+
+        // TentaNas destroyed it (the labels stay on the disk), then restarted.
+        let db = leaf_db(true);
+        seen_ok(&db);
+        super::super::pools::forget_removed_pool(&db, &HelperCommand::ZpoolDestroy { pool: "tank".into() }).await;
+        let (db, cell) = after_a_restart(&db);
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        assert!(!cell.read().disks["wwn-leaf"].awaiting_import, "a destroyed pool's label holds nothing");
+        end_the_boot_window(&cell);
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        assert!(open_pool_alert(&db).is_none(), "a destroyed pool is not missing");
+
+        // An export by TentaNas is the same; another command forgets nothing.
+        let db = leaf_db(true);
+        seen_ok(&db);
+        super::super::pools::forget_removed_pool(&db, &HelperCommand::ZpoolScrub { pool: "tank".into(), action: tentanas_helper::ScrubAction::Start }).await;
+        assert!(store::known_pool_names(&db).unwrap().contains("tank"));
+        super::super::pools::forget_removed_pool(&db, &HelperCommand::ZpoolExport { pool: "tank".into(), force: false }).await;
+        assert!(store::known_pool_names(&db).unwrap().is_empty());
+
+        // A foreign disk carrying a label of a pool this node never had.
+        let db = leaf_db(true);
+        seen_ok(&db);
+        store::forget_pool(&db, "tank").unwrap();
+        store::remember_pools(&db, &HashMap::from([("fast".to_string(), "guid-fast".to_string())])).unwrap();
+        let (db, cell) = after_a_restart(&db);
+        inventory_pass(&db, &cell, &gate, tank_read(None, &["fast"])).await.unwrap();
+        end_the_boot_window(&cell);
+        inventory_pass(&db, &cell, &gate, tank_read(None, &["fast"])).await.unwrap();
+        assert!(open_pool_alert(&db).is_none(), "a foreign disk's pool is not this node's");
+
+        // An alert a previous process raised for a pool destroyed since is closed.
+        store::raise_coded_alert(&db, "pool:tank:not_imported", "critical", "pool", "tank", &store::AlertText::new("pool_not_imported", "Pool tank was not imported", ""))
+            .unwrap();
+        inventory_pass(&db, &cell, &gate, tank_read(None, &["fast"])).await.unwrap();
+        assert!(open_pool_alert(&db).is_none());
+        // And every imported pool is learnt.
+        assert!(store::known_pool_names(&db).unwrap().contains("fast"));
+
+        // Held while the record was unreadable (kept as before), then judged
+        // against a record that does not name it: never alerted.
+        let db = leaf_db(true);
+        seen_ok(&db);
+        store::forget_pool(&db, "tank").unwrap();
+        let (db, cell) = after_a_restart(&db);
+        db.write().unwrap().execute_batch("ALTER TABLE nas_known_pools RENAME TO nas_known_pools_gone").unwrap();
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        assert!(cell.read().disks["wwn-leaf"].awaiting_import, "an unreadable record holds as before");
+        db.write().unwrap().execute_batch("ALTER TABLE nas_known_pools_gone RENAME TO nas_known_pools").unwrap();
+        end_the_boot_window(&cell);
+        inventory_pass(&db, &cell, &gate, tank_read(None, &[])).await.unwrap();
+        assert!(
+            store::alerts_for_subject(&db, "pool", "tank").unwrap().is_empty(),
+            "a pool the record does not name is never alerted, not even for one pass"
+        );
+    }
+
+    /// Critic wave 9a, R2-MINOR 4: a pass that read `zpool list` while the
+    /// pool was still imported must not record it again after the destroy
+    /// forgot it. The forget waits for the running pass (the health gate),
+    /// so it always has the last word.
+    #[tokio::test]
+    async fn a_destroyed_pool_is_not_recorded_again_by_a_pass_that_read_it_before() {
+        let db = leaf_db(true);
+        seen_ok(&db);
+        let cell = RwLock::new(State::new());
+        let gate = tokio::sync::Mutex::new(());
+        let (read_done, read_seen) = tokio::sync::oneshot::channel::<()>();
+        let (go_on, wait_go) = tokio::sync::oneshot::channel::<()>();
+        let pass = inventory_pass(&db, &cell, &gate, move || async move {
+            // `zpool list` saw the pool imported ...
+            let _ = read_done.send(());
+            // ... and the destroy finishes before this pass records it.
+            let _ = wait_go.await;
+            Ok::<InventoryRead, anyhow::Error>((
+                vec![tank_member()],
+                HashMap::new(),
+                Some(HashMap::new()),
+                HashMap::from([("tank".to_string(), "guid-tank".to_string())]),
+            ))
+        });
+        let forget = async {
+            read_seen.await.unwrap();
+            let forgetting = forget_known_pool_gated(&db, &gate, "tank");
+            tokio::pin!(forgetting);
+            // The forget waits for the pass instead of running in its middle.
+            assert!(tokio::time::timeout(Duration::from_millis(100), &mut forgetting).await.is_err());
+            go_on.send(()).unwrap();
+            forgetting.await.unwrap();
+        };
+        let (passed, ()) = tokio::join!(pass, forget);
+        passed.unwrap();
+        assert!(!store::known_pool_names(&db).unwrap().contains("tank"), "the destroy has the last word");
     }
 
     /// A disk SMART still calls critical keeps its ONE alert across a
@@ -4761,7 +5150,7 @@ mod tests {
 
         let disk = &disk;
         let reading = move |state: &str| -> Result<InventoryRead> {
-            Ok((vec![disk.clone()], HashMap::new(), Some(leaves(state)), HashSet::new()))
+            Ok((vec![disk.clone()], HashMap::new(), Some(leaves(state)), HashMap::new()))
         };
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
@@ -4837,7 +5226,7 @@ mod tests {
         store::store_smart(&db, "wwn-leaf", "{}", "warning", &[coded_reason("reallocated", &[("count", "8".to_string())])])
             .unwrap();
         let reading = |disks: Vec<NasDisk>| {
-            move || async move { Ok::<InventoryRead, anyhow::Error>((disks, HashMap::new(), None, HashSet::new())) }
+            move || async move { Ok::<InventoryRead, anyhow::Error>((disks, HashMap::new(), None, HashMap::new())) }
         };
 
         inventory_pass(&db, &cell, &gate, reading(vec![disk.clone()])).await.unwrap();

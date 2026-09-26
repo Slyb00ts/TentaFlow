@@ -1369,7 +1369,13 @@ test('n02: a conflict row copies the other version\'s path on request and never 
     Object.defineProperty(globalThis.navigator, 'clipboard', { configurable: true, value: undefined });
     const execCommand = document.execCommand;
     const viaCommand = [];
-    document.execCommand = (cmd) => { viaCommand.push([cmd, document.activeElement?.value ?? document.querySelector('textarea[readonly]')?.value]); return true; };
+    // What `copy` copies is the selection: the helper textarea's selected
+    // text at the moment of the command.
+    document.execCommand = (cmd) => {
+      const area = document.querySelector('textarea[readonly]');
+      viaCommand.push([cmd, area ? area.value.slice(area.selectionStart, area.selectionEnd) : null]);
+      return true;
+    };
     try {
       click(row.querySelector('[data-copy]'));
       await flush();
@@ -1378,6 +1384,9 @@ test('n02: a conflict row copies the other version\'s path on request and never 
     }
     assert.equal(viaCommand.length, 1);
     assert.equal(viaCommand[0][0], 'copy');
+    // Critic wave 8, MINOR 3: the command copied THIS path, not an empty or
+    // another one.
+    assert.equal(viaCommand[0][1], kept, 'the fallback copies the other version\'s path');
     assert.equal(document.querySelector('textarea[readonly]'), null, 'the helper textarea is gone');
     assert.doesNotMatch(root.innerHTML, new RegExp(uuid));
   } finally {
@@ -2140,6 +2149,41 @@ test('the fleet view is patched by its poll, never redrawn', async () => {
   assert.equal(same(root.querySelector('#nas-node-grid'), grid), true, 'the node grid is not rebuilt');
   assert.equal(same(root.querySelector('#nas-fleet-alerts'), alertsTable), true, 'nor the alert table');
   [...root.querySelectorAll('.kpi tf-stat-card')].forEach((el, i) => assert.equal(same(el, cards[i]), true, `fleet tile ${i} survives`));
+  Screen.unmount();
+});
+
+// Critic wave 8, MINOR 1: every poll stamps new node objects with
+// `receivedAt`, and the fleet tables' rows carry those objects — so the
+// change check saw a change on every poll and both tables re-rendered every
+// 10 s. An unchanged poll must not assign `rows` at all; a changed one must.
+test('an unchanged fleet poll does not re-render the fleet tables', async () => {
+  let nodes = fixtures.tentaNasNodesListRequest;
+  stubTransport({ ...fixtures, tentaNasNodesListRequest: () => nodes });
+  const root = await mountScreen();
+  await flush();
+  await flush();
+  const assigned = { alerts: 0, res: 0 };
+  for (const [id, key] of [['#nas-fleet-alerts', 'alerts'], ['#nas-fleet-res-table', 'res']]) {
+    const table = root.querySelector(id);
+    const proto = Object.getPrototypeOf(table);
+    const setter = Object.getOwnPropertyDescriptor(proto, 'rows')?.set
+      || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(proto), 'rows')?.set;
+    const getter = Object.getOwnPropertyDescriptor(proto, 'rows')?.get
+      || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(proto), 'rows')?.get;
+    Object.defineProperty(table, 'rows', {
+      configurable: true,
+      get() { return getter.call(this); },
+      set(v) { assigned[key] += 1; setter.call(this, v); },
+    });
+  }
+  await new Promise((r) => setTimeout(r, 5));
+  await Screen.refreshFleet();
+  await flush();
+  assert.deepEqual(assigned, { alerts: 0, res: 0 }, 'the same answer a few ms later is no change');
+  nodes = { ...nodes, nodes: nodes.nodes.map((n) => (n.nodeId === REMOTE ? { ...n, nodeName: 'orion-2' } : n)) };
+  await Screen.refreshFleet();
+  await flush();
+  assert.ok(assigned.alerts >= 1 || assigned.res >= 1, `a renamed node is a change (${JSON.stringify(assigned)})`);
   Screen.unmount();
 });
 
@@ -2970,6 +3014,51 @@ test('a ksmbd row refused by the exposure guard reads as a warning, not as a mis
   assert.match(row.version, /default gateway/);
 });
 
+// Critic wave 9a, MINOR 8: n16's AnyRAID row — a grey chip, never a green
+// OK for a feature TentaNas cannot create, and the ZFS version said once.
+test('the AnyRAID row is a grey chip with the version said once', async () => {
+  const anyraid = (status, detail) => ({
+    id: 'anyraid', status, version: null, requiredVersion: null, binaries: [], kernelModule: null, packages: [], detail, optional: true,
+  });
+  for (const [status, label] of [['unsupported', 'niedostępne'], ['not_offered', 'jeszcze niedostępne w TentaNas']]) {
+    stubTransport({
+      ...fixtures,
+      tentaNasEnvironmentRequest: { environment: {
+        ...environment,
+        features: [...environment.features, anyraid(status, 'ZFS 2.4.1 on this node does not support AnyRAID')],
+        featureReasons: { anyraid: [{ code: status === 'unsupported' ? 'anyraid_not_in_zfs' : 'anyraid_supported_not_offered', params: { version: '2.4.1' } }] },
+      } },
+    });
+    const root = await mountScreen({ node: LOCAL, tab: 'environment' });
+    await flush();
+    await flush();
+    const row = root.querySelector('#nas-feature-table').rows.find((r) => r._feature.id === 'anyraid');
+    assert.equal(row.status.status, 'neutral', `${status}: the grey chip of n16`);
+    assert.equal(row.status.label, label);
+    const shown = row.version.replace(/<[^>]*>/g, '');
+    assert.equal((shown.match(/2\.4\.1/g) || []).length, 1, `the version once: ${shown}`);
+    Screen.unmount();
+  }
+});
+
+// Critic wave 9a, MINOR 11: an older node stored the provisioning user's id
+// when the account had no display name; the tab never shows it.
+test('a stored user id is never shown as who provisioned the helper', async () => {
+  const uuid = '0191f2c0-4b1e-7c3a-9f2d-8ac41b5e9d70';
+  stubTransport({
+    ...fixtures,
+    tentaNasEnvironmentRequest: { environment: {
+      ...environment,
+      elevation: { ...environment.elevation, mode: 'helper', provisionedAt: '2026-09-01T10:00:00Z', provisionedBy: uuid },
+    } },
+  });
+  const root = await mountScreen({ node: LOCAL, tab: 'environment' });
+  await flush();
+  await flush();
+  assert.ok(!root.innerHTML.includes(uuid), 'the id is nowhere on the tab');
+  Screen.unmount();
+});
+
 // -----------------------------------------------------------------------------
 // The forced setup step (n16)
 //
@@ -3576,6 +3665,46 @@ test('the job-log window appends the growing tail instead of rewriting the whole
     // pending timer fires — this MUST run even when an assertion above
     // throws, or that timer keeps firing every 1.5 s forever and the test
     // process never exits.
+    Screen.unmount();
+  }
+});
+
+// Owner decision 2026-09-26: a job log carries no ids. The node writes it
+// without them (tentanas/log_ids.rs); a row an older node wrote still has
+// them, so the window scrubs every line it paints — and the tail it appends.
+test('the job-log window never paints an id an older node left in the log', async () => {
+  let calls = 0;
+  const uuid = '5f1e2d3c-aaaa-bbbb-cccc-1234567890ab';
+  const logByCall = [
+    [`usunięto sygnaturę xfs na 0x0 (uuid ${uuid})`],
+    [`usunięto sygnaturę xfs na 0x0 (uuid ${uuid})`, '$ zpool detach tank /dev/disk/by-id/wwn-0x5000c500a1b2c3d4 ⟦id⟧ [identifier] 4000787030016'],
+  ];
+  stubTransport({
+    ...fixtures,
+    tentaNasJobGetRequest: () => {
+      const log = logByCall[Math.min(calls, logByCall.length - 1)];
+      calls += 1;
+      return {
+        job: {
+          jobId: 'j1', kind: 'disk_wipe', subject: 'sdb', status: 'running', progressPct: 40,
+          startedBy: 'admin', startedAt: '2026-09-02 09:58:00', finishedAt: null, error: null, log,
+        },
+      };
+    },
+  });
+  await mountScreen({ node: LOCAL });
+  try {
+    Screen.openJobLog('j1');
+    await flush();
+    const pre = document.getElementById('nas-joblog');
+    assert.equal(pre.textContent, 'usunięto sygnaturę xfs na 0x0 (uuid [identyfikator])');
+    await new Promise((r) => setTimeout(r, 1700));
+    await flush();
+    // The node's neutral token and an older node's English one are worded;
+    // a plain number (a size) stays.
+    assert.equal(pre.textContent, 'usunięto sygnaturę xfs na 0x0 (uuid [identyfikator])\n$ zpool detach tank /dev/disk/by-id/[identyfikator] [identyfikator] [identyfikator] 4000787030016');
+    assert.ok(!pre.textContent.includes(uuid) && !pre.textContent.includes('wwn-0x'), pre.textContent);
+  } finally {
     Screen.unmount();
   }
 });

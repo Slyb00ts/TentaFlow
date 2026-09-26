@@ -92,6 +92,9 @@ pub struct JobHandle {
     db: DbPool,
     pub job_id: String,
     cancel: CancellationToken,
+    /// Ids this job knows the name of that the node's tables may not hold
+    /// any more (a dissolved array's id, released by a wipe): see `name_id`.
+    extra_names: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl JobHandle {
@@ -125,19 +128,47 @@ impl JobHandle {
             db: db.clone(),
             job_id: job_id.to_string(),
             cancel: CancellationToken::new(),
+            extra_names: Arc::default(),
         }
     }
 
+    /// Every line is written with its ids named or hidden
+    /// (`log_ids::LogNames`, owner decision 2026-09-26): the log is an
+    /// audit trail an admin reads, and an id is the one thing in it nobody
+    /// can recognise.
     pub fn log(&self, line: impl AsRef<str>) {
-        for l in line.as_ref().lines() {
+        let text = line.as_ref();
+        if text.trim().is_empty() {
+            return;
+        }
+        let names = self.names();
+        for l in text.lines() {
             let l = l.trim_end();
             if l.is_empty() {
                 continue;
             }
-            if let Err(e) = store::append_job_log(&self.db, &self.job_id, l) {
+            let l = names.scrub(l);
+            if let Err(e) = store::append_job_log(&self.db, &self.job_id, &l) {
                 tracing::warn!("tentanas job {}: log write failed: {e}", self.job_id);
             }
         }
+    }
+
+    /// `id` reads as `name` in every later line of this job: for an id whose
+    /// row is gone before the line is written (the array a wipe released).
+    pub fn name_id(&self, id: &str, name: &str) {
+        self.extra_names
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((id.to_string(), name.to_string()));
+    }
+
+    fn names(&self) -> super::log_ids::LogNames {
+        let mut names = super::log_ids::LogNames::load(&self.db);
+        for (id, name) in self.extra_names.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            names.insert(id, name);
+        }
+        names
     }
 
     pub fn progress(&self, pct: u8) {
@@ -371,7 +402,9 @@ where
         db: db.clone(),
         job_id: job.job_id.clone(),
         cancel: cancel.clone(),
+        extra_names: Arc::default(),
     };
+    let error_names = handle.clone();
     let db = db.clone();
     let job_id = job.job_id.clone();
     tokio::spawn(async move {
@@ -393,10 +426,11 @@ where
                 }
             }
         }
+        // The error is the log's last word and follows its rule: no ids.
         let (status, error) = match &outcome {
             Ok(()) => ("succeeded", None),
             Err(e) if e.to_string() == "cancelled" => ("cancelled", None),
-            Err(e) => ("failed", Some(e.to_string())),
+            Err(e) => ("failed", Some(error_names.names().scrub(&e.to_string()))),
         };
         if let Err(e) = store::finish_job(&db, &job_id, status, error.as_deref()) {
             tracing::warn!("tentanas job {job_id}: finish write failed: {e}");
@@ -484,6 +518,46 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         }).await.unwrap()
+    }
+
+    /// Owner decision 2026-09-26: whatever a job body writes — its own
+    /// sentence, a tool's output, the error it ends with — reaches the log
+    /// with its ids named or hidden. Through a real `spawn`, so a writer that
+    /// bypassed `JobHandle::log` (or an error stored unscrubbed) fails here.
+    #[tokio::test]
+    async fn a_job_log_and_its_error_carry_no_ids() {
+        let db = database();
+        let array_id = "0191f2c0-7a3b-7c11-9d2e-1234567890ab";
+        db.write().unwrap().execute(
+            "INSERT INTO nas_elastic_arrays (array_id, org_id, addon_id, name, filesystem, state, state_detail, created_at, updated_at) \
+             VALUES (?1, 'org-a', 'nas', 'media', 'xfs', 'active', '', 'now', 'now')",
+            rusqlite::params![array_id],
+        ).unwrap();
+        let gone = "5f1e2d3c-aaaa-bbbb-cccc-1234567890ab";
+        let job = spawn(&db, "disk_wipe", "sdb", "test", None, None, move |h| async move {
+            h.log(format!("rm /var/lib/tentanas/{array_id}.json"));
+            h.name_id(gone, "archive");
+            h.log(format!("journal {gone} released\n$ zpool detach tank /dev/disk/by-id/wwn-0x5000c500ffffffee"));
+            h.log("$ zpool detach tank 12345678901234567890");
+            h.log("usunięto sygnaturę xfs na 0x0 (uuid 11111111-2222-3333-4444-555555555555)");
+            Err(anyhow!("wipefs failed on /dev/disk/by-id/wwn-0x5000c500ffffffff (job {array_id})"))
+        })
+        .unwrap();
+        let done = finished(&db, &job.job_id).await;
+        assert_eq!(
+            done.log,
+            vec![
+                "rm /var/lib/tentanas/media.json".to_string(),
+                "journal archive released".to_string(),
+                "$ zpool detach tank /dev/disk/by-id/⟦id⟧".to_string(),
+                "$ zpool detach tank ⟦id⟧".to_string(),
+                "usunięto sygnaturę xfs na 0x0 (uuid ⟦id⟧)".to_string(),
+            ]
+        );
+        assert_eq!(
+            done.error.as_deref(),
+            Some("wipefs failed on /dev/disk/by-id/⟦id⟧ (job media)")
+        );
     }
 
     /// A2/A3/A5: a cancel an admin can ask for must really stop the work.
@@ -1487,7 +1561,11 @@ pub async fn provision_helper(
     super::elevation::set_mode(h.db(), super::elevation::Mode::Helper)?;
     // Only now: a provisioning that did not verify has nobody to attribute.
     super::elevation::record_provisioning(h.db(), &admin)?;
-    h.log(format!("provisioned by {admin}"));
+    if admin.is_empty() {
+        h.log("provisioned");
+    } else {
+        h.log(format!("provisioned by {admin}"));
+    }
     super::disks::request_smart_refresh();
     h.progress(100);
     Ok(())

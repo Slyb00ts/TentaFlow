@@ -212,6 +212,7 @@ pub async fn destroy_job(
     )
     .await?;
     drop(explicit);
+    super::pools::forget_removed_pool(h.db(), &command).await;
     match super::keystore::forget(&addon_id, &subject, subtree) {
         Ok(0) => {}
         Ok(n) => h.log(format!("dropped {n} encryption keys from the node keystore")),

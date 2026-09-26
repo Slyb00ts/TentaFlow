@@ -91,17 +91,39 @@ export const isDiskIdShape = (value) => {
 
 const EMBEDDED_UUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
 const TEXT_TOKEN = /[^\s'"`„”«»()[\]{}<>,;|=]+/g;
-const TEXT_DISK_ID_PREFIX = /^(wwn-|sn-|eui\.|nvme-eui\.|nvme-uuid\.|ata-|scsi-|dm-uuid-|md-uuid-|lvm-pv-uuid-)/i;
+// Prefixes that are an id whatever follows them.
+const TEXT_ID_ALWAYS = /^(nvme-eui\.|nvme-uuid\.|dm-uuid-|md-uuid-|lvm-pv-uuid-)/i;
+// Prefixes a name can start with too (a pool `ata-archive`, a share
+// `scsi-luns`, a pool `eui.lab`): an id only with an id body behind them —
+// hex for a WWN/EUI (critic wave 9a, MINOR 1), `<model>_<serial>` for a
+// by-id disk name.
+const TEXT_ID_HEX = /^(wwn-|eui\.|naa\.)(0x)?[0-9a-f]{16,}$/i;
+// `<prefix><model>_<serial>`: the serial part has a digit and six or more
+// characters (`ata-data_2025` is a dataset name, not a disk).
+const TEXT_ID_BY_ID = /^(ata-|scsi-|sn-)[^_]+(_[^_]+)*_([A-Za-z0-9.-]*\d[A-Za-z0-9.-]*?)(-part\d+)?$|^scsi-[0-9a-f]{12,}$/i;
+// TentaNas's own disk id for a disk with a serial and no WWN: `sn-<serial>`.
+const TEXT_ID_OWN_SERIAL = /^sn-(?=[A-Za-z0-9._-]*\d)[A-Za-z0-9._-]{6,}$/i;
 const BY_DISK_PATH = /^(\/dev\/disk\/by-[a-z]+\/)(.+)$/i;
 
-function isTextId(token) {
-  if (/^\d+$/.test(token)) return token.length >= 16;
-  return isOpaqueId(token) || /^[0-9a-f]{32,}$/i.test(token) || TEXT_DISK_ID_PREFIX.test(token);
+function isByIdName(token) {
+  const m = TEXT_ID_BY_ID.exec(token);
+  return Boolean(m) && (m[3] === undefined || m[3].length >= 6);
+}
+
+// A decimal is an id from `digits[0]` to `digits[1]` digits.
+function isTextId(token, digits) {
+  if (/^\d+$/.test(token)) return token.length >= digits[0] && token.length <= digits[1];
+  return isOpaqueId(token) || /^[0-9a-f]{32,}$/i.test(token)
+    || TEXT_ID_ALWAYS.test(token) || TEXT_ID_HEX.test(token) || isByIdName(token) || TEXT_ID_OWN_SERIAL.test(token);
 }
 
 /** `text` with every id replaced by `placeholder` — or by `nameOf(id)` when
- *  that returns a name. See the section comment for what counts as an id. */
-export function scrubIds(text, placeholder, nameOf = () => '') {
+ *  that returns a name. See the section comment for what counts as an id.
+ *  `guidDigits`: a plain decimal is an id only at a ZFS GUID's length, 17-20
+ *  digits — for a job log, whose sizes and timestamps must stay readable
+ *  (critic wave 9a, R2-BLOCKER 1); otherwise from 16 digits on. */
+export function scrubIds(text, placeholder, nameOf = () => '', { guidDigits = false } = {}) {
+  const digits = guidDigits ? [17, 20] : [16, Infinity];
   const shown = (id) => String(nameOf(id) || '').trim() || placeholder;
   return String(text ?? '')
     .replace(EMBEDDED_UUID, (id) => shown(id))
@@ -111,7 +133,7 @@ export function scrubIds(text, placeholder, nameOf = () => '') {
       // Path segments are judged one by one ("…/wwn-0x5…/part1").
       return token.split('/').map((segment) => {
         const bare = segment.replace(/[:.!?]+$/, '');
-        return bare && isTextId(bare) ? shown(bare) + segment.slice(bare.length) : segment;
+        return bare && isTextId(bare, digits) ? shown(bare) + segment.slice(bare.length) : segment;
       }).join('/');
     });
 }

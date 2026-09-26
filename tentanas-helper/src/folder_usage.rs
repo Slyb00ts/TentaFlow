@@ -284,6 +284,8 @@ pub(crate) fn folder_bytes(branch: &Path, folder: &str, budget: &mut Budget) -> 
             if stack.len() >= MAX_DEPTH {
                 return Err(Gap::OverBudget);
             }
+            #[cfg(test)]
+            tests::before_child_open(&name);
             let child = match open_directory_at(dir, &name) {
                 Ok(child) => child,
                 Err(error) if error.raw_os_error() == Some(libc::ENOENT) => continue,
@@ -292,8 +294,12 @@ pub(crate) fn folder_bytes(branch: &Path, folder: &str, budget: &mut Budget) -> 
             if !same_entry(&child, &stat) {
                 // Swapped for another directory, or mounted over, after it
                 // was judged: never descended into (defence in depth; the
-                // branches are invisible from the host namespace).
-                continue;
+                // branches are invisible from the host namespace). And the
+                // folder has no figure: what the judged directory held was
+                // not counted, so any sum would be low without saying so —
+                // the same answer as the top-level swap above (critic wave 8,
+                // MINOR 6).
+                return Err(Gap::Unreadable);
             }
             let names = list(child.as_raw_fd(), budget)?;
             stack.push((child, names));
@@ -318,6 +324,22 @@ mod tests {
     use std::time::Duration;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        /// Runs between a child directory's `fstatat` and its `openat` — the
+        /// window a swap races into. Per thread, so parallel tests never see
+        /// each other's hook.
+        static BEFORE_CHILD_OPEN: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub(super) fn before_child_open(name: &CString) {
+        BEFORE_CHILD_OPEN.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(&name.to_string_lossy());
+            }
+        });
+    }
 
     fn scratch(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -456,6 +478,35 @@ mod tests {
         let judged = stat_at(root.as_raw_fd(), &a).unwrap();
         assert!(same_entry(&open_directory_at(root.as_raw_fd(), &a).unwrap(), &judged));
         assert!(!same_entry(&open_directory_at(root.as_raw_fd(), &b).unwrap(), &judged), "a swapped directory is not entered");
+    }
+
+    /// Critic wave 8, MINOR 6: a directory swapped between its `fstatat` and
+    /// its `openat` was skipped, and the folder's figure came out low with
+    /// nothing saying so. It is now a folder with no figure, like the same
+    /// swap at the top level.
+    #[test]
+    fn a_directory_swapped_during_the_walk_leaves_the_folder_without_a_figure() {
+        let branch = scratch("swapped");
+        let folder = branch.join("dom");
+        fs::create_dir_all(folder.join("zdjecia")).unwrap();
+        write(&folder.join("zdjecia").join("a.jpg"), 64 * 1024);
+        write(&folder.join("list.txt"), 4096);
+        assert!(folder_bytes(&branch, "dom", &mut roomy()).unwrap() > 64 * 1024, "measured whole before the swap");
+
+        let judged = folder.join("zdjecia");
+        let aside = folder.join("zdjecia-old");
+        BEFORE_CHILD_OPEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |name: &str| {
+                if name == "zdjecia" && !aside.exists() {
+                    fs::rename(&judged, &aside).unwrap();
+                    fs::create_dir(&judged).unwrap();
+                }
+            }));
+        });
+        let swapped = folder_bytes(&branch, "dom", &mut roomy());
+        BEFORE_CHILD_OPEN.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(swapped, Err(Gap::Unreadable), "a swapped directory is not a smaller folder");
+        fs::remove_dir_all(&branch).unwrap();
     }
 
     /// A directory root cannot list is a folder with no figure, not a smaller one.

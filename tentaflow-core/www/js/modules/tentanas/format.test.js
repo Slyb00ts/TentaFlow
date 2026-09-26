@@ -313,7 +313,7 @@ function documentedAlertCodes() {
 const ALERT_PARAMS = {
   health: 'warning', name: 'sdq', name_source: 'live', operation: 'pool_destroy', subject: 'tank', array: 'media',
   runs: '4', oldest_secs: '32400', limit_secs: '28800', cause: 'files_busy', count: '2', alerted: '1',
-  sweep_failed: 'true', error: 'EIO', target: 'vm-a',
+  sweep_failed: 'true', error: 'EIO', target: 'vm-a', pool: 'tank', disks: '3', minutes: '10',
 };
 const A = (code, params = ALERT_PARAMS, extra = {}) => ({
   alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'x', title: 'English title', detail: 'English detail', code, params, reasons: [], ...extra,
@@ -608,6 +608,46 @@ test('the held Sync alert words its cause in every locale', async () => {
       assert.equal(legacy.detail, errors.detail, lang);
       assert.doesNotMatch(fault.detail, /tentanas\.|\{/, lang);
     }
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+});
+
+test('jobLogLines hides every id a log line carries and keeps names and sizes', async () => {
+  const { jobLogLines } = await import('./format.js');
+  assert.deepEqual(jobLogLines([
+    'rm /var/lib/tentanas/0191f2c0-7a3b-7c11-9d2e-1234567890ab.json',
+    'wrote 4000787030016 bytes to /dev/sdd1',
+    'share dev-backups: created',
+  ]), [
+    'rm /var/lib/tentanas/[identyfikator].json',
+    'wrote 4000787030016 bytes to /dev/sdd1',
+    'share dev-backups: created',
+  ]);
+  assert.deepEqual(jobLogLines(null), []);
+  // Critic wave 9a, MINOR 1/2/4: names people chose and plain numbers stay;
+  // the node's neutral token and the older literals read in the reader's
+  // language.
+  assert.deepEqual(jobLogLines([
+    'zpool create ata-archive mirror sdb sdc',
+    'share scsi-luns created; pool eui.lab; tank 1234567890123456 used',
+    'uuid ⟦id⟧, old [identifier], older [identyfikator]',
+    'vdev ata-WDC_WD40EFRX-68N32N0_WD-WCC7K1234567 FAULTED, lun naa.60014054d1a2b3c4d5e6f7a8',
+    '$ zpool replace tank 11427865429582413522 sdb; $ zpool offline tank 98765432109876543',
+    '   id: 12156453278383891134; size 9007199254740992',
+    'dataset tank/usb-backup_2024 and tank/ata-data_2025; disk sn-WD-WCC7K7654321; share sn-backups',
+  ]), [
+    'zpool create ata-archive mirror sdb sdc',
+    'share scsi-luns created; pool eui.lab; tank 1234567890123456 used',
+    'uuid [identyfikator], old [identyfikator], older [identyfikator]',
+    'vdev [identyfikator] FAULTED, lun [identyfikator]',
+    '$ zpool replace tank [identyfikator] sdb; $ zpool offline tank [identyfikator]',
+    '   id: [identyfikator]; size 9007199254740992',
+    'dataset tank/usb-backup_2024 and tank/ata-data_2025; disk [identyfikator]; share sn-backups',
+  ]);
+  await I18n.setLanguage('en');
+  try {
+    assert.deepEqual(jobLogLines(['uuid ⟦id⟧']), ['uuid [identifier]']);
   } finally {
     await I18n.setLanguage('pl');
   }

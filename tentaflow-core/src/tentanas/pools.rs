@@ -1009,6 +1009,66 @@ pub fn vdev_groups(
 
 // ----- live reads -----------------------------------------------------------------
 
+/// Serialises what puts a share or a target on a pool against a pool
+/// destroy: `share_create`, `target_create` and a configuration import hold
+/// it from their read of the pools to the rows they write, and a pool destroy
+/// holds it from its last check of other organisations' resources to the end
+/// of `zpool destroy` (critic wave 9a, MINOR 5). A tokio mutex: both sides
+/// hold it across awaits.
+///
+/// One per node database (`db`), which in production is one per node; tests
+/// with their own database never contend with each other.
+pub fn resources_lock(db: &DbPool) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    locks.entry(Arc::as_ptr(db) as usize).or_default().clone()
+}
+
+/// How long a creation waits for a running pool destroy before refusing.
+pub const RESOURCES_LOCK_WAIT: Duration = Duration::from_secs(3);
+
+/// The refusal of a creation that met a pool destroy in progress (critic
+/// wave 9a, R2-MAJOR 1): the destroy may run for minutes on a failing pool,
+/// and a creation that waited that long would land after the screen gave up
+/// — a share the user was told had failed. Worded by the screen.
+pub const POOL_DESTROY_IN_PROGRESS: &str = "refusal:pool_destroy_in_progress";
+
+/// The creation side of `resources_lock`: waits at most
+/// `RESOURCES_LOCK_WAIT`, else `None` and the caller refuses with
+/// `POOL_DESTROY_IN_PROGRESS`. Never an unbounded wait.
+pub async fn try_resources_lock(db: &DbPool) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    tokio::time::timeout(RESOURCES_LOCK_WAIT, resources_lock(db).lock_owned()).await.ok()
+}
+
+/// Whether any of `shares` or `targets` lives on `pool`: a share on one of
+/// its datasets or under one of their mountpoints, a zvol LUN of the pool, a
+/// file LUN under one of its mountpoints. `mountpoints` are the mountpoints
+/// of the pool's datasets (`zfs list -r`); `/`, `none`, `legacy` and `-`
+/// mount nothing a path could be under. The same places the destroy
+/// dialog's dependents list reads (n17a, pool-detail.js
+/// `paintPoolDependents`), plus a share whose path IS a mountpoint.
+pub fn holds_resources(
+    pool: &str,
+    mountpoints: &[String],
+    shares: &[store::ShareRow],
+    targets: &[store::TargetRow],
+) -> bool {
+    let on_pool = |name: &str| name == pool || name.strip_prefix(pool).is_some_and(|rest| rest.starts_with('/'));
+    let mounts: Vec<&str> = mountpoints
+        .iter()
+        .map(|m| m.trim_end_matches('/'))
+        .filter(|m| m.starts_with('/') && !m.is_empty())
+        .collect();
+    let under_mount = |path: &str| {
+        mounts.iter().any(|m| path == *m || path.strip_prefix(m).is_some_and(|rest| rest.starts_with('/')))
+    };
+    shares.iter().any(|s| s.dataset.as_deref().is_some_and(on_pool) || under_mount(&s.source_path))
+        || targets.iter().any(|t| {
+            t.luns.iter().any(|l| if l.source_kind == "zvol" { on_pool(&l.source) } else { under_mount(&l.source) })
+        })
+}
+
 pub async fn list_rows() -> Result<Vec<PoolListRow>, BrokerError> {
     let text = zfs::zpool(&["list", "-Hp", "-o", LIST_COLUMNS]).await?;
     Ok(parse_list(&text))
@@ -1041,6 +1101,35 @@ fn live_io() -> &'static parking_lot::RwLock<HashMap<String, NasPoolIo>> {
     static IO: std::sync::OnceLock<parking_lot::RwLock<HashMap<String, NasPoolIo>>> =
         std::sync::OnceLock::new();
     IO.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+}
+
+/// Device GUID → the name the node knows its leaf by (the kernel name it
+/// was last seen under), for every leaf `zpool status` could only name by
+/// its GUID. The GUID is what the screen sends back to replace, detach or
+/// offline such a leaf, so it is what those jobs' argv carries: the job log
+/// names it from here (`log_ids::LogNames::load`, owner's rule: no GUIDs).
+/// Kept for the process's life; a GUID nothing named maps to "".
+fn leaf_guids() -> &'static parking_lot::RwLock<HashMap<String, String>> {
+    static GUIDS: std::sync::OnceLock<parking_lot::RwLock<HashMap<String, String>>> = std::sync::OnceLock::new();
+    GUIDS.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+}
+
+pub(crate) fn remember_leaf_guid(guid: &str, name: Option<&str>) {
+    let name = name.unwrap_or_default().trim().to_string();
+    let known = leaf_guids().read().get(guid) == Some(&name);
+    if !known {
+        leaf_guids().write().insert(guid.to_string(), name);
+    }
+}
+
+/// Every leaf GUID with a name (see `leaf_guids`).
+pub fn named_leaf_guids() -> Vec<(String, String)> {
+    leaf_guids()
+        .read()
+        .iter()
+        .filter(|(_, name)| !name.is_empty())
+        .map(|(guid, name)| (guid.clone(), name.clone()))
+        .collect()
 }
 
 /// Kernel name → (disk id, size) of every disk the inventory knows, so a vdev
@@ -1080,6 +1169,9 @@ fn assemble(
             // GUI). The "was …" note is consumed here: it carries the old
             // path, often a by-id link, and a screen prints `note` as it is.
             leaf.last_known_name = last_known_leaf_name(leaf, |link| last_name_by_link(db, link));
+            if is_device_guid(&leaf.name) {
+                remember_leaf_guid(&leaf.name, leaf.last_known_name.as_deref());
+            }
             if leaf.note.starts_with("was ") {
                 leaf.note.clear();
             }
@@ -1263,8 +1355,27 @@ pub async fn command_job(
 ) -> anyhow::Result<()> {
     super::jobs::run_step(&h, &command, explicit.as_deref(), MUTATION_TIMEOUT).await?;
     drop(explicit);
+    forget_removed_pool(h.db(), &command).await;
     h.progress(100);
     Ok(())
+}
+
+/// After a SUCCESSFUL `zpool destroy` or `zpool export` by TentaNas: the pool
+/// is meant to be absent, so the labels it leaves on its disks are not a
+/// missing pool (`store::forget_pool`, `disks::pool_import_alerts`). A failed
+/// write is logged: the worst it leaves is one alert the admin can read.
+///
+/// Under the disks' health gate (`disks::forget_known_pool`): an inventory
+/// pass that read `zpool list` before the destroy cannot record the pool
+/// again after this forgot it (critic wave 9a, R2-MINOR 4).
+pub async fn forget_removed_pool(db: &DbPool, command: &HelperCommand) {
+    let pool = match command {
+        HelperCommand::ZpoolDestroy { pool } | HelperCommand::ZpoolExport { pool, .. } => pool,
+        _ => return,
+    };
+    if let Err(e) = super::disks::forget_known_pool(db, pool).await {
+        tracing::warn!("tentanas: the removed pool {pool} stays in the known pools: {e}");
+    }
 }
 
 /// `zpool create`, with the encryption key on stdin when the wizard asked for
@@ -1277,6 +1388,11 @@ pub async fn create_job(
     key: Option<KeyForNewRoot>,
     explicit: Option<Arc<ElevationToken>>,
 ) -> anyhow::Result<()> {
+    // The new pool is in no record yet: its name is kept in this job's log
+    // as a name, whatever it looks like.
+    if let HelperCommand::ZpoolCreate { pool, .. } = &command {
+        h.name_id(pool, pool);
+    }
     match key {
         Some(key) => {
             super::jobs::run_step_with_key(

@@ -11,7 +11,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage,
-  jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames, nodeTextTitle,
+  jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames, nodeTextTitle, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, setClass, patchHtml, patchKeyedList } from '/js/lib/dom-patch.js';
 import { isOpaqueId, isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
@@ -207,7 +207,7 @@ export function paintJobRow(row, j) {
   const chip = row.querySelector('[data-role="status"]');
   setAttr(chip, 'status', jobTone(j.status));
   setAttr(chip, 'label', T('jobs.status_' + j.status));
-  const last = (j.log || []).slice(-1)[0] || '';
+  const last = jobLogLines((j.log || []).slice(-1))[0] || '';
   const author = jobAuthor(j.startedBy);
   const sub = row.querySelector('[data-role="sub"]');
   setText(sub, T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }) + (last ? ' · ' + last : ''));

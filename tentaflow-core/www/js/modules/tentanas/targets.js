@@ -79,7 +79,7 @@ export function portalCellHtml(target) {
 export function sourceCellHtml(target) {
   const lun = (target.luns || [])[0];
   if (!lun) return '—';
-  const size = [fmtBytes(lun.sizeBytes), lun.thin ? 'thin' : ''].filter(Boolean).join(' · ');
+  const size = [fmtBytes(lun.sizeBytes), lun.thin ? T('datasets.thin_short') : ''].filter(Boolean).join(' · ');
   return `<span class="tf-table__cell--mono">zvol ${escapeHtml(lun.source)}</span><div class="tf-table__cell-sub">${escapeHtml(size)}</div>`;
 }
 
@@ -90,7 +90,7 @@ export function sourceCellHtml(target) {
 export function fleetSourceHtml(target) {
   const lun = (target.luns || [])[0];
   if (!lun) return '—';
-  const line = [`zvol ${lun.source}`, fmtBytes(lun.sizeBytes), lun.thin ? 'thin' : ''].filter(Boolean).join(' · ');
+  const line = [`zvol ${lun.source}`, fmtBytes(lun.sizeBytes), lun.thin ? T('datasets.thin_short') : ''].filter(Boolean).join(' · ');
   return `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(line)}</span></span>`;
 }
 

@@ -6704,6 +6704,10 @@
         "elastic_add_disk_abort_unconfirmed": {
           "title": "Macierz {array}: niepotwierdzone wycofanie dodania dysku",
           "detail": "Wycofanie zatrzymało się po pierwszym kroku; dodawanie dysku pozostaje niedokończone i można je dokończyć albo ponownie wycofać. Błąd kroku jest w treści węzła"
+        },
+        "pool_not_imported": {
+          "title": "Pula {pool} nie została zaimportowana",
+          "detail": "{n} {n|dysk tego węzła ma|dyski tego węzła mają|dysków tego węzła ma} etykietę tej puli, a węzeł nie zaimportował jej w ciągu {minutes} min od startu TentaNas. Zaimportuj pulę (pula szyfrowana może czekać na klucz); jeśli pula już nie istnieje, jej dyski można wyczyścić."
         }
       },
       "node_text": "Treść węzła",
@@ -7046,7 +7050,10 @@
         "ksmbd_experimental": "EKSPERYMENTALNE (wg dokumentacji jądra)",
         "module_loaded": "{module} załadowany",
         "module_on_demand": "{module} dostępny, ładowany przy pierwszym użyciu",
-        "module_absent": "modułu {module} nie ma w drzewie modułów jądra"
+        "module_absent": "modułu {module} nie ma w drzewie modułów jądra",
+        "anyraid_not_in_zfs": "{zfs} na tym węźle nie obsługuje AnyRAID",
+        "anyraid_supported_not_offered": "AnyRAID obsługiwane przez {zfs}, jeszcze niedostępne w TentaNas",
+        "anyraid_unreadable": "Nie udało się sprawdzić, czy {zfs} na tym węźle obsługuje AnyRAID"
       }
     },
     "feature": {
@@ -7063,7 +7070,8 @@
       "ledmon": "ledmon (diody obudowy)",
       "mdadm": "mdadm",
       "rdma": "RDMA (InfiniBand / RoCE)",
-      "ksmbd": "ksmbd (SMB Direct przez RDMA)"
+      "ksmbd": "ksmbd (SMB Direct przez RDMA)",
+      "anyraid": "ZFS AnyRAID"
     },
     "feature_status": {
       "ok": "OK",
@@ -7076,7 +7084,9 @@
       "outdated": "przestarzała",
       "missing": "brak",
       "no_device": "brak urządzenia",
-      "exposed": "interfejs z bramą domyślną"
+      "exposed": "interfejs z bramą domyślną",
+      "unsupported": "niedostępne",
+      "not_offered": "jeszcze niedostępne w TentaNas"
     },
     "sudo": {
       "title": "Hasło sudo — {node}",
@@ -7569,7 +7579,6 @@
       "kind_title": "Typ puli",
       "kind_sub": "Wybór jest nieodwracalny dla tej puli — determinuje możliwości i sposób rozbudowy.",
       "kind_zfs_desc": "Snapshoty, kompresja, samonaprawa danych",
-      "kind_anyraid_desc": "Niedostępne — Twój OpenZFS nie wspiera AnyRAID",
       "kind_elastic_desc": "Dowolne rozmiary dysków, rozbudowa o jeden",
       "disks_title": "Dyski",
       "disks_sub": "Dostępne są tylko dyski nieużywane przez inne pule.",
@@ -7606,7 +7615,7 @@
       "sub_layout": "Układ przekłada wybrane dyski na pojemność i odporność.",
       "header_sub_layout": "Dobierz układ danych i podstawowe opcje puli.",
       "sub_summary": "Sprawdź konfigurację przed utworzeniem puli.",
-      "kind_anyraid_title": "OpenZFS {v} nie wspiera AnyRAID — zobacz Środowisko",
+      "kind_anyraid_title": "{reason} — zobacz Środowisko",
       "kind_hint": "Równe dyski i maksymalne bezpieczeństwo → ZFS · różne rozmiary i dokładanie po jednym → Elastic Array.",
       "occupied_title": "w puli {pool} ({layout}) — niedostępne",
       "occupied_sub": "zajęte: pula {pool}",
@@ -9039,7 +9048,10 @@
       "elastic_disk_absent": "Dysku, który miałby zostać wyczyszczony, nie ma na tym nodzie — podłącz go i spróbuj ponownie",
       "job_not_cancellable": "Tego zadania nie można anulować — przerwanie nie zatrzymałoby już rozpoczętej pracy",
       "pool_detach_not_allowed": "Tego dysku nie można teraz odłączyć: odłączyć można tylko dysk zastąpiony dyskiem zapasowym, który jest sprawny, i dopiero gdy resilver zakończył się bez błędów, a pula nie zgłasza trwałych błędów danych.",
-      "elastic_one_cache_disk": "Macierz Elastic może mieć najwyżej jeden dysk cache"
+      "elastic_one_cache_disk": "Macierz Elastic może mieć najwyżej jeden dysk cache",
+      "pool_destroy_foreign_resources": "Tej puli nie można zniszczyć: korzystają z niej udziały lub targety innej organizacji.",
+      "pool_destroy_unverified": "Nie udało się sprawdzić, czy z tej puli korzystają inne organizacje, więc nie została zniszczona. Spróbuj ponownie.",
+      "pool_destroy_in_progress": "Trwa niszczenie puli na tym węźle, spróbuj ponownie za chwilę."
     },
     "unreachable": {
       "title": "Węzeł {node} niedostępny",
