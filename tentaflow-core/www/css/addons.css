@@ -1570,6 +1570,11 @@ tf-chip.addon-badge.state-off > .tf-chip {
 .addon-disable-window .disable-stop-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; color: var(--text); }
 .addon-disable-window .disable-stop-result { border: 1px solid var(--border); border-left: 3px solid var(--warning); border-radius: var(--radius-sm, 8px); padding: 8px 10px; background: var(--bg-2); color: var(--text); }
 .addon-disable-window .disable-stop-result[hidden] { display: none; }
+/* n18d footer (mockup n18-modale-2): Cancel on the left, the actions on the
+   right. The slotted footer takes the whole row so the cancel's auto margin
+   pushes the rest right (hidden stop-step buttons take no room). */
+.addon-disable-window > [slot="footer"] { flex: 1 1 auto; }
+.addon-disable-window > [slot="footer"] > tf-button[data-action="cancel"] { margin-right: auto; }
 
 /* MAJOR 22 — the per-node table of a fleet-wide uninstall (modules/addons/uninstall-dialog.js). */
 .addon-uninstall-window .uninstall-nodes {

@@ -536,7 +536,10 @@ pub struct NasAlert {
     /// - 'sharing_resume_failed' {attempts} — sharing stopped with the
     ///   disable (n18d, wave 10) could not be resumed; retried with a back-off;
     /// - 'sharing_share_not_resumed' {share} — one share that was serving
-    ///   when sharing stopped did not come back (its organisation's alert).
+    ///   when sharing stopped did not come back (its organisation's alert);
+    /// - 'sharing_stop_interrupted' {phase} — a restart cut off the stop or
+    ///   the resume of sharing ('stopping' | 'resuming'); sharing stays
+    ///   stopped until TentaNas is enabled (mode B: the channel armed).
     ///
     /// Every parameter is a string, as in `NasHealthReason`.
     #[serde(default)]

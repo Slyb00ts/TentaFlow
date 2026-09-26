@@ -5809,6 +5809,7 @@
     "node_unsupported": "not supported",
     "node_init_error": "start failed",
     "node_nothing": "nothing to do — the app keeps no state on this node",
+    "node_absent": "the app is not installed on this node — nothing to do (the node running the uninstall checks this itself; should it be unable to, type the node's name below)",
     "node_offline_scope": "the node does not answer — the uninstall runs when it is back",
     "node_plan_error": "could not read the scope from this node",
     "node_blocked": "blocked: {what}",
@@ -5824,6 +5825,7 @@
       "done_with_warnings": "uninstalled with warnings",
       "failed": "failed",
       "failed_in": "at the step: {phase}",
+      "failed_because": "the node refused: {what}",
       "absent": "the app is no longer on the node",
       "unreachable": "node not answering",
       "unreachable_detail": "the uninstall runs when it is back",
@@ -6758,6 +6760,11 @@
           "title": "Sharing did not come back on this node",
           "detail": "The share configs could not be written (attempt {n}). The node retries with a growing interval; in mode B an armed privilege channel is needed."
         },
+        "sharing_stop_interrupted": {
+          "title": "Sharing on this node stays stopped after a restart",
+          "detail_stopping": "A restart of the node interrupted the stop of sharing. Shares and targets stay suspended; they come back when TentaNas is enabled — in mode B only once the privilege channel is armed.",
+          "detail_resuming": "A restart of the node interrupted the resume of sharing. Shares and targets stay suspended; the node tries again when TentaNas is enabled — in mode B only once the privilege channel is armed."
+        },
         "sharing_share_not_resumed": {
           "title": "Share {share} did not come back when sharing was resumed",
           "detail": "The share's state says why. The node retries with a growing interval; the alert closes once the share serves again."
@@ -6832,7 +6839,7 @@
       "pool_filter_all": "Pool: all",
       "smart_selected": "SMART test of selected ({n})",
       "smart_selected_title": "SMART test — {n} {n|disk|disks}",
-      "smart_selected_done": "SMART test started on {n} {n|disk|disks}",
+      "smart_selected_done": "SMART test requested on {n} {n|disk|disks} — the job shows each disk's result",
       "legend_title": "How to read health",
       "legend_hint": "The status combines SMART, the pool error counters (READ/WRITE/CKSUM), kernel I/O errors and trends — not SMART alone.",
       "legend_ok": "no symptom in any source",
@@ -7015,6 +7022,7 @@
       "disk_reason": {
         "self_test_running": "a SMART test already runs on this disk",
         "disk_gone": "the disk is no longer in the node’s inventory",
+        "disk_unknown": "this node does not know the disk — it was not tested",
         "start_failed": "the disk did not accept the test command",
         "privilege": "the password or the privilege channel was refused — the disks after it were not started",
         "test_failed": "the disk failed the test: {detail}",
@@ -8306,7 +8314,7 @@
       "smart_pill_long": "long: {when}",
       "smart_sub": "last short: {short} · last long: {long}",
       "smart_no_disks": "No disk on this node supports SMART.",
-      "smart_started": "SMART test started on {n} {n|disk|disks|disks}",
+      "smart_started": "SMART test requested on {n} {n|disk|disks|disks} — the job shows each disk's result",
       "last_run": "last: {t}",
       "never_ran": "not run yet",
       "enabled_done": "Enabled: {name}",
@@ -8805,7 +8813,7 @@
           "snapshot": "snapshot schedule of dataset {subject}",
           "smart": "SMART test schedule"
         },
-        "sharing_stop": "Stops sharing on node {node} — shares: {shares}; targets: {targets} — then disables TentaNas on the whole fleet.",
+        "sharing_stop": "Stops sharing on node {node} — shares: {shares}; targets: {targets} — then disables TentaNas on the whole fleet. The list is as of the request — the node reads it again when it stops sharing.",
         "sharing_stop_none": "none",
         "sharing_stop_node_unnamed": "without a name",
         "sharing_stop_other_shares": "{n} {n|share|shares} of other organisations",
@@ -9174,7 +9182,7 @@
       "elastic_one_cache_disk": "An Elastic Array can have at most one cache disk",
       "pool_destroy_foreign_resources": "This pool cannot be destroyed: another organisation's shares or targets use it.",
       "pool_destroy_unverified": "Could not check whether other organisations use this pool, so it was not destroyed. Try again.",
-      "pool_destroy_in_progress": "A pool is being destroyed on this node; try again in a moment.",
+      "pool_destroy_in_progress": "Another change to this node's pools, shares or targets is in progress; try again in a moment.",
       "forward_address_refused": "This address is not allowed: a private network not on the platform admin’s internal collector list, or loopback, link-local or a cloud metadata address.",
       "forward_https_only": "The webhook must be an https:// address (http:// only to a host on the platform admin’s list marked “allow http”).",
       "forward_node_retired": "The node’s shared target is retired: it can only be deleted.",

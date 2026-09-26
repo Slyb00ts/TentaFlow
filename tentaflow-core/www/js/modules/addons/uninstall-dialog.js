@@ -47,6 +47,12 @@ const STATUS_POLL_MS = 2000;
 const STATUS_FOLLOW_MS = 10 * 60 * 1000;
 /** A node that has finished, one way or the other. */
 const FINAL_STATES = new Set(['done', 'failed', 'absent']);
+/**
+ * The teardown steps in which a node refuses because of what its plan calls
+ * blocking (`NativeAppHooks::refusable_teardown`): a failure there is that
+ * blocker, as the node last published it or as its plan said.
+ */
+const REFUSAL_PHASES = new Set(['tentanas_elastic_check']);
 /** The refusals a node answers BEFORE the removal replicates. */
 const NOT_STARTED = /refusal:(teardown_[a-z_]+)/;
 
@@ -236,6 +242,21 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
 
   const stateOfNode = (node) => nodeState.get(node.nodeId) || {};
 
+  // A node with work, as this dialog knows it: `nodeHasWork`, and not a node
+  // that answered that the instance is not installed there (critic wave 9b,
+  // MINOR 10) — such a node neither counts nor holds anything back. The node
+  // running the uninstall asks that peer again itself before it proceeds
+  // (`teardown_preflight`, wave 11 round 2): this screen's reading is never
+  // taken on trust. Should that check fail (the peer dropped off meanwhile),
+  // the uninstall is refused and the peer's retype field is there.
+  const hasWork = (node) => nodeHasWork(node) && stateOfNode(node).planState !== 'absent';
+
+  // The nodes "Odinstaluj na N węzłach" counts: with work, and known to have
+  // the instance — they reported a status for it, or their own plan came
+  // back. A peer that never reported and has not answered yet is listed, not
+  // counted.
+  const countedNodes = () => nodes.filter((n) => hasWork(n) && (n.status !== 'unknown' || stateOfNode(n).planState === 'ok'));
+
   // Whether an OFFLINE node may be torn down when it returns: only when the
   // blockers it last published are known and empty.
   const offlineCleared = (node) => node.lastKnown === true && !(node.lastBlocks || []).length;
@@ -247,7 +268,7 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
       return (plan.entries || []).filter((e) => e.blocks).map((e) => ({ node: null, text: t('blocked_reason_local', { what: entryLabel(e) }) }));
     }
     const out = [];
-    for (const node of nodes.filter(nodeHasWork)) {
+    for (const node of nodes.filter(hasWork)) {
       const s = stateOfNode(node);
       const name = nodeName(node);
       // Acknowledged by its retyped name: the uninstall proceeds without it.
@@ -275,8 +296,12 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
   // moved — never acknowledged: its teardown would refuse for certain
   // (wave-9b critic, round 3, MAJOR C; the node refuses it too).
   function ackable(node) {
-    if (node.local || !nodeHasWork(node) || started) return false;
+    if (node.local || started) return false;
     const s = stateOfNode(node);
+    // Kept for a peer that said it has no instance: optional, but the way
+    // on should the node running the uninstall be unable to confirm it.
+    if (s.planState === 'absent') return nodeHasWork(node);
+    if (!hasWork(node)) return false;
     if (s.planState === 'offline') return !offlineCleared(node);
     return s.planState === 'error';
   }
@@ -293,6 +318,7 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
   const syncButton = () => {
     if (armed() && !busy && !started) confirmBtn.removeAttribute('disabled');
     else confirmBtn.setAttribute('disabled', '');
+    if (nodes.length) setText(confirmBtn, t('button_fleet', { n: countedNodes().length }));
   };
 
   // ----- the per-node rows, patched in place --------------------------------
@@ -302,6 +328,7 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
   function scopeLines(node) {
     const s = stateOfNode(node);
     if (node.unpaired) return [{ text: t('node_unpaired') }];
+    if (s.planState === 'absent') return [{ text: t('node_absent') }];
     if (!nodeHasWork(node)) return [{ text: t('node_nothing') }];
     if (s.planState === 'offline') {
       if (offlineCleared(node)) return [{ text: t('node_offline_scope') }];
@@ -330,7 +357,7 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
       el.classList.toggle('blocked', !!line.blocked);
     });
     const s = stateOfNode(node);
-    const retry = !started && nodeHasWork(node)
+    const retry = !started && hasWork(node)
       && (s.planState === 'error' || (s.planState === 'offline' && !offlineCleared(node)));
     setAttr(row.querySelector('[data-act="retry"]'), 'hidden', !retry);
     setAttr(row.querySelector('[data-role="ack"]'), 'hidden', !ackable(node));
@@ -373,7 +400,7 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
     const own = stateOfNode(node).planState === 'ok' ? stateOfNode(node).plan : null;
     const chip = row.querySelector('[data-role="backup-chip"]');
     const file = own ? String(own.backupFile || '') : '';
-    if (own && nodeHasWork(node) && (file || own.privilege)) {
+    if (own && hasWork(node) && (file || own.privilege)) {
       setAttr(chip, 'status', 'ok');
       setAttr(chip, 'label', t('backup_auto'));
       setAttr(chip, 'hidden', null);
@@ -389,7 +416,7 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
   function stateOf(node) {
     const s = stateOfNode(node);
     if (!started) return { status: 'neutral', label: t('state.planned'), detail: '' };
-    if (!nodeHasWork(node)) return { status: 'neutral', label: t('state.nothing'), detail: '' };
+    if (!hasWork(node)) return { status: 'neutral', label: t('state.nothing'), detail: '' };
     if (notStarted && !node.local) return { status: 'neutral', label: t('state.not_started'), detail: t('state.not_started_detail') };
     if (s.unreachable) return { status: 'offline', label: t('state.unreachable'), detail: t('state.unreachable_detail') };
     const st = s.status;
@@ -403,6 +430,21 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
       case 'running': return { status: 'accent', label: t('state.running'), detail: worded('phases', st.phase) };
       case 'done': return { status: warnings ? 'warn' : 'ok', label: t(warnings ? 'state.done_with_warnings' : 'state.done'), detail: warnings };
       case 'failed': {
+        // What refused, from the node's own plan read after the failure
+        // (critic wave 9b, MINOR 8): "3 macierze Elastic pod nadzorem", not
+        // only the step it stopped at.
+        // A peer's instance row is gone once the removal reached it, so its
+        // plan cannot be read again: a refusal in the check step is then
+        // the blocker it had shown or last published.
+        // Only a failure IN a refusal step is a refusal (wave 11 round 2):
+        // a failed wipe or backup on a node that also has a blocker says
+        // the step it failed at.
+        const refusal = REFUSAL_PHASES.has(st.phase);
+        const known = !refusal ? []
+          : s.failBlocks?.length ? s.failBlocks
+            : [...(s.plan?.entries || []).filter((e) => e.blocks), ...(node.lastBlocks || [])].slice(0, 1);
+        const blocks = known.map(entryLabel).filter(Boolean);
+        if (blocks.length) return { status: 'err', label: t('state.failed'), detail: t('state.failed_because', { what: blocks.join(', ') }) };
         const phase = worded('phases', st.phase);
         return { status: 'err', label: t('state.failed'), detail: phase ? t('state.failed_in', { phase }) : '' };
       }
@@ -451,7 +493,10 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
       nodeState.set(node.nodeId, { ...stateOfNode(node), plan: own, planState: 'ok' });
       paintAll();
     }, (err) => {
-      nodeState.set(node.nodeId, { ...stateOfNode(node), planState: err?.code === 'NodeUnreachable' ? 'offline' : 'error' });
+      // NotFound is the node itself answering that the instance is not
+      // installed there: nothing to do on it (MINOR 10).
+      const planState = err?.code === 'NodeUnreachable' ? 'offline' : err?.code === 'NotFound' ? 'absent' : 'error';
+      nodeState.set(node.nodeId, { ...stateOfNode(node), planState });
       paintAll();
     });
   }
@@ -495,6 +540,9 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
     }
     let ok = true;
     for (const job of jobs) {
+      // Closed mid-arming (critic round 3, C6): no further node is armed;
+      // the caller takes back what was already handed out.
+      if (closed) break;
       try {
         await ApiBinary.action('addonTeardownArmRequest', { addonId, sudoPassword: job.password },
           job.node && !job.node.local ? { targetNodeId: job.node.nodeId } : undefined);
@@ -516,11 +564,21 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
     pollTimer = null;
     if (!win.isConnected) return;
     // After a refusal nothing reached the other nodes: only this one is read.
-    const open = nodes.filter((n) => nodeHasWork(n) && (!notStarted || n.local) && !FINAL_STATES.has(stateOfNode(n).status?.state));
+    const open = nodes.filter((n) => hasWork(n) && (!notStarted || n.local) && !FINAL_STATES.has(stateOfNode(n).status?.state));
     await Promise.all(open.map(async (node) => {
       try {
         const status = await ApiBinary.action('addonTeardownStatusRequest', { addonId }, node.local ? undefined : { targetNodeId: node.nodeId });
         nodeState.set(node.nodeId, { ...stateOfNode(node), status, unreachable: false });
+        // A failed teardown keeps the instance on its node: its plan, read
+        // now, says what refused (MINOR 8). Asked once; a failed read leaves
+        // the step it stopped at.
+        if (status?.state === 'failed' && !stateOfNode(node).failAsked) {
+          nodeState.set(node.nodeId, { ...stateOfNode(node), failAsked: true });
+          try {
+            const own = await ApiBinary.action('addonTeardownPlanRequest', { addonId }, node.local ? undefined : { targetNodeId: node.nodeId });
+            nodeState.set(node.nodeId, { ...stateOfNode(node), failBlocks: (own?.entries || []).filter((e) => e.blocks) });
+          } catch { /* the step it stopped at is what is known */ }
+        }
       } catch (err) {
         if (err?.code === 'NodeUnreachable' || !node.online) {
           nodeState.set(node.nodeId, { ...stateOfNode(node), unreachable: true });
@@ -528,7 +586,7 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
       }
       paintNode(node);
     }));
-    const pending = nodes.some((n) => nodeHasWork(n) && !FINAL_STATES.has(stateOfNode(n).status?.state));
+    const pending = nodes.some((n) => hasWork(n) && !FINAL_STATES.has(stateOfNode(n).status?.state));
     if (pending && !notStarted && Date.now() < followUntil && win.isConnected) pollTimer = setTimeout(pollStatuses, STATUS_POLL_MS);
   }
 
@@ -648,10 +706,7 @@ export function openUninstallDialog({ addonId, displayName, onDone }) {
     plan = res;
     nodes = fleetNodes(plan);
     win.setAttribute('subtitle', plan.displayName || displayName || t('subtitle_unnamed'));
-    if (nodes.length) {
-      win.setAttribute('width', '820');
-      setText(confirmBtn, t('button_fleet', { n: nodes.filter(nodeHasWork).length }));
-    }
+    if (nodes.length) win.setAttribute('width', '820');
     // Last: tf-window consumes `title` into its header and re-reads it on
     // every later attribute change, so a title set before them would be lost.
     win.setAttribute('title', nodes.length ? t('confirm_title_fleet', { name: plan.displayName }) : t('confirm_title'));

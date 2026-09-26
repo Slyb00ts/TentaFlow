@@ -239,18 +239,69 @@ pub fn busy(db: &DbPool, org_id: &str) -> Result<Option<Busy>> {
 /// interrupted stop never completed; an interrupted resume is simply retried).
 ///
 /// `native_init` runs again on every reconcile, not only at start, so this
-/// acts only when it can take the node-wide share lock: a stop or a resume of
-/// THIS process holds it for its whole run, and its record is then live.
+/// acts only under the node-wide share lock: a stop or a resume of THIS
+/// process holds it for its whole run, and its record is then live — and
+/// once such a job released it, its record is final (`stopped`, or lifted),
+/// so a `stopping`/`resuming` record read under the lock is always one a
+/// restart cut off. When the lock is busy (a share apply at start, a job of
+/// this process), a waiter takes it as soon as it is free and recovers then
+/// (critic wave 10 round 3, R2-4), instead of leaving the record to the next
+/// reconcile. One waiter per node database: keyed by the pool's address,
+/// which is stable because `app_db::open` caches one pool per instance
+/// database. The lock it waits for is process-global
+/// (`shares::apply_mutex`), which is what makes "free lock ⇒ no live job of
+/// this process" true.
+///
+/// The record that is recovered raises a node alert (MINOR 5): sharing stays
+/// stopped until TentaNas is enabled — in mode B until the privilege channel
+/// is armed — and the alert says so, instead of the shares reading
+/// "wstrzymany" with nothing saying why. The resume closes it.
 pub fn recover_after_restart(db: &DbPool) -> Result<()> {
-    let Ok(_serial) = super::shares::apply_mutex().try_lock() else {
+    if let Ok(_serial) = super::shares::apply_mutex().try_lock() {
+        return recover_locked(db);
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return Ok(());
     };
+    static WAITING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> = std::sync::OnceLock::new();
+    let key = std::sync::Arc::as_ptr(db) as usize;
+    if !WAITING.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner()).insert(key) {
+        return Ok(());
+    }
+    let db = db.clone();
+    handle.spawn(async move {
+        let serial = super::shares::apply_mutex().lock().await;
+        if let Err(e) = recover_locked(&db) {
+            tracing::warn!("tentanas: the interrupted sharing record was not recovered: {e:#}");
+        }
+        drop(serial);
+        WAITING.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+    });
+    Ok(())
+}
+
+/// `recover_after_restart` under the share lock.
+fn recover_locked(db: &DbPool) -> Result<()> {
     if let Some(mut m) = mark(db)? {
         if m.phase != PHASE_STOPPED {
             tracing::warn!("tentanas: a sharing {} was interrupted by a restart; it is resumed when TentaNas is enabled", m.phase);
+            let interrupted = m.phase.clone();
             m.phase = PHASE_STOPPED.to_string();
             m.next_attempt_at = String::new();
             write_mark(db, &m)?;
+            let _ = store::raise_coded_alert(
+                db,
+                INTERRUPTED_ALERT_KEY,
+                "warning",
+                "node",
+                "sharing",
+                &store::AlertText::new(
+                    "sharing_stop_interrupted",
+                    "Sharing on this node stays stopped: a restart interrupted the sharing job",
+                    "shares and targets come back when TentaNas is enabled; in mode B once the privilege channel is armed",
+                )
+                .param("phase", interrupted),
+            );
         }
     }
     Ok(())
@@ -314,6 +365,10 @@ pub fn share_alert_key(share_name: &str) -> String {
 
 /// The dedupe key of the node alert saying the resume keeps failing.
 const RESUME_ALERT_KEY: &str = "sharing:resume";
+
+/// The dedupe key of the node alert saying a stop or a resume was cut off by
+/// a restart (critic wave 10, MINOR 5).
+const INTERRUPTED_ALERT_KEY: &str = "sharing:interrupted";
 
 // ----- what a stop takes out -------------------------------------------------------
 
@@ -645,6 +700,18 @@ pub async fn run_resume(db: &DbPool, ops: &dyn SharingOps, sink: &dyn StepSink, 
         tracing::warn!("tentanas sharing resume: shares not restored: {e:#}");
         let attempts = record.attempts + 1;
         write_mark(db, &Suspension { phase: PHASE_STOPPED.to_string(), attempts, next_attempt_at: backoff(attempts), ..record })?;
+        // The apply may have failed half-way (smb.conf written, the exports
+        // not): what it put back would serve while the record says stopped
+        // (critic wave 10 round 3, R2-5). Applied again under the record,
+        // every enabled share is judged suspended and leaves the configs.
+        // Unattended, like the resume (wave 11 round 2, M1): an unreadable
+        // dataset listing then writes nothing — `Change` would read it as
+        // "no datasets" and write every ZFS share out as a false "source
+        // missing" error.
+        if let Err(e) = ops.apply_shares(super::shares::ApplyTrigger::Resume).await {
+            tracing::warn!("tentanas sharing resume: shares not taken back out after the failed resume: {e:#}");
+            sink.log("the failed resume could not take the shares it had put back out of service again; each share's row says what serves");
+        }
         sink.line(0, "failed", &[failure_reason(&e)]);
         sink.line(1, "skipped", &[]);
         let _ = store::raise_coded_alert(
@@ -664,6 +731,7 @@ pub async fn run_resume(db: &DbPool, ops: &dyn SharingOps, sink: &dyn StepSink, 
         return Err(anyhow!("refusal:sharing_resume_failed"));
     }
     let _ = store::resolve_alert(db, RESUME_ALERT_KEY);
+    let _ = store::resolve_alert(db, INTERRUPTED_ALERT_KEY);
     let recorded_shares = Serving { shares: record.serving.shares.clone(), targets: Vec::new() };
     let left_shares = ops.not_serving(&recorded_shares).map(|s| s.shares).unwrap_or_else(|_| recorded_shares.shares.clone());
     raise_share_alerts(db, &left_shares);
@@ -1055,6 +1123,10 @@ mod tests {
     struct Fake {
         calls: Mutex<Vec<String>>,
         fail_shares: bool,
+        /// The dataset listing cannot be read: the apply goes through the
+        /// real `shares::readable_datasets` rule, and a reading it lets pass
+        /// (as "no datasets") is a write of every ZFS share as an error.
+        listing_unreadable: bool,
         targets_left: usize,
         fail_disable: bool,
         frozen: usize,
@@ -1100,6 +1172,12 @@ mod tests {
                 let job = resume_if_due(main, db).await.is_some();
                 let locked = super::super::shares::apply_mutex().try_lock().is_err();
                 self.seen_mid_stop.lock().unwrap().push(format!("wanted={wanted} job={job} locked={locked}"));
+            }
+            if self.listing_unreadable {
+                let unreadable = Err(super::super::broker::BrokerError::InvalidArgument("zfs unavailable".into()));
+                super::super::shares::readable_datasets(unreadable, trigger)?;
+                self.note("wrote_every_zfs_share_as_source_missing");
+                return Ok(());
             }
             if self.fail_shares { Err(anyhow!("smbd refused the include")) } else { Ok(()) }
         }
@@ -1307,6 +1385,9 @@ mod tests {
         let record = mark(&db).unwrap().unwrap();
         let fake = Fake { db: Some(db.clone()), fail_shares: true, ..Default::default() };
         run_resume(&db, &fake, &Lines::default(), record, "org-a").await.expect_err("failed");
+        // R2-5: whatever the failed apply put back is taken out again, under
+        // the record (the stop's own apply).
+        assert_eq!(fake.calls(), vec!["shares:Resume".to_string(), "shares:Resume+stopped".to_string()]);
         let m = mark(&db).unwrap().expect("still stopped");
         assert_eq!((m.phase.as_str(), m.attempts), (PHASE_STOPPED, 1));
         assert!(m.next_attempt_at > store::now());
@@ -1327,6 +1408,25 @@ mod tests {
         write_pending(&db, &Pending { shares: vec![row("s2", "kadry", "org-b")], attempts: 1, next_attempt_at: String::new() }).unwrap();
         run_retry(&db, &fake, &Lines::default(), pending(&db).unwrap().unwrap(), "org-a").await.expect("back");
         assert_eq!(pending(&db).unwrap(), None);
+    }
+
+    /// Wave 11 round 2, M1: a resume that failed because the dataset listing
+    /// cannot be read takes shares back out with the SAME unattended rule —
+    /// nothing is written, and no ZFS share is recorded as a false "source
+    /// missing" error.
+    #[tokio::test]
+    async fn a_resume_on_an_unreadable_listing_writes_no_false_errors() {
+        let db = pool();
+        suspend_for_test(&db, PHASE_RESUMING);
+        let record = mark(&db).unwrap().unwrap();
+        let fake = Fake { db: Some(db.clone()), listing_unreadable: true, ..Default::default() };
+        run_resume(&db, &fake, &Lines::default(), record, "org-a").await.expect_err("failed");
+        assert!(
+            !fake.calls().iter().any(|c| c.starts_with("wrote_every_zfs_share")),
+            "no write from an unreadable listing: {:?}",
+            fake.calls()
+        );
+        assert_eq!(mark(&db).unwrap().unwrap().phase, PHASE_STOPPED);
     }
 
     /// After a restart no sharing job runs: a `stopping` or `resuming`
@@ -1351,7 +1451,45 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             assert_eq!(mark(&db).unwrap().unwrap().phase, PHASE_STOPPED);
+            // MINOR 5: a node alert says why sharing stays stopped.
+            let alert = store::list_alerts(&db, true)
+                .unwrap()
+                .into_iter()
+                .find(|a| a.code == "sharing_stop_interrupted")
+                .expect("the interrupted job is said");
+            assert_eq!(alert.params.get("phase").map(String::as_str), Some(phase));
         }
+    }
+
+    /// R2-4: a record found while the share lock is busy is recovered as
+    /// soon as the lock is free, not left to the next reconcile; the resume
+    /// closes the alert.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_interrupted_record_is_recovered_once_the_lock_is_free_and_the_resume_closes_its_alert() {
+        let db = pool();
+        suspend_for_test(&db, PHASE_STOPPING);
+        let held = super::super::shares::apply_mutex().lock().await;
+        recover_after_restart(&db).unwrap();
+        assert_eq!(mark(&db).unwrap().unwrap().phase, PHASE_STOPPING, "left alone while the lock is held");
+        drop(held);
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if mark(&db).unwrap().unwrap().phase == PHASE_STOPPED {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(recovered.is_ok(), "recovered once the lock was free");
+        assert!(store::list_alerts(&db, true).unwrap().iter().any(|a| a.code == "sharing_stop_interrupted"));
+        let record = mark(&db).unwrap().unwrap();
+        let fake = Fake { db: Some(db.clone()), ..Default::default() };
+        run_resume(&db, &fake, &Lines::default(), record, "org-a").await.expect("resumed");
+        assert!(
+            !store::list_alerts(&db, true).unwrap().iter().any(|a| a.code == "sharing_stop_interrupted"),
+            "the resume closes it"
+        );
     }
 
     /// While sharing is stopped every enabled share that would serve and

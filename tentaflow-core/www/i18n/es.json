@@ -3703,6 +3703,7 @@
     "node_unsupported": "no compatible",
     "node_init_error": "error de inicio",
     "node_nothing": "nada que hacer: la aplicación no tiene estado en este nodo",
+    "node_absent": "la aplicación no está instalada en este nodo: nada que hacer (el nodo que desinstala lo comprueba por sí mismo; si no pudiera, escriba abajo el nombre del nodo)",
     "node_offline_scope": "el nodo no responde: la desinstalación se ejecutará cuando vuelva",
     "node_plan_error": "no se pudo leer el alcance de este nodo",
     "node_blocked": "bloqueado: {what}",
@@ -3718,6 +3719,7 @@
       "done_with_warnings": "desinstalado con avisos",
       "failed": "falló",
       "failed_in": "en el paso: {phase}",
+      "failed_because": "el nodo se negó: {what}",
       "absent": "la aplicación ya no está en el nodo",
       "unreachable": "el nodo no responde",
       "unreachable_detail": "la desinstalación se ejecutará cuando vuelva",
@@ -5505,6 +5507,7 @@
       "disk_reason": {
         "self_test_running": "ya hay una prueba SMART en curso en este disco",
         "disk_gone": "el disco ya no está en el inventario del nodo",
+        "disk_unknown": "este nodo no conoce el disco: no se probó",
         "start_failed": "el disco no aceptó la orden de prueba",
         "privilege": "contraseña o canal de privilegios rechazado: los discos siguientes no se iniciaron",
         "test_failed": "el disco no superó la prueba: {detail}",
@@ -6506,7 +6509,7 @@
       "smart_pill_long": "long: {when}",
       "smart_sub": "último short: {short} · último long: {long}",
       "smart_no_disks": "Ningún disco de este nodo admite SMART.",
-      "smart_started": "Prueba SMART iniciada en {n} {n|disco|discos|discos}",
+      "smart_started": "Prueba SMART solicitada en {n} {n|disco|discos|discos} — la tarea muestra el resultado de cada disco",
       "last_run": "último: {t}",
       "never_ran": "aún no ejecutado",
       "enabled_done": "Activado: {name}",
@@ -7031,6 +7034,11 @@
           "title": "La compartición no ha vuelto en este nodo",
           "detail": "No se pudo escribir la configuración de los recursos compartidos (intento {n}). El nodo reintenta con un intervalo creciente; en el modo B se necesita un canal de privilegios armado."
         },
+        "sharing_stop_interrupted": {
+          "title": "La compartición en este nodo sigue detenida tras un reinicio",
+          "detail_stopping": "Un reinicio del nodo interrumpió la detención de la compartición. Los recursos compartidos y los destinos siguen suspendidos; volverán cuando TentaNas esté activado — en el modo B solo cuando el canal de privilegios esté armado.",
+          "detail_resuming": "Un reinicio del nodo interrumpió la reanudación de la compartición. Los recursos compartidos y los destinos siguen suspendidos; el nodo lo intentará de nuevo cuando TentaNas esté activado — en el modo B solo cuando el canal de privilegios esté armado."
+        },
         "sharing_share_not_resumed": {
           "title": "El recurso compartido {share} no volvió al reanudar la compartición",
           "detail": "El estado del recurso indica por qué. El nodo reintenta con un intervalo creciente; la alerta se cierra cuando el recurso vuelve a servir."
@@ -7105,7 +7113,7 @@
       "pool_filter_all": "Pool: todos",
       "smart_selected": "Prueba SMART de la selección ({n})",
       "smart_selected_title": "Prueba SMART — {n} {n|disco|discos}",
-      "smart_selected_done": "Prueba SMART iniciada en {n} {n|disco|discos}",
+      "smart_selected_done": "Prueba SMART solicitada en {n} {n|disco|discos} — la tarea muestra el resultado de cada disco",
       "legend_title": "Cómo leer la salud",
       "legend_hint": "El estado combina SMART, los contadores de errores del pool (READ/WRITE/CKSUM), los errores de E/S del kernel y las tendencias — no solo SMART.",
       "legend_ok": "sin síntomas en ninguna fuente",
@@ -7589,7 +7597,7 @@
           "snapshot": "programación de instantáneas del dataset {subject}",
           "smart": "programación de las pruebas SMART"
         },
-        "sharing_stop": "Detiene la compartición en el nodo {node} — recursos compartidos: {shares}; destinos: {targets} — y después desactiva TentaNas en toda la flota.",
+        "sharing_stop": "Detiene la compartición en el nodo {node} — recursos compartidos: {shares}; destinos: {targets} — y después desactiva TentaNas en toda la flota. La lista refleja el momento de la solicitud: al detener, el nodo la vuelve a determinar.",
         "sharing_stop_none": "ninguno",
         "sharing_stop_node_unnamed": "sin nombre",
         "sharing_stop_other_shares": "{n} {n|recurso compartido|recursos compartidos} de otras organizaciones",
@@ -7958,7 +7966,7 @@
       "elastic_one_cache_disk": "Una matriz Elastic puede tener como máximo un disco de caché",
       "pool_destroy_foreign_resources": "Este pool no se puede destruir: lo usan recursos compartidos o destinos de otra organización.",
       "pool_destroy_unverified": "No se pudo comprobar si otras organizaciones usan este pool, así que no se destruyó. Inténtalo de nuevo.",
-      "pool_destroy_in_progress": "Se está destruyendo un pool en este nodo; inténtalo de nuevo en un momento.",
+      "pool_destroy_in_progress": "Hay otro cambio en curso en los pools, recursos compartidos o destinos de este nodo; inténtalo de nuevo en un momento.",
       "forward_address_refused": "Esta dirección no está permitida: una red privada fuera de la lista de colectores internos del administrador de la plataforma, o loopback, link-local o una dirección de metadatos de la nube.",
       "forward_https_only": "El webhook debe ser una dirección https:// (http:// solo a un host de la lista del administrador de la plataforma marcado «permitir http»).",
       "forward_node_retired": "El destino compartido del nodo está retirado: solo se puede eliminar.",

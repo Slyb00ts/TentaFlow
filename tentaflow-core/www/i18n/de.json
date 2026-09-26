@@ -3703,6 +3703,7 @@
     "node_unsupported": "nicht unterstützt",
     "node_init_error": "Startfehler",
     "node_nothing": "nichts zu tun — die App hat auf diesem Knoten keinen Zustand",
+    "node_absent": "die App ist auf diesem Knoten nicht installiert — nichts zu tun (der Knoten, der deinstalliert, prüft das selbst; kann er es nicht, geben Sie unten den Namen des Knotens ein)",
     "node_offline_scope": "der Knoten antwortet nicht — die Deinstallation läuft, sobald er zurück ist",
     "node_plan_error": "der Umfang ließ sich von diesem Knoten nicht lesen",
     "node_blocked": "blockiert: {what}",
@@ -3718,6 +3719,7 @@
       "done_with_warnings": "mit Hinweisen deinstalliert",
       "failed": "fehlgeschlagen",
       "failed_in": "beim Schritt: {phase}",
+      "failed_because": "der Knoten hat abgelehnt: {what}",
       "absent": "die App ist nicht mehr auf dem Knoten",
       "unreachable": "Knoten antwortet nicht",
       "unreachable_detail": "die Deinstallation läuft, sobald er zurück ist",
@@ -5505,6 +5507,7 @@
       "disk_reason": {
         "self_test_running": "auf diesem Laufwerk läuft bereits ein SMART-Test",
         "disk_gone": "das Laufwerk ist nicht mehr im Inventar des Knotens",
+        "disk_unknown": "dieser Knoten kennt das Laufwerk nicht — es wurde nicht getestet",
         "start_failed": "das Laufwerk hat den Testbefehl nicht angenommen",
         "privilege": "Passwort oder Rechtekanal abgelehnt — die folgenden Laufwerke wurden nicht gestartet",
         "test_failed": "das Laufwerk hat den Test nicht bestanden: {detail}",
@@ -5517,7 +5520,7 @@
         "shares_stopped": "{smb} SMB, {nfs} NFS gestoppt",
         "targets_stopped": "{iscsi} iSCSI, {nvmet} NVMe-oF aus dem Kernel entfernt",
         "targets_left": "{count} noch im Kernel",
-        "step_privilege": "kein Berechtigungskanal, oder das Passwort wurde abgelehnt",
+        "step_privilege": "kein Rechtekanal, oder das Passwort wurde abgelehnt",
         "step_failed": "der Schritt ist fehlgeschlagen — Details im Knotenprotokoll",
         "already_stopped": "die Freigabe wird bereits gestoppt oder ist gestoppt",
         "targets_frozen": "{count} {count|Target mit verschobenem Portal läuft|Targets mit verschobenem Portal laufen} noch — nichts wurde gestoppt",
@@ -6506,7 +6509,7 @@
       "smart_pill_long": "long: {when}",
       "smart_sub": "letzter short: {short} · letzter long: {long}",
       "smart_no_disks": "Kein Laufwerk auf diesem Knoten unterstützt SMART.",
-      "smart_started": "SMART-Test auf {n} {n|Laufwerk|Laufwerken|Laufwerken} gestartet",
+      "smart_started": "SMART-Test für {n} {n|Laufwerk|Laufwerke|Laufwerke} angefordert — der Auftrag zeigt das Ergebnis jedes Laufwerks",
       "last_run": "zuletzt: {t}",
       "never_ran": "noch nicht ausgeführt",
       "enabled_done": "Aktiviert: {name}",
@@ -6678,7 +6681,7 @@
         "source_unmounted": "Die Quelle der Freigabe ist nicht eingehängt — die Freigabe bleibt außerhalb der Konfiguration",
         "service_missing": "Auf diesem Knoten fehlt das Paket {package}",
         "smb_direct_not_served": "SMB Direct wird auf diesem Knoten nicht bereitgestellt (die Freigabe funktioniert weiter über das LAN)",
-        "sharing_suspended": "Die Freigabe auf diesem Knoten wurde zusammen mit der Deaktivierung von TentaNas gestoppt — sie kehrt zurück, sobald TentaNas wieder aktiviert wird. Im Modus B kehrt sie zurück, sobald der Berechtigungskanal scharfgeschaltet ist."
+        "sharing_suspended": "Die Freigabe auf diesem Knoten wurde zusammen mit der Deaktivierung von TentaNas gestoppt — sie kehrt zurück, sobald TentaNas wieder aktiviert wird. Im Modus B kehrt sie zurück, sobald der Rechtekanal scharfgeschaltet ist."
       },
       "state_suspended": "Angehalten"
     },
@@ -7029,7 +7032,12 @@
         },
         "sharing_resume_failed": {
           "title": "Die Freigabe auf diesem Knoten ist nicht zurückgekehrt",
-          "detail": "Die Freigabekonfiguration konnte nicht geschrieben werden (Versuch {n}). Der Knoten versucht es mit wachsendem Abstand erneut; im Modus B wird ein scharfgeschalteter Berechtigungskanal benötigt."
+          "detail": "Die Freigabekonfiguration konnte nicht geschrieben werden (Versuch {n}). Der Knoten versucht es mit wachsendem Abstand erneut; im Modus B wird ein scharfgeschalteter Rechtekanal benötigt."
+        },
+        "sharing_stop_interrupted": {
+          "title": "Die Freigabe auf diesem Knoten bleibt nach einem Neustart gestoppt",
+          "detail_stopping": "Ein Neustart des Knotens hat das Stoppen der Freigabe unterbrochen. Freigaben und Targets bleiben ausgesetzt; sie kehren zurück, sobald TentaNas aktiviert ist — im Modus B erst, wenn der Rechtekanal scharfgeschaltet ist.",
+          "detail_resuming": "Ein Neustart des Knotens hat die Wiederaufnahme der Freigabe unterbrochen. Freigaben und Targets bleiben ausgesetzt; der Knoten versucht es erneut, sobald TentaNas aktiviert ist — im Modus B erst, wenn der Rechtekanal scharfgeschaltet ist."
         },
         "sharing_share_not_resumed": {
           "title": "Freigabe {share} ist nach dem Fortsetzen nicht zurückgekehrt",
@@ -7105,7 +7113,7 @@
       "pool_filter_all": "Pool: alle",
       "smart_selected": "SMART-Test der Auswahl ({n})",
       "smart_selected_title": "SMART-Test — {n} {n|Festplatte|Festplatten}",
-      "smart_selected_done": "SMART-Test auf {n} {n|Festplatte|Festplatten} gestartet",
+      "smart_selected_done": "SMART-Test für {n} {n|Festplatte|Festplatten} angefordert — der Auftrag zeigt das Ergebnis jeder Festplatte",
       "legend_title": "Zustand richtig lesen",
       "legend_hint": "Der Status kombiniert SMART, die Pool-Fehlerzähler (READ/WRITE/CKSUM), Kernel-I/O-Fehler und Trends — nicht nur SMART.",
       "legend_ok": "kein Symptom in irgendeiner Quelle",
@@ -7589,7 +7597,7 @@
           "snapshot": "Snapshot-Zeitplan des Datasets {subject}",
           "smart": "SMART-Testzeitplan"
         },
-        "sharing_stop": "Stoppt die Freigabe auf Knoten {node} — Freigaben: {shares}; Targets: {targets} — und deaktiviert dann TentaNas in der ganzen Flotte.",
+        "sharing_stop": "Stoppt die Freigabe auf Knoten {node} — Freigaben: {shares}; Targets: {targets} — und deaktiviert dann TentaNas in der ganzen Flotte. Die Liste gibt den Stand der Anfrage wieder — beim Stoppen ermittelt der Knoten sie neu.",
         "sharing_stop_none": "keine",
         "sharing_stop_node_unnamed": "ohne Namen",
         "sharing_stop_other_shares": "{n} {n|Freigabe|Freigaben} anderer Organisationen",
@@ -7802,7 +7810,7 @@
         "portal_moved_head_no_address": "Das Portal des Targets ist nicht mehr dort, wo es festgelegt wurde. Die Adresse {address} gehörte zur Schnittstelle {interface}, die auf diesem Knoten vorhanden ist, aber derzeit keine Adresse hat (Link getrennt oder DHCP-Lease verloren).",
         "portal_moved_silent_since": "Seit {since} liegt sie auf {elsewhere}. Das Target ist nicht im Kernel, daher lauscht unter dieser Adresse nichts — der Export ist auf {elsewhere} nicht erreichbar und wird dort nicht automatisch neu gebunden.",
         "portal_moved_reachable_since": "Seit {since} liegt sie auf {elsewhere}, das niemand für dieses Target gewählt hat — der Export ist dort erreichbar.",
-        "sharing_suspended": "Die Freigabe auf diesem Knoten wurde zusammen mit der Deaktivierung von TentaNas gestoppt — das Target kehrt in den Kernel zurück, sobald TentaNas wieder aktiviert wird. Im Modus B kehrt es zurück, sobald der Berechtigungskanal scharfgeschaltet ist."
+        "sharing_suspended": "Die Freigabe auf diesem Knoten wurde zusammen mit der Deaktivierung von TentaNas gestoppt — das Target kehrt in den Kernel zurück, sobald TentaNas wieder aktiviert wird. Im Modus B kehrt es zurück, sobald der Rechtekanal scharfgeschaltet ist."
       },
       "host_state": "Status",
       "host_connected": "Verbunden",
@@ -7958,7 +7966,7 @@
       "elastic_one_cache_disk": "Ein Elastic Array kann höchstens ein Cache-Laufwerk haben",
       "pool_destroy_foreign_resources": "Dieser Pool kann nicht zerstört werden: Freigaben oder Targets einer anderen Organisation nutzen ihn.",
       "pool_destroy_unverified": "Es konnte nicht geprüft werden, ob andere Organisationen diesen Pool nutzen, daher wurde er nicht zerstört. Versuchen Sie es erneut.",
-      "pool_destroy_in_progress": "Auf diesem Knoten wird gerade ein Pool zerstört; versuchen Sie es gleich noch einmal.",
+      "pool_destroy_in_progress": "Auf diesem Knoten läuft gerade eine andere Änderung an Pools, Freigaben oder Targets; versuchen Sie es gleich noch einmal.",
       "forward_address_refused": "Diese Adresse ist nicht erlaubt: ein privates Netz außerhalb der Liste interner Kollektoren des Plattform-Admins, oder Loopback, Link-Local bzw. eine Cloud-Metadatenadresse.",
       "forward_https_only": "Der Webhook muss eine https://-Adresse sein (http:// nur zu einem Host auf der Liste des Plattform-Admins mit „http erlauben“).",
       "forward_node_retired": "Das gemeinsame Ziel des Knotens ist eingestellt: es kann nur gelöscht werden.",

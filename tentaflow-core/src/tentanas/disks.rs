@@ -1863,6 +1863,11 @@ struct State {
     /// the window, one still not imported raises `pool_not_imported` instead
     /// of its disks settling in silence (`pool_import_alerts`).
     boot_held_pools: BTreeSet<String>,
+    /// The pools the last complete inventory read saw imported, `None` until
+    /// one did: what the disable preview names (critic wave 9b, MINOR 3) —
+    /// not the remembered `nas_known_pools`, which also holds a pool that
+    /// was exported outside TentaNas.
+    imported_pools: Option<BTreeSet<String>>,
     telemetry: NasTelemetryState,
     inventory_error: Option<String>,
 }
@@ -1922,6 +1927,7 @@ impl State {
             started: Instant::now(),
             boot_clock_shift: Duration::ZERO,
             boot_held_pools: BTreeSet::new(),
+            imported_pools: None,
             telemetry: NasTelemetryState {
                 sampled_at: None,
                 smart_read_at: None,
@@ -1931,6 +1937,12 @@ impl State {
             inventory_error: None,
         }
     }
+}
+
+/// The pools the last complete inventory read saw imported, `None` before
+/// this process made one.
+pub fn imported_pools() -> Option<BTreeSet<String>> {
+    state().read().imported_pools.clone()
 }
 
 /// Current disks with live I/O, the sparkline and the telemetry state.
@@ -2326,6 +2338,9 @@ where
         }
     };
     let mut st = cell.write();
+    if leaf_states.is_some() {
+        st.imported_pools = Some(imported.keys().cloned().collect());
+    }
     let mut next = BTreeMap::new();
     let in_boot_grace = st.boot_elapsed() < BOOT_IMPORT_GRACE;
     // Leaf-state changes, whose alerts are written once the lock is released:

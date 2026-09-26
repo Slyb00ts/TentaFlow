@@ -252,6 +252,7 @@ const ALERT_PARAMS = {
   health: 'warning', name: 'sdq', name_source: 'live', operation: 'pool_destroy', subject: 'tank', array: 'media',
   runs: '4', oldest_secs: '32400', limit_secs: '28800', cause: 'files_busy', count: '2', alerted: '1',
   sweep_failed: 'true', error: 'EIO', target: 'vm-a', pool: 'tank', disks: '3', minutes: '10', attempts: '2', share: 'projekty',
+  phase: 'stopping',
 };
 const A = (code, params = ALERT_PARAMS, extra = {}) => ({
   alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'x', title: 'English title', detail: 'English detail', code, params, reasons: [], ...extra,
@@ -279,6 +280,15 @@ test('every alert code the node raises or documents has words in every locale', 
   } finally {
     await I18n.setLanguage('pl');
   }
+});
+
+test('an interrupted sharing job is worded by the step the restart cut off', () => {
+  const stopping = alertText(A('sharing_stop_interrupted', { phase: 'stopping' }));
+  const resuming = alertText(A('sharing_stop_interrupted', { phase: 'resuming' }));
+  assert.equal(stopping.title, 'Udostępnianie na tym węźle pozostaje zatrzymane po restarcie');
+  assert.match(stopping.detail, /przerwał zatrzymywanie udostępniania.*w trybie B dopiero po uzbrojeniu kanału uprawnień/);
+  assert.match(resuming.detail, /przerwał przywracanie udostępniania/);
+  assert.equal(alertText(A('sharing_stop_interrupted', { phase: 'other' })).known, false, 'an unknown step falls back to the node text');
 });
 
 test('a disk health alert is worded from its grade, its name and its reason codes', () => {

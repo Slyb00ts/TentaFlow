@@ -559,11 +559,11 @@ test('a sharing-stop approval names the node, its shares and targets, and counts
   });
   try {
     for (const [language, expected, label] of [
-      ['pl', 'Zatrzymuje udostępnianie na węźle helios — udziały: media, projekty, 2 udziały innych organizacji; targety: vm-store — a potem wyłącza TentaNas na całej flocie.', 'Zatrzymanie udostępniania i wyłączenie TentaNas'],
-      ['en', 'Stops sharing on node helios — shares: media, projekty, 2 shares of other organisations; targets: vm-store — then disables TentaNas on the whole fleet.', 'Stop sharing and disable TentaNas'],
-      ['de', 'Stoppt die Freigabe auf Knoten helios — Freigaben: media, projekty, 2 Freigaben anderer Organisationen; Targets: vm-store — und deaktiviert dann TentaNas in der ganzen Flotte.', 'Freigabe stoppen und TentaNas deaktivieren'],
-      ['fr', 'Arrête le partage sur le nœud helios — partages : media, projekty, 2 partages d\'autres organisations ; cibles : vm-store — puis désactive TentaNas sur toute la flotte.', 'Arrêter le partage et désactiver TentaNas'],
-      ['es', 'Detiene la compartición en el nodo helios — recursos compartidos: media, projekty, 2 recursos compartidos de otras organizaciones; destinos: vm-store — y después desactiva TentaNas en toda la flota.', 'Detener la compartición y desactivar TentaNas'],
+      ['pl', 'Zatrzymuje udostępnianie na węźle helios — udziały: media, projekty, 2 udziały innych organizacji; targety: vm-store — a potem wyłącza TentaNas na całej flocie. Lista pochodzi z chwili zgłoszenia — przy zatrzymaniu węzeł ustala ją na nowo.', 'Zatrzymanie udostępniania i wyłączenie TentaNas'],
+      ['en', 'Stops sharing on node helios — shares: media, projekty, 2 shares of other organisations; targets: vm-store — then disables TentaNas on the whole fleet. The list is as of the request — the node reads it again when it stops sharing.', 'Stop sharing and disable TentaNas'],
+      ['de', 'Stoppt die Freigabe auf Knoten helios — Freigaben: media, projekty, 2 Freigaben anderer Organisationen; Targets: vm-store — und deaktiviert dann TentaNas in der ganzen Flotte. Die Liste gibt den Stand der Anfrage wieder — beim Stoppen ermittelt der Knoten sie neu.', 'Freigabe stoppen und TentaNas deaktivieren'],
+      ['fr', 'Arrête le partage sur le nœud helios — partages : media, projekty, 2 partages d\'autres organisations ; cibles : vm-store — puis désactive TentaNas sur toute la flotte. La liste date de la demande — à l’arrêt, le nœud la détermine à nouveau.', 'Arrêter le partage et désactiver TentaNas'],
+      ['es', 'Detiene la compartición en el nodo helios — recursos compartidos: media, projekty, 2 recursos compartidos de otras organizaciones; destinos: vm-store — y después desactiva TentaNas en toda la flota. La lista refleja el momento de la solicitud: al detener, el nodo la vuelve a determinar.', 'Detener la compartición y desactivar TentaNas'],
     ]) {
       await I18n.setLanguage(language);
       assert.equal(approvalDetail(approval()).text, expected, language);
@@ -572,7 +572,7 @@ test('a sharing-stop approval names the node, its shares and targets, and counts
     await I18n.setLanguage('pl');
     assert.equal(
       approvalDetail(approval({ node: '', shares: '', targets: '', other_shares: '0' })).text,
-      'Zatrzymuje udostępnianie na węźle bez nazwy — udziały: brak; targety: brak — a potem wyłącza TentaNas na całej flocie.',
+      'Zatrzymuje udostępnianie na węźle bez nazwy — udziały: brak; targety: brak — a potem wyłącza TentaNas na całej flocie. Lista pochodzi z chwili zgłoszenia — przy zatrzymaniu węzeł ustala ją na nowo.',
     );
     // Counts that are not numbers are not worded: the node's sentence is.
     assert.equal(approvalDetail(approval({ other_shares: 'x' })).text, 'stops sharing on helios: …');

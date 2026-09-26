@@ -523,9 +523,27 @@ pub(crate) mod teardown_hold {
     }
 
     /// Holds `token` for the teardown of `addon_id`, replacing any earlier one.
+    /// The password is dropped (and zeroised) when it expires, not only on
+    /// the next access (critic wave 9b round 3, C3): a reaper wakes at the
+    /// expiry and drops whatever has expired by then — a newer `put` with a
+    /// later expiry is left alone.
     pub fn put(addon_id: &str, token: Arc<ElevationToken>, ttl: Duration) {
         *slot().lock().unwrap_or_else(|p| p.into_inner()) =
             Some(Held { addon_id: addon_id.to_string(), token, until: Instant::now() + ttl });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                tokio::time::sleep(ttl).await;
+                reap_expired();
+            });
+        }
+    }
+
+    /// Drops the held password if it has expired.
+    pub fn reap_expired() {
+        let mut guard = slot().lock().unwrap_or_else(|p| p.into_inner());
+        if guard.as_ref().is_some_and(|h| h.until <= Instant::now()) {
+            *guard = None;
+        }
     }
 
     /// Takes the token for `addon_id` — once. An expired one, or one held
@@ -746,12 +764,18 @@ async fn teardown_steps(
 pub fn native_disable_consequences(ctx: &NativeAppContext, viewer_org: &str) -> Result<Vec<DisableConsequence>> {
     let db = open_db(ctx.db, ctx.org_id, ctx.addon_id)?;
     let running = jobs::running().lock().unwrap_or_else(|p| p.into_inner()).len() as i64;
-    disable_consequences_of(&db, viewer_org, running)
+    disable_consequences_of(&db, viewer_org, running, disks::imported_pools())
 }
 
 /// `native_disable_consequences` over the node database itself, with the
-/// number of jobs this process runs.
-fn disable_consequences_of(db: &DbPool, viewer_org: &str, running: i64) -> Result<Vec<DisableConsequence>> {
+/// number of jobs this process runs and the pools its last complete read saw
+/// imported (`disks::imported_pools`).
+fn disable_consequences_of(
+    db: &DbPool,
+    viewer_org: &str,
+    running: i64,
+    imported: Option<std::collections::BTreeSet<String>>,
+) -> Result<Vec<DisableConsequence>> {
     let db = db.clone();
     let helper = elevation::mode(&db) == elevation::Mode::Helper;
     let counts = |pairs: &[(&str, i64)]| -> std::collections::BTreeMap<String, i64> {
@@ -844,7 +868,15 @@ fn disable_consequences_of(db: &DbPool, viewer_org: &str, running: i64) -> Resul
             });
         }
     }
-    let mut pools: Vec<String> = db::known_pools(&db)?.into_iter().map(|(name, _)| name).collect();
+    // The pools that ARE imported (critic wave 9b, MINOR 3): a remembered
+    // pool that was exported or destroyed outside TentaNas stays in
+    // `nas_known_pools` and is not "kept imported". Only before this process
+    // completed its first inventory read (seconds after a start) are the
+    // remembered pools the best answer there is.
+    let mut pools: Vec<String> = match imported {
+        Some(imported) => imported.into_iter().collect(),
+        None => db::known_pools(&db)?.into_iter().map(|(name, _)| name).collect(),
+    };
     pools.sort();
     if !pools.is_empty() {
         out.push(DisableConsequence {
@@ -1025,7 +1057,7 @@ mod tests {
         .expect("pools");
 
         let by_kind = |list: &[DisableConsequence], kind: &str| list.iter().find(|c| c.kind == kind).cloned();
-        let b = disable_consequences_of(&pool, "org-a", 2).expect("mode B");
+        let b = disable_consequences_of(&pool, "org-a", 2, None).expect("mode B");
         assert!(by_kind(&b, "tentanas_api_closed").is_some());
         assert_eq!(by_kind(&b, "tentanas_smb_shares_continue").expect("smb").count_vars["n"], 2, "only the enabled shares serve");
         assert_eq!(by_kind(&b, "tentanas_nfs_shares_continue").expect("nfs").count_vars["n"], 1);
@@ -1037,13 +1069,19 @@ mod tests {
         assert!(by_kind(&b, "tentanas_background_stop").is_some());
         assert_eq!(by_kind(&b, "tentanas_arrays_mounted").expect("own arrays").names, vec!["alpha"]);
         assert_eq!(by_kind(&b, "tentanas_arrays_mounted_other").expect("the others").count_vars["n"], 1);
-        assert_eq!(by_kind(&b, "tentanas_pools_imported").expect("pools").names, vec!["fast", "tank"]);
+        assert_eq!(by_kind(&b, "tentanas_pools_imported").expect("pools").names, vec!["fast", "tank"], "before the first read");
+        // Critic wave 9b, MINOR 3: once a read saw what is imported, a
+        // remembered pool that is not imported is not named.
+        let read = disable_consequences_of(&pool, "org-a", 0, Some(["tank".to_string()].into())).expect("read");
+        assert_eq!(by_kind(&read, "tentanas_pools_imported").expect("pools").names, vec!["tank"]);
+        let none = disable_consequences_of(&pool, "org-a", 0, Some(Default::default())).expect("none imported");
+        assert!(by_kind(&none, "tentanas_pools_imported").is_none(), "no pool imported, no sentence");
         assert_eq!(by_kind(&b, "tentanas_jobs_continue").expect("jobs").count_vars["n"], 2);
         let text = format!("{b:?}");
         assert!(!text.contains("bravo"), "another organisation's array is never named: {text}");
 
         elevation::set_mode(&pool, elevation::Mode::Helper).expect("mode A");
-        let a = disable_consequences_of(&pool, "org-a", 0).expect("mode A");
+        let a = disable_consequences_of(&pool, "org-a", 0, None).expect("mode A");
         assert!(by_kind(&a, "tentanas_iscsi_targets_continue").is_some());
         assert!(by_kind(&a, "tentanas_schedules_continue").is_some());
         assert!(by_kind(&a, "tentanas_background_continue").is_some());
@@ -1075,11 +1113,16 @@ mod tests {
         std::sync::Arc::new(crate::profiling::collectors::elevation::ElevationToken::new_sudo(secret.to_string()))
     }
 
+    /// The teardown password slot is process-global: the tests that use it
+    /// run one at a time.
+    static HOLD_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// MAJOR B of round 2: the teardown password is held for ONE instance's
     /// teardown, taken once, dropped on demand, and gone when it expires —
     /// and it is not the node's armed slot, so nothing else can use it.
     #[test]
     fn the_teardown_password_is_one_shot_and_bound_to_its_instance() {
+        let _slot = HOLD_SLOT.lock().unwrap_or_else(|p| p.into_inner());
         let id = "tentanas-hold0001";
         teardown_hold::put(id, token("test-secret-not-real"), std::time::Duration::from_secs(60));
         assert!(elevation::armed_token().is_none(), "the node's armed slot is untouched");
@@ -1100,11 +1143,34 @@ mod tests {
         assert!(teardown_hold::take(id).is_none(), "an expired one is not handed out");
     }
 
+    /// Critic wave 9b round 3, C3: an expired password is dropped at its
+    /// expiry by the reaper, with no access to the slot in between — the
+    /// last reference to the token is gone.
+    #[tokio::test]
+    async fn an_expired_teardown_password_is_dropped_without_another_access() {
+        // Held for the whole test: no other test's `put` can replace the
+        // slot and drop the token, so only the reaper can (wave 11 round 2).
+        let _slot = HOLD_SLOT.lock().unwrap_or_else(|p| p.into_inner());
+        let id = "tentanas-hold0003";
+        let held = token("test-secret-not-real");
+        let weak = std::sync::Arc::downgrade(&held);
+        teardown_hold::put(id, held, std::time::Duration::from_millis(50));
+        assert!(weak.upgrade().is_some(), "held until it expires");
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(gone.is_ok(), "the reaper dropped the expired password");
+    }
+
     /// Every way out of the teardown hook drops the password — here the
     /// earliest one (the instance database cannot be opened), which returns
     /// before any privileged step (critic: the refusing path skipped it).
     #[test]
     fn a_teardown_that_ends_early_still_consumes_the_password() {
+        let _slot = HOLD_SLOT.lock().unwrap_or_else(|p| p.into_inner());
         let id = "tentanas-hold0002";
         let state = crate::dispatch::state::AppState::for_test();
         teardown_hold::put(id, token("test-secret-not-real"), std::time::Duration::from_secs(60));

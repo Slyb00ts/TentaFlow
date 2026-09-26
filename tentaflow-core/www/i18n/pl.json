@@ -5860,6 +5860,7 @@
     "node_unsupported": "nieobsługiwany",
     "node_init_error": "błąd startu",
     "node_nothing": "nic do zrobienia — aplikacja nie ma stanu na tym węźle",
+    "node_absent": "aplikacja nie jest zainstalowana na tym węźle — nic do zrobienia (węzeł wykonujący odinstalowanie sprawdzi to sam; gdyby nie mógł, wpisz nazwę węzła poniżej)",
     "node_offline_scope": "węzeł nie odpowiada — odinstalowanie wykona się, gdy wróci",
     "node_plan_error": "nie udało się pobrać zakresu z tego węzła",
     "node_blocked": "blokada: {what}",
@@ -5875,6 +5876,7 @@
       "done_with_warnings": "odinstalowano z uwagami",
       "failed": "nie powiodło się",
       "failed_in": "na kroku: {phase}",
+      "failed_because": "węzeł odmówił: {what}",
       "absent": "aplikacji już nie ma na węźle",
       "unreachable": "węzeł nie odpowiada",
       "unreachable_detail": "odinstalowanie wykona się, gdy wróci",
@@ -6809,6 +6811,11 @@
           "title": "Udostępnianie na tym węźle nie wróciło",
           "detail": "Nie udało się zapisać konfiguracji udziałów (próba {n}). Węzeł ponawia z rosnącym odstępem; w trybie B potrzebny jest uzbrojony kanał uprawnień."
         },
+        "sharing_stop_interrupted": {
+          "title": "Udostępnianie na tym węźle pozostaje zatrzymane po restarcie",
+          "detail_stopping": "Restart węzła przerwał zatrzymywanie udostępniania. Udziały i targety pozostają wstrzymane; wrócą, gdy TentaNas będzie włączony — w trybie B dopiero po uzbrojeniu kanału uprawnień.",
+          "detail_resuming": "Restart węzła przerwał przywracanie udostępniania. Udziały i targety pozostają wstrzymane; węzeł spróbuje ponownie, gdy TentaNas będzie włączony — w trybie B dopiero po uzbrojeniu kanału uprawnień."
+        },
         "sharing_share_not_resumed": {
           "title": "Udział {share} nie wrócił po wznowieniu udostępniania",
           "detail": "Stan udziału mówi dlaczego. Węzeł ponawia z rosnącym odstępem; alert zamknie się, gdy udział znów zacznie działać."
@@ -6883,7 +6890,7 @@
       "pool_filter_all": "Pula: wszystkie",
       "smart_selected": "Test SMART zaznaczonych ({n})",
       "smart_selected_title": "Test SMART — {n} {n|dysk|dyski|dysków}",
-      "smart_selected_done": "Uruchomiono test SMART na {n} {n|dysku|dyskach|dyskach}",
+      "smart_selected_done": "Zlecono test SMART na {n} {n|dysku|dyskach|dyskach} — wynik każdego dysku pokazuje zadanie",
       "legend_title": "Jak czytać zdrowie",
       "legend_hint": "Status łączy SMART, liczniki błędów puli (READ/WRITE/CKSUM), błędy I/O kernela i trendy — nie sam SMART.",
       "legend_ok": "brak symptomów we wszystkich źródłach",
@@ -7066,6 +7073,7 @@
       "disk_reason": {
         "self_test_running": "na tym dysku trwa już test SMART",
         "disk_gone": "dysku nie ma już w inwentarzu węzła",
+        "disk_unknown": "węzeł nie zna tego dysku — nie został przetestowany",
         "start_failed": "dysk nie przyjął polecenia testu",
         "privilege": "hasło lub kanał uprawnień odrzucony — kolejne dyski nie zostały uruchomione",
         "test_failed": "dysk nie przeszedł testu: {detail}",
@@ -8357,7 +8365,7 @@
       "smart_pill_long": "long: {when}",
       "smart_sub": "ostatni short: {short} · ostatni long: {long}",
       "smart_no_disks": "Żaden dysk na tym nodzie nie obsługuje SMART.",
-      "smart_started": "Test SMART uruchomiony na {n} {n|dysku|dyskach|dyskach}",
+      "smart_started": "Zlecono test SMART na {n} {n|dysku|dyskach|dyskach} — wynik każdego dysku pokazuje zadanie",
       "last_run": "ostatni: {t}",
       "never_ran": "jeszcze nie uruchomiony",
       "enabled_done": "Włączono: {name}",
@@ -8856,7 +8864,7 @@
           "snapshot": "harmonogram snapshotów datasetu {subject}",
           "smart": "harmonogram testów SMART"
         },
-        "sharing_stop": "Zatrzymuje udostępnianie na węźle {node} — udziały: {shares}; targety: {targets} — a potem wyłącza TentaNas na całej flocie.",
+        "sharing_stop": "Zatrzymuje udostępnianie na węźle {node} — udziały: {shares}; targety: {targets} — a potem wyłącza TentaNas na całej flocie. Lista pochodzi z chwili zgłoszenia — przy zatrzymaniu węzeł ustala ją na nowo.",
         "sharing_stop_none": "brak",
         "sharing_stop_node_unnamed": "bez nazwy",
         "sharing_stop_other_shares": "{n} {n|udział|udziały|udziałów} innych organizacji",
@@ -9225,7 +9233,7 @@
       "elastic_one_cache_disk": "Macierz Elastic może mieć najwyżej jeden dysk cache",
       "pool_destroy_foreign_resources": "Tej puli nie można zniszczyć: korzystają z niej udziały lub targety innej organizacji.",
       "pool_destroy_unverified": "Nie udało się sprawdzić, czy z tej puli korzystają inne organizacje, więc nie została zniszczona. Spróbuj ponownie.",
-      "pool_destroy_in_progress": "Trwa niszczenie puli na tym węźle, spróbuj ponownie za chwilę.",
+      "pool_destroy_in_progress": "Na tym węźle trwa inna zmiana puli, udziałów lub targetów, spróbuj ponownie za chwilę.",
       "forward_address_refused": "Ten adres jest niedozwolony: sieć prywatna spoza listy kolektorów wewnętrznych administratora platformy, albo loopback, link-local lub adres metadanych chmury.",
       "forward_https_only": "Webhook musi być adresem https:// (http:// tylko do hosta z listy administratora platformy oznaczonego „zezwól na http”).",
       "forward_node_retired": "Wspólny cel noda jest wycofany: można go tylko usunąć.",

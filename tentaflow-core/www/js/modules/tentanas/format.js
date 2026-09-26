@@ -713,6 +713,11 @@ const ALERT_WORDS = new Map([
     const n = numParams(p, ['attempts']);
     return n ? { title: T('alerts.code.sharing_resume_failed.title'), detail: T('alerts.code.sharing_resume_failed.detail', { n: n.attempts }) } : null;
   }],
+  // A stop or resume a restart cut off (critic wave 10, MINOR 5): sharing
+  // stays stopped until TentaNas is enabled / the channel is armed.
+  ['sharing_stop_interrupted', (p) => (['stopping', 'resuming'].includes(p.phase)
+    ? { title: T('alerts.code.sharing_stop_interrupted.title'), detail: T('alerts.code.sharing_stop_interrupted.detail_' + p.phase) }
+    : null)],
   ['sharing_share_not_resumed', (p) => {
     const t = textParams(p, ['share']);
     return t ? { title: T('alerts.code.sharing_share_not_resumed.title', t), detail: T('alerts.code.sharing_share_not_resumed.detail') } : null;

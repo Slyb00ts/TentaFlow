@@ -95,6 +95,9 @@ pub struct JobHandle {
     /// Ids this job knows the name of that the node's tables may not hold
     /// any more (a dissolved array's id, released by a wipe): see `name_id`.
     extra_names: Arc<Mutex<Vec<(String, String)>>>,
+    /// Pools this job's lines name before any record knows them (a new
+    /// pool in its own create job).
+    extra_pools: Arc<Mutex<Vec<String>>>,
 }
 
 impl JobHandle {
@@ -130,6 +133,7 @@ impl JobHandle {
             job_id: job_id.to_string(),
             cancel: CancellationToken::new(),
             extra_names: Arc::default(),
+            extra_pools: Arc::default(),
         }
     }
 
@@ -164,10 +168,19 @@ impl JobHandle {
             .push((id.to_string(), name.to_string()));
     }
 
+    /// `pool` is a pool's name in every later line of this job, and the
+    /// head of its dataset paths: for a pool no record knows yet.
+    pub fn name_pool(&self, pool: &str) {
+        self.extra_pools.lock().unwrap_or_else(|p| p.into_inner()).push(pool.to_string());
+    }
+
     fn names(&self) -> super::log_ids::LogNames {
         let mut names = super::log_ids::LogNames::load(&self.db);
         for (id, name) in self.extra_names.lock().unwrap_or_else(|p| p.into_inner()).iter() {
             names.insert(id, name);
+        }
+        for pool in self.extra_pools.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            names.keep_pool(pool);
         }
         names
     }
@@ -446,6 +459,7 @@ where
         job_id: job.job_id.clone(),
         cancel: cancel.clone(),
         extra_names: Arc::default(),
+        extra_pools: Arc::default(),
     };
     let error_names = handle.clone();
     let db = db.clone();
@@ -1571,6 +1585,8 @@ mod tests {
             });
         }
         let disks = vec![
+            // A disk the node never knew has no name (critic wave 9b, MINOR 12).
+            ("sn-wave9b-never".to_string(), String::new()),
             ("sn-wave9b-gone".to_string(), "sdwg".to_string()),
             ("sn-wave9b-batch-a".to_string(), "sdwa".to_string()),
             ("sn-wave9b-batch-b".to_string(), "sdwb".to_string()),
@@ -1592,6 +1608,7 @@ mod tests {
             .map(|l| (l.name.as_str(), l.state.as_str(), l.reasons.first().map(|r| r.code.as_str()).unwrap_or("")))
             .collect();
         assert_eq!(shown, vec![
+            ("", "refused", "disk_unknown"),
             ("sdwg", "refused", "disk_gone"),
             ("sdwa", "refused", "privilege"),
             ("sdwb", "skipped", ""),
@@ -1599,9 +1616,35 @@ mod tests {
         assert_eq!(done.status, "failed");
         assert!(done.error.as_deref().unwrap_or("").contains("privilege channel not available"), "{:?}", done.error);
         assert!(done.log.iter().any(|l| l.contains("the remaining disks are not started")), "{:?}", done.log);
+        assert!(done.log.iter().any(|l| l.contains("a disk this node does not know was asked for")), "{:?}", done.log);
+        assert!(!done.log.iter().any(|l| l.contains("sn-wave9b-never")), "the id never reaches the log: {:?}", done.log);
         for id in ["sn-wave9b-batch-a", "sn-wave9b-batch-b"] {
             super::super::disks::remove_live_for_test(id);
         }
+    }
+
+    /// Critic wave 9b, MINOR 12: a disk the node never knew is a refused line
+    /// of its own (no name, `disk_unknown`), written by the same transaction
+    /// as the others, and it holds no disk as "self-test running".
+    #[tokio::test]
+    async fn an_unknown_disk_is_a_refused_line_not_a_refused_batch() {
+        let db = database();
+        let disks = vec![("sn-w11-never".to_string(), String::new()), ("sn-w11-known".to_string(), "sdk1x".to_string())];
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let job = spawn_smart_batch(&db, "short|sdk1x", "test", &disks, |_h| async move {
+            let _ = wait.await;
+            Ok(())
+        })
+        .unwrap();
+        let lines = store::job_disks(&db, &job.job_id).unwrap();
+        let shown: Vec<(&str, &str, &str)> = lines
+            .iter()
+            .map(|l| (l.name.as_str(), l.state.as_str(), l.reasons.first().map(|r| r.code.as_str()).unwrap_or("")))
+            .collect();
+        assert_eq!(shown, vec![("", "refused", "disk_unknown"), ("sdk1x", "pending", "")]);
+        assert!(!store::self_test_busy(&db, "sn-w11-never").unwrap(), "a refused line claims nothing");
+        assert!(store::self_test_busy(&db, "sn-w11-known").unwrap());
+        let _ = release.send(());
     }
 }
 
@@ -2317,10 +2360,14 @@ pub async fn smart_self_test_batch(
             SelfTestKind::Long => "long",
         },
         lines.len(),
-        lines.iter().map(|l| l.name.as_str()).collect::<Vec<_>>().join(", ")
+        lines.iter().map(|l| l.name.as_str()).filter(|n| !n.is_empty()).collect::<Vec<_>>().join(", ")
     ));
     for line in lines.iter().filter(|l| l.state == "refused") {
-        h.log(format!("{}: a self-test already runs on this disk", line.name));
+        if line.name.is_empty() {
+            h.log("a disk this node does not know was asked for: not tested");
+        } else {
+            h.log(format!("{}: a self-test already runs on this disk", line.name));
+        }
     }
     let mut halted: Option<anyhow::Error> = None;
     let mut started = Vec::new();

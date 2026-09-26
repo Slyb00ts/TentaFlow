@@ -2364,7 +2364,12 @@ pub fn insert_job_full(
         ],
     )?;
     for (position, (disk_id, name)) in disks.iter().enumerate() {
-        let (state, reasons) = if job.kind == SMART_BATCH_KIND && self_test_running_on(&tx, disk_id)? {
+        // A batch line with no name is a disk the node never knew (critic
+        // wave 9b, MINOR 12): refused as such, never tested, never counted
+        // as a running self-test.
+        let (state, reasons) = if job.kind == SMART_BATCH_KIND && name.is_empty() {
+            ("refused", vec![super::disks::coded_reason("disk_unknown", &[])])
+        } else if job.kind == SMART_BATCH_KIND && self_test_running_on(&tx, disk_id)? {
             ("refused", vec![super::disks::coded_reason("self_test_running", &[])])
         } else {
             ("pending", Vec::new())

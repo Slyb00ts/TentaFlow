@@ -29,6 +29,20 @@
 // only with a by-id body behind it (`ata-archive` is a pool name, `ata-WDC_…
 // _WD-WCC7K1234567` is a disk).
 //
+// The one exception to "plain decimals stay": a 17-20 digit decimal is
+// hidden, because that is a ZFS GUID's length (a random 64-bit number). The
+// price is that a counter or a nanosecond timestamp of that length is hidden
+// too (1.7e16 ns is only 197 days of uptime, so `CLOCK_BOOTTIME` in ns and a
+// Unix time in ns are both hidden); a size is not (10^16 bytes is 8.9 PiB).
+// Nothing TentaNas writes into a job log prints such a counter.
+//
+// A dataset path (`tank/usb-backup_2024/sn-A1B2`) is kept segment by
+// segment only when its first segment is a pool this node knows: the rest
+// are dataset and snapshot names a person chose. A strong id shape later in
+// such a path (a UUID, a 32+ hex run, a WWN, a ZFS GUID) is still named or
+// hidden (critic wave 9a round 3). An array, share or target name is kept
+// as a whole token, never as the head of a path.
+//
 // `HIDDEN` is a language-neutral token the screen words in the reader's
 // language (`jobLogLines`, format.js). The screen scrubs every line again
 // when it paints it (`scrubIds`, machine-id.js): the backstop for rows
@@ -153,6 +167,25 @@ fn is_id_token(token: &str) -> bool {
     false
 }
 
+/// An id shape nobody chooses as a dataset or snapshot name (a UUID never
+/// gets here: `uuid_re` names or hides it earlier, in the whole line): a ZFS GUID's
+/// 17-20 digits, a 32+ hex run, a `0x…` / `naa.` / `eui.` / `wwn-` WWN, a
+/// `zfs-<hex>` label, a device-mapper / md / LVM / NVMe uuid name. The weaker
+/// shapes (`<model>_<serial>`, `sn-…`, `t10.…`, short hex-dash forms) are a
+/// person's name inside a known pool's dataset path.
+fn is_strong_id_token(token: &str) -> bool {
+    if !is_id_token(token) {
+        return false;
+    }
+    let (token, _) = split_partition(token);
+    let lower = token.to_ascii_lowercase();
+    token.chars().all(|c| c.is_ascii_digit())
+        || (token.len() >= 32 && is_hex(token))
+        || ["0x", "naa.", "eui.", "wwn-", "zfs-", "dm-uuid-", "md-uuid-", "lvm-pv-uuid-", "nvme-eui.", "nvme-uuid.", "nvme-nvme."]
+            .iter()
+            .any(|p| lower.starts_with(p))
+}
+
 /// Whether a token is worth looking up as a link on this node: an id shape,
 /// or a by-id prefix whose body is not recognisable (a `virtio-` serial the
 /// admin chose).
@@ -189,6 +222,9 @@ pub struct LogNames {
     serials: Vec<(String, String, bool)>,
     /// Names a person chose (pools, arrays, shares, targets): never hidden.
     keep: HashSet<String>,
+    /// The pools among them: a path whose first segment is one of these is a
+    /// dataset path.
+    pools: HashSet<String>,
 }
 
 impl LogNames {
@@ -217,19 +253,32 @@ impl LogNames {
                 out.serials.push((d.serial.clone(), d.name.clone(), true));
             }
         }
-        // A leaf zpool names by its GUID: the name the node knows it by.
-        for (guid, name) in super::pools::named_leaf_guids() {
-            out.insert(&guid, &name);
-        }
         if let Ok(pools) = super::db::known_pools(db) {
             for (name, guid) in pools {
                 out.insert(&guid, &name);
-                out.keep.insert(name);
+                out.keep_pool(&name);
             }
         }
         let Ok(conn) = db.read() else {
+            // A leaf zpool names by its GUID: the name the node knows it by.
+            for (guid, name, _) in super::pools::named_leaf_guids() {
+                out.insert(&guid, &name);
+            }
             return out;
         };
+        // Gone disks by the kernel name they were last seen under, for the
+        // leaves below.
+        let mut gone_by_name: HashMap<String, Vec<String>> = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT disk_id, name, model FROM nas_disks") {
+            if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))) {
+                for (disk_id, name, model) in rows.flatten() {
+                    if kernel_of_disk.contains_key(&disk_id) || name.is_empty() || model.trim().is_empty() {
+                        continue;
+                    }
+                    gone_by_name.entry(name).or_default().push(model.trim().to_string());
+                }
+            }
+        }
         // A disk that is gone: its model, never its old kernel name.
         if let Ok(mut stmt) = conn.prepare("SELECT disk_id, model, serial, wwn FROM nas_disks") {
             let rows = stmt.query_map([], |r| {
@@ -286,6 +335,22 @@ impl LogNames {
                 }
             }
         }
+        // A leaf zpool names by its GUID is a disk zpool cannot find. Its
+        // remembered kernel name may already belong to the disk replacing it
+        // (`zpool replace tank sdk /dev/sdk`, critic wave 9a round 3), so:
+        // - with the by-id link it was last seen under, that very disk — its
+        //   live kernel name, or its model once gone (wave 11 round 2);
+        // - with a kernel name only, the model of the ONE gone disk last seen
+        //   under that name; with none or several, the remembered name (a
+        //   model picked among several would be a guess).
+        for (guid, name, link) in super::pools::named_leaf_guids() {
+            let by_link = link.as_deref().and_then(|link| out.lookup(split_partition(link).0)).map(|(named, _)| named);
+            let shown = by_link.unwrap_or_else(|| match gone_by_name.get(&name).map(Vec::as_slice) {
+                Some([model]) => model.clone(),
+                _ => name.clone(),
+            });
+            out.insert(&guid, &shown);
+        }
         out
     }
 
@@ -316,6 +381,14 @@ impl LogNames {
     pub fn keep_name(&mut self, name: &str) {
         if !name.is_empty() {
             self.keep.insert(name.to_string());
+        }
+    }
+
+    /// `pool` is a pool's name: kept, and the head of a dataset path.
+    pub fn keep_pool(&mut self, pool: &str) {
+        if !pool.is_empty() {
+            self.keep.insert(pool.to_string());
+            self.pools.insert(pool.to_string());
         }
     }
 
@@ -414,10 +487,37 @@ impl LogNames {
         }
         // A dataset path of a pool this node knows (`tank/usb-backup_2024`,
         // `tank/vm@auto-1`): every segment after the pool is a name a person
-        // chose.
-        if let Some((pool, _)) = token.split_once('/') {
-            if self.keep.contains(pool) {
-                out.push_str(token);
+        // chose — unless it is a strong id shape, which no one types as a
+        // dataset name.
+        // The head ends at the first `/`, `@` or `#`: `tank@<snapshot>` at
+        // the pool root is a pool path too (wave 11 round 3).
+        if let Some(at) = token.find(['/', '@', '#']) {
+            let (pool, rest) = (&token[..at], &token[at..]);
+            if self.pools.contains(pool) {
+                out.push_str(pool);
+                let rest = rest.strip_prefix('/').map(|r| (r, true)).unwrap_or((rest, false));
+                for (i, segment) in rest.0.split('/').enumerate() {
+                    if i > 0 || rest.1 {
+                        out.push('/');
+                    }
+                    let bare = segment.trim_end_matches(['.', '!', '?']);
+                    let tail = &segment[bare.len()..];
+                    // A snapshot (`@`) or bookmark (`#`) name is judged on
+                    // its own (wave 11 round 2): `vm@<GUID>` hides the GUID.
+                    for piece in bare.split_inclusive(['@', '#']) {
+                        let (name, mark) = match piece.strip_suffix(['@', '#']) {
+                            Some(name) => (name, &piece[name.len()..]),
+                            None => (piece, ""),
+                        };
+                        if is_strong_id_token(name) && !self.keep.contains(name) {
+                            out.push_str(&self.lookup(name).map(|(named, _)| named).unwrap_or_else(|| HIDDEN.to_string()));
+                        } else {
+                            out.push_str(name);
+                        }
+                        out.push_str(mark);
+                    }
+                    out.push_str(tail);
+                }
                 return;
             }
         }
@@ -475,7 +575,7 @@ mod tests {
     fn own_disk_ids_dataset_paths_and_short_serials() {
         let mut n = names();
         n.insert_device("sn-ZA1B2C3D", "sdq");
-        n.keep_name("tank");
+        n.keep_pool("tank");
         assert_eq!(n.scrub_with("disk sn-ZA1B2C3D: FAULTED", NO_LINKS), "disk sdq: FAULTED");
         assert_eq!(n.scrub_with("disk sn-WD-WCC7K7654321 gone", NO_LINKS), format!("disk {H} gone"));
         assert_eq!(n.scrub_with("share sn-backups, sn-1", NO_LINKS), "share sn-backups, sn-1");
@@ -573,6 +673,40 @@ mod tests {
         }
     }
 
+    /// Critic wave 9a round 3: only a POOL heads a kept dataset path; an
+    /// array, share or target name at the head of a path keeps nothing
+    /// behind it, and a strong id shape inside a pool's path is still named
+    /// or hidden.
+    #[test]
+    fn only_a_pool_heads_a_kept_path_and_strong_ids_inside_it_go() {
+        let mut n = names();
+        n.keep_pool("tank");
+        n.keep_name("media");
+        n.insert("12156453278383891134", "sdk");
+        for (line, want) in [
+            ("dataset tank/usb-backup_2024/sn-A1B2C3D4E5 ok", "dataset tank/usb-backup_2024/sn-A1B2C3D4E5 ok".to_string()),
+            ("tank/vm/0123456789abcdef0123456789abcdef", format!("tank/vm/{H}")),
+            ("tank/wwn-0x5000c500ffffffff00.", format!("tank/{H}.")),
+            ("tank/12156453278383891134/x", "tank/sdk/x".to_string()),
+            ("tank/2024/1234567890123456", "tank/2024/1234567890123456".to_string()),
+            // Wave 11 round 2: a snapshot or bookmark name after `@` / `#`.
+            ("tank/vm@12345678901234567890", format!("tank/vm@{H}")),
+            ("tank/vm@0123456789abcdef0123456789abcdef.", format!("tank/vm@{H}.")),
+            ("tank/vm#12156453278383891134", "tank/vm#sdk".to_string()),
+            ("tank/vm@auto-2026-09-26_0200", "tank/vm@auto-2026-09-26_0200".to_string()),
+            // Wave 11 round 3: a snapshot of the pool's root dataset.
+            ("tank@12345678901234567890", format!("tank@{H}")),
+            ("tank#12156453278383891134 kept", "tank#sdk kept".to_string()),
+            ("tank@auto-2026-09-26", "tank@auto-2026-09-26".to_string()),
+            // An array or share name at the head of a path is no pool.
+            ("media/ata-WDC_WD40EFRX-68N32N0_WD-WCC7K7654321", format!("media/{H}")),
+            ("media/sn-A1B2C3D4E5", format!("media/{H}")),
+            ("media stays", "media stays".to_string()),
+        ] {
+            assert_eq!(n.scrub_with(line, NO_LINKS), want, "{line}");
+        }
+    }
+
     /// Critic wave 9a, MINOR 1/2: names people chose and plain numbers are
     /// never taken for ids.
     #[test]
@@ -637,9 +771,31 @@ mod tests {
         assert_eq!(n.scrub_with("vdev ata-ST8000VN004-2M2101_ZA1B2C3D FAULTED", NO_LINKS), "vdev ST8000VN004-2M2101 FAULTED");
         assert_eq!(n.scrub_with("pool 11427865429582413522 imported", NO_LINKS), "pool ata-archive imported");
         // A leaf zpool can only name by its GUID, as the pool view resolved it.
-        super::super::pools::remember_leaf_guid("16051979283746501928", Some("sdk"));
+        super::super::pools::remember_leaf_guid("16051979283746501928", Some("sdk"), None);
         let n = LogNames::load(&db);
         assert_eq!(n.scrub_with("$ zpool replace tank 16051979283746501928 /dev/sdx", NO_LINKS), "$ zpool replace tank sdk /dev/sdx");
+        // Critic wave 9a round 3: a leaf whose remembered kernel name was a
+        // disk that is now gone reads as that disk's model, not as the kernel
+        // name the replacing disk may already hold.
+        super::super::pools::remember_leaf_guid("16051979283746501929", Some("sdq"), None);
+        let n = LogNames::load(&db);
+        assert_eq!(
+            n.scrub_with("$ zpool replace tank 16051979283746501929 /dev/sdq", NO_LINKS),
+            "$ zpool replace tank ST8000VN004-2M2101 /dev/sdq"
+        );
+        // Wave 11 round 2: two gone disks were last seen as `sdr` — a kernel
+        // name alone picks neither model; the leaf's by-id link names its
+        // very disk.
+        for (id, model, serial) in [("sn-gone-r1", "WDC WD80EFZZ", "R1SERIAL01"), ("sn-gone-r2", "ST4000VN008", "R2SERIAL02")] {
+            super::super::db::upsert_disk_seen(&db, &super::super::db::DiskIdentity {
+                disk_id: id, name: "sdr", model, serial, wwn: None, size_bytes: 1, kind: "hdd",
+            }).unwrap();
+        }
+        super::super::pools::remember_leaf_guid("16051979283746501930", Some("sdr"), None);
+        super::super::pools::remember_leaf_guid("16051979283746501931", Some("sdr"), Some("ata-ST4000VN008_R2SERIAL02"));
+        let n = LogNames::load(&db);
+        assert_eq!(n.scrub_with("offline 16051979283746501930", NO_LINKS), "offline sdr", "ambiguous: the remembered name");
+        assert_eq!(n.scrub_with("offline 16051979283746501931", NO_LINKS), "offline ST4000VN008", "the link names the disk");
         assert_eq!(n.scrub_with("zpool destroy ata-archive; share scsi-luns", NO_LINKS), "zpool destroy ata-archive; share scsi-luns");
         // A name the node knows is kept even when it is shaped like an id.
         assert_eq!(n.scrub_with("share t10.archive2026: created", NO_LINKS), "share t10.archive2026: created");

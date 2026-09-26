@@ -614,3 +614,206 @@ test('R1: a failed single-node uninstall never shows the node\'s raw text', asyn
   assert.match(text, /szczegóły są w dzienniku węzła/);
   assert.doesNotMatch(text, /0a1b2c3d|\/var\/lib/);
 });
+
+// ----- wave 11: backlog minors ------------------------------------------------
+
+test('C6: closing the dialog mid-arming arms no further node and takes back the one handed out', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const win = await armedThenStopped({
+    addonTeardownArmRequest: () => gate.then(() => ({})),
+    addonUninstallRequest: { ok: true },
+  }, async (w) => {
+    rowOf(w, HELIOS).querySelector('[data-role="password"]').value = 'test-secret-local';
+    w.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+    await flush();
+    w.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'cancel' }, cancelable: true }));
+    release();
+  });
+  const armedTargets = fleetCalls.filter((c) => c.kind === 'addonTeardownArmRequest').map((c) => c.target);
+  assert.deepEqual(armedTargets, [null], 'only the node whose arming was already under way; atlas is never armed');
+  assert.deepEqual(disarmed(), [null], 'and that one is taken back');
+  assert.ok(!fleetCalls.some((c) => c.kind === 'addonUninstallRequest'), 'nothing uninstalled');
+  win.remove();
+});
+
+const ZED = 'e'.repeat(64);
+
+// The server's preflight as `teardown_preflight` runs it (wave 11 round 2,
+// B1): a peer that published nothing is passed only when the server's OWN
+// probe of it answers NotFound, or when its name was retyped. The request
+// carries nothing else about it.
+function serverUninstall(serverSaysAbsent) {
+  return (payload) => {
+    const acked = new Set((payload.acknowledgedNodes || []).filter((a) => a.confirmName === 'zed').map((a) => a.nodeId));
+    if (!serverSaysAbsent() && !acked.has(ZED)) {
+      throw Object.assign(new Error('refusal:teardown_peer_unknown — zed has not published what its teardown would refuse'), { code: 'Conflict' });
+    }
+    return { ok: true };
+  };
+}
+
+test('B1: a peer without the app neither counts nor locks, and the server that confirms it lets the uninstall through', async () => {
+  const withZed = {
+    ...fleetPlan,
+    nodes: [...fleetPlan.nodes, { nodeId: ZED, name: 'zed', local: false, online: true, status: 'unknown', lastKnown: false, lastBlocks: [] }],
+  };
+  const win = await openFleet({
+    addonTeardownPlanRequest: (_p, target) => {
+      if (target === ZED) throw Object.assign(new Error('addon nie istnieje'), { code: 'NotFound' });
+      return target === ATLAS ? atlasPlan : withZed;
+    },
+    addonUninstallRequest: serverUninstall(() => true),
+    addonTeardownStatusRequest: { addonId: plan.addonId, state: 'done', phase: 'done', warnings: [] },
+  });
+  await flush(); await flush();
+  assert.match(rowOf(win, ZED).textContent, /aplikacja nie jest zainstalowana na tym węźle/);
+  assert.ok(!rowOf(win, ZED).querySelector('[data-role="ack"]').hasAttribute('hidden'), 'the retype stays available');
+  assert.ok(!locked(win), 'the absent peer holds nothing back');
+  assert.equal(win.querySelector('tf-button[data-action="confirm"]').textContent, 'Odinstaluj na 3 węzłach', 'zed is not counted');
+  win.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  for (let i = 0; i < 8; i += 1) await flush();
+  const sent = fleetCalls.filter((c) => c.kind === 'addonUninstallRequest');
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].payload.acknowledgedNodes, [], 'no claim about zed is sent; the server asked zed itself');
+  assert.notEqual(rowOf(win, HELIOS).querySelector('[data-role="state-chip"]').getAttribute('label'), 'odmówiono', 'the server did not refuse');
+  win.remove();
+});
+
+test('B1: when the server cannot confirm the peer is without the app, it refuses, and the retyped name gets through', async () => {
+  const withZed = {
+    ...fleetPlan,
+    nodes: [...fleetPlan.nodes, { nodeId: ZED, name: 'zed', local: false, online: true, status: 'unknown', lastKnown: false, lastBlocks: [] }],
+  };
+  const win = await openFleet({
+    addonTeardownPlanRequest: (_p, target) => {
+      if (target === ZED) throw Object.assign(new Error('addon nie istnieje'), { code: 'NotFound' });
+      return target === ATLAS ? atlasPlan : withZed;
+    },
+    addonUninstallRequest: serverUninstall(() => false),
+    addonTeardownStatusRequest: { addonId: plan.addonId, state: 'installed', phase: '', warnings: [] },
+  });
+  await flush(); await flush();
+  win.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  for (let i = 0; i < 8; i += 1) await flush();
+  assert.equal(rowOf(win, HELIOS).querySelector('[data-role="state-chip"]').getAttribute('label'), 'odmówiono', 'the server refused: nothing went out');
+  win.remove();
+
+  // The admin opens it again and retypes zed's name: the server accepts.
+  const again = await openFleet({
+    addonTeardownPlanRequest: (_p, target) => {
+      if (target === ZED) throw Object.assign(new Error('addon nie istnieje'), { code: 'NotFound' });
+      return target === ATLAS ? atlasPlan : withZed;
+    },
+    addonUninstallRequest: serverUninstall(() => false),
+    addonTeardownStatusRequest: { addonId: plan.addonId, state: 'done', phase: 'done', warnings: [] },
+  });
+  await flush(); await flush();
+  const ack = rowOf(again, ZED).querySelector('[data-role="ack-input"]');
+  ack.value = 'zed';
+  ack.dispatchEvent(new window.CustomEvent('input', { bubbles: true }));
+  again.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  for (let i = 0; i < 8; i += 1) await flush();
+  const sent = fleetCalls.filter((c) => c.kind === 'addonUninstallRequest').at(-1);
+  assert.deepEqual(sent.payload.acknowledgedNodes, [{ nodeId: ZED, confirmName: 'zed' }]);
+  assert.notEqual(rowOf(again, HELIOS).querySelector('[data-role="state-chip"]').getAttribute('label'), 'odmówiono');
+  again.remove();
+});
+
+test('MINOR 10: a peer that never reported is counted only once its own plan came back', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const withZed = {
+    ...fleetPlan,
+    nodes: [...fleetPlan.nodes, { nodeId: ZED, name: 'zed', local: false, online: true, status: 'unknown', lastKnown: true, lastBlocks: [] }],
+  };
+  const win = await openFleet({
+    addonTeardownPlanRequest: (_p, target) => {
+      if (target === ZED) return gate.then(() => atlasPlan);
+      return target === ATLAS ? atlasPlan : withZed;
+    },
+  });
+  await flush();
+  const button = win.querySelector('tf-button[data-action="confirm"]');
+  assert.equal(button.textContent, 'Odinstaluj na 3 węzłach', 'unknown yet: listed, not counted');
+  release();
+  await flush(); await flush();
+  assert.equal(button.textContent, 'Odinstaluj na 4 węzłach', 'its plan came back: it has the app');
+  win.remove();
+});
+
+test('MINOR 8: a node whose teardown failed says what refused, read from its plan after the failure', async () => {
+  const blocked = { ...atlasPlan, entries: [...atlasPlan.entries, { path: '', kind: 'tentanas_elastic_arrays', description: 'x', removed: false, sizeBytes: 0, countVars: { n: 2 }, blocks: true }] };
+  let failed = false;
+  const win = await openFleet({
+    addonTeardownPlanRequest: (_p, target) => {
+      if (target === ATLAS) return failed ? blocked : atlasPlan;
+      return fleetPlan;
+    },
+    addonUninstallRequest: { ok: true },
+    addonTeardownStatusRequest: (_p, target) => {
+      if (target === ATLAS) { failed = true; return { addonId: plan.addonId, state: 'failed', phase: 'tentanas_elastic_check', warnings: [] }; }
+      if (target === ORION) throw Object.assign(new Error('node did not answer'), { code: 'NodeUnreachable' });
+      return { addonId: plan.addonId, state: 'done', phase: 'done', warnings: [] };
+    },
+  });
+  await flush();
+  win.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  for (let i = 0; i < 10; i += 1) await flush();
+  assert.equal(rowOf(win, ATLAS).querySelector('[data-role="state-chip"]').getAttribute('label'), 'nie powiodło się');
+  assert.match(rowOf(win, ATLAS).querySelector('[data-role="state-detail"]').textContent,
+    /^węzeł odmówił: 2 macierze Elastic pod nadzorem TentaNas/);
+  win.remove();
+});
+
+test('MINOR 8: a peer whose plan cannot be read again is judged by the blocker it last published', async () => {
+  const published = {
+    ...fleetPlan,
+    nodes: fleetPlan.nodes.map((n) => (n.nodeId === ATLAS
+      ? { ...n, lastBlocks: [{ kind: 'tentanas_elastic_arrays', blocks: true, countVars: { n: 3 } }] }
+      : n)),
+  };
+  let failed = false;
+  const win = await openFleet({
+    addonTeardownPlanRequest: (_p, target) => {
+      if (target === ATLAS && failed) throw Object.assign(new Error('addon nie istnieje'), { code: 'NotFound' });
+      return target === ATLAS ? atlasPlan : published;
+    },
+    addonUninstallRequest: { ok: true },
+    addonTeardownStatusRequest: (_p, target) => {
+      if (target === ATLAS) { failed = true; return { addonId: plan.addonId, state: 'failed', phase: 'tentanas_elastic_check', warnings: [] }; }
+      if (target === ORION) throw Object.assign(new Error('node did not answer'), { code: 'NodeUnreachable' });
+      return { addonId: plan.addonId, state: 'done', phase: 'done', warnings: [] };
+    },
+  });
+  await flush();
+  win.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  for (let i = 0; i < 10; i += 1) await flush();
+  assert.match(rowOf(win, ATLAS).querySelector('[data-role="state-detail"]').textContent,
+    /^węzeł odmówił: 3 macierze Elastic pod nadzorem TentaNas/);
+  win.remove();
+});
+
+test('MINOR 8 (round 2): a failure in another step is worded by its step even when the node has a blocker', async () => {
+  const blocked = { ...atlasPlan, entries: [...atlasPlan.entries, { path: '', kind: 'tentanas_elastic_arrays', description: 'x', removed: false, sizeBytes: 0, countVars: { n: 2 }, blocks: true }] };
+  let failed = false;
+  const win = await openFleet({
+    addonTeardownPlanRequest: (_p, target) => {
+      if (target === ATLAS) return failed ? blocked : atlasPlan;
+      return fleetPlan;
+    },
+    addonUninstallRequest: { ok: true },
+    addonTeardownStatusRequest: (_p, target) => {
+      if (target === ATLAS) { failed = true; return { addonId: plan.addonId, state: 'failed', phase: 'tentanas_backup', warnings: [] }; }
+      if (target === ORION) throw Object.assign(new Error('node did not answer'), { code: 'NodeUnreachable' });
+      return { addonId: plan.addonId, state: 'done', phase: 'done', warnings: [] };
+    },
+  });
+  await flush();
+  win.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  for (let i = 0; i < 10; i += 1) await flush();
+  const detail = rowOf(win, ATLAS).querySelector('[data-role="state-detail"]').textContent;
+  assert.match(detail, /^na kroku: /);
+  assert.doesNotMatch(detail, /odmówił/);
+  win.remove();
+});

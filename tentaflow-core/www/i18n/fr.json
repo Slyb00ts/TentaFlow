@@ -3703,6 +3703,7 @@
     "node_unsupported": "non pris en charge",
     "node_init_error": "échec du démarrage",
     "node_nothing": "rien à faire — l’application n’a pas d’état sur ce nœud",
+    "node_absent": "l’application n’est pas installée sur ce nœud — rien à faire (le nœud qui désinstalle le vérifie lui-même ; s’il ne le peut pas, saisissez ci-dessous le nom du nœud)",
     "node_offline_scope": "le nœud ne répond pas — la désinstallation s’exécutera à son retour",
     "node_plan_error": "impossible de lire la portée depuis ce nœud",
     "node_blocked": "bloqué : {what}",
@@ -3718,6 +3719,7 @@
       "done_with_warnings": "désinstallé avec remarques",
       "failed": "échec",
       "failed_in": "à l’étape : {phase}",
+      "failed_because": "le nœud a refusé : {what}",
       "absent": "l’application n’est plus sur le nœud",
       "unreachable": "le nœud ne répond pas",
       "unreachable_detail": "la désinstallation s’exécutera à son retour",
@@ -5505,6 +5507,7 @@
       "disk_reason": {
         "self_test_running": "un test SMART est déjà en cours sur ce disque",
         "disk_gone": "le disque n’est plus dans l’inventaire du nœud",
+        "disk_unknown": "ce nœud ne connaît pas le disque — il n’a pas été testé",
         "start_failed": "le disque n’a pas accepté la commande de test",
         "privilege": "mot de passe ou canal de privilèges refusé — les disques suivants n’ont pas été lancés",
         "test_failed": "le disque a échoué au test : {detail}",
@@ -6506,7 +6509,7 @@
       "smart_pill_long": "long: {when}",
       "smart_sub": "dernier short : {short} · dernier long : {long}",
       "smart_no_disks": "Aucun disque de ce nœud ne prend en charge SMART.",
-      "smart_started": "Test SMART lancé sur {n} {n|disque|disques|disques}",
+      "smart_started": "Test SMART demandé sur {n} {n|disque|disques|disques} — la tâche affiche le résultat de chaque disque",
       "last_run": "dernier : {t}",
       "never_ran": "pas encore exécuté",
       "enabled_done": "Activé : {name}",
@@ -7031,6 +7034,11 @@
           "title": "Le partage n'est pas revenu sur ce nœud",
           "detail": "La configuration des partages n'a pas pu être écrite (tentative {n}). Le nœud réessaie à intervalle croissant ; en mode B, un canal de privilèges armé est nécessaire."
         },
+        "sharing_stop_interrupted": {
+          "title": "Le partage sur ce nœud reste arrêté après un redémarrage",
+          "detail_stopping": "Un redémarrage du nœud a interrompu l’arrêt du partage. Les partages et les cibles restent suspendus ; ils reviennent quand TentaNas est activé — en mode B seulement une fois le canal de privilèges armé.",
+          "detail_resuming": "Un redémarrage du nœud a interrompu la reprise du partage. Les partages et les cibles restent suspendus ; le nœud réessaie quand TentaNas est activé — en mode B seulement une fois le canal de privilèges armé."
+        },
         "sharing_share_not_resumed": {
           "title": "Le partage {share} n'est pas revenu à la reprise du partage",
           "detail": "L'état du partage indique pourquoi. Le nœud réessaie à intervalle croissant ; l'alerte se ferme dès que le partage sert de nouveau."
@@ -7105,7 +7113,7 @@
       "pool_filter_all": "Pool : tous",
       "smart_selected": "Test SMART de la sélection ({n})",
       "smart_selected_title": "Test SMART — {n} {n|disque|disques}",
-      "smart_selected_done": "Test SMART lancé sur {n} {n|disque|disques}",
+      "smart_selected_done": "Test SMART demandé sur {n} {n|disque|disques} — la tâche affiche le résultat de chaque disque",
       "legend_title": "Comment lire la santé",
       "legend_hint": "Le statut combine SMART, les compteurs d'erreurs du pool (READ/WRITE/CKSUM), les erreurs d'E/S du noyau et les tendances — pas seulement SMART.",
       "legend_ok": "aucun symptôme dans aucune source",
@@ -7589,7 +7597,7 @@
           "snapshot": "planification des instantanés du dataset {subject}",
           "smart": "planification des tests SMART"
         },
-        "sharing_stop": "Arrête le partage sur le nœud {node} — partages : {shares} ; cibles : {targets} — puis désactive TentaNas sur toute la flotte.",
+        "sharing_stop": "Arrête le partage sur le nœud {node} — partages : {shares} ; cibles : {targets} — puis désactive TentaNas sur toute la flotte. La liste date de la demande — à l’arrêt, le nœud la détermine à nouveau.",
         "sharing_stop_none": "aucun",
         "sharing_stop_node_unnamed": "sans nom",
         "sharing_stop_other_shares": "{n} {n|partage|partages} d'autres organisations",
@@ -7958,7 +7966,7 @@
       "elastic_one_cache_disk": "Une matrice Elastic peut avoir au plus un disque de cache",
       "pool_destroy_foreign_resources": "Ce pool ne peut pas être détruit : des partages ou des cibles d’une autre organisation l’utilisent.",
       "pool_destroy_unverified": "Impossible de vérifier si d’autres organisations utilisent ce pool ; il n’a donc pas été détruit. Réessayez.",
-      "pool_destroy_in_progress": "Un pool est en cours de destruction sur ce nœud ; réessayez dans un instant.",
+      "pool_destroy_in_progress": "Une autre modification des pools, partages ou cibles de ce nœud est en cours ; réessayez dans un instant.",
       "forward_address_refused": "Cette adresse n’est pas autorisée : un réseau privé absent de la liste des collecteurs internes de l’administrateur de la plateforme, ou loopback, lien local ou une adresse de métadonnées cloud.",
       "forward_https_only": "Le webhook doit être une adresse https:// (http:// uniquement vers un hôte de la liste de l’administrateur de la plateforme marqué « autoriser http »).",
       "forward_node_retired": "La cible partagée du nœud est retirée : elle ne peut qu’être supprimée.",

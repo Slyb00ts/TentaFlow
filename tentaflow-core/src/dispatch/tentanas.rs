@@ -397,7 +397,8 @@ fn name_jobs(
                 // lines as they are now.
                 let (kind, rest) = job.subject.split_once('|').unwrap_or(("short", ""));
                 if rest != "all" && !job.disks.is_empty() {
-                    let names: Vec<String> = job.disks.iter().map(|d| d.name.clone()).collect();
+                    let names: Vec<String> =
+                        job.disks.iter().map(|d| d.name.clone()).filter(|name| !name.is_empty()).collect();
                     job.subject = tentanas::db::smart_batch_subject(kind == "long", Some(&names));
                 }
             }
@@ -810,6 +811,32 @@ async fn disk_smart_test(
 /// shelf this product manages.
 const SMART_BATCH_MAX_DISKS: usize = 256;
 
+/// The longest disk id a batch may carry (wave 11 round 2): an unknown id is
+/// now stored as a refused line, so each one is bounded. The node's own ids
+/// (`wwn-…`, `sn-<serial>`, a by-id name) are far shorter.
+const SMART_BATCH_MAX_ID_LEN: usize = 128;
+
+/// The distinct ids of a batch request, or why it is refused.
+fn smart_batch_ids(disk_ids: &[String]) -> Result<Vec<&String>, ProtocolError> {
+    if let Some(long) = disk_ids.iter().find(|id| id.len() > SMART_BATCH_MAX_ID_LEN) {
+        return Err(ProtocolError::bad_request(format!(
+            "a disk id is at most {SMART_BATCH_MAX_ID_LEN} characters (got {})",
+            long.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<&String> = disk_ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+    if ids.is_empty() {
+        return Err(ProtocolError::bad_request("no disk to test"));
+    }
+    if ids.len() > SMART_BATCH_MAX_DISKS {
+        return Err(ProtocolError::bad_request(format!(
+            "at most {SMART_BATCH_MAX_DISKS} disks per self-test job"
+        )));
+    }
+    Ok(ids)
+}
+
 /// One SMART self-test job over several disks (`jobs::smart_self_test_batch`):
 /// one request, one job row with a line per disk, one credential, and a stop
 /// at the first privilege/credential error instead of one refusal per disk.
@@ -825,28 +852,25 @@ async fn disk_smart_test_batch(
         "long" => SelfTestKind::Long,
         other => return Err(ProtocolError::bad_request(format!("unknown self-test kind '{other}'"))),
     };
-    let mut seen = std::collections::HashSet::new();
-    let ids: Vec<&String> = disk_ids.iter().filter(|id| seen.insert(id.as_str())).collect();
-    if ids.is_empty() {
-        return Err(ProtocolError::bad_request("no disk to test"));
-    }
-    if ids.len() > SMART_BATCH_MAX_DISKS {
-        return Err(ProtocolError::bad_request(format!(
-            "at most {SMART_BATCH_MAX_DISKS} disks per self-test job"
-        )));
-    }
+    let ids = smart_batch_ids(disk_ids)?;
     // Every line is named when the job is written: the kernel name now, or the
-    // name the node last saw the disk under. A disk the node never knew is
-    // refused here rather than written as a line with no name to show.
+    // name the node last saw the disk under. A disk the node never knew is a
+    // line with NO name (critic wave 9b, MINOR 12): written refused
+    // (`disk_unknown`, `db::insert_job_full`), shown as "unknown disk" — its
+    // id is never a name — and the other disks are still tested. Only a
+    // request in which the node knows no disk at all is refused.
     let mut disks = Vec::with_capacity(ids.len());
     for id in ids {
         let name = match tentanas::disks::shown_disk_name(&g.db, id, None) {
             tentanas::disks::ShownDiskName::Live(name) | tentanas::disks::ShownDiskName::LastKnown(name) => name,
-            tentanas::disks::ShownDiskName::Unknown => return Err(ProtocolError::not_found("disk not found")),
+            tentanas::disks::ShownDiskName::Unknown => String::new(),
         };
         disks.push((id.clone(), name));
     }
-    let names: Vec<String> = disks.iter().map(|(_, name)| name.clone()).collect();
+    if disks.iter().all(|(_, name)| name.is_empty()) {
+        return Err(ProtocolError::not_found("disk not found"));
+    }
+    let names: Vec<String> = disks.iter().map(|(_, name)| name.clone()).filter(|name| !name.is_empty()).collect();
     let subject = tentanas::db::smart_batch_subject(kind == SelfTestKind::Long, Some(&names));
     let explicit = secret.map(token);
     let job = tentanas::jobs::spawn_smart_batch(&g.db, &subject, &g.user_id, &disks, move |h| {
@@ -1334,8 +1358,8 @@ fn pool_destroy_guard(
     Ok(())
 }
 
-/// `pools::try_resources_lock`, or the coded refusal of a creation that met a
-/// pool destroy in progress.
+/// `pools::try_resources_lock`, or the coded refusal of a creation that met
+/// the lock held (a pool destroy, another creation or an import).
 async fn resources_or_refuse(g: &Gate) -> Result<tokio::sync::OwnedMutexGuard<()>, ProtocolError> {
     tentanas::pools::try_resources_lock(&g.db)
         .await
@@ -2640,11 +2664,14 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     let g = gate_shares(ctx)?;
     tentanas_helper::validate_share_name(name)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    // The environment probe reads no pool, so it runs before the lock: the
+    // lock is held only from the read of the datasets to the row, and a
+    // concurrent creation is not refused because this one was probing.
+    let (rdma_ok, smb_direct_ok) = transport_gates(&g).await;
     // From the read of the datasets to the row: a pool destroy cannot run in
     // between (`pools::resources_lock`) — and one that is running refuses
     // this after a short wait, never an unbounded one.
     let _serialised = resources_or_refuse(&g).await?;
-    let (rdma_ok, smb_direct_ok) = transport_gates(&g).await;
     tentanas::shares::validate_options(protocol, smb, nfs, rdma_ok, smb_direct_ok)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     require_own_grantees(&g, smb, &[])?;
@@ -6721,6 +6748,26 @@ register_tentanas_variant!(
     "tentaflow_ws_handler_nas_elastic_folder_cache_set"
 );
 register_tentanas_variant!("TentaNasSharingStopRequest", "tentaflow_ws_handler_nas_sharing_stop");
+
+#[cfg(test)]
+mod smart_batch_id_tests {
+    use super::*;
+
+    /// Wave 11 round 2: every id is bounded, duplicates count once, the
+    /// count is bounded.
+    #[test]
+    fn a_batch_bounds_each_id_and_the_count() {
+        let ok = vec!["wwn-0x5000c500a1b2c3d4".to_string(), "wwn-0x5000c500a1b2c3d4".to_string(), "x".repeat(SMART_BATCH_MAX_ID_LEN)];
+        assert_eq!(smart_batch_ids(&ok).expect("bounded").len(), 2);
+        let long = vec!["sda".to_string(), "x".repeat(SMART_BATCH_MAX_ID_LEN + 1)];
+        let refused = smart_batch_ids(&long).expect_err("too long");
+        assert!(refused.message.contains("at most 128 characters"), "{}", refused.message);
+        assert!(!refused.message.contains("xxxx"), "the id is not echoed");
+        assert!(smart_batch_ids(&[]).is_err());
+        let many: Vec<String> = (0..=SMART_BATCH_MAX_DISKS).map(|i| format!("sn-{i:08}")).collect();
+        assert!(smart_batch_ids(&many).is_err());
+    }
+}
 
 #[cfg(test)]
 mod config_import_subject_tests {

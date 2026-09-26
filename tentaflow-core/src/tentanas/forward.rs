@@ -41,6 +41,17 @@
 //       organisation's target and a single `forwarded_at` mark cannot say
 //       which of them it reached. Delivery stays AT LEAST ONCE: a cursor
 //       moves after the send. A target sends what is raised while it is on.
+//
+//       AN ALERT WHOSE OWNER CHANGES KEEPS ITS ROW (critic wave 9b, MINOR 2):
+//       `raise_coded_alert` re-stamps an open alert's `org_id` in place when
+//       its subject changes hands (an array adopted by another organisation),
+//       so its rowid does not move. A cursor of the NEW owner that already
+//       passed that rowid never sends it; the old owner's cursor may have
+//       sent it while it was theirs. Nothing leaks — each send happened
+//       while the row was visible to that target — the new owner only misses
+//       the alert on its collector (it sees it on the screen). Same rule as
+//       the old single `forwarded_at` mark; a fix would need a new row per
+//       owner change.
 // =============================================================================
 
 use std::time::Duration;
@@ -809,17 +820,13 @@ pub async fn forward_tick(main_db: &DbPool, nas_db: &DbPool) {
         return;
     };
     let (node, orgs) = stored_all(main_db, &addon_id);
-    // A soft-deleted organisation's target is not served: its admins are gone,
-    // and the node-wide alerts it would receive are nobody's business there.
-    let deleted: std::collections::BTreeSet<String> = crate::services::org::list_organizations(main_db, None)
-        .map(|all| all.into_iter().filter(|o| o.status == "deleted").map(|o| o.org_id).collect())
-        .unwrap_or_default();
+    let active = active_orgs(main_db);
     let mut targets: Vec<(Target<'_>, &Stored)> = Vec::new();
     if let Some(node) = node.as_ref() {
         targets.push((Target::Node, node));
     }
     for (org, s) in &orgs {
-        if !deleted.contains(org) {
+        if org_target_served(org, active.as_ref()) {
             targets.push((Target::Org(org), s));
         }
     }
@@ -836,6 +843,27 @@ pub async fn forward_tick(main_db: &DbPool, nas_db: &DbPool) {
             let _ = store::record_forward_error(nas_db, target.cursor_key(), &code);
         }
     }
+}
+
+/// The organisations whose status is `active`, `None` when the list cannot
+/// be read.
+fn active_orgs(main_db: &DbPool) -> Option<std::collections::BTreeSet<String>> {
+    crate::services::org::list_organizations(main_db, None)
+        .map(|all| all.into_iter().filter(|o| o.status == "active").map(|o| o.org_id).collect())
+        .ok()
+}
+
+/// Whether an organisation's target is served on this pass: only while the
+/// organisation is `active` (critic wave 9b, MINOR 13). A soft-deleted one's
+/// admins are gone, and a suspended one's cannot sign in to see or change
+/// where its rows go — neither gets its own alerts nor the node-wide ones.
+/// Nothing is dropped: the target's cursor stays where it stood, so a
+/// suspended organisation that is active again receives what was raised
+/// meanwhile (at least once, like any other pause). An organisation no row
+/// names, or a list that cannot be read, is not served on this pass
+/// (fail closed; the rows wait for the next one).
+fn org_target_served(org: &str, active: Option<&std::collections::BTreeSet<String>>) -> bool {
+    active.is_some_and(|active| active.contains(org))
 }
 
 /// One batch for one target. Returns how many rows left the node.
@@ -1259,6 +1287,34 @@ mod tests {
             assert_eq!(err.to_string(), NOT_ACCEPTED);
         }
         assert!(received(&collector).await.is_empty(), "nothing reached the loopback collector");
+    }
+
+    /// Critic wave 9b, MINOR 13: only an ACTIVE organisation's target is
+    /// served — not a suspended or deleted one, not one no row names, and
+    /// none at all when the list cannot be read.
+    #[test]
+    fn only_an_active_organisations_target_is_served() {
+        let active: std::collections::BTreeSet<String> = ["org-a".to_string()].into();
+        assert!(org_target_served("org-a", Some(&active)));
+        assert!(!org_target_served("org-suspended", Some(&active)));
+        assert!(!org_target_served("org-unknown", Some(&active)));
+        assert!(!org_target_served("org-a", None), "an unreadable list serves nobody");
+        // Through the real organisation list: a suspended organisation is
+        // left out of the set the pass builds.
+        let main = crate::dispatch::state::AppState::for_test().db.clone();
+        main.write()
+            .expect("write")
+            .execute_batch(
+                "INSERT INTO organizations (org_id, name, slug, status, created_at) VALUES \
+                   ('org-live', 'Live', 'live', 'active', '2026-09-01T00:00:00Z'), \
+                   ('org-paused', 'Paused', 'paused', 'suspended', '2026-09-01T00:00:00Z'), \
+                   ('org-gone', 'Gone', 'gone', 'deleted', '2026-09-01T00:00:00Z');",
+            )
+            .expect("orgs");
+        let set = active_orgs(&main).expect("orgs");
+        assert!(org_target_served("org-live", Some(&set)));
+        assert!(!org_target_served("org-paused", Some(&set)), "suspended");
+        assert!(!org_target_served("org-gone", Some(&set)), "deleted");
     }
 
     /// A tiny HTTP endpoint: answers every request with `status` and

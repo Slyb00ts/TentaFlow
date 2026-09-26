@@ -185,6 +185,12 @@ pub fn published_teardown_blocks(
 /// A peer as the uninstall preflight judges it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerForTeardown {
+    /// Verified by the node running the uninstall, never taken from the
+    /// client: the peer's OWN dispatcher answered that it has no instance
+    /// row for this app (`AddonTeardownPlanRequest` forwarded to it →
+    /// NotFound). Such a peer has nothing to tear down and holds nothing
+    /// back (wave 11 round 2, B1).
+    pub absent: bool,
     pub node_id: String,
     /// The node's name ('' when it never told one).
     pub name: String,
@@ -233,7 +239,7 @@ pub fn peer_teardown_refusal(
 ) -> Result<Vec<AcknowledgedPeer>, String> {
     let mut acknowledged = Vec::new();
     for node in nodes {
-        if node.status == "unsupported" || node.unpaired {
+        if node.status == "unsupported" || node.unpaired || node.absent {
             continue;
         }
         let reason = match published.get(&node.node_id) {
@@ -744,7 +750,7 @@ mod tests {
     use super::*;
 
     fn peer(id: &str, name: &str, status: &str, unpaired: bool) -> PeerForTeardown {
-        PeerForTeardown { node_id: id.into(), name: name.into(), status: status.into(), unpaired, online: false }
+        PeerForTeardown { node_id: id.into(), name: name.into(), status: status.into(), unpaired, online: false, absent: false }
     }
 
     /// MAJOR A of round 2: how the preflight judges each peer, and the two
