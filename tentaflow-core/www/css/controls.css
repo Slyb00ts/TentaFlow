@@ -3044,6 +3044,9 @@ tf-section-card { display: block; }
    ============================================================================= */
 
 tf-alert { display: block; }
+/* `display: block` outranks the user-agent rule for [hidden], so an alert
+   kept in the markup and toggled by `hidden` would never disappear. */
+tf-alert[hidden] { display: none; }
 
 .tf-alert {
   display: flex;
