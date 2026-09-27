@@ -2402,6 +2402,46 @@ mod tp_shard_tests {
     }
 
     #[test]
+    fn glowice_v_ida_klasami_reszty_na_cztery_rangi() {
+        // The configuration we actually run, and the one the world=2 test above
+        // does NOT pin: 16 K heads over 4 ranks give 4 K heads per rank and
+        // three runs of V, and a mistake here yields silently wrong weights
+        // with nothing to assert against at runtime.
+        let n_k = 16usize;
+        let n_v = 48usize;
+        let world = 4usize;
+        let per_k = n_k / world;
+        let expected: [[usize; 12]; 4] = [
+            [0, 1, 2, 3, 16, 17, 18, 19, 32, 33, 34, 35],
+            [4, 5, 6, 7, 20, 21, 22, 23, 36, 37, 38, 39],
+            [8, 9, 10, 11, 24, 25, 26, 27, 40, 41, 42, 43],
+            [12, 13, 14, 15, 28, 29, 30, 31, 44, 45, 46, 47],
+        ];
+        let mut all = Vec::new();
+        for (rank, expected_order) in expected.iter().enumerate() {
+            let shard = TpShard::new(rank, world).expect("ranga");
+            let order = shard.v_head_order(n_k, n_v).expect("podział V");
+            assert_eq!(order, *expected_order, "ranga {rank}");
+            // Local numbering of the fused DeltaNet step: `h_local + run * per_k`.
+            let (first_k, per_rank_k) = shard.k_head_range(n_k).expect("zakres K");
+            assert_eq!(per_rank_k, per_k);
+            for (slot, &head) in order.iter().enumerate() {
+                assert_eq!(head, (slot / per_k) * n_k + first_k + slot % per_k);
+                // The V head must reach a K head this rank owns (GGUF pairs them
+                // by modulo).
+                let k = head % n_k;
+                assert!(
+                    k >= first_k && k < first_k + per_k,
+                    "ranga {rank}: głowica V {head} sięga po K {k}"
+                );
+            }
+            all.extend(order);
+        }
+        all.sort_unstable();
+        assert_eq!(all, (0..n_v).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn niepodzielne_ksztalty_sa_odrzucane() {
         let shard = TpShard::new(0, 3).expect("ranga 0 z trzech");
         // 16 głowic K nie dzieli się na trzy rangi.
@@ -2850,12 +2890,12 @@ mod role_shard_tests {
         assert_eq!(params.attn_scale_at(0), 1.0 / (128.0f32).sqrt());
     }
 
-    /// Suma wycinków obu rang musi pokryć KAŻDY wiersz (albo kolumnę) dokładnie
-    /// raz. To jest bramka, która łapie i lukę, i nakładkę.
-    fn assert_partition(p: &Hyperparams, role: WeightRole, total: usize) {
+    /// Suma wycinków wszystkich rang musi pokryć KAŻDY wiersz (albo kolumnę)
+    /// dokładnie raz. To jest bramka, która łapie i lukę, i nakładkę.
+    fn assert_partition(p: &Hyperparams, role: WeightRole, total: usize, world: usize) {
         let mut seen = vec![0usize; total];
-        for rank in 0..2 {
-            let shard = TpShard::new(rank, 2).expect("ranga");
+        for rank in 0..world {
+            let shard = TpShard::new(rank, world).expect("ranga");
             let ranges = match shard.role_shard(p, role).expect("plan") {
                 RoleShard::Rows(r) | RoleShard::Cols(r) => r,
                 RoleShard::Replicated => panic!("{role:?} miała być dzielona"),
@@ -2875,16 +2915,46 @@ mod role_shard_tests {
     fn podzialy_pokrywaja_kazdy_element_dokladnie_raz() {
         let p = qwen35();
         let ssm = p.ssm.clone().expect("ssm");
-        assert_partition(&p, WeightRole::AttnQ, 24 * 256 * 2);
-        assert_partition(&p, WeightRole::AttnK, 4 * 256);
-        assert_partition(&p, WeightRole::AttnO, 24 * 256);
-        assert_partition(&p, WeightRole::FfnGate, 17408);
-        assert_partition(&p, WeightRole::FfnDown, 17408);
-        assert_partition(&p, WeightRole::SsmInProj, ssm.conv_dim());
-        assert_partition(&p, WeightRole::SsmConv1d, ssm.conv_dim());
-        assert_partition(&p, WeightRole::SsmGate, ssm.value_dim());
-        assert_partition(&p, WeightRole::SsmOut, ssm.value_dim());
-        assert_partition(&p, WeightRole::SsmAlpha, 48);
+        assert_partition(&p, WeightRole::AttnQ, 24 * 256 * 2, 2);
+        assert_partition(&p, WeightRole::AttnK, 4 * 256, 2);
+        assert_partition(&p, WeightRole::AttnO, 24 * 256, 2);
+        assert_partition(&p, WeightRole::FfnGate, 17408, 2);
+        assert_partition(&p, WeightRole::FfnDown, 17408, 2);
+        assert_partition(&p, WeightRole::SsmInProj, ssm.conv_dim(), 2);
+        assert_partition(&p, WeightRole::SsmConv1d, ssm.conv_dim(), 2);
+        assert_partition(&p, WeightRole::SsmGate, ssm.value_dim(), 2);
+        assert_partition(&p, WeightRole::SsmOut, ssm.value_dim(), 2);
+        assert_partition(&p, WeightRole::SsmAlpha, 48, 2);
+    }
+
+    #[test]
+    fn podzialy_na_cztery_rangi_pokrywaja_kazdy_element_dokladnie_raz() {
+        // The intended tensor-parallel width. DeltaNet carries the risky split
+        // (V heads by remainder class), so a rank's slices must still tile the
+        // full matrix with no gap and no overlap at world = 4.
+        let p = qwen35();
+        let ssm = p.ssm.clone().expect("ssm");
+        let world = 4;
+        let local = p
+            .shard(TpShard::new(3, world).expect("ranga"))
+            .expect("hiperparametry");
+        let local_ssm = local.ssm.expect("ssm rangi");
+        // 48 V heads over 16 K heads, both cut into four: each rank keeps a
+        // quarter of the K heads and three runs of V.
+        assert_eq!(local_ssm.n_group, 4);
+        assert_eq!(local_ssm.dt_rank, 12);
+        assert_eq!(local.n_heads, 6);
+        assert_eq!(local.n_kv_heads, 1);
+        assert_partition(&p, WeightRole::AttnQ, 24 * 256 * 2, world);
+        assert_partition(&p, WeightRole::AttnK, 4 * 256, world);
+        assert_partition(&p, WeightRole::AttnO, 24 * 256, world);
+        assert_partition(&p, WeightRole::FfnGate, 17408, world);
+        assert_partition(&p, WeightRole::FfnDown, 17408, world);
+        assert_partition(&p, WeightRole::SsmInProj, ssm.conv_dim(), world);
+        assert_partition(&p, WeightRole::SsmConv1d, ssm.conv_dim(), world);
+        assert_partition(&p, WeightRole::SsmGate, ssm.value_dim(), world);
+        assert_partition(&p, WeightRole::SsmOut, ssm.value_dim(), world);
+        assert_partition(&p, WeightRole::SsmAlpha, 48, world);
     }
 
     #[test]

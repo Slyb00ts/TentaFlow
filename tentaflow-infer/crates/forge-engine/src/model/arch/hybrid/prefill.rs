@@ -439,9 +439,9 @@ impl Model {
     pub(crate) fn ensure_hybrid_prefill_capacity(&mut self, cap: usize) -> Result<()> {
         self.ensure_prefill_bufs()?;
         self.ensure_hybrid_verify_bufs(4)?;
-        std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+        self.swap_hybrid_verify_prefill_bufs();
         let result = self.ensure_hybrid_verify_bufs(cap.max(4));
-        std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+        self.swap_hybrid_verify_prefill_bufs();
         result
     }
 
@@ -1959,7 +1959,7 @@ impl Model {
         let prefill_cap = tokens.len().min(chunk_size);
         let saved_graphs = if prefill_cap > 4 {
             self.ensure_hybrid_verify_bufs(4)?;
-            std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+            self.swap_hybrid_verify_prefill_bufs();
             Some((
                 std::mem::take(&mut self.hybrid_verify_graphs),
                 std::mem::take(&mut self.hybrid_verify_graph_disabled),
@@ -2078,7 +2078,7 @@ impl Model {
         restore_after(result, || {
             if let Some((graphs, disabled)) = saved_graphs {
                 // Verifier decode zachowuje własne bufory cap=4 i przechwycone grafy.
-                std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+                self.swap_hybrid_verify_prefill_bufs();
                 self.hybrid_verify_graphs = graphs;
                 self.hybrid_verify_graph_disabled = disabled;
             }

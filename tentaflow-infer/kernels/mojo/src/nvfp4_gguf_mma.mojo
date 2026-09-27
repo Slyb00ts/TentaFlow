@@ -9,7 +9,7 @@ from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace, async_copy_commit_group, async_copy_wait_group
 from std.gpu.compute.mma import mma, ld_matrix
 from std.memory import stack_allocation
-from src.gemm import _issue_x, _store_tile
+from src.gemm import _issue_x, _store_tile, _store_tile_f32
 from src.gemv2 import _e2m1x8
 from src.nvfp4_gguf_batch import _ue4m3_value
 
@@ -18,8 +18,8 @@ comptime LDK = 40
 comptime LDW = 40
 
 
-def gemm_nvfp4_gguf_mma_impl[BM: Int, BN: Int, NW: Int](
-    y: UnsafePointer[Float16, MutAnyOrigin],
+def gemm_nvfp4_gguf_mma_impl[BM: Int, BN: Int, NW: Int, OUT: DType = DType.float16](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
     n_cols: Int,
@@ -196,10 +196,18 @@ def gemm_nvfp4_gguf_mma_impl[BM: Int, BN: Int, NW: Int](
     if output_scale != 1.0:
         comptime for i in range(8):
             accumulators[i] *= output_scale
-    _store_tile(
-        y, accumulators, token0, row0, warp_m, warp_n, group, lane4,
-        n_rows, n_tokens,
-    )
+    # `OUT = f32` keeps the mma accumulator verbatim: the result is a partial sum
+    # that other ranks add to, so narrowing it here would round twice.
+    comptime if OUT == DType.float32:
+        _store_tile_f32(
+            y.bitcast[Float32](), accumulators, token0, row0, warp_m, warp_n,
+            group, lane4, n_rows, n_tokens,
+        )
+    else:
+        _store_tile(
+            y.bitcast[Float16](), accumulators, token0, row0, warp_m, warp_n,
+            group, lane4, n_rows, n_tokens,
+        )
 
 
 def gemm_nvfp4_gguf_mma_prefetch_impl[BM: Int, BN: Int, NW: Int](
@@ -413,3 +421,6 @@ comptime gemm_nvfp4_gguf_mma_f16_bm128_prefetch = gemm_nvfp4_gguf_mma_prefetch_i
 comptime gemm_nvfp4_gguf_mma_f16_bm32 = gemm_nvfp4_gguf_mma_impl[32, 64, 2]
 comptime gemm_nvfp4_gguf_mma_f16_bm128 = gemm_nvfp4_gguf_mma_impl[128, 64, 8]
 comptime gemm_nvfp4_gguf_mma_f16_bm128_bn32 = gemm_nvfp4_gguf_mma_impl[128, 32, 4]
+comptime gemm_nvfp4_gguf_mma_out_f32_bm128 = gemm_nvfp4_gguf_mma_impl[
+    128, 64, 8, DType.float32
+]

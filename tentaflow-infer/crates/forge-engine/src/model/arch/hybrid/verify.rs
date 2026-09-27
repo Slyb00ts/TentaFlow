@@ -2,6 +2,21 @@
 use super::super::super::*;
 
 impl Model {
+    /// Exchanges the two roles of the hybrid scratch on every member of the split.
+    ///
+    /// `hybrid_verify_bufs` carries either the capture-sized verifier workspace or
+    /// the aliased prefill scratch, and only the owner of the split performed that
+    /// exchange, so the ranks kept whichever layout was asked for last. A rank that
+    /// was last sized for a prefill chunk then fails the draft-verification forward,
+    /// which runs there with `inplace_prefill = false`.
+    pub(crate) fn swap_hybrid_verify_prefill_bufs(&mut self) {
+        for index in 0..self.tp_rank_count() {
+            let rank = &mut self.tp.as_mut().expect("podział sprawdzony").ranks[index];
+            rank.swap_hybrid_verify_prefill_bufs();
+        }
+        std::mem::swap(&mut self.hybrid_verify_bufs, &mut self.hybrid_prefill_bufs);
+    }
+
     pub(crate) fn ensure_hybrid_verify_bufs(&mut self, cap: usize) -> Result<()> {
         for index in 0..self.tp_rank_count() {
             let rank = &mut self.tp.as_mut().expect("podział sprawdzony").ranks[index];

@@ -580,21 +580,51 @@ fn detect_caps(ctx: &Arc<CudaContext>) -> Result<DeviceCaps> {
     })
 }
 
+/// Real driver probe of whether the memory of device `to` is directly readable
+/// by the device `from`. This is the capability alone: opening P2P is a separate
+/// step that can still fail (the driver bounds how many peer mappings a context
+/// may hold), so a `true` here is not "P2P is open".
+fn peer_accessible(from: sys::CUdevice, to: i32) -> Result<bool> {
+    let mut accessible: i32 = 0;
+    unsafe { sys::cuDeviceCanAccessPeer(&mut accessible, from, to) }
+        .result()
+        .map_err(|e| cu_err("cuDeviceCanAccessPeer", e))?;
+    Ok(accessible != 0)
+}
+
+/// `supports_p2p` answers the question tensor parallel asks BEFORE it cuts a
+/// model: can this device reach EVERY other visible device? One reachable peer
+/// is not enough — `enable_peer_mesh` opens all ordered pairs and refuses the
+/// split otherwise, so a `true` for a partially connected set would advertise a
+/// capability the very next step fails on.
 fn detect_p2p(ctx: &Arc<CudaContext>) -> Result<bool> {
-    let count = CudaContext::device_count().map_err(|e| cu_err("cuDeviceGetCount", e))? as usize;
-    for peer in 0..count {
-        if peer == ctx.ordinal() {
-            continue;
-        }
-        let mut accessible: i32 = 0;
-        unsafe { sys::cuDeviceCanAccessPeer(&mut accessible, ctx.cu_device(), peer as i32) }
-            .result()
-            .map_err(|e| cu_err("cuDeviceCanAccessPeer", e))?;
-        if accessible != 0 {
-            return Ok(true);
+    let count = CudaContext::device_count().map_err(|e| cu_err("cuDeviceGetCount", e))?;
+    let mut peers = (0..count as usize)
+        .filter(|&peer| peer != ctx.ordinal())
+        .peekable();
+    if peers.peek().is_none() {
+        return Ok(false);
+    }
+    for peer in peers {
+        if !peer_accessible(ctx.cu_device(), peer as i32)? {
+            return Ok(false);
         }
     }
-    Ok(false)
+    Ok(true)
+}
+
+/// Peer copies take device memory on both ends. Pinned and managed allocations
+/// belong to a context but are host memory: the driver has no peer path for
+/// them, so it would quietly stage the transfer through the host — a wrong
+/// direction that reports success and costs an order of magnitude. PURE, so the
+/// refusal itself is testable without two cards.
+fn device_endpoints_only(from: usize, to: usize, src: MemKind, dst: MemKind) -> Result<()> {
+    if src == MemKind::Device && dst == MemKind::Device {
+        return Ok(());
+    }
+    Err(ForgeError::Device(format!(
+        "peer copy from device {from} to device {to} needs device memory on both ends, got {src:?} and {dst:?}"
+    )))
 }
 
 // Checked add: `offset + bytes` overflowing in release would pass the bound
@@ -765,7 +795,11 @@ impl Device for CudaDevice {
     fn wait_event(&self, stream: &Stream, event: &Event) -> Result<()> {
         let event = event.downcast::<CudaEventImpl>()?;
         let stream = stream.downcast::<CudaStreamImpl>()?;
-        self.check_same_device(event.event.context(), "Event")?;
+        // The EVENT may belong to another card: `cuStreamWaitEvent` accepts an
+        // event recorded anywhere, and a rank waiting on another rank's event is
+        // the only ordering the symmetric reduction has. Recording
+        // (`cuEventRecord`) and timing (`cuEventElapsedTime`) do need a shared
+        // context and stay strict, this one does not.
         self.check_same_device(stream.stream.context(), "Stream")?;
         stream
             .stream
@@ -785,6 +819,57 @@ impl Device for CudaDevice {
             .map_err(|e| cu_err("cuEventElapsedTime", e))
     }
 
+    /// The CUDA device index this context was opened on — the same index peer
+    /// access is addressed by. It lands HERE, with `enable_peer_access`, on
+    /// purpose: left at the trait default (always 0) the self-guard inside
+    /// `enable_peer_access` would swallow every request for a peer and the mesh
+    /// would report success while opening nothing.
+    fn ordinal(&self) -> usize {
+        self.ctx.ordinal()
+    }
+
+    /// Opens access from THIS device's context to the peer's. CUDA keeps that
+    /// state per context pair and reports an error when the same pair is opened
+    /// twice; the target state is already reached then, so it counts as success
+    /// and the caller need not track who opened what.
+    fn enable_peer_access(&self, peer_ordinal: usize) -> Result<()> {
+        if peer_ordinal == self.ctx.ordinal() {
+            return Ok(());
+        }
+        let count = CudaContext::device_count().map_err(|e| cu_err("cuDeviceGetCount", e))?;
+        if peer_ordinal >= count as usize {
+            return Err(ForgeError::Device(format!(
+                "P2P: device {peer_ordinal} is outside the {count} visible device(s)"
+            )));
+        }
+        self.bind()?;
+        // `CudaContext::new` retains the peer's PRIMARY context, and a device has
+        // exactly one: a peer already opened as a device hands back that very
+        // context, not a second one, so this Arc pinning it here is the same
+        // context the peer's own `CudaDevice` holds. Dropping the handle only
+        // releases the retain it took.
+        let peer = CudaContext::new(peer_ordinal)
+            .map_err(|e| cu_err(&format!("CudaContext::new({peer_ordinal})"), e))?;
+        if !peer_accessible(self.ctx.cu_device(), peer_ordinal as i32)? {
+            return Err(ForgeError::Unsupported(format!(
+                "cards {} and {peer_ordinal} cannot see each other's memory",
+                self.ctx.ordinal()
+            )));
+        }
+        // `CudaContext::new` binds the PEER's context on this thread, while
+        // `cuCtxEnablePeerAccess` enables access FROM the current context TO its
+        // argument — ours has to be current again before the call.
+        self.bind()?;
+        match unsafe { sys::cuCtxEnablePeerAccess(peer.cu_ctx(), 0) } {
+            sys::CUresult::CUDA_SUCCESS | sys::CUresult::CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED => {
+                Ok(())
+            }
+            other => other
+                .result()
+                .map_err(|e| cu_err("cuCtxEnablePeerAccess", e)),
+        }
+    }
+
     fn copy(
         &self,
         src: &DevBuffer,
@@ -794,26 +879,55 @@ impl Device for CudaDevice {
         bytes: usize,
         stream: &Stream,
     ) -> Result<()> {
-        self.check_same_device(src.downcast::<CudaBuffer>()?.ctx(), "source DevBuffer")?;
-        self.check_same_device(dst.downcast::<CudaBuffer>()?.ctx(), "destination DevBuffer")?;
+        let source = src.downcast::<CudaBuffer>()?;
+        let target = dst.downcast::<CudaBuffer>()?;
         let stream_impl = stream.downcast::<CudaStreamImpl>()?;
+        // The card that issues the copy owns the source endpoint and the stream
+        // (a rank records its `done` event on that stream right after, so the
+        // copy has to be ordered on it). The DESTINATION may sit on another card
+        // — that is the peer path.
+        self.check_same_device(source.ctx(), "source DevBuffer")?;
         self.check_same_device(stream_impl.stream.context(), "Stream")?;
         bounds_check(src, src_offset, bytes)?;
         bounds_check(dst, dst_offset, bytes)?;
         self.bind()?;
-        // Every HAL buffer address is UVA (device pools, pinned host, managed),
-        // so the direction-agnostic cuMemcpyAsync covers H2D/D2H/D2D/H2H with
-        // stream ordering in one call.
-        unsafe {
-            sys::cuMemcpyAsync(
-                dst.device_ptr() + dst_offset as u64,
-                src.device_ptr() + src_offset as u64,
-                bytes,
-                stream_impl.stream.cu_stream(),
-            )
+        let target_ctx = target.ctx();
+        if target_ctx.ordinal() == self.ctx.ordinal() {
+            // Every HAL buffer address is UVA (device pools, pinned host,
+            // managed), so the direction-agnostic cuMemcpyAsync covers
+            // H2D/D2H/D2D/H2H with stream ordering in one call.
+            unsafe {
+                sys::cuMemcpyAsync(
+                    dst.device_ptr() + dst_offset as u64,
+                    src.device_ptr() + src_offset as u64,
+                    bytes,
+                    stream_impl.stream.cu_stream(),
+                )
+            }
+            .result()
+            .map_err(|e| cu_err("cuMemcpyAsync", e))?;
+        } else {
+            device_endpoints_only(
+                self.ctx.ordinal(),
+                target_ctx.ordinal(),
+                source.kind,
+                target.kind,
+            )?;
+            // Both contexts are named explicitly because only one of them can be
+            // current: the stream is validated against the current context, so
+            // the copy is enqueued where it is ordered.
+            unsafe {
+                result::memcpy_peer_async(
+                    target_ctx.cu_ctx(),
+                    dst.device_ptr() + dst_offset as u64,
+                    self.ctx.cu_ctx(),
+                    src.device_ptr() + src_offset as u64,
+                    bytes,
+                    stream_impl.stream.cu_stream(),
+                )
+            }
+            .map_err(|e| cu_err("cuMemcpyPeerAsync", e))?;
         }
-        .result()
-        .map_err(|e| cu_err("cuMemcpyAsync", e))?;
         // Keep both endpoints alive if this copy is being captured into a graph.
         if let Some(retained) = stream_impl
             .capture_retained
@@ -1053,8 +1167,20 @@ impl Device for CudaDevice {
 #[cfg(test)]
 mod tests {
     use super::{
-        mxf4_block_scale, nvf4_block_scale, tcgen05_available, wgmma_available, PoolSizes,
+        device_endpoints_only, mxf4_block_scale, nvf4_block_scale, tcgen05_available,
+        wgmma_available, MemKind, PoolSizes,
     };
+
+    #[test]
+    fn peer_copy_refuses_host_endpoints() {
+        // Device-to-device is the only shape a peer copy can carry; a host
+        // endpoint would silently become a staged copy through the host.
+        assert!(device_endpoints_only(0, 1, MemKind::Device, MemKind::Device).is_ok());
+        assert!(device_endpoints_only(0, 1, MemKind::PinnedHost, MemKind::Device).is_err());
+        assert!(device_endpoints_only(0, 1, MemKind::Device, MemKind::PinnedHost).is_err());
+        assert!(device_endpoints_only(0, 1, MemKind::Managed, MemKind::Device).is_err());
+        assert!(device_endpoints_only(0, 1, MemKind::Managed, MemKind::Managed).is_err());
+    }
 
     #[test]
     fn suma_pul_cuda_odrzuca_przepelnienie() {

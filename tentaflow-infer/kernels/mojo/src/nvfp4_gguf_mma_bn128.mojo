@@ -19,8 +19,8 @@ comptime LDW = 40
 comptime NW = 8
 
 
-def gemm_nvfp4_gguf_mma_sync1_impl[BN: Int, N_TILES: Int](
-    y: UnsafePointer[Float16, MutAnyOrigin],
+def gemm_nvfp4_gguf_mma_sync1_impl[BN: Int, N_TILES: Int, OUT: DType = DType.float16](
+    y: UnsafePointer[Scalar[OUT], MutAnyOrigin],
     weights: UnsafePointer[UInt8, MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
     n_cols: Int,
@@ -195,19 +195,21 @@ def gemm_nvfp4_gguf_mma_sync1_impl[BN: Int, N_TILES: Int](
     if output_scale != 1.0:
         comptime for index in range(2 * N_TILES):
             accumulators[index] *= output_scale
+    # `OUT = f32` stores the accumulator verbatim (`.cast[f32]` is a no-op): the
+    # result is a partial sum that other ranks add to, so it must not be narrowed.
     comptime for m_tile in range(2):
         token = token0 + warp_m + m_tile * 16 + group
         comptime for n_tile in range(N_TILES):
             row = row0 + warp_n + n_tile * 8 + lane4 * 2
             output_values = accumulators[m_tile * N_TILES + n_tile]
             if token < n_tokens and row < n_rows:
-                y[token * n_rows + row] = Float16(output_values[0])
+                y[token * n_rows + row] = output_values[0].cast[OUT]()
                 if row + 1 < n_rows:
-                    y[token * n_rows + row + 1] = Float16(output_values[1])
+                    y[token * n_rows + row + 1] = output_values[1].cast[OUT]()
             if token + 8 < n_tokens and row < n_rows:
-                y[(token + 8) * n_rows + row] = Float16(output_values[2])
+                y[(token + 8) * n_rows + row] = output_values[2].cast[OUT]()
                 if row + 1 < n_rows:
-                    y[(token + 8) * n_rows + row + 1] = Float16(output_values[3])
+                    y[(token + 8) * n_rows + row + 1] = output_values[3].cast[OUT]()
 
 
 comptime gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1 = (
@@ -215,4 +217,7 @@ comptime gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1 = (
 )
 comptime gemm_nvfp4_gguf_mma_f16_bm128_bn128 = (
     gemm_nvfp4_gguf_mma_sync1_impl[128, 8]
+)
+comptime gemm_nvfp4_gguf_mma_out_f32_bm128_bn128 = (
+    gemm_nvfp4_gguf_mma_sync1_impl[128, 8, DType.float32]
 )

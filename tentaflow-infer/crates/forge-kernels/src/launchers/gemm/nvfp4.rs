@@ -1048,15 +1048,19 @@ impl Kernels {
         self.device.launch(kernel, &config, &args, stream)
     }
 
-    /// GEMM GGUF NVFP4 z wyjściem f32 dla dużego `T` (RDNA3+, WMMA).
+    /// GEMM GGUF NVFP4 z wyjściem f32 dla dużego `T` (kafel macierzowy).
     ///
     /// Istnieje po to, żeby macierz WIERSZOWO równoległa podziału na rangi mogła
     /// liczyć prefill przy pełnym `T`. Rodzina `gemm_nvfp4_gguf_out_f32_b*`
     /// przyjmuje wyłącznie `B = 2/4/8/16`, a `T = 16` leży POD progiem, przy
     /// którym wchodzi kafel macierzowy — zmierzone 37,25 s wobec 3,84 s przy
     /// T = 32 na prompcie 820 tokenów.
+    ///
+    /// The tile family exists on both matrix units: `mma` on NVIDIA, WMMA on
+    /// RDNA3+. A row-parallel shard asks for an f32 partial sum, not for a
+    /// specific unit, so the branch lives here and never reaches the caller.
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm_nvfp4_gguf_wmma_out_f32(
+    pub fn gemm_nvfp4_gguf_out_f32_tiled(
         &self,
         y_f32: &DevBuffer,
         weights: &DevBuffer,
@@ -1074,46 +1078,67 @@ impl Kernels {
             || !output_scale.is_finite()
         {
             return Err(ForgeError::Kernel(format!(
-                "gemm_nvfp4_gguf_wmma_out_f32 wymaga rows > 0, cols % 64 == 0 i skończonej skali; otrzymano rows={rows}, cols={cols}, scale={output_scale}"
+                "gemm_nvfp4_gguf_out_f32_tiled wymaga rows > 0, cols % 64 == 0 i skończonej skali; otrzymano rows={rows}, cols={cols}, scale={output_scale}"
             )));
         }
-        let bn128 = self
-            .artifacts
-            .has("gemm_nvfp4_gguf_wmma_out_f32_bm256_bn128");
-        let (kernel_name, token_tile, row_tile, block_threads) = if bn128 {
-            ("gemm_nvfp4_gguf_wmma_out_f32_bm256_bn128", 256, 128, 256u32)
-        } else {
-            ("gemm_nvfp4_gguf_wmma_out_f32_bm256", 256, 64, 256u32)
-        };
+        let (kernel_name, token_tile, row_tile, block_threads) =
+            if self.device.caps().vendor == forge_types::Vendor::Nvidia {
+                // The tiled BN128 variant reads the activations `rows / 128`
+                // times instead of `rows / 64`, but needs a full tile of tokens
+                // to pay for its wider block — the same threshold the f16 family
+                // applies in `nvfp4_gguf_dispatch`.
+                if n_tokens >= 256
+                    && n_tokens.is_multiple_of(128)
+                    && self
+                        .artifacts
+                        .has("gemm_nvfp4_gguf_mma_out_f32_bm128_bn128")
+                {
+                    (
+                        "gemm_nvfp4_gguf_mma_out_f32_bm128_bn128",
+                        128,
+                        128,
+                        256u32,
+                    )
+                } else {
+                    ("gemm_nvfp4_gguf_mma_out_f32_bm128", 128, 64, 256u32)
+                }
+            } else if self
+                .artifacts
+                .has("gemm_nvfp4_gguf_wmma_out_f32_bm256_bn128")
+            {
+                ("gemm_nvfp4_gguf_wmma_out_f32_bm256_bn128", 256, 128, 256u32)
+            } else {
+                ("gemm_nvfp4_gguf_wmma_out_f32_bm256", 256, 64, 256u32)
+            };
         if !self.artifacts.has(kernel_name) {
-            return Err(ForgeError::Kernel(
-                "gemm_nvfp4_gguf_wmma_out_f32: brak artefaktu dla tej architektury".into(),
-            ));
+            return Err(ForgeError::Kernel(format!(
+                "gemm_nvfp4_gguf_out_f32_tiled: brak artefaktu {kernel_name} dla tej architektury"
+            )));
         }
         if block_threads > self.device.caps().max_threads_per_block {
             return Err(ForgeError::Kernel(
-                "gemm_nvfp4_gguf_wmma_out_f32: blok przekracza limit urządzenia".into(),
+                "gemm_nvfp4_gguf_out_f32_tiled: blok przekracza limit urządzenia".into(),
             ));
         }
         let output_bytes =
-            checked_buffer_bytes("gemm_nvfp4_gguf_wmma_out_f32 output", &[n_tokens, rows], 4)?;
+            checked_buffer_bytes("gemm_nvfp4_gguf_out_f32_tiled output", &[n_tokens, rows], 4)?;
         let weight_bytes = checked_buffer_bytes(
-            "gemm_nvfp4_gguf_wmma_out_f32 weights",
+            "gemm_nvfp4_gguf_out_f32_tiled weights",
             &[rows, cols / 64],
             36,
         )?;
         let input_bytes =
-            checked_buffer_bytes("gemm_nvfp4_gguf_wmma_out_f32 input", &[n_tokens, cols], 2)?;
+            checked_buffer_bytes("gemm_nvfp4_gguf_out_f32_tiled input", &[n_tokens, cols], 2)?;
         if y_f32.len() < output_bytes || weights.len() < weight_bytes || x.len() < input_bytes {
             return Err(ForgeError::Kernel(
-                "gemm_nvfp4_gguf_wmma_out_f32: bufor jest mniejszy od wymaganego kształtu".into(),
+                "gemm_nvfp4_gguf_out_f32_tiled: bufor jest mniejszy od wymaganego kształtu".into(),
             ));
         }
         let grid_x = u32::try_from(rows.div_ceil(row_tile)).map_err(|_| {
-            ForgeError::Kernel("gemm_nvfp4_gguf_wmma_out_f32: grid.x przekracza u32".into())
+            ForgeError::Kernel("gemm_nvfp4_gguf_out_f32_tiled: grid.x przekracza u32".into())
         })?;
         let grid_y = u32::try_from(n_tokens.div_ceil(token_tile)).map_err(|_| {
-            ForgeError::Kernel("gemm_nvfp4_gguf_wmma_out_f32: grid.y przekracza u32".into())
+            ForgeError::Kernel("gemm_nvfp4_gguf_out_f32_tiled: grid.y przekracza u32".into())
         })?;
         let kernel = self.artifacts.get(kernel_name)?;
         let config = LaunchConfig {
@@ -1126,13 +1151,13 @@ impl Kernels {
             .buf(weights)
             .buf(x)
             .scalar(i64::try_from(cols).map_err(|_| {
-                ForgeError::Kernel("gemm_nvfp4_gguf_wmma_out_f32: cols przekracza i64".into())
+                ForgeError::Kernel("gemm_nvfp4_gguf_out_f32_tiled: cols przekracza i64".into())
             })?)
             .scalar(i64::try_from(rows).map_err(|_| {
-                ForgeError::Kernel("gemm_nvfp4_gguf_wmma_out_f32: rows przekracza i64".into())
+                ForgeError::Kernel("gemm_nvfp4_gguf_out_f32_tiled: rows przekracza i64".into())
             })?)
             .scalar(i64::try_from(n_tokens).map_err(|_| {
-                ForgeError::Kernel("gemm_nvfp4_gguf_wmma_out_f32: T przekracza i64".into())
+                ForgeError::Kernel("gemm_nvfp4_gguf_out_f32_tiled: T przekracza i64".into())
             })?)
             .scalar(output_scale);
         self.device.launch(kernel, &config, &args, stream)

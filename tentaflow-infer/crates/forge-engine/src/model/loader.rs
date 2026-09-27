@@ -64,12 +64,38 @@ impl Model {
             .chain(ranks.iter())
             .map(|member| member.device.create_event())
             .collect::<Result<Vec<_>>>()?;
-        let acc = std::iter::once(&zero)
+        // One pointer table per rank, each holding the address of EVERY rank's
+        // partial in rank order. UVA + peer access make those addresses valid on
+        // all cards, and the reduction kernel indexes the table, so the number
+        // of ranks never enters the launch. The table is written ONCE, here, on
+        // the card that will read it — a reduction must not copy anything.
+        let addresses = std::iter::once(&zero)
             .chain(ranks.iter())
             .map(|member| {
                 member
-                    .device
-                    .alloc(hidden * 4, MemKind::Device, Pool::Activations)
+                    .tp_partial
+                    .as_ref()
+                    .map(|partial| partial.device_ptr())
+                    .ok_or_else(|| {
+                        ForgeError::Scheduler(format!(
+                            "podział na {world} rang bez sumy cząstkowej rangi"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut table_bytes = Vec::with_capacity(addresses.len() * 8);
+        for address in &addresses {
+            table_bytes.extend_from_slice(&address.to_le_bytes());
+        }
+        let sources = std::iter::once(&zero)
+            .chain(ranks.iter())
+            .map(|member| {
+                let table =
+                    member
+                        .device
+                        .alloc(table_bytes.len(), MemKind::Device, Pool::Activations)?;
+                member.device.write(&table_bytes, &table, 0)?;
+                Ok(table)
             })
             .collect::<Result<Vec<_>>>()?;
         tracing::info!(
@@ -84,7 +110,7 @@ impl Model {
             ranks,
             events,
             read_events,
-            acc,
+            sources,
         }));
         Ok(zero)
     }

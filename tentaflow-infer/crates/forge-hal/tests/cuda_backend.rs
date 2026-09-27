@@ -376,12 +376,85 @@ fn cross_device_handles_rejected() {
     let foreign_stream = other.create_stream().unwrap();
     let foreign_event = other.create_event().unwrap();
     // Same backend type, different device: the downcast passes but the
-    // owning-context check must reject the mix.
+    // owning-context check must reject the mix. A cross-device COPY stays legal
+    // in exactly one shape — issued by the card that owns the source buffer and
+    // the stream — so this one, whose source lives on the peer, is refused.
     assert!(dev.copy(&foreign, 0, &local, 0, 64, &stream).is_err());
     assert!(dev.copy(&local, 0, &local, 0, 64, &foreign_stream).is_err());
     assert!(dev.write(&[0u8; 64], &foreign, 0).is_err());
     assert!(dev.record_event(&foreign_event, &stream).is_err());
     assert!(dev.begin_capture(&foreign_stream).is_err());
+}
+
+#[test]
+fn ordinal_reports_the_opened_device_and_self_peer_access_is_a_noop() {
+    let Some(dev) = device() else { return };
+    assert_eq!(dev.ordinal(), 0);
+    // Peer access to the card itself needs no driver call. The same guard makes
+    // every request for a real peer a silent no-op when `ordinal` is left at the
+    // trait default (always 0), so the two land in one change.
+    dev.enable_peer_access(dev.ordinal())
+        .expect("self peer access");
+    assert!(dev.enable_peer_access(usize::MAX).is_err());
+}
+
+#[test]
+fn peer_mesh_copies_and_orders_across_devices() {
+    let Some(dev) = device() else { return };
+    let Ok(Ok(other)) = std::panic::catch_unwind(|| CudaDevice::new(1, TEST_POOLS)) else {
+        eprintln!("skipping peer-mesh test: no second CUDA device");
+        return;
+    };
+    assert_eq!(other.ordinal(), 1);
+    dev.enable_peer_access(other.ordinal()).unwrap();
+    other.enable_peer_access(dev.ordinal()).unwrap();
+    // Opening the same pair twice means the target state is already reached.
+    dev.enable_peer_access(other.ordinal()).unwrap();
+
+    let n = 4096usize;
+    let payload: Vec<u8> = (0..n).map(|i| (i * 17 % 251) as u8).collect();
+    let src_stream = dev.create_stream().unwrap();
+    let dst_stream = other.create_stream().unwrap();
+    let staged = dev
+        .alloc(n, MemKind::PinnedHost, Pool::Activations)
+        .unwrap();
+    dev.write(&payload, &staged, 0).unwrap();
+    let src = dev.alloc(n, MemKind::Device, Pool::KvCache).unwrap();
+    let dst = other.alloc(n, MemKind::Device, Pool::KvCache).unwrap();
+    let back = other
+        .alloc(n, MemKind::PinnedHost, Pool::Activations)
+        .unwrap();
+
+    // The shape `cluster::reduce_partials` uses: the source card issues the peer
+    // copy on its own stream, records `done` there, and the peer waits on that
+    // foreign event with a stream of its own.
+    dev.copy(&staged, 0, &src, 0, n, &src_stream).unwrap();
+    dev.copy(&src, 0, &dst, 0, n, &src_stream).unwrap();
+    let done = dev.create_event().unwrap();
+    dev.record_event(&done, &src_stream).unwrap();
+    other.wait_event(&dst_stream, &done).unwrap();
+    other.copy(&dst, 0, &back, 0, n, &dst_stream).unwrap();
+    dst_stream.synchronize().unwrap();
+
+    let mut out = vec![0u8; n];
+    other.read(&back, 0, &mut out).unwrap();
+    assert_eq!(out, payload, "peer copy lost or reordered data");
+
+    // The mirror image, which is what makes the reduction symmetric: the OTHER
+    // card issues the copy, its destination sits on the first one.
+    let mirrored = dev.alloc(n, MemKind::Device, Pool::KvCache).unwrap();
+    other.copy(&dst, 0, &mirrored, 0, n, &dst_stream).unwrap();
+    dst_stream.synchronize().unwrap();
+    let mut mirrored_out = vec![0u8; n];
+    dev.read(&mirrored, 0, &mut mirrored_out).unwrap();
+    assert_eq!(mirrored_out, payload, "reverse peer copy lost data");
+
+    // A host endpoint on the peer path is refused outright: the driver would
+    // stage it through the host and report success.
+    let err = dev
+        .copy(&staged, 0, &dst, 0, n, &src_stream)
+        .expect_err("peer copy from pinned host memory must be refused");
+    assert!(err.to_string().contains("device memory"), "{err}");
 }
 
 #[test]

@@ -184,3 +184,50 @@ def add_f32_out_f16(
     i = Int(global_idx.x)
     if i < n:
         out_ptr[i] = Float16(a[i] + b[i])
+
+
+def all_reduce_sum_out_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    sources: UnsafePointer[UnsafePointer[Float32, MutAnyOrigin], MutAnyOrigin],
+    n_src: Int,
+    n: Int,
+):
+    """out = f16(sum of n_src f32 sources) over n elements, in ONE launch.
+
+    The tail of a row-parallel projection: every rank holds one f32 partial per
+    element, every rank adds ALL of them and rounds once. `sources` is a pointer
+    TABLE in device memory, so the work per reduction point does not grow with
+    the number of ranks — one launch covers one rank exactly as well as eight.
+    This is what the previous shape got wrong: one rank cast, two ranks used a
+    fused add, and three or more ran N-1 dependent adds into a private
+    accumulator plus a separate cast, which on four cards cost three launches
+    per reduction point reading peer memory with 12.7 us of start-up and event
+    wait each.
+
+    The sum starts from the first source rather than from 0.0 and walks the
+    sources in order, so the f16 result does not depend on how the partials were
+    distributed (and -0.0 never picks up a sign flip). `n_src >= 1` is a
+    launcher contract.
+
+    The bulk loop folds four sources per turn. Every source costs two dependent
+    global loads — the table entry, then the element — so with many ranks a
+    one-at-a-time walk would leave the peer reads serialised behind each other.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        var acc = sources[0][i]
+        var k = 1
+        while k + 4 <= n_src:
+            var a = sources[k][i]
+            var b = sources[k + 1][i]
+            var c = sources[k + 2][i]
+            var d = sources[k + 3][i]
+            acc += a
+            acc += b
+            acc += c
+            acc += d
+            k += 4
+        while k < n_src:
+            acc += sources[k][i]
+            k += 1
+        out_ptr[i] = Float16(acc)

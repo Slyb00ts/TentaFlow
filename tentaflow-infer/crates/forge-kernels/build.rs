@@ -19,7 +19,7 @@ fn main() {
     let kernel_build_dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels/mojo/build");
 
-    let architectures = vec!["sm_89", "sm_121a", "gfx1030", "gfx1100", "gfx1201"];
+    let architectures = vec!["sm_86", "sm_89", "sm_121a", "gfx1030", "gfx1100", "gfx1201"];
     let mut generated_code = String::new();
     let mut embedded_sets_entries = Vec::new();
 

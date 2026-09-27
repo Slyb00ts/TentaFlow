@@ -81,7 +81,7 @@ impl Model {
                         *output_scale,
                         stream,
                     ),
-                    _ => self.kernels.gemm_nvfp4_gguf_wmma_out_f32(
+                    _ => self.kernels.gemm_nvfp4_gguf_out_f32_tiled(
                         partial,
                         buf,
                         x,
@@ -326,8 +326,8 @@ impl Model {
             })
             .collect();
         let out: Vec<&DevBuffer> = members.iter().map(|m| out_of(m)).collect();
-        let acc: Vec<&DevBuffer> = tp.acc.iter().collect();
-        crate::cluster::all_reduce_f16(&ranks, &acc, &out, elems)
+        let sources: Vec<&DevBuffer> = tp.sources.iter().collect();
+        crate::cluster::all_reduce_f16(&ranks, &sources, &out, elems)
     }
 
     /// Krok modelu hybrydowego rozłożony na rangi.

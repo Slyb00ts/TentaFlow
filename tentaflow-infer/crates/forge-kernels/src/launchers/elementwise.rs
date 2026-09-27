@@ -159,6 +159,46 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// `out = f16(sum of the `n_src` sources listed in `sources`)` — the whole
+    /// reduction of one tensor-parallel point in ONE launch, for any number of
+    /// ranks.
+    ///
+    /// `sources` is a device-side POINTER TABLE: the reduction reads every
+    /// rank's f32 partial straight through P2P, and the table is what lets one
+    /// compiled kernel address N of them — the argument list is the same at one
+    /// rank and at eight. The table's entries are fixed for the model's life
+    /// (the partials are allocated once), so it is written once at load and
+    /// never touched per reduction.
+    pub fn all_reduce_sum_out_f16(
+        &self,
+        out: &DevBuffer,
+        sources: &DevBuffer,
+        n_src: usize,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if n == 0 || n_src == 0 {
+            return Err(ForgeError::Kernel(
+                "all_reduce_sum_out_f16 wymaga n > 0 i co najmniej jednego źródła".into(),
+            ));
+        }
+        let f16_bytes = checked_buffer_bytes("all_reduce_sum_out_f16 wyjście", &[n], 2)?;
+        let table_bytes = checked_buffer_bytes("all_reduce_sum_out_f16 tablica", &[n_src], 8)?;
+        if out.len() < f16_bytes || sources.len() < table_bytes {
+            return Err(ForgeError::Kernel(
+                "all_reduce_sum_out_f16: bufor jest mniejszy od wymaganego kształtu".into(),
+            ));
+        }
+        let k = self.artifacts.get("all_reduce_sum_out_f16")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(sources)
+            .scalar(n_src as i64)
+            .scalar(n as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// logits = cap * tanh(logits / cap) w miejscu (ograniczenie logitów Gemmy).
     /// `offset` liczony w elementach f32 — głowa batcha zapisuje kolejne lane'y
     /// do jednego bufora.

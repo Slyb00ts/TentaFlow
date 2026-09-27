@@ -1170,10 +1170,13 @@ struct TpSpmd {
     events: Vec<Event>,
     /// Zdarzenie każdej rangi: skończyła czytać cudze sumy cząstkowe.
     read_events: Vec<Event>,
-    /// Akumulator f32 KAŻDEJ rangi, na jej własnej karcie. Redukcja jest
-    /// symetryczna — każda ranga sumuje u siebie — więc nie ma jednej karty
-    /// zbierającej ani bufora na przywożone cząstki.
-    acc: Vec<DevBuffer>,
+    /// Pointer table for the reduction, one per rank (rank zero first) and
+    /// allocated on THAT rank's card. Entry `k` is the device address of rank
+    /// `k`'s f32 partial, which is what lets one kernel address every rank's
+    /// partial without a per-reduction argument list of its own: the addresses
+    /// are fixed for the model's life, so the table is written once here and
+    /// read (never rewritten) by every later reduction.
+    sources: Vec<DevBuffer>,
 }
 
 pub struct Model {
