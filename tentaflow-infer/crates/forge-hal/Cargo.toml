@@ -12,6 +12,9 @@ cuda = ["dep:cudarc"]
 hip = []
 # Backend Metal (macOS). Shim Objective-C budowany przez build.rs.
 metal = []
+# Wiązanie CoreML / Apple Neural Engine (macOS, iOS). Shim Objective-C budowany
+# przez build.rs; niezależne od `metal`.
+coreml = []
 
 [dependencies]
 forge-types.workspace = true

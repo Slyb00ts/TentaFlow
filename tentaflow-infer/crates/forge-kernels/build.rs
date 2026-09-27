@@ -12,6 +12,14 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=../../kernels/mojo/build");
+    // Ramię ANE kompiluje się z prawdziwym CoreML (`ane`) albo z zaślepką
+    // (`ane-check`); kod ma jeden warunek zamiast dwóch cech w każdym `cfg`.
+    println!("cargo:rustc-check-cfg=cfg(forge_ane)");
+    if std::env::var_os("CARGO_FEATURE_ANE").is_some()
+        || std::env::var_os("CARGO_FEATURE_ANE_CHECK").is_some()
+    {
+        println!("cargo:rustc-cfg=forge_ane");
+    }
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("embedded_artifacts.rs");

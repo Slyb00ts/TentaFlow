@@ -58,7 +58,8 @@ fn caps_report_what_was_measured_not_what_was_hoped() {
     // Zmierzone w EKS-A2: fp8 jest emulowany, fp4 nie istnieje, bf16 kosztuje
     // tyle co f16. Rejestr możliwości ma mówić prawdę, a nie życzenia.
     assert!(!caps.fp8_native);
-    assert!(!caps.fp4_native);
+    assert!(!caps.fp4_block_scale_ue8m0);
+    assert!(!caps.fp4_block_scale_e4m3);
     assert!(caps.bf16_native);
     assert!(!caps.supports_graph_capture);
 }

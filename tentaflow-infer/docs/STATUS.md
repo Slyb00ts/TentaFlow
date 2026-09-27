@@ -10,7 +10,31 @@ najtrudniejszy RDZEŃ jednokartowy (kernele, silnik, KV, batching, kwantyzacja)
 
 Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
-Ostatnia aktualizacja: 2026-07-25.
+Ostatnia aktualizacja: 2026-09-11.
+
+- 🟡 **Ścieżka Apple ma trzecie ramię prefillu: Neural Engine (2026-09-11).**
+  Nowe moduły: `forge-hal/coreml/forge_coreml_shim.m` + `forge-hal/src/coreml.rs`
+  (cecha `coreml`; ładowanie `.mlmodelc`, predict na buforach wołającego przez
+  `initWithDataPointer` + `outputBackings`), `forge-kernels/src/ane_matmul.rs`
+  (`AneMatmul`: manifest, wątek roboczy `start`/`join`, budżet 120 funkcji,
+  sub-predicty), `forge-kernels/src/msl/scatter.rs` (rozrzut ogona ANE do slotu),
+  trzecia forma `MatrixUnitsSharedWithCpuAndAne` w `variant.rs` i `attach_ane` w
+  `dense_exec.rs`. Cecha `ane` w `forge-kernels`/`forge-model` (= `metal` +
+  `forge-hal/coreml`). Narzędzie `tools/ane-export/ane_export.py` wycina ogon
+  wierszy z checkpointu MLX i buduje multifunction `.mlmodelc` int8 per-channel
+  z `manifest.json`. Zmienne: `FORGE_ANE_DIR` (katalog z manifestem),
+  `FORGE_ANE_SHAPES` (np. `256`; zawęża kształty T, na 16 GB obowiązkowe),
+  `FORGE_ANE_LAYERS` (bisekcja, nie produkcja). Ograniczenia: tylko checkpointy
+  MLX affine (grupa 64) jako źródło, tylko FFN (gate/up/down; `qkv`/`o` eksport
+  umie, silnik niemierzony), wagi re-kwantyzowane do int8 per-channel (kompilator
+  ANE nie wykonuje blockwise — spada na CPU; błąd wyjścia 0,85–1,2 % wobec MLX),
+  druga kopia wag 3,07 GiB int8 w pamięci wired (+4,0 GB z buforami T256) obok
+  checkpointu 4-bit. Pomiar końcowy na M1 16 GB
+  (`docs/pomiary/eks-a10-ane-prefill-m1.md`): 1024 tokeny GPU+CPU 129,7 →
+  GPU+CPU+ANE **168,7 tok/s (+30 %)**, 512 −3 % (w rozrzucie), 256 **−36 %**;
+  bramki logitów (argmax ten sam, RMS 0,151 %) i dekodowania (11,0 / 11,0
+  tok/s) przechodzą. Nie w produkcji: ramię jest opcją biblioteki włączaną
+  `attach_ane`, bez progu długości innego niż `MIN_SPLIT_TOKENS`.
 
 - ✅ **Audyt CPU i batch decode Qwen na R9700 (2026-08-11).** Profil startupu
   wskazał `fetch_embedding_host` i seryjne F32→F16 jako koszt ładowania; zmiana

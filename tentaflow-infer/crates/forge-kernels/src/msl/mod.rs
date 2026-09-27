@@ -151,8 +151,12 @@ impl OutDtype {
 }
 
 pub use matmul::*;
-mod matmul;
 pub mod k_quants;
+mod matmul;
+// Rozrzut ogona ANE do wyjścia projekcji. Osobny plik, bo to nie jest forma
+// mnożenia, tylko kopia z konwersją — i będzie ich dokładnie dwie.
+pub use scatter::*;
+mod scatter;
 
 /// Threads in one RMSNorm threadgroup. The reduction is per SIMD group and
 /// then across the eight of them, so the count is fixed by the kernel body and

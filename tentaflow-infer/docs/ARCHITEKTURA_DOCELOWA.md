@@ -221,6 +221,12 @@ Dziś w repozytorium liczą DWIE rzeczy i dzielą tylko kernele:
 | radix, continuous batching, spekulacja, TP | **jest** | nie ma |
 | Apple / Metal | **zero wystąpień** | jedyna, która tam liczy |
 
+Na Apple `MetalExec` dzieli prefill między GPU, CPU (Accelerate, EKS-A7) i —
+za cechą `ane` — Neural Engine (`forge-hal::coreml`, `forge-kernels::ane_matmul`,
+modele z `tools/ane-export`; pomiar `docs/pomiary/eks-a10-ane-prefill-m1.md`).
+Podział jest sprawą wykonawcy: model emituje te same `Op`, forma
+`MatrixUnitsSharedWithCpuAndAne` jest wybierana z rejestru wariantów po kształcie.
+
 Kierunek zejścia nie jest wyborem. Silnik nie przeniesie się na Metal ani na
 żaden następny backend, bo jego model JEST kodem wołającym kernele jednej
 rodziny kart — „przeniesienie" znaczyłoby napisanie go drugi raz, czyli

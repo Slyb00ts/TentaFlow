@@ -18,6 +18,14 @@ mod cuda_exec;
 pub use cuda_exec::CudaExec;
 #[cfg(any(feature = "metal", feature = "metal-check"))]
 pub use dense_exec::MetalExec;
+// Ramię ANE: z cechą `ane` (prawdziwy CoreML, tylko Apple — build.rs
+// forge-hal odmawia gdzie indziej) albo `ane-check` (zaślepka, wszędzie).
+#[cfg(forge_ane)]
+pub mod ane_matmul;
+#[cfg(forge_ane)]
+pub use ane_matmul::{
+    AneBindingLite, AneDone, AneLoadReport, AneMatmul, AneProjKind, AneRole, AneStats,
+};
 #[cfg(any(feature = "metal", feature = "metal-check"))]
 pub mod msl;
 // Czesc wspolna rejestru (Problem, Variant, Registry) kompiluje sie wszedzie;

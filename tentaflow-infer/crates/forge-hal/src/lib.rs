@@ -17,6 +17,8 @@ pub mod cuda;
 pub mod gpu;
 #[cfg(feature = "hip")]
 pub mod hip;
+#[cfg(all(feature = "coreml", any(target_os = "macos", target_os = "ios")))]
+pub mod coreml;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
