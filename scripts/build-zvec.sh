@@ -290,6 +290,7 @@ case "$PLATFORM" in
     ARTIFACT="$OUT_LIB_DIR/libzvec_c_api.so"
     ;;
   macos-arm64)
+    resolve_macos_sdk "$PLATFORM"
     ensure_cmake_pin_on_path
     ensure_apple_libtool_shim_on_program_path
     # Izolacja symboli: eksportuj WYŁĄCZNIE C API zvec (`_zvec_*`), schowaj
@@ -320,6 +321,8 @@ case "$PLATFORM" in
         echo "Build iOS ($PLATFORM) wymaga macOS + Xcode."
         exit 1
     fi
+    # Snowball runs on the host; only target libraries use CMAKE_OSX_SYSROOT.
+    resolve_macos_sdk "$(detect_platform)"
     if [ "$PLATFORM" = "ios-arm64" ]; then
         IOS_SDK="iphoneos"
     else
