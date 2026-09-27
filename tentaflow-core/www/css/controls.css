@@ -1161,6 +1161,8 @@ tf-tabs {
 .tf-table td.nowrap {
   white-space: nowrap;
 }
+/* A numeric column's header sits over its right-aligned numbers. */
+.tf-table thead th.num { text-align: right; }
 .tf-table td.num {
   font-family: 'SF Mono', Menlo, monospace;
   text-align: right;
@@ -1280,7 +1282,6 @@ tf-tabs {
 .tf-table--variant-flush td.fill { max-width: 0; min-width: 220px; }
 .tf-table--variant-flush td.fill .tf-table__cell-title,
 .tf-table--variant-flush td.fill .tf-table__cell-sub { overflow: hidden; text-overflow: ellipsis; }
-.tf-table--variant-flush thead th.num { text-align: right; }
 .tf-table--variant-flush td.num { font-family: inherit; white-space: nowrap; }
 .tf-table--variant-flush td.actions { padding-left: 0; }
 .tf-table--variant-flush tbody tr { cursor: pointer; }

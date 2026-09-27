@@ -454,26 +454,18 @@ fn partition_high_watermark(
         .high_watermark
 }
 
-/// Read-only per-partition lag for `group` on `topic` — `open_consumer` is
-/// idempotent (reconnects to the existing `bus_groups` row rather than
-/// resetting it) and `lag()` touches no durable state, so this is safe to
-/// call on every run, seeded or not, purely for the summary. Resolves
-/// through the free-function `bus::open_consumer`, which looks its engine
-/// up by `ctx.instance_id` in the real multi-instance registry — the same
-/// registry `start_engine` above registered this instance's engine into.
-fn group_lag(ctx: &BusCallContext, group: &str, topic: &str) -> Vec<(TopicPartition, u64)> {
-    let handle = bus::open_consumer(
-        ctx,
-        group,
-        &[topic.to_string()],
-        ConsumerConfig {
-            commit_mode: groups::CommitMode::Explicit,
-        },
-    )
-    .unwrap_or_else(|e| panic!("open_consumer('{group}') for summary failed: {e}"));
-    handle
-        .lag()
-        .unwrap_or_else(|e| panic!("lag('{group}') failed: {e}"))
+/// Read-only per-partition lag for `group` on `topic`, for the summary.
+/// `BusService::group_lag` opens no consumer session: opening one here would
+/// rewrite the group's `bus_groups.commit_mode` to whatever this helper
+/// passed, erasing the mode each group was seeded with.
+fn group_lag(
+    svc: &BusService,
+    ctx: &BusCallContext,
+    group: &str,
+    topic: &str,
+) -> Vec<bus::GroupPartitionLag> {
+    svc.group_lag(ctx, group, topic)
+        .unwrap_or_else(|e| panic!("group_lag('{group}') failed: {e}"))
 }
 
 /// Seeds one instance's full demo scenario (lab.results + DLQ, orders.created
@@ -735,24 +727,23 @@ fn seed_instance(svc: &BusService, db: &DbPool, ctx: &BusCallContext, spec: &Ins
         svc.instance_id()
     );
     println!("topic '{LAB_TOPIC}': {} partitions", lab_cfg.partitions);
-    let billing_lag = group_lag(ctx, BILLING_GROUP, LAB_TOPIC);
+    let billing_lag = group_lag(svc, ctx, BILLING_GROUP, LAB_TOPIC);
     let mut lab_total = 0u64;
-    for (tp, lag) in &billing_lag {
-        let hw = partition_high_watermark(svc, ctx, LAB_TOPIC, tp.partition);
+    for part in &billing_lag {
+        let hw = partition_high_watermark(svc, ctx, LAB_TOPIC, part.partition);
         lab_total += hw;
         println!(
-            "  partition {}: {hw} records, billing committed={}, lag={lag}",
-            tp.partition,
-            hw - lag
+            "  partition {}: {hw} records, billing committed={}, lag={}",
+            part.partition, part.committed_offset, part.lag
         );
     }
     println!("  total records published: {lab_total}");
 
-    let notifier_lag = group_lag(ctx, NOTIFIER_GROUP, ORDERS_TOPIC);
+    let notifier_lag = group_lag(svc, ctx, NOTIFIER_GROUP, ORDERS_TOPIC);
     let orders_total: u64 = (0..orders_cfg.partitions)
         .map(|p| partition_high_watermark(svc, ctx, ORDERS_TOPIC, p))
         .sum();
-    let notifier_lag_total: u64 = notifier_lag.iter().map(|(_, lag)| lag).sum();
+    let notifier_lag_total: u64 = notifier_lag.iter().map(|part| part.lag).sum();
     println!(
         "topic '{ORDERS_TOPIC}': {} partitions, {orders_total} records published, \
          notifier total lag={notifier_lag_total}",
@@ -926,22 +917,28 @@ fn publish_generated(
     publish_chunked(svc, ctx, topic, records);
 }
 
-/// Opens `group` on `topic`, reads everything and commits `fraction` of each
-/// partition. Returns the fetched records by partition and the committed
-/// offsets.
+/// Opens `group` on `topic` with `commit_mode` (the mode the group row then
+/// shows), reads everything and commits `fraction` of each partition.
+/// Returns the fetched records by partition and the committed offsets.
+/// `AtMostOnce` is not accepted: it commits inside `fetch`, so the group
+/// would end up caught up whatever `fraction` says.
 fn consume_fraction(
     ctx: &BusCallContext,
     group: &str,
     topic: &str,
+    commit_mode: groups::CommitMode,
     fraction: f64,
 ) -> (BTreeMap<u32, Vec<FetchedRecordMeta>>, BTreeMap<u32, u64>) {
+    assert_ne!(
+        commit_mode,
+        groups::CommitMode::AtMostOnce,
+        "consume_fraction cannot seed a partial commit for an at-most-once group"
+    );
     let handle = bus::open_consumer(
         ctx,
         group,
         &[topic.to_string()],
-        ConsumerConfig {
-            commit_mode: groups::CommitMode::Explicit,
-        },
+        ConsumerConfig { commit_mode },
     )
     .unwrap_or_else(|e| panic!("open_consumer('{group}') failed: {e}"));
     let fetched = handle
@@ -973,9 +970,9 @@ fn consume_fraction(
     (by_part, committed)
 }
 
-fn total_lag(ctx: &BusCallContext, group: &str, topic: &str) -> (u64, u64) {
-    let per_partition = group_lag(ctx, group, topic);
-    let lag: u64 = per_partition.iter().map(|(_, l)| l).sum();
+fn total_lag(svc: &BusService, ctx: &BusCallContext, group: &str, topic: &str) -> (u64, u64) {
+    let per_partition = group_lag(svc, ctx, group, topic);
+    let lag: u64 = per_partition.iter().map(|part| part.lag).sum();
     (per_partition.len() as u64, lag)
 }
 
@@ -1035,7 +1032,13 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
         let cfg = topics::get_topic(db, svc.instance_id(), &ctx.org_id, RESULTS_TOPIC)
             .expect("get_topic")
             .expect("wyniki-badan exists");
-        let (records, committed) = consume_fraction(ctx, DOCTOR_APP_GROUP, RESULTS_TOPIC, 0.25);
+        let (records, committed) = consume_fraction(
+            ctx,
+            DOCTOR_APP_GROUP,
+            RESULTS_TOPIC,
+            groups::CommitMode::AutoAfterSuccess,
+            0.25,
+        );
         // The consumer's program reports failures on the records right after
         // what it committed; each exhausts its attempts and becomes an
         // unprocessed message of the last hour.
@@ -1067,7 +1070,13 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
                 }
             }
         }
-        consume_fraction(ctx, LAB_REPORTS_GROUP, RESULTS_TOPIC, 1.0);
+        consume_fraction(
+            ctx,
+            LAB_REPORTS_GROUP,
+            RESULTS_TOPIC,
+            groups::CommitMode::Explicit,
+            1.0,
+        );
     }
 
     // ---- wizyty: JSON bound to the pattern, a consumer slightly behind ------
@@ -1084,7 +1093,13 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
         },
     ) {
         publish_generated(svc, ctx, VISITS_TOPIC, VISITS_RECORDS, true, visit_json);
-        consume_fraction(ctx, REGISTRATION_GROUP, VISITS_TOPIC, 0.9);
+        consume_fraction(
+            ctx,
+            REGISTRATION_GROUP,
+            VISITS_TOPIC,
+            groups::CommitMode::AutoAfterSuccess,
+            0.9,
+        );
     }
 
     // ---- faktury: XML, the billing system paused with everything waiting ----
@@ -1107,13 +1122,19 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
             false,
             invoice_xml,
         );
-        consume_fraction(ctx, BILLING_SYSTEM_GROUP, INVOICES_TOPIC, 0.0);
+        consume_fraction(
+            ctx,
+            BILLING_SYSTEM_GROUP,
+            INVOICES_TOPIC,
+            groups::CommitMode::Explicit,
+            0.0,
+        );
         svc.pause_group(ctx, BILLING_SYSTEM_GROUP, INVOICES_TOPIC)
             .expect("pause system-rozliczen");
     }
 
     // ---- 25 minutes of rising lag for the consumer that falls behind -------
-    let (_, lag_now) = total_lag(ctx, DOCTOR_APP_GROUP, RESULTS_TOPIC);
+    let (_, lag_now) = total_lag(svc, ctx, DOCTOR_APP_GROUP, RESULTS_TOPIC);
     let now = now_ms();
     let start_lag = lag_now / 4;
     for step in 0..=RISING_MINUTES {
@@ -1141,7 +1162,7 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
         (REGISTRATION_GROUP, VISITS_TOPIC),
         (BILLING_SYSTEM_GROUP, INVOICES_TOPIC),
     ] {
-        let (partitions, lag) = total_lag(ctx, group, topic);
+        let (partitions, lag) = total_lag(svc, ctx, group, topic);
         println!("seed[clinic]: '{group}' on '{topic}': {partitions} partitions, lag {lag}");
     }
 }

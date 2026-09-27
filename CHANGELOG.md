@@ -47,6 +47,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   kopie (which node leads each partition, its copies, moving the leadership).
   The Kopie i nody tab shows the nodes, the partitions that need attention and
   the leadership changes; changing a partition's copies by hand is gone.
+- New Odbiorcy screen: the consumers with what waits for each, filters for
+  the ones behind and the paused ones, pause and resume in the row. A
+  consumer's page shows Stan (what waits and whether it grows, reading rate,
+  its own unprocessed messages, what needs attention), Miejsce czytania (per
+  partition the last message read and what waits, with "Przesuń", whose
+  window counts how many messages will be read again or skipped before it is
+  confirmed) and Ustawienia (how the program confirms, set by the program
+  itself and shown locked).
+- Moving a consumer's reading place now takes effect for a program that is
+  reading at that moment: it continues from the new place at its next fetch,
+  and a confirmation of messages it fetched before the move no longer undoes
+  the move (or fails, after a move forward). The move is refused on a node
+  that does not lead the partition and for a number the topic no longer
+  keeps, and a move forward reaches the other nodes' copies.
+- Pausing and resuming a consumer now needs the same rights as moving its
+  reading place (the instance's administration, the organisation's Admin role
+  and the right to administer the topic), and both refuse a consumer that has
+  never connected instead of creating it. A pause is refused on a node that
+  does not lead every partition of the topic; it is not copied to the other
+  nodes, so after a change of leading node the consumer reads again.
+- Consumers of a topic the user may not read are no longer listed, counted in
+  the statistics or found by name.
 - Partitions added to an existing topic now get a leader like the ones it was
   created with, and so does any partition left without one; any settings
   change of the topic places them. Before, on a node with replication every

@@ -11,7 +11,7 @@ import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { fmtCount, fmtBytes, fmtElapsed, fmtSince, fmtLagSeconds, fmtRetention, fmtWhen, contentTypeLabel, contentKind, loadErrorKind } = await import('./format.js');
+const { fmtCount, fmtBytes, fmtElapsed, fmtSince, fmtLagSeconds, fmtRetention, fmtWhen, fmtDayTime, contentTypeLabel, contentKind, loadErrorKind } = await import('./format.js');
 
 // Intl groups with a no-break space; the screen prints exactly that.
 const sp = (s) => s.replace(/\u00a0|\u202f/g, ' ');
@@ -91,4 +91,12 @@ test('content kinds behind the plain-word labels', () => {
   assert.equal(contentKind('application/hl7-v2'), 'hl7v2');
   assert.equal(contentKind('APPLICATION/JSON'), 'json');
   assert.equal(contentKind('application/x-unknown'), '');
+});
+
+test('a list\'s "Zmieniono": today and yesterday with the time, older days as a date', () => {
+  const now = new Date(2026, 8, 23, 15, 0, 0).getTime();
+  assert.equal(fmtDayTime(new Date(2026, 8, 23, 13, 55, 12).getTime(), now), 'dziś 13:55');
+  assert.equal(fmtDayTime(new Date(2026, 8, 22, 9, 5, 0).getTime(), now), 'wczoraj 09:05');
+  assert.equal(fmtDayTime(new Date(2026, 8, 18, 9, 5, 0).getTime(), now), '18.09.2026');
+  assert.equal(fmtDayTime(null, now), '—');
 });

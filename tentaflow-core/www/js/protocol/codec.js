@@ -3099,6 +3099,24 @@ export const encode = {
   },
 
   /**
+   * BusPayload::OffsetForTimestampRequest (bus.read + Consume on the topic, read-only):
+   * the first offset of `partition` whose record timestamp is >= tsMs (the high watermark
+   * when none) — lets the reset dialog state how many messages a "from a chosen time"
+   * move would re-read or skip before the admin confirms. payload: { instanceId, topic,
+   * partition, tsMs }. Answers BusOffsetForTimestampResponse { offset }.
+   */
+  busOffsetForTimestampRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusOffsetForTimestampRequest(
+      encode._busInstanceId(payload),
+      String(payload.topic ?? ''),
+      Number(payload.partition ?? 0),
+      BigInt(payload.tsMs ?? payload.ts_ms ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
    * BusPayload::MessagesBrowseRequest (M08 — audited `bus.messages.browse`, <=100
    * records / <=1 MiB, redacted preview, never a real consumer; uses `BusService::peek`,
    * follow-up toru P task 1 — no ephemeral consumer group/`bus_groups` row anymore).

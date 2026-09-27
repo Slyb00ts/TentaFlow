@@ -205,10 +205,10 @@ function paintPage(body, view, ctx) {
   }
 
   for (const s of TOPIC_SECTIONS) {
-    const host = body.querySelector(`[data-section="${s}"]`);
+    const host = body.querySelector(`.tb-section > [data-section="${s}"]`);
     host.hidden = s !== section;
   }
-  const host = body.querySelector(`[data-section="${section}"]`);
+  const host = body.querySelector(`.tb-section > [data-section="${section}"]`);
   const sectionView = {
     ...view,
     topic,

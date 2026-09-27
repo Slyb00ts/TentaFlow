@@ -382,6 +382,10 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
             ProtocolErrorCode::Conflict,
             format!("bus.group_paused: '{group}' on '{topic}'"),
         ),
+        // Same code and wording `group_detail_v1` answers for a missing row.
+        BusServiceError::GroupNotFound { group, topic } => {
+            ProtocolError::not_found(format!("bus.group_not_found: '{group}' on '{topic}'"))
+        }
         BusServiceError::DlqOfDlqNotAllowed { topic } => {
             ProtocolError::bad_request(format!("bus.dlq_of_dlq_not_allowed: '{topic}'"))
         }
@@ -1431,6 +1435,11 @@ pub async fn bus_dispatch(
             group,
             since_ms,
         } => lag_history_v1(ctx, instance_id, topic.clone(), group.clone(), *since_ms).await?,
+        BusPayload::OffsetForTimestampRequest {
+            topic,
+            partition,
+            ts_ms,
+        } => offset_for_timestamp_v1(ctx, instance_id, topic.clone(), *partition, *ts_ms).await?,
 
         BusPayload::TopicListResponse { .. }
         | BusPayload::TopicCreateResponse { .. }
@@ -1466,7 +1475,8 @@ pub async fn bus_dispatch(
         | BusPayload::SchemaRegisterResponse { .. }
         | BusPayload::SchemaCompatibilitySetResponse
         | BusPayload::SchemaDeleteResponse { .. }
-        | BusPayload::LagHistoryResponse { .. } => {
+        | BusPayload::LagHistoryResponse { .. }
+        | BusPayload::OffsetForTimestampResponse { .. } => {
             return Err(ProtocolError::bad_request(
                 "variant is not routed through bus_dispatch (UserSession tier)",
             ))
@@ -1573,6 +1583,10 @@ register_bus_variant!(
 register_bus_variant!(
     "BusLagHistoryRequest",
     "tentaflow_ws_handler_bus_lag_history"
+);
+register_bus_variant!(
+    "BusOffsetForTimestampRequest",
+    "tentaflow_ws_handler_bus_offset_for_timestamp"
 );
 
 // plan-app-platform §4.2/§7 W7: the 11 variants formerly routed through
@@ -1718,7 +1732,7 @@ async fn topic_detail_v1(
     let access = BusTopicAccessWire {
         can_read,
         can_write,
-        can_admin: topic_admin && ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin")),
+        can_admin: topic_admin && is_org_admin(ctx),
     };
     let admin_labels = topic_admin_labels(ctx, &g, &name).await?;
     if !can_read {
@@ -1893,14 +1907,15 @@ async fn group_list_v1(
     let bctx = bus_ctx(ctx, &g);
     let org_id = g.org_id.clone();
     let svc = g.svc.clone();
+    let org_admin = is_org_admin(ctx);
     let groups = run_blocking(move || {
-        let rows = repository::bus_group_list(svc.local_db(), &org_id)
-            .map_err(|e| db_err("bus_group_list", e))?;
+        let rows = visible_groups(&svc, &bctx, &org_id)?;
+        let mut access = TopicAccessCache::default();
         Ok(rows
             .into_iter()
-            .filter(|g| !is_hidden_group(&g.group_id))
             .map(|g| BusGroupSummaryWire {
                 lag_total: group_lag_total(&svc, &bctx, &g.group_id, &g.topic),
+                can_admin: org_admin && access.get(&svc, &bctx, &g.topic).2,
                 group: g.group_id,
                 topic: g.topic,
                 commit_mode: g.commit_mode,
@@ -1912,6 +1927,49 @@ async fn group_list_v1(
     })
     .await?;
     Ok(BusPayload::GroupListResponse { groups })
+}
+
+fn is_org_admin(ctx: &HandlerContext) -> bool {
+    ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin"))
+}
+
+/// `BusService::topic_access` per distinct topic: a group list touches the
+/// same topic once per group reading it, and each answer costs three
+/// authorizer calls.
+#[derive(Default)]
+struct TopicAccessCache(std::collections::HashMap<String, (bool, bool, bool)>);
+
+impl TopicAccessCache {
+    fn get(
+        &mut self,
+        svc: &bus::BusService,
+        bctx: &BusCallContext,
+        topic: &str,
+    ) -> (bool, bool, bool) {
+        if let Some(access) = self.0.get(topic) {
+            return *access;
+        }
+        let access = svc.topic_access(bctx, topic);
+        self.0.insert(topic.to_string(), access);
+        access
+    }
+}
+
+/// The org's consumer groups this caller may see: hidden `tf-*` groups are
+/// dropped, and so is every group of a topic the caller may not Consume —
+/// a group's name, commit mode and paused state describe that topic's
+/// readers and must not reach someone who cannot read the topic itself.
+fn visible_groups(
+    svc: &bus::BusService,
+    bctx: &BusCallContext,
+    org_id: &str,
+) -> Result<Vec<repository::DbBusGroup>, ProtocolError> {
+    let mut access = TopicAccessCache::default();
+    Ok(repository::bus_group_list(svc.local_db(), org_id)
+        .map_err(|e| db_err("bus_group_list", e))?
+        .into_iter()
+        .filter(|g| !is_hidden_group(&g.group_id) && access.get(svc, bctx, &g.topic).0)
+        .collect())
 }
 
 /// A group's lag summed over the topic's partitions, or `None` when this
@@ -1937,16 +1995,25 @@ async fn group_detail_v1(
     let g = gate_read(ctx, instance_id)?;
     let bctx = bus_ctx(ctx, &g);
     let org_id = g.org_id.clone();
-    let local_db = g.svc.local_db().clone();
+    let svc = g.svc.clone();
     let (group_clone, topic_clone) = (group.clone(), topic.clone());
+    let bctx_access = bctx.clone();
     let row = run_blocking(move || {
-        repository::bus_group_get(&local_db, &org_id, &group_clone, &topic_clone)
-            .map_err(|e| db_err("bus_group_get", e))?
-            .ok_or_else(|| {
-                ProtocolError::not_found(format!(
-                    "bus.group_not_found: '{group_clone}' on '{topic_clone}'"
-                ))
-            })
+        // Authorized before the lookup, with the same answer for both: a
+        // distinct "denied" would tell a caller who cannot read the topic
+        // which groups exist on it.
+        let readable = svc.topic_access(&bctx_access, &topic_clone).0;
+        let row = if readable {
+            repository::bus_group_get(svc.local_db(), &org_id, &group_clone, &topic_clone)
+                .map_err(|e| db_err("bus_group_get", e))?
+        } else {
+            None
+        };
+        row.ok_or_else(|| {
+            ProtocolError::not_found(format!(
+                "bus.group_not_found: '{group_clone}' on '{topic_clone}'"
+            ))
+        })
     })
     .await?;
 
@@ -1987,8 +2054,9 @@ async fn group_pause_v1(
     group: String,
     topic: String,
 ) -> Result<BusPayload, ProtocolError> {
-    // §4.3: operational, reversible, does not destroy data — write tier.
-    let g = gate_write(ctx, instance_id)?;
+    // Admin tier, like the offset move and the UI's `can_admin`: pausing
+    // stops every consumer of the group, whoever runs it.
+    let g = gate_admin(ctx, instance_id)?;
     let bctx = bus_ctx(ctx, &g);
     let svc = g.svc.clone();
     run_blocking(move || {
@@ -2005,7 +2073,7 @@ async fn group_resume_v1(
     group: String,
     topic: String,
 ) -> Result<BusPayload, ProtocolError> {
-    let g = gate_write(ctx, instance_id)?;
+    let g = gate_admin(ctx, instance_id)?;
     let bctx = bus_ctx(ctx, &g);
     let svc = g.svc.clone();
     run_blocking(move || {
@@ -2094,6 +2162,28 @@ async fn offset_reset_v1(
         }
     };
     Ok(BusPayload::OffsetResetResponse { new_offset })
+}
+
+/// Read-only preview for the "from a chosen time" reset: which offset
+/// `OffsetReset { Timestamp }` would move to, without moving anything.
+/// `bus.read`; `resolve_offset_for_timestamp` itself demands Consume on the
+/// topic and checks the partition range.
+async fn offset_for_timestamp_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    topic: String,
+    partition: u32,
+    ts_ms: i64,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
+    let offset = run_blocking(move || {
+        svc.resolve_offset_for_timestamp(&bctx, &topic, partition, ts_ms)
+            .map_err(map_bus_error)
+    })
+    .await?;
+    Ok(BusPayload::OffsetForTimestampResponse { offset })
 }
 
 // =============================================================================
@@ -3006,19 +3096,16 @@ async fn stats_snapshot_v1(
     let db = ctx.state.db.clone();
     let svc = g.svc.clone();
     let instance_id = svc.instance_id().to_string();
-    let local_db = svc.local_db().clone();
+    let bctx_groups = bctx.clone();
     let (topics, groups) = run_blocking(move || {
         let topics = topics::list_topics(&db, &instance_id, &org_id).map_err(map_bus_error)?;
-        // Hidden (`tf-`-prefixed) groups are dropped here, once, so every
+        // Filtered here, once, exactly like `GroupList` (hidden `tf-*`
+        // groups and groups of topics the caller may not read), so every
         // KPI/lag figure below derived from `groups` — `group_count`,
         // `paused_group_count`, and the per-topic lag loop — agrees with
         // what `GroupList` itself shows (M1-R2 review N-2/N-7, coordinator
         // decisions 3/7).
-        let groups = repository::bus_group_list(&local_db, &org_id)
-            .map_err(|e| db_err("bus_group_list", e))?
-            .into_iter()
-            .filter(|g| !is_hidden_group(&g.group_id))
-            .collect::<Vec<_>>();
+        let groups = visible_groups(&svc, &bctx_groups, &org_id)?;
         Ok::<_, ProtocolError>((topics, groups))
     })
     .await?;
@@ -7510,15 +7597,9 @@ mod tests {
         .expect("acl deny");
         match stats_snapshot_v1(&reader, inst.as_str()).await.unwrap() {
             BusPayload::StatsSnapshotResponse { snapshot } => {
-                let row = snapshot.groups.iter().find(|g| g.group == group).unwrap();
-                assert_eq!(row.lag_total, None);
-                assert_eq!(
-                    row.lag_rising_since_ms, None,
-                    "trend leaked past the lag ACL"
-                );
-                assert_eq!(
-                    row.consume_rate_per_min, None,
-                    "rate leaked past the lag ACL"
+                assert!(
+                    snapshot.groups.iter().all(|g| g.group != group),
+                    "a group of an unreadable topic leaked, with its lag and trend"
                 );
             }
             other => panic!("unexpected response: {other:?}"),
@@ -7584,6 +7665,261 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    /// Two topics of one org, each with one consumer group row, and a
+    /// reader holding `bus.read` whom `hidden`'s ACL denies read. Rows are
+    /// written straight into `bus_groups` — `open_consumer` would depend on
+    /// whichever coordinator another test left on the shared instance.
+    async fn groups_with_a_reader_denied_one_topic(
+        db: &DbPool,
+    ) -> (HandlerContext, HandlerContext, String, String) {
+        let (admin, org_id, _) = admin_session(db);
+        let inst = fixture_instance_id();
+        let visible = format!("widoczny.{}", uuid::Uuid::new_v4().simple());
+        let hidden = format!("ukryty.{}", uuid::Uuid::new_v4().simple());
+        let svc = gate_read(&admin, inst.as_str()).expect("gate").svc.clone();
+        for (topic, group, paused) in [(&visible, "czytelnik", false), (&hidden, "tajny", true)] {
+            topic_create_v1(
+                &admin,
+                inst.as_str(),
+                topic.clone(),
+                BusTopicOptionsWire {
+                    partitions: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("topic create");
+            repository::bus_group_upsert(
+                svc.local_db(),
+                &repository::DbBusGroup {
+                    org_id: org_id.clone(),
+                    group_id: group.to_string(),
+                    topic: topic.clone(),
+                    commit_mode: groups::CommitMode::Explicit.as_str().to_string(),
+                    paused,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            )
+            .expect("group row");
+        }
+        let reader_id = format!("u-reader-{}", uuid::Uuid::new_v4());
+        seed_bus_permissions(db, &reader_id, &["bus.read"]);
+        let reader = handler_ctx(db.clone(), org_context(&org_id, &reader_id, &[]));
+        acl_set_v1(
+            &admin,
+            inst.as_str(),
+            hidden.clone(),
+            "user".to_string(),
+            reader_id,
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("acl deny");
+        (admin, reader, visible, hidden)
+    }
+
+    async fn listed_groups(ctx: &HandlerContext) -> Vec<BusGroupSummaryWire> {
+        match group_list_v1(ctx, fixture_instance_id().as_str())
+            .await
+            .expect("group list")
+        {
+            BusPayload::GroupListResponse { groups } => groups,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A consumer group describes who reads a topic: someone who may not
+    /// read the topic must not learn its groups from any list, count or
+    /// detail lookup — and `can_admin` follows the topic page's rule.
+    #[tokio::test]
+    async fn groups_of_an_unreadable_topic_are_invisible_to_the_reader() {
+        let (_guard, db) = bus_fixture();
+        let (admin, reader, visible, hidden) = groups_with_a_reader_denied_one_topic(&db).await;
+        let inst = fixture_instance_id();
+
+        let admin_groups = listed_groups(&admin).await;
+        assert_eq!(admin_groups.len(), 2, "{admin_groups:?}");
+        assert!(
+            admin_groups.iter().all(|g| g.can_admin),
+            "an org admin with bus.admin may manage every group: {admin_groups:?}"
+        );
+
+        let reader_groups = listed_groups(&reader).await;
+        assert_eq!(
+            reader_groups
+                .iter()
+                .map(|g| (g.group.as_str(), g.topic.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("czytelnik", visible.as_str())]
+        );
+        assert!(!reader_groups[0].can_admin, "a reader manages nothing");
+
+        match stats_snapshot_v1(&reader, inst.as_str())
+            .await
+            .expect("stats snapshot")
+        {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
+                assert_eq!(
+                    snapshot
+                        .groups
+                        .iter()
+                        .map(|g| g.group.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["czytelnik"]
+                );
+                assert_eq!(snapshot.group_count, 1);
+                assert_eq!(snapshot.paused_group_count, 0, "the paused group is hidden");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let hidden_err = group_detail_v1(&reader, inst.as_str(), "tajny".to_string(), hidden)
+            .await
+            .expect_err("an unreadable topic's group is not found");
+        let missing_err = group_detail_v1(
+            &reader,
+            inst.as_str(),
+            "nie-ma-takiej".to_string(),
+            visible.clone(),
+        )
+        .await
+        .expect_err("a missing group is not found");
+        assert_eq!(hidden_err.code, missing_err.code);
+        assert!(
+            hidden_err.message.starts_with("bus.group_not_found"),
+            "{}",
+            hidden_err.message
+        );
+        assert!(
+            missing_err.message.starts_with("bus.group_not_found"),
+            "{}",
+            missing_err.message
+        );
+        group_detail_v1(&reader, inst.as_str(), "czytelnik".to_string(), visible)
+            .await
+            .expect("the readable topic's group stays visible");
+    }
+
+    /// Pausing or resuming a group needs the same double lock as moving its
+    /// offset: `bus.admin` in the matrix AND the org Admin role. A user who
+    /// holds every bus permission but not the org role is refused at the
+    /// gate, before the service is reached.
+    #[tokio::test]
+    async fn pause_and_resume_require_the_org_admin_role() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-pause-{}", uuid::Uuid::new_v4());
+        let org_id = seed_bus_permissions(&db, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org_admin = handler_ctx(db.clone(), org_context(&org_id, &user_id, &["org.admin"]));
+        let operator = handler_ctx(db.clone(), org_context(&org_id, &user_id, &[]));
+        let inst = fixture_instance_id();
+        let topic = format!("pauza.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &org_admin,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        let svc = gate_read(&org_admin, inst.as_str())
+            .expect("gate")
+            .svc
+            .clone();
+        repository::bus_group_upsert(
+            svc.local_db(),
+            &repository::DbBusGroup {
+                org_id: org_id.clone(),
+                group_id: "operatorzy".to_string(),
+                topic: topic.clone(),
+                commit_mode: groups::CommitMode::Explicit.as_str().to_string(),
+                paused: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .expect("group row");
+
+        let pause = group_pause_v1(
+            &operator,
+            inst.as_str(),
+            "operatorzy".to_string(),
+            topic.clone(),
+        )
+        .await
+        .expect_err("pause without the org Admin role");
+        let resume = group_resume_v1(
+            &operator,
+            inst.as_str(),
+            "operatorzy".to_string(),
+            topic.clone(),
+        )
+        .await
+        .expect_err("resume without the org Admin role");
+        for err in [pause, resume] {
+            assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
+        }
+        assert!(
+            !repository::bus_group_get(svc.local_db(), &org_id, "operatorzy", &topic)
+                .expect("group row")
+                .expect("group row")
+                .paused
+        );
+
+        // The org admin passes the gate. Whether the pause then lands
+        // depends on the coordinator another test may have installed on
+        // the shared instance, so only "not refused by the gate" is checked.
+        if let Err(err) =
+            group_pause_v1(&org_admin, inst.as_str(), "operatorzy".to_string(), topic).await
+        {
+            assert_ne!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
+        }
+    }
+
+    /// The preview names the offset a "from a chosen time" reset would move
+    /// to and moves nothing; a caller who may not read the topic is refused.
+    #[tokio::test]
+    async fn offset_for_timestamp_previews_the_reset_target_for_a_reader_only() {
+        let (_guard, db) = bus_fixture();
+        let (admin, reader, visible, hidden) = groups_with_a_reader_denied_one_topic(&db).await;
+        let inst = fixture_instance_id();
+        let base = bus::now_ms() - 60_000;
+        publish_records(
+            &admin,
+            &visible,
+            vec![
+                ("a".to_string(), base),
+                ("b".to_string(), base + 10_000),
+                ("c".to_string(), base + 20_000),
+            ],
+        )
+        .await;
+
+        for (ts_ms, expected) in [(base - 1, 0), (base + 30_000, 3)] {
+            match offset_for_timestamp_v1(&reader, inst.as_str(), visible.clone(), 0, ts_ms)
+                .await
+                .expect("preview")
+            {
+                BusPayload::OffsetForTimestampResponse { offset } => {
+                    assert_eq!(offset, expected, "ts_ms={ts_ms}")
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        let err = offset_for_timestamp_v1(&reader, inst.as_str(), hidden, 0, base)
+            .await
+            .expect_err("no preview of an unreadable topic");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
+        let err = offset_for_timestamp_v1(&reader, inst.as_str(), visible, 7, base)
+            .await
+            .expect_err("partition out of range");
+        assert!(err.message.contains("out of range"), "{}", err.message);
     }
 
     /// PLAN-UI review 5: no whole-instance history, and at most

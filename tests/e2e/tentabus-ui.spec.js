@@ -13,7 +13,11 @@
 //              layout, the empty instance's creator; then U2: a topic's page
 //              (Stan, Ustawienia with its four windows and delete, Partycje
 //              i kopie), Kopie i nody, the phone layout and a reader without
-//              administration or read access; and, last because it
+//              administration or read access; then U3: Odbiorcy (the list,
+//              its filters, pause and resume), a consumer's page (Stan,
+//              Miejsce czytania, Ustawienia), moving the reading place each
+//              way with the counted consequence checked against the server,
+//              the phone layout and a reader without rights; and, last because it
 //              stops the node, the list kept under the connection notice (T12). Stateful: run the whole
 //              project, never `-g`.
 //              The runtime lives under the repo's `.runtime/` — on macOS a
@@ -159,6 +163,8 @@ async function openInstance(page, name) {
 const tab = (page, id) => page.locator(`#tb-tabs tf-tab#${id} > button`);
 const overview = (page) => page.locator('#tb-panel > [data-tb-view-slot="overview"]');
 const topicsSlot = (page) => page.locator('#tb-panel > [data-tb-view-slot="topics"]');
+const consumersSlot = (page) => page.locator('#tb-panel > [data-tb-view-slot="groups"]');
+const consumerSlot = (page) => page.locator('#tb-panel > [data-tb-view-slot="consumer"]');
 const hashParams = (page) => Object.fromEntries(new URLSearchParams(new URL(page.url()).hash.split('?')[1] || ''));
 const norm = (s) => String(s).replace(/[\u00a0\u202f]/g, ' ').replace(/\s+/g, ' ').trim();
 
@@ -389,7 +395,7 @@ test('main tabs: each one shows its content, the address and the breadcrumb foll
       await expect(topicsSlot(page).locator('[data-role="footer"]')).toContainText('8 partycji');
     },
     groups: async () => {
-      const rows = page.locator('#tb-groups-table tbody tr');
+      const rows = consumersSlot(page).locator('[data-role="table"] tbody tr');
       await expect(rows).toHaveCount(4, { timeout: 15000 });
       const text = (await rows.allTextContents()).join(' | ');
       // "Czeka" per consumer — the same figures Przegląd counts (3 of 4 wait).
@@ -449,8 +455,9 @@ test('alert and row buttons lead to the consumer, the unprocessed messages, the 
 
   await ov.locator('.tb-alert', { hasText: 'aplikacja-lekarza' }).locator('tf-button').click();
   await expect(tab(page, 'groups')).toHaveAttribute('aria-selected', 'true');
-  await expect(page.locator('#tb-group-detail')).toContainText('aplikacja-lekarza');
+  await expect(consumerSlot(page).locator('.tb-title')).toHaveText('aplikacja-lekarza', { timeout: 15000 });
   expect(hashParams(page)).toMatchObject({ tab: 'groups', group: 'aplikacja-lekarza', gtopic: 'wyniki-badan' });
+  await expect(page.locator('#tb-crumbs .tf-breadcrumb-item')).toHaveText(['TentaBus', 'Produkcja', 'Odbiorcy', 'aplikacja-lekarza']);
 
   await tab(page, 'overview').click();
   await ov.locator('.tb-alert', { hasText: 'Przybywa' }).locator('tf-button').click();
@@ -502,8 +509,12 @@ test('reload keeps the tab, the open topic and the open consumer', async ({ page
 
   await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instance}&tab=groups&group=system-rozliczen&gtopic=faktury`);
   await page.reload();
-  await expect(page.locator('#tb-group-detail')).toContainText('system-rozliczen', { timeout: 20000 });
+  await expect(consumerSlot(page).locator('.tb-title')).toHaveText('system-rozliczen', { timeout: 20000 });
   await expect(tab(page, 'groups')).toHaveAttribute('aria-selected', 'true');
+  await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instance}&tab=groups&group=system-rozliczen&gtopic=faktury&section=settings`);
+  await page.reload();
+  await expect(consumerSlot(page).locator('[data-role="menu"]')).toHaveAttribute('value', 'settings', { timeout: 20000 });
+  await expect(consumerSlot(page).locator('[data-section="settings"]')).toBeVisible();
   expect(errors, errors.join('\n')).toEqual([]);
 });
 
@@ -533,6 +544,8 @@ test('switching to the empty instance: T11 empty states, counters at zero, no al
   await expect(page.locator('#tb-dlq-toolbar')).toBeHidden();
   await expect(page.locator('#tb-dlq-retry-all')).toBeHidden();
   await assertNoInternalTopics(page);
+  await tab(page, 'groups').click();
+  await expect(consumersSlot(page).locator('tf-empty-state')).toHaveAttribute('title', 'Nikt jeszcze nie czyta z tej instancji', { timeout: 15000 });
   await tab(page, 'replication').click();
   const repl = page.locator('#tb-panel > [data-tb-view-slot="replication"]');
   await expect(repl.locator('[data-role="topics-none"]')).toHaveText('Ta instancja nie ma jeszcze topików.', { timeout: 15000 });
@@ -1246,6 +1259,375 @@ test('U2 without administration: no change buttons, who can change, reading stil
     // A reader is not promised a leadership move they cannot make.
     await expect(rp.locator('#tb-panel > [data-tb-view-slot="replication"] [data-role="topics-sub"]')).toHaveText('Kliknij topik, aby zobaczyć jego partycje.');
     expect(readerErrors.filter((e) => !/PolicyDenied|permission_denied|protocol error/i.test(e)), readerErrors.join('\n')).toEqual([]);
+  } finally {
+    await context.close();
+    await busCall(page, 'busAclSetRequest', { instanceId, topic: 'faktury', subjectType: 'user', subjectId: readerId, accessLevel: 'clear', action: 'read' });
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+// ----------------------------------------------------------------------------
+// U3 — Odbiorcy (T05) and a consumer's page (Stan, Miejsce czytania,
+// Ustawienia). What the screen says is checked against the server itself: the
+// consumer's row in the instance database and its reading places over the
+// wire.
+// ----------------------------------------------------------------------------
+
+const moveWindow = (page) => page.locator('tf-window.tb-move-window');
+const consumerSection = (page, id) => consumerSlot(page).locator(`.tb-section > [data-section="${id}"]`);
+
+// The consumer's row as the node keeps it (the instance's own database).
+function groupRow(group, topic) {
+  for (const db of laggedSampleDbs()) {
+    const out = execFileSync('/usr/bin/sqlite3', ['-separator', '|', db, `SELECT paused, commit_mode FROM bus_groups WHERE group_id = '${group}' AND topic = '${topic}';`], { encoding: 'utf8' }).trim();
+    if (out) {
+      const [paused, commitMode] = out.split('|');
+      return { paused: paused === '1', commitMode };
+    }
+  }
+  return null;
+}
+
+function auditCount(action) {
+  return Number(execFileSync('/usr/bin/sqlite3', [DB, `SELECT COUNT(*) FROM audit_log WHERE action = '${action}';`], { encoding: 'utf8' }).trim());
+}
+
+async function readingPlaces(page, instanceId, group, topic) {
+  const r = await busCall(page, 'busGroupDetailRequest', { instanceId, group, topic });
+  return Object.fromEntries((r?.detail?.partitions || []).map((p) => [p.partition, { committed: p.committedOffset, waiting: p.lag, hw: p.committedOffset + p.lag }]));
+}
+
+async function openConsumerPage(page, group, topic, sectionId = null) {
+  const instance = await openInstance(page, 'Produkcja');
+  const params = new URLSearchParams({ instance, tab: 'groups', group, gtopic: topic });
+  if (sectionId) params.set('section', sectionId);
+  await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?${params.toString()}`);
+  await expect(consumerSlot(page).locator('.tb-title')).toHaveText(group, { timeout: 20000 });
+  return instance;
+}
+
+// Grouped the way the screen prints it (a no-break space), so attributes compare exactly.
+const fmt = (n) => new Intl.NumberFormat('pl-PL', { useGrouping: 'always' }).format(n);
+
+test('U3 Odbiorcy at 1440: the list, its filters and footer; pause in the row leads to the consumer, resume in its header', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openInstance(page, 'Produkcja');
+  await tab(page, 'groups').click();
+  const c = consumersSlot(page);
+  const table = c.locator('[data-role="table"]');
+  await expect(table.locator('tbody tr')).toHaveCount(4, { timeout: 15000 });
+  await expect(c.locator('[data-role="filter"] .tf-seg-opt')).toHaveText(['Wszyscy 4', 'Opóźnieni 3', 'Wstrzymani 1']);
+  const row = (name) => table.locator('tbody tr', { hasText: name });
+  await expect(row('aplikacja-lekarza')).toContainText('wyniki-badan');
+  await expect(row('aplikacja-lekarza')).toContainText('po udanym przetworzeniu');
+  await expect(row('aplikacja-lekarza')).toContainText('działa');
+  await expect(row('system-rozliczen')).toContainText('wstrzymany');
+  await expect(row('system-rozliczen').locator('tf-button[data-act="resume"]')).toHaveText('Wznów');
+  await expect(row('raporty-laboratorium').locator('tf-button[data-act="pause"]')).toHaveText('Wstrzymaj');
+  await expect(c.locator('[data-role="footer"]')).toContainText('4 odbiorcy');
+  await expect(c.locator('[data-role="footer"]')).toContainText('wstrzymanych: 1');
+  await expect(c.locator('.tb-commit-legend .legend-item')).toHaveCount(3);
+  // Search by the topic, then the Opóźnieni filter: nothing waiting is not behind.
+  await c.locator('[data-role="search"] input').fill('faktury');
+  await expect(table.locator('tbody tr')).toHaveCount(1);
+  await c.locator('[data-role="search"] input').fill('');
+  await expect(table.locator('tbody tr')).toHaveCount(4);
+  await c.locator('[data-role="filter"] .tf-seg-opt', { hasText: 'Opóźnieni' }).click();
+  await expect(table.locator('tbody tr')).toHaveCount(3);
+  await expect(row('raporty-laboratorium')).toHaveCount(0);
+  await c.locator('[data-role="filter"] .tf-seg-opt', { hasText: 'Wszyscy' }).click();
+  await assertNoOverflow(page);
+  await assertNoBannedWords(page);
+  await assertSentenceCaseChips(page);
+  await page.screenshot({ path: path.join(SHOTS, 't05-odbiorcy.png'), fullPage: true });
+
+  // "Wstrzymaj" in the row: the server pauses it, the consumer's Stan says so.
+  await row('raporty-laboratorium').locator('tf-button[data-act="pause"]').click();
+  const d = consumerSlot(page);
+  await expect(d.locator('.tb-title')).toHaveText('raporty-laboratorium', { timeout: 15000 });
+  await expect(consumerSection(page, 'state').locator('tf-alert')).toHaveAttribute('title', 'Wstrzymano odbiorcę.');
+  await expect(consumerSection(page, 'state').locator('tf-alert')).toHaveAttribute('message', /raporty-laboratorium nie dostają nowych wiadomości z topiku wyniki-badan/);
+  await expect(consumerSection(page, 'state').locator('tf-stat-card[data-kpi="state"]')).toHaveAttribute('value', 'wstrzymany', { timeout: 15000 });
+  await expect(d.locator('[data-role="toggle"]')).toHaveText('Wznów');
+  expect(groupRow('raporty-laboratorium', 'wyniki-badan').paused).toBe(true);
+  await page.screenshot({ path: path.join(SHOTS, 'od-wstrzymany.png'), fullPage: true });
+
+  // The list follows: two paused now.
+  await d.locator('[data-go="back"]').click();
+  await expect(c.locator('[data-role="filter"] .tf-seg-opt')).toHaveText(['Wszyscy 4', 'Opóźnieni 3', 'Wstrzymani 2'], { timeout: 15000 });
+  await c.locator('[data-role="filter"] .tf-seg-opt', { hasText: 'Wstrzymani' }).click();
+  await expect(table.locator('tbody tr')).toHaveCount(2);
+  await row('raporty-laboratorium').click();
+
+  // "Wznów" in the page header.
+  await d.locator('[data-role="toggle"]').click();
+  await expect(consumerSection(page, 'state').locator('tf-alert')).toHaveAttribute('title', 'Wznowiono odbiorcę.', { timeout: 15000 });
+  await expect(consumerSection(page, 'state').locator('tf-stat-card[data-kpi="state"]')).toHaveAttribute('value', 'działa', { timeout: 15000 });
+  await expect(d.locator('[data-role="toggle"]')).toHaveText('Wstrzymaj');
+  expect(groupRow('raporty-laboratorium', 'wyniki-badan').paused).toBe(false);
+  await page.screenshot({ path: path.join(SHOTS, 'od-wznowiony.png'), fullPage: true });
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U3 consumer page: Stan, Miejsce czytania and Ustawienia, each alone; the way of confirming is what the program chose', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openConsumerPage(page, 'aplikacja-lekarza', 'wyniki-badan');
+  const d = consumerSlot(page);
+  await expect(d.locator('[data-role="desc"]')).toHaveText('czyta topik wyniki-badan');
+  await expect(page.locator('#tb-crumbs .tf-breadcrumb-item')).toHaveText(['TentaBus', 'Produkcja', 'Odbiorcy', 'aplikacja-lekarza']);
+  const menu = d.locator('[data-role="menu"]');
+  await expect(menu).toHaveAttribute('orientation', 'vertical');
+  await expect(menu.locator('tf-tab')).toHaveText([/Stan/, /Miejsce czytania\s*3/, /Ustawienia/]);
+
+  const places = await readingPlaces(page, instanceId, 'aplikacja-lekarza', 'wyniki-badan');
+  const total = Object.values(places).reduce((sum, p) => sum + p.waiting, 0);
+  const s = consumerSection(page, 'state');
+  const tile = (k) => s.locator(`tf-stat-card[data-kpi="${k}"]`);
+  await expect(tile('waiting')).toHaveAttribute('value', fmt(total), { timeout: 15000 });
+  // Nobody consumes during the run: the backlog waits, it does not grow.
+  await expect(tile('waiting')).toHaveAttribute('delta', /^czeka od \d+ (min|godz)/);
+  await expect(tile('rate')).toHaveAttribute('delta', /do topiku przybywa \d+\/s|za mało pomiarów/);
+  await expect(tile('state')).toHaveAttribute('value', 'działa');
+  await expect(tile('state')).toHaveAttribute('delta', 'potwierdza po udanym przetworzeniu');
+  await expect(tile('dlq')).toHaveAttribute('value', '14');
+  await expect(tile('dlq')).toHaveAttribute('delta', '14 w ostatniej godzinie');
+  await expect(s.locator('.tb-alert [data-role="title"]')).toHaveText(['Odbiorca nie nadąża', '14 nieprzetworzonych wiadomości tego odbiorcy']);
+  await expect(s.locator('[data-role="topic-sub"]')).toHaveText('HL7 v2 · 3 partycje');
+  await assertNoOverflow(page);
+  await assertNoBannedWords(page);
+  await page.screenshot({ path: path.join(SHOTS, 'od-stan.png'), fullPage: true });
+
+  // Miejsce czytania: the last message read, the newest one and what waits, as the server has them.
+  await s.locator('.tb-alert', { hasText: 'nie nadąża' }).locator('tf-button').click();
+  await expect.poll(() => hashParams(page).section).toBe('position');
+  const ps = consumerSection(page, 'position');
+  await expect(s).toBeHidden();
+  const rows = ps.locator('tf-table tbody tr');
+  await expect(rows).toHaveCount(3, { timeout: 15000 });
+  for (const [p, v] of Object.entries(places)) {
+    const r = rows.nth(Number(p));
+    await expect(r).toContainText(`Partycja ${p}`);
+    await expect(r).toContainText(v.committed > 0 ? fmt(v.committed - 1) : 'nic');
+    await expect(r).toContainText(fmt(v.hw - 1));
+    await expect(r).toContainText(fmt(v.waiting));
+    await expect(r.locator('tf-button', { hasText: 'Przesuń' })).toBeVisible();
+  }
+  await expect(ps.locator('[data-role="footer"]')).toContainText(`Razem czeka ${fmt(total)} wiadomości.`);
+  await page.screenshot({ path: path.join(SHOTS, 'od-miejsce-czytania.png'), fullPage: true });
+
+  // Ustawienia: values only, the way of confirming locked, retries lead to the topic.
+  await menu.locator('tf-tab#settings > button').click();
+  const st = consumerSection(page, 'settings');
+  await expect(st.locator('.section-card')).toHaveCount(2);
+  await expect(st.locator('[data-go="change"]')).toHaveCount(0);
+  await expect(st).toContainText('po udanym przetworzeniu');
+  await expect(st).toContainText('Ustawia go program odbiorcy przy każdym połączeniu');
+  await expect(st).toContainText(/\d+ prób, pierwsza przerwa/);
+  expect(await st.innerText()).not.toMatch(/czas na odpowiedź/i);
+  await page.screenshot({ path: path.join(SHOTS, 'od-ustawienia.png'), fullPage: true });
+  // The page polls every few seconds: the program's own choice must survive it (§0.1).
+  await page.waitForTimeout(10_000);
+  expect(groupRow('aplikacja-lekarza', 'wyniki-badan').commitMode).toBe('auto_after_success');
+  await expect(st).toContainText('po udanym przetworzeniu');
+  await st.locator('[data-go="topic-settings"]').click();
+  await expect(detailSlot(page).locator('.tb-title')).toHaveText('wyniki-badan', { timeout: 15000 });
+  await expect(detailSlot(page).locator('[data-role="menu"]')).toHaveAttribute('value', 'settings');
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U3 Przesuń: to a number, to the start, to the end and to a time — the window counts what the server then does', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const group = 'rejestracja-online';
+  const topic = 'wizyty';
+  const instanceId = await openConsumerPage(page, group, topic, 'position');
+  const ps = consumerSection(page, 'position');
+  const rows = ps.locator('tf-table tbody tr');
+  await expect(rows).toHaveCount(3, { timeout: 15000 });
+  const audits = auditCount('bus.offset.reset');
+  const topicDetail = await busCall(page, 'busTopicDetailRequest', { instanceId, name: topic });
+  const earliest = Object.fromEntries(topicDetail.partitions.map((p) => [p.partition, p.earliestOffset]));
+  const win = moveWindow(page);
+  const impact = win.locator('[data-role="impact"]');
+  const moveButton = (p) => rows.nth(p).locator('tf-button', { hasText: 'Przesuń' });
+
+  // 1. A chosen number: five messages back on partition 0.
+  let before = await readingPlaces(page, instanceId, group, topic);
+  await moveButton(0).click();
+  await expect(win.locator('.tf-window-title-text')).toHaveText(`Przesuń miejsce czytania — ${group}, partycja 0`);
+  await expect(win.locator('[data-role="now"]')).toHaveText(`przeczytano do numeru ${fmt(before[0].committed - 1)} z ${fmt(before[0].hw - 1)}`);
+  const target = before[0].committed - 5;
+  await win.locator('#tb-move-offset input').fill(String(target));
+  await expect(impact).toContainText(`odbiorca ${group} przeczyta ponownie 5 wiadomości z partycji 0 (od numeru ${fmt(target)}); w tej partycji czekać będzie ${fmt(before[0].waiting + 5)}.`);
+  await expect(impact).toContainText('przejdzie na nowe miejsce przy następnym pobraniu');
+  await page.screenshot({ path: path.join(SHOTS, 'od-przesun-p0.png') });
+  await win.locator('[data-act="move"]').click();
+  await expect(win).toHaveCount(0);
+  await expect(ps.locator('tf-alert')).toHaveAttribute('title', 'Zapisano nowe miejsce czytania.');
+  let after = await readingPlaces(page, instanceId, group, topic);
+  await expect(ps.locator('tf-alert')).toHaveAttribute('message', `Partycja 0: odbiorca czyta od numeru ${fmt(target)}; w tej partycji czeka ${fmt(after[0].waiting)} wiadomości.`);
+  expect(after[0].committed).toBe(target);
+  await expect(rows.nth(0)).toContainText('zmieniono przed chwilą', { timeout: 15000 });
+  await expect(moveButton(0)).toHaveAttribute('disabled', '');
+  await expect(rows.nth(0)).toContainText(fmt(after[0].waiting));
+  await page.screenshot({ path: path.join(SHOTS, 'od-przesunieto-p0.png'), fullPage: true });
+
+  // A number the topic does not keep is refused in the window; Anuluj changes nothing.
+  await moveButton(1).click();
+  await win.locator('#tb-move-offset input').fill(String(after[1].hw));
+  await expect(win.locator('#tb-move-offset')).toHaveAttribute('error', /^Podaj numer od /);
+  await expect(win.locator('[data-act="move"]')).toHaveAttribute('disabled', '');
+  await win.locator('[data-act="cancel"]').click();
+  await expect(win).toHaveCount(0);
+  expect((await readingPlaces(page, instanceId, group, topic))[1].committed).toBe(after[1].committed);
+
+  // 2. The oldest kept message, on partition 1.
+  before = after;
+  await moveButton(1).click();
+  await win.locator('tf-choice-card[value="earliest"]').click();
+  const back1 = before[1].committed - earliest[1];
+  await expect(impact).toContainText(`przeczyta ponownie ${fmt(back1)} ${back1 === 1 ? 'wiadomość' : 'wiadomości'} z partycji 1 (od numeru ${fmt(earliest[1])})`);
+  await win.locator('[data-act="move"]').click();
+  await expect(win).toHaveCount(0);
+  after = await readingPlaces(page, instanceId, group, topic);
+  expect(after[1].committed).toBe(earliest[1]);
+
+  // 3. The newest message, on partition 2: every waiting one is skipped.
+  before = after;
+  await moveButton(2).click();
+  await win.locator('tf-choice-card[value="latest"]').click();
+  await expect(impact).toContainText(`odbiorca ${group} pominie ${fmt(before[2].waiting)} zaległych wiadomości z partycji 2 i zacznie od nowych.`);
+  await win.locator('[data-act="move"]').click();
+  await expect(win).toHaveCount(0);
+  await expect(ps.locator('tf-alert')).toHaveAttribute('message', `Partycja 2: odbiorca czyta od numeru ${fmt(before[2].hw)}; w tej partycji czeka 0 wiadomości.`);
+  after = await readingPlaces(page, instanceId, group, topic);
+  expect(after[2].committed).toBe(before[2].hw);
+  expect(after[2].waiting).toBe(0);
+
+  // 4. A chosen time, on partition 0 again after "Odśwież": first a time after
+  // every message (nothing to read again), then one before all of them.
+  await page.locator('#tb-refresh').click();
+  await expect(moveButton(0)).not.toHaveAttribute('disabled', '', { timeout: 15000 });
+  before = await readingPlaces(page, instanceId, group, topic);
+  await moveButton(0).click();
+  await win.locator('tf-choice-card[value="timestamp"]').click();
+  await expect(impact).toContainText('Wybierz datę i godzinę');
+  await win.locator('#tb-move-time input').fill('2099-01-01T00:00');
+  await expect(impact).toContainText(`pominie ${fmt(before[0].waiting)} zaległych wiadomości z partycji 0 i zacznie od nowych.`, { timeout: 15000 });
+  await expect(impact).toContainText('także zapisane przed tą godziną');
+  await win.locator('#tb-move-time input').fill('2020-01-01T00:00');
+  const back0 = before[0].committed - earliest[0];
+  await expect(impact).toContainText(`przeczyta ponownie ${fmt(back0)} wiadomości z partycji 0 (od numeru ${fmt(earliest[0])})`, { timeout: 15000 });
+  await page.screenshot({ path: path.join(SHOTS, 'od-przesun-chwila.png') });
+  await win.locator('[data-act="move"]').click();
+  await expect(win).toHaveCount(0);
+  after = await readingPlaces(page, instanceId, group, topic);
+  expect(after[0].committed).toBe(earliest[0]);
+
+  // Every move is in the audit log.
+  expect(auditCount('bus.offset.reset')).toBe(audits + 4);
+  // Stan's waiting count follows the moves.
+  const total = Object.values(after).reduce((sum, p) => sum + p.waiting, 0);
+  await consumerSlot(page).locator('[data-role="menu"] tf-tab#state > button').click();
+  await expect(consumerSection(page, 'state').locator('tf-stat-card[data-kpi="waiting"]')).toHaveAttribute('value', fmt(total), { timeout: 15000 });
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U3 at 390x844: the list as cards, the section list, the move window fills the phone', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(PHONE);
+  await login(page);
+  await openInstance(page, 'Produkcja');
+  await tab(page, 'groups').click();
+  await expect(consumersSlot(page).locator('[data-role="table"] tbody tr')).toHaveCount(4, { timeout: 15000 });
+  await assertNoOverflow(page);
+  await page.screenshot({ path: path.join(SHOTS, 't05-odbiorcy-telefon.png'), fullPage: true });
+  await consumersSlot(page).locator('[data-role="table"] tbody tr', { hasText: 'aplikacja-lekarza' }).click();
+  const d = consumerSlot(page);
+  await expect(d.locator('.tb-title')).toHaveText('aplikacja-lekarza', { timeout: 15000 });
+  await expect(d.locator('[data-role="menu"]')).toBeHidden();
+  const pick = d.locator('[data-role="pick"]');
+  await expect(pick).toBeVisible();
+  await expect(consumerSection(page, 'state').locator('tf-stat-card')).toHaveCount(4, { timeout: 15000 });
+  await assertNoOverflow(page);
+  await page.screenshot({ path: path.join(SHOTS, 'od-stan-telefon.png'), fullPage: true });
+  await pick.locator('select').selectOption('position');
+  await expect(consumerSection(page, 'position').locator('tf-table tbody tr')).toHaveCount(3, { timeout: 15000 });
+  await assertNoOverflow(page);
+  await page.screenshot({ path: path.join(SHOTS, 'od-miejsce-czytania-telefon.png'), fullPage: true });
+  await consumerSection(page, 'position').locator('tf-table tbody tr').first().locator('tf-button', { hasText: 'Przesuń' }).click();
+  await expect(moveWindow(page).locator('.tf-window-title-text')).toBeVisible();
+  await windowFits(page, 'tf-window.tb-move-window', PHONE.width);
+  await page.screenshot({ path: path.join(SHOTS, 'od-przesun-p0-telefon.png') });
+  await moveWindow(page).locator('[data-act="cancel"]').click();
+  await pick.locator('select').selectOption('settings');
+  await expect(consumerSection(page, 'settings').locator('.section-card')).toHaveCount(2);
+  await assertNoOverflow(page);
+  await page.screenshot({ path: path.join(SHOTS, 'od-ustawienia-telefon.png'), fullPage: true });
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U3 without rights: no pause or move, who can; a consumer of a topic the reader may not read is not shown at all', async ({ page, browser }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const users = await page.evaluate(async () => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    return ApiBinary.one('iamListUsersRequest', {});
+  });
+  const reader = (users?.users || []).find((u) => u.username === 'tomasz');
+  expect(reader, 'the reader created by the U2 test').toBeTruthy();
+  const readerId = reader.userId ?? reader.user_id ?? reader.id;
+  await busCall(page, 'busAclSetRequest', { instanceId, topic: 'faktury', subjectType: 'user', subjectId: readerId, accessLevel: 'deny', action: 'read' });
+
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: DESKTOP });
+  const rp = await context.newPage();
+  const readerErrors = trackErrors(rp);
+  try {
+    await rp.addInitScript(() => {
+      localStorage.setItem('tentaflow_lang', 'pl');
+      document.addEventListener('DOMContentLoaded', () => {
+        const st = document.createElement('style');
+        st.textContent = '.update-overlay{display:none!important}';
+        document.head.appendChild(st);
+      });
+    });
+    await loginAsAdmin(rp, { port: PORT, username: 'tomasz', password: 'Tomasz-czyta-1' });
+    await rp.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=groups`);
+    const list = consumersSlot(rp);
+    const table = list.locator('[data-role="table"]');
+    // system-rozliczen reads faktury, which this reader may not read: not listed, not counted.
+    await expect(table.locator('tbody tr')).toHaveCount(3, { timeout: 20000 });
+    await expect(table.locator('tbody tr', { hasText: 'system-rozliczen' })).toHaveCount(0);
+    await expect(rp.locator('#tb-tabs tf-tab#groups')).toHaveAttribute('count', '3', { timeout: 15000 });
+    await expect(table.locator('tf-button[data-act="pause"], tf-button[data-act="resume"]')).toHaveCount(0);
+    await expect(list.locator('[data-role="admin-note"]')).toBeVisible();
+    await expect(list.locator('[data-role="admin-note"]')).toContainText('administrator topiku');
+    await rp.screenshot({ path: path.join(SHOTS, 't05-bez-uprawnien.png'), fullPage: true });
+
+    await table.locator('tbody tr', { hasText: 'aplikacja-lekarza' }).click();
+    const d = consumerSlot(rp);
+    await expect(d.locator('.tb-title')).toHaveText('aplikacja-lekarza', { timeout: 15000 });
+    await expect(d.locator('[data-role="toggle"]')).toHaveCount(0);
+    await expect(d.locator('.tb-title-note')).toContainText('Wstrzymywać tego odbiorcę i przesuwać jego miejsce czytania może administrator topiku wyniki-badan (');
+    await d.locator('[data-role="menu"] tf-tab#position > button').click();
+    const ps = d.locator('[data-section="position"]');
+    await expect(ps.locator('tf-table tbody tr')).toHaveCount(3, { timeout: 15000 });
+    await expect(ps.locator('tf-table tf-button')).toHaveCount(0);
+    await expect(ps.locator('.tb-who-can')).toHaveCount(0);
+    await rp.screenshot({ path: path.join(SHOTS, 'od-bez-uprawnien.png'), fullPage: true });
+
+    // A link to the hidden consumer says it is not there, without its data.
+    await rp.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=groups&group=system-rozliczen&gtopic=faktury`);
+    await expect(d.locator('tf-empty-state')).toHaveAttribute('title', 'Odbiorcy system-rozliczen już nie ma', { timeout: 20000 });
+    await assertNoBannedWords(rp);
+    expect(readerErrors.filter((e) => !/PolicyDenied|permission_denied|group_not_found|NotFound|protocol error/i.test(e)), readerErrors.join('\n')).toEqual([]);
   } finally {
     await context.close();
     await busCall(page, 'busAclSetRequest', { instanceId, topic: 'faktury', subjectType: 'user', subjectId: readerId, accessLevel: 'clear', action: 'read' });

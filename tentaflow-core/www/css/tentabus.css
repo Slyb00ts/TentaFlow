@@ -210,37 +210,6 @@
 .tb-partition-summary { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
 .tb-partition-summary .tf-chip { font-variant-numeric: tabular-nums; }
 
-/* ----- Lag bar ----- */
-.tb-lagbar { position: relative; width: 100%; min-width: 80px; height: 6px; border-radius: 4px; background: var(--tf-bg-3); overflow: hidden; }
-.tb-lagbar > span { position: absolute; inset: 0; border-radius: 4px; background: var(--tf-gradient-accent); }
-.tb-lagbar.tb-lagbar--warn > span { background: var(--tf-warning); }
-.tb-lagbar.tb-lagbar--danger > span { background: var(--tf-danger); }
-
-/* ----- Dialog forms (offset reset) ----- */
-.tb-wizard-form { display: flex; flex-direction: column; gap: 14px; min-width: 420px; }
-.tb-field-hint { font-size: 11px; color: var(--tf-text-3); margin-top: 2px; }
-
-.tb-modal-footer { display: flex; gap: 8px; align-items: center; width: 100%; }
-
-/* N-4 (KRYTYK-M1-R2.md): the offset-reset modal toggles the JS `hidden`
-   property on its `tf-input`s per mode, but controls.css's own
-   `tf-input, tf-select { display: block; }` is an AUTHOR rule that beats
-   the browser's bare `[hidden] { display: none; }` UA rule regardless of
-   selector specificity (author always outranks user-agent) — same class of
-   bug `.tb-card tf-table[hidden]` above already documents, one level down
-   at the individual-field granularity. Without this override BOTH the
-   offset and the timestamp field stayed visible in every reset mode,
-   including "Najwcześniejszy"/"Najnowszy" where neither applies. */
-.tb-wizard-form tf-input[hidden] { display: none; }
-
-/* N-4: this form reuses `.tb-wizard-form`'s 420px `min-width`, but the
-   reset dialog itself opens at
-   `size="sm"` — the mismatch pushed the fields ~20px past the card's own
-   right edge and forced a horizontal scrollbar in the modal body. The
-   reset form has only one field visible at a time (mode + one conditional
-   input), so it does not need a wide minimum in the first place. */
-.tb-reset-form { min-width: 0; }
-
 /* ----- DLQ ----- */
 .tb-dlq-detail { padding: 12px 16px; background: var(--tf-bg-2); border-top: 1px solid var(--tf-border); display: flex; flex-direction: column; gap: 10px; }
 .tb-header-list { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: 4px 10px; font-size: 11.5px; }
@@ -251,10 +220,6 @@
   background: var(--tf-bg-3); border-radius: var(--tf-radius-sm); padding: 10px; overflow-wrap: anywhere;
   white-space: pre-wrap; max-height: 160px; overflow-y: auto;
 }
-
-/* ----- Groups ----- */
-.tb-group-detail { display: flex; flex-direction: column; gap: 14px; }
-.tb-group-detail-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 
 /* P2-1: the shared `.toast-container` (compat.css, z-index: 2000) sits
    below `tf-modal`'s backdrop (z-index: 9990) / card (9991), so an error
@@ -276,7 +241,7 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
    appended to <body>, outside `.tb-root`, so window rules are scoped by
    `.tb-window` instead.
    ============================================================================= */
-.tb-root .tb-topics-toolbar { margin: 0; }
+.tb-root .tb-topics-toolbar, .tb-root .tb-consumers-toolbar { margin: 0; }
 .tb-root .tb-admin-note { display: flex; align-items: center; gap: 6px; margin: -4px 0 10px; }
 .tb-root .tb-admin-note .icon { width: 13px; height: 13px; flex-shrink: 0; }
 .tb-root .tb-table-footer {
@@ -408,10 +373,6 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
    Responsive — tablet (<=1024px) and phone (<=720px). Tables never widen the
    page: tf-table's flush variant scrolls horizontally inside its own card.
    ============================================================================= */
-@media (max-width: 1024px) {
-  .tb-wizard-form { min-width: 0; }
-}
-
 @media (max-width: 720px) {
   .tb-toolbar { row-gap: 8px; }
   .tb-toolbar > tf-searchbox, .tb-toolbar > tf-select { flex: 1 1 100%; max-width: none; }
@@ -477,18 +438,27 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 .tb-root .tb-stat-rows .k { color: var(--tf-text-2); }
 .tb-root .tb-stat-rows .v { font-weight: 700; font-variant-numeric: tabular-nums; font-family: var(--tf-font-mono, ui-monospace, monospace); text-align: right; }
 .tb-root .tb-stat-rows .v.is-warn { color: var(--tf-warning); }
-[data-tb-view-slot="replication"] { display: flex; flex-direction: column; gap: 16px; }
-[data-tb-view-slot="replication"][hidden] { display: none; }
+[data-tb-view-slot="replication"], [data-tb-view-slot="groups"] { display: flex; flex-direction: column; gap: 16px; }
+[data-tb-view-slot="replication"][hidden], [data-tb-view-slot="groups"][hidden] { display: none; }
 
 /* The "Zmień …" and "Przenieś prowadzenie" windows */
-.tb-change-window .stack, .tb-transfer-window .stack { display: flex; flex-direction: column; gap: 14px; }
+.tb-change-window .stack, .tb-transfer-window .stack, .tb-move-window .stack { display: flex; flex-direction: column; gap: 14px; }
 .tb-window .tb-will-happen { display: flex; gap: 10px; align-items: flex-start; padding: 11px 14px; border-radius: var(--tf-radius-sm); background: rgba(96, 165, 250, 0.07); border: 1px solid rgba(96, 165, 250, 0.3); font-size: 12.5px; color: var(--tf-text-2); line-height: 1.55; }
 .tb-window .tb-will-happen .icon { color: var(--tf-info); width: 16px; height: 16px; margin-top: 1px; flex-shrink: 0; }
 .tb-window .tb-will-happen b { color: var(--tf-text); }
 .tb-window .tb-vr-lock .icon { width: 12px; height: 12px; }
 .tb-window [slot="footer"] .tb-foot-note { margin-right: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--tf-text-3); }
 .tb-window [slot="footer"] .tb-foot-note .icon { width: 13px; height: 13px; }
-.tb-change-window .tb-window-error, .tb-transfer-window .tb-window-error { margin-top: 0; }
+.tb-change-window .tb-window-error, .tb-transfer-window .tb-window-error, .tb-move-window .tb-window-error { margin-top: 0; }
+
+/* U3 Odbiorcy: the three ways of confirming under the list, the retries line
+   that leads to the topic, and the reading-place window. */
+.tb-root .tb-commit-legend { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.tb-root .tb-vr-link { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
+.tb-move-window .tb-move-head { align-items: end; }
+/* Block, not flex: the bold number sits inside a sentence, and flex items drop the spaces around it. */
+.tb-move-window .tb-move-now { font-size: 13px; color: var(--tf-text-2); padding: 10px 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.tb-move-window .tb-move-now b { color: var(--tf-text); }
 
 @media (max-width: 767px) {
   .tb-title { font-size: 19px; }
@@ -502,4 +472,6 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
   .tb-root .tb-consumer-row .tb-lag-cell { width: 110px; }
   .tb-node-grid { grid-template-columns: minmax(0, 1fr); }
   .tb-window [slot="footer"] .tb-foot-note { flex-basis: 100%; }
+  .tb-root .tb-commit-legend { grid-template-columns: minmax(0, 1fr); }
+  .tb-move-window .form-grid-2 { grid-template-columns: minmax(0, 1fr); }
 }

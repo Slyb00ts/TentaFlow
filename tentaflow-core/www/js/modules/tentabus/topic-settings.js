@@ -233,14 +233,16 @@ export function whoCanChange(adminLabels) {
 // The section
 // ---------------------------------------------------------------------------
 
-function row(label, value, note, lock = false) {
+/** One "label — value" line of a settings card, with its hint or its lock and reason. */
+export function valueRow(label, value, note, lock = false) {
   const noteHtml = note
     ? (lock ? `<div class="tb-vr-lock">${sprite('lock')}<span>${escapeHtml(note)}</span></div>` : `<div class="tb-vr-hint">${escapeHtml(note)}</div>`)
     : '';
   return `<div class="tb-vrow"><div class="tb-vr-label">${escapeHtml(label)}</div><div><div class="tb-vr-value">${escapeHtml(value)}</div>${noteHtml}</div></div>`;
 }
 
-function card(key, icon, title, rows, canAdmin) {
+/** A settings card: its title, its value lines and — for an administrator — "Zmień". */
+export function settingsCard(key, icon, title, rows, canAdmin) {
   return `
     <div class="section-card" data-card="${key}">
       <div class="section-card-head">
@@ -265,47 +267,47 @@ export function settingsHtml(view) {
   const subject = boundSubject(topic, subjects);
 
   const retention = [
-    row(T('settings.retention.period_label'), fmtRetention(topic.retentionMs), T('settings.retention.period_hint', { minutes: fmtCount(SWEEP_MINUTES) })),
-    row(T('settings.retention.limit_label'), fmtBytes(topic.retentionBytesPerPartition), facts.largest != null && facts.largest > 0
+    valueRow(T('settings.retention.period_label'), fmtRetention(topic.retentionMs), T('settings.retention.period_hint', { minutes: fmtCount(SWEEP_MINUTES) })),
+    valueRow(T('settings.retention.limit_label'), fmtBytes(topic.retentionBytesPerPartition), facts.largest != null && facts.largest > 0
       ? T('settings.retention.limit_hint_now', { size: fmtBytes(facts.largest) })
       : T('settings.retention.limit_hint')),
-    row(T('settings.retention.cleanup_label'), T('settings.retention.cleanup_value'), T('settings.retention.cleanup_lock'), true),
+    valueRow(T('settings.retention.cleanup_label'), T('settings.retention.cleanup_value'), T('settings.retention.cleanup_lock'), true),
   ];
   const write = [
-    row(T('settings.write.partitions_label'), fmtCount(topic.partitions), T('settings.write.partitions_hint')),
-    row(T('settings.write.copies_label'), fmtCount(rf), T('settings.write.copies_lock'), true),
-    row(T('settings.write.acks_label'), T(`settings.write.acks_${ACKS.includes(topic.acks) ? topic.acks : 'leader'}`), acksHint(topic.acks, rf)),
-    row(T('settings.write.durability_label'), T(`settings.write.durability_${topic.durabilityClass === 'critical' ? 'critical' : 'standard'}`), T('settings.write.durability_lock'), true),
-    row(T('settings.write.compression_label'), T(topic.compression === 'none' ? 'settings.write.compression_off' : 'settings.write.compression_on'),
+    valueRow(T('settings.write.partitions_label'), fmtCount(topic.partitions), T('settings.write.partitions_hint')),
+    valueRow(T('settings.write.copies_label'), fmtCount(rf), T('settings.write.copies_lock'), true),
+    valueRow(T('settings.write.acks_label'), T(`settings.write.acks_${ACKS.includes(topic.acks) ? topic.acks : 'leader'}`), acksHint(topic.acks, rf)),
+    valueRow(T('settings.write.durability_label'), T(`settings.write.durability_${topic.durabilityClass === 'critical' ? 'critical' : 'standard'}`), T('settings.write.durability_lock'), true),
+    valueRow(T('settings.write.compression_label'), T(topic.compression === 'none' ? 'settings.write.compression_off' : 'settings.write.compression_on'),
       T(topic.compression === 'none' ? 'settings.write.compression_off_hint' : 'settings.write.compression_on_hint')),
   ];
   const retry = [
-    row(T('settings.retry.attempts_label'), T('settings.retry.attempts_value', { count: fmtCount(topic.maxDeliveryAttempts), n: topic.maxDeliveryAttempts }), T('settings.retry.attempts_hint')),
-    row(T('settings.retry.backoff_label'), fmtDuration(topic.retryBackoffMs), T('settings.retry.backoff_hint', { cap: fmtDuration(BACKOFF_CAP_MS) })),
+    valueRow(T('settings.retry.attempts_label'), T('settings.retry.attempts_value', { count: fmtCount(topic.maxDeliveryAttempts), n: topic.maxDeliveryAttempts }), T('settings.retry.attempts_hint')),
+    valueRow(T('settings.retry.backoff_label'), fmtDuration(topic.retryBackoffMs), T('settings.retry.backoff_hint', { cap: fmtDuration(BACKOFF_CAP_MS) })),
   ];
   const pattern = [
-    row(T('settings.pattern.kind_label'), contentTypeLabel(topic.contentType) || topic.contentType, T('settings.pattern.kind_lock'), true),
+    valueRow(T('settings.pattern.kind_label'), contentTypeLabel(topic.contentType) || topic.contentType, T('settings.pattern.kind_lock'), true),
   ];
   if (topic.schemaId) {
     const format = subject ? schemaFormatLabel(subject.schemaType) : '';
-    pattern.push(row(T('settings.pattern.schema_label'), format ? `${topic.schemaId} (${format})` : topic.schemaId,
+    pattern.push(valueRow(T('settings.pattern.schema_label'), format ? `${topic.schemaId} (${format})` : topic.schemaId,
       subject?.deprecatedAtMs != null
         ? T('settings.pattern.schema_hint_withdrawn')
         : (subject?.latestVersion ? T('settings.pattern.schema_hint', { version: fmtCount(subject.latestVersion) }) : '')));
     const mode = VALIDATION_MODES.includes(topic.validation) ? topic.validation : 'off';
-    pattern.push(row(T('settings.pattern.mode_label'), T(`settings.pattern.mode_${mode}`), T(`settings.pattern.mode_${mode}_hint`)));
+    pattern.push(valueRow(T('settings.pattern.mode_label'), T(`settings.pattern.mode_${mode}`), T(`settings.pattern.mode_${mode}_hint`)));
   } else {
-    pattern.push(row(T('settings.pattern.schema_label'), T('settings.pattern.schema_none'), T('settings.pattern.schema_none_hint')));
+    pattern.push(valueRow(T('settings.pattern.schema_label'), T('settings.pattern.schema_none'), T('settings.pattern.schema_none_hint')));
   }
 
   return `
     ${notice ? `<tf-alert tone="${escapeAttr(notice.tone || 'success')}" title="${escapeAttr(notice.title)}" message="${escapeAttr(notice.text || '')}" data-role="saved"></tf-alert>` : ''}
     ${access?.canRead ? '' : `<div class="tb-who-can">${sprite('lock')}<span>${escapeHtml(T('detail.no_read', { name: topic.name }))}</span></div>`}
     ${canAdmin ? '' : `<div class="tb-who-can">${sprite('lock')}<span>${escapeHtml(whoCanChange(adminLabels))}</span></div>`}
-    ${card('retention', 'clock', T('settings.retention.title'), retention, canAdmin)}
-    ${card('write', 'shield', T('settings.write.title'), write, canAdmin)}
-    ${card('retry', 'rotate', T('settings.retry.title'), retry, canAdmin)}
-    ${card('pattern', 'file-code', T('settings.pattern.title'), pattern, canAdmin)}
+    ${settingsCard('retention', 'clock', T('settings.retention.title'), retention, canAdmin)}
+    ${settingsCard('write', 'shield', T('settings.write.title'), write, canAdmin)}
+    ${settingsCard('retry', 'rotate', T('settings.retry.title'), retry, canAdmin)}
+    ${settingsCard('pattern', 'file-code', T('settings.pattern.title'), pattern, canAdmin)}
     ${canAdmin ? `
       <div class="tb-danger-zone">
         <h4>${sprite('alert')} ${escapeHtml(T('settings.delete.title'))}</h4>

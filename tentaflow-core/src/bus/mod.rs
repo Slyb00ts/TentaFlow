@@ -822,6 +822,13 @@ pub enum BusServiceError {
     /// mistaking "paused" for "caught up".
     #[error("group '{group}' is paused on topic '{topic}'")]
     GroupPaused { group: String, topic: String },
+    /// An admin action (`pause_group`/`resume_group`/`reset_offset`) named a
+    /// group that has no `bus_groups` row on the topic — no consumer of it
+    /// ever opened a session here. Refused rather than acted on, so an
+    /// admin action never creates a phantom group past the `max_groups`
+    /// quota `open_consumer` enforces.
+    #[error("group '{group}' not found on topic '{topic}'")]
+    GroupNotFound { group: String, topic: String },
     /// a DLQ topic (`__dlq.<x>`) can never itself have a DLQ — M1 has
     /// no "poison of poison" escalation path. Distinct from
     /// `InvalidTopicName` (which `__dlq.__dlq.x` would otherwise hit via
@@ -2067,6 +2074,124 @@ type TopicKey = (String, String);
 /// Per-(org, group) `commit` mutexes — see `BusService::commit_locks`'s doc.
 type CommitLocks = Arc<DashMap<(String, String), Arc<parking_lot::Mutex<()>>>>;
 
+/// `(org, group, topic, partition)` of one admin offset reset.
+type OffsetResetKey = (String, String, String, u32);
+
+/// Admin offset resets (`BusService::reset_offset`) as seen by OPEN consumer
+/// sessions. A `ConsumerHandle` keeps its fetch cursor in memory, so without
+/// this it would ignore a reset: after a backward move its next commit of a
+/// higher offset silently undoes the reset, and after a forward move its
+/// next commit of a lower offset fails with `OffsetRegression`. What a
+/// handle does with a reset: `ConsumerCursor` and `ConsumerHandle::commit`.
+///
+/// `generation` moves on every reset anywhere, so a handle whose remembered
+/// generation still matches pays one atomic load on `fetch`/`commit` and no
+/// map lookup. `seqs` holds, per reset partition, the generation of its
+/// latest reset — what each `ConsumerPartition` compares against the one it
+/// last applied.
+#[derive(Default)]
+struct OffsetResets {
+    generation: AtomicU64,
+    seqs: DashMap<OffsetResetKey, u64>,
+}
+
+impl OffsetResets {
+    /// Records a reset of `key`. The map entry is held while the generation
+    /// moves, so a handle that observes the new generation and then looks the
+    /// key up waits for the entry and reads the new seq — it can never store
+    /// the new generation as applied while still reading the old seq.
+    fn note(&self, key: OffsetResetKey) {
+        let mut entry = self.seqs.entry(key).or_insert(0);
+        *entry = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn seq(&self, org: &str, group: &str, topic: &str, partition: u32) -> u64 {
+        self.seqs
+            .get(&(
+                org.to_string(),
+                group.to_string(),
+                topic.to_string(),
+                partition,
+            ))
+            .map(|seq| *seq)
+            .unwrap_or(0)
+    }
+
+    /// Drops the seqs of a deleted topic. A handle still subscribed to it
+    /// then sees seq 0 and reloads a cursor its detached partition can no
+    /// longer serve anyway; a handle opened on a re-created topic of the
+    /// same name starts at seq 0 like on any never-reset partition.
+    fn remove_topic(&self, org_id: &str, topic: &str) {
+        self.seqs
+            .retain(|(org, _, t, _), _| !(org == org_id && t == topic));
+    }
+
+    fn remove_org(&self, org_id: &str) {
+        self.seqs.retain(|(org, _, _, _), _| org != org_id);
+    }
+}
+
+/// A `ConsumerPartition`'s fetch position plus what `commit` needs to tell
+/// a pre-reset acknowledgement from a current one. Behind one mutex so a
+/// reset reload and a fetch advancing the cursor can never interleave.
+struct ConsumerCursor {
+    /// Next offset `fetch` reads from.
+    next: u64,
+    /// Seq (`OffsetResets::seqs`) of the latest admin reset `next` reflects.
+    applied_reset: u64,
+    /// Where the latest applied reset moved `next`. The handle has fetched
+    /// nothing below it since, so a lower commit acknowledges records
+    /// fetched before the reset. 0 when never reset.
+    reset_floor: u64,
+    /// The highest position this handle had fetched to before the latest
+    /// applied reset. While `next` is below it the handle is replaying, and
+    /// a commit above `next` can only acknowledge a pre-reset batch.
+    stale_hi: u64,
+}
+
+impl ConsumerCursor {
+    fn new(next: u64, applied_reset: u64) -> Self {
+        Self {
+            next,
+            applied_reset,
+            reset_floor: 0,
+            stale_hi: 0,
+        }
+    }
+
+    /// Moves the cursor to a reset's `committed` offset. `stale_hi` keeps
+    /// the higher of the old position and any replay still in progress, so
+    /// two resets in a row do not forget batches fetched before the first.
+    fn reload(&mut self, committed: u64, seq: u64) {
+        self.stale_hi = self.stale_hi.max(self.next);
+        self.next = committed;
+        self.reset_floor = committed;
+        self.applied_reset = seq;
+    }
+
+    /// Moves the cursor from `from` to `new_next` after a fetch read
+    /// `[from, new_next)`. `false` when the cursor is no longer at `from`
+    /// — a reset reloaded it while those records were read.
+    fn advance(&mut self, from: u64, new_next: u64) -> bool {
+        if self.next != from {
+            return false;
+        }
+        self.next = new_next;
+        true
+    }
+
+    /// Whether `commit` may write `offset`: not below the latest reset's
+    /// target, and — while replaying below the pre-reset position — not
+    /// above what the handle has fetched since the reset.
+    fn accepts(&self, offset: u64) -> bool {
+        offset >= self.reset_floor && (offset <= self.next || self.next >= self.stale_hi)
+    }
+}
+
 /// PLAN-F3 §4.2: one `BusService::schema_cache` entry — a subject's
 /// currently-effective version, compiled once at resolve time, plus the
 /// bookkeeping `resolve_validator` needs to know whether it is still
@@ -2273,6 +2398,9 @@ pub struct BusService {
     /// `DashMap` and drop the map's own shard guard immediately, rather
     /// than holding it for `commit`'s whole duration.
     commit_locks: CommitLocks,
+    /// Shared with every `ConsumerHandle` this service opens — see
+    /// `OffsetResets`' doc.
+    offset_resets: Arc<OffsetResets>,
     /// `org_id -> purge count`, bumped by `purge_org`. A `ConsumerHandle`
     /// snapshots the current count for its org at `open_consumer` time; if
     /// a later `commit`/`seek_to_earliest` observes a different count, the
@@ -2691,6 +2819,7 @@ impl BusService {
             sweeper_shutdown: Arc::new(AtomicBool::new(false)),
             group_state: Arc::new(GroupStateCache::new()),
             commit_locks: Arc::new(DashMap::new()),
+            offset_resets: Arc::new(OffsetResets::default()),
             purged_orgs: Arc::new(DashMap::new()),
             dedup_expected_rate_per_sec: cfg.dedup_expected_rate_per_sec,
             consumer_partitions: Arc::new(DashMap::new()),
@@ -3451,6 +3580,7 @@ impl BusService {
         self.round_robin
             .remove(&(org_id.to_string(), name.to_string()));
         self.group_state.remove_topic(org_id, name);
+        self.offset_resets.remove_topic(org_id, name);
         let offset_keys_purged = self.offsets.purge_topic(org_id, name)?;
         let producer_seq_keys_purged = self.producer_seq.purge_topic(org_id, name)?;
         // A no-op scan (0 rows) when `name` never had any discard markers
@@ -4744,6 +4874,25 @@ impl BusService {
         Ok(())
     }
 
+    /// Moves `group`'s committed offset on `(topic, partition)` to `offset`,
+    /// forward or backward — the admin "change reading place" action.
+    ///
+    /// Leader-only, like every other consumer-offset read and write: a
+    /// follower's committed offsets are never read by a consumer, so a reset
+    /// written there would be accepted and then do nothing. `offset` must lie
+    /// in the partition's retained range `[earliest_offset, high_watermark]`.
+    ///
+    /// The group must exist on the topic (`bus_groups` row), else
+    /// `GroupNotFound`.
+    ///
+    /// Open consumer sessions of the group honour the reset (see
+    /// `OffsetResets`): their next `fetch` reads from the new place, and
+    /// `ConsumerHandle::commit` drops an acknowledgement of records fetched
+    /// before the reset (its doc states the exact rule). The move is replicated
+    /// through `note_offset_commit`, but followers apply offsets
+    /// monotonically (`apply_offsets`), so only a FORWARD move reaches them:
+    /// after a backward reset and a leader change the group resumes from the
+    /// followers' higher offset.
     pub fn reset_offset(
         &self,
         ctx: &BusCallContext,
@@ -4752,6 +4901,9 @@ impl BusService {
         partition: u32,
         offset: u64,
     ) -> Result<(), BusServiceError> {
+        // First: the name is part of NUL-separated fjall keys, so an
+        // unvalidated one could address another group's offsets.
+        validate_group_name(group)?;
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
@@ -4762,13 +4914,51 @@ impl BusService {
         // offset key for data that no longer has a corresponding topic row
         // (an admin re-issuing a stale reset request, or a UI action
         // replayed after the topic/org was already erased).
-        self.topic_config(&ctx.org_id, topic)?;
+        let cfg = self.topic_config(&ctx.org_id, topic)?;
+        check_partition_in_range(topic, partition, &cfg)?;
+        self.require_group_row(&ctx.org_id, group, topic)?;
+        let coordinator = self.replication();
+        check_leader_role(&coordinator, &ctx.org_id, topic, partition)?;
+        // Read straight off the partition: Admin is already authorized, and
+        // `partition_stats` would additionally demand Consume.
+        let stats = self.read_partition_stats(&ctx.org_id, topic, partition, &cfg)?;
+        if offset < stats.earliest_offset || offset > stats.high_watermark {
+            return Err(BusServiceError::InvalidArgument(format!(
+                "offset {offset} is outside partition {partition} of topic '{topic}': \
+                 the retained range is {}..={}",
+                stats.earliest_offset, stats.high_watermark
+            )));
+        }
+        // The group's commit mutex keeps a consumer `commit` from validating
+        // against the old offset and writing after this reset.
+        let lock = self
+            .commit_locks
+            .entry((ctx.org_id.clone(), group.to_string()))
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone();
+        let guard = lock.lock();
+        // Again under the lock: leadership may have moved while this call
+        // waited for it, and a follower's offset write is never read.
+        let coordinator = self.replication();
+        check_leader_role(&coordinator, &ctx.org_id, topic, partition)?;
         // `force_commit`, not `commit`: this is the one legitimate
         // path allowed to move an offset BACKWARD, gated on `bus.admin` and
         // audited right below — `commit`'s own monotonicity guard exists
         // specifically to keep every other caller off this move.
         self.offsets
             .force_commit(&ctx.org_id, group, topic, partition, offset, now_ms())?;
+        // After the write: a handle that sees the new seq must read the new
+        // committed offset when it reloads its cursor.
+        self.offset_resets.note((
+            ctx.org_id.clone(),
+            group.to_string(),
+            topic.to_string(),
+            partition,
+        ));
+        drop(guard);
+        if let Some(coordinator) = &coordinator {
+            coordinator.note_offset_commit(&ctx.org_id, group, topic, partition, offset, 0);
+        }
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.actor.as_deref(),
@@ -6259,6 +6449,9 @@ impl BusService {
 
         // Phase 2: every topic passed validation — now perform the actual
         // side effects (`bus_groups` upsert, partition open).
+        // Before any per-partition seq is read, so a reset racing this call
+        // leaves the handle's generation behind and gets picked up.
+        let reset_generation = self.offset_resets.generation();
         let mut partitions = Vec::new();
         for (topic, topic_cfg, existing_row) in &checked {
             // register/refresh this group's `bus_groups` row so
@@ -6283,6 +6476,10 @@ impl BusService {
             let env_byte = environment_to_u8(topic_cfg.environment);
             for p in 0..topic_cfg.partitions {
                 let part = self.partition_handle(&ctx.org_id, topic, p, topic_cfg)?;
+                // Seq before the committed offset: a reset landing between
+                // the two reads then shows up as a moved seq and reloads the
+                // cursor, instead of being taken as already applied.
+                let applied_reset = self.offset_resets.seq(&ctx.org_id, group, topic, p);
                 let committed = self
                     .offsets
                     .committed_offset(&ctx.org_id, group, topic, p)?;
@@ -6303,7 +6500,7 @@ impl BusService {
                     // regardless of whether `self.partitions` still has an
                     // entry for this key.
                     handle: part,
-                    next_offset: AtomicU64::new(committed),
+                    cursor: parking_lot::Mutex::new(ConsumerCursor::new(committed, applied_reset)),
                     environment: env_byte,
                     gap_audited: std::sync::atomic::AtomicBool::new(false),
                 });
@@ -6360,6 +6557,8 @@ impl BusService {
             audit_windows: Arc::clone(&self.audit_windows),
             group_state: Arc::clone(&self.group_state),
             commit_locks: Arc::clone(&self.commit_locks),
+            offset_resets: Arc::clone(&self.offset_resets),
+            reset_generation: AtomicU64::new(reset_generation),
             purged_orgs: Arc::clone(&self.purged_orgs),
             purge_epoch: purge_epoch_before,
             replication: Arc::clone(&self.replication),
@@ -6911,13 +7110,35 @@ impl BusService {
 
     // ---- Group administration (PLAN §8.2 `bus.group.pause`) --------------
 
-    /// Sets a group's paused bookkeeping flag (`bus_groups` table) and
-    /// audits the change. `ConsumerHandle::fetch` DOES consult this (via
-    /// `GroupStateCache`, invalidated right below) and refuses to serve a
-    /// paused group with `BusServiceError::GroupPaused` — a caller does not
-    /// need to poll `is_group_paused` itself before calling `fetch` to get
-    /// that enforcement, though doing so avoids paying for a `fetch` call
-    /// it already knows will be rejected.
+    /// `group`'s `bus_groups` row on `topic`, or `GroupNotFound`.
+    fn require_group_row(
+        &self,
+        org_id: &str,
+        group: &str,
+        topic: &str,
+    ) -> Result<crate::db::repository::DbBusGroup, BusServiceError> {
+        crate::db::repository::bus_group_get(&self.local_db, org_id, group, topic)?.ok_or_else(
+            || BusServiceError::GroupNotFound {
+                group: group.to_string(),
+                topic: topic.to_string(),
+            },
+        )
+    }
+
+    /// Sets a group's paused flag (`bus_groups` table) and audits the
+    /// change. `ConsumerHandle::fetch` consults it (via `GroupStateCache`,
+    /// invalidated right below) and refuses to serve a paused group with
+    /// `BusServiceError::GroupPaused`.
+    ///
+    /// The flag lives in THIS node's `tentabus.db` and is not replicated,
+    /// while `fetch` runs on each partition's leader. So the call is
+    /// refused with `NotLeader` unless this node leads EVERY partition of
+    /// the topic — a flag written anywhere else would be accepted and then
+    /// ignored by the node actually serving the group. After a leadership
+    /// change the new leader does not know the flag.
+    ///
+    /// Only an existing group (a `bus_groups` row, written when a consumer
+    /// opens a session) can be paused or resumed, else `GroupNotFound`.
     fn set_group_paused(
         &self,
         ctx: &BusCallContext,
@@ -6925,29 +7146,26 @@ impl BusService {
         topic: &str,
         paused: bool,
     ) -> Result<(), BusServiceError> {
+        validate_group_name(group)?;
         // `check_instance` here (not duplicated in `pause_group`/
-        // `resume_group`) covers both public wrappers, since this is the
-        // first statement either of them reaches.
+        // `resume_group`) covers both public wrappers.
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, topic)
             .map_err(|_| deny(BusAction::Admin, topic))?;
-        let now = now_ms();
-        let commit_mode =
-            crate::db::repository::bus_group_get(&self.local_db, &ctx.org_id, group, topic)?
-                .map(|g| g.commit_mode)
-                .unwrap_or_else(|| groups::CommitMode::AutoAfterSuccess.as_str().to_string());
+        let cfg = self.topic_config(&ctx.org_id, topic)?;
+        let coordinator = self.replication();
+        for partition in 0..cfg.partitions {
+            check_leader_role(&coordinator, &ctx.org_id, topic, partition)?;
+        }
+        let row = self.require_group_row(&ctx.org_id, group, topic)?;
         crate::db::repository::bus_group_upsert(
             &self.local_db,
             &crate::db::repository::DbBusGroup {
-                org_id: ctx.org_id.clone(),
-                group_id: group.to_string(),
-                topic: topic.to_string(),
-                commit_mode,
                 paused,
-                created_at_ms: now,
-                updated_at_ms: now,
+                updated_at_ms: now_ms(),
+                ..row
             },
         )?;
         // Invalidate rather than update-in-place: simpler to reason about
@@ -7314,6 +7532,7 @@ impl BusService {
         self.round_robin.retain(|k, _| k.0 != org_id);
         self.publish_rates.retain(|k, _| k.0 != org_id);
         self.group_state.remove_org(org_id);
+        self.offset_resets.remove_org(org_id);
         self.audit_windows.remove_org(org_id);
         self.commit_locks.retain(|k, _| k.0 != org_id);
         self.quota.remove_org(org_id);
@@ -7576,7 +7795,10 @@ struct ConsumerPartition {
     /// at `open_consumer` time so `delete_topic`/`purge_org` can `detach()`
     /// it even after the map entry is gone.
     handle: tentaflow_bus::Partition,
-    next_offset: AtomicU64,
+    /// Fetch position and admin-reset bookkeeping — see `ConsumerCursor`.
+    /// Lock order: the group's commit mutex (`commit_locks`) first, when
+    /// both are taken.
+    cursor: parking_lot::Mutex<ConsumerCursor>,
     /// Snapshot of the topic's environment (PLAN §4.4 Z12) taken at
     /// `open_consumer` time, encoded via `environment_to_u8` — compared
     /// against the handle's `node_environment` on every `fetch`.
@@ -7626,6 +7848,11 @@ pub struct ConsumerHandle {
     group_state: Arc<GroupStateCache>,
     /// Shared with `BusService::commit_locks` — see that field's doc.
     commit_locks: CommitLocks,
+    /// Shared with `BusService::offset_resets` — see `OffsetResets`' doc.
+    offset_resets: Arc<OffsetResets>,
+    /// `OffsetResets::generation` this handle last applied to every one of
+    /// its partitions.
+    reset_generation: AtomicU64,
     /// Shared with `BusService::purged_orgs` — see that field's doc.
     purged_orgs: Arc<DashMap<String, u64>>,
     /// This handle's org's purge count at `open_consumer` time — compared
@@ -7711,6 +7938,86 @@ impl ConsumerHandle {
         Ok(())
     }
 
+    /// This group's commit mutex (see `BusService::commit_locks`), which
+    /// `BusService::reset_offset` also holds while it moves an offset.
+    fn commit_lock(&self) -> Arc<parking_lot::Mutex<()>> {
+        self.commit_locks
+            .entry((self.org_id.clone(), self.group.clone()))
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    }
+
+    /// Whether an admin reset happened anywhere since this handle last
+    /// applied resets — one atomic load, the no-reset fast path.
+    fn resets_pending(&self) -> bool {
+        self.reset_generation.load(Ordering::Acquire) != self.offset_resets.generation()
+    }
+
+    /// Applies admin offset resets made since this handle last looked:
+    /// every partition whose reset seq moved reloads its cursor from the
+    /// committed offset (`ConsumerCursor::reload`). The caller holds the
+    /// group's commit mutex, so no reset is half-written while this reads.
+    fn apply_offset_resets_locked(&self) -> Result<(), BusServiceError> {
+        let generation = self.offset_resets.generation();
+        if self.reset_generation.load(Ordering::Acquire) == generation {
+            return Ok(());
+        }
+        for cp in &self.partitions {
+            let seq = self
+                .offset_resets
+                .seq(&self.org_id, &self.group, &cp.topic, cp.partition);
+            let mut cursor = cp.cursor.lock();
+            if seq == cursor.applied_reset {
+                continue;
+            }
+            let committed = self.offsets.committed_offset(
+                &self.org_id,
+                &self.group,
+                &cp.topic,
+                cp.partition,
+            )?;
+            cursor.reload(committed, seq);
+            cp.gap_audited.store(false, Ordering::Release);
+        }
+        self.reset_generation.store(generation, Ordering::Release);
+        Ok(())
+    }
+
+    /// Moves `cp`'s cursor past the records `fetch` just read from `from`
+    /// up to `new_next`. `false` when a reset moved the cursor meanwhile:
+    /// those records are then not delivered, and nothing is committed.
+    ///
+    /// `AtMostOnce` commits here, under the group's commit mutex and after
+    /// applying pending resets under it: a reset that lands between reading
+    /// the cursor and this commit is seen as a moved cursor, so the commit
+    /// never overwrites it.
+    fn advance_cursor(
+        &self,
+        cp: &ConsumerPartition,
+        from: u64,
+        new_next: u64,
+    ) -> Result<bool, BusServiceError> {
+        if self.commit_mode != groups::CommitMode::AtMostOnce {
+            return Ok(cp.cursor.lock().advance(from, new_next));
+        }
+        let lock = self.commit_lock();
+        let _guard = lock.lock();
+        self.apply_offset_resets_locked()?;
+        let mut cursor = cp.cursor.lock();
+        if cursor.next != from {
+            return Ok(false);
+        }
+        self.offsets.commit(
+            &self.org_id,
+            &self.group,
+            &cp.topic,
+            cp.partition,
+            new_next,
+            now_ms(),
+        )?;
+        Ok(cursor.advance(from, new_next))
+    }
+
     /// Pull-based fetch (PLAN §5.3.7): polls every subscribed partition
     /// round-robin up to `max_bytes` total, long-polling up to
     /// `max_wait_ms` if nothing is available yet.
@@ -7753,6 +8060,11 @@ impl ConsumerHandle {
                 });
             }
         }
+        if self.resets_pending() {
+            let lock = self.commit_lock();
+            let _guard = lock.lock();
+            self.apply_offset_resets_locked()?;
+        }
         let deadline = Instant::now() + Duration::from_millis(max_wait_ms as u64);
         loop {
             let mut records = Vec::new();
@@ -7763,7 +8075,7 @@ impl ConsumerHandle {
                 }
                 self.check_environment(cp)?;
                 check_leader_role(&coordinator, &self.org_id, &cp.topic, cp.partition)?;
-                let from = cp.next_offset.load(Ordering::Acquire);
+                let from = cp.cursor.lock().next;
                 let batches = match cp
                     .reader
                     .fetch_from_offset(from, max_bytes.saturating_sub(consumed))
@@ -7806,6 +8118,7 @@ impl ConsumerHandle {
                     }
                     Err(other) => return Err(map_engine_error(other, &cp.topic, cp.partition)),
                 };
+                let (records_before, consumed_before) = (records.len(), consumed);
                 let mut new_next = from;
                 for view in &batches {
                     for rv in view.records_from(from) {
@@ -7828,18 +8141,11 @@ impl ConsumerHandle {
                     }
                     new_next = new_next.max(view.header().next_offset());
                 }
-                if new_next > from {
-                    cp.next_offset.store(new_next, Ordering::Release);
-                    if self.commit_mode == groups::CommitMode::AtMostOnce {
-                        self.offsets.commit(
-                            &self.org_id,
-                            &self.group,
-                            &cp.topic,
-                            cp.partition,
-                            new_next,
-                            now_ms(),
-                        )?;
-                    }
+                if new_next > from && !self.advance_cursor(cp, from, new_next)? {
+                    // An admin reset moved this partition while it was
+                    // read: those records belong to the old position.
+                    records.truncate(records_before);
+                    consumed = consumed_before;
                 }
             }
             if !records.is_empty() || Instant::now() >= deadline {
@@ -7927,15 +8233,28 @@ impl ConsumerHandle {
     /// a `committed_offset` that a first call's write loop is
     /// concurrently about to move past, and the two writes could interleave
     /// even though each one individually validated cleanly.
+    ///
+    /// Admin offset resets (`BusService::reset_offset`): pending resets are
+    /// applied first, under the same mutex `reset_offset` writes under, and
+    /// an entry that can only acknowledge records fetched BEFORE the latest
+    /// reset of its partition is DROPPED — not written, not an error, and
+    /// the cursor is not raised by it. Exactly, per partition
+    /// (`ConsumerCursor::accepts`):
+    /// - an offset below the reset's target is dropped: this handle has
+    ///   fetched nothing below it since the reset;
+    /// - while the handle replays below the position it had reached before
+    ///   the reset, an offset above what it has fetched since the reset is
+    ///   dropped (a fetch-ahead batch committed after the move back).
+    ///
+    /// Everything else is validated and written as usual. Not
+    /// distinguishable, hence accepted: a pre-reset acknowledgement at or
+    /// below what the handle has already re-fetched, and — once the replay
+    /// has passed the pre-reset position — any offset above it.
     pub fn commit(&self, offsets: &[(TopicPartition, u64)]) -> Result<(), BusServiceError> {
         self.revalidate()?;
         // M2 (PLAN-M2 §1e): consumption is leader-only.
         let coordinator = self.replication.read().clone();
-        let lock = self
-            .commit_locks
-            .entry((self.org_id.clone(), self.group.clone()))
-            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-            .clone();
+        let lock = self.commit_lock();
         let _guard = lock.lock();
         // Checked UNDER the group's commit mutex, not before acquiring
         // it: `purge_org` bumps `purged_orgs` and only then goes on to
@@ -7948,6 +8267,10 @@ impl ConsumerHandle {
         if let Some((tp, _)) = offsets.first() {
             self.check_not_purged(&tp.topic)?;
         }
+        // Under the commit mutex, which `reset_offset` also holds while it
+        // writes: no reset can land between this and the writes below.
+        self.apply_offset_resets_locked()?;
+        let mut accepted = Vec::with_capacity(offsets.len());
         for (tp, offset) in offsets {
             let cp = self
                 .partitions
@@ -7959,6 +8282,14 @@ impl ConsumerHandle {
                 })?;
             self.check_environment(cp)?;
             check_leader_role(&coordinator, &self.org_id, &tp.topic, tp.partition)?;
+            if !cp.cursor.lock().accepts(*offset) {
+                tracing::debug!(
+                    org_id = %self.org_id, group = %self.group, topic = %tp.topic,
+                    partition = tp.partition, offset = *offset,
+                    "commit dropped: it acknowledges records fetched before an admin offset reset"
+                );
+                continue;
+            }
             let committed = self.offsets.committed_offset(
                 &self.org_id,
                 &self.group,
@@ -7973,15 +8304,16 @@ impl ConsumerHandle {
                     committed,
                 });
             }
+            accepted.push((tp, *offset, cp));
         }
         let now = now_ms();
-        for (tp, offset) in offsets {
+        for (tp, offset, cp) in accepted {
             self.offsets.commit(
                 &self.org_id,
                 &self.group,
                 &tp.topic,
                 tp.partition,
-                *offset,
+                offset,
                 now,
             )?;
             // K-M2-5: replicate this offset commit so a failover redelivers
@@ -7999,20 +8331,12 @@ impl ConsumerHandle {
                     &self.group,
                     &tp.topic,
                     tp.partition,
-                    *offset,
+                    offset,
                     0,
                 );
             }
-            if let Some(cp) = self
-                .partitions
-                .iter()
-                .find(|p| p.topic == tp.topic && p.partition == tp.partition)
-            {
-                let cur = cp.next_offset.load(Ordering::Acquire);
-                if *offset > cur {
-                    cp.next_offset.store(*offset, Ordering::Release);
-                }
-            }
+            let mut cursor = cp.cursor.lock();
+            cursor.next = cursor.next.max(offset);
         }
         Ok(())
     }
@@ -8058,7 +8382,7 @@ impl ConsumerHandle {
             earliest,
             now_ms(),
         )?;
-        cp.next_offset.store(earliest, Ordering::Release);
+        cp.cursor.lock().next = earliest;
         cp.gap_audited.store(false, Ordering::Release);
         Ok(earliest)
     }
@@ -9597,6 +9921,15 @@ mod tests {
         let ctx = test_ctx("org-1");
         svc.create_topic(&ctx, "orders.paused", topics::TopicOptions::default())
             .unwrap();
+        svc.open_consumer(
+            &ctx,
+            "g1",
+            &["orders.paused".to_string()],
+            ConsumerConfig {
+                commit_mode: groups::CommitMode::Explicit,
+            },
+        )
+        .unwrap();
 
         assert!(!svc.is_group_paused("org-1", "g1", "orders.paused").unwrap());
         svc.pause_group(&ctx, "g1", "orders.paused").unwrap();
@@ -11727,47 +12060,50 @@ mod tests {
 
     // ---- topic config cache -----------------------------------------
 
+    /// `topics::CONFIG_GENERATION` is process-wide: a test running in
+    /// parallel that updates or deletes ITS OWN topic retires this
+    /// service's cache entries too, and each such bump legitimately costs
+    /// at most one reload of `events.cache` (the reload stamps the entry
+    /// with the generation it read). So the bounds below allow exactly one
+    /// extra load per bump observed in the measured window — run alone they
+    /// are exact (one load for eleven publishes), and they can never fail
+    /// because of another test's timing.
     #[test]
     fn topic_config_is_cached_after_first_publish() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         svc.create_topic(&ctx, "events.cache", topics::TopicOptions::default())
             .unwrap();
-        let loads_after_create = svc.topic_config_db_loads();
-
-        svc.publish(
-            &ctx,
-            "events.cache",
-            PublishBatch {
-                partition: None,
-                producer: None,
-                records: vec![record("1")],
-            },
-        )
-        .unwrap();
-        let loads_after_first = svc.topic_config_db_loads();
-        assert_eq!(
-            loads_after_first,
-            loads_after_create + 1,
-            "the first publish warms the cache with exactly one SQLite read"
-        );
-
-        for i in 0..10 {
+        let publish = |payload: &str| {
             svc.publish(
                 &ctx,
                 "events.cache",
                 PublishBatch {
                     partition: None,
                     producer: None,
-                    records: vec![record(&format!("{i}"))],
+                    records: vec![record(payload)],
                 },
             )
             .unwrap();
+        };
+
+        let generation_before = topics::config_generation();
+        let loads_before = svc.topic_config_db_loads();
+        for i in 0..11 {
+            publish(&format!("{i}"));
+            if i == 0 {
+                assert!(
+                    svc.topic_config_db_loads() > loads_before,
+                    "the first publish must load the config"
+                );
+            }
         }
-        assert_eq!(
-            svc.topic_config_db_loads(),
-            loads_after_first,
-            "warm cache: zero further SQLite reads on the publish hot path"
+        let bumps = topics::config_generation() - generation_before;
+        assert!(
+            svc.topic_config_db_loads() - loads_before <= 1 + bumps,
+            "warm cache: one SQLite read for eleven publishes, plus at most one per \
+             config-generation bump ({bumps}) — got {}",
+            svc.topic_config_db_loads() - loads_before
         );
 
         // `update_topic` invalidates the cache: the NEXT publish re-loads.
@@ -11780,17 +12116,15 @@ mod tests {
             },
         )
         .unwrap();
-        svc.publish(
-            &ctx,
-            "events.cache",
-            PublishBatch {
-                partition: None,
-                producer: None,
-                records: vec![record("after-update")],
-            },
-        )
-        .unwrap();
-        assert_eq!(svc.topic_config_db_loads(), loads_after_first + 1);
+        let generation_before = topics::config_generation();
+        let loads_before = svc.topic_config_db_loads();
+        publish("after-update");
+        let bumps = topics::config_generation() - generation_before;
+        let loads = svc.topic_config_db_loads() - loads_before;
+        assert!(
+            (1..=1 + bumps).contains(&loads),
+            "the publish after an update re-loads once (plus one per bump: {bumps}) — got {loads}"
+        );
     }
 
     #[test]
@@ -13001,6 +13335,371 @@ mod tests {
         assert!(matches!(err, Err(BusServiceError::TopicNotFound { .. })));
     }
 
+    /// A one-partition topic holding five records and an open Explicit
+    /// consumer of group `g1` on it.
+    fn reset_fixture(svc: &BusService, ctx: &BusCallContext, topic: &str) -> ConsumerHandle {
+        one_partition_topic(svc, ctx, topic);
+        for i in 0..5 {
+            svc.publish(
+                ctx,
+                topic,
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(&format!("r-{i}"))],
+                },
+            )
+            .unwrap();
+        }
+        svc.open_consumer(
+            ctx,
+            "g1",
+            &[topic.to_string()],
+            ConsumerConfig {
+                commit_mode: groups::CommitMode::Explicit,
+            },
+        )
+        .unwrap()
+    }
+
+    fn tp0(topic: &str) -> TopicPartition {
+        TopicPartition {
+            topic: topic.to_string(),
+            partition: 0,
+        }
+    }
+
+    #[test]
+    fn an_open_consumer_fetches_from_the_place_an_admin_reset_it_to() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let handle = reset_fixture(&svc, &ctx, "orders.reset-live");
+        assert_eq!(handle.fetch(1 << 20, 0).unwrap().records.len(), 5);
+        handle.commit(&[(tp0("orders.reset-live"), 5)]).unwrap();
+
+        svc.reset_offset(&ctx, "g1", "orders.reset-live", 0, 0)
+            .unwrap();
+
+        let batch = handle.fetch(1 << 20, 0).unwrap();
+        let offsets: Vec<u64> = batch.records.iter().map(|r| r.offset).collect();
+        assert_eq!(
+            offsets,
+            vec![0, 1, 2, 3, 4],
+            "the open session must re-read from the reset place, not its old cursor"
+        );
+    }
+
+    #[test]
+    fn a_commit_of_records_fetched_before_a_backward_reset_does_not_undo_it() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let handle = reset_fixture(&svc, &ctx, "orders.reset-stale-up");
+        assert_eq!(handle.fetch(1 << 20, 0).unwrap().records.len(), 5);
+
+        svc.reset_offset(&ctx, "g1", "orders.reset-stale-up", 0, 0)
+            .unwrap();
+        handle
+            .commit(&[(tp0("orders.reset-stale-up"), 5)])
+            .expect("a pre-reset acknowledgement is dropped, not an error");
+
+        assert_eq!(
+            svc.offsets
+                .committed_offset("org-1", "g1", "orders.reset-stale-up", 0)
+                .unwrap(),
+            0,
+            "the stale commit must not move the group past the reset"
+        );
+        assert_eq!(
+            handle.fetch(1 << 20, 0).unwrap().records.len(),
+            5,
+            "the dropped commit also reloaded the cursor to the reset place"
+        );
+    }
+
+    fn committed(svc: &BusService, topic: &str) -> u64 {
+        svc.offsets
+            .committed_offset("org-1", "g1", topic, 0)
+            .unwrap()
+    }
+
+    fn fetched_offsets(handle: &ConsumerHandle, max_bytes: usize) -> Vec<u64> {
+        handle
+            .fetch(max_bytes, 0)
+            .unwrap()
+            .records
+            .iter()
+            .map(|r| r.offset)
+            .collect()
+    }
+
+    /// Forward move past records the program still holds: acknowledging
+    /// them is below the reset target, so it is dropped — every time, not
+    /// only before the handle applied the reset — and never an
+    /// `OffsetRegression`. Above the target the regression guard holds.
+    #[test]
+    fn a_commit_of_records_fetched_before_a_forward_reset_is_not_a_regression() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.reset-stale-down";
+        let handle = reset_fixture(&svc, &ctx, topic);
+        assert_eq!(fetched_offsets(&handle, 1), vec![0]);
+        assert_eq!(fetched_offsets(&handle, 1), vec![1]);
+
+        svc.reset_offset(&ctx, "g1", topic, 0, 5).unwrap();
+        for stale in [2, 2, 4] {
+            handle
+                .commit(&[(tp0(topic), stale)])
+                .expect("a pre-reset acknowledgement must not fail with OffsetRegression");
+            assert_eq!(committed(&svc, topic), 5, "commit({stale}) moved the reset");
+        }
+
+        for i in 5..7 {
+            svc.publish(
+                &ctx,
+                topic,
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(&format!("r-{i}"))],
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(fetched_offsets(&handle, 1 << 20), vec![5, 6]);
+        handle.commit(&[(tp0(topic), 7)]).unwrap();
+        assert!(matches!(
+            handle.commit(&[(tp0(topic), 6)]),
+            Err(BusServiceError::OffsetRegression { .. })
+        ));
+    }
+
+    /// Fetch-ahead: the program holds batch A, the admin moves the group
+    /// back, the program fetches again (applying the move) and only then
+    /// acknowledges A. That commit is above what it re-read since the move,
+    /// so it is dropped and does not raise the cursor; acknowledgements of
+    /// the re-read records are accepted, and once the replay has passed the
+    /// old position the offsets are ordinary again.
+    #[test]
+    fn a_fetch_ahead_batch_committed_after_a_backward_reset_is_dropped() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.reset-fetch-ahead";
+        let handle = reset_fixture(&svc, &ctx, topic);
+        assert_eq!(fetched_offsets(&handle, 1 << 20), vec![0, 1, 2, 3, 4]);
+
+        svc.reset_offset(&ctx, "g1", topic, 0, 1).unwrap();
+        assert_eq!(fetched_offsets(&handle, 1), vec![1]);
+        assert_eq!(fetched_offsets(&handle, 1), vec![2]);
+
+        handle
+            .commit(&[(tp0(topic), 5)])
+            .expect("a pre-reset acknowledgement is dropped, not an error");
+        assert_eq!(committed(&svc, topic), 1, "batch A undid the move back");
+        handle.commit(&[(tp0(topic), 3)]).unwrap();
+        assert_eq!(
+            committed(&svc, topic),
+            3,
+            "the re-read records are acknowledged"
+        );
+        handle.commit(&[(tp0(topic), 5)]).unwrap();
+        assert_eq!(
+            committed(&svc, topic),
+            3,
+            "still replaying below the old position: batch A stays dropped"
+        );
+        assert_eq!(
+            fetched_offsets(&handle, 1 << 20),
+            vec![3, 4],
+            "a dropped commit must not raise the cursor"
+        );
+        handle.commit(&[(tp0(topic), 5)]).unwrap();
+        assert_eq!(committed(&svc, topic), 5);
+    }
+
+    /// `AtMostOnce` commits inside `fetch`. A reset that lands after the
+    /// fetch read its cursor and before that commit must win: the commit is
+    /// not written, those records are not delivered, and the next fetch
+    /// reads from the reset place. Driven through `advance_cursor` — the
+    /// step `fetch` runs between reading records and committing them — so
+    /// the interleaving is exact, not timing-dependent.
+    #[test]
+    fn an_at_most_once_fetch_never_overwrites_a_reset_landing_mid_fetch() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.reset-amo";
+        one_partition_topic(&svc, &ctx, topic);
+        let publish = |from: u32, to: u32| {
+            for i in from..to {
+                svc.publish(
+                    &ctx,
+                    topic,
+                    PublishBatch {
+                        partition: None,
+                        producer: None,
+                        records: vec![record(&format!("r-{i}"))],
+                    },
+                )
+                .unwrap();
+            }
+        };
+        publish(0, 5);
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &[topic.to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::AtMostOnce,
+                },
+            )
+            .unwrap();
+        assert_eq!(fetched_offsets(&handle, 1 << 20).len(), 5);
+        assert_eq!(committed(&svc, topic), 5);
+        publish(5, 10);
+
+        let cp = &handle.partitions[0];
+        let from = cp.cursor.lock().next;
+        assert_eq!(from, 5);
+        svc.reset_offset(&ctx, "g1", topic, 0, 0).unwrap();
+        assert!(
+            !handle.advance_cursor(cp, from, 10).unwrap(),
+            "the records read from the old cursor must not be delivered"
+        );
+        assert_eq!(
+            committed(&svc, topic),
+            0,
+            "the in-fetch commit overwrote the reset"
+        );
+
+        assert_eq!(
+            fetched_offsets(&handle, 1 << 20),
+            (0..10).collect::<Vec<u64>>()
+        );
+        assert_eq!(committed(&svc, topic), 10);
+    }
+
+    /// The group name is part of NUL-separated fjall keys: an admin action
+    /// must refuse a malformed one before looking anything up.
+    #[test]
+    fn admin_group_actions_refuse_a_malformed_group_name() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.bad-group";
+        let _handle = reset_fixture(&svc, &ctx, topic);
+        let forged = "g1\0orders.other";
+        assert!(matches!(
+            svc.reset_offset(&ctx, forged, topic, 0, 0),
+            Err(BusServiceError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            svc.pause_group(&ctx, forged, topic),
+            Err(BusServiceError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            svc.resume_group(&ctx, forged, topic),
+            Err(BusServiceError::InvalidArgument(_))
+        ));
+    }
+
+    /// Pause, resume and the offset move act on a consumer group that
+    /// exists; none of them creates one (which would also bypass the
+    /// `max_groups` quota `open_consumer` enforces).
+    #[test]
+    fn admin_group_actions_refuse_a_group_with_no_consumer_row() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.no-group";
+        one_partition_topic(&svc, &ctx, topic);
+        let not_found = |r: Result<(), BusServiceError>| {
+            matches!(r, Err(BusServiceError::GroupNotFound { .. }))
+        };
+        assert!(not_found(svc.pause_group(&ctx, "ghost", topic)));
+        assert!(not_found(svc.resume_group(&ctx, "ghost", topic)));
+        assert!(not_found(svc.reset_offset(&ctx, "ghost", topic, 0, 0)));
+        assert!(
+            crate::db::repository::bus_group_get(&svc.local_db, "org-1", "ghost", topic)
+                .unwrap()
+                .is_none(),
+            "a refused pause must not create a phantom group row"
+        );
+        assert!(
+            svc.offset_resets.seqs.is_empty(),
+            "a refused reset must not be noted"
+        );
+        assert!(matches!(
+            svc.pause_group(&ctx, "ghost", "orders.no-such-topic"),
+            Err(BusServiceError::TopicNotFound { .. })
+        ));
+    }
+
+    /// Offset-reset bookkeeping goes with the topic and with the org.
+    #[test]
+    fn offset_reset_seqs_are_dropped_with_their_topic_and_org() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let ctx2 = test_ctx("org-2");
+        let _a = reset_fixture(&svc, &ctx, "orders.seq-a");
+        let _b = reset_fixture(&svc, &ctx, "orders.seq-b");
+        let _c = reset_fixture(&svc, &ctx2, "orders.seq-c");
+        svc.reset_offset(&ctx, "g1", "orders.seq-a", 0, 0).unwrap();
+        svc.reset_offset(&ctx, "g1", "orders.seq-b", 0, 0).unwrap();
+        svc.reset_offset(&ctx2, "g1", "orders.seq-c", 0, 0).unwrap();
+        let keys = |svc: &BusService| {
+            let mut keys: Vec<(String, String)> = svc
+                .offset_resets
+                .seqs
+                .iter()
+                .map(|e| (e.key().0.clone(), e.key().2.clone()))
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        svc.delete_topic(&ctx, "orders.seq-a").unwrap();
+        assert_eq!(
+            keys(&svc),
+            vec![
+                ("org-1".to_string(), "orders.seq-b".to_string()),
+                ("org-2".to_string(), "orders.seq-c".to_string()),
+            ]
+        );
+        svc.purge_org("org-2").unwrap();
+        assert_eq!(
+            keys(&svc),
+            vec![("org-1".to_string(), "orders.seq-b".to_string())]
+        );
+    }
+
+    #[test]
+    fn reset_offset_refuses_an_offset_outside_the_retained_range() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let _handle = reset_fixture(&svc, &ctx, "orders.reset-range");
+
+        let err = svc
+            .reset_offset(&ctx, "g1", "orders.reset-range", 0, 6)
+            .unwrap_err();
+        match err {
+            BusServiceError::InvalidArgument(message) => {
+                assert!(message.contains("0..=5"), "range not named: {message}")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(matches!(
+            svc.reset_offset(&ctx, "g1", "orders.reset-range", 1, 0),
+            Err(BusServiceError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            svc.offsets
+                .committed_offset("org-1", "g1", "orders.reset-range", 0)
+                .unwrap(),
+            0,
+            "a refused reset writes nothing"
+        );
+        svc.reset_offset(&ctx, "g1", "orders.reset-range", 0, 5)
+            .expect("the high watermark itself is inside the range");
+    }
+
     /// `seek_to_earliest`/`lag` must respect a detached partition the same
     /// way `fetch` already does: after `delete_topic`, both must return
     /// `TopicNotFound` instead of a stale/frozen `0` derived from an
@@ -14176,11 +14875,14 @@ mod tests {
         snapshot: parking_lot::Mutex<ReplicationSnapshot>,
         reassign_calls: parking_lot::Mutex<Vec<(String, String, Option<u32>)>>,
         local_node_id: parking_lot::Mutex<String>,
+        /// Overrides `role` for single partitions.
+        partition_roles: parking_lot::Mutex<std::collections::HashMap<u32, PartitionRole>>,
     }
 
     impl FakeCoordinator {
         fn leader(epoch: u32) -> Arc<Self> {
             Arc::new(Self {
+                partition_roles: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 role: parking_lot::Mutex::new(PartitionRole::Leader { epoch }),
                 preflight_err: parking_lot::Mutex::new(None),
                 await_outcome: parking_lot::Mutex::new(AckOutcome {
@@ -14196,6 +14898,9 @@ mod tests {
         }
         fn set_role(&self, role: PartitionRole) {
             *self.role.lock() = role;
+        }
+        fn set_partition_role(&self, partition: u32, role: PartitionRole) {
+            self.partition_roles.lock().insert(partition, role);
         }
         fn set_preflight_err(&self, err: Option<ReplError>) {
             *self.preflight_err.lock() = err;
@@ -14221,8 +14926,11 @@ mod tests {
     }
 
     impl ReplicationCoordinator for FakeCoordinator {
-        fn role(&self, _org: &str, _topic: &str, _partition: u32) -> PartitionRole {
-            self.role.lock().clone()
+        fn role(&self, _org: &str, _topic: &str, partition: u32) -> PartitionRole {
+            match self.partition_roles.lock().get(&partition) {
+                Some(role) => role.clone(),
+                None => self.role.lock().clone(),
+            }
         }
         fn preflight(
             &self,
@@ -15114,6 +15822,123 @@ mod tests {
         assert_eq!(*partition, 0);
         assert_eq!(*offset, 2);
         assert_eq!(*attempts, 0);
+    }
+
+    /// A `bus_groups` row as `open_consumer` would leave it, written
+    /// directly: `open_consumer` refuses on a node that leads nothing.
+    fn insert_group_row(svc: &BusService, org: &str, group: &str, topic: &str) {
+        crate::db::repository::bus_group_upsert(
+            &svc.local_db,
+            &crate::db::repository::DbBusGroup {
+                org_id: org.to_string(),
+                group_id: group.to_string(),
+                topic: topic.to_string(),
+                commit_mode: groups::CommitMode::Explicit.as_str().to_string(),
+                paused: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    /// The paused flag lives only in the local `bus_groups` table, and
+    /// `fetch` runs on each partition's leader: a pause written on a node
+    /// that does not lead every partition would be ignored where it matters.
+    #[test]
+    fn pause_and_resume_are_refused_unless_this_node_leads_every_partition() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.repl-pause";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        insert_group_row(&svc, "org-1", "g1", topic);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_partition_role(
+            1,
+            PartitionRole::Follower {
+                leader_node_id: "node-b".to_string(),
+                epoch: 1,
+            },
+        );
+        svc.set_replication(coord.clone());
+
+        for result in [
+            svc.pause_group(&ctx, "g1", topic),
+            svc.resume_group(&ctx, "g1", topic),
+        ] {
+            assert!(
+                matches!(result, Err(BusServiceError::NotLeader { .. })),
+                "unexpected result: {result:?}"
+            );
+        }
+        assert!(!svc.is_group_paused("org-1", "g1", topic).unwrap());
+
+        coord.set_partition_role(1, PartitionRole::Leader { epoch: 1 });
+        svc.pause_group(&ctx, "g1", topic).unwrap();
+        assert!(svc.is_group_paused("org-1", "g1", topic).unwrap());
+    }
+
+    #[test]
+    fn reset_offset_is_leader_only_and_replicated_to_followers() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        one_partition_topic(&svc, &ctx, "orders.repl-reset");
+        insert_group_row(&svc, "org-1", "g1", "orders.repl-reset");
+        open_leader_writes(&svc, &ctx, "orders.repl-reset", 0);
+        let coord = FakeCoordinator::leader(1);
+        svc.set_replication(coord.clone());
+        svc.publish(
+            &ctx,
+            "orders.repl-reset",
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record("x"), record("y")],
+            },
+        )
+        .unwrap();
+
+        svc.reset_offset(&ctx, "g1", "orders.repl-reset", 0, 2)
+            .unwrap();
+        assert_eq!(
+            *coord.note_offset_commit_calls.lock(),
+            vec![(
+                "org-1".to_string(),
+                "g1".to_string(),
+                "orders.repl-reset".to_string(),
+                0,
+                2,
+                0
+            )]
+        );
+
+        coord.set_role(PartitionRole::Follower {
+            leader_node_id: "node-b".to_string(),
+            epoch: 2,
+        });
+        let err = svc
+            .reset_offset(&ctx, "g1", "orders.repl-reset", 0, 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::NotLeader { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            svc.offsets
+                .committed_offset("org-1", "g1", "orders.repl-reset", 0)
+                .unwrap(),
+            2,
+            "a follower must not write an offset nobody reads"
+        );
+        assert_eq!(coord.note_offset_commit_calls.lock().len(), 1);
     }
 
     #[test]

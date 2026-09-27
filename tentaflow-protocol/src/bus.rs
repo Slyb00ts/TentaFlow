@@ -299,6 +299,13 @@ pub struct BusGroupSummaryWire {
     /// field existed — never a guessed `0`.
     #[serde(default)]
     pub lag_total: Option<u64>,
+    /// Whether the caller may pause/resume this group and move its reading
+    /// place — the same rule as `TopicDetailResponse.access.can_admin`
+    /// (Admin on the group's topic AND the caller's org Admin role), so the
+    /// consumer list never offers an action the server would refuse. `false`
+    /// from a peer built before this field existed.
+    #[serde(default)]
+    pub can_admin: bool,
 }
 
 /// One partition's state for `GroupDetailResponse` — `committed_offset` is
@@ -1305,6 +1312,21 @@ pub enum BusPayload {
         #[serde(default)]
         truncated: bool,
     },
+
+    // ===== U3 (PLAN-UI-20260923) — consumer reading place. =====
+    /// READ-ONLY lookup (`bus.read` + Consume on `topic`) of the first offset
+    /// of `partition` whose record timestamp is `>= ts_ms`, or the high
+    /// watermark when no record is that recent. It lets the dashboard state
+    /// exactly how many messages a "from a chosen time" reset would re-read
+    /// or skip BEFORE the admin confirms it; it moves nothing.
+    OffsetForTimestampRequest {
+        topic: String,
+        partition: u32,
+        ts_ms: i64,
+    },
+    OffsetForTimestampResponse {
+        offset: u64,
+    },
 }
 
 #[cfg(test)]
@@ -1568,6 +1590,7 @@ mod tests {
                 created_at_ms: 1,
                 updated_at_ms: 2,
                 lag_total: Some(18_420),
+                can_admin: true,
             }],
         });
     }
@@ -2607,6 +2630,51 @@ mod tests {
         .expect("encode");
         let decoded: BusGroupSummaryWire = crate::cbor::decode(&bytes).expect("decode");
         assert_eq!(decoded.lag_total, None, "absent means unknown, never 0");
+        assert!(!decoded.can_admin, "absent grants no admin action");
+    }
+
+    #[test]
+    fn group_summary_without_can_admin_decodes_as_not_admin() {
+        #[derive(SerdeSerialize)]
+        struct LegacyGroup {
+            group: String,
+            topic: String,
+            commit_mode: String,
+            paused: bool,
+            created_at_ms: i64,
+            updated_at_ms: i64,
+            lag_total: Option<u64>,
+        }
+        let bytes = crate::cbor::encode(&LegacyGroup {
+            group: "lekarze".to_string(),
+            topic: "wyniki-badan".to_string(),
+            commit_mode: "explicit".to_string(),
+            paused: true,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            lag_total: Some(14),
+        })
+        .expect("encode");
+        let decoded: BusGroupSummaryWire = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded.lag_total, Some(14));
+        assert!(decoded.paused);
+        assert!(!decoded.can_admin, "absent grants no admin action");
+    }
+
+    #[test]
+    fn offset_for_timestamp_round_trip() {
+        round_trip(BusPayload::OffsetForTimestampRequest {
+            topic: "wyniki-badan".to_string(),
+            partition: 2,
+            ts_ms: 1_756_000_000_000,
+        });
+        round_trip(BusPayload::OffsetForTimestampRequest {
+            topic: "wyniki-badan".to_string(),
+            partition: 0,
+            ts_ms: -1,
+        });
+        round_trip(BusPayload::OffsetForTimestampResponse { offset: 0 });
+        round_trip(BusPayload::OffsetForTimestampResponse { offset: u64::MAX });
     }
 
     #[test]
@@ -3002,6 +3070,8 @@ mod tests {
             "SchemaDeleteResponse",
             "LagHistoryRequest",
             "LagHistoryResponse",
+            "OffsetForTimestampRequest",
+            "OffsetForTimestampResponse",
         ];
         assert_eq!(
             live, pinned,

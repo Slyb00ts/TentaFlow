@@ -2167,6 +2167,28 @@ pub fn encode_bus_offset_reset_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// Read-only lookup behind the "from a chosen time" reset: the first offset
+/// of `partition` whose record timestamp is `>= ts_ms` (the high watermark
+/// when none), so the dashboard can state how many messages that move would
+/// re-read or skip before the admin confirms it.
+#[wasm_bindgen(js_name = encodeBusOffsetForTimestampRequest)]
+pub fn encode_bus_offset_for_timestamp_request(
+    instance_id: String,
+    topic: String,
+    partition: u32,
+    ts_ms: i64,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::OffsetForTimestampRequest {
+            topic,
+            partition,
+            ts_ms,
+        },
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeBusMessagesBrowseRequest)]
 pub fn encode_bus_messages_browse_request(
     instance_id: String,
@@ -11968,6 +11990,7 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                     "lag_total",
                     opt_f64_to_js(g.lag_total.map(|v| v as f64)),
                 );
+                set_bus(&o, "canAdmin", "can_admin", g.can_admin.into());
                 arr.push(&o);
             }
             set(obj, "groups", arr.into());
@@ -12485,6 +12508,13 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 "sample_interval_ms",
                 (sample_interval_ms as f64).into(),
             );
+        }
+        BP::OffsetForTimestampRequest { .. } => {
+            set(obj, "variant", "BusOffsetForTimestampRequest".into())
+        }
+        BP::OffsetForTimestampResponse { offset } => {
+            set(obj, "variant", "BusOffsetForTimestampResponse".into());
+            set(obj, "offset", (offset as f64).into());
         }
     }
 }

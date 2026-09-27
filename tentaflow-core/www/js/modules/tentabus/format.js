@@ -119,6 +119,22 @@ export function fmtWhen(ms, nowMs = Date.now()) {
   return `${date} ${time}`;
 }
 
+/**
+ * When something last changed, as a list cell says it: "dziś 13:55",
+ * "wczoraj 09:12", otherwise the date alone. `—` for no value.
+ */
+export function fmtDayTime(ms, nowMs = Date.now()) {
+  const at = new Date(Number(ms));
+  if (ms == null || !Number.isFinite(at.getTime())) return '—';
+  const lang = I18n.getLanguage();
+  const startOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((startOf(new Date(nowMs)) - startOf(at)) / 86_400_000);
+  const time = new Intl.DateTimeFormat(lang, { hour: '2-digit', minute: '2-digit', hour12: false }).format(at);
+  if (days === 0) return T('fmt.today', { time });
+  if (days === 1) return T('fmt.yesterday', { time });
+  return fmtDate(ms);
+}
+
 /** Seconds a replica trails its leader, rounded UP: "do 4 s" is a bound. */
 export function fmtLagSeconds(ms) {
   const secs = Math.max(1, Math.ceil(Number(ms) / 1000) || 0);

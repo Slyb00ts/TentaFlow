@@ -2,10 +2,9 @@
 // File: modules/tentabus.request-builders.test.js
 // Description: Unit tests for tentabus.js's pure helpers — request builders
 //       (replica list, leader transfer, the per-partition
-//       `buildFromOffsetsForNextPage` cursor), formatters
-//       (`datetimeLocalToTsMs`), lag math (`computeLagRatio`,
-//       `lagSeverityClass`), the stats join (`findTopicStats`) and the
-//       server-error-code mapper (`busErrorCode`/`mapBusErrorMessage`).
+//       `buildFromOffsetsForNextPage` cursor), the stats join
+//       (`findTopicStats`) and the server-error-code mapper
+//       (`busErrorCode`/`mapBusErrorMessage`).
 //       tentabus.js imports DOM-only custom-element modules at load time
 //       (`customElements.define(...)` has no global under plain Node), so —
 //       exactly like `services.row-lifecycle.test.js` and `ml-studio.derive-
@@ -75,18 +74,15 @@ const CONSTS = ['DLQ_RETRY_ALL_MAX', 'NO_CAPABILITIES'];
 const NAMES = [
   'requireInstanceId',
   'clampInt', 'clampDlqRetryAllMax',
-  'computeLagRatio', 'lagSeverityClass', 'dlqSourceTopicOptions',
+  'dlqSourceTopicOptions',
   'busErrorCode', 'mapBusErrorMessage', 'findTopicStats', 'buildFromOffsetsForNextPage',
-  'datetimeLocalToTsMs', 'unwrapCapabilities', 'isValidExplicitOffset',
-  // task 3 (Groups KPI = list, N-2/N-7):
-  'isInternalGroupId', 'filterVisibleGroups',
+  'unwrapCapabilities',
+  'isInternalGroupId',
   // task 4 (P3-14, DLQ header date formatting):
   'formatHeaderValue', 'msToDate',
   // R3-1 (KRYTYK-M1-R3.md, P1: DLQ tab empty on entry) — the single, pure
   // state-transition helper `ensureDlqTabReady` acts on:
   'resolveDlqEntrySource',
-  // The consumer table's poll-skip gate.
-  'diffRowsByKey',
   // Replication request builders and the `not_leader` hint extractor.
   'buildReplicaListRequest', 'buildLeaderTransferRequest',
   'extractNotLeaderHint',
@@ -137,10 +133,8 @@ test('clampDlqRetryAllMax stays within the server-enforced [1,500] bound', () =>
 });
 
 // ---------------------------------------------------------------------------
-// Groups KPI = list (task 3, KRYTYK-M1-R2.md's N-2/N-7) — the client-side
-// `tf-*` filter applied as defense in depth on top of the backend hiding
-// them (POSTEP.md's "Decyzje koordynatora po krytyku R2" #3), and the
-// exact list both the M04 table and the KPI strip now share.
+// The broker's internal `tf-*` consumer groups, left out again client-side
+// on top of the server hiding them.
 // ---------------------------------------------------------------------------
 
 test('isInternalGroupId recognizes the tf-* prefix used by internal probes', () => {
@@ -149,24 +143,6 @@ test('isInternalGroupId recognizes the tf-* prefix used by internal probes', () 
   assert.equal(helpers.isInternalGroupId('notifier'), false);
   assert.equal(helpers.isInternalGroupId(''), false);
   assert.equal(helpers.isInternalGroupId(null), false);
-});
-
-test('filterVisibleGroups drops every tf-* group and keeps business groups, in order', () => {
-  const groups = [
-    { group: 'billing', topic: 'lab.results' },
-    { group: 'tf-system-probe', topic: 'lab.results' },
-    { group: 'notifier', topic: 'orders.created' },
-    { group: 'tf-system-probe', topic: 'orders.created' },
-  ];
-  assert.deepEqual(helpers.filterVisibleGroups(groups), [
-    { group: 'billing', topic: 'lab.results' },
-    { group: 'notifier', topic: 'orders.created' },
-  ]);
-});
-
-test('filterVisibleGroups tolerates a non-array input', () => {
-  assert.deepEqual(helpers.filterVisibleGroups(null), []);
-  assert.deepEqual(helpers.filterVisibleGroups(undefined), []);
 });
 
 // ---------------------------------------------------------------------------
@@ -221,41 +197,6 @@ test('buildFromOffsetsForNextPage returns an empty array once every partition is
 });
 
 // ---------------------------------------------------------------------------
-// datetimeLocalToTsMs — M04's 4th offset-reset mode (`timestamp`).
-// ---------------------------------------------------------------------------
-
-test('datetimeLocalToTsMs converts a datetime-local value to an epoch-ms number', () => {
-  const ms = helpers.datetimeLocalToTsMs('2026-08-27T14:30');
-  assert.equal(ms, new Date('2026-08-27T14:30').getTime());
-});
-
-test('datetimeLocalToTsMs returns null for empty/invalid input', () => {
-  assert.equal(helpers.datetimeLocalToTsMs(''), null);
-  assert.equal(helpers.datetimeLocalToTsMs(null), null);
-  assert.equal(helpers.datetimeLocalToTsMs('not-a-date'), null);
-});
-
-// ---------------------------------------------------------------------------
-// isValidExplicitOffset (P3-6) — the reset modal's `explicit` mode used to
-// coerce an empty field to offset 0 via `Number('' || 0)` with no error.
-// ---------------------------------------------------------------------------
-
-test('isValidExplicitOffset accepts a non-negative integer (as a string or a number)', () => {
-  assert.equal(helpers.isValidExplicitOffset('0'), true);
-  assert.equal(helpers.isValidExplicitOffset('150'), true);
-  assert.equal(helpers.isValidExplicitOffset(150), true);
-});
-
-test('isValidExplicitOffset rejects empty/whitespace-only/negative/non-numeric input', () => {
-  assert.equal(helpers.isValidExplicitOffset(''), false);
-  assert.equal(helpers.isValidExplicitOffset('   '), false);
-  assert.equal(helpers.isValidExplicitOffset(undefined), false);
-  assert.equal(helpers.isValidExplicitOffset(null), false);
-  assert.equal(helpers.isValidExplicitOffset('-1'), false);
-  assert.equal(helpers.isValidExplicitOffset('abc'), false);
-});
-
-// ---------------------------------------------------------------------------
 // unwrapCapabilities (P1-1) — `busCapabilitiesRequest` decodes to the
 // ENVELOPE `tentaflow-protocol-wasm/src/lib.rs`'s `decode_bus_payload`
 // builds for `BP::CapabilitiesResponse`: `{ variant: 'BusCapabilitiesResponse',
@@ -293,18 +234,6 @@ test('unwrapCapabilities fails closed to NO_CAPABILITIES for null/undefined/garb
 // ---------------------------------------------------------------------------
 // Lag math
 // ---------------------------------------------------------------------------
-
-test('computeLagRatio is lag/highWatermark clamped to [0,1], 0 when hw<=0', () => {
-  assert.equal(helpers.computeLagRatio(50, 100), 0.5);
-  assert.equal(helpers.computeLagRatio(150, 100), 1);
-  assert.equal(helpers.computeLagRatio(5, 0), 0);
-});
-
-test('lagSeverityClass buckets the ratio into ok/warn/danger', () => {
-  assert.equal(helpers.lagSeverityClass(0.1), '');
-  assert.equal(helpers.lagSeverityClass(0.4), 'tb-lagbar--warn');
-  assert.equal(helpers.lagSeverityClass(0.8), 'tb-lagbar--danger');
-});
 
 // ---------------------------------------------------------------------------
 // DLQ source options / byte preview / headers / BlobRef detection
@@ -424,14 +353,11 @@ for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], [
   });
 }
 
-// R3-1's DLQ-load error state (`dlq_load_error_retry`) and R3-3's row
-// activation hint (`row_activate_hint`) are new keys added in this fala —
-// guard 5-locale parity for both the same way the error codes above are
-// guarded, plus R3-5's confirm body still carrying both placeholders after
-// its wording was extended to mention that discarded records are skipped.
+// R3-1's DLQ-load error state (`dlq_load_error_retry`) in every locale, plus
+// R3-5's confirm body still carrying both placeholders after its wording was
+// extended to mention that discarded records are skipped.
 for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
-  test(`tentabus.${locName}.json has non-empty row_activate_hint and dlq_load_error_retry`, () => {
-    assert.ok(dict.tentabus.row_activate_hint?.length > 0, `${locName} is missing row_activate_hint`);
+  test(`tentabus.${locName}.json has a non-empty dlq_load_error_retry`, () => {
     assert.ok(dict.tentabus.dlq_load_error_retry?.length > 0, `${locName} is missing dlq_load_error_retry`);
   });
 
@@ -453,51 +379,6 @@ test('mapBusErrorMessage falls back to the raw server message for an unknown cod
 test('mapBusErrorMessage falls back to errors.generic for a non-"bus." message', () => {
   const translate = makeTranslate(pl);
   assert.equal(helpers.mapBusErrorMessage('', translate), pl.tentabus.errors.generic);
-});
-
-// ---------------------------------------------------------------------------
-// `diffRowsByKey` — the consumer table's poll-skip gate: a poll that read the
-// same rows leaves the table alone.
-// ---------------------------------------------------------------------------
-
-test('diffRowsByKey reports changed:false when every row is byte-for-byte identical to the last paint', () => {
-  const prev = [{ id: 'a', v: 1 }, { id: 'b', v: 2 }];
-  const next = prev.map((r) => ({ ...r }));
-  assert.deepEqual(helpers.diffRowsByKey(prev, next, (r) => r.id), {
-    added: [], updated: [], removed: [], changed: false,
-  });
-});
-
-test('diffRowsByKey reports an added key for a new row', () => {
-  const prev = [{ id: 'a', v: 1 }];
-  const next = [{ id: 'a', v: 1 }, { id: 'b', v: 2 }];
-  const diff = helpers.diffRowsByKey(prev, next, (r) => r.id);
-  assert.deepEqual(diff.added, ['b']);
-  assert.deepEqual(diff.updated, []);
-  assert.deepEqual(diff.removed, []);
-  assert.equal(diff.changed, true);
-});
-
-test('diffRowsByKey reports a removed key for a dropped row', () => {
-  const prev = [{ id: 'a', v: 1 }, { id: 'b', v: 2 }];
-  const next = [{ id: 'a', v: 1 }];
-  const diff = helpers.diffRowsByKey(prev, next, (r) => r.id);
-  assert.deepEqual(diff.removed, ['b']);
-  assert.equal(diff.changed, true);
-});
-
-test('diffRowsByKey reports an updated key when a value changes for the same key', () => {
-  const prev = [{ id: 'a', v: 1 }];
-  const next = [{ id: 'a', v: 2 }];
-  const diff = helpers.diffRowsByKey(prev, next, (r) => r.id);
-  assert.deepEqual(diff.updated, ['a']);
-  assert.equal(diff.changed, true);
-});
-
-test('diffRowsByKey treats a missing/null prevRows as "everything added"', () => {
-  const next = [{ id: 'a', v: 1 }];
-  assert.deepEqual(helpers.diffRowsByKey(null, next, (r) => r.id).added, ['a']);
-  assert.deepEqual(helpers.diffRowsByKey(undefined, next, (r) => r.id).added, ['a']);
 });
 
 // ---------------------------------------------------------------------------
@@ -667,28 +548,4 @@ test('no control in tentabus.js is gated on isSiteAdmin', () => {
     [],
     'every admin control must gate on canAdmin() — the site-admin dispatch tier is gone',
   );
-});
-
-// The wording drifted behind the gate once already: the strings still named a
-// role the backend had stopped asking for, so a user who was refused knew the
-// wrong reason to go fix.
-// The double lock (the instance's admin permission AND the org admin role),
-// said in plain words rather than as a raw permission id.
-test('the admin-required notes name both roles the double lock needs, in every locale', () => {
-  const keys = ['group_detail_admin_required'];
-  const words = {
-    pl: ['administrator instancji', 'administratorem organizacji'],
-    en: ['instance administrator', 'organisation administrator'],
-    de: ['Administrator der Instanz', 'Administrator der Organisation'],
-    es: ['administrador de la instancia', 'administrador de la organización'],
-    fr: ['administrateur de l’instance', 'administrateur de l’organisation'],
-  };
-  for (const [name, loc] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
-    for (const key of keys) {
-      const value = loc.tentabus?.[key];
-      assert.equal(typeof value, 'string', `${name}.${key}: key missing`);
-      for (const w of words[name]) assert.ok(value.includes(w), `${name}.${key} must name "${w}": ${value}`);
-      assert.doesNotMatch(value, /\bbus\.[a-z_]+/, `${name}.${key}: no raw permission id`);
-    }
-  }
 });

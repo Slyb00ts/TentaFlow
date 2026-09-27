@@ -4,12 +4,12 @@
 // the TentaBus header card with the instance picker, the six underlined main
 // tabs (Przegląd / Topiki / Odbiorcy / Nieprzetworzone / Wzory wiadomości /
 // Kopie i nody) with their counters, the address (`#/tentabus?instance=…&tab=
-// …&topic=…&section=…&group=…`, see modules/tentabus/routes.js) and the
-// polling every tab reads. Przegląd, Topiki with a topic's page (Stan,
-// Ustawienia, Partycje i kopie), Wzory wiadomości and Kopie i nody live in
-// modules/tentabus/*. Odbiorcy and Nieprzetworzone below are the M1/M2 views
-// (consumer groups with offset reset, unprocessed messages per topic) until
-// their U3–U4 packages replace them.
+// …&topic=…&section=…&group=…&gtopic=…`, see modules/tentabus/routes.js) and
+// the polling every tab reads. Przegląd, Topiki with a topic's page (Stan,
+// Ustawienia, Partycje i kopie), Odbiorcy with a consumer's page (Stan,
+// Miejsce czytania, Ustawienia), Wzory wiadomości and Kopie i nody live in
+// modules/tentabus/*. Nieprzetworzone below is the M1/M2 view (unprocessed
+// messages per topic) until its U4 package replaces it.
 //
 // Every request names its instance (`BusEnvelope.instance_id`): `mount`
 // resolves `state.instanceId` from `?instance=` (or the same-screen instance
@@ -25,7 +25,7 @@ import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { setAttr, setText, patchHtml, setClass } from '/js/lib/dom-patch.js';
 import { fmtCount, fmtElapsed, loadErrorKind } from '/js/modules/tentabus/format.js';
-import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, parseRoute, routeParams } from '/js/modules/tentabus/routes.js';
+import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTIONS, parseRoute, routeParams } from '/js/modules/tentabus/routes.js';
 import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
@@ -38,6 +38,9 @@ import { drawTopicDetail, effectiveSection, topicDetailLoader } from '/js/module
 import { openSettingsWindow } from '/js/modules/tentabus/topic-settings.js';
 import { openLeaderTransfer, transferChoices } from '/js/modules/tentabus/partitions.js';
 import { drawReplication } from '/js/modules/tentabus/replication.js';
+import { drawConsumers, consumerKey } from '/js/modules/tentabus/consumers.js';
+import { drawConsumerDetail, positionRows, DLQ_PAGE, consumerDlq } from '/js/modules/tentabus/consumer-detail.js';
+import { openOffsetMove, movedText } from '/js/modules/tentabus/offset-move.js';
 import { bytesToPreviewText, headerText } from '/js/modules/tentabus/payload.js';
 import { confirmDialog } from '/js/lib/confirm-dialog.js';
 import '/js/components/tf-breadcrumb.js';
@@ -45,9 +48,7 @@ import '/js/components/tf-button.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-select.js';
-import '/js/components/tf-input.js';
 import '/js/components/tf-chip.js';
-import '/js/components/tf-modal.js';
 import '/js/components/tf-spinner.js';
 
 const T = (key, params) => I18n.t(`tentabus.${key}`, params);
@@ -62,14 +63,13 @@ const STATS_POLL_MS = 3000;
 const REPLICA_POLL_MS = 10_000;
 const TABS = MAIN_TABS;
 const TAB_ICONS = { overview: 'gauge', topics: 'share', groups: 'users', dlq: 'inbox', schemas: 'file-code', replication: 'branch' };
-// The mutually-exclusive views `#tb-panel` can show (six tabs + topic
-// detail) — each gets its OWN persistent container (`ensureViewContainer`)
+// The mutually-exclusive views `#tb-panel` can show (six tabs, a topic's
+// page, a consumer's page) — each gets its OWN persistent container (`ensureViewContainer`)
 // so switching between them shows/hides existing DOM instead of tearing it
 // down and rebuilding it, keeping scroll position, in-progress search text,
 // table sort and focus intact across a tab switch.
-const VIEW_SLOTS = ['overview', 'topics', 'groups', 'dlq', 'schemas', 'detail', 'replication'];
+const VIEW_SLOTS = ['overview', 'topics', 'groups', 'dlq', 'schemas', 'detail', 'consumer', 'replication'];
 const DLQ_RETRY_ALL_MAX = 500;
-const COMMIT_MODES = ['auto_after_success', 'explicit', 'at_most_once'];
 // =============================================================================
 // Pure helpers — no DOM, no ApiBinary. Unit-tested from
 // `tentabus.request-builders.test.js` by brace-extraction (services.js-style),
@@ -102,19 +102,6 @@ function requireInstanceId(instanceId) {
   return instanceId;
 }
 
-function computeLagRatio(lag, highWatermark) {
-  const l = Number(lag) || 0;
-  const hw = Number(highWatermark) || 0;
-  if (hw <= 0) return 0;
-  return Math.min(1, Math.max(0, l / hw));
-}
-
-function lagSeverityClass(ratio) {
-  if (ratio >= 0.8) return 'tb-lagbar--danger';
-  if (ratio >= 0.4) return 'tb-lagbar--warn';
-  return '';
-}
-
 // Looks up one topic's row in `BusStatsSnapshotWire.topics` by name — `null`
 // when the snapshot has not loaded yet or predates this topic (a brand-new
 // topic can lag one poll behind `topics[]`, tor U task 3).
@@ -122,23 +109,11 @@ function findTopicStats(statsTopics, name) {
   return (Array.isArray(statsTopics) ? statsTopics : []).find((t) => t.topic === name) || null;
 }
 
-// Task 3 (KRYTYK-M1-R2.md's N-2 "KPI = 4, lista = 3" / N-7's
-// `tf-system-probe` leaking into the KPI strip): `PROBE_GROUP`
-// (`dispatch/bus.rs`'s "fixed, reused consumer group behind every read-only
-// probe … obviously non-human") and any other internal `tf-*` group are not
-// something an operator manages, so they should never appear in the M04
-// table or count toward "Grupy konsumentów"/"Wstrzymane grupy". The backend
-// fix (POSTEP.md's "Decyzje koordynatora po krytyku R2" #3) hides them
-// server-side; this filters again client-side as defense in depth, and —
-// the actual N-2 fix — both the KPI numbers (`paintKpiStrip`) and the M04
-// table (`paintGroupsTable`) now read this SAME filtered list, so they
-// cannot drift apart the way KPI=4/list=3 did.
+// The broker's internal `tf-*` consumer groups (the read-only probe) are
+// not something an operator manages; the server already hides them and the
+// topic's delete window leaves them out again.
 function isInternalGroupId(groupId) {
   return typeof groupId === 'string' && groupId.startsWith('tf-');
-}
-
-function filterVisibleGroups(groups) {
-  return (Array.isArray(groups) ? groups : []).filter((g) => !isInternalGroupId(g.group));
 }
 
 // Per-partition paging cursor for the NEXT `MessagesBrowse`/`DlqList` page
@@ -150,29 +125,6 @@ function buildFromOffsetsForNextPage(partitions) {
   return (Array.isArray(partitions) ? partitions : [])
     .filter((p) => p.hasMore)
     .map((p) => ({ partition: p.partition, offset: p.nextOffset }));
-}
-
-// `<input type="datetime-local">`'s value ("2026-08-27T14:30") has no
-// timezone — the browser renders/parses it in the user's LOCAL timezone,
-// which is exactly what `new Date(str)` does for that exact string shape,
-// so this is a thin, testable wrapper rather than manual epoch math that
-// would silently disagree with the input's own display.
-function datetimeLocalToTsMs(value) {
-  if (!value) return null;
-  const ms = new Date(value).getTime();
-  return Number.isFinite(ms) ? ms : null;
-}
-
-// P3-6: the reset modal's `explicit` mode "Offset" field had no validation
-// of its own — `Number('' || 0)` silently coerced an empty field to offset
-// `0` (a real, consequential reset to the earliest offset) instead of
-// surfacing an error the way the `timestamp` mode's own empty-field check
-// already does. A negative number is likewise never a valid offset.
-function isValidExplicitOffset(value) {
-  const trimmed = String(value ?? '').trim();
-  if (trimmed === '') return false;
-  const n = Number(trimmed);
-  return Number.isFinite(n) && n >= 0;
 }
 
 // The broker's own `__*` topics (the unprocessed-message stores themselves,
@@ -277,7 +229,7 @@ const NO_CAPABILITIES = { canRead: false, canWrite: false, canAdmin: false, isSi
 // capabilities: BusCapabilitiesWire }`). Reading the envelope flat (the
 // earlier bug) always yields `undefined` for every field, so every
 // `canAdmin()`/`isSiteAdmin()` check fails closed — hiding "Nowy topik",
-// edit/delete, pause/resume, DLQ retry/discard, and offset reset for EVERY
+// edit/delete and DLQ retry/discard for EVERY
 // user including a site admin. This also accepts an already-flat shape
 // (`{ canRead, ... }` with no `.capabilities`) so a future wire
 // simplification degrades to "read the fields" instead of re-introducing
@@ -290,37 +242,6 @@ function unwrapCapabilities(resp) {
     if (typeof resp.canAdmin === 'boolean') return resp;
   }
   return NO_CAPABILITIES;
-}
-
-// =============================================================================
-// Incremental repaint: a poll only swaps values, it never re-renders a table
-// whose rows did not change. Unit-tested from `tentabus.request-builders.test.js`.
-// =============================================================================
-
-// Key-based diff between two row-array snapshots (the M04
-// groups table): which keys were added/updated/removed, and whether ANYTHING
-// changed at all. Used to skip a `tf-table.rows = …` write entirely when a
-// poll's freshly computed rows are identical to what is already painted —
-// `tf-table` itself recycles `<tr>`/`<td>` by position and only writes a
-// cell when its value changed (see tf-table.js's `_renderTbody`/`_writeCell`),
-// but it unconditionally REBUILDS each row's action-cell element on every
-// `rows = …` (bound-closure buttons need a fresh row reference) — skipping
-// the assignment on a no-op poll avoids destroying/recreating those action
-// buttons (and any focus/hover state on them) for no reason.
-function diffRowsByKey(prevRows, nextRows, keyFn) {
-  const prevMap = new Map((Array.isArray(prevRows) ? prevRows : []).map((r) => [keyFn(r), r]));
-  const nextMap = new Map((Array.isArray(nextRows) ? nextRows : []).map((r) => [keyFn(r), r]));
-  const added = [];
-  const updated = [];
-  const removed = [];
-  for (const [key, row] of nextMap) {
-    if (!prevMap.has(key)) added.push(key);
-    else if (JSON.stringify(prevMap.get(key)) !== JSON.stringify(row)) updated.push(key);
-  }
-  for (const key of prevMap.keys()) {
-    if (!nextMap.has(key)) removed.push(key);
-  }
-  return { added, updated, removed, changed: added.length > 0 || updated.length > 0 || removed.length > 0 };
 }
 
 // =============================================================================
@@ -365,7 +286,7 @@ const state = {
   instanceLabel: '',
   capabilities: NO_CAPABILITIES,
   tab: DEFAULT_TAB,
-  view: null, // null | { kind: 'topic-detail', name, section }
+  view: null, // null | { kind: 'topic-detail', name, section } | { kind: 'consumer-detail', group, topic, section }
 
   topics: [],
   topicsLoaded: false,
@@ -390,9 +311,18 @@ const state = {
   justMoved: new Set(),
   replicationNotice: null,
 
-  groups: [],
-  groupsLoaded: false,
-  groupDetail: null, // { group, topic, commitMode, paused, partitions }
+  // `GroupListResponse.groups`, `null` until it answers, and the failed load.
+  groups: null,
+  groupsError: null,
+  // The open consumer's page: `{ detail, topicDetail, dlq, samples }` once
+  // its first answer landed, the failed load, the note over the section it
+  // concerns, the partitions whose reading place was just moved (marked and
+  // not offered again until "Odśwież"), and a pause/resume in flight.
+  consumer: null,
+  consumerError: null,
+  consumerNotice: null,
+  consumerMoved: new Set(),
+  consumerBusy: false,
 
   dlqSource: '',
   dlqRecords: null,
@@ -406,12 +336,6 @@ const state = {
   // can render an error box with a retry button instead of treating both the
   // same way `dlqRecords == null` used to (a silently empty container).
   dlqError: null,
-
-  // Last-painted rows of the consumer table, diffed against the next poll's
-  // (`diffRowsByKey`) so an unchanged poll leaves the table alone.
-  dom: {
-    groupsTableRows: null,
-  },
 
   // What the frame (header card, tab counters) and Przegląd read beside the
   // stats snapshot — see `freshShellState`.
@@ -439,12 +363,12 @@ function freshShellState() {
 }
 
 // `canAdmin` gates every instance-level change: creating and deleting topics,
-// pause/resume, retry/discard of unprocessed messages, offset reset and moving
-// a partition's leadership from Kopie i nody. It is `bus.admin` in the
-// instance matrix AND the org Admin role — what every such handler's
-// `gate_admin` checks — and fails closed before `busCapabilitiesRequest`
-// answers. A topic's page gates on the topic's own `access.canAdmin`, which
-// also honours the topic's ACL.
+// retry/discard of unprocessed messages and moving a partition's leadership
+// from Kopie i nody. It is `bus.admin` in the instance matrix AND the org
+// Admin role — what every such handler's `gate_admin` checks — and fails
+// closed before `busCapabilitiesRequest` answers. A topic's page, a consumer
+// (pause, resume, moving its reading place) and its list row gate on the
+// topic's own administration instead, which also honours the topic's ACL.
 function canAdmin() {
   return state.capabilities?.canAdmin === true;
 }
@@ -590,7 +514,7 @@ const TentaBusScreen = {
 
     renderPanel();
     if (route.topic) openTopicDetail(route.topic, route.section);
-    else if (route.group && route.groupTopic) openGroupDetail(route.group, route.groupTopic);
+    else if (route.group && route.groupTopic) openConsumer(route.group, route.groupTopic, route.section);
     loadShellMeta();
     startStatsPolling();
     // Task 3: groups load together with topics so every counter reads the
@@ -618,16 +542,15 @@ const TentaBusScreen = {
     state.detailNotice = null;
     state.justMoved = new Set();
     state.replicationNotice = null;
-    state.groups = [];
-    state.groupsLoaded = false;
-    state.groupDetail = null;
+    state.groups = null;
+    state.groupsError = null;
+    closeConsumer();
     state.dlqSource = '';
     state.dlqRecords = null;
     state.dlqPartitions = [];
     state.dlqLoading = false;
     state.dlqError = null;
     state.shell = freshShellState();
-    state.dom = { groupsTableRows: null };
   },
 };
 
@@ -699,6 +622,9 @@ function paintCrumbs() {
     if (state.view?.kind === 'topic-detail') {
       items.push({ label: tabLabel, act: 'topics', href: href({ tab: 'topics' }) });
       items.push({ label: state.view.name });
+    } else if (state.view?.kind === 'consumer-detail') {
+      items.push({ label: tabLabel, act: 'groups', href: href({ tab: 'groups' }) });
+      items.push({ label: state.view.group });
     } else {
       items.push({ label: tabLabel });
     }
@@ -727,14 +653,17 @@ function syncLocation() {
   const key = (params) => new URLSearchParams(Object.entries(params || {}).sort()).toString();
   const inBar = Router.fromHash();
   if (inBar && key(inBar.params) !== key(Router.currentParams())) return;
-  const gd = state.tab === 'groups' ? state.groupDetail : null;
+  const consumer = state.view?.kind === 'consumer-detail' ? state.view : null;
+  let section = null;
+  if (state.view?.kind === 'topic-detail') section = currentSection();
+  else if (consumer) section = consumer.section;
   Router.replaceParams(routeParams({
     instance: state.instanceId,
     tab: state.tab,
     topic: state.view?.kind === 'topic-detail' ? state.view.name : null,
-    section: state.view?.kind === 'topic-detail' ? currentSection() : null,
-    group: gd?.group || null,
-    groupTopic: gd?.topic || null,
+    section,
+    group: consumer?.group || null,
+    groupTopic: consumer?.topic || null,
     dlqTopic: state.tab === 'dlq' ? state.dlqSource || null : null,
   }));
 }
@@ -847,8 +776,11 @@ async function refreshAll() {
   loadSubjects();
   await Promise.all([loadTopics(), loadGroups()]);
   if (state.view?.kind === 'topic-detail') loadTopicDetail(state.view.name);
-  else if (state.tab === 'dlq') loadDlqRecords(true);
-  else if (state.tab === 'groups' && state.groupDetail) openGroupDetail(state.groupDetail.group, state.groupDetail.topic);
+  else if (state.view?.kind === 'consumer-detail') {
+    state.consumerMoved = new Set();
+    consumerDlqDue = true;
+    loadConsumer(consumerKey(state.view.group, state.view.topic));
+  } else if (state.tab === 'dlq') loadDlqRecords(true);
   renderPanel();
 }
 
@@ -874,7 +806,7 @@ const tabContext = {
   go(action) {
     if (action.kind === 'tab' && TABS.includes(action.tab)) setTab(action.tab);
     else if (action.kind === 'topic') { setTab('topics'); openTopicDetail(action.topic, DEFAULT_SECTION); }
-    else if (action.kind === 'group') { setTab('groups'); openGroupDetail(action.group, action.topic); }
+    else if (action.kind === 'group') openConsumer(action.group, action.topic);
     else if (action.kind === 'dlq') {
       // Chosen BEFORE the tab opens, so the tab's own default pick does not
       // start a second, racing load of another topic.
@@ -905,13 +837,13 @@ const schemasContext = {
 };
 
 function setTab(id) {
-  if (state.view) closeTopicDetail();
-  if (id !== 'groups') state.groupDetail = null;
+  if (state.view?.kind === 'topic-detail') closeTopicDetail();
+  else if (state.view?.kind === 'consumer-detail') closeConsumer();
   if (id !== 'topics') state.topicsNotice = null;
   if (id !== 'replication') { state.replicationNotice = null; state.justMoved = new Set(); }
   state.tab = id;
   renderPanel();
-  if (id === 'groups' && !state.groupsLoaded) loadGroups();
+  if (id === 'groups' && state.groups == null) loadGroups();
   if (id === 'dlq') ensureDlqTabReady();
 }
 
@@ -935,7 +867,9 @@ function ensureViewContainer(panel, key) {
 function renderPanel() {
   const panel = byId('tb-panel');
   if (!panel) return;
-  const activeKey = state.view?.kind === 'topic-detail' ? 'detail' : state.tab;
+  let activeKey = state.tab;
+  if (state.view?.kind === 'topic-detail') activeKey = 'detail';
+  else if (state.view?.kind === 'consumer-detail') activeKey = 'consumer';
   let activeEl = null;
   for (const key of VIEW_SLOTS) {
     const el = ensureViewContainer(panel, key);
@@ -948,7 +882,8 @@ function renderPanel() {
   if (activeKey === 'schemas') { drawSchemas(activeEl, schemasContext); return; }
   if (activeKey === 'detail') { drawTopicDetail(activeEl, detailContext); return; }
   if (activeKey === 'topics') { drawTopics(activeEl, topicsContext); return; }
-  if (activeKey === 'groups') { renderGroupsTab(activeEl); return; }
+  if (activeKey === 'groups') { drawConsumers(activeEl, consumersContext); return; }
+  if (activeKey === 'consumer') { drawConsumerDetail(activeEl, consumerContext); return; }
   if (activeKey === 'dlq') { renderDlqTab(activeEl); return; }
   if (activeKey === 'replication') { drawReplication(activeEl, replicationContext); return; }
 }
@@ -965,7 +900,7 @@ function ensureSkeleton(panel, viewId, buildFn) {
 
 // =============================================================================
 // Polling — BusStatsSnapshotRequest every 3 s (the header, the tab counters,
-// Przegląd and the legacy tab strips all read it) and ReplicaListRequest 10 s
+// Przegląd, the lists and the open pages all read it) and ReplicaListRequest 10 s
 // after the previous cycle answered (node state and lagging replicas). Plain polls, not push
 // subscriptions; started once in mount(), stopped in unmount(). A failed poll
 // keeps the last data on screen and turns the header to "Brak połączenia"
@@ -1026,8 +961,14 @@ async function refreshStats() {
     renderPanel();
   }
   if (state.tab === 'topics' && !state.view) renderPanel();
-  if (state.tab === 'groups' && !state.view && state.groupsLoaded) paintGroupsTable();
-  if (state.view?.kind === 'topic-detail') renderPanel();
+  if (state.tab === 'groups' && !state.view) {
+    // A consumer that connected since the list answered shows up in the
+    // snapshot first: the list is asked again so its row can be drawn.
+    const known = new Set((state.groups || []).map((g) => consumerKey(g.group, g.topic)));
+    if (state.groups && (state.stats.groups || []).some((g) => !known.has(consumerKey(g.group, g.topic)))) loadGroups();
+    renderPanel();
+  }
+  if (state.view) renderPanel();
 }
 
 // Keeps the live-chart window as epoch-ms points, so a chart built later
@@ -1084,6 +1025,11 @@ async function refreshReplicas() {
     // The page's partition numbers and sizes move with the log; they come
     // with the topic's own answer, asked again on the replica cadence.
     loadTopicDetail(state.view.name);
+    return;
+  }
+  if (state.view?.kind === 'consumer-detail') {
+    // Its reading places move with the log, asked again on the same cadence.
+    loadConsumer(consumerKey(state.view.group, state.view.topic));
     return;
   }
   if (!state.view && (state.tab === 'overview' || state.tab === 'replication')) renderPanel();
@@ -1230,77 +1176,6 @@ function openTopicDeleteWindow(name) {
   });
 }
 
-// =============================================================================
-// Keyboard access for `tf-table` rows (P2-3, WCAG 2.1.1) — the shared
-// component (tentaflow-core/www/js/components/tf-table.js, out of this
-// module's file scope) marks no `<tr>` focusable and only emits `row-click`
-// from a mouse click, so a keyboard-only user could reach every OTHER
-// control in the consumer table but never open a group's detail panel. This is a progressive-enhancement layer added from
-// outside the component instead: re-applied after every `table.rows = ...`
-// (tf-table RECYCLES `<tr>` elements in place across paints — see its own
-// `_renderTbody` comment — so this only needs to touch newly-created rows
-// each time, not rebind every row on every poll) plus one delegated keydown
-// listener per table (added once, never duplicated).
-//
-// P3-13 (KRYTYK-M1-R2.md): a focusable `<tr>` with no `role`/accessible name
-// announces only the concatenated cell text with no cue that it activates
-// anything ("lab.results01 185150 B87 dni1×").
-//
-// R3-3 (KRYTYK-M1-R3.md): the P3-13 fix used `role="button"` to give the row
-// an accessible name — but overriding a `<tr>`'s native `role="row"` pulls
-// every `<td>` out of the table's accessibility tree, so a screen reader
-// stops announcing "column Commit mode: explicit" per cell and instead reads
-// the whole row as one giant button with a long comma-joined label. The row
-// keeps its NATIVE role (no override — table semantics stay intact) plus
-// `tabindex="0"`, its `aria-label`, and an `aria-describedby` pointing at one
-// shared, visually-hidden hint per table explaining that Enter/Space opens
-// the row's details.
-// =============================================================================
-
-function ensureRowActivationHint(table) {
-  const root = table.shadowRoot;
-  if (!root) return null;
-  let hint = root.getElementById('tb-row-activation-hint');
-  if (!hint) {
-    hint = document.createElement('span');
-    hint.id = 'tb-row-activation-hint';
-    hint.className = 'tf-visually-hidden';
-    hint.textContent = T('row_activate_hint');
-    root.appendChild(hint);
-  }
-  return hint;
-}
-
-function makeRowsFocusable(table) {
-  const hint = ensureRowActivationHint(table);
-  table.shadowRoot?.querySelectorAll('tbody tr[data-idx]').forEach((tr) => {
-    if (!tr.hasAttribute('tabindex')) tr.setAttribute('tabindex', '0');
-    if (hint) tr.setAttribute('aria-describedby', hint.id);
-    const label = Array.from(tr.querySelectorAll('td'))
-      .map((td) => td.textContent.trim())
-      .filter(Boolean)
-      .join(', ');
-    if (label) tr.setAttribute('aria-label', label);
-  });
-}
-
-// Activates the focused row with Enter/Space exactly like a mouse click.
-// `keydown` is a composed, bubbling event, so a single listener on the host
-// element (light DOM) sees it even though the actual `<tr>` lives inside
-// `table`'s shadow root. Only fires when the ROW ITSELF is the original
-// target (`composedPath()[0]`) — a focused action button/icon inside the
-// row already gets its own native Enter/Space→click, and re-triggering the
-// row's own navigation on top of that would double-activate.
-function wireRowKeyboardActivation(table) {
-  table.addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
-    const origin = e.composedPath()[0];
-    if (!(origin instanceof HTMLElement) || origin.tagName !== 'TR' || origin.dataset.idx == null) return;
-    e.preventDefault();
-    origin.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-  });
-}
-
 function msToDate(ms) {
   if (ms == null) return '—';
   const d = new Date(Number(ms));
@@ -1320,94 +1195,6 @@ function formatHeaderValue(key, text) {
     return msToDate(Number(text));
   }
   return text;
-}
-
-function closeModal(modal) {
-  modal.removeAttribute('open');
-  setTimeout(() => modal.remove(), 300);
-}
-
-// =============================================================================
-// Modal focus trap (`<tf-modal>`, tentaflow-core/www/js/components/tf-modal.js,
-// has none — Tab cycles out into the page behind the dialog and focus never
-// moves into the dialog on open, WCAG 2.1.1/2.4.3). `tf-modal.js` is a
-// shared component outside this file's change scope, so every dialog THIS
-// module builds traps focus itself instead: `openOffsetResetModal` calls
-// `trapModalFocus` directly.
-// =============================================================================
-
-// `tf-button`/`tf-input`/`tf-select` (the controls every dialog in this
-// module is built from) are light-DOM wrappers around a REAL
-// `<button>`/`<input>`/`<select>` — that inner native element is what the
-// browser actually places in the Tab order, and it is what the plain tag
-// selectors below already match. Listing the wrapper custom elements too
-// would add a second, non-focusable "candidate" right before each real one
-// (parent precedes child in document order), which could end up chosen as
-// the trap's computed first/last element and silently swallow the initial
-// autofocus / a wrap-around `.focus()` call.
-const FOCUSABLE_SELECTOR = [
-  'a[href]', 'button:not([disabled])', 'textarea:not([disabled])',
-  'input:not([disabled])', 'select:not([disabled])',
-  '[tabindex]:not([tabindex="-1"])',
-].join(', ');
-
-function focusableElements(container) {
-  return Array.from(container.querySelectorAll(FOCUSABLE_SELECTOR))
-    .filter((el) => !el.hasAttribute('disabled') && el.getClientRects().length > 0);
-}
-
-// Moves focus into `modal` on open, cycles Tab/Shift+Tab within it while
-// open, and restores focus to whatever had it before the dialog opened once
-// it closes — the three pieces `tf-modal.js` is missing today.
-function trapModalFocus(modal) {
-  const previouslyFocused = document.activeElement;
-  const card = modal._card || modal;
-  // Ensures `card.focus()` below actually moves focus even for a dialog
-  // with no focusable field of its own (e.g. a body that is pure text) —
-  // `tabindex="-1"` makes an element programmatically focusable without
-  // adding it to the normal Tab order.
-  if (!card.hasAttribute('tabindex')) card.setAttribute('tabindex', '-1');
-
-  const onKeydown = (e) => {
-    if (e.key !== 'Tab') return;
-    const focusables = focusableElements(card);
-    if (!focusables.length) { e.preventDefault(); return; }
-    const first = focusables[0];
-    const last = focusables[focusables.length - 1];
-    if (e.shiftKey && document.activeElement === first) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
-      e.preventDefault();
-      first.focus();
-    }
-  };
-  document.addEventListener('keydown', onKeydown, true);
-
-  // `_build()`/`_update()` run synchronously off `setAttribute('open', '')`,
-  // but layout (`getClientRects()` inside `focusableElements`) needs one
-  // frame to settle before an element is reliably reported as visible.
-  requestAnimationFrame(() => {
-    const focusables = focusableElements(card);
-    (focusables[0] || card).focus();
-  });
-
-  // Watches the `open` ATTRIBUTE rather than the `close` EVENT: `tf-modal`
-  // only dispatches `close` from its own Escape/backdrop/X dismissal path
-  // (`_dismiss()`); every close button THIS module wires (offset-reset
-  // Cancel/confirm) calls `closeModal()` directly, which just removes the `open`
-  // attribute without dispatching that event — a `close`-event-only cleanup
-  // would leak the document keydown listener and skip focus restoration on
-  // every one of those button paths.
-  const observer = new MutationObserver(() => {
-    if (modal.hasAttribute('open')) return;
-    observer.disconnect();
-    document.removeEventListener('keydown', onKeydown, true);
-    if (previouslyFocused && typeof previouslyFocused.focus === 'function') {
-      previouslyFocused.focus();
-    }
-  });
-  observer.observe(modal, { attributes: true, attributeFilter: ['open'] });
 }
 
 // =============================================================================
@@ -1499,7 +1286,7 @@ const detailContext = {
     else if (action.kind === 'delete') openTopicDeleteWindow(name);
     else if (action.kind === 'change') openTopicSettings(name, action.card);
     else if (action.kind === 'transfer') openPartitionTransfer(name, action.partition, 'topic');
-    else if (action.kind === 'group') { setTab('groups'); openGroupDetail(action.group, name); }
+    else if (action.kind === 'group') openConsumer(action.group, name);
     else if (action.kind === 'dlq') tabContext.go({ kind: 'dlq', topic: name });
     else if (action.kind === 'retry') { state.detailError = null; renderPanel(); loadTopicDetail(name); }
   },
@@ -1580,10 +1367,6 @@ const replicationContext = {
   },
 };
 
-function chipHtml(chip) {
-  return `<tf-chip variant="outline" status="${escapeAttr(chip.status)}">${escapeHtml(chip.label)}</tf-chip>`;
-}
-
 // Per-partition summary chips above the unprocessed-message table: which
 // message numbers each partition still keeps.
 function partitionSummaryHtml(partitions) {
@@ -1600,241 +1383,258 @@ function partitionSummaryHtml(partitions) {
 }
 
 // =============================================================================
-// Consumer groups (M04)
+// Odbiorcy (T05): the list lives in modules/tentabus/consumers.js, a
+// consumer's page in consumer-detail.js and the "Przesuń" window in
+// offset-move.js; the shell loads the data and says where each move leads.
 // =============================================================================
 
 async function loadGroups() {
+  const instanceId = state.instanceId;
   try {
-    state.groups = await ApiBinary.list('busGroupListRequest', { arrayKey: 'groups', payload: { instanceId: requireInstanceId(state.instanceId) } });
+    const groups = await ApiBinary.list('busGroupListRequest', { arrayKey: 'groups', payload: { instanceId: requireInstanceId(instanceId) } });
+    if (state.instanceId !== instanceId) return;
+    state.groups = (groups || []).filter((g) => !isInternalGroupId(g.group));
+    state.groupsError = null;
   } catch (err) {
-    toast(mapBusErrorMessage(err?.message, T), 'error');
-    state.groups = [];
+    if (state.instanceId !== instanceId) return;
+    // The last list stays on screen; a list never loaded shows the failure.
+    state.groupsError = err;
   }
-  state.groupsLoaded = true;
-  if (state.tab === 'groups' && !state.view) paintGroupsTable();
+  if (state.tab === 'groups' && !state.view) renderPanel();
 }
 
-function renderGroupsTab(panel) {
-  const rebuilt = ensureSkeleton(panel, 'groups', groupsSkeletonHtml);
-  if (rebuilt) wireGroupsSkeleton(panel);
-  paintGroupsTable();
-  paintGroupDetail();
-}
+const consumersContext = {
+  view() {
+    return {
+      groups: state.groupsError && !state.groups ? null : state.groups,
+      error: state.groupsError,
+      errorKind: state.groupsError ? loadErrorKind(state.groupsError) : null,
+      stats: state.stats,
+      instanceLabel: state.instanceLabel,
+      notice: null,
+      nowMs: Date.now(),
+    };
+  },
+  go(action) {
+    if (action.kind === 'open') openConsumer(action.group, action.topic);
+    else if (action.kind === 'pause' || action.kind === 'resume') toggleConsumerPause(action.group, action.topic, action.kind === 'pause');
+    else if (action.kind === 'retry') { state.groupsError = null; state.groups = null; renderPanel(); loadGroups(); }
+  },
+};
 
-function groupsSkeletonHtml() {
-  return `
-    <div class="tb-card">
-      <div class="tb-c-body tb-c-body--table">
-        <tf-table id="tb-groups-table" variant="flush">
-          <tf-column key="group" label="${escapeAttr(T('groups_col_group'))}" fill sortable></tf-column>
-          <tf-column key="topic" label="${escapeAttr(T('groups_col_topic'))}"></tf-column>
-          <tf-column key="commitMode" label="${escapeAttr(T('groups_col_commit_mode'))}" hide-below="900"></tf-column>
-          <tf-column key="state" label="${escapeAttr(T('groups_col_state'))}" renderer="chip"></tf-column>
-          <tf-column key="waiting" label="${escapeAttr(T('groups_col_waiting'))}" renderer="num"></tf-column>
-        </tf-table>
-        <div id="tb-groups-empty" hidden></div>
-      </div>
-    </div>
-    <div id="tb-group-detail"></div>
-  `;
-}
-
-function wireGroupsSkeleton(panel) {
-  const table = panel.querySelector('#tb-groups-table');
-  if (!table) return;
-  wireRowKeyboardActivation(table);
-  table.rowActions = (row, idx, currentRow) => {
-    if (!canAdmin()) return null;
-    // The actions cell can be kept across re-renders, so pause/resume must act
-    // on the row sitting in this slot at click time.
-    const live = () => currentRow?.() ?? row;
-    const btn = document.createElement('tf-button');
-    btn.setAttribute('variant', 'ghost');
-    btn.setAttribute('size', 'sm');
-    btn.setAttribute('icon', row.paused ? 'play' : 'pause');
-    btn.title = T(row.paused ? 'groups_action_resume' : 'groups_action_pause');
-    btn.addEventListener('click', (e) => { e.stopPropagation(); toggleGroupPause(live()); });
-    return btn;
-  };
-  table.addEventListener('row-click', (e) => openGroupDetail(e.detail.row.group, e.detail.row.topic));
-}
-
-function paintGroupsTable() {
-  const table = byId('tb-groups-table');
-  if (!table) return;
-  const visibleGroups = filterVisibleGroups(state.groups);
-  const liveLag = new Map((state.stats?.groups || []).map((g) => [`${g.group}\u0000${g.topic}`, g.lagTotal]));
-  const fmtWaiting = (v) => (v == null ? '—' : fmtCount(v));
-  const rows = visibleGroups.map((g) => ({
-    group: g.group,
-    topic: g.topic,
-    // Chosen by the consumer's program when it connects: shown, never edited.
-    commitMode: COMMIT_MODES.includes(g.commitMode) ? T(`groups_commit_${g.commitMode}`) : String(g.commitMode || '—'),
-    // The live snapshot's figure (what Przegląd counts), else the list's own.
-    // Unknown (`null`) is not zero: a lag this node cannot measure prints "—".
-    waiting: fmtWaiting(liveLag.has(`${g.group}\u0000${g.topic}`) ? liveLag.get(`${g.group}\u0000${g.topic}`) : g.lagTotal),
-    state: { status: g.paused ? 'warn' : 'ok', variant: 'outline', label: T(g.paused ? 'groups_state_paused' : 'groups_state_active') },
-    paused: g.paused,
-  }));
-  // A no-op-poll gate (this table is not on the
-  // stats-poll path today — `loadGroups()` only runs on user action — but
-  // pause/resume reload the whole list, so this still avoids rebuilding
-  // every OTHER row's pause/resume button when only one row changed).
-  const diff = diffRowsByKey(state.dom.groupsTableRows, rows, (r) => `${r.group}::${r.topic}`);
-  if (state.dom.groupsTableRows == null || diff.changed) {
-    table.rows = rows;
-    state.dom.groupsTableRows = rows;
+function openConsumer(group, topic, section = CONSUMER_SECTIONS[0]) {
+  const same = state.view?.kind === 'consumer-detail' && state.view.group === group && state.view.topic === topic;
+  if (state.view?.kind === 'topic-detail') closeTopicDetail();
+  if (!same) {
+    closeConsumer();
+    consumerDlqDue = true;
   }
-  makeRowsFocusable(table);
-  // P2-2: same bare-header gap as M01 — no groups exist on a fresh install
-  // (a group only appears once a consumer reads from a topic), so this adds
-  // the missing message rather than leaving a header with zero rows below it.
-  const emptyHost = byId('tb-groups-empty');
-  if (emptyHost) {
-    const empty = visibleGroups.length === 0;
-    table.hidden = empty;
-    emptyHost.hidden = !empty;
-    emptyHost.innerHTML = empty ? `<div class="tb-state tb-empty">${escapeHtml(T('groups_empty'))}</div>` : '';
-  }
+  state.tab = 'groups';
+  state.view = { kind: 'consumer-detail', group, topic, section: CONSUMER_SECTIONS.includes(section) ? section : CONSUMER_SECTIONS[0] };
+  renderPanel();
+  loadConsumer(consumerKey(group, topic));
 }
 
-async function toggleGroupPause(row) {
+function closeConsumer() {
+  if (state.view?.kind === 'consumer-detail') state.view = null;
+  state.consumer = null;
+  state.consumerError = null;
+  state.consumerNotice = null;
+  state.consumerMoved = new Set();
+  state.consumerBusy = false;
+}
+
+// Everything the consumer's page shows, in one answer: the consumer itself
+// (reading places, how it confirms), its topic (rights, who administers it,
+// the oldest numbers kept, retries), its own unprocessed messages among the
+// newest page of the topic's, and its recent lag samples (whether the backlog
+// still grows). Only the consumer itself is required; the rest degrades to
+// "unknown" on the page.
+//
+// Reading the unprocessed messages is a message read the server audits
+// (`bus.messages.browse`, one row per partition), so it happens when the
+// page opens and on "Odśwież" — not on every poll, where the count it gives
+// would cost a stream of audit rows the reader never asked for.
+let consumerDlqDue = true;
+
+async function fetchConsumer(instanceId, group, topic) {
+  const iid = requireInstanceId(instanceId);
+  const [groupResp, topicDetail] = await Promise.all([
+    ApiBinary.one('busGroupDetailRequest', { instanceId: iid, group, topic }),
+    ApiBinary.one('busTopicDetailRequest', { instanceId: iid, name: topic }).catch(() => null),
+  ]);
+  const nowMs = Date.now();
+  const readDlq = consumerDlqDue || !state.consumer?.dlq;
+  consumerDlqDue = false;
+  const [dlqResp, history] = await Promise.allSettled([
+    !readDlq ? Promise.resolve(null)
+      : topicDetail?.access?.canRead
+      ? ApiBinary.one('busDlqListRequest', { instanceId: iid, sourceTopic: topic, limit: DLQ_PAGE, newestFirst: true })
+      : Promise.reject(new Error('no read access')),
+    ApiBinary.one('busLagHistoryRequest', { instanceId: iid, group, topic, sinceMs: nowMs - 10 * 60_000 }),
+  ]);
+  let dlq = null;
+  if (!readDlq) dlq = state.consumer?.dlq ?? null;
+  else if (dlqResp.status === 'fulfilled') {
+    dlq = consumerDlq({ records: dlqResp.value?.records, hasMore: dlqResp.value?.hasMore, group, nowMs });
+  } else if (busErrorCode(dlqResp.reason?.message) === 'topic_not_found') {
+    // The topic has never had an unprocessed message: nothing is this consumer's.
+    dlq = consumerDlq({ records: [], hasMore: false, group, nowMs });
+  }
+  const series = history.status === 'fulfilled'
+    ? (history.value?.groups || []).find((x) => x.group === group && x.topic === topic)
+    : null;
+  return { detail: groupResp?.detail, topicDetail, dlq, samples: series?.samples || [] };
+}
+
+// A failed reload keeps the page it already shows (the header says the data
+// is old); only a consumer never loaded, or one gone since, shows the failure.
+const loadConsumer = topicDetailLoader({
+  fetch: (instanceId, key) => {
+    const [group, topic] = key.split('\u0000');
+    return fetchConsumer(instanceId, group, topic);
+  },
+  context: () => ({
+    instanceId: state.instanceId,
+    name: state.view?.kind === 'consumer-detail' ? consumerKey(state.view.group, state.view.topic) : null,
+  }),
+  apply({ detail, error }) {
+    if (!error) {
+      state.consumer = detail;
+      state.consumerError = null;
+    } else {
+      const missing = busErrorCode(error?.message) === 'group_not_found';
+      if (state.consumer && !missing) return;
+      if (missing) state.consumer = null;
+      state.consumerError = error;
+    }
+    renderPanel();
+  },
+});
+
+const consumerContext = {
+  view() {
+    const v = state.view;
+    return {
+      group: v.group,
+      topic: v.topic,
+      section: v.section,
+      data: state.consumer,
+      error: state.consumerError,
+      errorKind: state.consumerError ? loadErrorKind(state.consumerError) : null,
+      stats: state.stats,
+      notice: state.consumerNotice,
+      justMoved: state.consumerMoved,
+      busy: state.consumerBusy,
+      instanceLabel: state.instanceLabel,
+      nowMs: Date.now(),
+    };
+  },
+  go(action) {
+    const v = state.view;
+    if (v?.kind !== 'consumer-detail') return;
+    if (action.kind === 'back') setTab('groups');
+    else if (action.kind === 'section') {
+      if (!CONSUMER_SECTIONS.includes(action.section) || action.section === v.section) return;
+      v.section = action.section;
+      state.consumerNotice = null;
+      renderPanel();
+    } else if (action.kind === 'pause' || action.kind === 'resume') toggleConsumerPause(v.group, v.topic, action.kind === 'pause');
+    else if (action.kind === 'move') openConsumerMove(action.partition);
+    else if (action.kind === 'topic') { setTab('topics'); openTopicDetail(v.topic, DEFAULT_SECTION); }
+    else if (action.kind === 'topic-settings') { setTab('topics'); openTopicDetail(v.topic, 'settings'); }
+    else if (action.kind === 'dlq') tabContext.go({ kind: 'dlq', topic: v.topic });
+    else if (action.kind === 'retry') { state.consumerError = null; renderPanel(); loadConsumer(consumerKey(v.group, v.topic)); }
+  },
+};
+
+// Where the reader stands: the consumer list, one consumer's page, or elsewhere.
+function consumerSurface() {
+  if (state.view?.kind === 'consumer-detail') return `page:${consumerKey(state.view.group, state.view.topic)}`;
+  return state.tab === 'groups' && !state.view ? 'list' : 'other';
+}
+
+// "Wstrzymaj" / "Wznów" from a list row or the consumer's page: both end on
+// the consumer's Stan with the result, the way the mockups lead — unless the
+// reader has gone elsewhere while the server answered; then a toast only.
+async function toggleConsumerPause(group, topic, pause) {
+  if (state.consumerBusy) return;
+  const instanceId = state.instanceId;
+  const surface = consumerSurface();
+  state.consumerBusy = true;
+  renderPanel();
   try {
-    await ApiBinary.action(row.paused ? 'busGroupResumeRequest' : 'busGroupPauseRequest', { instanceId: requireInstanceId(state.instanceId), group: row.group, topic: row.topic });
-    toast(T('saved'), 'success');
-    await loadGroups();
-    if (state.groupDetail?.group === row.group && state.groupDetail?.topic === row.topic) await openGroupDetail(row.group, row.topic);
+    await ApiBinary.action(pause ? 'busGroupPauseRequest' : 'busGroupResumeRequest', { instanceId: requireInstanceId(instanceId), group, topic });
   } catch (err) {
-    toast(mapBusErrorMessage(err?.message, T), 'error');
+    state.consumerBusy = false;
+    if (state.instanceId !== instanceId) return;
+    toast(describeBusError(err), 'error');
+    renderPanel();
+    return;
   }
+  state.consumerBusy = false;
+  if (state.instanceId !== instanceId) return;
+  // The server has answered: the page shows the new state at once instead of
+  // the last poll's until the next one lands.
+  for (const g of [...(state.stats?.groups || []), ...(state.groups || [])]) {
+    if (g.group === group && g.topic === topic) g.paused = pause;
+  }
+  const title = T(pause ? 'consumer.paused_title' : 'consumer.resumed_title');
+  // The pause is kept by the node that leads the topic's partitions (the
+  // server refuses it anywhere else) and is not copied to the other nodes:
+  // with copies, a change of leading node lets the consumer read again.
+  const copies = (Number(topicByName(topic)?.replicationFactor) || 1) > 1;
+  const text = [
+    T(pause ? 'consumer.paused_text' : 'consumer.resumed_text', { group, topic }),
+    pause && copies ? T('consumer.paused_copies') : '',
+  ].filter(Boolean).join(' ');
+  if (consumerSurface() === surface && surface !== 'other') {
+    openConsumer(group, topic, CONSUMER_SECTIONS[0]);
+    state.consumerNotice = { section: 'state', tone: 'success', title, text };
+  } else {
+    toast(title, 'success');
+  }
+  renderPanel();
+  await Promise.all([refreshStats(), loadGroups()]);
 }
 
-async function openGroupDetail(group, topic) {
-  try {
-    const resp = await ApiBinary.one('busGroupDetailRequest', { instanceId: requireInstanceId(state.instanceId), group, topic });
-    state.groupDetail = resp.detail;
-  } catch (err) {
-    toast(mapBusErrorMessage(err?.message, T), 'error');
-    state.groupDetail = null;
-  }
-  paintGroupDetail();
-  paintFrame();
-}
-
-function paintGroupDetail() {
-  const host = byId('tb-group-detail');
-  if (!host) return;
-  const gd = state.groupDetail;
-  if (!gd) { host.innerHTML = ''; return; }
-  const rows = (gd.partitions || []).map((p) => {
-    const ratio = computeLagRatio(p.lag, p.committedOffset + p.lag);
-    return `
-      <tr>
-        <td>${p.partition}</td>
-        <td>${p.committedOffset}</td>
-        <td>${p.lag}</td>
-        <td><span class="tb-lagbar ${lagSeverityClass(ratio)}" role="img" aria-label="${escapeAttr(T('group_detail_lag_ratio_label', { percent: Math.round(ratio * 100) }))}"><span style="width:${Math.round(ratio * 100)}%"></span></span></td>
-        <td>${canAdmin() ? `<tf-button variant="ghost" size="sm" icon="rotate" class="tb-reset-offset" data-partition="${p.partition}">${escapeHtml(T('group_detail_reset_offset'))}</tf-button>` : ''}</td>
-      </tr>
-    `;
-  }).join('');
-  host.innerHTML = `
-    <div class="tb-card">
-      <div class="tb-c-head tb-group-detail-head">
-        <h3>${escapeHtml(gd.group)} → ${escapeHtml(gd.topic)}</h3>
-        ${chipHtml({ status: gd.paused ? 'warn' : 'ok', label: T(gd.paused ? 'groups_state_paused' : 'groups_state_active') })}
-      </div>
-      <div class="tb-c-body">
-        ${canAdmin() ? '' : `<div class="tb-gap-note">${sprite('info')}${escapeHtml(T('group_detail_admin_required'))}</div>`}
-        <table style="width:100%;border-collapse:collapse;font-size:12.5px">
-          <thead><tr>
-            <th style="text-align:left;padding:6px 4px">${escapeHtml(T('group_detail_col_partition'))}</th>
-            <th style="text-align:left;padding:6px 4px">${escapeHtml(T('group_detail_col_committed'))}</th>
-            <th style="text-align:left;padding:6px 4px">${escapeHtml(T('group_detail_col_lag'))}</th>
-            <th style="text-align:left;padding:6px 4px"><span class="tf-visually-hidden">${escapeHtml(T('group_detail_col_lag_ratio'))}</span></th>
-            <th></th>
-          </tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>
-    </div>
-  `;
-  if (canAdmin()) {
-    host.querySelectorAll('.tb-reset-offset').forEach((btn) => {
-      btn.addEventListener('click', () => openOffsetResetModal(gd.group, gd.topic, Number(btn.dataset.partition)));
-    });
-  }
-}
-
-function openOffsetResetModal(group, topic, partition) {
-  const body = document.createElement('div');
-  body.className = 'tb-wizard-form tb-reset-form';
-  body.innerHTML = `
-    <p>${escapeHtml(T('reset_modal_target', { group, topic, partition }))}</p>
-    <tf-select id="tb-reset-mode" label="${escapeAttr(T('reset_field_mode'))}" value="earliest">
-      <option value="earliest">${escapeHtml(T('reset_mode_earliest'))}</option>
-      <option value="latest">${escapeHtml(T('reset_mode_latest'))}</option>
-      <option value="explicit">${escapeHtml(T('reset_mode_explicit'))}</option>
-      <option value="timestamp">${escapeHtml(T('reset_mode_timestamp'))}</option>
-    </tf-select>
-    <tf-input id="tb-reset-offset" type="text" inputmode="numeric" label="${escapeAttr(T('reset_field_offset'))}" hidden></tf-input>
-    <tf-input id="tb-reset-ts" type="datetime-local" label="${escapeAttr(T('reset_field_timestamp'))}" hidden></tf-input>
-    <p class="tb-field-hint">${escapeHtml(T('reset_audit_note'))}</p>
-  `;
-  const modeSelect = body.querySelector('#tb-reset-mode');
-  const offsetInput = body.querySelector('#tb-reset-offset');
-  const tsInput = body.querySelector('#tb-reset-ts');
-  modeSelect?.addEventListener('change', (e) => {
-    const mode = e.detail?.value;
-    if (offsetInput) offsetInput.hidden = mode !== 'explicit';
-    if (tsInput) tsInput.hidden = mode !== 'timestamp';
+function openConsumerMove(partition) {
+  const v = state.view;
+  const data = state.consumer;
+  if (v?.kind !== 'consumer-detail' || !data?.topicDetail?.access?.canAdmin) return;
+  const instanceId = state.instanceId;
+  const { group, topic } = v;
+  const key = consumerKey(group, topic);
+  const live = (state.stats?.groups || []).find((g) => g.group === group && g.topic === topic);
+  openOffsetMove({
+    group,
+    places: positionRows({ detail: data.detail, topicPartitions: data.topicDetail.partitions }),
+    partition,
+    paused: live ? Boolean(live.paused) : Boolean(data.detail.paused),
+    replicated: (Number(data.topicDetail.topic?.replicationFactor) || 1) > 1,
+    resolveTimestamp: async (p, tsMs) => (await ApiBinary.one('busOffsetForTimestampRequest', { instanceId: requireInstanceId(instanceId), topic, partition: p, tsMs }))?.offset,
+    move: async (req) => (await ApiBinary.action('busOffsetResetRequest', {
+      instanceId: requireInstanceId(instanceId), group, topic, partition: req.partition, mode: req.mode, offset: req.offset, tsMs: req.tsMs,
+    }))?.newOffset,
+    describeError: describeBusError,
+    onMoved: async ({ partition: p, after }) => {
+      const here = () => state.instanceId === instanceId && state.view?.kind === 'consumer-detail' && consumerKey(state.view.group, state.view.topic) === key;
+      if (!here()) return;
+      state.consumerMoved.add(p);
+      state.consumerNotice = { section: 'position', tone: 'success', title: T('move.done_title'), text: movedText({ partition: p, after, waiting: null }) };
+      renderPanel();
+      await loadConsumer(key);
+      refreshStats();
+      if (!here()) return;
+      // What waits comes from the answer after the move, not from the numbers
+      // the window opened with: the consumer may have read on meanwhile.
+      const now = (state.consumer?.detail?.partitions || []).find((x) => Number(x.partition) === p);
+      if (now) {
+        state.consumerNotice = { section: 'position', tone: 'success', title: T('move.done_title'), text: movedText({ partition: p, after, waiting: Number(now.lag) || 0 }) };
+        renderPanel();
+      }
+    },
   });
-
-  const modal = document.createElement('tf-modal');
-  modal.setAttribute('title', T('reset_modal_title'));
-  modal.setAttribute('variant', 'modal');
-  modal.setAttribute('size', 'sm');
-  const bodySlot = document.createElement('div');
-  bodySlot.setAttribute('slot', 'body');
-  bodySlot.appendChild(body);
-  modal.appendChild(bodySlot);
-  const footer = document.createElement('div');
-  footer.setAttribute('slot', 'footer');
-  footer.className = 'tb-modal-footer';
-  const cancel = document.createElement('tf-button');
-  cancel.setAttribute('variant', 'secondary');
-  cancel.textContent = T('common_cancel');
-  cancel.addEventListener('click', () => closeModal(modal));
-  const confirm = document.createElement('tf-button');
-  confirm.setAttribute('variant', 'danger');
-  confirm.textContent = T('reset_confirm');
-  confirm.addEventListener('click', async () => {
-    const mode = modeSelect?.value || 'earliest';
-    if (mode === 'explicit' && !isValidExplicitOffset(offsetInput?.value)) {
-      toast(T('reset_field_offset_required'), 'error');
-      return;
-    }
-    const offset = mode === 'explicit' ? Number(offsetInput?.value) : undefined;
-    const tsMs = mode === 'timestamp' ? datetimeLocalToTsMs(tsInput?.value) : undefined;
-    if (mode === 'timestamp' && tsMs == null) {
-      toast(T('reset_field_timestamp_required'), 'error');
-      return;
-    }
-    try {
-      await ApiBinary.action('busOffsetResetRequest', { instanceId: requireInstanceId(state.instanceId), group, topic, partition, mode, offset, tsMs });
-      toast(T('reset_done'), 'success');
-      closeModal(modal);
-      await openGroupDetail(group, topic);
-    } catch (err) {
-      toast(mapBusErrorMessage(err?.message, T), 'error');
-    }
-  });
-  footer.append(cancel, confirm);
-  modal.appendChild(footer);
-  document.body.appendChild(modal);
-  modal.setAttribute('open', '');
-  trapModalFocus(modal);
-  modal.addEventListener('close', () => closeModal(modal), { once: true });
 }
 
 // =============================================================================
