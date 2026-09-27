@@ -741,14 +741,21 @@ async fn run_loop_region(
     // from the agent's per-definition `max_iterations`, so a single seeded
     // region serves agents with different budgets. It overrides the compile-time
     // region budget but is still clamped to the same hard cap (parity with the
-    // legacy loop block's resolution).
-    let max_iterations = current
-        .meta
-        .get("loop_max_iterations")
-        .and_then(|v| v.as_i64())
-        .filter(|n| *n > 0)
-        .map(|n| (n as u32).min(crate::flow_engine::cache::LOOP_REGION_MAX_ITERATIONS_CAP))
-        .unwrap_or(region.max_iterations);
+    // legacy loop block's resolution). A gated region is not the agent's tool
+    // loop: its rounds are a review budget set on the block itself, and the
+    // orchestrator's tool budget riding in meta would let a critic that never
+    // approves keep the planner going for dozens of rounds.
+    let max_iterations = if region.gated {
+        region.max_iterations
+    } else {
+        current
+            .meta
+            .get("loop_max_iterations")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n > 0)
+            .map(|n| (n as u32).min(crate::flow_engine::cache::LOOP_REGION_MAX_ITERATIONS_CAP))
+            .unwrap_or(region.max_iterations)
+    };
     let exit_reason: &str = loop {
         // Cancel / deadline are checked before each iteration so a long agent
         // loop honours a client disconnect or the flow deadline without waiting
@@ -4644,6 +4651,82 @@ mod loop_region_tests {
                 .is_some_and(|e| e.contains("cancelled")),
             "expected a cancelled error, got: {:?}",
             outcome.error
+        );
+    }
+
+    /// A critic gate that never approves: it passes the envelope through and
+    /// leaves the exit signal unset, like a critic that keeps finding faults.
+    struct NeverApprovingGate;
+
+    #[async_trait]
+    impl NodeAdapter for NeverApprovingGate {
+        fn node_type(&self) -> &str {
+            crate::flow_engine::cache::CRITIC_GATE_NODE_TYPE
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Any)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("full", FlowDataType::Any)]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            inputs: &[NodeInput],
+            _ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            Ok(inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(FlowEnvelope::empty))
+        }
+    }
+
+    /// A review loop keeps the round budget set on its block. The orchestrator's
+    /// tool budget arrives in `meta.loop_max_iterations` too, and letting it
+    /// through turned a 3-round review into 40 rounds of planning.
+    #[tokio::test]
+    async fn a_gated_region_ignores_the_agent_budget_in_meta() {
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register(Arc::new(AgentBodyAdapter { stop_at: 1000 }));
+        r.register(Arc::new(NeverApprovingGate));
+        let reg = Arc::new(r);
+        let flow = json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "b", "type": "region_test_body", "region": "review",
+                 "config": {"loop_max_iterations": 3}},
+                {"id": "g", "type": "critic_gate", "region": "review", "config": {}},
+                {"id": "o", "type": "output", "config": {"format": "text"}}
+            ],
+            "edges": [
+                {"from": "t", "to": "b", "from_port": "text", "to_port": "in"},
+                {"from": "b", "to": "g", "from_port": "full", "to_port": "in"},
+                {"from": "g", "to": "b", "from_port": "full", "to_port": "in", "kind": "loop_back"},
+                {"from": "g", "to": "o", "from_port": "full", "to_port": "text"}
+            ]
+        });
+        let compiled =
+            Arc::new(CompiledFlow::from_json("0", &flow.to_string(), &reg).expect("compile"));
+        assert!(compiled.regions[0].gated);
+        let mut seed = FlowEnvelope::empty();
+        seed.meta.insert("loop_max_iterations".into(), json!(40));
+        let outcome = execute_blocking(db(), compiled, seed, stub_ctx(), reg)
+            .await
+            .expect("execute_blocking");
+        assert_eq!(
+            outcome.final_envelope.meta.get("iter").and_then(|v| v.as_i64()),
+            Some(3)
+        );
+        assert_eq!(
+            outcome
+                .final_envelope
+                .meta
+                .get("loop_exit_reason")
+                .and_then(|v| v.as_str()),
+            Some("max_iterations")
         );
     }
 

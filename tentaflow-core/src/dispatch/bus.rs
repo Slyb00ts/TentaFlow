@@ -382,9 +382,21 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
             ProtocolErrorCode::Conflict,
             format!("bus.group_paused: '{group}' on '{topic}'"),
         ),
+        // Same code and wording `group_detail_v1` answers for a missing row.
+        BusServiceError::GroupNotFound { group, topic } => {
+            ProtocolError::not_found(format!("bus.group_not_found: '{group}' on '{topic}'"))
+        }
         BusServiceError::DlqOfDlqNotAllowed { topic } => {
             ProtocolError::bad_request(format!("bus.dlq_of_dlq_not_allowed: '{topic}'"))
         }
+        BusServiceError::DlqRecordHandled {
+            topic,
+            partition,
+            offset,
+        } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!("bus.dlq_record_handled: '{topic}' {partition}/{offset}"),
+        ),
         BusServiceError::PartitionPoisoned { topic, partition } => ProtocolError::internal(
             format!("bus.partition_poisoned: '{topic}'/{partition}"),
         ),
@@ -538,6 +550,17 @@ fn map_repl_error(e: ReplError) -> ProtocolError {
         ReplError::EpochFenced { have, requested } => ProtocolError::new(
             ProtocolErrorCode::Conflict,
             format!("bus.not_leader: epoch fenced have={have} requested={requested}"),
+        ),
+        ReplError::NotPartitionLeader {
+            topic,
+            partition,
+            leader,
+        } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!(
+                "bus.not_leader: only the leader '{leader}' of '{topic}'/{partition} may add \
+                 nodes to its replica set"
+            ),
         ),
         ReplError::Internal(msg) => {
             ProtocolError::internal(format!("bus.replication_internal_error: {msg}"))
@@ -975,16 +998,21 @@ fn peek_topic(
 }
 
 /// `DlqListRequest { newest_first: true }`: pages a DLQ BACKWARDS, newest
-/// arrival first. `ends` holds each partition's EXCLUSIVE upper bound (a
-/// partition absent from it starts at its high watermark). Every partition
-/// contributes its newest `limit` records below its bound; those per-
-/// partition lists (offset-descending) are merged by always taking the head
-/// with the latest `dlq::arrival_ms`, and the merge stops at `limit`. Taking
-/// only heads means what a partition contributed is always a contiguous
-/// run just below its bound, so its `next_offset` (the lowest offset taken,
-/// or the unchanged bound) is the exact bound of the next page: no record is
-/// skipped or repeated across pages even when two partitions' arrival clocks
-/// interleave. The top-level `next_offset` is the lowest per-partition one.
+/// arrival first, over the records still waiting — a record retried or
+/// discarded (`dlq_discarded_offsets`) is skipped, so a page is never short
+/// or empty only because the newest records were already handled. `ends`
+/// holds each partition's EXCLUSIVE upper bound (a partition absent from
+/// it starts at its high watermark). Every partition contributes its newest
+/// `limit` waiting records below its bound; those per-partition lists
+/// (offset-descending) are merged by always taking the head with the latest
+/// `dlq::arrival_ms`, and the merge stops at `limit`. Taking only heads
+/// means what a partition contributed is always the run of waiting records
+/// just below its bound, so its `next_offset` (the lowest offset taken, or
+/// the unchanged bound) is the exact bound of the next page: no record is
+/// skipped or repeated across pages even when two partitions' arrival
+/// clocks interleave. `has_more` says whether a waiting record is left
+/// below that bound. The top-level `next_offset` is the lowest
+/// per-partition one.
 fn peek_dlq_newest_first(
     bctx: &BusCallContext,
     dlq_topic: &str,
@@ -1013,6 +1041,7 @@ fn peek_dlq_newest_first(
         earliest: u64,
         high_watermark: u64,
         end: u64,
+        handled: std::collections::HashSet<u64>,
         /// Offset-descending.
         records: std::collections::VecDeque<bus::FetchedRecordMeta>,
         taken_low: Option<u64>,
@@ -1022,18 +1051,31 @@ fn peek_dlq_newest_first(
         let stats = svc
             .partition_stats(bctx, dlq_topic, partition)
             .map_err(map_bus_error)?;
+        let handled = svc
+            .dlq_discarded_offsets(bctx, dlq_topic, partition)
+            .map_err(map_bus_error)?;
         let end = ends
             .get(&partition)
             .copied()
             .unwrap_or(stats.high_watermark)
             .min(stats.high_watermark);
-        let start = end.saturating_sub(limit as u64).max(stats.earliest_offset);
+        // The lowest offset of the `limit` newest waiting records below
+        // `end`, found from the handled set alone — no record is read to
+        // step over the handled ones.
+        let mut start = end;
+        let mut waiting = 0usize;
+        while start > stats.earliest_offset && waiting < limit {
+            start -= 1;
+            if !handled.contains(&start) {
+                waiting += 1;
+            }
+        }
         // `peek` stops at its byte budget, which would drop the NEWEST end
         // of the window — keep reading up to `end` so the page is always
         // the run directly below the bound.
         let mut in_window: Vec<bus::FetchedRecordMeta> = Vec::new();
         let mut cursor = start;
-        while cursor < end {
+        while waiting > 0 && cursor < end {
             let peeked = svc
                 .peek(
                     bctx,
@@ -1047,7 +1089,12 @@ fn peek_dlq_newest_first(
             let Some(highest) = peeked.records.iter().map(|r| r.offset).max() else {
                 break;
             };
-            in_window.extend(peeked.records.into_iter().filter(|r| r.offset < end));
+            in_window.extend(
+                peeked
+                    .records
+                    .into_iter()
+                    .filter(|r| r.offset < end && !handled.contains(&r.offset)),
+            );
             cursor = highest + 1;
         }
         in_window.sort_by(|a, b| b.offset.cmp(&a.offset));
@@ -1057,6 +1104,7 @@ fn peek_dlq_newest_first(
             earliest: stats.earliest_offset,
             high_watermark: stats.high_watermark,
             end,
+            handled,
             records,
             taken_low: None,
         });
@@ -1082,7 +1130,12 @@ fn peek_dlq_newest_first(
     let mut lowest_next = u64::MAX;
     for w in &windows {
         let next_offset = w.taken_low.unwrap_or(w.end);
-        let has_more = next_offset > w.earliest;
+        let handled_below = w
+            .handled
+            .iter()
+            .filter(|&&o| o >= w.earliest && o < next_offset)
+            .count() as u64;
+        let has_more = next_offset.saturating_sub(w.earliest) > handled_below;
         any_has_more |= has_more;
         lowest_next = lowest_next.min(next_offset);
         partitions_wire.push(BusBrowsePartitionInfoWire {
@@ -1420,6 +1473,11 @@ pub async fn bus_dispatch(
             group,
             since_ms,
         } => lag_history_v1(ctx, instance_id, topic.clone(), group.clone(), *since_ms).await?,
+        BusPayload::OffsetForTimestampRequest {
+            topic,
+            partition,
+            ts_ms,
+        } => offset_for_timestamp_v1(ctx, instance_id, topic.clone(), *partition, *ts_ms).await?,
 
         BusPayload::TopicListResponse { .. }
         | BusPayload::TopicCreateResponse { .. }
@@ -1455,7 +1513,8 @@ pub async fn bus_dispatch(
         | BusPayload::SchemaRegisterResponse { .. }
         | BusPayload::SchemaCompatibilitySetResponse
         | BusPayload::SchemaDeleteResponse { .. }
-        | BusPayload::LagHistoryResponse { .. } => {
+        | BusPayload::LagHistoryResponse { .. }
+        | BusPayload::OffsetForTimestampResponse { .. } => {
             return Err(ProtocolError::bad_request(
                 "variant is not routed through bus_dispatch (UserSession tier)",
             ))
@@ -1562,6 +1621,10 @@ register_bus_variant!(
 register_bus_variant!(
     "BusLagHistoryRequest",
     "tentaflow_ws_handler_bus_lag_history"
+);
+register_bus_variant!(
+    "BusOffsetForTimestampRequest",
+    "tentaflow_ws_handler_bus_offset_for_timestamp"
 );
 
 // plan-app-platform §4.2/§7 W7: the 11 variants formerly routed through
@@ -1707,7 +1770,7 @@ async fn topic_detail_v1(
     let access = BusTopicAccessWire {
         can_read,
         can_write,
-        can_admin: topic_admin && ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin")),
+        can_admin: topic_admin && is_org_admin(ctx),
     };
     let admin_labels = topic_admin_labels(ctx, &g, &name).await?;
     if !can_read {
@@ -1882,14 +1945,15 @@ async fn group_list_v1(
     let bctx = bus_ctx(ctx, &g);
     let org_id = g.org_id.clone();
     let svc = g.svc.clone();
+    let org_admin = is_org_admin(ctx);
     let groups = run_blocking(move || {
-        let rows = repository::bus_group_list(svc.local_db(), &org_id)
-            .map_err(|e| db_err("bus_group_list", e))?;
+        let rows = visible_groups(&svc, &bctx, &org_id)?;
+        let mut access = TopicAccessCache::default();
         Ok(rows
             .into_iter()
-            .filter(|g| !is_hidden_group(&g.group_id))
             .map(|g| BusGroupSummaryWire {
                 lag_total: group_lag_total(&svc, &bctx, &g.group_id, &g.topic),
+                can_admin: org_admin && access.get(&svc, &bctx, &g.topic).2,
                 group: g.group_id,
                 topic: g.topic,
                 commit_mode: g.commit_mode,
@@ -1901,6 +1965,49 @@ async fn group_list_v1(
     })
     .await?;
     Ok(BusPayload::GroupListResponse { groups })
+}
+
+fn is_org_admin(ctx: &HandlerContext) -> bool {
+    ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin"))
+}
+
+/// `BusService::topic_access` per distinct topic: a group list touches the
+/// same topic once per group reading it, and each answer costs three
+/// authorizer calls.
+#[derive(Default)]
+struct TopicAccessCache(std::collections::HashMap<String, (bool, bool, bool)>);
+
+impl TopicAccessCache {
+    fn get(
+        &mut self,
+        svc: &bus::BusService,
+        bctx: &BusCallContext,
+        topic: &str,
+    ) -> (bool, bool, bool) {
+        if let Some(access) = self.0.get(topic) {
+            return *access;
+        }
+        let access = svc.topic_access(bctx, topic);
+        self.0.insert(topic.to_string(), access);
+        access
+    }
+}
+
+/// The org's consumer groups this caller may see: hidden `tf-*` groups are
+/// dropped, and so is every group of a topic the caller may not Consume —
+/// a group's name, commit mode and paused state describe that topic's
+/// readers and must not reach someone who cannot read the topic itself.
+fn visible_groups(
+    svc: &bus::BusService,
+    bctx: &BusCallContext,
+    org_id: &str,
+) -> Result<Vec<repository::DbBusGroup>, ProtocolError> {
+    let mut access = TopicAccessCache::default();
+    Ok(repository::bus_group_list(svc.local_db(), org_id)
+        .map_err(|e| db_err("bus_group_list", e))?
+        .into_iter()
+        .filter(|g| !is_hidden_group(&g.group_id) && access.get(svc, bctx, &g.topic).0)
+        .collect())
 }
 
 /// A group's lag summed over the topic's partitions, or `None` when this
@@ -1926,16 +2033,25 @@ async fn group_detail_v1(
     let g = gate_read(ctx, instance_id)?;
     let bctx = bus_ctx(ctx, &g);
     let org_id = g.org_id.clone();
-    let local_db = g.svc.local_db().clone();
+    let svc = g.svc.clone();
     let (group_clone, topic_clone) = (group.clone(), topic.clone());
+    let bctx_access = bctx.clone();
     let row = run_blocking(move || {
-        repository::bus_group_get(&local_db, &org_id, &group_clone, &topic_clone)
-            .map_err(|e| db_err("bus_group_get", e))?
-            .ok_or_else(|| {
-                ProtocolError::not_found(format!(
-                    "bus.group_not_found: '{group_clone}' on '{topic_clone}'"
-                ))
-            })
+        // Authorized before the lookup, with the same answer for both: a
+        // distinct "denied" would tell a caller who cannot read the topic
+        // which groups exist on it.
+        let readable = svc.topic_access(&bctx_access, &topic_clone).0;
+        let row = if readable {
+            repository::bus_group_get(svc.local_db(), &org_id, &group_clone, &topic_clone)
+                .map_err(|e| db_err("bus_group_get", e))?
+        } else {
+            None
+        };
+        row.ok_or_else(|| {
+            ProtocolError::not_found(format!(
+                "bus.group_not_found: '{group_clone}' on '{topic_clone}'"
+            ))
+        })
     })
     .await?;
 
@@ -1976,8 +2092,9 @@ async fn group_pause_v1(
     group: String,
     topic: String,
 ) -> Result<BusPayload, ProtocolError> {
-    // §4.3: operational, reversible, does not destroy data — write tier.
-    let g = gate_write(ctx, instance_id)?;
+    // Admin tier, like the offset move and the UI's `can_admin`: pausing
+    // stops every consumer of the group, whoever runs it.
+    let g = gate_admin(ctx, instance_id)?;
     let bctx = bus_ctx(ctx, &g);
     let svc = g.svc.clone();
     run_blocking(move || {
@@ -1994,7 +2111,7 @@ async fn group_resume_v1(
     group: String,
     topic: String,
 ) -> Result<BusPayload, ProtocolError> {
-    let g = gate_write(ctx, instance_id)?;
+    let g = gate_admin(ctx, instance_id)?;
     let bctx = bus_ctx(ctx, &g);
     let svc = g.svc.clone();
     run_blocking(move || {
@@ -2083,6 +2200,28 @@ async fn offset_reset_v1(
         }
     };
     Ok(BusPayload::OffsetResetResponse { new_offset })
+}
+
+/// Read-only preview for the "from a chosen time" reset: which offset
+/// `OffsetReset { Timestamp }` would move to, without moving anything.
+/// `bus.read`; `resolve_offset_for_timestamp` itself demands Consume on the
+/// topic and checks the partition range.
+async fn offset_for_timestamp_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    topic: String,
+    partition: u32,
+    ts_ms: i64,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_read(ctx, instance_id)?;
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
+    let offset = run_blocking(move || {
+        svc.resolve_offset_for_timestamp(&bctx, &topic, partition, ts_ms)
+            .map_err(map_bus_error)
+    })
+    .await?;
+    Ok(BusPayload::OffsetForTimestampResponse { offset })
 }
 
 // =============================================================================
@@ -2282,7 +2421,18 @@ async fn dlq_retry_all_v1(
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
-    let max_records = max_records.clamp(1, DLQ_RETRY_ALL_MAX);
+    let max_records = max_records.clamp(1, DLQ_RETRY_ALL_MAX) as usize;
+
+    // Every single retry below needs administration of the topic; asked
+    // once here, so a caller without it is refused instead of answered
+    // "0 retried, N failed".
+    let (_, _, topic_admin) = g.svc.topic_access(&bctx, &dlq_topic);
+    if !topic_admin {
+        return Err(map_bus_error(BusServiceError::PermissionDenied {
+            action: bus::BusAction::Admin.as_str(),
+            topic: dlq_topic,
+        }));
+    }
 
     let dlq_topic_for_cfg = dlq_topic.clone();
     let partitions = run_blocking(move || {
@@ -2299,26 +2449,8 @@ async fn dlq_retry_all_v1(
 
     let bctx2 = bctx.clone();
     let dlq_topic2 = dlq_topic.clone();
-    let dlq_topic2b = dlq_topic.clone();
-    let empty_starts = std::collections::HashMap::new();
-    // M1-R2 review N-5, coordinator decision 2: a discarded record must
-    // never come back via "Ponów wszystkie" (the exact failure mode the
-    // review reproduced — a record "discarded" minutes earlier reappeared
-    // in the source topic through this exact call). Filtered out of the
-    // page BEFORE any retry runs, same helper `DlqList` uses. This can
-    // retry fewer than `max_records` non-discarded records in one call if
-    // the page itself contained discarded ones — the same "one page, not a
-    // guaranteed exact-N batch" shape `peek`-based paging already has.
     let records = run_blocking(move || {
-        let (records, _, _, _) = peek_topic(
-            &bctx2,
-            &dlq_topic2,
-            partitions,
-            &empty_starts,
-            max_records,
-            None,
-        )?;
-        filter_out_discarded(&bctx2, &dlq_topic2b, records)
+        retryable_dlq_records(&bctx2, &dlq_topic2, partitions, max_records)
     })
     .await?;
 
@@ -2327,17 +2459,91 @@ async fn dlq_retry_all_v1(
         let bctx3 = bctx.clone();
         let dlq_topic3 = dlq_topic.clone();
         let svc = g.svc.clone();
-        let outcome = run_blocking(move || {
-            svc.dlq_retry(&bctx3, &dlq_topic3, rv.partition, rv.offset)
-                .map_err(map_bus_error)
-        })
-        .await;
+        let outcome =
+            run_blocking(move || Ok(svc.dlq_retry(&bctx3, &dlq_topic3, rv.partition, rv.offset)))
+                .await?;
         match outcome {
             Ok(_) => retried += 1,
+            // Retried or discarded by someone else since it was read: not
+            // this call's failure, and never republished twice.
+            Err(BusServiceError::DlqRecordHandled { .. }) => {}
             Err(_) => failed += 1,
         }
     }
     Ok(BusPayload::DlqRetryAllResponse { retried, failed })
+}
+
+/// The oldest `max_records` records of `dlq_topic` "Ponów wszystkie" acts
+/// on, partition by partition: waiting ones only (a retried or discarded
+/// record is never republished again — M1-R2 review N-5), and never one
+/// rejected at write time (`dlq::rejected_at_write`), which the topic's
+/// validation would only send back as a new record. Reads on past pages
+/// made only of such records, so a batch is never short because the oldest
+/// records were already handled; the handled ones at the head of a
+/// partition are stepped over from the handled set alone, without reading
+/// them.
+fn retryable_dlq_records(
+    bctx: &BusCallContext,
+    dlq_topic: &str,
+    partitions: u32,
+    max_records: usize,
+) -> Result<Vec<bus::FetchedRecordMeta>, ProtocolError> {
+    let svc = instance_service(&bctx.instance_id)?;
+    let mut handled = std::collections::HashMap::new();
+    let mut starts = std::collections::HashMap::new();
+    let mut ends = std::collections::HashMap::new();
+    for partition in 0..partitions {
+        let stats = svc
+            .partition_stats(bctx, dlq_topic, partition)
+            .map_err(map_bus_error)?;
+        let set = svc
+            .dlq_discarded_offsets(bctx, dlq_topic, partition)
+            .map_err(map_bus_error)?;
+        let mut first = stats.earliest_offset;
+        while first < stats.high_watermark && set.contains(&first) {
+            first += 1;
+        }
+        starts.insert(partition, first);
+        ends.insert(partition, stats.high_watermark);
+        handled.insert(partition, set);
+    }
+    let mut picked = Vec::new();
+    let unread = |starts: &std::collections::HashMap<u32, u64>| {
+        starts.iter().any(|(p, &s)| s < ends[p])
+    };
+    while picked.len() < max_records && unread(&starts) {
+        let (records, _, _, partitions_wire) = peek_topic(
+            bctx,
+            dlq_topic,
+            partitions,
+            &starts,
+            max_records as u32,
+            None,
+        )?;
+        picked.extend(
+            records
+                .into_iter()
+                .filter(|r| {
+                    !handled[&r.partition].contains(&r.offset)
+                        && !dlq::rejected_at_write(&r.headers)
+                })
+                .take(max_records - picked.len()),
+        );
+        let mut moved = false;
+        for p in partitions_wire {
+            let set = &handled[&p.partition];
+            let mut next = p.next_offset.min(ends[&p.partition]);
+            while next < ends[&p.partition] && set.contains(&next) {
+                next += 1;
+            }
+            moved |= next != starts[&p.partition];
+            starts.insert(p.partition, next);
+        }
+        if !moved {
+            break;
+        }
+    }
+    Ok(picked)
 }
 
 // =============================================================================
@@ -2441,16 +2647,22 @@ async fn acl_set_v1(
                     "bus.invalid_argument: access_level must be 'allow', 'deny' or 'clear'",
                 ));
             }
-            repository::resource_permissions::set_with_action(
+            // An entry belongs to a topic that exists, like a data-hiding rule
+            // (`field_policies::set_policy`); see `set_topic_rule`.
+            let written = repository::resource_permissions::set_topic_rule(
                 &db,
-                "topic",
                 &resource_id,
                 &subject_type2,
                 &subject_id2,
                 &action2,
                 &access_level2,
             )
-            .map_err(|e| db_err("resource_permissions::set_with_action", e))
+            .map_err(|e| db_err("resource_permissions::set_topic_rule", e))?;
+            if written {
+                Ok(())
+            } else {
+                Err(map_bus_error(BusServiceError::TopicNotFound { name: topic2 }))
+            }
         }
     })
     .await?;
@@ -2989,19 +3201,16 @@ async fn stats_snapshot_v1(
     let db = ctx.state.db.clone();
     let svc = g.svc.clone();
     let instance_id = svc.instance_id().to_string();
-    let local_db = svc.local_db().clone();
+    let bctx_groups = bctx.clone();
     let (topics, groups) = run_blocking(move || {
         let topics = topics::list_topics(&db, &instance_id, &org_id).map_err(map_bus_error)?;
-        // Hidden (`tf-`-prefixed) groups are dropped here, once, so every
+        // Filtered here, once, exactly like `GroupList` (hidden `tf-*`
+        // groups and groups of topics the caller may not read), so every
         // KPI/lag figure below derived from `groups` — `group_count`,
         // `paused_group_count`, and the per-topic lag loop — agrees with
         // what `GroupList` itself shows (M1-R2 review N-2/N-7, coordinator
         // decisions 3/7).
-        let groups = repository::bus_group_list(&local_db, &org_id)
-            .map_err(|e| db_err("bus_group_list", e))?
-            .into_iter()
-            .filter(|g| !is_hidden_group(&g.group_id))
-            .collect::<Vec<_>>();
+        let groups = visible_groups(&svc, &bctx_groups, &org_id)?;
         Ok::<_, ProtocolError>((topics, groups))
     })
     .await?;
@@ -3404,11 +3613,15 @@ fn parse_audit_kv(details: &str) -> std::collections::HashMap<&str, &str> {
 /// A row without `instance_id` (written before the field existed, or by an
 /// instance-anonymous `AuditLogReplAudit::new`, which writes `-`) cannot be
 /// attributed to an instance and is left out.
+///
+/// `readable` answers whether the caller may read a topic: a row of a topic
+/// they may not read is left out, like the topic's offsets in the partition
+/// list, so the timeline does not show what moves inside it.
 fn failover_events_from_audit(
     db: &crate::db::DbPool,
     instance_id: &str,
     org_id: &str,
-    topic: Option<&str>,
+    readable: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<BusFailoverEventWire>, ProtocolError> {
     let mut rows = Vec::new();
     for action in [BUS_FAILOVER_AUDIT_ACTION, BUS_LEADER_TRANSFER_AUDIT_ACTION] {
@@ -3439,15 +3652,11 @@ fn failover_events_from_audit(
         let Some(row_topic) = row.resource.clone() else {
             continue;
         };
-        if let Some(want_topic) = topic {
-            if row_topic != want_topic {
-                continue;
-            }
-        }
         let details = row.details.unwrap_or_default();
         let kv = parse_audit_kv(&details);
         if kv.get("org_id").copied() != Some(org_id)
             || kv.get("instance_id").copied() != Some(instance_id)
+            || !readable(&row_topic)
         {
             continue;
         }
@@ -3523,9 +3732,15 @@ fn failover_events_from_audit(
 /// instead of an empty one: this node is the sole replica of every
 /// partition it owns (`leader_epoch=0`, `isr=[this node]`), which is
 /// exactly M1's real, unreplicated behavior, so the M06 screen has
-/// something truthful to show on a single node. `failovers` is ALWAYS
-/// read straight from `audit_log` (see `failover_events_from_audit`'s
-/// doc), independent of whether a coordinator is installed.
+/// something truthful to show on a single node. `failovers` is read
+/// straight from `audit_log` (see `failover_events_from_audit`'s doc),
+/// independent of whether a coordinator is installed, and only for the
+/// instance-wide call (`topic: None`): the screen polls one call per topic,
+/// and each would otherwise rescan the audit log for a history nobody reads.
+///
+/// Reading is per topic: asking for a topic the caller may not read is
+/// refused, and the instance-wide answer leaves such a topic's partitions
+/// and leadership history out on both paths.
 async fn replica_list_v1(
     ctx: &HandlerContext,
     instance_id: &str,
@@ -3533,6 +3748,14 @@ async fn replica_list_v1(
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_read(ctx, instance_id)?;
     let bctx = bus_ctx(ctx, &g);
+    if let Some(name) = topic.as_deref() {
+        if !g.svc.topic_access(&bctx, name).0 {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                format!("bus.permission_denied: read on '{name}'"),
+            ));
+        }
+    }
     let org_id = g.org_id.clone();
     let db = ctx.state.db.clone();
     let local_node_id = ctx.state.local_node_id.to_string();
@@ -3560,6 +3783,7 @@ async fn replica_list_v1(
             let partitions: Vec<BusPartitionReplicaWire> = snapshot
                 .partitions
                 .iter()
+                .filter(|p| svc.topic_access(&bctx_for_snapshot, &p.topic).0)
                 .map(partition_replica_wire)
                 .collect();
             return Ok((nodes, partitions));
@@ -3583,6 +3807,13 @@ async fn replica_list_v1(
         let mut partition_count = 0u32;
         let mut partitions_wire = Vec::new();
         for cfg in &topics_in_scope {
+            // The node-wide view must not fail for a caller refused reading
+            // one topic: that topic's offsets are left out, its partitions
+            // still count towards what this node leads.
+            if topic_for_snapshot.is_none() && !svc.topic_access(&bctx_for_snapshot, &cfg.name).0 {
+                partition_count += cfg.partitions;
+                continue;
+            }
             for partition in 0..cfg.partitions {
                 partition_count += 1;
                 let stats = svc
@@ -3616,10 +3847,17 @@ async fn replica_list_v1(
     })
     .await?;
 
-    let instance = g.instance.as_str().to_string();
-    let failovers =
-        run_blocking(move || failover_events_from_audit(&db, &instance, &org_id, topic.as_deref()))
-            .await?;
+    let failovers = if topic.is_some() {
+        Vec::new()
+    } else {
+        let instance = g.instance.as_str().to_string();
+        let svc = g.svc.clone();
+        run_blocking(move || {
+            let readable = |name: &str| svc.topic_access(&bctx, name).0;
+            failover_events_from_audit(&db, &instance, &org_id, &readable)
+        })
+        .await?
+    };
 
     Ok(BusPayload::ReplicaListResponse {
         nodes,
@@ -3670,6 +3908,19 @@ async fn replica_reassign_v1(
         .map(|_| ())
     })
     .await?;
+    // Choosing which nodes hold a topic's copies is administration of that
+    // topic, as moving its leadership is (`leader_transfer_v1`).
+    let svc = g.svc.clone();
+    let bctx = bus_ctx(ctx, &g);
+    let topic_for_access = topic.clone();
+    let (_, _, topic_admin) =
+        run_blocking(move || Ok(svc.topic_access(&bctx, &topic_for_access))).await?;
+    if !topic_admin {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!("bus.permission_denied: admin on '{topic}'"),
+        ));
+    }
 
     let topic_for_call = topic.clone();
     let org_id_for_call = org_id.clone();
@@ -3762,6 +4013,20 @@ async fn leader_transfer_v1(
         .map(|_| ())
     })
     .await?;
+    // Moving a partition's leader is administration OF THIS TOPIC, like
+    // changing its settings (`update_topic` authorizes `Admin` on it): a
+    // topic ACL that denies someone administration must deny this too.
+    let svc = g.svc.clone();
+    let bctx = bus_ctx(ctx, &g);
+    let topic_for_access = topic.clone();
+    let (_, _, topic_admin) =
+        run_blocking(move || Ok(svc.topic_access(&bctx, &topic_for_access))).await?;
+    if !topic_admin {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!("bus.permission_denied: admin on '{topic}'"),
+        ));
+    }
 
     let topic_for_call = topic.clone();
     let org_id_for_call = org_id.clone();
@@ -5457,6 +5722,7 @@ mod tests {
             _attempts: u32,
         ) {
         }
+        fn note_dlq_handled(&self, _org: &str, _source_topic: &str, _dlq_partition: u32, _offset: u64) {}
         fn evict_node_from_replica_sets(
             &self,
             _node_id: &str,
@@ -5749,9 +6015,65 @@ mod tests {
         .unwrap_err();
         assert!(err.message.contains("bus.topic_not_found"));
 
+        // A second topic this caller is refused reading: the coordinator
+        // reports its partition and its leadership history like any other,
+        // and the answer must leave both out.
+        let closed_topic = format!("closed.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            closed_topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("closed topic create");
+        acl_set_v1(
+            &ctx,
+            fixture_instance_id().as_str(),
+            closed_topic.clone(),
+            "user".to_string(),
+            user_id.clone(),
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("deny read on the closed topic");
+        for name in [&topic_name, &closed_topic] {
+            repository::log_audit(
+                &db,
+                None,
+                None,
+                BUS_FAILOVER_AUDIT_ACTION,
+                Some(name),
+                Some(&format!(
+                    "instance_id={} org_id={org_id} partition=0 from_node=- from_epoch=0 \
+                     to_epoch=1 duration_ms=40 reason=lease_expired",
+                    fixture_instance_id().as_str()
+                )),
+                None,
+                Some("node-d"),
+            )
+            .unwrap();
+        }
+
         // ---- 4. Install the coordinator — every assertion from here on
         // depends on it, and nothing above this line may run again in this
         // process. ----
+        let closed_partition = bus::PartitionReplicaInfo {
+            topic: closed_topic.clone(),
+            partition: 0,
+            leader_node_id: Some("gcm-core-01".to_string()),
+            leader_epoch: 1,
+            replicas: vec!["gcm-core-01".to_string()],
+            isr: vec!["gcm-core-01".to_string()],
+            lagging: vec![],
+            high_watermark: 9_000,
+            log_end_offset: 9_000,
+            unavailable_reason: None,
+        };
         let fake_snapshot = bus::ReplicationSnapshot {
             nodes: vec![bus::ReplicaNodeInfo {
                 node_id: "gcm-core-01".to_string(),
@@ -5780,9 +6102,10 @@ mod tests {
                 high_watermark: 42,
                 log_end_offset: 44,
                 unavailable_reason: None,
-            }],
+            }, closed_partition],
             failovers: vec![],
         };
+        rf1_replica_list_leaves_out_a_topic_the_caller_may_not_read(&db).await;
         let coordinator = std::sync::Arc::new(FakeCoordinator {
             reassign_applied: 3,
             transfer_epoch: 7,
@@ -5826,7 +6149,7 @@ mod tests {
             "must be the coordinator's own return value"
         );
 
-        let (nodes, partitions) = match replica_list_v1(
+        let (nodes, partitions, topic_failovers) = match replica_list_v1(
             &ctx,
             fixture_instance_id().as_str(),
             Some(topic_name.clone()),
@@ -5835,10 +6158,15 @@ mod tests {
         .expect("replica list via coordinator")
         {
             BusPayload::ReplicaListResponse {
-                nodes, partitions, ..
-            } => (nodes, partitions),
+                nodes,
+                partitions,
+                failovers,
+            } => (nodes, partitions, failovers),
             other => panic!("unexpected response: {other:?}"),
         };
+        // The per-topic call carries no history: the screen reads it from
+        // the instance-wide one, and polls this one for every topic.
+        assert!(topic_failovers.is_empty());
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, "gcm-core-01");
         assert_eq!(nodes[0].environment, "prod");
@@ -5864,6 +6192,25 @@ mod tests {
             };
         assert!(other_nodes.is_empty());
         assert!(other_partitions.is_empty());
+
+        // The instance-wide history keeps the readable topic's failover and
+        // leaves out the one of the topic this caller may not read.
+        let failovers = match replica_list_v1(&ctx, fixture_instance_id().as_str(), None)
+            .await
+            .expect("replica list, no topic filter")
+        {
+            BusPayload::ReplicaListResponse { failovers, .. } => failovers,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(failovers.iter().any(|f| f.topic == topic_name), "{failovers:?}");
+        assert!(failovers.iter().all(|f| f.topic != closed_topic), "{failovers:?}");
+
+        // Asking for the refused topic itself is refused, as without a
+        // coordinator.
+        let refused = replica_list_v1(&ctx, fixture_instance_id().as_str(), Some(closed_topic))
+            .await
+            .expect_err("no read on the closed topic");
+        assert_eq!(refused.code, ProtocolErrorCode::PolicyDenied);
     }
 
     // ---- SUM/tentabus/POLITYKI-POL-FORMATY.md (F0): field policy CRUD ----
@@ -5907,6 +6254,14 @@ mod tests {
         let ctx = handler_ctx(db, org);
         let instance = fixture_instance_id();
         let topic = "acl.actions.topic".to_string();
+        topic_create_v1(
+            &ctx,
+            instance.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
 
         acl_set_v1(
             &ctx,
@@ -6009,6 +6364,41 @@ mod tests {
         .await
         .expect_err("an unknown action must be rejected");
         assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+    }
+
+    /// An access entry cannot be written ahead of its topic: nothing would
+    /// order it against the topic's creation on other nodes. Clearing one
+    /// stays possible, so a leftover row can always be removed.
+    #[tokio::test]
+    async fn acl_set_refuses_a_topic_that_does_not_exist() {
+        let (_guard, db) = bus_fixture();
+        let user_id = "u-acl-admin3".to_string();
+        let org_id = seed_membership(&db, &user_id, "org.admin");
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let ctx = handler_ctx(db, org);
+        let instance = fixture_instance_id();
+        let topic = format!("jeszcze.nie.ma.{}", uuid::Uuid::new_v4().simple());
+        let set = |level: &str| {
+            acl_set_v1(
+                &ctx,
+                instance.as_str(),
+                topic.clone(),
+                "user".to_string(),
+                "u-target".to_string(),
+                level.to_string(),
+                "read".to_string(),
+            )
+        };
+        let err = set("deny").await.expect_err("no topic, no entry");
+        assert!(err.message.contains("topic_not_found"), "{err:?}");
+        set("clear").await.expect("clearing needs no topic");
+        match acl_list_v1(&ctx, instance.as_str(), topic.clone())
+            .await
+            .expect("list")
+        {
+            BusPayload::AclListResponse { entries } => assert!(entries.is_empty()),
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -6655,6 +7045,12 @@ mod tests {
         let bctx = bus_ctx(ctx, &g);
         let topic = topic.to_string();
         tokio::task::spawn_blocking(move || {
+            // Another test in this module may have installed a fake
+            // coordinator on the shared instance, which admits writes as
+            // leader; open them the way a real leader handle would.
+            svc.local_partition(&bctx, &topic, 0)
+                .expect("partition")
+                .open_leader_writes();
             svc.publish(
                 &bctx,
                 &topic,
@@ -7108,6 +7504,227 @@ mod tests {
         topic
     }
 
+    /// A one-partition topic whose first `failed` records each exhausted
+    /// their single delivery attempt of group "g": DLQ offsets 0..failed.
+    async fn topic_with_failed_records(ctx: &HandlerContext, failed: u64) -> String {
+        let inst = fixture_instance_id();
+        let topic = format!("wyniki.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        let g = gate_read(ctx, inst.as_str()).expect("gate");
+        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(ctx, &g), topic.clone());
+        tokio::task::spawn_blocking(move || {
+            for i in 0..failed {
+                let payload = Bytes::from(format!("payload-{i}"));
+                svc.publish(
+                    &bctx,
+                    &t,
+                    bus::PublishBatch {
+                        partition: Some(0),
+                        producer: None,
+                        records: vec![bus::PublishRecord {
+                            key: None,
+                            headers: vec![],
+                            payload: payload.clone(),
+                            timestamp_ms: bus::now_ms(),
+                            schema_id: 0,
+                        }],
+                    },
+                )
+                .expect("publish");
+                let fetched = bus::FetchedRecordMeta {
+                    topic: t.clone(),
+                    partition: 0,
+                    offset: i,
+                    timestamp_ms: bus::now_ms(),
+                    key: None,
+                    headers: vec![],
+                    payload,
+                    schema_id: 0,
+                };
+                svc.note_delivery_failure(
+                    &bctx,
+                    "g",
+                    &t,
+                    0,
+                    i,
+                    &fetched,
+                    dlq::DlqReason::ConsumerError,
+                    "boom",
+                )
+                .expect("to the DLQ");
+            }
+        })
+        .await
+        .expect("setup task");
+        topic
+    }
+
+    async fn source_high_watermark(ctx: &HandlerContext, topic: &str) -> u64 {
+        let g = gate_read(ctx, fixture_instance_id().as_str()).expect("gate");
+        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(ctx, &g), topic.to_string());
+        tokio::task::spawn_blocking(move || svc.partition_stats(&bctx, &t, 0).unwrap().high_watermark)
+            .await
+            .unwrap()
+    }
+
+    async fn dlq_depth(ctx: &HandlerContext, topic: &str) -> u64 {
+        match stats_snapshot_v1(ctx, fixture_instance_id().as_str()).await.unwrap() {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
+                snapshot.topics.iter().find(|t| t.topic == topic).unwrap().dlq_depth
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    async fn retry_all(ctx: &HandlerContext, topic: &str, max: u32) -> (u32, u32) {
+        match dlq_retry_all_v1(ctx, fixture_instance_id().as_str(), topic.to_string(), max)
+            .await
+            .expect("retry all")
+        {
+            BusPayload::DlqRetryAllResponse { retried, failed } => (retried, failed),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// "Ponów" takes the message off the list and the counters, and a
+    /// second "Ponów" of it — or "Ponów wszystkie" after it — does not send
+    /// it to the topic's consumers again.
+    #[tokio::test]
+    async fn a_retried_dlq_record_leaves_the_list_and_is_never_republished_twice() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = topic_with_failed_records(&ctx, 3).await;
+        assert_eq!(source_high_watermark(&ctx, &topic).await, 3);
+
+        dlq_retry_v1(&ctx, inst.as_str(), topic.clone(), 0, 1)
+            .await
+            .expect("retry");
+        assert_eq!(dlq_list_offsets(&ctx, topic.clone()).await, vec![0, 2]);
+        assert_eq!(dlq_depth(&ctx, &topic).await, 2);
+        let err = dlq_retry_v1(&ctx, inst.as_str(), topic.clone(), 0, 1)
+            .await
+            .expect_err("a retried record is not retried again");
+        assert!(err.message.contains("bus.dlq_record_handled"), "{}", err.message);
+        assert_eq!(source_high_watermark(&ctx, &topic).await, 4);
+
+        assert_eq!(retry_all(&ctx, &topic, 10).await, (2, 0));
+        assert_eq!(retry_all(&ctx, &topic, 10).await, (0, 0));
+        assert_eq!(dlq_depth(&ctx, &topic).await, 0);
+        assert!(dlq_list_offsets(&ctx, topic.clone()).await.is_empty());
+        assert_eq!(
+            source_high_watermark(&ctx, &topic).await,
+            6,
+            "each unprocessed message went back exactly once"
+        );
+    }
+
+    /// "Ponów wszystkie" reads past records already handled at the head of
+    /// the DLQ: a batch is not empty only because the oldest ones were
+    /// retried or discarded before.
+    #[tokio::test]
+    async fn dlq_retry_all_reaches_past_handled_records() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = topic_with_failed_records(&ctx, 7).await;
+        for offset in 0..5 {
+            dlq_discard_v1(&ctx, inst.as_str(), topic.clone(), 0, offset)
+                .await
+                .expect("discard");
+        }
+        assert_eq!(retry_all(&ctx, &topic, 2).await, (2, 0));
+        assert_eq!(dlq_depth(&ctx, &topic).await, 0);
+    }
+
+    /// A message rejected when it was written stays where it is: the
+    /// topic's validation would only send it back as a new record.
+    #[tokio::test]
+    async fn dlq_retry_all_leaves_records_rejected_at_write() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let topic = topic_with_rejected_records(&ctx, 3).await;
+        assert_eq!(retry_all(&ctx, &topic, 10).await, (0, 0));
+        assert_eq!(dlq_list_offsets(&ctx, topic.clone()).await, vec![0, 1, 2]);
+        assert_eq!(dlq_depth(&ctx, &topic).await, 3);
+    }
+
+    /// Without administration of the topic "Ponów wszystkie" is refused as
+    /// a whole instead of answering "0 retried, N failed".
+    #[tokio::test]
+    async fn dlq_retry_all_without_topic_administration_is_refused() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, user_id) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = topic_with_failed_records(&ctx, 2).await;
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            user_id,
+            "deny".to_string(),
+            "admin".to_string(),
+        )
+        .await
+        .expect("deny administration");
+        let err = dlq_retry_all_v1(&ctx, inst.as_str(), topic.clone(), 10)
+            .await
+            .expect_err("refused");
+        assert!(err.message.contains("bus.permission_denied"), "{}", err.message);
+        assert_eq!(source_high_watermark(&ctx, &topic).await, 2);
+    }
+
+    /// The newest page skips the handled records instead of coming back
+    /// short or empty when the newest messages were already retried.
+    #[tokio::test]
+    async fn dlq_list_newest_first_skips_the_newest_handled_records() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = topic_with_rejected_records(&ctx, 7).await;
+        for offset in [4, 5, 6] {
+            dlq_discard_v1(&ctx, inst.as_str(), topic.clone(), 0, offset)
+                .await
+                .expect("discard");
+        }
+        let page = |from: Vec<BusPartitionOffsetWire>| {
+            let ctx = &ctx;
+            let topic = topic.clone();
+            async move {
+                match dlq_list_v1(ctx, fixture_instance_id().as_str(), topic, None, from, 3, None, true)
+                    .await
+                    .expect("dlq list")
+                {
+                    BusPayload::DlqListResponse { result } => result,
+                    other => panic!("unexpected response: {other:?}"),
+                }
+            }
+        };
+        let first = page(vec![]).await;
+        assert_eq!(first.records.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![3, 2, 1]);
+        assert!(first.has_more);
+        let next = first
+            .partitions
+            .iter()
+            .map(|p| BusPartitionOffsetWire { partition: p.partition, offset: p.next_offset })
+            .collect();
+        let second = page(next).await;
+        assert_eq!(second.records.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![0]);
+        assert!(!second.has_more);
+    }
+
     /// `newest_first` pages a DLQ backwards: following each partition's
     /// `next_offset` visits every waiting record exactly once, newest first,
     /// and never returns a discarded one.
@@ -7307,15 +7924,9 @@ mod tests {
         .expect("acl deny");
         match stats_snapshot_v1(&reader, inst.as_str()).await.unwrap() {
             BusPayload::StatsSnapshotResponse { snapshot } => {
-                let row = snapshot.groups.iter().find(|g| g.group == group).unwrap();
-                assert_eq!(row.lag_total, None);
-                assert_eq!(
-                    row.lag_rising_since_ms, None,
-                    "trend leaked past the lag ACL"
-                );
-                assert_eq!(
-                    row.consume_rate_per_min, None,
-                    "rate leaked past the lag ACL"
+                assert!(
+                    snapshot.groups.iter().all(|g| g.group != group),
+                    "a group of an unreadable topic leaked, with its lag and trend"
                 );
             }
             other => panic!("unexpected response: {other:?}"),
@@ -7381,6 +7992,261 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    /// Two topics of one org, each with one consumer group row, and a
+    /// reader holding `bus.read` whom `hidden`'s ACL denies read. Rows are
+    /// written straight into `bus_groups` — `open_consumer` would depend on
+    /// whichever coordinator another test left on the shared instance.
+    async fn groups_with_a_reader_denied_one_topic(
+        db: &DbPool,
+    ) -> (HandlerContext, HandlerContext, String, String) {
+        let (admin, org_id, _) = admin_session(db);
+        let inst = fixture_instance_id();
+        let visible = format!("widoczny.{}", uuid::Uuid::new_v4().simple());
+        let hidden = format!("ukryty.{}", uuid::Uuid::new_v4().simple());
+        let svc = gate_read(&admin, inst.as_str()).expect("gate").svc.clone();
+        for (topic, group, paused) in [(&visible, "czytelnik", false), (&hidden, "tajny", true)] {
+            topic_create_v1(
+                &admin,
+                inst.as_str(),
+                topic.clone(),
+                BusTopicOptionsWire {
+                    partitions: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("topic create");
+            repository::bus_group_upsert(
+                svc.local_db(),
+                &repository::DbBusGroup {
+                    org_id: org_id.clone(),
+                    group_id: group.to_string(),
+                    topic: topic.clone(),
+                    commit_mode: groups::CommitMode::Explicit.as_str().to_string(),
+                    paused,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            )
+            .expect("group row");
+        }
+        let reader_id = format!("u-reader-{}", uuid::Uuid::new_v4());
+        seed_bus_permissions(db, &reader_id, &["bus.read"]);
+        let reader = handler_ctx(db.clone(), org_context(&org_id, &reader_id, &[]));
+        acl_set_v1(
+            &admin,
+            inst.as_str(),
+            hidden.clone(),
+            "user".to_string(),
+            reader_id,
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("acl deny");
+        (admin, reader, visible, hidden)
+    }
+
+    async fn listed_groups(ctx: &HandlerContext) -> Vec<BusGroupSummaryWire> {
+        match group_list_v1(ctx, fixture_instance_id().as_str())
+            .await
+            .expect("group list")
+        {
+            BusPayload::GroupListResponse { groups } => groups,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A consumer group describes who reads a topic: someone who may not
+    /// read the topic must not learn its groups from any list, count or
+    /// detail lookup — and `can_admin` follows the topic page's rule.
+    #[tokio::test]
+    async fn groups_of_an_unreadable_topic_are_invisible_to_the_reader() {
+        let (_guard, db) = bus_fixture();
+        let (admin, reader, visible, hidden) = groups_with_a_reader_denied_one_topic(&db).await;
+        let inst = fixture_instance_id();
+
+        let admin_groups = listed_groups(&admin).await;
+        assert_eq!(admin_groups.len(), 2, "{admin_groups:?}");
+        assert!(
+            admin_groups.iter().all(|g| g.can_admin),
+            "an org admin with bus.admin may manage every group: {admin_groups:?}"
+        );
+
+        let reader_groups = listed_groups(&reader).await;
+        assert_eq!(
+            reader_groups
+                .iter()
+                .map(|g| (g.group.as_str(), g.topic.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("czytelnik", visible.as_str())]
+        );
+        assert!(!reader_groups[0].can_admin, "a reader manages nothing");
+
+        match stats_snapshot_v1(&reader, inst.as_str())
+            .await
+            .expect("stats snapshot")
+        {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
+                assert_eq!(
+                    snapshot
+                        .groups
+                        .iter()
+                        .map(|g| g.group.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["czytelnik"]
+                );
+                assert_eq!(snapshot.group_count, 1);
+                assert_eq!(snapshot.paused_group_count, 0, "the paused group is hidden");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let hidden_err = group_detail_v1(&reader, inst.as_str(), "tajny".to_string(), hidden)
+            .await
+            .expect_err("an unreadable topic's group is not found");
+        let missing_err = group_detail_v1(
+            &reader,
+            inst.as_str(),
+            "nie-ma-takiej".to_string(),
+            visible.clone(),
+        )
+        .await
+        .expect_err("a missing group is not found");
+        assert_eq!(hidden_err.code, missing_err.code);
+        assert!(
+            hidden_err.message.starts_with("bus.group_not_found"),
+            "{}",
+            hidden_err.message
+        );
+        assert!(
+            missing_err.message.starts_with("bus.group_not_found"),
+            "{}",
+            missing_err.message
+        );
+        group_detail_v1(&reader, inst.as_str(), "czytelnik".to_string(), visible)
+            .await
+            .expect("the readable topic's group stays visible");
+    }
+
+    /// Pausing or resuming a group needs the same double lock as moving its
+    /// offset: `bus.admin` in the matrix AND the org Admin role. A user who
+    /// holds every bus permission but not the org role is refused at the
+    /// gate, before the service is reached.
+    #[tokio::test]
+    async fn pause_and_resume_require_the_org_admin_role() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-pause-{}", uuid::Uuid::new_v4());
+        let org_id = seed_bus_permissions(&db, &user_id, &["bus.read", "bus.write", "bus.admin"]);
+        let org_admin = handler_ctx(db.clone(), org_context(&org_id, &user_id, &["org.admin"]));
+        let operator = handler_ctx(db.clone(), org_context(&org_id, &user_id, &[]));
+        let inst = fixture_instance_id();
+        let topic = format!("pauza.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &org_admin,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        let svc = gate_read(&org_admin, inst.as_str())
+            .expect("gate")
+            .svc
+            .clone();
+        repository::bus_group_upsert(
+            svc.local_db(),
+            &repository::DbBusGroup {
+                org_id: org_id.clone(),
+                group_id: "operatorzy".to_string(),
+                topic: topic.clone(),
+                commit_mode: groups::CommitMode::Explicit.as_str().to_string(),
+                paused: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .expect("group row");
+
+        let pause = group_pause_v1(
+            &operator,
+            inst.as_str(),
+            "operatorzy".to_string(),
+            topic.clone(),
+        )
+        .await
+        .expect_err("pause without the org Admin role");
+        let resume = group_resume_v1(
+            &operator,
+            inst.as_str(),
+            "operatorzy".to_string(),
+            topic.clone(),
+        )
+        .await
+        .expect_err("resume without the org Admin role");
+        for err in [pause, resume] {
+            assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
+        }
+        assert!(
+            !repository::bus_group_get(svc.local_db(), &org_id, "operatorzy", &topic)
+                .expect("group row")
+                .expect("group row")
+                .paused
+        );
+
+        // The org admin passes the gate. Whether the pause then lands
+        // depends on the coordinator another test may have installed on
+        // the shared instance, so only "not refused by the gate" is checked.
+        if let Err(err) =
+            group_pause_v1(&org_admin, inst.as_str(), "operatorzy".to_string(), topic).await
+        {
+            assert_ne!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
+        }
+    }
+
+    /// The preview names the offset a "from a chosen time" reset would move
+    /// to and moves nothing; a caller who may not read the topic is refused.
+    #[tokio::test]
+    async fn offset_for_timestamp_previews_the_reset_target_for_a_reader_only() {
+        let (_guard, db) = bus_fixture();
+        let (admin, reader, visible, hidden) = groups_with_a_reader_denied_one_topic(&db).await;
+        let inst = fixture_instance_id();
+        let base = bus::now_ms() - 60_000;
+        publish_records(
+            &admin,
+            &visible,
+            vec![
+                ("a".to_string(), base),
+                ("b".to_string(), base + 10_000),
+                ("c".to_string(), base + 20_000),
+            ],
+        )
+        .await;
+
+        for (ts_ms, expected) in [(base - 1, 0), (base + 30_000, 3)] {
+            match offset_for_timestamp_v1(&reader, inst.as_str(), visible.clone(), 0, ts_ms)
+                .await
+                .expect("preview")
+            {
+                BusPayload::OffsetForTimestampResponse { offset } => {
+                    assert_eq!(offset, expected, "ts_ms={ts_ms}")
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        let err = offset_for_timestamp_v1(&reader, inst.as_str(), hidden, 0, base)
+            .await
+            .expect_err("no preview of an unreadable topic");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied, "{}", err.message);
+        let err = offset_for_timestamp_v1(&reader, inst.as_str(), visible, 7, base)
+            .await
+            .expect_err("partition out of range");
+        assert!(err.message.contains("out of range"), "{}", err.message);
     }
 
     /// PLAN-UI review 5: no whole-instance history, and at most
@@ -7492,7 +8358,8 @@ mod tests {
             "node-e",
         );
 
-        let events = failover_events_from_audit(&db, inst_a, &org_id, Some(&topic)).unwrap();
+        let all = |_: &str| true;
+        let events = failover_events_from_audit(&db, inst_a, &org_id, &all).unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
         let event = &events[0];
         assert_eq!(event.to_node, "node-b");
@@ -7503,7 +8370,7 @@ mod tests {
         assert_eq!(event.reason, LEADER_TRANSFER_REASON);
         assert_eq!(event.actor_label.as_deref(), Some("Piotr Admin"));
 
-        let events_b = failover_events_from_audit(&db, inst_b, &org_id, Some(&topic)).unwrap();
+        let events_b = failover_events_from_audit(&db, inst_b, &org_id, &all).unwrap();
         let mut to_nodes: Vec<&str> = events_b.iter().map(|e| e.to_node.as_str()).collect();
         to_nodes.sort();
         assert_eq!(to_nodes, vec!["node-c", "node-d"]);
@@ -7556,6 +8423,159 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    /// Leadership of a topic's partitions is administration of that topic: a
+    /// topic ACL that denies its administration refuses the transfer before
+    /// anything reaches the replication layer, and one that allows it gets
+    /// that far.
+    #[tokio::test]
+    async fn leader_transfer_needs_administration_of_the_topic() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, admin_id) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("wyniki.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+
+        let allowed = leader_transfer_v1(&ctx, inst.as_str(), topic.clone(), 0, "node-b".to_string())
+            .await
+            .expect_err("no replication in this fixture");
+        assert!(
+            !allowed.message.contains("bus.permission_denied"),
+            "an allowed administrator must get past the topic check: {}",
+            allowed.message
+        );
+
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            admin_id,
+            "deny".to_string(),
+            "admin".to_string(),
+        )
+        .await
+        .expect("acl set");
+        let denied = leader_transfer_v1(&ctx, inst.as_str(), topic, 0, "node-b".to_string())
+            .await
+            .expect_err("denied administration");
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+        assert!(denied.message.contains("bus.permission_denied"), "{}", denied.message);
+    }
+
+    /// Choosing which nodes hold a topic's copies is administration of that
+    /// topic too: denied there, the reassignment never reaches the
+    /// replication layer; allowed, it gets that far.
+    #[tokio::test]
+    async fn replica_reassign_needs_administration_of_the_topic() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, admin_id) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("wizyty.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+
+        // Without a coordinator the call then stops at "replication
+        // disabled"; with the one another test in this binary installs
+        // (a one-way door) it succeeds. Either way it passed the topic check.
+        if let Err(allowed) =
+            replica_reassign_v1(&ctx, inst.as_str(), topic.clone(), None, vec!["node-b".to_string()]).await
+        {
+            assert!(
+                !allowed.message.contains("bus.permission_denied"),
+                "an allowed administrator must get past the topic check: {}",
+                allowed.message
+            );
+        }
+
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            admin_id,
+            "deny".to_string(),
+            "admin".to_string(),
+        )
+        .await
+        .expect("acl set");
+        let denied = replica_reassign_v1(&ctx, inst.as_str(), topic, None, vec!["node-b".to_string()])
+            .await
+            .expect_err("denied administration");
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+        assert!(denied.message.contains("bus.permission_denied"), "{}", denied.message);
+    }
+
+    /// The RF=1 node-wide replica view answers a caller refused reading one
+    /// topic: that topic's offsets are left out, while the node still counts
+    /// its partitions among the ones it leads. Run from
+    /// `replica_dispatch_rf1_fallback_then_coordinator_path` before it
+    /// installs a coordinator, for the reason given there.
+    async fn rf1_replica_list_leaves_out_a_topic_the_caller_may_not_read(db: &DbPool) {
+        let (ctx, _org_id, admin_id) = admin_session(db);
+        let inst = fixture_instance_id();
+        let open = format!("wizyty.{}", uuid::Uuid::new_v4().simple());
+        let closed = format!("faktury.{}", uuid::Uuid::new_v4().simple());
+        for (name, partitions) in [(&open, 1u32), (&closed, 2u32)] {
+            topic_create_v1(
+                &ctx,
+                inst.as_str(),
+                name.clone(),
+                BusTopicOptionsWire {
+                    partitions: Some(partitions),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("topic create");
+        }
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            closed.clone(),
+            "user".to_string(),
+            admin_id,
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("acl set");
+
+        let BusPayload::ReplicaListResponse { nodes, partitions, .. } =
+            replica_list_v1(&ctx, inst.as_str(), None)
+                .await
+                .expect("the node-wide view answers")
+        else {
+            panic!("expected ReplicaListResponse");
+        };
+        assert_eq!(partitions.len(), 1, "only the readable topic's partition");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].leader_count, 3);
+
+        let refused = replica_list_v1(&ctx, inst.as_str(), Some(closed))
+            .await
+            .expect_err("asking for the refused topic itself stays refused");
+        assert_eq!(refused.code, ProtocolErrorCode::PolicyDenied);
     }
 
     /// plan-app-platform §4.3's enforcement test (modelled on `ml_studio.

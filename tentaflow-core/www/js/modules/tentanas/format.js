@@ -18,6 +18,44 @@ export const T = (k, p) => I18n.t('tentanas.' + k, p);
 // badge said ok, and `elevation.short_unset` rendered as a raw key. One
 // spelling from here on — the i18n keys keep theirs.
 export const channelMode = (mode) => (!mode || mode === 'unset' ? 'unarmed' : mode);
+
+// The channel a node REALLY has right now, from its mode and — for mode B —
+// until when its password is held (`NasNodeInfo::armed_until`,
+// `NasElevation::armed_until`). The mode alone called every mode-B node a
+// working channel, so a node whose password had expired read green and its
+// "Uzbrój…" was never offered (n16: "tryb B — nieuzbrojony"). A missing or
+// past instant is "not armed"; an older node that does not send the field
+// therefore reads as not armed, which asks for a password rather than
+// promising one is held. Answers 'helper' | 'interactive' |
+// 'interactive_unarmed' | 'unarmed'.
+// `armedUntil` is the node's instant (RFC 3339) or an expiry already on this
+// browser's clock in ms (`armedExpiryMs`).
+export function liveChannelMode(mode, armedUntil, now = Date.now()) {
+  const m = channelMode(mode);
+  if (m !== 'interactive') return m;
+  const until = typeof armedUntil === 'number' ? armedUntil : Date.parse(String(armedUntil || ''));
+  return Number.isFinite(until) && until > now ? 'interactive' : 'interactive_unarmed';
+}
+
+// When a mode-B password expires, on THIS browser's clock (critic wave 7,
+// MINOR 11): the moment the answer arrived (`receivedAt`, stamped where it is
+// read) plus the seconds the node said were left by its own clock
+// (`armedSecsLeft`). Comparing the node's instant with the browser's clock
+// read a node near expiry wrongly by however far the two clocks disagree.
+// An older node sends no seconds: its instant is all there is. NaN when
+// neither says anything.
+export function armedExpiryMs(src) {
+  const left = src?.armedSecsLeft;
+  if (left !== null && left !== undefined && Number.isFinite(Number(left)) && Number.isFinite(src?.receivedAt)) {
+    return src.receivedAt + Number(left) * 1000;
+  }
+  return Date.parse(String(src?.armedUntil || ''));
+}
+
+export const nodeChannelMode = (n, now = Date.now()) => liveChannelMode(n?.elevationMode, armedExpiryMs(n), now);
+// Both "no channel" and "mode B with no password held" leave the node unable
+// to run a privileged step without someone typing a password.
+export const channelIsUnarmed = (m) => m === 'unarmed' || m === 'interactive_unarmed';
 export const sprite = (id) => `<svg class="icon"><use href="#i-${id}"/></svg>`;
 
 // ----- Names, never identifiers ---------------------------------------------
@@ -653,6 +691,15 @@ const ALERT_WORDS = new Map([
     const t = textParams(p, ['array']);
     return t ? { title: T('alerts.code.elastic_restore_waiting.title', t), detail: T('alerts.code.elastic_restore_waiting.detail') } : null;
   }],
+  // Raised by tentanas/disks.rs when the boot window closes on a pool that
+  // is still not imported (owner decision 2026-09-26).
+  ['pool_not_imported', (p) => {
+    const t = textParams(p, ['pool']);
+    const n = numParams(p, ['disks', 'minutes']);
+    return t && n
+      ? { title: T('alerts.code.pool_not_imported.title', t), detail: T('alerts.code.pool_not_imported.detail', { n: n.disks, minutes: n.minutes }) }
+      : null;
+  }],
   // Raised by tentanas/targets.rs.
   ['target_portal_moved', (p) => {
     const t = textParams(p, ['target']);
@@ -660,7 +707,31 @@ const ALERT_WORDS = new Map([
   }],
   ['target_not_applied', targetFailure('target_not_applied')],
   ['target_still_in_kernel', targetFailure('target_still_in_kernel')],
+  // Wave 12: an allowlist refused because an excluded client cannot be reset.
+  ['target_session_not_reset', (p) => {
+    const t = textParams(p, ['target']);
+    return t ? { title: T('alerts.code.target_session_not_reset.title', t), detail: T('alerts.code.target_session_not_reset.detail') } : null;
+  }],
+  // Helper 0.17.1: an open target's rebuild stopped short and could not even disable it.
+  ['target_rebuild_not_disabled', (p) => {
+    const t = textParams(p, ['target']);
+    return t ? { title: T('alerts.code.target_rebuild_not_disabled.title', t), detail: T('alerts.code.target_rebuild_not_disabled.detail') } : null;
+  }],
   ['elevation_unarmed', () => ({ title: T('alerts.code.elevation_unarmed.title'), detail: T('alerts.code.elevation_unarmed.detail') })],
+  // Raised by tentanas/sharing.rs (wave 10): the resume of a node's sharing.
+  ['sharing_resume_failed', (p) => {
+    const n = numParams(p, ['attempts']);
+    return n ? { title: T('alerts.code.sharing_resume_failed.title'), detail: T('alerts.code.sharing_resume_failed.detail', { n: n.attempts }) } : null;
+  }],
+  // A stop or resume a restart cut off (critic wave 10, MINOR 5): sharing
+  // stays stopped until TentaNas is enabled / the channel is armed.
+  ['sharing_stop_interrupted', (p) => (['stopping', 'resuming'].includes(p.phase)
+    ? { title: T('alerts.code.sharing_stop_interrupted.title'), detail: T('alerts.code.sharing_stop_interrupted.detail_' + p.phase) }
+    : null)],
+  ['sharing_share_not_resumed', (p) => {
+    const t = textParams(p, ['share']);
+    return t ? { title: T('alerts.code.sharing_share_not_resumed.title', t), detail: T('alerts.code.sharing_share_not_resumed.detail') } : null;
+  }],
   ['targets_sweep_failing', (p) => {
     const n = numParams(p, ['count', 'alerted']);
     if (!n || !['true', 'false'].includes(p.sweep_failed)) return null;
@@ -680,6 +751,24 @@ const ALERT_WORDS = new Map([
   // and migration 21 leave it: no count this process has measured.
   ['targets_sweep_stale', () => ({ title: T('alerts.code.targets_sweep_stale.title'), detail: T('alerts.code.targets_sweep_stale.detail') })],
 ]);
+
+// A job's log lines as a screen paints them. The node writes them with every
+// id named or hidden already (tentanas/log_ids.rs, owner decision
+// 2026-09-26); this is the backstop for rows an older node wrote, and for
+// any id a writer let through: every line goes through `scrubIds`.
+export function jobLogLines(lines, nameOf = () => '') {
+  const hidden = T('alerts.id_hidden');
+  return (Array.isArray(lines) ? lines : []).map((line) => scrubIds(wordIdTokens(line), hidden, nameOf, { guidDigits: true }));
+}
+
+// The node writes a hidden id as a language-neutral token (`⟦id⟧`,
+// tentanas/log_ids.rs `HIDDEN`); rows written before it carry the English
+// `[identifier]`, and a screen's own scrub the Polish `[identyfikator]`.
+// Each reads in the reader's language.
+const ID_TOKENS = /⟦id⟧|\[identifier\]|\[identyfikator\]/g;
+export function wordIdTokens(text) {
+  return String(text ?? '').replace(ID_TOKENS, () => T('alerts.id_hidden'));
+}
 
 // The node's own sentence for the tooltip: title, then detail — and the raw
 // text a composer kept off the line, when the node's detail does not already
@@ -777,17 +866,56 @@ export function transportChipHtml(transport) {
   return `<tf-chip size="sm" status="${transport === 'rdma' ? 'accent' : 'neutral'}" label="${escapeAttr(transportLabel(transport === 'rdma'))}"></tf-chip>`;
 }
 
+// A node sentence that also travels as codes (wave 6, `tentanas::CodedText`
+// on the node: an Elastic Array's or a target's state detail, a parked
+// request's detail, a kernel-support reason). `reasons` is the wire's
+// `[{ code, params }]`; `words` maps a code to `(params) => sentence`, which
+// may answer null for parameters that do not read. The parts are joined the
+// way the node joins its sentence (" · ").
+//
+// '' when there are no reasons, or when any of them has no words in this
+// build: the caller then shows the node's own sentence as it came — truthful,
+// if not translated — rather than half a translation.
+export function wordReasons(reasons, words) {
+  const list = Array.isArray(reasons) ? reasons : [];
+  if (!list.length) return '';
+  const parts = list.map((r) => {
+    const fn = words.get(String(r?.code || ''));
+    return fn ? fn(r?.params || {}) : null;
+  });
+  return parts.every((p) => typeof p === 'string' && p) ? parts.join(' · ') : '';
+}
+
+// The node's own sentence, for a tooltip only: it is one language, and it
+// may name what a screen must not show (a by-id path, a WWN, a node id), so
+// every such id is replaced by the neutral word first.
+export function nodeTextTitle(text) {
+  return scrubIds(String(text || '').trim(), T('alerts.id_hidden'));
+}
+
 // A refusal the node sends as a CODE rather than a sentence (M1):
 // `refusal:<code>` as the whole error message (`SHARE_USER_IN_USE_ELSEWHERE`
 // in tentanas/db.rs, `ApprovalError` in tentanas/approvals.rs). Worded here
 // from `refusal.<code>`; a code this build has no words for is shown as the
 // node sent it — truthful, if not pretty — rather than dropped.
 //
+// Wave 13 (`tentanas/refusal.rs`) lets the code carry PARAMETERS and the
+// node's own English sentence:
+//
+//     refusal:<code>[?<key>=<value>[&…]][ <sentence>]
+//
+// The values are percent-encoded, so the code-and-parameters token ends at
+// the first space; the sentence is only ever a tooltip or a detail
+// (`errDetail`), ids scrubbed. A disk comes as ONE of `disk` (kernel name),
+// `data` / `parity` (its 1-based number in the array), `cache` or `model`,
+// and the words always see it as one `{disk}` phrase (`refusalDiskWords`).
+// Parameters never carry an id, and each value is scrubbed anyway.
+//
 // What a screen catches is not the node's message alone: `binary-ws-client.js`
 // rejects every error reply as `protocol error <Code>: <message>` (the same
 // wrapping `describeError` in agent-accounts.js strips), so the code is looked
 // for after that prefix.
-const REFUSAL = /^refusal:([a-z0-9_]+)$/;
+const REFUSAL = /^refusal:([a-z0-9_]+)(?:\?(\S*))?(?: ([\s\S]*))?$/;
 const WIRE_ERROR_PREFIX = /^protocol error ([A-Za-z]+):\s*/;
 
 // The wire enum of a failed call (`ProtocolErrorCode`: 'NotFound',
@@ -799,69 +927,111 @@ export function errCode(e) {
   return WIRE_ERROR_PREFIX.exec(String(e?.message ?? e ?? '').trim())?.[1] || '';
 }
 
-export function errMessage(e) {
-  const message = (e && e.message) ? e.message : String(e);
-  const code = REFUSAL.exec(message.trim().replace(WIRE_ERROR_PREFIX, ''))?.[1];
-  if (!code) return message;
-  const key = 'refusal.' + code;
-  const words = T(key);
-  return words === 'tentanas.' + key ? message : words;
+// A long hex run is a node id (64 hex), a GUID written without dashes or a
+// digest — never words a reader needs, and the owner's rule keeps every id off
+// the screen, a toast included.
+const HEX_ID = /[0-9a-f]{32,}/gi;
+
+function scrubText(text, nameOf = () => '') {
+  const hidden = T('alerts.id_hidden');
+  return scrubIds(wordIdTokens(String(text || '')), hidden, nameOf).replace(HEX_ID, (id) => String(nameOf(id) || '').trim() || hidden);
 }
 
-// ----- Per-disk batches (SMART "all disks" / SMART "selected") -------------
-//
-// Both batches send the same request once per disk with one sudo password
-// for the whole run. Two very different things can make one of those
-// requests fail, and they need OPPOSITE handling:
-//   - a refusal specific to THIS disk (busy, a test already runs, the disk
-//     rejects the command) — record it, try the next disk.
-//   - a privilege/credential failure (a rejected or expired sudo password,
-//     an unarmed privilege channel, a helper/core version mismatch) — this
-//     will fail identically for every remaining disk, so retrying it per
-//     disk only replays the same password (or the same unarmed channel)
-//     against sudo once per disk. On a distro with `pam_faillock` that can
-//     lock the account the core runs as.
-//
-// The server tells the two apart with one stable code: `broker_error` in
-// dispatch/tentanas.rs maps `BrokerError::Unarmed` (rejected/expired
-// password, unarmed channel), `BrokerError::HelperVersion` (helper/core
-// version mismatch, `HELPER_VERSION_MARKER`) and `BrokerError::ToolMissing`
-// all to `ProtocolErrorCode::NotAvailable` — never left to a guess from the
-// (partly Polish, partly English) error text. `api-binary-shim.js` copies
-// that code onto the thrown `Error` as `.code`.
-const BATCH_HALT_CODE = 'NotAvailable';
-
-/** True for the one error shape that must stop a whole per-disk batch. */
-export function isBatchHaltError(e) {
-  return Boolean(e) && e.code === BATCH_HALT_CODE;
-}
-
-/**
- * Runs `request(disk)` once per disk in `disks`, in order, with one shared
- * sudo password closed over by the caller. A per-disk refusal is recorded in
- * `refused` and the loop continues; a privilege/credential error
- * (`isBatchHaltError`) is rethrown immediately, so the caller's `withSudo`
- * stops the batch and surfaces that one error instead of every disk's copy
- * of it.
- */
-export async function runDiskBatch(disks, request) {
-  const started = [];
-  const refused = [];
-  for (const disk of disks) {
+/** The coded refusal an error carries — `{ code, params, text }` — or null. */
+export function parseRefusal(e) {
+  const message = (e && e.message) ? e.message : String(e ?? '');
+  const m = REFUSAL.exec(message.trim().replace(WIRE_ERROR_PREFIX, ''));
+  if (!m) return null;
+  const params = {};
+  for (const pair of String(m[2] || '').split('&')) {
+    if (!pair) continue;
+    const at = pair.indexOf('=');
+    const key = at < 0 ? pair : pair.slice(0, at);
+    let value = at < 0 ? '' : pair.slice(at + 1);
     try {
-      await request(disk);
-      started.push(disk);
-    } catch (e) {
-      if (isBatchHaltError(e)) throw e;
-      refused.push({ disk, error: e });
+      value = decodeURIComponent(value);
+    } catch {
+      // A value that does not decode is not read at all: the words that need
+      // it fall back to the node's sentence.
+      continue;
     }
+    if (/^[a-z0-9_]+$/.test(key) && value !== '') params[key] = scrubText(value);
   }
-  return { started, refused };
+  return { code: m[1], params, text: String(m[3] || '').trim() };
 }
 
-/** The disks a batch refused, named — never a disk id — for one toast. */
-export function refusedBatchNames(refused) {
-  return refused.map((r) => `${r.disk.name}: ${errMessage(r.error)}`).join(' · ');
+/** One disk of a refusal as ONE phrase the words embed after their own
+ *  noun ("Dysk {disk} …"): the kernel name, else its place in the array,
+ *  else its model; '' when the refusal names none. */
+export function refusalDiskWords(p) {
+  if (p.disk) return p.disk;
+  if (/^\d+$/.test(p.data || '')) return T('refusal_disk.data', { n: Number(p.data) });
+  if (/^\d+$/.test(p.parity || '')) return T('refusal_disk.parity', { n: Number(p.parity) });
+  if (p.cache) return T('refusal_disk.cache');
+  if (p.model) return T('refusal_disk.model', { model: p.model });
+  return '';
+}
+
+const OWNER_KINDS = new Set(['elastic', 'spare', 'pool', 'md', 'system', 'mounted', 'used', 'remote']);
+
+/** What holds a disk (`elastic::conflicting_owner_code`): 'pool' + 'tank'
+ *  → "należy do puli ZFS tank". '' for a kind this build does not know. */
+export function diskOwnerWords(owner, name = '') {
+  if (!OWNER_KINDS.has(owner)) return '';
+  const named = String(name || '');
+  return named && owner !== 'elastic' && owner !== 'system' && owner !== 'used' && owner !== 'remote'
+    ? T('wizard_pool.elastic_owner.' + owner + '_named', { name: named })
+    : T('wizard_pool.elastic_owner.' + owner);
+}
+
+// Parameters a refusal's words need in a form the wire does not carry.
+const REFUSAL_PARAMS = new Map([
+  ['elastic_disk_in_use', (p) => ({ owner: diskOwnerWords(p.owner, p.owner_name) })],
+  ['elastic_import_incomplete', (p) => ({ reused: p.reused || '—' })],
+]);
+
+const PLACEHOLDER = /\{([a-zA-Z0-9_]+)(?:\|[^}]*)?\}/g;
+
+/** The words of a coded refusal in the reader's language, or '' when this
+ *  build has none for its code or a placeholder they need has no value. */
+export function refusalWords(refusal) {
+  if (!refusal) return '';
+  const key = 'refusal.' + refusal.code;
+  const template = T(key);
+  if (template === 'tentanas.' + key) return '';
+  const vars = { ...refusal.params, ...(REFUSAL_PARAMS.get(refusal.code)?.(refusal.params) || {}) };
+  const disk = refusalDiskWords(refusal.params);
+  if (disk) vars.disk = disk;
+  for (const [, name] of template.matchAll(PLACEHOLDER)) {
+    if (vars[name] === undefined || vars[name] === '') return '';
+  }
+  return T(key, vars);
+}
+
+// `nameOf` (node id -> name, `nodeNameOf`) lets an id the fleet knows read as
+// that node's name instead of the neutral placeholder.
+export function errMessage(e, nameOf = () => '') {
+  // "The addressed node did not answer" (dispatch/app_route.rs) is worded
+  // here, whatever the forwarder wrote: its sentence names the node by its
+  // 64-hex id, and a toast, a banner or a tab body would print it as is.
+  if (errCode(e) === 'NodeUnreachable') return T('unreachable.error');
+  const message = (e && e.message) ? e.message : String(e);
+  const refusal = parseRefusal(message);
+  if (!refusal) return scrubText(message, nameOf);
+  const words = refusalWords(refusal);
+  if (words) return words;
+  // No words in this build: the node's own sentence, ids scrubbed — or, with
+  // no sentence either, the message as it came.
+  return scrubText(refusal.text || message, nameOf);
+}
+
+/** The node's own sentence behind a worded refusal, ids scrubbed — for a
+ *  tooltip or a detail line only. '' when there is none, or when the
+ *  sentence is already what `errMessage` shows. */
+export function errDetail(e, nameOf = () => '') {
+  const refusal = parseRefusal(e);
+  if (!refusal?.text || !refusalWords(refusal)) return '';
+  return scrubText(refusal.text, nameOf);
 }
 
 export function jobTone(status) {
@@ -871,7 +1041,13 @@ export function jobTone(status) {
 // Job kinds are snake_case on the wire ("pool_scrub") and map 1:1 onto
 // `jobs.kind_*` keys. A kind without a label shows its wire name so a new
 // backend job is still readable in the list.
-export function jobKindLabel(kind) {
+export function jobKindLabel(kind, subject = '') {
+  // A multi-disk SMART job carries its test kind in its subject
+  // (`<short|long>|…`, `db::smart_batch_subject`): n15 reads "SMART short".
+  if (kind === 'smart_test_batch') {
+    const test = String(subject || '').split('|')[0];
+    return T(test === 'long' ? 'jobs.kind_smart_batch_long' : 'jobs.kind_smart_batch_short');
+  }
   const key = 'jobs.kind_' + String(kind || '');
   const label = T(key);
   return label === 'tentanas.' + key ? String(kind || '—') : label;
@@ -920,4 +1096,21 @@ export function leafDisplayName(d, inv, position = 0) {
   const remembered = String(d.lastKnownName || '').trim();
   if (remembered && !isDiskIdShape(remembered)) return T('pool.leaf_last_known', { name: remembered });
   return position ? T('pool.leaf_missing_at', { n: position }) : T('elastic.disk_absent');
+}
+
+/** The same leaf for a sentence that already says "disk" before the name
+ *  ("Wymień dysk {device}", "Nie wyciągaj dysku {device}"): "brak dysku
+ *  (ostatnio sdk)" read "Wymień dysk brak dysku (ostatnio sdk)" there
+ *  (critic wave 5, MINOR 9), so a leaf with no current name is named
+ *  noun-free by its position — "nr 2 (ostatnio sdk)", "nr 2". A leaf with a
+ *  name, or with no position to give, reads as `leafDisplayName` does. */
+export function leafEmbeddedName(d, inv, position = 0) {
+  const shown = leafDisplayName(d, inv, position);
+  if (!isDiskIdShape(d?.name) || !position) return shown;
+  const kernelName = inv && inv.name && !isDiskIdShape(inv.name) ? inv.name : null;
+  if (kernelName) return shown;
+  const remembered = String(d.lastKnownName || '').trim();
+  return remembered && !isDiskIdShape(remembered)
+    ? T('pool.leaf_embedded_last_known', { n: position, name: remembered })
+    : T('pool.leaf_embedded_at', { n: position });
 }

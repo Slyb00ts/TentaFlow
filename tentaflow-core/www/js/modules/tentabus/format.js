@@ -66,6 +66,75 @@ export function fmtSince(sinceMs, nowMs) {
   return T('fmt.hours_minutes', { hours: fmtCount(hours), minutes: fmtCount(rest) });
 }
 
+/**
+ * How long a topic keeps its messages: whole days as "30 dni", anything
+ * shorter or uneven in hours. `—` for no value.
+ */
+export function fmtRetention(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return '—';
+  const day = 86_400_000;
+  if (value % day === 0) {
+    const days = value / day;
+    return T('fmt.days', { count: fmtCount(days), n: days });
+  }
+  const hours = Math.max(1, Math.round(value / 3_600_000));
+  return T('fmt.hours', { count: fmtCount(hours), n: hours });
+}
+
+/**
+ * A short span of time as a setting states it: "500 ms", "2 s", "1 min",
+ * "1 godz.". Uneven values fall back to the unit below (90 s stays "90 s").
+ */
+export function fmtDuration(ms) {
+  const value = Math.max(0, Math.round(Number(ms) || 0));
+  if (value < 1000) return T('fmt.millis', { count: fmtCount(value) });
+  if (value % 3_600_000 === 0) return T('fmt.hours', { count: fmtCount(value / 3_600_000), n: value / 3_600_000 });
+  if (value % 60_000 === 0) return T('fmt.minutes', { count: fmtCount(value / 60_000), n: value / 60_000 });
+  const secs = Math.round(value / 1000);
+  return T('fmt.seconds', { count: fmtCount(secs), n: secs });
+}
+
+/** A calendar date in the reader's locale: "24.08.2026". `—` for no value. */
+export function fmtDate(ms) {
+  const at = new Date(Number(ms));
+  if (ms == null || !Number.isFinite(at.getTime())) return '—';
+  return new Intl.DateTimeFormat(I18n.getLanguage(), { day: '2-digit', month: '2-digit', year: 'numeric' }).format(at);
+}
+
+/**
+ * When a message was written, the way the preview says it: "dziś 14:09:59",
+ * "wczoraj 22:03:11", otherwise the date and the time.
+ */
+export function fmtWhen(ms, nowMs = Date.now()) {
+  const at = new Date(Number(ms));
+  if (!Number.isFinite(at.getTime())) return '—';
+  const lang = I18n.getLanguage();
+  const time = new Intl.DateTimeFormat(lang, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(at);
+  const startOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((startOf(new Date(nowMs)) - startOf(at)) / 86_400_000);
+  if (days === 0) return T('fmt.today', { time });
+  if (days === 1) return T('fmt.yesterday', { time });
+  const date = new Intl.DateTimeFormat(lang, { day: '2-digit', month: '2-digit', year: 'numeric' }).format(at);
+  return `${date} ${time}`;
+}
+
+/**
+ * When something last changed, as a list cell says it: "dziś 13:55",
+ * "wczoraj 09:12", otherwise the date alone. `—` for no value.
+ */
+export function fmtDayTime(ms, nowMs = Date.now()) {
+  const at = new Date(Number(ms));
+  if (ms == null || !Number.isFinite(at.getTime())) return '—';
+  const lang = I18n.getLanguage();
+  const startOf = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((startOf(new Date(nowMs)) - startOf(at)) / 86_400_000);
+  const time = new Intl.DateTimeFormat(lang, { hour: '2-digit', minute: '2-digit', hour12: false }).format(at);
+  if (days === 0) return T('fmt.today', { time });
+  if (days === 1) return T('fmt.yesterday', { time });
+  return fmtDate(ms);
+}
+
 /** Seconds a replica trails its leader, rounded UP: "do 4 s" is a bound. */
 export function fmtLagSeconds(ms) {
   const secs = Math.max(1, Math.ceil(Number(ms) / 1000) || 0);
@@ -87,8 +156,13 @@ const CONTENT_TYPE_KEYS = {
  * the caller then leaves that part of the line out instead of guessing.
  */
 export function contentTypeLabel(contentType) {
-  const key = CONTENT_TYPE_KEYS[String(contentType || '').trim().toLowerCase()];
+  const key = contentKind(contentType);
   return key ? T(`fmt.content.${key}`) : '';
+}
+
+/** The payload kind of a content type (`json` / `xml` / `hl7v2` / `binary`), or '' when unknown. */
+export function contentKind(contentType) {
+  return CONTENT_TYPE_KEYS[String(contentType || '').trim().toLowerCase()] || '';
 }
 
 /**

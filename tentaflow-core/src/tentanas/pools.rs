@@ -100,6 +100,15 @@ pub struct StatusReport {
     pub data_errors: u64,
     /// Every physical leaf as the disks inventory binds it, in config order.
     pub leaves: Vec<LeafSeen>,
+    /// The `replacing-N` / `spare-N` container the rows being read sit in.
+    open_container: Option<String>,
+    /// The depth of that container's own row: a row at this depth or
+    /// shallower is no longer inside it. 2 inside a top-level vdev
+    /// (`raidz2-0` > `spare-1`), 1 for a `spare-N` that IS the top-level vdev
+    /// (a single-disk vdev whose disk a hot spare replaced).
+    container_depth: usize,
+    /// Leaves inside a `spare-N` container: (vdev index, leaf index, container).
+    spare_members: Vec<(usize, usize, String)>,
 }
 
 /// One physical leaf of `zpool status`, as the disks inventory needs it: the
@@ -269,6 +278,7 @@ pub fn parse_status(text: &str) -> StatusReport {
         }
         i += 1;
     }
+    mark_detachable(&mut report);
     report
 }
 
@@ -281,8 +291,19 @@ fn apply_config_row(report: &mut StatusReport, row: &ConfigRow<'_>, role: &mut S
         // row's state already came from the `state:` header.
         return;
     }
+    if row.depth <= report.container_depth {
+        report.open_container = None;
+        report.container_depth = 0;
+    }
     if row.depth == 1 {
         let kind = group_kind(row.name).unwrap_or("disk");
+        // A top-level `spare-N` (critic wave 7, R2-3 c): the vdev's only disk
+        // was replaced by a hot spare, and its two leaves sit one level
+        // higher than in a raidz or mirror — they are the group all the same.
+        if row.name.starts_with("spare-") {
+            report.open_container = Some(row.name.to_string());
+            report.container_depth = 1;
+        }
         if kind == "disk" {
             // A bare leaf at top level: a single-disk vdev of its own.
             report.leaves.push(leaf_seen(row, role.as_str(), "disk"));
@@ -309,12 +330,68 @@ fn apply_config_row(report: &mut StatusReport, row: &ConfigRow<'_>, role: &mut S
     // Deeper rows are leaves of the current top-level vdev; a `replacing-N`
     // or `spare-N` container in between contributes no leaf of its own.
     if group_kind(row.name).is_some() && row.depth == 2 {
+        report.open_container = Some(row.name.to_string());
+        report.container_depth = 2;
         return;
     }
+    let vdev_index = report.vdevs.len().wrapping_sub(1);
     if let Some(vdev) = report.vdevs.last_mut() {
         vdev.disks.push(leaf(row));
         vdev.fault_tolerance = fault_tolerance_of(&vdev.kind, vdev.disks.len());
         report.leaves.push(leaf_seen(row, &vdev.role, &vdev.kind));
+        if let Some(container) = report.open_container.as_ref().filter(|c| c.starts_with("spare-")) {
+            report.spare_members.push((vdev_index, vdev.disks.len() - 1, container.clone()));
+        }
+    }
+}
+
+/// Marks the leaves `zpool detach` may take out: the ORIGINAL disk of a
+/// `spare-N` group — a hot spare took its place and the pool kept both.
+///
+/// A leaf is detachable only when (a) it is not the hot spare itself (the
+/// spare is the member the `spares` section also lists), (b) the spare beside
+/// it is ONLINE, and (c) no resilver is running: detaching the old disk
+/// before the spare holds the data would take redundancy the pool still
+/// needs. (d) The resilver onto the spare did not end with errors and the
+/// pool reports no permanent data errors (critic wave 7, R2-3 a): the
+/// action's promise is that the data is already on the spare, and a resilver
+/// that could not rebuild every block does not keep it — the kernel's own
+/// check would still refuse a detach that drops the last copy, but the
+/// screen must not offer one it cannot honour. (e) The group holds no nested
+/// container (`replacing-N` inside `spare-N`, R2-3 b): the parser reads such
+/// a row as a leaf, and neither it nor its children are a disk the spare
+/// simply replaced. Anything else keeps `detachable` false, and the node
+/// refuses a detach of it whatever a screen sends (`PoolDetachRequest`).
+fn mark_detachable(report: &mut StatusReport) {
+    let spares: std::collections::BTreeSet<String> = report
+        .vdevs
+        .iter()
+        .filter(|v| v.role == "spare")
+        .flat_map(|v| v.disks.iter().map(|d| d.name.clone()))
+        .collect();
+    let resilvering = report.scan.kind == "resilver" && report.scan.status == "running";
+    let resilver_failed = report.scan.kind == "resilver" && report.scan.errors > 0;
+    let settled = !resilvering && !resilver_failed && report.data_errors == 0;
+    let members = std::mem::take(&mut report.spare_members);
+    for (vdev, _, container) in &members {
+        let group: Vec<usize> = members
+            .iter()
+            .filter(|(v, _, c)| v == vdev && c == container)
+            .map(|(_, leaf, _)| *leaf)
+            .collect();
+        let disks = &report.vdevs[*vdev].disks;
+        let spare_ready = group
+            .iter()
+            .any(|&i| spares.contains(&disks[i].name) && disks[i].state == "online");
+        let nested = group.iter().any(|&i| group_kind(&disks[i].name).is_some());
+        let marks: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|&i| !spares.contains(&disks[i].name))
+            .collect();
+        for i in marks {
+            report.vdevs[*vdev].disks[i].detachable = spare_ready && settled && !nested;
+        }
     }
 }
 
@@ -344,6 +421,7 @@ fn leaf(row: &ConfigRow<'_>) -> NasVdevDisk {
         size_bytes: 0,
         note: row.note.clone(),
         last_known_name: None,
+        detachable: false,
     }
 }
 
@@ -382,8 +460,29 @@ pub(crate) fn last_name_by_link(db: &DbPool, link: &str) -> Option<String> {
         let id = format!("wwn-{}", hex.trim_start_matches("0x"));
         return store::disk_last_name(db, &id).ok().flatten();
     }
-    let (_, serial) = link.rsplit_once('_')?;
-    store::disk_last_name_by_serial(db, serial).ok().flatten()
+    store::disk_last_name_by_serial(db, link_serial(link)?).ok().flatten()
+}
+
+/// The serial a `<bus>-<model>_<serial>` by-id link ends with.
+///
+/// An NVMe namespace link adds the namespace number after the serial
+/// (`nvme-<model>_<serial>_1`, critic wave 5, MINOR 12): a short trailing
+/// digit run there is the namespace, not the serial, and the serial is the
+/// token before it. A "serial" shorter than four characters names nothing a
+/// record can be trusted to match.
+fn link_serial(link: &str) -> Option<&str> {
+    let tokens: Vec<&str> = link.split('_').collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let last = tokens[tokens.len() - 1];
+    let namespace = link.starts_with("nvme-")
+        && tokens.len() >= 3
+        && !last.is_empty()
+        && last.len() <= 3
+        && last.bytes().all(|b| b.is_ascii_digit());
+    let serial = if namespace { tokens[tokens.len() - 2] } else { last };
+    (serial.len() >= 4).then_some(serial)
 }
 
 /// The kernel name a leaf zpool can no longer find was last seen under, for
@@ -766,10 +865,22 @@ pub fn recommended_layout(disks: usize) -> Option<&'static str> {
     }
 }
 
+/// The wizard's layout step for a picked set of disks (`plan`).
+pub struct LayoutPlan {
+    /// What each layout would give.
+    pub options: Vec<NasPoolLayoutOption>,
+    /// The warnings as codes (`plan_warning_codes`)…
+    pub warning_codes: Vec<NasHealthReason>,
+    /// …and the same warnings in English, for an older screen and the log.
+    pub warnings: Vec<String>,
+    pub smallest_disk_bytes: u64,
+}
+
 /// The wizard's layout step for a picked set of disks: what each layout would
 /// give, plus the warnings that make a selection a bad idea rather than an
-/// impossible one.
-pub fn plan(disks: &[NasDisk]) -> (Vec<NasPoolLayoutOption>, Vec<String>, u64) {
+/// impossible one — computed once, as codes, and spelled in English from
+/// those same codes (critic wave 5, MINOR 15).
+pub fn plan(disks: &[NasDisk]) -> LayoutPlan {
     let n = disks.len();
     let smallest = disks.iter().map(|d| d.size_bytes).min().unwrap_or(0);
     let recommended = recommended_layout(n);
@@ -803,8 +914,9 @@ pub fn plan(disks: &[NasDisk]) -> (Vec<NasPoolLayoutOption>, Vec<String>, u64) {
         })
         .collect();
 
-    let warnings = plan_warning_codes(disks).iter().map(plan_warning_sentence).collect();
-    (options, warnings, smallest)
+    let warning_codes = plan_warning_codes(disks);
+    let warnings = warning_codes.iter().map(plan_warning_sentence).collect();
+    LayoutPlan { options, warning_codes, warnings, smallest_disk_bytes: smallest }
 }
 
 /// The warnings of the layout step as CODES the wizard words in the reader's
@@ -911,6 +1023,70 @@ pub fn vdev_groups(
 
 // ----- live reads -----------------------------------------------------------------
 
+/// Serialises what puts a share or a target on a pool against a pool
+/// destroy: `share_create`, `target_create` and a configuration import hold
+/// it from their read of the pools to the rows they write, and a pool destroy
+/// holds it from its last check of other organisations' resources to the end
+/// of `zpool destroy` (critic wave 9a, MINOR 5). A tokio mutex: both sides
+/// hold it across awaits.
+///
+/// One per node database (`db`), which in production is one per node; tests
+/// with their own database never contend with each other.
+pub fn resources_lock(db: &DbPool) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    locks.entry(Arc::as_ptr(db) as usize).or_default().clone()
+}
+
+/// How long a creation waits for a running pool destroy before refusing.
+pub const RESOURCES_LOCK_WAIT: Duration = Duration::from_secs(3);
+
+/// The refusal of a creation that met `resources_lock` held for longer than
+/// `RESOURCES_LOCK_WAIT` (critic wave 9a, R2-MAJOR 1): usually a pool
+/// destroy, which may run for minutes on a failing pool, but the holder can
+/// also be another share or target creation or a configuration import — so
+/// the screen words it neutrally ("another change to this node's pools,
+/// shares or targets is in progress", wave 9a round-3 minor). A creation that
+/// waited longer would land after the screen gave up — a share the user was
+/// told had failed. The code keeps its historical name.
+pub const POOL_DESTROY_IN_PROGRESS: &str = "refusal:pool_destroy_in_progress";
+
+/// The creation side of `resources_lock`: waits at most
+/// `RESOURCES_LOCK_WAIT`, else `None` and the caller refuses with
+/// `POOL_DESTROY_IN_PROGRESS`. Never an unbounded wait.
+pub async fn try_resources_lock(db: &DbPool) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    tokio::time::timeout(RESOURCES_LOCK_WAIT, resources_lock(db).lock_owned()).await.ok()
+}
+
+/// Whether any of `shares` or `targets` lives on `pool`: a share on one of
+/// its datasets or under one of their mountpoints, a zvol LUN of the pool, a
+/// file LUN under one of its mountpoints. `mountpoints` are the mountpoints
+/// of the pool's datasets (`zfs list -r`); `/`, `none`, `legacy` and `-`
+/// mount nothing a path could be under. The same places the destroy
+/// dialog's dependents list reads (n17a, pool-detail.js
+/// `paintPoolDependents`), plus a share whose path IS a mountpoint.
+pub fn holds_resources(
+    pool: &str,
+    mountpoints: &[String],
+    shares: &[store::ShareRow],
+    targets: &[store::TargetRow],
+) -> bool {
+    let on_pool = |name: &str| name == pool || name.strip_prefix(pool).is_some_and(|rest| rest.starts_with('/'));
+    let mounts: Vec<&str> = mountpoints
+        .iter()
+        .map(|m| m.trim_end_matches('/'))
+        .filter(|m| m.starts_with('/') && !m.is_empty())
+        .collect();
+    let under_mount = |path: &str| {
+        mounts.iter().any(|m| path == *m || path.strip_prefix(m).is_some_and(|rest| rest.starts_with('/')))
+    };
+    shares.iter().any(|s| s.dataset.as_deref().is_some_and(on_pool) || under_mount(&s.source_path))
+        || targets.iter().any(|t| {
+            t.luns.iter().any(|l| if l.source_kind == "zvol" { on_pool(&l.source) } else { under_mount(&l.source) })
+        })
+}
+
 pub async fn list_rows() -> Result<Vec<PoolListRow>, BrokerError> {
     let text = zfs::zpool(&["list", "-Hp", "-o", LIST_COLUMNS]).await?;
     Ok(parse_list(&text))
@@ -943,6 +1119,47 @@ fn live_io() -> &'static parking_lot::RwLock<HashMap<String, NasPoolIo>> {
     static IO: std::sync::OnceLock<parking_lot::RwLock<HashMap<String, NasPoolIo>>> =
         std::sync::OnceLock::new();
     IO.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+}
+
+/// Device GUID → the name the node knows its leaf by (the kernel name it
+/// was last seen under), for every leaf `zpool status` could only name by
+/// its GUID. The GUID is what the screen sends back to replace, detach or
+/// offline such a leaf, so it is what those jobs' argv carries: the job log
+/// names it from here (`log_ids::LogNames::load`, owner's rule: no GUIDs).
+/// Kept for the process's life; a GUID nothing named maps to "".
+///
+/// With the name goes the by-id link the leaf was last seen under, when
+/// zpool's "was …" note gave one: it names the very disk (its serial or
+/// WWN), where a kernel name may have belonged to several disks over time
+/// (wave 11 round 2).
+fn leaf_guids() -> &'static parking_lot::RwLock<HashMap<String, (String, Option<String>)>> {
+    static GUIDS: std::sync::OnceLock<parking_lot::RwLock<HashMap<String, (String, Option<String>)>>> = std::sync::OnceLock::new();
+    GUIDS.get_or_init(|| parking_lot::RwLock::new(HashMap::new()))
+}
+
+pub(crate) fn remember_leaf_guid(guid: &str, name: Option<&str>, link: Option<&str>) {
+    let value = (name.unwrap_or_default().trim().to_string(), link.map(str::to_string));
+    let known = leaf_guids().read().get(guid) == Some(&value);
+    if !known {
+        leaf_guids().write().insert(guid.to_string(), value);
+    }
+}
+
+/// Every leaf GUID with a name: (GUID, remembered name, by-id link).
+pub fn named_leaf_guids() -> Vec<(String, String, Option<String>)> {
+    leaf_guids()
+        .read()
+        .iter()
+        .filter(|(_, (name, _))| !name.is_empty())
+        .map(|(guid, (name, link))| (guid.clone(), name.clone(), link.clone()))
+        .collect()
+}
+
+/// The by-id link in a leaf's "was /dev/disk/by-id/…" note, when it has one.
+fn leaf_link(leaf: &NasVdevDisk) -> Option<String> {
+    let path = leaf.note.strip_prefix("was ")?.trim();
+    let base = path.rsplit('/').next().unwrap_or(path);
+    is_by_id_link(base).then(|| whole_disk_link(base).to_string())
 }
 
 /// Kernel name → (disk id, size) of every disk the inventory knows, so a vdev
@@ -982,6 +1199,9 @@ fn assemble(
             // GUI). The "was …" note is consumed here: it carries the old
             // path, often a by-id link, and a screen prints `note` as it is.
             leaf.last_known_name = last_known_leaf_name(leaf, |link| last_name_by_link(db, link));
+            if is_device_guid(&leaf.name) {
+                remember_leaf_guid(&leaf.name, leaf.last_known_name.as_deref(), leaf_link(leaf).as_deref());
+            }
             if leaf.note.starts_with("was ") {
                 leaf.note.clear();
             }
@@ -1165,8 +1385,27 @@ pub async fn command_job(
 ) -> anyhow::Result<()> {
     super::jobs::run_step(&h, &command, explicit.as_deref(), MUTATION_TIMEOUT).await?;
     drop(explicit);
+    forget_removed_pool(h.db(), &command).await;
     h.progress(100);
     Ok(())
+}
+
+/// After a SUCCESSFUL `zpool destroy` or `zpool export` by TentaNas: the pool
+/// is meant to be absent, so the labels it leaves on its disks are not a
+/// missing pool (`store::forget_pool`, `disks::pool_import_alerts`). A failed
+/// write is logged: the worst it leaves is one alert the admin can read.
+///
+/// Under the disks' health gate (`disks::forget_known_pool`): an inventory
+/// pass that read `zpool list` before the destroy cannot record the pool
+/// again after this forgot it (critic wave 9a, R2-MINOR 4).
+pub async fn forget_removed_pool(db: &DbPool, command: &HelperCommand) {
+    let pool = match command {
+        HelperCommand::ZpoolDestroy { pool } | HelperCommand::ZpoolExport { pool, .. } => pool,
+        _ => return,
+    };
+    if let Err(e) = super::disks::forget_known_pool(db, pool).await {
+        tracing::warn!("tentanas: the removed pool {pool} stays in the known pools: {e}");
+    }
 }
 
 /// `zpool create`, with the encryption key on stdin when the wizard asked for
@@ -1179,6 +1418,11 @@ pub async fn create_job(
     key: Option<KeyForNewRoot>,
     explicit: Option<Arc<ElevationToken>>,
 ) -> anyhow::Result<()> {
+    // The new pool is in no record yet: its name is kept in this job's log
+    // as a name, whatever it looks like.
+    if let HelperCommand::ZpoolCreate { pool, .. } = &command {
+        h.name_pool(pool);
+    }
     match key {
         Some(key) => {
             super::jobs::run_step_with_key(
@@ -1567,6 +1811,131 @@ errors: No known data errors\n";
         assert_eq!(layout_summary(&s.vdevs), "mirror");
     }
 
+    /// A RAIDZ2 whose `sdb` was replaced by the hot spare `sdk`: the pool
+    /// keeps both in `spare-1` until `zpool detach` takes the old one out.
+    fn spare_in_use(scan: &str, spare_state: &str) -> String {
+        format!(
+            "  pool: tank\n state: DEGRADED\n  scan: {scan}\nconfig:\n\n\
+\tNAME            STATE     READ WRITE CKSUM\n\
+\ttank            DEGRADED     0     0     0\n\
+\t  raidz2-0      DEGRADED     0     0     0\n\
+\t    /dev/sda    ONLINE       0     0     0\n\
+\t    spare-1     DEGRADED     0     0     0\n\
+\t      /dev/sdb  FAULTED      9    40     0  too many errors\n\
+\t      /dev/sdk  {spare_state}       0     0     0\n\
+\t    /dev/sdc    ONLINE       0     0     0\n\
+\t    /dev/sdd    ONLINE       0     0     0\n\
+\tspares\n\
+\t  /dev/sdk      INUSE     currently in use\n\
+\t  /dev/sdm      AVAIL\n\
+\nerrors: No known data errors\n"
+        )
+    }
+
+    /// Owner decision (wave 7): only the ORIGINAL disk of a `spare-N` group
+    /// is detachable, and only once the spare beside it is ONLINE with no
+    /// resilver running. Never the spare itself, never an ordinary leaf.
+    #[test]
+    fn only_the_disk_a_ready_hot_spare_replaced_is_detachable() {
+        let detachable = |text: &str| -> Vec<String> {
+            parse_status(text)
+                .vdevs
+                .iter()
+                .flat_map(|v| v.disks.iter())
+                .filter(|d| d.detachable)
+                .map(|d| d.name.clone())
+                .collect()
+        };
+        let done = spare_in_use("resilvered 1.2T in 03:10:00 with 0 errors on Tue Sep  1 12:00:00 2026", "ONLINE");
+        assert_eq!(detachable(&done), ["sdb"]);
+        let report = parse_status(&done);
+        assert_eq!(report.vdevs[0].disks.len(), 5, "the spare-1 container is no leaf of its own");
+        // The spare is still resilvering: the old disk holds data the pool needs.
+        let running = spare_in_use(
+            "resilver in progress since Tue Sep  1 09:00:00 2026\n\t1T scanned, 500G issued\n\t0B repaired, 40.00% done, 01:00:00 to go",
+            "ONLINE",
+        );
+        assert!(detachable(&running).is_empty(), "{:?}", detachable(&running));
+        // A spare that is itself not healthy: nothing may go.
+        assert!(detachable(&spare_in_use("none requested", "FAULTED")).is_empty());
+        // A pool with no spare group: nothing at all.
+        assert!(detachable(DEGRADED_RAIDZ2).is_empty());
+    }
+
+    /// Critic wave 7, R2-3: the spare is ONLINE, but the resilver onto it
+    /// could not rebuild every block, or the pool has permanent data errors —
+    /// "its data is already on the spare" would be a false promise, so the
+    /// old disk is not offered. A container nested in the group is no disk
+    /// the spare simply replaced either.
+    /// Critic wave 7, R2-3 c: a `spare-N` group that is itself the top-level
+    /// vdev (a single-disk vdev whose disk a hot spare replaced) offers its
+    /// original disk once the spare holds the data — never the spare, never
+    /// while it resilvers, and a leaf after the group is an ordinary vdev.
+    #[test]
+    fn a_top_level_spare_group_offers_its_original_disk() {
+        let top = |scan: &str, spare_state: &str| {
+            format!(
+                "  pool: tank\n state: DEGRADED\n  scan: {scan}\nconfig:\n\n\
+\tNAME          STATE     READ WRITE CKSUM\n\
+\ttank          DEGRADED     0     0     0\n\
+\t  spare-0     DEGRADED     0     0     0\n\
+\t    /dev/sdb  FAULTED      9    40     0  too many errors\n\
+\t    /dev/sdk  {spare_state}       0     0     0\n\
+\t  /dev/sdc    ONLINE       0     0     0\n\
+\tspares\n\
+\t  /dev/sdk    INUSE     currently in use\n\
+\nerrors: No known data errors\n"
+            )
+        };
+        let detachable = |text: &str| -> Vec<String> {
+            parse_status(text)
+                .vdevs
+                .iter()
+                .flat_map(|v| v.disks.iter())
+                .filter(|d| d.detachable)
+                .map(|d| d.name.clone())
+                .collect()
+        };
+        let done = top("resilvered 1.2T in 03:10:00 with 0 errors on Tue Sep  1 12:00:00 2026", "ONLINE");
+        assert_eq!(detachable(&done), ["sdb"]);
+        let report = parse_status(&done);
+        assert_eq!(report.vdevs.len(), 3, "spare-0, the single disk after it, the spares");
+        assert_eq!(report.vdevs[0].disks.len(), 2, "the spare-0 group's two leaves");
+        assert_eq!(report.vdevs[1].disks.len(), 1, "sdc is its own vdev, outside the group");
+        let running = top(
+            "resilver in progress since Tue Sep  1 09:00:00 2026\n\t1T scanned, 500G issued\n\t0B repaired, 40.00% done, 01:00:00 to go",
+            "ONLINE",
+        );
+        assert!(detachable(&running).is_empty(), "{:?}", detachable(&running));
+        assert!(detachable(&top("none requested", "FAULTED")).is_empty());
+    }
+
+    #[test]
+    fn a_resilver_that_ended_with_errors_offers_no_detach() {
+        let detachable = |text: &str| -> Vec<String> {
+            parse_status(text)
+                .vdevs
+                .iter()
+                .flat_map(|v| v.disks.iter())
+                .filter(|d| d.detachable)
+                .map(|d| d.name.clone())
+                .collect()
+        };
+        let with_errors = spare_in_use("resilvered 1.2T in 03:10:00 with 3 errors on Tue Sep  1 12:00:00 2026", "ONLINE");
+        assert_eq!(parse_status(&with_errors).scan.errors, 3);
+        assert!(detachable(&with_errors).is_empty(), "{:?}", detachable(&with_errors));
+        let lost = spare_in_use("resilvered 1.2T in 03:10:00 with 0 errors on Tue Sep  1 12:00:00 2026", "ONLINE")
+            .replace("errors: No known data errors", "errors: 4 data errors, use '-v' for a list");
+        assert_eq!(parse_status(&lost).data_errors, 4);
+        assert!(detachable(&lost).is_empty(), "{:?}", detachable(&lost));
+        let nested = spare_in_use("resilvered 1.2T in 03:10:00 with 0 errors on Tue Sep  1 12:00:00 2026", "ONLINE").replace(
+            "\t      /dev/sdb  FAULTED      9    40     0  too many errors\n",
+            "\t      replacing-0  DEGRADED  0     0     0\n\t        /dev/sdb  FAULTED      9    40     0  too many errors\n\t        /dev/sdn  ONLINE       0     0     0\n",
+        );
+        assert!(nested.contains("replacing-0"));
+        assert!(detachable(&nested).is_empty(), "{:?}", detachable(&nested));
+    }
+
     #[test]
     fn degraded_raidz2_reports_the_resilver_and_the_replacing_container() {
         let s = parse_status(DEGRADED_RAIDZ2);
@@ -1746,7 +2115,7 @@ errors: No known data errors\n";
     fn layout_plan_matches_the_wizard_rules() {
         const TB8: u64 = 8_001_563_222_016;
         let two = vec![disk("sdl", TB8, true, "ok"), disk("sdm", TB8, true, "ok")];
-        let (options, warnings, smallest) = plan(&two);
+        let LayoutPlan { options, warnings, smallest_disk_bytes: smallest, .. } = plan(&two);
         assert_eq!(smallest, TB8);
         assert!(warnings.is_empty(), "{warnings:?}");
         let by = |l: &str| options.iter().find(|o| o.layout == l).unwrap().clone();
@@ -1761,7 +2130,7 @@ errors: No known data errors\n";
         let six: Vec<NasDisk> = (0..6)
             .map(|i| disk(&format!("sd{i}"), TB8, true, "ok"))
             .collect();
-        let (options, _, _) = plan(&six);
+        let LayoutPlan { options, .. } = plan(&six);
         assert!(options.iter().find(|o| o.layout == "raidz2").unwrap().recommended);
         assert_eq!(
             options.iter().find(|o| o.layout == "raidz2").unwrap().usable_bytes,
@@ -1782,7 +2151,7 @@ errors: No known data errors\n";
             disk("sdc", 4_000_787_030_016, true, "ok"),
             disk("nvme0n1", TB8, false, "ok"),
         ];
-        let (options, warnings, smallest) = plan(&four);
+        let LayoutPlan { options, warnings, smallest_disk_bytes: smallest, .. } = plan(&four);
         assert_eq!(smallest, 4_000_787_030_016);
         assert!(options.iter().find(|o| o.layout == "raidz1").unwrap().recommended);
         assert!(warnings.iter().any(|w| w.contains("mixed disk sizes")));
@@ -2080,5 +2449,18 @@ errors: No known data errors\n";
         assert_eq!(last_name_by_link(&db, "ata-WDC_WD40_WD-7788-part1").as_deref(), Some("sdm"));
         assert_eq!(last_name_by_link(&db, "ata-WDC_WD40_WD-0000"), None);
         assert_eq!(last_name_by_link(&db, "wwn-0x1111"), None);
+    }
+
+    /// Critic wave 5, MINOR 12: an NVMe namespace link carries the namespace
+    /// number after the serial; the serial is the token before it, never "1".
+    #[test]
+    fn an_nvme_namespace_link_is_read_by_its_serial_not_its_namespace() {
+        assert_eq!(link_serial("nvme-Samsung_SSD_980_PRO_1TB_S5GXNF0R123456"), Some("S5GXNF0R123456"));
+        assert_eq!(link_serial("nvme-Samsung_SSD_980_PRO_1TB_S5GXNF0R123456_1"), Some("S5GXNF0R123456"));
+        assert_eq!(link_serial("ata-WDC_WD40_WD-7788"), Some("WD-7788"));
+        // A SATA serial that happens to be digits is still the serial.
+        assert_eq!(link_serial("ata-ST4000_1234"), Some("1234"));
+        assert_eq!(link_serial("ata-ST4000_12"), None, "too short to name a disk");
+        assert_eq!(link_serial("nvme-eui.0025388b91c1a2b3"), None);
     }
 }

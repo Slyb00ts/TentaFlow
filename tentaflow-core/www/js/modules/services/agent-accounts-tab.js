@@ -37,6 +37,7 @@ import {
 } from '/js/modules/agent-accounts.js';
 import { openAccountWindow, openCreateAccountWindow } from '/js/modules/agent-accounts-window.js';
 import { openLoginWizard } from '/js/modules/agent-accounts-login.js';
+import { repairProcessSandbox, sandboxRepairable, sandboxRepairProblem } from '/js/lib/sandbox-repair.js';
 
 const state = {
   host: null,
@@ -340,7 +341,7 @@ function paintRuntime(body) {
       node: `<div class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(node.node_name ?? '')}</div>`
         + `<div class="tf-table__cell-sub">${escapeHtml(nodeSubLine(node))}</div>`
         + (gate.ok ? '' : `<div class="tf-table__cell-sub">${escapeHtml(T(gate.reason))}</div>`),
-      sandbox: sandboxChip(capable),
+      sandbox: sandboxCell(node),
       _nodeId: node.node_id,
       _receives: node.receives_accounts === true,
     };
@@ -389,6 +390,20 @@ function runtimeGate(node) {
   if (node.sandbox_capable === false) return { ok: false, reason: 'runtime_not_possible' };
   if (!node.online) return { ok: false, reason: 'runtime_node_unreachable' };
   return { ok: true, reason: '' };
+}
+
+/**
+ * The sandbox cell: the chip, and where the node can fix the cause itself, the
+ * repair that asks for its sudo password. A broken sandbox is shown with what
+ * to do about it, not only as a red dot.
+ */
+function sandboxCell(node) {
+  const chip = sandboxChip(node.sandbox_capable);
+  if (node.sandbox_capable !== false || !sandboxRepairable(node.sandbox_cause)) return chip;
+  const name = node.node_name ?? node.node_id ?? '';
+  return `<div class="tf-table__ent">${chip}<tf-button variant="primary" size="sm" icon="shield"
+      data-sandbox-repair data-node="${escapeAttr(node.node_id ?? '')}"
+      title="${escapeAttr(sandboxRepairProblem(name))}">${escapeHtml(I18n.t('sandbox_repair.action'))}</tf-button></div>`;
 }
 
 function sandboxChip(capable) {
@@ -465,6 +480,12 @@ function wireRuntimeMenu(body) {
   let target = null;
 
   body.querySelector('#aa-runtime-table').addEventListener('click', (event) => {
+    const repair = event.composedPath().find((el) => el?.dataset?.sandboxRepair !== undefined);
+    if (repair) {
+      event.stopPropagation();
+      runSandboxRepair(repair.dataset.node);
+      return;
+    }
     const direct = event.composedPath().find((el) => el?.dataset?.runtimeInstall !== undefined);
     if (direct) {
       if (!direct.hasAttribute('disabled')) runInstall(direct.dataset.node, direct.dataset.engine, true);
@@ -486,6 +507,20 @@ function wireRuntimeMenu(body) {
     if (!target || (action !== 'install' && action !== 'uninstall')) return;
     runInstall(target.nodeId, target.engineId, action === 'install');
   });
+}
+
+/** Repairs one node's sandbox with its sudo password, then re-reads the matrix. */
+async function runSandboxRepair(nodeId) {
+  const node = state.nodes.find((entry) => entry.node_id === nodeId);
+  if (!node) return;
+  const outcome = await repairProcessSandbox({
+    nodeId,
+    nodeName: node.node_name ?? nodeId,
+    isLocal: node.is_local === true,
+  });
+  if (!outcome) return;
+  toast(I18n.t('sandbox_repair.done'), 'success');
+  await load();
 }
 
 /**

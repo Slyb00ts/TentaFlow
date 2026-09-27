@@ -18,7 +18,11 @@
 //     dequantized copy of a 7B checkpoint would be 16 GB against 4.2, and
 //     reading the weights once IS the cost of a decode step.
 
+#[cfg(forge_ane)]
+use std::cell::Cell;
 use std::cell::RefCell;
+#[cfg(forge_ane)]
+use std::path::Path;
 use std::sync::Arc;
 
 use half::f16;
@@ -30,6 +34,10 @@ use forge_graph::{
 use forge_hal::{DevBuffer, Device, Event, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
 use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
 
+#[cfg(forge_ane)]
+use crate::ane_matmul::ComputeUnits;
+#[cfg(forge_ane)]
+use crate::ane_matmul::{AneBindingLite, AneLoadReport, AneMatmul, AneRole, AneStats};
 use crate::cpu_matmul::{BlockOperands, CpuMatmul, Operands};
 use crate::msl::{self, OutDtype, ScaleDtype};
 use crate::variant::{
@@ -123,6 +131,11 @@ struct Pipelines {
     residual: KernelHandle,
     kv_append: KernelHandle,
     argmax: KernelHandle,
+    /// Rozrzut ogona ANE z ciągłego bufora do slotu: [wyjście f32→0, f16→1].
+    /// Kompilowane zawsze — są tanie, a dzięki temu ścieżka Metalowa bez
+    /// ANE sprawdza to samo źródło, które ANE potem uruchamia.
+    #[cfg_attr(not(forge_ane), allow(dead_code))]
+    scatter: [KernelHandle; 2],
 }
 
 struct Scratch {
@@ -163,6 +176,21 @@ pub struct MetalExec {
     /// Names the command buffer a split submitted.
     split_event: Event,
     cpu_share: bool,
+    /// Ramię ANE, gdy podłączono katalog modeli CoreML (`attach_ane`).
+    #[cfg(forge_ane)]
+    ane: Option<AneMatmul>,
+    /// Czy ogon ANE bierze udział w podziale. Domyślnie tak po podłączeniu.
+    #[cfg(forge_ane)]
+    ane_share: bool,
+    /// Sloty wyjściowe części trwającej grupy, po indeksie części. Zapisywane
+    /// w op-ie każdej części, czytane przy rozrzucie po `join`: część `gate`
+    /// jest rozrzucana w op-ie `up`, a wtedy bieżącym slotem jest `up`.
+    #[cfg(forge_ane)]
+    ane_outs: RefCell<Vec<Option<(DevBuffer, bool)>>>,
+    /// Czy ostrzeżenie o części grupy bez trwającego predict już poszło do
+    /// logu — raz na wykonawcę, bo powtarzałoby się co warstwę.
+    #[cfg(forge_ane)]
+    ane_orphan_warned: Cell<bool>,
     shape: DenseShape,
     seq_cap: u32,
     /// Typ, w jakim skompilowano kernele kwantyzowane. Trzymany, żeby waga
@@ -242,6 +270,16 @@ impl MetalExec {
             residual: compile(msl::RESIDUAL_ADD_SOURCE, msl::RESIDUAL_ADD_NAME)?,
             kv_append: compile(msl::KV_APPEND_SOURCE, msl::KV_APPEND_NAME)?,
             argmax: compile(msl::ARGMAX_SOURCE, msl::ARGMAX_NAME)?,
+            scatter: [
+                compile(
+                    &msl::scatter_cols_source(OutDtype::F32),
+                    &msl::scatter_cols_name(OutDtype::F32),
+                )?,
+                compile(
+                    &msl::scatter_cols_source(OutDtype::F16),
+                    &msl::scatter_cols_name(OutDtype::F16),
+                )?,
+            ],
         };
 
         let f16b =
@@ -291,6 +329,14 @@ impl MetalExec {
             cpu: RefCell::new(CpuMatmul::new()),
             split_event,
             cpu_share: true,
+            #[cfg(forge_ane)]
+            ane: None,
+            #[cfg(forge_ane)]
+            ane_share: false,
+            #[cfg(forge_ane)]
+            ane_outs: RefCell::new(Vec::new()),
+            #[cfg(forge_ane)]
+            ane_orphan_warned: Cell::new(false),
             shape,
             seq_cap,
             quant_params: spec.quant_params,
@@ -317,6 +363,302 @@ impl MetalExec {
     /// is bandwidth bound anyway: adding compute there measured -14%.
     pub fn set_cpu_share(&mut self, on: bool) {
         self.cpu_share = on;
+    }
+
+    /// Podłącza katalog modeli CoreML (`manifest.json` + `.mlmodelc`) jako
+    /// trzecie ramię podziału. Wiązania mówią, która waga wykonawcy jest
+    /// którą projekcją której warstwy; grupy bez kompletu wiązań są pomijane.
+    ///
+    /// `FORGE_ANE_LAYERS` (np. `0`, `0,5`, `0-3`) ogranicza wiązania do
+    /// wybranych warstw — do bisekcji, nie do produkcji. `FORGE_ANE_SHAPES`
+    /// (np. `256`) zawęża kształty T (patrz `AneMatmul::load`).
+    #[cfg(forge_ane)]
+    pub fn attach_ane(&mut self, dir: &Path, bindings: &[AneBindingLite]) -> Result<AneLoadReport> {
+        self.ensure_ane_joined()?;
+        let filtered: Vec<AneBindingLite> = match std::env::var("FORGE_ANE_LAYERS") {
+            Ok(spec) => {
+                let keep = parse_layer_set(&spec)?;
+                bindings
+                    .iter()
+                    .copied()
+                    .filter(|b| keep.contains(&b.layer))
+                    .collect()
+            }
+            Err(_) => bindings.to_vec(),
+        };
+        let (ane, report) = AneMatmul::load(
+            &*self.device,
+            dir,
+            &filtered,
+            ComputeUnits::CpuAndNeuralEngine,
+            PREFILL_CHUNK,
+        )?;
+        let max_parts = (0..report.models)
+            .map(|g| ane.group(g).parts.len())
+            .max()
+            .unwrap_or(0);
+        self.ane_outs = RefCell::new(vec![None; max_parts]);
+        self.ane = Some(ane);
+        self.ane_share = true;
+        Ok(report)
+    }
+
+    /// Włącza lub wyłącza ogon ANE. Bez podłączonego katalogu nie ma skutku.
+    #[cfg(forge_ane)]
+    pub fn set_ane_share(&mut self, on: bool) {
+        self.ane_share = on;
+    }
+
+    #[cfg(forge_ane)]
+    pub fn ane_attached(&self) -> bool {
+        self.ane.is_some()
+    }
+
+    /// Liczniki ramienia ANE od ostatniego zerowania (domyślne bez ramienia).
+    #[cfg(forge_ane)]
+    pub fn ane_stats(&self) -> AneStats {
+        self.ane.as_ref().map(AneMatmul::stats).unwrap_or_default()
+    }
+
+    #[cfg(forge_ane)]
+    pub fn reset_ane_stats(&self) {
+        if let Some(ane) = &self.ane {
+            ane.reset_stats();
+        }
+    }
+
+    /// Ogon ANE dla tej wagi przy tym wsadzie; zero bez ramienia.
+    ///
+    /// Zero także wtedy, gdy ramię NIE MOŻE tego ogona policzyć: funkcja nie
+    /// daje się doładować albo część grupy (Middle/Last) nie ma trwającego
+    /// predict, bo jej pierwsza część już odpadła. Decyzja zapada TU, przed
+    /// podziałem, bo po nim GPU i CPU liczyłyby już bez tych wierszy.
+    /// Odmowa to ostrzeżenie w logu i pełne wiersze na GPU+CPU — poprawny
+    /// wynik, tylko wolniejszy.
+    #[cfg(forge_ane)]
+    fn ane_rows_for(&self, w: WeightId, tokens: u32) -> u32 {
+        let Some(ane) = &self.ane else { return 0 };
+        if !self.ane_share {
+            return 0;
+        }
+        let rows = ane.ane_rows(w, tokens);
+        if rows == 0 {
+            return 0;
+        }
+        match ane.role(w) {
+            Some(AneRole::First | AneRole::Solo) => {
+                if let Err(e) = ane.ensure_loaded(w, tokens) {
+                    tracing::warn!(
+                        "ANE: waga {} przy {tokens} tokenach: doładowanie funkcji nie powiodło \
+                         się, wiersze liczy GPU+CPU: {e}",
+                        w.0
+                    );
+                    return 0;
+                }
+                rows
+            }
+            Some(AneRole::Middle | AneRole::Last) => {
+                if ane.pending() == ane.group_of(w) {
+                    return rows;
+                }
+                if !self.ane_orphan_warned.replace(true) {
+                    tracing::warn!(
+                        "ANE: waga {} to część grupy bez trwającego predict (pierwsza część \
+                         odpadła) — wiersze liczy GPU+CPU; to ostrzeżenie pojawia się raz",
+                        w.0
+                    );
+                }
+                0
+            }
+            None => 0,
+        }
+    }
+
+    #[cfg(not(forge_ane))]
+    fn ane_rows_for(&self, _w: WeightId, _tokens: u32) -> u32 {
+        0
+    }
+
+    /// Bezpiecznik: gdy jakaś grupa jeszcze liczy, dołącz ją i rozrzuć wynik.
+    /// Wołany przed każdym op-em spoza grupy i przed każdym odczytem.
+    #[cfg(forge_ane)]
+    fn ensure_ane_joined(&self) -> Result<()> {
+        match &self.ane {
+            Some(ane) if ane.pending().is_some() => self.ane_finish(),
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(not(forge_ane))]
+    fn ensure_ane_joined(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Przed op-em: jeśli to nie jest mnożenie wagą z trwającej grupy,
+    /// trwająca grupa musi się skończyć TU — inaczej jej rozrzut trafiłby
+    /// za konsumenta jej slotów.
+    #[cfg(forge_ane)]
+    fn ane_guard(&self, op: &Op) -> Result<()> {
+        let Some(ane) = &self.ane else { return Ok(()) };
+        let Some(pending) = ane.pending() else {
+            return Ok(());
+        };
+        if let Op::MatMul { w, .. } = op {
+            if ane.group_of(*w) == Some(pending) {
+                return Ok(());
+            }
+        }
+        self.ane_finish()
+    }
+
+    /// Początek udziału ANE w mnożeniu wagą `w`: zapamiętuje slot wyjściowy
+    /// części, a dla pierwszej części grupy zleca predict.
+    ///
+    /// Wołane PO `stream.synchronize()`: `x` jest wtedy zmaterializowane, a
+    /// rozrzut poprzedniej grupy wykonany, więc bufor wyjściowy ANE jest wolny.
+    #[cfg(forge_ane)]
+    fn ane_begin(
+        &self,
+        w: WeightId,
+        tokens: u32,
+        x: &DevBuffer,
+        out: &DevBuffer,
+        f16_out: bool,
+    ) -> Result<()> {
+        let ane = self
+            .ane
+            .as_ref()
+            .ok_or_else(|| ForgeError::Other("ANE: ogon bez ramienia".into()))?;
+        let (gi, pi) = ane
+            .part_of(w)
+            .ok_or_else(|| ForgeError::Other(format!("ANE: waga {} bez grupy", w.0)))?;
+        match ane.role(w) {
+            Some(AneRole::First | AneRole::Solo) => {
+                // SAFETY: slot `x` ma PREFILL_CHUNK wierszy, czyli co najmniej
+                // T' (<= 1024) — wiersze ponad `tokens` to śmieci w ważnej
+                // pamięci. Strumień jest zsynchronizowany, więc x jest gotowe
+                // i nikt go nie pisze do końca grupy (następny zapis tego
+                // slotu jest w op-ie, który `ane_guard` poprzedza joinem).
+                // Zadanie trzyma klon uchwytu, więc slot żyje do `join`.
+                unsafe { ane.start(w, tokens, x, 0)? };
+            }
+            Some(AneRole::Middle | AneRole::Last) => {
+                if ane.pending() != Some(gi) {
+                    return Err(ForgeError::Other(format!(
+                        "ANE: część {pi} grupy {gi} bez trwającego predict tej grupy"
+                    )));
+                }
+            }
+            None => return Err(ForgeError::Other(format!("ANE: waga {} bez roli", w.0))),
+        }
+        self.ane_outs.borrow_mut()[pi] = Some((out.clone(), f16_out));
+        Ok(())
+    }
+
+    /// Koniec udziału ANE w mnożeniu wagą `w`: dla ostatniej części grupy
+    /// czeka na predict i rozrzuca wynik do slotów wszystkich części.
+    #[cfg(forge_ane)]
+    fn ane_end(&self, w: WeightId) -> Result<()> {
+        let Some(ane) = &self.ane else { return Ok(()) };
+        match ane.role(w) {
+            Some(AneRole::Last | AneRole::Solo) => self.ane_finish(),
+            _ => Ok(()),
+        }
+    }
+
+    /// `join` + rozrzut: każdą część grupy z ciągłego `[T', width]` f16 do
+    /// jej slotu, w typie tego slotu, w otwartym buforze poleceń — czyli
+    /// PRZED wszystkim, co ten slot potem czyta.
+    ///
+    /// Po błędzie (join albo brak slotu) sloty części są CZYSZCZONE: stary
+    /// slot nie może przeżyć do następnej grupy i udawać jej wyjścia.
+    #[cfg(forge_ane)]
+    fn ane_finish(&self) -> Result<()> {
+        let r = self.ane_finish_inner();
+        if r.is_err() {
+            self.ane_outs
+                .borrow_mut()
+                .iter_mut()
+                .for_each(|s| *s = None);
+        }
+        r
+    }
+
+    #[cfg(forge_ane)]
+    fn ane_finish_inner(&self) -> Result<()> {
+        let ane = self
+            .ane
+            .as_ref()
+            .ok_or_else(|| ForgeError::Other("ANE: join bez ramienia".into()))?;
+        let done = ane.join()?;
+        let group = ane.group(done.group_idx);
+        let mut outs = self.ane_outs.borrow_mut();
+        for (pi, part) in group.parts.iter().enumerate() {
+            let (dst, f16_out) = outs[pi].take().ok_or_else(|| {
+                ForgeError::Other(format!(
+                    "ANE: L{} {}: część {pi} bez slotu wyjściowego — op tej części nie \
+                     przeszedł przez ogon ANE",
+                    group.layer, group.name
+                ))
+            })?;
+            self.launch(
+                &self.pipes.scatter[usize::from(f16_out)],
+                LaunchArgs::new()
+                    .buf(ane.out_buf())
+                    .buf(&dst)
+                    .scalar(group.out_width)
+                    .scalar(part.out_col0)
+                    .scalar(part.rows)
+                    .scalar(part.ane0)
+                    .scalar(part.ane_rows)
+                    .scalar(done.tokens),
+                msl::scatter_groups(part.ane_rows, done.tokens),
+                msl::SCATTER_THREADS,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Najszerszy zakres `a-b` przyjmowany przez `FORGE_ANE_LAYERS`.
+#[cfg(forge_ane)]
+const MAX_LAYER_RANGE: u32 = 4096;
+
+/// `0`, `0,5,7`, `0-3`, także mieszane: `0-3,7`.
+#[cfg(forge_ane)]
+fn parse_layer_set(spec: &str) -> Result<std::collections::HashSet<u32>> {
+    let mut set = std::collections::HashSet::new();
+    for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let bad = || ForgeError::Format(format!("FORGE_ANE_LAYERS: '{item}' to nie zakres"));
+        match item.split_once('-') {
+            Some((a, b)) => {
+                let a: u32 = a.trim().parse().map_err(|_| bad())?;
+                let b: u32 = b.trim().parse().map_err(|_| bad())?;
+                // Zakres malejący to literówka, a ogromny to `HashSet` na
+                // miliardy wpisów — żaden model nie ma tylu warstw.
+                if b < a || b - a >= MAX_LAYER_RANGE {
+                    return Err(ForgeError::Format(format!(
+                        "FORGE_ANE_LAYERS: zakres '{item}' musi rosnąć i mieć mniej niż \
+                         {MAX_LAYER_RANGE} warstw"
+                    )));
+                }
+                set.extend(a..=b);
+            }
+            None => {
+                set.insert(item.parse().map_err(|_| bad())?);
+            }
+        }
+    }
+    Ok(set)
+}
+
+/// Trwająca grupa ANE jest dołączana PRZED zwolnieniem pól: wątek roboczy
+/// trzyma własne uchwyty buforów, więc to nie jest kwestia pamięci, ale
+/// predict w toku nie powinien przeżyć wykonawcy, który go zlecił.
+#[cfg(forge_ane)]
+impl Drop for MetalExec {
+    fn drop(&mut self) {
+        let _ = self.ensure_ane_joined();
     }
 }
 
@@ -447,6 +789,8 @@ impl Executor for MetalExec {
             }
         };
         let tokens = step.tokens();
+        #[cfg(forge_ane)]
+        self.ane_guard(op)?;
         match op {
             Op::Embed { table, tokens, .. } => self.op_embed(*table, tokens),
             Op::RmsNorm { out, x, w, .. } => self.op_rmsnorm(*out, *x, *w, tokens),
@@ -512,10 +856,12 @@ impl Executor for MetalExec {
     }
 
     fn sync(&self) -> Result<()> {
+        self.ensure_ane_joined()?;
         self.stream.synchronize()
     }
 
     fn read(&self, act: Act, len: usize) -> Result<Vec<f32>> {
+        self.ensure_ane_joined()?;
         self.stream.synchronize()?;
         if Self::is_half(act) {
             let mut raw = vec![0u8; len * 2];
@@ -539,6 +885,7 @@ impl Executor for MetalExec {
                 "wybór dla {lanes} lane'ów, a ten wykonawca trzyma jeden"
             )));
         }
+        self.ensure_ane_joined()?;
         self.launch(
             &self.pipes.argmax,
             LaunchArgs::new()
@@ -622,7 +969,9 @@ impl MetalExec {
                 msl::elementwise_groups(n * self.shape.hidden),
                 msl::ELEMENTWISE_THREADS,
             ),
-            Weight::Plain(_) => Err(ForgeError::Other("embedding wymaga wagi kwantyzowanej".into())),
+            Weight::Plain(_) => Err(ForgeError::Other(
+                "embedding wymaga wagi kwantyzowanej".into(),
+            )),
         }
     }
 
@@ -644,7 +993,9 @@ impl MetalExec {
                 self.buf(x),
                 last,
             ),
-            Weight::Plain(_) => Err(ForgeError::Other("logity wymagają wagi kwantyzowanej".into())),
+            Weight::Plain(_) => Err(ForgeError::Other(
+                "logity wymagają wagi kwantyzowanej".into(),
+            )),
         }
     }
 
@@ -684,6 +1035,7 @@ impl MetalExec {
         match self.weight(w)? {
             Weight::Quant(weight) => self.matmul(
                 self.buf(out),
+                w,
                 weight,
                 self.buf(x),
                 tokens,
@@ -696,7 +1048,9 @@ impl MetalExec {
                 tokens,
                 Self::is_half(out),
             ),
-            Weight::Plain(_) => Err(ForgeError::Other("mnożenie wymaga wagi kwantyzowanej".into())),
+            Weight::Plain(_) => Err(ForgeError::Other(
+                "mnożenie wymaga wagi kwantyzowanej".into(),
+            )),
         }
     }
 
@@ -801,10 +1155,7 @@ impl MetalExec {
     fn weight(&self, id: WeightId) -> Result<&Weight> {
         match self.weights.get(id.0 as usize) {
             Some(weight) => Ok(weight),
-            _ => Err(ForgeError::Other(format!(
-                "brak wagi {}",
-                id.0
-            ))),
+            _ => Err(ForgeError::Other(format!("brak wagi {}", id.0))),
         }
     }
 
@@ -872,6 +1223,7 @@ impl MetalExec {
                 rows: w.rows,
                 cols: w.cols,
                 bits: 4,
+                ane_rows: 0,
             };
             if self.cpu_share {
                 if let Some(split) = variant::split_rows(&problem) {
@@ -979,16 +1331,21 @@ impl MetalExec {
     fn matmul(
         &self,
         out: &DevBuffer,
+        w_id: WeightId,
         w: &Quantized,
         x: &DevBuffer,
         tokens: u32,
         f16_out: bool,
     ) -> Result<()> {
+        // Ogon ANE jest faktem o wadze (ma model CoreML albo nie) pomnożonym
+        // przez politykę (`ane_share`). Bez ramienia to zero i rejestr
+        // odpowiada bit w bit tak, jak przed jego istnieniem.
         let problem = Problem {
             tokens,
             rows: w.rows,
             cols: w.cols,
             bits: w.bits,
+            ane_rows: self.ane_rows_for(w_id, tokens),
         };
         let chosen = MATMUL_FORMS.pick(&problem).ok_or_else(|| {
             ForgeError::Unsupported(format!("brak wariantu mnożenia dla {problem:?}"))
@@ -996,15 +1353,30 @@ impl MetalExec {
         match chosen.form {
             MatmulForm::Vector => self.gemv(self.pipes.qmv.get(w.bits, f16_out), out, w, x, 0),
             MatmulForm::RegisterBlocked => self.matmul_blocked(out, w, x, tokens, f16_out),
-            MatmulForm::MatrixUnits => self.matmul_matrix_units(out, w, x, tokens, f16_out, None),
+            MatmulForm::MatrixUnits => {
+                self.matmul_matrix_units(out, w_id, w, x, tokens, f16_out, None)
+            }
             MatmulForm::MatrixUnitsSharedWithCpu if !self.cpu_share => {
-                self.matmul_matrix_units(out, w, x, tokens, f16_out, None)
+                self.matmul_matrix_units(out, w_id, w, x, tokens, f16_out, None)
             }
             MatmulForm::MatrixUnitsSharedWithCpu => {
                 let split = variant::split_rows(&problem).ok_or_else(|| {
                     ForgeError::Other(format!("podział wybrany dla {problem:?}, ale niemożliwy"))
                 })?;
-                self.matmul_matrix_units(out, w, x, tokens, f16_out, Some(split))
+                self.matmul_matrix_units(out, w_id, w, x, tokens, f16_out, Some(split))
+            }
+            // Trzy jednostki. Rejestr wybiera tę formę tylko z niezerowym
+            // ogonem ANE; udział CPU jest tu polityką jak wyżej — wyłączony
+            // oddaje swoje wiersze GPU, ogon ANE zostaje.
+            MatmulForm::MatrixUnitsSharedWithCpuAndAne => {
+                let mut split = variant::split_rows(&problem).ok_or_else(|| {
+                    ForgeError::Other(format!("podział wybrany dla {problem:?}, ale niemożliwy"))
+                })?;
+                if !self.cpu_share {
+                    split.gpu_rows += split.cpu_rows;
+                    split.cpu_rows = 0;
+                }
+                self.matmul_matrix_units(out, w_id, w, x, tokens, f16_out, Some(split))
             }
         }
     }
@@ -1015,9 +1387,11 @@ impl MetalExec {
     /// writes with — and the grid is what decides which rows it touches. So
     /// giving it a shorter grid leaves the tail of every row untouched, which
     /// is exactly the window the CPU then fills.
+    #[allow(clippy::too_many_arguments)]
     fn matmul_matrix_units(
         &self,
         out: &DevBuffer,
+        w_id: WeightId,
         w: &Quantized,
         x: &DevBuffer,
         tokens: u32,
@@ -1029,6 +1403,28 @@ impl MetalExec {
             let (gx, gy) = msl::qmg_affine_4bit_groups(w.rows, tokens);
             return self.launch_qmg(k, out, w, x, tokens, (gx, gy));
         };
+        #[cfg(not(forge_ane))]
+        let _ = w_id;
+
+        if split.cpu_rows == 0 {
+            // Tylko GPU i ANE. Ten sam porządek co niżej, bez rozpakowywania:
+            // czekanie na x, start ANE, GPU na czele, zatwierdzenie bufora
+            // poleceń (żeby GPU liczyło, gdy ANE liczy), na koniec join.
+            self.stream.synchronize()?;
+            #[cfg(forge_ane)]
+            if split.ane_rows > 0 {
+                self.ane_begin(w_id, tokens, x, out, f16_out)?;
+            }
+            let (gx, gy) = msl::qmg_affine_4bit_groups(split.gpu_rows, tokens);
+            self.launch_qmg(k, out, w, x, tokens, (gx, gy))?;
+            self.device.record_event(&self.split_event, &self.stream)?;
+            self.split_event.synchronize()?;
+            #[cfg(forge_ane)]
+            if split.ane_rows > 0 {
+                self.ane_end(w_id)?;
+            }
+            return Ok(());
+        }
 
         let operands = Operands {
             packed: host_slice(&w.packed)?,
@@ -1065,6 +1461,15 @@ impl MetalExec {
         // hold — which is not a crash, just a different model.
         self.stream.synchronize()?;
 
+        // Ogon ANE startuje TU: po zmaterializowaniu x (ta sama pułapka co
+        // dla CPU — ANE czyta x własnymi instrukcjami), a przed GPU, żeby
+        // wszystkie trzy jednostki liczyły naraz. Dla grupy dwuczęściowej
+        // (gate+up) predict zaczyna się w `gate`, a kończy w `up`.
+        #[cfg(forge_ane)]
+        if split.ane_rows > 0 {
+            self.ane_begin(w_id, tokens, x, out, f16_out)?;
+        }
+
         let (gx, gy) = msl::qmg_affine_4bit_groups(split.gpu_rows, tokens);
         self.launch_qmg(k, out, w, x, tokens, (gx, gy))?;
 
@@ -1081,7 +1486,12 @@ impl MetalExec {
         // wait below, before anything reads the whole result.
         unsafe { cpu.multiply(&operands, split.gpu_rows, split.cpu_rows)? };
         drop(cpu);
-        self.split_event.synchronize()
+        self.split_event.synchronize()?;
+        #[cfg(forge_ane)]
+        if split.ane_rows > 0 {
+            self.ane_end(w_id)?;
+        }
+        Ok(())
     }
 
     /// The matrix-unit dispatch itself. The kernel always receives the FULL row

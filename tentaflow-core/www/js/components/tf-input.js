@@ -6,11 +6,15 @@
 //       Reflektuje .value do atrybutu i emituje "input"/"change".
 // Przyklad: <tf-input label="Email" icon="search" hint="pomocniczy tekst"></tf-input>
 //   z slotem: <tf-input><span slot="label">Klucz <tf-chip status="warn">secret</tf-chip></span></tf-input>
+//   `stepper` (with type="number", min/max/step) frames the field with − / +
+//   buttons that move the value by `step` inside [min, max] and emit the same
+//   "input"/"change" as typing; `stepper-dec-label` / `stepper-inc-label`
+//   name them for assistive tech. A button at its bound is disabled.
 // =============================================================================
 
 class TfInput extends HTMLElement {
   static get observedAttributes() {
-    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'trailing-icon', 'prefix', 'suffix', 'disabled', 'readonly', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows', 'min', 'max', 'step'];
+    return ['label', 'placeholder', 'value', 'hint', 'error', 'type', 'icon', 'trailing-icon', 'prefix', 'suffix', 'disabled', 'readonly', 'autocomplete', 'autofocus', 'required', 'name', 'autocapitalize', 'autocorrect', 'spellcheck', 'inputmode', 'minlength', 'maxlength', 'pattern', 'multiline', 'rows', 'min', 'max', 'step', 'stepper', 'stepper-dec-label', 'stepper-inc-label'];
   }
 
   constructor() {
@@ -25,6 +29,8 @@ class TfInput extends HTMLElement {
     this._trailingIconEl = null;
     this._prefixEl = null;
     this._suffixEl = null;
+    this._stepDec = null;
+    this._stepInc = null;
     this._slotObserver = null;
     this._hasSlotLabel = false;
     this._onInput = this._onInput.bind(this);
@@ -251,11 +257,73 @@ class TfInput extends HTMLElement {
     this._suffixEl.style.display = suffix ? '' : 'none';
     this._wrap.classList.toggle('tf-input-wrap-has-suffix', !!suffix);
 
+    this._updateStepper();
+
     this._hintEl.textContent = hint;
     this._hintEl.style.display = hint && !error ? '' : 'none';
 
     this._errorEl.textContent = error;
     this._errorEl.style.display = error ? '' : 'none';
+  }
+
+  _bound(name) {
+    const raw = this.getAttribute(name);
+    const n = raw === null || raw === '' ? NaN : Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  _updateStepper() {
+    const on = this.hasAttribute('stepper') && this._input.tagName !== 'TEXTAREA';
+    if (on && !this._stepDec) {
+      const make = (dir, text) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = `tf-input-step tf-input-step--${dir < 0 ? 'dec' : 'inc'}`;
+        b.textContent = text;
+        b.addEventListener('click', () => this.stepBy(dir));
+        return b;
+      };
+      this._stepDec = make(-1, '\u2212');
+      this._stepInc = make(1, '+');
+      this._wrap.prepend(this._stepDec);
+      this._wrap.appendChild(this._stepInc);
+    } else if (!on && this._stepDec) {
+      this._stepDec.remove();
+      this._stepInc.remove();
+      this._stepDec = null;
+      this._stepInc = null;
+    }
+    this._wrap.classList.toggle('tf-input-wrap-stepper', on);
+    if (!on) return;
+    this._stepDec.setAttribute('aria-label', this.getAttribute('stepper-dec-label') || '\u2212');
+    this._stepInc.setAttribute('aria-label', this.getAttribute('stepper-inc-label') || '+');
+    this._syncStepBounds();
+  }
+
+  _syncStepBounds() {
+    if (!this._stepDec) return;
+    const disabled = this.hasAttribute('disabled') || this.hasAttribute('readonly');
+    const value = Number(this._input.value);
+    const min = this._bound('min');
+    const max = this._bound('max');
+    const known = this._input.value.trim() !== '' && Number.isFinite(value);
+    this._stepDec.disabled = disabled || (known && min !== null && value <= min);
+    this._stepInc.disabled = disabled || (known && max !== null && value >= max);
+  }
+
+  /** Moves the value by `direction` steps inside [min, max], as if typed. */
+  stepBy(direction) {
+    const step = this._bound('step') || 1;
+    const min = this._bound('min');
+    const max = this._bound('max');
+    const current = Number(this._input.value);
+    let next = Number.isFinite(current) && this._input.value.trim() !== '' ? current + direction * step : (min ?? 0);
+    if (min !== null) next = Math.max(min, next);
+    if (max !== null) next = Math.min(max, next);
+    this.value = String(next);
+    this._syncStepBounds();
+    this.dispatchEvent(new CustomEvent('input', { bubbles: true, detail: { value: this._input.value } }));
+    this.dispatchEvent(new CustomEvent('change', { bubbles: true, detail: { value: this._input.value } }));
   }
 
   _onInput(e) {
@@ -265,6 +333,7 @@ class TfInput extends HTMLElement {
     // `e.detail?.value ?? ''` clobbers state).
     e?.stopPropagation();
     this.setAttribute('value', this._input.value);
+    this._syncStepBounds();
     this.dispatchEvent(new CustomEvent('input', {
       bubbles: true,
       detail: { value: this._input.value },

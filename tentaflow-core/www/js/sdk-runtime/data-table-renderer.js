@@ -848,9 +848,16 @@ function renderTable(component, ctx) {
     // tf-table draws no checkbox in single mode, so the row itself is the only
     // selection affordance there; multi mode goes through the checkboxes below.
     if (selectMode !== 'single') return;
-    const tr = tfTable.shadowRoot?.querySelectorAll('tbody tr')[index];
+    const trs = [...(tfTable.shadowRoot?.querySelectorAll('tbody tr') || [])];
+    const tr = trs[index];
     const nowSelected = !e.detail.selected;
-    if (tr) tr.classList.toggle('selected', nowSelected);
+    // One row at most: the highlight moves, it never stays on the row picked
+    // before (iteration-5 MAJOR 2). The next render re-syncs every slot from
+    // the rows' `_selected` (tf-table `_updateRowCells`).
+    for (const other of trs) {
+      const on = other === tr && nowSelected;
+      if (other.classList.contains('selected') !== on) other.classList.toggle('selected', on);
+    }
     emitSelection(nowSelected ? rowId : null, rowId);
   };
   tfTable.addEventListener('row-click', onRowClick);

@@ -1641,6 +1641,13 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::AddonUninstallResponseBody(_) => "AddonUninstallResponse",
         MessageBody::AddonTeardownPlanRequestBody(_) => "AddonTeardownPlanRequest",
         MessageBody::AddonTeardownPlanResponseBody(_) => "AddonTeardownPlanResponse",
+        MessageBody::AddonTeardownStatusRequestBody(_) => "AddonTeardownStatusRequest",
+        MessageBody::AddonTeardownStatusResponseBody(_) => "AddonTeardownStatusResponse",
+        MessageBody::AddonTeardownArmRequestBody(_) => "AddonTeardownArmRequest",
+        MessageBody::AddonTeardownArmResponseBody(_) => "AddonTeardownArmResponse",
+        MessageBody::AddonTeardownDisarmRequestBody(_) => "AddonTeardownDisarmRequest",
+        MessageBody::AddonDisablePreviewRequestBody(_) => "AddonDisablePreviewRequest",
+        MessageBody::AddonDisablePreviewResponseBody(_) => "AddonDisablePreviewResponse",
         MessageBody::AddonConfigGetRequestBody(_) => "AddonConfigGetRequest",
         MessageBody::AddonConfigGetResponseBody(_) => "AddonConfigGetResponse",
         MessageBody::AddonRequirementInstallRequestBody(_) => "AddonRequirementInstallRequest",
@@ -2341,6 +2348,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Cs::ProjectLinkSetRequest { .. } => "CodeStudioProjectLinkSetRequest",
                 Cs::RepoTreeRequest { .. } => "CodeStudioRepoTreeRequest",
                 Cs::RepoTreeResponse { .. } => "CodeStudioRepoTreeResponse",
+                Cs::ProcessSandboxRepairRequest { .. } => "CodeStudioProcessSandboxRepairRequest",
+                Cs::ProcessSandboxRepairResponse { .. } => "CodeStudioProcessSandboxRepairResponse",
             }
         }
         MessageBody::BusBody(env) => {
@@ -2420,6 +2429,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Bp::SchemaDeleteResponse { .. } => "BusSchemaDeleteResponse",
                 Bp::LagHistoryRequest { .. } => "BusLagHistoryRequest",
                 Bp::LagHistoryResponse { .. } => "BusLagHistoryResponse",
+                Bp::OffsetForTimestampRequest { .. } => "BusOffsetForTimestampRequest",
+                Bp::OffsetForTimestampResponse { .. } => "BusOffsetForTimestampResponse",
             }
         }
         MessageBody::TentaNasBody(p) => {
@@ -2447,6 +2458,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::DiskGetRequest { .. } => "TentaNasDiskGetRequest",
                 Tn::DiskGetResponse { .. } => "TentaNasDiskGetResponse",
                 Tn::DiskSmartTestRequest { .. } => "TentaNasDiskSmartTestRequest",
+                Tn::DiskSmartTestBatchRequest { .. } => "TentaNasDiskSmartTestBatchRequest",
                 Tn::DiskLocateRequest { .. } => "TentaNasDiskLocateRequest",
                 Tn::DiskLocateResponse { .. } => "TentaNasDiskLocateResponse",
                 Tn::DiskWipePlanRequest { .. } => "TentaNasDiskWipePlanRequest",
@@ -2473,6 +2485,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::PoolRemoveVdevRequest { .. } => "TentaNasPoolRemoveVdevRequest",
                 Tn::PoolReplaceDiskRequest { .. } => "TentaNasPoolReplaceDiskRequest",
                 Tn::PoolDeviceStateRequest { .. } => "TentaNasPoolDeviceStateRequest",
+                Tn::PoolDetachRequest { .. } => "TentaNasPoolDetachRequest",
                 Tn::PoolSetPropertiesRequest { .. } => "TentaNasPoolSetPropertiesRequest",
                 Tn::ScrubScheduleSetRequest { .. } => "TentaNasScrubScheduleSetRequest",
                 Tn::DatasetsListRequest { .. } => "TentaNasDatasetsListRequest",
@@ -2547,6 +2560,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::TargetGetResponse { .. } => "TentaNasTargetGetResponse",
                 Tn::TargetCreateRequest { .. } => "TentaNasTargetCreateRequest",
                 Tn::TargetUpdateRequest { .. } => "TentaNasTargetUpdateRequest",
+                Tn::TargetSessionResetRequest { .. } => "TentaNasTargetSessionResetRequest",
                 Tn::TargetDeleteRequest { .. } => "TentaNasTargetDeleteRequest",
                 // Added for the TentaNAS session: `variant_name_of` matches
                 // their payload EXHAUSTIVELY, so a variant of theirs does not
@@ -2585,6 +2599,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::ElasticFolderCacheSetRequest { .. } => {
                     "TentaNasElasticFolderCacheSetRequest"
                 }
+                Tn::SharingStopRequest {} => "TentaNasSharingStopRequest",
             }
         }
         MessageBody::TentaVmBody(p) => {
@@ -3504,6 +3519,10 @@ mod tests {
             "AddonInstallRequest",
             "AddonUninstallRequest",
             "AddonTeardownPlanRequest",
+            "AddonTeardownStatusRequest",
+            "AddonDisablePreviewRequest",
+            "AddonTeardownArmRequest",
+            "AddonTeardownDisarmRequest",
             "AddonConfigGetRequest",
             "AddonConfigSetRequest",
             "AddonLogsRequest",

@@ -238,20 +238,22 @@ test('the forwarding dialog sends both targets and reports what the node refused
     syslogTarget: 'siem.local:514',
     webhookUrl: 'https://siem.local/hooks/tentanas',
     includeAccess: false,
+    nodeWide: false,
   });
   // The saved answer repaints the card without a second request.
   assert.match(body.querySelector('#nas-access-state').textContent, /Przekazywanie włączone: siem\.local:514, https:\/\/siem\.local\/hooks\/tentanas \(w kolejce: 3\)/);
   screen.dispose();
 });
 
-// The node forwards no access line at all (tentanas/forward.rs): each one
-// belongs to an organisation, and the target is one setting for the whole
-// node. The switch that used to ask for them must say so and must not move.
-async function openForwarding(stored) {
-  let sent = null;
+// The target is the asking organisation's own (tentanas/forward.rs): its
+// access lines go there only when the admin switches them on, and the
+// node-wide target kept from before is a separate section that exists only
+// while it is set.
+async function openForwarding(stored, node = {}) {
+  const sent = [];
   const screen = fakeScreen({
-    tentaNasAccessLogRequest: answer({ forward: { ...answer().forward, ...stored } }),
-    tentaNasAlertForwardSetRequest: (p) => { sent = p; return answer(); },
+    tentaNasAccessLogRequest: answer({ forward: { ...answer().forward, ...stored }, forwardNode: { ...answer().forward, ...node } }),
+    tentaNasAlertForwardSetRequest: (p) => { sent.push(p); return answer(); },
   });
   const body = mount();
   const view = wireAccessLog(screen, body);
@@ -259,59 +261,78 @@ async function openForwarding(stored) {
   await flush();
   click(body.querySelector('#nas-access-card [data-act="forward"]'));
   await flush();
-  return { screen, dialog: latestWindow(), sentPayload: () => sent };
+  return { screen, body, dialog: latestWindow(), sent };
 }
 
-test('the access-log forwarding switch cannot be turned on and says why', async () => {
-  const { screen, dialog } = await openForwarding({});
+test('the access-log switch is the organisation\'s own choice and reaches the node', async () => {
+  const { screen, dialog, sent } = await openForwarding({ enabled: true, syslogTarget: 'siem.local:514' });
   try {
     const toggle = dialog.querySelector('#nas-forward-include');
-    assert.ok(toggle.hasAttribute('disabled'), 'the switch is disabled');
-    assert.equal(toggle.checked, false, 'and off');
-    const inner = toggle.querySelector('.tf-toggle');
-    assert.equal(inner.getAttribute('aria-disabled'), 'true');
-    click(inner);
-    inner.dispatchEvent(new window.KeyboardEvent('keydown', { key: ' ', bubbles: true, cancelable: true }));
-    inner.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    assert.ok(!toggle.hasAttribute('disabled'), 'the switch works: the lines go to this organisation only');
+    assert.equal(toggle.checked, false);
+    assert.match(dialog.textContent, /Twojej organizacji/, 'the section says whose target it is');
+    toggle.checked = true;
+    confirmWindow(dialog);
     await flush();
-    assert.equal(toggle.checked, false, 'a click or a key does not turn it on');
-    const why = dialog.querySelector('#nas-forward-include-why').textContent;
-    assert.match(why, /należą do jednej organizacji/, 'the reason: the lines are one organisation\'s');
-    assert.match(why, /wspólny dla całego noda/, 'and the target is the whole node\'s');
-    assert.match(why, /nie są jeszcze zbudowane/, 'and per-organisation targets do not exist yet');
-    assert.doesNotMatch(why, /zostaje zachowany/, 'nothing stored, nothing to keep');
-    assert.doesNotMatch(dialog.textContent, /wpisy dziennika dostępu\)/, 'the explanation no longer promises the log');
+    await flush();
+    assert.equal(sent.length, 1, 'no node-wide target is set, so only the organisation\'s is saved');
+    assert.deepEqual(sent[0], { enabled: true, syslogTarget: 'siem.local:514', webhookUrl: '', includeAccess: true, nodeWide: false });
   } finally {
     screen.dispose();
   }
 });
 
-test('a stored "forward the access log" survives a save and is named as kept', async () => {
-  const { screen, dialog, sentPayload } = await openForwarding({ enabled: true, syslogTarget: 'siem.local:514', includeAccess: true });
+test('the retired node-wide target is shown masked, cannot be edited and can be deleted', async () => {
+  const none = await openForwarding({});
   try {
-    const toggle = dialog.querySelector('#nas-forward-include');
-    assert.equal(toggle.checked, false, 'a stored "on" is not shown as working');
-    assert.match(dialog.querySelector('#nas-forward-include-why').textContent, /Zapisany wybór „włączone” zostaje zachowany, ale nic nie jest wysyłane/);
-    // Even a switch forced on by script does not reach the node: the save
-    // sends what the node holds.
-    toggle.checked = true;
+    assert.equal(none.dialog.querySelector('[data-act="delete-node"]'), null, 'no section for a target nobody set');
+  } finally {
+    none.screen.dispose();
+  }
+
+  const { screen, body, dialog, sent } = await openForwarding({}, { enabled: true, syslogTarget: 'legacy.local:514', webhookUrl: 'https://hooks.example.com/…', pending: 2 });
+  try {
+    assert.match(body.querySelector('#nas-access-state').textContent, /legacy\.local:514/, 'the card names the node-wide target too');
+    assert.equal(dialog.querySelector('#nas-forward-node-syslog'), null, 'no field edits it');
+    assert.equal(dialog.querySelector('#nas-forward-node-enabled'), null, 'no switch turns it back on');
+    assert.match(dialog.textContent, /https:\/\/hooks\.example\.com\/…/, 'shown masked, as the node sent it');
+    assert.match(dialog.textContent, /tylko alerty noda/i, 'and says what it receives');
+    // Saving the organisation's own target does not touch it.
     confirmWindow(dialog);
     await flush();
     await flush();
-    assert.equal(sentPayload().includeAccess, true, 'the stored choice is sent back untouched');
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].nodeWide, false);
   } finally {
     screen.dispose();
   }
-  const { screen: screen2, dialog: dialog2, sentPayload: sent2 } = await openForwarding({ includeAccess: false });
+
+  const second = await openForwarding({}, { enabled: true, syslogTarget: 'legacy.local:514' });
   try {
-    dialog2.querySelector('#nas-forward-include').checked = true;
-    confirmWindow(dialog2);
+    click(second.dialog.querySelector('[data-act="delete-node"]'));
     await flush();
     await flush();
-    assert.equal(sent2().includeAccess, false, 'a stored "off" cannot be turned on through the switch');
+    assert.deepEqual(second.sent, [{ enabled: false, syslogTarget: '', webhookUrl: '', includeAccess: false, nodeWide: true }],
+      'the one change it takes: deleted');
   } finally {
-    screen2.dispose();
+    second.screen.dispose();
   }
+});
+
+test('a failed send reads as the node words it: not accepted, or the HTTP status — never a socket error', async () => {
+  const { forwardErrorText } = await import('./access-log.js');
+  assert.equal(forwardErrorText('forward:http_status:404'), 'cel nie przyjął alertu (HTTP 404)');
+  assert.equal(forwardErrorText('forward:not_accepted'), 'cel nie przyjął alertu');
+  assert.equal(forwardErrorText('connection refused to 10.0.0.5:22'), 'cel nie przyjął alertu', 'an older raw text is not shown');
+  const screen = fakeScreen({ tentaNasAccessLogRequest: answer({ forward: { ...answer().forward, enabled: true, lastError: 'forward:http_status:404' } }) });
+  const body = mount();
+  const view = wireAccessLog(screen, body);
+  await view.refresh();
+  await flush();
+  const text = body.querySelector('#nas-access-state').textContent;
+  assert.match(text, /cel nie przyjął alertu \(HTTP 404\)/);
+  assert.match(text, /Przekazywanie włączone \(w kolejce: 0\)/, 'a reader is told it is on, not where to');
+  screen.dispose();
 });
 
 test('a viewer sees the log but not the forwarding button', async () => {
@@ -366,4 +387,21 @@ test('a changed access-log state line is still repainted', async () => {
   await flush();
   assert.match(stateEl.textContent, /kolektor zatrzymany/, 'the new line reached the card');
   screen.dispose();
+});
+
+// Critic R3 (round 3): a webhook stored before the https rule is shown as
+// needing a change — and the rest of the target still saves.
+test('an old http webhook is shown as needing a change and does not block saving', async () => {
+  const { screen, dialog, sent } = await openForwarding({ enabled: true, webhookUrl: 'http://old.example.com/…', webhookNeedsMigration: true });
+  try {
+    assert.match(dialog.querySelector('#nas-forward-webhook-migration').textContent, /https:\/\//);
+    dialog.querySelector('#nas-forward-enabled').checked = false;
+    confirmWindow(dialog);
+    await flush();
+    await flush();
+    assert.equal(sent[0].webhookUrl, 'http://old.example.com/…', 'the mask goes back and the node keeps the stored URL');
+    assert.equal(sent[0].enabled, false);
+  } finally {
+    screen.dispose();
+  }
 });

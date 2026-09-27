@@ -34,6 +34,140 @@ const TICK: Duration = Duration::from_secs(60);
 /// Who the Tasks tab shows as the starter of an unattended run.
 pub const STARTED_BY: &str = "scheduler";
 
+// ----- the outcome of one slot ------------------------------------------------------
+
+/// What one due slot of a schedule came to — the `last_result` column of
+/// every schedule table, stored as JSON.
+///
+/// WHY a structure and not the sentence it replaces: the column used to hold
+/// "started job <uuid>" / "failed to start: <error>" / "pominięto: …", which
+/// a screen could only pattern-match, and whose job id it then had to look
+/// up by hand to learn what happened — the id riding the wire into the
+/// browser to get there. Now the node resolves the job's status itself when
+/// it answers the list (`dispatch` `schedules_list`), and the id stays here.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ScheduleOutcome {
+    /// A job ran from the slot; its status is the slot's result.
+    Started { job_id: String },
+    /// The node refused to start one: `insert_job`'s serialisation (a busy
+    /// array, a running self-test) or a failed spawn. `detail` is the node's
+    /// own sentence; a CODED refusal (`tentanas::refusal`, wave 13) is kept
+    /// as its code and parameters in `refusal`, and `detail` is then only its
+    /// sentence — never the wire form, which is not text to show.
+    StartFailed {
+        detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<StoredRefusal>,
+    },
+    /// Declined on purpose, with the reason as a code
+    /// ('elastic_scrub_errors_unrepaired', 'elastic_parity_fault_unacknowledged',
+    /// 'array_not_created'). `detail` is the sentence of a skip stored before
+    /// the codes, and '' otherwise.
+    Skipped {
+        reason: String,
+        #[serde(default)]
+        detail: String,
+    },
+}
+
+/// A coded refusal as a schedule outcome stores it: the code and its
+/// parameters (no ids, `tentanas::refusal`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredRefusal {
+    pub code: String,
+    #[serde(default)]
+    pub params: Vec<(String, String)>,
+}
+
+impl StoredRefusal {
+    /// The refusal as the screens read it (`refusal:<code>?k=v <sentence>`).
+    pub fn wire(&self, sentence: &str) -> String {
+        super::refusal::wire_form(&self.code, self.params.iter().map(|(k, v)| (k.as_str(), v.as_str())), sentence)
+    }
+}
+
+impl ScheduleOutcome {
+    /// The outcome of one spawn attempt. A coded refusal is stored as its
+    /// code and parameters, with its sentence as the detail.
+    pub fn of_spawn(started: &anyhow::Result<tentaflow_protocol::tentanas::NasJob>) -> Self {
+        match started {
+            Ok(job) => Self::Started { job_id: job.job_id.clone() },
+            Err(e) => match super::refusal::Refusal::find(e) {
+                Some(refusal) => Self::StartFailed {
+                    detail: refusal.text.clone(),
+                    refusal: Some(StoredRefusal {
+                        code: refusal.code.to_string(),
+                        params: refusal.params.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+                    }),
+                },
+                None => Self::StartFailed { detail: e.to_string(), refusal: None },
+            },
+        }
+    }
+
+    pub fn skipped(reason: &str) -> Self {
+        Self::Skipped { reason: reason.to_string(), detail: String::new() }
+    }
+
+    /// The column's value.
+    pub fn stored(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+
+    /// A stored value read back — the JSON this build writes, or the
+    /// sentence an older build wrote. `None` for a slot that never ran and
+    /// for a form nothing here understands.
+    pub fn parse(stored: &str) -> Option<Self> {
+        let stored = stored.trim();
+        if stored.is_empty() {
+            return None;
+        }
+        if stored.starts_with('{') {
+            return serde_json::from_str(stored).ok();
+        }
+        if let Some(job_id) = stored.strip_prefix("started job ") {
+            let job_id = job_id.trim();
+            return (!job_id.is_empty() && !job_id.contains(char::is_whitespace))
+                .then(|| Self::Started { job_id: job_id.to_string() });
+        }
+        if let Some(detail) = stored.strip_prefix("failed to start") {
+            let detail = detail.trim_start_matches(':').trim();
+            return Some(Self::StartFailed { detail: detail.to_string(), refusal: None });
+        }
+        if let Some(why) = stored.strip_prefix("pominięto") {
+            let why = why.trim_start_matches(':').trim();
+            return Some(match why.strip_prefix("reason:") {
+                Some(code) if !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') => {
+                    Self::skipped(code)
+                }
+                _ => Self::Skipped { reason: String::new(), detail: why.to_string() },
+            });
+        }
+        None
+    }
+
+    /// The older sentence form, for a screen that predates the structured
+    /// fields (`NasScheduleRow::last_result`).
+    pub fn legacy_sentence(&self) -> String {
+        match self {
+            Self::Started { job_id } => format!("started job {job_id}"),
+            Self::StartFailed { detail, .. } => format!("failed to start: {detail}"),
+            Self::Skipped { reason, .. } if !reason.is_empty() => format!("pominięto: reason:{reason}"),
+            Self::Skipped { detail, .. } => format!("pominięto: {detail}"),
+        }
+    }
+
+    /// The wire word (`NasScheduleRow::last_outcome`).
+    pub fn wire_word(&self) -> &'static str {
+        match self {
+            Self::Started { .. } => "started",
+            Self::StartFailed { .. } => "start_failed",
+            Self::Skipped { .. } => "skipped",
+        }
+    }
+}
+
 // ----- next run -------------------------------------------------------------------
 
 fn at_local(naive: chrono::NaiveDateTime) -> Option<DateTime<Local>> {
@@ -250,7 +384,10 @@ async fn tick(main_db: &DbPool, db: &DbPool) {
         super::disks::snapshot()
             .0
             .into_iter()
-            .map(|d| (d.disk_id, d.path))
+            // `(disk_id, kernel name)`: a line of the one job is named, and
+            // only a disk that reports SMART can take a self-test.
+            .filter(|d| d.smart_available)
+            .map(|d| (d.disk_id, d.name))
             .collect(),
     )
     .await;
@@ -291,6 +428,9 @@ async fn run_elastic_passes(
     };
     run_due_elastic_tasks(db, &arrays, now).await;
     run_automatic_movers(db, &arrays, clock, observer).await;
+    // In the background: a cold walk of a large array takes minutes, and it
+    // paces itself (`FolderUsageCache::due`), so most ticks start nothing.
+    super::elastic::spawn_folder_usage_pass(db, arrays);
 }
 
 /// The recurring scrub and the recurring TRIM (§5.10) are the same loop over
@@ -324,10 +464,7 @@ async fn run_due_pool_tasks(db: &DbPool, task: store::PoolTask, now: DateTime<Lo
             store::PoolTask::Scrub => super::pools::spawn_scheduled_scrub(db, &row.pool),
             store::PoolTask::Trim => super::pools::spawn_scheduled_trim(db, &row.pool),
         };
-        let result = match &started {
-            Ok(job) => format!("started job {}", job.job_id),
-            Err(e) => format!("failed to start: {e}"),
-        };
+        let result = ScheduleOutcome::of_spawn(&started).stored();
         if let Err(e) = store::record_pool_schedule_run(db, task, &row.pool, &result, next.as_deref()) {
             tracing::warn!(
                 "tentanas scheduler: {} run not recorded: {e}",
@@ -386,6 +523,26 @@ async fn run_due_elastic_tasks(
                 }
                 continue;
             }
+            // AN ARRAY THAT WAS NEVER CREATED HAS NOTHING TO RUN ON. The
+            // default scrub is written in the transaction that writes the
+            // array row (`insert_default_scrub_schedule`), before the create
+            // job has done anything. A create that FAILED closes the array
+            // `needs_attention`, which the parity admission accepts (it is how
+            // a failed parity run is settled) — so the scrub would run over a
+            // half-made array; one still running is refused and read as a
+            // failed schedule. Neither is a slot of a real array: it is
+            // skipped with its reason (`CREATION_UNFINISHED`) and moves on, so
+            // a Restore that finishes the array later does not fire a stale
+            // slot the minute it succeeds.
+            if array.state == "creating" || array.creation_unfinished {
+                let reason = ScheduleOutcome::skipped("array_not_created").stored();
+                if let Err(e) =
+                    store::record_elastic_schedule_run(db, &row.array_id, task, &reason, next.as_deref())
+                {
+                    tracing::warn!("tentanas scheduler: elastic {} skip of {} not recorded: {e}", task.kind(), array.name);
+                }
+                continue;
+            }
             // AN UNATTENDED SYNC DOES NOT RUN OVER A SCRUB'S REPORTED ERRORS.
             //
             // A Sync is admitted on an array that needs attention — that is
@@ -427,11 +584,14 @@ async fn run_due_elastic_tasks(
                     &array.name,
                     &store::AlertText::new(
                         "elastic_sync_held",
-                        "Zaplanowany Sync wstrzymany: parity zgłasza błędy",
-                        "Scrub tej macierzy zgłosił błędy, których nic jeszcze nie naprawiło. Node nie uruchamia \
-                         zaplanowanego Sync, bo zapisałby obecny stan plików usuniętych lub zmienionych od ostatniego \
-                         Sync, także uszkodzonych, i ich wcześniejszych wersji nie dałoby się już odtworzyć z parity. \
-                         Uruchom naprawę z parity, a potem scrub; Sync ręczny pozostaje dostępny.",
+                        // The node's English, the tooltip of the worded
+                        // alert (critic wave 6, MINOR 5: it was Polish).
+                        "Scheduled Sync held: parity reports errors",
+                        "The scrub of this array reported errors nothing has repaired yet. Files deleted or \
+                         changed since the previous Sync may be among the damaged ones, and a Sync would record \
+                         them as the new state: their earlier versions could no longer be restored from parity. \
+                         The node does not run the scheduled Sync; run the repair from parity, then a scrub. A \
+                         manual Sync stays available.",
                     )
                     .param("array", &array.name)
                     // Which fault holds it: counted scrub errors, or a fault
@@ -452,7 +612,7 @@ async fn run_due_elastic_tasks(
             if let Some(code) = parity_fault {
                 // The advanced `next_run_at` goes in with the reason, so the
                 // slot is skipped once and not re-tried every tick.
-                let reason = format!("pominięto: reason:{code}");
+                let reason = ScheduleOutcome::skipped(code).stored();
                 if let Err(e) =
                     store::record_elastic_schedule_run(db, &row.array_id, task, &reason, next.as_deref())
                 {
@@ -494,10 +654,7 @@ async fn run_due_elastic_tasks(
             if task == store::ElasticTask::Mover && started.is_ok() {
                 super::elastic::MoverClock::global().started(&array.name);
             }
-            let result = match &started {
-                Ok(job) => format!("started job {}", job.job_id),
-                Err(e) => format!("failed to start: {e}"),
-            };
+            let result = ScheduleOutcome::of_spawn(&started).stored();
             // The advanced `next_run_at` goes in with the result whether the
             // spawn worked or not. Leaving it where it was would make a busy
             // array re-fire every single tick instead of next cadence.
@@ -564,7 +721,14 @@ async fn run_automatic_movers(
     observer: &impl CacheObserver,
 ) {
     for array in arrays {
-        if !array.enabled || array.cache().next().is_none() || !clock.cooled_down(&array.name) {
+        // An array whose create has not completed has no union to move into
+        // (see `run_due_elastic_tasks`): not probed, not moved.
+        if !array.enabled
+            || array.state == "creating"
+            || array.creation_unfinished
+            || array.cache().next().is_none()
+            || !clock.cooled_down(&array.name)
+        {
             continue;
         }
         let Some(array_id) = array.array_id() else {
@@ -721,10 +885,7 @@ async fn run_due_snapshots(db: &DbPool, now: DateTime<Local>) {
             .map(str::to_string)
             .collect();
         let started = super::snapshots::spawn_auto(db, &schedule, tiers, now);
-        let result = match &started {
-            Ok(job) => format!("started job {}", job.job_id),
-            Err(e) => format!("failed to start: {e}"),
-        };
+        let result = ScheduleOutcome::of_spawn(&started).stored();
         if let Err(e) = store::record_snapshot_run(db, &schedule.schedule_id, &result, next.as_deref())
         {
             tracing::warn!("tentanas scheduler: snapshot run not recorded: {e}");
@@ -746,6 +907,7 @@ async fn run_due_snapshots(db: &DbPool, now: DateTime<Local>) {
 /// schedule. That refusal IS the serialisation this needs — for the scheduled
 /// and the manual start alike — and a second lock here would only be able to
 /// disagree with it.
+/// `disks` is `(disk_id, kernel name)` of every disk that reports SMART.
 async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>, disks: Vec<(String, String)>) {
     let mut smart = match store::smart_schedule(db) {
         Ok(s) => s,
@@ -800,19 +962,25 @@ async fn run_due_smart_tests(db: &DbPool, now: DateTime<Local>, disks: Vec<(Stri
             smart.next_short_at = next;
         }
         changed = true;
+        // ONE job for the whole pass (owner decision 2026-09-26, wave 9b):
+        // n15's "SMART short — wszystkie · 18/18 OK" row, a line per disk. A
+        // disk a self-test already runs on is its own refused line
+        // (`store::insert_job_full`); a pass where EVERY disk is busy starts
+        // no job at all, rather than a job whose every line is refused.
+        let free = disks.iter().any(|(disk_id, _)| !store::self_test_busy(db, disk_id).unwrap_or(true));
         let mut started_any = false;
-        for (disk_id, device) in disks.iter().cloned() {
-            match super::jobs::spawn(db, "smart_test", &disk_id, STARTED_BY, None, None, move |h| {
-                super::jobs::smart_self_test(h, device, kind, None)
+        if free {
+            let subject = store::smart_batch_subject(long, None);
+            match super::jobs::spawn_smart_batch(db, &subject, STARTED_BY, &disks, move |h| {
+                super::jobs::smart_self_test_batch(h, kind, None)
             }) {
                 Ok(_) => started_any = true,
-                // Logged at info, not warn: on a node whose long test is still
-                // running this is the expected answer for every disk, and the
-                // message carries the reason the refusal gave.
-                Err(e) => tracing::info!(
-                    "tentanas scheduler: SMART test for {disk_id} not started: {e}"
-                ),
+                Err(e) => tracing::warn!("tentanas scheduler: SMART job not started: {e}"),
             }
+        } else {
+            // Logged at info, not warn: on a node whose long test is still
+            // running this is the expected answer for every disk.
+            tracing::info!("tentanas scheduler: SMART pass found every disk already testing");
         }
         // A pass that started NOTHING did not run, so it does not stamp
         // `last_*_at`. The Tasks tab renders that field as the schedule's
@@ -1235,7 +1403,10 @@ mod tests {
         let sync_row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Sync)
             .expect("read")
             .expect("row");
-        assert_eq!(sync_row.last_result, "pominięto: reason:elastic_scrub_errors_unrepaired");
+        assert_eq!(
+            ScheduleOutcome::parse(&sync_row.last_result),
+            Some(ScheduleOutcome::skipped("elastic_scrub_errors_unrepaired"))
+        );
         let rearmed = DateTime::parse_from_rfc3339(sync_row.next_run_at.as_deref().expect("next"))
             .expect("parse")
             .with_timezone(&Local);
@@ -1253,11 +1424,14 @@ mod tests {
         let alert = store::list_alerts(&p, true)
             .expect("alerts")
             .into_iter()
-            .find(|alert| alert.subject_id == "media" && alert.title.contains("Sync wstrzymany"))
+            .find(|alert| alert.subject_id == "media" && alert.code == "elastic_sync_held")
             .expect("the skip raises an alert");
         assert_eq!(alert.severity, "warning");
         assert_eq!(alert.subject_kind, "elastic-array");
-        assert!(alert.detail.contains("naprawę"), "{}", alert.detail);
+        // The node's English, the tooltip: the fault-specific reason and the
+        // remedy (critic wave 6, MINOR 5 — it used to be Polish).
+        assert!(alert.title.contains("Sync held"), "{}", alert.title);
+        assert!(alert.detail.contains("may be among the damaged ones") && alert.detail.contains("repair"), "{}", alert.detail);
         assert_eq!(alert.code, "elastic_sync_held", "worded by the screen, not by this text");
         assert_eq!(alert.params.get("array").map(String::as_str), Some("media"));
         assert_eq!(alert.params.get("cause").map(String::as_str), Some("scrub_errors"));
@@ -1325,7 +1499,7 @@ mod tests {
             store::list_alerts(&p, true)
                 .expect("alerts")
                 .into_iter()
-                .all(|alert| !alert.title.contains("Sync wstrzymany")),
+                .all(|alert| alert.code != "elastic_sync_held"),
             "and the alert is resolved"
         );
     }
@@ -1380,7 +1554,10 @@ mod tests {
         let sync_row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Sync)
             .expect("read")
             .expect("row");
-        assert_eq!(sync_row.last_result, "pominięto: reason:elastic_parity_fault_unacknowledged");
+        assert_eq!(
+            ScheduleOutcome::parse(&sync_row.last_result),
+            Some(ScheduleOutcome::skipped("elastic_parity_fault_unacknowledged"))
+        );
         assert!(
             store::list_jobs(&p, 100).expect("jobs").iter().all(|job| job.kind != "elastic_sync"),
             "no Sync the helper can only refuse is started"
@@ -1453,7 +1630,7 @@ mod tests {
             .expect("read")
             .expect("row");
         assert!(
-            refused.last_result.starts_with("failed to start"),
+            matches!(ScheduleOutcome::parse(&refused.last_result), Some(ScheduleOutcome::StartFailed { ref detail, .. }) if !detail.is_empty()),
             "the refusal is recorded, not swallowed: {}",
             refused.last_result
         );
@@ -1465,7 +1642,7 @@ mod tests {
             .expect("read")
             .expect("row");
         assert!(
-            started.last_result.starts_with("started job"),
+            matches!(ScheduleOutcome::parse(&started.last_result), Some(ScheduleOutcome::Started { .. })),
             "one array's refusal must not stop the next one: {}",
             started.last_result
         );
@@ -1506,8 +1683,13 @@ mod tests {
         let fired = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub)
             .expect("read")
             .expect("row");
-        assert!(fired.last_result.starts_with("started job"), "{}", fired.last_result);
         let jobs = scrubs(&p);
+        assert_eq!(
+            ScheduleOutcome::parse(&fired.last_result),
+            jobs.first().map(|job| ScheduleOutcome::Started { job_id: job.job_id.clone() }),
+            "the slot names the job it started: {}",
+            fired.last_result
+        );
         assert_eq!(jobs.len(), 1, "one scheduled scrub");
         assert_eq!(jobs[0].subject, "media");
         assert_eq!(jobs[0].started_by, STARTED_BY);
@@ -1608,41 +1790,186 @@ mod tests {
         assert!(store::list_snapshot_schedules(&p).expect("list").is_empty());
     }
 
-    /// The default scrub obeys the same admission as a manual one: on an array
-    /// that does not admit a parity run (here: its create never finished) the
-    /// slot records the refusal and starts nothing.
+    /// C2 (wave 6): the default scrub is written with the array row, before
+    /// the create has done anything. On an array whose create is still
+    /// running, or FAILED — which closes it `needs_attention`, a state the
+    /// parity admission accepts — the slot is skipped with its reason, moves
+    /// on, and starts nothing.
     #[tokio::test]
-    async fn the_default_scrub_respects_parity_admission() {
+    async fn the_default_scrub_skips_an_array_whose_create_did_not_finish() {
+        for failed in [false, true] {
+            let p = db();
+            let spec = crate::tentanas::elastic::tests::create_spec("media");
+            let job = tentaflow_protocol::tentanas::NasJob {
+                job_id: uuid::Uuid::now_v7().to_string(),
+                kind: "elastic_create".to_string(),
+                subject: spec.name.clone(),
+                status: "running".to_string(),
+                started_by: "test".to_string(),
+                started_at: store::now(),
+                ..Default::default()
+            };
+            store::insert_job(&p, &job, Some(&crate::tentanas::jobs::ElasticJobIntent::Create(spec.clone())))
+                .expect("create job");
+            if failed {
+                // What a failed create leaves: the array and its create
+                // operation closed `needs_attention`.
+                store::fail_elastic_job(&p, &job.job_id, "mkfs.xfs failed on sdb").expect("fail the create");
+                store::finish_job(&p, &job.job_id, "failed", Some("mkfs.xfs failed on sdb")).expect("job");
+            }
+            let armed_at = Some("2026-09-01T00:00:00Z");
+            let default = store::default_elastic_scrub_schedule();
+            store::set_elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub, true, &default, armed_at)
+                .expect("due");
+            let arrays = store::elastic_arrays_all(&p).expect("arrays");
+            assert_eq!(arrays[0].state, if failed { "needs_attention" } else { "creating" });
+            assert!(arrays[0].creation_unfinished, "failed={failed}");
+            run_due_elastic_tasks(&p, &arrays, at(2026, 9, 2, 10, 0)).await;
+            let row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub)
+                .expect("read")
+                .expect("row");
+            assert_eq!(
+                ScheduleOutcome::parse(&row.last_result),
+                Some(ScheduleOutcome::skipped("array_not_created")),
+                "failed={failed}: {}",
+                row.last_result
+            );
+            assert_ne!(row.next_run_at.as_deref(), armed_at, "the skipped slot moves on");
+            assert!(
+                store::list_jobs(&p, 100)
+                    .expect("jobs")
+                    .iter()
+                    .all(|job| job.kind != "elastic_scrub"),
+                "failed={failed}: an array whose create did not finish is not scrubbed"
+            );
+        }
+    }
+
+    /// Critic wave 6, MINOR 14: a create that failed is made whole by a
+    /// Restore that SUCCEEDED after it — and from then on the default scrub
+    /// fires again (`CREATION_UNFINISHED`'s `(created_at, operation_id)`
+    /// comparison). A Restore still running, or one that failed, is not that.
+    #[tokio::test]
+    async fn the_default_scrub_fires_again_once_a_restore_made_a_failed_create_whole() {
         let p = db();
         let spec = crate::tentanas::elastic::tests::create_spec("media");
-        let job = tentaflow_protocol::tentanas::NasJob {
+        let job = |kind: &str| tentaflow_protocol::tentanas::NasJob {
             job_id: uuid::Uuid::now_v7().to_string(),
-            kind: "elastic_create".to_string(),
+            kind: kind.to_string(),
             subject: spec.name.clone(),
             status: "running".to_string(),
             started_by: "test".to_string(),
             started_at: store::now(),
             ..Default::default()
         };
-        store::insert_job(&p, &job, Some(&crate::tentanas::jobs::ElasticJobIntent::Create(spec.clone())))
-            .expect("create job");
+        let create = job("elastic_create");
+        store::insert_job(&p, &create, Some(&crate::tentanas::jobs::ElasticJobIntent::Create(spec.clone()))).expect("create job");
+        store::fail_elastic_job(&p, &create.job_id, "mkfs.xfs failed on sdb").expect("fail the create");
+        store::finish_job(&p, &create.job_id, "failed", Some("mkfs.xfs failed on sdb")).expect("job");
+        // The create is from an earlier minute, as a real Restore of it is.
+        p.write()
+            .expect("db")
+            .execute("UPDATE nas_elastic_operations SET created_at = '2026-09-01T00:00:00Z' WHERE kind = 'create'", [])
+            .expect("backdate");
+        let unfinished = || store::elastic_arrays_all(&p).expect("arrays")[0].creation_unfinished;
+        assert!(unfinished());
+
+        // A Restore that is still running does not make the create whole.
+        let restore = job("elastic_restore");
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        store::insert_job(&p, &restore, Some(&crate::tentanas::jobs::ElasticJobIntent::Restore {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: operation_id.clone(),
+        }))
+        .expect("restore job");
+        assert!(unfinished(), "a running Restore is not a finished one");
+        store::finish_elastic_operation(&p, &spec.owner, &operation_id, Ok(&crate::tentanas::elastic::tests::ready_result(&spec)))
+            .expect("the restore succeeds");
+        store::finish_job(&p, &restore.job_id, "succeeded", None).expect("job");
+        assert!(!unfinished(), "a succeeded Restore after the failed create makes it whole");
+
         let armed_at = Some("2026-09-01T00:00:00Z");
         let default = store::default_elastic_scrub_schedule();
-        store::set_elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub, true, &default, armed_at)
-            .expect("due");
+        store::set_elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub, true, &default, armed_at).expect("due");
         let arrays = store::elastic_arrays_all(&p).expect("arrays");
+        assert_eq!(arrays[0].state, "active");
         run_due_elastic_tasks(&p, &arrays, at(2026, 9, 2, 10, 0)).await;
-        let row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub)
-            .expect("read")
-            .expect("row");
-        assert!(row.last_result.starts_with("failed to start"), "{}", row.last_result);
-        assert!(
-            store::list_jobs(&p, 100)
-                .expect("jobs")
-                .iter()
-                .all(|job| job.kind != "elastic_scrub"),
-            "an array that is still being created is not scrubbed"
+        let row = store::elastic_schedule(&p, &spec.array_id, store::ElasticTask::Scrub).expect("read").expect("row");
+        assert_ne!(
+            ScheduleOutcome::parse(&row.last_result),
+            Some(ScheduleOutcome::skipped("array_not_created")),
+            "{}",
+            row.last_result
         );
+        assert!(
+            store::list_jobs(&p, 100).expect("jobs").iter().any(|job| job.kind == "elastic_scrub"),
+            "the scrub fires again: {:?}",
+            row.last_result
+        );
+    }
+
+    /// The stored outcome is JSON this build reads back, and the sentence an
+    /// older build wrote is read too — so a row written before the upgrade
+    /// keeps its meaning on the Tasks tab.
+    /// Critic wave 13, MAJOR 1: a scheduled run the store refuses in code
+    /// (`elastic_operation_unresolved` on a busy array) is stored as the
+    /// code, its parameters and its sentence — never as the wire string a
+    /// tooltip would show raw — and goes out as a code the screen words.
+    #[test]
+    fn a_coded_refusal_of_a_scheduled_run_is_stored_as_code_and_params() {
+        let refused: anyhow::Result<tentaflow_protocol::tentanas::NasJob> = Err(
+            super::super::refusal::Refusal::not_available("elastic_disk_in_array", "data disk no. 2 is already in the array media")
+                .disk(super::super::refusal::DiskWords::Data(2))
+                .param("array", "media")
+                .into(),
+        );
+        let outcome = ScheduleOutcome::of_spawn(&refused);
+        let stored = outcome.stored();
+        assert!(!stored.contains("refusal:"), "no wire string is stored: {stored}");
+        let ScheduleOutcome::StartFailed { detail, refusal: Some(refusal) } = ScheduleOutcome::parse(&stored).unwrap() else {
+            panic!("a coded start failure: {stored}")
+        };
+        assert_eq!(detail, "data disk no. 2 is already in the array media");
+        assert_eq!(refusal.code, "elastic_disk_in_array");
+        assert_eq!(refusal.params, vec![("data".to_string(), "2".to_string()), ("array".to_string(), "media".to_string())]);
+        assert_eq!(refusal.wire(""), "refusal:elastic_disk_in_array?data=2&array=media");
+        assert_eq!(outcome.legacy_sentence(), "failed to start: data disk no. 2 is already in the array media");
+        // An uncoded failure keeps its sentence and no refusal.
+        let plain: anyhow::Result<tentaflow_protocol::tentanas::NasJob> = Err(anyhow::anyhow!("busy"));
+        assert_eq!(ScheduleOutcome::of_spawn(&plain), ScheduleOutcome::StartFailed { detail: "busy".into(), refusal: None });
+        // A value stored before wave 13 reads back without one.
+        assert_eq!(
+            ScheduleOutcome::parse(r#"{"outcome":"start_failed","detail":"busy"}"#),
+            Some(ScheduleOutcome::StartFailed { detail: "busy".into(), refusal: None })
+        );
+    }
+
+    #[test]
+    fn a_schedule_outcome_reads_back_in_both_forms() {
+        for outcome in [
+            ScheduleOutcome::Started { job_id: "0191f2c0-0000-7000-8000-000000000001".to_string() },
+            ScheduleOutcome::StartFailed { detail: "Na tym dysku trwa już autotest SMART".to_string(), refusal: None },
+            ScheduleOutcome::skipped("elastic_scrub_errors_unrepaired"),
+        ] {
+            assert_eq!(ScheduleOutcome::parse(&outcome.stored()), Some(outcome.clone()));
+            assert_eq!(ScheduleOutcome::parse(&outcome.legacy_sentence()), Some(outcome.clone()));
+        }
+        assert_eq!(
+            ScheduleOutcome::parse("started job 0191f2c0-0000-7000-8000-000000000001"),
+            Some(ScheduleOutcome::Started { job_id: "0191f2c0-0000-7000-8000-000000000001".to_string() })
+        );
+        assert_eq!(
+            ScheduleOutcome::parse("failed to start: busy"),
+            Some(ScheduleOutcome::StartFailed { detail: "busy".to_string(), refusal: None })
+        );
+        assert_eq!(
+            ScheduleOutcome::parse("pominięto: parity zgłasza błędy"),
+            Some(ScheduleOutcome::Skipped { reason: String::new(), detail: "parity zgłasza błędy".to_string() })
+        );
+        assert_eq!(ScheduleOutcome::parse(""), None, "never ran");
+        assert_eq!(ScheduleOutcome::parse("ok"), None, "a bare older word is not a structure");
+        assert_eq!(ScheduleOutcome::parse("started job "), None);
     }
     // ----- the automatic mover ------------------------------------------------
 
@@ -2318,29 +2645,43 @@ mod tests {
         store::insert_job(p, &job, None).expect("occupy the disk");
     }
 
-    fn smart_test_subjects(p: &DbPool) -> Vec<String> {
-        let mut subjects: Vec<String> = store::list_jobs(p, 500)
+    /// The multi-disk SMART jobs the passes started, each as its subject and
+    /// its lines `(kernel name, state)`.
+    fn smart_batches(p: &DbPool) -> Vec<(String, Vec<(String, String)>)> {
+        let mut jobs: Vec<(String, Vec<(String, String)>)> = store::list_jobs(p, 500)
             .expect("jobs")
             .into_iter()
-            .filter(|j| j.kind == "smart_test")
-            .map(|j| j.subject)
+            .filter(|j| j.kind == store::SMART_BATCH_KIND)
+            .map(|j| {
+                let lines = store::job_disks(p, &j.job_id)
+                    .expect("lines")
+                    .into_iter()
+                    .map(|l| (l.name, l.state))
+                    .collect();
+                (j.subject, lines)
+            })
             .collect();
-        subjects.sort();
-        subjects
+        jobs.sort();
+        jobs
     }
 
     fn two_disks() -> Vec<(String, String)> {
         vec![
-            ("disk-a".to_string(), "/dev/sda".to_string()),
-            ("disk-b".to_string(), "/dev/sdb".to_string()),
+            ("disk-a".to_string(), "sda".to_string()),
+            ("disk-b".to_string(), "sdb".to_string()),
         ]
     }
 
-    /// A second self-test on one disk ABORTS the first, so a disk that is
-    /// already under test is left alone — and the disks beside it still get
-    /// theirs, because one refusal must not end the pass.
+    fn line(name: &str, state: &str) -> (String, String) {
+        (name.to_string(), state.to_string())
+    }
+
+    /// A scheduled pass is ONE job over every disk (owner decision, wave 9b;
+    /// n15 "SMART short — wszystkie"). A second self-test on one disk ABORTS
+    /// the first, so a disk already under test is its own refused line — and
+    /// the disks beside it still get theirs.
     #[tokio::test]
-    async fn a_disk_already_running_a_self_test_gets_no_second_one() {
+    async fn a_pass_is_one_job_and_a_busy_disk_is_its_own_refused_line() {
         let p = db();
         occupy_disk(&p, "disk-a");
         let now = at(2026, 9, 1, 3, 0);
@@ -2353,9 +2694,9 @@ mod tests {
         run_due_smart_tests(&p, now, two_disks()).await;
 
         assert_eq!(
-            smart_test_subjects(&p),
-            ["disk-a", "disk-b"],
-            "disk-a keeps the ONE test it was already running and disk-b gets its first"
+            smart_batches(&p),
+            vec![("short|all".to_string(), vec![line("sda", "refused"), line("sdb", "pending")])],
+            "one job; disk-a keeps the ONE test it was already running and disk-b gets its first"
         );
         let after = store::smart_schedule(&p).expect("schedule");
         assert!(after.last_short_at.is_some(), "disk-b did start, so the pass ran");
@@ -2363,10 +2704,9 @@ mod tests {
     }
 
     /// Both cadences due in the same tick: the LONG pass takes the disks and
-    /// the short pass is refused on every one of them. Reversing the two loop
-    /// passes would make a daily short test cut every long test short — and
-    /// the only thing that records WHICH pass got the disks is `last_*_at`,
-    /// because the job row says "smart_test" for both.
+    /// the short pass finds every one of them testing, so it starts no job.
+    /// Reversing the two passes would make a daily short test cut every long
+    /// test short.
     #[tokio::test]
     async fn the_long_pass_takes_the_disks_before_the_short_pass_sees_them() {
         let p = db();
@@ -2377,9 +2717,9 @@ mod tests {
         run_due_smart_tests(&p, now, two_disks()).await;
 
         assert_eq!(
-            smart_test_subjects(&p),
-            ["disk-a", "disk-b"],
-            "one test per disk, not one per pass"
+            smart_batches(&p),
+            vec![("long|all".to_string(), vec![line("sda", "pending"), line("sdb", "pending")])],
+            "one long job over both disks and no short one"
         );
         let after = store::smart_schedule(&p).expect("schedule");
         assert!(after.last_long_at.is_some(), "the long pass is the one that ran");
@@ -2412,11 +2752,7 @@ mod tests {
 
         run_due_smart_tests(&p, now, two_disks()).await;
 
-        assert_eq!(
-            smart_test_subjects(&p),
-            ["disk-a", "disk-b"],
-            "only the two tests that were already running"
-        );
+        assert!(smart_batches(&p).is_empty(), "every disk was testing: no job whose every line is refused");
         let after = store::smart_schedule(&p).expect("schedule");
         assert!(
             after.last_short_at.is_none(),
@@ -2428,5 +2764,280 @@ mod tests {
             next_run_utc(&after.short, now),
             "the cadence re-arms forward anyway"
         );
+    }
+
+    // ----- folder usage (n11 "Użycie") ----------------------------------------
+
+    use crate::tentanas::elastic::{
+        fill_folder_usage, run_folder_usage_pass, FolderRow, FolderUsageCache, FolderUsageProber,
+        FOLDER_USAGE_EVERY, FOLDER_USAGE_RETRY,
+    };
+    use tentanas_helper::elastic::{ElasticFolderBytes, ElasticFolderGap, ElasticFolderUsage};
+
+    /// Canned folder walks, counted: what the pass asked and how often.
+    struct Walks {
+        answer: Option<Vec<ElasticFolderBytes>>,
+        asked: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl Walks {
+        fn answering(answer: Option<Vec<ElasticFolderBytes>>) -> Self {
+            Self { answer, asked: Default::default() }
+        }
+        fn count(&self) -> usize {
+            self.asked.lock().unwrap().len()
+        }
+    }
+
+    impl FolderUsageProber for Walks {
+        async fn measure(&self, _: &ElasticArrayRow, folders: &[String]) -> anyhow::Result<ElasticFolderUsage> {
+            self.asked.lock().unwrap().push(folders.to_vec());
+            match &self.answer {
+                Some(folders) => Ok(ElasticFolderUsage { folders: folders.clone() }),
+                None => Err(anyhow::anyhow!("elastic_folder_usage exited with 69: unknown command")),
+            }
+        }
+    }
+
+    fn bytes(name: &str, bytes: u64) -> ElasticFolderBytes {
+        ElasticFolderBytes { name: name.into(), bytes: Some(bytes), gap: None }
+    }
+
+    fn gap(name: &str, gap: ElasticFolderGap) -> ElasticFolderBytes {
+        ElasticFolderBytes { name: name.into(), bytes: None, gap: Some(gap) }
+    }
+
+    /// A settled array whose union was read: two folders.
+    fn array_with_folders(p: &DbPool, name: &str) -> ElasticArrayRow {
+        settled_cached_array(p, name);
+        let mut array = store::elastic_arrays_all(p).expect("arrays").remove(0);
+        array.folders = ["filmy", "foto"]
+            .iter()
+            .map(|f| FolderRow { name: f.to_string(), cache_policy: "yes".into(), ..Default::default() })
+            .collect();
+        array.folders_known = true;
+        array
+    }
+
+    /// The folders of `array` as the wire carries them after `fill_folder_usage`.
+    fn wire_folders(array: &ElasticArrayRow, cache: &FolderUsageCache) -> Vec<tentaflow_protocol::tentanas::NasElasticFolder> {
+        let mut wire = tentaflow_protocol::tentanas::NasElasticArray {
+            folders: array
+                .folders
+                .iter()
+                .map(|f| tentaflow_protocol::tentanas::NasElasticFolder { name: f.name.clone(), ..Default::default() })
+                .collect(),
+            ..Default::default()
+        };
+        fill_folder_usage(&mut wire, array, cache);
+        wire.folders
+    }
+
+    fn codes(folder: &tentaflow_protocol::tentanas::NasElasticFolder) -> Vec<&str> {
+        folder.used_reasons.iter().map(|r| r.code.as_str()).collect()
+    }
+
+    /// The pass measures an array once, the read copies the figures, and the
+    /// NEXT pass asks nothing until `FOLDER_USAGE_EVERY` has passed: the walk
+    /// is paced by the cache, never started by a read.
+    #[tokio::test]
+    async fn folder_usage_is_measured_once_per_period_and_the_read_only_copies_it() {
+        let p = db();
+        let array = array_with_folders(&p, "media");
+        let cache = FolderUsageCache::new();
+        let walks = Walks::answering(Some(vec![bytes("filmy", 4_000), gap("foto", ElasticFolderGap::OverBudget)]));
+
+        let before = wire_folders(&array, &cache);
+        assert_eq!(codes(&before[0]), ["folder_usage_pending"], "nothing measured yet");
+        assert_eq!(before[0].used_bytes, None);
+        assert_eq!(walks.count(), 0, "a read never walks");
+
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 1);
+        assert_eq!(walks.asked.lock().unwrap()[0], ["filmy", "foto"]);
+        let wire = wire_folders(&array, &cache);
+        assert_eq!(wire[0].used_bytes, Some(4_000));
+        assert!(wire[0].used_measured_at.is_some());
+        assert!(wire[0].used_reasons.is_empty());
+        assert_eq!(wire[1].used_bytes, None, "over budget is no figure, never a partial one");
+        assert_eq!(codes(&wire[1]), ["folder_usage_over_budget"]);
+        assert_eq!(wire[1].used_reasons[0].params.get("minutes").map(String::as_str), Some("5"));
+
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 1, "measured within the period: not walked again");
+
+        cache.age_for_test(array.array_id().unwrap(), FOLDER_USAGE_EVERY);
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 2, "the period passed: measured again");
+    }
+
+    /// Critic wave 7, MINOR 8: a restart (a fresh cache over the same node
+    /// database) keeps the last reading and its date, and does not walk the
+    /// array again before `FOLDER_USAGE_EVERY` counted from that date. A
+    /// dissolved array leaves no reading behind.
+    #[tokio::test]
+    async fn a_restart_keeps_the_last_folder_reading_and_its_pacing() {
+        let p = db();
+        let array = array_with_folders(&p, "media");
+        let id = array.array_id().unwrap().to_string();
+        let walks = Walks::answering(Some(vec![bytes("filmy", 4_000), gap("foto", ElasticFolderGap::OverBudget)]));
+        let before_restart = FolderUsageCache::new();
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &before_restart, &walks).await;
+        assert_eq!(walks.count(), 1);
+        let measured_at = wire_folders(&array, &before_restart)[0].used_measured_at.clone();
+        assert!(measured_at.is_some());
+
+        let restarted = FolderUsageCache::new();
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &restarted, &walks).await;
+        assert_eq!(walks.count(), 1, "a restart does not walk an array measured within the period");
+        let wire = wire_folders(&array, &restarted);
+        assert_eq!(wire[0].used_bytes, Some(4_000), "the figure survives the restart");
+        assert_eq!(wire[0].used_measured_at, measured_at, "with the date it was measured");
+        assert_eq!(codes(&wire[1]), ["folder_usage_over_budget"]);
+
+        // A reading older than the period is measured again after a restart.
+        let key = format!("folder_usage:{id}");
+        let old = (chrono::Utc::now() - chrono::Duration::hours(7)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let text = store::setting(&p, &key).unwrap().expect("stored");
+        let aged = text.replace(measured_at.as_deref().unwrap(), &old);
+        assert_ne!(aged, text);
+        store::set_setting(&p, &key, &aged).unwrap();
+        let restarted_late = FolderUsageCache::new();
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &restarted_late, &walks).await;
+        assert_eq!(walks.count(), 2, "an old reading is measured again");
+
+        // A reading from the future (a clock step) is not trusted.
+        let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        store::set_setting(&p, &key, &aged.replace(&old, &future)).unwrap();
+        let stepped = FolderUsageCache::new();
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &stepped, &walks).await;
+        assert_eq!(walks.count(), 3, "a reading dated in the future is measured again");
+
+        let spec = array.persisted_spec().unwrap().clone();
+        assert!(store::setting(&p, &key).unwrap().is_some());
+        assert!(store::delete_elastic_array(&p, &spec.owner, &spec.array_id).expect("delete"));
+        assert_eq!(store::setting(&p, &key).unwrap(), None, "a dissolved array leaves no reading");
+    }
+
+    /// A helper that refuses the command (an older build) leaves the folders
+    /// with NO figure and the reason, is asked again only after
+    /// `FOLDER_USAGE_RETRY`, and never turns an earlier figure into a zero.
+    #[tokio::test]
+    async fn a_refused_measurement_is_a_reason_and_is_retried_later() {
+        let p = db();
+        let array = array_with_folders(&p, "media");
+        let cache = FolderUsageCache::new();
+        let refused = Walks::answering(None);
+
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &refused).await;
+        let wire = wire_folders(&array, &cache);
+        assert_eq!(wire[0].used_bytes, None);
+        assert_eq!(codes(&wire[0]), ["folder_usage_failed"]);
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &refused).await;
+        assert_eq!(refused.count(), 1, "not re-asked before the retry");
+
+        cache.age_for_test(array.array_id().unwrap(), FOLDER_USAGE_RETRY);
+        let working = Walks::answering(Some(vec![bytes("filmy", 7), bytes("foto", 9)]));
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &working).await;
+        assert_eq!(working.count(), 1, "retried after the retry period");
+        assert_eq!(wire_folders(&array, &cache)[1].used_bytes, Some(9));
+
+        // A later failure keeps the measured figures with their date.
+        cache.age_for_test(array.array_id().unwrap(), FOLDER_USAGE_EVERY);
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &refused).await;
+        assert_eq!(wire_folders(&array, &cache)[1].used_bytes, Some(9));
+    }
+
+    /// MINOR 5 (wave 7): a branch that was not mounted (a Restore, a disk
+    /// being replaced) is a passing state. The folders it covered are asked
+    /// again after `FOLDER_USAGE_RETRY`, not after `FOLDER_USAGE_EVERY`.
+    #[tokio::test]
+    async fn an_unmounted_branch_is_measured_again_after_the_retry_not_six_hours() {
+        let p = db();
+        let array = array_with_folders(&p, "media");
+        let cache = FolderUsageCache::new();
+        let unmounted = Walks::answering(Some(vec![gap("filmy", ElasticFolderGap::NotMounted), gap("foto", ElasticFolderGap::NotMounted)]));
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &unmounted).await;
+        assert_eq!(codes(&wire_folders(&array, &cache)[0]), ["folder_usage_not_mounted"]);
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &unmounted).await;
+        assert_eq!(unmounted.count(), 1, "not re-asked at once");
+        cache.age_for_test(array.array_id().unwrap(), FOLDER_USAGE_RETRY);
+        let mounted = Walks::answering(Some(vec![bytes("filmy", 3), bytes("foto", 4)]));
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &mounted).await;
+        assert_eq!(mounted.count(), 1, "re-measured after the retry, well before six hours");
+        assert_eq!(wire_folders(&array, &cache)[0].used_bytes, Some(3));
+    }
+
+    /// MINOR 6 (wave 7): a folder name the walk refuses (a control character,
+    /// over 255 bytes) is left out of the request and gets its own reason; the
+    /// other folders are measured instead of the whole array failing forever.
+    #[tokio::test]
+    async fn a_refused_folder_name_does_not_take_the_other_folders_down() {
+        let p = db();
+        let mut array = array_with_folders(&p, "media");
+        array.folders.push(FolderRow { name: "bad\nname".into(), cache_policy: "yes".into(), ..Default::default() });
+        array.folders.push(FolderRow { name: "x".repeat(256), cache_policy: "yes".into(), ..Default::default() });
+        let cache = FolderUsageCache::new();
+        let walks = Walks::answering(Some(vec![bytes("filmy", 5), bytes("foto", 6)]));
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.asked.lock().unwrap()[0], ["filmy", "foto"], "only the valid names are asked");
+        let wire = wire_folders(&array, &cache);
+        assert_eq!((wire[0].used_bytes, wire[1].used_bytes), (Some(5), Some(6)));
+        assert_eq!(codes(&wire[2]), ["folder_usage_name_refused"]);
+        assert_eq!(codes(&wire[3]), ["folder_usage_name_refused"]);
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 1, "a refused name is an answer, not a reason to retry every pass");
+    }
+
+    /// An answer that is not about the folders asked — another name, another
+    /// count, a figure and a gap at once — is not a measurement.
+    #[tokio::test]
+    async fn an_answer_about_other_folders_is_not_recorded() {
+        let p = db();
+        let array = array_with_folders(&p, "media");
+        for answer in [
+            vec![bytes("filmy", 1)],
+            vec![bytes("filmy", 1), bytes("muzyka", 2)],
+            vec![bytes("filmy", 1), ElasticFolderBytes { name: "foto".into(), bytes: Some(2), gap: Some(ElasticFolderGap::Unreadable) }],
+        ] {
+            let cache = FolderUsageCache::new();
+            run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &Walks::answering(Some(answer))).await;
+            let wire = wire_folders(&array, &cache);
+            assert_eq!(wire[0].used_bytes, None);
+            assert_eq!(codes(&wire[0]), ["folder_usage_failed"]);
+        }
+    }
+
+    /// Not walked: an array whose folder list is unknown, and one with an
+    /// operation running (a Restore changes the very mounts the walk reads).
+    #[tokio::test]
+    async fn folder_usage_skips_unknown_folders_and_a_running_operation() {
+        let p = db();
+        let mut array = array_with_folders(&p, "media");
+        let cache = FolderUsageCache::new();
+        let walks = Walks::answering(Some(vec![bytes("filmy", 1), bytes("foto", 2)]));
+        array.folders_known = false;
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 0, "an unknown folder list is not measured");
+        array.folders_known = true;
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "elastic_restore".to_string(),
+            subject: array.name.clone(),
+            status: "running".to_string(),
+            started_by: "test".to_string(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        let spec = array.persisted_spec().unwrap().clone();
+        store::insert_job(&p, &job, Some(&crate::tentanas::jobs::ElasticJobIntent::Restore {
+            owner: spec.owner.clone(),
+            array_id: spec.array_id.clone(),
+            operation_id: uuid::Uuid::now_v7().to_string(),
+        }))
+        .expect("restore job");
+        assert!(store::elastic_operation_running(&p, &spec.array_id).unwrap());
+        run_folder_usage_pass(&p, std::slice::from_ref(&array), &cache, &walks).await;
+        assert_eq!(walks.count(), 0, "not walked while an operation runs");
     }
 }

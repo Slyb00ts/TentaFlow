@@ -11,9 +11,11 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
   T, sprite, POLL_JOB_MODAL_MS, ADMIN_TIMEOUT_MS,
-  fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel, diskReasonsText,
+  fmtBytes, pct, healthClass, errMessage, layoutLabel, jobKindLabel, nodeLabel, diskReasonsText, diskOwnerWords,
+  wordReasons, nodeTextTitle, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, paintJobLog } from '/js/lib/dom-patch.js';
+import { elasticCapabilitiesDetail } from '/js/modules/tentanas/feature-words.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-checkbox.js';
@@ -34,6 +36,96 @@ export const elasticNameValid = (name) => /^[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,63}$/.t
 const COMPRESSION_OPTIONS = ['zstd', 'lz4', 'off'];
 
 const KIND_LABELS = { zfs: 'ZFS', anyraid: 'ZFS AnyRAID', elastic: 'Elastic Array' };
+
+// Why the AnyRAID card is disabled, from the node's own `zpool upgrade -v`
+// read (the Environment row `anyraid`, environment.rs `anyraid_refine`) and
+// the node's ZFS version. The card stays disabled even when ZFS knows the
+// feature: this build cannot create an AnyRAID pool yet (owner decision
+// 2026-09-26), and a card that can be picked and then does nothing would be a
+// lie. A node too old to send the row, or a read that failed, is "not
+// checked" — never "supported".
+export function anyraidCardText(environment, fallbackVersion = '') {
+  const features = environment?.features || [];
+  const row = features.find((f) => f.id === 'anyraid');
+  const version = row?.version || features.find((f) => f.id === 'zfs')?.version || (fallbackVersion !== '—' ? fallbackVersion : '') || '';
+  const zfs = version ? `ZFS ${version}` : 'ZFS';
+  const key = row?.status === 'not_offered' ? 'anyraid_supported_not_offered' : row?.status === 'unsupported' ? 'anyraid_not_in_zfs' : 'anyraid_unreadable';
+  const reason = T('env.detail.' + key, { zfs });
+  return { description: reason, title: T('wizard_pool.kind_anyraid_title', { reason }) };
+}
+
+// The Elastic preview's refusals and warnings in the reader's language (wave
+// 6): the node sends each with a code and its parameters beside its own
+// sentence (`elastic::layout_refusals`, `layout_warning_codes`), and the
+// sentence becomes the tooltip. A code this build has no words for — or a
+// node too old to send codes — shows the node's sentence as it came.
+const ELASTIC_ROLE_WORDS = new Set(['data', 'parity', 'cache']);
+const elasticRole = (role) => (ELASTIC_ROLE_WORDS.has(role) ? T('wizard_pool.elastic_role_' + role) : '');
+const bytesParam = (value) => (Number.isFinite(Number(value)) && String(value) !== '' ? fmtBytes(Number(value)) : '');
+
+const elasticOwner = (p) => diskOwnerWords(p.owner, p.owner_name);
+
+const ELASTIC_REFUSAL_WORDS = new Map([
+  ['too_many_cache_disks', () => T('wizard_pool.elastic_refusal.too_many_cache_disks')],
+  ['name_invalid', (p) => (p.name ? T('wizard_pool.elastic_refusal.name_invalid', { name: String(p.name) }) : null)],
+  ['name_taken', (p) => (p.name && p.path ? T('wizard_pool.elastic_refusal.name_taken', { name: p.name, path: p.path }) : null)],
+  ['no_data_disks', () => T('wizard_pool.elastic_refusal.no_data_disks')],
+  ['too_many_parity', (p) => (p.count && p.max ? T('wizard_pool.elastic_refusal.too_many_parity', { count: p.count, max: p.max }) : null)],
+  ['disk_repeated', (p, disk) => {
+    // Two rows of one device: named by the other disk, not by the identity
+    // they share (a WWN or a serial stays in the node's sentence).
+    if (p.other) {
+      const role = elasticRole(p.role);
+      const other = elasticRole(p.other_role);
+      return disk && role && other ? T('wizard_pool.elastic_refusal.same_device', { disk, role, other: p.other, other_role: other }) : null;
+    }
+    const first = elasticRole(p.first_role);
+    const role = elasticRole(p.role);
+    return disk && first && role ? T('wizard_pool.elastic_refusal.disk_repeated', { disk, first, role }) : null;
+  }],
+  ['data_disks_same_device', (p, disk) => (disk && p.other ? T('wizard_pool.elastic_refusal.data_disks_same_device', { disk, other: p.other }) : null)],
+  ['disk_in_use', (p, disk) => {
+    // A LUN another target serves to this node (MAJOR 27 F4): named as what
+    // it is rather than as an owner the disk would be shared with.
+    if (p.owner === 'remote') return disk ? T('wizard_pool.elastic_refusal.disk_remote', { disk }) : null;
+    const owner = elasticOwner(p);
+    return disk && owner ? T('wizard_pool.elastic_refusal.disk_in_use', { disk, owner }) : null;
+  }],
+  ['parity_too_small', (p, disk) => {
+    const size = bytesParam(p.size);
+    const largest = bytesParam(p.largest);
+    return disk && size && largest ? T('wizard_pool.elastic_refusal.parity_too_small', { disk, size, largest }) : null;
+  }],
+  ['filesystem_invalid', (p) => (p.filesystem ? T('wizard_pool.elastic_refusal.filesystem_invalid', { filesystem: p.filesystem }) : null)],
+  ['filesystem_unavailable', (p) => (p.filesystem ? T('wizard_pool.elastic_refusal.filesystem_unavailable', { filesystem: p.filesystem }) : null)],
+  ['plan_failed', () => T('wizard_pool.elastic_refusal.plan_failed')],
+]);
+
+// `{ text, title }` of one refusal: the words, and the node's sentence as the
+// tooltip when the words replace it.
+export function elasticRefusalText(r) {
+  const fn = ELASTIC_REFUSAL_WORDS.get(String(r?.code || ''));
+  const words = fn ? fn(r?.params || {}, String(r?.diskName || '')) : null;
+  const detail = String(r?.detail || '');
+  return words ? { text: words, title: nodeTextTitle(detail) } : { text: detail, title: '' };
+}
+
+const ELASTIC_WARNING_WORDS = new Map([
+  ['no_parity', () => T('wizard_pool.elastic_warning.no_parity')],
+  ['parity_tight', (p) => (p.disk ? T('wizard_pool.elastic_warning.parity_tight', { disk: p.disk }) : null)],
+  ['no_cache', () => T('wizard_pool.elastic_warning.no_cache')],
+  ['unhealthy_disks', (p) => (p.disks ? T('wizard_pool.elastic_warning.unhealthy_disks', { disks: p.disks }) : null)],
+  ['mixed_sizes', () => T('wizard_pool.elastic_warning.mixed_sizes')],
+]);
+
+// The preview's warnings, one line each: worded from `warningCodes`, or the
+// node's sentences when it sent no codes (or one this build cannot word).
+export function elasticPlanWarnings(plan) {
+  const codes = Array.isArray(plan?.warningCodes) ? plan.warningCodes : [];
+  const worded = codes.map((c) => wordReasons([c], ELASTIC_WARNING_WORDS));
+  if (codes.length && worded.every(Boolean)) return worded;
+  return Array.isArray(plan?.warnings) ? plan.warnings.map(String) : [];
+}
 
 /**
  * Every disk of the node for the picker: the free ones are selectable, the
@@ -181,16 +273,25 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
   };
 
   // Dostępność Elastic pochodzi z aktualnego węzła, nie z obecności ZFS.
+  const anyraid = anyraidCardText(screen.environment, zfsVersion);
   const stepKind = () => `
     <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.kind_title'))}</h2>
     <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.kind_sub'))}</p>
     <tf-choice-group id="nas-pw-kind" value="${escapeAttr(state.kind)}" columns="3">
       <tf-choice-card value="zfs" icon="layers" heading="ZFS" description="${escapeAttr(T('wizard_pool.kind_zfs_desc'))}"></tf-choice-card>
-      <tf-choice-card value="anyraid" icon="layers" heading="ZFS AnyRAID" description="${escapeAttr(T('wizard_pool.kind_anyraid_desc'))}" title="${escapeAttr(T('wizard_pool.kind_anyraid_title', { v: zfsVersion }))}" disabled></tf-choice-card>
+      <tf-choice-card value="anyraid" icon="layers" heading="ZFS AnyRAID" description="${escapeAttr(anyraid.description)}" title="${escapeAttr(anyraid.title)}" disabled></tf-choice-card>
       <tf-choice-card value="elastic" icon="cylinder" heading="Elastic Array" description="${escapeAttr(T('wizard_pool.kind_elastic_desc'))}" ${elasticAvailable() ? '' : 'disabled'}></tf-choice-card>
     </tf-choice-group>
     <div class="text-xs text-3 mt-md">${escapeHtml(T('wizard_pool.kind_hint'))}</div>
-    ${elasticAvailable() ? '' : `<div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(state.capabilitiesError || state.capabilities?.detail || (state.capabilities ? T('wizard_pool.elastic_unavailable') : I18n.t('common.loading')))}<tf-button variant="ghost" data-pw-environment>${escapeHtml(T('tabs.environment'))}</tf-button></div></div>`}`;
+    ${elasticAvailable() ? '' : elasticUnavailableHtml()}`;
+  // Why the Elastic card is disabled: the node's reasons in the reader's
+  // language (`elasticCapabilitiesDetail`), its own sentence as the tooltip.
+  function elasticUnavailableHtml() {
+    const caps = state.capabilities ? elasticCapabilitiesDetail(state.capabilities) : { text: '', title: '' };
+    const text = state.capabilitiesError || caps.text || (state.capabilities ? T('wizard_pool.elastic_unavailable') : I18n.t('common.loading'));
+    const title = !state.capabilitiesError && caps.title ? ` title="${escapeAttr(caps.title)}"` : '';
+    return `<div class="wizard-warning info mt-md">${sprite('info')}<div${title}>${escapeHtml(text)}<tf-button variant="ghost" data-pw-environment>${escapeHtml(T('tabs.environment'))}</tf-button></div></div>`;
+  }
 
   // Step 2 — disks. Members and spares of other pools are disabled with the
   // reason; a free disk with a critical SMART verdict cannot be picked either.
@@ -316,8 +417,11 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
     if (state.planning) return `<p>${escapeHtml(I18n.t('common.loading'))}</p>`;
     if (state.planError) return `<div class="wizard-warning danger mt-md">${sprite('alert')}<div>${escapeHtml(state.planError)}</div></div>`;
     if (!state.plan) return '';
-    return `${state.plan.refusals.map((r) => `<div class="wizard-warning danger mt-md">${sprite('alert')}<div>${escapeHtml(r.detail)}</div></div>`).join('')}
-      ${state.plan.warnings.map((w) => `<div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(w)}</div></div>`).join('')}
+    return `${state.plan.refusals.map((r) => {
+      const { text, title } = elasticRefusalText(r);
+      return `<div class="wizard-warning danger mt-md"${title ? ` title="${escapeAttr(title)}"` : ''}>${sprite('alert')}<div>${escapeHtml(text)}</div></div>`;
+    }).join('')}
+      ${elasticPlanWarnings(state.plan).map((w) => `<div class="wizard-warning info mt-md">${sprite('info')}<div>${escapeHtml(w)}</div></div>`).join('')}
       ${state.plan.refusals.length ? '' : `<div class="explain-box mt-md">${escapeHtml(T('wizard_pool.sum_usable'))}: ${escapeHtml(fmtBytes(state.plan.usableBytes))} · ${escapeHtml(state.plan.unionPath)}</div>`}`;
   };
 
@@ -335,14 +439,14 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
       const ok = state.result.ok;
       if (state.outcome?.outcome === 'approval' || state.outcome?.outcome === 'unknown') return `<div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(state.result.detail)}</div></div>`;
       return `<div class="result-box ${ok ? 'ok' : 'err'}">${sprite(ok ? 'check-circle' : 'alert')}<h3>${escapeHtml(ok ? T('wizard_pool.done_title', { name: state.name }) : T('wizard_pool.failed_title'))}</h3><p>${escapeHtml(state.result.detail || '')}</p></div>
-        ${state.job ? `<pre class="job-log mono">${escapeHtml((state.job.log || []).join('\n'))}</pre>` : ''}`;
+        ${state.job ? `<pre class="job-log mono">${escapeHtml(jobLogLines(state.job.log).join('\n'))}</pre>` : ''}`;
     }
     if (state.job) {
       return `
         <h2 class="wizard-section-title">${escapeHtml(T('wizard_pool.creating_title', { name: state.name }))}</h2>
         <p class="wizard-section-sub">${escapeHtml(T('wizard_pool.creating_sub'))}</p>
         <tf-progress-bar value="${Number(state.job.progressPct) || 0}" tone="accent" label="${escapeAttr(T('jobs.status_' + state.job.status))}"></tf-progress-bar>
-        <pre class="job-log mono mt-sm">${escapeHtml((state.job.log || []).join('\n'))}</pre>`;
+        <pre class="job-log mono mt-sm">${escapeHtml(jobLogLines(state.job.log).join('\n'))}</pre>`;
     }
     if (state.kind === 'elastic') return elasticSummary();
     const plan = state.plan;
@@ -637,7 +741,7 @@ export function openPoolWizard(screen, { freeDisks = [], pools = [], onDone = nu
       if (bar && log) {
         setAttr(bar, 'value', String(Number(state.job.progressPct) || 0));
         setAttr(bar, 'label', T('jobs.status_' + state.job.status));
-        paintJobLog(log, state.job.log);
+        paintJobLog(log, jobLogLines(state.job.log));
       } else {
         draw();
       }

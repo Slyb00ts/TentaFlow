@@ -158,6 +158,7 @@ pub fn check_available() -> Result<(), super::SandboxUnavailable> {
     // text is not a cause a node picker could translate.
     super::classify(
         Path::new("/usr/bin/sandbox-exec").is_file(),
+        None,
         Some(cfg!(test) || HOST_INITIALIZED.load(std::sync::atomic::Ordering::Acquire)),
         Some(coalition(std::process::id() as i32).unwrap_or(0)),
         Some(launchd_domain()),

@@ -26,7 +26,7 @@ use tentanas_helper::{HelperCommand, PackageManager, SelfTestKind};
 use super::HandlerContext;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
-use crate::tentanas::{self, broker::BrokerError, db as store};
+use crate::tentanas::{self, broker::BrokerError, db as store, refusal::{DiskWords, Refusal}, CodedText};
 use tentanas_helper::elastic::{ElasticOwner, ElasticCreateSpec, ElasticDiskSpec, ElasticFilesystem};
 
 const PERM_READ: &str = "nas.read";
@@ -57,13 +57,13 @@ fn broker_error(scope: &str, error: BrokerError) -> ProtocolError {
         // Environment tab and start the wizard" pointed at a card that is not
         // on screen in exactly the state that produces this error.
         //
-        // Polish, like every other operator-facing refusal this file writes
-        // ("Macierz nie istnieje w tej instancji", "Nieprawidłowy zestaw
-        // dysków Elastic"). The two arms below read English because they
-        // forward `BrokerError`'s own `#[error]` text verbatim from
-        // broker.rs — a pre-existing split across one error surface. It is
-        // real, and it is not silently converted here: those strings have
-        // other callers, so flipping them is its own change.
+        // Still a Polish sentence, not yet a coded refusal: the Elastic
+        // refusals of this file are coded since wave 13
+        // (`tentanas::refusal`), this one is shared by every privileged path
+        // and is tracked in the backlog. The two arms below read English
+        // because they forward `BrokerError`'s own `#[error]` text verbatim
+        // from broker.rs — those strings have other callers, so flipping
+        // them is its own change.
         BrokerError::Unarmed(why) => ProtocolError::new(
             ProtocolErrorCode::NotAvailable,
             format!(
@@ -96,11 +96,27 @@ fn broker_error(scope: &str, error: BrokerError) -> ProtocolError {
 /// request with. `anyhow` keeps the concrete error in the chain, so the
 /// actionable half is recoverable; anything that is not a `BrokerError` is a
 /// genuine internal fault and stays one.
+///
+/// A refusal the admin reads (`tentanas::refusal`) anywhere in the chain is
+/// answered as it is, with its code and parameters — never as an internal
+/// fault (wave 13).
 fn privileged_error(scope: &str, error: anyhow::Error) -> ProtocolError {
+    if let Some(refusal) = Refusal::find(&error) {
+        return logged_refusal(scope, refusal);
+    }
     match error.downcast::<BrokerError>() {
         Ok(broker) => broker_error(scope, broker),
         Err(other) => internal(scope, other),
     }
+}
+
+/// A refusal the store or the Elastic layer raised, as the answer — and in
+/// the node's log with its sentence, because a toast shows only the words
+/// and some sentences carry the one reason an operator can act on (a
+/// helper's refusal line: "the reason is in the node's log").
+fn logged_refusal(scope: &str, refusal: &Refusal) -> ProtocolError {
+    tracing::info!(scope, refusal = %refusal, "tentanas refusal");
+    refusal.into()
 }
 
 /// The caller's instance + database after the matrix check.
@@ -182,12 +198,16 @@ fn actor<'a>(
 }
 
 /// Parks one red-path request and answers with the row to watch. Nothing ran.
+///
+/// `detail` is what the approver decides on: a code with parameters the
+/// approver's screen words (`approvals.detail_<code>`) and the node's English
+/// sentence for the audit row, the forwarded alert and the tooltip.
 fn park(
     ctx: &HandlerContext,
     g: &Gate,
     operation: &str,
     subject: &str,
-    detail: &str,
+    detail: CodedText,
     payload: &P,
 ) -> Result<MessageBody, ProtocolError> {
     park_shown(ctx, g, operation, subject, subject, detail, payload)
@@ -202,7 +222,7 @@ fn park_shown(
     operation: &str,
     subject: &str,
     shown_subject: &str,
-    detail: &str,
+    detail: CodedText,
     payload: &P,
 ) -> Result<MessageBody, ProtocolError> {
     let a = actor(ctx, g)?;
@@ -384,6 +404,28 @@ fn name_jobs(
         if job.kind == "config_import" {
             job.subject = config_import_subject(&job.subject, |id| tentanas::fleet::node_name(ctx, id));
         }
+        // A multi-disk job's lines, each named by the same rule, and its
+        // subject rebuilt from them — never the stored ids.
+        if job.kind == tentanas::db::SMART_BATCH_KIND {
+            if let Some(db) = db {
+                job.disks = job_disk_lines(db, &job.job_id);
+                // The test kind and "all" stay; a chosen set is named by its
+                // lines as they are now.
+                let (kind, rest) = job.subject.split_once('|').unwrap_or(("short", ""));
+                if rest != "all" && !job.disks.is_empty() {
+                    let names: Vec<String> =
+                        job.disks.iter().map(|d| d.name.clone()).filter(|name| !name.is_empty()).collect();
+                    job.subject = tentanas::db::smart_batch_subject(kind == "long", Some(&names));
+                }
+            }
+        }
+        // The steps of a sharing stop or resume (wave 10): shares, targets,
+        // the disable — each line named by its step.
+        if tentanas::sharing::is_step_kind(&job.kind) {
+            if let Some(db) = db {
+                job.disks = job_disk_lines(db, &job.job_id);
+            }
+        }
         if job.kind == "smart_test" {
             if let Some((name, last_known)) = smart_subject_name(&job.subject, |id| {
                 match db {
@@ -395,6 +437,36 @@ fn name_jobs(
                 job.subject_last_known = last_known;
             }
         }
+    }
+    // A job's error and log are an operation's own words, and an Elastic
+    // operation's may carry a branch path whose slot is not a disk name
+    // (R2-3). Loaded only when some line has one.
+    if let Some(db) = db {
+        let has_path = |t: &str| t.contains(tentanas_helper::elastic::BRANCH_ROOT);
+        if jobs.iter().any(|j| j.error.as_deref().is_some_and(has_path) || j.log.iter().any(|l| has_path(l))) {
+            let names = tentanas::elastic::BranchNames::load(db);
+            for job in jobs.iter_mut() {
+                if let Some(error) = job.error.as_mut() {
+                    *error = names.name(error);
+                }
+                for line in job.log.iter_mut() {
+                    *line = names.name(line);
+                }
+            }
+        }
+    }
+}
+
+/// Alert and approval sentences through the same branch-path naming as the
+/// job lines (`name_jobs`): a stored sentence may carry a slot directory.
+fn name_branch_paths<'t>(db: &DbPool, texts: impl IntoIterator<Item = &'t mut String>) {
+    let mut texts: Vec<&mut String> = texts.into_iter().collect();
+    if !texts.iter().any(|t| t.contains(tentanas_helper::elastic::BRANCH_ROOT)) {
+        return;
+    }
+    let names = tentanas::elastic::BranchNames::load(db);
+    for text in texts.iter_mut() {
+        **text = names.name(text);
     }
 }
 
@@ -422,6 +494,41 @@ fn config_import_subject(subject: &str, name_of: impl FnOnce(&str) -> String) ->
 /// only REMEMBERED: `(live name, false)`, or `(last-seen name, true)` once the
 /// disk has left the inventory. `None` keeps the stored subject (a disk the
 /// node never named).
+/// The lines of a multi-disk job for the screen: each disk by its live name,
+/// else the name it was last seen under (flagged), else the name stored when
+/// the job started — flagged too, it is no longer the device as it is now.
+fn job_disk_lines(db: &DbPool, job_id: &str) -> Vec<tentaflow_protocol::tentanas::NasJobDisk> {
+    tentanas::db::job_disks(db, job_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            // A step of the sharing stop or resume (wave 10): its name is the
+            // step's code, which the screen words.
+            if row.disk_id.starts_with("step:") {
+                return tentaflow_protocol::tentanas::NasJobDisk {
+                    name: row.name,
+                    last_known: false,
+                    state: row.state,
+                    progress_pct: row.progress_pct,
+                    reasons: row.reasons,
+                };
+            }
+            let (name, last_known) = match tentanas::disks::shown_disk_name(db, &row.disk_id, None) {
+                tentanas::disks::ShownDiskName::Live(name) => (name, false),
+                tentanas::disks::ShownDiskName::LastKnown(name) => (name, true),
+                tentanas::disks::ShownDiskName::Unknown => (row.name.clone(), true),
+            };
+            tentaflow_protocol::tentanas::NasJobDisk {
+                name,
+                last_known,
+                state: row.state,
+                progress_pct: row.progress_pct,
+                reasons: row.reasons,
+            }
+        })
+        .collect()
+}
+
 fn smart_subject_name(
     disk_id: &str,
     shown: impl FnOnce(&str) -> tentanas::disks::ShownDiskName,
@@ -469,8 +576,10 @@ async fn elevation_plan(ctx: &HandlerContext) -> Result<MessageBody, ProtocolErr
 }
 
 /// The name the Environment tab shows next to "provisioned by". The account's
-/// display name when the platform knows one, its id otherwise — the point is
-/// that an admin reading the node months later can tell who armed it.
+/// display name when the platform knows one — the point is that an admin
+/// reading the node months later can tell who armed it. Nothing when the
+/// platform knows no name: an account id is not a name, and the tab and the
+/// job log never show one (owner's rule).
 fn admin_display_name(ctx: &HandlerContext, g: &Gate) -> String {
     crate::db::repository::lookup_user_names(&ctx.state.db, std::slice::from_ref(&g.user_id))
         .ok()
@@ -483,7 +592,7 @@ fn admin_display_name(ctx: &HandlerContext, g: &Gate) -> String {
             }
         })
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| g.user_id.clone())
+        .unwrap_or_default()
 }
 
 async fn elevation_provision(ctx: &HandlerContext, secret: &SudoSecret) -> Result<MessageBody, ProtocolError> {
@@ -529,12 +638,14 @@ async fn elevation_arm(ctx: &HandlerContext, secret: &SudoSecret, ttl_secs: u32)
             .map_err(|e| internal("settings", e))?;
     }
     tentanas::disks::request_smart_refresh();
+    tentanas::disks::request_summary_refresh();
     Ok(tn(P::ElevationResponse { elevation }))
 }
 
 async fn elevation_disarm(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let g = gate_admin(ctx)?;
     tentanas::elevation::disarm();
+    tentanas::disks::request_summary_refresh();
     Ok(tn(P::ElevationResponse {
         elevation: tentanas::elevation::status(&g.db).await,
     }))
@@ -603,12 +714,11 @@ fn job_cancel(ctx: &HandlerContext, job_id: &str) -> Result<MessageBody, Protoco
     let job = store::job_for_org(&g.db, org_viewer(ctx, &g), job_id)
         .map_err(|e| internal("jobs", e))?
         .ok_or_else(|| ProtocolError::not_found("job not found"))?;
-    if matches!(job.kind.as_str(), "elastic_create" | "elastic_restore") {
-        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,
-            "Przyjęte tworzenie/przywracanie macierzy nie jest anulowalne"));
-    }
     // Only a kind whose cancel really stops the work (`jobs::user_cancellable`):
-    // anything else would read "cancelled" while its command runs on.
+    // anything else would read "cancelled" while its command runs on. An
+    // accepted Elastic create or restore is one of those, refused with the
+    // same code the screen words (critic wave 5, MINOR 13: it used to get a
+    // Polish sentence of its own first).
     if !tentanas::jobs::user_cancellable(&job.kind) {
         return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable, JOB_NOT_CANCELLABLE));
     }
@@ -711,6 +821,79 @@ async fn disk_smart_test(
     })
     .map_err(|e| internal("job", e))?;
     Ok(job_response(ctx, job))
+}
+
+/// Most disks one batch may name — a bound on the request, far above any
+/// shelf this product manages.
+const SMART_BATCH_MAX_DISKS: usize = 256;
+
+/// The longest disk id a batch may carry (wave 11 round 2): an unknown id is
+/// now stored as a refused line, so each one is bounded. The node's own ids
+/// (`wwn-…`, `sn-<serial>`, a by-id name) are far shorter.
+const SMART_BATCH_MAX_ID_LEN: usize = 128;
+
+/// The distinct ids of a batch request, or why it is refused.
+fn smart_batch_ids(disk_ids: &[String]) -> Result<Vec<&String>, ProtocolError> {
+    if let Some(long) = disk_ids.iter().find(|id| id.len() > SMART_BATCH_MAX_ID_LEN) {
+        return Err(ProtocolError::bad_request(format!(
+            "a disk id is at most {SMART_BATCH_MAX_ID_LEN} characters (got {})",
+            long.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<&String> = disk_ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+    if ids.is_empty() {
+        return Err(ProtocolError::bad_request("no disk to test"));
+    }
+    if ids.len() > SMART_BATCH_MAX_DISKS {
+        return Err(ProtocolError::bad_request(format!(
+            "at most {SMART_BATCH_MAX_DISKS} disks per self-test job"
+        )));
+    }
+    Ok(ids)
+}
+
+/// One SMART self-test job over several disks (`jobs::smart_self_test_batch`):
+/// one request, one job row with a line per disk, one credential, and a stop
+/// at the first privilege/credential error instead of one refusal per disk.
+async fn disk_smart_test_batch(
+    ctx: &HandlerContext,
+    disk_ids: &[String],
+    kind: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_POOLS)?;
+    let kind = match kind {
+        "short" => SelfTestKind::Short,
+        "long" => SelfTestKind::Long,
+        other => return Err(ProtocolError::bad_request(format!("unknown self-test kind '{other}'"))),
+    };
+    let ids = smart_batch_ids(disk_ids)?;
+    // Every line is named when the job is written: the kernel name now, or the
+    // name the node last saw the disk under. A disk the node never knew is a
+    // line with NO name (critic wave 9b, MINOR 12): written refused
+    // (`disk_unknown`, `db::insert_job_full`), shown as "unknown disk" — its
+    // id is never a name — and the other disks are still tested. Only a
+    // request in which the node knows no disk at all is refused.
+    let mut disks = Vec::with_capacity(ids.len());
+    for id in ids {
+        let name = match tentanas::disks::shown_disk_name(&g.db, id, None) {
+            tentanas::disks::ShownDiskName::Live(name) | tentanas::disks::ShownDiskName::LastKnown(name) => name,
+            tentanas::disks::ShownDiskName::Unknown => String::new(),
+        };
+        disks.push((id.clone(), name));
+    }
+    if disks.iter().all(|(_, name)| name.is_empty()) {
+        return Err(ProtocolError::not_found("disk not found"));
+    }
+    let names: Vec<String> = disks.iter().map(|(_, name)| name.clone()).filter(|name| !name.is_empty()).collect();
+    let subject = tentanas::db::smart_batch_subject(kind == SelfTestKind::Long, Some(&names));
+    let explicit = secret.map(token);
+    let job = tentanas::jobs::spawn_smart_batch(&g.db, &subject, &g.user_id, &disks, move |h| {
+        tentanas::jobs::smart_self_test_batch(h, kind, explicit)
+    })
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response_in(ctx, Some(&g.db), job))
 }
 
 async fn disk_locate(ctx: &HandlerContext, disk_id: &str, enable: bool) -> Result<MessageBody, ProtocolError> {
@@ -902,6 +1085,36 @@ fn since_24h() -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+/// The coded refusal of a remote LUN on any disk-accepting request.
+const DISK_REMOTE_REFUSAL: &str = "refusal:disk_remote";
+
+/// A disk id the node's inventory does not hold. The id is not echoed: it is
+/// an id, and the screen that sent it knows which disk it meant.
+fn disk_not_found() -> ProtocolError {
+    Refusal::not_found("disk_not_found", "the disk is not on this node (any more)").into()
+}
+
+fn no_disks_selected() -> ProtocolError {
+    Refusal::bad_request("no_disks_selected", "no disks selected").into()
+}
+
+/// Disks by id for a read-only PREVIEW: unknown ids are refused, and every
+/// disk the node has comes back whatever its role — a remote LUN included —
+/// so the preview's own per-disk refusals can name it (critic wave 12 R2-1).
+fn disks_for_plan(disk_ids: &[String]) -> Result<Vec<NasDisk>, ProtocolError> {
+    let mut out = Vec::with_capacity(disk_ids.len());
+    for id in disk_ids {
+        out.push(
+            tentanas::disks::disk(id)
+                .ok_or_else(disk_not_found)?,
+        );
+    }
+    if out.is_empty() {
+        return Err(no_disks_selected());
+    }
+    Ok(out)
+}
+
 /// Disks by id, refusing anything this node does not have. `require_free`
 /// guards the destructive paths: a pool is never built on a disk that already
 /// belongs to a pool, an array or the running system.
@@ -909,17 +1122,27 @@ fn disks_by_id(disk_ids: &[String], require_free: bool) -> Result<Vec<NasDisk>, 
     let mut out = Vec::with_capacity(disk_ids.len());
     for id in disk_ids {
         let disk = tentanas::disks::disk(id)
-            .ok_or_else(|| ProtocolError::not_found(format!("disk '{id}' not found on this node")))?;
+            .ok_or_else(disk_not_found)?;
+        // A LUN another target serves to this node (MAJOR 27 F4) is never a
+        // pool disk — on EVERY path, the ones that do not require a free disk
+        // included (`PoolReplaceDiskRequest` accepts a spare; critic wave 12).
+        // A pool on a node's own export reached over loopback is a pool
+        // inside itself.
+        if disk.role == tentanas::disks::ROLE_REMOTE {
+            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, DISK_REMOTE_REFUSAL));
+        }
         if require_free && disk.role != "free" {
-            return Err(ProtocolError::bad_request(format!(
-                "disk {} is not free: {}",
-                disk.name, disk.role
-            )));
+            return Err(Refusal::bad_request(
+                "disk_not_free",
+                format!("disk {} is not free: {}", disk.name, disk.role),
+            )
+            .disk(DiskWords::Kernel(disk.name.clone()))
+            .into());
         }
         out.push(disk);
     }
     if out.is_empty() {
-        return Err(ProtocolError::bad_request("no disks selected"));
+        return Err(no_disks_selected());
     }
     Ok(out)
 }
@@ -997,12 +1220,12 @@ async fn pools_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> 
 fn pool_plan(ctx: &HandlerContext, disk_ids: &[String]) -> Result<MessageBody, ProtocolError> {
     gate(ctx, PERM_READ)?;
     let disks = disks_by_id(disk_ids, false)?;
-    let (options, warnings, smallest_disk_bytes) = tentanas::pools::plan(&disks);
+    let plan = tentanas::pools::plan(&disks);
     Ok(tn(P::PoolPlanResponse {
-        options,
-        warnings,
-        smallest_disk_bytes,
-        warning_codes: tentanas::pools::plan_warning_codes(&disks),
+        options: plan.options,
+        warnings: plan.warnings,
+        smallest_disk_bytes: plan.smallest_disk_bytes,
+        warning_codes: plan.warning_codes,
     }))
 }
 
@@ -1152,10 +1375,62 @@ fn require_confirm(name: &str, confirm_name: &str) -> Result<(), ProtocolError> 
     if name == confirm_name {
         Ok(())
     } else {
-        Err(ProtocolError::bad_request(
-            "the typed confirmation does not match the name",
-        ))
+        Err(tentanas::elastic::confirm_mismatch().into())
     }
+}
+
+/// A pool that holds another organisation's shares or block targets is not
+/// this organisation's to destroy (owner decision 2026-09-26). The refusal
+/// names nobody: which tenant, and what, stays that tenant's business.
+const POOL_DESTROY_FOREIGN: &str = "refusal:pool_destroy_foreign_resources";
+/// The pool's datasets or the other tenants' rows could not be read, so the
+/// check above could not be made — refused, never assumed clear.
+const POOL_DESTROY_UNVERIFIED: &str = "refusal:pool_destroy_unverified";
+
+/// The destroy guard: `Ok` when nothing of another organisation lives on
+/// `pool`. `mountpoints` is `None` when the pool's datasets could not be
+/// listed. Resources of the asking organisation are not looked at here —
+/// they follow the existing flow (the dialog lists them, the destroy takes
+/// them with it).
+fn pool_destroy_guard(
+    db: &DbPool,
+    org_id: &str,
+    pool: &str,
+    mountpoints: Option<&[String]>,
+) -> Result<(), ProtocolError> {
+    let unverified = || ProtocolError::new(ProtocolErrorCode::NotAvailable, POOL_DESTROY_UNVERIFIED);
+    let (shares, targets) = store::resources_of_other_orgs(db, org_id).map_err(|_| unverified())?;
+    // By dataset and zvol name first: that answer needs no mountpoint, so a
+    // pool whose datasets cannot be listed is still refused as FOREIGN when
+    // the rows alone say so.
+    if tentanas::pools::holds_resources(pool, mountpoints.unwrap_or_default(), &shares, &targets) {
+        return Err(ProtocolError::new(ProtocolErrorCode::Conflict, POOL_DESTROY_FOREIGN));
+    }
+    if mountpoints.is_none() {
+        return Err(unverified());
+    }
+    Ok(())
+}
+
+/// `pools::try_resources_lock`, or the coded refusal of a creation that met
+/// the lock held (a pool destroy, another creation or an import).
+async fn resources_or_refuse(g: &Gate) -> Result<tokio::sync::OwnedMutexGuard<()>, ProtocolError> {
+    tentanas::pools::try_resources_lock(&g.db)
+        .await
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::Conflict, POOL_DESTROY_IN_PROGRESS))
+}
+
+/// See `pools::POOL_DESTROY_IN_PROGRESS` (the literal is here too, where the
+/// screen's refusal scan reads the dispatcher's codes).
+const POOL_DESTROY_IN_PROGRESS: &str = "refusal:pool_destroy_in_progress";
+
+/// The pool's mountpoints for `pool_destroy_guard`, `None` when its datasets
+/// cannot be listed.
+async fn pool_mountpoints(pool: &str) -> Option<Vec<String>> {
+    tentanas::datasets::list(pool)
+        .await
+        .ok()
+        .map(|datasets| datasets.into_iter().filter_map(|d| d.mountpoint).collect())
 }
 
 async fn pool_destroy(
@@ -1167,13 +1442,22 @@ async fn pool_destroy(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name, confirm_name)?;
+    tentanas_helper::validate_pool_name(name).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    // Checked when the request is made AND again when an approved one runs:
+    // another tenant may have exported something from the pool in between.
+    let mountpoints = pool_mountpoints(name).await;
+    pool_destroy_guard(&g.db, &g.org_id, name, mountpoints.as_deref())?;
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
         return park(
             ctx,
             &g,
             tentanas::approvals::OP_POOL_DESTROY,
             name,
-            &format!("destroys the pool '{name}' and every dataset and snapshot on it"),
+            CodedText::new(
+                "pool_destroy",
+                &[("pool", name.to_string())],
+                format!("destroys the pool '{name}' and every dataset and snapshot on it"),
+            ),
             &P::PoolDestroyRequest {
                 name: name.to_string(),
                 confirm_name: confirm_name.to_string(),
@@ -1181,20 +1465,42 @@ async fn pool_destroy(
             },
         );
     }
-    let answer = spawn_destroy_job(
-        ctx,
-        &g,
-        "pool_destroy",
-        name,
-        HelperCommand::ZpoolDestroy {
-            pool: name.to_string(),
-        },
-        true,
-        secret,
-    )?;
-    // The schedule of a pool that no longer exists would keep firing.
-    let _ = store::delete_pool_schedules(&g.db, name);
-    Ok(answer)
+    // The check above answers the request at once; the job checks again
+    // under `resources_lock` and holds it through `zpool destroy`, so no
+    // share or target of another organisation can land on the pool between
+    // the last check and the destroy.
+    let command = HelperCommand::ZpoolDestroy { pool: name.to_string() };
+    command.plan().map_err(|e| broker_error("pool_destroy", catalog_error(e)))?;
+    let explicit = secret.map(token);
+    let (db, org_id, addon_id, pool) = (g.db.clone(), g.org_id.clone(), g.addon_id.clone(), name.to_string());
+    let job = tentanas::jobs::spawn(&g.db, "pool_destroy", name, &g.user_id, None, None, move |h| {
+        pool_destroy_job(h, db, org_id, addon_id, pool, command, explicit)
+    })
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response(ctx, job))
+}
+
+/// The body of a pool destroy job: the last check of other organisations'
+/// resources and `zpool destroy`, both under `resources_lock`.
+async fn pool_destroy_job(
+    h: tentanas::jobs::JobHandle,
+    db: DbPool,
+    org_id: String,
+    addon_id: String,
+    pool: String,
+    command: HelperCommand,
+    explicit: Option<Arc<ElevationToken>>,
+) -> anyhow::Result<()> {
+    let _serialised = tentanas::pools::resources_lock(&db).lock_owned().await;
+    let mountpoints = pool_mountpoints(&pool).await;
+    pool_destroy_guard(&db, &org_id, &pool, mountpoints.as_deref())
+        .map_err(|refusal| anyhow::anyhow!(refusal.message))?;
+    tentanas::datasets::destroy_job(h, command, addon_id, pool.clone(), true, explicit).await?;
+    // Only now: a destroy the re-check refused, or one that failed, leaves a
+    // pool that still needs its scrub and trim schedules (critic wave 9a,
+    // R2-MINOR 2).
+    let _ = store::delete_pool_schedules(&db, &pool);
+    Ok(())
 }
 
 async fn pool_scrub(
@@ -1424,6 +1730,43 @@ async fn pool_device_state(
         }
     };
     run_now(&g, "device state", &command, secret).await?;
+    pool_view(&g, name).await
+}
+
+/// The refusal of a detach the node does not allow (`refusal:<code>`, worded
+/// by the screen).
+const POOL_DETACH_NOT_ALLOWED: &str = "refusal:pool_detach_not_allowed";
+
+/// Whether `device` of this pool status may be detached: a leaf the node
+/// itself marked `detachable` (the original disk of a `spare-N` group whose
+/// hot spare is ONLINE, with no resilver running — `pools::mark_detachable`).
+/// The screen's word is never enough: a detach of any other leaf would take
+/// redundancy, or a disk, the pool still needs.
+fn detach_allowed(status: &tentanas::pools::StatusReport, device: &str) -> bool {
+    !device.is_empty()
+        && status
+            .vdevs
+            .iter()
+            .flat_map(|v| &v.disks)
+            .any(|d| d.detachable && d.name == device)
+}
+
+/// Owner decision (wave 7): after a replace onto a hot spare the old disk
+/// stays in the pool's `spare-N` group; this takes it out with `zpool detach`
+/// once the node — reading `zpool status` again, now — agrees it may go.
+async fn pool_detach(
+    ctx: &HandlerContext,
+    name: &str,
+    device: &str,
+    secret: Option<&SudoSecret>,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate(ctx, PERM_POOLS)?;
+    let status = tentanas::pools::status(name).await.map_err(|e| broker_error("pool", e))?;
+    if !detach_allowed(&status, device) {
+        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable, POOL_DETACH_NOT_ALLOWED));
+    }
+    let command = HelperCommand::ZpoolDetach { pool: name.to_string(), device: device.to_string() };
+    run_now(&g, "detach", &command, secret).await?;
     pool_view(&g, name).await
 }
 
@@ -2073,33 +2416,66 @@ async fn snapshot_schedules_list(ctx: &HandlerContext) -> Result<MessageBody, Pr
 
 // ----- schedules (Tasks tab) ---------------------------------------------------------
 
+/// A schedule row's last outcome as the wire carries it (B, wave 6): the
+/// structured fields, with the job's status read here — the job id stays on
+/// the node — and the older sentence for a screen that predates them. A
+/// stored value this build does not read (an older bare word) travels as the
+/// sentence alone.
+fn with_outcome(db: &crate::db::DbPool, mut row: NasScheduleRow, stored: &str) -> NasScheduleRow {
+    use tentanas::scheduler::ScheduleOutcome;
+    let Some(outcome) = ScheduleOutcome::parse(stored) else {
+        row.last_result = stored.to_string();
+        return row;
+    };
+    row.last_result = outcome.legacy_sentence();
+    row.last_outcome = outcome.wire_word().to_string();
+    match outcome {
+        ScheduleOutcome::Started { job_id } => {
+            // A job that is gone (pruned) has no status: the row then says
+            // only that it ran.
+            row.last_job_status = store::job(db, &job_id).ok().flatten().map(|j| j.status).unwrap_or_default();
+        }
+        // A coded refusal travels as its code and parameters, which the
+        // screen words; the sentence stays the detail an older screen shows.
+        ScheduleOutcome::StartFailed { detail, refusal } => {
+            row.last_reason = refusal.map(|r| r.wire("")).unwrap_or_default();
+            row.last_detail = detail;
+        }
+        ScheduleOutcome::Skipped { reason, detail } => {
+            row.last_reason = reason;
+            row.last_detail = detail;
+        }
+    }
+    row
+}
+
 fn schedules_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     let mut rows = Vec::new();
     for task in [store::PoolTask::Scrub, store::PoolTask::Trim] {
         for row in store::list_pool_schedules(&g.db, task).map_err(|e| internal("schedules", e))? {
-            rows.push(NasScheduleRow {
+            rows.push(with_outcome(&g.db, NasScheduleRow {
                 kind: task.kind().to_string(),
                 subject: row.pool,
                 enabled: row.enabled,
                 schedule: row.schedule,
                 last_run_at: row.last_run_at,
-                last_result: row.last_result,
                 next_run_at: row.next_run_at,
-            });
+                ..Default::default()
+            }, &row.last_result));
         }
     }
     for s in store::list_snapshot_schedules(&g.db).map_err(|e| internal("schedules", e))? {
         let last_result = store::snapshot_schedule_result(&g.db, &s.schedule_id).unwrap_or_default();
-        rows.push(NasScheduleRow {
+        rows.push(with_outcome(&g.db, NasScheduleRow {
             kind: "snapshot".to_string(),
             subject: s.dataset,
             enabled: s.enabled,
             schedule: s.schedule,
             last_run_at: s.last_run_at,
-            last_result,
             next_run_at: s.next_run_at,
-        });
+            ..Default::default()
+        }, &last_result));
     }
     // The Elastic cadences (§5.3, E2-10). The kind is PREFIXED: the Tasks tab
     // buckets a row called 'scrub' as a POOL scrub and offers to run `zpool
@@ -2117,15 +2493,15 @@ fn schedules_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
             else {
                 continue;
             };
-            rows.push(NasScheduleRow {
+            rows.push(with_outcome(&g.db, NasScheduleRow {
                 kind: format!("elastic_{}", task.kind()),
                 subject: array.name.clone(),
                 enabled: row.enabled,
                 schedule: row.schedule,
                 last_run_at: row.last_run_at,
-                last_result: row.last_result,
                 next_run_at: row.next_run_at,
-            });
+                ..Default::default()
+            }, &row.last_result));
         }
     }
     let smart = store::smart_schedule(&g.db).map_err(|e| internal("schedules", e))?;
@@ -2139,8 +2515,8 @@ fn schedules_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
             enabled: smart.enabled,
             schedule: schedule.clone(),
             last_run_at: last.clone(),
-            last_result: String::new(),
             next_run_at: next.clone(),
+            ..Default::default()
         });
     }
     Ok(tn(P::SchedulesListResponse { rows, smart }))
@@ -2154,7 +2530,6 @@ fn smart_schedule_set(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_POOLS)?;
     let now = chrono::Local::now();
-    let mut smart = store::smart_schedule(&g.db).map_err(|e| internal("schedules", e))?;
     let next_short = tentanas::scheduler::next_run_utc(short, now);
     let next_long = tentanas::scheduler::next_run_utc(long, now);
     if enabled && (next_short.is_none() || next_long.is_none()) {
@@ -2162,12 +2537,17 @@ fn smart_schedule_set(
             "unknown schedule cadence for the SMART tests",
         ));
     }
-    smart.enabled = enabled;
-    smart.short = short.clone();
-    smart.long = long.clone();
-    smart.next_short_at = enabled.then_some(next_short).flatten();
-    smart.next_long_at = enabled.then_some(next_long).flatten();
-    store::set_smart_schedule(&g.db, &smart).map_err(|e| internal("schedules", e))?;
+    // Not read-modify-write: a scheduler tick between a read here and the
+    // write would lose its run stamps (`store::save_smart_schedule`).
+    let smart = store::save_smart_schedule(
+        &g.db,
+        enabled,
+        short,
+        long,
+        enabled.then_some(next_short).flatten(),
+        enabled.then_some(next_long).flatten(),
+    )
+    .map_err(|e| internal("schedules", e))?;
     Ok(tn(P::SmartScheduleResponse { smart }))
 }
 
@@ -2343,7 +2723,14 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
     let g = gate_shares(ctx)?;
     tentanas_helper::validate_share_name(name)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    // The environment probe reads no pool, so it runs before the lock: the
+    // lock is held only from the read of the datasets to the row, and a
+    // concurrent creation is not refused because this one was probing.
     let (rdma_ok, smb_direct_ok) = transport_gates(&g).await;
+    // From the read of the datasets to the row: a pool destroy cannot run in
+    // between (`pools::resources_lock`) — and one that is running refuses
+    // this after a short wait, never an unbounded one.
+    let _serialised = resources_or_refuse(&g).await?;
     tentanas::shares::validate_options(protocol, smb, nfs, rdma_ok, smb_direct_ok)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     require_own_grantees(&g, smb, &[])?;
@@ -2387,6 +2774,7 @@ async fn share_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Prot
         // in any config, and "disabled" is what that is.
         state: "disabled".to_string(),
         state_detail: String::new(),
+        state_reasons: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
     };
@@ -2453,9 +2841,13 @@ async fn share_delete(
             &g,
             tentanas::approvals::OP_SHARE_DELETE,
             &row.name,
-            &format!(
-                "removes the share '{}' — the data under {} stays, the export does not",
-                row.name, row.source_path
+            CodedText::new(
+                "share_delete",
+                &[("share", row.name.clone()), ("path", row.source_path.clone())],
+                format!(
+                    "removes the share '{}' — the data under {} stays, the export does not",
+                    row.name, row.source_path
+                ),
             ),
             &P::ShareDeleteRequest {
                 share_id: share_id.to_string(),
@@ -2704,6 +3096,14 @@ async fn block_capabilities(
     tentanas::targets::capabilities(&features, &datasets, targets)
 }
 
+thread_local! {
+    /// Capability computations asked for on this thread (each one an
+    /// environment read and a `zfs list` unless the 5 s cache holds them) —
+    /// the dispatch test's proof that the fleet's summary path never asks.
+    /// Per thread, so parallel tests do not count each other.
+    static CAPABILITY_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// How long the two EXPENSIVE inputs of `block_capabilities` are reused on the
 /// polled list path.
 const CAPABILITIES_CACHE: Duration = Duration::from_secs(5);
@@ -2738,6 +3138,7 @@ async fn block_capabilities_cached(
     g: &Gate,
     targets: &[store::TargetRow],
 ) -> tentaflow_protocol::tentanas::NasBlockCapabilities {
+    CAPABILITY_READS.with(|n| n.set(n.get() + 1));
     let cached = capabilities_cache()
         .lock()
         .ok()
@@ -2759,9 +3160,31 @@ async fn block_capabilities_cached(
     tentanas::targets::capabilities(&features, &datasets, targets)
 }
 
-async fn targets_list(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+async fn targets_list(ctx: &HandlerContext, summary: bool) -> Result<MessageBody, ProtocolError> {
     let g = gate(ctx, PERM_READ)?;
     let rows = store::list_targets_of_org(&g.db, &g.org_id).map_err(|e| internal("targets", e))?;
+    // The fleet's 10 s poll (critic wave 7, MAJOR 2): it reads the targets and
+    // the service rows, never the capabilities, so it pays for neither the
+    // environment read nor the `zfs list` behind them, and it takes a session
+    // reading up to `FLEET_SESSIONS_MAX_AGE` old instead of a sudo per tick.
+    if summary {
+        let nvmet = if rows.iter().any(|row| row.protocol == "nvmet") {
+            tentanas::targets::nvmet_sessions_within(&g.db, tentanas::targets::FLEET_SESSIONS_MAX_AGE).await
+        } else {
+            Default::default()
+        };
+        return Ok(tn(P::TargetsListResponse {
+            targets: rows
+                .iter()
+                .map(|row| {
+                    let (sessions, known) = tentanas::targets::sessions_from(row, &nvmet);
+                    tentanas::targets::to_protocol(row, sessions.len() as u32, known)
+                })
+                .collect(),
+            services: tentanas::targets::services(),
+            capabilities: Default::default(),
+        }));
+    }
     // The cached variant: this list is POLLED, and the uncached one spawns two
     // or three `zfs` processes and may fall through to a full environment
     // probe on every single request. Judged against EVERY target of the node
@@ -2797,7 +3220,21 @@ async fn target_get(ctx: &HandlerContext, target_id: &str) -> Result<MessageBody
     } else {
         Default::default()
     };
-    let (sessions, known) = tentanas::targets::sessions_from(&row, &nvmet);
+    let (readings, known) = tentanas::targets::readings_from(&row, &nvmet);
+    // The sampler (MAJOR 27): iSCSI is sampled on the tick too, and again here
+    // so a session that began since the last tick has its first sighting now;
+    // NVMe-oF ONLY here — while a target view is open, at most once a minute
+    // (owner decision D3), from the reading this view took anyway.
+    if known {
+        if row.protocol == "iscsi" {
+            let _ = tentanas::targets::sample_sessions(&g.db, &row, &readings);
+        } else {
+            tentanas::targets::sample_nvmet_if_due(&g.db, &row, &readings, known);
+        }
+    }
+    let seen = store::target_seen(&g.db, &row.target_id).map_err(|e| internal("targets", e))?;
+    let sessions = tentanas::targets::with_connected_at(&row, &readings, &seen);
+    let seen_since = store::target_seen_since(&g.db).map_err(|e| internal("targets", e))?;
     // The preview is rendered from placeholder credentials and redacted on top
     // of that, so it can travel and be logged. A row the catalog's own rules
     // refuse cannot be rendered — and that is a fact about this target the
@@ -2811,6 +3248,16 @@ async fn target_get(ctx: &HandlerContext, target_id: &str) -> Result<MessageBody
         target: tentanas::targets::to_protocol(&row, sessions.len() as u32, known),
         sessions,
         config_preview,
+        initiators_seen: seen
+            .into_iter()
+            .map(|s| tentaflow_protocol::tentanas::NasTargetInitiatorSeen {
+                initiator: s.initiator,
+                last_seen_at: s.last_seen_at,
+                session_since: s.session_since,
+            })
+            .collect(),
+        seen_since,
+        listen: tentanas::targets::listen_states(&row),
     }))
 }
 
@@ -2999,6 +3446,7 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         transports,
         auth,
         initiators,
+        initiator_descriptions,
         confirm_all_interfaces,
         enabled,
         sudo_password,
@@ -3006,7 +3454,14 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     else {
         return Err(ProtocolError::bad_request("expected TargetCreateRequest"));
     };
+    // "Opis" (wave 12): judged before anything is read or written, and a key
+    // that is not on the list is refused rather than dropped.
+    let descriptions = tentanas::targets::clean_descriptions(initiators, initiator_descriptions)
+        .map_err(ProtocolError::bad_request)?;
     let g = gate_targets(ctx)?;
+    // From the read of the volumes to the row: a pool destroy cannot run in
+    // between (`pools::resources_lock`), and a running one refuses this.
+    let _serialised = resources_or_refuse(&g).await?;
     // Checked before anything else is read or written: the host segment is
     // part of the target's permanent identity, and a node whose hostname is
     // empty (or holds nothing an IQN may carry) would publish `iqn.…:.name`.
@@ -3113,6 +3568,7 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         // for host NQNs on the NVMe-oF path (n14 leaves the iSCSI allowlist to
         // the target detail, and this stays empty there).
         initiators: initiators.clone(),
+        initiator_descriptions: descriptions,
         auth_method: method,
         auth_username: username,
         auth_secret: secret,
@@ -3124,6 +3580,7 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         // no kernel, and "disabled" is what that is.
         state: "disabled".to_string(),
         state_detail: String::new(),
+        state_reasons: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
         target_id,
@@ -3178,6 +3635,7 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         repick_portal,
         auth,
         initiators,
+        initiator_descriptions,
         port_groups,
         confirm_all_interfaces,
         enabled,
@@ -3188,6 +3646,29 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     };
     let g = gate_targets(ctx)?;
     let mut row = target_row(&g, target_id)?;
+    // SECURITY (MAJOR 27 F2): the last entry never leaves the allowlist. An
+    // empty list is an OPEN target, so "revoke the last initiator" would let
+    // everybody in — the one it meant to shut out first (measured: back in
+    // 2.2 s). The coded refusal names what does cut everybody off: stopping
+    // the target.
+    if tentanas::targets::removes_last_initiator(&row.initiators, initiators) {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            tentanas::targets::LAST_INITIATOR_REFUSAL,
+        ));
+    }
+    // "Opis": `None` (an older client) keeps what the initiators that stay
+    // already had; `Some` replaces it and is judged like the create's.
+    let descriptions = match initiator_descriptions {
+        Some(asked) => tentanas::targets::clean_descriptions(initiators, asked)
+            .map_err(ProtocolError::bad_request)?,
+        None => row
+            .initiator_descriptions
+            .iter()
+            .filter(|(initiator, _)| initiators.contains(initiator))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
     let existing = targets_seen_by(&g)?;
     let caps = block_capabilities(&g, &existing).await;
     let (method, username, secret, mutual_username, mutual_secret, hash, dhgroup) =
@@ -3217,6 +3698,7 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     )
     .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     row.initiators = initiators.clone();
+    row.initiator_descriptions = descriptions;
     if !port_groups.is_empty() {
         row.port_groups = port_groups.clone();
     }
@@ -3244,6 +3726,70 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     spawn_target_job(ctx, &g, "target_update", &name, target_id, sudo_password.as_ref())
 }
 
+/// n19 "Rozłącz" (wave 12, MAJOR 27 §L.7): reset the iSCSI session of ONE
+/// allowlisted initiator, or — with `revoke` — take it off the allowlist so
+/// it cannot come back.
+///
+/// The same gate as any other target write (PERM_TARGETS + admin, and the
+/// elevation the channel needs). Every refusal is CODED and comes before a
+/// job exists; the helper checks the kernel-side half once more as root.
+///
+/// `revoke` is no new helper command: the row loses the initiator and the
+/// ordinary apply runs, whose ACL `rmdir` drops the session at once
+/// (measured) — refused when it is the only entry, because an empty list
+/// opens the target (F2).
+async fn target_session_reset(ctx: &HandlerContext, req: &P) -> Result<MessageBody, ProtocolError> {
+    let P::TargetSessionResetRequest {
+        target_id,
+        initiator,
+        revoke,
+        sudo_password,
+    } = req
+    else {
+        return Err(ProtocolError::bad_request("expected TargetSessionResetRequest"));
+    };
+    let g = gate_targets(ctx)?;
+    let mut row = target_row(&g, target_id)?;
+    if let Some(code) = tentanas::targets::session_reset_refusal(&row, initiator, *revoke) {
+        return Err(ProtocolError::new(ProtocolErrorCode::Conflict, code));
+    }
+    if *revoke {
+        row.initiators.retain(|i| i != initiator);
+        row.initiator_descriptions.remove(initiator);
+        row.updated_at = store::now();
+        let name = row.name.clone();
+        store::upsert_target(&g.db, &g.org_id, &row).map_err(|e| internal("targets", e))?;
+        return spawn_target_job(ctx, &g, "target_update", &name, target_id, sudo_password.as_ref());
+    }
+    let explicit = sudo_password.as_ref().map(token);
+    let cipher = ctx.state.settings_cipher.clone();
+    let who = initiator.clone();
+    let subject = row.name.clone();
+    let job = tentanas::jobs::spawn_owned(
+        &g.db,
+        "target_session_reset",
+        &subject,
+        &g.user_id,
+        Some(g.org_id.as_str()),
+        None,
+        None,
+        move |h| async move {
+            let db = h.db().clone();
+            h.log(format!("{}: resetting the session of {who}", row.name));
+            let (lines, outcome) =
+                tentanas::targets::reset_session(&db, &cipher, &row, &who, explicit.as_deref()).await;
+            drop(explicit);
+            for line in lines {
+                h.log(line);
+            }
+            h.progress(100);
+            outcome
+        },
+    )
+    .map_err(|e| internal("job", e))?;
+    Ok(job_response(ctx, job))
+}
+
 /// Deleting a target cuts a live client off from a raw disk mid-write, which
 /// is the same blast radius as deleting a share with data on it — so it takes
 /// the same road: the destructive gate, a retyped name, and four eyes when the
@@ -3266,11 +3812,15 @@ async fn target_delete(
             &g,
             tentanas::approvals::OP_TARGET_DELETE,
             &row.name,
-            &format!(
-                "stops exporting '{}' ({}) — a client using it loses the disk; {} and its data stay",
-                row.name,
-                row.wwn,
-                sources.join(", ")
+            CodedText::new(
+                "target_delete",
+                &[("target", row.name.clone()), ("sources", sources.join(", "))],
+                format!(
+                    "stops exporting '{}' ({}) — a client using it loses the disk; {} and its data stay",
+                    row.name,
+                    row.wwn,
+                    sources.join(", ")
+                ),
             ),
             &P::TargetDeleteRequest {
                 target_id: target_id.to_string(),
@@ -3461,7 +4011,15 @@ async fn config_import_apply(
                 tentanas::approvals::OP_CONFIG_IMPORT,
                 &subject,
                 &shown,
-                &format!("overwrites {}: {}", overwritten.len(), overwritten.join(", ")),
+                CodedText::new(
+                    "config_import",
+                    &[
+                        ("count", overwritten.len().to_string()),
+                        ("items", overwritten.join(", ")),
+                        ("schedules", tentanas::config_io::overwritten_schedules_json(&items)),
+                    ],
+                    format!("overwrites {}: {}", overwritten.len(), overwritten.join(", ")),
+                ),
                 &P::ConfigImportApplyRequest {
                     json: json.to_string(),
                     sudo_password: None,
@@ -3588,6 +4146,7 @@ fn alerts_list(ctx: &HandlerContext, include_acked: bool) -> Result<MessageBody,
     let mut alerts = store::list_alerts_for_org(&g.db, org_viewer(ctx, &g), include_acked)
         .map_err(|e| internal("alerts", e))?;
     resolve_import_alerts(&mut alerts, |id| tentanas::fleet::node_name(ctx, id));
+    name_branch_paths(&g.db, alerts.iter_mut().flat_map(|a| [&mut a.title, &mut a.detail]));
     Ok(tn(P::AlertsListResponse { alerts }))
 }
 
@@ -3634,9 +4193,12 @@ async fn snapshot_protection_release(
         ));
     }
     if tentanas::approvals::second_pair_available(&actor(ctx, &g)?) {
-        let detail = if reason.trim().is_empty() {
+        // The author's reason is data, carried as written.
+        let mut params = vec![("snapshot", snapshot.to_string())];
+        let text = if reason.trim().is_empty() {
             format!("lifts the protection of {snapshot}")
         } else {
+            params.push(("reason", reason.trim().to_string()));
             format!("lifts the protection of {snapshot} — {}", reason.trim())
         };
         return park(
@@ -3644,7 +4206,7 @@ async fn snapshot_protection_release(
             &g,
             tentanas::approvals::OP_SNAPSHOT_RELEASE,
             snapshot,
-            &detail,
+            CodedText::new("snapshot_release", &params, text),
             &P::SnapshotProtectionReleaseRequest {
                 snapshot: snapshot.to_string(),
                 reason: reason.to_string(),
@@ -3692,6 +4254,7 @@ async fn access_log(
         store::access_events(&g.db, &g.org_id, filter).map_err(|e| internal("access log", e))?;
     let (shares, users, operations) =
         store::access_facets(&g.db, &g.org_id).map_err(|e| internal("access log", e))?;
+    let viewer = forward_viewer(ctx);
     Ok(tn(P::AccessLogResponse {
         events,
         total,
@@ -3699,31 +4262,73 @@ async fn access_log(
         shares,
         users,
         operations,
-        forward: tentanas::forward::settings(&ctx.state.db, &g.db, &g.addon_id),
+        forward: tentanas::forward::settings(
+            &ctx.state.db,
+            &g.db,
+            &g.addon_id,
+            tentanas::forward::Target::Org(&g.org_id),
+            viewer,
+        ),
+        forward_node: tentanas::forward::settings(
+            &ctx.state.db,
+            &g.db,
+            &g.addon_id,
+            tentanas::forward::Target::Node,
+            viewer,
+        ),
     }))
 }
 
-/// Where this node forwards its alert pipeline (§5.9). Fleet-wide, so it needs
-/// the same gate the four-eyes switch does.
+/// Who may see the forwarding targets' addresses: the caller's organisation's
+/// admins (the same gate that sets them), and even they only masked; every
+/// other reader of the log sees whether forwarding is on, never where to
+/// (critic wave 9b, MAJOR 5: a webhook URL is a bearer secret).
+fn forward_viewer(ctx: &HandlerContext) -> tentanas::forward::Viewer {
+    if gate_admin(ctx).is_ok() {
+        tentanas::forward::Viewer::Admin
+    } else {
+        tentanas::forward::Viewer::Reader
+    }
+}
+
+/// Where the alert pipeline goes (§5.9): the asking organisation's own
+/// target, or — `node_wide` — the deletion of the retired node-wide one.
+/// Both are fleet-wide settings, so they need the same gate the four-eyes
+/// switch does. The organisation is the caller's own, never one the request
+/// names.
+#[allow(clippy::too_many_arguments)]
 async fn alert_forward_set(
     ctx: &HandlerContext,
     enabled: bool,
     syslog_target: &str,
     webhook_url: &str,
     include_access: bool,
+    node_wide: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_admin(ctx)?;
-    tentanas::forward::set_settings(
-        &ctx.state.db,
-        &g.db,
-        &g.addon_id,
-        &g.user_id,
-        enabled,
-        syslog_target,
-        webhook_url,
-        include_access,
-    )
-    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if node_wide {
+        // Retired (owner decision 2026-09-26): deleting it is the one change
+        // left — an "off, no address" request — and nothing edits or creates
+        // one.
+        if enabled || !syslog_target.trim().is_empty() || !webhook_url.trim().is_empty() {
+            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, tentanas::forward::FORWARD_NODE_RETIRED));
+        }
+        tentanas::forward::delete_node_target(&ctx.state.db, &g.db, &g.addon_id)
+            .map_err(|e| internal("forwarding", e))?;
+    } else {
+        tentanas::forward::set_settings(
+            &ctx.state.db,
+            &g.db,
+            &g.addon_id,
+            &g.user_id,
+            &g.org_id,
+            enabled,
+            syslog_target,
+            webhook_url,
+            include_access,
+        )
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    }
     access_log(
         ctx,
         &store::AccessFilter {
@@ -3763,6 +4368,12 @@ fn approvals_view(
             row.decided_by = Some(name);
         }
     }
+    name_branch_paths(a.nas_db, approvals.iter_mut().map(|r| &mut r.detail));
+    // A stop parked in another organisation blocks this node too (R2-2): a
+    // platform admin sees it — stripped to the node — and may reject it.
+    if platform_admin(ctx) && gate_admin(ctx).is_ok() {
+        approvals.extend(tentanas::approvals::foreign_pending_stops(&a).map_err(|e| internal("approvals", e))?);
+    }
     Ok(tn(P::ApprovalsListResponse {
         approvals,
         settings: tentanas::approvals::settings(a.main_db, a.checker, a.org_id, a.addon_id),
@@ -3800,13 +4411,45 @@ async fn approval_decide(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_admin(ctx)?;
     if !approve {
-        tentanas::approvals::reject(&actor(ctx, &g)?, request_id, note).map_err(approval_error)?;
+        match tentanas::approvals::reject(&actor(ctx, &g)?, request_id, note) {
+            // Another organisation's stop blocks this node too: a platform
+            // admin may reject it (R2-2) — reject only, never release.
+            Err(tentanas::approvals::ApprovalError::NotFound) if platform_admin(ctx) => {
+                tentanas::approvals::reject_foreign_stop(&actor(ctx, &g)?, request_id, note).map_err(approval_error)?;
+            }
+            other => {
+                other.map_err(approval_error)?;
+            }
+        }
         return approvals_response(ctx, &g);
+    }
+    // A stop of the node's sharing is released only by a PLATFORM admin
+    // (wave 10) — refused BEFORE the claim, so the request stays pending for
+    // one who is, instead of closing as 'failed'. Another organisation's row
+    // is left to `claim`, which answers it like a missing one.
+    if sharing_stop_needs_platform_admin(ctx, &g, request_id) {
+        return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, SHARING_STOP_PLATFORM_ADMIN));
+    }
+    // And its AUTHOR must still be one, and still an admin of this
+    // organisation (critic wave 10, MINOR 2): a request whose author lost the
+    // role since it was parked is not carried out.
+    if sharing_stop_author_gone(ctx, &g, request_id) {
+        return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, SHARING_STOP_AUTHOR_GONE));
     }
     let row = tentanas::approvals::claim(&actor(ctx, &g)?, request_id).map_err(approval_error)?;
     let payload =
         tentanas::approvals::stored_payload(&row).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    let outcome = execute_approved(ctx, &payload, secret).await;
+    let outcome = match payload {
+        // The stop carries its request: the record and the audit say which
+        // request stopped sharing and who asked (MINOR 1).
+        P::SharingStopRequest {} => sharing_stop_run(ctx, secret, tentanas::sharing::StopContext {
+            request_id: row.approval.request_id.clone(),
+            requested_by: row.approval.requested_by.clone(),
+            approved_by: g.user_id.clone(),
+            org_id: g.org_id.clone(),
+        }),
+        payload => execute_approved(ctx, &payload, secret).await,
+    };
     let job_id = match &outcome {
         Ok(MessageBody::TentaNasBody(P::JobResponse { job })) => Some(job.job_id.clone()),
         _ => None,
@@ -3876,6 +4519,11 @@ async fn execute_approved(
         P::ConfigImportApplyRequest { json, .. } => {
             config_import_apply(ctx, json, secret, Origin::Approved).await
         }
+        // Released ONLY through `approval_decide`, which re-checks its author
+        // and hands it its request (R2-3): never replayed from here.
+        P::SharingStopRequest {} => Err(ProtocolError::bad_request(
+            "'SharingStopRequest' is released only through its own approval",
+        )),
         P::SnapshotProtectionReleaseRequest { snapshot, .. } => {
             let g = gate_destructive(ctx)?;
             let explicit = secret.map(token);
@@ -3890,10 +4538,191 @@ async fn execute_approved(
     }
 }
 
+// ----- stopping this node's sharing (n18d, wave 10) ---------------------------------
+
+/// The requester or the approver of a sharing stop is not a platform admin.
+const SHARING_STOP_PLATFORM_ADMIN: &str = "refusal:sharing_stop_platform_admin";
+/// No other platform admin of the organisation could release the request.
+const SHARING_STOP_NO_SECOND_ADMIN: &str = "refusal:sharing_stop_no_second_admin";
+/// A stop of this node's sharing already waits for its second admin, or runs,
+/// or sharing is stopped here — in any organisation.
+const SHARING_STOP_PENDING: &str = "refusal:sharing_stop_pending";
+/// A stop parked in ANOTHER organisation waits for approval on this node.
+const SHARING_STOP_PENDING_ELSEWHERE: &str = "refusal:sharing_stop_pending_elsewhere";
+/// The author of a parked stop is no longer a platform admin of this
+/// organisation.
+const SHARING_STOP_AUTHOR_GONE: &str = "refusal:sharing_stop_author_gone";
+/// A block target with a moved portal still serves on this node.
+const SHARING_STOP_FROZEN: &str = "refusal:sharing_stop_frozen_targets";
+
+/// Whether the caller holds the platform's account role `admin` — what the
+/// Applications screen's switch requires (`AddonToggleRequest` is
+/// `#[policy(Admin)]`). The org Admin role is not enough: the stop is the
+/// platform's disable, and it reaches every organisation's shares here.
+fn platform_admin(ctx: &HandlerContext) -> bool {
+    super::SessionAuthKind::Admin.session_satisfies(&ctx.session)
+}
+
+/// Whether the account `user_id` holds the platform role `admin`.
+fn platform_admin_account(ctx: &HandlerContext, user_id: &str) -> bool {
+    crate::db::repository::get_user_role(&ctx.state.db, user_id)
+        .ok()
+        .flatten()
+        .is_some_and(|(role, _)| role == "admin")
+}
+
+/// Whether `request_id` is a sharing stop of the caller's organisation that
+/// the caller, lacking the platform role, may not release.
+fn sharing_stop_needs_platform_admin(ctx: &HandlerContext, g: &Gate, request_id: &str) -> bool {
+    !platform_admin(ctx)
+        && store::approval(&g.db, request_id)
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.org_id == g.org_id && row.approval.operation == tentanas::approvals::OP_SHARING_STOP)
+}
+
+/// Whether `request_id` is a sharing stop of the caller's organisation whose
+/// author is no longer a platform admin, or no longer an approver (org Admin
+/// with `nas.admin`) of this organisation.
+fn sharing_stop_author_gone(ctx: &HandlerContext, g: &Gate, request_id: &str) -> bool {
+    let Some(row) = store::approval(&g.db, request_id).ok().flatten() else { return false };
+    if row.org_id != g.org_id || row.approval.operation != tentanas::approvals::OP_SHARING_STOP {
+        return false;
+    }
+    let author = &row.approval.requested_by;
+    let still_approver = actor(ctx, g)
+        .map(|a| tentanas::approvals::approver_ids(a.main_db, a.checker, a.org_id, a.addon_id).contains(author))
+        .unwrap_or(false);
+    !(platform_admin_account(ctx, author) && still_approver)
+}
+
+/// n18d "Wyłącz i zatrzymaj udostępnianie…": parks the stop of THIS node's
+/// sharing for a second platform admin, with what it stops by name. Always
+/// parked, whatever the four-eyes switch says — the owner's decision makes
+/// it a four-eyes request — and refused outright when nobody could release
+/// it, rather than parking a request that can only expire.
+fn sharing_stop(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
+    let g = gate_admin(ctx)?;
+    if !platform_admin(ctx) {
+        return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, SHARING_STOP_PLATFORM_ADMIN));
+    }
+    let a = actor(ctx, &g)?;
+    let second = tentanas::approvals::approver_ids(a.main_db, a.checker, a.org_id, a.addon_id)
+        .into_iter()
+        .any(|id| id != g.user_id && platform_admin_account(ctx, &id));
+    if !second {
+        return Err(ProtocolError::new(ProtocolErrorCode::Conflict, SHARING_STOP_NO_SECOND_ADMIN));
+    }
+    // Per NODE (critic wave 10, M2): a stop parked by another
+    // organisation's admin, a stop or resume running, a node already stopped.
+    match tentanas::sharing::busy(&g.db, &g.org_id).map_err(|e| internal("sharing", e))? {
+        None => {}
+        // Said as such, never naming the organisation (R2-2): this node's
+        // platform admins see it in their approvals list and can reject it.
+        Some(tentanas::sharing::Busy::PendingElsewhere) => {
+            return Err(ProtocolError::new(ProtocolErrorCode::Conflict, SHARING_STOP_PENDING_ELSEWHERE));
+        }
+        Some(_) => return Err(ProtocolError::new(ProtocolErrorCode::Conflict, SHARING_STOP_PENDING)),
+    }
+    // A frozen target cannot be put back by a rollback or the resume
+    // (critic M3): the stop is refused while one serves.
+    if !tentanas::targets::frozen_targets(&g.db).map_err(|e| internal("targets", e))?.is_empty() {
+        return Err(ProtocolError::new(ProtocolErrorCode::Conflict, SHARING_STOP_FROZEN));
+    }
+    let plan = tentanas::sharing::plan(&g.db, &g.org_id).map_err(|e| internal("sharing plan", e))?;
+    // The node by its NAME; a node without one is named by nobody (the
+    // screen then shows the operation alone) — never by its id.
+    let node = crate::dispatch::app_route::node_display_name(ctx, &ctx.state.local_node_id.to_string());
+    park(
+        ctx,
+        &g,
+        tentanas::approvals::OP_SHARING_STOP,
+        &node,
+        tentanas::sharing::stop_detail(&plan, &node),
+        &P::SharingStopRequest {},
+    )
+}
+
+/// The released stop: one job, shares → targets → disable, with the
+/// approver's password when the node has no unattended channel. The job
+/// belongs to the organisation that asked, and holds the node-wide share
+/// lock for its whole run (M2).
+fn sharing_stop_run(
+    ctx: &HandlerContext,
+    secret: Option<&SudoSecret>,
+    stop: tentanas::sharing::StopContext,
+) -> Result<MessageBody, ProtocolError> {
+    let g = gate_admin(ctx)?;
+    if !platform_admin(ctx) {
+        return Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, SHARING_STOP_PLATFORM_ADMIN));
+    }
+    let plan = tentanas::sharing::plan(&g.db, &g.org_id).map_err(|e| internal("sharing plan", e))?;
+    let ops = tentanas::sharing::NodeOps {
+        main_db: ctx.state.db.clone(),
+        db: g.db.clone(),
+        addon_id: g.addon_id.clone(),
+        explicit: secret.map(token),
+        cipher: None,
+    };
+    let db = g.db.clone();
+    let node = crate::dispatch::app_route::node_display_name(ctx, &ctx.state.local_node_id.to_string());
+    let owner = g.org_id.clone();
+    let job = tentanas::jobs::spawn_steps(&g.db, tentanas::sharing::STOP_KIND, &node, &g.user_id, Some(&owner), move |h| async move {
+        let _serial = tentanas::shares::apply_mutex().lock().await;
+        tentanas::sharing::run_stop(&db, &ops, &h, &stop, &plan).await
+    })
+    .map_err(|e| internal("sharing stop", e))?;
+    Ok(job_response(ctx, job))
+}
+
 // ----- Elastic Array (§5.3) ---------------------------------------------------------
 
 fn elastic_owner(g: &Gate) -> ElasticOwner {
     ElasticOwner { org_id: g.org_id.clone(), addon_id: g.addon_id.clone() }
+}
+
+// Every refusal of an Elastic request is CODED (wave 13, `tentanas::refusal`):
+// the screen words it in the reader's language from its code and parameters,
+// and the English sentence beside it is only a tooltip. The scan test
+// `elastic_requests_answer_no_raw_sentence` holds this section to it.
+
+/// An error of the Elastic layer (a store write, a job spawn): its refusal as
+/// it is, a privilege-channel failure as `broker_error` words it, anything
+/// else an internal fault.
+fn elastic_error(scope: &str, error: anyhow::Error) -> ProtocolError {
+    privileged_error(scope, error)
+}
+
+fn elastic_refusal(refusal: Refusal) -> ProtocolError {
+    refusal.into()
+}
+
+/// The array the request names is not one of this instance's.
+fn array_missing(name: &str) -> ProtocolError {
+    elastic_refusal(
+        Refusal::not_found("elastic_array_not_found", format!("The array {name} does not exist in this instance"))
+            .param("array", name),
+    )
+}
+
+/// A name no array can have (the helper's rule, `validate_array_name`).
+fn valid_array_name(name: &str) -> Result<(), ProtocolError> {
+    tentanas_helper::elastic::validate_array_name(name)
+        .map_err(|e| elastic_refusal(Refusal::bad_request("elastic_name_invalid", e.to_string()).param("array", name)))
+}
+
+/// A disk id the request carries that no inventory could hold.
+fn valid_disk_id(disk_id: &str) -> Result<(), ProtocolError> {
+    if disk_id.is_empty() || disk_id.len() > 128 {
+        return Err(elastic_refusal(Refusal::bad_request("elastic_disk_id_invalid", "The request names no valid disk")));
+    }
+    Ok(())
+}
+
+/// The array's operation in flight blocks this one (the store refuses the
+/// same, `db::elastic_unresolved_refusal`).
+fn unresolved_operation() -> ProtocolError {
+    elastic_refusal(store::elastic_unresolved_refusal())
 }
 
 /// The asking organisation's array names, for `disks::hide_other_org_array`.
@@ -3924,18 +4753,43 @@ fn orgs_on_node(ctx: &HandlerContext) -> Result<std::collections::BTreeSet<Strin
 }
 
 /// Who reads the job and alert lists (`store::OrgViewer`): the caller's
-/// organisation, and whether it is the ONLY organisation of this node — then
-/// the rows whose owner is gone (a dissolved array's jobs and alerts,
-/// migration 18) are its to see (owner decision, wave 5). A failed read of
-/// the organisations answers "not the only one": hidden, never leaked.
+/// organisation, and whether it is the sole organisation here — then the
+/// rows whose owner is gone (a dissolved array's jobs and alerts, migration
+/// 18) are its to see (owner decisions, wave 5 and 2026-09-26). A failed
+/// read of either set answers "not the sole one": hidden, never leaked.
 fn org_viewer<'a>(ctx: &HandlerContext, g: &'a Gate) -> store::OrgViewer<'a> {
-    let sole_org = orgs_on_node_of(ctx).is_ok_and(|orgs| is_sole_org(&orgs, &g.org_id));
+    let sole_org = match (org_statuses_of(ctx), store::orgs_with_resources(&g.db)) {
+        (Ok(statuses), Ok(owning)) => is_sole_org(&statuses, &owning, &g.org_id),
+        _ => false,
+    };
     store::OrgViewer { org_id: &g.org_id, sole_org }
 }
 
-/// Whether `org_id` is the one and only organisation in `orgs`.
-fn is_sole_org(orgs: &std::collections::BTreeSet<String>, org_id: &str) -> bool {
-    !org_id.is_empty() && orgs.len() == 1 && orgs.contains(org_id)
+/// Whether `org_id` is "the sole organisation": itself `active`, and no
+/// OTHER organisation that still exists owns resources on this node
+/// (`owning`). Only a soft-deleted organisation (`deleted`) is ignored; a
+/// suspended one is still present — a suspension is reversible, and its
+/// rows must not become another tenant's to see meanwhile (critic wave 9a) —
+/// and so is an owner id no organisation row names (nothing says it is gone).
+/// The viewer need not own anything here: an organisation that dissolved its
+/// only array still sees that array's rows. `statuses` is org id → status.
+fn is_sole_org(
+    statuses: &std::collections::BTreeMap<String, String>,
+    owning: &std::collections::BTreeSet<String>,
+    org_id: &str,
+) -> bool {
+    !org_id.is_empty()
+        && statuses.get(org_id).is_some_and(|status| status == "active")
+        && !owning
+            .iter()
+            .any(|org| org != org_id && statuses.get(org).is_none_or(|status| status != "deleted"))
+}
+
+/// Every organisation's status, by id.
+fn org_statuses_of(ctx: &HandlerContext) -> Result<std::collections::BTreeMap<String, String>, ProtocolError> {
+    crate::services::org::list_organizations(&ctx.state.db, None)
+        .map(|orgs| orgs.into_iter().map(|org| (org.org_id, org.status)).collect())
+        .map_err(|e| internal("organisations", e))
 }
 
 fn orgs_on_node_of(ctx: &HandlerContext) -> Result<std::collections::BTreeSet<String>, ProtocolError> {
@@ -3976,20 +4830,30 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     secret: Option<&SudoSecret>,origin: Origin) -> Result<MessageBody,ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name,confirm_name)?;
-    tentanas_helper::elastic::validate_array_name(name).map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     let filesystem_kind = match filesystem {
         "ext4" => ElasticFilesystem::Ext4,
         "xfs" => ElasticFilesystem::Xfs,
-        _ => return Err(ProtocolError::bad_request("Wymagany filesystem xfs albo ext4")),
+        _ => {
+            return Err(elastic_refusal(
+                Refusal::bad_request("elastic_filesystem_invalid", "The filesystem has to be xfs or ext4")
+                    .param("filesystem", filesystem),
+            ))
+        }
     };
     if data_disk_ids.is_empty() || parity_disk_ids.len() > 2 || cache_disk_ids.len() > 1
         || data_disk_ids.len() + parity_disk_ids.len() + cache_disk_ids.len() > 32
         || data_disk_ids.iter().chain(parity_disk_ids).chain(cache_disk_ids).any(|id| id.is_empty() || id.len() > 128) {
-        return Err(ProtocolError::bad_request("Nieprawidłowy zestaw dysków Elastic"));
+        return Err(elastic_refusal(Refusal::bad_request(
+            "elastic_disk_set_invalid",
+            "The disk set is not one an Elastic Array can have: at least one data disk, at most two parity \
+             disks and one cache disk, 32 disks in all",
+        )));
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx,&g)?) {
         return park(ctx,&g,tentanas::approvals::OP_ELASTIC_CREATE,name,
-            "Formatuje wybrane dyski i tworzy macierz Elastic",
+            CodedText::new("elastic_create", &[("array", name.to_string())],
+                "formats the picked disks and creates the Elastic Array"),
             &P::ElasticArrayCreateRequest { name:name.to_string(),filesystem:filesystem.to_string(),
                 data_disk_ids:data_disk_ids.to_vec(),parity_disk_ids:parity_disk_ids.to_vec(),cache_disk_ids:cache_disk_ids.to_vec(),
                 confirm_name:confirm_name.to_string(),sudo_password:None });
@@ -4001,7 +4865,13 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     let explicit = secret.map(token);
     let global = root_claims(&g,"elastic root claims",Some(name),explicit.as_deref()).await?;
     if global.name_claimed != Some(false) || global.namespace_clear != Some(true) {
-        return Err(ProtocolError::bad_request("Nazwa lub przestrzeń montowania jest zajęta albo niepotwierdzona"));
+        return Err(elastic_refusal(
+            Refusal::bad_request(
+                "elastic_name_unavailable",
+                format!("The name {name} or its mount namespace is taken, or could not be confirmed free"),
+            )
+            .param("array", name),
+        ));
     }
     let mut claims = store::elastic_claims(&g.db).map_err(|e| internal("elastic claims",e))?;
     claims.extend(global.disks);
@@ -4012,13 +4882,23 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
     let capabilities = tentanas::elastic::capabilities(&features,&has_mkfs);
     if !capabilities.mergerfs || (!parity.is_empty() && !capabilities.snapraid)
         || !capabilities.filesystems.iter().any(|fs| fs == filesystem) {
-        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,"Brak działających narzędzi macierzy"));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_tools_missing",
+            "The tools an Elastic Array needs (mergerfs, snapraid for parity, the mkfs of the filesystem) \
+             are not all installed",
+        )));
     }
     // Pusty zbiór nazw wynika z pozytywnego odczytu namespace przez roota, nie błędu zpool.
     let plan = tentanas::elastic::plan_layout(name,filesystem,&data,&parity,&cache,&taken,
         &std::collections::BTreeSet::new(),&capabilities.filesystems,&tentanas_helper::elastic::Tools::for_preview());
     if !plan.refusals.is_empty() {
-        return Err(ProtocolError::bad_request(plan.refusals.iter().map(|r| r.detail.as_str()).collect::<Vec<_>>().join("; ")));
+        return Err(elastic_refusal(
+            Refusal::bad_request(
+                "elastic_plan_refused",
+                plan.refusals.iter().map(|r| r.detail.as_str()).collect::<Vec<_>>().join("; "),
+            )
+            .param("count", plan.refusals.len()),
+        ));
     }
     let disk_spec = |disk: &NasDisk| ElasticDiskSpec {
         disk_id:disk.disk_id.clone(),wwn:disk.wwn.clone().filter(|w| !w.is_empty()),
@@ -4029,10 +4909,10 @@ async fn elastic_create(ctx: &HandlerContext,name: &str,filesystem: &str,
         operation_id:uuid::Uuid::now_v7().to_string(),owner:elastic_owner(&g),name:name.to_string(),
         filesystem:filesystem_kind,data:data.iter().map(disk_spec).collect(),
         cache:cache.first().map(disk_spec),parity:parity.iter().map(disk_spec).collect() };
-    spec.validate().map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    spec.validate().map_err(|e| logged_refusal("elastic spec", &Refusal::bad_request("elastic_spec_invalid", e.to_string())))?;
     let intent = tentanas::jobs::ElasticJobIntent::Create(spec.clone());
     let job = tentanas::jobs::spawn(&g.db,"elastic_create",name,&g.user_id,Some(intent),None,
-        move |h| tentanas::elastic::create_job(h,spec,explicit)).map_err(|e| internal("elastic create",e))?;
+        move |h| tentanas::elastic::create_job(h,spec,explicit)).map_err(|e| elastic_error("elastic create",e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -4040,9 +4920,9 @@ async fn elastic_restore(ctx: &HandlerContext,name: &str,secret: Option<&SudoSec
     let g = gate_admin(ctx)?;
     let row = store::elastic_array(&g.db,&elastic_owner(&g),name)
         .map_err(|e| internal("elastic array",e))?
-        .ok_or_else(||ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     let job = tentanas::elastic::spawn_restore(&g.db,&row,&g.user_id,secret.map(token),None)
-        .map_err(|e| internal("elastic restore",e))?;
+        .map_err(|e| elastic_error("elastic restore",e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -4050,10 +4930,24 @@ async fn elastic_restore(ctx: &HandlerContext,name: &str,secret: Option<&SudoSec
 /// member no longer carries the UUID its journal recorded" — and not a server
 /// fault. Only the privilege channel failing is, and that arrives as a
 /// `BrokerError`, so it keeps `broker_error`'s classification.
+///
+/// A refusal is answered with its code; any other failure of the adoption is
+/// coded as `elastic_import_failed`, its sentence (ids scrubbed on the
+/// screen) only the detail.
+///
+/// Every refusal of the adoption answers `BadRequest`, whatever status the
+/// store or the Elastic layer gave it: that is what this request answered
+/// with before its refusals were coded, and the code, not the status, is
+/// what a screen reads.
 fn import_error(scope: &str, error: anyhow::Error) -> ProtocolError {
+    if let Some(refusal) = Refusal::find(&error) {
+        let mut answer = logged_refusal(scope, refusal);
+        answer.code = ProtocolErrorCode::BadRequest;
+        return answer;
+    }
     match error.downcast::<BrokerError>() {
         Ok(broker) => broker_error(scope, broker),
-        Err(other) => ProtocolError::bad_request(other.to_string()),
+        Err(other) => logged_refusal(scope, &Refusal::bad_request("elastic_import_failed", other.to_string())),
     }
 }
 
@@ -4093,8 +4987,9 @@ async fn elastic_import(
     secret: Option<&SudoSecret>,
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
-    tentanas_helper::elastic::validate_elastic_uuid(array_id)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    tentanas_helper::elastic::validate_elastic_uuid(array_id).map_err(|_| {
+        elastic_refusal(Refusal::bad_request("elastic_import_request_invalid", "The request names no valid array journal"))
+    })?;
     let owner = elastic_owner(&g);
     // The same tenant rule as the scan: another org of this node's journal is
     // not a candidate, so the adoption refuses it like a journal that is not
@@ -4115,7 +5010,7 @@ async fn elastic_import(
     let array = tentanas::elastic::get(&g.db, &owner, &name)
         .await
         .map_err(|e| internal("elastic get", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(&name))?;
     Ok(tn(P::ElasticArrayGetResponse { array }))
 }
 
@@ -4138,16 +5033,15 @@ async fn elastic_snapraid(
     use tentanas_helper::elastic::ElasticSnapraidKind;
     let g = gate_destructive(ctx)?;
     super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_READ)?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     let array = store::elastic_array(&g.db, &elastic_owner(&g), name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     if array.parity.is_empty() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "SnapRAID wymaga zakończonej aktywnej macierzy z parity",
-        ));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_no_parity",
+            "The array has no parity, so SnapRAID has nothing to check or write",
+        )));
     }
     if let ElasticSnapraidKind::Fix { disk } = &kind {
         // A repair is the ONE operation an array that needs attention may
@@ -4155,15 +5049,13 @@ async fn elastic_snapraid(
         // reported errors leaves exactly this array, and refusing the repair
         // here would leave it with no way out through the product.
         if !matches!(array.state.as_str(), "active" | "needs_attention") {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "Naprawa wymaga macierzy aktywnej albo wymagającej uwagi",
-            ));
+            return Err(elastic_refusal(Refusal::not_available(
+                "elastic_repair_not_ready",
+                "A repair needs an array that is active or needs attention",
+            )));
         }
         if !array.branches.iter().any(|b| b.role == "data" && b.name == *disk) {
-            return Err(ProtocolError::bad_request(format!(
-                "Macierz '{name}' nie ma dysku danych '{disk}'"
-            )));
+            return Err(elastic_refusal(store::no_such_data_disk(disk).param("array", name)));
         }
         // The OBSERVED array is read here, not the database row: the button on
         // the screen reads exactly these fields off the wire, and one rule over
@@ -4171,27 +5063,27 @@ async fn elastic_snapraid(
         let observed = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
             .await
             .map_err(|e| internal("elastic get", e))?
-            .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+            .ok_or_else(|| array_missing(name))?;
         // CAN it run, before WHETHER it should. A repair writes the named disk,
         // so a data disk that is missing or unmounted makes it impossible —
         // and that is the very state a repair is reached for, so the refusal
         // has to say what must happen first instead of handing the admin the
         // helper's `precondition_failed`.
         if let Some(blocker) = tentanas::elastic::repair_blocker(&observed) {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                format!("Naprawa macierzy '{name}' nie jest teraz możliwa: {blocker}"),
-            ));
+            return Err(elastic_refusal(blocker));
         }
         // Nothing to repair — see `elastic::repair_evidence` for why a repair
         // needs evidence rather than permission.
         if tentanas::elastic::repair_evidence(&observed).is_none() {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                format!(
-                    "Macierz '{name}' nie zgłasza awarii dysku ani błędów parity; naprawa \
-                     jest dostępna po scrubie, który wykryje błędy"
-                ),
+            return Err(elastic_refusal(
+                Refusal::not_available(
+                    "elastic_repair_nothing",
+                    format!(
+                        "The array {name} reports no disk failure and no parity errors; a repair is \
+                         offered after a scrub that finds errors"
+                    ),
+                )
+                .param("array", name),
             ));
         }
     } else if !array.parity_run_available {
@@ -4199,10 +5091,7 @@ async fn elastic_snapraid(
         // without success, so they are offered on the array such a run left
         // behind; everything else — a mover record in flight, a half-finished
         // add — still refuses (`db::parity_admission`).
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "SnapRAID wymaga macierzy z parity bez nierozwiązanej operacji poza parity",
-        ));
+        return Err(parity_run_blocked());
     }
     // What the Sync carries to the helper, and what the approver reads.
     let mut acknowledged = None;
@@ -4215,12 +5104,9 @@ async fn elastic_snapraid(
         let observed = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
             .await
             .map_err(|e| internal("elastic get", e))?
-            .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+            .ok_or_else(|| array_missing(name))?;
         if !observed.parity_run_available {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "SnapRAID wymaga macierzy z parity bez nierozwiązanej operacji poza parity",
-            ));
+            return Err(parity_run_blocked());
         }
         // I3: A SYNC OVER A RECORDED SCRUB OR REPAIR FAULT IS THE ADMIN'S
         // DECISION. Measured on rig11 (snapraid 13.0-1, probe f1-f4): the
@@ -4274,9 +5160,9 @@ async fn elastic_snapraid(
                 // language (`approvals.detail_<code>`): this is the data-loss
                 // warning, and a de/en/fr/es approver has to read it.
                 if fault_warning {
-                    tentanas::approvals::coded_detail("elastic_sync_over_fault")
+                    CodedText::new("elastic_sync_over_fault", &[], store::SYNC_OVER_FAULT_TEXT)
                 } else {
-                    tentanas::approvals::coded_detail("elastic_sync")
+                    CodedText::new("elastic_sync", &[], store::SYNC_TEXT)
                 },
             ),
             ElasticSnapraidKind::Scrub => (
@@ -4285,7 +5171,11 @@ async fn elastic_snapraid(
                     name: name.into(),
                     sudo_password: None,
                 },
-                "Sprawdza pełny checkpoint i zapisuje metadane scrub".to_string(),
+                CodedText::new(
+                    "elastic_scrub",
+                    &[],
+                    "checks the full checkpoint and records the scrub's metadata",
+                ),
             ),
             ElasticSnapraidKind::Fix { disk } => (
                 tentanas::approvals::OP_ELASTIC_FIX,
@@ -4305,12 +5195,30 @@ async fn elastic_snapraid(
                 // described an unfiltered `fix` this product never runs, and an
                 // approver who believed it would refuse a safe operation — or
                 // approve it expecting deleted files back.
-                format!(
-                    "Zapisuje z parity bloki zaznaczone przez ostatni scrub, w plikach niezmienionych od ostatniego Sync; operacja jest zapisana przy dysku '{disk}'"
-                ),
+                //
+                // The request keys the member by its SLOT ('d1'), which is not
+                // a name the approver has ever seen: the code names the disk by
+                // its kernel name now, and by its number when the node cannot
+                // see it (`number`, 1-based among the data disks).
+                //
+                // The ENGLISH too (wave-6 critic MAJOR 1): it is the approvals
+                // tooltip and the parked alert's text, and a slot there is as
+                // unknown to the approver as on the line itself.
+                {
+                    let branch = array.data().enumerate().find(|(_, b)| b.name == *disk);
+                    let shown = branch
+                        .and_then(|(_, b)| tentanas::disks::disk_name(&b.disk_id))
+                        .unwrap_or_default();
+                    let number = branch.map(|(i, _)| (i + 1).to_string()).unwrap_or_default();
+                    CodedText::new(
+                        "elastic_fix",
+                        &[("disk", shown.clone()), ("number", number.clone())],
+                        fix_detail_text(&shown, &number),
+                    )
+                },
             ),
         };
-        return park(ctx, &g, operation, name, &description, &request);
+        return park(ctx, &g, operation, name, description, &request);
     }
     let job = tentanas::elastic::spawn_snapraid(
         &g.db,
@@ -4320,8 +5228,17 @@ async fn elastic_snapraid(
         kind,
         acknowledge_parity_fault,
     )
-    .map_err(|e| internal("elastic snapraid", e))?;
+    .map_err(|e| elastic_error("elastic snapraid", e))?;
     Ok(job_response(ctx, job))
+}
+
+/// A Sync or a Scrub on an array whose unresolved operation is not a parity
+/// run (a mover record in flight, a half-finished add).
+fn parity_run_blocked() -> ProtocolError {
+    elastic_refusal(Refusal::not_available(
+        "elastic_parity_run_blocked",
+        "SnapRAID needs an array with parity and no unresolved operation other than a parity run",
+    ))
 }
 
 /// §5.3's headline: one more data disk on an array that keeps serving.
@@ -4343,15 +5260,12 @@ async fn elastic_add_disk(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name, confirm_name)?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    if disk_id.is_empty() || disk_id.len() > 128 {
-        return Err(ProtocolError::bad_request("Nieprawidłowy identyfikator dysku"));
-    }
+    valid_array_name(name)?;
+    valid_disk_id(disk_id)?;
     let owner = elastic_owner(&g);
     let array = store::elastic_array(&g.db, &owner, name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     let persisted = array
         .persisted_spec()
         .map_err(|e| internal("elastic spec", e))?
@@ -4375,22 +5289,19 @@ async fn elastic_add_disk(
     let pending = pinned;
     if pending.is_none() {
         if array.state != "active" || !array.enabled {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "Dodanie dysku wymaga zakończonej aktywnej macierzy",
-            ));
+            return Err(elastic_refusal(Refusal::not_available(
+                "elastic_add_not_ready",
+                "Adding a disk needs an enabled array whose creation has finished",
+            )));
         }
         if array.unresolved_operation {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "Macierz ma niepotwierdzoną operację; rozwiąż ją przed dodaniem dysku",
-            ));
+            return Err(unresolved_operation());
         }
     } else if !array.enabled || !matches!(array.state.as_str(), "active" | "needs_attention") {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "Powtórzenie dodania dysku wymaga włączonej macierzy",
-        ));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_add_retry_not_ready",
+            "Repeating the disk add needs an enabled array",
+        )));
     }
     // A disk this array (or any array of this instance) already holds is not a
     // "not free" disk to the admin reading the error — it is THEIR disk in
@@ -4409,9 +5320,17 @@ async fn elastic_add_disk(
                 .map(|parity| parity.name.clone())
         })
     {
-        return Err(ProtocolError::bad_request(format!(
-            "Dysk jest już w macierzy '{name}' jako '{member}'"
-        )));
+        // Named by its kernel name, else by its place in the array — never by
+        // the slot key the request would have to spell.
+        let words = DiskWords::member(&member, &tentanas::disks::disk_name(disk_id).unwrap_or_default());
+        return Err(elastic_refusal(
+            Refusal::bad_request(
+                "elastic_disk_in_array",
+                format!("{} is already in the array {name}", words.english()),
+            )
+            .disk(words)
+            .param("array", name),
+        ));
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
         return park(
@@ -4419,7 +5338,11 @@ async fn elastic_add_disk(
             &g,
             tentanas::approvals::OP_ELASTIC_ADD_DISK,
             name,
-            "Formatuje wybrany dysk i dołącza go do działającej macierzy Elastic",
+            CodedText::new(
+                "elastic_add_disk",
+                &[("disk", tentanas::disks::disk_name(disk_id).unwrap_or_default())],
+                "formats the picked disk and adds it to the running Elastic Array",
+            ),
             &P::ElasticArrayAddDiskRequest {
                 name: name.to_string(),
                 disk_id: disk_id.to_string(),
@@ -4438,7 +5361,9 @@ async fn elastic_add_disk(
             let picked = disks_by_id(std::slice::from_ref(&disk_id.to_string()), true)?
                 .into_iter()
                 .next()
-                .ok_or_else(|| ProtocolError::bad_request("Nie wybrano dysku"))?;
+                .ok_or_else(|| {
+                    elastic_refusal(Refusal::bad_request("elastic_no_disk_picked", "No disk was picked"))
+                })?;
             let global = root_claims(&g, "elastic root claims", None, explicit.as_deref()).await?;
             let mut claims =
                 store::elastic_claims(&g.db).map_err(|e| internal("elastic claims", e))?;
@@ -4446,12 +5371,28 @@ async fn elastic_add_disk(
             if !tentanas::elastic::claimed_disk_ids(std::slice::from_ref(&picked), &claims)
                 .is_empty()
             {
-                return Err(ProtocolError::bad_request(
-                    "Dysk jest już zarezerwowany przez macierz Elastic na tym nodzie",
+                return Err(elastic_refusal(
+                    Refusal::bad_request(
+                        "elastic_disk_claimed_here",
+                        format!("Disk {} is already reserved by an Elastic Array on this node", picked.name),
+                    )
+                    .disk(DiskWords::Kernel(picked.name.clone())),
                 ));
             }
-            if let Some(conflict) = tentanas::elastic::conflicting_owner(&picked) {
-                return Err(ProtocolError::bad_request(conflict));
+            if let Some((owner, owner_name)) = tentanas::elastic::conflicting_owner_code(&picked) {
+                return Err(elastic_refusal(
+                    Refusal::bad_request(
+                        "elastic_disk_in_use",
+                        format!(
+                            "Disk {} is {}",
+                            picked.name,
+                            tentanas::elastic::conflicting_owner(&picked).unwrap_or_default()
+                        ),
+                    )
+                    .disk(DiskWords::Kernel(picked.name.clone()))
+                    .param("owner", owner)
+                    .param("owner_name", owner_name),
+                ));
             }
             ElasticDiskSpec {
                 disk_id: picked.disk_id.clone(),
@@ -4469,16 +5410,24 @@ async fn elastic_add_disk(
     // refuses only once the data has outgrown the parity (MEASURED 2026-09-06,
     // snapraid 14.7).
     let after = tentanas::elastic::spec_with_added_disk(&persisted, &disk)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+        .map_err(|e| logged_refusal("elastic spec", &Refusal::bad_request("elastic_spec_invalid", e.to_string())))?;
     if let Some(parity) = after.parity.iter().map(|p| p.bytes).min() {
         if disk.bytes > parity {
-            return Err(ProtocolError::bad_request(
-                "Dysk danych jest większy niż parity macierzy; parity nie pokryłaby go w całości",
+            let words = tentanas::disks::disk_name(&disk.disk_id).map_or(DiskWords::Unnamed, DiskWords::Kernel);
+            return Err(elastic_refusal(
+                Refusal::bad_request(
+                    "elastic_disk_larger_than_parity",
+                    format!(
+                        "{} is larger than the array's parity; parity would not cover all of it",
+                        words.english()
+                    ),
+                )
+                .disk(words),
             ));
         }
     }
     let job = tentanas::elastic::spawn_add_disk(&g.db, &array, &g.user_id, explicit, disk)
-        .map_err(|e| internal("elastic add disk", e))?;
+        .map_err(|e| elastic_error("elastic add disk", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -4503,18 +5452,15 @@ async fn elastic_add_disk_abort(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name, confirm_name)?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
-    if disk_id.is_empty() || disk_id.len() > 128 {
-        return Err(ProtocolError::bad_request("Nieprawidłowy identyfikator dysku"));
-    }
+    valid_array_name(name)?;
+    valid_disk_id(disk_id)?;
     let owner = elastic_owner(&g);
     let array = store::elastic_array(&g.db, &owner, name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
-    let refuse = |code: &str| ProtocolError::new(ProtocolErrorCode::NotAvailable, format!("refusal:elastic_{code}"));
+        .ok_or_else(|| array_missing(name))?;
+    let refuse = |code: &'static str| elastic_refusal(Refusal::not_available(code, ""));
     if !array.enabled || !matches!(array.state.as_str(), "active" | "needs_attention") {
-        return Err(refuse("array_not_ready"));
+        return Err(refuse("elastic_array_not_ready"));
     }
     // The observation first: it settles an undo the core lost track of
     // (`elastic::reconcile_undone_add`), so a repeated undo reads "nothing to
@@ -4522,17 +5468,17 @@ async fn elastic_add_disk_abort(
     let observed = tentanas::elastic::get(&g.db, &owner, name)
         .await
         .map_err(|e| internal("elastic get", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     let disk = store::unfinished_elastic_add_disk(&g.db, &owner, &array.persisted_spec().map_err(|e| internal("elastic spec", e))?.array_id)
         .map_err(|e| internal("elastic add disk", e))?
         .filter(|disk| disk.disk_id == disk_id)
-        .ok_or_else(|| refuse("nothing_to_undo"))?;
+        .ok_or_else(|| refuse("elastic_nothing_to_undo"))?;
     // Nothing read from the helper: nothing says the disk never joined.
     if observed.state == "unknown" {
-        return Err(refuse("state_unknown"));
+        return Err(refuse("elastic_state_unknown"));
     }
     if !observed.pending_add_disk.as_ref().is_some_and(|pending| pending.disk_id == disk_id && pending.undo_possible) {
-        return Err(refuse("add_joined"));
+        return Err(refuse("elastic_add_joined"));
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
         return park(
@@ -4540,7 +5486,12 @@ async fn elastic_add_disk_abort(
             &g,
             tentanas::approvals::OP_ELASTIC_ADD_DISK_ABORT,
             name,
-            "Wycofuje niedokończone dodanie dysku, zanim dysk dołączył do udziału; czyści tylko system plików nadany przez to dodanie",
+            CodedText::new(
+                "elastic_add_disk_abort",
+                &[],
+                "undoes an unfinished disk add before the disk joined the share; clears only the \
+                 filesystem that add made",
+            ),
             &P::ElasticArrayAddDiskAbortRequest {
                 name: name.to_string(),
                 disk_id: disk_id.to_string(),
@@ -4550,7 +5501,7 @@ async fn elastic_add_disk_abort(
         );
     }
     let job = tentanas::elastic::spawn_add_disk_abort(&g.db, &array, &g.user_id, secret.map(token), disk)
-        .map_err(|e| internal("elastic add disk abort", e))?;
+        .map_err(|e| elastic_error("elastic add disk abort", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -4613,13 +5564,17 @@ async fn elastic_replace_disk(
     // arrays from a withdrawn feature either.
     let _g = gate_destructive(ctx)?;
     let _ = (branch, confirm_disk, replacement_disk_id, accept_stale_parity, secret, origin);
-    Err(ProtocolError::new(
-        ProtocolErrorCode::NotAvailable,
-        format!(
-            "Wymiana dysku macierzy '{name}' nie jest udostępniona w tej wersji. Macierz serwuje \
-             dalej z dysków, które ma; naprawa z parity działa dla dysków obecnych na nodzie, a \
-             macierz z brakującym dyskiem można rozwiązać i przejąć ponownie po jego podłączeniu."
-        ),
+    Err(elastic_refusal(
+        Refusal::not_available(
+            "elastic_replace_withdrawn",
+            format!(
+                "Disk replacement of the array {name} is not available in this version. The array keeps \
+                 serving from the disks it has; a repair from parity works for the disks present on the \
+                 node, and an array with a missing disk can be dissolved and adopted again once the disk \
+                 is connected."
+            ),
+        )
+        .param("array", name),
     ))
 }
 
@@ -4646,12 +5601,11 @@ async fn elastic_destroy(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     require_confirm(name, confirm_name)?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     let owner = elastic_owner(&g);
     let array = store::elastic_array(&g.db, &owner, name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     let union = array.union_path();
     let shares: Vec<String> = store::list_shares(&g.db)
         .map_err(|e| internal("shares", e))?
@@ -4662,12 +5616,16 @@ async fn elastic_destroy(
         .map(|share| share.name)
         .collect();
     if !shares.is_empty() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            format!(
-                "Macierz udostępnia share'y: {}. Usuń je przed rozwiązaniem macierzy",
-                shares.join(", ")
-            ),
+        return Err(elastic_refusal(
+            Refusal::not_available(
+                "elastic_destroy_shared",
+                format!(
+                    "The array serves shares: {}. Delete them before dissolving the array",
+                    shares.join(", ")
+                ),
+            )
+            .param("array", name)
+            .param("shares", shares.join(", ")),
         ));
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
@@ -4676,8 +5634,12 @@ async fn elastic_destroy(
             &g,
             tentanas::approvals::OP_ELASTIC_DESTROY,
             name,
-            "Zatrzymuje udostępnianie macierzy Elastic i usuwa jej nadzór; \
-             dyski zachowują systemy plików i dane",
+            CodedText::new(
+                "elastic_destroy",
+                &[],
+                "stops serving the Elastic Array and removes its supervision; the disks keep \
+                 their filesystems and data",
+            ),
             &P::ElasticArrayDestroyRequest {
                 name: name.to_string(),
                 confirm_name: confirm_name.to_string(),
@@ -4686,7 +5648,7 @@ async fn elastic_destroy(
         );
     }
     let job = tentanas::elastic::spawn_dissolve(&g.db, &array, &g.user_id, secret.map(token))
-        .map_err(|e| internal("elastic destroy", e))?;
+        .map_err(|e| elastic_error("elastic destroy", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -4699,27 +5661,26 @@ async fn elastic_mover(
 ) -> Result<MessageBody, ProtocolError> {
     let g = gate_destructive(ctx)?;
     super::app_gate::require_app_permission(ctx, tentanas::PACKAGE_ID, PERM_READ)?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     let array = store::elastic_array(&g.db, &elastic_owner(&g), name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     // An array whose only unresolved operations are mover runs takes the
     // next run: that run is what settles them.
     if array.state != "active" && !array.mover_settles_unresolved {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "Mover wymaga zakończonej aktywnej macierzy",
-        ));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_mover_not_ready",
+            "The mover needs an array whose creation has finished and that is active",
+        )));
     }
     // Nothing to move. Without a cache branch every write already lands on the
     // data disks, so a run would walk an empty source and report having moved
     // nothing — a job whose success says nothing about anything.
     if array.cache().next().is_none() {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "Macierz bez dysku cache nie ma czego przenosić",
-        ));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_mover_no_cache",
+            "An array without a cache disk has nothing to move",
+        )));
     }
     // An unresolved operation blocks the mover in the store. Without this the
     // refusal would surface as a generic internal error from `insert_job`, and
@@ -4728,20 +5689,21 @@ async fn elastic_mover(
     // does exactly that, which is how an enabled button used to meet an opaque
     // error. Clearing such an operation is E2-13, not this path.
     if array.unresolved_operation && !array.mover_settles_unresolved {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
-            "Macierz ma niepotwierdzoną operację; rozwiąż ją przed uruchomieniem movera",
-        ));
+        return Err(unresolved_operation());
     }
     if origin == Origin::Direct && tentanas::approvals::required(&actor(ctx, &g)?) {
         // What is recorded in the approval must be what will actually run: with
         // the coupling off the moved files stay outside parity, and promising a
         // sync that will not happen would be a lie preserved in the audit row.
-        let description = if array.mover.coupled_sync {
-            "Przenosi pliki z cache na dyski danych i uruchamia sprzężony sync parity"
-        } else {
-            "Przenosi pliki z cache na dyski danych BEZ sprzężonego sync parity"
-        };
+        let description = CodedText::new(
+            "elastic_mover",
+            &[("coupled_sync", array.mover.coupled_sync.to_string())],
+            if array.mover.coupled_sync {
+                "moves files from the cache to the data disks and runs the coupled parity sync"
+            } else {
+                "moves files from the cache to the data disks WITHOUT the coupled parity sync"
+            },
+        );
         return park(
             ctx,
             &g,
@@ -4755,7 +5717,7 @@ async fn elastic_mover(
         );
     }
     let job = tentanas::elastic::spawn_mover(&g.db, &array, &g.user_id, secret.map(token))
-        .map_err(|e| internal("elastic mover", e))?;
+        .map_err(|e| elastic_error("elastic mover", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -4763,23 +5725,40 @@ async fn elastic_mover(
 /// to. Unknown cadences are quoted rather than described: the handler refuses
 /// them anyway, and inventing a phrase for one would be the approval saying
 /// something the scheduler cannot do.
+/// The English of a parked repair, naming the disk the way its code does:
+/// by kernel name, else by its number among the data disks, else as "a data
+/// disk of the array" — never by the slot the request keys it by.
+fn fix_detail_text(disk: &str, number: &str) -> String {
+    let target = if !disk.is_empty() {
+        format!("disk {disk}")
+    } else if !number.is_empty() {
+        format!("data disk no. {number}")
+    } else {
+        "a data disk of the array".to_string()
+    };
+    format!(
+        "writes back from parity the blocks the last scrub marked bad, in files unchanged since \
+         the last Sync, on {target}"
+    )
+}
+
 fn cadence_text(s: &NasSchedule) -> String {
     match s.every.as_str() {
         // The OFFSET inside the period is what `scheduler::period_and_offset`
         // fires on, so it is carried here too — "co 15 min" alone would imply
         // the top of the period and quietly drop the half of the cadence the
         // scheduler actually reads.
-        "15m" => format!("co 15 min, o minucie :{:02}", s.minute % 15),
-        "30m" => format!("co 30 min, o minucie :{:02}", s.minute % 30),
-        "1h" => format!("co godzinę, o minucie :{:02}", s.minute),
-        "6h" => format!("co 6 godzin, o {:02}:{:02} w cyklu", s.hour % 6, s.minute),
-        "daily" => format!("codziennie o {:02}:{:02}", s.hour, s.minute),
+        "15m" => format!("every 15 min, at minute :{:02}", s.minute % 15),
+        "30m" => format!("every 30 min, at minute :{:02}", s.minute % 30),
+        "1h" => format!("hourly, at minute :{:02}", s.minute),
+        "6h" => format!("every 6 hours, at {:02}:{:02} of the cycle", s.hour % 6, s.minute),
+        "daily" => format!("daily at {:02}:{:02}", s.hour, s.minute),
         "weekly" => format!(
-            "co tydzień, dzień {}, o {:02}:{:02}",
+            "weekly, day {}, at {:02}:{:02}",
             s.weekday, s.hour, s.minute
         ),
-        "monthly" => format!("co miesiąc, {}. dnia o {:02}:{:02}", s.day, s.hour, s.minute),
-        other => format!("kadencja '{other}'"),
+        "monthly" => format!("monthly, day {} at {:02}:{:02}", s.day, s.hour, s.minute),
+        other => format!("cadence '{other}'"),
     }
 }
 
@@ -4818,9 +5797,10 @@ async fn elastic_schedule_set(
         (None, None, None) => None,
         (Some(age), Some(pct), Some(coupled)) => Some((age, pct, coupled)),
         _ => {
-            return Err(ProtocolError::bad_request(
-                "Niepełne reguły movera: podaj wszystkie trzy albo żadnej",
-            ))
+            return Err(elastic_refusal(Refusal::bad_request(
+                "elastic_mover_rules_incomplete",
+                "Incomplete mover rules: send all three or none",
+            )))
         }
     };
     // EVERY range check belongs above the park below. A value the replay would
@@ -4829,24 +5809,28 @@ async fn elastic_schedule_set(
     // the approver would have been shown "próg wolnego cache 200%".
     if let Some((min_age_secs, cache_min_free_pct, _)) = mover_rules {
         if cache_min_free_pct > 100 {
-            return Err(ProtocolError::bad_request(
-                "Minimum wolnego miejsca na cache to 0–100%",
-            ));
+            return Err(elastic_refusal(Refusal::bad_request(
+                "elastic_cache_free_range",
+                "The cache free-space threshold is 0–100%",
+            )));
         }
         if min_age_secs > MAX_MOVER_MIN_AGE_SECS {
-            return Err(ProtocolError::bad_request(
-                "Wiek plików do przeniesienia nie może przekraczać 365 dni",
+            return Err(elastic_refusal(
+                Refusal::bad_request(
+                    "elastic_mover_age_range",
+                    "The age of the files to move cannot exceed 365 days",
+                )
+                .param("days", MAX_MOVER_MIN_AGE_SECS / 86_400),
             ));
         }
     }
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     let array_id = store::elastic_array(&g.db, &elastic_owner(&g), name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?
+        .ok_or_else(|| array_missing(name))?
         .array_id()
         .map(str::to_string)
-        .ok_or_else(|| internal("elastic schedule", "macierz bez utrwalonej intencji"))?;
+        .ok_or_else(|| internal("elastic schedule", "the array has no persisted intent"))?;
     // An unknown cadence never fires — `next_run_after` refuses to guess one —
     // so an enabled schedule this node could never run is refused here instead
     // of being stored as a promise nothing keeps.
@@ -4854,9 +5838,9 @@ async fn elastic_schedule_set(
         .then(|| tentanas::scheduler::next_run_utc(schedule, chrono::Local::now()))
         .flatten();
     if enabled && next.is_none() {
-        return Err(ProtocolError::bad_request(format!(
-            "unknown schedule cadence '{}'",
-            schedule.every
+        return Err(elastic_refusal(Refusal::bad_request(
+            "schedule_cadence_unknown",
+            format!("unknown schedule cadence '{}'", schedule.every),
         )));
     }
     // §5.10 applies to any request that CHANGES what will run — not merely to
@@ -4921,27 +5905,43 @@ async fn elastic_schedule_set(
         // operation, the array, the cadence and the rules — and a request that
         // leaves the schedule switched off must say so rather than claim to
         // arm something.
-        let mut detail = format!(
-            "{}: {verb} macierzy {name}, {}",
+        //
+        // The codes carry the schedule itself ('every', 'hour', 'minute',
+        // 'weekday', 'day'): the approver's screen words the cadence with the
+        // same formatter the schedule editor uses.
+        let mut text = format!(
+            "{}: {verb} of array {name}, {}",
             if enabled {
-                "Uzbraja harmonogram"
+                "arms the schedule"
             } else {
-                "Zmienia harmonogram (pozostaje wyłączony)"
+                "changes the schedule (it stays off)"
             },
             cadence_text(schedule)
         );
+        let mut params = vec![
+            ("task", task.kind().to_string()),
+            ("enabled", enabled.to_string()),
+            ("every", schedule.every.clone()),
+            ("hour", schedule.hour.to_string()),
+            ("minute", schedule.minute.to_string()),
+            ("weekday", schedule.weekday.to_string()),
+            ("day", schedule.day.to_string()),
+        ];
         if let Some((age, pct, coupled)) = mover_rules {
-            detail.push_str(&format!(
-                "; pliki starsze niż {age} s, próg wolnego cache {pct}%, sprzężony sync: {}",
-                if coupled { "tak" } else { "nie" }
+            text.push_str(&format!(
+                "; files older than {age} s, cache free-space threshold {pct}%, coupled sync: {}",
+                if coupled { "yes" } else { "no" }
             ));
+            params.push(("min_age_secs", age.to_string()));
+            params.push(("cache_min_free_pct", pct.to_string()));
+            params.push(("coupled_sync", coupled.to_string()));
         }
         return park(
             ctx,
             &g,
             tentanas::approvals::OP_ELASTIC_SCHEDULE,
             name,
-            &detail,
+            CodedText::new("elastic_schedule", &params, text),
             &request,
         );
     }
@@ -4960,7 +5960,7 @@ async fn elastic_schedule_set(
     let array = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
         .await
         .map_err(|e| internal("elastic get", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     Ok(tn(P::ElasticArrayGetResponse { array }))
 }
 
@@ -4988,22 +5988,25 @@ async fn elastic_folder_cache_set(
     // Both shapes before either lookup: a caller who spelled the policy wrong
     // gets told which values exist, rather than a refusal about a folder.
     let policy = tentanas::elastic::CachePolicy::parse(cache_policy).ok_or_else(|| {
-        ProtocolError::bad_request("Nieznana polityka cache: dozwolone „yes”, „no” i „only”")
+        elastic_refusal(Refusal::bad_request(
+            "elastic_cache_policy_invalid",
+            "Unknown cache policy: the values are \"yes\", \"no\" and \"only\"",
+        ))
     })?;
-    tentanas_helper::elastic::validate_array_name(name)
-        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    valid_array_name(name)?;
     if !tentanas::elastic::folder_name_valid(folder) {
-        return Err(ProtocolError::bad_request(
-            "Folder musi być jedną nazwą bezpośrednio pod unią macierzy",
-        ));
+        return Err(elastic_refusal(Refusal::bad_request(
+            "elastic_folder_invalid",
+            "A folder has to be one name directly under the array's union",
+        )));
     }
     let array = store::elastic_array(&g.db, &elastic_owner(&g), name)
         .map_err(|e| internal("elastic array", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     let array_id = array
         .array_id()
         .map(str::to_string)
-        .ok_or_else(|| internal("elastic folder cache", "macierz bez utrwalonej intencji"))?;
+        .ok_or_else(|| internal("elastic folder cache", "the array has no persisted intent"))?;
     // The two refusals are NOT interchangeable. `NoSuchFolder` is a folder the
     // node looked for in a list it could read; `FoldersUnknown` is a list it
     // could not read at all, which happens on every array whose branches are
@@ -5011,27 +6014,34 @@ async fn elastic_folder_cache_set(
     // their folder is gone.
     if let Some(refusal) = tentanas::elastic::folder_policy_refusal(&array, folder) {
         return Err(match refusal {
-            tentanas::elastic::FolderPolicyRefusal::NoSuchFolder => {
-                ProtocolError::not_found("Ten folder nie istnieje w tej macierzy")
-            }
-            tentanas::elastic::FolderPolicyRefusal::FoldersUnknown => ProtocolError::new(
-                ProtocolErrorCode::NotAvailable,
-                "Nie można odczytać listy folderów macierzy — polityka cache nie została zapisana",
+            tentanas::elastic::FolderPolicyRefusal::NoSuchFolder => elastic_refusal(
+                Refusal::not_found("elastic_folder_not_found", format!("The folder {folder} does not exist in this array"))
+                    .param("folder", folder),
             ),
+            tentanas::elastic::FolderPolicyRefusal::FoldersUnknown => elastic_refusal(Refusal::not_available(
+                "elastic_folders_unreadable",
+                "The array's folder list cannot be read; the cache policy was not saved",
+            )),
         });
     }
     if !store::set_elastic_folder_policy(&g.db, &array_id, folder, policy)
         .map_err(|e| internal("elastic folder cache", e))?
     {
-        return Err(ProtocolError::bad_request(format!(
-            "Najwyżej {} folderów tej macierzy może mieć własną politykę cache",
-            store::FOLDER_POLICY_LIMIT
-        )));
+        return Err(elastic_refusal(
+            Refusal::bad_request(
+                "elastic_folder_policy_limit",
+                format!(
+                    "At most {} folders of this array can have their own cache policy",
+                    store::FOLDER_POLICY_LIMIT
+                ),
+            )
+            .param("limit", store::FOLDER_POLICY_LIMIT),
+        ));
     }
     let array = tentanas::elastic::get(&g.db, &elastic_owner(&g), name)
         .await
         .map_err(|e| internal("elastic get", e))?
-        .ok_or_else(|| ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+        .ok_or_else(|| array_missing(name))?;
     Ok(tn(P::ElasticArrayGetResponse { array }))
 }
 
@@ -5075,7 +6085,9 @@ async fn elastic_array_plan(
     // the request outright would leave the wizard with a red error box and no
     // idea which disk to unpick.
     if cache_disk_ids.len() > 1 {
-        return Err(ProtocolError::bad_request("Elastic dopuszcza najwyżej jeden dysk cache"));
+        // A code the screen words in the reader's language, never a Polish
+        // sentence in an English toast (critic wave 6, MINOR 5).
+        return Err(ProtocolError::bad_request("refusal:elastic_one_cache_disk"));
     }
     let data = read_disks(data_disk_ids)?;
     let parity = optional_disks(parity_disk_ids, &read_disks)?;
@@ -5085,7 +6097,10 @@ async fn elastic_array_plan(
     // because the plan is what tells them to install it. Nothing here runs.
     let global = namespace.await?;
     if !name.is_empty() && (global.name_claimed.is_none() || global.namespace_clear.is_none()) {
-        return Err(ProtocolError::new(ProtocolErrorCode::NotAvailable,"Niepotwierdzona przestrzeń nazw"));
+        return Err(elastic_refusal(Refusal::not_available(
+            "elastic_namespace_unconfirmed",
+            "The mount namespace of the name could not be confirmed",
+        )));
     }
     let mut reserved = std::collections::BTreeSet::new();
     if global.name_claimed == Some(true) || global.namespace_clear == Some(false) {
@@ -5181,6 +6196,9 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::DiskGetRequest { disk_id } => disk_get(ctx, disk_id),
         P::DiskSmartTestRequest { disk_id, kind, sudo_password } => {
             disk_smart_test(ctx, disk_id, kind, sudo_password.as_ref()).await
+        }
+        P::DiskSmartTestBatchRequest { disk_ids, kind, sudo_password } => {
+            disk_smart_test_batch(ctx, disk_ids, kind, sudo_password.as_ref()).await
         }
         P::DiskLocateRequest { disk_id, enable } => disk_locate(ctx, disk_id, *enable).await,
         P::DiskWipePlanRequest { disk_id, sudo_password } => {
@@ -5372,6 +6390,11 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             action,
             sudo_password,
         } => pool_device_state(ctx, name, device, action, sudo_password.as_ref()).await,
+        P::PoolDetachRequest {
+            name,
+            device,
+            sudo_password,
+        } => pool_detach(ctx, name, device, sudo_password.as_ref()).await,
         P::PoolSetPropertiesRequest {
             name,
             changes,
@@ -5486,10 +6509,11 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ShareBrowseRequest { path } => share_browse(ctx, path).await,
 
         // ----- block targets -----
-        P::TargetsListRequest {} => targets_list(ctx).await,
+        P::TargetsListRequest { summary } => targets_list(ctx, *summary).await,
         P::TargetGetRequest { target_id } => target_get(ctx, target_id).await,
         P::TargetCreateRequest { .. } => target_create(ctx, payload).await,
         P::TargetUpdateRequest { .. } => target_update(ctx, payload).await,
+        P::TargetSessionResetRequest { .. } => target_session_reset(ctx, payload).await,
         P::TargetDeleteRequest {
             target_id,
             confirm_name,
@@ -5549,6 +6573,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ApprovalSettingsSetRequest { enabled, ttl_hours } => {
             approval_settings_set(ctx, *enabled, *ttl_hours)
         }
+        P::SharingStopRequest {} => sharing_stop(ctx),
         P::SnapshotProtectionReleaseRequest {
             snapshot,
             reason,
@@ -5590,7 +6615,8 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
             syslog_target,
             webhook_url,
             include_access,
-        } => alert_forward_set(ctx, *enabled, syslog_target, webhook_url, *include_access).await,
+            node_wide,
+        } => alert_forward_set(ctx, *enabled, syslog_target, webhook_url, *include_access, *node_wide).await,
         P::PoolTrimRequest {
             name,
             action,
@@ -5642,7 +6668,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::ElasticArrayGetRequest {name} => {
             let g = gate(ctx,PERM_READ)?;
             let array = tentanas::elastic::get(&g.db,&elastic_owner(&g),name).await
-                .map_err(|e| internal("elastic get",e))?.ok_or_else(||ProtocolError::not_found("Macierz nie istnieje w tej instancji"))?;
+                .map_err(|e| internal("elastic get",e))?.ok_or_else(|| array_missing(name))?;
             Ok(tn(P::ElasticArrayGetResponse {array}))
         }
         P::ElasticArrayImportScanRequest { sudo_password } => {
@@ -5668,7 +6694,10 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
                 parity_disk_ids,
                 cache_disk_ids,
                 filesystem,
-                |ids| disks_by_id(ids, false),
+                // The PREVIEW names a remote LUN as a per-disk refusal
+                // (`conflicting_owner_code` → 'remote') instead of failing
+                // outright; the create path still refuses it coded.
+                disks_for_plan,
                 async {
                     let g = gate(ctx,PERM_READ)?;
                     root_claims(&g,"elastic namespace",(!name.is_empty()).then_some(name.as_str()),None).await
@@ -5788,6 +6817,10 @@ register_tentanas_variant!(
     "TentaNasDiskSmartTestRequest",
     "tentaflow_ws_handler_nas_disk_smart_test"
 );
+register_tentanas_variant!(
+    "TentaNasDiskSmartTestBatchRequest",
+    "tentaflow_ws_handler_nas_disk_smart_test_batch"
+);
 register_tentanas_variant!("TentaNasDiskLocateRequest", "tentaflow_ws_handler_nas_disk_locate");
 register_tentanas_variant!(
     "TentaNasDiskWipePlanRequest",
@@ -5825,6 +6858,7 @@ register_tentanas_variant!(
     "TentaNasPoolDeviceStateRequest",
     "tentaflow_ws_handler_nas_pool_device_state"
 );
+register_tentanas_variant!("TentaNasPoolDetachRequest", "tentaflow_ws_handler_nas_pool_detach");
 register_tentanas_variant!(
     "TentaNasPoolSetPropertiesRequest",
     "tentaflow_ws_handler_nas_pool_set_properties"
@@ -5968,6 +7002,7 @@ register_tentanas_variant!("TentaNasTargetsListRequest", "tentaflow_ws_handler_n
 register_tentanas_variant!("TentaNasTargetGetRequest", "tentaflow_ws_handler_nas_target_get");
 register_tentanas_variant!("TentaNasTargetCreateRequest", "tentaflow_ws_handler_nas_target_create");
 register_tentanas_variant!("TentaNasTargetUpdateRequest", "tentaflow_ws_handler_nas_target_update");
+register_tentanas_variant!("TentaNasTargetSessionResetRequest", "tentaflow_ws_handler_nas_target_session_reset");
 register_tentanas_variant!("TentaNasTargetDeleteRequest", "tentaflow_ws_handler_nas_target_delete");
 register_tentanas_variant!(
     "TentaNasElasticCapabilitiesRequest",
@@ -6025,6 +7060,351 @@ register_tentanas_variant!(
     "TentaNasElasticFolderCacheSetRequest",
     "tentaflow_ws_handler_nas_elastic_folder_cache_set"
 );
+register_tentanas_variant!("TentaNasSharingStopRequest", "tentaflow_ws_handler_nas_sharing_stop");
+
+/// Wave 13: every refusal an Elastic request answers is CODED
+/// (`tentanas::refusal`), and a raw sentence cannot come back unnoticed.
+///
+/// A scan of the sources, in the manner of the alert raisers' scan in
+/// `tentanas/db.rs`: the Elastic section of this dispatcher builds no
+/// `ProtocolError` from a sentence, the store and Elastic functions a request
+/// runs through refuse in no Polish sentence, and every refusal code those
+/// files send has words in all five locales.
+#[cfg(test)]
+mod elastic_refusal_scan_tests {
+    const DISPATCH: &str = include_str!("tentanas.rs");
+    const DB: &str = include_str!("../tentanas/db.rs");
+    const ELASTIC: &str = include_str!("../tentanas/elastic.rs");
+    const LOCALES: [(&str, &str); 5] = [
+        ("pl", include_str!("../../www/i18n/pl.json")),
+        ("en", include_str!("../../www/i18n/en.json")),
+        ("de", include_str!("../../www/i18n/de.json")),
+        ("es", include_str!("../../www/i18n/es.json")),
+        ("fr", include_str!("../../www/i18n/fr.json")),
+    ];
+
+    /// The code of `source` with every comment dropped, and the string
+    /// literals it holds. In the code, a char literal becomes `'_'` and a raw
+    /// string an ordinary one (its quotes and backslashes escaped), so a
+    /// `'{'`, a `'('` or a `"` inside `r#"…"#` never unbalances the matchers
+    /// below (critic wave 13, MINOR 6).
+    fn code_and_strings(source: &str) -> (String, Vec<String>) {
+        let bytes = source.as_bytes();
+        let mut code = String::with_capacity(source.len());
+        let mut strings = Vec::new();
+        let mut i = 0;
+        let word_before = |i: usize| i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        while i < bytes.len() {
+            let rest = &source[i..];
+            if rest.starts_with("//") {
+                i += rest.find('\n').unwrap_or(rest.len());
+                continue;
+            }
+            if rest.starts_with("/*") {
+                i += rest.find("*/").map_or(rest.len(), |at| at + 2);
+                continue;
+            }
+            // A raw string: `r"…"`, `r#"…"#`, `br"…"` (hashes counted).
+            let raw_at = if rest.starts_with("br") { 2 } else if rest.starts_with('r') { 1 } else { 0 };
+            if raw_at > 0 && !word_before(i) {
+                let hashes = rest[raw_at..].bytes().take_while(|b| *b == b'#').count();
+                if rest[raw_at + hashes..].starts_with('"') {
+                    let open = raw_at + hashes + 1;
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let end = rest[open..].find(&close).map_or(rest.len(), |at| open + at);
+                    let content = &rest[open..end];
+                    strings.push(content.to_string());
+                    code.push('"');
+                    code.push_str(&content.replace('\\', "\\\\").replace('"', "\\\""));
+                    code.push('"');
+                    i += (end + close.len()).min(rest.len());
+                    continue;
+                }
+            }
+            // A char literal (`'x'`, `'\n'`, `'\u{7b}'`); a lifetime (`'a`)
+            // has no closing quote right after one character.
+            if bytes[i] == b'\'' {
+                let len = if rest.starts_with("'\\") {
+                    rest.get(3..).and_then(|tail| tail.find('\'')).map(|at| at + 4)
+                } else {
+                    let mut chars = rest[1..].chars();
+                    chars.next().and_then(|c| (chars.next() == Some('\'')).then(|| c.len_utf8() + 2))
+                };
+                if let Some(len) = len {
+                    code.push_str("'_'");
+                    i += len;
+                    continue;
+                }
+            }
+            if bytes[i] == b'"' {
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] != b'"' {
+                    if bytes[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                strings.push(source[i + 1..j.min(bytes.len())].to_string());
+                code.push_str(&source[i..(j + 1).min(bytes.len())]);
+                i = j + 1;
+                continue;
+            }
+            let ch = rest.chars().next().unwrap();
+            code.push(ch);
+            i += ch.len_utf8();
+        }
+        (code, strings)
+    }
+
+    #[test]
+    fn the_scanner_reads_char_literals_raw_strings_and_comments() {
+        let source = "fn f() { let a = '{'; let b = '\\''; let c = r#\"say \"(\" now\"#; /* { */ g(\"x)\") }";
+        let (code, strings) = code_and_strings(source);
+        assert_eq!(strings, vec!["say \"(\" now".to_string(), "x)".to_string()]);
+        assert!(!code.contains("/*"), "{code}");
+        let body = function(&code, "f", None);
+        assert!(body.ends_with("g(\"x)\") "), "the whole body, not cut at a brace in a literal: {body}");
+        let at = code.find("g(").unwrap() + 1;
+        assert_eq!(parenthesised(&code, at), "\"x)\"");
+    }
+
+    /// The text between the `(` at `open` and its matching `)`.
+    fn parenthesised(code: &str, open: usize) -> &str {
+        let (mut depth, mut in_string, mut escaped) = (0usize, false, false);
+        for (at, ch) in code[open..].char_indices() {
+            if in_string {
+                match (escaped, ch) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &code[open + 1..open + at];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced parentheses at {open}");
+    }
+
+    /// The body of `fn name(` in `source` (to its closing brace), from
+    /// `from` on when that marker is given.
+    fn function<'a>(source: &'a str, name: &str, from: Option<&str>) -> &'a str {
+        let head = [format!("fn {name}("), format!("fn {name}<")]
+            .iter()
+            .filter_map(|head| source.find(head.as_str()))
+            .min()
+            .unwrap_or_else(|| panic!("fn {name}"));
+        let open = head + source[head..].find('{').expect("a body");
+        let (mut depth, mut end, mut in_string, mut escaped) = (0usize, open, false, false);
+        for (at, ch) in source[open..].char_indices() {
+            if in_string {
+                match (escaped, ch) {
+                    (true, _) => escaped = false,
+                    (false, '\\') => escaped = true,
+                    (false, '"') => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + at;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &source[open..end];
+        match from {
+            Some(marker) => &body[body.find(marker).unwrap_or_else(|| panic!("{marker} in {name}"))..],
+            None => body,
+        }
+    }
+
+    fn polish(text: &str) -> bool {
+        const WORDS: [&str; 12] =
+            ["nie", "Brak", "brak", "Macierz", "macierz", "macierzy", "dysk", "Dysk", "dysku", "Zadanie", "Operacja", "jest"];
+        text.chars().any(|c| "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ".contains(c))
+            || text.split(|c: char| !c.is_alphanumeric()).any(|word| WORDS.contains(&word))
+    }
+
+    /// The Elastic handlers and the dispatcher's Elastic arms.
+    fn elastic_dispatch() -> String {
+        let cut = |start: &str, end: &str| {
+            let from = DISPATCH.find(start).unwrap_or_else(|| panic!("{start}"));
+            let to = from + DISPATCH[from..].find(end).unwrap_or_else(|| panic!("{end}"));
+            DISPATCH[from..to].to_string()
+        };
+        cut("// ----- Elastic Array (§5.3)", "// ----- dispatcher")
+            + &cut("// ----- Elastic Array -----", "P::NodesListResponse { .. }")
+    }
+
+    #[test]
+    fn elastic_requests_answer_no_raw_sentence() {
+        let (code, strings) = code_and_strings(&elastic_dispatch());
+        let mut raw = Vec::new();
+        let mut checked = 0;
+        for constructor in ["ProtocolError::bad_request(", "ProtocolError::not_found(", "ProtocolError::new("] {
+            for (at, _) in code.match_indices(constructor) {
+                let args = parenthesised(&code, at + constructor.len() - 1);
+                checked += 1;
+                // The message argument (after an explicit status) is exactly
+                // a `"refusal:<code>"` literal, or exactly the name of a
+                // constant this file declares as one — nothing built around
+                // it (critic wave 13, MINOR 6: any ALL_CAPS token used to pass).
+                let message = match args.trim().strip_prefix("ProtocolErrorCode::") {
+                    Some(rest) => rest.split_once(',').map_or("", |(_, message)| message),
+                    None => args,
+                }
+                .trim();
+                let literal = message.strip_prefix("\"refusal:").and_then(|rest| rest.strip_suffix('"'));
+                let coded = literal.is_some_and(|code| {
+                    !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                }) || (!message.is_empty()
+                    && message.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                    && DISPATCH.contains(&format!("const {message}: &str = \"refusal:")));
+                if !coded {
+                    raw.push(args.trim().to_string());
+                }
+            }
+        }
+        assert!(checked >= 3, "the scan found the constructors ({checked})");
+        assert!(raw.is_empty(), "Elastic requests answer raw sentences: {raw:#?}");
+        let polish: Vec<&String> = strings.iter().filter(|s| polish(s)).collect();
+        assert!(polish.is_empty(), "Polish sentences in the Elastic handlers: {polish:#?}");
+        // The refusals really are there: the section is not an empty cut.
+        assert!(code.matches("Refusal::").count() >= 30, "the section builds its refusals");
+    }
+
+    /// The store and Elastic functions a request runs through before any
+    /// job is started: whatever they refuse reaches the admin, so it is a
+    /// `Refusal` or an internal fault in English — never a Polish sentence.
+    #[test]
+    fn the_elastic_refusal_paths_refuse_in_no_polish_sentence() {
+        // Comments out first: a quote in a comment is not a string.
+        let db = code_and_strings(DB).0;
+        let elastic = code_and_strings(ELASTIC).0;
+        let paths = [
+            // The Elastic intents (the SMART and ownership checks above them
+            // are not Elastic refusals; the teardown one is coded).
+            ("db.rs", function(&db, "insert_job_full", Some("if let Some(intent) = intent {"))),
+            ("db.rs", function(&db, "reserve_added_disk", None)),
+            ("db.rs", function(&db, "elastic_import", None)),
+            ("elastic.rs", function(&elastic, "import_selection", None)),
+            ("elastic.rs", function(&elastic, "journals", None)),
+            ("elastic.rs", function(&elastic, "import_apply", None)),
+            ("elastic.rs", function(&elastic, "repair_blocker", None)),
+        ];
+        let mut found = Vec::new();
+        let mut refusals = 0;
+        // EVERY literal of these bodies, not only the arguments of
+        // `bail!`/`ensure!`/`anyhow!`: a `.context("…")`, an `Error::msg`
+        // or a sentence built first and raised later is caught too.
+        for (file, body) in paths {
+            let (code, strings) = code_and_strings(body);
+            refusals += code.matches("Refusal::").count() + code.matches("refuse(").count();
+            found.extend(strings.into_iter().filter(|s| polish(s)).map(|s| format!("{file}: {s}")));
+        }
+        assert!(refusals >= 15, "the scan found the refusals ({refusals})");
+        assert!(found.is_empty(), "raw Polish refusals on an Elastic request path: {found:#?}");
+    }
+
+    /// Every code the Elastic layer and this dispatcher refuse with.
+    fn refusal_codes() -> std::collections::BTreeSet<String> {
+        let mut codes = std::collections::BTreeSet::new();
+        for source in [DISPATCH, DB, ELASTIC] {
+            let production = source.split("mod tests {").next().unwrap_or(source);
+            let (code, _) = code_and_strings(production);
+            for opener in [
+                "Refusal::not_available(",
+                "Refusal::bad_request(",
+                "Refusal::not_found(",
+                "Refusal::conflict(",
+                "refuse(",
+            ] {
+                for (at, _) in code.match_indices(opener) {
+                    let rest = code[at + opener.len()..].trim_start();
+                    if let Some(literal) = rest.strip_prefix('"') {
+                        let name = &literal[..literal.find('"').unwrap()];
+                        // `refuse(` is also the layout plan's helper
+                        // (`elastic::layout_refusals`), whose codes are the
+                        // wizard's and not refusals of a request.
+                        let wire = opener != "refuse(" || name.starts_with("elastic_");
+                        if wire && !name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') {
+                            codes.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+            for (at, _) in code.match_indices("\"refusal:") {
+                let name: String = code[at + 9..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                    .collect();
+                // `"refusal:elastic_{code}"` builds a code; its parts are
+                // the helper's refusal codes, worded under their full names.
+                if !name.is_empty() && !name.ends_with('_') {
+                    codes.insert(name);
+                }
+            }
+        }
+        codes
+    }
+
+    #[test]
+    fn every_elastic_refusal_code_has_words_in_all_five_locales() {
+        let codes = refusal_codes();
+        for known in ["elastic_disk_member", "elastic_import_incomplete", "elastic_array_not_found", "confirm_mismatch"] {
+            assert!(codes.contains(known), "the scan found {known}: {codes:?}");
+        }
+        let mut missing = Vec::new();
+        for (locale, text) in LOCALES {
+            let bundle: serde_json::Value = serde_json::from_str(text).expect("a locale bundle");
+            for code in &codes {
+                let words = bundle["tentanas"]["refusal"][code.as_str()].as_str().unwrap_or_default();
+                if words.trim().is_empty() {
+                    missing.push(format!("{locale}: {code}"));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "refusal codes without words: {missing:#?}");
+    }
+}
+
+#[cfg(test)]
+mod smart_batch_id_tests {
+    use super::*;
+
+    /// Wave 11 round 2: every id is bounded, duplicates count once, the
+    /// count is bounded.
+    #[test]
+    fn a_batch_bounds_each_id_and_the_count() {
+        let ok = vec!["wwn-0x5000c500a1b2c3d4".to_string(), "wwn-0x5000c500a1b2c3d4".to_string(), "x".repeat(SMART_BATCH_MAX_ID_LEN)];
+        assert_eq!(smart_batch_ids(&ok).expect("bounded").len(), 2);
+        let long = vec!["sda".to_string(), "x".repeat(SMART_BATCH_MAX_ID_LEN + 1)];
+        let refused = smart_batch_ids(&long).expect_err("too long");
+        assert!(refused.message.contains("at most 128 characters"), "{}", refused.message);
+        assert!(!refused.message.contains("xxxx"), "the id is not echoed");
+        assert!(smart_batch_ids(&[]).is_err());
+        let many: Vec<String> = (0..=SMART_BATCH_MAX_DISKS).map(|i| format!("sn-{i:08}")).collect();
+        assert!(smart_batch_ids(&many).is_err());
+    }
+}
 
 #[cfg(test)]
 mod config_import_subject_tests {
@@ -6161,6 +7541,145 @@ mod registration_tests {
         fixture
     }
 
+    /// B (wave 6): a schedule row says what its last slot came to as
+    /// structured fields, with the started job's status read by the node —
+    /// the job id stays in the node's database and is in none of them.
+    #[tokio::test]
+    async fn a_schedule_row_says_what_its_last_slot_came_to_without_the_job_id() {
+        use tentanas::scheduler::ScheduleOutcome;
+        let fixture = dispatch_fixture();
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let daily = NasSchedule { every: "daily".into(), hour: 3, minute: 0, weekday: 0, day: 1 };
+        for task in [store::PoolTask::Scrub, store::PoolTask::Trim] {
+            store::set_pool_schedule(&g.db, task, "tank", true, &daily, None).unwrap();
+        }
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: "pool_scrub".into(),
+            subject: "tank".into(),
+            status: "running".into(),
+            started_by: tentanas::scheduler::STARTED_BY.into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        store::insert_job(&g.db, &job, None).unwrap();
+        store::finish_job(&g.db, &job.job_id, "succeeded", None).unwrap();
+        let started = ScheduleOutcome::Started { job_id: job.job_id.clone() };
+        store::record_pool_schedule_run(&g.db, store::PoolTask::Scrub, "tank", &started.stored(), None).unwrap();
+        let refused = ScheduleOutcome::StartFailed { detail: "the pool is busy".into(), refusal: None };
+        store::record_pool_schedule_run(&g.db, store::PoolTask::Trim, "tank", &refused.stored(), None).unwrap();
+
+        let MessageBody::TentaNasBody(P::SchedulesListResponse { rows, .. }) = schedules_list(&fixture.ctx).unwrap() else {
+            panic!("a schedules list")
+        };
+        let row = |kind: &str| rows.iter().find(|r| r.kind == kind).expect(kind).clone();
+        let scrub = row("scrub");
+        assert_eq!((scrub.last_outcome.as_str(), scrub.last_job_status.as_str()), ("started", "succeeded"));
+        assert_eq!((scrub.last_reason.as_str(), scrub.last_detail.as_str()), ("", ""));
+        let trim = row("trim");
+        assert_eq!((trim.last_outcome.as_str(), trim.last_detail.as_str()), ("start_failed", "the pool is busy"));
+        assert!(trim.last_job_status.is_empty());
+        assert!(trim.last_reason.is_empty(), "an uncoded failure carries no code");
+        // A CODED refusal (wave 13) goes out as its code for the screen to
+        // word, and its sentence stays the detail (critic wave 13, MAJOR 1).
+        let coded: anyhow::Result<tentaflow_protocol::tentanas::NasJob> =
+            Err(store::elastic_unresolved_refusal().into());
+        store::record_pool_schedule_run(&g.db, store::PoolTask::Trim, "tank", &ScheduleOutcome::of_spawn(&coded).stored(), None)
+            .unwrap();
+        let MessageBody::TentaNasBody(P::SchedulesListResponse { rows, .. }) = schedules_list(&fixture.ctx).unwrap() else {
+            panic!("a schedules list")
+        };
+        let trim = rows.iter().find(|r| r.kind == "trim").unwrap();
+        assert_eq!(trim.last_outcome, "start_failed");
+        assert_eq!(trim.last_reason, "refusal:elastic_operation_unresolved");
+        assert!(!trim.last_detail.contains("refusal:") && trim.last_detail.contains("unresolved operation"), "{}", trim.last_detail);
+        for r in &rows {
+            for field in [&r.last_outcome, &r.last_job_status, &r.last_reason, &r.last_detail] {
+                assert!(!field.contains(&job.job_id), "{}: {field}", r.kind);
+            }
+        }
+        // An older screen still gets the sentence it parses.
+        assert_eq!(scrub.last_result, format!("started job {}", job.job_id));
+        // The SMART pair never carries an outcome.
+        assert!(row("smart_short").last_outcome.is_empty());
+    }
+
+    /// Owner decision (wave 7): the node decides what a detach may take out,
+    /// from `zpool status` read again at the request — only the original disk
+    /// of a `spare-N` group whose spare is ready. The spare itself, an
+    /// ordinary leaf, an empty name and any disk during a resilver are refused.
+    #[test]
+    fn a_detach_is_allowed_only_for_the_disk_a_ready_spare_replaced() {
+        let status = |scan: &str| {
+            tentanas::pools::parse_status(&format!(
+                "  pool: tank\n state: DEGRADED\n  scan: {scan}\nconfig:\n\n\
+\tNAME            STATE     READ WRITE CKSUM\n\
+\ttank            DEGRADED     0     0     0\n\
+\t  mirror-0      DEGRADED     0     0     0\n\
+\t    /dev/sda    ONLINE       0     0     0\n\
+\t    spare-1     DEGRADED     0     0     0\n\
+\t      /dev/sdb  FAULTED      9    40     0\n\
+\t      /dev/sdk  ONLINE       0     0     0\n\
+\tspares\n\
+\t  /dev/sdk      INUSE     currently in use\n\
+\nerrors: No known data errors\n"
+            ))
+        };
+        let settled = status("resilvered 1T in 01:00:00 with 0 errors on Tue Sep  1 12:00:00 2026");
+        assert!(detach_allowed(&settled, "sdb"));
+        for other in ["sdk", "sda", "", "tank"] {
+            assert!(!detach_allowed(&settled, other), "{other}");
+        }
+        let running = status("resilver in progress since Tue Sep  1 09:00:00 2026\n\t1T scanned\n\t0B repaired, 40.00% done, 01:00:00 to go");
+        assert!(!detach_allowed(&running, "sdb"), "not while the spare resilvers");
+        assert_eq!(POOL_DETACH_NOT_ALLOWED, "refusal:pool_detach_not_allowed");
+    }
+
+    /// Critic wave 7, MAJOR 2: the fleet's 10 s poll asks for the light
+    /// answer. It never computes the capabilities (environment read + full
+    /// `zfs list`), and a second poll within `FLEET_SESSIONS_MAX_AGE` makes no
+    /// privileged NVMe-oF session read; the targets and the service rows are
+    /// still there. The Sharing tab's full answer does compute them.
+    #[tokio::test]
+    async fn the_fleet_summary_of_targets_skips_the_heavy_reads() {
+        let fixture = dispatch_fixture();
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let row = store::TargetRow {
+            target_id: "t-nvme".into(),
+            name: "scratch".into(),
+            protocol: "nvmet".into(),
+            wwn: "nqn.2026-09.local.tentaflow:helios:scratch".into(),
+            enabled: true,
+            state: "active".into(),
+            created_at: store::now(),
+            updated_at: store::now(),
+            ..Default::default()
+        };
+        store::upsert_target(&g.db, &g.org_id, &row).unwrap();
+        let caps = || CAPABILITY_READS.with(|n| n.get());
+        let sudo = || tentanas::targets::SESSION_READS.with(|n| n.get());
+
+        let (caps0, sudo0) = (caps(), sudo());
+        for _ in 0..2 {
+            let MessageBody::TentaNasBody(P::TargetsListResponse { targets, services, .. }) =
+                targets_list(&fixture.ctx, true).await.unwrap()
+            else {
+                panic!("a targets list")
+            };
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].name, "scratch");
+            assert_eq!(services.len(), 2, "the LIO and nvmet rows the services chip reads");
+        }
+        assert_eq!(caps() - caps0, 0, "the summary never computes capabilities");
+        assert!(sudo() - sudo0 <= 1, "at most one privileged session read for two polls, not one per poll");
+        let after_two = sudo();
+        targets_list(&fixture.ctx, true).await.unwrap();
+        assert_eq!(sudo(), after_two, "a poll within the window reads no sessions");
+
+        targets_list(&fixture.ctx, false).await.unwrap();
+        assert_eq!(caps() - caps0, 1, "the Sharing tab's full answer still computes them");
+    }
+
     #[tokio::test]
     async fn a_tentanas_frame_reaches_its_handler_through_dispatch() {
         let fixture = dispatch_fixture();
@@ -6239,6 +7758,62 @@ mod registration_tests {
         }
     }
 
+    /// Round 4 (critic C2): the platform admin's list of internal collectors
+    /// names internal hosts and networks — only a platform admin gets it
+    /// from the settings list.
+    #[tokio::test]
+    async fn only_a_platform_admin_reads_the_collector_allowlist() {
+        let state = crate::dispatch::state::AppState::for_test();
+        crate::db::repository::set_setting(&state.db, tentanas::forward::ALLOWLIST_SETTING, r#"[{"entry":"siem.lan"}]"#).unwrap();
+        let listed = |role: &str| {
+            let ctx = crate::dispatch::test_handler_context(state.clone(), Some(role), None);
+            let MessageBody::SettingsListResponse { entries } = crate::dispatch::handlers::settings_list(&MessageBody::SettingsListRequest, &ctx).unwrap() else {
+                panic!("a settings list")
+            };
+            entries.iter().any(|e| e.key == tentanas::forward::ALLOWLIST_SETTING)
+        };
+        assert!(listed("admin"));
+        assert!(!listed("user"), "an ordinary user gets nothing of it");
+    }
+
+    /// MAJOR 5 of the wave-9b critic, through the real dispatcher: the
+    /// retired node-wide target cannot be edited or recreated — only deleted
+    /// — and a reader of the access log never receives a target's address.
+    #[tokio::test]
+    async fn the_node_wide_target_is_retired_and_a_reader_gets_no_address() {
+        let mut fixture = dispatch_fixture();
+        let set = |enabled: bool, syslog: &str, webhook: &str, node_wide: bool| tn(P::AlertForwardSetRequest {
+            enabled,
+            syslog_target: syslog.to_string(),
+            webhook_url: webhook.to_string(),
+            include_access: false,
+            node_wide,
+        });
+        // A reader first: it may read the log, never set a target.
+        let (response, error) = crate::dispatch::dispatch(&set(true, "", "https://siem.example.com/in/SECRET", false), &fixture.ctx).await;
+        assert!(error, "{response:?}");
+        elastic_admin(&mut fixture);
+        let (response, error) = crate::dispatch::dispatch(&set(true, "", "https://siem.example.com/in/SECRET", false), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::AccessLogResponse { forward, .. }) = response else { panic!("an access log") };
+        assert_eq!(forward.webhook_url, "https://siem.example.com/…", "the admin reads it masked");
+        // Creating or editing a node-wide target is refused; deleting is not.
+        let (response, error) = crate::dispatch::dispatch(&set(true, "legacy.example.com:514", "", true), &fixture.ctx).await;
+        assert!(error);
+        assert!(matches!(&response, MessageBody::Error(e) if e.message == tentanas::forward::FORWARD_NODE_RETIRED), "{response:?}");
+        let (response, error) = crate::dispatch::dispatch(&set(false, "", "", true), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        // A reader of the same organisation: on, and nothing about where.
+        fixture.ctx.org_context.as_mut().unwrap().permissions.remove("org.admin");
+        let (response, error) = crate::dispatch::dispatch(&tn(P::AccessLogRequest {
+            share: String::new(), user: String::new(), operation: String::new(), result: String::new(), since: String::new(), limit: 0,
+        }), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::AccessLogResponse { forward, .. }) = response else { panic!("an access log") };
+        assert!(forward.enabled);
+        assert_eq!((forward.webhook_url.as_str(), forward.syslog_target.as_str()), ("", ""));
+    }
+
     #[tokio::test]
     async fn elastic_create_permissions_and_retype_precede_all_storage_work() {
         let mut fixture=dispatch_fixture();
@@ -6258,16 +7833,223 @@ mod registration_tests {
         assert_eq!(tentanas::elevation::audit_entries(&g.db),0);
     }
 
-    /// Owner decision (wave 5): the orphaned rows are one viewer's only when it
-    /// is the node's single organisation.
+    /// Owner decision 2026-09-26: a pool holding another organisation's
+    /// share or target is not destroyed, and the refusal names neither the
+    /// organisation nor the resource. The asking organisation's own
+    /// resources still follow the existing flow (listed by the dialog, taken
+    /// with the pool). A check that could not be made refuses.
     #[test]
-    fn a_viewer_is_the_sole_organisation_only_when_the_node_has_no_other() {
+    fn pool_destroy_refuses_while_another_organisation_uses_the_pool() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::migrate(&conn).unwrap();
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let mounts = vec!["/tank".to_string(), "/tank/projekty".to_string()];
+        let share = |org: &str, name: &str, path: &str, dataset: Option<&str>| {
+            store::upsert_share(&db, org, &store::ShareRow {
+                share_id: format!("s-{name}"),
+                name: name.into(),
+                protocol: "smb".into(),
+                source_path: path.into(),
+                dataset: dataset.map(str::to_string),
+                enabled: true,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                ..Default::default()
+            }).unwrap();
+        };
+        let target = |org: &str, name: &str, kind: &str, source: &str| {
+            store::upsert_target(&db, org, &store::TargetRow {
+                target_id: format!("t-{name}"),
+                name: name.into(),
+                protocol: "iscsi".into(),
+                wwn: format!("iqn.2026-09.test:{name}"),
+                enabled: true,
+                luns: vec![tentaflow_protocol::tentanas::NasTargetLun {
+                    source: source.into(),
+                    source_kind: kind.into(),
+                    ..Default::default()
+                }],
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                ..Default::default()
+            }).unwrap();
+        };
+        let guard = |mounts: Option<&[String]>| pool_destroy_guard(&db, "org-a", "tank", mounts);
+
+        // The asking organisation's own share and zvol: the existing flow.
+        share("org-a", "projekty", "/tank/projekty", Some("tank/projekty"));
+        target("org-a", "vm-a", "zvol", "tank/vm-a");
+        assert!(guard(Some(&mounts)).is_ok(), "same-organisation resources follow the existing flow");
+        // Another organisation's, but on another pool: not this pool's business.
+        share("org-b", "media", "/srv/media/x", None);
+        target("org-b", "vm-other", "zvol", "tankard/vm");
+        assert!(guard(Some(&mounts)).is_ok(), "`tankard` is not `tank`");
+
+        for (why, add) in [
+            ("a share by path", Box::new(|| share("org-b", "b-docs", "/tank/projekty/b", None)) as Box<dyn Fn()>),
+            ("a share on a dataset", Box::new(|| share("org-b", "b-root", "/elsewhere", Some("tank")))),
+            ("a zvol LUN", Box::new(|| target("org-b", "b-vm", "zvol", "tank/b-vm"))),
+            ("a file LUN", Box::new(|| target("org-b", "b-file", "file", "/tank/images/b.img"))),
+        ] {
+            add();
+            let refused = guard(Some(&mounts)).expect_err(why);
+            assert_eq!(refused.code, ProtocolErrorCode::Conflict, "{why}");
+            assert_eq!(refused.message, POOL_DESTROY_FOREIGN, "{why}: coded, and it names nobody");
+            db.write().unwrap().execute_batch(
+                "DELETE FROM nas_shares WHERE name LIKE 'b-%'; DELETE FROM nas_targets WHERE name LIKE 'b-%';",
+            ).unwrap();
+            assert!(guard(Some(&mounts)).is_ok(), "{why}: clean again");
+        }
+
+        let unverified = guard(None).expect_err("datasets unreadable");
+        assert_eq!(unverified.message, POOL_DESTROY_UNVERIFIED);
+        // With the datasets unreadable, a foreign zvol by name is still FOREIGN.
+        target("org-b", "b-zvol", "zvol", "tank/b-zvol");
+        assert_eq!(guard(None).expect_err("zvol by name").message, POOL_DESTROY_FOREIGN);
+        db.write().unwrap().execute_batch("DELETE FROM nas_targets WHERE name = 'b-zvol';").unwrap();
+
+        // Critic wave 9a, MINOR 6: another organisation's target whose record
+        // cannot be read may be on the pool — unverified, never "no LUNs".
+        target("org-b", "b-corrupt", "zvol", "elsewhere/x");
+        db.write().unwrap().execute_batch("UPDATE nas_targets SET spec_json = '{not json' WHERE name = 'b-corrupt';").unwrap();
+        assert_eq!(guard(Some(&mounts)).expect_err("corrupt record").message, POOL_DESTROY_UNVERIFIED);
+        db.write().unwrap().execute_batch("DELETE FROM nas_targets WHERE name = 'b-corrupt';").unwrap();
+        // The asking organisation's own corrupt record is not this check's.
+        target("org-a", "a-corrupt", "zvol", "elsewhere/y");
+        db.write().unwrap().execute_batch("UPDATE nas_targets SET spec_json = '{not json' WHERE name = 'a-corrupt';").unwrap();
+        assert!(guard(Some(&mounts)).is_ok());
+        db.write().unwrap().execute_batch("ALTER TABLE nas_targets RENAME TO nas_targets_gone").unwrap();
+        assert_eq!(guard(Some(&mounts)).expect_err("rows unreadable").message, POOL_DESTROY_UNVERIFIED);
+    }
+
+    /// Critic wave 9a, R2-MINOR 2: a destroy the job's own re-check refuses
+    /// leaves the pool's schedules in place — they go only with a destroy
+    /// that ran.
+    #[tokio::test]
+    async fn a_destroy_refused_by_the_job_keeps_the_pool_schedules() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::migrate(&conn).unwrap();
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let schedule = tentaflow_protocol::tentanas::NasSchedule::default();
+        store::set_pool_schedule(&db, store::PoolTask::Scrub, "tank", true, &schedule, None).unwrap();
+        store::upsert_share(&db, "org-b", &store::ShareRow {
+            share_id: "s-b".into(), name: "b".into(), protocol: "smb".into(), source_path: "/tank/b".into(),
+            dataset: Some("tank/b".into()), enabled: true, created_at: "now".into(), updated_at: "now".into(),
+            ..Default::default()
+        }).unwrap();
+        let h = tentanas::jobs::JobHandle::for_test(&db, "job-destroy-refused");
+        let refused = pool_destroy_job(h, db.clone(), "org-a".into(), "nas".into(), "tank".into(),
+            HelperCommand::ZpoolDestroy { pool: "tank".into() }, None).await.expect_err("refused");
+        assert_eq!(refused.to_string(), POOL_DESTROY_FOREIGN);
+        assert!(store::pool_schedule(&db, store::PoolTask::Scrub, "tank").unwrap().is_some(), "the schedule stays");
+    }
+
+    /// Critic wave 9a, MINOR 10: the approved execution of a parked pool
+    /// destroy runs the guard too, before any job exists — through
+    /// `execute_approved`, so a reorder that put the guard behind the
+    /// `origin` check, or after the spawn, fails here.
+    #[tokio::test]
+    async fn an_approved_pool_destroy_is_refused_while_another_organisation_uses_the_pool() {
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        store::upsert_share(&g.db, "org-other", &store::ShareRow {
+            share_id: "s-theirs".into(),
+            name: "theirs".into(),
+            protocol: "smb".into(),
+            source_path: "/tank/theirs".into(),
+            dataset: Some("tank/theirs".into()),
+            enabled: true,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+            ..Default::default()
+        }).unwrap();
+        let parked = P::PoolDestroyRequest { name: "tank".into(), confirm_name: "tank".into(), sudo_password: None };
+        let refused = execute_approved(&fixture.ctx, &parked, None).await.expect_err("refused");
+        assert_eq!(refused.code, ProtocolErrorCode::Conflict);
+        assert_eq!(refused.message, POOL_DESTROY_FOREIGN, "coded, naming nobody");
+        assert!(store::list_jobs(&g.db, 100).unwrap().is_empty(), "no destroy job was started");
+    }
+
+    /// Critic wave 9a, MINOR 5 and R2-MAJOR 1: a creation never lands on a
+    /// pool between a destroy's last check and `zpool destroy`, and never
+    /// waits for the destroy without limit: while the lock is held it is
+    /// refused (coded) after a short wait, and it runs once the lock is free.
+    #[tokio::test]
+    async fn share_and_target_creation_are_refused_while_a_pool_destroy_holds_the_lock() {
+        assert_eq!(POOL_DESTROY_IN_PROGRESS, tentanas::pools::POOL_DESTROY_IN_PROGRESS);
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        for permission in [PERM_SHARES, PERM_TARGETS] {
+            crate::dispatch::app_gate::test_support::set_permission(&fixture.ctx.state, &fixture.addon_id,
+                "user", &fixture.ctx.org_context.as_ref().unwrap().user_id, permission, "allow");
+        }
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let share = P::ShareCreateRequest {
+            name: "lockcheck".into(), protocol: "smb".into(), source_path: "/tank/lockcheck".into(),
+            smb: None, nfs: None, fleet_mount: false, enabled: false, sudo_password: None,
+        };
+        let target = P::TargetCreateRequest {
+            name: "lockcheck".into(), protocol: "iscsi".into(), source: "tank/lockcheck".into(),
+            create_size_bytes: 0, thin: false, portal_interface: String::new(), transports: Vec::new(),
+            auth: None, initiators: Vec::new(), initiator_descriptions: Default::default(), confirm_all_interfaces: false, enabled: false, sudo_password: None,
+        };
+        let bound = tentanas::pools::RESOURCES_LOCK_WAIT + std::time::Duration::from_secs(5);
+        let held = tentanas::pools::resources_lock(&g.db).lock_owned().await;
+        for (what, answer) in [
+            ("share", tokio::time::timeout(bound, share_create(&fixture.ctx, &share)).await.expect("bounded wait")),
+            ("target", tokio::time::timeout(bound, target_create(&fixture.ctx, &target)).await.expect("bounded wait")),
+        ] {
+            let refused = answer.expect_err(what);
+            assert_eq!(refused.code, ProtocolErrorCode::Conflict, "{what}");
+            assert_eq!(refused.message, POOL_DESTROY_IN_PROGRESS, "{what}: coded");
+        }
+        assert!(store::share_by_name(&g.db, "lockcheck").unwrap().is_none(), "nothing was created behind the refusal");
+        drop(held);
+        // Free again: the creation runs (its own checks decide the rest).
+        for (what, answer) in [
+            ("share", tokio::time::timeout(bound, share_create(&fixture.ctx, &share)).await.expect("runs")),
+            ("target", tokio::time::timeout(bound, target_create(&fixture.ctx, &target)).await.expect("runs")),
+        ] {
+            if let Err(e) = answer {
+                assert_ne!(e.message, POOL_DESTROY_IN_PROGRESS, "{what} is not refused once the lock is free");
+            }
+        }
+    }
+
+    /// Owner decision 2026-09-26: the orphaned rows are one viewer's when it
+    /// is active and no OTHER active organisation has resources on this node
+    /// (the viewer itself need own nothing here).
+    #[test]
+    fn a_viewer_is_the_sole_organisation_only_when_no_other_active_one_owns_anything_here() {
         let set = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<std::collections::BTreeSet<_>>();
-        assert!(is_sole_org(&set(&["org-a"]), "org-a"));
-        assert!(!is_sole_org(&set(&["org-a", "org-b"]), "org-a"), "two organisations: nobody sees the orphans");
-        assert!(!is_sole_org(&set(&["org-b"]), "org-a"), "not the one organisation there is");
-        assert!(!is_sole_org(&set(&[""]), ""), "an empty org id is no tenant");
-        assert!(!is_sole_org(&set(&[]), "org-a"));
+        let orgs = |rows: &[(&str, &str)]| {
+            rows.iter().map(|(id, status)| (id.to_string(), status.to_string())).collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let statuses = orgs(&[("org-a", "active"), ("org-b", "active"), ("org-default", "active"), ("org-gone", "deleted"), ("org-paused", "suspended")]);
+        assert!(is_sole_org(&statuses, &set(&["org-a"]), "org-a"));
+        assert!(!is_sole_org(&statuses, &set(&["org-a", "org-b"]), "org-a"), "two owners: nobody sees the orphans");
+        assert!(!is_sole_org(&statuses, &set(&["org-b"]), "org-a"), "another organisation is the owner here");
+        assert!(is_sole_org(&statuses, &set(&["org-a", "org-gone"]), "org-a"), "a soft-deleted owner does not count");
+        assert!(
+            !is_sole_org(&statuses, &set(&["org-a", "org-paused"]), "org-a"),
+            "a suspended owner is still present: its rows stay hidden"
+        );
+        assert!(!is_sole_org(&statuses, &set(&["org-paused"]), "org-a"), "the same with the viewer owning nothing");
+        assert!(
+            is_sole_org(&statuses, &set(&["org-a"]), "org-a"),
+            "an active organisation without resources here does not count"
+        );
+        assert!(
+            is_sole_org(&statuses, &set(&[]), "org-a"),
+            "the viewer owns nothing here and nobody else does: it sees the orphans"
+        );
+        assert!(is_sole_org(&statuses, &set(&["org-gone"]), "org-a"), "only a soft-deleted owner besides it");
+        assert!(!is_sole_org(&statuses, &set(&["org-unknown"]), "org-a"), "an owner nothing says is gone still counts");
+        assert!(!is_sole_org(&statuses, &set(&[]), "org-gone"), "a soft-deleted viewer");
+        assert!(!is_sole_org(&statuses, &set(&[]), "org-paused"), "a suspended viewer");
+        assert!(!is_sole_org(&statuses, &set(&[]), "org-x"), "a viewer no organisation row knows");
+        assert!(!is_sole_org(&orgs(&[("", "active")]), &set(&[""]), ""), "an empty org id is no tenant");
     }
 
     /// The set an Elastic journal's owner is judged against: every
@@ -6397,6 +8179,125 @@ mod registration_tests {
         assert_eq!(store::share_user_owner(&g.db, "obcy").unwrap().as_deref(), Some("org-other"));
         assert_eq!(store::list_share_users(&g.db, "org-other").unwrap()[0].description, "kadry");
         assert!(store::list_jobs(&g.db, 100).unwrap().is_empty());
+    }
+
+    /// Wave 12 (MAJOR 27): the allowlist edits and "Rozłącz" are refused
+    /// with a CODE before any probe, row write or job. The last initiator
+    /// never leaves the list (an empty list OPENS the target — F2), a
+    /// description for an unlisted initiator is refused, and a reset needs an
+    /// allowlisted iSCSI initiator with a live session (D2, D4).
+    #[tokio::test]
+    async fn the_last_initiator_descriptions_and_the_session_reset_are_refused_with_codes() {
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        crate::dispatch::app_gate::test_support::set_permission(
+            &fixture.ctx.state,
+            &fixture.addon_id,
+            "user",
+            &fixture.ctx.org_context.as_ref().unwrap().user_id,
+            PERM_TARGETS,
+            "allow",
+        );
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let who = "iqn.1994-05.com.redhat:vmhost-01";
+        let row = store::TargetRow {
+            target_id: "t-w12".into(),
+            name: "vm-w12".into(),
+            protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.local.tentaflow:n.vm-w12".into(),
+            enabled: true,
+            initiators: vec![who.into()],
+            auth_method: "none".into(),
+            state: "active".into(),
+            created_at: store::now(),
+            updated_at: store::now(),
+            ..Default::default()
+        };
+        store::upsert_target(&g.db, &g.org_id, &row).unwrap();
+        let update = |initiators: Vec<String>, descriptions: Option<std::collections::BTreeMap<String, String>>| P::TargetUpdateRequest {
+            target_id: "t-w12".into(),
+            portals: Vec::new(),
+            repick_portal: false,
+            auth: None,
+            initiators,
+            initiator_descriptions: descriptions,
+            port_groups: Vec::new(),
+            confirm_all_interfaces: false,
+            enabled: true,
+            sudo_password: None,
+        };
+        // F2: emptying the list is refused, coded.
+        let refused = target_update(&fixture.ctx, &update(Vec::new(), None)).await.unwrap_err();
+        assert_eq!(refused.code, ProtocolErrorCode::Conflict);
+        assert_eq!(refused.message, "refusal:target_last_initiator");
+        // "Opis" for an initiator that is not on the list.
+        let stray = std::collections::BTreeMap::from([("iqn.x:stray".to_string(), "x".to_string())]);
+        let refused = target_update(&fixture.ctx, &update(vec![who.into()], Some(stray))).await.unwrap_err();
+        assert_eq!(refused.message, "refusal:target_description_unlisted");
+        // Nothing changed behind the refusals.
+        assert_eq!(store::target(&g.db, &g.org_id, "t-w12").unwrap().unwrap().initiators, vec![who.to_string()]);
+
+        let reset = |initiator: &str, revoke: bool| P::TargetSessionResetRequest {
+            target_id: "t-w12".into(),
+            initiator: initiator.into(),
+            revoke,
+            sudo_password: None,
+        };
+        let code = |e: ProtocolError| e.message;
+        // D2: not on the allowlist.
+        assert_eq!(
+            code(target_session_reset(&fixture.ctx, &reset("iqn.x:stranger", false)).await.unwrap_err()),
+            "refusal:target_session_reset_not_allowlisted"
+        );
+        // Revoking the only entry would open the target.
+        assert_eq!(
+            code(target_session_reset(&fixture.ctx, &reset(who, true)).await.unwrap_err()),
+            "refusal:target_last_initiator"
+        );
+        // This host has no LIO object for the target: no live session.
+        assert_eq!(
+            code(target_session_reset(&fixture.ctx, &reset(who, false)).await.unwrap_err()),
+            "refusal:target_session_none"
+        );
+        // NVMe-oF has no per-host disconnect.
+        let mut nvme = row.clone();
+        nvme.target_id = "t-w12n".into();
+        nvme.name = "vm-w12n".into();
+        nvme.protocol = "nvmet".into();
+        nvme.wwn = "nqn.2026-09.local.tentaflow:n.vm-w12n".into();
+        store::upsert_target(&g.db, &g.org_id, &nvme).unwrap();
+        let refused = target_session_reset(
+            &fixture.ctx,
+            &P::TargetSessionResetRequest { target_id: "t-w12n".into(), initiator: who.into(), revoke: false, sudo_password: None },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(refused.message, "refusal:target_session_reset_nvmet");
+        assert!(store::list_jobs(&g.db, 100).unwrap().is_empty(), "no job behind any refusal");
+    }
+
+    /// Critic wave 12: a remote LUN is refused, coded, by every path that
+    /// takes a disk id — the replace path, which does not require a free disk,
+    /// included.
+    #[test]
+    fn a_remote_lun_is_refused_by_every_disk_accepting_path() {
+        let id = "dev-sdz-w12-remote";
+        tentanas::disks::insert_live_for_test(NasDisk {
+            disk_id: id.into(),
+            name: "sdz".into(),
+            role: tentanas::disks::ROLE_REMOTE.into(),
+            ..Default::default()
+        });
+        for require_free in [false, true] {
+            let refused = disks_by_id(&[id.to_string()], require_free).expect_err("remote");
+            assert_eq!(refused.code, ProtocolErrorCode::Conflict);
+            assert_eq!(refused.message, "refusal:disk_remote");
+        }
+        // The Elastic PREVIEW reads it and names it per disk instead (R2-1).
+        let read = disks_for_plan(&[id.to_string()]).expect("the preview reads it");
+        assert_eq!(tentanas::elastic::conflicting_owner_code(&read[0]), Some(("remote", String::new())));
+        assert!(disks_for_plan(&["nope".to_string()]).is_err());
+        tentanas::disks::remove_live_for_test(id);
     }
 
     /// A legacy account migration 20 gave to this organisation because it
@@ -6598,7 +8499,8 @@ mod registration_tests {
             .unwrap_err();
         assert_eq!(healthy.code, ProtocolErrorCode::NotAvailable);
         assert!(
-            healthy.message.contains("nie zgłasza awarii") && healthy.message.contains("scrub"),
+            healthy.message.starts_with("refusal:elastic_repair_nothing?array=media ")
+                && healthy.message.contains("scrub"),
             "{}",
             healthy.message
         );
@@ -6616,7 +8518,12 @@ mod registration_tests {
             .await
             .unwrap_err();
         assert_eq!(foreign.code, ProtocolErrorCode::BadRequest);
-        assert!(foreign.message.contains("d9"), "{}", foreign.message);
+        // Named by its number among the data disks, never by the slot key.
+        assert!(
+            foreign.message.starts_with("refusal:elastic_no_such_data_disk?data=9&array=media "),
+            "{}",
+            foreign.message
+        );
 
         // NO PARITY. The array's own parity disk is what a repair rebuilds
         // from; without one there is nothing to rebuild from at all.
@@ -6726,7 +8633,8 @@ mod registration_tests {
             .await
             .unwrap_err();
             assert_eq!(refused.code, ProtocolErrorCode::NotAvailable, "{}", refused.message);
-            assert!(refused.message.contains("naprawa"), "{}", refused.message);
+            assert!(refused.message.starts_with("refusal:elastic_replace_withdrawn?array="), "{}", refused.message);
+            assert!(refused.message.contains("repair from parity"), "{}", refused.message);
         }
 
         // NOTHING WAS WRITTEN: no operation of any kind, no job, no approval,
@@ -6788,7 +8696,9 @@ mod registration_tests {
         // The row has to name the DISK: what it authorises is overwriting that
         // one disk from parity, and an approval reading only "repair" would be
         // an approval for whichever disk the author picked afterwards.
-        assert!(stored.approval.detail.contains("d1"), "{}", stored.approval.detail);
+        // It names it as the approver knows it (by number here: this node
+        // does not see the disk); the REQUEST keeps the slot the node keys it by.
+        assert!(stored.approval.detail.contains("data disk no. 1"), "{}", stored.approval.detail);
         assert!(stored.payload_json.contains("\"disk\":\"d1\""), "{}", stored.payload_json);
         assert!(!stored.payload_json.contains("never-store-repair-secret"));
         assert!(!stored.payload_json.contains("sudo_password"));
@@ -6803,8 +8713,22 @@ mod registration_tests {
         ));
         // The repair's own sentence describes `-e fix`, not the unfiltered
         // rebuild this product never runs.
-        assert!(stored.approval.detail.contains("zaznaczone"), "{}", stored.approval.detail);
-        assert!(!stored.approval.detail.contains("nadpisując"), "{}", stored.approval.detail);
+        assert!(stored.approval.detail.contains("marked bad"), "{}", stored.approval.detail);
+        assert!(!stored.approval.detail.contains("overwrit"), "{}", stored.approval.detail);
+        // The code names the disk by its number, never by its slot: the node
+        // of this fixture does not see the disk, so it has no kernel name.
+        let [fix] = stored.approval.detail_reasons.as_slice() else {
+            panic!("one coded detail: {:?}", stored.approval.detail_reasons)
+        };
+        assert_eq!(fix.code, "elastic_fix");
+        assert_eq!(fix.params.get("number").map(String::as_str), Some("1"));
+        assert!(fix.params.values().all(|v| v != "d1"), "{:?}", fix.params);
+        // …and so does the node's own sentence, which is the approvals
+        // tooltip and the parked alert's text (wave-6 critic MAJOR 1).
+        assert!(stored.approval.detail.ends_with("on data disk no. 1"), "{}", stored.approval.detail);
+        assert!(!stored.approval.detail.contains("d1"), "{}", stored.approval.detail);
+        let parked_alert = store::alerts_for_subject(&g.db, "approval", &approval.request_id).unwrap();
+        assert!(!parked_alert.is_empty() && parked_alert.iter().all(|a| !a.detail.contains("d1")), "{parked_alert:?}");
 
         // AND THE SYNC PARKED ON THE SAME ARRAY SAYS WHAT IT COSTS. A Sync over
         // an array whose scrub reported errors is a different operation from a
@@ -6856,7 +8780,16 @@ mod registration_tests {
         };
         let sync_row = store::approval(&g.db, &sync_approval.request_id).unwrap().unwrap();
         assert_eq!(sync_row.approval.operation, tentanas::approvals::OP_ELASTIC_SYNC);
-        assert_eq!(sync_row.approval.detail, "text:elastic_sync_over_fault", "the warning, as a code the screen words");
+        assert_eq!(
+            sync_row.approval.detail_reasons.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            vec!["elastic_sync_over_fault"],
+            "the warning, as a code the screen words"
+        );
+        assert!(sync_row.approval.detail.contains("can no longer be restored"), "{}", sync_row.approval.detail);
+        // The alert the park raises carries the sentence, not a code in its
+        // place: its detail is the forwarded text and the tooltip.
+        let alert = store::alerts_for_subject(&g.db, "approval", &sync_approval.request_id).unwrap();
+        assert!(alert.iter().all(|a| !a.detail.starts_with("text:")), "{alert:?}");
         // The acknowledgement is parked WITH the request: the approver
         // releases the author's decision, not a Sync that would be refused.
         assert!(
@@ -6864,6 +8797,18 @@ mod registration_tests {
             "{}",
             sync_row.payload_json
         );
+    }
+
+    /// Wave-6 critic MAJOR 1: the repair's English names the disk the way
+    /// its code does, and never by a slot, whatever the node knows of it.
+    #[test]
+    fn a_parked_repair_is_worded_without_the_slot() {
+        assert!(fix_detail_text("sdb", "2").ends_with("on disk sdb"));
+        assert!(fix_detail_text("", "2").ends_with("on data disk no. 2"));
+        assert!(fix_detail_text("", "").ends_with("on a data disk of the array"));
+        for text in [fix_detail_text("sdb", "2"), fix_detail_text("", "2"), fix_detail_text("", "")] {
+            assert!(!["d1", "d2", "c1", "parity1"].iter().any(|slot| text.contains(slot)), "{text}");
+        }
     }
 
     /// An add that STOPPED PART-WAY (K4, F3/F4 on the node's side): while it
@@ -6973,19 +8918,22 @@ mod registration_tests {
         // A DISK THIS ARRAY ALREADY HOLDS, by its data role and by its parity
         // role, each named as the member it is.
         for (disk_id, member) in [
-            (spec.data[0].disk_id.clone(), "d1"),
-            (spec.parity[0].disk_id.clone(), "parity1"),
+            (spec.data[0].disk_id.clone(), "data=1"),
+            (spec.parity[0].disk_id.clone(), "parity=1"),
         ] {
             let error =
                 elastic_add_disk(&fixture.ctx, "media", &disk_id, "media", None, Origin::Direct)
                     .await
                     .unwrap_err();
             assert_eq!(error.code, ProtocolErrorCode::BadRequest, "{member}");
+            // The fixture's disks are in no inventory: named by their place
+            // in the array, never by the slot key or the id.
             assert!(
-                error.message.contains("media") && error.message.contains(member),
+                error.message.starts_with(&format!("refusal:elastic_disk_in_array?{member}&array=media ")),
                 "{member}: {}",
                 error.message
             );
+            assert!(!error.message.contains(&disk_id), "{}", error.message);
         }
 
         // A disk that is not on this node at all is not free either, and the
@@ -7072,6 +9020,7 @@ mod registration_tests {
                 nfs: None,
                 state: "active".into(),
                 state_detail: String::new(),
+                state_reasons: Vec::new(),
                 created_at: store::now(),
                 updated_at: store::now(),
             },
@@ -7094,6 +9043,50 @@ mod registration_tests {
             0
         );
         assert_eq!(tentanas::elevation::audit_entries(&g.db), 0);
+    }
+
+    /// Critic wave 13, MINOR 2: the adoption answers every refusal with the
+    /// status it always had (`BadRequest`), whatever status the Elastic layer
+    /// gave it; a refusal raised while a job opens keeps its own status (the
+    /// documented change: it used to be an `Internal` "failed").
+    #[test]
+    fn the_adoption_keeps_its_status_and_a_store_refusal_keeps_its_own() {
+        let taken = || anyhow::Error::from(store::elastic_already_adopted());
+        let adopted = import_error("elastic import", taken());
+        assert_eq!(adopted.code, ProtocolErrorCode::BadRequest);
+        assert!(adopted.message.starts_with("refusal:elastic_already_adopted "), "{}", adopted.message);
+        let gone = import_error("elastic import", anyhow::Error::from(Refusal::not_found("elastic_journal_gone", "gone")));
+        assert_eq!(gone.code, ProtocolErrorCode::BadRequest);
+        assert_eq!(elastic_error("elastic create", taken()).code, ProtocolErrorCode::Conflict);
+        assert_eq!(elastic_error("elastic create", anyhow::anyhow!("disk full")).code, ProtocolErrorCode::Internal);
+    }
+
+    /// Wave 13: a refusal the STORE raises while the request opens its job
+    /// (`db::insert_job_full`) reaches the admin as its code — not as
+    /// "tentanas elastic destroy failed", which is what `internal()` made of
+    /// every one of them — and nothing is started.
+    #[tokio::test]
+    async fn a_store_refusal_reaches_the_admin_coded_and_starts_nothing() {
+        let mut fixture = dispatch_fixture();
+        let spec = active_array(&mut fixture);
+        let g = gate_destructive(&fixture.ctx).unwrap();
+        g.db.write()
+            .unwrap()
+            .execute(
+                "INSERT INTO nas_settings(key,value,updated_at) VALUES ('elastic_teardown_started','true',?1)",
+                rusqlite::params![store::now()],
+            )
+            .unwrap();
+        let refused = elastic_destroy(&fixture.ctx, "media", "media", None, Origin::Approved)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code, ProtocolErrorCode::NotAvailable, "{}", refused.message);
+        assert!(refused.message.starts_with("refusal:elastic_teardown_started "), "{}", refused.message);
+        assert!(store::elastic_array(&g.db, &spec.owner, "media").unwrap().is_some());
+        assert!(
+            store::list_jobs(&g.db, 100).unwrap().iter().all(|job| job.kind != "elastic_destroy"),
+            "no job was opened"
+        );
     }
 
     #[tokio::test]
@@ -7383,11 +9376,7 @@ mod registration_tests {
             .await
             .unwrap_err();
         assert_eq!(unknown.code, ProtocolErrorCode::NotAvailable);
-        assert!(
-            unknown.message.contains("Nie można odczytać listy folderów"),
-            "{}",
-            unknown.message
-        );
+        assert!(unknown.message.starts_with("refusal:elastic_folders_unreadable "), "{}", unknown.message);
         // And it wrote nothing — a refused request must not leave a rule the
         // next mover run would honour.
         let stored: i64 = g
@@ -7612,9 +9601,27 @@ mod registration_tests {
         // offset, and the rules.
         assert!(approval.detail.contains("mover"), "{}", approval.detail);
         assert!(approval.detail.contains("media"), "{}", approval.detail);
-        assert!(approval.detail.contains("co godzinę"), "{}", approval.detail);
+        assert!(approval.detail.contains("hourly"), "{}", approval.detail);
         assert!(approval.detail.contains(":30"), "{}", approval.detail);
         assert!(approval.detail.contains("35%"), "{}", approval.detail);
+        // The same, as a code the approver's screen words (wave 6): the
+        // cadence travels as the schedule itself, so the screen formats it
+        // the way the schedule editor does. Stored with the row.
+        let stored = store::approval(&g.db, &approval.request_id).unwrap().unwrap();
+        assert_eq!(stored.approval.detail_reasons, approval.detail_reasons);
+        let [reason] = approval.detail_reasons.as_slice() else {
+            panic!("one coded detail: {:?}", approval.detail_reasons)
+        };
+        assert_eq!(reason.code, "elastic_schedule");
+        let param = |k: &str| reason.params.get(k).map(String::as_str);
+        assert_eq!(
+            (param("task"), param("enabled"), param("every"), param("minute")),
+            (Some("mover"), Some("true"), Some("1h"), Some("30"))
+        );
+        assert_eq!(
+            (param("min_age_secs"), param("cache_min_free_pct"), param("coupled_sync")),
+            (Some("1800"), Some("35"), Some("false"))
+        );
 
         // Nothing armed and no rule written until a second admin agrees.
         assert!(
@@ -7887,8 +9894,8 @@ mod registration_tests {
             .unwrap_err();
         assert_eq!(refused.code, ProtocolErrorCode::NotAvailable, "{refused:?}");
         assert!(
-            refused.message.contains("niepotwierdzoną operację"),
-            "odmowa musi nazwać powód: {}",
+            refused.message.starts_with("refusal:elastic_operation_unresolved "),
+            "the refusal names its reason: {}",
             refused.message
         );
         assert!(
@@ -8356,6 +10363,55 @@ mod registration_tests {
         assert_eq!(named, Some(("sdq".to_string(), true)), "gone, so the name is flagged as last-known");
     }
 
+    /// Wave 9b: the lines of a multi-disk SMART job reach the screen named
+    /// by the one disk-naming rule — the live kernel name; a disk that left
+    /// the inventory by the name it was last seen under, flagged; and one the
+    /// node never recorded by the name stored when the job started, flagged
+    /// too. The stored disk ids never leave the node.
+    #[test]
+    fn a_batch_job_lines_are_named_and_never_carry_an_id() {
+        let conn = rusqlite::Connection::open_in_memory().expect("memory db");
+        tentanas::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let live = "wwn-wave9b-lines-live-5000cca2";
+        let gone = "wwn-wave9b-lines-gone-5000cca3";
+        let never = "wwn-wave9b-lines-never-5000cca4";
+        tentanas::disks::insert_live_for_test(tentaflow_protocol::tentanas::NasDisk {
+            disk_id: live.into(),
+            name: "sdlv".into(),
+            path: "/dev/sdlv".into(),
+            ..Default::default()
+        });
+        tentanas::db::upsert_disk_seen(
+            &db,
+            &tentanas::db::DiskIdentity { disk_id: gone, name: "sdq", model: "HGST", serial: "S9", wwn: None, size_bytes: 1, kind: "hdd" },
+        )
+        .expect("record the disk");
+        let job = tentaflow_protocol::tentanas::NasJob {
+            job_id: uuid::Uuid::now_v7().to_string(),
+            kind: tentanas::db::SMART_BATCH_KIND.into(),
+            subject: "short|sdlv, sdq, sdx".into(),
+            status: "running".into(),
+            started_by: "test".into(),
+            started_at: store::now(),
+            ..Default::default()
+        };
+        tentanas::db::insert_job_full(
+            &db,
+            &job,
+            None,
+            None,
+            &[(live.into(), "sdlv".into()), (gone.into(), "sdq".into()), (never.into(), "sdx".into())],
+        )
+        .expect("batch");
+        let lines = job_disk_lines(&db, &job.job_id);
+        let shown: Vec<(&str, bool, &str)> = lines.iter().map(|d| (d.name.as_str(), d.last_known, d.state.as_str())).collect();
+        assert_eq!(shown, vec![("sdlv", false, "pending"), ("sdq", true, "pending"), ("sdx", true, "pending")]);
+        let wire = serde_json::to_string(&lines).expect("json");
+        assert!(!wire.contains("wwn-"), "no disk id in the lines: {wire}");
+        tentanas::disks::remove_live_for_test(live);
+    }
+
     #[test]
     fn a_wipe_plan_for_a_vanished_disk_names_it_and_never_by_its_id() {
         use tentanas::disks::ShownDiskName;
@@ -8439,6 +10495,13 @@ mod registration_tests {
     /// modal, the alert list and the FleetView badge must all show the orphan
     /// on a one-organisation node — the badge counting exactly what the list
     /// shows — and all hide it once a second organisation exists.
+    fn db_status(ctx: &HandlerContext, org_id: &str, status: &str) {
+        ctx.state.db.write().unwrap().execute(
+            "UPDATE organizations SET status = ?2 WHERE org_id = ?1",
+            rusqlite::params![org_id, status],
+        ).unwrap();
+    }
+
     #[tokio::test]
     async fn the_handlers_show_a_dissolved_arrays_rows_only_to_the_sole_organisation() {
         let mut fixture = dispatch_fixture();
@@ -8476,18 +10539,62 @@ mod registration_tests {
             nodes.iter().find(|n| n.is_local).map(|n| n.alerts_active).unwrap()
         };
 
+        // Owner decision 2026-09-26: "sole" means no OTHER active
+        // organisation has resources on this node; the viewer need own none.
+        let share = |org: &str, name: &str| {
+            g.db.write().unwrap().execute(
+                "INSERT INTO nas_shares (share_id, name, protocol, source_path, created_at, updated_at, org_id) \
+                 VALUES (?1, ?1, 'smb', '/tank/x', 'now', 'now', ?2)",
+                rusqlite::params![name, org],
+            ).unwrap();
+        };
+        // The viewer owns nothing here, and no other active organisation
+        // does: its dissolved array's rows are its to see.
+        let (in_list, in_modal, orphan_alerts, _) = seen(&fixture.ctx);
+        assert!(in_list && in_modal && orphan_alerts == 1, "a viewer without resources, alone on the node, sees them");
+        share("org-default", "projekty");
+
         let (in_list, in_modal, orphan_alerts, listed) = seen(&fixture.ctx);
         assert!(in_list && in_modal, "the sole organisation sees its dissolved array's job");
         assert_eq!(orphan_alerts, 1, "and its alert");
         let (answer, _) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
         assert_eq!(local_badge(answer), listed, "the FleetView badge counts what the list shows");
 
-        crate::services::org::create_organization(&fixture.ctx.state.db, "Tenant B", "tenant-b", None, None, None, None).unwrap();
+        // A second organisation that owns nothing here does not count.
+        let other = crate::services::org::create_organization(&fixture.ctx.state.db, "Tenant B", "tenant-b", None, None, None, None).unwrap();
+        let (in_list, in_modal, orphan_alerts, _) = seen(&fixture.ctx);
+        assert!(in_list && in_modal && orphan_alerts == 1, "an organisation without resources here is nobody to leak to");
+
+        // It owns a target here now: nobody sees the orphans.
+        g.db.write().unwrap().execute(
+            "INSERT INTO nas_targets (target_id, name, protocol, wwn, created_at, updated_at, org_id) \
+             VALUES ('t-b', 'vm-b', 'iscsi', 'iqn.2026-09.test:vm-b', 'now', 'now', ?1)",
+            rusqlite::params![other.org_id],
+        ).unwrap();
         let (in_list, in_modal, orphan_alerts, listed) = seen(&fixture.ctx);
-        assert!(!in_list && !in_modal, "two organisations: nobody sees it");
+        assert!(!in_list && !in_modal, "two organisations with resources: nobody sees it");
         assert_eq!(orphan_alerts, 0);
         let (answer, _) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
         assert_eq!(local_badge(answer), listed, "and the badge still agrees with the list");
+
+        // Suspended: still present (reversible), so its resources still count.
+        db_status(&fixture.ctx, &other.org_id, "suspended");
+        let (in_list, in_modal, orphan_alerts, _) = seen(&fixture.ctx);
+        assert!(!in_list && !in_modal && orphan_alerts == 0, "a suspended organisation still counts");
+        db_status(&fixture.ctx, &other.org_id, "active");
+
+        // Soft-deleted, its rows kept under retention: it counts no more.
+        assert!(crate::services::org::delete_organization(&fixture.ctx.state.db, &other.org_id).unwrap());
+        let (in_list, in_modal, orphan_alerts, listed) = seen(&fixture.ctx);
+        assert!(in_list && in_modal && orphan_alerts == 1, "a soft-deleted organisation does not count");
+        let (answer, _) = crate::dispatch::dispatch(&body, &fixture.ctx).await;
+        assert_eq!(local_badge(answer), listed);
+
+        // A read of the owners that fails hides the rows again.
+        g.db.write().unwrap().execute_batch("ALTER TABLE nas_targets RENAME TO nas_targets_gone").unwrap();
+        let (in_list, in_modal, orphan_alerts, _) = seen(&fixture.ctx);
+        assert!(!in_list && !in_modal && orphan_alerts == 0, "a failed read never leaks");
+        g.db.write().unwrap().execute_batch("ALTER TABLE nas_targets_gone RENAME TO nas_targets").unwrap();
     }
 
     /// A job another tenant's user started on SHARED hardware stays on the
@@ -8588,5 +10695,307 @@ mod registration_tests {
         let mut mine = branch("media");
         tentanas::disks::hide_other_org_array(&mut mine, &own_array_names(&g).unwrap());
         assert_eq!(mine, branch("media"));
+    }
+
+    // ----- wave 10: stopping this node's sharing (n18d) --------------------------------
+
+    /// The fixture's organisation made real (memberships need a row), with the
+    /// fixture's user and — when asked — a second user as org Admins holding
+    /// every TentaNas permission, each with the platform account role given.
+    /// Returns the second user's context (another session on the same node).
+    fn two_admins(fixture: &mut DispatchFixture, me_platform: bool, other_platform: bool) -> HandlerContext {
+        let db = fixture.ctx.state.db.clone();
+        let org = crate::services::org::create_organization(&db, "Acme", "acme-w10", None, None, None, None).unwrap();
+        let admin_role = crate::services::org::repo::list_roles(&db).unwrap()
+            .into_iter().find(|r| r.name == "org_admin").expect("the seeded org admin role").role_id;
+        let me = fixture.ctx.org_context.as_ref().unwrap().user_id.clone();
+        let other = uuid::Uuid::from_bytes([8u8; 16]).to_string();
+        db.write().unwrap().execute(
+            "INSERT INTO user_accounts (id, username, password_hash, is_active, must_change_password, role) \
+             VALUES (?1, 'second-admin', 'test', 1, 0, ?2)",
+            rusqlite::params![other, if other_platform { "admin" } else { "user" }],
+        ).unwrap();
+        db.write().unwrap().execute(
+            "UPDATE user_accounts SET role = ?2 WHERE id = ?1",
+            rusqlite::params![me, if me_platform { "admin" } else { "user" }],
+        ).unwrap();
+        {
+            let ctx = fixture.ctx.org_context.as_mut().unwrap();
+            ctx.org_id = org.org_id.clone();
+        }
+        elastic_admin(fixture);
+        for user in [&me, &other] {
+            crate::services::org::repo::add_membership(&db, &org.org_id, user, &admin_role, "test").unwrap();
+            for permission in [PERM_READ, PERM_ADMIN, PERM_POOLS] {
+                crate::dispatch::app_gate::test_support::set_permission(&fixture.ctx.state, &fixture.addon_id, "user", user, permission, "allow");
+            }
+        }
+        if let tentaflow_protocol::SessionAuth::UserSession { role, .. } = &mut fixture.ctx.session {
+            *role = Some(if me_platform { "admin" } else { "user" }.to_string());
+        }
+        let mut second = crate::dispatch::test_handler_context(
+            fixture.ctx.state.clone(),
+            Some(if other_platform { "admin" } else { "user" }),
+            Some(crate::services::rbac::OrgContext {
+                user_id: other.clone(),
+                org_id: org.org_id.clone(),
+                role_id: admin_role,
+                permissions: ["org.admin".to_string()].into_iter().collect(),
+            }),
+        );
+        second.session = tentaflow_protocol::SessionAuth::UserSession { user_id: [8u8; 16], role: Some(if other_platform { "admin" } else { "user" }.to_string()) };
+        second
+    }
+
+    fn stop_request() -> MessageBody {
+        tn(P::SharingStopRequest {})
+    }
+
+    fn refusal_of(response: &MessageBody) -> String {
+        match response {
+            MessageBody::Error(e) => e.message.clone(),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// n18d, through the real dispatcher: only a PLATFORM admin asks, and
+    /// only when another platform admin of the organisation could release
+    /// it. The parked request names the node and the caller's shares and
+    /// targets, counts another organisation's, stores no id as its subject,
+    /// and a second one for the same node is refused while it waits.
+    #[tokio::test]
+    async fn stopping_sharing_parks_for_a_second_platform_admin_with_the_names_it_stops() {
+        // Each fixture holds the storage-override lock: one at a time.
+        {
+            let mut fixture = dispatch_fixture();
+            let _second = two_admins(&mut fixture, false, false);
+            let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+            assert!(error);
+            assert_eq!(refusal_of(&response), SHARING_STOP_PLATFORM_ADMIN, "an org admin without the platform role");
+        }
+        {
+            let mut fixture = dispatch_fixture();
+            let _second = two_admins(&mut fixture, true, false);
+            let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+            assert!(error);
+            assert_eq!(refusal_of(&response), SHARING_STOP_NO_SECOND_ADMIN, "nobody else could release it");
+        }
+
+        let mut fixture = dispatch_fixture();
+        let _second = two_admins(&mut fixture, true, true);
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let share = |id: &str, name: &str, enabled: bool| store::ShareRow {
+            share_id: id.into(), name: name.into(), protocol: "smb".into(), source_path: format!("/tank/{name}"),
+            enabled, created_at: "now".into(), updated_at: "now".into(), ..Default::default()
+        };
+        store::upsert_share(&g.db, &g.org_id, &share("s1", "projekty", true)).unwrap();
+        store::upsert_share(&g.db, &g.org_id, &share("s2", "stare", false)).unwrap();
+        store::upsert_share(&g.db, "org-other", &share("s3", "kadry", true)).unwrap();
+        store::upsert_target(&g.db, &g.org_id, &store::TargetRow {
+            target_id: "t1".into(), name: "vm-store".into(), protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.local.tentaflow:vm-store".into(), enabled: true, auth_method: "none".into(),
+            created_at: "now".into(), updated_at: "now".into(), ..Default::default()
+        }).unwrap();
+        let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) = response else { panic!("parked") };
+        assert_eq!(approval.operation, tentanas::approvals::OP_SHARING_STOP);
+        let node = crate::dispatch::app_route::node_display_name(&fixture.ctx, &fixture.ctx.state.local_node_id.to_string());
+        assert_eq!(approval.subject, node, "the node by its name");
+        assert!(!approval.subject.contains(&fixture.ctx.state.local_node_id.to_string()), "never its id");
+        let reason = &approval.detail_reasons[0];
+        assert_eq!(reason.code, "sharing_stop");
+        assert_eq!(reason.params["shares"], "projekty", "the caller's enabled share, by name");
+        assert_eq!(reason.params["targets"], "vm-store");
+        assert_eq!(reason.params["other_shares"], "1", "another organisation's share, counted");
+        assert!(!approval.detail.contains("kadry") && reason.params.values().all(|v| !v.contains("kadry")));
+        let stored = store::approval(&g.db, &approval.request_id).unwrap().unwrap();
+        assert_eq!(stored.approval.status, "pending");
+        assert!(store::list_jobs(&g.db, 100).unwrap().is_empty(), "nothing ran");
+        assert!(!tentanas::sharing::suspended(&g.db).unwrap(), "nothing is stopped yet");
+
+        let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        assert!(error);
+        assert_eq!(refusal_of(&response), SHARING_STOP_PENDING, "one waiting stop per node");
+    }
+
+    /// The release: another org Admin WITHOUT the platform role is refused
+    /// before the claim (the request stays pending for one who has it); the
+    /// author cannot release their own; a second platform admin starts ONE
+    /// job, which runs for real (only the privilege channel is recorded, so
+    /// nothing reaches the host) and ends with TentaNas disabled and the
+    /// record naming the request. Its three step lines reach the screen
+    /// through the real job list (critic wave 10, M1, M5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_second_platform_admin_releases_a_sharing_stop_and_it_runs_as_three_steps() {
+        let mut fixture = dispatch_fixture();
+        let second = two_admins(&mut fixture, true, true);
+        let (response, _) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) = response else { panic!("parked") };
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let _channel = tentanas::broker::test_channel::install(&g.db);
+        let decide = |approve: bool| tn(P::ApprovalDecideRequest {
+            request_id: approval.request_id.clone(), approve, note: String::new(), sudo_password: None,
+        });
+
+        // The same second admin, seen without the platform role.
+        let mut org_only = crate::dispatch::test_handler_context(fixture.ctx.state.clone(), Some("user"), second.org_context.clone());
+        org_only.session = tentaflow_protocol::SessionAuth::UserSession { user_id: [8u8; 16], role: Some("user".into()) };
+        let (response, error) = crate::dispatch::dispatch(&decide(true), &org_only).await;
+        assert!(error);
+        assert_eq!(refusal_of(&response), SHARING_STOP_PLATFORM_ADMIN);
+        assert_eq!(store::approval(&g.db, &approval.request_id).unwrap().unwrap().approval.status, "pending", "still waiting");
+
+        let (response, error) = crate::dispatch::dispatch(&decide(true), &fixture.ctx).await;
+        assert!(error, "the author never releases their own: {response:?}");
+        assert_eq!(store::approval(&g.db, &approval.request_id).unwrap().unwrap().approval.status, "pending");
+
+        let (response, error) = crate::dispatch::dispatch(&decide(true), &second).await;
+        assert!(!error, "{response:?}");
+        let stored = store::approval(&g.db, &approval.request_id).unwrap().unwrap();
+        assert_eq!(stored.approval.status, "approved");
+        let job_id = stored.approval.decision_job_id.expect("the job it started");
+        let mut job = None;
+        for _ in 0..500 {
+            job = store::list_jobs(&g.db, 100).unwrap().into_iter().find(|j| j.job_id == job_id && j.status != "running");
+            if job.is_some() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let job = job.expect("the stop finished");
+        assert_eq!(job.kind, tentanas::sharing::STOP_KIND);
+        assert_eq!(job.status, "succeeded", "{:?}", job.error);
+        let record = tentanas::sharing::mark(&g.db).unwrap().expect("sharing stopped");
+        assert_eq!(record.request_id, approval.request_id, "the record names the request");
+        assert_eq!(record.phase, tentanas::sharing::PHASE_STOPPED);
+        assert_eq!(
+            crate::db::repository::get_addon_enabled(&fixture.ctx.state.db, &fixture.addon_id).unwrap(),
+            Some(false),
+            "TentaNas disabled"
+        );
+        // The job list reaches the screen through the real read path (the
+        // app enabled again so its API answers).
+        crate::db::repository::set_addon_enabled(&fixture.ctx.state.db, &fixture.addon_id, true).unwrap();
+        let (response, error) = crate::dispatch::dispatch(&tn(P::JobsListRequest { limit: 50 }), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::JobsListResponse { jobs }) = response else { panic!("a job list") };
+        let listed = jobs.iter().find(|j| j.job_id == job_id).expect("the stop is in the owner organisation's list");
+        let lines: Vec<(&str, &str)> = listed.disks.iter().map(|l| (l.name.as_str(), l.state.as_str())).collect();
+        assert_eq!(lines, vec![("shares", "done"), ("targets", "done"), ("disable", "done")]);
+        assert!(listed.disks.iter().all(|l| !l.last_known), "a step is not a remembered disk");
+    }
+
+    /// Critic wave 10, M2 and M3: a second stop is refused per NODE — also
+    /// when another organisation's admin parked the first — and a stop is
+    /// refused up front while a frozen target serves.
+    #[tokio::test]
+    async fn one_stop_per_node_and_none_while_a_target_is_frozen() {
+        let mut fixture = dispatch_fixture();
+        let _second = two_admins(&mut fixture, true, true);
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        // Another organisation's stop waits on this node.
+        let other = tentanas::approvals::Actor { org_id: "org-somebody-else", ..actor(&fixture.ctx, &g).unwrap() };
+        tentanas::approvals::park(&other, tentanas::approvals::OP_SHARING_STOP, "helios", "stops sharing", &P::SharingStopRequest {}).unwrap();
+        let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        assert!(error);
+        assert_eq!(
+            refusal_of(&response),
+            SHARING_STOP_PENDING_ELSEWHERE,
+            "the node is one, and the refusal says the waiting stop is another organisation's (R2-2)"
+        );
+        // A platform admin of THIS organisation sees it, stripped to the
+        // node, and may reject it — never release it.
+        let (response, error) = crate::dispatch::dispatch(&tn(P::ApprovalsListRequest { include_closed: false }), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        let MessageBody::TentaNasBody(P::ApprovalsListResponse { approvals, .. }) = response else { panic!("a list") };
+        let foreign = approvals.iter().find(|p| p.operation == tentanas::approvals::OP_SHARING_STOP).expect("listed");
+        assert_eq!(foreign.detail_reasons[0].code, "sharing_stop_other_org");
+        assert_eq!(foreign.detail_reasons[0].params["node"], "helios");
+        assert!(foreign.requested_by.is_empty() && !foreign.detail.contains("org-somebody-else"), "nothing of the other organisation");
+        let request_id = foreign.request_id.clone();
+        let decide = |approve: bool| tn(P::ApprovalDecideRequest {
+            request_id: request_id.clone(), approve, note: String::new(), sudo_password: None,
+        });
+        let (_, error) = crate::dispatch::dispatch(&decide(true), &fixture.ctx).await;
+        assert!(error, "another organisation's stop is never released from here");
+        // An org admin without the platform role neither sees nor rejects it.
+        if let tentaflow_protocol::SessionAuth::UserSession { role, .. } = &mut fixture.ctx.session {
+            *role = Some("user".into());
+        }
+        let (response, _) = crate::dispatch::dispatch(&tn(P::ApprovalsListRequest { include_closed: false }), &fixture.ctx).await;
+        let MessageBody::TentaNasBody(P::ApprovalsListResponse { approvals, .. }) = response else { panic!("a list") };
+        assert!(approvals.iter().all(|p| p.request_id != request_id));
+        let (_, error) = crate::dispatch::dispatch(&decide(false), &fixture.ctx).await;
+        assert!(error);
+        assert_eq!(store::approval(&g.db, &request_id).unwrap().unwrap().approval.status, "pending");
+        if let tentaflow_protocol::SessionAuth::UserSession { role, .. } = &mut fixture.ctx.session {
+            *role = Some("admin".into());
+        }
+        let (response, error) = crate::dispatch::dispatch(&decide(false), &fixture.ctx).await;
+        assert!(!error, "{response:?}");
+        assert_eq!(store::approval(&g.db, &request_id).unwrap().unwrap().approval.status, "rejected");
+        // A running stop job counts too.
+        let job = tentanas::jobs::spawn_steps(&g.db, tentanas::sharing::STOP_KIND, "helios", "u", None, |_h| async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(())
+        }).unwrap();
+        let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        assert!(error);
+        assert_eq!(refusal_of(&response), SHARING_STOP_PENDING, "a stop runs");
+        store::finish_job(&g.db, &job.job_id, "cancelled", None).unwrap();
+        tentanas::jobs::cancel(&job.job_id);
+        // A frozen target: its portal's interface does not hold its address.
+        store::upsert_target(&g.db, &g.org_id, &store::TargetRow {
+            target_id: "t-frozen".into(), name: "frozen".into(), protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.local.tentaflow:frozen".into(), enabled: true, auth_method: "none".into(),
+            portals: vec![tentaflow_protocol::tentanas::NasTargetPortal {
+                address: "203.0.113.77".into(), port: 3260, interface: "tfw10-none0".into(), ..Default::default()
+            }],
+            created_at: "now".into(), updated_at: "now".into(), ..Default::default()
+        }).unwrap();
+        let frozen = tentanas::targets::frozen_targets(&g.db).unwrap();
+        if frozen.is_empty() {
+            // Only a host with a kernel target can judge drift (the judgement
+            // asks `installed` first); the refusal itself is covered by
+            // `sharing::tests::the_stop_refuses_up_front_while_a_frozen_target_serves`.
+            return;
+        }
+        let (response, error) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        assert!(error);
+        assert_eq!(refusal_of(&response), SHARING_STOP_FROZEN);
+    }
+
+    /// Critic wave 10, R2-3: a stop is released only through its own
+    /// approval (which re-checks its author) — a replay through
+    /// `execute_approved` is refused and starts nothing.
+    #[tokio::test]
+    async fn a_stop_is_never_replayed_outside_its_approval() {
+        let mut fixture = dispatch_fixture();
+        let _second = two_admins(&mut fixture, true, true);
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let refused = execute_approved(&fixture.ctx, &P::SharingStopRequest {}, None).await.expect_err("refused");
+        assert_eq!(refused.code, ProtocolErrorCode::BadRequest);
+        assert!(store::list_jobs(&g.db, 10).unwrap().is_empty(), "no stop job");
+        assert!(!tentanas::sharing::suspended(&g.db).unwrap());
+    }
+
+    /// Critic wave 10, MINOR 2: a stop whose author lost the platform role
+    /// after parking it is not carried out, and stays pending.
+    #[tokio::test]
+    async fn a_stop_whose_author_lost_the_platform_role_is_not_released() {
+        let mut fixture = dispatch_fixture();
+        let second = two_admins(&mut fixture, true, true);
+        let (response, _) = crate::dispatch::dispatch(&stop_request(), &fixture.ctx).await;
+        let MessageBody::TentaNasBody(P::ApprovalPendingResponse { approval }) = response else { panic!("parked") };
+        let me = fixture.ctx.org_context.as_ref().unwrap().user_id.clone();
+        fixture.ctx.state.db.write().unwrap()
+            .execute("UPDATE user_accounts SET role = 'user' WHERE id = ?1", rusqlite::params![me]).unwrap();
+        let (response, error) = crate::dispatch::dispatch(&tn(P::ApprovalDecideRequest {
+            request_id: approval.request_id.clone(), approve: true, note: String::new(), sudo_password: None,
+        }), &second).await;
+        assert!(error);
+        assert_eq!(refusal_of(&response), SHARING_STOP_AUTHOR_GONE);
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        assert_eq!(store::approval(&g.db, &approval.request_id).unwrap().unwrap().approval.status, "pending");
+        assert!(store::list_jobs(&g.db, 10).unwrap().is_empty(), "nothing ran");
     }
 }

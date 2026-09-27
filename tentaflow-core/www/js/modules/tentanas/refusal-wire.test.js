@@ -32,7 +32,7 @@ if (!skip) {
   ({ BinaryWsClient } = await import('../../protocol/binary-ws-client.js'));
 }
 await import('./_test-setup.js');
-const { errMessage } = await import('./format.js');
+const { errMessage, errDetail } = await import('./format.js');
 
 // With the codec ready, the shared setup's `I18n.setLanguage('pl')` makes the
 // app's own transport try a socket that is not there and keep retrying it.
@@ -109,4 +109,22 @@ test('a refusal wrapped by the websocket client is still worded', { skip }, asyn
   // A code this build has no words for is shown as the client reported it.
   const unknown = await refusedThroughTheClient('PolicyDenied', 'refusal:quota_exceeded');
   assert.equal(errMessage(unknown), 'protocol error PolicyDenied: refusal:quota_exceeded');
+});
+
+// Wave 13: a refusal with PARAMETERS and the node's sentence
+// (`tentanas/refusal.rs`). The two messages are the exact wires
+// `refusal.rs`'s own test pins (`the_wire_form_the_screens_read`), so the
+// node's writer and the screen's reader are held to one string.
+test('a coded refusal with parameters crosses the real client and is worded with them', { skip }, async () => {
+  const member = 'refusal:elastic_disk_in_array?data=2&array=media Data disk no. 2 is already in the array media';
+  const error = await refusedThroughTheClient('BadRequest', member);
+  assert.equal(error.message, `protocol error BadRequest: ${member}`);
+  assert.equal(errMessage(error), 'Dysk danych nr 2 jest już w macierzy media');
+  assert.equal(errDetail(error), 'Data disk no. 2 is already in the array media', 'the sentence is only the detail');
+
+  const shared = 'refusal:elastic_destroy_shared?array=media&shares=kadry%2C%20zdj%C4%99cia%20%26%20wideo '
+    + 'The array serves shares: kadry, zdjęcia & wideo. Delete them before dissolving the array';
+  const refused = await refusedThroughTheClient('NotAvailable', shared);
+  assert.equal(errMessage(refused), 'Macierz media udostępnia udziały: kadry, zdjęcia & wideo. Usuń je przed rozwiązaniem macierzy');
+  assert.doesNotMatch(errMessage(refused), /refusal:|protocol error|%/);
 });

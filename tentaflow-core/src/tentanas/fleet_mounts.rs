@@ -774,23 +774,35 @@ fn stale_mountpoints(keep: &[String]) -> Vec<String> {
 }
 
 async fn unmount_if_present(db: &DbPool, mountpoint: &str) {
+    unmount_with(db, mountpoint, None).await
+}
+
+async fn unmount_with(
+    db: &DbPool,
+    mountpoint: &str,
+    explicit: Option<&crate::profiling::collectors::elevation::ElevationToken>,
+) {
     if current_mount(mountpoint).is_none() {
         return;
     }
     let command = HelperCommand::FleetUmount {
         mountpoint: mountpoint.to_string(),
     };
-    if let Err(e) = super::broker::run_privileged(db, &command, None, MOUNT_TIMEOUT).await {
+    if let Err(e) = super::broker::run_privileged(db, &command, explicit, MOUNT_TIMEOUT).await {
         tracing::warn!("tentanas: {mountpoint} not unmounted: {e}");
     }
 }
 
 /// Unmounts every fleet mount of this node — the uninstall teardown (§5.8
 /// step 2). The remote data is untouched: only this node stops reading it.
-pub async fn unmount_all(db: &DbPool) -> Vec<String> {
+/// `explicit`: the teardown's own password (mode B, `teardown_hold`).
+pub async fn unmount_all(
+    db: &DbPool,
+    explicit: Option<&crate::profiling::collectors::elevation::ElevationToken>,
+) -> Vec<String> {
     let mut log = Vec::new();
     for mountpoint in stale_mountpoints(&[]) {
-        unmount_if_present(db, &mountpoint).await;
+        unmount_with(db, &mountpoint, explicit).await;
         log.push(format!("unmounted {mountpoint}"));
     }
     log

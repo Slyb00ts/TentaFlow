@@ -18,7 +18,9 @@ use tentaflow_protocol::{
     AddonNetworkRulesSetResponse, AddonPackageInfo, AddonRecordingStats, AddonReloadResponse,
     AddonResourcesGetResponse, AddonResourcesSetResponse, AddonSqlStats, AddonSqlTable,
     AddonStoragePayload, AddonStorageStatsResponse, AddonToggleResponse, AddonToolDecl,
-    AddonTeardownDependent, AddonTeardownEntry, AddonTeardownPlanResponse, AddonToolParam,
+    AddonDisableConsequence, AddonDisablePreviewResponse, AddonTeardownDependent,
+    AddonTeardownArmResponse, AddonTeardownEntry, AddonTeardownNode, AddonTeardownPlanResponse,
+    AddonTeardownStatusResponse, AddonToolParam,
     AddonToolsResponse, AddonUninstallResponse, AddonVectorConfig,
     AddonVectorConfigResponse, AddonVectorPayload, AddonVectorSetConfigResponse, AddonVectorStats,
     MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth,
@@ -464,6 +466,51 @@ pub fn addon_uninstall(
         ));
     }
 
+    // Refused HERE, before anything replicates, when a teardown would refuse
+    // (MAJOR 1 of the wave-9b critic): on this node, from its live plan, and
+    // on every other node, from the blockers it last published. A removal
+    // that went out to the fleet cannot be called back, and a node whose
+    // teardown refuses after its row is gone loses the supervision the
+    // refusal protects (TentaNas: its Elastic Arrays). The `refusal:` code is
+    // also how the dialog knows the removal never left this node.
+    let acknowledged = match teardown_preflight(ctx, &addon, &payload.acknowledged_nodes) {
+        Ok(acknowledged) => acknowledged,
+        Err(refusal) => {
+            // Nothing went out, so no teardown will consume a password this
+            // node was handed for it (MAJOR B of round 2).
+            disarm_local_teardown(ctx, &addon);
+            return Err(refusal);
+        }
+    };
+    // Each node the admin proceeds without is on the record, with what that
+    // means (MAJOR A of round 2).
+    for peer in &acknowledged {
+        audit(
+            ctx,
+            "addon_uninstall_node_acknowledged",
+            &payload.addon_id,
+            serde_json::json!({
+                "node": peer.name,
+                "reason": peer.reason,
+                "consequence": match peer.reason {
+                    "blocked" => "the node's teardown refuses when the removal reaches it: its instance row goes, its data directory and the state its refusal protects (TentaNas: Elastic Arrays) stay on that node without supervision",
+                    _ => "the node never said what its teardown would refuse: when the removal reaches it, its teardown may refuse and leave its state (TentaNas: Elastic Arrays) without supervision",
+                },
+            }),
+            "warning",
+        );
+    }
+
+    // An UNPAIRED node that recorded a status for the instance is not reached
+    // now; paired again later, it receives the removal and its teardown may
+    // refuse — nothing acknowledged that (critic wave 9b round 3, C5). Said
+    // on the record, by name, for an app whose teardown can refuse.
+    if native_hooks_of(&addon).is_some_and(|h| h.refusable_teardown) {
+        for details in unpaired_audit_details(&instance_nodes(ctx, &payload.addon_id)) {
+            audit(ctx, "addon_uninstall_node_unpaired", &payload.addon_id, details, "warning");
+        }
+    }
+
     // Emit the mesh delete tombstone BEFORE removing the row — a durable
     // pre-delete capture so a crash mid-uninstall can never strand peers with
     // the addon still installed. Gated bundled (uploaded/never-synced instances
@@ -515,6 +562,200 @@ pub fn addon_uninstall(
     ))
 }
 
+/// One audit record per unpaired peer the uninstall does not reach now: its
+/// name (never its id; "unnamed node" without one) and what that means.
+fn unpaired_audit_details(nodes: &[AddonTeardownNode]) -> Vec<serde_json::Value> {
+    nodes
+        .iter()
+        .filter(|n| !n.local && n.unpaired)
+        .map(|n| {
+            let name = n.name.trim();
+            serde_json::json!({
+                "node": if name.is_empty() { "unnamed node" } else { name },
+                "consequence": "the node is not paired with the fleet and is not reached now; if it is paired again it receives the removal, and its teardown may refuse and leave its state (TentaNas: Elastic Arrays) without supervision — check it there",
+            })
+        })
+        .collect()
+}
+
+/// The hooks of a native instance, when it is one.
+fn native_hooks_of(addon: &crate::db::models::Addon) -> Option<&'static crate::addon::native_apps::NativeAppHooks> {
+    let manifest = crate::addon::lifecycle::parse_manifest_toml(&addon.manifest_json).ok()?;
+    if !manifest.is_native() {
+        return None;
+    }
+    crate::addon::native_apps::hooks_for(&addon.package_id)
+}
+
+/// See the call site in `addon_uninstall`. Only an app whose teardown can
+/// refuse is judged; every other app's teardown cannot refuse. `Ok` lists
+/// the peers the admin proceeds without (retyped acknowledgements).
+fn teardown_preflight(
+    ctx: &HandlerContext,
+    addon: &crate::db::models::Addon,
+    acks: &[tentaflow_protocol::AddonUninstallAck],
+) -> Result<Vec<crate::addon::native_apps::AcknowledgedPeer>, ProtocolError> {
+    if !native_hooks_of(addon).is_some_and(|h| h.refusable_teardown) {
+        return Ok(Vec::new());
+    }
+    let refused = |detail: String| ProtocolError::new(ProtocolErrorCode::Conflict, detail);
+    let local = crate::addon::lifecycle::teardown_plan(&addon.addon_id, &ctx.state.db)
+        .map_err(|e| ProtocolError::internal(format!("teardown plan: {e}")))?;
+    if let Some(block) = local.iter().find(|p| p.entry.blocks) {
+        return Err(refused(format!("refusal:teardown_blocked — {}", block.entry.description)));
+    }
+    let published = crate::addon::native_apps::published_teardown_blocks(&ctx.state.db, &addon.addon_id);
+    let peers: Vec<crate::addon::native_apps::PeerForTeardown> = instance_nodes(ctx, &addon.addon_id)
+        .into_iter()
+        .filter(|n| !n.local)
+        .map(|n| crate::addon::native_apps::PeerForTeardown {
+            node_id: n.node_id,
+            name: n.name,
+            status: n.status,
+            unpaired: n.unpaired,
+            online: n.online,
+            absent: false,
+        })
+        .collect();
+    let acks: std::collections::BTreeMap<String, String> =
+        acks.iter().map(|a| (a.node_id.clone(), a.confirm_name.clone())).collect();
+    // A peer that would hold the uninstall back is asked HERE whether it has
+    // the app at all (wave 11 round 2, B1): its own dispatcher answering
+    // NotFound to the plan request is the proof — the request carries no
+    // client claim about it. Only a connected peer is asked (an offline one
+    // would cost the whole forward deadline); anything but NotFound leaves
+    // the peer judged as before.
+    //
+    // This relaxes the wave-9b round-3 MAJOR C rule for one case on purpose:
+    // a CONNECTED peer whose last published blockers are non-empty is
+    // normally never passed (not even by a retype), because its teardown
+    // would refuse for certain. If that peer itself answers NotFound, it has
+    // no instance any more — no teardown will run there, so nothing can
+    // refuse and nothing loses supervision; its published record is stale.
+    // So such a peer is passed too.
+    //
+    // All holding peers are asked AT ONCE, each within `PEER_PROBE_TIMEOUT`
+    // and all within `PEER_PROBES_TOTAL` (wave 11 round 3): the preflight
+    // stays well under the dashboard's 30 s request deadline however many
+    // peers are slow. A peer that does not answer in time is not absent.
+    let mut peers = peers;
+    let holding: Vec<usize> = peers
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.status != "unsupported" && !p.unpaired)
+        .filter(|(_, p)| !matches!(published.get(&p.node_id), Some(blocks) if blocks.is_empty()))
+        .map(|(i, _)| i)
+        .collect();
+    let asked: Vec<crate::addon::native_apps::PeerForTeardown> = holding.iter().map(|&i| peers[i].clone()).collect();
+    let answers = probe_peers_absent(ctx, &addon.addon_id, &asked);
+    for (&i, answer) in holding.iter().zip(answers) {
+        peers[i].absent = answer == PeerProbe::Absent;
+    }
+    let proceeding = crate::addon::native_apps::peer_teardown_refusal(&published, &peers, &acks).map_err(refused)?;
+    for peer in peers.iter().filter(|p| p.absent) {
+        let name = peer.name.trim();
+        audit(
+            ctx,
+            "addon_uninstall_node_absent",
+            &addon.addon_id,
+            serde_json::json!({
+                "node": if name.is_empty() { "unnamed node" } else { name },
+                "consequence": "the node answered that it has no instance of this app; nothing to tear down there",
+            }),
+            "info",
+        );
+    }
+    Ok(proceeding)
+}
+
+/// What a peer answered about its instance of the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerProbe {
+    /// Its own dispatcher answered NotFound: no instance row there.
+    Absent,
+    /// It answered with a plan: the instance is there.
+    Present,
+    /// Offline, unreachable, or any other error: nothing is known.
+    Unknown,
+}
+
+/// How long one peer may take to say whether it has the app.
+const PEER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long all of them together may take (they are asked at once).
+const PEER_PROBES_TOTAL: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// A test's stand-in for the network: the answer of one peer by node id,
+/// which may take as long as the test wants.
+#[cfg(test)]
+type ProbeOverride = fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = PeerProbe> + Send>>;
+#[cfg(test)]
+static PEER_PROBE_OVERRIDE: std::sync::Mutex<Option<ProbeOverride>> = std::sync::Mutex::new(None);
+
+/// Asks each of `peers` itself, all at once, through the signed mesh
+/// forward, for its teardown plan of `addon_id`: one answer per peer, in
+/// order. A peer that does not answer within `PEER_PROBE_TIMEOUT`, or before
+/// `PEER_PROBES_TOTAL` runs out, is `Unknown`. Tests replace the network
+/// with `PEER_PROBE_OVERRIDE`; the timeouts and the judgement of the answer
+/// (`peer_probe_of`) are the same code.
+fn probe_peers_absent(ctx: &HandlerContext, addon_id: &str, peers: &[crate::addon::native_apps::PeerForTeardown]) -> Vec<PeerProbe> {
+    let unknown = vec![PeerProbe::Unknown; peers.len()];
+    if peers.is_empty() {
+        return unknown;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return unknown;
+    };
+    if handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+        return unknown;
+    }
+    let one = |peer: &crate::addon::native_apps::PeerForTeardown| {
+        let node_id = peer.node_id.clone();
+        let online = peer.online;
+        let body = MessageBody::AddonTeardownPlanRequestBody(tentaflow_protocol::AddonTeardownPlanRequest {
+            addon_id: addon_id.to_string(),
+        });
+        async move {
+            #[cfg(test)]
+            let overridden = *PEER_PROBE_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner());
+            #[cfg(test)]
+            if let Some(probe) = overridden {
+                return tokio::time::timeout(PEER_PROBE_TIMEOUT, probe(node_id)).await.unwrap_or(PeerProbe::Unknown);
+            }
+            if !online {
+                return PeerProbe::Unknown;
+            }
+            let Ok(bytes) = tentaflow_protocol::cbor::encode(&body) else {
+                return PeerProbe::Unknown;
+            };
+            match tokio::time::timeout(PEER_PROBE_TIMEOUT, crate::dispatch::app_route::forward_to_node(ctx, &node_id, bytes)).await {
+                Ok(answer) => peer_probe_of(answer),
+                Err(_) => PeerProbe::Unknown,
+            }
+        }
+    };
+    let all = futures::future::join_all(peers.iter().map(one));
+    tokio::task::block_in_place(|| handle.block_on(tokio::time::timeout(PEER_PROBES_TOTAL, all))).unwrap_or(unknown)
+}
+
+/// The judgement of a peer's answer: only NotFound — which only the peer's
+/// own plan handler sends, for an instance it does not have — is "absent".
+fn peer_probe_of(answer: Result<MessageBody, ProtocolError>) -> PeerProbe {
+    match answer {
+        Ok(MessageBody::AddonTeardownPlanResponseBody(_)) => PeerProbe::Present,
+        Err(e) if e.code == ProtocolErrorCode::NotFound => PeerProbe::Absent,
+        _ => PeerProbe::Unknown,
+    }
+}
+
+/// Drops the teardown password THIS node was handed, when the uninstall
+/// stops before its teardown could consume it.
+fn disarm_local_teardown(ctx: &HandlerContext, addon: &crate::db::models::Addon) {
+    let Some(disarm) = native_hooks_of(addon).and_then(|h| h.disarm_teardown) else { return };
+    let org_id = crate::services::org::DEFAULT_ORG_ID;
+    let Ok(data_dir) = crate::addon::fs_sandbox::addon_data_dir_no_create(org_id, &addon.addon_id) else { return };
+    disarm(&crate::addon::native_apps::NativeAppContext { db: &ctx.state.db, addon_id: &addon.addon_id, org_id, data_dir });
+}
+
 // =============================================================================
 // 3b. AddonTeardownPlanRequest — Admin. Side-effect-free preview backing the
 //     uninstall dialog: paths (with sizes) the wipe removes or keeps, plus the
@@ -553,8 +794,24 @@ pub fn addon_teardown_plan(
             removed: p.entry.removed,
             size_bytes: p.size_bytes,
             count_vars: p.entry.count_vars.clone(),
+            blocks: p.entry.blocks,
         })
         .collect();
+
+    // n18a's mode chip and backup column for THIS node.
+    let node_info = native_hooks_of(&addon)
+        .and_then(|hooks| hooks.teardown_node_info)
+        .and_then(|info| {
+            let org_id = crate::services::org::DEFAULT_ORG_ID;
+            let data_dir = crate::addon::fs_sandbox::addon_data_dir_no_create(org_id, &addon.addon_id).ok()?;
+            Some(info(&crate::addon::native_apps::NativeAppContext {
+                db: &ctx.state.db,
+                addon_id: &addon.addon_id,
+                org_id,
+                data_dir,
+            }))
+        })
+        .unwrap_or_default();
 
     // A dependency binds to the PACKAGE: other instances of the same package
     // keep serving the dependents, so only the last instance breaks them.
@@ -599,8 +856,331 @@ pub fn addon_teardown_plan(
             },
             entries,
             dependents,
+            nodes: instance_nodes(ctx, &payload.addon_id),
+            privilege: node_info.privilege.to_string(),
+            backup_file: node_info.backup_file,
         },
     ))
+}
+
+/// Every node an uninstall of `addon_id` reaches, this one first: this node,
+/// every trust-paired peer, and any node that recorded its own reconcile of
+/// the instance (`__node_status/<node>`) although the mesh does not list it
+/// now. Each by the name the fleet surfaces use; the id only routes.
+fn instance_nodes(ctx: &HandlerContext, addon_id: &str) -> Vec<AddonTeardownNode> {
+    let local_id = ctx.state.local_node_id.to_string();
+    let statuses: std::collections::BTreeMap<String, String> = repository::list_addon_config_prefixed(
+        &ctx.state.db,
+        addon_id,
+        crate::addon::native_apps::NODE_STATUS_KEY_PREFIX,
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(node_id, value, _)| {
+        let status = serde_json::from_str::<serde_json::Value>(&value)
+            .ok()
+            .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+        (node_id, status)
+    })
+    .collect();
+    // `(node_id, online, trusted)`: every trusted peer, and every node that
+    // recorded a status for the instance — a node no longer trusted is kept
+    // in the list, marked unpaired, so the dialog can say the removal will
+    // not reach it (and it holds nothing back).
+    let mut ids: Vec<(String, bool, bool)> = vec![(local_id.clone(), true, true)];
+    if let Some(iroh) = ctx.state.quic_mesh.as_ref() {
+        for peer in ctx.state.mesh_peer_store.list() {
+            if peer.node_id == local_id || !iroh.is_trusted(&peer.node_id) {
+                continue;
+            }
+            ids.push((peer.node_id.clone(), peer.quic_connected, true));
+        }
+    }
+    for node_id in statuses.keys() {
+        if !ids.iter().any(|(id, _, _)| id == node_id) {
+            // Without a running mesh nothing says the node is gone: it is
+            // counted as paired (it holds the uninstall back until known).
+            let trusted = ctx.state.quic_mesh.as_ref().is_none_or(|iroh| iroh.is_trusted(node_id));
+            ids.push((node_id.clone(), false, trusted));
+        }
+    }
+    // What each node last published as refusing its teardown. An app whose
+    // teardown cannot refuse has nothing to publish and nothing to know.
+    let refusable = repository::get_addon(&ctx.state.db, addon_id)
+        .ok()
+        .flatten()
+        .and_then(|addon| native_hooks_of(&addon))
+        .is_some_and(|hooks| hooks.refusable_teardown);
+    let published = if refusable {
+        crate::addon::native_apps::published_teardown_blocks(&ctx.state.db, addon_id)
+    } else {
+        Default::default()
+    };
+    ids.into_iter()
+        .map(|(node_id, online, trusted)| {
+            let last = published.get(&node_id);
+            AddonTeardownNode {
+                name: crate::dispatch::app_route::node_display_name(ctx, &node_id),
+                local: node_id == local_id,
+                online,
+                status: statuses.get(&node_id).cloned().unwrap_or_else(|| "unknown".to_string()),
+                last_known: !refusable || last.is_some(),
+                last_blocks: last
+                    .map(|blocks| {
+                        blocks
+                            .iter()
+                            .map(|b| AddonTeardownEntry {
+                                path: String::new(),
+                                kind: b.kind.clone(),
+                                description: String::new(),
+                                removed: false,
+                                size_bytes: 0,
+                                count_vars: b.count_vars.clone(),
+                                blocks: true,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                unpaired: !trusted,
+                node_id,
+            }
+        })
+        .collect()
+}
+
+// =============================================================================
+// 3f. AddonTeardownDisarmRequest — Admin. Drops the teardown password THIS
+//     node holds (the dialog's every exit before the uninstall).
+// =============================================================================
+
+#[handler(variant = "AddonTeardownDisarmRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn addon_teardown_disarm(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AddonTeardownDisarmRequestBody(p) => p,
+        _ => return Err(ProtocolError::bad_request("expected AddonTeardownDisarmRequestBody")),
+    };
+    validate_addon_id(&payload.addon_id)?;
+    let addon = repository::get_addon(&ctx.state.db, &payload.addon_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("addon nie istnieje"))?;
+    disarm_local_teardown(ctx, &addon);
+    Ok(MessageBody::AddonTeardownArmResponseBody(AddonTeardownArmResponse {
+        addon_id: addon.addon_id,
+        armed_until: String::new(),
+    }))
+}
+
+// =============================================================================
+// 3e. AddonTeardownArmRequest — Admin. Arms THIS node's privilege channel for
+//     the teardown about to start (n18a: a mode-B node's password prompt).
+// =============================================================================
+
+#[handler(variant = "AddonTeardownArmRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn addon_teardown_arm(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AddonTeardownArmRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AddonTeardownArmRequestBody",
+            ))
+        }
+    };
+    validate_addon_id(&payload.addon_id)?;
+    let addon = repository::get_addon(&ctx.state.db, &payload.addon_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("addon nie istnieje"))?;
+    let arm = native_hooks_of(&addon)
+        .and_then(|hooks| hooks.arm_teardown)
+        .ok_or_else(|| ProtocolError::bad_request("this app's teardown takes no password"))?;
+    let org_id = crate::services::org::DEFAULT_ORG_ID;
+    let data_dir = crate::addon::fs_sandbox::addon_data_dir_no_create(org_id, &payload.addon_id)
+        .map_err(|e| ProtocolError::internal(format!("instance data dir: {e:?}")))?;
+    // A rejected password is the one outcome the admin acts on, so it has its
+    // own code; the node's own words stay in the log.
+    let armed_until = arm(
+        &crate::addon::native_apps::NativeAppContext {
+            db: &ctx.state.db,
+            addon_id: &payload.addon_id,
+            org_id,
+            data_dir,
+        },
+        payload.sudo_password.0.clone(),
+    )
+    .map_err(|e| {
+        tracing::info!("addon '{}': teardown arm refused: {e}", payload.addon_id);
+        ProtocolError::new(ProtocolErrorCode::PolicyDenied, "refusal:teardown_password_rejected")
+    })?;
+    audit(ctx, "addon_teardown_arm", &payload.addon_id, serde_json::json!({}), "warning");
+    Ok(MessageBody::AddonTeardownArmResponseBody(AddonTeardownArmResponse {
+        addon_id: addon.addon_id,
+        armed_until,
+    }))
+}
+
+// =============================================================================
+// 3c. AddonTeardownStatusRequest — Admin. Where the uninstall stands on THIS
+//     node; the dialog forwards it to each node in turn (MAJOR 22).
+// =============================================================================
+
+#[handler(variant = "AddonTeardownStatusRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn addon_teardown_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AddonTeardownStatusRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AddonTeardownStatusRequestBody",
+            ))
+        }
+    };
+    validate_addon_id(&payload.addon_id)?;
+    let installed = repository::get_addon(&ctx.state.db, &payload.addon_id)
+        .map_err(db_err)?
+        .is_some();
+    Ok(MessageBody::AddonTeardownStatusResponseBody(teardown_status_of(
+        &payload.addon_id,
+        installed,
+        crate::addon::native_apps::teardown_status::get(&payload.addon_id),
+    )))
+}
+
+/// The answer from its two sources: this process's record of a teardown, and
+/// whether the instance row is still here. A record wins — a FAILED uninstall
+/// on this node keeps the row, and must read failed, not "not reached yet".
+fn teardown_status_of(
+    addon_id: &str,
+    installed: bool,
+    record: Option<crate::addon::native_apps::teardown_status::Status>,
+) -> AddonTeardownStatusResponse {
+    match record {
+        Some(status) => AddonTeardownStatusResponse {
+            addon_id: addon_id.to_string(),
+            state: status.state.to_string(),
+            phase: status.phase,
+            warnings: status.warnings,
+        },
+        None => AddonTeardownStatusResponse {
+            addon_id: addon_id.to_string(),
+            state: if installed { "installed" } else { "absent" }.to_string(),
+            phase: String::new(),
+            warnings: Vec::new(),
+        },
+    }
+}
+
+// =============================================================================
+// 3d. AddonDisablePreviewRequest — Admin. What disabling the instance does on
+//     THIS node (n18d), from the app's own consequence provider.
+// =============================================================================
+
+#[handler(variant = "AddonDisablePreviewRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn addon_disable_preview(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AddonDisablePreviewRequestBody(p) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AddonDisablePreviewRequestBody",
+            ))
+        }
+    };
+    validate_addon_id(&payload.addon_id)?;
+    let addon = repository::get_addon(&ctx.state.db, &payload.addon_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("addon nie istnieje"))?;
+    let manifest = crate::addon::lifecycle::parse_manifest_toml(&addon.manifest_json).ok();
+    let background_on_disable = manifest
+        .as_ref()
+        .and_then(|m| m.native.as_ref().map(|n| n.background_on_disable))
+        .unwrap_or(false);
+    let provider = manifest
+        .as_ref()
+        .filter(|m| m.is_native())
+        .and_then(|_| crate::addon::native_apps::hooks_for(&addon.package_id))
+        .and_then(|hooks| hooks.disable_consequences);
+    let consequences = match provider {
+        Some(provider) => {
+            let org_id = crate::services::org::DEFAULT_ORG_ID;
+            let data_dir = crate::addon::fs_sandbox::addon_data_dir_no_create(org_id, &payload.addon_id)
+                .map_err(|e| ProtocolError::internal(format!("instance data dir: {e:?}")))?;
+            let viewer = ctx.org_context.as_ref().map(|o| o.org_id.clone()).unwrap_or_default();
+            provider(
+                &crate::addon::native_apps::NativeAppContext {
+                    db: &ctx.state.db,
+                    addon_id: &payload.addon_id,
+                    org_id,
+                    data_dir,
+                },
+                &viewer,
+            )
+            .map_err(|e| ProtocolError::internal(format!("disable consequences: {e}")))?
+            .into_iter()
+            .map(|c| AddonDisableConsequence {
+                kind: c.kind.to_string(),
+                effect: c.effect.to_string(),
+                count_vars: c.count_vars,
+                names: c.names,
+            })
+            .collect()
+        }
+        None => Vec::new(),
+    };
+    // n18d per node (wave 10): the mode chip of THIS node, from the same hook
+    // the uninstall dialog reads (`teardown_node_info`); '' for an app that
+    // needs no privilege.
+    let privilege = native_hooks_of(&addon)
+        .and_then(|hooks| hooks.teardown_node_info)
+        .and_then(|info| {
+            let org_id = crate::services::org::DEFAULT_ORG_ID;
+            let data_dir = crate::addon::fs_sandbox::addon_data_dir_no_create(org_id, &addon.addon_id).ok()?;
+            Some(info(&crate::addon::native_apps::NativeAppContext {
+                db: &ctx.state.db,
+                addon_id: &addon.addon_id,
+                org_id,
+                data_dir,
+            }))
+        })
+        .map(|info| info.privilege.to_string())
+        .unwrap_or_default();
+    // Disabling is fleet-wide: every node it reaches, by name. Listed only
+    // when the app has consequences to show at all — a provider-less app is
+    // disabled without a dialog and needs no roster.
+    let nodes = if consequences.is_empty() { Vec::new() } else { instance_nodes(ctx, &payload.addon_id) };
+    Ok(MessageBody::AddonDisablePreviewResponseBody(AddonDisablePreviewResponse {
+        addon_id: addon.addon_id,
+        display_name: if addon.display_name.is_empty() {
+            addon.name
+        } else {
+            addon.display_name
+        },
+        node_name: crate::dispatch::app_route::node_display_name(
+            ctx,
+            &ctx.state.local_node_id.to_string(),
+        ),
+        background_on_disable,
+        consequences,
+        nodes,
+        privilege,
+    }))
 }
 
 // =============================================================================
@@ -2407,6 +2987,306 @@ mod declared_status_tests {
         assert_eq!(out[1].status, "conflicting");
         assert_eq!(out[2].status, "missing");
     }
+}
+
+#[cfg(test)]
+mod teardown_status_tests {
+    use super::*;
+    use crate::addon::native_apps::teardown_status::Status;
+
+    /// A record of this process wins over the instance row: a FAILED
+    /// uninstall keeps the row on this node and must read failed, not
+    /// "the removal has not reached this node yet". Without a record, the
+    /// row alone says whether the removal is still to come.
+    #[test]
+    fn a_failed_teardown_reads_failed_even_with_the_row_still_there() {
+        let failed = Status { state: "failed", phase: "tentanas_elastic_check".into(), warnings: Vec::new() };
+        let r = teardown_status_of("tentanas-1a2b3c4d", true, Some(failed));
+        assert_eq!((r.state.as_str(), r.phase.as_str()), ("failed", "tentanas_elastic_check"));
+        assert_eq!(teardown_status_of("tentanas-1a2b3c4d", true, None).state, "installed");
+        assert_eq!(teardown_status_of("tentanas-1a2b3c4d", false, None).state, "absent");
+        let done = Status { state: "done", phase: "done".into(), warnings: vec!["tentanas_backup_failed".into()] };
+        let r = teardown_status_of("tentanas-1a2b3c4d", false, Some(done));
+        assert_eq!((r.state.as_str(), r.warnings.clone()), ("done", vec!["tentanas_backup_failed".to_string()]));
+    }
+}
+
+#[cfg(test)]
+mod uninstall_preflight_tests {
+    use super::*;
+    use crate::addon::native_apps::{record_teardown_blocks, test_support, PublishedBlock};
+    use crate::dispatch::state::AppState;
+    use std::sync::Arc;
+    use tentaflow_protocol::AddonUninstallRequest;
+
+    const ADDON: &str = "test-refusing-app-1a2b3c4d";
+    const PEER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn ctx(state: &Arc<AppState>) -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession { user_id: [9u8; 16], role: Some("admin".to_string()) },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: state.clone(),
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: None,
+        }
+    }
+
+    /// An instance of the refusing fixture, and a peer that reconciled it.
+    fn seeded() -> Arc<AppState> {
+        let state = AppState::for_test();
+        let manifest = test_support::fixture_manifest_toml(false)
+            .replace(&format!("id = \"{}\"", test_support::PACKAGE_ID), &format!("id = \"{}\"", test_support::REFUSING_PACKAGE_ID));
+        state.db.write().unwrap().execute(
+            "INSERT INTO addons (addon_id, name, version, package_id, package_version, runtime, is_enabled, manifest_json) \
+             VALUES (?1, ?1, '1.0.0', ?2, '1.0.0', 'native', 1, ?3)",
+            rusqlite::params![ADDON, test_support::REFUSING_PACKAGE_ID, manifest],
+        ).expect("addon row");
+        repository::upsert_addon_config_value(&state.db, ADDON, &format!("__node_status/{PEER}"), r#"{"status":"ready"}"#, false, None)
+            .expect("peer status");
+        state
+    }
+
+    fn uninstall(state: &Arc<AppState>) -> Result<MessageBody, ProtocolError> {
+        addon_uninstall(
+            &MessageBody::AddonUninstallRequestBody(AddonUninstallRequest { addon_id: ADDON.to_string(), acknowledged_nodes: Vec::new() }),
+            &ctx(state),
+        )
+    }
+
+    fn still_installed(state: &Arc<AppState>) -> bool {
+        repository::get_addon(&state.db, ADDON).unwrap().is_some()
+    }
+
+    fn publish_for(state: &Arc<AppState>, node: &str, blocks: &[PublishedBlock]) {
+        let key = format!("{}{node}", crate::addon::native_apps::TEARDOWN_BLOCKS_KEY_PREFIX);
+        repository::upsert_addon_config_value(&state.db, ADDON, &key, &serde_json::to_string(blocks).unwrap(), false, None)
+            .expect("publish");
+    }
+
+    /// MAJOR 1 of the wave-9b critic, the server half: an uninstall of an app
+    /// whose teardown can refuse is refused BEFORE anything replicates — the
+    /// instance row stays, so no peer loses what its refusal protects — when a
+    /// peer published nothing, when a peer's last published plan blocks, and
+    /// when this node's own plan blocks. A peer that published an empty plan
+    /// lets it through.
+    #[test]
+    fn an_uninstall_is_refused_before_it_replicates_while_any_node_would_refuse() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        test_support::REFUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let state = seeded();
+
+        let err = uninstall(&state).expect_err("the peer published nothing");
+        assert_eq!(err.code, ProtocolErrorCode::Conflict);
+        assert!(err.message.starts_with("refusal:teardown_peer_unknown"), "{}", err.message);
+        assert!(still_installed(&state), "refused before the row was touched");
+
+        publish_for(&state, PEER, &[PublishedBlock { kind: "test_blocker".into(), count_vars: Default::default() }]);
+        let err = uninstall(&state).expect_err("the peer's last plan blocks");
+        assert!(err.message.starts_with("refusal:teardown_peer_blocked"), "{}", err.message);
+        assert!(still_installed(&state));
+
+        publish_for(&state, PEER, &[]);
+        test_support::REFUSE.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = uninstall(&state).expect_err("this node's own plan blocks");
+        assert!(err.message.starts_with("refusal:teardown_blocked"), "{}", err.message);
+        assert!(still_installed(&state));
+
+        test_support::REFUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let addon = repository::get_addon(&state.db, ADDON).unwrap().unwrap();
+        assert!(teardown_preflight(&ctx(&state), &addon, &[]).is_ok(), "every node known and none refuses");
+        let _ = record_teardown_blocks;
+    }
+
+    fn uninstall_with(state: &Arc<AppState>, acks: Vec<tentaflow_protocol::AddonUninstallAck>) -> Result<MessageBody, ProtocolError> {
+        addon_uninstall(
+            &MessageBody::AddonUninstallRequestBody(AddonUninstallRequest { addon_id: ADDON.to_string(), acknowledged_nodes: acks }),
+            &ctx(state),
+        )
+    }
+
+    /// MAJOR A of round 2: a peer that never published would hold the
+    /// uninstall back forever. The admin proceeds without it by retyping its
+    /// name (`LOST` for a node without one — this peer has none); a wrong
+    /// word does not count; the acknowledgement is on the audit record with
+    /// its consequence; and a refusal drops the teardown password this node
+    /// was handed (MAJOR B).
+    #[test]
+    fn a_peer_that_never_published_is_passed_only_with_its_name_retyped() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        test_support::REFUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let state = seeded();
+        let before = test_support::DISARM_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let err = uninstall_with(&state, vec![]).expect_err("never published");
+        assert!(err.message.starts_with("refusal:teardown_peer_unknown"), "{}", err.message);
+        assert!(test_support::DISARM_CALLS.load(std::sync::atomic::Ordering::SeqCst) > before, "the refusal drops the held password");
+        let err = uninstall_with(&state, vec![tentaflow_protocol::AddonUninstallAck { node_id: PEER.into(), confirm_name: "lost".into() }])
+            .expect_err("a wrong word is no acknowledgement");
+        assert!(err.message.starts_with("refusal:teardown_peer_unknown"), "{}", err.message);
+        assert!(still_installed(&state));
+
+        uninstall_with(&state, vec![tentaflow_protocol::AddonUninstallAck { node_id: PEER.into(), confirm_name: "LOST".into() }])
+            .expect("acknowledged: the uninstall proceeds without that node");
+        assert!(!still_installed(&state), "uninstalled");
+        let audited: i64 = state.db.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'addon_uninstall_node_acknowledged' AND details LIKE '%supervision%'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(audited, 1, "the acknowledgement and its consequence are on the record");
+    }
+
+    /// Critic wave 9b round 3, C5: every unpaired peer is on the record by
+    /// name with the consequence; paired peers and this node are not.
+    #[test]
+    fn an_unpaired_peer_is_recorded_by_name_with_the_consequence() {
+        let node = |id: &str, name: &str, local: bool, unpaired: bool| AddonTeardownNode {
+            node_id: id.to_string(),
+            name: name.to_string(),
+            local,
+            online: false,
+            status: "ready".to_string(),
+            last_known: false,
+            last_blocks: Vec::new(),
+            unpaired,
+        };
+        let details = unpaired_audit_details(&[
+            node(&"a".repeat(64), "helios", true, false),
+            node(&"b".repeat(64), "atlas", false, true),
+            node(&"c".repeat(64), "", false, true),
+            node(&"d".repeat(64), "orion", false, false),
+        ]);
+        let named: Vec<&str> = details.iter().map(|d| d["node"].as_str().unwrap()).collect();
+        assert_eq!(named, vec!["atlas", "unnamed node"]);
+        let text = serde_json::to_string(&details).unwrap();
+        assert!(text.contains("paired again"), "{text}");
+        assert!(!text.contains(&"b".repeat(32)) && !text.contains(&"c".repeat(32)), "no node id on the record: {text}");
+    }
+
+    /// Wave 11 round 2, B1: a peer that never published is passed WITHOUT an
+    /// acknowledgement only when the node running the uninstall asked it and
+    /// its own dispatcher answered that it has no instance (NotFound). The
+    /// request carries no client claim: a peer that answers with a plan, or
+    /// cannot be asked, still needs its name retyped.
+    fn answer(probe: PeerProbe) -> std::pin::Pin<Box<dyn std::future::Future<Output = PeerProbe> + Send>> {
+        Box::pin(async move { probe })
+    }
+
+    struct ResetProbe;
+    impl Drop for ResetProbe {
+        fn drop(&mut self) {
+            *PEER_PROBE_OVERRIDE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_without_the_app_is_passed_only_when_it_says_so_itself() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        test_support::REFUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _reset = ResetProbe;
+
+        // The peer HAS the app (it answers with a plan): no way past it
+        // without the retype, whatever the dialog believed.
+        *PEER_PROBE_OVERRIDE.lock().unwrap() = Some(|_| answer(PeerProbe::Present));
+        let state = seeded();
+        let err = uninstall_with(&state, vec![]).expect_err("the peer has the app and published nothing");
+        assert!(err.message.starts_with("refusal:teardown_peer_unknown"), "{}", err.message);
+        assert!(still_installed(&state));
+
+        // The peer cannot be asked: judged as before.
+        *PEER_PROBE_OVERRIDE.lock().unwrap() = Some(|_| answer(PeerProbe::Unknown));
+        let err = uninstall_with(&state, vec![]).expect_err("unknown");
+        assert!(err.message.starts_with("refusal:teardown_peer_unknown"), "{}", err.message);
+
+        // The peer's own dispatcher says NotFound: nothing to tear down there.
+        *PEER_PROBE_OVERRIDE.lock().unwrap() = Some(|_| answer(PeerProbe::Absent));
+        uninstall_with(&state, vec![]).expect("the absent peer holds nothing back");
+        assert!(!still_installed(&state), "uninstalled");
+        let audited: i64 = state.db.read().unwrap().query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'addon_uninstall_node_absent'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(audited, 1, "the absent peer is on the record");
+    }
+
+    /// Wave 11 round 3: a peer that does not answer is not waited for past
+    /// `PEER_PROBE_TIMEOUT`: it is judged as before (not absent), the
+    /// request is refused well inside the dashboard's 30 s, and the refusal
+    /// drops the teardown password this node was handed, like any refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_peer_times_out_is_not_absent_and_the_refusal_is_quick() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        test_support::REFUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _reset = ResetProbe;
+        *PEER_PROBE_OVERRIDE.lock().unwrap() = Some(|_| {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                PeerProbe::Absent
+            })
+        });
+        let state = seeded();
+        // A second slow peer: asked at the same time, so the wait is one
+        // timeout, not two.
+        let other = "c".repeat(64);
+        repository::upsert_addon_config_value(&state.db, ADDON, &format!("__node_status/{other}"), r#"{"status":"ready"}"#, false, None)
+            .expect("second peer");
+        let before = test_support::DISARM_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let err = uninstall_with(&state, vec![]).expect_err("a peer that did not answer is not absent");
+        let took = started.elapsed();
+        assert!(err.message.starts_with("refusal:teardown_peer_unknown"), "{}", err.message);
+        // One per-peer timeout, not the total cap and not two timeouts in a
+        // row: each peer has its own bound, and both were asked at once.
+        assert!(took >= PEER_PROBE_TIMEOUT && took < PEER_PROBE_TIMEOUT + std::time::Duration::from_secs(2), "took {took:?}");
+        assert!(took < std::time::Duration::from_secs(20), "well under the 30 s request deadline: {took:?}");
+        assert!(still_installed(&state));
+        assert!(
+            test_support::DISARM_CALLS.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "the refusal drops the held password"
+        );
+    }
+
+    /// Only the peer's NotFound is "absent"; a plan is "present"; anything
+    /// else — an unreachable node, a refusal, a policy error — is unknown.
+    #[test]
+    fn only_the_peers_own_not_found_reads_as_absent() {
+        let plan = MessageBody::AddonTeardownPlanResponseBody(AddonTeardownPlanResponse {
+            addon_id: ADDON.into(),
+            display_name: String::new(),
+            entries: Vec::new(),
+            dependents: Vec::new(),
+            nodes: Vec::new(),
+            privilege: String::new(),
+            backup_file: String::new(),
+        });
+        assert_eq!(peer_probe_of(Ok(plan)), PeerProbe::Present);
+        assert_eq!(peer_probe_of(Err(ProtocolError::not_found("addon nie istnieje"))), PeerProbe::Absent);
+        for code in [ProtocolErrorCode::NodeUnreachable, ProtocolErrorCode::PolicyDenied, ProtocolErrorCode::NotAvailable, ProtocolErrorCode::Internal] {
+            assert_eq!(peer_probe_of(Err(ProtocolError::new(code, "x"))), PeerProbe::Unknown, "{code:?}");
+        }
+    }
+
+    /// The plan tells the dialog what an OFFLINE node last published.
+    #[test]
+    fn the_plan_carries_each_nodes_last_published_blockers() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        test_support::REFUSE.store(false, std::sync::atomic::Ordering::SeqCst);
+        let state = seeded();
+        let nodes = instance_nodes(&ctx(&state), ADDON);
+        let peer = nodes.iter().find(|n| n.node_id == PEER).expect("the peer is listed");
+        assert!(!peer.last_known, "nothing published yet");
+        publish_for(&state, PEER, &[PublishedBlock { kind: "test_blocker".into(), count_vars: Default::default() }]);
+        let nodes = instance_nodes(&ctx(&state), ADDON);
+        let peer = nodes.iter().find(|n| n.node_id == PEER).unwrap();
+        assert!(peer.last_known);
+        assert_eq!(peer.last_blocks[0].kind, "test_blocker");
+    }
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 #[cfg(test)]

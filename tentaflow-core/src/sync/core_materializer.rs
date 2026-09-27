@@ -174,14 +174,17 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
 
     // HLC last-writer-wins gate: drop stale concurrent edits before touching the
     // target row, so a slower-but-older write never clobbers a newer one.
-    if lww_tracked
-        && !incoming_hlc_wins(
-            &tx,
+    // `core.bus_topic` is ordered by its incarnation first (`bus_topic_op_wins`).
+    let wins = |tx: &rusqlite::Transaction<'_>| match descriptor.kind {
+        CoreSyncResourceKind::BusTopic => bus_topic_op_wins(tx, operation),
+        _ => incoming_hlc_wins(
+            tx,
             &operation.body.resource_type,
             &operation.body.resource_id,
             &operation.body.hlc_timestamp,
-        )?
-    {
+        ),
+    };
+    if lww_tracked && !wins(&tx)? {
         tx.commit()
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
         return Ok(0);
@@ -283,7 +286,9 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
         }
         CoreSyncResourceKind::BusTopic => apply_bus_topic(&tx, operation)?,
         CoreSyncResourceKind::BusPartitionAssignment => {
-            apply_bus_partition_assignment(&tx, operation)?
+            let applied = apply_bus_partition_assignment(&tx, operation)?;
+            authorized = applied.orders_the_resource;
+            applied.rows
         }
         CoreSyncResourceKind::BusFieldPolicy => apply_bus_field_policy(&tx, operation)?,
         CoreSyncResourceKind::BusSchemaSubject => apply_bus_schema_subject(&tx, operation)?,
@@ -348,6 +353,24 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
         )
     {
         crate::bus::schema_registry::bump_generation();
+    }
+    // A topic's access entries decide what an open TentaBus consumer may read,
+    // and a consumer re-checks only when the ACL generation moves
+    // (`bus_authorizer::bump_acl_generation`). A replicated entry — and a
+    // topic op, whose create/delete removes the topic's entries here — moves
+    // it like a local write does, or a deny set on another node would not
+    // reach a consumer already reading on this one.
+    // Every node caches the topic configs its publishes and deliveries read;
+    // a replicated change retires those entries, or the node would keep
+    // enforcing the old settings until it restarts.
+    if rows > 0 && descriptor.kind == CoreSyncResourceKind::BusTopic {
+        crate::bus::topics::bump_config_generation();
+    }
+    if descriptor.kind == CoreSyncResourceKind::BusTopic
+        || (descriptor.kind == CoreSyncResourceKind::ResourcePermission
+            && field_string(operation, "resource_type").is_ok_and(|t| t == "topic"))
+    {
+        crate::services::bus_authorizer::bump_acl_generation();
     }
     // An agent-account credential is NOT on the ledger, so these two rows are
     // the only way a revocation and a withdrawn runtime flag reach the node
@@ -701,6 +724,23 @@ fn apply_resource_permission(
             "resource_permission composite id mismatch: body={}, fields={}",
             operation.body.resource_id, expected_id
         )));
+    }
+    // A topic's access entry names its topic through the ACL's composite
+    // `(instance_id, org_id, topic)` id (`bus_authorizer::topic_acl_resource_id`).
+    if resource_type == "topic" && operation.body.action != ActionType::Delete {
+        if let Some([instance_id, org_id, topic]) =
+            crate::sync::resource_id::decode_segments(&resource_id).as_deref()
+        {
+            if topic_rule_write_is_stale(
+                tx,
+                instance_id,
+                org_id,
+                topic,
+                &operation.body.hlc_timestamp,
+            )? {
+                return Ok(0);
+            }
+        }
     }
     match operation.body.action {
         ActionType::Insert | ActionType::Update => tx
@@ -3654,6 +3694,26 @@ fn apply_bus_topic(
             .as_str()
             .to_string();
     }
+    // A row from a peer on a build before topic incarnations carries no
+    // generation (`0` by serde default). That says nothing about which
+    // incarnation it updates, so it keeps the one this node already holds
+    // instead of resetting it and orphaning every current placement.
+    let held = match topic_incarnation(tx, &row.instance_id, &row.org_id, &row.name)? {
+        TopicIncarnation::Current(current) => Some(current),
+        _ => None,
+    };
+    if row.generation == 0 {
+        if let Some(current) = held {
+            row.generation = current;
+        }
+    }
+    if operation.body.action != ActionType::Delete {
+        if let Some(source) = row.name.strip_prefix(crate::bus::dlq::DLQ_TOPIC_PREFIX) {
+            if !dead_letter_topic_has_its_source(tx, &row, source)? {
+                return Ok(0);
+            }
+        }
+    }
     match operation.body.action {
         ActionType::Insert | ActionType::Update => tx
             .execute(
@@ -3662,9 +3722,12 @@ fn apply_bus_topic(
                   cleanup_policy, delivery, idempotency_key, dedup_window_ms, \
                   max_delivery_attempts, retry_backoff_ms, schema_id, validation, content_type, \
                   replication_factor, acks, durability, max_inline_bytes, compression, \
-                  environment, created_at_ms, updated_at_ms, durability_class) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24) \
+                  environment, created_at_ms, updated_at_ms, durability_class, generation) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25) \
                  ON CONFLICT(instance_id, org_id, name) DO UPDATE SET \
+                 created_at_ms = CASE WHEN generation = excluded.generation \
+                                 THEN created_at_ms ELSE excluded.created_at_ms END, \
+                 generation = excluded.generation, \
                  partitions = excluded.partitions, retention_ms = excluded.retention_ms, \
                  retention_bytes = excluded.retention_bytes, cleanup_policy = excluded.cleanup_policy, \
                  delivery = excluded.delivery, idempotency_key = excluded.idempotency_key, \
@@ -3701,16 +3764,506 @@ fn apply_bus_topic(
                     row.created_at_ms,
                     row.updated_at_ms,
                     row.durability_class,
+                    row.generation as i64,
                 ],
             )
-            .map_err(sql_error),
-        ActionType::Delete => tx
-            .execute(
-                "DELETE FROM bus_topics WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+            .map_err(sql_error)
+            .and_then(|rows| {
+                // A newer incarnation that replaced the row without this node
+                // having applied the delete in between: the old incarnation's
+                // placements must not outlive it here either.
+                drop_placements_of_other_incarnations(tx, &row)?;
+                // Same for its rules and its dead letters: whatever this node
+                // holds under the name from before this incarnation — the old
+                // incarnation's, whether or not this node ever held that
+                // incarnation's row or applied its delete.
+                if row.generation != 0 && held != Some(row.generation) {
+                    let created = generation_instant(row.generation);
+                    drop_topic_rules_written_before(tx, &row, &created)?;
+                    drop_dead_letter_topic(tx, &row, Some(row.generation))?;
+                }
+                Ok(rows)
+            }),
+        ActionType::Delete => {
+            // The tombstone names the generation actually removed here, or
+            // the op's own if later — the op's may be `0` (a peer from before
+            // incarnations, already read as the held one above) or name an
+            // incarnation this node never held.
+            let removed: Option<i64> = tx
+                .query_row(
+                    "SELECT generation FROM bus_topics \
+                     WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+                    rusqlite::params![row.instance_id, row.org_id, row.name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let deleted = tx
+                .execute(
+                    "DELETE FROM bus_topics WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+                    rusqlite::params![row.instance_id, row.org_id, row.name],
+                )
+                .map_err(sql_error)?;
+            // At least the generation the op concerns: a delete of a newer
+            // incarnation than the one held here also closes the order for
+            // everything up to that incarnation — recorded as the older one
+            // it happened to remove, the newer one's own late insert would
+            // bring it back on this node alone.
+            let removed = removed
+                .map(|g| (g as u64).max(row.generation))
+                .unwrap_or(row.generation);
+            record_bus_topic_tombstone(tx, &row.instance_id, &row.org_id, &row.name, removed)?;
+            // The deleted incarnation's placements go with it. Left behind,
+            // they kept electing leaders for a topic that no longer existed.
+            // The delete itself stays in the LWW order through
+            // `core_resource_versions`, which is what a late placement of the
+            // deleted incarnation is judged against
+            // (`apply_bus_partition_assignment`).
+            tx.execute(
+                "DELETE FROM bus_partition_assignments \
+                 WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3",
                 rusqlite::params![row.instance_id, row.org_id, row.name],
             )
-            .map_err(sql_error),
+            .map_err(sql_error)?;
+            drop_topic_rules_written_before(tx, &row, &operation.body.hlc_timestamp)?;
+            drop_dead_letter_topic(tx, &row, None)?;
+            Ok(deleted)
+        }
     }
+}
+
+/// Drops the access entries and data-hiding rules of `topic` whose last write
+/// is ordered before `boundary` — the instant its incarnation ended (the
+/// topic's Delete) or the instant a newer incarnation began (its creation,
+/// when this node replaces one incarnation's row with the next without ever
+/// applying the delete in between). The deleting node already replicates one
+/// Delete per row it held; this covers rows only THIS node had, which no
+/// peer's Delete names — left behind they would apply to the next topic
+/// created under the name.
+///
+/// Neither table is keyed by incarnation, so HLC is the only order they have
+/// against the topic: a row whose last write is ordered after `boundary` was
+/// written by a node that had already seen it — a rule of a newer incarnation
+/// — and is kept. A row with no recorded version predates versioning and
+/// belongs to the incarnation that ended.
+fn drop_topic_rules_written_before(
+    tx: &rusqlite::Transaction<'_>,
+    topic: &crate::db::repository::DbBusTopic,
+    boundary: &HybridLogicalTimestamp,
+) -> LedgerResult<()> {
+    let policy_type = crate::sync::core_registry::descriptor_for_kind(
+        CoreSyncResourceKind::BusFieldPolicy,
+    )
+    .resource_type;
+    let policies: Vec<(String, String, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT subject_type, subject_id, direction FROM bus_field_policies \
+                 WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3",
+            )
+            .map_err(sql_error)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![topic.instance_id, topic.org_id, topic.name],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        rows
+    };
+    for (subject_type, subject_id, direction) in policies {
+        let id = crate::sync::resource_id::composite_resource_id(&[
+            &topic.instance_id,
+            &topic.org_id,
+            &topic.name,
+            &subject_type,
+            &subject_id,
+            &direction,
+        ]);
+        if !incoming_hlc_wins(tx, policy_type, &id, boundary)? {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM bus_field_policies WHERE instance_id = ?1 AND org_id = ?2 \
+             AND topic = ?3 AND subject_type = ?4 AND subject_id = ?5 AND direction = ?6",
+            rusqlite::params![
+                topic.instance_id,
+                topic.org_id,
+                topic.name,
+                subject_type,
+                subject_id,
+                direction
+            ],
+        )
+        .map_err(sql_error)?;
+    }
+
+    let acl_type = crate::sync::core_registry::descriptor_for_kind(
+        CoreSyncResourceKind::ResourcePermission,
+    )
+    .resource_type;
+    let acl_resource_id = crate::services::bus_authorizer::topic_acl_resource_id(
+        &topic.instance_id,
+        &topic.org_id,
+        &topic.name,
+    );
+    let entries: Vec<(String, String, String)> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT subject_type, subject_id, action FROM resource_permissions \
+                 WHERE resource_type = 'topic' AND resource_id = ?1",
+            )
+            .map_err(sql_error)?;
+        let rows = stmt
+            .query_map(rusqlite::params![acl_resource_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        rows
+    };
+    for (subject_type, subject_id, action) in entries {
+        let id = if action == "*" {
+            crate::sync::resource_id::composite_resource_id(&[
+                "topic",
+                &acl_resource_id,
+                &subject_type,
+                &subject_id,
+            ])
+        } else {
+            crate::sync::resource_id::composite_resource_id(&[
+                "topic",
+                &acl_resource_id,
+                &subject_type,
+                &subject_id,
+                &action,
+            ])
+        };
+        if !incoming_hlc_wins(tx, acl_type, &id, boundary)? {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM resource_permissions WHERE resource_type = 'topic' AND resource_id = ?1 \
+             AND subject_type = ?2 AND subject_id = ?3 AND action = ?4",
+            rusqlite::params![acl_resource_id, subject_type, subject_id, action],
+        )
+        .map_err(sql_error)?;
+    }
+    Ok(())
+}
+
+/// Whether a replicated dead-letter topic `dlq` may be written here: only
+/// beside the source incarnation it was created for. A DLQ is created on a
+/// node that holds its source (`topics::create_internal_topic`), so its
+/// generation is later than that source's creation:
+/// - the source is here and not newer than the DLQ: write it;
+/// - the source here is a newer incarnation: the DLQ is the old one's — drop;
+/// - the source was deleted here: a DLQ created before that delete is the
+///   deleted topic's (drop); a later one belongs to a re-creation whose own
+///   op is still in flight (defer), as is a DLQ whose source has not arrived.
+///   A deferral is retried like any out-of-order op; one whose source never
+///   comes (a DLQ created concurrently with its source's delete, stamped
+///   after it) ends as a terminal conflict after the inbox's retry limit
+///   (`sync::runtime::MAX_INBOX_DEFER_ATTEMPTS`) and is never written.
+///
+/// Without this a node that had not yet applied the source's delete could
+/// create the DLQ of a topic that is gone, and every other node would keep it.
+fn dead_letter_topic_has_its_source(
+    tx: &rusqlite::Transaction<'_>,
+    dlq: &crate::db::repository::DbBusTopic,
+    source: &str,
+) -> LedgerResult<bool> {
+    let defer = || {
+        Err(SyncLedgerError::DeferredOrdering(format!(
+            "bus dead-letter topic before its source: {}/{}/{} (generation {})",
+            dlq.instance_id, dlq.org_id, dlq.name, dlq.generation
+        )))
+    };
+    match topic_incarnation(tx, &dlq.instance_id, &dlq.org_id, source)? {
+        TopicIncarnation::Current(g) => Ok(g == 0 || dlq.generation == 0 || dlq.generation >= g),
+        TopicIncarnation::Deleted(_) => {
+            let ended = topic_ended_at(tx, &dlq.instance_id, &dlq.org_id, source)?;
+            if dlq.generation < ended {
+                Ok(false)
+            } else {
+                defer()
+            }
+        }
+        TopicIncarnation::Unknown => defer(),
+    }
+}
+
+/// Removes `source`'s dead-letter topic from this node when `source` is
+/// deleted (`below = None`) or replaced by the incarnation `below` (only a
+/// DLQ older than it goes), with its tombstone and placements — the same
+/// removal the deleting node replicates, for a DLQ this node may have created
+/// itself before the delete reached it.
+fn drop_dead_letter_topic(
+    tx: &rusqlite::Transaction<'_>,
+    source: &crate::db::repository::DbBusTopic,
+    below: Option<u64>,
+) -> LedgerResult<()> {
+    if source.name.starts_with(crate::bus::dlq::DLQ_TOPIC_PREFIX) {
+        return Ok(());
+    }
+    let name = crate::bus::dlq::dlq_topic_name(&source.name);
+    let generation: Option<i64> = tx
+        .query_row(
+            "SELECT generation FROM bus_topics \
+             WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+            rusqlite::params![source.instance_id, source.org_id, name],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(generation) = generation.map(|g| g as u64) else {
+        return Ok(());
+    };
+    if below.is_some_and(|b| generation >= b) {
+        return Ok(());
+    }
+    tx.execute(
+        "DELETE FROM bus_topics WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+        rusqlite::params![source.instance_id, source.org_id, name],
+    )
+    .map_err(sql_error)?;
+    record_bus_topic_tombstone(tx, &source.instance_id, &source.org_id, &name, generation)?;
+    tx.execute(
+        "DELETE FROM bus_partition_assignments \
+         WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3",
+        rusqlite::params![source.instance_id, source.org_id, name],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+/// The HLC instant a topic generation was packed from
+/// (`repository::bus_topic_generation_at`), with no node: any write stamped
+/// at that very instant counts as not before it.
+fn generation_instant(generation: u64) -> HybridLogicalTimestamp {
+    HybridLogicalTimestamp {
+        wall_time_ms: (generation >> 16) as i64,
+        logical: (generation & 0xFFFF) as u32,
+        node_id: String::new(),
+    }
+}
+
+/// Where a deleted topic's order ends, on the generation scale: the later of
+/// the generation its delete removed and the instant of that delete (the
+/// topic's slot in `core_resource_versions`, `0` when none is recorded).
+fn topic_ended_at(
+    tx: &rusqlite::Transaction<'_>,
+    instance_id: &str,
+    org_id: &str,
+    topic: &str,
+) -> LedgerResult<u64> {
+    let removed: Option<i64> = tx
+        .query_row(
+            "SELECT generation FROM bus_topic_tombstones \
+             WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+            rusqlite::params![instance_id, org_id, topic],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let descriptor =
+        crate::sync::core_registry::descriptor_for_kind(CoreSyncResourceKind::BusTopic);
+    let resource_id =
+        crate::sync::resource_id::composite_resource_id(&[instance_id, org_id, topic]);
+    let deleted_at: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT hlc_wall, hlc_logical FROM core_resource_versions \
+             WHERE resource_type = ?1 AND resource_id = ?2",
+            rusqlite::params![descriptor.resource_type, resource_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let deleted_at = deleted_at.map_or(0, |(wall, logical)| {
+        crate::db::repository::bus_topic_generation_at(&HybridLogicalTimestamp {
+            wall_time_ms: wall,
+            logical: logical as u32,
+            node_id: String::new(),
+        })
+    });
+    Ok((removed.unwrap_or(0).max(0) as u64).max(deleted_at))
+}
+
+/// Whether a write to one of a topic's rules (an access entry or a
+/// data-hiding rule), stamped `hlc`, is older than the incarnation this node
+/// holds for the topic — older than the current incarnation's creation, or
+/// older than the Delete that removed the name. Such a write concerns a topic
+/// that no longer exists, and applying it would hand its rule to whatever
+/// topic holds the name now. `false` when nothing about the topic has reached
+/// this node yet, and for a topic from before incarnations (generation `0`):
+/// neither gives an order to judge by.
+///
+/// Judging against the CURRENT incarnation's creation is sound because a rule
+/// is written only on a node that holds its topic (`acl_set_v1`,
+/// `field_policies::set_policy`), and holding an incarnation means having
+/// folded its creation into the clock — a rule of that incarnation is always
+/// stamped after it. A rule stamped earlier is an older incarnation's, and the
+/// node that creates a topic drops such rules too (`bus_topic_create`), so the
+/// creator and every receiver end with the same rules whatever the order of
+/// delivery (the insert side of the same order: `apply_bus_topic`).
+fn topic_rule_write_is_stale(
+    tx: &rusqlite::Transaction<'_>,
+    instance_id: &str,
+    org_id: &str,
+    topic: &str,
+    hlc: &HybridLogicalTimestamp,
+) -> LedgerResult<bool> {
+    let boundary = match topic_incarnation(tx, instance_id, org_id, topic)? {
+        TopicIncarnation::Current(generation) => generation,
+        TopicIncarnation::Deleted(_) => topic_ended_at(tx, instance_id, org_id, topic)?,
+        TopicIncarnation::Unknown => 0,
+    };
+    Ok(crate::db::repository::bus_topic_generation_at(hlc) < boundary)
+}
+
+/// The order `core.bus_topic` ops are applied in: by topic incarnation
+/// first, and by HLC only within one incarnation. Plain HLC order let a
+/// concurrent edit of a deleted incarnation, stamped after the re-creation,
+/// overwrite the new row's generation on the nodes that had the re-creation —
+/// dropping its placements, after which the new incarnation's placements
+/// were refused there for good — while the node that made the edit kept
+/// serving the deleted one.
+///
+/// One total order for every op, the stored state included: the key is
+/// (generation the op concerns, HLC). An insert or update concerns the
+/// incarnation it writes, a delete the one it removed; what this node holds
+/// is keyed the same way — the row's generation, or the generation its
+/// tombstone removed (`TopicIncarnation`), with the HLC of the op that put
+/// it there. An op wins iff its key is greater, so every delivery order ends
+/// on the op with the greatest key. A row from a build before incarnations
+/// (generation `0`) says nothing about which incarnation it concerns, and is
+/// judged within the held one.
+fn bus_topic_op_wins(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<bool> {
+    let row_json = field_string(operation, "row_json")?;
+    let row: crate::db::repository::DbBusTopic = serde_json::from_str(&row_json)
+        .map_err(|e| SyncLedgerError::Runtime(format!("invalid bus_topic payload: {e}")))?;
+    let held = match topic_incarnation(tx, &row.instance_id, &row.org_id, &row.name)? {
+        TopicIncarnation::Current(generation) | TopicIncarnation::Deleted(generation) => generation,
+        TopicIncarnation::Unknown => return Ok(true),
+    };
+    let incoming = if row.generation == 0 {
+        held
+    } else {
+        row.generation
+    };
+    match incoming.cmp(&held) {
+        std::cmp::Ordering::Greater => Ok(true),
+        std::cmp::Ordering::Less => Ok(false),
+        std::cmp::Ordering::Equal => incoming_hlc_wins(
+            tx,
+            &operation.body.resource_type,
+            &operation.body.resource_id,
+            &operation.body.hlc_timestamp,
+        ),
+    }
+}
+
+/// Which generation a delete removed — the stored half of
+/// `bus_topic_op_wins`'s order key for a deleted name.
+/// Never lowered: once a generation is known removed, an older delete
+/// arriving later does not bring its incarnation back into the order.
+pub(crate) fn record_bus_topic_tombstone(
+    tx: &rusqlite::Connection,
+    instance_id: &str,
+    org_id: &str,
+    name: &str,
+    removed_generation: u64,
+) -> LedgerResult<()> {
+    tx.execute(
+        "INSERT INTO bus_topic_tombstones (instance_id, org_id, name, generation) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(instance_id, org_id, name) \
+         DO UPDATE SET generation = MAX(generation, excluded.generation)",
+        rusqlite::params![instance_id, org_id, name, removed_generation as i64],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+fn drop_placements_of_other_incarnations(
+    tx: &rusqlite::Transaction<'_>,
+    row: &crate::db::repository::DbBusTopic,
+) -> LedgerResult<()> {
+    tx.execute(
+        "DELETE FROM bus_partition_assignments \
+         WHERE instance_id = ?1 AND org_id = ?2 AND topic = ?3 AND topic_generation <> ?4",
+        rusqlite::params![row.instance_id, row.org_id, row.name, row.generation as i64],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+/// Which incarnation of a topic name this node currently holds, as the
+/// ledger has ordered it here.
+enum TopicIncarnation {
+    /// The row exists: its `generation`.
+    Current(u64),
+    /// No row, but the name has a place in the order — the op that put it
+    /// there removed the row: the generation that op removed
+    /// (`bus_topic_tombstones`). A delete recorded before that table existed
+    /// removed a topic from before incarnations: generation `0`.
+    Deleted(u64),
+    /// Neither: nothing about the name has reached this node yet.
+    Unknown,
+}
+
+fn topic_incarnation(
+    tx: &rusqlite::Transaction<'_>,
+    instance_id: &str,
+    org_id: &str,
+    name: &str,
+) -> LedgerResult<TopicIncarnation> {
+    let generation: Option<i64> = tx
+        .query_row(
+            "SELECT generation FROM bus_topics \
+             WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+            rusqlite::params![instance_id, org_id, name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if let Some(generation) = generation {
+        return Ok(TopicIncarnation::Current(generation as u64));
+    }
+    let removed: Option<i64> = tx
+        .query_row(
+            "SELECT generation FROM bus_topic_tombstones \
+             WHERE instance_id = ?1 AND org_id = ?2 AND name = ?3",
+            rusqlite::params![instance_id, org_id, name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if let Some(removed) = removed {
+        return Ok(TopicIncarnation::Deleted(removed as u64));
+    }
+    let descriptor = crate::sync::core_registry::descriptor_for_kind(
+        crate::sync::core_registry::CoreSyncResourceKind::BusTopic,
+    );
+    let resource_id = crate::sync::resource_id::composite_resource_id(&[instance_id, org_id, name]);
+    let version: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT hlc_wall, hlc_logical FROM core_resource_versions \
+             WHERE resource_type = ?1 AND resource_id = ?2",
+            rusqlite::params![descriptor.resource_type, resource_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    Ok(match version {
+        Some(_) => TopicIncarnation::Deleted(0),
+        None => TopicIncarnation::Unknown,
+    })
 }
 
 /// Materializes a replicated `core.bus_field_policy` op into
@@ -3740,6 +4293,17 @@ fn apply_bus_field_policy(
             "bus_field_policy composite id mismatch: body={}, payload={}",
             operation.body.resource_id, expected_id
         )));
+    }
+    if operation.body.action != ActionType::Delete
+        && topic_rule_write_is_stale(
+            tx,
+            &row.instance_id,
+            &row.org_id,
+            &row.topic,
+            &operation.body.hlc_timestamp,
+        )?
+    {
+        return Ok(0);
     }
     match operation.body.action {
         ActionType::Insert | ActionType::Update => tx
@@ -3987,6 +4551,18 @@ fn apply_bus_schema_version(
     }
 }
 
+/// What `apply_bus_partition_assignment` did with one op.
+#[derive(Debug)]
+struct AssignmentApplied {
+    rows: usize,
+    /// `false` for a placement of a deleted topic incarnation: it must not
+    /// take the partition's slot in the HLC-LWW order, or a stale op minted
+    /// by a node that had not seen the delete — with a clock ahead of the
+    /// new incarnation's author — would make every later placement of the
+    /// new incarnation look older than it and be dropped.
+    orders_the_resource: bool,
+}
+
 /// Materializes a replicated `core.bus_partition_assignment` op into
 /// `bus_partition_assignments` (migration v144). Payload shape mirrors
 /// `apply_bus_topic`: the whole `PartitionAssignment` (the ledger's own
@@ -4002,27 +4578,33 @@ fn apply_bus_schema_version(
 /// `incoming.leader_epoch > stored.leader_epoch`, or on a tie,
 /// `incoming.leader_node_id < stored.leader_node_id` (lowest node id wins
 /// the tie — the same rule `election.rs`, wave 1 agent EL, uses to pick a
-/// candidate when `LeoQuery` also ties). No stored row yet: always
-/// admitted.
+/// candidate when `LeoQuery` also ties), and on the same epoch AND leader
+/// — two replica-set changes minted from one row, e.g. two evictions made
+/// on different nodes at once — the later HLC: the outer gate already let
+/// only an op newer than the stored row's through. No stored row yet:
+/// always admitted.
 ///
 /// A rejected (stale-epoch) op returns `Ok(0)` — "applied but no-op", the
 /// same convention the outer HLC gate itself uses for a stale op — NOT an
-/// error. Note this means `apply_core_operation` still advances
-/// `core_resource_versions` for this resource_id afterwards regardless of
-/// this function's return value (that bump is unconditional in the caller,
-/// not gated on `rows > 0`): a stale-epoch op still moves the HLC-LWW
-/// watermark forward. Accepted tradeoff, not a bug: the only way this bites
-/// is a LATER op that legitimately carries a HIGHER epoch but (through
-/// clock skew) an OLDER HLC than the stale one — it would then be rejected
-/// by the OUTER gate first and never reach this function at all. Given
-/// epoch only advances on a real election (K-M2-3's `LeoQuery`/majority
-/// handshake takes far longer than realistic clock skew), this is treated
-/// as acceptable rather than worth complicating the shared HLC-LWW gate
-/// every OTHER resource kind also relies on.
+/// error, and it does not take the resource's slot in the HLC-LWW order
+/// (`AssignmentApplied::orders_the_resource`). So the order's watermark is
+/// always the HLC of the row actually stored, which is what makes "the later
+/// HLC wins" above the same verdict on every node whatever order the two ops
+/// arrive in: a stale op that arrived in between cannot raise the watermark
+/// past the later of the two and have it refused on one node only. What the
+/// outer gate still decides alone: an op of a higher epoch whose HLC is older
+/// than the stored row's (clock skew larger than an election takes) is
+/// refused there — accepted, as elections take far longer than realistic
+/// skew.
+///
+/// An incoming row without epoch slots (written by a node that predates
+/// them) keeps the slots stored for the same topic incarnation: re-deriving
+/// them from its replica set would hand a departed member's reserved slot
+/// to someone else.
 fn apply_bus_partition_assignment(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
-) -> LedgerResult<usize> {
+) -> LedgerResult<AssignmentApplied> {
     let payload = field_string(operation, "assignment_json")?;
     let incoming: crate::bus::replication::assignment::PartitionAssignment =
         serde_json::from_str(&payload).map_err(|e| {
@@ -4034,7 +4616,10 @@ fn apply_bus_partition_assignment(
         // guard in `apply_bus_topic`), so reaching that lookup would read
         // "topic not yet materialized" and retry this op forever instead of
         // recognizing it as permanently not-ours.
-        return Ok(0);
+        return Ok(AssignmentApplied {
+            rows: 0,
+            orders_the_resource: true,
+        });
     }
     let expected_id = crate::sync::resource_id::composite_resource_id(&[
         &incoming.instance_id,
@@ -4049,7 +4634,50 @@ fn apply_bus_partition_assignment(
         )));
     }
 
-    match operation.body.action {
+    // Incarnation first, epochs second: a topic deleted and re-created under
+    // the same name restarts at epoch 1, so its placements cannot be ordered
+    // against the deleted incarnation's by epoch. The reference is the topic
+    // row as the ledger has ordered it here — never a side table of its own,
+    // which could settle differently from the row on different nodes:
+    //   - the row names another incarnation: an older placement is of an
+    //     incarnation already replaced here (dropped for good), a newer one
+    //     belongs to a row that has not arrived yet (deferred);
+    //   - the row was deleted: a placement created before that delete is of
+    //     the deleted incarnation (dropped), a later one is a re-creation
+    //     still in flight (deferred);
+    //   - nothing about the name yet: the topic's own op is in flight.
+    let drop_stale = |reference: u64| {
+        tracing::debug!(
+            org_id = %incoming.org_id, topic = %incoming.topic, partition = incoming.partition,
+            incoming_generation = incoming.topic_generation, reference,
+            "core sync: dropping a placement of a replaced or deleted topic incarnation"
+        );
+        Ok(AssignmentApplied {
+            rows: 0,
+            orders_the_resource: false,
+        })
+    };
+    let defer = |why: &str| {
+        Err(SyncLedgerError::DeferredOrdering(format!(
+            "bus topic {why}: {}/{}/{} (placement generation {})",
+            incoming.instance_id, incoming.org_id, incoming.topic, incoming.topic_generation
+        )))
+    };
+    match topic_incarnation(tx, &incoming.instance_id, &incoming.org_id, &incoming.topic)? {
+        TopicIncarnation::Current(current) if incoming.topic_generation == current => {}
+        TopicIncarnation::Current(current) if incoming.topic_generation < current => {
+            return drop_stale(current);
+        }
+        TopicIncarnation::Current(_) => return defer("incarnation not yet materialized"),
+        TopicIncarnation::Deleted(removed) if incoming.topic_generation <= removed => {
+            return drop_stale(removed);
+        }
+        TopicIncarnation::Deleted(_) | TopicIncarnation::Unknown => {
+            return defer("not yet materialized")
+        }
+    }
+
+    let rows = match operation.body.action {
         ActionType::Insert | ActionType::Update => {
             let stored: Option<(u32, String)> = tx
                 .query_row(
@@ -4070,11 +4698,14 @@ fn apply_bus_partition_assignment(
                 Some((stored_epoch, stored_leader)) => {
                     incoming.leader_epoch > *stored_epoch
                         || (incoming.leader_epoch == *stored_epoch
-                            && incoming.leader_node_id < *stored_leader)
+                            && incoming.leader_node_id <= *stored_leader)
                 }
             };
             if !admit {
-                return Ok(0);
+                return Ok(AssignmentApplied {
+                    rows: 0,
+                    orders_the_resource: false,
+                });
             }
             // The parent topic's row carries `environment`
             // (`PartitionAssignment` itself deliberately does not — see that
@@ -4104,15 +4735,22 @@ fn apply_bus_partition_assignment(
                 .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
             let isr_json = serde_json::to_string(&incoming.isr)
                 .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            let slots_json = serde_json::to_string(&incoming.epoch_slots)
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
             tx.execute(
                 "INSERT INTO bus_partition_assignments \
                  (instance_id, org_id, topic, partition, leader_node_id, replicas, isr, \
-                  leader_epoch, environment, updated_at_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+                  leader_epoch, environment, updated_at_ms, topic_generation, epoch_slots) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
                  ON CONFLICT(instance_id, org_id, topic, partition) DO UPDATE SET \
                  leader_node_id = excluded.leader_node_id, replicas = excluded.replicas, \
                  isr = excluded.isr, leader_epoch = excluded.leader_epoch, \
-                 environment = excluded.environment, updated_at_ms = excluded.updated_at_ms",
+                 environment = excluded.environment, updated_at_ms = excluded.updated_at_ms, \
+                 epoch_slots = CASE \
+                   WHEN excluded.epoch_slots = '{}' \
+                    AND topic_generation = excluded.topic_generation \
+                   THEN epoch_slots ELSE excluded.epoch_slots END, \
+                 topic_generation = excluded.topic_generation",
                 rusqlite::params![
                     incoming.instance_id,
                     incoming.org_id,
@@ -4124,6 +4762,8 @@ fn apply_bus_partition_assignment(
                     incoming.leader_epoch,
                     environment,
                     incoming.updated_at_ms,
+                    incoming.topic_generation as i64,
+                    slots_json,
                 ],
             )
             .map_err(sql_error)
@@ -4140,7 +4780,11 @@ fn apply_bus_partition_assignment(
                 ],
             )
             .map_err(sql_error),
-    }
+    }?;
+    Ok(AssignmentApplied {
+        rows,
+        orders_the_resource: true,
+    })
 }
 
 /// UPDATE matched no row: the INSERT that creates this resource has not been
@@ -6693,6 +7337,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             durability_class: None,
+            generation: 0,
         }
     }
 
@@ -6784,6 +7429,8 @@ mod tests {
             isr: vec![leader_node_id.to_string(), "node-b".to_string()],
             leader_epoch,
             updated_at_ms: 1_000,
+            topic_generation: 0,
+            epoch_slots: Default::default(),
         }
     }
 
@@ -6998,6 +7645,825 @@ mod tests {
         );
     }
 
+    /// A topic setting changed on another node must reach the configs this
+    /// node's bus engines cache, and only an applied row may retire them.
+    #[test]
+    fn applied_bus_topic_retires_cached_topic_configs() {
+        let db = bus_db();
+        let mut row = bus_topic_row("org-1", "orders.retry");
+        let before = crate::bus::topics::config_generation();
+        assert_eq!(
+            apply_core_operation(&db, &bus_topic_op(&row, ActionType::Insert)).unwrap(),
+            1
+        );
+        let after_insert = crate::bus::topics::config_generation();
+        assert!(after_insert > before, "an applied topic insert must move the generation");
+
+        row.max_delivery_attempts = 3;
+        row.updated_at_ms += 1;
+        assert_eq!(
+            apply_core_operation(&db, &at(bus_topic_op(&row, ActionType::Update), 2_000_000_000_000))
+                .unwrap(),
+            1
+        );
+        assert!(
+            crate::bus::topics::config_generation() > after_insert,
+            "an applied topic update must move the generation"
+        );
+    }
+
+    /// Stamps `op` with HLC wall time `wall_ms` — the bus resources are
+    /// HLC-LWW tracked, so a sequence of ops must carry increasing stamps.
+    fn at(mut op: SyncOperation, wall_ms: i64) -> SyncOperation {
+        op.body.hlc_timestamp.wall_time_ms = wall_ms;
+        op
+    }
+
+    fn generation_at(wall_ms: i64) -> u64 {
+        repository::bus_topic_generation_at(&HybridLogicalTimestamp {
+            wall_time_ms: wall_ms,
+            logical: 0,
+            node_id: String::new(),
+        })
+    }
+
+    fn incarnation(wall_ms: i64) -> repository::DbBusTopic {
+        let mut row = bus_topic_row("org-1", "orders");
+        row.generation = generation_at(wall_ms);
+        row.created_at_ms = wall_ms;
+        row
+    }
+
+    fn placement(
+        generation: u64,
+        leader: &str,
+        epoch: u32,
+    ) -> crate::bus::replication::assignment::PartitionAssignment {
+        let mut a = test_assignment("org-1", "orders", 0, leader, epoch);
+        a.topic_generation = generation;
+        a
+    }
+
+    /// A topic deleted and created again under the same name restarts at
+    /// epoch 1. Its placements must not be ordered against the deleted
+    /// incarnation's by epoch: the delete takes the old rows with it, the old
+    /// incarnation's late ops are dropped — before and after the re-creation
+    /// lands — and the new incarnation's epoch-1 placement is admitted, where
+    /// before it was refused as older than the dead epoch-3 row (and the dead
+    /// partition kept electing leaders on every replica).
+    #[test]
+    fn a_recreated_topics_placement_is_not_ordered_against_the_deleted_incarnation() {
+        const INSTANCE: &str = "tentabus-00000001";
+        let db = bus_db();
+        let first = incarnation(1_000);
+        apply_core_operation(&db, &at(bus_topic_op(&first, ActionType::Insert), 1_000)).unwrap();
+        let old = placement(first.generation, "node-a", 3);
+        let old_op = at(bus_assignment_op(&old, ActionType::Insert), 1_100);
+        assert_eq!(apply_core_operation(&db, &old_op).unwrap(), 1);
+
+        apply_core_operation(&db, &at(bus_topic_op(&first, ActionType::Delete), 5_000)).unwrap();
+        assert!(
+            repository::bus_assignment_get(&db, INSTANCE, "org-1", "orders", 0)
+                .unwrap()
+                .is_none(),
+            "the deleted incarnation's placement goes with the topic"
+        );
+
+        // A late op of the deleted incarnation — minted by a node that had
+        // not seen the delete yet, so its stamp may even be later than the
+        // new incarnation's — is dropped, not deferred until a topic of the
+        // same name reappears, and does not take the partition's slot in
+        // the LWW order: the new placement below still lands after it.
+        let late = placement(first.generation, "node-a", 4);
+        let late_op = at(bus_assignment_op(&late, ActionType::Insert), 9_000);
+        assert_eq!(apply_core_operation(&db, &late_op).unwrap(), 0);
+
+        let second = incarnation(5_500);
+        apply_core_operation(&db, &at(bus_topic_op(&second, ActionType::Insert), 5_500)).unwrap();
+        let fresh = placement(second.generation, "node-b", 1);
+        let fresh_op = at(bus_assignment_op(&fresh, ActionType::Insert), 6_000);
+        assert_eq!(apply_core_operation(&db, &fresh_op).unwrap(), 1);
+
+        // Once the new row is here, the old incarnation is judged against it.
+        let later = placement(first.generation, "node-a", 5);
+        let later_op = at(bus_assignment_op(&later, ActionType::Insert), 9_500);
+        assert_eq!(apply_core_operation(&db, &later_op).unwrap(), 0);
+        let stored = repository::bus_assignment_get(&db, INSTANCE, "org-1", "orders", 0)
+            .unwrap()
+            .expect("the new incarnation's placement");
+        assert_eq!(
+            (
+                stored.leader_node_id.as_str(),
+                stored.leader_epoch,
+                stored.topic_generation
+            ),
+            ("node-b", 1, second.generation)
+        );
+
+        // A placement of an incarnation whose row has not reached this node
+        // waits for it.
+        let ahead = placement(generation_at(7_500), "node-c", 1);
+        let ahead_op = at(bus_assignment_op(&ahead, ActionType::Insert), 7_600);
+        assert!(matches!(
+            apply_core_operation(&db, &ahead_op),
+            Err(SyncLedgerError::DeferredOrdering(_))
+        ));
+    }
+
+    /// Applies `ops` in the given order the way the inbox does: an op
+    /// deferred for ordering is retried after the others, until a pass
+    /// moves nothing.
+    fn apply_like_the_inbox(db: &crate::db::DbPool, ops: &[SyncOperation]) {
+        let mut pending: Vec<&SyncOperation> = ops.iter().collect();
+        loop {
+            let before = pending.len();
+            pending.retain(|op| apply_core_operation(db, op).is_err());
+            if pending.is_empty() || pending.len() == before {
+                return;
+            }
+        }
+    }
+
+    fn topic_policy(subject: &str) -> repository::DbBusFieldPolicy {
+        repository::DbBusFieldPolicy {
+            instance_id: "tentabus-00000001".to_string(),
+            org_id: "org-1".to_string(),
+            topic: "orders".to_string(),
+            subject_type: "user".to_string(),
+            subject_id: subject.to_string(),
+            direction: "read".to_string(),
+            fields_json: r#"["pesel"]"#.to_string(),
+            required_fields_json: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn topic_policy_op(row: &repository::DbBusFieldPolicy, action: ActionType) -> SyncOperation {
+        let capture = repository::bus_field_policy_write_capture(
+            row,
+            match action {
+                ActionType::Delete => crate::sync::runtime::SqlWriteAction::Delete,
+                _ => crate::sync::runtime::SqlWriteAction::Update,
+            },
+        )
+        .expect("capture");
+        bus_operation(
+            &capture.org_id,
+            &capture.resource_type.clone(),
+            &capture.resource_id.clone(),
+            &capture.table_name.clone(),
+            &capture.primary_key.clone(),
+            action,
+            capture.changed_fields.clone(),
+        )
+    }
+
+    /// One `resource_permissions` row of the topic "orders"' ACL, as
+    /// `resource_permissions::set_with_action_tx` replicates it.
+    fn topic_acl_op(subject_type: &str, subject_id: &str, action: &str) -> SyncOperation {
+        let acl = crate::services::bus_authorizer::topic_acl_resource_id(
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+        );
+        let descriptor = crate::sync::core_registry::descriptor_for_kind(
+            CoreSyncResourceKind::ResourcePermission,
+        );
+        let mut fields = BTreeMap::new();
+        for (k, v) in [
+            ("resource_type", "topic"),
+            ("resource_id", acl.as_str()),
+            ("subject_type", subject_type),
+            ("subject_id", subject_id),
+            ("action", action),
+            ("access_level", "allow"),
+        ] {
+            fields.insert(k.to_string(), FieldValue::String(v.to_string()));
+        }
+        let id = crate::sync::resource_id::composite_resource_id(&[
+            "topic",
+            &acl,
+            subject_type,
+            subject_id,
+            action,
+        ]);
+        bus_operation(
+            "org-1",
+            descriptor.resource_type,
+            &id,
+            descriptor.table_name,
+            &id,
+            ActionType::Update,
+            fields,
+        )
+    }
+
+    fn topic_rules(db: &crate::db::DbPool) -> (Vec<String>, Vec<String>) {
+        let policies = repository::bus_field_policy_list_for_topic(
+            db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+        )
+        .unwrap()
+        .into_iter()
+        .map(|p| p.subject_id)
+        .collect();
+        let acl = crate::services::bus_authorizer::topic_acl_resource_id(
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+        );
+        let entries = repository::resource_permissions::list_for_resource(db, "topic", &acl)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.subject_id)
+            .collect();
+        (policies, entries)
+    }
+
+    /// A delete that reaches this node from a peer takes the topic's
+    /// data-hiding rules and access entries with it — also those written
+    /// here, which the deleting peer never had and so never names — and no
+    /// rule of the deleted topic reaches the topic re-created under its name,
+    /// in any delivery order. The re-created topic's own rules, written after
+    /// the delete, stay. Neither table is keyed by incarnation, so this holds
+    /// by HLC order: every rule of the old topic is stamped before its delete.
+    #[test]
+    fn a_remote_delete_takes_the_topics_rules_and_a_recreation_inherits_none() {
+        let first = incarnation(1_000);
+        let create = at(bus_topic_op(&first, ActionType::Insert), 1_000);
+        let old_policy = at(topic_policy_op(&topic_policy("anna"), ActionType::Update), 1_500);
+        let old_entry = at(topic_acl_op("group", "ksiegowosc", "read"), 1_600);
+        let mut delete = at(bus_topic_op(&first, ActionType::Delete), 2_000);
+        delete.body.hlc_timestamp.node_id = "node-z".to_string();
+        let second = incarnation(3_000);
+        let recreate = at(bus_topic_op(&second, ActionType::Insert), 3_000);
+        let new_policy = at(topic_policy_op(&topic_policy("bob"), ActionType::Update), 3_500);
+
+        let check = |prefix: &[&SyncOperation],
+                     concurrent: &[SyncOperation],
+                     suffix: &[&SyncOperation]| {
+            for order in permutations(concurrent) {
+                let db = bus_db();
+                let ops: Vec<SyncOperation> = prefix
+                    .iter()
+                    .map(|o| (*o).clone())
+                    .chain(order)
+                    .chain(suffix.iter().map(|o| (*o).clone()))
+                    .collect();
+                apply_like_the_inbox(&db, &ops);
+                let row = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders")
+                    .unwrap()
+                    .map(|r| r.generation);
+                assert_eq!(row, Some(second.generation));
+                assert_eq!(
+                    topic_rules(&db),
+                    (vec!["bob".to_string()], Vec::<String>::new()),
+                    "order: {:?}",
+                    ops.iter()
+                        .map(|o| (o.body.table_name.clone(), o.body.hlc_timestamp.wall_time_ms))
+                        .collect::<Vec<_>>()
+                );
+            }
+        };
+        // The old topic's rules in every position around its delete and the
+        // re-creation; the new topic's rule last.
+        check(
+            &[&create],
+            &[old_policy.clone(), old_entry.clone(), delete.clone(), recreate.clone()],
+            &[&new_policy],
+        );
+        // The new topic's rule reaching a node before the delete it follows.
+        check(
+            &[&create, &old_policy, &old_entry],
+            &[delete, recreate, new_policy],
+            &[],
+        );
+    }
+
+    /// A node that never held the old incarnation (C) still ends without its
+    /// rules. B wrote a rule on g1 that only B had, and dropped it when A's
+    /// delete reached B — no op names that removal. C receives B's rule
+    /// first (nothing about the topic yet: applied), then the re-creation g2,
+    /// then g1's delete, which loses to g2. The rule must not be enforced on
+    /// g2 — nor when it reaches C after the re-creation.
+    #[test]
+    fn a_node_that_never_held_the_old_topic_drops_its_rules_at_the_re_creation() {
+        let first = incarnation(1_000);
+        let b_rule = at(topic_policy_op(&topic_policy("anna"), ActionType::Update), 1_500);
+        let b_entry = at(topic_acl_op("group", "ksiegowosc", "read"), 1_600);
+        let delete = at(bus_topic_op(&first, ActionType::Delete), 2_000);
+        let second = incarnation(3_000);
+        let recreate = at(bus_topic_op(&second, ActionType::Insert), 3_000);
+
+        for ops in [
+            vec![b_rule.clone(), b_entry.clone(), recreate.clone(), delete.clone()],
+            vec![recreate.clone(), b_rule.clone(), b_entry.clone(), delete.clone()],
+        ] {
+            let db = bus_db();
+            apply_like_the_inbox(&db, &ops);
+            let row = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .map(|r| r.generation);
+            assert_eq!(row, Some(second.generation));
+            assert_eq!(topic_rules(&db), (Vec::<String>::new(), Vec::<String>::new()));
+        }
+    }
+
+    fn dlq_row(wall_ms: i64) -> repository::DbBusTopic {
+        let mut row = bus_topic_row("org-1", "__dlq.orders");
+        row.generation = generation_at(wall_ms);
+        row.created_at_ms = wall_ms;
+        row
+    }
+
+    fn dlq_present(db: &crate::db::DbPool) -> bool {
+        repository::bus_topic_get(db, "tentabus-00000001", "org-1", "__dlq.orders")
+            .unwrap()
+            .is_some()
+    }
+
+    /// A dead-letter topic lives only beside its source: the source's delete
+    /// takes a DLQ this node created itself, and a DLQ created elsewhere for
+    /// the deleted source (a node that had not applied the delete yet) is
+    /// not written here. A DLQ of a re-created source waits for it.
+    #[test]
+    fn a_dead_letter_topic_does_not_outlive_its_deleted_source() {
+        let first = incarnation(1_000);
+        let create = at(bus_topic_op(&first, ActionType::Insert), 1_000);
+        let dlq = at(bus_topic_op(&dlq_row(1_500), ActionType::Insert), 1_500);
+        let delete = at(bus_topic_op(&first, ActionType::Delete), 2_000);
+
+        // The DLQ was here before the delete: the delete takes it.
+        let db = bus_db();
+        apply_like_the_inbox(&db, &[create.clone(), dlq.clone()]);
+        assert!(dlq_present(&db));
+        apply_like_the_inbox(&db, &[delete.clone()]);
+        assert!(!dlq_present(&db), "the source's delete takes its DLQ");
+
+        // The DLQ arrives after the delete: it belongs to the deleted source.
+        let db = bus_db();
+        apply_like_the_inbox(&db, &[create.clone(), delete.clone(), dlq.clone()]);
+        assert!(!dlq_present(&db), "a DLQ of a deleted source is not written");
+
+        // A DLQ of the re-created source waits for the source, in any order.
+        let second = incarnation(3_000);
+        let recreate = at(bus_topic_op(&second, ActionType::Insert), 3_000);
+        let new_dlq = at(bus_topic_op(&dlq_row(3_500), ActionType::Insert), 3_500);
+        for ops in [
+            vec![create.clone(), delete.clone(), new_dlq.clone(), recreate.clone()],
+            vec![create.clone(), delete.clone(), recreate.clone(), new_dlq.clone()],
+        ] {
+            let db = bus_db();
+            apply_like_the_inbox(&db, &ops);
+            assert!(dlq_present(&db), "the re-created source's DLQ is written");
+        }
+    }
+
+    /// A deny set on another node reaches a consumer already reading here:
+    /// applying the replicated entry moves the ACL generation, so the open
+    /// consumer re-checks its topic on its next fetch and is refused.
+    #[test]
+    fn a_replicated_deny_stops_a_consumer_already_reading_here() {
+        use crate::bus::{
+            BusCallContext, BusInitConfig, BusService, BusServiceError, ConsumerConfig,
+            PublishBatch, PublishRecord,
+        };
+        let db = bus_db();
+        let instance = crate::bus::instance::BusInstanceId::parse("tentabus-00000001").unwrap();
+        let checker = std::sync::Arc::new(crate::addon::permissions::PermissionChecker::new(
+            db.clone(),
+        ));
+        for perm in ["bus.read", "bus.write", "bus.admin"] {
+            repository::upsert_permission(
+                &db,
+                instance.as_str(),
+                "user",
+                "anna",
+                perm,
+                "allow",
+                None,
+            )
+            .unwrap();
+        }
+        checker.refresh_addon(instance.as_str());
+        let local = rusqlite::Connection::open_in_memory().unwrap();
+        crate::bus::db::migrate(&local).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let svc = BusService::new(BusInitConfig {
+            instance_id: instance.clone(),
+            local_db: std::sync::Arc::new(crate::db::Db::from_connection(local)),
+            bus_dir: dir.path().join("bus"),
+            db: db.clone(),
+            authorizer: std::sync::Arc::new(
+                crate::services::bus_authorizer::InstanceBusAuthorizer::new(
+                    db.clone(),
+                    instance.clone(),
+                    checker,
+                ),
+            ),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: crate::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .unwrap();
+        let ctx = BusCallContext {
+            instance_id: instance,
+            org_id: "org-1".to_string(),
+            actor: Some("anna".to_string()),
+            correlation_id: None,
+            origin: "test".to_string(),
+        };
+        svc.create_topic(&ctx, "orders", crate::bus::topics::TopicOptions::default())
+            .unwrap();
+        svc.publish(
+            &ctx,
+            "orders",
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![PublishRecord {
+                    key: None,
+                    headers: vec![],
+                    payload: bytes::Bytes::from_static(b"{}"),
+                    timestamp_ms: 1,
+                    schema_id: 0,
+                }],
+            },
+        )
+        .unwrap();
+        let consumer = svc
+            .open_consumer(
+                &ctx,
+                "lekarze",
+                &["orders".to_string()],
+                ConsumerConfig {
+                    commit_mode: crate::bus::groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        consumer.fetch(1024, 20).expect("allowed before the deny");
+
+        // Stamped after the topic's creation here: the deny is the current
+        // topic's, as it would be on the node that set it.
+        let mut deny = topic_acl_op("user", "anna", "read");
+        deny.body
+            .changed_fields
+            .insert("access_level".to_string(), FieldValue::String("deny".to_string()));
+        let deny = at(deny, crate::bus::now_ms() + 60_000);
+        assert_eq!(apply_core_operation(&db, &deny).unwrap(), 1);
+        assert!(matches!(
+            consumer.fetch(1024, 20),
+            Err(BusServiceError::PermissionDenied { .. })
+        ));
+    }
+
+    /// Two deletes of one incarnation (one of them concurrent with and later
+    /// delivered than a re-creation elsewhere) and the re-creation itself,
+    /// delivered in different orders on different nodes. The incarnation a
+    /// node settles on must follow the topic row's own LWW order, so every
+    /// node ends up with the same row and the same placement — a marker kept
+    /// outside that order let the nodes disagree for good.
+    #[test]
+    fn nodes_converge_on_one_incarnation_whatever_order_deletes_and_a_recreation_arrive_in() {
+        let first = incarnation(1_000);
+        let create = at(bus_topic_op(&first, ActionType::Insert), 1_000);
+        let old_placement = at(
+            bus_assignment_op(
+                &placement(first.generation, "node-a", 2),
+                ActionType::Insert,
+            ),
+            1_100,
+        );
+        let mut delete_z = at(bus_topic_op(&first, ActionType::Delete), 2_000);
+        delete_z.body.hlc_timestamp.node_id = "node-z".to_string();
+        let mut delete_x = at(bus_topic_op(&first, ActionType::Delete), 3_000);
+        delete_x.body.hlc_timestamp.node_id = "node-x".to_string();
+        let second = incarnation(4_000);
+        let recreate = at(bus_topic_op(&second, ActionType::Insert), 4_000);
+        let new_placement = at(
+            bus_assignment_op(
+                &placement(second.generation, "node-y", 1),
+                ActionType::Insert,
+            ),
+            4_100,
+        );
+
+        let orders: [Vec<&SyncOperation>; 3] = [
+            vec![
+                &create,
+                &old_placement,
+                &delete_z,
+                &delete_x,
+                &recreate,
+                &new_placement,
+            ],
+            vec![
+                &create,
+                &delete_x,
+                &recreate,
+                &new_placement,
+                &old_placement,
+                &delete_z,
+            ],
+            vec![
+                &create,
+                &recreate,
+                &old_placement,
+                &new_placement,
+                &delete_x,
+                &delete_z,
+            ],
+        ];
+        let mut outcomes = Vec::new();
+        for order in orders {
+            let db = bus_db();
+            let ops: Vec<SyncOperation> = order.into_iter().cloned().collect();
+            apply_like_the_inbox(&db, &ops);
+            let row = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .map(|r| r.generation);
+            let placed =
+                repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders", 0)
+                    .unwrap()
+                    .map(|a| (a.leader_node_id, a.leader_epoch, a.topic_generation));
+            outcomes.push((row, placed));
+        }
+        let expected = (
+            Some(second.generation),
+            Some(("node-y".to_string(), 1, second.generation)),
+        );
+        for outcome in &outcomes {
+            assert_eq!(outcome, &expected, "every delivery order: {outcomes:?}");
+        }
+    }
+
+    /// B deletes the topic and re-creates it; A, not having seen either,
+    /// edits the deleted incarnation with a LATER stamp than the
+    /// re-creation. Under plain HLC order A's edit reverted B and C to the
+    /// deleted incarnation and dropped the new placement — refused there for
+    /// good afterwards — while A kept serving the deleted topic. Ordered by
+    /// incarnation first, every delivery order settles on the re-creation.
+    #[test]
+    fn a_late_edit_of_a_deleted_incarnation_never_reverts_its_re_creation() {
+        let first = incarnation(1_000);
+        let create = at(bus_topic_op(&first, ActionType::Insert), 1_000);
+        let delete = at(bus_topic_op(&first, ActionType::Delete), 2_000);
+        let second = incarnation(3_000);
+        let recreate = at(bus_topic_op(&second, ActionType::Insert), 3_000);
+        let new_placement = at(
+            bus_assignment_op(
+                &placement(second.generation, "node-b", 1),
+                ActionType::Insert,
+            ),
+            3_100,
+        );
+        let mut stale = first.clone();
+        stale.retention_ms += 1;
+        let mut stale_edit = at(bus_topic_op(&stale, ActionType::Update), 4_000);
+        stale_edit.body.hlc_timestamp.node_id = "node-a".to_string();
+
+        let orders: [Vec<&SyncOperation>; 3] = [
+            // B and C: the edit arrives last.
+            vec![&create, &delete, &recreate, &new_placement, &stale_edit],
+            // A: its own edit first, B's delete and re-creation after it.
+            vec![&create, &stale_edit, &delete, &recreate, &new_placement],
+            vec![&create, &recreate, &stale_edit, &new_placement, &delete],
+        ];
+        for order in orders {
+            let db = bus_db();
+            let ops: Vec<SyncOperation> = order.into_iter().cloned().collect();
+            apply_like_the_inbox(&db, &ops);
+            let row = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .expect("the re-created topic");
+            assert_eq!(
+                (row.generation, row.retention_ms),
+                (second.generation, second.retention_ms),
+                "the re-creation, not the edit of the deleted incarnation"
+            );
+            let placed =
+                repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders", 0)
+                    .unwrap()
+                    .map(|a| (a.leader_node_id, a.topic_generation));
+            assert_eq!(placed, Some(("node-b".to_string(), second.generation)));
+        }
+    }
+
+    /// Every ordering of `ops`.
+    fn permutations(ops: &[SyncOperation]) -> Vec<Vec<SyncOperation>> {
+        if ops.len() <= 1 {
+            return vec![ops.to_vec()];
+        }
+        let mut all = Vec::new();
+        for i in 0..ops.len() {
+            let mut rest = ops.to_vec();
+            let first = rest.remove(i);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, first.clone());
+                all.push(tail);
+            }
+        }
+        all
+    }
+
+    /// What one node ended with: the topic row's (generation, retention)
+    /// and the partition-0 placement's generation.
+    type NodeOutcome = (Option<(u64, i64)>, Option<u64>);
+
+    /// Applies `prefix`, then `concurrent` in every order, each on a fresh
+    /// node, and returns what each node ended with.
+    fn outcomes_of_every_order(
+        prefix: &[SyncOperation],
+        concurrent: &[SyncOperation],
+    ) -> Vec<NodeOutcome> {
+        permutations(concurrent)
+            .into_iter()
+            .map(|order| {
+                let db = bus_db();
+                let ops: Vec<SyncOperation> = prefix.iter().cloned().chain(order).collect();
+                apply_like_the_inbox(&db, &ops);
+                let row = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders")
+                    .unwrap()
+                    .map(|r| (r.generation, r.retention_ms));
+                let placed =
+                    repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders", 0)
+                        .unwrap()
+                        .map(|a| a.topic_generation);
+                (row, placed)
+            })
+            .collect()
+    }
+
+    /// I2 case 1: a delete of incarnation `g` and a later-stamped edit of the
+    /// same `g`, concurrent. One key orders both — (g, stamp) — so every
+    /// node ends the same, whichever arrives first.
+    #[test]
+    fn a_delete_and_a_later_edit_of_one_incarnation_converge_in_every_order() {
+        let first = incarnation(1_000);
+        let create = at(bus_topic_op(&first, ActionType::Insert), 1_000);
+        let mut delete = at(bus_topic_op(&first, ActionType::Delete), 2_000);
+        delete.body.hlc_timestamp.node_id = "node-z".to_string();
+        let mut edited = first.clone();
+        edited.retention_ms += 1;
+        let mut edit = at(bus_topic_op(&edited, ActionType::Update), 3_000);
+        edit.body.hlc_timestamp.node_id = "node-a".to_string();
+
+        let outcomes = outcomes_of_every_order(&[create], &[delete, edit]);
+        for outcome in &outcomes {
+            assert_eq!(
+                outcome.0,
+                Some((first.generation, edited.retention_ms)),
+                "every delivery order: {outcomes:?}"
+            );
+        }
+    }
+
+    /// I2 case 2: D deletes `g` and re-creates `g'` (stamped 2000); A,
+    /// concurrently, deletes `g` stamped 3000 — after the re-creation. A
+    /// delete keyed by its own stamp outranked the re-creation where it
+    /// arrived first, while D refused it: the nodes split for good. Keyed by
+    /// the generation it removed, A's delete concerns `g` and loses to `g'`
+    /// everywhere, and so does every placement of `g'`.
+    #[test]
+    fn a_concurrent_delete_of_the_old_incarnation_never_removes_its_re_creation() {
+        let first = incarnation(1_000);
+        let create = at(bus_topic_op(&first, ActionType::Insert), 1_000);
+        let mut d_delete = at(bus_topic_op(&first, ActionType::Delete), 1_500);
+        d_delete.body.hlc_timestamp.node_id = "node-d".to_string();
+        let second = incarnation(2_000);
+        let mut d_create = at(bus_topic_op(&second, ActionType::Insert), 2_000);
+        d_create.body.hlc_timestamp.node_id = "node-d".to_string();
+        let placed = at(
+            bus_assignment_op(
+                &placement(second.generation, "node-d", 1),
+                ActionType::Insert,
+            ),
+            2_100,
+        );
+        let mut a_delete = at(bus_topic_op(&first, ActionType::Delete), 3_000);
+        a_delete.body.hlc_timestamp.node_id = "node-a".to_string();
+
+        let outcomes = outcomes_of_every_order(&[create], &[d_delete, d_create, placed, a_delete]);
+        assert_eq!(outcomes.len(), 24);
+        for outcome in &outcomes {
+            assert_eq!(
+                outcome,
+                &(
+                    Some((second.generation, second.retention_ms)),
+                    Some(second.generation)
+                ),
+                "every delivery order: {outcomes:?}"
+            );
+        }
+    }
+
+    /// A holds G1, deletes it, re-creates G2; B deletes G2. A node still on
+    /// G1 that receives B's delete first removes G1 — the tombstone must
+    /// still close the order up to G2, or A's G2 insert arriving later
+    /// resurrects G2 on that node alone. Every delivery order ends with no
+    /// topic.
+    #[test]
+    fn a_delete_of_a_newer_incarnation_than_the_held_one_closes_the_order_up_to_it() {
+        let first = incarnation(1_000);
+        let create = at(bus_topic_op(&first, ActionType::Insert), 1_000);
+        let mut del_first = at(bus_topic_op(&first, ActionType::Delete), 2_000);
+        del_first.body.hlc_timestamp.node_id = "node-a".to_string();
+        let second = incarnation(3_000);
+        let mut create_second = at(bus_topic_op(&second, ActionType::Insert), 3_000);
+        create_second.body.hlc_timestamp.node_id = "node-a".to_string();
+        let mut del_second = at(bus_topic_op(&second, ActionType::Delete), 4_000);
+        del_second.body.hlc_timestamp.node_id = "node-b".to_string();
+
+        let outcomes =
+            outcomes_of_every_order(&[create], &[del_first, create_second, del_second]);
+        assert_eq!(outcomes.len(), 6);
+        for outcome in &outcomes {
+            assert_eq!(outcome.0, None, "every delivery order: {outcomes:?}");
+        }
+    }
+
+    /// X5: a delete from a build before incarnations carries generation 0.
+    /// The tombstone must name the generation actually removed here — named
+    /// 0, a late placement of that removed incarnation looked like a
+    /// re-creation still in flight and waited for good instead of being
+    /// dropped.
+    #[test]
+    fn a_legacy_delete_tombstones_the_generation_it_actually_removed() {
+        let db = bus_db();
+        let row = incarnation(1_000);
+        apply_core_operation(&db, &at(bus_topic_op(&row, ActionType::Insert), 1_000)).unwrap();
+        let mut legacy = row.clone();
+        legacy.generation = 0;
+        apply_core_operation(&db, &at(bus_topic_op(&legacy, ActionType::Delete), 2_000)).unwrap();
+
+        let late = placement(row.generation, "node-a", 1);
+        let late_op = at(bus_assignment_op(&late, ActionType::Insert), 3_000);
+        assert_eq!(
+            apply_core_operation(&db, &late_op).unwrap(),
+            0,
+            "a placement of the removed incarnation is dropped, not deferred"
+        );
+    }
+
+    /// X5: the local delete, its row and its tombstone commit together. A
+    /// tombstone that cannot be written leaves the topic in place and the
+    /// caller told — never a delete nothing orders.
+    #[test]
+    fn a_local_delete_whose_tombstone_fails_deletes_nothing() {
+        let db = bus_db();
+        let row = incarnation(1_000);
+        repository::bus_topic_create(&db, &row).unwrap();
+        db.write()
+            .unwrap()
+            .execute("DROP TABLE bus_topic_tombstones", [])
+            .unwrap();
+        assert!(
+            repository::bus_topic_delete(&db, &row.instance_id, &row.org_id, &row.name).is_err()
+        );
+        assert!(
+            repository::bus_topic_get(&db, &row.instance_id, &row.org_id, &row.name)
+                .unwrap()
+                .is_some(),
+            "the delete must roll back with its tombstone"
+        );
+    }
+
+    /// A topic row from a peer on a build before incarnations carries
+    /// generation 0. It must not reset the incarnation this node holds, or
+    /// every current placement would be dropped as another incarnation's.
+    #[test]
+    fn a_topic_update_without_an_incarnation_keeps_the_one_held() {
+        let db = bus_db();
+        let row = incarnation(1_000);
+        apply_core_operation(&db, &at(bus_topic_op(&row, ActionType::Insert), 1_000)).unwrap();
+        let placed = placement(row.generation, "node-a", 1);
+        apply_core_operation(
+            &db,
+            &at(bus_assignment_op(&placed, ActionType::Insert), 1_100),
+        )
+        .unwrap();
+
+        let mut legacy = row.clone();
+        legacy.generation = 0;
+        legacy.retention_ms += 1;
+        apply_core_operation(&db, &at(bus_topic_op(&legacy, ActionType::Update), 2_000)).unwrap();
+
+        let stored = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders")
+            .unwrap()
+            .expect("row");
+        assert_eq!(stored.generation, row.generation);
+        assert_eq!(stored.retention_ms, legacy.retention_ms);
+        assert!(
+            repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders", 0)
+                .unwrap()
+                .is_some()
+        );
+    }
+
     /// Same isolation, exercised on `apply_bus_partition_assignment` — the
     /// one materializer that ALSO reads `bus_topics` mid-apply (the parent
     /// topic's `environment`). An unhosted instance must be recognized and
@@ -7187,6 +8653,79 @@ mod tests {
                 .leader_node_id,
             "node-a"
         );
+    }
+
+    /// Review round 6, F1: two replica-set changes minted from one row carry
+    /// the same epoch and leader. Every node must keep the same one — the
+    /// later HLC — whatever order they arrive in, even with a stale
+    /// lower-epoch op of a still later HLC arriving in between (which used to
+    /// raise the HLC watermark past the later change on one node only).
+    #[test]
+    fn two_changes_of_one_epoch_and_leader_settle_on_the_later_everywhere() {
+        let mut first = test_assignment("org-1", "orders.created", 0, "node-l", 5);
+        first.replicas = vec!["node-l".to_string(), "node-x".to_string()];
+        let mut second = first.clone();
+        second.replicas = vec!["node-l".to_string(), "node-y".to_string()];
+        let stale = test_assignment("org-1", "orders.created", 0, "node-l", 4);
+        let op = |a: &crate::bus::replication::assignment::PartitionAssignment, wall: i64| {
+            let mut op = bus_assignment_op(a, ActionType::Insert);
+            op.body.hlc_timestamp.wall_time_ms = wall;
+            op
+        };
+        let (first_op, second_op, stale_op) = (op(&first, 10), op(&second, 20), op(&stale, 30));
+        let settle = |order: [&SyncOperation; 3]| {
+            let db = bus_db();
+            let topic_op = bus_topic_op(
+                &bus_topic_row("org-1", "orders.created"),
+                ActionType::Insert,
+            );
+            apply_core_operation(&db, &topic_op).unwrap();
+            for op in order {
+                apply_core_operation(&db, op).unwrap();
+            }
+            repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders.created", 0)
+                .unwrap()
+                .unwrap()
+                .replicas
+        };
+        assert_eq!(settle([&first_op, &stale_op, &second_op]), second.replicas);
+        assert_eq!(settle([&second_op, &stale_op, &first_op]), second.replicas);
+        assert_eq!(settle([&second_op, &first_op, &stale_op]), second.replicas);
+    }
+
+    /// Review round 6, F3: a row an older node writes carries no epoch slots.
+    /// The stored ones stay — re-derived from the new set they would hand a
+    /// departed member's reserved slot to someone else — unless the row is
+    /// of another topic incarnation.
+    #[test]
+    fn a_row_without_epoch_slots_keeps_the_stored_ones() {
+        let db = bus_db();
+        let topic_op = bus_topic_op(
+            &bus_topic_row("org-1", "orders.created"),
+            ActionType::Insert,
+        );
+        apply_core_operation(&db, &topic_op).unwrap();
+        let mut stamped = test_assignment("org-1", "orders.created", 0, "node-l", 5);
+        stamped.epoch_slots = BTreeMap::from([
+            ("node-l".to_string(), 0),
+            ("node-b".to_string(), 1),
+            ("node-gone".to_string(), 2),
+        ]);
+        let mut first = bus_assignment_op(&stamped, ActionType::Insert);
+        first.body.hlc_timestamp.wall_time_ms = 10;
+        apply_core_operation(&db, &first).unwrap();
+
+        let mut older_build = test_assignment("org-1", "orders.created", 0, "node-l", 6);
+        older_build.replicas = vec!["node-l".to_string(), "node-new".to_string()];
+        let mut second = bus_assignment_op(&older_build, ActionType::Insert);
+        second.body.hlc_timestamp.wall_time_ms = 20;
+        assert_eq!(apply_core_operation(&db, &second).unwrap(), 1);
+        let stored =
+            repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders.created", 0)
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored.leader_epoch, 6);
+        assert_eq!(stored.epoch_slots, stamped.epoch_slots);
     }
 
     #[test]

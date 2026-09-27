@@ -12,17 +12,18 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, errMessage, errCode } from '/js/modules/tentanas/format.js';
+import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, fmtAgo, fmtDate, fmtDuration, parseServerTs, errMessage, errCode, wordReasons, nodeTextTitle } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchHtml, patchKeyedList, SLOT, slotEl, setRowsIfChanged } from '/js/lib/dom-patch.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, warningHtml, NAS_DIALOG, nasRetypeLabel } from '/js/modules/tentanas/dialogs.js';
-import { openTargetWizard, sharedHostWarning, parseHostNqns, invalidHostNqns } from '/js/modules/tentanas/target-wizard.js';
+import { openTargetWizard, sharedHostWarning, parseHostNqns, invalidHostNqns, kernelSupportText } from '/js/modules/tentanas/target-wizard.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-input.js';
+import '/js/components/tf-checkbox.js';
 import { portalDrifted, bindableAddresses } from '/js/modules/tentanas/target-wizard.js';
 import { primaryAddress } from '/js/modules/tentanas/target-wizard.js';
 
@@ -79,8 +80,36 @@ export function portalCellHtml(target) {
 export function sourceCellHtml(target) {
   const lun = (target.luns || [])[0];
   if (!lun) return '—';
-  const size = [fmtBytes(lun.sizeBytes), lun.thin ? 'thin' : ''].filter(Boolean).join(' · ');
+  const size = [fmtBytes(lun.sizeBytes), lun.thin ? T('datasets.thin_short') : ''].filter(Boolean).join(' · ');
   return `<span class="tf-table__cell--mono">zvol ${escapeHtml(lun.source)}</span><div class="tf-table__cell-sub">${escapeHtml(size)}</div>`;
+}
+
+/**
+ * The fleet table's "Źródło" of a target (n01): one line, "zvol fast/scratch ·
+ * 500 GB", where the Sharing tab stacks the size under the source.
+ */
+export function fleetSourceHtml(target) {
+  const lun = (target.luns || [])[0];
+  if (!lun) return '—';
+  const line = [`zvol ${lun.source}`, fmtBytes(lun.sizeBytes), lun.thin ? T('datasets.thin_short') : ''].filter(Boolean).join(' · ');
+  return `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(line)}</span></span>`;
+}
+
+/** The transports of a target's portals as n01 writes them: "TCP+RDMA" —
+ *  the bare acronyms, where the detail's `transportLabel` adds "(RoCE)". */
+export const transportsText = (target) => [...new Set((target.portals || []).map((p) => String(p.transport || 'tcp').toUpperCase()))].join('+');
+
+/**
+ * The fleet's "Sesje" cell of a target. The node counts NVMe-oF sessions for
+ * the fleet at most every five minutes (`targets::FLEET_SESSIONS_MAX_AGE`),
+ * while an iSCSI count is read live: the tooltip says how old an NVMe-oF
+ * count may be, so two counts of different freshness do not look alike.
+ */
+export const FLEET_NVMET_SESSIONS_MAX_AGE_MIN = 5;
+export function fleetSessionsHtml(target) {
+  const label = escapeHtml(sessionsCountLabel(target));
+  if (target.protocol !== 'nvmet' || target.sessionsKnown !== true) return label;
+  return `<span title="${escapeAttr(T('fleet.sessions_nvmet_age', { minutes: FLEET_NVMET_SESSIONS_MAX_AGE_MIN }))}">${label}</span>`;
 }
 
 /**
@@ -101,6 +130,56 @@ export function sourceCellHtml(target) {
 export const sessionsCountLabel = (t) => (t.sessionsKnown !== true ? '—' : String((t.sessions ?? 0)));
 export const sessionsEmptyText = (t) => T(t.sessionsKnown !== true ? 'targets.sessions_unknown' : 'targets.sessions_none');
 
+// A target's state detail in the reader's language (wave 6, MAJOR 25): the
+// node sends it as codes (`targets::target_state`, `NasTarget::state_reasons`)
+// beside its own English sentence, which becomes the tooltip. A row stored
+// before the codes — and an older node — has only the sentence, shown as it
+// came until the node judges the row again.
+const TARGET_STATE_WORDS = new Map([
+  ['target_kernel_missing', (p) => (p.protocol ? T('targets.state_reason.kernel_missing', { proto: protocolLabel(p.protocol) }) : null)],
+  ['target_volume_missing', () => T('targets.state_reason.volume_missing')],
+  ['target_portal_moved', (p) => {
+    // N19b: where the address was, what its interface holds now, where it
+    // went, and whether anything listens there.
+    if (!p.address || !p.interface || !['true', 'false'].includes(p.in_kernel)) return null;
+    // Three states of the interface the portal was pinned to (wave-6
+    // critic MAJOR 2): it holds other addresses, it is there with NONE (link
+    // down, lease lost), or it is gone. A node before `interface_state` sent
+    // `current` only when it had addresses to name.
+    const state = p.interface_state || (p.current ? 'addressed' : 'missing');
+    let head;
+    if (state === 'addressed' && p.current) head = T('targets.state_reason.portal_moved_head', { address: p.address, interface: p.interface, current: p.current });
+    else if (state === 'no_address') head = T('targets.state_reason.portal_moved_head_no_address', { address: p.address, interface: p.interface });
+    else if (state === 'missing') head = T('targets.state_reason.portal_moved_head_gone', { address: p.address, interface: p.interface });
+    else return null;
+    // Since WHEN the address is elsewhere (critic wave 6, MINOR 11): the
+    // node's drift alert was raised at the first tick that saw the move.
+    const since = p.since && parseServerTs(p.since) ? fmtDate(p.since) : '';
+    const sinceKey = since ? '_since' : '';
+    if (!p.elsewhere) return `${head} ${T('targets.state_reason.portal_moved_nowhere')} ${T('targets.state_reason.portal_moved_tail')}`;
+    // N19b's case — nothing listens there — ends as the mockup does: the
+    // export "will not be moved there automatically".
+    if (p.in_kernel !== 'true') return `${head} ${T('targets.state_reason.portal_moved_silent' + sinceKey, { elsewhere: p.elsewhere, since })}`;
+    return `${head} ${T('targets.state_reason.portal_moved_reachable' + sinceKey, { elsewhere: p.elsewhere, since })} ${T('targets.state_reason.portal_moved_tail')}`;
+  }],
+  ['target_not_exported', () => T('targets.state_reason.not_exported')],
+  // The node's sharing was stopped with the disable (n18d, wave 10).
+  ['sharing_suspended', () => T('targets.state_reason.sharing_suspended')],
+  ['target_no_auth', () => T('targets.state_reason.no_auth')],
+  ['import_secret_needed', () => T('targets.state_reason.import_secret_needed')],
+  ['import_all_interfaces', () => T('targets.state_reason.import_all_interfaces')],
+]);
+
+export function targetStateText(t) {
+  return wordReasons(t?.stateReasons, TARGET_STATE_WORDS) || String(t?.stateDetail || '');
+}
+
+// The node's own sentence, as the tooltip of the worded one.
+export function targetStateTitle(t) {
+  const own = String(t?.stateDetail || '');
+  return own && targetStateText(t) !== own ? nodeTextTitle(own) : '';
+}
+
 /**
  * The one place a target's state becomes a chip.
  *
@@ -111,11 +190,17 @@ export const sessionsEmptyText = (t) => T(t.sessionsKnown !== true ? 'targets.se
  * detail window, which always wants one, supplies the green one itself.
  */
 function stateChip(t) {
+  const shown = targetStateText(t);
   if (t.state === 'error') {
-    return `<span title="${escapeAttr(t.stateDetail || '')}"><tf-chip size="sm" status="err" dot label="${escapeAttr(T('targets.state_error'))}"></tf-chip></span>`;
+    return `<span title="${escapeAttr(shown)}"><tf-chip size="sm" status="err" dot label="${escapeAttr(T('targets.state_error'))}"></tf-chip></span>`;
   }
   if (!t.enabled || t.state === 'disabled') {
     return `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('targets.state_disabled'))}"></tf-chip>`;
+  }
+  // Stopped with the node's sharing (n18d, wave 10): out of the kernel until
+  // TentaNas is enabled again — not an error, and not active either.
+  if (t.state === 'suspended') {
+    return `<span title="${escapeAttr(shown)}"><tf-chip size="sm" status="warn" label="${escapeAttr(T('targets.state_suspended'))}"></tf-chip></span>`;
   }
   // The node has decided this target should be exported and is not exporting
   // it yet — saved seconds ago, a pool still importing, a reconcile that has
@@ -124,12 +209,12 @@ function stateChip(t) {
   // target lost to a transient used to sit "active" forever with nothing
   // behind it.
   if (t.state === 'pending') {
-    return `<span title="${escapeAttr(t.stateDetail || '')}"><tf-chip size="sm" status="info" dot label="${escapeAttr(T('targets.state_pending'))}"></tf-chip></span>`;
+    return `<span title="${escapeAttr(shown)}"><tf-chip size="sm" status="info" dot label="${escapeAttr(T('targets.state_pending'))}"></tf-chip></span>`;
   }
   // An ACTIVE target with a detail is the node saying the export works and is
   // not authenticated — never silent, never the same chip as a clean one.
-  if (t.stateDetail) {
-    return `<span title="${escapeAttr(t.stateDetail)}"><tf-chip size="sm" status="warn" dot label="${escapeAttr(T('targets.state_warning'))}"></tf-chip></span>`;
+  if (shown) {
+    return `<span title="${escapeAttr(shown)}"><tf-chip size="sm" status="warn" dot label="${escapeAttr(T('targets.state_warning'))}"></tf-chip></span>`;
   }
   return '';
 }
@@ -137,7 +222,7 @@ function stateChip(t) {
 export function targetRow(t) {
   return {
     _target: t,
-    name: `<div class="tf-table__cell-row">${sprite('target')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(t.name)}</span></span>${stateChip(t)}</div>${t.stateDetail ? `<div class="tf-table__cell-sub">${escapeHtml(t.stateDetail)}</div>` : ''}`,
+    name: `<div class="tf-table__cell-row">${sprite('target')}<span class="tf-table__cell--mono"><span class="tf-table__cell-title tf-table__cell-title--strong">${escapeHtml(t.name)}</span></span>${stateChip(t)}</div>${targetStateText(t) ? `<div class="tf-table__cell-sub"${targetStateTitle(t) ? ` title="${escapeAttr(targetStateTitle(t))}"` : ''}>${escapeHtml(targetStateText(t))}</div>` : ''}`,
     protocol: protocolChipHtml(t.protocol),
     source: sourceCellHtml(t),
     auth: authChipHtml(t.auth),
@@ -202,7 +287,11 @@ export function mountTargetsSection(screen, host, { onChange = null } = {}) {
     // cannot serve NVMe-oF says so here instead of only inside the wizard.
     patchHtml(host.querySelector('#nas-tg-services'), state.services
       .filter((s) => !s.installed)
-      .map((s) => `<div class="muted">${escapeHtml(T('targets.service_missing', { proto: protocolLabel(s.protocol), detail: s.detail }))}</div>`)
+      .map((s) => {
+        const detail = kernelSupportText(s.reasons, s.detail);
+        const title = detail !== String(s.detail || '') ? nodeTextTitle(s.detail) : '';
+        return `<div class="muted"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(T('targets.service_missing', { proto: protocolLabel(s.protocol), detail }))}</div>`;
+      })
       .join(''));
     const list = host.querySelector('#nas-tg-list');
     setAttr(host.querySelector('#nas-tg-count'), 'label', String(state.targets.length));
@@ -335,8 +424,119 @@ export const groupStateLabel = (state) => (GROUP_STATE_LABEL[state] ? T(GROUP_ST
  * and only one is printed.
  */
 export const sessionLine = (s) => (s.client && s.user && s.user !== s.client
-  ? `${escapeHtml(s.client)} · ${escapeHtml(s.user)}`
-  : escapeHtml(s.client || s.user || '—'));
+  ? `${escapeHtml(s.client)} · ${hostIdentityHtml(s.user)}`
+  : hostIdentityHtml(s.client || s.user || '—'));
+
+// A host NQN built from a UUID (`nqn.2014-08.org.nvmexpress:uuid:<uuid>`,
+// what `nvme gen-hostnqn` writes) is one opaque string of 36 characters
+// after its prefix. n19 shows it with the UUID cut in the middle
+// ("…:uuid:9f2c…a17b"); the whole identity stays in the tooltip, because the
+// admin compares it with the client's own `/etc/nvme/hostnqn`.
+const UUID_HOST_NQN = /^(.*:uuid:)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+/** An allowlisted or logged-in IQN/NQN as a cell shows it (see above). */
+export function hostIdentityHtml(identity) {
+  const text = String(identity || '');
+  const m = UUID_HOST_NQN.exec(text);
+  if (!m) return escapeHtml(text || '—');
+  return `<span title="${escapeAttr(text)}">${escapeHtml(`${m[1]}${m[2].slice(0, 4)}…${m[2].slice(-4)}`)}</span>`;
+}
+
+/**
+ * The allowlist's "Stan" cell (n19, MAJOR 27 front slice): whether this
+ * IQN/NQN has a session right now, read from the session list the node
+ * already returns — the identity each session logged in with.
+ * Where the node could not measure sessions (`sessionsKnown` is not true:
+ * NVMe-oF without the channel or debugfs) the cell is a dash with the reason
+ * the sessions card gives, never a confident "niepołączony".
+ */
+export function hostConnectionHtml(t, sessions, identity) {
+  if (t?.sessionsKnown !== true) {
+    return `<span class="text-3" title="${escapeAttr(sessionsEmptyText(t))}">—</span>`;
+  }
+  const id = String(identity || '').toLowerCase();
+  // `user` is the identity (NVMe-oF: `client` is the address); an iSCSI
+  // session carries the IQN in both.
+  const on = (sessions || []).some((s) => String(s.user || s.client || '').toLowerCase() === id);
+  return on
+    ? `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('targets.host_connected'))}"></tf-chip>`
+    : `<tf-chip size="sm" status="neutral" label="${escapeAttr(T('targets.host_not_connected'))}"></tf-chip>`;
+}
+
+/**
+ * The allowlist's "Ostatnie połączenie" cell (n19, MAJOR 27): "teraz" while
+ * the initiator has a session, otherwise the last time the node's sampler saw
+ * one (`initiatorsSeen`). The kernel keeps no such date, so a row the sampler
+ * never saw reads "brak zapisu" — never "nigdy" — with the start of the
+ * recording in the tooltip. Where the node cannot measure sessions at all the
+ * cell is a dash with the sessions card's reason.
+ */
+export function lastSeenHtml(t, sessions, seen, seenSince, identity) {
+  if (t?.sessionsKnown !== true) {
+    return `<span class="text-3" title="${escapeAttr(sessionsEmptyText(t))}">—</span>`;
+  }
+  const id = String(identity || '').toLowerCase();
+  if ((sessions || []).some((s) => String(s.user || '').toLowerCase() === id)) return escapeHtml(T('targets.last_now'));
+  const row = (seen || []).find((r) => String(r.initiator || '').toLowerCase() === id);
+  // The node refreshes a live session's `last_seen_at` at most once a minute
+  // (`db::SEEN_REFRESH_SECS`), so the tooltip says the date is to the minute.
+  if (row?.lastSeenAt) return `<span title="${escapeAttr(T('targets.last_seen_hint', { ago: fmtAgo(row.lastSeenAt) }))}">${escapeHtml(fmtDate(row.lastSeenAt))}</span>`;
+  const since = seenSince ? fmtDate(seenSince) : '—';
+  return `<span class="text-3" title="${escapeAttr(T('targets.last_none_hint', { date: since }))}">${escapeHtml(T('targets.last_none'))}</span>`;
+}
+
+const LISTEN_KEYS = {
+  listening: 'targets.listen_listening',
+  target_disabled: 'targets.listen_target_disabled',
+  not_listening: 'targets.listen_not_listening',
+  rdma: 'targets.listen_rdma',
+};
+
+/**
+ * "Nasłuch targetu" (MAJOR 27 §L.7): the node's per-portal reading of
+ * configfs and `/proc/net/tcp`. One portal reads as its state; several name
+ * their portal first. A state this build does not know — or none at all
+ * (an older node) — is "Nie zmierzono", never a guess.
+ */
+export function listenText(listen) {
+  const list = Array.isArray(listen) ? listen : [];
+  const word = (l) => T(LISTEN_KEYS[l?.state] || 'targets.listen_unknown');
+  if (!list.length) return T('targets.listen_unknown');
+  if (list.length === 1) return word(list[0]);
+  return list.map((l) => `${l.address}:${l.port} (${transportLabel(l.transport)}) — ${word(l)}`).join('; ');
+}
+
+/**
+ * A session's "Czas trwania": from the sampler's first sighting of THIS
+ * session (`connectedAt`), so it is an "at least" — the tooltip says so.
+ */
+export function sessionDurationHtml(connectedAt, now = Date.now()) {
+  const since = parseServerTs(connectedAt);
+  if (!since) return '<span class="text-3">—</span>';
+  const text = fmtDuration(Math.max(0, (now - since.getTime()) / 1000));
+  return `<span title="${escapeAttr(T('targets.duration_hint', { since: fmtDate(connectedAt) }))}">${escapeHtml(text)}</span>`;
+}
+
+/** A session's "Stan" as the kernel names it (`LOGGED_IN`, nvmet `ready`). */
+export function sessionStateHtml(state) {
+  const text = String(state || '');
+  if (!text) return '<span class="text-3">—</span>';
+  const ok = text === 'LOGGED_IN' || text === 'ready' || text === 'live';
+  return `<tf-chip size="sm" status="${ok ? 'ok' : 'warn'}" label="${escapeAttr(text)}"></tf-chip>`;
+}
+
+/**
+ * Why "Rozłącz" is not offered on this target, or '' when it is (owner
+ * defaults D2/D4): no per-session reset without an allowlist, and none for
+ * NVMe-oF — where the kernel publishes no controllers, and where it does, the
+ * per-host mechanism is not measured yet.
+ */
+export function resetUnavailableText(t) {
+  if (!t) return '';
+  if (t.protocol === 'nvmet') return T(t.sessionsKnown === true ? 'targets.reset_nvmet_unmeasured' : 'targets.reset_nvmet_no_debugfs');
+  if (!(t.initiators || []).length) return T('targets.reset_no_allowlist');
+  return '';
+}
 
 /**
  * One IQN/NQN per line; blanks and duplicates fall away.
@@ -382,7 +582,14 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
   body.replaceChildren(win);
   const content = win.querySelector('[data-part="content"]');
   slotEl(content, true, 'loading', `<div class="muted">${escapeHtml(I18n.t('common.loading'))}</div>`);
-  const state = { target: null, sessions: [], preview: '', initiatorsText: '', capabilities, siblings, error: '', gone: false };
+  const state = {
+    target: null, sessions: [], preview: '', initiatorsText: '', capabilities, siblings, error: '', gone: false,
+    // "Opis" per initiator: the node's until the admin edits one, then a
+    // draft that the "Zapisz" button sends with the list (`descriptionsDirty`).
+    descriptions: {}, descriptionsDirty: false,
+    // The sampler's "Ostatnie połączenie" and the per-portal "Nasłuch".
+    seen: [], seenSince: '', listen: [],
+  };
   let loadSeq = 0;
   // TargetGet-only reads since the list was last read (see LIST_EVERY_POLLS).
   let listAge = Infinity;
@@ -397,7 +604,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     if (!isCurrent() || state.gone) return false;
     const seq = ++loadSeq;
     const requestDraft = state.initiatorsText;
-    const hasDraft = state.target && state.initiatorsText !== (state.target.initiators || []).join('\n');
+    const hasDraft = state.target && (state.initiatorsText !== (state.target.initiators || []).join('\n') || state.descriptionsDirty);
     // One read in every LIST_EVERY_POLLS carries the list.
     const readList = withList || listAge + 1 >= LIST_EVERY_POLLS;
     try {
@@ -419,8 +626,14 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       state.target = r.target;
       state.sessions = r.sessions || [];
       state.preview = r.configPreview || '';
+      state.seen = r.initiatorsSeen || [];
+      state.seenSince = r.seenSince || '';
+      state.listen = r.listen || [];
       state.error = '';
-      if (!hasDraft && state.initiatorsText === requestDraft) state.initiatorsText = (r.target.initiators || []).join('\n');
+      if (!hasDraft && state.initiatorsText === requestDraft) {
+        state.initiatorsText = (r.target.initiators || []).join('\n');
+        state.descriptions = { ...(r.target.initiatorDescriptions || {}) };
+      }
     } catch (e) {
       if (!isCurrent() || seq !== loadSeq) return false;
       // Another admin deleted it (or it left this organisation): that is not
@@ -470,7 +683,14 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     const invalidHtml = invalid.length
       ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_target.host_nqn_invalid', { nqns: invalid.join(', ') }))}</div></div>`
       : '';
-    return sharedHtml + invalidHtml;
+    // F2 (MAJOR 27): an emptied list is an OPEN target, so the node refuses
+    // to store one over an allowlist. Said here, while the admin is editing,
+    // not only after the sudo prompt.
+    const emptied = (t.initiators || []).length > 0 && parseInitiators(state.initiatorsText).length === 0;
+    const emptiedHtml = emptied
+      ? `<div class="wizard-warning danger" data-testid="allowlist-last-warning">${sprite('alert')}<div>${escapeHtml(T('targets.allowlist_last_warning'))}</div></div>`
+      : '';
+    return sharedHtml + invalidHtml + emptiedHtml;
   };
 
   const updateHosts = () => {
@@ -479,6 +699,10 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     if (!t || !hostsTable) return;
     setRowsIfChanged(hostsTable, parseInitiators(state.initiatorsText).map((identity) => ({
       identity,
+      shown: hostIdentityHtml(identity),
+      description: state.descriptions[identity] ? escapeHtml(state.descriptions[identity]) : '<span class="text-3">—</span>',
+      connected: hostConnectionHtml(t, state.sessions, identity),
+      last: lastSeenHtml(t, state.sessions, state.seen, state.seenSince, identity),
       auth: authChipHtml(t.auth),
       shared: state.capabilities ? state.siblings.filter((other) => other.targetId !== t.targetId && other.protocol === t.protocol && (other.initiators || []).includes(identity)).map((other) => other.name).join(', ') || '—' : T('targets.portal_unknown'),
     })));
@@ -495,19 +719,29 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     const hostsTable = win.querySelector('#nas-td-hosts');
     if (admin) hostsTable.rowActions = (row, idx, currentRow) => {
       const live = () => currentRow?.() ?? row;
-      const button = document.createElement('tf-button');
-      button.setAttribute('variant', 'ghost');
-      button.setAttribute('tone', 'critical');
-      button.setAttribute('size', 'sm');
-      button.setAttribute('icon', 'trash');
-      button.textContent = T('targets.remove_initiator');
-      button.addEventListener('click', () => {
+      const wrap = document.createElement('div');
+      wrap.className = 'tf-table__cell-row';
+      wrap.innerHTML = `<tf-button variant="ghost" size="sm" icon="edit" data-act="edit-description" title="${escapeAttr(T('targets.edit_description'))}"></tf-button>`
+        + `<tf-button variant="ghost" tone="critical" size="sm" icon="trash" data-act="remove-initiator">${escapeHtml(T('targets.remove_initiator'))}</tf-button>`;
+      wrap.querySelector('[data-act="edit-description"]').addEventListener('click', (e) => {
+        e.stopPropagation();
+        const identity = live().identity;
+        openDescriptionDialog(identity, state.descriptions[identity] || '', (text) => {
+          const next = { ...state.descriptions };
+          if (text) next[identity] = text; else delete next[identity];
+          state.descriptions = next;
+          state.descriptionsDirty = true;
+          updateHosts();
+        });
+      });
+      wrap.querySelector('[data-act="remove-initiator"]').addEventListener('click', (e) => {
+        e.stopPropagation();
         const identity = live().identity;
         state.initiatorsText = parseInitiators(state.initiatorsText).filter((host) => host !== identity).join('\n');
         win.querySelector('#nas-td-initiators').value = state.initiatorsText;
         updateHosts();
       });
-      return button;
+      return wrap;
     };
     win.querySelector('#nas-td-initiators')?.addEventListener('input', (e) => { state.initiatorsText = e.target.value; updateHosts(); });
   };
@@ -528,7 +762,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       return;
     }
     const built = content.firstElementChild?.dataset.part !== 'detail';
-    slotEl(content, true, 'detail', targetDetailHtml(admin));
+    slotEl(content, true, 'detail', targetDetailHtml(admin, t.protocol));
     slotEl(win.querySelector('[data-part="footer"]'), true, 'footer', targetFooterHtml(admin));
     if (built) wireDetail();
 
@@ -544,13 +778,21 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     // (`setCrumbTail` compares its markup): once, in practice.
     setCrumbs(t.name);
     const drift = slotEl(win.querySelector('[data-part="drift"]'), drifted, 'drift', driftBannerHtml(admin));
-    if (drift) setText(slotEl(drift.querySelector('[data-part="drift-detail"]'), Boolean(t.stateDetail), 'detail', '<p></p>'), t.stateDetail);
+    const stateText = targetStateText(t);
+    const stateTitle = targetStateTitle(t);
+    if (drift) {
+      const detail = slotEl(drift.querySelector('[data-part="drift-detail"]'), Boolean(stateText), 'detail', '<p></p>');
+      setText(detail, stateText);
+      setAttr(detail, 'title', stateTitle);
+    }
     setText(field('name'), t.name);
     const protocolChip = protocolChipHtml(t.protocol);
     slotEl(win.querySelector('[data-part="protocol"]'), true, protocolChip, protocolChip);
     const stateHtml = stateChip(t) || `<tf-chip size="sm" status="ok" dot label="${escapeAttr(T('targets.state_active'))}"></tf-chip>`;
     slotEl(win.querySelector('[data-part="state"]'), true, stateHtml, stateHtml);
-    setText(slotEl(win.querySelector('[data-part="state-detail"]'), Boolean(t.stateDetail) && !drifted, 'detail', '<p class="text-3"></p>'), t.stateDetail);
+    const stateDetail = slotEl(win.querySelector('[data-part="state-detail"]'), Boolean(stateText) && !drifted, 'detail', '<p class="text-3"></p>');
+    setText(stateDetail, stateText);
+    setAttr(stateDetail, 'title', stateTitle);
     const lun = (t.luns || [])[0];
     setText(field('wwn'), t.wwn);
     setText(field('lun'), lun ? `${lun.source} · ${fmtBytes(lun.sizeBytes)}${lun.thin ? ' · thin' : ''}` : '—');
@@ -564,7 +806,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       ['targets.portal_current_addresses', Array.isArray(interfaces) ? bindableAddresses(state.capabilities, portal.interface).join(', ') || '—' : T('targets.portal_unknown')],
       ['targets.portal_actual', !portal.interface ? T('targets.all_interfaces') : owners ? owners.join(', ') || T('targets.portal_no_owner') : T('targets.portal_unknown')],
       ['targets.portal_transport', [...new Set(t.portals.map((p) => transportLabel(p.transport)))].join(' + ')],
-      ['targets.portal_exposure', T('targets.portal_unknown')],
+      ['targets.portal_exposure', listenText(state.listen)],
     ] : [];
     const rowSpec = ([key, value]) => ({ key, label: T(key), value, testid: key.slice('targets.'.length), mono: true });
     paintValueRows(win.querySelector('[data-part="portal-a"]'), portalRows.slice(0, 3).map(rowSpec));
@@ -599,14 +841,56 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     setAttr(field('sessions-chip'), 'label', sessionsCountLabel(t));
     const sessionsHost = win.querySelector('[data-part="sessions"]');
     if (state.sessions.length) {
-      const table = slotEl(sessionsHost, true, 'table', `<tf-table id="nas-td-sessions"><tf-column key="client" label="${escapeAttr(T('targets.session_identity'))}" fill></tf-column><tf-column key="identity" label="IQN / NQN" renderer="html" fill></tf-column></tf-table>`);
-      setRowsIfChanged(table, state.sessions.map((s) => ({ client: s.client || '—', identity: sessionLine({ user: s.user }) })));
+      // n19: Initiator | Adres | Czas trwania | Stan | Akcje. The identity is
+      // the client's own IQN/NQN (truncated as n19 shows it); no session id,
+      // ISID, TSIH or controller id exists on the wire to be shown.
+      const table = slotEl(sessionsHost, true, 'table', `<tf-table id="nas-td-sessions">
+        <tf-column key="identity" label="${escapeAttr(T('targets.col_session_initiator'))}" renderer="html" fill></tf-column>
+        <tf-column key="address" label="${escapeAttr(T('targets.col_session_address'))}" renderer="html"></tf-column>
+        <tf-column key="duration" label="${escapeAttr(T('targets.col_session_duration'))}" renderer="html"></tf-column>
+        <tf-column key="state" label="${escapeAttr(T('targets.col_session_state'))}" renderer="html"></tf-column>
+      </tf-table>`);
+      if (admin && !table.rowActions) {
+        table.rowActions = (row, idx, currentRow) => {
+          const live = () => currentRow?.() ?? row;
+          if (!row._resettable) return null;
+          const button = document.createElement('tf-button');
+          button.setAttribute('variant', 'ghost');
+          button.setAttribute('tone', 'critical');
+          button.setAttribute('size', 'sm');
+          button.setAttribute('icon', 'power');
+          button.setAttribute('data-act', 'disconnect');
+          button.setAttribute('title', T('targets.disconnect'));
+          button.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const cur = state.target;
+            if (cur) openDisconnectDialog(screen, cur, live()._identity, () => { onChange?.(); load(); }, isCurrent);
+          });
+          return button;
+        };
+      }
+      const now = Date.now();
+      // Owner default D2/D4: "Rozłącz" only for an allowlisted iSCSI initiator.
+      const resettable = !resetUnavailableText(t);
+      setRowsIfChanged(table, state.sessions.map((s) => ({
+        _identity: s.user || '',
+        _resettable: resettable && (t.initiators || []).includes(s.user),
+        identity: s.user ? hostIdentityHtml(s.user) : `<span class="text-3">${escapeHtml(T('targets.session_unnamed'))}</span>`,
+        address: s.address ? `<span class="mono">${escapeHtml(s.address)}</span>` : '<span class="text-3">—</span>',
+        duration: sessionDurationHtml(s.connectedAt, now),
+        state: sessionStateHtml(s.state),
+      })));
     } else if (t.sessionsKnown !== true) {
       const empty = slotEl(sessionsHost, true, 'unmeasured', `<tf-empty-state icon="users" title="${escapeAttr(T('targets.sessions_unmeasured'))}"></tf-empty-state>`);
       setAttr(empty, 'message', sessionsEmptyText(t));
     } else {
       setText(slotEl(sessionsHost, true, 'none', '<div class="muted"></div>'), sessionsEmptyText(t));
     }
+
+    // Where "Rozłącz" is not offered, the sessions card says why (D2/D4).
+    const resetNote = resetUnavailableText(t);
+    const resetHost = slotEl(win.querySelector('[data-part="reset-note"]'), Boolean(resetNote) && (state.sessions.length > 0 || t.protocol === 'nvmet'), 'note', '<p class="muted" data-testid="reset-note"></p>');
+    setText(resetHost, resetNote);
 
     // The allowlist field follows the node only while the admin has no draft
     // of their own in it (`load` keeps `initiatorsText` in that case).
@@ -691,13 +975,26 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       toast(T('wizard_target.host_nqn_invalid', { nqns: badNqns.join(', ') }), 'error');
       return;
     }
+    const initiators = parseInitiators(state.initiatorsText);
+    // F2: the node refuses this too (coded); refusing it here spares the admin
+    // a sudo prompt for a save that cannot happen.
+    if ((t.initiators || []).length && !initiators.length) {
+      toast(errMessage(new Error('refusal:target_last_initiator')), 'error');
+      return;
+    }
+    // Only the listed initiators' descriptions travel: the node refuses a
+    // description for an initiator that is not on the list.
+    const initiatorDescriptions = Object.fromEntries(initiators
+      .filter((i) => String(state.descriptions[i] || '').trim())
+      .map((i) => [i, String(state.descriptions[i]).trim()]));
     const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasTargetUpdateRequest', {
       targetId,
       // Saving the allowlist changes the allowlist. The portal stays where the
       // admin put it — see `setTargetEnabled` for what sending it used to do.
       portals: [],
       auth: t.auth,
-      initiators: parseInitiators(state.initiatorsText),
+      initiators,
+      initiatorDescriptions,
       portGroups: t.portGroups || [],
       confirmAllInterfaces: (t.portals || []).some((p) => !p.interface),
       enabled: t.enabled,
@@ -705,7 +1002,9 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('targets.save'), isCurrent);
     if (!res) return;
     followResponse(screen, res, onChange, T('targets.saved_done', { name: t.name }));
-    state.target.initiators = parseInitiators(state.initiatorsText);
+    state.target.initiators = initiators;
+    state.target.initiatorDescriptions = initiatorDescriptions;
+    state.descriptionsDirty = false;
     if (win.isConnected) load();
   };
 
@@ -735,7 +1034,13 @@ const POLL_TARGET_DETAIL_MS = 10_000;
 // The detail's skeleton: labels, section heads and addressed empty places.
 // Nothing in it comes from the target, so it is built once per visit; `paint`
 // fills it.
-function targetDetailHtml(admin) {
+function targetDetailHtml(admin, protocol) {
+  const nvmet = protocol === 'nvmet';
+  // n19a (iSCSI): IQN | Opis | Stan | Ostatnie połączenie. n19b (NVMe-oF):
+  // NQN | Opis | Uwierzytelnienie | Używany też przez.
+  const hostColumns = nvmet
+    ? `<tf-column key="shown" label="${escapeAttr(T('targets.col_host_nqn'))}" renderer="html" fill></tf-column><tf-column key="description" label="${escapeAttr(T('targets.col_description'))}" renderer="html"></tf-column><tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html"></tf-column><tf-column key="shared" label="${escapeAttr(T('targets.host_shared'))}"></tf-column>`
+    : `<tf-column key="shown" label="${escapeAttr(T('targets.col_initiator_iqn'))}" renderer="html" fill></tf-column><tf-column key="description" label="${escapeAttr(T('targets.col_description'))}" renderer="html"></tf-column><tf-column key="connected" label="${escapeAttr(T('targets.host_state'))}" renderer="html"></tf-column><tf-column key="last" label="${escapeAttr(T('targets.col_last_seen'))}" renderer="html"></tf-column>`;
   return `<div class="stack" data-part="detail">
     <div data-part="drift" ${SLOT}></div>
     <section class="nas-target-card">
@@ -758,15 +1063,17 @@ function targetDetailHtml(admin) {
     <section class="nas-target-card">
     <div class="section-card-head"><h3 class="title">${sprite('users')} ${escapeHtml(T('targets.sessions_title'))}</h3> <tf-chip size="sm" status="neutral" data-f="sessions-chip"></tf-chip></div>
     <div data-part="sessions" ${SLOT}></div>
+    <div data-part="reset-note" ${SLOT}></div>
     </section>
     <section class="nas-target-card">
     <div class="section-card-head"><h3 class="title">${sprite('shield')} ${escapeHtml(T('targets.initiators'))}</h3></div>
-    <tf-table id="nas-td-hosts" empty-message="${escapeAttr(T('targets.no_initiators'))}"><tf-column key="identity" label="IQN / NQN" fill></tf-column><tf-column key="auth" label="${escapeAttr(T('targets.col_auth'))}" renderer="html"></tf-column><tf-column key="shared" label="${escapeAttr(T('targets.host_shared'))}"></tf-column></tf-table>
+    <tf-table id="nas-td-hosts" empty-message="${escapeAttr(T('targets.no_initiators'))}">${hostColumns}</tf-table>
     ${admin ? `<details><summary>${escapeHtml(T('targets.edit_initiators'))}</summary>
       <tf-input id="nas-td-initiators" multiline rows="3" spellcheck="false" hint="${escapeAttr(T('targets.initiators_hint'))}"></tf-input>
       </details><p class="muted" data-testid="initiators-draft-hint">${escapeHtml(T('targets.initiators_draft'))}</p>` : ''}
     <div id="nas-td-shared"></div>
     ${warningHtml('info', T('targets.allowlist_note'))}
+    ${nvmet ? `<div class="wizard-warning" data-testid="nvmet-remove-note">${sprite('alert')}<div>${escapeHtml(T('targets.nvmet_remove_keeps_connection'))}</div></div>` : ''}
     </section>
     <section class="nas-target-card">
     <div class="section-card-head"><h3 class="title">${sprite('lock')} ${escapeHtml(T('targets.col_auth'))}</h3><span data-part="auth-chip" ${SLOT}></span></div>
@@ -830,6 +1137,130 @@ function paintValueRows(host, specs) {
     html: `<div class="sr"><span class="k">${escapeHtml(s.label)}</span><span class="v${s.mono ? ' mono' : ''}"${s.testid ? ` data-testid="${escapeAttr(s.testid)}"` : ''}></span></div>`,
   })));
   specs.forEach((s, i) => setText(host.children[i]?.querySelector('.v'), s.value));
+}
+
+// ---------------------------------------------------------------------------
+// "Opis" and "Rozłącz" (n19, MAJOR 27)
+// ---------------------------------------------------------------------------
+
+/** The node's limit for one "Opis" (`targets::DESCRIPTION_MAX_CHARS`). */
+export const DESCRIPTION_MAX = 80;
+
+/**
+ * A small window with a body, Cancel and one confirm button. `onConfirm`
+ * may throw (the window stays with the error worded) or answer `false`
+ * (nothing ran, the window stays as it was).
+ */
+function openSmallDialog({ title, icon, bodyHtml, confirmLabel, confirmIcon, danger = false, wire = null, onConfirm }) {
+  const win = document.createElement('tf-window');
+  win.className = NAS_DIALOG.className;
+  win.setAttribute('title', title);
+  win.setAttribute('icon', icon);
+  win.setAttribute('buttons', 'close');
+  win.setAttribute('draggable', '');
+  win.setAttribute('width', '520');
+  win.setAttribute('min-width', '420');
+  win.setAttribute('initial-x', 'center');
+  win.setAttribute('initial-y', 'center');
+  win.innerHTML = `<div slot="body" class="stack">${bodyHtml}<div class="num-err" data-part="dialog-error" hidden></div></div>
+    <div slot="footer">
+      <tf-button variant="ghost" data-action="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
+      <span class="spacer" style="flex:1"></span>
+      <tf-button variant="${danger ? 'danger' : 'primary'}" icon="${escapeAttr(confirmIcon)}" data-action="confirm">${escapeHtml(confirmLabel)}</tf-button>
+    </div>`;
+  document.body.appendChild(win);
+  let busy = false;
+  win.addEventListener('close-request', (e) => { if (busy) e.preventDefault(); });
+  const confirm = async () => {
+    if (busy) return;
+    busy = true;
+    win.querySelector('[data-action="confirm"]').setAttribute('disabled', '');
+    try {
+      const outcome = await onConfirm(win);
+      busy = false;
+      win.querySelector('[data-action="confirm"]').removeAttribute('disabled');
+      if (outcome !== false) win.close(true);
+    } catch (err) {
+      busy = false;
+      win.querySelector('[data-action="confirm"]').removeAttribute('disabled');
+      const el = win.querySelector('[data-part="dialog-error"]');
+      el.textContent = errMessage(err);
+      el.hidden = false;
+    }
+  };
+  win.querySelector('[data-action="cancel"]').addEventListener('click', () => { if (!busy) win.close(true); });
+  win.querySelector('[data-action="confirm"]').addEventListener('click', confirm);
+  if (wire) wire(win);
+  return win;
+}
+
+/**
+ * "Edytuj opis": the admin's own words for one initiator (§4.1: trimmed, at
+ * most 80 characters, no control characters). A draft until "Zapisz", like
+ * every other change of the list.
+ */
+export function openDescriptionDialog(identity, current, onSave) {
+  return openSmallDialog({
+    title: T('targets.description_title'),
+    icon: 'edit',
+    bodyHtml: `<p class="mono">${hostIdentityHtml(identity)}</p>
+      <tf-input id="nas-td-description" maxlength="${DESCRIPTION_MAX}" label="${escapeAttr(T('targets.col_description'))}" value="${escapeAttr(current)}" hint="${escapeAttr(T('targets.description_hint', { n: DESCRIPTION_MAX }))}"></tf-input>`,
+    confirmLabel: T('targets.description_apply'),
+    confirmIcon: 'check',
+    onConfirm: (win) => {
+      // Control characters (a pasted newline, a tab) are what the node
+      // refuses; they are folded to spaces here instead of failing the save.
+      const text = String(win.querySelector('#nas-td-description').value || '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim();
+      if ([...text].length > DESCRIPTION_MAX) throw new Error('refusal:target_description_too_long');
+      onSave(text);
+      return true;
+    },
+  });
+}
+
+/**
+ * n19 "Rozłącz" for one allowlisted iSCSI initiator (MAJOR 27 §L.7): a
+ * session RESET — the client logs back in within about 2 s and keeps its
+ * access — or, with "i usuń z listy dozwolonych", a revoke that keeps it out.
+ * The texts are the measured behaviour. The checkbox is refused for the only
+ * entry: an empty list would OPEN the target (F2). The window names the
+ * initiator as the screen shows it; no session id exists to be shown.
+ */
+export function openDisconnectDialog(screen, target, identity, onDone, isCurrent) {
+  const only = (target.initiators || []).length <= 1;
+  const bodyHtml = `
+    <p>${escapeHtml(T('targets.disconnect_lead'))} <span class="mono">${hostIdentityHtml(identity)}</span></p>
+    <div data-part="disconnect-text">${warningHtml('info', T('targets.disconnect_reset_text'))}</div>
+    <tf-checkbox id="nas-td-revoke" ${only ? 'disabled' : ''} label="${escapeAttr(T('targets.disconnect_revoke_label'))}"></tf-checkbox>
+    ${only ? `<p class="muted" data-testid="revoke-only-entry">${escapeHtml(T('refusal.target_last_initiator'))}</p>` : ''}`;
+  let revoke = false;
+  return openSmallDialog({
+    title: T('targets.disconnect_title'),
+    icon: 'power',
+    bodyHtml,
+    confirmLabel: T('targets.disconnect_confirm'),
+    confirmIcon: 'power',
+    danger: true,
+    wire: (win) => {
+      win.querySelector('#nas-td-revoke')?.addEventListener('change', (e) => {
+        revoke = !only && Boolean(e.detail?.checked ?? e.target.checked);
+        patchHtml(win.querySelector('[data-part="disconnect-text"]'), revoke
+          ? warningHtml('danger', T('targets.disconnect_revoke_text'))
+          : warningHtml('info', T('targets.disconnect_reset_text')));
+      });
+    },
+    onConfirm: async () => {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasTargetSessionResetRequest', {
+        targetId: target.targetId,
+        initiator: identity,
+        revoke: revoke && !only,
+        sudoPassword,
+      }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('targets.disconnect_title'), isCurrent);
+      if (res === null) return false;
+      followResponse(screen, res, onDone, T('targets.disconnect_done'));
+      return true;
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------

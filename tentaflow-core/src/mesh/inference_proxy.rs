@@ -300,6 +300,10 @@ pub async fn dispatch_reverse_request(
                         .choices
                         .first()
                         .and_then(|c| c.message.reasoning_content.clone());
+                    let metrics = crate::routing::chat::completion_metrics(
+                        &chat_response.model,
+                        chat_response.usage.as_ref(),
+                    );
 
                     ModelResponse {
                         request_id,
@@ -318,7 +322,7 @@ pub async fn dispatch_reverse_request(
                             speaker_id: None,
                             speaker_name: None,
                         }),
-                        metrics: None,
+                        metrics,
                     }
                 }
                 Err(e) => make_error_response(request_id, &e),

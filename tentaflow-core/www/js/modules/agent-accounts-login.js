@@ -22,7 +22,9 @@ import '/js/components/tf-input.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { escapeAttr, escapeHtml, toast } from '/js/utils.js';
+import '/js/components/tf-alert.js';
 import { AgentAccounts, T, describeError, engineName, osLabel } from '/js/modules/agent-accounts.js';
+import { repairProcessSandbox, sandboxRepairable, sandboxRepairProblem } from '/js/lib/sandbox-repair.js';
 
 /** How often a started sign-in is polled. The person is at the provider for most of it. */
 export const LOGIN_POLL_MS = 1500;
@@ -289,6 +291,11 @@ export function openLoginWizard({
           <p class="aa-hint">${escapeHtml(T('login.step_start_hint'))}</p>
           ${eligible.length ? `
             <tf-select data-field="node" label="${escapeAttr(T('login.field_node'))}"></tf-select>` : ''}
+          <tf-alert tone="warning" data-sandbox hidden>
+            <div slot="actions">
+              <tf-button variant="primary" size="sm" icon="shield" data-act="repair">${escapeHtml(I18n.t('sandbox_repair.action'))}</tf-button>
+            </div>
+          </tf-alert>
           <div class="aa-login-actions">
             <tf-button variant="primary" data-act="start">${escapeHtml(T('login.action_start'))}</tf-button>
           </div>
@@ -366,6 +373,19 @@ export function openLoginWizard({
     );
   }
 
+  // The node the sign-in will run on: the picked one, else the account's home,
+  // else the node answering. Its sandbox decides whether a start can work at
+  // all — a CLI that cannot be isolated dies before it prints an address.
+  const targetNode = () => {
+    const id = picker ? picker.value : homeNodeId;
+    return nodes.find((node) => (node.node_id ?? node.nodeId) === id)
+      ?? nodes.find((node) => node.is_local ?? node.isLocal);
+  };
+  const sandboxBlocked = () => {
+    const node = targetNode();
+    return node?.sandbox_capable === false && sandboxRepairable(node.sandbox_cause);
+  };
+
   const stepState = () => {
     const started = Boolean(flow.loginId);
     return {
@@ -393,8 +413,15 @@ export function openLoginWizard({
       ? I18n.t(flow.instructionKey)
       : T('login.step_open_hint');
 
+    const blocked = !flow.loginId && sandboxBlocked();
+    const sandboxAlert = body.querySelector('[data-sandbox]');
+    sandboxAlert.hidden = !blocked;
+    if (blocked) {
+      const node = targetNode();
+      sandboxAlert.setAttribute('message', sandboxRepairProblem(node.node_name ?? node.node_id ?? ''));
+    }
     act('start').hidden = Boolean(flow.loginId);
-    act('start').toggleAttribute('disabled', flow.busy);
+    act('start').toggleAttribute('disabled', flow.busy || blocked);
     if (picker) picker.toggleAttribute('disabled', Boolean(flow.loginId) || flow.busy);
 
     const canType = flow.state === 'awaiting_input' || flow.state === 'awaiting_open';
@@ -439,6 +466,22 @@ export function openLoginWizard({
   };
 
   flow.onChange(paint);
+
+  if (picker) picker.addEventListener('change', paint);
+  act('repair').addEventListener('click', async () => {
+    const node = targetNode();
+    if (!node) return;
+    const outcome = await repairProcessSandbox({
+      nodeId: node.node_id ?? node.nodeId,
+      nodeName: node.node_name ?? node.nodeName ?? '',
+      isLocal: (node.is_local ?? node.isLocal) === true,
+    });
+    if (!outcome) return;
+    node.sandbox_capable = true;
+    node.sandbox_cause = null;
+    toast(I18n.t('sandbox_repair.done'), 'success');
+    paint();
+  });
 
   act('start').addEventListener('click', () => {
     flow.start({ accountId, nodeId: picker ? picker.value || null : null });

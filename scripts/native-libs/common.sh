@@ -94,6 +94,24 @@ platform_cpu_count() {
   nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4
 }
 
+resolve_macos_sdk() {
+  case "$1" in
+    macos-*) ;;
+    *) return 0 ;;
+  esac
+  require_cmd xcrun
+  local sdk
+  sdk="$(xcrun --sdk macosx --show-sdk-path)" || return 1
+  if [ ! -d "$sdk" ]; then
+    echo "Nie znaleziono SDK macOS: $sdk" >&2
+    return 1
+  fi
+  # An implicit sysroot can mix Xcode's linker with a newer CLT SDK.
+  # SDKROOT reaches both CMake and direct compiler calls (whisper's dylib).
+  export SDKROOT="$sdk"
+  echo "[native-libs] macOS SDK: $SDKROOT" >&2
+}
+
 # Resolves a compiler binary: PATH first, then the given fallback locations.
 # Prints the absolute path on success.
 find_toolchain_compiler() {

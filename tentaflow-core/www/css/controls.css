@@ -415,6 +415,29 @@ tf-window [slot="footer"] {
 .tf-input-prefix { margin-right: 6px; }
 .tf-input-suffix { margin-left: 6px; }
 
+/* Stepper: [−][value][+] — the buttons sit at the field's edges and the value
+   is centred between them. */
+.tf-input-wrap.tf-input-wrap-stepper { padding: 0; }
+.tf-input-wrap-stepper .tf-input { text-align: center; -moz-appearance: textfield; }
+.tf-input-wrap-stepper .tf-input::-webkit-outer-spin-button,
+.tf-input-wrap-stepper .tf-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.tf-input-step {
+  flex: 0 0 38px;
+  align-self: stretch;
+  border: none;
+  background: transparent;
+  color: var(--tf-text-2);
+  font: inherit;
+  font-size: 16px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.tf-input-step--dec { order: -1; border-right: 1px solid var(--tf-border); border-radius: var(--tf-radius) 0 0 var(--tf-radius); }
+.tf-input-step--inc { order: 5; border-left: 1px solid var(--tf-border); border-radius: 0 var(--tf-radius) var(--tf-radius) 0; }
+.tf-input-step:hover:not(:disabled) { background: var(--tf-bg-card-hover); color: var(--tf-text); }
+.tf-input-step:focus-visible { outline: 2px solid var(--tf-accent-1); outline-offset: -2px; }
+.tf-input-step:disabled { opacity: 0.4; cursor: not-allowed; }
+
 /* =============================================================================
    tf-searchbox
    ============================================================================= */
@@ -1138,6 +1161,8 @@ tf-tabs {
 .tf-table td.nowrap {
   white-space: nowrap;
 }
+/* A numeric column's header sits over its right-aligned numbers. */
+.tf-table thead th.num { text-align: right; }
 .tf-table td.num {
   font-family: 'SF Mono', Menlo, monospace;
   text-align: right;
@@ -1157,11 +1182,16 @@ tf-tabs {
     padding: 12px 14px;
     border-bottom: 1px solid var(--tf-border);
   }
-  .tf-table tr + tr td { border-top: 0; }
+  /* As specific as the desktop row divider it cancels, or every field of
+     every card but the first gets a line, the corner button's cell included. */
+  .tf-table tbody tr + tr td { border-top: 0; }
   /* Tryb kart: etykieta (::before) NAD wartością. Wartość dostaje pełną szerokość
      karty, więc szerokie badge/teksty/ID nie są przycinane na prawej krawędzi
      (poprzedni układ label↔wartość w jednym wierszu obcinał szersze wartości). */
   .tf-table td {
+    /* width:100% plus the corner clearance below would push the first cell
+       past its card. */
+    box-sizing: border-box;
     padding: 6px 0;
     display: flex;
     flex-direction: column;
@@ -1252,7 +1282,6 @@ tf-tabs {
 .tf-table--variant-flush td.fill { max-width: 0; min-width: 220px; }
 .tf-table--variant-flush td.fill .tf-table__cell-title,
 .tf-table--variant-flush td.fill .tf-table__cell-sub { overflow: hidden; text-overflow: ellipsis; }
-.tf-table--variant-flush thead th.num { text-align: right; }
 .tf-table--variant-flush td.num { font-family: inherit; white-space: nowrap; }
 .tf-table--variant-flush td.actions { padding-left: 0; }
 .tf-table--variant-flush tbody tr { cursor: pointer; }
@@ -1279,7 +1308,8 @@ tf-tabs {
     width: auto !important;
     padding: 9px 10px;
   }
-  .tf-table--variant-flush tr + tr td { border-top: 1px solid var(--tf-border); }
+  /* Must outrank the card layout's `tbody tr + tr td { border-top: 0 }`. */
+  .tf-table--variant-flush tbody tr + tr td { border-top: 1px solid var(--tf-border); }
   .tf-table--variant-flush td::before { display: none; }
   .tf-table--variant-flush td.actions { margin-top: 0; }
   /* The card scrolls, so the name column keeps a readable fixed cap instead
@@ -3021,6 +3051,9 @@ tf-section-card { display: block; }
    ============================================================================= */
 
 tf-alert { display: block; }
+/* `display: block` outranks the user-agent rule for [hidden], so an alert
+   kept in the markup and toggled by `hidden` would never disappear. */
+tf-alert[hidden] { display: none; }
 
 .tf-alert {
   display: flex;
@@ -10400,6 +10433,70 @@ tf-tabs[safe-area][layout="stacked"] .tf-tab .tf-tab-count { top: 4px; margin-ri
   color: #1a1200;
   border-color: transparent;
 }
+
+.tf-tab .tf-tab-count--warn,
+.tf-tab.active .tf-tab-count--warn {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--tf-warning);
+}
+
+/* --- orientation="vertical": a section menu, one row per tab -------------- */
+
+tf-tabs[orientation="vertical"] { display: block; }
+tf-tabs[orientation="vertical"] .tf-tabs-viewport { overflow: visible; border-bottom: 0; }
+tf-tabs[orientation="vertical"] .tf-tabs-fade,
+tf-tabs[orientation="vertical"] .tf-tabs-chev { display: none; }
+.tf-tabs--vertical {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+  max-width: none;
+  overflow: hidden;
+  white-space: normal;
+  touch-action: auto;
+  background: var(--tf-bg-2);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+}
+.tf-tabs--vertical > tf-tab { display: block; }
+.tf-tabs--vertical > tf-tab + tf-tab { border-top: 1px solid var(--tf-border); }
+.tf-tabs--vertical .tf-tab {
+  display: flex;
+  width: 100%;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 0;
+  border-left: 3px solid transparent;
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: var(--tf-text-2);
+  text-align: left;
+  white-space: normal;
+}
+.tf-tabs--vertical .tf-tab:hover { background: var(--tf-bg-card); color: var(--tf-text); }
+.tf-tabs--vertical .tf-tab.active,
+.tf-tabs--vertical[data-indicator] .tf-tab.active {
+  background: var(--tf-accent-glow);
+  color: var(--tf-text);
+  border-left-color: var(--tf-accent-1);
+  font-weight: 700;
+  box-shadow: none;
+}
+.tf-tabs--vertical .tf-tab svg { color: var(--tf-text-3); }
+.tf-tabs--vertical .tf-tab.active svg { color: var(--tf-accent-2); }
+.tf-tabs--vertical .tf-tab .tf-tab-count { margin-left: auto; }
+.tf-tabs--vertical .tf-tab.active .tf-tab-count:not(.tf-tab-count--warn):not(.tf-tab-count--hot) {
+  background: var(--tf-bg-3);
+  color: var(--tf-text-2);
+}
+.tf-tabs--vertical .tf-tab[disabled] { opacity: 0.45; cursor: not-allowed; }
+.tf-tabs--vertical .tf-tab[disabled]:hover { background: transparent; color: var(--tf-text-2); }
+.tf-tabs--vertical .tf-tab-indicator,
+.tf-tabs--vertical .tf-tab-underline-bar,
+.tf-tabs--vertical .tf-tab-bar-line { display: none; }
 
 /* --- closable: the × is a sibling, parked over the tab's right padding ------ */
 

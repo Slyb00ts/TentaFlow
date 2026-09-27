@@ -57,6 +57,7 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         | HelperCommand::ElasticAddDiskAbort { .. }
         | HelperCommand::ElasticDestroy { .. }
         | HelperCommand::ElasticInspect { .. } | HelperCommand::ElasticCacheAge { .. }
+        | HelperCommand::ElasticFolderUsage { .. }
         | HelperCommand::ElasticClaims { .. }
         | HelperCommand::ElasticJournals {} | HelperCommand::ElasticAdopt { .. } => {
             crate::elastic::execution::execute(command)
@@ -94,6 +95,7 @@ pub fn run(command: &HelperCommand, payload: &[u8]) -> Result<String, String> {
         HelperCommand::IscsiTargetRemove { iqn } => {
             block::remove_iscsi(Path::new(block::TARGET_CONFIGFS), iqn).map(|log| log.join("\n"))
         }
+        HelperCommand::IscsiSessionReset { initiator } => iscsi_session_reset(initiator, payload),
         HelperCommand::NvmetSubsystemApply {} => nvmet_subsystem_apply(payload),
         HelperCommand::NvmetSubsystemRemove { nqn } => {
             block::remove_nvmet(Path::new(block::NVMET_CONFIGFS), nqn).map(|log| log.join("\n"))
@@ -1112,25 +1114,30 @@ fn iscsi_target_apply(payload: &[u8]) -> Result<String, String> {
     let spec: block::IscsiTargetSpec =
         serde_json::from_slice(payload).map_err(|e| format!("iSCSI target spec: {e}"))?;
     require_configfs(block::TARGET_CONFIGFS)?;
-    // Observed HERE, not by the core: between a preview and this apply another
-    // request may have changed what the kernel holds, and a plan built for the
-    // wrong state either writes an attribute LIO refuses or removes an object
-    // somebody else just created.
-    let observed = block::observe_iscsi(Path::new(block::TARGET_CONFIGFS), &spec);
-    let plan = block::plan_iscsi(&spec, &observed).map_err(|e| e.to_string())?;
-    // The warnings are the credential-mode check (see `protect_attr`). They go
-    // into the job log ABOVE the summary line, because a key that stayed
-    // world-readable is the one thing about this apply an admin has to act on.
-    let warnings = block::apply_plan(&plan)?;
-    // The rendered plan goes into the job log — `render` is the only rendering
-    // there is and it prints `***` for every secret.
-    Ok(format!(
-        "{}\n{}iSCSI target {} applied ({} configfs steps)",
-        block::render(&plan).trim_end(),
-        warnings.iter().map(|w| format!("{w}\n")).collect::<String>(),
-        spec.iqn,
-        block::kernel_step_count(&plan)
-    ))
+    // Observe, plan, rebuild an open TPG that gets an allowlist, apply, and
+    // check the allowlist's post-condition — see `block::execute_iscsi_apply`,
+    // where the sequence lives so it can run against a fake configfs.
+    block::execute_iscsi_apply(Path::new(block::TARGET_CONFIGFS), &spec)
+}
+
+/// "Rozłącz" for one allowlisted initiator: drop its ACL, re-create it at
+/// once (`block::plan_session_reset`, L1 measured on rig11).
+///
+/// Observed HERE, as root, right before acting — the core checked the same
+/// preconditions a moment ago, but the session it saw may be gone, and the
+/// refusal must describe the kernel this process is about to change.
+///
+/// The two halves are applied and reported apart. A failed DROP means nothing
+/// happened to the client that matters; a failed RE-CREATE after a successful
+/// drop means the initiator has LOST ACCESS until the ACL is back, and the
+/// error says exactly that, so the core re-applies the target instead of
+/// treating it as a failed button press. Only the steps taken are reported —
+/// the rendered plan, which redacts every secret; no session id anywhere.
+fn iscsi_session_reset(initiator: &str, payload: &[u8]) -> Result<String, String> {
+    let spec: block::IscsiTargetSpec =
+        serde_json::from_slice(payload).map_err(|e| format!("iSCSI target spec: {e}"))?;
+    require_configfs(block::TARGET_CONFIGFS)?;
+    block::execute_session_reset(Path::new(block::TARGET_CONFIGFS), &spec, initiator)
 }
 
 fn nvmet_subsystem_apply(payload: &[u8]) -> Result<String, String> {

@@ -970,7 +970,11 @@ function renderDetailHeader() {
   if ((agent.max_subagents ?? 0) > 0) {
     badges.push(`<tf-chip variant="outline" status="neutral">${escapeHtml(t('hdr_subagents', { count: agent.max_subagents, depth: agent.max_spawn_depth ?? 1 }))}</tf-chip>`);
   }
-  badges.push(`<tf-chip variant="outline" status="neutral">${escapeHtml(t('hdr_loop_limits', { iterations: agent.max_iterations ?? 25, timeout: agent.timeout_secs ?? 600 }))}</tf-chip>`);
+  const timeoutSecs = agent.timeout_secs ?? 600;
+  const loopLimits = timeoutSecs > 0
+    ? t('hdr_loop_limits', { iterations: agent.max_iterations ?? 25, timeout: timeoutSecs })
+    : t('hdr_loop_limits_no_timeout', { iterations: agent.max_iterations ?? 25 });
+  badges.push(`<tf-chip variant="outline" status="neutral">${escapeHtml(loopLimits)}</tf-chip>`);
   const adminActions = state.isAdmin ? `
     <tf-button variant="primary" icon="play" data-hdr-test>${escapeHtml(t('hdr_run_test'))}</tf-button>
     <tf-button variant="secondary" icon="copy" data-hdr-duplicate>${escapeHtml(t('action_duplicate'))}</tf-button>
@@ -1124,7 +1128,7 @@ async function saveDetailDraft() {
     skills: { names: [...d.skillNames], tags: [...d.skillTags] },
     params,
     max_iterations: Number.parseInt(c.max_iterations, 10) || 25,
-    timeout_secs: Number.parseInt(c.timeout_secs, 10) || 600,
+    timeout_secs: nonNegativeInt(c.timeout_secs, 600),
     max_subagents: Number.parseInt(c.max_subagents, 10) || 0,
     max_spawn_depth: Number.parseInt(c.max_spawn_depth, 10) || 1,
     on_child_complete: c.on_child_complete || 'notify',
@@ -1491,7 +1495,7 @@ function renderConfigTab(body) {
       ${sliderRow('max_spawn_depth', 'label_max_spawn_depth', 'slider_depth_desc', 1, MAX_SPAWN_DEPTH_CAP, spawnDepth)}
       <div class="agents-editor-grid agents-limits">
         <tf-input data-cfg="timeout_secs" type="number" label="${escapeAttr(t('label_timeout_secs'))}"
-          value="${escapeAttr(String(c.timeout_secs ?? 600))}" min="1"></tf-input>
+          value="${escapeAttr(String(c.timeout_secs ?? 600))}" min="0"></tf-input>
         <div>
           <tf-select data-cfg="on_child_complete" label="${escapeAttr(t('label_on_child_complete'))}">
             <option value="notify" ${c.on_child_complete !== 'continue' ? 'selected' : ''}>${escapeHtml(t('on_child_complete_notify'))}</option>
@@ -3302,7 +3306,7 @@ function wizardBodyHtml(agent, mode, models) {
 
       <div class="agents-editor-grid agents-limits">
         <tf-input id="agent-wz-timeout-secs" type="number" label="${escapeAttr(t('label_timeout_secs'))}"
-          value="${escapeAttr(String(agent?.timeout_secs ?? 600))}" min="1"></tf-input>
+          value="${escapeAttr(String(agent?.timeout_secs ?? 600))}" min="0"></tf-input>
         <tf-input id="agent-wz-max-subagents" type="number" label="${escapeAttr(t('label_max_subagents'))}"
           value="${escapeAttr(String(agent?.max_subagents ?? 0))}" min="0"></tf-input>
         <tf-input id="agent-wz-max-spawn-depth" type="number" label="${escapeAttr(t('label_max_spawn_depth'))}"
@@ -3479,6 +3483,12 @@ function showFormError(message) {
   if (!box) return;
   box.textContent = message || '';
   box.hidden = !message;
+}
+
+// 0 is a real value for a timeout (no deadline), so `|| fallback` would erase it.
+function nonNegativeInt(raw, fallback) {
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 function intField(sel, fallback) {

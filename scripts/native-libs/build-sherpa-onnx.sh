@@ -12,6 +12,7 @@ PLATFORM="${1:-$(detect_platform)}"
 BACKEND="${SHERPA_ONNX_BACKEND:-cpu}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake
+resolve_macos_sdk "$PLATFORM"
 
 SRC="$(repo_checkout sherpa-onnx https://github.com/k2-fsa/sherpa-onnx.git "$SHERPA_ONNX_REF")"
 BUILD="$NATIVE_CACHE/build/sherpa-onnx-$PLATFORM-$BACKEND"

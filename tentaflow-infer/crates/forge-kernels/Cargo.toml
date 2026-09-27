@@ -16,6 +16,14 @@ metal = ["forge-hal/metal"]
 # Makiem. `cargo check -p forge-kernels --features metal-check` odbija to od
 # kompilatora wszędzie.
 metal-check = []
+# Ramię ANE (CoreML) w podziale wierszy prefillu. Wymaga Metala (bufory
+# wspólne, kernel scatter) i wiązania CoreML z forge-hal.
+ane = ["metal", "forge-hal/coreml", "dep:tracing"]
+# Typuje ramię ANE na KAŻDEJ platformie, bez wiązania CoreML: zaślepka
+# `CoreMlModel` w `ane_matmul` odmawia w czasie wykonania, ale kontrakt
+# z `MetalExec` (Job, sloty, role) sprawdza kompilator. build.rs zamienia
+# `ane` lub `ane-check` na wspólny `cfg(forge_ane)`.
+ane-check = ["metal-check", "dep:tracing"]
 
 [dependencies]
 forge-types.workspace = true
@@ -28,6 +36,7 @@ bytemuck = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, default-features = true }
 thiserror.workspace = true
+tracing = { workspace = true, optional = true }
 
 [build-dependencies]
 serde_json = { workspace = true, default-features = true }

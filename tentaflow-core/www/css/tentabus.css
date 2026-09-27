@@ -1,14 +1,10 @@
 /* =============================================================================
-   File: tentabus.css — TentaBus M1 (topics, consumer groups, DLQ, message
-   preview) + M2 (replication & failover, PLAN-M2.md §1f, mockup
-   m06-replikacja-failover.html: node cards, role matrix, current-lag state
-   list, failover history — see "M06 replication & failover" section below;
-   also feeds M03's partitions table and M02's node picker). Only --tf-*
-   tokens (scripts/ci-gates.sh Gate 5a); classes tb-*. Layout/spacing
-   patterns mirror analytics.css (an-*) so the module fits the rest of the
-   admin shell without inventing a new visual language. Animations use
-   transform/opacity only; prefers-reduced-motion is neutralized globally by
-   controls.css.
+   File: tentabus.css — the TentaBus screen: the shell and Przegląd (U0),
+   Topiki with the creator, delete and preview windows (U1), a topic's page
+   and Kopie i nody (U2), Odbiorcy with a consumer's page (U3) and
+   Nieprzetworzone wiadomości (U4). Only --tf-* tokens (scripts/ci-gates.sh Gate 5a);
+   classes tb-*. Animations use transform/opacity only; prefers-reduced-motion
+   is neutralized globally by controls.css.
    ============================================================================= */
 
 .tb-root { min-width: 0; display: flex; flex-direction: column; gap: 16px; }
@@ -131,63 +127,15 @@
   .tb-root .legend-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
-/* ----- KPI strip ----- */
-.tb-kpi-grid {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-  gap: 12px; margin-bottom: 12px;
-}
-.tb-kpi-grid tf-stat-card { animation: tb-rise 0.4s cubic-bezier(0.22, 1, 0.36, 1) both; }
-.tb-kpi-note {
-  font-size: 11px; color: var(--tf-text-3); margin: -4px 0 16px; display: flex;
-  align-items: center; gap: 6px;
-}
-.tb-kpi-note svg { width: 13px; height: 13px; flex-shrink: 0; }
-
-/* ----- Toolbar ----- */
-.tb-toolbar {
-  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-  background: var(--tf-bg-2); border: 1px solid var(--tf-border); border-radius: var(--tf-radius);
-  padding: 10px 12px; margin-bottom: 16px;
-}
-.tb-toolbar > tf-searchbox { flex: 0 1 320px; min-width: 200px; }
-.tb-toolbar > tf-select { flex: 0 0 auto; width: auto; min-width: 130px; max-width: 220px; }
-.tb-toolbar .tf-select { min-height: 30px; padding: 5px 30px 5px 12px; font-size: 12px; border-radius: var(--tf-radius-sm); }
-.tb-spacer { margin-left: auto; }
-
-/* ----- Section cards ----- */
-.tb-card {
-  position: relative; display: flex; flex-direction: column;
-  background: var(--tf-bg-card); border: 1px solid var(--tf-border); border-radius: var(--tf-radius);
-  margin-bottom: 16px; overflow: hidden; min-width: 0;
-  animation: tb-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) both;
-}
-.tb-c-head {
-  display: flex; align-items: center; gap: 10px; padding: 13px 16px;
-  border-bottom: 1px solid var(--tf-border); flex-wrap: wrap;
-}
-.tb-c-head h3 { font-size: 13.5px; font-weight: 800; margin: 0; }
-.tb-hint { font-size: 11px; color: var(--tf-text-3); margin-left: auto; }
-.tb-c-body { padding: 16px; }
-.tb-c-body--table { padding: 6px 0; }
-.tb-card tf-table { display: block; }
-/* P2-2: `.tb-card tf-table { display: block; }` above outranks the UA
-   `[hidden] { display: none; }` rule (class+tag beats a bare attribute
-   selector), so toggling the `hidden` property from JS to swap a table for
-   its empty state (M01/M04) would otherwise do nothing — same fix
-   analytics.css already needed for its own `tf-table[hidden]`. */
-.tb-card tf-table[hidden] { display: none; }
-.tb-row-actions { display: inline-flex; gap: 4px; }
-
 .tb-state {
   display: flex; align-items: center; justify-content: center; gap: 10px;
   padding: 28px 16px; font-size: 12px; color: var(--tf-text-3);
 }
-.tb-empty { text-align: center; }
 
-/* R3-1 (KRYTYK-M1-R3.md): the DLQ tab's "last load failed" state — a
-   `.tb-state` that also carries an icon, the mapped error text and a retry
-   button on one line, wrapping to a stacked layout on narrow cards instead
-   of squeezing the button under the message text. */
+/* A list's "last load failed" state — a `.tb-state` that also carries an
+   icon, the mapped error text and a retry button on one line, wrapping to a
+   stacked layout on narrow cards instead of squeezing the button under the
+   message text. */
 .tb-state--error { color: var(--tf-danger); flex-wrap: wrap; }
 .tb-state--error svg { width: 16px; height: 16px; flex-shrink: 0; }
 
@@ -213,186 +161,6 @@
 .tb-audit-banner svg { width: 16px; height: 16px; flex-shrink: 0; margin-top: 1px; color: var(--tf-warning); }
 .tb-audit-banner strong { color: var(--tf-text); }
 
-/* ----- Backend-gap notes (documented UI-vs-protocol shortfalls) ----- */
-.tb-gap-note {
-  display: flex; gap: 8px; align-items: flex-start; padding: 10px 12px;
-  border-radius: var(--tf-radius-sm); background: var(--tf-bg-3);
-  border: 1px dashed var(--tf-border-hover); font-size: 11.5px; color: var(--tf-text-3);
-  margin: 0 0 14px;
-}
-.tb-gap-note svg { width: 14px; height: 14px; flex-shrink: 0; margin-top: 1px; }
-
-/* ----- Breadcrumb / back ----- */
-.tb-back { margin-bottom: 12px; }
-
-/* ----- Detail hero ----- */
-.tb-hero { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
-.tb-hero-ident { min-width: 0; }
-.tb-hero-name {
-  display: flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 800;
-  font-family: var(--tf-font-mono, ui-monospace, monospace);
-}
-.tb-hero-meta { display: flex; gap: 8px; margin-top: 7px; flex-wrap: wrap; }
-.tb-mini-kpis { display: flex; gap: 24px; margin-left: auto; text-align: right; flex-wrap: wrap; }
-/* M03 overview tiles (msg/s, bytes/s, disk, lag, DLQ depth) reuse .tb-mk but
-   sit inside a plain card, left-aligned and evenly spaced, not pinned right
-   next to the hero title like the two hero mini-KPIs above. */
-.tb-mini-kpis--wrap { margin-left: 0; text-align: left; justify-content: flex-start; gap: 28px; }
-.tb-mk b { display: block; font-size: 18px; font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.tb-mk span { font-size: 10.5px; color: var(--tf-text-3); text-transform: uppercase; letter-spacing: 0.06em; }
-
-/* ----- Per-partition earliest/high-watermark summary (M08/M05 paging) ----- */
-.tb-partition-summary { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
-.tb-partition-summary .tf-chip { font-variant-numeric: tabular-nums; }
-
-/* ----- Key/value config table ----- */
-.tb-kv { display: grid; grid-template-columns: minmax(160px, 260px) 1fr; gap: 0; }
-.tb-kv-row {
-  display: contents;
-}
-.tb-kv-row > .tb-kv-key, .tb-kv-row > .tb-kv-val {
-  padding: 9px 4px; border-bottom: 1px solid var(--tf-border); font-size: 12.5px;
-}
-.tb-kv-key { color: var(--tf-text-3); }
-.tb-kv-val { color: var(--tf-text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-.tb-kv-val.mono { font-family: var(--tf-font-mono, ui-monospace, monospace); }
-/* Owner decision B (durability class): the config tab's durability-class row
-   stacks the chip above its resolved-policy secondary text instead of the
-   default inline flow every other kv-val uses. */
-.tb-kv-val .tf-chip + .tb-field-hint { display: block; margin-top: 4px; }
-
-/* ----- Lag bar ----- */
-.tb-lagbar { position: relative; width: 100%; min-width: 80px; height: 6px; border-radius: 4px; background: var(--tf-bg-3); overflow: hidden; }
-.tb-lagbar > span { position: absolute; inset: 0; border-radius: 4px; background: var(--tf-gradient-accent); }
-.tb-lagbar.tb-lagbar--warn > span { background: var(--tf-warning); }
-.tb-lagbar.tb-lagbar--danger > span { background: var(--tf-danger); }
-
-/* ----- Wizard (topic creator) ----- */
-.tb-wizard-form { display: flex; flex-direction: column; gap: 14px; min-width: 420px; }
-.tb-wizard-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-.tb-wizard-grid--3 { grid-template-columns: repeat(3, 1fr); }
-.tb-field-hint { font-size: 11px; color: var(--tf-text-3); margin-top: 2px; }
-.tb-field-error { font-size: 11px; color: var(--tf-danger); margin-top: 2px; }
-
-.tb-adv-toggle {
-  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
-  background: var(--tf-bg-3); border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm);
-  padding: 10px 12px; color: var(--tf-text); font-size: 12.5px; font-weight: 700; cursor: pointer;
-}
-.tb-adv-toggle:hover { border-color: var(--tf-border-hover); }
-.tb-adv-toggle .tb-adv-chevron { margin-left: auto; transition: transform 0.15s ease; width: 14px; height: 14px; }
-.tb-adv-toggle[aria-expanded="true"] .tb-adv-chevron { transform: rotate(180deg); }
-.tb-adv-sub { font-weight: 400; color: var(--tf-text-3); margin-left: 6px; }
-.tb-adv-body {
-  display: flex; flex-direction: column; gap: 14px; padding: 14px; margin-top: 8px;
-  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-2);
-}
-.tb-adv-body[hidden] { display: none; }
-
-/* P1-3: without `flex-wrap`, the RF=1 warning chip (`white-space: nowrap`,
-   tf-chip) shared one unwrapped flex row with the label and the stepper and
-   squeezed the stepper's `−`/`+` buttons down to ~9px wide — narrower than
-   the chip's own content demanded, so `elementFromPoint` at the buttons'
-   nominal center hit the chip instead and a user who dropped to RF=1 could
-   no longer click `+` to raise it back. `flex-wrap: wrap` lets the chip
-   drop to its own line instead of compressing its siblings; `flex: 0 0 auto`
-   on the label/stepper keeps them at their natural size no matter how much
-   room the chip wants. */
-.tb-rf-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.tb-rf-row > span { flex: 0 0 auto; }
-.tb-rf-stepper { display: inline-flex; align-items: center; gap: 0; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); overflow: hidden; flex: 0 0 auto; }
-.tb-rf-stepper button {
-  /* 32px meets the common ~32px minimum touch-target guidance; the previous
-     30px was not itself the P1-3 bug (missing flex-wrap crushing it below
-     that to ~9px was), but there is no reason to sit right at the edge. */
-  width: 32px; height: 32px; display: flex; align-items: center; justify-content: center;
-  background: var(--tf-bg-3); border: none; color: var(--tf-text); cursor: pointer; font-size: 15px;
-  flex: 0 0 auto;
-}
-.tb-rf-stepper button:hover:not(:disabled) { background: var(--tf-bg-card-hover); }
-.tb-rf-stepper button:disabled { opacity: 0.4; cursor: not-allowed; }
-.tb-rf-stepper output {
-  width: 34px; text-align: center; font-weight: 800; font-variant-numeric: tabular-nums;
-}
-.tb-rf-warning { display: none; flex: 1 1 220px; min-width: 200px; }
-.tb-rf-warning.show { display: inline-flex; }
-
-/* ----- Durability class radios (KRYTYK-M1-R5.md b.4, P2) -----
-   Native <input type="radio"> instead of <tf-radio-group>/<tf-radio>
-   (tentaflow-core/www/js/components/tf-radio.js, shared/out-of-scope for
-   this fala): that component's roving tabindex has no arrow-key handling
-   (the second option was unreachable by keyboard) and its `role="radio"`
-   lives on an empty <span> with the label as an unassociated sibling (no
-   accessible name). Native radios inside a <fieldset>/<legend>, each wrapped
-   in its own <label for>, get the full APG group pattern — Tab enters/
-   leaves the group once, arrow keys move AND select, Space selects, every
-   option has a real accessible name — from the platform, for free. */
-.tb-radio-native-group { display: flex; flex-direction: column; gap: 10px; border: none; margin: 0; padding: 0; min-width: 0; }
-.tb-radio-native {
-  display: flex; align-items: flex-start; gap: 10px; cursor: pointer;
-  padding: 10px 12px; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm);
-  background: var(--tf-bg-3);
-}
-.tb-radio-native:hover { border-color: var(--tf-border-hover); }
-.tb-radio-native:has(input:checked) { border-color: var(--tf-accent-1); background: var(--tf-bg-card-hover); }
-.tb-radio-native input[type="radio"] {
-  appearance: none; -webkit-appearance: none; margin: 2px 0 0; flex: 0 0 auto;
-  width: 16px; height: 16px; border-radius: 50%; position: relative; cursor: pointer;
-  border: 1.5px solid var(--tf-border-hover); background: var(--tf-bg-input);
-}
-.tb-radio-native input[type="radio"]:checked { border-color: var(--tf-accent-1); background: var(--tf-accent-1); }
-.tb-radio-native input[type="radio"]:checked::after {
-  content: ''; position: absolute; inset: 3px; border-radius: 50%; background: var(--tf-bg-card);
-}
-.tb-radio-native input[type="radio"]:focus-visible { box-shadow: 0 0 0 3px var(--tf-accent-glow); }
-.tb-radio-native-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.tb-radio-native-label { font-size: 12.5px; font-weight: 700; color: var(--tf-text); }
-.tb-radio-native-hint { font-size: 11px; color: var(--tf-text-3); }
-
-/* Same show/hide-by-class pattern as `.tb-rf-warning` above (native
-   `[hidden]` on `<tf-chip>` has no author rule turning it back into
-   `display:none` in this stylesheet, so this reuses the established
-   convention instead of adding a `tf-chip[hidden]` gate for one control). */
-.tb-durability-explicit-warn { display: none; margin-top: 10px; }
-.tb-durability-explicit-warn.show { display: inline-flex; }
-
-.tb-modal-footer { display: flex; gap: 8px; align-items: center; width: 100%; }
-
-/* N-4 (KRYTYK-M1-R2.md): the offset-reset modal toggles the JS `hidden`
-   property on its `tf-input`s per mode, but controls.css's own
-   `tf-input, tf-select { display: block; }` is an AUTHOR rule that beats
-   the browser's bare `[hidden] { display: none; }` UA rule regardless of
-   selector specificity (author always outranks user-agent) — same class of
-   bug `.tb-card tf-table[hidden]` above already documents, one level down
-   at the individual-field granularity. Without this override BOTH the
-   offset and the timestamp field stayed visible in every reset mode,
-   including "Najwcześniejszy"/"Najnowszy" where neither applies. */
-.tb-wizard-form tf-input[hidden] { display: none; }
-
-/* N-4: this form reuses `.tb-wizard-form`'s 420px `min-width` (sized for the
-   topic wizard's `size="lg"` modal), but the reset dialog itself opens at
-   `size="sm"` — the mismatch pushed the fields ~20px past the card's own
-   right edge and forced a horizontal scrollbar in the modal body. The
-   reset form has only one field visible at a time (mode + one conditional
-   input), so it does not need a wide minimum in the first place. */
-.tb-reset-form { min-width: 0; }
-
-/* ----- DLQ ----- */
-.tb-dlq-reason-legend { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-.tb-dlq-detail { padding: 12px 16px; background: var(--tf-bg-2); border-top: 1px solid var(--tf-border); display: flex; flex-direction: column; gap: 10px; }
-.tb-header-list { display: grid; grid-template-columns: minmax(140px, 220px) 1fr; gap: 4px 10px; font-size: 11.5px; }
-.tb-header-list dt { color: var(--tf-text-3); font-family: var(--tf-font-mono, ui-monospace, monospace); }
-.tb-header-list dd { color: var(--tf-text); overflow-wrap: anywhere; font-family: var(--tf-font-mono, ui-monospace, monospace); margin: 0; }
-.tb-payload-preview {
-  font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 11.5px; color: var(--tf-text-2);
-  background: var(--tf-bg-3); border-radius: var(--tf-radius-sm); padding: 10px; overflow-wrap: anywhere;
-  white-space: pre-wrap; max-height: 160px; overflow-y: auto;
-}
-
-/* ----- Groups ----- */
-.tb-group-detail { display: flex; flex-direction: column; gap: 14px; }
-.tb-group-detail-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-
 /* P2-1: the shared `.toast-container` (compat.css, z-index: 2000) sits
    below `tf-modal`'s backdrop (z-index: 9990) / card (9991), so an error
    toast raised while a TentaBus wizard/dialog is open (invalid partition
@@ -407,88 +175,251 @@
    for every OTHER module's modals, not just TentaBus's. */
 body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 
-/* ----- M06 replication & failover ----- */
-.tb-repl-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
-
-.tb-node-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-.tb-node-card {
-  background: var(--tf-bg-3); border: 1px solid var(--tf-border); border-radius: var(--tf-radius);
-  padding: 14px; min-width: 0;
+/* =============================================================================
+   U1 Topiki (T02/T04): the topic list, and the windows opened over it — the
+   topic creator, the delete window and the message preview. A tf-window is
+   appended to <body>, outside `.tb-root`, so window rules are scoped by
+   `.tb-window` instead.
+   ============================================================================= */
+.tb-root .tb-topics-toolbar, .tb-root .tb-consumers-toolbar { margin: 0; }
+.tb-root .tb-admin-note { display: flex; align-items: center; gap: 6px; margin: -4px 0 10px; }
+.tb-root .tb-admin-note .icon { width: 13px; height: 13px; flex-shrink: 0; }
+.tb-root .tb-table-footer {
+  display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px;
+  font-size: 12px; color: var(--tf-text-3);
 }
-.tb-node-card--degraded { border-color: var(--tf-warning); background: color-mix(in srgb, var(--tf-warning) 8%, var(--tf-bg-3)); }
-.tb-node-card-head { display: flex; align-items: center; gap: 8px; font-weight: 800; font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 13px; flex-wrap: wrap; }
-.tb-node-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: var(--tf-text-3); }
-.tb-node-dot--live { background: var(--tf-success); }
-.tb-node-dot--warn { background: var(--tf-warning); }
-.tb-node-dot--down { background: var(--tf-danger); }
-.tb-node-stats { display: flex; gap: 16px; margin-top: 10px; }
-.tb-node-stats b { display: block; font-size: 16px; font-weight: 800; font-variant-numeric: tabular-nums; }
-.tb-node-stats span { font-size: 9.5px; color: var(--tf-text-3); text-transform: uppercase; letter-spacing: 0.05em; }
-.tb-node-sub { margin-top: 8px; font-size: 11px; color: var(--tf-text-3); }
-.tb-node-card--degraded .tb-node-sub { color: var(--tf-warning); }
+.tb-root .tb-table-footer b { color: var(--tf-text-2); font-weight: 600; }
+.tb-root [data-role="notice"] tf-alert { display: block; }
 
-/* ----- Role matrix ----- */
-.tb-role-matrix th, .tb-role-matrix td { padding: 8px 10px; border-bottom: 1px solid var(--tf-border); text-align: center; }
-.tb-role-matrix th:first-child, .tb-role-matrix td:first-child { text-align: left; }
-.tb-role-pill { display: inline-block; padding: 2px 8px; border-radius: var(--tf-radius-pill); font-size: 10px; font-weight: 700; }
-.tb-role-pill--leader { background: color-mix(in srgb, var(--tf-accent-2) 18%, transparent); color: var(--tf-accent-2); }
-.tb-role-pill--isr { background: color-mix(in srgb, var(--tf-success) 16%, transparent); color: var(--tf-success); }
-.tb-role-pill--lagging { background: color-mix(in srgb, var(--tf-warning) 16%, transparent); color: var(--tf-warning); }
-.tb-role-cell-empty { color: var(--tf-text-3); }
-.tb-role-unavailable-chip { margin-top: 4px; }
-/* Shared by M06's matrix and M03's partitions table — a partition-level
-   STATE (PLAN-M2.md §4.1 A4: "niedostępna" is a state, not a producer
-   error), never an error-red row treatment. */
-.tb-row-unavailable { background: color-mix(in srgb, var(--tf-warning) 6%, transparent); }
+.tb-window [hidden] { display: none !important; }
+.tb-window .mono { font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
+.tb-window .mt-md { margin-top: 16px; }
+.tb-window .muted { color: var(--tf-text-3); font-size: 12px; }
+.tb-window .install-header-meta { flex: 1; min-width: 0; }
+.tb-window .install-header h1 { overflow-wrap: anywhere; }
+.tb-window .install-header + .install-progress { margin-top: 12px; }
+.tb-window .form-grid-2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+.tb-window .field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+/* Same caption as the tf-input / tf-select labels beside it. */
+.tb-window .field > label, .tb-window .tb-preview-range .k { font-size: 11px; font-weight: 600; color: var(--tf-text-2); letter-spacing: 0.04em; text-transform: uppercase; }
+.tb-window .tb-mono-input input { font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); }
 
-/* ----- Current lag state list (module-doc gap #10: no shrink/expand
-   HISTORY on the wire — this is a flat "right now" list, not a timeline) ----- */
-.tb-lag-list { display: flex; flex-direction: column; gap: 10px; }
-.tb-lag-item { padding: 10px 12px; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-3); }
-.tb-lag-item-head { font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 12px; font-weight: 700; }
-.tb-lag-item-body { font-size: 11.5px; color: var(--tf-warning); margin-top: 3px; }
-
-/* ----- Node picker (M02 wizard "informational" multiselect + M06's
-   "Zmień repliki" dialog) — same fieldset/label shape as
-   `.tb-radio-native-group` above, checkbox instead of radio. ----- */
-.tb-node-picker-wrap { margin-top: 10px; }
-.tb-node-picker {
-  display: flex; flex-direction: column; gap: 8px; border: none; margin: 0; padding: 0; min-width: 0;
-  max-height: 220px; overflow-y: auto;
+.tb-window .tb-stat-rows .sr {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 0; border-bottom: 1px solid var(--tf-border); font-size: 13px;
 }
-.tb-node-picker-item {
-  display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer;
-  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-3);
-  font-size: 12px;
+.tb-window .tb-stat-rows .sr:last-child { border-bottom: 0; }
+.tb-window .tb-stat-rows .k { display: inline-flex; align-items: center; gap: 6px; color: var(--tf-text-2); }
+.tb-window .tb-stat-rows .k .icon { width: 13px; height: 13px; }
+.tb-window .tb-stat-rows .v { color: var(--tf-text); text-align: right; }
+
+.tb-window .tb-copies-box {
+  display: flex; align-items: center; gap: 14px; padding: 12px 16px;
+  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-2);
 }
-.tb-node-picker-item:has(input:checked) { border-color: var(--tf-accent-1); background: var(--tf-bg-card-hover); }
-.tb-node-picker-item.is-foreign { opacity: 0.55; cursor: not-allowed; text-decoration: line-through; }
-.tb-node-picker-item input[type="checkbox"] { flex-shrink: 0; cursor: pointer; }
-.tb-node-picker-item.is-foreign input[type="checkbox"] { cursor: not-allowed; }
-.tb-node-picker-name { font-weight: 700; }
+.tb-window .tb-copies-box .cb-num { flex: 0 0 auto; font-size: 26px; font-weight: 800; color: var(--tf-accent-1); line-height: 1; }
+.tb-window .tb-copies-box .cb-num .icon { width: 22px; height: 22px; }
+.tb-window .tb-copies-box .cb-txt { font-size: 13px; color: var(--tf-text-2); }
+.tb-window .tb-copies-box .cb-txt b { color: var(--tf-text); }
+
+.tb-window .tb-toggle-card {
+  display: flex; align-items: center; gap: 12px; padding: 12px 14px;
+  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-2);
+}
+.tb-window .tb-toggle-card .tc-name { font-size: 13px; font-weight: 600; color: var(--tf-text); }
+.tb-window .tb-toggle-card .tc-sub { font-size: 12px; color: var(--tf-text-3); }
+.tb-window .tb-explain-box {
+  padding: 12px 14px; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm);
+  background: var(--tf-bg-2); font-size: 13px; color: var(--tf-text-2);
+}
+.tb-window .tb-explain-box--error {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  border-color: var(--tf-danger); color: var(--tf-text);
+}
+.tb-window .tb-kv-grid {
+  display: grid; grid-template-columns: minmax(120px, 34%) minmax(0, 1fr);
+  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); overflow: hidden; font-size: 13px;
+}
+.tb-window .tb-kv-grid > div { padding: 9px 12px; border-bottom: 1px solid var(--tf-border); min-width: 0; overflow-wrap: anywhere; }
+.tb-window .tb-kv-grid > div:nth-last-child(-n+2) { border-bottom: 0; }
+.tb-window .tb-kv-grid .k { color: var(--tf-text-3); background: var(--tf-bg-2); }
+.tb-window .tb-kv-grid .v { color: var(--tf-text); }
+.tb-window .tb-window-error {
+  display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; padding: 10px 12px;
+  border: 1px solid var(--tf-danger); border-radius: var(--tf-radius-sm);
+  background: var(--tf-bg-2); color: var(--tf-text); font-size: 13px;
+}
+.tb-window .tb-window-error .icon { width: 15px; height: 15px; flex-shrink: 0; color: var(--tf-danger); margin-top: 1px; }
+
+/* Delete window */
+.tb-window .tb-danger-box {
+  display: flex; align-items: flex-start; gap: 10px; padding: 12px 14px;
+  border: 1px solid var(--tf-danger); border-radius: var(--tf-radius-sm);
+  background: var(--tf-bg-2); font-size: 13px; color: var(--tf-text-2);
+}
+.tb-window .tb-danger-box .icon { width: 16px; height: 16px; flex-shrink: 0; color: var(--tf-danger); margin-top: 1px; }
+.tb-window .tb-danger-box b { color: var(--tf-text); }
+.tb-window .tb-impact-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--tf-text-2); }
+.tb-window .tb-impact-list li { display: flex; align-items: flex-start; gap: 8px; }
+.tb-window .tb-impact-list .icon { width: 14px; height: 14px; flex-shrink: 0; color: var(--tf-danger); margin-top: 2px; }
+.tb-window .tb-kept-box {
+  margin-top: 10px; padding: 10px 12px; border: 1px dashed var(--tf-border-hover);
+  border-radius: var(--tf-radius-sm); font-size: 12.5px; color: var(--tf-text-2);
+}
+.tb-window .confirm-type { display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--tf-text-2); }
+/* The name to retype is shown exactly as it must be typed — never upper-cased. */
+.tb-window .confirm-type .field > label { font-size: 13px; letter-spacing: 0; text-transform: none; }
+.tb-window .tb-retype-name { font-family: var(--tf-font-mono, ui-monospace, monospace); color: var(--tf-danger); font-weight: 700; white-space: nowrap; }
+.tb-window .num-err { color: var(--tf-danger); font-size: 12px; font-weight: 600; }
+.tb-delete-window .stack { display: flex; flex-direction: column; gap: 14px; }
+
+/* Message preview */
+.tb-window .tb-preview { display: flex; flex-direction: column; gap: 14px; }
+.tb-window .tb-audit-banner { display: flex; align-items: flex-start; gap: 10px; padding: 11px 14px; border-radius: var(--tf-radius-sm); background: var(--tf-bg-3); border: 1px solid var(--tf-border); font-size: 12px; color: var(--tf-text-2); }
+.tb-window .tb-audit-banner .icon { width: 16px; height: 16px; flex-shrink: 0; margin-top: 1px; color: var(--tf-warning); }
+.tb-window .tb-audit-banner b { color: var(--tf-text); }
+.tb-window .tb-preview-controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: end; }
+.tb-window .tb-preview-range .k { margin-bottom: 8px; }
+.tb-window .tb-preview-list { max-height: 300px; overflow: auto; }
+.tb-window .tb-preview-range .v { font-size: 13px; color: var(--tf-text); min-height: 40px; display: flex; align-items: center; }
+.tb-window .tb-state { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--tf-text-2); padding: 12px 0; }
+.tb-window .tb-state .icon { width: 15px; height: 15px; color: var(--tf-danger); }
+.tb-window .tb-preview-more { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; flex-wrap: wrap; }
+.tb-window .tb-preview-record-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; color: var(--tf-text); margin-bottom: 8px; }
+.tb-window .tb-payload {
+  margin: 0; padding: 12px 14px; max-height: 280px; overflow: auto;
+  border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); background: var(--tf-bg-2);
+  font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px;
+  color: var(--tf-text); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  .tb-window .form-grid-2, .tb-window .tb-preview-controls { grid-template-columns: minmax(0, 1fr); }
+  .tb-window .install-progress { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .tb-window .install-progress .install-step { min-width: 0; }
+  .tb-window .install-progress .label { white-space: normal; overflow-wrap: anywhere; }
+  .tb-window .tb-kv-grid { grid-template-columns: minmax(0, 1fr); }
+  .tb-window .tb-kv-grid .k { border-bottom: 0; padding-bottom: 2px; }
+  .tb-window .tb-stat-rows .sr { flex-wrap: wrap; }
+  /* The topic name keeps its own line whole; the instance tag goes under it. */
+  .tb-window .install-header h1 [data-role="heading"] { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tb-window .install-header h1 .version { display: inline-block; margin: 4px 0 0; }
+}
 
 /* ----- Animations ----- */
 @keyframes tb-rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 
 /* =============================================================================
-   Responsive — tablet (<=1024px) and phone (<=720px). Tables never widen the
-   page: tf-table's flush variant scrolls horizontally inside its own card.
+   U2 a topic's page (PROJEKT-SZCZEGOLOW.md): "← Wszystkie topiki", the title
+   with one line of what the topic carries, the vertical section menu beside
+   one section, and on a phone a "Sekcja: …" list under the title instead.
+   Values read as "label — value" rows; locks say why a value stays.
    ============================================================================= */
-@media (max-width: 1024px) {
-  .tb-wizard-grid, .tb-wizard-grid--3 { grid-template-columns: 1fr; }
-  .tb-wizard-form { min-width: 0; }
-  .tb-mini-kpis { margin-left: 0; width: 100%; justify-content: flex-start; }
-  .tb-repl-grid-2 { grid-template-columns: 1fr; }
+.tb-detail { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.tb-back { display: flex; }
+.tb-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px 16px; flex-wrap: wrap; }
+.tb-title-main { min-width: 0; }
+.tb-title { margin: 0; font-size: 22px; font-weight: 800; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+.tb-title-desc { font-size: 13px; color: var(--tf-text-2); margin-top: 4px; }
+.tb-title-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+.tb-title-note { font-size: 11.5px; color: var(--tf-text-3); text-align: right; max-width: 320px; }
+.tb-section-pick { display: none; }
+.tb-drill { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 20px; align-items: start; }
+.tb-drill > * { min-width: 0; }
+.tb-section-nav { position: sticky; top: 12px; }
+.tb-section > [data-section] { display: flex; flex-direction: column; gap: 16px; }
+.tb-section > [data-section][hidden] { display: none; }
+/* A slot with nothing to say (no notice, no lock line) must not add a gap. */
+.tb-section > [data-section] > [data-role]:empty { display: none; }
+
+.tb-root .tb-vrows { display: flex; flex-direction: column; }
+.tb-root .tb-vrow { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 4px 16px; padding: 10px 0; border-bottom: 1px solid var(--tf-border); }
+.tb-root .tb-vrow:last-child { border-bottom: 0; }
+.tb-root .tb-vr-label { font-size: 12.5px; color: var(--tf-text-2); }
+.tb-root .tb-vr-value { font-size: 13px; font-weight: 700; color: var(--tf-text); overflow-wrap: anywhere; }
+.tb-root .tb-vr-hint { font-size: 11.5px; color: var(--tf-text-3); margin-top: 2px; line-height: 1.5; }
+.tb-vr-lock { display: flex; align-items: flex-start; gap: 6px; font-size: 11.5px; color: var(--tf-text-3); margin-top: 2px; line-height: 1.5; }
+.tb-vr-lock .icon { width: 12px; height: 12px; margin-top: 2px; flex-shrink: 0; }
+.tb-who-can { display: flex; gap: 10px; align-items: center; padding: 10px 14px; border-radius: var(--tf-radius-sm); background: var(--tf-bg-3); border: 1px solid var(--tf-border); font-size: 12.5px; color: var(--tf-text-2); }
+.tb-who-can .icon { color: var(--tf-text-3); width: 15px; height: 15px; }
+.tb-danger-zone { border: 1px solid rgba(239, 68, 68, 0.4); border-radius: var(--tf-radius); padding: 16px 18px; background: rgba(239, 68, 68, 0.04); }
+.tb-danger-zone h4 { margin: 0 0 8px; color: var(--tf-danger); font-size: 13px; font-weight: 800; display: flex; gap: 8px; align-items: center; }
+.tb-danger-zone h4 .icon { width: 15px; height: 15px; }
+.tb-dz-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.tb-dz-desc { font-size: 12px; color: var(--tf-text-2); line-height: 1.55; }
+.tb-dz-desc b { color: var(--tf-text); }
+.tb-dz-row tf-button { flex-shrink: 0; }
+
+.tb-root .tb-consumer-row .tb-lag-cell { display: flex; flex-direction: column; align-items: flex-end; gap: 5px; width: 170px; flex: 0 0 auto; }
+.tb-root .tb-consumer-row .tb-lag-cell .v { font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tb-root .tb-consumer-row .tb-lag-cell tf-progress-bar { display: block; width: 100%; }
+.tb-root .tb-consumer-row > .icon { color: var(--tf-text-3); }
+.tb-warn-text { color: var(--tf-warning); }
+
+/* Kopie i nody (T10) */
+.tb-node-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.tb-node-card { background: var(--tf-bg-card); border: 1px solid var(--tf-border); border-radius: var(--tf-radius); padding: 14px 16px; min-width: 0; }
+.tb-node-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.tb-node-card-head .icon { color: var(--tf-accent-2); }
+.tb-node-card-head tf-chip { margin-left: auto; }
+.tb-node-name { font-weight: 800; font-size: 14px; overflow-wrap: anywhere; min-width: 0; }
+.tb-root .tb-stat-rows .sr { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--tf-border); font-size: 12.5px; }
+.tb-root .tb-stat-rows .sr:last-child { border-bottom: 0; }
+.tb-root .tb-stat-rows .k { color: var(--tf-text-2); }
+.tb-root .tb-stat-rows .v { font-weight: 700; font-variant-numeric: tabular-nums; font-family: var(--tf-font-mono, ui-monospace, monospace); text-align: right; }
+.tb-root .tb-stat-rows .v.is-warn { color: var(--tf-warning); }
+[data-tb-view-slot="replication"], [data-tb-view-slot="groups"] { display: flex; flex-direction: column; gap: 16px; }
+[data-tb-view-slot="replication"][hidden], [data-tb-view-slot="groups"][hidden] { display: none; }
+
+/* The "Zmień …" and "Przenieś prowadzenie" windows */
+.tb-change-window .stack, .tb-transfer-window .stack, .tb-move-window .stack { display: flex; flex-direction: column; gap: 14px; }
+.tb-window .tb-will-happen { display: flex; gap: 10px; align-items: flex-start; padding: 11px 14px; border-radius: var(--tf-radius-sm); background: rgba(96, 165, 250, 0.07); border: 1px solid rgba(96, 165, 250, 0.3); font-size: 12.5px; color: var(--tf-text-2); line-height: 1.55; }
+.tb-window .tb-will-happen .icon { color: var(--tf-info); width: 16px; height: 16px; margin-top: 1px; flex-shrink: 0; }
+.tb-window .tb-will-happen b { color: var(--tf-text); }
+.tb-window .tb-vr-lock .icon { width: 12px; height: 12px; }
+.tb-window [slot="footer"] .tb-foot-note { margin-right: auto; display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--tf-text-3); }
+.tb-window [slot="footer"] .tb-foot-note .icon { width: 13px; height: 13px; }
+.tb-change-window .tb-window-error, .tb-transfer-window .tb-window-error, .tb-move-window .tb-window-error { margin-top: 0; }
+
+/* U3 Odbiorcy: the three ways of confirming under the list, the retries line
+   that leads to the topic, and the reading-place window. */
+.tb-root .tb-commit-legend { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.tb-root .tb-vr-link { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
+.tb-move-window .tb-move-head { align-items: end; }
+/* Block, not flex: the bold number sits inside a sentence, and flex items drop the spaces around it. */
+.tb-move-window .tb-move-now { font-size: 13px; color: var(--tf-text-2); padding: 10px 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.tb-move-window .tb-move-now b { color: var(--tf-text); }
+
+@media (max-width: 767px) {
+  .tb-title { font-size: 19px; }
+  .tb-title-actions { align-items: flex-start; }
+  .tb-title-note { text-align: left; }
+  .tb-drill { grid-template-columns: minmax(0, 1fr); }
+  .tb-drill > tf-tabs.tb-section-nav { display: none; }
+  .tb-section-pick { display: block; }
+  .tb-root .tb-vrow { grid-template-columns: minmax(0, 1fr); }
+  .tb-dz-row { flex-direction: column; align-items: flex-start; }
+  .tb-root .tb-consumer-row .tb-lag-cell { width: 110px; }
+  .tb-node-grid { grid-template-columns: minmax(0, 1fr); }
+  .tb-window [slot="footer"] .tb-foot-note { flex-basis: 100%; }
+  .tb-root .tb-commit-legend { grid-template-columns: minmax(0, 1fr); }
+  .tb-move-window .form-grid-2 { grid-template-columns: minmax(0, 1fr); }
 }
 
+/* =============================================================================
+   U4 Nieprzetworzone wiadomości (T06 and a topic's section): the tile per
+   topic, the list footer with "Wczytaj więcej", and the "Pokaż" window.
+   ============================================================================= */
+.tb-root .tb-unp-tile .job-sub { flex-wrap: wrap; }
+.tb-root .tb-unp-tile > tf-button { flex: 0 0 auto; }
+.tb-root .tb-unp-who { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--tf-text-3); }
+.tb-root .tb-unp-who .icon { width: 13px; height: 13px; flex-shrink: 0; }
+.tb-root .tb-unp-footer { align-items: center; justify-content: space-between; }
+.tb-root .tb-unp-footer > div { display: flex; flex-wrap: wrap; gap: 6px 18px; }
+.tb-window .tb-unp-body-head { margin-top: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; color: var(--tf-text); }
+.tb-window.tb-unp-view .tb-audit-banner { margin-bottom: 0; }
 @media (max-width: 720px) {
-  .tb-toolbar { row-gap: 8px; }
-  .tb-toolbar > tf-searchbox, .tb-toolbar > tf-select { flex: 1 1 100%; max-width: none; }
-  .tb-kpi-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
-  .tb-kv { grid-template-columns: 1fr; }
-  .tb-kv-row > .tb-kv-key { padding-bottom: 0; border-bottom: none; }
-  .tb-mini-kpis { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; text-align: left; }
-  .tb-header-list { grid-template-columns: 1fr; }
-  .tb-node-grid { grid-template-columns: 1fr; }
-  .tb-node-stats { gap: 12px; }
+  .tb-root .tb-unp-tile { flex-wrap: wrap; }
+  .tb-root .tb-unp-tile .job-main { flex: 1 1 calc(100% - 44px); }
+  .tb-root .tb-unp-tile > tf-button { margin-left: 44px; }
 }

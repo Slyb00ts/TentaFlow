@@ -559,6 +559,17 @@ fn validate_scope_resource(
     Ok("*")
 }
 
+/// Whether a `topic` scope's `resource_id` names an existing TentaBus topic.
+fn topic_scope_target_exists(
+    db: &crate::db::DbPool,
+    resource_id: &str,
+) -> Result<bool, ProtocolError> {
+    let conn = db
+        .read()
+        .map_err(|_| ProtocolError::internal("db lock poisoned"))?;
+    repository::resource_permissions::topic_rule_target_exists(&conn, resource_id).map_err(db_err)
+}
+
 /// The action a scope clear removes: `Some` (exactly that row) for
 /// `bus_schema_registry`, `None` (every row of the pair) for every other type.
 /// Only the shape is checked for `bus_schema_registry` — a grant whose instance
@@ -708,6 +719,13 @@ pub fn api_key_create(
     for r in &payload.scope_resources {
         let action =
             validate_scope_resource(db, &r.resource_type, &r.resource_id, r.action.as_deref())?;
+        // Checked again, with the write, in `create_api_key_with_scopes`; here
+        // it answers with a reason instead of a failed transaction.
+        if r.resource_type == "topic" && !topic_scope_target_exists(db, &r.resource_id)? {
+            return Err(ProtocolError::not_found(
+                "resource_id names no existing TentaBus topic",
+            ));
+        }
         scopes.push((
             r.resource_type.clone(),
             r.resource_id.clone(),
@@ -874,16 +892,34 @@ pub fn api_key_scope_set(
     let action =
         validate_scope_resource(&ctx.state.db, resource_type, resource_id, action.as_deref())?;
     require_general_key(ctx, key_uid)?;
-    repository::resource_permissions::set_with_action(
-        &ctx.state.db,
-        resource_type,
-        resource_id,
-        "api_key",
-        key_uid,
-        action,
-        access_level,
-    )
-    .map_err(iam_err)?;
+    if resource_type == "topic" {
+        // Same guarded write as TentaBus's own topic entries.
+        let written = repository::resource_permissions::set_topic_rule(
+            &ctx.state.db,
+            resource_id,
+            "api_key",
+            key_uid,
+            action,
+            access_level,
+        )
+        .map_err(iam_err)?;
+        if !written {
+            return Err(ProtocolError::not_found(
+                "resource_id names no existing TentaBus topic",
+            ));
+        }
+    } else {
+        repository::resource_permissions::set_with_action(
+            &ctx.state.db,
+            resource_type,
+            resource_id,
+            "api_key",
+            key_uid,
+            action,
+            access_level,
+        )
+        .map_err(iam_err)?;
+    }
 
     // Audit is mandatory: a successful mutation that cannot be recorded must fail
     // the request rather than silently drop the trail. The write commits in its own
@@ -952,6 +988,9 @@ pub fn api_key_scope_clear(
         ),
     }
     .map_err(db_err)?;
+    if resource_type == "topic" {
+        crate::services::bus_authorizer::bump_acl_generation();
+    }
 
     // Audit mandatory (see api_key_scope_set): propagate the failure.
     let actor = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
@@ -2631,8 +2670,16 @@ pub fn settings_list(
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
     let settings = repository::list_settings(&ctx.state.db).map_err(db_err)?;
+    // The platform admin's list of internal alert collectors names the
+    // operator's internal hosts and networks: only a platform admin reads it
+    // (wave-9b critic, round 3, C2).
+    let platform_admin = matches!(
+        &ctx.session,
+        tentaflow_protocol::SessionAuth::UserSession { role: Some(r), .. } if r == "admin"
+    );
     let entries: Vec<SettingEntry> = settings
         .into_iter()
+        .filter(|s| platform_admin || s.key != crate::tentanas::forward::ALLOWLIST_SETTING)
         .map(|s| {
             let is_secret = crate::crypto::SettingsCipher::should_encrypt(&s.key);
             let value = if is_secret && !s.value.is_empty() {
@@ -2679,6 +2726,17 @@ pub fn settings_update(
         return Err(ProtocolError::bad_request(
             "data_dir/sync_dir zmienia sie przez Magazyn danych (StorageMigrateRequest), nie przez settings",
         ));
+    }
+
+    // The platform admin's list of internal alert collectors (TentaNas): a
+    // malformed entry, or one no target may ever reach (loopback, link-local,
+    // metadata), refuses the whole request rather than being stored.
+    for entry in &payload.entries {
+        if entry.key == crate::tentanas::forward::ALLOWLIST_SETTING {
+            if let Err(e) = crate::tentanas::forward::parse_allowlist(&entry.value) {
+                return Err(ProtocolError::bad_request(e.to_string()));
+            }
+        }
     }
 
     // Walidacja PRZED zapisem: niepusta sciezka musi byc tworzalna. Inaczej
@@ -9549,6 +9607,14 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                     "bus_schema_registry grants are set per API key with an explicit action",
                 ));
             }
+            // A topic's access entries go through TentaBus (`BusAclSetRequest`),
+            // which writes one only while the topic exists; one written here
+            // ahead of its topic would vanish when the topic is created.
+            if resource_type == "topic" {
+                return Err(ProtocolError::bad_request(
+                    "topic access entries are set in TentaBus (BusAclSetRequest)",
+                ));
+            }
             repository::resource_permissions::set(
                 db,
                 resource_type,
@@ -9574,6 +9640,10 @@ pub fn iam_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBo
                 subject_id,
             )
             .map_err(db_err)?;
+            // Open TentaBus consumers re-check their topics on the next fetch.
+            if resource_type == "topic" {
+                crate::services::bus_authorizer::bump_acl_generation();
+            }
             P::ResOk
         }
         P::ReqListPermsForResource {

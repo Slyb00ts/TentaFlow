@@ -41,7 +41,6 @@ let probeInProgress = false;
 let probeResults = [];
 let probeUnsub = null;
 let winEl = null;
-let backdropEl = null;
 
 const ClusterWizard = {
   open({ cluster = null, onDone = null } = {}) {
@@ -79,12 +78,17 @@ const ClusterWizard = {
 };
 
 function close() {
+  const win = winEl;
+  release();
+  if (win && win.isConnected) win.remove();
+}
+
+// Ends the probe subscription and forgets the window — also when the window
+// went without `close()` (Escape, the router clearing the screen).
+function release() {
   if (probeUnsub) { try { probeUnsub(); } catch (_) {} probeUnsub = null; }
   probeInProgress = false;
-  if (winEl && winEl.isConnected) winEl.remove();
-  if (backdropEl && backdropEl.isConnected) backdropEl.remove();
   winEl = null;
-  backdropEl = null;
 }
 
 // ---- Data ----------------------------------------------------------------
@@ -112,10 +116,7 @@ async function loadNodes() {
 
 function renderShell() {
   close();
-  backdropEl = document.createElement('div');
-  backdropEl.className = 'tf-window-backdrop';
-  document.body.appendChild(backdropEl);
-
+  // `modal` brings the backdrop and takes it away with the window.
   winEl = document.createElement('tf-window');
   winEl.setAttribute('title', editCluster ? I18n.t('clusters.edit_title') : I18n.t('clusters.create_title'));
   winEl.setAttribute('buttons', 'close');
@@ -130,6 +131,8 @@ function renderShell() {
     <div slot="footer" id="cw-footer"></div>
   `;
   document.body.appendChild(winEl);
+  const win = winEl;
+  win.addEventListener('closed', () => { if (winEl === win) release(); });
 
   winEl.addEventListener('action', (e) => {
     const a = e.detail?.action;
@@ -137,11 +140,6 @@ function renderShell() {
       close();
     }
   });
-  winEl.addEventListener('close-request', () => {
-    // Uzytkownik klika "x" w headerze: zamknij wizard + backdrop.
-    if (backdropEl && backdropEl.isConnected) backdropEl.remove();
-  });
-  backdropEl.addEventListener('click', () => close());
 }
 
 function refreshBody() {

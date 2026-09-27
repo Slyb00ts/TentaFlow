@@ -360,6 +360,8 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                         // UNSPECIFIED on this arm; do not read as ours.
                         environment: hello.environment,
                         reject: Some(ReplReject::UnknownInstance),
+                        follower_log_epoch: None,
+                        follower_committed: None,
                     };
                     let _ = frames::write_frame(&mut send, &ReplFrame::HelloAck(ack)).await;
                 }
@@ -370,7 +372,7 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                 .ok()
                 .and_then(|id| managers().get(&id).map(|e| e.value().clone()));
             match target {
-                Some(mgr) => mgr.answer_leo_query(query, send).await,
+                Some(mgr) => mgr.answer_leo_query(&remote_hex, query, send).await,
                 None => {
                     tracing::warn!(
                         peer = %remote_hex,
@@ -383,6 +385,13 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                         hw: 0,
                         leader_epoch: 0,
                         in_isr: false,
+                        log_epoch: None,
+                        leading: false,
+                        ineligible: true,
+                        committed: None,
+                        leader_alive: false,
+                        promised_epoch: None,
+                        promises: true,
                     });
                     let _ = frames::write_frame(&mut send, &reply).await;
                 }
@@ -431,6 +440,7 @@ pub fn running_managers() -> Vec<Arc<ReplicationManager>> {
 mod tests {
     use super::*;
     use crate::bus::replication::assignment::PartitionAssignment;
+    use crate::bus::replication::election::LogPosition;
     use crate::bus::replication::frames::{ReplHello, ReplLeoQuery};
     use crate::bus::replication::manager::{
         AssignmentStore, FollowerRunner, FollowerRunnerFactory, LeaderHandle, LeaderHandleFactory,
@@ -519,6 +529,34 @@ mod tests {
             _leader_recv: BusRecv,
             _leader_send: BusSend,
         ) -> Result<Box<dyn FollowerRunner>, ReplError> {
+            unimplemented!("decoy fixture: never driven")
+        }
+        fn undialed_lease(&self) -> Duration {
+            unimplemented!("decoy fixture: never driven")
+        }
+        fn leader_lease(&self) -> Duration {
+            unimplemented!("decoy fixture: never driven")
+        }
+        fn election_stagger(&self) -> Duration {
+            unimplemented!("decoy fixture: never driven")
+        }
+        fn fence_to_epoch(
+            &self,
+            _assignment: &PartitionAssignment,
+            _epoch: u32,
+        ) -> Result<u32, ReplError> {
+            unimplemented!("decoy fixture: never driven")
+        }
+        fn cut_to_committed(
+            &self,
+            _assignment: &PartitionAssignment,
+        ) -> Result<LogPosition, ReplError> {
+            unimplemented!("decoy fixture: never driven")
+        }
+        fn local_log_position(
+            &self,
+            _assignment: &PartitionAssignment,
+        ) -> Result<LogPosition, ReplError> {
             unimplemented!("decoy fixture: never driven")
         }
     }
@@ -616,6 +654,7 @@ mod tests {
                 leader_epoch: 1,
                 replicas: vec!["l".to_string()],
                 environment: NodeEnvironment::Prod,
+                topic_generation: Some(0),
             }),
         )
         .await
@@ -663,6 +702,7 @@ mod tests {
                 leader_epoch: 1,
                 replicas: vec!["l".to_string()],
                 environment: NodeEnvironment::Prod,
+                topic_generation: Some(0),
             }),
         )
         .await
@@ -703,6 +743,7 @@ mod tests {
                 topic: "orders".to_string(),
                 partition: 0,
                 known_epoch: 5,
+                candidate_epoch: None,
             }),
         )
         .await

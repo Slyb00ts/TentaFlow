@@ -128,8 +128,9 @@ pub struct SessionInfo {
 /// A reason sentence cannot be translated — "process isolation requires the
 /// current user's GUI launchd domain" is not something a Polish picker can
 /// render — so the CAUSE crosses the wire and each locale says it in its own
-/// words. `gui_session_required` is the one that has to name the missing GUI
-/// session: it is the only cause an operator can still fix on that machine.
+/// words. `gui_session_required` names the missing GUI session;
+/// `user_namespaces_denied` is the one the node repairs itself
+/// (`ProcessSandboxRepairRequest`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessSandboxCause {
@@ -137,6 +138,9 @@ pub enum ProcessSandboxCause {
     SupervisorNotInitialized,
     MissingCoalition,
     GuiSessionRequired,
+    /// `bwrap` is installed but the kernel denies it user namespaces (Ubuntu's
+    /// AppArmor restriction). Fixable with root on the node itself.
+    UserNamespacesDenied,
 }
 
 /// Node that can host a workspace, for the wizard's node picker.
@@ -1708,6 +1712,25 @@ pub enum CodeStudioPayload {
         /// never has to re-derive it and disagree.
         open: u32,
     },
+
+    // ---- Process sandbox repair ----
+    /// Makes the process sandbox of the node that EXECUTES this request work,
+    /// where its cause is one root can fix there (`user_namespaces_denied`).
+    /// Addressed to a peer through the envelope's forward routing, so a remote
+    /// node is repaired by its own root, never by the dashboard's. Admin only.
+    ProcessSandboxRepairRequest {
+        /// The executing node's sudo password, used once for this repair and
+        /// dropped. Required: the repair runs outside TentaNas, so there is no
+        /// configured privilege channel to fall back on.
+        sudo_password: crate::tentanas::SudoSecret,
+    },
+    /// The sandbox as measured AFTER the repair, so the caller shows what is
+    /// true now rather than what the repair intended.
+    ProcessSandboxRepairResponse {
+        supports_process_sandbox: bool,
+        process_sandbox_cause: Option<ProcessSandboxCause>,
+        process_sandbox_reason: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -1764,8 +1787,8 @@ mod tests {
 
         // (enum, variant count, digest of the variants in declaration order)
         let pinned: &[(&str, usize, u64)] = &[
-            ("ProcessSandboxCause", 4, 0xbda1_1274_7a3b_16de),
-            ("CodeStudioPayload", 135, 0x2cf8_e9cb_5203_5ab6),
+            ("ProcessSandboxCause", 5, 0x4173_ad6e_75ed_9b50),
+            ("CodeStudioPayload", 137, 0x72ef_04cb_779f_3232),
         ];
         assert_eq!(pinned.len(), enums.len());
         for (name, count, digest) in pinned {

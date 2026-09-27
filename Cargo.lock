@@ -5783,6 +5783,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -15297,7 +15298,7 @@ dependencies = [
 
 [[package]]
 name = "tentanas-helper"
-version = "0.14.0"
+version = "0.17.1"
 dependencies = [
  "libc",
  "serde",

@@ -118,6 +118,11 @@ fn main() -> ExitCode {
         eprintln!("tentanas-helper: refused: no key material on stdin");
         return ExitCode::from(65);
     }
+    if let Err(CatalogError::InvalidArgument(detail)) = command.validate_payload(&key_material) {
+        syslog(&format!("refused: {detail}"));
+        eprintln!("tentanas-helper: refused: {detail}");
+        return ExitCode::from(65);
+    }
     let plan = match command.plan() {
         Ok(p) => p,
         Err(CatalogError::InvalidArgument(detail)) => {

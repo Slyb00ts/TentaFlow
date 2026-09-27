@@ -23,6 +23,8 @@ use std::path::Path;
 
 use tentaflow_protocol::features::FeatureState;
 
+use super::CodedText;
+
 /// The Environment row's feature id (`FEATURES` in environment.rs) and the id
 /// the package install uses.
 pub const FEATURE_ID: &str = "rdma";
@@ -216,17 +218,31 @@ pub fn module_loaded(module: &str) -> bool {
 /// Turns a probe into the Environment row (n16). Split from `probe` so the
 /// wording is testable against a fixture instead of against this host.
 pub fn describe(probe: &Probe) -> (&'static str, String) {
+    let (status, detail) = describe_coded(probe);
+    (status, detail.text)
+}
+
+/// `describe` with the row's detail as codes beside the English, for the
+/// Environment tab to word (`NasEnvironment::feature_reasons`). The one
+/// place both are built, so the sentence and the codes cannot disagree.
+pub fn describe_coded(probe: &Probe) -> (&'static str, CodedText) {
+    let module_param = [("module", RPCRDMA_MODULE.to_string())];
     let module = if probe.module_loaded {
-        format!("{RPCRDMA_MODULE} loaded (provides svcrdma/xprtrdma)")
+        CodedText::new("module_loaded", &module_param, format!("{RPCRDMA_MODULE} loaded (provides svcrdma/xprtrdma)"))
     } else if probe.module_available {
-        format!("{RPCRDMA_MODULE} available, loaded when the listener opens")
+        CodedText::new("module_on_demand", &module_param, format!("{RPCRDMA_MODULE} available, loaded when the listener opens"))
     } else {
-        format!("{RPCRDMA_MODULE} is not in this kernel's module tree")
+        CodedText::new("module_absent", &module_param, format!("{RPCRDMA_MODULE} is not in this kernel's module tree"))
     };
     if probe.devices.is_empty() {
         return (
             "no_device",
-            format!("no RDMA device under {INFINIBAND_CLASS} · {module}"),
+            CodedText::new(
+                "rdma_no_device",
+                &[("path", INFINIBAND_CLASS.to_string())],
+                format!("no RDMA device under {INFINIBAND_CLASS}"),
+            )
+            .and(module),
         );
     }
     let devices = probe
@@ -242,7 +258,7 @@ pub fn describe(probe: &Probe) -> (&'static str, String) {
     } else {
         "ok"
     };
-    (status, format!("{devices} · {module}"))
+    (status, CodedText::new("rdma_devices", &[("devices", devices.clone())], devices).and(module))
 }
 
 /// Replaces the generic feature probe's answer for the RDMA row.
@@ -253,12 +269,18 @@ pub fn describe(probe: &Probe) -> (&'static str, String) {
 /// than as an installed feature. So the generic probe supplies the id and the
 /// package list and this supplies the verdict.
 pub fn refine(feature: &mut FeatureState) {
+    refine_coded(feature);
+}
+
+/// `refine`, answering the row's detail as codes too.
+pub fn refine_coded(feature: &mut FeatureState) -> Vec<tentaflow_protocol::tentanas::NasHealthReason> {
     let probe = probe();
-    let (status, detail) = describe(&probe);
+    let (status, detail) = describe_coded(&probe);
     feature.status = status.to_string();
-    feature.detail = detail;
+    feature.detail = detail.text;
     feature.version = None;
     feature.kernel_module = Some(RPCRDMA_MODULE.to_string());
+    detail.reasons
 }
 
 /// Whether the RDMA row of an environment says this node can use RDMA. The
@@ -349,6 +371,22 @@ mod tests {
 
     #[test]
     fn a_node_without_a_card_says_so_instead_of_blaming_the_module() {
+        // Wave 7: the same row as codes, one per part of the sentence.
+        let (_, coded) = describe_coded(&Probe { devices: Vec::new(), module_loaded: false, module_available: true });
+        assert_eq!(
+            coded.reasons.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            vec!["rdma_no_device", "module_on_demand"]
+        );
+        assert_eq!(coded.reasons[1].params.get("module").map(String::as_str), Some(RPCRDMA_MODULE));
+        let (_, coded) = describe_coded(&Probe {
+            devices: vec![device("mlx5_0", "ACTIVE", "enp1s0f0np0", "10.10.0.5")],
+            module_loaded: true,
+            module_available: true,
+        });
+        assert_eq!(coded.reasons[0].code, "rdma_devices");
+        assert_eq!(coded.reasons[0].params.get("devices").map(String::as_str), Some("mlx5_0 ACTIVE (enp1s0f0np0 10.10.0.5)"));
+        assert_eq!(coded.reasons[1].code, "module_loaded");
+
         let empty = Probe {
             devices: Vec::new(),
             module_loaded: false,

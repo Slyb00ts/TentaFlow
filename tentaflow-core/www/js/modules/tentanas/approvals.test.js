@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const { approvalsCardHtml, wireApprovals, operationLabel, reportParked } = await import('./approvals.js');
+const { approvalsCardHtml, wireApprovals, operationLabel, reportParked, approvalDetail } = await import('./approvals.js');
 const { followResponse } = await import('./dialogs.js');
 
 const inAnHour = () => new Date(Date.now() + 3600_000).toISOString();
@@ -446,4 +446,164 @@ test('a coded approval detail is worded in the reader language, in all five loca
       screen.dispose();
     }
   } finally { await I18n.setLanguage('pl'); }
+});
+
+// Wave-6 critic MAJOR 1: a repair the node could not name at all is worded
+// without a disk — never the node's sentence, never a slot.
+test('a parked repair with no disk name or number still reads in words', async () => {
+  const screen = fakeScreen({ tentaNasApprovalsListRequest: {
+    approvals: [pending({ operation: 'elastic_fix', subject: 'media', detail: 'writes back … on a data disk of the array', detailReasons: [{ code: 'elastic_fix', params: { disk: '', number: '' } }] })],
+    settings: settings(),
+  } });
+  const body = mount();
+  const { refresh } = wireApprovals(screen, body);
+  await refresh();
+  await flush();
+  const cell = body.querySelector('#nas-approvals-table').rows[0].operation;
+  assert.match(cell, /na jednym z dysków danych macierzy\./);
+  assert.doesNotMatch(cell, />writes back/);
+  screen.dispose();
+});
+
+// Wave 6: every parked request carries its detail as a code with parameters
+// beside the node's English (`detailReasons`). The row words it in the
+// approver's language — the schedule's cadence with the schedule editor's own
+// formatter, a repair's disk by its number when the node cannot name it,
+// never its slot — and the English is only the sub-line's tooltip.
+test('a parked detail is worded from its code in all five locales, the English only in the tooltip', async () => {
+  const { I18n } = await import('./_test-setup.js');
+  const english = 'arms the schedule: scrub parity of array media, daily at 03:00';
+  const approvals = [
+    pending({
+      operation: 'elastic_schedule', subject: 'media', detail: english,
+      detailReasons: [{ code: 'elastic_schedule', params: { task: 'scrub', enabled: 'true', every: 'daily', hour: '3', minute: '0', weekday: '0', day: '1' } }],
+    }),
+    pending({
+      requestId: 'r-2', operation: 'elastic_fix', subject: 'media', detail: "writes back from parity …; recorded against disk 'd2'",
+      detailReasons: [{ code: 'elastic_fix', params: { disk: '', number: '2' } }],
+    }),
+    pending({ requestId: 'r-3', detail: 'an older sentence' }),
+  ];
+  try {
+    for (const [language, schedule, fix] of [
+      ['pl', /^Uzbraja harmonogram: scrub parity, codziennie o 03:00\.$/, /na dysku danych nr 2\.$/],
+      ['en', /^Arms the schedule: parity scrub, /, /on data disk no\. 2\.$/],
+      ['de', /^Aktiviert den Zeitplan: Paritäts-Scrub, /, /auf Datenträger Nr\. 2\.$/],
+      ['es', /^Activa la programación: scrub de paridad, /, /en el disco de datos n\.º 2\.$/],
+      ['fr', /^Arme la planification : scrub de parité, /, /sur le disque de données n° 2\.$/],
+    ]) {
+      await I18n.setLanguage(language);
+      const screen = fakeScreen({ tentaNasApprovalsListRequest: { approvals, settings: settings() } });
+      const body = mount();
+      const { refresh } = wireApprovals(screen, body);
+      await refresh();
+      await flush();
+      const rows = body.querySelector('#nas-approvals-table').rows;
+      const sub = (i) => {
+        const cell = document.createElement('div');
+        cell.innerHTML = rows[i].operation;
+        return cell.querySelector('.tf-table__cell-sub');
+      };
+      assert.match(sub(0).textContent, schedule, language);
+      assert.equal(sub(0).getAttribute('title'), english, language);
+      assert.match(sub(1).textContent, fix, language);
+      assert.doesNotMatch(sub(1).textContent, /\bd2\b/, language);
+      assert.equal(sub(2).textContent, 'an older sentence', 'a sentence without codes is shown as written');
+      assert.equal(sub(2).getAttribute('title'), null);
+      screen.dispose();
+    }
+  } finally { await I18n.setLanguage('pl'); }
+});
+
+// Critic wave 6, MINOR 10: the config-import approval words the schedules it
+// overwrites from the node's `[task, subject]` pairs — never the plan's own
+// "scrub tank, smart" — and falls back on the node's list when the pairs do
+// not cover every overwritten item.
+test('a config-import approval words the overwritten schedules in the reader\'s language', async () => {
+  const { I18n } = await import('./_test-setup.js');
+  const approval = (schedules, count = '3') => ({
+    detail: 'overwrites 3: scrub tank, snapshot tank/x, smart',
+    detailReasons: [{ code: 'config_import', params: { count, items: 'scrub tank, snapshot tank/x, smart', schedules } }],
+  });
+  const pairs = JSON.stringify([['scrub', 'tank'], ['snapshot', 'tank/x'], ['smart', '']]);
+  try {
+    for (const [language, expected] of [
+      ['pl', 'Nadpisuje istniejące elementy (3): harmonogram scrub puli tank, harmonogram snapshotów datasetu tank/x, harmonogram testów SMART.'],
+      ['de', 'Überschreibt vorhandene Einträge (3): Scrub-Zeitplan des Pools tank, Snapshot-Zeitplan des Datasets tank/x, SMART-Testzeitplan.'],
+    ]) {
+      await I18n.setLanguage(language);
+      assert.equal(approvalDetail(approval(pairs)).text, expected, language);
+    }
+    await I18n.setLanguage('pl');
+    // An older node (no pairs), pairs that miss an item, or a task with no
+    // words here: the node's own list, as sent.
+    for (const fallback of [approval(undefined), approval(pairs, '4'), approval(JSON.stringify([['scrub', 'tank'], ['defrag', 'x'], ['smart', '']]))]) {
+      assert.match(approvalDetail(fallback).text, /: scrub tank, snapshot tank\/x, smart\.$/);
+    }
+  } finally { await I18n.setLanguage('pl'); }
+});
+
+// Wave 10 (n18d): a stop of a node's sharing tells the approver which shares
+// and targets stop BY NAME — the asking organisation's — with another
+// organisation's only counted, in all five locales, and a node without a
+// name is named in words, never by an id.
+test('a sharing-stop approval names the node, its shares and targets, and counts other organisations', async () => {
+  const { I18n } = await import('./_test-setup.js');
+  const approval = (over = {}) => ({
+    operation: 'sharing_stop',
+    detail: 'stops sharing on helios: …',
+    detailReasons: [{ code: 'sharing_stop', params: {
+      node: 'helios', shares: 'media, projekty', targets: 'vm-store', other_shares: '2', other_targets: '0',
+      smb: '3', nfs: '1', iscsi: '1', nvmet: '0', ...over,
+    } }],
+  });
+  try {
+    for (const [language, expected, label] of [
+      ['pl', 'Zatrzymuje udostępnianie na węźle helios — udziały: media, projekty, 2 udziały innych organizacji; targety: vm-store — a potem wyłącza TentaNas na całej flocie. Lista pochodzi z chwili zgłoszenia — przy zatrzymaniu węzeł ustala ją na nowo.', 'Zatrzymanie udostępniania i wyłączenie TentaNas'],
+      ['en', 'Stops sharing on node helios — shares: media, projekty, 2 shares of other organisations; targets: vm-store — then disables TentaNas on the whole fleet. The list is as of the request — the node reads it again when it stops sharing.', 'Stop sharing and disable TentaNas'],
+      ['de', 'Stoppt die Freigabe auf Knoten helios — Freigaben: media, projekty, 2 Freigaben anderer Organisationen; Targets: vm-store — und deaktiviert dann TentaNas in der ganzen Flotte. Die Liste gibt den Stand der Anfrage wieder — beim Stoppen ermittelt der Knoten sie neu.', 'Freigabe stoppen und TentaNas deaktivieren'],
+      ['fr', 'Arrête le partage sur le nœud helios — partages : media, projekty, 2 partages d\'autres organisations ; cibles : vm-store — puis désactive TentaNas sur toute la flotte. La liste date de la demande — à l’arrêt, le nœud la détermine à nouveau.', 'Arrêter le partage et désactiver TentaNas'],
+      ['es', 'Detiene la compartición en el nodo helios — recursos compartidos: media, projekty, 2 recursos compartidos de otras organizaciones; destinos: vm-store — y después desactiva TentaNas en toda la flota. La lista refleja el momento de la solicitud: al detener, el nodo la vuelve a determinar.', 'Detener la compartición y desactivar TentaNas'],
+    ]) {
+      await I18n.setLanguage(language);
+      assert.equal(approvalDetail(approval()).text, expected, language);
+      assert.equal(operationLabel('sharing_stop'), label, language);
+    }
+    await I18n.setLanguage('pl');
+    assert.equal(
+      approvalDetail(approval({ node: '', shares: '', targets: '', other_shares: '0' })).text,
+      'Zatrzymuje udostępnianie na węźle bez nazwy — udziały: brak; targety: brak — a potem wyłącza TentaNas na całej flocie. Lista pochodzi z chwili zgłoszenia — przy zatrzymaniu węzeł ustala ją na nowo.',
+    );
+    // Counts that are not numbers are not worded: the node's sentence is.
+    assert.equal(approvalDetail(approval({ other_shares: 'x' })).text, 'stops sharing on helios: …');
+  } finally { await I18n.setLanguage('pl'); }
+});
+
+// Wave 10 round 3 (R2-2): another organisation's stop of this node is listed
+// for a platform admin with the node only, and offers ONLY a rejection.
+test('another organisation\'s stop of this node is worded by the node and can only be rejected', async () => {
+  let sent = null;
+  const foreign = pending({
+    requestId: 'r-f', operation: 'sharing_stop', subject: 'helios', requestedBy: '',
+    detail: 'a stop of this node\'s sharing, requested in another organisation, waits for approval',
+    detailReasons: [{ code: 'sharing_stop_other_org', params: { node: 'helios' } }],
+  });
+  const screen = fakeScreen({
+    tentaNasApprovalsListRequest: { approvals: [foreign], settings: settings() },
+    tentaNasApprovalDecideRequest: (p) => { sent = p; return { approvals: [], settings: settings() }; },
+  });
+  const body = mount();
+  const { refresh } = wireApprovals(screen, body);
+  await refresh();
+  await flush();
+  const table = body.querySelector('#nas-approvals-table');
+  assert.match(table.rows[0].operation, /Zatrzymanie udostępniania na węźle helios, zgłoszone w innej organizacji/);
+  const buttons = [...table.rowActions(table.rows[0]).querySelectorAll('tf-button')];
+  assert.deepEqual(buttons.map((b) => b.textContent), ['Odrzuć'], 'no approve button');
+  click(buttons[0]);
+  await confirmDecision();
+  await flush();
+  assert.equal(sent.approve, false);
+  assert.equal(sent.requestId, 'r-f');
+  screen.dispose();
 });

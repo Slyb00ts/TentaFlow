@@ -542,8 +542,10 @@ async fn auto_job(
         }
     }
     h.progress(100);
-    let pruning = spawn_prune(h.db(), &dataset, recursive, keep, super::scheduler::STARTED_BY)?;
-    h.log(format!("retention runs as job {}", pruning.job_id));
+    // The pruning job is on the job list under its own kind; its id is not
+    // a word for the log (owner decision 2026-09-26).
+    spawn_prune(h.db(), &dataset, recursive, keep, super::scheduler::STARTED_BY)?;
+    h.log(format!("retention of {dataset} runs as a separate job"));
     Ok(())
 }
 

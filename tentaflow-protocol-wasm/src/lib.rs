@@ -34,6 +34,8 @@ use tentaflow_protocol::{
         AddonPermissionMatrixRequest, AddonPermissionSetRequest, AddonReloadRequest,
         AddonResourcesGetRequest, AddonResourcesSetRequest, AddonShowInCatalogSetRequest,
         AddonStoragePayload, AddonStorageStatsRequest, AddonTeardownPlanRequest,
+        AddonTeardownStatusRequest, AddonDisablePreviewRequest, AddonTeardownArmRequest,
+        AddonTeardownDisarmRequest,
         AddonToggleRequest, AddonToolsRequest, AddonUninstallRequest, AddonVectorConfig,
         AddonVectorGetConfigRequest, AddonVectorPayload, AddonVectorServiceRef,
         AddonVectorSetConfigRequest, AddonVisibilityListRequest, AddonVisibilitySetRequest,
@@ -2165,6 +2167,28 @@ pub fn encode_bus_offset_reset_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// Read-only lookup behind the "from a chosen time" reset: the first offset
+/// of `partition` whose record timestamp is `>= ts_ms` (the high watermark
+/// when none), so the dashboard can state how many messages that move would
+/// re-read or skip before the admin confirms it.
+#[wasm_bindgen(js_name = encodeBusOffsetForTimestampRequest)]
+pub fn encode_bus_offset_for_timestamp_request(
+    instance_id: String,
+    topic: String,
+    partition: u32,
+    ts_ms: i64,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::OffsetForTimestampRequest {
+            topic,
+            partition,
+            ts_ms,
+        },
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeBusMessagesBrowseRequest)]
 pub fn encode_bus_messages_browse_request(
     instance_id: String,
@@ -2397,26 +2421,6 @@ pub fn encode_bus_replica_list_request(
     encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
         instance_id,
         payload: tentaflow_protocol::BusPayload::ReplicaListRequest { topic },
-    }))
-    .map_err(|e| JsError::new(&e))
-}
-
-/// Admin-triggered replica-set change (M06 "Zmień repliki"). `partition:
-/// None` targets every partition of `topic`; `Some(n)` targets one.
-#[wasm_bindgen(js_name = encodeBusReassignRequest)]
-pub fn encode_bus_reassign_request(
-    instance_id: String,
-    topic: String,
-    partition: Option<u32>,
-    replicas: Vec<String>,
-) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
-        instance_id,
-        payload: tentaflow_protocol::BusPayload::ReassignRequest {
-            topic,
-            partition,
-            replicas,
-        },
     }))
     .map_err(|e| JsError::new(&e))
 }
@@ -10031,9 +10035,27 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::AddonUninstallRequestBody(r) => {
             set(&obj, "variant", "AddonUninstallRequest".into());
             set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "acknowledgedCount", (r.acknowledged_nodes.len() as f64).into());
         }
         MessageBody::AddonTeardownPlanRequestBody(r) => {
             set(&obj, "variant", "AddonTeardownPlanRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+        }
+        MessageBody::AddonTeardownStatusRequestBody(r) => {
+            set(&obj, "variant", "AddonTeardownStatusRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+        }
+        MessageBody::AddonDisablePreviewRequestBody(r) => {
+            set(&obj, "variant", "AddonDisablePreviewRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+        }
+        MessageBody::AddonTeardownDisarmRequestBody(r) => {
+            set(&obj, "variant", "AddonTeardownDisarmRequest".into());
+            set(&obj, "addonId", r.addon_id.into());
+        }
+        MessageBody::AddonTeardownArmRequestBody(r) => {
+            // The password is never echoed back into a JS object.
+            set(&obj, "variant", "AddonTeardownArmRequest".into());
             set(&obj, "addonId", r.addon_id.into());
         }
         MessageBody::AddonConfigGetRequestBody(r) => {
@@ -10118,6 +10140,13 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&eo, "description", e.description.into());
                 set(&eo, "removed", e.removed.into());
                 set(&eo, "sizeBytes", (e.size_bytes as f64).into());
+                set(&eo, "blocks", e.blocks.into());
+                // The named counts a kind's translation interpolates
+                // (`addon_uninstall.entries.<kind>`); `undefined` when the
+                // kind has none, which the dialog treats as "no vars".
+                if !e.count_vars.is_empty() {
+                    set(&eo, "countVars", count_vars_object(&e.count_vars).into());
+                }
                 entries.push(&eo.into());
             }
             set(&obj, "entries", entries.into());
@@ -10130,6 +10159,85 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 dependents.push(&dobj.into());
             }
             set(&obj, "dependents", dependents.into());
+            let nodes = js_sys::Array::new();
+            for n in r.nodes {
+                let no = js_sys::Object::new();
+                set(&no, "nodeId", n.node_id.into());
+                set(&no, "name", n.name.into());
+                set(&no, "local", n.local.into());
+                set(&no, "online", n.online.into());
+                set(&no, "status", n.status.into());
+                set(&no, "lastKnown", n.last_known.into());
+                let blocks = js_sys::Array::new();
+                for e in n.last_blocks {
+                    let eo = js_sys::Object::new();
+                    set(&eo, "kind", e.kind.into());
+                    set(&eo, "description", e.description.into());
+                    set(&eo, "blocks", true.into());
+                    if !e.count_vars.is_empty() {
+                        set(&eo, "countVars", count_vars_object(&e.count_vars).into());
+                    }
+                    blocks.push(&eo.into());
+                }
+                set(&no, "lastBlocks", blocks.into());
+                set(&no, "unpaired", n.unpaired.into());
+                nodes.push(&no.into());
+            }
+            set(&obj, "nodes", nodes.into());
+            set(&obj, "privilege", r.privilege.into());
+            set(&obj, "backupFile", r.backup_file.into());
+        }
+        MessageBody::AddonTeardownArmResponseBody(r) => {
+            set(&obj, "variant", "AddonTeardownArmResponse".into());
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "armedUntil", r.armed_until.into());
+        }
+        MessageBody::AddonTeardownStatusResponseBody(r) => {
+            set(&obj, "variant", "AddonTeardownStatusResponse".into());
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "state", r.state.into());
+            set(&obj, "phase", r.phase.into());
+            let warnings = js_sys::Array::new();
+            for w in r.warnings {
+                warnings.push(&w.into());
+            }
+            set(&obj, "warnings", warnings.into());
+        }
+        MessageBody::AddonDisablePreviewResponseBody(r) => {
+            set(&obj, "variant", "AddonDisablePreviewResponse".into());
+            set(&obj, "addonId", r.addon_id.into());
+            set(&obj, "displayName", r.display_name.into());
+            set(&obj, "nodeName", r.node_name.into());
+            set(&obj, "backgroundOnDisable", r.background_on_disable.into());
+            let consequences = js_sys::Array::new();
+            for c in r.consequences {
+                let co = js_sys::Object::new();
+                set(&co, "kind", c.kind.into());
+                set(&co, "effect", c.effect.into());
+                set(&co, "countVars", count_vars_object(&c.count_vars).into());
+                let names = js_sys::Array::new();
+                for n in c.names {
+                    names.push(&n.into());
+                }
+                set(&co, "names", names.into());
+                consequences.push(&co.into());
+            }
+            set(&obj, "consequences", consequences.into());
+            // Wave 10: every node the disable reaches, by name (the id only
+            // routes), and the answering node's privilege mode.
+            let nodes = js_sys::Array::new();
+            for n in r.nodes {
+                let no = js_sys::Object::new();
+                set(&no, "nodeId", n.node_id.into());
+                set(&no, "name", n.name.into());
+                set(&no, "local", n.local.into());
+                set(&no, "online", n.online.into());
+                set(&no, "status", n.status.into());
+                set(&no, "unpaired", n.unpaired.into());
+                nodes.push(&no.into());
+            }
+            set(&obj, "nodes", nodes.into());
+            set(&obj, "privilege", r.privilege.into());
         }
         MessageBody::AddonConfigGetResponseBody(r) => {
             set(&obj, "variant", "AddonConfigGetResponse".into());
@@ -11882,6 +11990,7 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                     "lag_total",
                     opt_f64_to_js(g.lag_total.map(|v| v as f64)),
                 );
+                set_bus(&o, "canAdmin", "can_admin", g.can_admin.into());
                 arr.push(&o);
             }
             set(obj, "groups", arr.into());
@@ -12399,6 +12508,13 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 "sample_interval_ms",
                 (sample_interval_ms as f64).into(),
             );
+        }
+        BP::OffsetForTimestampRequest { .. } => {
+            set(obj, "variant", "BusOffsetForTimestampRequest".into())
+        }
+        BP::OffsetForTimestampResponse { offset } => {
+            set(obj, "variant", "BusOffsetForTimestampResponse".into());
+            set(obj, "offset", (offset as f64).into());
         }
     }
 }
@@ -17061,7 +17177,54 @@ pub fn encode_suggest_service_port_request(payload_json: String) -> Result<Vec<u
 #[wasm_bindgen(js_name = encodeAddonUninstallRequest)]
 pub fn encode_addon_uninstall_request(addon_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AddonUninstallRequestBody(
-        AddonUninstallRequest { addon_id },
+        AddonUninstallRequest { addon_id, acknowledged_nodes: Vec::new() },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `payload_json`: `{ "addon_id": …, "acknowledged_nodes": [{ "node_id", "confirm_name" }] }`.
+#[wasm_bindgen(js_name = encodeAddonUninstallRequestJson)]
+pub fn encode_addon_uninstall_request_json(payload_json: String) -> Result<Vec<u8>, JsError> {
+    let payload: AddonUninstallRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("payload parse: {e}")))?;
+    encode_body_inner(&MessageBody::AddonUninstallRequestBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAddonTeardownDisarmRequest)]
+pub fn encode_addon_teardown_disarm_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonTeardownDisarmRequestBody(AddonTeardownDisarmRequest { addon_id }))
+        .map_err(|e| JsError::new(&e))
+}
+
+/// `{ name: count }` as a plain JS object, the shape `I18n.t` interpolates.
+fn count_vars_object(vars: &std::collections::BTreeMap<String, i64>) -> js_sys::Object {
+    let out = js_sys::Object::new();
+    for (k, v) in vars {
+        set(&out, k, (*v as f64).into());
+    }
+    out
+}
+
+#[wasm_bindgen(js_name = encodeAddonTeardownStatusRequest)]
+pub fn encode_addon_teardown_status_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonTeardownStatusRequestBody(
+        AddonTeardownStatusRequest { addon_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `payload_json`: `{ "addon_id": …, "sudo_password": … }`.
+#[wasm_bindgen(js_name = encodeAddonTeardownArmRequest)]
+pub fn encode_addon_teardown_arm_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    let payload: AddonTeardownArmRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("payload parse: {e}")))?;
+    encode_body_inner(&MessageBody::AddonTeardownArmRequestBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAddonDisablePreviewRequest)]
+pub fn encode_addon_disable_preview_request(addon_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AddonDisablePreviewRequestBody(
+        AddonDisablePreviewRequest { addon_id },
     ))
     .map_err(|e| JsError::new(&e))
 }
@@ -23043,6 +23206,15 @@ pub fn encode_code_studio_repo_tree_request(request_json: String) -> Result<Vec<
     encode_code_studio_json_request("RepoTreeRequest", &request_json)
 }
 
+/// MessageBody::CodeStudioBody(ProcessSandboxRepairRequest) — carries the
+/// executing node's sudo password for this one repair.
+#[wasm_bindgen(js_name = encodeCodeStudioProcessSandboxRepairRequest)]
+pub fn encode_code_studio_process_sandbox_repair_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("ProcessSandboxRepairRequest", &request_json)
+}
+
 // =============================================================================
 // Agent provider accounts — `MessageBody::ProviderAccountBody`. Built from a
 // JSON object of the variant's fields, exactly like Code Studio and TentaNas:
@@ -23588,6 +23760,15 @@ pub fn encode_tentanas_elastic_folder_cache_set_request(
     encode_tentanas_json_request("ElasticFolderCacheSetRequest", &request_json)
 }
 
+/// MessageBody::TentaNasBody(SharingStopRequest) — n18d "Wyłącz i zatrzymaj
+/// udostępnianie…" (wave 10): a four-eyes request to take every share and
+/// target of the answering node out of service and then disable TentaNas.
+/// Carries no field; answers with ApprovalPendingResponse.
+#[wasm_bindgen(js_name = encodeTentaNasSharingStopRequest)]
+pub fn encode_tentanas_sharing_stop_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("SharingStopRequest", &request_json)
+}
+
 /// Plan wyczyszczenia dysku — co zostanie usunięte i każda odmowa.
 ///
 /// Bez tego enkodera i bez wpisu w `codec.js` żądanie nie opuszcza
@@ -23684,7 +23865,7 @@ mod elastic_codec_tests {
 
     #[test]
     fn elastic_encoders_roundtrip_actual_protocol_body() {
-        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 23] = [
+        let cases: [(&str, fn(String) -> Result<Vec<u8>, JsError>, &str); 26] = [
             ("ElasticCapabilitiesRequest", encode_tentanas_elastic_capabilities_request, "{}"),
             ("DiskWipePlanRequest", encode_tentanas_disk_wipe_plan_request,
                 r#"{"disk_id":"wwn-0x5000c500a1b2c3d4"}"#),
@@ -23735,6 +23916,14 @@ mod elastic_codec_tests {
             // how a folder goes back to the default rather than a fourth value.
             ("ElasticFolderCacheSetRequest", encode_tentanas_elastic_folder_cache_set_request,
                 r#"{"name":"dane","folder":"foto","cache_policy":"only"}"#),
+            // Wave 10: the stop-sharing request has no field at all.
+            ("SharingStopRequest", encode_tentanas_sharing_stop_request, r#"{}"#),
+            // Wave 12: "Rozłącz" names the initiator by its IQN, and the
+            // allowlist save carries the "Opis" map.
+            ("TargetSessionResetRequest", encode_tentanas_target_session_reset_request,
+                r#"{"target_id":"t1","initiator":"iqn.1994-05.com.redhat:vmhost-01","revoke":true}"#),
+            ("TargetUpdateRequest", encode_tentanas_target_update_request,
+                r#"{"target_id":"t1","initiators":["iqn.1994-05.com.redhat:vmhost-01"],"initiator_descriptions":{"iqn.1994-05.com.redhat:vmhost-01":"Proxmox vmhost-01"},"enabled":true}"#),
         ];
         for (variant, encode, fields) in cases {
             let bytes = encode(fields.to_owned()).unwrap();
@@ -23930,6 +24119,12 @@ pub fn encode_tentanas_disk_smart_test_request(request_json: String) -> Result<V
     encode_tentanas_json_request("DiskSmartTestRequest", &request_json)
 }
 
+/// MessageBody::TentaNasBody(DiskSmartTestBatchRequest) — one SMART self-test job over several disks; answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasDiskSmartTestBatchRequest)]
+pub fn encode_tentanas_disk_smart_test_batch_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("DiskSmartTestBatchRequest", &request_json)
+}
+
 /// MessageBody::TentaNasBody(DiskLocateRequest) — blink the bay LED (`enable` toggles).
 #[wasm_bindgen(js_name = encodeTentaNasDiskLocateRequest)]
 pub fn encode_tentanas_disk_locate_request(request_json: String) -> Result<Vec<u8>, JsError> {
@@ -24016,6 +24211,13 @@ pub fn encode_tentanas_pool_replace_disk_request(request_json: String) -> Result
 #[wasm_bindgen(js_name = encodeTentaNasPoolDeviceStateRequest)]
 pub fn encode_tentanas_pool_device_state_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("PoolDeviceStateRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(PoolDetachRequest) — `zpool detach` of the disk a hot spare
+/// replaced; the node re-checks that the leaf may go.
+#[wasm_bindgen(js_name = encodeTentaNasPoolDetachRequest)]
+pub fn encode_tentanas_pool_detach_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("PoolDetachRequest", &request_json)
 }
 
 #[wasm_bindgen(js_name = encodeTentaNasPoolSetPropertiesRequest)]
@@ -24696,7 +24898,8 @@ pub fn encode_tentanas_target_get_request(request_json: String) -> Result<Vec<u8
 
 /// MessageBody::TentaNasBody(TargetsListRequest) — the block targets of the node (n12) plus
 /// what this node can serve: LIO, nvmet, iSER, NVMe-oF/RDMA, DH-HMAC-CHAP, its interfaces
-/// and the zvols the wizard may export.
+/// and the zvols the wizard may export. `{"summary": true}` asks for the fleet's light
+/// answer (targets and service rows only).
 #[wasm_bindgen(js_name = encodeTentaNasTargetsListRequest)]
 pub fn encode_tentanas_targets_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("TargetsListRequest", &request_json)
@@ -24707,6 +24910,14 @@ pub fn encode_tentanas_targets_list_request(request_json: String) -> Result<Vec<
 #[wasm_bindgen(js_name = encodeTentaNasTargetUpdateRequest)]
 pub fn encode_tentanas_target_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("TargetUpdateRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(TargetSessionResetRequest) — n19 "Rozłącz" (wave 12): reset
+/// the iSCSI session of one allowlisted initiator, named by its IQN; `revoke` also takes it
+/// off the allowlist. No session id travels. Answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasTargetSessionResetRequest)]
+pub fn encode_tentanas_target_session_reset_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("TargetSessionResetRequest", &request_json)
 }
 
 /// MessageBody::TentaNasBody(TrimScheduleSetRequest) — the recurring trim of one pool.

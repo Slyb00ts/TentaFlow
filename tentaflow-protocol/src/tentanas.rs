@@ -52,8 +52,14 @@ pub struct NasNodeInfo {
     pub disks_total: u32,
     pub disks_warning: u32,
     pub pools_total: u32,
+    /// The asking organisation's shared resources on the node: SMB/NFS shares
+    /// AND iSCSI/NVMe-oF targets, as the Sharing tab lists them (see
+    /// `per_org_counted` for when it is a real count).
     pub shares_total: u32,
     pub alerts_active: u32,
+    /// Usable bytes of the node's storage (pools' root datasets, used +
+    /// available, plus measured Elastic Arrays) — the unit of the node's own
+    /// capacity tile, never zpool's raw size.
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     pub updated_at: Option<String>,
@@ -95,6 +101,24 @@ pub struct NasNodeInfo {
     /// on a row from an older build.
     #[serde(default)]
     pub per_org_counted: bool,
+    /// Until when the node's interactive (mode B) channel holds the sudo
+    /// password, RFC 3339 UTC; `None` when it is not armed — or the node is in
+    /// another mode, or too old to say. `elevation_mode` alone cannot tell an
+    /// armed mode-B node from one whose password expired, and the fleet and
+    /// Environment screens have to (n16: "tryb B — nieuzbrojony" + "Uzbrój…").
+    /// A remote row carries the value of its last published summary; a reader
+    /// compares it with the clock, since a past instant means "not armed".
+    #[serde(default)]
+    pub armed_until: Option<String>,
+    /// Seconds left of `armed_until`, counted by the ANSWERING node's clock
+    /// when it built this answer (0 once past). A browser judges the channel
+    /// by it — the time it received the answer plus these seconds — so a
+    /// browser clock off by minutes cannot read an armed node as unarmed or
+    /// the other way round (critic wave 7, MINOR 11). `None` when nothing is
+    /// armed, and from an older node, whose reader falls back on
+    /// `armed_until`.
+    #[serde(default)]
+    pub armed_secs_left: Option<u64>,
 }
 
 // =============================================================================
@@ -116,6 +140,11 @@ pub struct NasElevation {
     pub core_user: String,
     pub core_version: String,
     pub armed_until: Option<String>,
+    /// Seconds left of `armed_until` by this node's clock when it answered
+    /// (see `NasNodeInfo::armed_secs_left`). `None` when nothing is armed or
+    /// the node is older.
+    #[serde(default)]
+    pub armed_secs_left: Option<u64>,
     pub ttl_secs: u32,
     /// When mode A was provisioned on this node, and by whom (the display name
     /// of the admin who ran it). Both are written at provisioning time and
@@ -151,6 +180,26 @@ pub struct NasEnvironment {
     pub features: Vec<FeatureState>,
     pub elevation: NasElevation,
     pub probed_at: String,
+    /// Each feature row's `detail` as codes, keyed by the row's `id`
+    /// (`environment::probe`): the screen words these and keeps `detail`, the
+    /// node's English, for the tooltip. Beside `features` rather than inside
+    /// `FeatureState`, because that struct is shared with TentaVM and its
+    /// shape is pinned for both apps (`features.rs`). A row with no entry has
+    /// nothing to say or comes from an older node. Codes:
+    /// 'feature_binaries_missing' {binaries}, 'feature_version_too_low'
+    /// {found, required}, 'feature_module_not_loaded' {module},
+    /// 'snapraid_killed' {signal?}, 'snapraid_probe_unconfirmed' {code},
+    /// 'snapraid_probe_failed' {error}, 'snapraid_vanished' {}; the RDMA row
+    /// 'rdma_no_device' {path}, 'rdma_devices' {devices}; the ksmbd row
+    /// 'ksmbd_no_interface' {}, 'ksmbd_exposed' {interfaces},
+    /// 'ksmbd_tools_missing' {tools, listener}, 'ksmbd_listener' {listener},
+    /// 'ksmbd_experimental' {}; both rows' module part 'module_loaded'
+    /// {module}, 'module_on_demand' {module}, 'module_absent' {module}; the
+    /// block rows `NasBlockCapabilities::iscsi_reasons`' codes plus
+    /// 'module_on_demand' / 'module_absent' {module} for ib_isert and
+    /// nvmet-rdma.
+    #[serde(default)]
+    pub feature_reasons: std::collections::BTreeMap<String, Vec<NasHealthReason>>,
 }
 
 /// One entry of the helper's compiled-in command catalog: everything the
@@ -477,10 +526,27 @@ pub struct NasAlert {
     ///   text, a tooltip only, and absent when it names another
     ///   organisation's object;
     /// - 'target_still_in_kernel' {target, error?} — as the one above;
+    /// - 'target_session_not_reset' {target} — the allowlist of a target is
+    ///   written, but a client it excludes is still logged in and the TPG
+    ///   enable toggle that resets the target's sessions failed (wave 12);
+    /// - 'target_rebuild_not_disabled' {target} — an open target getting an
+    ///   allowlist had to be rebuilt (cached dynamic ACLs), the rebuild
+    ///   stopped short and even disabling it failed: the old open portal
+    ///   group may still accept any client (helper 0.17.1);
     /// - 'elevation_unarmed' {};
     /// - 'targets_sweep_failing' {count, alerted, sweep_failed} — `alerted`
     ///   is how many of `count` have an alert their organisation can read,
     ///   `sweep_failed` is 'true' | 'false'.
+    /// - 'pool_not_imported' {pool, disks, minutes} — a pool whose disks were
+    ///   held for its import at boot is still not imported `minutes` after
+    ///   the core started; `disks` of this node carry its label.
+    /// - 'sharing_resume_failed' {attempts} — sharing stopped with the
+    ///   disable (n18d, wave 10) could not be resumed; retried with a back-off;
+    /// - 'sharing_share_not_resumed' {share} — one share that was serving
+    ///   when sharing stopped did not come back (its organisation's alert);
+    /// - 'sharing_stop_interrupted' {phase} — a restart cut off the stop or
+    ///   the resume of sharing ('stopping' | 'resuming'); sharing stays
+    ///   stopped until TentaNas is enabled (mode B: the channel armed).
     ///
     /// Every parameter is a string, as in `NasHealthReason`.
     #[serde(default)]
@@ -552,6 +618,11 @@ pub struct NasForwardSettings {
     pub last_sent_at: Option<String>,
     /// Why the last attempt failed, empty when it succeeded.
     pub last_error: String,
+    /// The stored webhook predates the https-only rule (`http://`) and is not
+    /// used until it is changed; the masked address is still shown so the
+    /// admin sees which one. Appended, `#[serde(default)]`.
+    #[serde(default)]
+    pub webhook_needs_migration: bool,
 }
 
 /// "Wymień, dopóki dysk jeszcze żyje" (§5.10, research R5): a proactive
@@ -741,6 +812,30 @@ pub struct NasJob {
     /// `sdq` would point the admin at the wrong drive in the shelf.
     #[serde(default)]
     pub subject_last_known: bool,
+    /// One line per disk of a multi-disk job (`smart_test_batch`), in the
+    /// order the job runs them; empty for every other kind. Appended,
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub disks: Vec<NasJobDisk>,
+}
+
+/// One disk of a multi-disk job, named — never by its id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasJobDisk {
+    /// Kernel name (`sdb`, `nvme0n1`); the last-known one when the disk has
+    /// left the inventory (`last_known`).
+    pub name: String,
+    #[serde(default)]
+    pub last_known: bool,
+    /// 'pending' | 'running' | 'passed' | 'failed' | 'refused' | 'skipped'
+    /// (never reached: the job stopped at a privilege error before it) |
+    /// 'cancelled'.
+    pub state: String,
+    pub progress_pct: Option<u8>,
+    /// Why, as codes the screen words (`jobs.disk_reason.<code>`); empty
+    /// when the state says it all.
+    #[serde(default)]
+    pub reasons: Vec<NasHealthReason>,
 }
 
 // =============================================================================
@@ -777,6 +872,13 @@ pub struct NasVdevDisk {
     /// leaf by its position, never by the id.
     #[serde(default)]
     pub last_known_name: Option<String>,
+    /// This leaf is the ORIGINAL disk of a `spare-N` group — a hot spare took
+    /// its place and holds its data (the spare is ONLINE, no resilver runs) —
+    /// so `zpool detach` may take it out of the pool (`PoolDetachRequest`).
+    /// The node judges it from `zpool status`; false everywhere else and from
+    /// an older node.
+    #[serde(default)]
+    pub detachable: bool,
 }
 
 /// A top-level vdev of the pool. `kind` is the redundancy of the group
@@ -1091,8 +1193,35 @@ pub struct NasScheduleRow {
     pub enabled: bool,
     pub schedule: NasSchedule,
     pub last_run_at: Option<String>,
+    /// DEPRECATED FOR DISPLAY: the stored outcome in the older sentence form
+    /// (`started job <id>`, `failed to start: <error>`, `pominięto: …`), kept
+    /// for an older screen. A screen reads the structured fields below.
     pub last_result: String,
     pub next_run_at: Option<String>,
+    /// The last slot's outcome (`tentanas::scheduler::ScheduleOutcome`):
+    /// 'started' (a job ran from it) | 'start_failed' (the node refused to
+    /// start one) | 'skipped' (declined on purpose) | '' (never ran, and
+    /// always for the SMART pair). Empty from an older node.
+    #[serde(default)]
+    pub last_outcome: String,
+    /// For 'started': the status of the job the slot started, read when the
+    /// list was built ('running', 'succeeded', 'failed', 'cancelled', …), or
+    /// '' when that job is gone. The job's id never travels.
+    #[serde(default)]
+    pub last_job_status: String,
+    /// For 'skipped', the reason as a code ('elastic_scrub_errors_unrepaired',
+    /// 'elastic_parity_fault_unacknowledged', 'array_not_created'); '' for an
+    /// older stored skip that carries only a sentence. For 'start_failed'
+    /// (wave 13), the coded refusal without its sentence
+    /// (`refusal:<code>?k=v`, `tentanas::refusal`) when the node refused in
+    /// code, which the screen words; '' otherwise.
+    #[serde(default)]
+    pub last_reason: String,
+    /// The node's own sentence for the outcome — a refusal's error, an older
+    /// skip's reason. For a tooltip only: it is one language, and may name
+    /// what a screen must not show.
+    #[serde(default)]
+    pub last_detail: String,
 }
 
 /// A property change of `DatasetSetPropertiesRequest`: `inherit` drops the
@@ -1226,7 +1355,22 @@ pub struct NasMountStatus {
 pub struct NasShareSession {
     pub client: String,
     pub user: String,
+    /// Block targets: the first sighting of THIS session by the node's
+    /// sampler (MAJOR 27) — the kernel keeps no login time, so a duration
+    /// shown from it is "at least".
     pub connected_at: Option<String>,
+    /// Block targets (wave 12): the peer address the KERNEL reports for the
+    /// session — LIO's `info` `Address` line, nvmet's `host_traddr`. Empty
+    /// where it publishes none (a generated iSCSI session, owner decision D2)
+    /// — never guessed from sockets (D5).
+    #[serde(default)]
+    pub address: String,
+    /// Block targets (wave 12): the session state as the kernel names it,
+    /// iSCSI with `TARG_SESS_STATE_` stripped (`LOGGED_IN`), nvmet verbatim
+    /// (`ready`). Empty where it publishes none. No session id, ISID, TSIH or
+    /// cntlid is ever carried.
+    #[serde(default)]
+    pub state: String,
 }
 
 /// A file share of this node as the Sharing tab lists it. Exactly one of
@@ -1253,6 +1397,14 @@ pub struct NasShare {
     pub state_detail: String,
     pub created_at: String,
     pub updated_at: String,
+    /// `state_detail` as codes the screen words in the reader's language
+    /// (wave 8; the pattern of `NasTarget::state_reasons`):
+    /// `share_source_invalid` {}, `share_source_unmounted` {},
+    /// `share_service_missing` {package}, `smb_direct_not_served` {} followed
+    /// by the node's SMB Direct (ksmbd) reasons. Empty from an older node and
+    /// for a row judged before the codes: the sentence is then all there is.
+    #[serde(default)]
+    pub state_reasons: Vec<NasHealthReason>,
 }
 
 /// One protocol service of the node (smbd / nfsd).
@@ -1265,6 +1417,11 @@ pub struct NasShareService {
     /// The file the app owns for this service (smb.conf include / exports.d).
     pub config_path: String,
     pub detail: String,
+    /// `detail` as codes, for the block rows (`targets::kernel_support`, the
+    /// codes `NasBlockCapabilities::iscsi_reasons` lists). Empty for the
+    /// share services and from an older node.
+    #[serde(default)]
+    pub reasons: Vec<NasHealthReason>,
 }
 
 /// A directory entry of the share source browser. Only pool mountpoints and
@@ -1322,7 +1479,9 @@ pub struct NasPendingApproval {
     pub subject: String,
     /// One sentence naming exactly what would happen, written when the
     /// operation was parked — the approver decides on THAT, not on a replay
-    /// of a state that may have moved on.
+    /// of a state that may have moved on. The node's own English (audit,
+    /// tooltip); a screen words `detail_reasons`. An older row may hold
+    /// `text:<code>` here instead.
     pub detail: String,
     pub status: String,
     pub requested_by: String,
@@ -1339,6 +1498,11 @@ pub struct NasPendingApproval {
     /// refuses the author's own approval regardless of what the UI shows.
     #[serde(default)]
     pub is_own_request: bool,
+    /// `detail` as a code the approver's screen words in the approver's
+    /// language (`tentanas::CodedText`), stored with the row. Empty from an
+    /// older node and for a row parked before the codes.
+    #[serde(default)]
+    pub detail_reasons: Vec<NasHealthReason>,
 }
 
 /// The fleet-wide four-eyes switch and what it was decided from.
@@ -1467,6 +1631,11 @@ pub struct NasTarget {
     /// authentication and the wizard says so.
     #[serde(default)]
     pub initiators: Vec<String>,
+    /// "Opis" per allowlisted initiator (wave 12, migration 29): IQN/NQN →
+    /// the admin's own words ("Proxmox vmhost-01"). Non-empty entries only,
+    /// every key on `initiators`.
+    #[serde(default)]
+    pub initiator_descriptions: std::collections::BTreeMap<String, String>,
     pub port_groups: Vec<NasTargetPortGroup>,
     pub sessions: u32,
     /// Whether `sessions` is a MEASUREMENT or just a zero.
@@ -1481,9 +1650,50 @@ pub struct NasTarget {
     pub sessions_known: bool,
     /// 'active' | 'error' | 'disabled'.
     pub state: String,
+    /// The node's own sentence (log, tooltip). A screen words
+    /// `state_reasons` instead.
     pub state_detail: String,
     pub created_at: String,
     pub updated_at: String,
+    /// `state_detail` as codes, one per part of the sentence
+    /// (`targets::target_state`): 'target_kernel_missing' {protocol},
+    /// 'target_volume_missing' {}, 'target_portal_moved' {address,
+    /// interface, interface_state: 'addressed' | 'no_address' | 'missing',
+    /// current? (only when the interface holds addresses), elsewhere?,
+    /// in_kernel}, 'target_not_exported' {},
+    /// 'target_no_auth' {}, and the config import's 'import_*' reasons. Empty
+    /// from an older node and for a row stored before the codes — the
+    /// sentence is then all there is.
+    #[serde(default)]
+    pub state_reasons: Vec<NasHealthReason>,
+}
+
+/// "Ostatnie połączenie" of one initiator of a target (wave 12): what the
+/// node's session sampler recorded. The kernel keeps no such date, so it is
+/// the LAST time the node saw a session of this initiator, and there is none
+/// for a time before the recording started (`seen_since`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasTargetInitiatorSeen {
+    pub initiator: String,
+    pub last_seen_at: String,
+    /// When the session seen last began, as far as the sampler knows.
+    #[serde(default)]
+    pub session_since: String,
+}
+
+/// "Nasłuch targetu" for one portal (wave 12), read by the node itself from
+/// configfs and `/proc/net/tcp{,6}`.
+///
+/// `state`: 'listening' (the portal is bound and logins are accepted) |
+/// 'target_disabled' (iSCSI: the port is open and the TPG is disabled, so
+/// logins are refused — measured) | 'not_listening' | 'rdma' (an RDMA portal:
+/// not measured, D6) | 'unknown' (a read failed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasTargetListen {
+    pub address: String,
+    pub port: u32,
+    pub transport: String,
+    pub state: String,
 }
 
 /// One interface the portal picker of the wizard offers (n14 step 2).
@@ -1543,6 +1753,21 @@ pub struct NasBlockCapabilities {
     pub rdma_detail: String,
     #[serde(default)]
     pub dhchap_detail: String,
+    /// The four details above as codes (`targets::kernel_support`,
+    /// `dhchap_support`): 'protocol_unknown' {protocol}, 'configfs_present'
+    /// {path}, 'modules_available' {modules}, 'modules_missing' {modules,
+    /// protocol}, 'iser_module_missing' {}, 'nvmet_rdma_module_missing' {},
+    /// 'rdma_unavailable' {}, 'dhchap_available' {path}, 'dhchap_not_built'
+    /// {path}, 'dhchap_not_mentioned' {path}, 'kernel_config_missing' {}.
+    /// Empty from an older node.
+    #[serde(default)]
+    pub iscsi_reasons: Vec<NasHealthReason>,
+    #[serde(default)]
+    pub nvmet_reasons: Vec<NasHealthReason>,
+    #[serde(default)]
+    pub rdma_reasons: Vec<NasHealthReason>,
+    #[serde(default)]
+    pub dhchap_reasons: Vec<NasHealthReason>,
     pub interfaces: Vec<NasBlockInterface>,
     pub volumes: Vec<NasBlockVolume>,
     /// The host segment this node puts into every IQN / NQN it creates — its
@@ -1676,7 +1901,22 @@ pub struct NasElasticFolder {
     /// them down on its first run whatever their age; 'only' means it never
     /// takes them down at all.
     pub cache_policy: String,
+    /// Allocated bytes of the folder over every data and cache disk, from the
+    /// node's last bounded walk (`elastic::FolderUsage`) — never measured on a
+    /// read. `None` exactly when `used_reasons` says why.
     pub used_bytes: Option<u64>,
+    /// When `used_bytes` was measured (RFC 3339), so the screen can say how
+    /// old the figure is. `None` with `used_bytes`.
+    #[serde(default)]
+    pub used_measured_at: Option<String>,
+    /// Why `used_bytes` is `None`, one code: 'folder_usage_pending' (not
+    /// measured yet), 'folder_usage_over_budget' {entries, minutes} (too many
+    /// files to count within the walk's bound), 'folder_usage_unreadable',
+    /// 'folder_usage_not_mounted', 'folder_usage_name_refused' (a name the
+    /// walk cannot take, e.g. a control character), 'folder_usage_failed' (the helper did not
+    /// answer the measurement). Empty when measured and from an older node.
+    #[serde(default)]
+    pub used_reasons: Vec<NasHealthReason>,
     /// The share serving this folder, empty when none does.
     pub share_id: String,
     pub share_label: String,
@@ -1861,7 +2101,24 @@ pub struct NasElasticArray {
     pub kind: String,
     /// Stany: 'active' | 'pending' | 'creating' | 'needs_attention' | 'error' | 'disabled' | 'unknown'.
     pub state: String,
+    /// The node's own sentence (log, tooltip). A screen words
+    /// `state_reasons` instead when there are any.
     pub state_detail: String,
+    /// `state_detail` as codes (`elastic::array_state`, `elastic::get`):
+    /// 'mount_table_unknown', 'mergerfs_missing', 'snapraid_unusable',
+    /// 'branches_unknown' / 'branches_mountable' {data, cache, parity} (the
+    /// kernel names per role, comma-separated, each key only when non-empty;
+    /// '#<n>' for a member known only by its number, never a slot name),
+    /// 'branches_gone' {data, cache, parity, union: 'serving' | 'down'},
+    /// 'union_not_mounted', 'no_parity', 'restart_required',
+    /// 'checkpoint_unfinished', 'awaiting_confirmation', 'service_not_online',
+    /// 'helper_failed' (the helper's own sentence stays in `state_detail`),
+    /// and for a sentence the row stores (migration 23) 'operation_failed'
+    /// {operation} (the failed operation's kind; its error is `state_detail`)
+    /// or 'supervision_lost'. Empty from an older node and for a stored
+    /// sentence no rule recognised: `state_detail` is then all there is.
+    #[serde(default)]
+    pub state_reasons: Vec<NasHealthReason>,
     /// 'ok' | 'warning' | 'critical' | 'unknown'.
     pub health: String,
     pub health_reason: String,
@@ -1975,7 +2232,7 @@ pub struct NasElasticPendingAdd {
 /// sentence so the UI can say it in its own language.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NasElasticRefusal {
-    /// 'no_data_disks' | 'too_many_parity' | 'parity_too_small' |
+    /// 'no_data_disks' | 'too_many_parity' | 'too_many_cache_disks' | 'parity_too_small' |
     /// 'disk_in_use' | 'disk_repeated' | 'data_disks_same_device' |
     /// 'name_invalid' | 'name_taken' | 'filesystem_invalid' |
     /// 'filesystem_unavailable' | 'plan_failed'.
@@ -1986,7 +2243,19 @@ pub struct NasElasticRefusal {
     /// The disk the refusal is about, empty when it is about the array.
     pub disk_id: String,
     pub disk_name: String,
+    /// The node's own sentence, for a tooltip. A screen words `code` with
+    /// `params` and `disk_name`.
     pub detail: String,
+    /// What the sentence names beyond the disk: 'name' (name_invalid,
+    /// name_taken), 'path' (name_taken), 'count' (too_many_cache_disks,
+    /// too_many_parity) and 'max' (too_many_parity),
+    /// 'size' and 'largest' in bytes (parity_too_small), 'first_role',
+    /// 'role' (disk_repeated), 'other' and 'other_role' (the second disk of
+    /// a shared device), 'owner' + 'owner_name' (disk_in_use:
+    /// 'elastic' | 'spare' | 'pool' | 'md' | 'system' | 'mounted' | 'used'),
+    /// 'filesystem' (filesystem_*). Empty from an older node.
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
 }
 
 /// The wizard's answer for a set of picked disks: what the array would be,
@@ -2005,7 +2274,8 @@ pub struct NasElasticPlan {
     /// Hard stops. A non-empty list means the create button stays disabled;
     /// there is no "create anyway".
     pub refusals: Vec<NasElasticRefusal>,
-    /// Things an admin should know and may still choose.
+    /// Things an admin should know and may still choose — the node's English,
+    /// for an older screen. A screen words `warning_codes` instead.
     pub warnings: Vec<String>,
     pub union_path: String,
     /// Every device the create would ERASE. The red button's count comes from
@@ -2015,6 +2285,11 @@ pub struct NasElasticPlan {
     /// the first sync. Empty when `refusals` is non-empty: there is no plan
     /// for something the node will not do.
     pub steps_preview: String,
+    /// `warnings` as codes (`elastic::layout_warning_codes`): 'no_parity' {},
+    /// 'parity_tight' {disk}, 'no_cache' {}, 'unhealthy_disks' {disks},
+    /// 'mixed_sizes' {}. Empty from an older node.
+    #[serde(default)]
+    pub warning_codes: Vec<NasHealthReason>,
 }
 
 /// An Elastic Array this node holds on disk but has no database record of —
@@ -2115,8 +2390,13 @@ pub struct NasElasticCapabilities {
     /// filesystem picker offers what will work.
     pub filesystems: Vec<String>,
     /// Why a capability above is false, for the UI to show instead of hiding
-    /// the option.
+    /// the option. The node's English; a screen words `reasons`.
     pub detail: String,
+    /// `detail` as codes (`elastic::capabilities`): 'elastic_tool_unavailable'
+    /// {tool, status — the tool's Environment status}, 'elastic_tool_not_probed'
+    /// {tool}, 'elastic_no_mkfs' {}. Empty from an older node.
+    #[serde(default)]
+    pub reasons: Vec<NasHealthReason>,
 }
 
 /// Every TentaNas request/response. Ciborium tags variants by NAME, but the
@@ -2228,6 +2508,19 @@ pub enum TentaNasPayload {
     /// 'short' | 'long'. Answers with `JobResponse`.
     DiskSmartTestRequest {
         disk_id: String,
+        kind: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// One SMART self-test job over several disks ('short' | 'long'). The
+    /// job starts the disks in order with one credential and STOPS at the
+    /// first privilege/credential error (a rejected password, an unarmed
+    /// channel, a helper mismatch) — replaying that credential per disk could
+    /// lock the account (`pam_faillock`); any other per-disk refusal is
+    /// recorded on that disk's line and the job goes on. Answers with
+    /// `JobResponse`.
+    DiskSmartTestBatchRequest {
+        disk_ids: Vec<String>,
         kind: String,
         #[serde(default)]
         sudo_password: Option<SudoSecret>,
@@ -2449,6 +2742,16 @@ pub enum TentaNasPayload {
         name: String,
         old: String,
         disk_id: String,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// `zpool detach` of the original disk a hot spare replaced
+    /// (`NasVdevDisk::detachable`). The node re-reads the pool and refuses
+    /// any other leaf (`refusal:pool_detach_not_allowed`). Answers with
+    /// `PoolGetResponse`.
+    PoolDetachRequest {
+        name: String,
+        device: String,
         #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
@@ -2924,10 +3227,18 @@ pub enum TentaNasPayload {
         shares: Vec<String>,
         users: Vec<String>,
         operations: Vec<String>,
+        /// The ASKING organisation's own forwarding target: its alerts, the
+        /// node-wide alerts every organisation may read, and — when
+        /// `include_access` — the access lines of its own shares.
         forward: NasForwardSettings,
+        /// The node-wide target kept from before targets were per
+        /// organisation: node-wide alerts only, never an organisation's row
+        /// and never an access line. Appended, `#[serde(default)]`.
+        #[serde(default)]
+        forward_node: NasForwardSettings,
     },
-    /// Sets where this node forwards the alert pipeline and the access log.
-    /// Answers with `AccessLogResponse` so the card repaints from one answer.
+    /// Sets a forwarding target. Answers with `AccessLogResponse` so the card
+    /// repaints from one answer.
     AlertForwardSetRequest {
         enabled: bool,
         #[serde(default)]
@@ -2936,6 +3247,10 @@ pub enum TentaNasPayload {
         webhook_url: String,
         #[serde(default)]
         include_access: bool,
+        /// false: the asking organisation's own target. true: the node-wide
+        /// target (node-wide alerts only; `include_access` is ignored).
+        #[serde(default)]
+        node_wide: bool,
     },
 
     // ----- zpool trim (§5.10, research R7) -----
@@ -2955,7 +3270,15 @@ pub enum TentaNasPayload {
     },
 
     // ----- block targets: iSCSI and NVMe-oF (§5.5) -----
-    TargetsListRequest {},
+    /// `summary`: the fleet's 10 s poll (n01) — the targets and the service
+    /// rows only. The node then skips `capabilities` (a full `zfs list` and an
+    /// environment read, answered as its default) and reads NVMe-oF sessions
+    /// through the privileged channel at most every few minutes instead of on
+    /// every tick. The Sharing tab never sets it.
+    TargetsListRequest {
+        #[serde(default)]
+        summary: bool,
+    },
     TargetsListResponse {
         targets: Vec<NasTarget>,
         /// The LIO and nvmet rows of the service table, next to smbd/nfsd.
@@ -2973,6 +3296,16 @@ pub enum TentaNasPayload {
         /// is the only render there is.
         #[serde(default)]
         config_preview: String,
+        /// "Ostatnie połączenie" per initiator the sampler has seen (wave 12).
+        #[serde(default)]
+        initiators_seen: Vec<NasTargetInitiatorSeen>,
+        /// When this node started recording sessions — before it there is
+        /// no record, and the screen says "brak zapisu", never "nigdy".
+        #[serde(default)]
+        seen_since: String,
+        /// "Nasłuch targetu", one entry per portal (wave 12).
+        #[serde(default)]
+        listen: Vec<NasTargetListen>,
     },
     /// Wizard "create" (n14). `source` is the zvol as ZFS names it;
     /// `create_size_bytes` > 0 creates it first (n14's "+ Nowy zvol").
@@ -2999,6 +3332,10 @@ pub enum TentaNasPayload {
         /// NVMe-oF subsystem cannot be created without at least one host NQN.
         #[serde(default)]
         initiators: Vec<String>,
+        /// "Opis" per entry of `initiators` (wave 12). Every key must be on
+        /// the list; an entry for an unlisted one is refused, not dropped.
+        #[serde(default)]
+        initiator_descriptions: std::collections::BTreeMap<String, String>,
         /// The admin confirmed the target binds every interface. Without it a
         /// portal on `0.0.0.0` is refused, so it can never be the default.
         #[serde(default)]
@@ -3038,11 +3375,31 @@ pub enum TentaNasPayload {
         auth: Option<NasTargetAuth>,
         #[serde(default)]
         initiators: Vec<String>,
+        /// "Opis" per entry of `initiators` (wave 12). `None` (an older
+        /// client) keeps the stored descriptions of the initiators that stay;
+        /// `Some` replaces them. A key not on `initiators` is refused.
+        #[serde(default)]
+        initiator_descriptions: Option<std::collections::BTreeMap<String, String>>,
         #[serde(default)]
         port_groups: Vec<NasTargetPortGroup>,
         #[serde(default)]
         confirm_all_interfaces: bool,
         enabled: bool,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// n19 "Rozłącz" (wave 12): resets the iSCSI session of ONE allowlisted
+    /// initiator. The client logs back in by itself (~2 s, measured) and
+    /// keeps its access; `revoke` also takes it off the allowlist, which
+    /// drops it for good and is refused when it is the only entry (an empty
+    /// list would open the target). The initiator is named by its IQN — the
+    /// name the screen shows; no session id travels. iSCSI only; refused on a
+    /// target without an allowlist (D2). Answers with `JobResponse`.
+    TargetSessionResetRequest {
+        target_id: String,
+        initiator: String,
+        #[serde(default)]
+        revoke: bool,
         #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
@@ -3310,6 +3667,15 @@ pub enum TentaNasPayload {
         folder: String,
         cache_policy: String,
     },
+    /// n18d "Wyłącz i zatrzymaj udostępnianie…" (wave 10): take every share
+    /// (SMB/NFS) and block target (iSCSI/NVMe-oF) of THIS node out of
+    /// service, then disable TentaNas fleet-wide. Always a four-eyes request:
+    /// it parks (`ApprovalPendingResponse`) and a second platform admin
+    /// releases it. Out of service means stopped in the daemon or the
+    /// kernel; the configuration rows stay, and enabling TentaNas again puts
+    /// them back. Carries nothing: the node reads its own shares and targets
+    /// when it parks and again when it runs.
+    SharingStopRequest {},
 }
 
 #[cfg(test)]
@@ -3520,6 +3886,17 @@ mod tests {
         let back: TentaNasPayload =
             crate::cbor::decode(&crate::cbor::encode(&folder).expect("encode")).expect("decode");
         assert_eq!(back, folder, "ElasticFolderCacheSetRequest wire drift");
+
+        // Wave 10: the stop-sharing request carries no field, and its tag is
+        // frozen like the others ("SharingStopRequest" + an empty map).
+        assert_eq!(
+            crate::cbor::encode(&TentaNasPayload::SharingStopRequest {}).expect("encode"),
+            hex_bytes("a17253686172696e6753746f7052657175657374a0"),
+            "SharingStopRequest wire drift"
+        );
+        let decoded: TentaNasPayload =
+            serde_json::from_value(serde_json::json!({ "SharingStopRequest": {} })).expect("decode");
+        assert_eq!(decoded, TentaNasPayload::SharingStopRequest {});
         let json = serde_json::json!({
             "ElasticFolderCacheSetRequest": { "name": "media", "folder": "foto", "cache_policy": "yes" }
         });
@@ -3553,6 +3930,11 @@ mod tests {
             decision_note: String::new(),
             decision_job_id: None,
             is_own_request: true,
+            // Wave 6: the coded detail round-trips with the row.
+            detail_reasons: vec![NasHealthReason {
+                code: "snapshot_release".to_string(),
+                params: [("snapshot".to_string(), "tank/projekty@przed-migracja".to_string())].into(),
+            }],
         };
         let body = MessageBody::TentaNasBody(TentaNasPayload::ApprovalsListResponse {
             approvals: vec![approval.clone()],
@@ -3686,6 +4068,7 @@ mod tests {
         assert_eq!(elevation.provisioned_by, None);
         assert_eq!(elevation.audit_entries, 0);
         assert!(!elevation.core_compatible);
+        assert_eq!(elevation.armed_secs_left, None, "an older node sends no remaining seconds");
 
         // A disk row and a disks answer from a node that predates the vdev
         // columns and the IOPS baseline decode with them at the neutral value.
@@ -4130,6 +4513,18 @@ mod tests {
                 syslog_target: String::new(),
                 webhook_url: String::new(),
                 include_access: false,
+                node_wide: false,
+            }
+        );
+
+        let json = serde_json::json!({ "DiskSmartTestBatchRequest": { "disk_ids": ["sn-a", "sn-b"], "kind": "short" } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(
+            decoded,
+            TentaNasPayload::DiskSmartTestBatchRequest {
+                disk_ids: vec!["sn-a".to_string(), "sn-b".to_string()],
+                kind: "short".to_string(),
+                sudo_password: None,
             }
         );
 
@@ -4194,6 +4589,12 @@ mod tests {
                 pending: 0,
                 last_sent_at: Some("2026-09-03T12:00:31Z".to_string()),
                 last_error: String::new(),
+                webhook_needs_migration: true,
+            },
+            forward_node: NasForwardSettings {
+                enabled: true,
+                syslog_target: "legacy.local:514".to_string(),
+                ..Default::default()
             },
         });
         let bytes = crate::cbor::encode(&body).expect("encode");
@@ -4208,7 +4609,10 @@ mod tests {
     fn the_block_target_wire_decodes_from_minimal_json() {
         let json = serde_json::json!({ "TargetsListRequest": {} });
         let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
-        assert_eq!(decoded, TentaNasPayload::TargetsListRequest {});
+        assert_eq!(decoded, TentaNasPayload::TargetsListRequest { summary: false });
+        let json = serde_json::json!({ "TargetsListRequest": { "summary": true } });
+        let decoded: TentaNasPayload = serde_json::from_value(json).expect("decode");
+        assert_eq!(decoded, TentaNasPayload::TargetsListRequest { summary: true });
 
         let json = serde_json::json!({
             "TargetCreateRequest": {
@@ -4230,6 +4634,7 @@ mod tests {
                 transports: Vec::new(),
                 auth: None,
                 initiators: Vec::new(),
+                initiator_descriptions: Default::default(),
                 confirm_all_interfaces: false,
                 enabled: false,
                 sudo_password: None,
@@ -4251,6 +4656,7 @@ mod tests {
                 repick_portal: false,
                 auth: None,
                 initiators: Vec::new(),
+                initiator_descriptions: None,
                 port_groups: Vec::new(),
                 confirm_all_interfaces: false,
                 enabled: true,
@@ -4312,6 +4718,7 @@ mod tests {
                 dhchap_dhgroup: String::new(),
             },
             initiators: vec!["iqn.1998-01.com.vmware:esx01".to_string()],
+            initiator_descriptions: Default::default(),
             port_groups: vec![NasTargetPortGroup {
                 group_id: 7,
                 state: "non-optimized".to_string(),
@@ -4323,6 +4730,7 @@ mod tests {
             state_detail: String::new(),
             created_at: "2026-09-03T12:00:00Z".to_string(),
             updated_at: "2026-09-03T12:00:00Z".to_string(),
+            state_reasons: vec![NasHealthReason { code: "target_no_auth".to_string(), params: Default::default() }],
         };
         let body = MessageBody::TentaNasBody(TentaNasPayload::TargetGetResponse {
             target: target.clone(),
@@ -4330,9 +4738,13 @@ mod tests {
                 client: "192.168.10.24".to_string(),
                 user: "iqn.1998-01.com.vmware:esx01".to_string(),
                 connected_at: Some("2026-09-03T11:00:00Z".to_string()),
+                ..Default::default()
             }],
             config_preview: "write /sys/kernel/config/target/iscsi/x/tpgt_1/auth/password = ***\n"
                 .to_string(),
+            initiators_seen: Vec::new(),
+            seen_since: String::new(),
+            listen: Vec::new(),
         });
         let bytes = crate::cbor::encode(&body).expect("encode");
         let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");
@@ -4353,6 +4765,86 @@ mod tests {
         assert!(decoded.auth.secret_set && decoded.auth.mutual_secret_set);
         assert!(decoded.auth.secret.is_none() && decoded.auth.mutual_secret.is_none());
         assert!(config_preview.contains("***"));
+    }
+
+    /// Wave 12 (MAJOR 27): the session fields, "Opis", the sampler's dates,
+    /// "Nasłuch" and "Rozłącz" round-trip through CBOR, and an older peer's
+    /// messages without them still decode (every field is `serde(default)`).
+    #[test]
+    fn the_wave12_target_fields_round_trip_and_default_when_absent() {
+        let body = MessageBody::TentaNasBody(TentaNasPayload::TargetGetResponse {
+            target: NasTarget {
+                initiators: vec!["iqn.1994-05.com.redhat:vmhost-01".into()],
+                initiator_descriptions: std::collections::BTreeMap::from([(
+                    "iqn.1994-05.com.redhat:vmhost-01".to_string(),
+                    "Proxmox vmhost-01".to_string(),
+                )]),
+                ..Default::default()
+            },
+            sessions: vec![NasShareSession {
+                client: "iqn.1994-05.com.redhat:vmhost-01".into(),
+                user: "iqn.1994-05.com.redhat:vmhost-01".into(),
+                connected_at: Some("2026-09-26T10:00:00Z".into()),
+                address: "10.10.0.21".into(),
+                state: "LOGGED_IN".into(),
+            }],
+            config_preview: String::new(),
+            initiators_seen: vec![NasTargetInitiatorSeen {
+                initiator: "iqn.1994-05.com.redhat:vmhost-01".into(),
+                last_seen_at: "2026-09-26T10:05:00Z".into(),
+                session_since: "2026-09-26T10:00:00Z".into(),
+            }],
+            seen_since: "2026-09-26T09:00:00Z".into(),
+            listen: vec![NasTargetListen {
+                address: "10.10.0.5".into(),
+                port: 3260,
+                transport: "tcp".into(),
+                state: "target_disabled".into(),
+            }],
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode")).expect("decode");
+        assert_eq!(back, body);
+
+        // An older node's answer: no session address/state, no Opis, no dates.
+        let old: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "TargetGetResponse": {
+                "target": serde_json::to_value(NasTarget::default()).unwrap(),
+                "sessions": [{ "client": "iqn.a:x", "user": "iqn.a:x", "connected_at": null }]
+            }
+        }))
+        .expect("an older answer decodes");
+        let TentaNasPayload::TargetGetResponse { sessions, listen, initiators_seen, seen_since, .. } = old else {
+            panic!("variant");
+        };
+        assert_eq!((sessions[0].address.as_str(), sessions[0].state.as_str()), ("", ""));
+        assert!(listen.is_empty() && initiators_seen.is_empty() && seen_since.is_empty());
+
+        // "Rozłącz": the initiator by its IQN, `revoke` false unless asked.
+        let reset: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "TargetSessionResetRequest": { "target_id": "t1", "initiator": "iqn.1994-05.com.redhat:vmhost-01" }
+        }))
+        .expect("decode");
+        assert_eq!(
+            reset,
+            TentaNasPayload::TargetSessionResetRequest {
+                target_id: "t1".into(),
+                initiator: "iqn.1994-05.com.redhat:vmhost-01".into(),
+                revoke: false,
+                sudo_password: None,
+            }
+        );
+        let back: TentaNasPayload = crate::cbor::decode(&crate::cbor::encode(&reset).expect("encode")).expect("decode");
+        assert_eq!(back, reset);
+
+        // An allowlist save from an older client carries no "Opis" map at
+        // all — `None`, which keeps the stored ones, never an empty map that
+        // would wipe them.
+        let update: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "TargetUpdateRequest": { "target_id": "t1", "enabled": true }
+        }))
+        .expect("decode");
+        let TentaNasPayload::TargetUpdateRequest { initiator_descriptions, .. } = update else { panic!("variant") };
+        assert_eq!(initiator_descriptions, None);
     }
 
     /// An Elastic Array answer round-trips, and — the point of the test — the
@@ -4470,7 +4962,13 @@ mod tests {
                     disk_id: "d-sdn".to_string(),
                     disk_name: "sdn".to_string(),
                     detail: "sdn (4.0 TB) is smaller than the largest data disk".to_string(),
+                    params: [
+                        ("size".to_string(), "4000000000000".to_string()),
+                        ("largest".to_string(), "8000000000000".to_string()),
+                    ]
+                    .into(),
                 }],
+                warning_codes: vec![NasHealthReason { code: "no_cache".to_string(), params: Default::default() }],
                 wiped_devices: vec!["/dev/sdl".to_string()],
                 union_path: "/mnt/archiwum".to_string(),
                 ..Default::default()
@@ -4497,6 +4995,7 @@ mod tests {
                 snapraid_version: "12.3".to_string(),
                 filesystems: vec!["xfs".to_string(), "ext4".to_string()],
                 detail: String::new(),
+                reasons: vec![NasHealthReason { code: "elastic_no_mkfs".to_string(), params: Default::default() }],
             },
             free_disks: Vec::new(),
         });

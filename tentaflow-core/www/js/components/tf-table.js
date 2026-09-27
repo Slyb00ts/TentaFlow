@@ -741,6 +741,16 @@ class TfTable extends HTMLElement {
   _updateRowCells(tr, cols, row, idx) {
     const tds = tr.children;
     this._applyRowClass(tr, row);
+    // Without the multi-select checkbox (single mode, or a host that marks
+    // rows itself), the <tr>'s `selected` class follows the row's OWN
+    // `_selected` too: a recycled slot must not keep the highlight of the row
+    // that sat in it before a page change or a new pick (iteration-5 MAJOR 2).
+    // A row with no `_selected` key leaves the class alone, as in
+    // `_syncRowSelectBox`; writes only when it differs.
+    if (!this._isMultiSelect() && row && typeof row === 'object' && Object.prototype.hasOwnProperty.call(row, '_selected')) {
+      const selected = !!row._selected;
+      if (tr.classList.contains('selected') !== selected) tr.classList.toggle('selected', selected);
+    }
     // Sciezka recyklingu dziala tylko gdy _expandable === false, a select-all
     // siedzi w naglowku — body nie ma kolumn wiodacych, wiec td[i] == kolumna i.
     const expected = cols.length + (this._rowActions ? 1 : 0);

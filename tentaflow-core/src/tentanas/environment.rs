@@ -11,10 +11,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tentaflow_protocol::features::FeatureState;
-use tentaflow_protocol::tentanas::NasEnvironment;
+use std::collections::BTreeMap;
+
+use tentaflow_protocol::tentanas::{NasEnvironment, NasHealthReason};
 use tentanas_helper::PackageManager;
 
 use super::broker::run_unprivileged;
+use super::CodedText;
 use crate::db::DbPool;
 
 const TOOL_DIRS: &[&str] = &["/usr/sbin", "/usr/bin", "/sbin", "/bin", "/usr/local/sbin", "/usr/local/bin"];
@@ -224,6 +227,22 @@ const FEATURES: &[FeatureSpec] = &[
         pacman: &["snapraid"],
         zypper: &["snapraid"],
     },
+    // n16's "ZFS AnyRAID" row. Not a package: whether the pool feature
+    // exists is a property of the OpenZFS build the `zfs` row already
+    // installs, and the answer comes from `zpool upgrade -v` (`anyraid_refine`),
+    // never from a version number — a distribution may backport the feature
+    // or build without it.
+    FeatureSpec {
+        id: ANYRAID_FEATURE_ID,
+        binaries: &[],
+        kernel_module: None,
+        required_version: None,
+        optional: true,
+        apt: &[],
+        dnf: &[],
+        pacman: &[],
+        zypper: &[],
+    },
     FeatureSpec {
         id: "mdadm",
         binaries: &["mdadm"],
@@ -236,6 +255,160 @@ const FEATURES: &[FeatureSpec] = &[
         zypper: &["mdadm"],
     },
 ];
+
+/// The Environment row, and the wizard card, of ZFS AnyRAID.
+pub const ANYRAID_FEATURE_ID: &str = "anyraid";
+
+/// The pool feature `zpool upgrade -v` lists when this OpenZFS can create
+/// AnyRAID vdevs.
+const ANYRAID_POOL_FEATURE: &str = "anyraid";
+
+/// What `zpool upgrade -v` says about one pool feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolFeatureListing {
+    Listed,
+    NotListed,
+    /// The document is not the one this parser knows (truncated, another
+    /// layout, an error message): nothing can be said either way.
+    Unreadable,
+}
+
+/// Whether `feature` is in the feature table of `zpool upgrade -v`.
+///
+/// MEASURED (rig11, 2026-09-26, OpenZFS 2.4.1): the table starts after "The
+/// following features are supported:", a `FEAT DESCRIPTION` header and a
+/// line of dashes; each feature is a line starting in column 0 with its
+/// short name (optionally followed by "(read-only compatible)"), and its
+/// description is the next, indented line. The table ends at "The following
+/// legacy versions are also supported:".
+///
+/// "Not listed" is only ever said about a COMPLETE table: the header, at
+/// least one feature and the closing legacy section must all be there, and
+/// every name line must look like a feature name. Anything else is
+/// `Unreadable` — a truncated document must never read as "this ZFS has no
+/// AnyRAID". A name qualified with its GUID-style prefix
+/// (`org.openzfs:anyraid`) matches on the part after the colon.
+pub fn pool_feature_listed(text: &str, feature: &str) -> PoolFeatureListing {
+    let mut lines = text.lines();
+    if !lines.by_ref().any(|l| l.trim() == "The following features are supported:") {
+        return PoolFeatureListing::Unreadable;
+    }
+    let mut header = false;
+    for line in lines.by_ref() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !header {
+            if !t.starts_with("FEAT") {
+                return PoolFeatureListing::Unreadable;
+            }
+            header = true;
+            continue;
+        }
+        if !t.chars().all(|c| c == '-') {
+            return PoolFeatureListing::Unreadable;
+        }
+        break;
+    }
+    if !header {
+        return PoolFeatureListing::Unreadable;
+    }
+    let mut names = 0usize;
+    let mut found = false;
+    for line in lines {
+        if line.trim().is_empty() || line.starts_with(char::is_whitespace) {
+            continue;
+        }
+        if line.starts_with("The following legacy versions") {
+            return match (names, found) {
+                (0, _) => PoolFeatureListing::Unreadable,
+                (_, true) => PoolFeatureListing::Listed,
+                (_, false) => PoolFeatureListing::NotListed,
+            };
+        }
+        let name = line.split_whitespace().next().unwrap_or_default();
+        let valid = name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '.' | ':'));
+        if !valid {
+            return PoolFeatureListing::Unreadable;
+        }
+        names += 1;
+        if name == feature || name.rsplit(':').next() == Some(feature) {
+            found = true;
+        }
+    }
+    PoolFeatureListing::Unreadable
+}
+
+/// The AnyRAID row's verdict from what `zpool upgrade -v` printed.
+/// `zfs_version` is the `zfs` row's version, named in every sentence so the
+/// admin reads which ZFS the answer is about. `output` is `None` when the
+/// command could not be run at all.
+///
+/// The row is never "ok": this build has no AnyRAID creation, so a ZFS that
+/// knows the feature is `not_offered` — a grey chip, never a green OK (critic
+/// wave 9a, MINOR 8) — and the wizard keeps its card disabled with that
+/// sentence (owner decision 2026-09-26).
+fn anyraid_verdict(
+    output: Option<(&str, &str)>,
+    zfs_version: Option<&str>,
+) -> (&'static str, CodedText) {
+    let version = zfs_version.unwrap_or_default().to_string();
+    let listing = output.map_or(PoolFeatureListing::Unreadable, |(stdout, stderr)| {
+        match pool_feature_listed(stdout, ANYRAID_POOL_FEATURE) {
+            PoolFeatureListing::Unreadable => pool_feature_listed(stderr, ANYRAID_POOL_FEATURE),
+            known => known,
+        }
+    });
+    let named = if version.is_empty() { "ZFS".to_string() } else { format!("ZFS {version}") };
+    match listing {
+        PoolFeatureListing::Listed => (
+            "not_offered",
+            CodedText::new(
+                "anyraid_supported_not_offered",
+                &[("version", version)],
+                format!("{named} supports AnyRAID; TentaNas cannot create AnyRAID pools yet"),
+            ),
+        ),
+        PoolFeatureListing::NotListed => (
+            "unsupported",
+            CodedText::new(
+                "anyraid_not_in_zfs",
+                &[("version", version)],
+                format!("{named} on this node does not support AnyRAID"),
+            ),
+        ),
+        PoolFeatureListing::Unreadable => (
+            "unknown",
+            CodedText::new(
+                "anyraid_unreadable",
+                &[("version", version)],
+                format!("could not read whether {named} on this node supports AnyRAID"),
+            ),
+        ),
+    }
+}
+
+/// Fills the AnyRAID row: `zpool upgrade -v` is an unprivileged read.
+async fn anyraid_refine(feature: &mut FeatureState, zfs: Option<&FeatureState>) -> Vec<NasHealthReason> {
+    let zfs_version = zfs.filter(|z| z.status != "missing").and_then(|z| z.version.clone());
+    let out = match find_binary("zpool") {
+        Some(zpool) => run_unprivileged(&zpool, &["upgrade", "-v"], Duration::from_secs(10)).await.ok(),
+        None => None,
+    };
+    let (status, detail) = anyraid_verdict(
+        out.as_ref().map(|o| (o.stdout.as_str(), o.stderr.as_str())),
+        zfs_version.as_deref(),
+    );
+    feature.status = status.to_string();
+    // The version is in the detail ("ZFS 2.4.1 …"); a version column beside
+    // it would say it twice (n16 shows it once).
+    feature.version = None;
+    feature.detail = detail.text;
+    detail.reasons
+}
 
 /// The absolute path of a system binary on the known tool directories, or None
 /// when this node does not have it. The share layer asks the same question the
@@ -319,13 +492,15 @@ async fn probe_version(binary_path: &str, feature_id: &str) -> Option<String> {
     extract_version(&out.stdout).or_else(|| extract_version(&out.stderr))
 }
 
-/// Brak wyniku sondy nie potwierdza sprawności binarki, nawet gdy odpowiadała na --version.
+/// A probe with no verdict does not confirm the binary works, even when it
+/// answered `--version`. Returns the row's new detail as codes, empty when the
+/// row stays as the generic probe left it.
 async fn snapraid_health(
     binary: &str,
     feature: &mut FeatureState,
     temp_root: &Path,
     timeout: Duration,
-) {
+) -> Vec<NasHealthReason> {
     let outcome = async {
         let dir = tempfile::Builder::new()
             .prefix("tentanas-snapraid-probe-")
@@ -343,28 +518,31 @@ async fn snapraid_health(
         ))
     }
     .await;
-    match outcome {
-        Ok(super::elastic::ToolHealth::Working) => {}
-        Ok(super::elastic::ToolHealth::Broken(why)) => {
-            feature.status = "broken".to_string();
-            feature.detail = why;
-        }
-        Ok(super::elastic::ToolHealth::Unknown(why)) => {
-            feature.status = "unknown".to_string();
-            feature.detail = why;
-        }
-        Err(error) => {
-            feature.status = "unknown".to_string();
-            feature.detail = format!("Nie można sprawdzić działania SnapRAID: {error}");
-        }
-    }
+    let (status, why) = match outcome {
+        Ok(super::elastic::ToolHealth::Working) => return Vec::new(),
+        Ok(super::elastic::ToolHealth::Broken(why)) => ("broken", why),
+        Ok(super::elastic::ToolHealth::Unknown(why)) => ("unknown", why),
+        Err(error) => (
+            "unknown",
+            CodedText::new(
+                "snapraid_probe_failed",
+                &[("error", error.to_string())],
+                format!("the SnapRAID probe could not be run: {error}"),
+            ),
+        ),
+    };
+    feature.status = status.to_string();
+    feature.detail = why.text;
+    why.reasons
 }
 
 fn kernel_module_loaded(name: &str) -> bool {
     Path::new(&format!("/sys/module/{name}")).is_dir()
 }
 
-async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> FeatureState {
+/// One row of the generic probe, with its detail as codes beside the
+/// English (`NasEnvironment::feature_reasons`).
+async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> (FeatureState, Vec<NasHealthReason>) {
     let packages = manager
         .and_then(|m| packages_for(spec.id, m))
         .unwrap_or_default();
@@ -381,33 +559,38 @@ async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> F
         }
     }
     let (status, version, detail) = if !missing.is_empty() {
+        let binaries = missing.join(", ");
         (
             "missing",
             None,
-            format!("missing: {}", missing.join(", ")),
+            CodedText::new("feature_binaries_missing", &[("binaries", binaries.clone())], format!("missing: {binaries}")),
         )
     } else {
         let version = probe_version(first_path.as_deref().unwrap_or_default(), spec.id).await;
         let outdated = match (spec.required_version, version.as_deref()) {
-            (Some(req), Some(v)) if !version_at_least(v, req) => {
-                Some(format!("found {v}, need at least {req}"))
-            }
+            (Some(req), Some(v)) if !version_at_least(v, req) => Some(CodedText::new(
+                "feature_version_too_low",
+                &[("found", v.to_string()), ("required", req.to_string())],
+                format!("found {v}, need at least {req}"),
+            )),
             _ => None,
         };
         match outdated {
             Some(detail) => ("outdated", version, detail),
             None => {
                 let module_note = match spec.kernel_module {
-                    Some(m) if !kernel_module_loaded(m) => {
-                        format!("kernel module {m} not loaded")
-                    }
-                    _ => String::new(),
+                    Some(m) if !kernel_module_loaded(m) => CodedText::new(
+                        "feature_module_not_loaded",
+                        &[("module", m.to_string())],
+                        format!("kernel module {m} not loaded"),
+                    ),
+                    _ => CodedText::default(),
                 };
                 ("ok", version, module_note)
             }
         }
     };
-    FeatureState {
+    let state = FeatureState {
         id: spec.id.to_string(),
         status: status.to_string(),
         version,
@@ -415,9 +598,10 @@ async fn probe_feature(spec: &FeatureSpec, manager: Option<PackageManager>) -> F
         binaries: spec.binaries.iter().map(|s| s.to_string()).collect(),
         kernel_module: spec.kernel_module.map(str::to_string),
         packages,
-        detail,
+        detail: detail.text,
         optional: spec.optional,
-    }
+    };
+    (state, detail.reasons)
 }
 
 fn read_trimmed(path: &str) -> Option<String> {
@@ -475,14 +659,15 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
     let manager = if linux { detect_package_manager() } else { None };
     let (os_name, os_version) = os_release();
     let mut features = Vec::with_capacity(FEATURES.len());
+    let mut feature_reasons = BTreeMap::new();
     if linux {
         for spec in FEATURES {
-            let mut feature = probe_feature(spec, manager).await;
+            let (mut feature, mut reasons) = probe_feature(spec, manager).await;
             if spec.id == super::rdma::FEATURE_ID {
-                super::rdma::refine(&mut feature);
+                reasons = super::rdma::refine_coded(&mut feature);
             }
             if spec.id == super::ksmbd::FEATURE_ID {
-                super::ksmbd::refine(&mut feature);
+                reasons = super::ksmbd::refine_coded(&mut feature);
             }
             // "Present" is not "working" — see `elastic::probe_verdict`. A
             // snapraid that segfaults answers `--version` happily and then
@@ -493,16 +678,21 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
             // indistinguishable from success.
             if spec.id == super::elastic::SNAPRAID_FEATURE_ID && feature.status == "ok" {
                 if let Some(path) = find_binary("snapraid") {
-                    snapraid_health(
+                    let health = snapraid_health(
                         &path,
                         &mut feature,
                         &std::env::temp_dir(),
                         Duration::from_secs(15),
                     )
                     .await;
+                    if !health.is_empty() {
+                        reasons = health;
+                    }
                 } else {
+                    let why = CodedText::new("snapraid_vanished", &[], "SnapRAID disappeared before its health probe");
                     feature.status = "unknown".to_string();
-                    feature.detail = "SnapRAID zniknął przed sprawdzeniem działania".to_string();
+                    feature.detail = why.text;
+                    reasons = why.reasons;
                 }
             }
             // §5.5 asks for the DH-HMAC-CHAP probe to be IN the Environment
@@ -510,7 +700,14 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
             // `nvmetcli` — this app never runs either. See `targets::refine`.
             if spec.id == "iscsi" || spec.id == "nvmet" || spec.id == super::targets::DHCHAP_FEATURE_ID
             {
-                super::targets::refine(&mut feature);
+                reasons = super::targets::refine_coded(&mut feature);
+            }
+            if spec.id == ANYRAID_FEATURE_ID {
+                let zfs = features.iter().find(|f: &&FeatureState| f.id == "zfs");
+                reasons = anyraid_refine(&mut feature, zfs).await;
+            }
+            if !reasons.is_empty() {
+                feature_reasons.insert(feature.id.clone(), reasons);
             }
             features.push(feature);
         }
@@ -532,6 +729,7 @@ pub async fn probe(db: &DbPool) -> NasEnvironment {
         features,
         elevation,
         probed_at: super::db::now(),
+        feature_reasons,
     }
 }
 
@@ -645,9 +843,16 @@ mod tests {
             let (dir, binary) = snapraid_probe_fixture(body);
             let mut feature = present_snapraid();
 
-            snapraid_health(binary.to_str().unwrap(), &mut feature, dir.path(), Duration::from_secs(5)).await;
+            let reasons = snapraid_health(binary.to_str().unwrap(), &mut feature, dir.path(), Duration::from_secs(5)).await;
 
             assert_eq!(feature.status, expected, "{body}: {}", feature.detail);
+            // A downgraded row says why in codes too; a working one adds none.
+            let want = match expected {
+                "ok" => None,
+                "broken" => Some("snapraid_killed"),
+                _ => Some("snapraid_probe_unconfirmed"),
+            };
+            assert_eq!(reasons.first().map(|r| r.code.as_str()), want, "{body}");
             let capabilities = super::super::elastic::capabilities(std::slice::from_ref(&feature), &|_| true);
             assert_eq!(capabilities.snapraid, expected == "ok");
             if expected != "ok" {
@@ -678,7 +883,7 @@ mod tests {
         .await;
 
         assert_eq!(feature.status, "unknown");
-        assert!(feature.detail.contains("Nie można sprawdzić"));
+        assert!(feature.detail.contains("could not be run"), "{}", feature.detail);
         assert!(
             !dir.path().join("paths").exists(),
             "program nie powinien się uruchomić"
@@ -696,7 +901,7 @@ mod tests {
         .await;
 
         assert_eq!(feature.status, "unknown");
-        assert!(feature.detail.contains("Nie można sprawdzić"));
+        assert!(feature.detail.contains("could not be run"), "{}", feature.detail);
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
             2,
@@ -765,6 +970,103 @@ mod tests {
         assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "nie usuwaj");
     }
 
+    /// MEASURED on rig11 (2026-09-26, OpenZFS 2.4.1-1ubuntu5.1), shortened
+    /// in the middle of the table: the layout `pool_feature_listed` reads.
+    const ZPOOL_UPGRADE_V_2_4_1: &str = "This system supports ZFS pool feature flags.
+
+The following features are supported:
+
+FEAT DESCRIPTION
+-------------------------------------------------------------
+async_destroy                         (read-only compatible)
+     Destroy filesystems asynchronously.
+empty_bpobj                           (read-only compatible)
+     Snapshots use less space.
+lz4_compress                         
+     LZ4 compression algorithm support.
+draid                                
+     Support for distributed spare RAID
+raidz_expansion                      
+     Support for raidz expansion
+fast_dedup                            (read-only compatible)
+     Support for advanced deduplication
+physical_rewrite                      (read-only compatible)
+     Support for preserving logical birth time during rewrite.
+
+The following legacy versions are also supported:
+
+VER  DESCRIPTION
+---  --------------------------------------------------------
+ 1   Initial ZFS version
+ 2   Ditto blocks (replicated metadata)
+";
+
+    fn with_anyraid(text: &str, line: &str) -> String {
+        text.replace("draid     ", &format!("{line}\n     Support for any-sized RAID\ndraid     "))
+    }
+
+    #[test]
+    fn zpool_upgrade_v_answers_whether_anyraid_is_listed() {
+        assert_eq!(pool_feature_listed(ZPOOL_UPGRADE_V_2_4_1, "anyraid"), PoolFeatureListing::NotListed);
+        assert_eq!(pool_feature_listed(ZPOOL_UPGRADE_V_2_4_1, "raidz_expansion"), PoolFeatureListing::Listed);
+        let listed = with_anyraid(ZPOOL_UPGRADE_V_2_4_1, "anyraid                              ");
+        assert_eq!(pool_feature_listed(&listed, "anyraid"), PoolFeatureListing::Listed);
+        let qualified = with_anyraid(ZPOOL_UPGRADE_V_2_4_1, "org.openzfs:anyraid");
+        assert_eq!(pool_feature_listed(&qualified, "anyraid"), PoolFeatureListing::Listed);
+        // A description that merely MENTIONS the word is not the feature.
+        let mentioned = ZPOOL_UPGRADE_V_2_4_1.replace("Support for raidz expansion", "anyraid is not this");
+        assert_eq!(pool_feature_listed(&mentioned, "anyraid"), PoolFeatureListing::NotListed);
+        // A feature whose name only starts the same is not it either.
+        let longer = with_anyraid(ZPOOL_UPGRADE_V_2_4_1, "anyraid_v2");
+        assert_eq!(pool_feature_listed(&longer, "anyraid"), PoolFeatureListing::NotListed);
+    }
+
+    /// "Not listed" is said only about a complete table: anything else is
+    /// unknown, never "this ZFS has no AnyRAID".
+    #[test]
+    fn a_zpool_upgrade_v_document_that_is_not_whole_is_unreadable() {
+        let cut = ZPOOL_UPGRADE_V_2_4_1.split("The following legacy").next().unwrap();
+        for (why, text) in [
+            ("empty", String::new()),
+            ("an error instead of the document", "The ZFS modules are not loaded.\nTry running 'modprobe zfs' as root to load them.\n".to_string()),
+            ("truncated before the legacy section", cut.to_string()),
+            ("no header", ZPOOL_UPGRADE_V_2_4_1.replace("FEAT DESCRIPTION\n", "")),
+            ("no separator", ZPOOL_UPGRADE_V_2_4_1.replace("-------------------------------------------------------------\n", "")),
+            (
+                "an empty table",
+                "The following features are supported:\n\nFEAT DESCRIPTION\n----\n\nThe following legacy versions are also supported:\n".to_string(),
+            ),
+            ("a line that is no feature name", ZPOOL_UPGRADE_V_2_4_1.replace("draid     ", "Draid!    ")),
+        ] {
+            assert_eq!(pool_feature_listed(&text, "anyraid"), PoolFeatureListing::Unreadable, "{why}");
+        }
+    }
+
+    #[test]
+    fn the_anyraid_row_names_the_zfs_version_and_never_calls_a_failed_read_supported() {
+        let (status, detail) = anyraid_verdict(Some((ZPOOL_UPGRADE_V_2_4_1, "")), Some("2.4.1"));
+        assert_eq!(status, "unsupported");
+        assert_eq!(detail.text, "ZFS 2.4.1 on this node does not support AnyRAID");
+        assert_eq!(detail.reasons[0].code, "anyraid_not_in_zfs");
+        assert_eq!(detail.reasons[0].params.get("version").map(String::as_str), Some("2.4.1"));
+
+        let listed = with_anyraid(ZPOOL_UPGRADE_V_2_4_1, "anyraid");
+        let (status, detail) = anyraid_verdict(Some((&listed, "")), Some("2.5.0"));
+        assert_eq!(status, "not_offered", "never a green OK for what TentaNas cannot create");
+        assert_eq!(detail.reasons[0].code, "anyraid_supported_not_offered");
+
+        // The command could not be run, or printed something else: unknown.
+        for output in [None, Some(("", "cannot open /dev/zfs")), Some(("garbage", ""))] {
+            let (status, detail) = anyraid_verdict(output, Some("2.4.1"));
+            assert_eq!(status, "unknown", "{output:?}");
+            assert_eq!(detail.reasons[0].code, "anyraid_unreadable");
+        }
+        // A version the `zfs` row could not read is left out, not invented.
+        let (_, detail) = anyraid_verdict(Some((ZPOOL_UPGRADE_V_2_4_1, "")), None);
+        assert_eq!(detail.text, "ZFS on this node does not support AnyRAID");
+        assert_eq!(detail.reasons[0].params.get("version").map(String::as_str), Some(""));
+    }
+
     #[test]
     fn version_comparison_is_numeric() {
         assert!(version_at_least("2.3.1", "2.3.0"));
@@ -814,7 +1116,34 @@ mod tests {
     /// nothing installable answers "was this kernel built with
     /// `CONFIG_NVME_TARGET_AUTH`". An install button there would promise
     /// something no package manager can deliver.
-    const NO_PACKAGE_FEATURES: &[&str] = &["iscsi", "nvmet", super::super::targets::DHCHAP_FEATURE_ID];
+    ///
+    /// `anyraid` has nothing to install either: the feature comes with the
+    /// OpenZFS build the `zfs` row installs, or it does not.
+    const NO_PACKAGE_FEATURES: &[&str] =
+        &["iscsi", "nvmet", super::super::targets::DHCHAP_FEATURE_ID, ANYRAID_FEATURE_ID];
+
+    /// Wave 7: the generic probe's detail travels as codes too, and the
+    /// English it always wrote stays the tooltip.
+    #[tokio::test]
+    async fn the_generic_probe_codes_a_missing_binary() {
+        let spec = FeatureSpec {
+            id: "zz-test",
+            binaries: &["tentanas-no-such-binary-w7"],
+            kernel_module: None,
+            required_version: None,
+            optional: true,
+            apt: &[],
+            dnf: &[],
+            pacman: &[],
+            zypper: &[],
+        };
+        let (feature, reasons) = probe_feature(&spec, None).await;
+        assert_eq!(feature.status, "missing");
+        assert_eq!(feature.detail, "missing: tentanas-no-such-binary-w7");
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, "feature_binaries_missing");
+        assert_eq!(reasons[0].params.get("binaries").map(String::as_str), Some("tentanas-no-such-binary-w7"));
+    }
 
     #[test]
     fn every_feature_has_packages_for_every_manager() {
@@ -839,7 +1168,7 @@ mod tests {
         // no `targetcli-fb` package read as "missing".
         for spec in FEATURES.iter().filter(|s| NO_PACKAGE_FEATURES.contains(&s.id)) {
             assert!(spec.binaries.is_empty(), "{} declares a binary", spec.id);
-            if spec.id == super::super::targets::DHCHAP_FEATURE_ID {
+            if spec.id == super::super::targets::DHCHAP_FEATURE_ID || spec.id == ANYRAID_FEATURE_ID {
                 // The one row whose answer is not a module at all: DH-HMAC-CHAP
                 // is a kernel BUILD option (`CONFIG_NVME_TARGET_AUTH`), so
                 // naming a module here would make the probe look for something

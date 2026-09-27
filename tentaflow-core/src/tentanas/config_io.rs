@@ -119,6 +119,10 @@ pub struct TargetConfig {
     pub port_groups: Vec<NasTargetPortGroup>,
     #[serde(default)]
     pub initiators: Vec<String>,
+    /// "Opis" per initiator (wave 12). Plain text, not a secret, so it
+    /// travels; absent from an older document.
+    #[serde(default)]
+    pub initiator_descriptions: std::collections::BTreeMap<String, String>,
     pub auth_method: String,
     #[serde(default)]
     pub auth_username: String,
@@ -302,6 +306,7 @@ async fn export_scoped(db: &DbPool, org_id: Option<&str>) -> Result<ConfigDocume
             portals: t.portals,
             port_groups: t.port_groups,
             initiators: t.initiators,
+            initiator_descriptions: t.initiator_descriptions,
             auth_method: t.auth_method,
             auth_username: t.auth_username,
             auth_mutual_username: t.auth_mutual_username,
@@ -880,6 +885,24 @@ pub fn overwritten(items: &[NasConfigImportItem]) -> Vec<String> {
         .collect()
 }
 
+/// The same overwritten schedules as `[task, subject]` pairs — `["scrub",
+/// "tank"]`, `["snapshot", "tank/x"]`, `["smart", ""]` — as JSON, for the
+/// approval's params: a screen words the task in the reader's language
+/// instead of printing the plan's own "scrub tank" (critic wave 6, MINOR 10).
+/// The plan names a schedule `<task> <subject>` (`plan`), a task being one
+/// word, so the first space splits them.
+pub fn overwritten_schedules_json(items: &[NasConfigImportItem]) -> String {
+    let pairs: Vec<[&str; 2]> = items
+        .iter()
+        .filter(|i| i.action == "update" && i.kind == "schedule")
+        .map(|i| {
+            let (task, subject) = i.name.split_once(' ').unwrap_or((i.name.as_str(), ""));
+            [task, subject]
+        })
+        .collect();
+    serde_json::to_string(&pairs).unwrap_or_else(|_| "[]".to_string())
+}
+
 // =============================================================================
 // import apply
 // =============================================================================
@@ -897,6 +920,13 @@ pub async fn apply(
     explicit: Option<&ElevationToken>,
 ) -> Result<()> {
     let db = handle.db().clone();
+    // An import creates shares and targets: from its read of the pools to its
+    // last row, a pool destroy cannot run in between, and a running one
+    // refuses the import after a short wait (`pools::resources_lock`, critic
+    // wave 9a R2-MINOR 1).
+    let _serialised = super::pools::try_resources_lock(&db)
+        .await
+        .ok_or_else(|| anyhow::anyhow!(super::pools::POOL_DESTROY_IN_PROGRESS))?;
     let live = live_state(&db, owner).await?;
     apply_with(handle, main_db, &owner.addon_id, document, explicit, live, None).await
 }
@@ -1045,6 +1075,7 @@ pub async fn apply_with(
             nfs: share.nfs.clone(),
             state: "disabled".to_string(),
             state_detail: String::new(),
+            state_reasons: Vec::new(),
             created_at: now.clone(),
             updated_at: now,
         };
@@ -1119,6 +1150,19 @@ pub async fn apply_with(
             portals: target.portals.clone(),
             port_groups: target.port_groups.clone(),
             initiators: target.initiators.clone(),
+            // Only the descriptions of listed initiators, judged by the same
+            // rule as a save: an edited document cannot smuggle in text the
+            // editor would refuse.
+            initiator_descriptions: super::targets::clean_descriptions(
+                &target.initiators,
+                &target
+                    .initiator_descriptions
+                    .iter()
+                    .filter(|(k, _)| target.initiators.contains(k))
+                    .map(|(k, v)| (k.clone(), v.chars().filter(|c| !c.is_control()).take(super::targets::DESCRIPTION_MAX_CHARS).collect()))
+                    .collect(),
+            )
+            .unwrap_or_default(),
             auth_method: target.auth_method.clone(),
             auth_username: target.auth_username.clone(),
             auth_secret: String::new(),
@@ -1135,6 +1179,15 @@ pub async fn apply_with(
                     .to_string()
             } else {
                 String::new()
+            },
+            // The same two reasons as codes, which the row keeps while it
+            // stays disabled (`targets::target_state` carries both).
+            state_reasons: if authenticated {
+                vec![super::disks::coded_reason("import_secret_needed", &[])]
+            } else if all_interfaces {
+                vec![super::disks::coded_reason("import_all_interfaces", &[])]
+            } else {
+                Vec::new()
             },
             created_at: now.clone(),
             updated_at: now,
@@ -1250,12 +1303,18 @@ pub async fn apply_with(
     }
     if document.schedules.smart.enabled {
         let now = chrono::Local::now();
-        let smart = NasSmartSchedule {
-            next_short_at: super::scheduler::next_run_utc(&document.schedules.smart.short, now),
-            next_long_at: super::scheduler::next_run_utc(&document.schedules.smart.long, now),
-            ..document.schedules.smart.clone()
-        };
-        store::set_smart_schedule(&db, &smart)?;
+        let smart = &document.schedules.smart;
+        // The cadences are the document's; the run stamps stay THIS node's
+        // (the document's are another node's runs), and a tick that lands
+        // meanwhile keeps its own (`store::save_smart_schedule`).
+        store::save_smart_schedule(
+            &db,
+            smart.enabled,
+            &smart.short,
+            &smart.long,
+            super::scheduler::next_run_utc(&smart.short, now),
+            super::scheduler::next_run_utc(&smart.long, now),
+        )?;
         handle.log("SMART schedule: written");
         step(handle, &mut done);
     }
@@ -1578,6 +1637,34 @@ mod tests {
         assert_eq!(planned("/mnt/bravo-old").0, "create", "a real directory of the pool");
     }
 
+    /// Critic wave 9a, R2-MINOR 1: an import takes the same lock a pool
+    /// destroy holds; while it is held the import is refused (coded) after a
+    /// short wait and creates nothing, and once it is free the import runs.
+    #[tokio::test]
+    async fn an_import_is_refused_while_a_pool_destroy_holds_the_lock() {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let handle = super::super::jobs::JobHandle::for_test(&db, "job-import-locked");
+        let owner = tentanas_helper::elastic::ElasticOwner { org_id: "org-a".into(), addon_id: "nas".into() };
+        let mut doc = document();
+        doc.pools.clear();
+        doc.datasets.clear();
+        doc.targets.clear();
+        // Nothing in it the second (successful) run could apply to this host.
+        doc.shares.clear();
+        doc.share_users.clear();
+        let held = super::super::pools::resources_lock(&db).lock_owned().await;
+        let refused = apply(&handle, &db, &owner, doc.clone(), None).await.expect_err("refused while held");
+        assert_eq!(refused.to_string(), super::super::pools::POOL_DESTROY_IN_PROGRESS);
+        drop(held);
+        // Free: the import gets past the lock (the rest is its own business —
+        // without zfs here, its live read may fail, but never with this).
+        if let Err(e) = apply(&handle, &db, &owner, doc, None).await {
+            assert_ne!(e.to_string(), super::super::pools::POOL_DESTROY_IN_PROGRESS);
+        }
+    }
+
     /// Everything an import creates belongs to the importing organisation,
     /// and a share's grant to an account that is not that organisation's is
     /// left out (and logged) rather than written.
@@ -1652,6 +1739,10 @@ mod tests {
         assert_eq!(find(&items, "share", "elsewhere").action, "conflict");
 
         assert_eq!(find(&items, "schedule", "scrub tank").action, "update");
+        // The approval's structured form of the same overwrite.
+        let pairs: Vec<[String; 2]> = serde_json::from_str(&overwritten_schedules_json(&items)).expect("json");
+        assert!(pairs.contains(&["scrub".to_string(), "tank".to_string()]), "{pairs:?}");
+        assert!(pairs.iter().all(|[task, _]| !task.contains(' ')));
         assert_eq!(
             find(&items, "schedule", "snapshot tank/projekty").action,
             "create"
@@ -1897,6 +1988,7 @@ mod tests {
             }],
             port_groups: super::super::targets::default_port_groups(),
             initiators: vec![esx.to_string()],
+            initiator_descriptions: Default::default(),
             auth_method: method.to_string(),
             auth_username: String::new(),
             auth_mutual_username: String::new(),
@@ -2012,6 +2104,7 @@ mod tests {
             }],
             port_groups: super::super::targets::default_port_groups(),
             initiators: vec!["nqn.2014-08.org.nvmexpress:uuid:esx01".to_string()],
+            initiator_descriptions: Default::default(),
             auth_method: "dhchap".to_string(),
             auth_username: String::new(),
             auth_mutual_username: String::new(),

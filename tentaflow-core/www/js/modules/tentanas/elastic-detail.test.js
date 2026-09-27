@@ -257,6 +257,72 @@ test('zmiana noda podczas sudo nie wysyła starej mutacji; spóźniony Get nie o
   stale.dispose();
 });
 
+// Wave 6: the array state detail arrives as codes beside the node's English.
+// The n05 card and the n11 pane read the reader's language, name members by
+// kernel name or number (never the slot), and keep the English as the
+// tooltip; a poll that brings a new state patches the same line.
+test('the array state is worded from its codes on the card and the pane, the English only in the tooltip', async () => {
+  const english = 'data disk #1, data disk sdh are present and not mounted yet — the next reconcile mounts them and then the union';
+  const pending = array({
+    state: 'pending',
+    stateDetail: english,
+    stateReasons: [{ code: 'branches_mountable', params: { data: '#1,sdh' } }],
+  });
+  const card = renderedElasticCard(pending);
+  const reason = card.querySelector('.pc-reason');
+  assert.equal(reason.textContent, 'Obecne i jeszcze niezamontowane: dysk danych nr 1, dysk danych sdh. Następne uzgodnienie zamontuje je, a potem unię.');
+  assert.equal(reason.getAttribute('title'), english);
+
+  let current = pending;
+  const { screen, body, poll } = await mountPolled(() => current);
+  try {
+    const line = body.querySelector('[data-f="state-detail"]');
+    assert.match(line.textContent, /^Obecne i jeszcze niezamontowane: dysk danych nr 1, dysk danych sdh\./);
+    assert.equal(line.getAttribute('title'), english);
+    current = array({
+      state: 'error',
+      stateDetail: 'data disk sdh is not on this node — the union stays down',
+      stateReasons: [{ code: 'branches_gone', params: { data: 'sdh', union: 'down' } }],
+    });
+    await poll();
+    assert.equal(body.querySelector('[data-f="state-detail"]'), line, 'the same line, patched');
+    assert.match(line.textContent, /^Brak na tym węźle: dysk danych sdh\. Unia pozostaje odmontowana/);
+    // A sentence the node stored without codes is said generically, in the
+    // reader's language, with the sentence as its tooltip.
+    current = array({ state: 'disabled', enabled: false, stateDetail: 'switched off by the import: the cache disk is not on this node' });
+    await poll();
+    assert.equal(line.textContent, 'Węzeł opisał stan tej macierzy tylko własnymi słowami — szczegóły w podpowiedzi.');
+    assert.equal(line.getAttribute('title'), 'switched off by the import: the cache disk is not on this node');
+  } finally {
+    screen.dispose();
+  }
+});
+
+// Wave-6 critic MINOR 4: a sentence the array's row STORES reaches the
+// screen coded and worded; the stored error is only the (id-filtered)
+// tooltip, and an older uncoded row goes through the id filter too.
+test('a stored array sentence is worded from its code, and an uncoded one never shows an id', () => {
+  const wwn = 'mkfs.xfs failed on /dev/disk/by-id/wwn-0x5000c500a1b2c3d4';
+  const failed = renderedElasticCard(array({
+    state: 'needs_attention', stateDetail: wwn,
+    stateReasons: [{ code: 'operation_failed', params: { operation: 'create' } }],
+  })).querySelector('.pc-reason');
+  assert.equal(failed.textContent, 'Operacja „Tworzenie Elastic Array” nie powiodła się — szczegóły w podpowiedzi.');
+  assert.doesNotMatch(failed.getAttribute('title'), /wwn-0x5000/);
+  assert.match(failed.getAttribute('title'), /^mkfs\.xfs failed on /);
+  const lost = renderedElasticCard(array({
+    state: 'needs_attention', stateDetail: 'Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O',
+    stateReasons: [{ code: 'supervision_lost', params: {} }],
+  })).querySelector('.pc-reason');
+  assert.match(lost.textContent, /^Węzeł stracił nadzór nad operacją tej macierzy/);
+  const unknownOp = renderedElasticCard(array({ state: 'needs_attention', stateDetail: 'x', stateReasons: [{ code: 'operation_failed', params: { operation: 'replace_disk' } }] })).querySelector('.pc-reason');
+  assert.equal(unknownOp.textContent, 'Operacja na tej macierzy nie powiodła się — szczegóły w podpowiedzi.');
+  const old = renderedElasticCard(array({ state: 'needs_attention', stateDetail: wwn })).querySelector('.pc-reason');
+  assert.equal(old.textContent, 'Węzeł opisał stan tej macierzy tylko własnymi słowami — szczegóły w podpowiedzi.', 'an uncoded stored sentence is said generically');
+  assert.doesNotMatch(old.getAttribute('title'), /wwn-0x5000/, 'and its tooltip goes through the id filter');
+  assert.match(old.getAttribute('title'), /^mkfs\.xfs failed on /);
+});
+
 test('odpowiedź obcej macierzy i HTML w diagnostyce są bezpiecznie odrzucane/renderowane', async () => {
   const wrong = await mount(array({ name: 'other' }));
   assert.ok(wrong.body.querySelector('tf-alert'));
@@ -264,7 +330,8 @@ test('odpowiedź obcej macierzy i HTML w diagnostyce są bezpiecznie odrzucane/r
   wrong.screen.dispose();
   const safe = await mount(array({ stateDetail: '<img src=x onerror=alert(1)>' }));
   assert.equal(safe.body.querySelector('img'), null);
-  assert.match(safe.body.textContent, /<img/);
+  // Uncoded, so said generically; the markup is the tooltip's TEXT.
+  assert.match(safe.body.querySelector('[data-f="state-detail"]').getAttribute('title'), /<img/);
   safe.screen.dispose();
 });
 
@@ -786,7 +853,7 @@ test('widok główny nie mówi „Mover” i pokazuje jedną linię o danych cze
   assert.ok(details.querySelector('.mover-hist'), 'historia pozostaje osiągalna');
   const lines = body.querySelectorAll('.nas-cache-pending .sr');
   assert.equal(lines.length, 1);
-  assert.equal(lines[0].querySelector('.k').textContent, 'Na dysku cache, jeszcze bez ochrony');
+  assert.equal(lines[0].querySelector('.k').textContent, 'Na cache bez parity');
   assert.equal(lines[0].querySelector('.v').textContent, '18 GiB');
   // Nothing else in the main view is a control for moving files.
   for (const act of ['mover', 'mover-schedule']) {
@@ -978,6 +1045,8 @@ test('nieudany scrub i naprawa bez zapisu zostawiają Sync i Scrub do uruchomien
     if (fault) {
       const win = document.querySelector('tf-window');
       assert.ok(win, `${history[0].outcome}: the confirm opens`);
+      // Critic wave 5, MINOR 3: the confirm says what was never measured.
+      assert.match(win.querySelector('.explain-box').textContent, /Dwóch przypadków nie zmierzono: pliku, którego scrub nie mógł odczytać, a który też się zmienił, oraz dysku, który zacznie zawodzić w trakcie Sync/);
       typeInto(win.querySelector('#retype-input'), 'media');
       confirmWindow(win);
       await flush();
@@ -1482,8 +1551,8 @@ test('bajty na cache poza parity prowadzą kafel Ochrona i mają wiersz na karci
     assert.equal(tile.getAttribute('value'), '18 GiB');
     assert.equal(tile.getAttribute('accent'), 'warning');
     assert.equal(tile.getAttribute('delta-type'), 'warn');
-    assert.equal(tile.getAttribute('delta'), 'Na dysku cache, jeszcze bez ochrony');
-    const rowOf = () => moverRow(body.querySelector('.nas-snapraid > .stat-rows'), 'Na dysku cache, jeszcze bez ochrony');
+    assert.equal(tile.getAttribute('delta'), 'Na cache bez parity');
+    const rowOf = () => moverRow(body.querySelector('.nas-snapraid > .stat-rows'), 'Na cache bez parity');
     assert.ok(rowOf(), 'the SnapRAID card has the cache row');
     assert.equal(rowOf().querySelector('.v').textContent, '18 GiB');
     assert.ok(rowOf().querySelector('.v').classList.contains('num-warn'));
@@ -1761,4 +1830,42 @@ test('przyczyny uwagi, kroki dodawania i potwierdzenie Sync są tłumaczone w pi
       assert.ok(!I18n.t('tentanas.approvals.op_elastic_add_disk_abort').startsWith('tentanas.'), language);
     }
   } finally { await I18n.setLanguage('pl'); }
+});
+
+// n11 "Użycie": the node's last bounded walk of each folder. A poll that
+// brings a new figure writes it into the SAME cell, and a folder with no
+// figure says "—" with the reason as its tooltip, never a zero.
+test('the folder usage column shows the measured size, patches it in place and words a missing one', async () => {
+  const measuredAt = new Date(Date.now() - 3 * 3600 * 1000).toISOString();
+  let usage = { usedBytes: 2 * 1024 ** 4, usedMeasuredAt: measuredAt, usedReasons: [] };
+  const read = () => array({
+    foldersKnown: true,
+    folders: [
+      { ...folders[0], ...usage },
+      { ...folders[1], usedBytes: null, usedReasons: [{ code: 'folder_usage_unreadable', params: {} }] },
+      { ...folders[2] },
+    ],
+  });
+  const { screen, body, poll } = await mountPolled(read);
+  try {
+    const cell = (name) => body.querySelector(`.nas-folders .fr[data-folder="${name}"] [data-f="folder-used"]`);
+    const filmy = cell('filmy');
+    assert.equal(filmy.textContent, '2.0 TiB');
+    assert.match(filmy.getAttribute('title'), /^Zmierzono 3 h temu/);
+    assert.equal(cell('foto').textContent, '—');
+    assert.match(cell('foto').getAttribute('title'), /nie dało się odczytać/);
+    // A node too old to send the field: no figure, no reason, no zero.
+    assert.equal(cell('backup').textContent, '—');
+    assert.equal(cell('backup').getAttribute('title'), 'Nie zmierzono');
+    assert.match(body.querySelector('.nas-folders .fr-head').textContent, /Użycie/);
+
+    usage = { usedBytes: 3 * 1024 ** 4, usedMeasuredAt: new Date().toISOString(), usedReasons: [] };
+    await poll();
+    assert.ok(cell('filmy') === filmy, 'the cell is the same node');
+    assert.equal(filmy.textContent, '3.0 TiB');
+    assert.match(filmy.getAttribute('title'), /^Zmierzono 0 s temu|^Zmierzono \d+ s temu/);
+  } finally {
+    screen.dispose?.();
+    body.remove();
+  }
 });

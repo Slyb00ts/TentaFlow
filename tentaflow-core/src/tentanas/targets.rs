@@ -42,6 +42,7 @@ use tentanas_helper::HelperCommand;
 use zeroize::Zeroizing;
 
 use super::db::{self as store, TargetRow};
+use super::CodedText;
 use crate::crypto::SettingsCipher;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
@@ -131,28 +132,46 @@ fn kernel_config() -> Option<(String, String)> {
 /// The Environment row id of the DH-HMAC-CHAP probe (n16, §5.5).
 pub const DHCHAP_FEATURE_ID: &str = "dhchap";
 
-pub fn dhchap_support() -> (bool, String) {
+pub fn dhchap_support() -> (bool, CodedText) {
     match kernel_config() {
-        Some((path, text)) => match kconfig_verdict(&text, "CONFIG_NVME_TARGET_AUTH") {
-            Some(true) => (
-                true,
-                format!("CONFIG_NVME_TARGET_AUTH in {path} — DH-HMAC-CHAP available"),
-            ),
-            Some(false) => (
-                false,
-                format!("this kernel was built without CONFIG_NVME_TARGET_AUTH ({path})"),
-            ),
-            None => (
-                false,
-                format!("{path} does not mention CONFIG_NVME_TARGET_AUTH"),
-            ),
-        },
+        Some((path, text)) => {
+            let at = [("path", path.clone())];
+            match kconfig_verdict(&text, "CONFIG_NVME_TARGET_AUTH") {
+                Some(true) => (
+                    true,
+                    CodedText::new(
+                        "dhchap_available",
+                        &at,
+                        format!("CONFIG_NVME_TARGET_AUTH in {path} — DH-HMAC-CHAP available"),
+                    ),
+                ),
+                Some(false) => (
+                    false,
+                    CodedText::new(
+                        "dhchap_not_built",
+                        &at,
+                        format!("this kernel was built without CONFIG_NVME_TARGET_AUTH ({path})"),
+                    ),
+                ),
+                None => (
+                    false,
+                    CodedText::new(
+                        "dhchap_not_mentioned",
+                        &at,
+                        format!("{path} does not mention CONFIG_NVME_TARGET_AUTH"),
+                    ),
+                ),
+            }
+        }
         None => (
             false,
-            "this kernel publishes no configuration (no /proc/config.gz, no /boot/config-*), \
-             so DH-HMAC-CHAP support cannot be confirmed — the wizard does not offer what it \
-             cannot confirm"
-                .to_string(),
+            CodedText::new(
+                "kernel_config_missing",
+                &[],
+                "this kernel publishes no configuration (no /proc/config.gz, no /boot/config-*), \
+                 so DH-HMAC-CHAP support cannot be confirmed — the wizard does not offer what it \
+                 cannot confirm",
+            ),
         ),
     }
 }
@@ -202,7 +221,7 @@ fn can_serve(configfs_present: bool, missing_modules: usize) -> bool {
     configfs_present || missing_modules == 0
 }
 
-pub fn kernel_support(protocol: &str) -> (bool, String) {
+pub fn kernel_support(protocol: &str) -> (bool, CodedText) {
     // FIRST, before the configfs check: an unknown protocol used to fall
     // through to LIO's tree, which exists on any node that ever served iSCSI —
     // so "is `tentanas-nonsense` supported?" answered yes. An empty module
@@ -211,7 +230,11 @@ pub fn kernel_support(protocol: &str) -> (bool, String) {
     if modules.is_empty() {
         return (
             false,
-            format!("'{protocol}' is not a block protocol this node serves"),
+            CodedText::new(
+                "protocol_unknown",
+                &[("protocol", protocol.to_string())],
+                format!("'{protocol}' is not a block protocol this node serves"),
+            ),
         );
     }
     let root = if protocol == "nvmet" {
@@ -220,7 +243,7 @@ pub fn kernel_support(protocol: &str) -> (bool, String) {
         block::TARGET_CONFIGFS
     };
     if Path::new(root).is_dir() {
-        return (true, format!("{root} present"));
+        return (true, CodedText::new("configfs_present", &[("path", root.to_string())], format!("{root} present")));
     }
     let missing: Vec<&str> = modules
         .iter()
@@ -232,17 +255,22 @@ pub fn kernel_support(protocol: &str) -> (bool, String) {
         // `target.service`, by §3.4. The apply does it through the catalog.
         return (
             true,
-            format!(
-                "{} available, loaded on the first target",
-                modules.join(", ")
+            CodedText::new(
+                "modules_available",
+                &[("modules", modules.join(", "))],
+                format!("{} available, loaded on the first target", modules.join(", ")),
             ),
         );
     }
     (
         false,
-        format!(
-            "this kernel has no {} — the {protocol} target is not built for it",
-            missing.join(", ")
+        CodedText::new(
+            "modules_missing",
+            &[("modules", missing.join(", ")), ("protocol", protocol.to_string())],
+            format!(
+                "this kernel has no {} — the {protocol} target is not built for it",
+                missing.join(", ")
+            ),
         ),
     )
 }
@@ -261,6 +289,13 @@ pub fn kernel_support(protocol: &str) -> (bool, String) {
 /// asks for it ("sonda w Środowisku"), and the iSCSI row carries the iSER
 /// module state (§5.5a).
 pub fn refine(feature: &mut FeatureState) {
+    refine_coded(feature);
+}
+
+/// `refine`, answering the row's detail as codes too
+/// (`NasEnvironment::feature_reasons`): the same codes the wizard words for
+/// `NasBlockCapabilities`, plus the transport module's state.
+pub fn refine_coded(feature: &mut FeatureState) -> Vec<tentaflow_protocol::tentanas::NasHealthReason> {
     // Nothing is installable for any of these rows: the modules come with the
     // kernel, the build option comes with the kernel, and the userspace tools
     // are exactly what this app does not use.
@@ -281,23 +316,27 @@ pub fn refine(feature: &mut FeatureState) {
     if feature.id == DHCHAP_FEATURE_ID {
         let (ok, detail) = dhchap_support();
         feature.status = if ok { "ok" } else { "missing_module" }.to_string();
-        feature.detail = detail;
+        feature.detail = detail.text;
         feature.kernel_module = None;
-        return;
+        return detail.reasons;
     }
 
-    let (ok, mut detail) = kernel_support(&feature.id);
-    if feature.id == "nvmet" {
-        detail.push_str(&format!(
-            " · nvmet-rdma {}",
-            module_state(nvmet_rdma_module())
-        ));
+    let (ok, detail) = kernel_support(&feature.id);
+    let (module, available) = if feature.id == "nvmet" {
+        ("nvmet-rdma", nvmet_rdma_module())
     } else {
-        detail.push_str(&format!(" · ib_isert {}", module_state(iser_module())));
-    }
+        ("ib_isert", iser_module())
+    };
+    let transport = CodedText::new(
+        if available { "module_on_demand" } else { "module_absent" },
+        &[("module", module.to_string())],
+        format!("{module} {}", module_state(available)),
+    );
+    let detail = detail.and(transport);
     feature.status = if ok { "ok" } else { "missing_module" }.to_string();
-    feature.detail = detail;
+    feature.detail = detail.text;
     feature.kernel_module = modules_for(&feature.id).first().map(|m| m.to_string());
+    detail.reasons
 }
 
 fn module_state(available: bool) -> &'static str {
@@ -506,15 +545,20 @@ pub fn capabilities(
     let (dhchap, dhchap_detail) = dhchap_support();
     let rdma_detail = if rdma_ok {
         let mut parts = Vec::new();
+        let mut reasons = Vec::new();
         if !iser_module() {
             parts.push("ib_isert is not in this kernel's module tree (no iSER)");
+            reasons.push(super::disks::coded_reason("iser_module_missing", &[]));
         }
         if !nvmet_rdma_module() {
             parts.push("nvmet-rdma is not in this kernel's module tree (no NVMe-oF over RDMA)");
+            reasons.push(super::disks::coded_reason("nvmet_rdma_module_missing", &[]));
         }
-        parts.join("; ")
+        CodedText { text: parts.join("; "), reasons }
     } else {
-        feature_detail(features, super::rdma::FEATURE_ID)
+        // The RDMA probe's own sentence (the Environment row's) says why; the
+        // screen says that RDMA is not usable here and shows it as the tooltip.
+        CodedText::new("rdma_unavailable", &[], feature_detail(features, super::rdma::FEATURE_ID))
     };
     // The two protocol rows come from the KERNEL, not from the `targetcli` /
     // `nvmetcli` Environment rows: this app never runs either tool, so a node
@@ -527,10 +571,14 @@ pub fn capabilities(
         iser: rdma_ok && iser_module(),
         nvme_rdma: rdma_ok && nvmet_rdma_module(),
         dhchap,
-        iscsi_detail,
-        nvmet_detail,
-        rdma_detail,
-        dhchap_detail,
+        iscsi_detail: iscsi_detail.text,
+        nvmet_detail: nvmet_detail.text,
+        rdma_detail: rdma_detail.text,
+        dhchap_detail: dhchap_detail.text,
+        iscsi_reasons: iscsi_detail.reasons,
+        nvmet_reasons: nvmet_detail.reasons,
+        rdma_reasons: rdma_detail.reasons,
+        dhchap_reasons: dhchap_detail.reasons,
         interfaces: interfaces(),
         volumes: volumes(datasets, targets),
         wwn_host: wwn_host(&super::config_io::hostname()),
@@ -557,7 +605,8 @@ pub fn services() -> Vec<NasShareService> {
             running,
             version: None,
             config_path: configfs.to_string(),
-            detail,
+            detail: detail.text,
+            reasons: detail.reasons,
         }
     })
     .collect()
@@ -649,7 +698,7 @@ pub fn target_state(
     installed: &dyn Fn(&str) -> bool,
     addresses: &BTreeMap<String, Vec<String>>,
     in_kernel: bool,
-) -> (&'static str, String, Disposition) {
+) -> (&'static str, CodedText, Disposition) {
     if !target.enabled {
         // A row that ARRIVED disabled keeps the sentence it arrived with.
         //
@@ -665,10 +714,12 @@ pub fn target_state(
         // and leaving that under a stopped row is stale rather than useful.
         // The two are told apart by what the row already says — an imported
         // row is written `disabled` with its reason, an active one is not.
+        //
+        // The carried sentence keeps the codes it arrived with, too.
         let carried = if target.state == "disabled" {
-            target.state_detail.clone()
+            CodedText { text: target.state_detail.clone(), reasons: target.state_reasons.clone() }
         } else {
-            String::new()
+            CodedText::default()
         };
         return ("disabled", carried, Disposition::Remove);
     }
@@ -678,12 +729,20 @@ pub fn target_state(
         } else {
             "the LIO kernel target is not available on this node"
         };
-        return ("error", missing.to_string(), Disposition::Remove);
+        return (
+            "error",
+            CodedText::new("target_kernel_missing", &[("protocol", target.protocol.clone())], missing),
+            Disposition::Remove,
+        );
     }
     if !volume_exists {
         return (
             "error",
-            "the backing volume does not exist — the target stays out of the kernel".to_string(),
+            CodedText::new(
+                "target_volume_missing",
+                &[],
+                "the backing volume does not exist — the target stays out of the kernel",
+            ),
             Disposition::Remove,
         );
     }
@@ -717,9 +776,17 @@ pub fn target_state(
                 name.as_str() != portal.interface && addrs.contains(&portal.address)
             })
             .map(|(name, _)| name.clone());
-        let on_the_interface = match held {
-            Some(current) => format!("{} now has {}", portal.interface, current.join(", ")),
-            None => format!("interface {} is gone from this node", portal.interface),
+        // THREE cases, not two (wave-6 critic MAJOR 2): the interface holds
+        // other addresses, it is THERE with none at all (link down, a DHCP
+        // lease lost — `interface_addresses` lists every interface), or it
+        // is gone from the node. Calling the second "gone" sends the admin
+        // looking for a NIC that is plugged in.
+        let (interface_state, on_the_interface) = match held {
+            Some(current) if !current.is_empty() => {
+                ("addressed", format!("{} now has {}", portal.interface, current.join(", ")))
+            }
+            Some(_) => ("no_address", format!("{} is there but has no address", portal.interface)),
+            None => ("missing", format!("interface {} is gone from this node", portal.interface)),
         };
         // "The export is reachable there" is a claim about what this node is
         // SERVING, so it is only made when the object is actually in the
@@ -738,12 +805,30 @@ pub fn target_state(
             ),
             (None, _) => "no interface of this node has that address".to_string(),
         };
+        // The same facts as parameters: the screen says them in the
+        // reader's language (N19b), the sentence stays the log's.
+        let mut params = vec![
+            ("address", portal.address.clone()),
+            ("interface", portal.interface.clone()),
+            ("in_kernel", in_kernel.to_string()),
+            ("interface_state", interface_state.to_string()),
+        ];
+        if let Some(current) = held.filter(|current| !current.is_empty()) {
+            params.push(("current", current.join(", ")));
+        }
+        if let Some(name) = &elsewhere {
+            params.push(("elsewhere", name.clone()));
+        }
         return (
             "error",
-            format!(
-                "portal {} is not on {} any more — {on_the_interface}, and {where_now}; the \
-                 target stays as it is until an admin re-picks the interface",
-                portal.address, portal.interface
+            CodedText::new(
+                "target_portal_moved",
+                &params,
+                format!(
+                    "portal {} is not on {} any more — {on_the_interface}, and {where_now}; the \
+                     target stays as it is until an admin re-picks the interface",
+                    portal.address, portal.interface
+                ),
             ),
             Disposition::Freeze,
         );
@@ -752,9 +837,13 @@ pub fn target_state(
     // whoever gets past the portal, and nothing past that point is
     // authenticated.
     let open = if target.auth_method == "none" {
-        "no authentication — the IQN/NQN allowlist is a filter, not a login"
+        CodedText::new(
+            "target_no_auth",
+            &[],
+            "no authentication — the IQN/NQN allowlist is a filter, not a login",
+        )
     } else {
-        ""
+        CodedText::default()
     };
     // "Active" is a claim about what this node is SERVING, so it is not made
     // about a target the node is not serving. A row can be judged appliable
@@ -767,16 +856,15 @@ pub fn target_state(
     // It is `pending`, not `error`: nothing is wrong, the node simply has not
     // done it yet, and the apply sweep on the next tick is what will.
     if !in_kernel {
-        let mut detail =
-            "saved, but this node is not exporting it yet — the next reconcile applies it"
-                .to_string();
-        if !open.is_empty() {
-            detail.push_str(" · ");
-            detail.push_str(open);
-        }
+        let detail = CodedText::new(
+            "target_not_exported",
+            &[],
+            "saved, but this node is not exporting it yet — the next reconcile applies it",
+        )
+        .and(open);
         return ("pending", detail, Disposition::Apply);
     }
-    ("active", open.to_string(), Disposition::Apply)
+    ("active", open, Disposition::Apply)
 }
 
 /// The dedupe key of one target's portal-drift alert. One open row per target,
@@ -796,7 +884,90 @@ pub fn forget_alerts(db: &DbPool, target_id: &str) -> Result<()> {
     for kind in [SweepKind::Apply, SweepKind::Remove] {
         store::resolve_alert(db, &reconcile_alert_key(kind, target_id))?;
     }
+    store::resolve_alert(db, &unresettable_alert_key(target_id))?;
+    store::resolve_alert(db, &rebuild_alert_key(target_id))?;
     Ok(())
+}
+
+/// The alert of a target whose allowlist is written while a client it
+/// excludes is still logged in: the helper's post-condition found one and
+/// the TPG enable toggle that would have reset it failed
+/// (`block::UNRESETTABLE_SESSION`, critic wave 12 R2-M1).
+fn unresettable_alert_key(target_id: &str) -> String {
+    format!("target:{target_id}:unresettable")
+}
+
+/// The alert of a target whose open → allowlist switch needed a TPG rebuild
+/// (cached dynamic ACLs, measured on rig11) that stopped short with even the
+/// disable failed (`block::TPG_REBUILD_MAY_SERVE`, critic ACL-fix M-1): the old
+/// OPEN portal group may still accept any client behind an allowlist the
+/// screen already shows.
+fn rebuild_alert_key(target_id: &str) -> String {
+    format!("target:{target_id}:rebuild")
+}
+
+/// Raises the two alerts above on the helper's coded failures and closes
+/// them on the next apply of the target that went through. Raised AT ONCE,
+/// not after the sweep's three failures: a client the admin just excluded is
+/// still reading and writing the disk, or may log in again.
+pub(crate) fn note_unresettable(db: &DbPool, target: &TargetRow, error: Option<&str>) {
+    note_rebuild_failed(db, target, error);
+    let key = unresettable_alert_key(&target.target_id);
+    let outcome = match error {
+        Some(e) if e.contains(block::UNRESETTABLE_SESSION) => store::raise_coded_alert(
+            db,
+            &key,
+            "critical",
+            "target",
+            &target.name,
+            &store::AlertText::new(
+                "target_session_not_reset",
+                format!("Target {}: a client outside the new allowlist is still connected", target.name),
+                "the allowlist is written, but a client that is not on it is still logged in and the \
+                 target's sessions could not be reset (the TPG enable toggle failed) — stop the target to \
+                 cut every client off"
+                    .to_string(),
+            )
+            .param("target", &target.name),
+        )
+        .map(|_| ()),
+        Some(_) => Ok(()),
+        None => store::resolve_alert(db, &key),
+    };
+    if let Err(e) = outcome {
+        tracing::warn!("tentanas targets: alert {key} not written: {e}");
+    }
+}
+
+/// `tpg_rebuild_failed: not_disabled` → the critical alert. The `disabled`
+/// variant raises nothing here: logins are refused (measured), so it is an
+/// ordinary failed apply the sweep alerts on.
+fn note_rebuild_failed(db: &DbPool, target: &TargetRow, error: Option<&str>) {
+    let key = rebuild_alert_key(&target.target_id);
+    let outcome = match error {
+        Some(e) if e.contains(block::TPG_REBUILD_MAY_SERVE) => store::raise_coded_alert(
+            db,
+            &key,
+            "critical",
+            "target",
+            &target.name,
+            &store::AlertText::new(
+                "target_rebuild_not_disabled",
+                format!("Target {}: the old open target may still accept any client", target.name),
+                "the target was open and had to be rebuilt before its new allowlist could take effect; \
+                 the rebuild stopped short and the target could not even be disabled, so the allowlist \
+                 is NOT in force and any client may still log in — stop the target"
+                    .to_string(),
+            )
+            .param("target", &target.name),
+        )
+        .map(|_| ()),
+        Some(_) => Ok(()),
+        None => store::resolve_alert(db, &key),
+    };
+    if let Err(e) = outcome {
+        tracing::warn!("tentanas targets: alert {key} not written: {e}");
+    }
 }
 
 /// Whether the configfs tree of a protocol is there RIGHT NOW.
@@ -1413,6 +1584,48 @@ fn object_in_kernel(target: &TargetRow) -> bool {
     Path::new(&path).is_dir()
 }
 
+/// The enabled targets this node judges FROZEN (portal drift): still in the
+/// kernel and serving, left exactly as they are by the drift policy. The
+/// sharing stop refuses while one exists (critic wave 10, M3): it would have
+/// to take the export out, and neither a rollback nor the resume can put a
+/// frozen target back — re-applying it would bind an address that moved.
+pub fn frozen_targets(db: &DbPool) -> Result<Vec<TargetRow>> {
+    let addresses = interface_addresses();
+    Ok(frozen_among(store::list_targets(db)?, &kernel_can_serve, &addresses, &object_in_kernel, &|t| {
+        t.luns.iter().all(|lun| Path::new(&lun.device_path).exists())
+    }))
+}
+
+/// `frozen_targets` over given rows, with the host's facts injected. Only a
+/// target that is IN THE KERNEL counts (critic wave 10, R2-1): a drifted
+/// target configfs no longer holds — after a reboot — serves nothing, so
+/// there is nothing a stop would take out and fail to put back.
+pub(crate) fn frozen_among(
+    targets: Vec<TargetRow>,
+    installed: &dyn Fn(&str) -> bool,
+    addresses: &BTreeMap<String, Vec<String>>,
+    in_kernel: &dyn Fn(&TargetRow) -> bool,
+    volume_exists: &dyn Fn(&TargetRow) -> bool,
+) -> Vec<TargetRow> {
+    targets
+        .into_iter()
+        .filter(|t| t.enabled && in_kernel(t))
+        .filter(|t| target_state(t, volume_exists(t), installed, addresses, true).2 == Disposition::Freeze)
+        .collect()
+}
+
+/// Whether this node's kernel holds `target` (its configfs object exists).
+pub fn in_kernel(target: &TargetRow) -> bool {
+    object_in_kernel(target)
+}
+
+/// How many ENABLED targets this node's kernel still holds — what the
+/// sharing stop reads back after its sweep (wave 10): a target still there
+/// is a client still holding a raw disk.
+pub fn enabled_in_kernel(db: &DbPool) -> Result<usize> {
+    Ok(store::list_targets(db)?.iter().filter(|t| t.enabled && object_in_kernel(t)).count())
+}
+
 /// Judges every row, persists what changed and raises or resolves the
 /// portal-drift alert. Returns what `apply` should DO with each row.
 ///
@@ -1443,6 +1656,11 @@ fn evaluate_rows(
     log: &mut Vec<String>,
 ) -> Result<BTreeMap<String, Disposition>> {
     let addresses = interface_addresses();
+    // While this node's sharing is stopped (n18d, wave 10) every enabled
+    // target is judged `suspended` / `Remove`: the sweeps take it out of the
+    // kernel and nothing puts it back until the resume lifts the mark. Read
+    // with `?`: an unreadable mark must not put every target back.
+    let stopped = super::sharing::suspended(db)?;
     let mut disposition: BTreeMap<String, Disposition> = BTreeMap::new();
     for target in targets.iter_mut() {
         // Asked of the DEVICE NODE, not of `zfs list`. A zvol the kernel can
@@ -1454,16 +1672,11 @@ fn evaluate_rows(
             .luns
             .iter()
             .all(|lun| Path::new(&lun.device_path).exists());
-        let (state, detail, verdict) = target_state(
+        let (state, mut detail, verdict) = super::sharing::target_state_while(
+            stopped,
             target,
-            volume_exists,
-            installed,
-            &addresses,
-            object_in_kernel(target),
+            target_state(target, volume_exists, installed, &addresses, object_in_kernel(target)),
         );
-        if target.state != state || target.state_detail != detail {
-            store::set_target_state(db, &target.target_id, state, &detail)?;
-        }
         // The drift alert (§5.5, owner decision 2026-09-04). The admin who
         // picked an interface has to HEAR that the portal is no longer on it,
         // and a state chip on a tab nobody is looking at is not hearing it —
@@ -1485,7 +1698,7 @@ fn evaluate_rows(
                 &store::AlertText::new(
                     "target_portal_moved",
                     format!("Target {}: the portal address moved", target.name),
-                    &detail,
+                    detail.text.as_str(),
                 )
                 .param("target", &target.name),
             )
@@ -1500,6 +1713,26 @@ fn evaluate_rows(
                 target.name
             ));
         }
+        // N19b says since WHEN the address has been elsewhere: the open drift
+        // alert's `raised_at`, stamped at the first tick that saw the move
+        // and kept by every later one (critic wave 6, MINOR 11). A parameter
+        // of the drift code only; an alert that could not be read leaves the
+        // sentence without it rather than guessing.
+        if verdict == Disposition::Freeze {
+            if let Ok(Some(since)) = store::open_alert_raised_at(db, &key) {
+                if let Some(reason) = detail.reasons.iter_mut().find(|r| r.code == "target_portal_moved") {
+                    reason.params.insert("since".to_string(), since);
+                }
+            }
+        }
+        // The codes count as a change: a row stored before migration 23 has
+        // the sentence and no codes, and this is what gives it them.
+        let changed = target.state != state
+            || target.state_detail != detail.text
+            || target.state_reasons != detail.reasons;
+        if changed {
+            store::set_target_state(db, &target.target_id, state, &detail, &detail.reasons)?;
+        }
         // Since WHEN the backing volume has been missing. Recorded here
         // because this is the one place that already asks — and recorded as a
         // TIMESTAMP rather than a tick count so that judging the same row
@@ -1513,10 +1746,11 @@ fn evaluate_rows(
         // day per such target, 43 000 on a ten-target node, burying every line
         // that meant something. `set_target_state` above is already gated this
         // way and so is `resolve_alert`; the log was the one that was not.
-        let changed = target.state != state || target.state_detail != detail;
+        let logged = target.state != state || target.state_detail != detail.text;
         target.state = state.to_string();
-        target.state_detail = detail;
-        if changed && !target.state_detail.is_empty() {
+        target.state_detail = detail.text;
+        target.state_reasons = detail.reasons;
+        if logged && !target.state_detail.is_empty() {
             log.push(format!("{}: {}", target.name, target.state_detail));
         }
     }
@@ -1581,7 +1815,10 @@ fn removal_is_due(target: &TargetRow) -> bool {
 /// directions. A test that can pass while the code is broken is worse than no
 /// test, and these were the ones watching a client's disk.
 fn removal_is_due_with(target: &TargetRow, since: &GraceClock) -> bool {
-    if !target.enabled {
+    // A disabled target, and one stopped with the node's sharing (its judged
+    // state, `sharing::target_state_while`): the admin asked for it to stop,
+    // so no grace period applies.
+    if !target.enabled || target.state == "suspended" {
         return true;
     }
     let volume_exists = target
@@ -1940,12 +2177,11 @@ pub fn unapplied_reason(db: &DbPool, name: &str) -> Result<Option<String>> {
         .iter()
         .all(|lun| Path::new(&lun.device_path).exists());
     let in_kernel = object_in_kernel(target);
-    let (_, detail, verdict) = target_state(
+    // The same judgement the sweeps act on, the stopped node's included.
+    let (_, detail, verdict) = super::sharing::target_state_while(
+        super::sharing::suspended(db)?,
         target,
-        volume_exists,
-        &kernel_can_serve,
-        &interface_addresses(),
-        in_kernel,
+        target_state(target, volume_exists, &kernel_can_serve, &interface_addresses(), in_kernel),
     );
     let because = |what: &str| {
         Some(if detail.is_empty() {
@@ -2817,7 +3053,9 @@ async fn apply_one(
     // dropped here. It is never logged: what the job log gets is the helper's
     // own rendering, which redacts.
     let document = Zeroizing::new(document);
-    run(db, &command, Some(&document), explicit, log).await
+    let outcome = run(db, &command, Some(&document), explicit, log).await;
+    note_unresettable(db, target, outcome.as_ref().err().map(|e| e.to_string()).as_deref());
+    outcome
 }
 
 /// Takes one target out of the kernel, and REPORTS whether it went.
@@ -3336,6 +3574,11 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                     }
                     Err(e) => tracing::warn!("tentanas: target state not evaluated: {e}"),
                 }
+                // The session sampler (MAJOR 27): iSCSI on every tick, from
+                // the same unprivileged configfs reads the sessions card
+                // makes. The kernel keeps no login date, so this is where
+                // "Ostatnie połączenie" and the session duration come from.
+                sample_iscsi_sessions(&db);
                 // A judgement is worth nothing until something carries it out,
                 // and BOTH halves need carrying. `Remove` without an executor
                 // meant a row saying "the target stays out of the kernel" over
@@ -3385,6 +3628,13 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                     }
                 }
                 if armed {
+                    // Wave 10: sharing stopped with the disable (n18d) comes
+                    // back here once TentaNas is enabled again and a channel
+                    // answers — a mode-B node the moment an admin arms it.
+                    // A cheap read when nothing is stopped.
+                    if let Some(job) = super::sharing::resume_if_due(&main_db, &db).await {
+                        tracing::info!("tentanas: sharing resumes on this node (job {})", job.job_id);
+                    }
                     // Two clocks, not one. A removal the kernel keeps
                     // refusing must not stretch the tick for a HEALTHY apply:
                     // a new target whose udev link has not appeared yet would
@@ -3615,9 +3865,21 @@ fn sessions_cache() -> &'static std::sync::Mutex<Option<(std::time::Instant, blo
 /// kernel option all mean the same thing to the caller — unknown — and each
 /// one carries its own sentence for the UI.
 pub async fn nvmet_sessions(db: &DbPool) -> block::NvmetSessions {
+    nvmet_sessions_within(db, SESSIONS_CACHE).await
+}
+
+/// How old a session reading the FLEET poll accepts (`TargetsListRequest
+/// { summary }`). The fleet asks every node every 10 s for as long as anyone
+/// has n01 open; at the Sharing tab's 10 s window that was one privileged
+/// read per node per tick. Five minutes keeps the fleet's count honest to
+/// within a few minutes and the channel's audit free of a polling screen.
+pub const FLEET_SESSIONS_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// `nvmet_sessions` accepting a reading up to `max_age` old.
+pub async fn nvmet_sessions_within(db: &DbPool, max_age: Duration) -> block::NvmetSessions {
     if let Ok(cache) = sessions_cache().lock() {
         if let Some((at, found)) = cache.as_ref() {
-            if at.elapsed() < SESSIONS_CACHE {
+            if at.elapsed() < max_age {
                 return found.clone();
             }
         }
@@ -3629,7 +3891,15 @@ pub async fn nvmet_sessions(db: &DbPool) -> block::NvmetSessions {
     found
 }
 
+thread_local! {
+    /// Privileged session reads made on this thread — how the dispatch tests
+    /// prove that the fleet's light path does not pay one per poll. Per
+    /// thread, so tests running in parallel cannot count each other's reads.
+    pub(crate) static SESSION_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 async fn read_nvmet_sessions(db: &DbPool) -> block::NvmetSessions {
+    SESSION_READS.with(|n| n.set(n.get() + 1));
     let outcome = super::broker::run_privileged(
         db,
         &HelperCommand::NvmetSessionsRead {},
@@ -3657,6 +3927,21 @@ async fn read_nvmet_sessions(db: &DbPool) -> block::NvmetSessions {
     })
 }
 
+/// One session of a target as the node read it, with the one thing the wire
+/// never carries: `key`, the sampler's internal session identity (the LIO
+/// Session ID; nvmet `cntlid@host_traddr`; empty for a generated iSCSI
+/// session, which publishes nothing but its name).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionReading {
+    /// The initiator IQN / host NQN the session declared. Empty for an nvmet
+    /// controller the kernel has not named — shown as "unnamed", never by its
+    /// controller id.
+    pub identity: String,
+    pub address: String,
+    pub state: String,
+    pub key: String,
+}
+
 /// The sessions of ONE target and whether this node could measure them at all.
 ///
 /// The second half of the pair is the whole point: `0` and "unknown" are
@@ -3667,8 +3952,15 @@ pub fn sessions_from(
     target: &TargetRow,
     nvmet: &block::NvmetSessions,
 ) -> (Vec<NasShareSession>, bool) {
+    let (readings, known) = readings_from(target, nvmet);
+    (readings.iter().map(|r| to_wire_session(target, r)).collect(), known)
+}
+
+/// `sessions_from` with the sampler's key kept — for the sampler and the
+/// "Rozłącz" reconnect check, never for the wire.
+pub fn readings_from(target: &TargetRow, nvmet: &block::NvmetSessions) -> (Vec<SessionReading>, bool) {
     if target.protocol != "nvmet" {
-        return sessions(target);
+        return iscsi_readings(target);
     }
     if !nvmet.available {
         return (Vec::new(), false);
@@ -3679,37 +3971,42 @@ pub fn sessions_from(
         .map(|controllers| {
             controllers
                 .iter()
-                .map(|c| {
-                    // The same shape every other protocol of this app uses:
-                    // `client` is WHERE the session came from, `user` is WHO it
-                    // says it is (smbd's machine/user, nfsd's address/name).
-                    // nvmet publishes both — `host_traddr` is measured to be
-                    // there — and they are not interchangeable: the address is
-                    // the one thing about an NVMe-oF session the client cannot
-                    // simply assert, while the NQN is exactly the string §5.5
-                    // keeps saying is client-declared.
-                    //
+                .map(|c| SessionReading {
                     // A controller the kernel named neither way is still a
-                    // session, so it is listed by its id rather than dropped.
-                    let identity = if c.hostnqn.is_empty() {
-                        format!("controller {}", c.cntlid)
-                    } else {
-                        c.hostnqn.clone()
-                    };
-                    NasShareSession {
-                        client: if c.host_traddr.is_empty() {
-                            identity.clone()
-                        } else {
-                            c.host_traddr.clone()
-                        },
-                        user: identity,
-                        connected_at: None,
-                    }
+                    // session, so it is listed — without a name, and never by
+                    // its controller id (no ids in the GUI).
+                    identity: c.hostnqn.clone(),
+                    address: c.host_traddr.clone(),
+                    // `state` verbatim (`ready` measured) and never branched on.
+                    state: c.state.clone(),
+                    // `cntlid` is reused by nvmet, so it is not unique alone.
+                    key: session_key(boot_id(), &format!("{}@{}", c.cntlid, c.host_traddr)),
                 })
                 .collect()
         })
         .unwrap_or_default();
     (list, true)
+}
+
+/// The wire shape of one reading. `client` / `user` keep the meaning every
+/// other protocol here gives them — WHERE the session came from and WHO it
+/// says it is — and owner decision D2 applies on top: a target WITHOUT an
+/// allowlist shows no address and no state (iSCSI publishes none for a
+/// generated session, and the two protocols are shown alike).
+fn to_wire_session(target: &TargetRow, r: &SessionReading) -> NasShareSession {
+    let allowlisted = !target.initiators.is_empty();
+    let client = if target.protocol == "nvmet" && !r.address.is_empty() {
+        r.address.clone()
+    } else {
+        r.identity.clone()
+    };
+    NasShareSession {
+        client,
+        user: r.identity.clone(),
+        connected_at: None,
+        address: if allowlisted { r.address.clone() } else { String::new() },
+        state: if allowlisted { r.state.clone() } else { String::new() },
+    }
 }
 
 /// The initiators logged into an iSCSI target right now, from LIO's own
@@ -3719,17 +4016,28 @@ pub fn sessions_from(
 /// configfs at all. They are read through the channel instead — see
 /// `nvmet_sessions` — and this function answers for iSCSI only.
 pub fn sessions(target: &TargetRow) -> (Vec<NasShareSession>, bool) {
+    let (readings, known) = iscsi_readings(target);
+    (readings.iter().map(|r| to_wire_session(target, r)).collect(), known)
+}
+
+fn iscsi_readings(target: &TargetRow) -> (Vec<SessionReading>, bool) {
+    iscsi_readings_in(Path::new(block::TARGET_CONFIGFS), target)
+}
+
+fn iscsi_readings_in(root: &Path, target: &TargetRow) -> (Vec<SessionReading>, bool) {
     if target.protocol != "iscsi" {
         return (Vec::new(), true);
     }
-    let tpg = format!("{}/iscsi/{}/tpgt_1", block::TARGET_CONFIGFS, target.wwn);
+    let tpg = root.join("iscsi").join(&target.wwn).join("tpgt_1");
     // TRAP: `dynamic_sessions` lists ONLY generated ACLs —
     // `target_show_dynamic_sessions()` skips every `se_nacl` without
     // `dynamic_node_acl`. An allowlisted target has `generate_node_acls = 0`,
     // so all of its ACLs are static and that file is always empty: the
     // targets with the tighter configuration would report zero sessions while
     // clients were writing to them, and the delete dialog would understate its
-    // own blast radius. The static half lives in each ACL's `info`.
+    // own blast radius. The static half lives in each ACL's `info`, which is
+    // also the only place LIO publishes a session's address and state
+    // (measured on rig11, MAJOR 27 §L.1; a generated session has neither).
     //
     // The second half of the pair is "did this node MEASURE the answer", the
     // same three-state the prune uses (`block::IscsiAclObserved::session`) and
@@ -3740,12 +4048,15 @@ pub fn sessions(target: &TargetRow) -> (Vec<NasShareSession>, bool) {
     //
     // A target that is not in the kernel at all is a measured zero, not an
     // unknown: there is nothing to be logged into.
-    if !Path::new(&tpg).is_dir() {
+    if !tpg.is_dir() {
         return (Vec::new(), true);
     }
     let mut known = true;
-    let mut out = match std::fs::read_to_string(format!("{tpg}/dynamic_sessions")) {
-        Ok(text) => parse_dynamic_sessions(&text),
+    let mut out: Vec<SessionReading> = match std::fs::read(tpg.join("dynamic_sessions")) {
+        Ok(bytes) => parse_dynamic_session_names(&String::from_utf8_lossy(&bytes))
+            .into_iter()
+            .map(|identity| SessionReading { identity, ..Default::default() })
+            .collect(),
         // Absent is fine — LIO only publishes it for a TPG with generated
         // ACLs. Unreadable for any other reason is not.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -3754,7 +4065,7 @@ pub fn sessions(target: &TargetRow) -> (Vec<NasShareSession>, bool) {
             Vec::new()
         }
     };
-    match std::fs::read_dir(format!("{tpg}/acls")) {
+    match std::fs::read_dir(tpg.join("acls")) {
         Ok(acls) => {
             let mut names: Vec<String> = acls
                 .flatten()
@@ -3762,23 +4073,34 @@ pub fn sessions(target: &TargetRow) -> (Vec<NasShareSession>, bool) {
                 .collect();
             names.sort();
             for initiator in names {
-                let info = match std::fs::read_to_string(format!("{tpg}/acls/{initiator}/info")) {
+                let info = match std::fs::read_to_string(tpg.join("acls").join(&initiator).join("info")) {
                     Ok(text) => text,
                     Err(_) => {
                         known = false;
                         continue;
                     }
                 };
-                if !acl_info_connected(&info) {
+                let session = match block::parse_acl_info(&info) {
+                    block::AclInfo::Active(session) => session,
+                    block::AclInfo::Idle => continue,
+                    // Empty: the same "does not know" the prune keeps apart.
+                    block::AclInfo::Unknown => {
+                        known = false;
+                        continue;
+                    }
+                };
+                if out.iter().any(|s| s.identity == initiator) {
                     continue;
                 }
-                if out.iter().any(|s| s.client == initiator) {
-                    continue;
-                }
-                out.push(NasShareSession {
-                    client: initiator.clone(),
-                    user: initiator,
-                    connected_at: None,
+                out.push(SessionReading {
+                    identity: initiator,
+                    address: session.addresses.first().cloned().unwrap_or_default(),
+                    state: session.state,
+                    // The LIO Session ID increments on every login (measured
+                    // 1 → 10 over nine resets), which is what makes it the
+                    // reconnect detector. A block whose id did not parse keeps
+                    // the key empty: "fields unknown", never a wrong number.
+                    key: session_key(boot_id(), &session.session_id.map(|id| id.to_string()).unwrap_or_default()),
                 });
             }
         }
@@ -3794,16 +4116,630 @@ pub fn sessions(target: &TargetRow) -> (Vec<NasShareSession>, bool) {
 /// this when nothing is connected" would be two places to get it wrong.
 pub use block::acl_info_connected;
 
+/// The names in a TPG's `dynamic_sessions` — `block::parse_dynamic_sessions`,
+/// which strips the trailing NUL the kernel writes (MAJOR 27 F1).
+fn parse_dynamic_session_names(text: &str) -> Vec<String> {
+    block::parse_dynamic_sessions(text)
+}
+
 pub fn parse_dynamic_sessions(text: &str) -> Vec<NasShareSession> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
+    parse_dynamic_session_names(text)
+        .into_iter()
         .map(|initiator| NasShareSession {
-            client: initiator.to_string(),
-            user: initiator.to_string(),
-            connected_at: None,
+            client: initiator.clone(),
+            user: initiator,
+            ..Default::default()
         })
         .collect()
+}
+
+// =============================================================================
+// Session sampler: "Ostatnie połączenie" and the session duration (MAJOR 27)
+// =============================================================================
+
+/// Records one reading of a target's sessions (`store::record_target_seen`).
+/// Called only with a MEASURED reading: a target whose sessions this node
+/// could not read writes nothing, so "unknown" never turns into "last seen".
+/// A session without a name (an nvmet controller the kernel did not name)
+/// has nothing to be recorded under.
+pub fn sample_sessions(db: &DbPool, target: &TargetRow, readings: &[SessionReading]) -> Result<()> {
+    let seen: Vec<(String, String, String)> = readings
+        .iter()
+        .filter(|r| !r.identity.is_empty())
+        .map(|r| (r.identity.clone(), r.key.clone(), r.address.clone()))
+        .collect();
+    store::record_target_seen(db, &target.target_id, &seen, &store::now()).map(|_| ())
+}
+
+/// This boot of the kernel (`/proc/sys/kernel/random/boot_id`), read once.
+///
+/// Part of every session key (critic wave 12, MAJOR 2): LIO's session ids and
+/// nvmet's controller ids are counters that start again after a reboot, so a
+/// host that had session 1 before it has session 1 after it — the same key,
+/// and the sampler would have kept the pre-reboot start. With the boot id in
+/// the key a reboot always starts a new session. Empty where the file cannot
+/// be read, which only loses that one distinction.
+fn boot_id() -> &'static str {
+    static BOOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT.get_or_init(|| {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    })
+}
+
+/// The sampler's key of one session: the boot id and the kernel's own number.
+/// An EMPTY raw key stays empty — a generated iSCSI session publishes no
+/// number, so it has no session identity at all, and no duration is shown for
+/// it (`with_connected_at`).
+pub fn session_key(boot: &str, raw: &str) -> String {
+    if raw.is_empty() {
+        String::new()
+    } else {
+        format!("{boot}/{raw}")
+    }
+}
+
+/// The iSCSI half of the sampler, on the reconcile tick (every 20 s): an
+/// unprivileged configfs read per target, so it runs whether or not the
+/// channel is armed. NVMe-oF is NOT sampled here — its sessions cost a
+/// privileged read, and owner decision D3 samples them only while a target
+/// view is open (`sample_nvmet_if_due`).
+pub fn sample_iscsi_sessions(db: &DbPool) {
+    let Ok(targets) = store::list_targets(db) else {
+        return;
+    };
+    for target in targets.iter().filter(|t| t.protocol == "iscsi") {
+        let (readings, known) = iscsi_readings(target);
+        if known {
+            if let Err(e) = sample_sessions(db, target, &readings) {
+                tracing::warn!("tentanas targets: sessions of {} not recorded: {e}", target.name);
+            }
+        }
+    }
+}
+
+/// How far apart two NVMe-oF samples of one target are at least (D3).
+pub const NVMET_SAMPLE_EVERY: Duration = Duration::from_secs(60);
+
+fn nvmet_sampled() -> &'static std::sync::Mutex<BTreeMap<String, std::time::Instant>> {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Samples an NVMe-oF target from the reading its OPEN target view just took,
+/// at most once per `NVMET_SAMPLE_EVERY` (owner decision D3): no privileged
+/// call is added for the sampler, and nothing is recorded while nobody looks.
+/// Returns whether it sampled.
+pub fn sample_nvmet_if_due(db: &DbPool, target: &TargetRow, readings: &[SessionReading], known: bool) -> bool {
+    if target.protocol != "nvmet" || !known {
+        return false;
+    }
+    {
+        let Ok(mut last) = nvmet_sampled().lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if last
+            .get(&target.target_id)
+            .is_some_and(|at| now.duration_since(*at) < NVMET_SAMPLE_EVERY)
+        {
+            return false;
+        }
+        last.insert(target.target_id.clone(), now);
+    }
+    sample_sessions(db, target, readings).is_ok()
+}
+
+/// Fills each session's `connected_at` from the sampler: the first sighting
+/// of THIS session (same key), which is an "at least" — the kernel keeps no
+/// login time. A session with no key (a generated one on an open target, or a
+/// block whose id did not parse) has no identity to follow across readings,
+/// so it gets no duration at all rather than a guessed one.
+pub fn with_connected_at(
+    target: &TargetRow,
+    readings: &[SessionReading],
+    seen: &[store::TargetSeenRow],
+) -> Vec<NasShareSession> {
+    readings
+        .iter()
+        .map(|r| {
+            let mut wire = to_wire_session(target, r);
+            wire.connected_at = seen
+                .iter()
+                .find(|s| !r.identity.is_empty() && !r.key.is_empty() && s.initiator == r.identity && s.session_key == r.key)
+                .map(|s| s.session_since.clone());
+            wire
+        })
+        .collect()
+}
+
+// =============================================================================
+// "Nasłuch targetu" per portal (MAJOR 27 §L.7, measured on rig11)
+// =============================================================================
+
+/// One LISTEN socket from `/proc/net/tcp{,6}`: the address as text (IPv4
+/// dotted, IPv6 as `std` prints it) and the port.
+fn parse_proc_net_listen(text: &str, v6: bool) -> Vec<(std::net::IpAddr, u16)> {
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let (Some(_sl), Some(local), Some(_remote), Some(state)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        // `0A` = TCP_LISTEN.
+        if state != "0A" {
+            continue;
+        }
+        let Some((addr, port)) = local.split_once(':') else { continue };
+        let Ok(port) = u16::from_str_radix(port, 16) else { continue };
+        let ip = if v6 {
+            // Four 32-bit words, each in host (little-endian) byte order.
+            if addr.len() != 32 {
+                continue;
+            }
+            let mut bytes = [0u8; 16];
+            let mut ok = true;
+            for w in 0..4 {
+                let Ok(word) = u32::from_str_radix(&addr[w * 8..w * 8 + 8], 16) else {
+                    ok = false;
+                    break;
+                };
+                bytes[w * 4..w * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            }
+            if !ok {
+                continue;
+            }
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(bytes))
+        } else {
+            // `0100007F` is 127.0.0.1: one little-endian word (measured).
+            let Ok(word) = u32::from_str_radix(addr, 16) else { continue };
+            std::net::IpAddr::V4(std::net::Ipv4Addr::from(word.to_le_bytes()))
+        };
+        out.push((ip, port));
+    }
+    out
+}
+
+/// Whether a LISTEN socket covers `address:port`: the exact address, the
+/// wildcard of its family, or (dual stack) the IPv6 wildcard / the
+/// IPv4-mapped form.
+fn listens_on(sockets: &[(std::net::IpAddr, u16)], address: &str, port: u32) -> bool {
+    let Ok(wanted) = address.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    sockets.iter().any(|(ip, p)| {
+        if u32::from(*p) != port {
+            return false;
+        }
+        if *ip == wanted || ip.is_unspecified() {
+            return true;
+        }
+        match (ip, wanted) {
+            (std::net::IpAddr::V6(v6), std::net::IpAddr::V4(v4)) => v6.to_ipv4_mapped() == Some(v4),
+            _ => false,
+        }
+    })
+}
+
+/// The LISTEN sockets of this node, or `None` when neither file could be read
+/// (then nothing can be said about listening at all).
+fn listen_sockets_in(proc_root: &Path) -> Option<Vec<(std::net::IpAddr, u16)>> {
+    let v4 = std::fs::read_to_string(proc_root.join("net/tcp")).ok();
+    let v6 = std::fs::read_to_string(proc_root.join("net/tcp6")).ok();
+    if v4.is_none() && v6.is_none() {
+        return None;
+    }
+    let mut out = v4.map(|t| parse_proc_net_listen(&t, false)).unwrap_or_default();
+    out.extend(v6.map(|t| parse_proc_net_listen(&t, true)).unwrap_or_default());
+    Some(out)
+}
+
+/// "Nasłuch targetu", one entry per portal of the row.
+pub fn listen_states(target: &TargetRow) -> Vec<tentaflow_protocol::tentanas::NasTargetListen> {
+    listen_states_in(
+        target,
+        Path::new(block::TARGET_CONFIGFS),
+        Path::new(block::NVMET_CONFIGFS),
+        Path::new("/proc"),
+    )
+}
+
+/// Reads a configfs attribute: `Ok(None)` when it does not exist, `Err` when
+/// it exists and cannot be read — the two answers "Brak nasłuchu" and
+/// "Nie zmierzono" must not be confused.
+fn read_attr(path: &Path) -> std::result::Result<Option<String>, ()> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text.trim_matches(|c: char| c.is_whitespace() || c == '\0').to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+fn listen_states_in(
+    target: &TargetRow,
+    iscsi_root: &Path,
+    nvmet_root: &Path,
+    proc_root: &Path,
+) -> Vec<tentaflow_protocol::tentanas::NasTargetListen> {
+    let sockets = listen_sockets_in(proc_root);
+    target
+        .portals
+        .iter()
+        .map(|portal| {
+            let state = if target.protocol == "nvmet" {
+                nvmet_listen_state(target, portal, nvmet_root, sockets.as_deref())
+            } else {
+                iscsi_listen_state(target, portal, iscsi_root, sockets.as_deref())
+            };
+            tentaflow_protocol::tentanas::NasTargetListen {
+                address: portal.address.clone(),
+                port: portal.port,
+                transport: portal.transport.clone(),
+                state: state.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// iSCSI (§L.4, measured): `mkdir np/<ip>:<port>` starts the kernel listener
+/// at once, on a TPG that was never enabled, and `enable = 0` keeps it
+/// listening while refusing every login. So a LISTEN socket alone does not
+/// mean "accepting logins" — `enable` does.
+fn iscsi_listen_state(
+    target: &TargetRow,
+    portal: &NasTargetPortal,
+    root: &Path,
+    sockets: Option<&[(std::net::IpAddr, u16)]>,
+) -> &'static str {
+    let tpg = root.join("iscsi").join(&target.wwn).join("tpgt_1");
+    let np = tpg.join("np").join(format!("{}:{}", portal.address, portal.port));
+    match std::fs::metadata(&np) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return "unknown",
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Absent because the whole tree is absent is the same answer, and
+            // it IS an answer: nothing of this target listens.
+            return "not_listening";
+        }
+        Err(_) => return "unknown",
+    }
+    match read_attr(&np.join("iser")) {
+        Ok(Some(v)) if v == "1" => return "rdma",
+        Ok(_) => {}
+        Err(()) => return "unknown",
+    }
+    let Some(sockets) = sockets else { return "unknown" };
+    if !listens_on(sockets, &portal.address, portal.port) {
+        return "not_listening";
+    }
+    match read_attr(&tpg.join("enable")) {
+        Ok(Some(v)) if v == "1" => "listening",
+        Ok(Some(_)) => "target_disabled",
+        _ => "unknown",
+    }
+}
+
+/// nvmet (§L.4, measured): a port listens from its FIRST subsystem link and
+/// stops at its last, so "this subsystem is served here" is the link
+/// `ports/<id>/subsystems/<nqn>` on the port whose `addr_*` match the portal,
+/// plus the LISTEN socket.
+fn nvmet_listen_state(
+    target: &TargetRow,
+    portal: &NasTargetPortal,
+    root: &Path,
+    sockets: Option<&[(std::net::IpAddr, u16)]>,
+) -> &'static str {
+    if portal.transport == "rdma" {
+        return "rdma";
+    }
+    let ports = match std::fs::read_dir(root.join("ports")) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return "not_listening",
+        Err(_) => return "unknown",
+    };
+    let mut linked = false;
+    for port in ports.flatten() {
+        let dir = port.path();
+        let (Ok(Some(trtype)), Ok(Some(traddr)), Ok(Some(trsvcid))) = (
+            read_attr(&dir.join("addr_trtype")),
+            read_attr(&dir.join("addr_traddr")),
+            read_attr(&dir.join("addr_trsvcid")),
+        ) else {
+            continue;
+        };
+        if trtype != portal.transport || traddr != portal.address || trsvcid != portal.port.to_string() {
+            continue;
+        }
+        if dir.join("subsystems").join(&target.wwn).symlink_metadata().is_ok() {
+            linked = true;
+            break;
+        }
+    }
+    if !linked {
+        return "not_listening";
+    }
+    let Some(sockets) = sockets else { return "unknown" };
+    if listens_on(sockets, &portal.address, portal.port) {
+        "listening"
+    } else {
+        "not_listening"
+    }
+}
+
+// =============================================================================
+// Allowlist edits: the last entry, and "Opis"
+// =============================================================================
+
+/// SECURITY (MAJOR 27 F2): the coded refusal of an edit that would take the
+/// LAST entry off a target's allowlist. An empty list is not "nobody" — it is
+/// `generate_node_acls = 1` / `attr_allow_any_host = 1`, i.e. every client
+/// that reaches the portal (measured: the revoked client was back in 2.2 s).
+/// "Stop the target" is what cuts everybody off, and the refusal says so.
+///
+/// WHY a refusal rather than a closed target with an empty ACL set: n19 and
+/// the wizard define the empty list as OPEN ("Pusta — łączy się każdy, kto
+/// dosięgnie portalu"), and keeping that one meaning is what makes the list
+/// readable; a second, invisible "closed and empty" state would make the same
+/// screen mean two things. `block::plan_iscsi` / `plan_nvmet` refuse the same
+/// transition once more from the kernel's side.
+pub const LAST_INITIATOR_REFUSAL: &str = "refusal:target_last_initiator";
+
+/// Whether an edit from `stored` to `asked` removes the last entry.
+pub fn removes_last_initiator(stored: &[String], asked: &[String]) -> bool {
+    !stored.is_empty() && asked.is_empty()
+}
+
+pub const DESCRIPTION_MAX_CHARS: usize = 80;
+pub const DESCRIPTION_UNLISTED: &str = "refusal:target_description_unlisted";
+pub const DESCRIPTION_TOO_LONG: &str = "refusal:target_description_too_long";
+pub const DESCRIPTION_INVALID: &str = "refusal:target_description_invalid";
+
+/// The "Opis" map a request may store (§4.1): trimmed, at most 80
+/// characters, no control characters, and every key on the same request's
+/// allowlist — a description for an unlisted initiator is REFUSED, not
+/// dropped silently. Empty entries fall away.
+pub fn clean_descriptions(
+    initiators: &[String],
+    asked: &BTreeMap<String, String>,
+) -> std::result::Result<BTreeMap<String, String>, &'static str> {
+    let mut out = BTreeMap::new();
+    for (initiator, text) in asked {
+        if !initiators.iter().any(|i| i == initiator) {
+            return Err(DESCRIPTION_UNLISTED);
+        }
+        let text = text.trim();
+        if text.chars().count() > DESCRIPTION_MAX_CHARS {
+            return Err(DESCRIPTION_TOO_LONG);
+        }
+        if text.chars().any(char::is_control) {
+            return Err(DESCRIPTION_INVALID);
+        }
+        if !text.is_empty() {
+            out.insert(initiator.clone(), text.to_string());
+        }
+    }
+    Ok(out)
+}
+
+// =============================================================================
+// "Rozłącz": the per-session reset (MAJOR 27 §L.7)
+// =============================================================================
+
+pub const RESET_NOT_ISCSI: &str = "refusal:target_session_reset_nvmet";
+pub const RESET_NOT_ALLOWLISTED: &str = "refusal:target_session_reset_not_allowlisted";
+pub const RESET_NO_SESSION: &str = "refusal:target_session_none";
+pub const RESET_NOT_SERVING: &str = "refusal:target_session_reset_not_serving";
+pub const RESET_NOT_APP_TARGET: &str = "refusal:target_session_reset_not_app_target";
+
+/// The session of `initiator` on an iSCSI target right now, from its ACL's
+/// `info`: `Some(key)` when one is POSITIVELY there (the key may be empty
+/// when the block's id did not parse).
+fn live_session_key_in(root: &Path, target: &TargetRow, initiator: &str) -> Option<String> {
+    let info = std::fs::read_to_string(
+        root.join("iscsi")
+            .join(&target.wwn)
+            .join("tpgt_1")
+            .join("acls")
+            .join(initiator)
+            .join("info"),
+    )
+    .ok()?;
+    match block::parse_acl_info(&info) {
+        block::AclInfo::Active(s) => Some(s.session_id.map(|id| id.to_string()).unwrap_or_default()),
+        _ => None,
+    }
+}
+
+/// The coded refusal of a "Rozłącz", before anything is spawned — the helper
+/// checks the kernel-side half once more as root.
+pub fn session_reset_refusal(target: &TargetRow, initiator: &str, revoke: bool) -> Option<&'static str> {
+    session_reset_refusal_in(Path::new(block::TARGET_CONFIGFS), target, initiator, revoke)
+}
+
+fn session_reset_refusal_in(root: &Path, target: &TargetRow, initiator: &str, revoke: bool) -> Option<&'static str> {
+    if target.protocol != "iscsi" {
+        // NVMe-oF has no per-host disconnect that works on every kernel: N3
+        // (removing the host) does not disconnect, N1 needs debugfs and is
+        // unmeasured (owner decision D4: hidden with the reason).
+        return Some(RESET_NOT_ISCSI);
+    }
+    // D2: no reset on a target without an allowlist — its sessions are
+    // generated ACLs, and a static mkdir+rmdir there is a client that logs
+    // straight back in (L4, measured).
+    if !target.initiators.iter().any(|i| i == initiator) {
+        return Some(RESET_NOT_ALLOWLISTED);
+    }
+    if revoke && target.initiators.len() == 1 {
+        return Some(LAST_INITIATOR_REFUSAL);
+    }
+    if !target.enabled || target.state == "disabled" {
+        return Some(RESET_NOT_SERVING);
+    }
+    // A WWN this app did not mint (a hand-edited import): the helper would
+    // refuse it anyway, uncoded — refused here, coded.
+    if !target.wwn.starts_with(block::APP_IQN_PREFIX) {
+        return Some(RESET_NOT_APP_TARGET);
+    }
+    if !revoke && live_session_key_in(root, target, initiator).is_none() {
+        return Some(RESET_NO_SESSION);
+    }
+    None
+}
+
+/// The helper's refusal head (`refused:<code>: …`) as this node's coded
+/// refusal, so a TOCTOU refusal reads like the pre-check's.
+///
+/// The wrapper prints a builtin's failure as `tentanas-helper: <label>:
+/// <detail>`, so the head is looked for right after the label.
+pub fn helper_refusal(stderr: &str) -> Option<&'static str> {
+    let body = reset_detail(stderr);
+    let code = body.strip_prefix("refused:")?.split(':').next()?;
+    Some(match code {
+        "not_allowlisted" => RESET_NOT_ALLOWLISTED,
+        "no_session" => RESET_NO_SESSION,
+        "not_app_target" => RESET_NOT_APP_TARGET,
+        _ => return None,
+    })
+}
+
+/// The helper's own words for a failed reset: the first line of its error,
+/// after the wrapper's `tentanas-helper: iscsi_session_reset: ` head.
+fn reset_detail(stderr: &str) -> &str {
+    let line = stderr.trim().lines().next().unwrap_or("");
+    line.split_once("iscsi_session_reset: ").map(|(_, rest)| rest).unwrap_or(line)
+}
+
+/// How long the core waits for the client to log back in after a reset, and
+/// how often it looks (§L.7 item 5). Both outcomes are informational.
+pub const RECONNECT_WAIT: Duration = Duration::from_secs(10);
+const RECONNECT_POLL: Duration = Duration::from_millis(100);
+
+/// Waits for a NEW session of `initiator` — a LIO Session ID other than
+/// `before`, in `LOGGED_IN` — and answers the job-log line.
+pub async fn await_reconnect(target: &TargetRow, initiator: &str, before: &str) -> String {
+    await_reconnect_in(Path::new(block::TARGET_CONFIGFS), target, initiator, before, RECONNECT_WAIT).await
+}
+
+async fn await_reconnect_in(root: &Path, target: &TargetRow, initiator: &str, before: &str, wait: Duration) -> String {
+    let started = std::time::Instant::now();
+    let info_path = root
+        .join("iscsi")
+        .join(&target.wwn)
+        .join("tpgt_1")
+        .join("acls")
+        .join(initiator)
+        .join("info");
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&info_path) {
+            if let block::AclInfo::Active(s) = block::parse_acl_info(&text) {
+                let key = s.session_id.map(|id| id.to_string()).unwrap_or_default();
+                if s.state == "LOGGED_IN" && !key.is_empty() && key != before {
+                    let secs = started.elapsed().as_secs_f64();
+                    return format!("{initiator}: the client reconnected after {secs:.1} s");
+                }
+            }
+        }
+        if started.elapsed() >= wait {
+            return format!(
+                "{initiator}: the client did not reconnect within {} s — it keeps its access and \
+                 may still log in later",
+                wait.as_secs()
+            );
+        }
+        tokio::time::sleep(RECONNECT_POLL).await;
+    }
+}
+
+/// Runs "Rozłącz" (reset only) for one initiator of one iSCSI target.
+/// Returns the job-log lines and the outcome; `Err` carries either a coded
+/// refusal (the helper's TOCTOU answer, `refusal:…`) or why the reset failed.
+///
+/// A reset whose RE-CREATE failed has cut the initiator off: the target is
+/// re-applied at once in the same job, and marked for the tick's apply sweep
+/// if that fails too, so the ACL comes back without an admin.
+pub async fn reset_session(
+    db: &DbPool,
+    cipher: &SettingsCipher,
+    target: &TargetRow,
+    initiator: &str,
+    explicit: Option<&ElevationToken>,
+) -> (Vec<String>, Result<()>) {
+    let mut log = Vec::new();
+    let before = live_session_key_in(Path::new(block::TARGET_CONFIGFS), target, initiator).unwrap_or_default();
+    let outcome = {
+        let _guard = apply_lock().lock().await;
+        reset_once(db, cipher, target, initiator, explicit, &mut log).await
+    };
+    if let Err(e) = outcome {
+        let text = e.to_string();
+        if let Some(code) = helper_refusal(&text) {
+            return (log, Err(anyhow!("{code}")));
+        }
+        // Any other `refused:` head was decided before a single write — there
+        // is nothing to repair.
+        if reset_detail(&text).starts_with("refused:") {
+            return (log, Err(anyhow!("{text}")));
+        }
+        // ANY failure that is not a coded refusal ends in a repair (critic
+        // wave 12, MAJOR 3): `lost_access`, a drop that stopped half-way
+        // (`reset_incomplete`), a channel timeout after the helper had started
+        // writing, an error nobody foresaw. The apply is an idempotent
+        // reconcile, so repairing a target that needed nothing costs a plan
+        // with no removals — and skipping it could leave a client logged in
+        // through an ACL that maps no LUN until the next mutation.
+        {
+            log.push(format!("{}: re-applying the target so {initiator} keeps its access", target.name));
+            match apply_one_now(db, cipher, target, explicit).await {
+                Ok(lines) => log.extend(lines),
+                Err(e2) => {
+                    note_apply_outcome(&target.target_id, false);
+                    log.push(format!("{}: not re-applied ({e2}); the node retries on its next tick", target.name));
+                }
+            }
+        }
+        return (log, Err(anyhow!("{text}")));
+    }
+    // Outside the apply lock: the wait is up to ten seconds of reading one
+    // configfs file, and no other target's apply has to queue behind it.
+    log.push(await_reconnect(target, initiator, &before).await);
+    (log, Ok(()))
+}
+
+async fn reset_once(
+    db: &DbPool,
+    cipher: &SettingsCipher,
+    target: &TargetRow,
+    initiator: &str,
+    explicit: Option<&ElevationToken>,
+    log: &mut Vec<String>,
+) -> Result<()> {
+    let secrets = secrets(cipher, target)?;
+    let spec = iscsi_spec(target, &secrets);
+    block::validate_iscsi(&spec).map_err(|e| anyhow!("{}: {e}", target.name))?;
+    // The spec carries the CHAP secrets the re-created ACL needs: stdin only,
+    // dropped here, and what reaches the log is the helper's redacted render.
+    let document = Zeroizing::new(serde_json::to_vec(&spec)?);
+    let command = HelperCommand::IscsiSessionReset { initiator: initiator.to_string() };
+    run(db, &command, Some(&document), explicit, log).await
+}
+
+/// Applies ONE target now under the apply lock — the repair after a reset
+/// that lost an initiator's access.
+async fn apply_one_now(
+    db: &DbPool,
+    cipher: &SettingsCipher,
+    target: &TargetRow,
+    explicit: Option<&ElevationToken>,
+) -> Result<Vec<String>> {
+    let _guard = apply_lock().lock().await;
+    let mut log = Vec::new();
+    let outcome = apply_one(db, cipher, target, explicit, &mut log).await;
+    note_apply_outcome(&target.target_id, outcome.is_ok());
+    outcome.map(|()| log)
 }
 
 // =============================================================================
@@ -3833,6 +4769,7 @@ pub fn to_protocol(target: &TargetRow, sessions: u32, sessions_known: bool) -> N
             dhchap_dhgroup: target.dhchap_dhgroup.clone(),
         },
         initiators: target.initiators.clone(),
+        initiator_descriptions: target.initiator_descriptions.clone(),
         port_groups: target.port_groups.clone(),
         sessions,
         sessions_known,
@@ -3840,6 +4777,7 @@ pub fn to_protocol(target: &TargetRow, sessions: u32, sessions_known: bool) -> N
         state_detail: target.state_detail.clone(),
         created_at: target.created_at.clone(),
         updated_at: target.updated_at.clone(),
+        state_reasons: target.state_reasons.clone(),
     }
 }
 
@@ -4048,6 +4986,7 @@ mod tests {
             portals: vec![portal_for(protocol, "storage0", "10.10.0.5", "tcp")],
             port_groups: default_port_groups(),
             initiators: Vec::new(),
+            initiator_descriptions: Default::default(),
             auth_method: "none".into(),
             auth_username: String::new(),
             auth_secret: String::new(),
@@ -4065,6 +5004,7 @@ mod tests {
             },
             state: "active".into(),
             state_detail: String::new(),
+            state_reasons: Vec::new(),
             created_at: "2026-09-03T12:00:00Z".into(),
             updated_at: "2026-09-03T12:00:00Z".into(),
         }
@@ -4585,13 +5525,17 @@ mod tests {
         // row no longer describes what would be served.
         assert_eq!(
             target_state(&off, true, &|_| true, &here, true),
-            ("disabled", String::new(), Disposition::Remove)
+            ("disabled", CodedText::default(), Disposition::Remove)
         );
         assert_eq!(
             target_state(&row, true, &|_| false, &here, true),
             (
                 "error",
-                "the LIO kernel target is not available on this node".to_string(),
+                CodedText::new(
+                    "target_kernel_missing",
+                    &[("protocol", "iscsi".to_string())],
+                    "the LIO kernel target is not available on this node"
+                ),
                 Disposition::Remove
             )
         );
@@ -4787,6 +5731,68 @@ mod tests {
         assert!(detail.contains("moved to lan0"), "{detail}");
         assert!(!detail.contains("reachable there"), "{detail}");
         assert!(detail.contains("not in the kernel"), "{detail}");
+
+        // Wave 6: the same facts as a code, which the drift card (N19b)
+        // words in the reader's language.
+        let [drift] = detail.reasons.as_slice() else { panic!("one code: {:?}", detail.reasons) };
+        assert_eq!(drift.code, "target_portal_moved");
+        let param = |k: &str| drift.params.get(k).map(String::as_str);
+        assert_eq!(
+            (param("address"), param("interface"), param("current"), param("elsewhere"), param("in_kernel")),
+            (Some("10.10.0.5"), Some("storage0"), Some("10.10.9.9"), Some("lan0"), Some("false"))
+        );
+    }
+
+    /// Wave-6 critic MAJOR 2: an interface that is THERE with no address
+    /// (link down, DHCP lease lost) is not an interface that is gone — the
+    /// two are separate codes, and neither sentence claims the other.
+    #[test]
+    fn an_interface_without_an_address_is_not_a_missing_interface() {
+        let row = target("iscsi");
+        let param = |d: &CodedText, k: &str| d.reasons[0].params.get(k).cloned();
+        let bare = node(&[("storage0", &[]), ("lan0", &["192.168.1.5"])]);
+        let (state, detail, verdict) = target_state(&row, true, &|_| true, &bare, false);
+        assert_eq!((state, verdict), ("error", Disposition::Freeze));
+        assert_eq!(param(&detail, "interface_state").as_deref(), Some("no_address"));
+        assert_eq!(param(&detail, "current"), None, "no empty list of addresses");
+        assert!(detail.contains("storage0 is there but has no address"), "{detail}");
+        assert!(!detail.contains("gone"), "{detail}");
+
+        let gone = node(&[("lan0", &["192.168.1.5"])]);
+        let (_, detail, _) = target_state(&row, true, &|_| true, &gone, false);
+        assert_eq!(param(&detail, "interface_state").as_deref(), Some("missing"));
+        assert!(detail.contains("interface storage0 is gone"), "{detail}");
+
+        let moved = node(&[("storage0", &["10.10.9.9"]), ("lan0", &["192.168.1.5"])]);
+        let (_, detail, _) = target_state(&row, true, &|_| true, &moved, false);
+        assert_eq!(param(&detail, "interface_state").as_deref(), Some("addressed"));
+        assert_eq!(param(&detail, "current").as_deref(), Some("10.10.9.9"));
+    }
+
+    /// Wave 6: the other state sentences as codes, joined the way the
+    /// sentences are.
+    #[test]
+    fn the_target_state_detail_is_coded() {
+        let row = target("iscsi");
+        let codes = |d: &CodedText| d.reasons.iter().map(|r| r.code.clone()).collect::<Vec<_>>();
+        let (state, pending, _) = target_state(&row, true, &|_| true, &here(), false);
+        assert_eq!(state, "pending");
+        assert_eq!(codes(&pending), vec!["target_not_exported", "target_no_auth"], "{pending}");
+        assert_eq!(pending.text.matches(" · ").count(), 1, "{pending}");
+        let (_, active, _) = target_state(&row, true, &|_| true, &here(), true);
+        assert_eq!(codes(&active), vec!["target_no_auth"]);
+        let (_, gone, _) = target_state(&row, false, &|_| true, &here(), true);
+        assert_eq!(codes(&gone), vec!["target_volume_missing"]);
+        let mut chap = row.clone();
+        chap.auth_method = "chap".to_string();
+        assert!(target_state(&chap, true, &|_| true, &here(), true).1.reasons.is_empty());
+        // An imported row keeps the codes it arrived with while it stays off.
+        let mut imported = row.clone();
+        imported.enabled = false;
+        imported.state = "disabled".to_string();
+        imported.state_detail = "the authentication secret has to be entered again after an import".to_string();
+        imported.state_reasons = vec![crate::tentanas::disks::coded_reason("import_secret_needed", &[])];
+        assert_eq!(codes(&target_state(&imported, true, &|_| true, &here(), true).1), vec!["import_secret_needed"]);
     }
 
     /// The wizard tells "taken by another organisation" from a target name
@@ -5072,7 +6078,7 @@ mod tests {
 
         let (kernel_ok, kernel_detail) = kernel_support("iscsi");
         assert_eq!(row.status == "ok", kernel_ok);
-        assert!(row.detail.starts_with(&kernel_detail), "{}", row.detail);
+        assert!(row.detail.starts_with(kernel_detail.text.as_str()), "{}", row.detail);
 
         // §5.5: the DH-HMAC-CHAP probe lives in the Environment tab. n16 gives
         // it its OWN row — an admin scanning the Status column for "can this
@@ -5244,6 +6250,14 @@ mod tests {
             "{:?}",
             open[0]
         );
+        // N19b "since": the drift code carries the open alert's `raised_at`,
+        // and a later tick keeps the same instant (critic wave 6, MINOR 11).
+        let since = stored.state_reasons.iter().find(|r| r.code == "target_portal_moved")
+            .and_then(|r| r.params.get("since").cloned());
+        assert_eq!(since.as_deref(), Some(open[0].raised_at.as_str()));
+        evaluate_rows(&db, &mut rows, &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
+        let again = store::target_by_name(&db, &row.name).expect("read").expect("row");
+        assert_eq!(again.state_reasons, stored.state_reasons, "a later tick keeps the first instant");
 
         // The address comes back (here: the portal stops naming an interface,
         // which is the deliberate 0.0.0.0 case) — the same tick closes it.
@@ -5267,6 +6281,34 @@ mod tests {
                 .state,
             "pending"
         );
+    }
+
+    /// Wave 6 (migration 23): a row stored before the codes has its
+    /// sentence and no codes, and a verdict that did not change is not
+    /// written again — so the codes themselves count as a change, and the
+    /// next tick gives such a row its codes.
+    #[test]
+    fn the_next_evaluation_gives_a_row_stored_before_the_codes_its_codes() {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let mut row = target("iscsi");
+        row.luns[0].device_path = "/dev/null".to_string();
+        row.portals[0].interface = "tentanas-nie-ma-takiego0".to_string();
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let mut log = Vec::new();
+        evaluate_rows(&db, &mut [row.clone()], &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
+        let judged = store::target_by_name(&db, &row.name).expect("read").expect("row");
+        assert_eq!(judged.state_reasons.first().map(|r| r.code.as_str()), Some("target_portal_moved"));
+
+        // What an older build left: the same state and sentence, no codes.
+        store::set_target_state(&db, &row.target_id, &judged.state, &judged.state_detail, &[]).expect("older row");
+        let mut rows = vec![store::target_by_name(&db, &row.name).expect("read").expect("row")];
+        assert!(rows[0].state_reasons.is_empty());
+        evaluate_rows(&db, &mut rows, &|_| true, &RetryMemory::new(), &mut log).expect("evaluate");
+        let coded = store::target_by_name(&db, &row.name).expect("read").expect("row");
+        assert_eq!(coded.state_detail, judged.state_detail, "the sentence did not change");
+        assert_eq!(coded.state_reasons, judged.state_reasons, "and the codes came back");
     }
 
     #[test]
@@ -6637,7 +7679,8 @@ mod tests {
                     state: "ready".into(),
                 },
                 // A controller the kernel has not named yet is still a live
-                // association, so it is listed by its id rather than dropped.
+                // association, so it is listed — without a name, and never by
+                // its controller id (no ids in the GUI).
                 tentanas_helper::block::NvmetController {
                     cntlid: "2".into(),
                     ..Default::default()
@@ -6652,12 +7695,30 @@ mod tests {
         // client-declared half.
         assert_eq!(
             list.iter().map(|s| s.client.as_str()).collect::<Vec<_>>(),
-            vec!["192.168.10.24", "controller 2"]
+            vec!["192.168.10.24", ""]
         );
         assert_eq!(
             list.iter().map(|s| s.user.as_str()).collect::<Vec<_>>(),
-            vec!["nqn.2014-08.org.nvmexpress:uuid:esx01", "controller 2"]
+            vec!["nqn.2014-08.org.nvmexpress:uuid:esx01", ""]
         );
+        // No controller id reaches the wire, anywhere in a session.
+        for s in &list {
+            assert!(
+                [&s.client, &s.user, &s.address, &s.state].iter().all(|f| *f != "2" && !f.contains("controller")),
+                "{s:?}"
+            );
+        }
+        // Owner decision D2: a subsystem WITHOUT an allowlist shows no address
+        // and no state; with one, both are the kernel's own words.
+        assert!(list.iter().all(|s| s.address.is_empty() && s.state.is_empty()), "{list:?}");
+        let mut listed = nvme.clone();
+        listed.initiators = vec!["nqn.2014-08.org.nvmexpress:uuid:esx01".into()];
+        let (list, _) = sessions_from(&listed, &seen);
+        assert_eq!(list[0].address, "192.168.10.24");
+        assert_eq!(list[0].state, "ready");
+        // The sampler's key stays internal: cntlid@address, never on the wire.
+        let (readings, _) = readings_from(&listed, &seen);
+        assert_eq!(readings[0].key, session_key(boot_id(), "1@192.168.10.24"));
         // iSCSI never depends on any of this: LIO publishes its sessions in
         // configfs, which any user can read — so a node that cannot read
         // debugfs still KNOWS an iSCSI target's session count. (Whether it
@@ -6819,5 +7880,485 @@ mod tests {
                 );
             }
         }
+    }
+    /// Critic wave 10, R2-1: only a drifted target that is IN THE KERNEL is
+    /// frozen for the sharing stop; the same row after a reboot (configfs
+    /// empty) serves nothing and holds nothing back.
+    #[test]
+    fn a_drifted_target_blocks_the_stop_only_while_it_is_in_the_kernel() {
+        let row = TargetRow {
+            target_id: "t1".into(),
+            name: "vm-store".into(),
+            protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.local.tentaflow:vm-store".into(),
+            enabled: true,
+            auth_method: "none".into(),
+            portals: vec![NasTargetPortal { interface: "eth9".into(), address: "192.0.2.10".into(), port: 3260, ..Default::default() }],
+            ..Default::default()
+        };
+        let nowhere: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let frozen = |in_kernel: bool| {
+            frozen_among(vec![row.clone()], &|_| true, &nowhere, &|_| in_kernel, &|_| true)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(frozen(true), vec!["vm-store".to_string()], "serving with a moved portal: the stop is refused");
+        assert!(frozen(false).is_empty(), "not in the kernel: nothing frozen serves");
+        let disabled = TargetRow { enabled: false, ..row.clone() };
+        assert!(frozen_among(vec![disabled], &|_| true, &nowhere, &|_| true, &|_| true).is_empty());
+    }
+
+
+    // ----- wave 12 (MAJOR 27): sessions, sampler, Nasłuch, F2, Opis, Rozłącz -----
+
+    /// rig11's bytes (`dynamic-sessions-bytes.log`).
+    const DYNAMIC_ONE: &[u8] = b"iqn.2004-10.com.ubuntu:01:35ed4c1b7a\n\x00";
+
+    const INFO_ACTIVE: &str = "InitiatorName: iqn.1994-05.com.redhat:vmhost-01\nInitiatorAlias: vmhost-01\nLIO Session ID: 7   ISID: 0x00 02 3d 00 00 01  TSIH: 7  SessionType: Normal\nSession State: TARG_SESS_STATE_LOGGED_IN\n---------------------[iSCSI Session Values]-----------------------\n  CmdSN/WR  :  CmdSN/WC  :  ExpCmdSN  :  MaxCmdSN  :     ITT    :     TTT\n 0x00000040   0x00000040   0x0000004a   0x00000089   0x0000004a   0x00000048\n----------------------[iSCSI Connections]-------------------------\nCID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN\n   Address 10.10.0.21 TCP  StatSN: 0x3cded8e9\n";
+
+    fn write(tree: &TempTree, rel: &str, bytes: &[u8]) {
+        let path = tree.0.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("parent");
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    fn memory_db() -> DbPool {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        std::sync::Arc::new(crate::db::Db::from_connection(conn))
+    }
+
+    #[test]
+    fn the_kernels_trailing_nul_is_not_a_phantom_session() {
+        // MAJOR 27 F1: `lines().map(str::trim)` kept "\0" as a session name.
+        let text = String::from_utf8(DYNAMIC_ONE.to_vec()).expect("utf-8");
+        let parsed = parse_dynamic_sessions(&text);
+        assert_eq!(parsed.len(), 1, "{parsed:?}");
+        assert_eq!(parsed[0].user, "iqn.2004-10.com.ubuntu:01:35ed4c1b7a");
+        // Through the configfs reader as well, from the file the kernel writes.
+        let tree = TempTree::new("f1");
+        let row = target("iscsi");
+        write(&tree, &format!("iscsi/{}/tpgt_1/dynamic_sessions", row.wwn), DYNAMIC_ONE);
+        tree.dir(&format!("iscsi/{}/tpgt_1/acls", row.wwn));
+        let (found, known) = iscsi_readings_in(&tree.0, &row);
+        assert!(known);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found.iter().any(|s| s.identity.contains('\0')));
+    }
+
+    #[test]
+    fn an_allowlisted_session_carries_the_kernels_address_and_state_and_an_internal_key() {
+        let tree = TempTree::new("acl-info");
+        let mut row = target("iscsi");
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into(), "iqn.1994-05.com.redhat:vmhost-02".into()];
+        let acls = format!("iscsi/{}/tpgt_1/acls", row.wwn);
+        write(&tree, &format!("{acls}/iqn.1994-05.com.redhat:vmhost-01/info"), INFO_ACTIVE.as_bytes());
+        write(
+            &tree,
+            &format!("{acls}/iqn.1994-05.com.redhat:vmhost-02/info"),
+            b"No active iSCSI Session for Initiator Endpoint: iqn.1994-05.com.redhat:vmhost-02\n",
+        );
+        let (readings, known) = iscsi_readings_in(&tree.0, &row);
+        assert!(known);
+        assert_eq!(readings.len(), 1, "the idle ACL is no session");
+        assert_eq!(readings[0].identity, "iqn.1994-05.com.redhat:vmhost-01");
+        assert_eq!(readings[0].address, "10.10.0.21");
+        assert_eq!(readings[0].state, "LOGGED_IN");
+        assert_eq!(readings[0].key, session_key(boot_id(), "7"));
+        let wire = to_wire_session(&row, &readings[0]);
+        assert_eq!((wire.address.as_str(), wire.state.as_str()), ("10.10.0.21", "LOGGED_IN"));
+        // No session id, ISID or TSIH anywhere on the wire.
+        let json = serde_json::to_string(&wire).expect("json");
+        for leaked in ["\"7\"", "0x00 02", "TSIH", "ISID", "Session ID"] {
+            assert!(!json.contains(leaked), "{leaked} in {json}");
+        }
+        // D2: the same reading on a target without an allowlist shows neither.
+        let mut open = row.clone();
+        open.initiators.clear();
+        let wire = to_wire_session(&open, &readings[0]);
+        assert!(wire.address.is_empty() && wire.state.is_empty(), "{wire:?}");
+        // An `info` that reads empty makes the count unknown, never lower.
+        write(&tree, &format!("{acls}/iqn.1994-05.com.redhat:vmhost-02/info"), b"");
+        assert!(!iscsi_readings_in(&tree.0, &row).1);
+    }
+
+    #[test]
+    fn the_last_initiator_is_refused_by_the_core_and_by_the_helpers_plan() {
+        // SECURITY (MAJOR 27 F2). The core's rule…
+        let one = vec!["iqn.1994-05.com.redhat:vmhost-01".to_string()];
+        assert!(removes_last_initiator(&one, &[]));
+        assert!(!removes_last_initiator(&one, &one));
+        assert!(!removes_last_initiator(&[], &[]), "an open target stays open");
+        assert!(!removes_last_initiator(&one, &["iqn.1994-05.com.redhat:vmhost-02".to_string()]));
+        assert_eq!(LAST_INITIATOR_REFUSAL, "refusal:target_last_initiator");
+
+        // …and the kernel-side backstop, through the SAME spec builder the
+        // apply uses (`iscsi_spec` inside `preview_in`): a row whose list was
+        // emptied some other way, over a TPG that is allowlisted in the
+        // kernel, renders no plan at all instead of one that opens it.
+        let tree = TempTree::new("f2-core");
+        let mut row = target("iscsi");
+        let tpg = format!("iscsi/{}/tpgt_1", row.wwn);
+        write(&tree, &format!("{tpg}/attrib/generate_node_acls"), b"0\n");
+        write(&tree, &format!("{tpg}/acls/{}/info", one[0]), INFO_ACTIVE.as_bytes());
+        row.initiators.clear();
+        let refused = preview_in(&row, &tree.0, &tree.0).expect_err("never opened");
+        assert!(refused.to_string().contains("refusing to open an allowlisted target"), "{refused}");
+        row.initiators = one.clone();
+        let text = preview_in(&row, &tree.0, &tree.0).expect("the list kept");
+        assert!(!text.contains("generate_node_acls = 1"), "{text}");
+        // nvmet: the same through `nvmet_spec` — an emptied host list is
+        // `allow_any_host`, refused over a subsystem that links a host.
+        let mut nvme = target("nvmet");
+        let host = "nqn.2014-08.org.nvmexpress:uuid:9f2c0000-0000-0000-0000-00000000a17b";
+        let allowed = tree.dir(&format!("subsystems/{}/allowed_hosts", nvme.wwn));
+        tree.dir(&format!("hosts/{host}"));
+        std::os::unix::fs::symlink(tree.0.join("hosts").join(host), allowed.join(host)).expect("link");
+        write(&tree, &format!("subsystems/{}/attr_allow_any_host", nvme.wwn), b"0\n");
+        nvme.initiators.clear();
+        let refused = preview_in(&nvme, &tree.0, &tree.0).expect_err("never opened");
+        assert!(refused.to_string().contains("refusing to open an allowlisted subsystem"), "{refused}");
+    }
+
+    #[test]
+    fn a_description_is_trimmed_bounded_and_only_for_a_listed_initiator() {
+        let list = vec!["iqn.1994-05.com.redhat:vmhost-01".to_string()];
+        let asked = |k: &str, v: &str| BTreeMap::from([(k.to_string(), v.to_string())]);
+        let kept = clean_descriptions(&list, &asked(&list[0], "  Proxmox vmhost-01 ")).expect("ok");
+        assert_eq!(kept.get(&list[0]).map(String::as_str), Some("Proxmox vmhost-01"));
+        // Blank falls away rather than storing an empty description.
+        assert!(clean_descriptions(&list, &asked(&list[0], "   ")).expect("ok").is_empty());
+        assert_eq!(clean_descriptions(&list, &asked("iqn.x:other", "x")), Err(DESCRIPTION_UNLISTED));
+        assert_eq!(clean_descriptions(&list, &asked(&list[0], &"ą".repeat(81))), Err(DESCRIPTION_TOO_LONG));
+        assert!(clean_descriptions(&list, &asked(&list[0], &"ą".repeat(80))).is_ok(), "80 characters, not bytes");
+        assert_eq!(clean_descriptions(&list, &asked(&list[0], "a\u{7}b")), Err(DESCRIPTION_INVALID));
+        assert_eq!(clean_descriptions(&list, &asked(&list[0], "a\nb")), Err(DESCRIPTION_INVALID));
+    }
+
+    #[test]
+    fn a_description_survives_the_store_and_leaves_with_its_initiator() {
+        let db = memory_db();
+        let mut row = target("iscsi");
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into(), "iqn.1994-05.com.redhat:vmhost-02".into()];
+        row.initiator_descriptions = BTreeMap::from([("iqn.1994-05.com.redhat:vmhost-01".into(), "Proxmox vmhost-01".into())]);
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let back = store::target(&db, "org-a", &row.target_id).expect("read").expect("row");
+        assert_eq!(back.initiator_descriptions, row.initiator_descriptions);
+        assert_eq!(to_protocol(&back, 0, true).initiator_descriptions, row.initiator_descriptions);
+        row.initiators.remove(0);
+        row.initiator_descriptions.clear();
+        store::upsert_target(&db, "org-a", &row).expect("update");
+        let back = store::target(&db, "org-a", &row.target_id).expect("read").expect("row");
+        assert!(back.initiator_descriptions.is_empty());
+    }
+
+    #[test]
+    fn the_sampler_keeps_a_session_start_moves_last_seen_and_restarts_on_a_reconnect() {
+        let db = memory_db();
+        let row = target("iscsi");
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        assert!(!store::target_seen_since(&db).expect("since").is_empty(), "migration 29 notes when recording began");
+        let who = "iqn.1994-05.com.redhat:vmhost-01".to_string();
+        let boot = "b-1";
+        let seen = |key: &str, at: &str| {
+            store::record_target_seen(&db, &row.target_id, &[(who.clone(), session_key(boot, key), "10.10.0.21".into())], at).expect("record")
+        };
+        let first = |db: &DbPool| store::target_seen(db, &row.target_id).expect("rows").remove(0);
+        assert_eq!(seen("7", "2026-09-26T10:00:00Z"), 1);
+        // Within a minute and nothing moved: no write at all (MINOR 10).
+        assert_eq!(seen("7", "2026-09-26T10:00:20Z"), 0);
+        assert_eq!(first(&db).last_seen_at, "2026-09-26T10:00:00Z");
+        assert_eq!(seen("7", "2026-09-26T10:01:05Z"), 1);
+        assert_eq!(first(&db).session_since, "2026-09-26T10:00:00Z", "the same session keeps its start");
+        assert_eq!(first(&db).last_seen_at, "2026-09-26T10:01:05Z");
+        // A new LIO Session ID is a reconnect: the duration starts again.
+        seen("8", "2026-09-26T10:01:25Z");
+        assert_eq!(first(&db).session_since, "2026-09-26T10:01:25Z");
+        // `connected_at` is the session's first sighting, only for the same key.
+        let reading = SessionReading { identity: who.clone(), key: session_key(boot, "8"), ..Default::default() };
+        let rows = store::target_seen(&db, &row.target_id).expect("rows");
+        assert_eq!(with_connected_at(&row, &[reading.clone()], &rows)[0].connected_at.as_deref(), Some("2026-09-26T10:01:25Z"));
+        let other = SessionReading { key: session_key(boot, "9"), ..reading.clone() };
+        assert_eq!(with_connected_at(&row, &[other], &rows)[0].connected_at, None);
+        // A session without a key (a generated one) never gets a duration.
+        let keyless = SessionReading { key: String::new(), ..reading };
+        assert_eq!(with_connected_at(&row, &[keyless], &rows)[0].connected_at, None);
+        // The rows leave with the target.
+        assert!(store::delete_target(&db, "org-a", &row.target_id).expect("delete"));
+        assert!(store::target_seen(&db, &row.target_id).expect("rows").is_empty());
+    }
+
+    #[test]
+    fn a_gap_in_the_samples_or_a_reboot_starts_a_new_session_even_under_the_same_number() {
+        // Critic wave 12, MAJOR 2.
+        let db = memory_db();
+        let row = target("iscsi");
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let who = "iqn.1994-05.com.redhat:vmhost-01".to_string();
+        let since = |db: &DbPool| store::target_seen(db, &row.target_id).expect("rows").remove(0).session_since;
+        let key = session_key("boot-a", "1");
+        store::record_target_seen(&db, &row.target_id, &[(who.clone(), key.clone(), String::new())], "2026-09-01T10:00:00Z").expect("seen");
+        // A GAP: a measured reading without the initiator closes its session…
+        store::record_target_seen(&db, &row.target_id, &[], "2026-09-01T10:00:20Z").expect("absent");
+        let closed = store::target_seen(&db, &row.target_id).expect("rows").remove(0);
+        assert_eq!(closed.session_key, store::SEEN_SESSION_CLOSED);
+        assert_eq!(closed.last_seen_at, "2026-09-01T10:00:00Z", "last seen stays: it is Ostatnie połączenie");
+        // …and the same key coming back is a NEW session.
+        store::record_target_seen(&db, &row.target_id, &[(who.clone(), key.clone(), String::new())], "2026-09-26T09:00:00Z").expect("back");
+        assert_eq!(since(&db), "2026-09-26T09:00:00Z");
+        // A REBOOT between two readings, with no gap seen at all (the node
+        // was down): LIO restarts its ids, the boot id does not repeat.
+        store::record_target_seen(&db, &row.target_id, &[(who.clone(), session_key("boot-b", "1"), String::new())], "2026-09-26T09:05:00Z").expect("rebooted");
+        assert_eq!(since(&db), "2026-09-26T09:05:00Z", "session 1 after a reboot is not session 1 before it");
+        // An open target's generated session (empty key) also restarts after a gap.
+        let open_seen = |db: &DbPool, at: &str| store::record_target_seen(db, &row.target_id, &[(who.clone(), session_key("boot-b", "1"), String::new()), ("iqn.x:open".into(), String::new(), String::new())], at).expect("open");
+        open_seen(&db, "2026-09-26T09:06:00Z");
+        store::record_target_seen(&db, &row.target_id, &[(who.clone(), session_key("boot-b", "1"), String::new())], "2026-09-26T09:06:20Z").expect("gone");
+        open_seen(&db, "2026-09-27T09:00:00Z");
+        let open = store::target_seen(&db, &row.target_id).expect("rows").into_iter().find(|r| r.initiator == "iqn.x:open").expect("row");
+        assert_eq!(open.session_since, "2026-09-27T09:00:00Z");
+        // The boot id is part of the key, and an empty number stays empty.
+        assert_eq!(session_key("b", "7"), "b/7");
+        assert_eq!(session_key("b", ""), "");
+    }
+
+    #[test]
+    fn nvme_of_is_sampled_only_from_an_open_view_and_at_most_once_a_minute() {
+        let db = memory_db();
+        let mut row = target("nvmet");
+        row.target_id = "t-nvme-sampler".into();
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let readings = vec![SessionReading { identity: "nqn.2014-08.org.nvmexpress:uuid:esx01".into(), key: "1@10.0.0.9".into(), ..Default::default() }];
+        assert!(!sample_nvmet_if_due(&db, &row, &readings, false), "an unmeasured reading writes nothing");
+        assert!(store::target_seen(&db, &row.target_id).expect("rows").is_empty());
+        assert!(sample_nvmet_if_due(&db, &row, &readings, true));
+        assert!(!sample_nvmet_if_due(&db, &row, &readings, true), "within a minute: no second sample");
+        assert_eq!(store::target_seen(&db, &row.target_id).expect("rows").len(), 1);
+        assert!(!sample_nvmet_if_due(&db, &target("iscsi"), &readings, true), "iSCSI is the tick's");
+    }
+
+    #[test]
+    fn listening_is_read_from_configfs_and_proc_net_tcp_per_portal() {
+        let tree = TempTree::new("listen");
+        let mut row = target("iscsi");
+        row.portals = vec![NasTargetPortal { interface: "lo".into(), address: "127.0.0.1".into(), port: 3260, transport: "tcp".into() }];
+        let tpg = format!("iscsi/{}/tpgt_1", row.wwn);
+        // The rows rig11 printed (§L.4): 127.0.0.1:3260 and :4420 listening.
+        let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:0CBC 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 100 0 0 10 0\n   1: 0100007F:1144 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 100 0 0 10 0\n";
+        write(&tree, "proc/net/tcp", tcp.as_bytes());
+        let state = |row: &TargetRow| listen_states_in(row, &tree.0, &tree.0, &tree.0.join("proc"))[0].state.clone();
+        assert_eq!(state(&row), "not_listening", "no np: nothing of this target listens");
+        tree.dir(&format!("{tpg}/np/127.0.0.1:3260"));
+        write(&tree, &format!("{tpg}/np/127.0.0.1:3260/iser"), b"0\n");
+        write(&tree, &format!("{tpg}/enable"), b"1\n");
+        assert_eq!(state(&row), "listening");
+        // Measured L3: the port stays open while the TPG is disabled.
+        write(&tree, &format!("{tpg}/enable"), b"0\n");
+        assert_eq!(state(&row), "target_disabled");
+        write(&tree, &format!("{tpg}/np/127.0.0.1:3260/iser"), b"1\n");
+        assert_eq!(state(&row), "rdma");
+        write(&tree, &format!("{tpg}/np/127.0.0.1:3260/iser"), b"0\n");
+        // The kernel did not bind: np present, no LISTEN row.
+        write(&tree, "proc/net/tcp", b"  sl  local_address rem_address   st\n");
+        assert_eq!(state(&row), "not_listening");
+        // Nothing readable at all: not measured, never "not listening".
+        std::fs::remove_file(tree.0.join("proc/net/tcp")).expect("rm");
+        assert_eq!(state(&row), "unknown");
+        // A dual-stack wildcard in tcp6 covers the IPv4 portal.
+        write(&tree, "proc/net/tcp6", b"  sl  local_address                         remote_address                        st\n   0: 00000000000000000000000000000000:0CBC 00000000000000000000000000000000:0000 0A 0\n");
+        write(&tree, &format!("{tpg}/enable"), b"1\n");
+        assert_eq!(state(&row), "listening");
+
+        // nvmet: the port whose addr_* match, linked to this subsystem.
+        let mut nvme = target("nvmet");
+        nvme.portals = vec![NasTargetPortal { interface: "lo".into(), address: "127.0.0.1".into(), port: 4420, transport: "tcp".into() }];
+        write(&tree, "proc/net/tcp", tcp.as_bytes());
+        let nstate = |row: &TargetRow| listen_states_in(row, &tree.0, &tree.0, &tree.0.join("proc"))[0].state.clone();
+        assert_eq!(nstate(&nvme), "not_listening");
+        for (name, value) in [("addr_trtype", "tcp\n"), ("addr_traddr", "127.0.0.1\n"), ("addr_trsvcid", "4420\n")] {
+            write(&tree, &format!("ports/2701/{name}"), value.as_bytes());
+        }
+        tree.dir("ports/2701/subsystems");
+        assert_eq!(nstate(&nvme), "not_listening", "a port without our link does not serve us");
+        tree.dir(&format!("subsystems/{}", nvme.wwn));
+        std::os::unix::fs::symlink(tree.0.join("subsystems").join(&nvme.wwn), tree.0.join("ports/2701/subsystems").join(&nvme.wwn)).expect("link");
+        assert_eq!(nstate(&nvme), "listening");
+        nvme.portals[0].transport = "rdma".into();
+        assert_eq!(nstate(&nvme), "rdma");
+    }
+
+    #[test]
+    fn a_session_reset_is_refused_with_a_code_before_anything_runs() {
+        let tree = TempTree::new("reset-refusal");
+        let mut row = target("iscsi");
+        let who = "iqn.1994-05.com.redhat:vmhost-01";
+        let info = format!("iscsi/{}/tpgt_1/acls/{who}/info", row.wwn);
+        write(&tree, &info, INFO_ACTIVE.as_bytes());
+        let refusal = |row: &TargetRow, revoke: bool| session_reset_refusal_in(&tree.0, row, who, revoke);
+        // D2: no allowlist, no reset.
+        assert_eq!(refusal(&row, false), Some(RESET_NOT_ALLOWLISTED));
+        row.initiators = vec![who.into()];
+        assert_eq!(refusal(&row, false), None);
+        // "i usuń z listy" on the only entry would open the target (F2).
+        assert_eq!(refusal(&row, true), Some(LAST_INITIATOR_REFUSAL));
+        row.initiators.push("iqn.1994-05.com.redhat:vmhost-02".into());
+        assert_eq!(refusal(&row, true), None);
+        // No live session: nothing to reset (the revoke still works).
+        write(&tree, &info, format!("No active iSCSI Session for Initiator Endpoint: {who}\n").as_bytes());
+        assert_eq!(refusal(&row, false), Some(RESET_NO_SESSION));
+        assert_eq!(refusal(&row, true), None);
+        row.enabled = false;
+        assert_eq!(refusal(&row, false), Some(RESET_NOT_SERVING));
+        // NVMe-oF has no per-host disconnect (D4).
+        let mut nvme = target("nvmet");
+        nvme.initiators = vec![who.into()];
+        assert_eq!(refusal(&nvme, false), Some(RESET_NOT_ISCSI));
+        // The helper's TOCTOU answer reads as the same coded refusal.
+        assert_eq!(
+            helper_refusal("tentanas-helper: iscsi_session_reset: refused:no_session: iqn.x has no session"),
+            Some(RESET_NO_SESSION)
+        );
+        assert_eq!(
+            helper_refusal("tentanas-helper: iscsi_session_reset: refused:not_allowlisted: x"),
+            Some(RESET_NOT_ALLOWLISTED)
+        );
+        assert_eq!(helper_refusal("tentanas-helper: iscsi_session_reset: lost_access: x"), None);
+        assert_eq!(reset_detail("tentanas-helper: iscsi_session_reset: lost_access: x"), "lost_access: x");
+    }
+
+    #[tokio::test]
+    async fn the_reconnect_after_a_reset_is_confirmed_or_reported_missing() {
+        let tree = TempTree::new("reconnect");
+        let mut row = target("iscsi");
+        let who = "iqn.1994-05.com.redhat:vmhost-01";
+        row.initiators = vec![who.into()];
+        let info = tree.0.join(format!("iscsi/{}/tpgt_1/acls/{who}/info", row.wwn));
+        std::fs::create_dir_all(info.parent().expect("parent")).expect("dir");
+        std::fs::write(&info, INFO_ACTIVE).expect("before");
+        // The same session id as before is NOT a reconnect.
+        let line = await_reconnect_in(&tree.0, &row, who, "7", Duration::from_millis(300)).await;
+        assert!(line.contains("did not reconnect within"), "{line}");
+        // A new LIO Session ID in LOGGED_IN, a moment later, is.
+        let path = info.clone();
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            std::fs::write(&path, INFO_ACTIVE.replace("LIO Session ID: 7 ", "LIO Session ID: 8 ")).expect("after");
+        });
+        let line = await_reconnect_in(&tree.0, &row, who, "7", Duration::from_secs(5)).await;
+        writer.await.expect("writer");
+        assert!(line.contains("reconnected after"), "{line}");
+        // No id in the job-log line.
+        assert!(!line.to_lowercase().contains("session id"), "{line}");
+    }
+
+    /// Critic wave 12, MAJOR 3: after "Rozłącz" the core re-applies the target
+    /// on EVERY failure that is not a coded refusal — a half-done drop, a lost
+    /// ACL, an error nobody foresaw — and on a refusal it touches nothing.
+    #[tokio::test]
+    async fn a_failed_reset_is_repaired_by_an_apply_unless_it_was_refused() {
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let mut row = target("iscsi");
+        row.target_id = "t-reset-repair".into();
+        row.auth_method = "none".into();
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        for (stderr, repaired) in [
+            ("tentanas-helper: iscsi_session_reset: reset_incomplete: the session could not be dropped", true),
+            ("tentanas-helper: iscsi_session_reset: lost_access: the ACL could not be re-created", true),
+            ("tentanas-helper: iscsi_session_reset: something nobody foresaw", true),
+            ("tentanas-helper: iscsi_session_reset: refused:no_session: nothing to reset", false),
+            ("tentanas-helper: iscsi_session_reset: refused:not_app_target: hand-made", false),
+        ] {
+            let db = memory_db();
+            store::upsert_target(&db, "org-a", &row).expect("insert");
+            let channel = super::super::broker::test_channel::install(&db);
+            channel.fail("iscsi_session_reset", stderr);
+            let (log, outcome) = reset_session(&db, &cipher, &row, "iqn.1994-05.com.redhat:vmhost-01", None).await;
+            assert!(outcome.is_err(), "{stderr}");
+            let names = channel.names();
+            let reset_at = names.iter().position(|n| n == "iscsi_session_reset").expect("the reset ran");
+            let applied = names[reset_at..].iter().any(|n| n == "iscsi_target_apply");
+            assert_eq!(applied, repaired, "{stderr}: {names:?}");
+            assert_eq!(log.iter().any(|l| l.contains("re-applying the target")), repaired, "{stderr}: {log:?}");
+            if repaired {
+                assert!(!apply_retry_pending(&row), "a repair that went through leaves nothing pending");
+            }
+        }
+        // The coded refusals keep their codes for the job.
+        let db = memory_db();
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let channel = super::super::broker::test_channel::install(&db);
+        channel.fail("iscsi_session_reset", "tentanas-helper: iscsi_session_reset: refused:no_session: x");
+        let (_, outcome) = reset_session(&db, &cipher, &row, "iqn.1994-05.com.redhat:vmhost-01", None).await;
+        assert_eq!(outcome.unwrap_err().to_string(), RESET_NO_SESSION);
+    }
+
+    /// Critic wave 12, MAJOR 1: an allowlist the helper refused because an
+    /// excluded client cannot be reset raises the target's alert AT ONCE,
+    /// and the next apply that goes through closes it.
+    #[tokio::test]
+    async fn an_unresettable_client_fails_the_apply_and_raises_the_targets_alert() {
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let db = memory_db();
+        let mut row = target("iscsi");
+        row.target_id = "t-unresettable".into();
+        row.auth_method = "none".into();
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let channel = super::super::broker::test_channel::install(&db);
+        channel.fail(
+            "iscsi_target_apply",
+            "tentanas-helper: iscsi_target_apply: invalid argument: unresettable_session: iqn.x: a client …",
+        );
+        assert!(apply_one_now(&db, &cipher, &row, None).await.is_err(), "the apply fails");
+        let open: Vec<_> = store::list_alerts(&db, true).expect("alerts").into_iter()
+            .filter(|a| a.code == "target_session_not_reset").collect();
+        assert_eq!(open.len(), 1, "raised at once");
+        assert_eq!(open[0].params.get("target").map(String::as_str), Some("vm-store"));
+        assert_eq!(open[0].severity, "critical");
+        channel.failing.lock().unwrap().clear();
+        apply_one_now(&db, &cipher, &row, None).await.expect("applied");
+        assert!(store::list_alerts(&db, true).expect("alerts").iter().all(|a| a.code != "target_session_not_reset"), "closed by the next apply");
+    }
+
+    /// Critic ACL-fix M-1: a rebuild of an open target that stopped short
+    /// with the disable failed may leave the OLD open TPG serving anyone
+    /// behind the allowlist on screen — the critical alert goes up AT ONCE.
+    /// A rebuild that did disable the target raises nothing here.
+    #[tokio::test]
+    async fn a_rebuild_that_may_leave_the_open_target_serving_raises_the_alert_at_once() {
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let db = memory_db();
+        let mut row = target("iscsi");
+        row.target_id = "t-rebuild".into();
+        row.auth_method = "none".into();
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let channel = super::super::broker::test_channel::install(&db);
+        let rebuild_alerts = |db: &DbPool| -> Vec<_> {
+            store::list_alerts(db, true).expect("alerts").into_iter()
+                .filter(|a| a.code == "target_rebuild_not_disabled").collect()
+        };
+        // Disabled: refused logins, no critical alert from this path.
+        channel.fail(
+            "iscsi_target_apply",
+            &format!("tentanas-helper: iscsi_target_apply: {}: iqn.x: the target was open …", block::TPG_REBUILD_DISABLED),
+        );
+        assert!(apply_one_now(&db, &cipher, &row, None).await.is_err(), "the apply fails");
+        assert!(rebuild_alerts(&db).is_empty(), "a disabled target is not serving");
+        // Not disabled: it may still serve openly.
+        channel.failing.lock().unwrap().clear();
+        channel.fail(
+            "iscsi_target_apply",
+            &format!("tentanas-helper: iscsi_target_apply: {}: iqn.x: the target was open …", block::TPG_REBUILD_MAY_SERVE),
+        );
+        assert!(apply_one_now(&db, &cipher, &row, None).await.is_err(), "the apply fails");
+        let open = rebuild_alerts(&db);
+        assert_eq!(open.len(), 1, "raised at once");
+        assert_eq!(open[0].severity, "critical");
+        assert_eq!(open[0].params.get("target").map(String::as_str), Some("vm-store"));
+        channel.failing.lock().unwrap().clear();
+        apply_one_now(&db, &cipher, &row, None).await.expect("applied");
+        assert!(rebuild_alerts(&db).is_empty(), "closed by the next apply");
     }
 }

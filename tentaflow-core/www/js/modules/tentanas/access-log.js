@@ -117,14 +117,25 @@ export function wireAccessLog(screen, body) {
       lines.push(audit.detail);
     }
     if (audit.collectedAt) lines.push(T('access.collected', { t: fmtAgo(audit.collectedAt) }));
+    // A reader who is not the organisation's admin gets no address at all
+    // (the node sends none), only that forwarding is on and how it fares.
     const forward = res.forward || {};
+    const targetOf = (f) => [f.syslogTarget, f.webhookUrl].filter(Boolean).join(', ');
     if (forward.enabled) {
-      lines.push(T('access.forward_on', {
-        target: [forward.syslogTarget, forward.webhookUrl].filter(Boolean).join(', '),
-        n: Number(forward.pending) || 0,
-      }));
+      const target = targetOf(forward);
+      lines.push(target
+        ? T('access.forward_on', { target, n: Number(forward.pending) || 0 })
+        : T('access.forward_on_hidden', { n: Number(forward.pending) || 0 }));
     }
-    if (forward.lastError) lines.push(T('access.forward_error', { error: forward.lastError }));
+    if (forward.lastError) lines.push(T('access.forward_error', { error: forwardErrorText(forward.lastError) }));
+    const node = res.forwardNode || {};
+    if (node.enabled) {
+      const target = targetOf(node);
+      lines.push(target
+        ? T('access.forward_node_on', { target, n: Number(node.pending) || 0 })
+        : T('access.forward_node_on_hidden', { n: Number(node.pending) || 0 }));
+    }
+    if (node.lastError) lines.push(T('access.forward_node_error', { error: forwardErrorText(node.lastError) }));
     // A page smaller than the match count has to say so, or the reader takes
     // the page for the whole answer. It belongs to the SAME block as the lines
     // above and is written with them in one go: the Tasks tab polls this card
@@ -171,52 +182,106 @@ export function wireAccessLog(screen, body) {
   }
   body.querySelector('#nas-access-card [data-act="refresh"]')?.addEventListener('click', refresh);
   body.querySelector('#nas-access-card [data-act="forward"]')?.addEventListener('click', () => {
-    openForwardDialog(screen, state.res?.forward || {}, apply);
+    openForwardDialog(screen, state.res?.forward || {}, apply, state.res?.forwardNode || {});
   });
 
   return { refresh };
 }
 
 /**
- * Where this node sends its alerts (§5.9). Both targets are optional and
- * independent; the node refuses a target it could not use, so the dialog
- * reports its error instead of saving something that would fail silently
- * every two minutes.
- *
- * The "forward the access log too" switch is shown DISABLED and off, with the
- * reason under it: every access line belongs to one organisation, and the
- * target is one setting for the whole node that any organisation's admin may
- * point anywhere, so the node sends no access line whatever the setting says
- * (`tentanas/forward.rs`). A switch that could be turned on would be a
- * control that does nothing. The stored choice is not dropped: the save sends
- * back exactly what the node holds, and a stored "on" is named as kept, so a
- * per-organisation target can honour it later.
+ * A failed send as the node reports it: a neutral code, never a socket error
+ * or an address (the node keeps those in its own log). Anything else — an
+ * older node's raw text — reads as "not accepted" too.
  */
-export function openForwardDialog(screen, forward, onSaved) {
+export function forwardErrorText(code) {
+  const status = /^forward:http_status:(\d{3})$/.exec(String(code || ''))?.[1];
+  if (status) return T('access.forward_err_http', { status });
+  return T('access.forward_err_not_accepted');
+}
+
+/** A node-wide target that exists at all: switched on, or holding an address. */
+function nodeTargetSet(node) {
+  return Boolean(node && (node.enabled || node.syslogTarget || node.webhookUrl));
+}
+
+function targetFieldsHtml(prefix, t) {
+  return `
+      <div class="toggle-card">
+        <div class="tc-text"><span>${escapeHtml(T('access.forward_enabled'))}</span><span class="tc-sub">${escapeHtml(T('access.forward_enabled_sub'))}</span></div>
+        <tf-toggle id="${prefix}-enabled" ${t.enabled ? 'checked' : ''}></tf-toggle>
+      </div>
+      <tf-input id="${prefix}-syslog" label="${escapeAttr(T('access.forward_syslog'))}" placeholder="siem.example.com:514" autocomplete="off" spellcheck="false" value="${escapeAttr(t.syslogTarget || '')}" hint="${escapeAttr(T('access.forward_syslog_hint'))}"></tf-input>
+      <tf-input id="${prefix}-webhook" label="${escapeAttr(T('access.forward_webhook'))}" placeholder="https://siem.example.com/hooks/tentanas" autocomplete="off" spellcheck="false" value="${escapeAttr(t.webhookUrl || '')}" hint="${escapeAttr(T('access.forward_webhook_hint'))}"></tf-input>
+      ${t.webhookNeedsMigration ? `<div class="wizard-warning warning" id="${prefix}-webhook-migration">${escapeHtml(T('access.forward_webhook_migration'))}</div>` : ''}`;
+}
+
+function readTarget(win, prefix) {
+  return {
+    enabled: Boolean(win.querySelector(`#${prefix}-enabled`).checked),
+    syslogTarget: String(win.querySelector(`#${prefix}-syslog`).value || '').trim(),
+    webhookUrl: String(win.querySelector(`#${prefix}-webhook`).value || '').trim(),
+  };
+}
+
+// The retired node-wide target (owner decision, wave 9b round 2): shown as
+// it is — masked — and deletable, never editable.
+function nodeTargetHtml(node) {
+  const target = [node.syslogTarget, node.webhookUrl].filter(Boolean).join(', ');
+  return `
+      <div class="section-title mt-md">${escapeHtml(T('access.forward_node_title'))}</div>
+      <div class="hint">${escapeHtml(T('access.forward_node_scope'))}</div>
+      <div class="toggle-card">
+        <div class="tc-text"><span class="mono">${escapeHtml(target || '—')}</span><span class="tc-sub">${escapeHtml(T(node.enabled ? 'access.forward_node_state_on' : 'access.forward_node_state_off'))}</span></div>
+        <tf-button size="sm" variant="danger" icon="trash" data-act="delete-node">${escapeHtml(T('access.forward_node_delete'))}</tf-button>
+      </div>`;
+}
+
+/**
+ * Where the alerts go (§5.9), one target per organisation (wave 9b).
+ *
+ * The first section is the admin's OWN organisation's target, set once for
+ * the whole fleet: it receives that organisation's alerts, the node-wide
+ * alerts every organisation sees (disks, pools) and — when switched on — the
+ * access log of that organisation's own shares. Never another tenant's row
+ * (`tentanas/forward.rs`).
+ *
+ * The second section appears only while the RETIRED node-wide target from
+ * before exists: it keeps sending node-wide alerts only, as it always did,
+ * it is shown masked and it can only be deleted — nothing edits it or
+ * creates a new one (owner decision, wave 9b). The organisation's own target
+ * already receives the node-wide alerts.
+ *
+ * A webhook URL is a secret: the node sends it masked (scheme and host), the
+ * field shows that mask, and a save that leaves it untouched keeps the stored
+ * URL.
+ *
+ * Both targets are optional and independent; the node refuses an address it
+ * could not use, so the dialog shows that error instead of saving something
+ * that would fail silently every minute.
+ */
+export function openForwardDialog(screen, forward, onSaved, node = {}) {
   const win = document.createElement('tf-window');
   win.className = 'nas-modal';
   win.setAttribute('title', T('access.forward_title'));
   win.setAttribute('icon', 'share');
   win.setAttribute('buttons', 'close');
   win.setAttribute('draggable', '');
-  win.setAttribute('width', '580');
+  win.setAttribute('width', '600');
   win.setAttribute('min-width', '460');
   win.setAttribute('initial-x', 'center');
   win.setAttribute('initial-y', 'center');
+  const withNode = nodeTargetSet(node);
   win.innerHTML = `
     <div slot="body" class="stack">
       <div class="explain-box">${escapeHtml(T('access.forward_explain'))}</div>
+      <div class="section-title">${escapeHtml(T('access.forward_org_title'))}</div>
+      <div class="hint">${escapeHtml(T('access.forward_org_scope'))}</div>
+      ${targetFieldsHtml('nas-forward', forward)}
       <div class="toggle-card">
-        <div class="tc-text"><span>${escapeHtml(T('access.forward_enabled'))}</span><span class="tc-sub">${escapeHtml(T('access.forward_enabled_sub'))}</span></div>
-        <tf-toggle id="nas-forward-enabled" ${forward.enabled ? 'checked' : ''}></tf-toggle>
+        <div class="tc-text"><span>${escapeHtml(T('access.forward_include'))}</span><span class="tc-sub">${escapeHtml(T('access.forward_include_sub'))}</span></div>
+        <tf-toggle id="nas-forward-include" ${forward.includeAccess ? 'checked' : ''}></tf-toggle>
       </div>
-      <tf-input id="nas-forward-syslog" label="${escapeAttr(T('access.forward_syslog'))}" placeholder="siem.example.com:514" autocomplete="off" spellcheck="false" value="${escapeAttr(forward.syslogTarget || '')}" hint="${escapeAttr(T('access.forward_syslog_hint'))}"></tf-input>
-      <tf-input id="nas-forward-webhook" label="${escapeAttr(T('access.forward_webhook'))}" placeholder="https://siem.example.com/hooks/tentanas" autocomplete="off" spellcheck="false" value="${escapeAttr(forward.webhookUrl || '')}" hint="${escapeAttr(T('access.forward_webhook_hint'))}"></tf-input>
-      <div class="toggle-card">
-        <div class="tc-text"><span>${escapeHtml(T('access.forward_include'))}</span><span class="tc-sub" id="nas-forward-include-why">${escapeHtml(T('access.forward_include_unavailable'))}${
-          forward.includeAccess ? ` ${escapeHtml(T('access.forward_include_kept'))}` : ''}</span></div>
-        <tf-toggle id="nas-forward-include" disabled></tf-toggle>
-      </div>
+      ${withNode ? nodeTargetHtml(node) : ''}
       <div class="num-err" id="nas-forward-error" hidden></div>
     </div>
     <div slot="footer">
@@ -225,6 +290,22 @@ export function openForwardDialog(screen, forward, onSaved) {
     </div>`;
   document.body.appendChild(win);
   let busy = false;
+  win.querySelector('[data-act="delete-node"]')?.addEventListener('click', async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      // Deleting is the one change the retired target takes: off, no address.
+      const res = await screen.nas('tentaNasAlertForwardSetRequest', { enabled: false, syslogTarget: '', webhookUrl: '', includeAccess: false, nodeWide: true });
+      toast(T('access.forward_node_deleted'), 'success');
+      win.close(true);
+      if (onSaved) onSaved(res);
+    } catch (err) {
+      busy = false;
+      const errEl = win.querySelector('#nas-forward-error');
+      errEl.textContent = errMessage(err);
+      errEl.hidden = false;
+    }
+  });
   win.addEventListener('action', async (e) => {
     if (e.detail?.action === 'cancel') { win.close(true); return; }
     if (e.detail?.action !== 'confirm') return;
@@ -232,12 +313,12 @@ export function openForwardDialog(screen, forward, onSaved) {
     if (busy) return;
     busy = true;
     try {
+      // The webhook field holds the MASKED address the node sent; sent back
+      // unchanged it keeps the stored one, and the secret never travels.
       const res = await screen.nas('tentaNasAlertForwardSetRequest', {
-        enabled: Boolean(win.querySelector('#nas-forward-enabled').checked),
-        syslogTarget: String(win.querySelector('#nas-forward-syslog').value || '').trim(),
-        webhookUrl: String(win.querySelector('#nas-forward-webhook').value || '').trim(),
-        // What the node holds, untouched — never the disabled switch.
-        includeAccess: Boolean(forward.includeAccess),
+        ...readTarget(win, 'nas-forward'),
+        includeAccess: Boolean(win.querySelector('#nas-forward-include').checked),
+        nodeWide: false,
       });
       toast(T('access.forward_saved'), 'success');
       win.close(true);

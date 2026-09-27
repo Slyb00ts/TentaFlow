@@ -77,6 +77,8 @@ pub mod elastic;
 mod elastic_namespace;
 #[cfg(unix)]
 mod elastic_transfer;
+#[cfg(target_os = "linux")]
+mod folder_usage;
 
 /// Catalog version the wrapper reports with `--version`; core refuses to use
 /// a wrapper built from a different catalog. Bumps with the crate version.
@@ -396,6 +398,11 @@ pub enum HelperCommand {
     /// core start a run only when aged files are actually waiting, instead of
     /// starting privileged runs on a timer to discover there was nothing.
     ElasticCacheAge { array_id: String, owner: elastic::ElasticOwner, rules: elastic::MoverRules },
+    /// How many bytes each named top-level folder of the array holds, summed
+    /// over its data and cache branches (n11 "Użycie"). Read-only and
+    /// bounded: a folder the entry budget or the deadline runs out in is
+    /// reported without a figure, never with the part that was counted.
+    ElasticFolderUsage { array_id: String, owner: elastic::ElasticOwner, folders: Vec<String> },
     ElasticClaims { name: Option<String> },
     /// Every Elastic journal on this node, whatever its owner. Owner-blind on
     /// purpose: a journal whose owner no longer matches the addon asking is
@@ -513,6 +520,14 @@ pub enum HelperCommand {
         pool: String,
         old: String,
         new: String,
+    },
+    /// `zpool detach <pool> <device>`: takes the original disk out of a
+    /// `spare-N` group once the hot spare that replaced it holds the data.
+    /// The core decides WHICH leaf (`NasVdevDisk::detachable`); this entry
+    /// only validates the two names, like `ZpoolOffline`.
+    ZpoolDetach {
+        pool: String,
+        device: String,
     },
     ZpoolOffline {
         pool: String,
@@ -727,6 +742,18 @@ pub enum HelperCommand {
     /// go away with the last audited export and with the uninstall.
     AuditRulesClear {},
 
+    // ----- process sandbox: user namespaces for bwrap -----
+    /// Writes [`BWRAP_APPARMOR_PROFILE`] to [`BWRAP_APPARMOR_PATH`] from stdin.
+    /// A kernel with `apparmor_restrict_unprivileged_userns=1` (Ubuntu 23.10+)
+    /// denies `bwrap` the user namespace the agent sandbox is built on unless a
+    /// profile grants `userns`; this is that profile, the same shape Ubuntu
+    /// ships for flatpak. The payload is checked against the constant before
+    /// anything runs, so the entry can write exactly one document.
+    BwrapProfileWrite {},
+    /// Loads the written profile into the running kernel, so the sandbox works
+    /// without a reboot.
+    BwrapProfileLoad {},
+
     // ----- block targets: iSCSI (LIO) and NVMe-oF (nvmet), §5.5 -----
     /// Builtin: loads the kernel target modules and makes sure configfs is
     /// mounted, so `/sys/kernel/config/{target,nvmet}` exist.
@@ -758,6 +785,24 @@ pub enum HelperCommand {
     /// and backstores back out of configfs. Only the named target — a
     /// hand-made target on the same node is left alone.
     IscsiTargetRemove { iqn: String },
+    /// Builtin: "Rozłącz" for ONE allowlisted initiator of one app-created
+    /// iSCSI target — a session RESET (MAJOR 27, L1 measured on rig11): the
+    /// initiator's ACL and its mapped LUNs are removed, which drops the
+    /// session within ~50 ms, and re-created at once exactly as the apply
+    /// would (`block::plan_session_reset`). The client logs back in by itself
+    /// (measured 2.1 s) and keeps its access; revoking it is the allowlist
+    /// edit, not this.
+    ///
+    /// The `block::IscsiTargetSpec` travels on stdin for the same reason as
+    /// `IscsiTargetApply {}`: re-creating the ACL writes its CHAP secrets, and
+    /// a secret never becomes an argv word. The only argument is the
+    /// initiator IQN — a name the admin reads on the screen. No session id,
+    /// ISID or TSIH crosses the channel: the helper finds the session itself.
+    ///
+    /// Refused before any write, with a stable `refused:<code>` head the core
+    /// maps: `not_app_target`, `not_allowlisted` (no reset on a target
+    /// without an allowlist, owner decision D2), `no_session`.
+    IscsiSessionReset { initiator: String },
     /// Builtin: the same contract for one NVMe-oF subsystem from the
     /// `block::NvmetSubsystemSpec` on stdin (namespaces, ANA groups, the NQN
     /// allowlist, the ports and the DH-HMAC-CHAP keys, which are also secrets
@@ -864,6 +909,19 @@ const ZFS: &[&str] = &["/usr/sbin/zfs", "/usr/bin/zfs", "/sbin/zfs"];
 /// and so a reader of the catalog can see there is no command that drops it.
 pub const PROTECTED_HOLD_TAG: &str = "tentanas:protected";
 const SMBSTATUS: &[&str] = &["/usr/bin/smbstatus", "/usr/sbin/smbstatus", "/sbin/smbstatus"];
+const TEE: &[&str] = &["/usr/bin/tee", "/bin/tee"];
+const APPARMOR_PARSER: &[&str] = &["/usr/sbin/apparmor_parser", "/sbin/apparmor_parser"];
+
+/// Where the bwrap profile lives: the name Ubuntu's own documentation uses for
+/// it, in the directory the AppArmor service loads at boot.
+pub const BWRAP_APPARMOR_PATH: &str = "/etc/apparmor.d/bwrap";
+/// The ABI the profile declares. The `userns` rule exists from AppArmor 4 on,
+/// which is also the first release that restricts unprivileged namespaces — a
+/// host without it has nothing to lift.
+const APPARMOR_ABI_4: &str = "/etc/apparmor.d/abi/4.0";
+/// The whole profile. Unconfined apart from naming the program, so it grants
+/// `bwrap` the namespaces and nothing else; `bwrap` itself is what confines.
+pub const BWRAP_APPARMOR_PROFILE: &str = "abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap /usr/bin/bwrap flags=(unconfined) {\n  userns,\n\n  include if exists <local/bwrap>\n}\n";
 /// The access log is read from the journal, which is where a systemd host's
 /// syslog lands. A host whose syslog is elsewhere has no journalctl, and the
 /// collector reports that instead of quietly reading a second source it cannot
@@ -2102,6 +2160,16 @@ fn encryption_flags(flag: &str, args: &mut Vec<String>) {
     }
 }
 
+/// AppArmor 4 on this host, which both bwrap entries need: its ABI file is what
+/// the profile declares, and without it the kernel is not restricting anything.
+fn apparmor_4() -> Result<(), CatalogError> {
+    if Path::new(APPARMOR_ABI_4).is_file() {
+        Ok(())
+    } else {
+        Err(CatalogError::ToolMissing("AppArmor 4"))
+    }
+}
+
 fn find_tool(tool: &'static str, candidates: &[&str]) -> Result<PathBuf, CatalogError> {
     candidates
         .iter()
@@ -2141,6 +2209,7 @@ impl HelperCommand {
             Self::ElasticDestroy { .. } => Some("elastic_destroy"),
             Self::ElasticInspect { .. } => Some("elastic_inspect"),
             Self::ElasticCacheAge { .. } => Some("elastic_cache_age"),
+            Self::ElasticFolderUsage { .. } => Some("elastic_folder_usage"),
             Self::ElasticClaims { .. } => Some("elastic_claims"),
             Self::ElasticJournals {} => Some("elastic_journals"),
             Self::ElasticAdopt { .. } => Some("elastic_adopt"),
@@ -2167,6 +2236,7 @@ impl HelperCommand {
             Self::BlockModulesLoad { .. } => Some("block_modules_load"),
             Self::IscsiTargetApply {} => Some("iscsi_target_apply"),
             Self::IscsiTargetRemove { .. } => Some("iscsi_target_remove"),
+            Self::IscsiSessionReset { .. } => Some("iscsi_session_reset"),
             Self::NvmetSubsystemApply {} => Some("nvmet_subsystem_apply"),
             Self::NvmetSubsystemRemove { .. } => Some("nvmet_subsystem_remove"),
             Self::NvmetSessionsRead {} => Some("nvmet_sessions_read"),
@@ -2271,6 +2341,11 @@ impl HelperCommand {
                 rules.validate()?;
                 owner.validate()
             }
+            Self::ElasticFolderUsage { array_id, owner, folders } => {
+                elastic::validate_elastic_uuid(array_id)?;
+                elastic::validate_usage_folders(folders)?;
+                owner.validate()
+            }
             Self::ElasticClaims { name } => match name {
                 Some(name) => elastic::validate_array_name(name),
                 None => Ok(()),
@@ -2344,6 +2419,9 @@ impl HelperCommand {
                 other => Err(invalid(format!("'{other}' is not a block protocol"))),
             },
             Self::IscsiTargetRemove { iqn } => block::validate_iqn(iqn),
+            // The initiator becomes a configfs directory name inside the
+            // target's `acls/`, so it dies here if it could aim anywhere else.
+            Self::IscsiSessionReset { initiator } => block::validate_iqn(initiator),
             Self::NvmetSubsystemRemove { nqn } => block::validate_nqn(nqn),
             // No arguments at all, so there is nothing a caller could aim
             // somewhere else: the path it reads is a constant of this crate.
@@ -2621,6 +2699,15 @@ impl HelperCommand {
                     env: env_c,
                 })
             }
+            Self::ZpoolDetach { pool, device } => {
+                validate_pool_name(pool)?;
+                validate_vdev_name(device)?;
+                Ok(Resolved {
+                    program: find_tool("zpool", ZPOOL)?,
+                    args: vec!["detach".into(), pool.clone(), device.clone()],
+                    env: env_c,
+                })
+            }
             Self::ZpoolOffline { pool, device } | Self::ZpoolOnline { pool, device } => {
                 validate_pool_name(pool)?;
                 validate_vdev_name(device)?;
@@ -2891,7 +2978,35 @@ impl HelperCommand {
                     env: env_c,
                 })
             }
+            Self::BwrapProfileWrite {} => {
+                apparmor_4()?;
+                Ok(Resolved {
+                    program: find_tool("tee", TEE)?,
+                    args: vec![BWRAP_APPARMOR_PATH.into()],
+                    env: env_c,
+                })
+            }
+            Self::BwrapProfileLoad {} => {
+                apparmor_4()?;
+                Ok(Resolved {
+                    program: find_tool("apparmor_parser", APPARMOR_PARSER)?,
+                    args: vec!["-r".into(), BWRAP_APPARMOR_PATH.into()],
+                    env: env_c,
+                })
+            }
             other => Err(invalid(format!("{other:?} has no exec form"))),
+        }
+    }
+
+    /// Checks what a stdin-reading entry is about to be given, where the
+    /// catalog can say what it has to be. Only the bwrap profile has one
+    /// possible document; the others validate their payload in their builtin.
+    pub fn validate_payload(&self, payload: &[u8]) -> Result<(), CatalogError> {
+        match self {
+            Self::BwrapProfileWrite {} if payload != BWRAP_APPARMOR_PROFILE.as_bytes() => Err(
+                invalid("the bwrap profile write takes only the catalog's own profile".to_string()),
+            ),
+            _ => Ok(()),
         }
     }
 
@@ -2914,7 +3029,9 @@ impl HelperCommand {
             // The target specs carry CHAP / DH-HMAC-CHAP secrets, so they take
             // the same road every other secret does: stdin, never argv.
             | Self::IscsiTargetApply {}
-            | Self::NvmetSubsystemApply {} => true,
+            | Self::IscsiSessionReset { .. }
+            | Self::NvmetSubsystemApply {}
+            | Self::BwrapProfileWrite {} => true,
             _ => false,
         }
     }
@@ -2960,6 +3077,7 @@ impl HelperCommand {
             Self::ElasticDestroy { .. } => ("builtin", "Zatrzymuje udostępnianie własnej macierzy Elastic bez formatowania dysków."),
             Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
             Self::ElasticCacheAge { .. } => ("builtin", "Odczytuje, ile plików na cache własnej macierzy Elastic czeka na przeniesienie, bez przenoszenia."),
+            Self::ElasticFolderUsage { .. } => ("builtin", "Odczytuje, ile miejsca zajmują foldery własnej macierzy Elastic, z limitem wpisów i czasu, bez zmian."),
             Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
             Self::ElasticJournals {} => ("builtin", "Wypisuje dzienniki macierzy Elastic obecne na tym nodzie."),
             Self::ElasticAdopt { .. } => ("builtin", "Przepisuje właściciela dziennika macierzy Elastic na przejmującą instancję."),
@@ -2989,6 +3107,7 @@ impl HelperCommand {
             }
             Self::ZpoolRemove { .. } => ("zpool", "Remove a cache, log or spare device from a pool."),
             Self::ZpoolReplace { .. } => ("zpool", "Replace a pool device with a free disk and resilver."),
+            Self::ZpoolDetach { .. } => ("zpool", "Detach the original disk a hot spare replaced."),
             Self::ZpoolOffline { .. } => ("zpool", "Take one pool device offline."),
             Self::ZpoolOnline { .. } => ("zpool", "Bring one pool device back online."),
             Self::ZpoolClear { .. } => ("zpool", "Clear the error counters of a device or a whole pool."),
@@ -3086,6 +3205,11 @@ impl HelperCommand {
                 "Install auditd watches on the audited NFS export paths.",
             ),
             Self::AuditRulesClear {} => ("builtin", "Remove the app-owned auditd watches."),
+            Self::BwrapProfileWrite {} => (
+                "tee",
+                "Write the AppArmor profile that lets bwrap create the agent sandbox's user namespace.",
+            ),
+            Self::BwrapProfileLoad {} => ("apparmor_parser", "Load the bwrap AppArmor profile into the kernel."),
             Self::BlockModulesLoad { .. } => (
                 "builtin",
                 "Load the kernel target modules (LIO / nvmet) and mount configfs — nothing else on the node does it.",
@@ -3093,6 +3217,10 @@ impl HelperCommand {
             Self::IscsiTargetApply {} => (
                 "builtin",
                 "Serve one iSCSI target from configfs: backstores, LUNs, ALUA groups, the IQN allowlist, portals and CHAP.",
+            ),
+            Self::IscsiSessionReset { .. } => (
+                "builtin",
+                "Reset one allowlisted initiator's iSCSI session: drop its ACL and re-create it at once (the client reconnects and keeps its access).",
             ),
             Self::IscsiTargetRemove { .. } => (
                 "builtin",
@@ -3156,6 +3284,7 @@ fn catalog_examples() -> Vec<HelperCommand> {
         HelperCommand::ElasticDestroy { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, operation_id: s() },
         HelperCommand::ElasticInspect { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
         HelperCommand::ElasticCacheAge { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, rules: elastic::MoverRules::default() },
+        HelperCommand::ElasticFolderUsage { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() }, folders: vec![s()] },
         HelperCommand::ElasticClaims { name: Some(s()) },
         HelperCommand::ElasticJournals {},
         HelperCommand::ElasticAdopt { array_id: s(), owner: elastic::ElasticOwner { org_id: s(), addon_id: s() } },
@@ -3221,6 +3350,10 @@ fn catalog_examples() -> Vec<HelperCommand> {
             pool: s(),
             old: s(),
             new: s(),
+        },
+        HelperCommand::ZpoolDetach {
+            pool: s(),
+            device: s(),
         },
         HelperCommand::ZpoolOffline {
             pool: s(),
@@ -3321,12 +3454,17 @@ fn catalog_examples() -> Vec<HelperCommand> {
         },
         HelperCommand::AuditRulesWrite {},
         HelperCommand::AuditRulesClear {},
+        HelperCommand::BwrapProfileWrite {},
+        HelperCommand::BwrapProfileLoad {},
         HelperCommand::BlockModulesLoad {
             protocol: String::from("iscsi"),
         },
         HelperCommand::IscsiTargetApply {},
         HelperCommand::IscsiTargetRemove {
             iqn: String::from("iqn.x"),
+        },
+        HelperCommand::IscsiSessionReset {
+            initiator: String::from("iqn.x"),
         },
         HelperCommand::NvmetSubsystemApply {},
         HelperCommand::NvmetSubsystemRemove {
@@ -3358,6 +3496,28 @@ pub fn catalog() -> Vec<CatalogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bwrap entries write exactly one document to exactly one path and
+    /// load it; any other payload is refused before a process starts.
+    #[test]
+    fn bwrap_profile_entries_take_only_the_catalog_profile() {
+        let write = HelperCommand::BwrapProfileWrite {};
+        assert!(write.reads_key_from_stdin());
+        assert!(!HelperCommand::BwrapProfileLoad {}.reads_key_from_stdin());
+        assert_eq!(write.validate_payload(BWRAP_APPARMOR_PROFILE.as_bytes()), Ok(()));
+        assert!(write.validate_payload(b"profile bwrap /usr/bin/bwrap {}\n").is_err());
+        assert!(write.validate_payload(b"").is_err());
+        assert!(BWRAP_APPARMOR_PROFILE.contains("userns,"));
+        assert!(BWRAP_APPARMOR_PROFILE.contains("profile bwrap /usr/bin/bwrap"));
+
+        // The resolved argv, where this host has the tools to resolve it.
+        if let Ok(Plan::Exec(resolved)) = write.plan() {
+            assert_eq!(resolved.args, vec![BWRAP_APPARMOR_PATH.to_string()]);
+        }
+        if let Ok(Plan::Exec(resolved)) = (HelperCommand::BwrapProfileLoad {}).plan() {
+            assert_eq!(resolved.args, vec!["-r".to_string(), BWRAP_APPARMOR_PATH.to_string()]);
+        }
+    }
 
     #[test]
     fn whole_disk_names_only() {
@@ -3567,6 +3727,34 @@ mod tests {
             Err(e) => assert_eq!(e, CatalogError::ToolMissing("zpool")),
         }
         assert!(!cmd.reads_key_from_stdin());
+    }
+
+    /// Owner decision (wave 7): `zpool detach` of the disk a hot spare
+    /// replaced. Both names are validated like `zpool offline`'s — no option,
+    /// no path outside /dev, no pool keyword — before the tool is looked up.
+    #[test]
+    fn zpool_detach_validates_the_pool_and_the_leaf() {
+        let detach = |pool: &str, device: &str| HelperCommand::ZpoolDetach { pool: pool.into(), device: device.into() };
+        match detach("tank", "sdb").resolve_exec() {
+            Ok(r) => assert_eq!(r.args, vec!["detach", "tank", "sdb"]),
+            Err(e) => assert_eq!(e, CatalogError::ToolMissing("zpool")),
+        }
+        for (pool, device) in [
+            ("tank", "-f"),
+            ("tank", "sdb;rm"),
+            ("tank", "../etc/passwd"),
+            ("tank", ""),
+            ("-f", "sdb"),
+            ("mirror", "sdb"),
+            ("tank/x", "sdb"),
+        ] {
+            assert!(
+                matches!(detach(pool, device).resolve_exec(), Err(CatalogError::InvalidArgument(_))),
+                "{pool} {device}"
+            );
+        }
+        assert!(!detach("tank", "sdb").guards_storage(), "a detach adds no device to a pool");
+        assert!(detach("tank", "sdb").builtin_label().is_none());
     }
 
     #[test]
@@ -4398,6 +4586,28 @@ mod tests {
         };
         assert_eq!(remove.plan(), Ok(Plan::Builtin("iscsi_target_remove")));
         assert!(!remove.reads_key_from_stdin());
+        // The per-session reset re-creates an ACL with its CHAP secrets, so it
+        // takes the spec on stdin too; its one argument is the initiator IQN,
+        // which becomes a directory name and is validated like one.
+        let reset = HelperCommand::IscsiSessionReset {
+            initiator: "iqn.1994-05.com.redhat:vmhost-01".into(),
+        };
+        assert_eq!(reset.plan(), Ok(Plan::Builtin("iscsi_session_reset")));
+        assert!(reset.reads_key_from_stdin());
+        for bad in ["../../etc", "iqn.x/../../y", "", "IQN.UPPER"] {
+            assert!(
+                matches!(
+                    HelperCommand::IscsiSessionReset { initiator: bad.into() }.plan(),
+                    Err(CatalogError::InvalidArgument(_))
+                ),
+                "{bad}"
+            );
+        }
+        let line = reset.to_json_line();
+        assert_eq!(
+            line,
+            "{\"cmd\":\"iscsi_session_reset\",\"initiator\":\"iqn.1994-05.com.redhat:vmhost-01\"}\n"
+        );
         // The name becomes a configfs directory, so a bad one dies in the
         // catalog rather than in a root-side `mkdir`.
         assert!(matches!(

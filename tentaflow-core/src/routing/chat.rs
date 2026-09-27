@@ -467,18 +467,7 @@ impl Router {
                     .first()
                     .and_then(|c| c.message.reasoning_content.clone());
 
-                let metrics = response.usage.map(|usage| ModelMetrics {
-                    model_name: response.model.clone(),
-                    latency_ms: 0,
-                    time_to_first_token_ms: None,
-                    tokens_processed: Some(usage.total_tokens as usize),
-                    throughput_tokens_per_sec: None,
-                    detailed: Some(DetailedMetrics::Completion {
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        total_tokens: usage.total_tokens,
-                    }),
-                });
+                let metrics = completion_metrics(&response.model, response.usage.as_ref());
 
                 Ok(ModelResponse {
                     request_id,
@@ -899,4 +888,25 @@ mod mesh_reverse_flow_discriminator_tests {
         let snap = snapshot_with(vec![]);
         assert!(!model_resolves_to_flow(&snap, "ghost"));
     }
+}
+
+/// What one answered chat cost, in the shape a mesh response carries it. The
+/// asking node records usage from this alone, so a responder that leaves it out
+/// makes every forwarded call count zero tokens.
+pub(crate) fn completion_metrics(
+    model: &str,
+    usage: Option<&crate::api::openai::types::Usage>,
+) -> Option<tentaflow_protocol::ModelMetrics> {
+    usage.map(|usage| tentaflow_protocol::ModelMetrics {
+        model_name: model.to_string(),
+        latency_ms: 0,
+        time_to_first_token_ms: None,
+        tokens_processed: Some(usage.total_tokens as usize),
+        throughput_tokens_per_sec: None,
+        detailed: Some(tentaflow_protocol::DetailedMetrics::Completion {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+        }),
+    })
 }

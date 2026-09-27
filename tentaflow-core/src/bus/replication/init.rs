@@ -442,12 +442,14 @@ fn spawn_lease_check_loop(manager: Arc<ReplicationManager>, interval: Duration) 
             tokio::select! {
                 _ = shutdown.cancelled() => return,
                 _ = ticker.tick() => {
-                    // Two halves of the same question — "is the role this
-                    // node holds still valid?" — on one tick: a follower
-                    // whose leader stopped refreshing the lease elects,
-                    // and a leader a peer has proved stale steps down.
+                    // One question — "is the role this node holds still
+                    // valid?" — on one tick: a follower whose leader stopped
+                    // refreshing the lease elects, a leader a peer has
+                    // proved stale steps down, and so does a leader that no
+                    // quorum has acknowledged for a whole lease.
                     manager.check_leases().await;
                     manager.check_stale_leadership().await;
+                    manager.check_quorum_leases().await;
                 }
             }
         }
@@ -596,6 +598,7 @@ mod tests {
             _org: &str,
             _topic: &str,
             _partition: u32,
+            _topic_generation: u64,
         ) -> Result<Partition, ReplError> {
             unimplemented!("fixture: init must bail before this is ever called")
         }

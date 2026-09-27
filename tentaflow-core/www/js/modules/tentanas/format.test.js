@@ -1,79 +1,17 @@
 // =============================================================================
 // File: modules/tentanas/format.test.js
-// Description: The per-disk batch helper shared by "SMART all disks"
-// (tasks.js) and "SMART selected" (tentanas.js): `runDiskBatch` keeps going
-// past a disk-specific refusal but stops the whole batch at once on a
-// privilege/credential error (`ProtocolErrorCode::NotAvailable`, the code
-// `broker_error` in dispatch/tentanas.rs gives a rejected sudo password, an
-// unarmed channel or a helper/core version mismatch), plus `refusedBatchNames`
-// naming the disks a batch refused; and `replacementAdviceText`, the
-// replacement advice rebuilt in the reader's language.
+// Description: `jobAuthor`; the disk, pool, alert and refusal codes worded
+// in every locale; and `replacementAdviceText`, the replacement advice
+// rebuilt in the reader's language. (The per-disk SMART batch helper that
+// lived here is gone: a multi-disk SMART test is ONE request and one job on
+// the node since wave 9b, which stops at the first privilege error itself.)
 // =============================================================================
 
 import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-const { isBatchHaltError, runDiskBatch, refusedBatchNames, jobAuthor } = await import('./format.js');
-
-const disk = (diskId) => ({ diskId, name: diskId });
-
-// A rejected/expired sudo password and an unarmed channel are both
-// `BrokerError::Unarmed`; a helper/core version mismatch is
-// `BrokerError::HelperVersion`. `broker_error` maps every one of them to
-// `ProtocolErrorCode::NotAvailable`, and `api-binary-shim.js` copies that
-// code onto the thrown Error as `.code` — this is the one marker the front
-// classifies on, never the (partly Polish) message text.
-const credentialError = (message = 'sudo rejected the password') => Object.assign(new Error(message), { code: 'NotAvailable' });
-// A per-disk refusal the node reports with no such code (e.g. the disk
-// vanished from the live inventory: `ProtocolErrorCode::NotFound`), or a
-// bare Error the way the disk-busy fixtures in tasks.test.js / tentanas.test.js
-// use it.
-const perDiskError = (message = 'dysk zajęty') => new Error(message);
-
-test('isBatchHaltError is true only for the NotAvailable code, never guessed from text', () => {
-  assert.equal(isBatchHaltError(credentialError()), true);
-  assert.equal(isBatchHaltError(perDiskError('unarmed privilege channel')), false, 'text alone is never enough');
-  assert.equal(isBatchHaltError(perDiskError()), false);
-  assert.equal(isBatchHaltError(Object.assign(new Error('disk not found'), { code: 'NotFound' })), false);
-  assert.equal(isBatchHaltError(null), false);
-  assert.equal(isBatchHaltError(undefined), false);
-});
-
-test('runDiskBatch tries every disk when refusals are per-disk', async () => {
-  const attempted = [];
-  const { started, refused } = await runDiskBatch([disk('sda'), disk('sdb'), disk('sdc')], async (d) => {
-    attempted.push(d.diskId);
-    if (d.diskId === 'sdb') throw perDiskError('dysk zajęty');
-  });
-  assert.deepEqual(attempted, ['sda', 'sdb', 'sdc'], 'sdc is still tried after sdb refuses');
-  assert.deepEqual(started.map((d) => d.diskId), ['sda', 'sdc']);
-  assert.equal(refused.length, 1);
-  assert.equal(refused[0].disk.diskId, 'sdb');
-  assert.equal(refused[0].error.message, 'dysk zajęty');
-});
-
-test('runDiskBatch stops at the first privilege/credential error and sends no further request', async () => {
-  const attempted = [];
-  const halt = credentialError('sudo rejected the password');
-  await assert.rejects(
-    runDiskBatch([disk('sda'), disk('sdb'), disk('sdc')], async (d) => {
-      attempted.push(d.diskId);
-      if (d.diskId === 'sda') throw halt;
-    }),
-    (e) => e === halt,
-  );
-  assert.deepEqual(attempted, ['sda'], 'exactly one request — sdb and sdc are never tried');
-});
-
-test('refusedBatchNames names the disks, never a disk id', () => {
-  const text = refusedBatchNames([
-    { disk: { diskId: 'wwn-0x5000c500a1b2c3d4', name: 'sdb' }, error: perDiskError('dysk zajęty') },
-    { disk: { diskId: 'wwn-0x5000c500a1b2c3d5', name: 'sdc' }, error: perDiskError('test już trwa') },
-  ]);
-  assert.equal(text, 'sdb: dysk zajęty · sdc: test już trwa');
-  assert.doesNotMatch(text, /wwn-/, 'no disk id leaks into the toast');
-});
+const { jobAuthor } = await import('./format.js');
 
 // `startedBy` is always a user id or a system token, never a name that could
 // collide with a disk-id prefix, so `jobAuthor` uses the opaque rule alone
@@ -295,7 +233,7 @@ const { alertText, ALERT_CODES } = await import('./format.js');
 // this test instead of showing the generic "Alert węzła" on screen.
 function raisedAlertCodes() {
   const codes = new Set();
-  for (const file of ['disks.rs', 'elastic.rs', 'scheduler.rs', 'approvals.rs', 'targets.rs']) {
+  for (const file of ['disks.rs', 'elastic.rs', 'scheduler.rs', 'approvals.rs', 'targets.rs', 'sharing.rs']) {
     const source = readFileSync(join(WWW_ROOT, '..', 'src', 'tentanas', file), 'utf8').split('mod tests {')[0];
     for (const m of source.matchAll(/AlertText::new\(\s*"(\w+)"/g)) codes.add(m[1]);
   }
@@ -313,7 +251,8 @@ function documentedAlertCodes() {
 const ALERT_PARAMS = {
   health: 'warning', name: 'sdq', name_source: 'live', operation: 'pool_destroy', subject: 'tank', array: 'media',
   runs: '4', oldest_secs: '32400', limit_secs: '28800', cause: 'files_busy', count: '2', alerted: '1',
-  sweep_failed: 'true', error: 'EIO', target: 'vm-a',
+  sweep_failed: 'true', error: 'EIO', target: 'vm-a', pool: 'tank', disks: '3', minutes: '10', attempts: '2', share: 'projekty',
+  phase: 'stopping',
 };
 const A = (code, params = ALERT_PARAMS, extra = {}) => ({
   alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'x', title: 'English title', detail: 'English detail', code, params, reasons: [], ...extra,
@@ -341,6 +280,15 @@ test('every alert code the node raises or documents has words in every locale', 
   } finally {
     await I18n.setLanguage('pl');
   }
+});
+
+test('an interrupted sharing job is worded by the step the restart cut off', () => {
+  const stopping = alertText(A('sharing_stop_interrupted', { phase: 'stopping' }));
+  const resuming = alertText(A('sharing_stop_interrupted', { phase: 'resuming' }));
+  assert.equal(stopping.title, 'Udostępnianie na tym węźle pozostaje zatrzymane po restarcie');
+  assert.match(stopping.detail, /przerwał zatrzymywanie udostępniania.*w trybie B dopiero po uzbrojeniu kanału uprawnień/);
+  assert.match(resuming.detail, /przerwał przywracanie udostępniania/);
+  assert.equal(alertText(A('sharing_stop_interrupted', { phase: 'other' })).known, false, 'an unknown step falls back to the node text');
 });
 
 test('a disk health alert is worded from its grade, its name and its reason codes', () => {
@@ -527,22 +475,60 @@ test('the Elastic and approval alerts word their parameters, never the node text
 
 // ----- Refusals the node sends as codes ------------------------------------
 
-const { errMessage } = await import('./format.js');
+const { errMessage, errDetail, parseRefusal, wordIdTokens, T } = await import('./format.js');
+const { scrubIds } = await import('./machine-id.js');
+
+// Every code the node refuses with: the `"refusal:<code>"` literals, and the
+// coded refusals with parameters (`Refusal::<kind>("<code>", …)`, wave 13).
+function nodeRefusalCodes() {
+  const codes = new Set();
+  for (const file of ['tentanas/db.rs', 'tentanas/approvals.rs', 'tentanas/jobs.rs', 'tentanas/elastic.rs', 'dispatch/tentanas.rs']) {
+    const source = readFileSync(join(WWW_ROOT, '..', 'src', file), 'utf8');
+    for (const m of source.matchAll(/"refusal:([a-z0-9_]+)"/g)) codes.add(m[1]);
+    for (const m of source.matchAll(/Refusal::(?:not_available|bad_request|not_found|conflict)\(\s*"([a-z0-9_]+)"/g)) codes.add(m[1]);
+    for (const m of source.matchAll(/\brefuse\(\s*"(elastic_[a-z0-9_]+)"/g)) codes.add(m[1]);
+  }
+  return codes;
+}
+
+// A value for every placeholder the Polish words of a code need — the way
+// the node sends them: a disk as its kernel name, the rest as plain values.
+function sampleParams(code) {
+  const words = JSON.parse(readFileSync(join(WWW_ROOT, 'i18n', 'pl.json'), 'utf8')).tentanas.refusal[code] || '';
+  const params = {};
+  for (const [, name] of words.matchAll(/\{([a-z0-9_]+)(?:\|[^}]*)?\}/g)) params[name] = '3';
+  if ('disk' in params) params.disk = 'sdq';
+  if ('owner' in params) Object.assign(params, { owner: 'pool', owner_name: 'tank' });
+  return params;
+}
+
+const wireOf = (code, params, text = 'The node\'s own sentence') => `refusal:${code}${Object.keys(params).length ? '?' : ''}${
+  Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&')} ${text}`;
 
 test('every refusal code the node sends is worded in every locale, an unknown one is shown as sent', async () => {
-  const codes = new Set();
-  for (const file of ['db.rs', 'approvals.rs']) {
-    const source = readFileSync(join(WWW_ROOT, '..', 'src', 'tentanas', file), 'utf8');
-    for (const m of source.matchAll(/"refusal:([a-z0-9_]+)"/g)) codes.add(m[1]);
-  }
+  const codes = nodeRefusalCodes();
+  assert.ok(codes.has('elastic_one_cache_disk') && codes.has('pool_detach_not_allowed'), 'the dispatcher\'s own refusals are scanned too');
   assert.ok(codes.has('share_user_in_use_elsewhere') && codes.has('approval_own_request'), `the scan found the codes (${[...codes].join(', ')})`);
-  assert.ok(codes.size >= 8, [...codes].join(', '));
+  for (const coded of ['elastic_disk_member', 'elastic_import_incomplete', 'elastic_array_not_found', 'confirm_mismatch', 'elastic_repair_disk_absent']) {
+    assert.ok(codes.has(coded), `the coded refusals with parameters are scanned too: ${coded}`);
+  }
+  assert.ok(codes.size >= 60, [...codes].join(', '));
   try {
     for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
       await I18n.setLanguage(lang);
       for (const code of codes) {
-        const text = errMessage(new Error(`refusal:${code}`));
-        assert.doesNotMatch(text, /refusal:|tentanas\./, `${code} is worded in ${lang}: ${text}`);
+        const params = sampleParams(code);
+        // With its parameters and the node's sentence, as wave 13 sends it,
+        // and through the websocket client's wrapping.
+        const error = new Error(`protocol error Conflict: ${wireOf(code, params)}`);
+        const text = errMessage(error);
+        assert.doesNotMatch(text, /refusal:|tentanas\.|\{|own sentence/, `${code} is worded in ${lang}: ${text}`);
+        for (const [name, value] of Object.entries(params)) {
+          if (name !== 'owner' && name !== 'owner_name') assert.ok(text.includes(value), `${code} in ${lang} carries {${name}}: ${text}`);
+        }
+        assert.equal(errDetail(error), 'The node\'s own sentence', `${code}: the sentence is the detail`);
+        // A code that needs no parameter is also worded in the old form.
+        if (!Object.keys(params).length) assert.equal(errMessage(new Error(`refusal:${code}`)), text, code);
       }
     }
   } finally {
@@ -552,12 +538,107 @@ test('every refusal code the node sends is worded in every locale, an unknown on
   // A code this build does not know, and a plain message, pass through as sent.
   assert.equal(errMessage(new Error('refusal:quota_exceeded')), 'refusal:quota_exceeded');
   assert.equal(errMessage(new Error('Macierz nie istnieje w tej instancji')), 'Macierz nie istnieje w tej instancji');
+  // A lost node is worded whatever the forwarder wrote, and no 64-hex id is
+  // ever passed through (critic wave 7, BLOCKER 1).
+  const id = 'b'.repeat(64);
+  assert.equal(errMessage(new Error(`protocol error NodeUnreachable: node '${id}' did not answer: timeout`)), 'Węzeł nie odpowiada — utracono połączenie przez mesh');
+  assert.equal(errMessage(Object.assign(new Error(`node '${id}' did not answer`), { code: 'NodeUnreachable' })), 'Węzeł nie odpowiada — utracono połączenie przez mesh');
+  const other = errMessage(new Error(`protocol error Internal: peer '${id}' closed the stream`));
+  assert.ok(!other.includes(id), other);
+  assert.match(other, /closed the stream/);
+  // Where the word-by-word scrubber sees no id (glued to other text), the hex
+  // backstop still takes it out.
+  for (const glued of [`peer_${id} gone`, `${id}—gone`]) {
+    assert.ok(!errMessage(new Error(glued)).includes(id), glued);
+  }
+  assert.equal(errMessage(new Error(`peer '${id}' closed`), (x) => (x === id ? 'atlas' : '')), "peer 'atlas' closed", 'a known node reads as its name');
   assert.equal(errMessage('mesh timeout'), 'mesh timeout');
   // A refusal code inside a longer message is not a refusal code — but the
   // client's own `protocol error <Code>: ` wrapping is not "a longer message"
   // (the real wrapped error is produced by the client itself in
   // refusal-wire.test.js).
   assert.equal(errMessage(new Error('failed: refusal:approval_expired')), 'failed: refusal:approval_expired');
+});
+
+// Wave 13: a coded refusal carries PARAMETERS and the node's own sentence
+// (`tentanas/refusal.rs`). The words come from the code; the sentence is a
+// detail only, ids scrubbed; a disk is ONE phrase whatever names it.
+test('a coded refusal is worded with its parameters, the node sentence only as the detail', async () => {
+  const wire = 'refusal:elastic_disk_in_array?data=2&array=media Data disk no. 2 is already in the array media';
+  assert.deepEqual(parseRefusal(new Error(wire)), {
+    code: 'elastic_disk_in_array', params: { data: '2', array: 'media' }, text: 'Data disk no. 2 is already in the array media',
+  });
+  assert.equal(errMessage(new Error(wire)), 'Dysk danych nr 2 jest już w macierzy media');
+  assert.equal(errDetail(new Error(wire)), 'Data disk no. 2 is already in the array media');
+  // Each way the node names a disk, as one phrase after the words' own noun.
+  const disk = (query) => errMessage(new Error(`refusal:elastic_disk_member?${query} x`));
+  assert.equal(disk('disk=sdq'), 'Dysk sdq należy już do macierzy Elastic na tym węźle');
+  assert.equal(disk('parity=1'), 'Dysk parity nr 1 należy już do macierzy Elastic na tym węźle');
+  assert.equal(disk('cache=1'), 'Dysk cache należy już do macierzy Elastic na tym węźle');
+  assert.equal(disk('model=WD%20Red%20Plus'), 'Dysk WD Red Plus należy już do macierzy Elastic na tym węźle');
+  // Percent-encoded values come back whole; an owner is worded from its kind.
+  assert.equal(errMessage(new Error('refusal:elastic_destroy_shared?array=media&shares=kadry%2C%20foto%20%26%20wideo x')),
+    'Macierz media udostępnia udziały: kadry, foto & wideo. Usuń je przed rozwiązaniem macierzy');
+  assert.equal(errMessage(new Error('refusal:elastic_disk_in_use?disk=sdq&owner=pool&owner_name=tank x')),
+    'Dysk sdq należy do puli ZFS tank — do macierzy można dodać tylko wolny dysk');
+  assert.equal(errMessage(new Error('refusal:elastic_import_incomplete?matched=2&total=3&missing=1 x')),
+    'Macierz jest niekompletna: 2 z 3 dysków potwierdziło UUID z dziennika (brakuje: 1; użyte ponownie: —)');
+  try {
+    await I18n.setLanguage('de');
+    assert.equal(errMessage(new Error(wire)), 'Datenträger Nr. 2 (Daten) ist bereits im Array media');
+    assert.equal(errMessage(new Error('refusal:elastic_disk_larger_than_parity?disk=sdq x')),
+      'Datenträger sdq ist größer als die Parität des Arrays — die Parität würde ihn nicht vollständig abdecken');
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+});
+
+test('a coded refusal the words cannot fill falls back to the node sentence, ids scrubbed, never to a raw key', () => {
+  const id = 'wwn-0x5000c500a1b2c3d4';
+  // No disk parameter: the words need one, so the sentence is the text —
+  // with the id it should never have carried hidden.
+  const unnamed = errMessage(new Error(`refusal:elastic_disk_member Disk ${id} is taken`));
+  assert.ok(!unnamed.includes(id) && unnamed.startsWith('Disk '), unnamed);
+  // A parameter value is scrubbed too, before it reaches the words.
+  const leaked = errMessage(new Error(`refusal:elastic_disk_member?disk=${encodeURIComponent(id)} x`));
+  assert.ok(!leaked.includes(id), leaked);
+  // A value that does not decode is not read; the sentence stands in.
+  assert.equal(errMessage(new Error('refusal:elastic_array_not_found?array=%E0%A4 The array x does not exist')), 'The array x does not exist');
+  assert.equal(errDetail(new Error('refusal:elastic_array_not_found?array=%E0%A4 The array x does not exist')), '', 'the sentence is not said twice');
+  // An unknown code with a sentence reads the sentence; with none, as sent.
+  assert.equal(errMessage(new Error('refusal:quota_exceeded?n=3 Over the quota')), 'Over the quota');
+  assert.equal(errMessage(new Error('refusal:quota_exceeded?n=3')), 'refusal:quota_exceeded?n=3');
+  assert.equal(errDetail(new Error('plain failure')), '');
+  // No words and no sentence: the message as sent — ids still scrubbed
+  // (critic wave 13, MINOR 3).
+  const bare = errMessage(new Error(`refusal:quota_exceeded?disk=${encodeURIComponent(id)}`));
+  assert.ok(!bare.includes('5000c500a1b2c3d4'), bare);
+});
+
+// A screen from before wave 13: a PINNED COPY of its `errMessage` (HEAD
+// before wave 13, format.js), fed the new wire through the client's
+// wrapping. It knows only `^refusal:<code>$`, so it shows the whole message
+// through its scrubber — the code, the parameters and the node's sentence,
+// which still reads.
+function preWave13ErrMessage(e) {
+  const REFUSAL_OLD = /^refusal:([a-z0-9_]+)$/;
+  const PREFIX = /^protocol error ([A-Za-z]+):\s*/;
+  const message = (e && e.message) ? e.message : String(e);
+  const code = REFUSAL_OLD.exec(message.trim().replace(PREFIX, ''))?.[1];
+  if (!code) {
+    const hidden = T('alerts.id_hidden');
+    return scrubIds(wordIdTokens(message), hidden).replace(/[0-9a-f]{32,}/gi, hidden);
+  }
+  const words = T('refusal.' + code);
+  return words === 'tentanas.refusal.' + code ? message : words;
+}
+
+test('a screen from before wave 13 still shows the node sentence of a coded refusal', () => {
+  const wire = 'refusal:elastic_disk_in_array?data=2&array=media Data disk no. 2 is already in the array media';
+  const shown = preWave13ErrMessage(new Error(`protocol error BadRequest: ${wire}`));
+  assert.match(shown, /Data disk no\. 2 is already in the array media$/);
+  // And a parameter-less code it knew still reads as its words.
+  assert.equal(preWave13ErrMessage(new Error('refusal:elastic_add_joined')), errMessage(new Error('refusal:elastic_add_joined')));
 });
 
 test('errCode reads the wire enum from the client wrapping or from .code', () => {
@@ -593,6 +674,46 @@ test('the held Sync alert words its cause in every locale', async () => {
       assert.equal(legacy.detail, errors.detail, lang);
       assert.doesNotMatch(fault.detail, /tentanas\.|\{/, lang);
     }
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+});
+
+test('jobLogLines hides every id a log line carries and keeps names and sizes', async () => {
+  const { jobLogLines } = await import('./format.js');
+  assert.deepEqual(jobLogLines([
+    'rm /var/lib/tentanas/0191f2c0-7a3b-7c11-9d2e-1234567890ab.json',
+    'wrote 4000787030016 bytes to /dev/sdd1',
+    'share dev-backups: created',
+  ]), [
+    'rm /var/lib/tentanas/[identyfikator].json',
+    'wrote 4000787030016 bytes to /dev/sdd1',
+    'share dev-backups: created',
+  ]);
+  assert.deepEqual(jobLogLines(null), []);
+  // Critic wave 9a, MINOR 1/2/4: names people chose and plain numbers stay;
+  // the node's neutral token and the older literals read in the reader's
+  // language.
+  assert.deepEqual(jobLogLines([
+    'zpool create ata-archive mirror sdb sdc',
+    'share scsi-luns created; pool eui.lab; tank 1234567890123456 used',
+    'uuid ⟦id⟧, old [identifier], older [identyfikator]',
+    'vdev ata-WDC_WD40EFRX-68N32N0_WD-WCC7K1234567 FAULTED, lun naa.60014054d1a2b3c4d5e6f7a8',
+    '$ zpool replace tank 11427865429582413522 sdb; $ zpool offline tank 98765432109876543',
+    '   id: 12156453278383891134; size 9007199254740992',
+    'dataset tank/usb-backup_2024 and tank/ata-data_2025; disk sn-WD-WCC7K7654321; share sn-backups',
+  ]), [
+    'zpool create ata-archive mirror sdb sdc',
+    'share scsi-luns created; pool eui.lab; tank 1234567890123456 used',
+    'uuid [identyfikator], old [identyfikator], older [identyfikator]',
+    'vdev [identyfikator] FAULTED, lun [identyfikator]',
+    '$ zpool replace tank [identyfikator] sdb; $ zpool offline tank [identyfikator]',
+    '   id: [identyfikator]; size 9007199254740992',
+    'dataset tank/usb-backup_2024 and tank/ata-data_2025; disk [identyfikator]; share sn-backups',
+  ]);
+  await I18n.setLanguage('en');
+  try {
+    assert.deepEqual(jobLogLines(['uuid ⟦id⟧']), ['uuid [identifier]']);
   } finally {
     await I18n.setLanguage('pl');
   }

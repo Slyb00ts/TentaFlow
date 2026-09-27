@@ -9,7 +9,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, channelMode, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel, transportLabel, nodeLabel } from '/js/modules/tentanas/format.js';
+import { T, sprite, nodeChannelMode, channelIsUnarmed, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel, transportLabel, nodeLabel } from '/js/modules/tentanas/format.js';
 import { openShareUsersDialog } from '/js/modules/tentanas/share-users.js';
 import { pathCrumbsHtml, wirePathCrumbs } from '/js/modules/tentanas/dialogs.js';
 import '/js/components/tf-window.js';
@@ -72,7 +72,9 @@ export function fleetPlan(nodes, currentNodeId) {
     let outcome;
     if (n.nodeId === currentNodeId) outcome = 'source';
     else if (n.instanceStatus !== 'ready') outcome = 'unsupported';
-    else if (channelMode(n.elevationMode) === 'unarmed') outcome = 'after_arm';
+    // A mode-B node whose password is not held mounts only once someone arms
+    // it, exactly like a node with no channel (`nodeChannelMode`).
+    else if (channelIsUnarmed(nodeChannelMode(n))) outcome = 'after_arm';
     else outcome = 'will_mount';
     return { nodeId: n.nodeId, nodeName: n.nodeName, outcome };
   });

@@ -25,6 +25,7 @@
 use tentaflow_protocol::features::FeatureState;
 
 use super::db::ShareRow;
+use super::CodedText;
 
 /// The Environment row's feature id (`FEATURES` in environment.rs) and the id
 /// the package install uses.
@@ -180,45 +181,60 @@ fn describe_interfaces(list: &[Interface]) -> String {
 /// documentation describes ksmbd, and an admin turning on a second SMB server
 /// deserves to read it in the same row that says the feature is available.
 pub fn describe(probe: &Probe) -> (&'static str, String) {
+    let (status, detail) = describe_coded(probe);
+    (status, detail.text)
+}
+
+/// `describe` with the row's detail as codes beside the English, for the
+/// Environment tab to word (`NasEnvironment::feature_reasons`). The one
+/// place both are built, so the sentence and the codes cannot disagree.
+pub fn describe_coded(probe: &Probe) -> (&'static str, CodedText) {
+    let module_param = [("module", MODULE.to_string())];
     let module = if probe.module_loaded {
-        format!("{MODULE} loaded")
+        CodedText::new("module_loaded", &module_param, format!("{MODULE} loaded"))
     } else if probe.module_available {
-        format!("{MODULE} available, loaded when the listener opens")
+        CodedText::new("module_on_demand", &module_param, format!("{MODULE} available, loaded when the listener opens"))
     } else {
-        format!("{MODULE} is not in this kernel's module tree")
+        CodedText::new("module_absent", &module_param, format!("{MODULE} is not in this kernel's module tree"))
     };
-    let experimental = "EXPERIMENTAL (kernel docs)";
+    let experimental = CodedText::new("ksmbd_experimental", &[], "EXPERIMENTAL (kernel docs)");
     if probe.interfaces.is_empty() && probe.exposed.is_empty() {
         return (
             "no_device",
-            format!("no RDMA interface with an address · {experimental} · {module}"),
+            CodedText::new("ksmbd_no_interface", &[], "no RDMA interface with an address").and(experimental).and(module),
         );
     }
     if probe.interfaces.is_empty() {
+        let exposed = describe_interfaces(&probe.exposed);
         return (
             "exposed",
-            format!(
-                "{} also carries the default gateway — SMB Direct needs a dedicated storage network · {experimental}",
-                describe_interfaces(&probe.exposed)
-            ),
+            CodedText::new(
+                "ksmbd_exposed",
+                &[("interfaces", exposed.clone())],
+                format!("{exposed} also carries the default gateway — SMB Direct needs a dedicated storage network"),
+            )
+            .and(experimental),
         );
     }
     let listener = describe_interfaces(&probe.interfaces);
     if !probe.missing_tools.is_empty() {
+        let tools = probe.missing_tools.join(", ");
         return (
             "missing",
-            format!(
-                "missing: {} · listener would be {listener} · {experimental}",
-                probe.missing_tools.join(", ")
-            ),
+            CodedText::new(
+                "ksmbd_tools_missing",
+                &[("tools", tools.clone()), ("listener", listener.clone())],
+                format!("missing: {tools} · listener would be {listener}"),
+            )
+            .and(experimental),
         );
     }
     if !(probe.module_loaded || probe.module_available) {
-        return ("missing_module", format!("{module} · {experimental}"));
+        return ("missing_module", module.and(experimental));
     }
     (
         "ok",
-        format!("{listener} · {experimental} · {module}"),
+        CodedText::new("ksmbd_listener", &[("listener", listener.clone())], listener).and(experimental).and(module),
     )
 }
 
@@ -227,14 +243,20 @@ pub fn describe(probe: &Probe) -> (&'static str, String) {
 /// here, and a node with the tools installed but the wrong network must read
 /// as unavailable rather than as an installed feature.
 pub fn refine(feature: &mut FeatureState) {
+    refine_coded(feature);
+}
+
+/// `refine`, answering the row's detail as codes too.
+pub fn refine_coded(feature: &mut FeatureState) -> Vec<tentaflow_protocol::tentanas::NasHealthReason> {
     let probe = probe();
-    let (status, detail) = describe(&probe);
+    let (status, detail) = describe_coded(&probe);
     feature.status = status.to_string();
-    feature.detail = detail;
+    feature.detail = detail.text;
     // The kernel release IS the version of this backend: ksmbd is in-tree, so
     // ksmbd-tools' own version says nothing about the server that serves.
     feature.version = Some(probe.kernel).filter(|k| !k.is_empty());
     feature.kernel_module = Some(MODULE.to_string());
+    detail.reasons
 }
 
 /// Whether the ksmbd row of an environment says this node may serve SMB
@@ -260,9 +282,13 @@ pub fn has_user_database() -> bool {
 /// The refusal the apply reports and pins on every share that asked for SMB
 /// Direct, when the node cannot serve it. Never silent: §5.4b says a warning,
 /// never a quiet start and never a quiet skip.
-pub fn refusal(probe: &Probe) -> String {
-    let (_, detail) = describe(probe);
-    format!("SMB Direct is not served on this node: {detail}")
+pub fn refusal(probe: &Probe) -> CodedText {
+    let (_, detail) = describe_coded(probe);
+    // The code says what happened to the share; the probe's own reasons say
+    // why, worded by the screen exactly as the Environment row words them.
+    let mut reasons = vec![super::disks::coded_reason("smb_direct_not_served", &[])];
+    reasons.extend(detail.reasons);
+    CodedText { text: format!("SMB Direct is not served on this node: {}", detail.text), reasons }
 }
 
 // =============================================================================
@@ -450,6 +476,7 @@ mod tests {
             nfs: None,
             state: "active".into(),
             state_detail: String::new(),
+            state_reasons: Vec::new(),
             created_at: "2026-09-03T10:00:00Z".into(),
             updated_at: "2026-09-03T10:00:00Z".into(),
         }
@@ -477,6 +504,19 @@ mod tests {
 
     #[test]
     fn a_dedicated_rdma_interface_with_the_tools_is_the_only_ok_state() {
+        // Wave 7: every shape of the row, as codes beside the same English.
+        let words = |p: &Probe| describe_coded(p).1.reasons.into_iter().map(|r| r.code).collect::<Vec<_>>();
+        assert_eq!(words(&ready_probe()), vec!["ksmbd_listener", "ksmbd_experimental", "module_loaded"]);
+        assert_eq!(describe_coded(&ready_probe()).1.text, describe(&ready_probe()).1);
+        let exposed = Probe { interfaces: Vec::new(), exposed: vec![iface("enp3s0", "192.168.1.20")], ..ready_probe() };
+        assert_eq!(words(&exposed), vec!["ksmbd_exposed", "ksmbd_experimental"]);
+        let no_tools = Probe { missing_tools: vec!["ksmbd.mountd".to_string()], ..ready_probe() };
+        assert_eq!(words(&no_tools), vec!["ksmbd_tools_missing", "ksmbd_experimental"]);
+        let no_module = Probe { module_loaded: false, module_available: false, ..ready_probe() };
+        assert_eq!(words(&no_module), vec!["module_absent", "ksmbd_experimental"]);
+        let nothing = Probe { interfaces: Vec::new(), exposed: Vec::new(), ..ready_probe() };
+        assert_eq!(words(&nothing), vec!["ksmbd_no_interface", "ksmbd_experimental", "module_loaded"]);
+
         let ready = ready_probe();
         let (status, detail) = describe(&ready);
         assert_eq!(status, "ok");

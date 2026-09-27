@@ -881,6 +881,77 @@ pub struct AddonManager {
     state_flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// The data-directory half of a removal that reached this node through sync,
+/// and the end of this node's teardown record. Returns whether the removal
+/// finished.
+///
+/// `keep_on_refusal`: the app's teardown can REFUSE (`NativeAppHooks::
+/// refusable_teardown`, TentaNas) and a refused teardown keeps the data
+/// directory, exactly as the uninstall on the node where the admin clicked
+/// does (`lifecycle::uninstall_instance` aborts before the wipe): the refusal
+/// protects exactly that state (the Elastic Arrays it supervises). Any other
+/// app's failed hook is an error, not a refusal, and its directory is removed
+/// as it always was — keeping it would leave an orphan with no instance row
+/// and no cleanup path.
+fn remove_data_after_remote_teardown(
+    addon_id: &str,
+    hook_failed: bool,
+    keep_on_refusal: bool,
+    dir: Option<&std::path::Path>,
+) -> bool {
+    let mut dir_failed = false;
+    if hook_failed && keep_on_refusal {
+        warn!("sync reconcile: '{addon_id}' teardown refused — data directory kept");
+    } else if let Some(dir) = dir {
+        native_apps::teardown_status::phase(addon_id, "data_dir");
+        if dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(dir) {
+                warn!("sync reconcile: usuwanie danych '{addon_id}' nieudane: {e}");
+                dir_failed = true;
+            }
+        }
+    }
+    let finished = !hook_failed && !dir_failed;
+    native_apps::teardown_status::finish(addon_id, finished);
+    finished
+}
+
+#[cfg(test)]
+mod remote_teardown_tests {
+    use super::*;
+
+    /// A replicated removal whose teardown REFUSED leaves the data directory
+    /// where it is (the app's refusal protects exactly that state) and reads
+    /// 'failed' in the uninstall dialog; one whose teardown ran removes it.
+    #[test]
+    fn a_refused_remote_teardown_keeps_the_data_directory() {
+        let root = std::env::temp_dir().join(format!("tf-remote-teardown-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("tentanas-1a2b3c4d");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("tentanas.db"), b"state").expect("file");
+
+        let id = "wave9b-remote-teardown-1a2b3c4d";
+        native_apps::teardown_status::begin(id);
+        assert!(!remove_data_after_remote_teardown(id, true, true, Some(&dir)));
+        assert!(dir.join("tentanas.db").exists(), "a refused teardown keeps the data");
+        assert_eq!(native_apps::teardown_status::get(id).expect("record").state, "failed");
+
+        // An app whose teardown cannot refuse: a failed hook is an error, and
+        // the directory goes as it always did (no orphan without a row).
+        let other = root.join("tentaquant-1a2b3c4d");
+        std::fs::create_dir_all(&other).expect("dir");
+        native_apps::teardown_status::begin(id);
+        assert!(!remove_data_after_remote_teardown(id, true, false, Some(&other)));
+        assert!(!other.exists(), "only an app that asks for it keeps its directory");
+
+        native_apps::teardown_status::begin(id);
+        assert!(remove_data_after_remote_teardown(id, false, true, Some(&dir)));
+        assert!(!dir.exists(), "a teardown that ran removes the directory");
+        assert_eq!(native_apps::teardown_status::get(id).expect("record").state, "done");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 impl crate::sync::runtime::AddonSyncReconciler for AddonManager {
     fn reconcile_addon(&self, addon_id: &str) {
         self.reconcile_synced_addon(addon_id);
@@ -1211,6 +1282,12 @@ impl AddonManager {
                 // and data dir here (fs cleanup the materializer can't do).
                 self.unregister_addon_runtime(addon_id);
                 let org_id = crate::services::org::DEFAULT_ORG_ID;
+                // This node's record for the uninstall dialog (MAJOR 22): the
+                // removal reached it through sync, and the admin who started
+                // it is watching every node's row.
+                native_apps::teardown_status::begin(addon_id);
+                let mut hook_failed = false;
+                let mut keep_on_refusal = false;
                 // Native apps: run the teardown hook first — the row is gone,
                 // so the package is recovered from the instance-id shape. The
                 // plan is logged for the audit trail (removed vs kept paths).
@@ -1242,19 +1319,16 @@ impl AddonManager {
                             }
                             if let Err(e) = (hooks.teardown)(&ctx) {
                                 warn!("sync reconcile: native '{addon_id}' teardown hook: {e}");
+                                hook_failed = true;
+                                keep_on_refusal = hooks.refusable_teardown;
                             }
                         }
                     }
                 }
                 crate::addon::storage_sql::close_addon_db(org_id, addon_id);
                 crate::addon::app_db::close(addon_id);
-                if let Ok(dir) = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id) {
-                    if dir.exists() {
-                        if let Err(e) = std::fs::remove_dir_all(&dir) {
-                            warn!("sync reconcile: usuwanie danych '{addon_id}' nieudane: {e}");
-                        }
-                    }
-                }
+                let dir = crate::addon::fs_sandbox::addon_data_dir(org_id, addon_id).ok();
+                remove_data_after_remote_teardown(addon_id, hook_failed, keep_on_refusal, dir.as_deref());
                 // The materializer's cascade purged the matrix rows — drop the
                 // checker's cached (stale-allow) entries for the instance too.
                 self.permission_checker.refresh_addon(addon_id);

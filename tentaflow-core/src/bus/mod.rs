@@ -822,6 +822,13 @@ pub enum BusServiceError {
     /// mistaking "paused" for "caught up".
     #[error("group '{group}' is paused on topic '{topic}'")]
     GroupPaused { group: String, topic: String },
+    /// An admin action (`pause_group`/`resume_group`/`reset_offset`) named a
+    /// group that has no `bus_groups` row on the topic — no consumer of it
+    /// ever opened a session here. Refused rather than acted on, so an
+    /// admin action never creates a phantom group past the `max_groups`
+    /// quota `open_consumer` enforces.
+    #[error("group '{group}' not found on topic '{topic}'")]
+    GroupNotFound { group: String, topic: String },
     /// a DLQ topic (`__dlq.<x>`) can never itself have a DLQ — M1 has
     /// no "poison of poison" escalation path. Distinct from
     /// `InvalidTopicName` (which `__dlq.__dlq.x` would otherwise hit via
@@ -830,6 +837,16 @@ pub enum BusServiceError {
     /// enforced.
     #[error("'{topic}' is already a DLQ topic; a DLQ-of-a-DLQ is not allowed")]
     DlqOfDlqNotAllowed { topic: String },
+    /// `dlq_retry`/`dlq_discard` of a DLQ record that was already retried
+    /// or discarded, or that a retry is republishing right now. Refused
+    /// instead of acted on again: every republish is a new message that
+    /// every consumer of the source topic receives.
+    #[error("DLQ record {partition}/{offset} of '{topic}' was already retried or discarded")]
+    DlqRecordHandled {
+        topic: String,
+        partition: u32,
+        offset: u64,
+    },
     /// `tentaflow_bus::BusError::PartitionPoisoned`: a group-commit fsync
     /// failed after that group had already rolled to a new segment, so the
     /// partition's writer thread refuses every further append until the
@@ -1316,6 +1333,7 @@ fn map_repl_error(
         },
         ReplError::NoAssignment { .. }
         | ReplError::NotAReplica { .. }
+        | ReplError::NotPartitionLeader { .. }
         | ReplError::EpochFenced { .. } => match coordinator.role(org, topic, partition) {
             PartitionRole::Leader { epoch } => {
                 // Raced: the coordinator says Leader now even though
@@ -1702,6 +1720,18 @@ pub enum ReplError {
     },
     #[error("leader epoch fenced: this node is at {have}, request carries {requested}")]
     EpochFenced { have: u32, requested: u32 },
+    /// A change only the partition's leader may make — adding a node to its
+    /// replica set, which hands that node an epoch slot — was asked of
+    /// another node.
+    #[error(
+        "'{topic}'/{partition}: only its leader '{leader}' may add nodes to its replica set; \
+         make the change on that node"
+    )]
+    NotPartitionLeader {
+        topic: String,
+        partition: u32,
+        leader: String,
+    },
     #[error("replication coordinator internal error: {0}")]
     Internal(String),
 }
@@ -1819,6 +1849,13 @@ pub trait ReplicationCoordinator: Send + Sync {
         offset: u64,
         attempts: u32,
     );
+    /// Records that the DLQ record at `(dlq_partition, offset)` of
+    /// `__dlq.<source_topic>` was retried or discarded, so the followers
+    /// stop listing it too. It rides the `ReplOffsets` stream of the SOURCE
+    /// topic's partition with the same number (the follower applies it to
+    /// `__dlq.<source_topic>`), and only a node leading that partition has
+    /// a stream to send it on.
+    fn note_dlq_handled(&self, org: &str, source_topic: &str, dlq_partition: u32, offset: u64);
     /// Removes `node_id` from every replica set it belongs to (PLAN §4.4:
     /// environment-change fencing) — returns the number of assignments
     /// touched.
@@ -2054,6 +2091,124 @@ type TopicKey = (String, String);
 /// Per-(org, group) `commit` mutexes — see `BusService::commit_locks`'s doc.
 type CommitLocks = Arc<DashMap<(String, String), Arc<parking_lot::Mutex<()>>>>;
 
+/// `(org, group, topic, partition)` of one admin offset reset.
+type OffsetResetKey = (String, String, String, u32);
+
+/// Admin offset resets (`BusService::reset_offset`) as seen by OPEN consumer
+/// sessions. A `ConsumerHandle` keeps its fetch cursor in memory, so without
+/// this it would ignore a reset: after a backward move its next commit of a
+/// higher offset silently undoes the reset, and after a forward move its
+/// next commit of a lower offset fails with `OffsetRegression`. What a
+/// handle does with a reset: `ConsumerCursor` and `ConsumerHandle::commit`.
+///
+/// `generation` moves on every reset anywhere, so a handle whose remembered
+/// generation still matches pays one atomic load on `fetch`/`commit` and no
+/// map lookup. `seqs` holds, per reset partition, the generation of its
+/// latest reset — what each `ConsumerPartition` compares against the one it
+/// last applied.
+#[derive(Default)]
+struct OffsetResets {
+    generation: AtomicU64,
+    seqs: DashMap<OffsetResetKey, u64>,
+}
+
+impl OffsetResets {
+    /// Records a reset of `key`. The map entry is held while the generation
+    /// moves, so a handle that observes the new generation and then looks the
+    /// key up waits for the entry and reads the new seq — it can never store
+    /// the new generation as applied while still reading the old seq.
+    fn note(&self, key: OffsetResetKey) {
+        let mut entry = self.seqs.entry(key).or_insert(0);
+        *entry = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn seq(&self, org: &str, group: &str, topic: &str, partition: u32) -> u64 {
+        self.seqs
+            .get(&(
+                org.to_string(),
+                group.to_string(),
+                topic.to_string(),
+                partition,
+            ))
+            .map(|seq| *seq)
+            .unwrap_or(0)
+    }
+
+    /// Drops the seqs of a deleted topic. A handle still subscribed to it
+    /// then sees seq 0 and reloads a cursor its detached partition can no
+    /// longer serve anyway; a handle opened on a re-created topic of the
+    /// same name starts at seq 0 like on any never-reset partition.
+    fn remove_topic(&self, org_id: &str, topic: &str) {
+        self.seqs
+            .retain(|(org, _, t, _), _| !(org == org_id && t == topic));
+    }
+
+    fn remove_org(&self, org_id: &str) {
+        self.seqs.retain(|(org, _, _, _), _| org != org_id);
+    }
+}
+
+/// A `ConsumerPartition`'s fetch position plus what `commit` needs to tell
+/// a pre-reset acknowledgement from a current one. Behind one mutex so a
+/// reset reload and a fetch advancing the cursor can never interleave.
+struct ConsumerCursor {
+    /// Next offset `fetch` reads from.
+    next: u64,
+    /// Seq (`OffsetResets::seqs`) of the latest admin reset `next` reflects.
+    applied_reset: u64,
+    /// Where the latest applied reset moved `next`. The handle has fetched
+    /// nothing below it since, so a lower commit acknowledges records
+    /// fetched before the reset. 0 when never reset.
+    reset_floor: u64,
+    /// The highest position this handle had fetched to before the latest
+    /// applied reset. While `next` is below it the handle is replaying, and
+    /// a commit above `next` can only acknowledge a pre-reset batch.
+    stale_hi: u64,
+}
+
+impl ConsumerCursor {
+    fn new(next: u64, applied_reset: u64) -> Self {
+        Self {
+            next,
+            applied_reset,
+            reset_floor: 0,
+            stale_hi: 0,
+        }
+    }
+
+    /// Moves the cursor to a reset's `committed` offset. `stale_hi` keeps
+    /// the higher of the old position and any replay still in progress, so
+    /// two resets in a row do not forget batches fetched before the first.
+    fn reload(&mut self, committed: u64, seq: u64) {
+        self.stale_hi = self.stale_hi.max(self.next);
+        self.next = committed;
+        self.reset_floor = committed;
+        self.applied_reset = seq;
+    }
+
+    /// Moves the cursor from `from` to `new_next` after a fetch read
+    /// `[from, new_next)`. `false` when the cursor is no longer at `from`
+    /// — a reset reloaded it while those records were read.
+    fn advance(&mut self, from: u64, new_next: u64) -> bool {
+        if self.next != from {
+            return false;
+        }
+        self.next = new_next;
+        true
+    }
+
+    /// Whether `commit` may write `offset`: not below the latest reset's
+    /// target, and — while replaying below the pre-reset position — not
+    /// above what the handle has fetched since the reset.
+    fn accepts(&self, offset: u64) -> bool {
+        offset >= self.reset_floor && (offset <= self.next || self.next >= self.stale_hi)
+    }
+}
+
 /// PLAN-F3 §4.2: one `BusService::schema_cache` entry — a subject's
 /// currently-effective version, compiled once at resolve time, plus the
 /// bookkeeping `resolve_validator` needs to know whether it is still
@@ -2098,7 +2253,22 @@ pub struct BusService {
     /// Durable set of DLQ records marked "handled" via `dlq_discard` — see
     /// `dlq::DiscardStore`'s doc (M1-R2 review N-5, coordinator decision 2).
     discarded: Arc<dlq::DiscardStore>,
+    /// DLQ records a retry or a discard is acting on right now.
+    dlq_retrying: dlq::RetryClaims,
     partitions: DashMap<PartitionKey, tentaflow_bus::Partition>,
+    /// Serializes every read-check-purge-write of a topic's incarnation
+    /// marker with `delete_topic`'s own purge: two partitions of one
+    /// re-created topic open concurrently, and the second must not purge
+    /// the directory the first just stamped. Rare (placement changes and
+    /// deletes only), so one lock for all topics.
+    topic_incarnation_lock: parking_lot::Mutex<()>,
+    /// The incarnation each topic's log was last checked or stamped at by
+    /// `ensure_topic_incarnation` in this process — the in-memory mirror of
+    /// the on-disk markers, so `partition_handle` compares one map entry on
+    /// every call instead of reading a file. Every call, not only on a cache
+    /// miss: a handle opened for a deleted incarnation stays cached until
+    /// something drops it, and a re-created topic must not be handed it.
+    topic_incarnations: DashMap<TopicKey, u64>,
     round_robin: DashMap<TopicKey, AtomicU32>,
     dedup_stores: DashMap<TopicKey, Arc<dedup::MmapDedupStore>>,
     quota: quota::QuotaManager,
@@ -2150,8 +2320,11 @@ pub struct BusService {
     /// message at any real throughput would serialize on the single shared
     /// application database. Invalidated (removed) by `update_topic`/
     /// `delete_topic` so a config change is visible on the very next
-    /// `publish`, never stale-forever.
-    topic_config_cache: DashMap<TopicKey, Arc<topics::TopicConfig>>,
+    /// `publish`, never stale-forever. Each entry also carries the
+    /// `topics::config_generation()` read before it was loaded: a change
+    /// another node made, applied here by the sync materializer, moves that
+    /// counter and retires every entry at once.
+    topic_config_cache: DashMap<TopicKey, (u64, Arc<topics::TopicConfig>)>,
     /// PLAN-F3 §4.2: compiled-validator cache, keyed `(org_id, subject)`.
     /// `resolve_validator` treats an entry as stale (and recompiles) as soon
     /// as its captured `ResolvedSchema::generation` no longer matches
@@ -2244,6 +2417,9 @@ pub struct BusService {
     /// `DashMap` and drop the map's own shard guard immediately, rather
     /// than holding it for `commit`'s whole duration.
     commit_locks: CommitLocks,
+    /// Shared with every `ConsumerHandle` this service opens — see
+    /// `OffsetResets`' doc.
+    offset_resets: Arc<OffsetResets>,
     /// `org_id -> purge count`, bumped by `purge_org`. A `ConsumerHandle`
     /// snapshots the current count for its org at `open_consumer` time; if
     /// a later `commit`/`seek_to_earliest` observes a different count, the
@@ -2455,6 +2631,81 @@ fn environment_from_u8(v: u8) -> NodeEnvironment {
     }
 }
 
+/// What `BusService::purge_local_topic_state` removed, for the audit line,
+/// and whether the log directory really went.
+struct LocalTopicPurge {
+    offset_keys_purged: usize,
+    producer_seq_keys_purged: usize,
+    discarded_keys_purged: usize,
+    groups_purged: usize,
+    log_removed: std::io::Result<()>,
+}
+
+/// Whether `dir` looks like a topic's log directory: it holds a partition
+/// directory (`pNNNN`) or an incarnation marker.
+fn holds_a_topic_log(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        name == TOPIC_INCARNATION_FILE
+            || (entry.file_type().is_ok_and(|t| t.is_dir())
+                && name
+                    .strip_prefix('p')
+                    .is_some_and(|n| n.len() == 4 && n.bytes().all(|b| b.is_ascii_digit())))
+    })
+}
+
+/// `<topic_dir>/incarnation`: the `topic_generation` of the incarnation the
+/// directory's log belongs to (`BusService::ensure_topic_incarnation`).
+const TOPIC_INCARNATION_FILE: &str = "incarnation";
+
+/// A missing marker is incarnation 0: every log written before markers
+/// existed, and every name that was never deleted.
+fn read_topic_incarnation(
+    bus_dir: &std::path::Path,
+    org_id: &str,
+    topic: &str,
+) -> Result<u64, BusServiceError> {
+    let path = topics::topic_dir(bus_dir, org_id, topic).join(TOPIC_INCARNATION_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => text
+            .trim()
+            .parse()
+            .map_err(|_| BusServiceError::PartitionUnavailable {
+                reason: format!("unreadable incarnation marker {}", path.display()),
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(BusServiceError::PartitionUnavailable {
+            reason: format!("reading incarnation marker {}: {e}", path.display()),
+        }),
+    }
+}
+
+/// Written through a synced temporary file and a rename, so a crash leaves
+/// either the previous marker or the new one — never a torn number that
+/// would make the next open refuse the topic.
+fn write_topic_incarnation(
+    bus_dir: &std::path::Path,
+    org_id: &str,
+    topic: &str,
+    topic_generation: u64,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = topics::topic_dir(bus_dir, org_id, topic);
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("{TOPIC_INCARNATION_FILE}.tmp"));
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(topic_generation.to_string().as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, dir.join(TOPIC_INCARNATION_FILE))?;
+    std::fs::File::open(&dir)?.sync_all()
+}
+
 /// One partition's stored log bytes, read straight out of the engine's own
 /// segment bookkeeping: every sealed segment's length plus the still-growing
 /// active one's. Both accessors read an in-memory `RwLock`ed descriptor list
@@ -2563,7 +2814,10 @@ impl BusService {
             offsets,
             producer_seq,
             discarded,
+            dlq_retrying: dlq::RetryClaims::default(),
             partitions: DashMap::new(),
+            topic_incarnation_lock: parking_lot::Mutex::new(()),
+            topic_incarnations: DashMap::new(),
             round_robin: DashMap::new(),
             dedup_stores: DashMap::new(),
             quota,
@@ -2585,6 +2839,7 @@ impl BusService {
             sweeper_shutdown: Arc::new(AtomicBool::new(false)),
             group_state: Arc::new(GroupStateCache::new()),
             commit_locks: Arc::new(DashMap::new()),
+            offset_resets: Arc::new(OffsetResets::default()),
             purged_orgs: Arc::new(DashMap::new()),
             dedup_expected_rate_per_sec: cfg.dedup_expected_rate_per_sec,
             consumer_partitions: Arc::new(DashMap::new()),
@@ -2608,8 +2863,96 @@ impl BusService {
         // WITHOUT this a restarted engine would let every org re-publish its
         // entire ceiling before the counter caught up. Best-effort and off
         // any request path — see `seed_org_stored_bytes`'s own doc.
+        svc.sweep_orphan_topic_dirs();
         svc.seed_org_stored_bytes();
         Ok(svc)
+    }
+
+    /// Startup half of migration v173: removes the local state of every
+    /// topic directory whose `bus_topics` row is gone. Builds before v172
+    /// left such directories behind whenever a delete reached a node through
+    /// the ledger — the row went, the log stayed, and a later topic of the
+    /// same name would have reopened it. Runs before anything can open a
+    /// partition, so no handle exists yet.
+    ///
+    /// Conservative on every doubt: a directory whose name is not a valid
+    /// org or topic name, that holds neither a partition directory nor an
+    /// incarnation marker, or whose row cannot be read, is left alone. A
+    /// topic whose row exists is never touched. Each removal is logged.
+    fn sweep_orphan_topic_dirs(&self) {
+        let Ok(orgs) = std::fs::read_dir(&self.bus_dir) else {
+            return;
+        };
+        for org in orgs.flatten() {
+            if !org.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let Some(org_id) = org.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if topics::validate_org_id(&org_id).is_err() {
+                continue;
+            }
+            let Ok(topic_dirs) = std::fs::read_dir(org.path()) else {
+                continue;
+            };
+            for topic_dir in topic_dirs.flatten() {
+                if !topic_dir.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let Some(name) = topic_dir.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                if topics::validate_user_topic_name(&name).is_err()
+                    && topics::validate_internal_topic_name(&name).is_err()
+                {
+                    continue;
+                }
+                if !holds_a_topic_log(&topic_dir.path()) {
+                    continue;
+                }
+                match crate::db::repository::bus_topic_get(
+                    &self.db,
+                    &self.instance_id,
+                    &org_id,
+                    &name,
+                ) {
+                    Ok(None) => {}
+                    Ok(Some(_)) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            org_id, topic = %name, error = %e,
+                            "bus init: topic row unreadable; its log directory is left alone"
+                        );
+                        continue;
+                    }
+                }
+                let _incarnation = self.topic_incarnation_lock.lock();
+                match self.purge_local_topic_state(&org_id, &name) {
+                    Ok(LocalTopicPurge {
+                        log_removed: Ok(()),
+                        offset_keys_purged,
+                        groups_purged,
+                        ..
+                    }) => tracing::info!(
+                        org_id, topic = %name, offset_keys_purged, groups_purged,
+                        "bus init: removed the log of a topic deleted before this node \
+                         cleaned up after deletes (no topic row)"
+                    ),
+                    Ok(LocalTopicPurge {
+                        log_removed: Err(e),
+                        ..
+                    }) => tracing::warn!(
+                        org_id, topic = %name, error = %e,
+                        "bus init: log directory of a deleted topic not removed"
+                    ),
+                    Err(e) => tracing::warn!(
+                        org_id, topic = %name, error = %e,
+                        "bus init: state of a deleted topic not purged"
+                    ),
+                }
+            }
+        }
     }
 
     /// The TentaBus instance every table this service touches is scoped to.
@@ -3181,8 +3524,13 @@ impl BusService {
         topic: &str,
     ) -> Result<topics::TopicConfig, BusServiceError> {
         let key = (org_id.to_string(), topic.to_string());
+        // Read before the row: a replicated change committed after this load
+        // bumps past it, so the entry cached below is retired on the next call.
+        let generation = topics::config_generation();
         if let Some(cached) = self.topic_config_cache.get(&key) {
-            return Ok((**cached).clone());
+            if cached.0 == generation {
+                return Ok((*cached.1).clone());
+            }
         }
         self.topic_config_db_loads.fetch_add(1, Ordering::Relaxed);
         let cfg =
@@ -3191,7 +3539,8 @@ impl BusService {
                     name: topic.to_string(),
                 }
             })?;
-        self.topic_config_cache.insert(key, Arc::new(cfg.clone()));
+        self.topic_config_cache
+            .insert(key, (generation, Arc::new(cfg.clone())));
         Ok(cfg)
     }
 
@@ -3199,9 +3548,237 @@ impl BusService {
     /// call re-reads SQLite. Called from `update_topic`/`delete_topic`
     /// — the only two admin paths that change what `bus_topics`
     /// holds for an existing topic.
+    ///
+    /// Removing the entry alone is not enough: a concurrent `topic_config`
+    /// that read the old row before the change committed would insert it
+    /// back after this removal. Bumping the generation retires that
+    /// late-inserted entry too, since it carries the generation it read.
     fn invalidate_topic_config_cache(&self, org_id: &str, topic: &str) {
+        topics::bump_config_generation();
         self.topic_config_cache
             .remove(&(org_id.to_string(), topic.to_string()));
+    }
+
+    /// Everything this node keeps for one topic OUTSIDE the platform
+    /// database: open partition handles, the log directory, dedup stores,
+    /// cached config, consumer-group state, committed offsets, producer
+    /// sequences, DLQ discard markers and `bus_groups` rows. Shared by
+    /// `delete_topic` (the author of a delete) and
+    /// `ensure_topic_incarnation` (every other replica, which learns of the
+    /// delete only through the ledger and must not carry the old log, its
+    /// leader epoch or its consumer offsets into a re-created topic of the
+    /// same name) — and by the startup sweep of log directories whose topic
+    /// row is gone (`sweep_orphan_topic_dirs`). Callers hold
+    /// `topic_incarnation_lock`.
+    ///
+    /// The log directory is removed LAST and its failure is returned (a
+    /// directory that does not exist is not one): a caller about to reuse
+    /// the name must not stamp a new incarnation over a log it could not
+    /// remove — on Windows an open file handle is enough to keep it.
+    fn purge_local_topic_state(
+        &self,
+        org_id: &str,
+        name: &str,
+    ) -> Result<LocalTopicPurge, BusServiceError> {
+        self.topic_incarnations
+            .remove(&(org_id.to_string(), name.to_string()));
+        self.partitions.retain(|k, v| {
+            if k.0 == org_id && k.1 == name {
+                v.detach();
+                false
+            } else {
+                true
+            }
+        });
+        self.detach_consumer_partitions(org_id, Some(name));
+        // Dedup stores are mmapped: dropping the `Arc` here unmaps the file
+        // before it is unlinked below, rather than leaving the mapping open
+        // against a deleted inode.
+        self.dedup_stores
+            .remove(&(org_id.to_string(), name.to_string()));
+        self.invalidate_topic_config_cache(org_id, name);
+        self.round_robin
+            .remove(&(org_id.to_string(), name.to_string()));
+        self.group_state.remove_topic(org_id, name);
+        self.offset_resets.remove_topic(org_id, name);
+        let offset_keys_purged = self.offsets.purge_topic(org_id, name)?;
+        let producer_seq_keys_purged = self.producer_seq.purge_topic(org_id, name)?;
+        // A no-op scan (0 rows) when `name` never had any discard markers
+        // (i.e. it is not a DLQ topic, or is one nobody ever discarded a
+        // record on) — mirrors `offsets`/`producer_seq` above, which pay
+        // the same harmless empty-prefix-scan cost for every non-DLQ topic
+        // deleted (M1-R2 review N-5, coordinator decision 2).
+        let discarded_keys_purged = self.discarded.purge_topic(org_id, name)?;
+        let groups_purged =
+            crate::db::repository::bus_groups_delete_by_topic(&self.local_db, org_id, name)?;
+        // Best-effort: stale history of a deleted topic only ever shows up in
+        // a re-created topic of the same name, which pruning clears in 24 h.
+        // Under `lag_history_lock`, after the `bus_topics` row is gone: a
+        // sampling round either wrote before this delete or sees the topic
+        // missing and drops its rows (`sample_lag_history`).
+        {
+            let _history = self.lag_history_lock.lock();
+            if let Err(e) = lag_history::delete_topic(&self.local_db, org_id, name) {
+                tracing::warn!(topic = %name, error = %e, "lag history: delete for topic failed");
+            }
+        }
+        self.lag_trends
+            .retain(|(org, _, topic), _| !(org == org_id && topic == name));
+        let dir = topics::topic_dir(&self.bus_dir, org_id, name);
+        let log_removed = match std::fs::remove_dir_all(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+        Ok(LocalTopicPurge {
+            offset_keys_purged,
+            producer_seq_keys_purged,
+            discarded_keys_purged,
+            groups_purged,
+            log_removed,
+        })
+    }
+
+    /// Makes sure the local log of `topic` belongs to incarnation
+    /// `topic_generation` before any handle is opened on it from disk —
+    /// every such open goes through `partition_handle`, whichever path asks
+    /// (a replication handle for a placement, a local publish, the creator's
+    /// own first write).
+    ///
+    /// A delete that reaches this node through the ledger removes the
+    /// topic row and its placements, but not the log: that lives in this
+    /// process, not in the database the materializer writes. Without this
+    /// check a re-created topic would reopen the deleted incarnation's
+    /// segments — its records, and its persisted leader epoch, which then
+    /// refuses the new incarnation's epoch-1 leader as stale — on a replica
+    /// and on the node that re-creates it alike.
+    ///
+    /// Older local incarnation: purged, then the new one is recorded — only
+    /// once the purge really removed the old log. Newer local incarnation
+    /// than asked for: refused, with the cached config dropped, since a
+    /// stale cached config is how a caller ends up asking for an old one.
+    fn ensure_topic_incarnation(
+        &self,
+        org_id: &str,
+        topic: &str,
+        topic_generation: u64,
+    ) -> Result<(), BusServiceError> {
+        let _incarnation = self.topic_incarnation_lock.lock();
+        let local = read_topic_incarnation(&self.bus_dir, org_id, topic)?;
+        if local == topic_generation {
+            self.topic_incarnations
+                .insert((org_id.to_string(), topic.to_string()), local);
+            return Ok(());
+        }
+        // No marker and no log: nothing of an older incarnation is here —
+        // this is the topic's first open on this node. Only stamped: purging
+        // now would take what the current incarnation already keeps outside
+        // the log (a consumer group opened before the first write, a dedup
+        // store) with it.
+        if local == 0 && !holds_a_topic_log(&topics::topic_dir(&self.bus_dir, org_id, topic)) {
+            write_topic_incarnation(&self.bus_dir, org_id, topic, topic_generation).map_err(
+                |e| BusServiceError::PartitionUnavailable {
+                    reason: format!("recording the incarnation of topic '{topic}': {e}"),
+                },
+            )?;
+            self.topic_incarnations
+                .insert((org_id.to_string(), topic.to_string()), topic_generation);
+            return Ok(());
+        }
+        if local > topic_generation {
+            self.invalidate_topic_config_cache(org_id, topic);
+            return Err(BusServiceError::PartitionUnavailable {
+                reason: format!(
+                    "topic '{topic}' was asked for incarnation {topic_generation}, \
+                     older than the local log's {local}"
+                ),
+            });
+        }
+        let released_bytes = self.topic_log_bytes(org_id, topic);
+        let purged = self.purge_local_topic_state(org_id, topic)?;
+        if let Err(e) = purged.log_removed {
+            // The handles and the per-topic state are gone, the files are
+            // not. Not stamped and the bytes stay counted: the next open
+            // retries the purge and releases them then.
+            return Err(BusServiceError::PartitionUnavailable {
+                reason: format!(
+                    "the log of a deleted incarnation of topic '{topic}' could not be removed: {e}"
+                ),
+            });
+        }
+        self.sub_org_stored_bytes(org_id, released_bytes);
+        write_topic_incarnation(&self.bus_dir, org_id, topic, topic_generation).map_err(|e| {
+            BusServiceError::PartitionUnavailable {
+                reason: format!("recording the incarnation of topic '{topic}': {e}"),
+            }
+        })?;
+        self.topic_incarnations
+            .insert((org_id.to_string(), topic.to_string()), topic_generation);
+        tracing::info!(
+            org_id,
+            topic,
+            previous_generation = local,
+            topic_generation,
+            released_bytes,
+            offset_keys_purged = purged.offset_keys_purged,
+            producer_seq_keys_purged = purged.producer_seq_keys_purged,
+            groups_purged = purged.groups_purged,
+            "bus: dropped the local log of a deleted topic incarnation"
+        );
+        Ok(())
+    }
+
+    /// Stored bytes of every partition this topic has on disk, in the unit
+    /// the org's counter uses (`partition_stored_bytes`: logical segment
+    /// lengths — the files themselves can be preallocated past them). Read
+    /// from each partition directory that EXISTS rather than from the topic
+    /// row, which after a re-creation describes the new incarnation and may
+    /// have another partition count; an open handle is read in place, any
+    /// other directory is opened just long enough to read it.
+    fn topic_log_bytes(&self, org_id: &str, topic: &str) -> u64 {
+        let Ok(entries) = std::fs::read_dir(topics::topic_dir(&self.bus_dir, org_id, topic)) else {
+            return 0;
+        };
+        let mut total: u64 = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(p) = name
+                .to_str()
+                .and_then(|n| n.strip_prefix('p'))
+                .and_then(|n| n.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let key = (org_id.to_string(), topic.to_string(), p);
+            let open = self
+                .partitions
+                .get(&key)
+                .map(|part| part.clone())
+                .or_else(|| {
+                    self.consumer_partitions
+                        .get(&key)
+                        .and_then(|weak_parts| weak_parts.iter().find_map(|w| w.upgrade()))
+                });
+            let bytes = match open {
+                Some(part) => partition_stored_bytes(&part),
+                None => match tentaflow_bus::Partition::open(
+                    &entry.path(),
+                    tentaflow_bus::RollPolicy::default(),
+                    tentaflow_bus::Durability::Os,
+                    256,
+                ) {
+                    Ok(part) => partition_stored_bytes(&part),
+                    Err(e) => {
+                        tracing::warn!(
+                            org_id, topic, partition = p, error = %e,
+                            "bus: partition unreadable; its bytes stay on the org's storage counter"
+                        );
+                        0
+                    }
+                },
+            };
+            total = total.saturating_add(bytes);
+        }
+        total
     }
 
     /// Opens (or returns the already-open) `Partition` for `(org, topic,
@@ -3232,6 +3809,15 @@ impl BusService {
         cfg: &topics::TopicConfig,
     ) -> Result<tentaflow_bus::Partition, BusServiceError> {
         let key = (org_id.to_string(), topic.to_string(), partition);
+        // Before the entry below is taken: the purge this may run walks
+        // `self.partitions` itself.
+        let checked = self
+            .topic_incarnations
+            .get(&(org_id.to_string(), topic.to_string()))
+            .map(|g| *g);
+        if checked != Some(cfg.generation) {
+            self.ensure_topic_incarnation(org_id, topic, cfg.generation)?;
+        }
         let part = {
             let entry = self.partitions.entry(key.clone()).or_try_insert_with(|| {
                 if let Some(live) = self
@@ -3670,16 +4256,22 @@ impl BusService {
     /// preflight resolves the leader through the registry, so every write
     /// to an unplaced partition is refused with `NotLeader
     /// (leader_node_id=None)`.
+    ///
+    /// Every placement names the incarnation it is for (`cfg.generation`,
+    /// `PartitionAssignment::topic_generation`): replicas admit it only
+    /// against the same incarnation of the topic row.
     fn propose_partition_assignments(
         &self,
         org_id: &str,
-        topic: &str,
+        cfg: &topics::TopicConfig,
         partitions: &[u32],
-        replication_factor: u32,
         local_node_id: &str,
         same_env: &[String],
     ) -> Option<(u32, Vec<String>)> {
         let store = self.assignment_store()?;
+        let topic = cfg.name.as_str();
+        let replication_factor = cfg.replication_factor;
+        let topic_generation = cfg.generation;
         let mut all_replicas: Vec<String> = Vec::new();
         let mut placed = 0u32;
         for &partition in partitions {
@@ -3700,14 +4292,17 @@ impl BusService {
                 replicas,
                 leader_epoch: 1,
                 updated_at_ms: now_ms(),
+                topic_generation,
+                epoch_slots: Default::default(),
             };
             match store.propose(&assignment) {
                 Ok(_) => placed += 1,
                 Err(e) => {
-                    // Best-effort: a failed placement leaves the topic
-                    // usable at RF=1-on-this-node (M1 behavior for that
-                    // partition) rather than failing topic creation
-                    // outright — an operator can `reassign` later.
+                    // Best-effort: a failed placement does not fail topic
+                    // creation. The partition stays without a leader until
+                    // it is placed again: `update_topic` places every
+                    // unplaced partition, so the topic's next settings
+                    // change does.
                     tracing::warn!(
                         org_id, topic, partition, error = %e,
                         "failed to propose partition assignment"
@@ -3757,13 +4352,18 @@ impl BusService {
             env,
             now_ms(),
         )?;
+        // Same reason as `create_topic_audited`: an existing incarnation
+        // passes straight through, a new one drops a deleted one's log first.
+        self.ensure_topic_incarnation(&ctx.org_id, name, cfg.generation)?;
         self.place_unplaced_partitions(&ctx.org_id, &cfg, env);
         Ok(cfg)
     }
 
-    /// Proposes assignments for every partition of `cfg` that has none.
-    /// Best-effort and silent on success — a broker-internal topic has no
-    /// audit row of its own to carry the placement detail.
+    /// Proposes assignments for every partition of `cfg` that has none —
+    /// a broker-internal topic's, the partitions `update_topic` added, or
+    /// one whose proposal failed earlier.
+    /// Best-effort and silent on success: the caller's own audit row (or,
+    /// for an internal topic, none) carries what changed.
     fn place_unplaced_partitions(
         &self,
         org_id: &str,
@@ -3784,7 +4384,7 @@ impl BusService {
             Err(e) => {
                 tracing::warn!(
                     org_id, topic = %cfg.name, error = %e,
-                    "internal topic: cannot read existing partition assignments; \
+                    "topic placement: cannot read existing partition assignments; \
                      leaving placement alone"
                 );
                 return;
@@ -3798,16 +4398,15 @@ impl BusService {
         }
         let placed = self.propose_partition_assignments(
             org_id,
-            &cfg.name,
+            cfg,
             &missing,
-            cfg.replication_factor,
             &placement.local_node_id,
             &placement.same_env,
         );
         if let Some((placed, _)) = placed {
             tracing::info!(
                 org_id, topic = %cfg.name, placed, missing = missing.len(),
-                "placed partitions of a broker-owned internal topic"
+                "placed partitions that had no assignment"
             );
         }
     }
@@ -3978,7 +4577,7 @@ impl BusService {
             }
         }
 
-        let cfg = topics::create_topic(
+        let (cfg, removed_rules) = topics::create_topic(
             &self.db,
             &self.instance_id,
             &ctx.org_id,
@@ -3990,15 +4589,20 @@ impl BusService {
         // Defensive: a delete+recreate of the same name must not resurrect a
         // stale cached config.
         self.invalidate_topic_config_cache(&ctx.org_id, name);
+        // Before anything else can touch the new incarnation: a log this node
+        // kept from a deleted one (it replicated it, and learned of the delete
+        // only through the ledger) goes now, not at the first open — by then
+        // a consumer group or a dedup store of the NEW incarnation may exist,
+        // and the purge would take it along.
+        self.ensure_topic_incarnation(&ctx.org_id, name, cfg.generation)?;
 
         let mut replicas_detail = String::new();
         if let Some((local_node_id, same_env)) = placement {
             let partitions: Vec<u32> = (0..cfg.partitions).collect();
             if let Some((placed, all_replicas)) = self.propose_partition_assignments(
                 &ctx.org_id,
-                name,
+                &cfg,
                 &partitions,
-                cfg.replication_factor,
                 &local_node_id,
                 &same_env,
             ) {
@@ -4020,7 +4624,8 @@ impl BusService {
                 &ctx.org_id,
                 Some(&format!(
                     "partitions={} retention_ms={} environment={} durability={} \
-                     durability_class={} durability_explicit={} replication_factor={}{replicas_detail}",
+                     durability_class={} durability_explicit={} replication_factor={}{replicas_detail} \
+                     acl_entries_removed={} field_policies_removed={}",
                     cfg.partitions,
                     cfg.retention_ms,
                     cfg.environment.as_str(),
@@ -4028,6 +4633,8 @@ impl BusService {
                     cfg.durability_class().as_str(),
                     cfg.durability_explicit(),
                     cfg.replication_factor,
+                    removed_rules.acl_entries,
+                    removed_rules.field_policies.len(),
                 )),
             )),
             None,
@@ -4067,9 +4674,19 @@ impl BusService {
         // Must happen before the config is stale-read by a concurrent
         // `publish`: the cache holds the OLD config, not this one.
         self.invalidate_topic_config_cache(&ctx.org_id, name);
+        // Every partition needs a leader: without an assignment `publish`'s
+        // preflight refuses every write to it (`NotLeader`, no leader
+        // known). Added partitions have none yet, and one whose proposal
+        // failed when the topic was made has none either — any settings
+        // change of the topic is the moment to place them all.
+        let env = crate::services::environment::get_node_environment(&self.db);
+        self.place_unplaced_partitions(&ctx.org_id, &cfg, env);
         let durability_detail = match before {
             Some(b) => format!(
-                "durability={}->{} durability_class={}->{} durability_explicit={}->{}",
+                "partitions={}->{} durability={}->{} durability_class={}->{} \
+                 durability_explicit={}->{}",
+                b.partitions,
+                cfg.partitions,
                 b.durability.to_wire_string(),
                 cfg.durability.to_wire_string(),
                 b.durability_class().as_str(),
@@ -4118,12 +4735,58 @@ impl BusService {
     /// new log without ever seeing its first N records) or have its first
     /// batch rejected as a producer-sequence `Duplicate` from the deleted
     /// topic's previous incarnation.
+    ///
+    /// A source topic takes its dead-letter topic (`__dlq.<name>`) with it —
+    /// the messages parked there belong to the deleted topic, and a topic
+    /// re-created under the name must not start with them. The DLQ goes
+    /// FIRST, while the source still exists, so a failure leaves a delete
+    /// the caller can simply repeat; a DLQ re-created in between by a
+    /// delivery that ran out of attempts is removed after the source.
+    /// The topic's access entries and data-hiding rules are removed with its
+    /// row (`repository::bus_topic_delete`).
     pub fn delete_topic(&self, ctx: &BusCallContext, name: &str) -> Result<(), BusServiceError> {
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, name)
             .map_err(|_| deny(BusAction::Admin, name))?;
+        if name.starts_with(dlq::DLQ_TOPIC_PREFIX) {
+            return self.remove_topic(ctx, name);
+        }
+        let dlq_name = dlq::dlq_topic_name(name);
+        let dlq_exists = |svc: &Self| -> Result<bool, BusServiceError> {
+            let row = crate::db::repository::bus_topic_get(
+                &svc.db,
+                &svc.instance_id,
+                &ctx.org_id,
+                &dlq_name,
+            )?;
+            Ok(row.is_some())
+        };
+        if dlq_exists(self)? {
+            self.remove_topic(ctx, &dlq_name)?;
+        }
+        self.remove_topic(ctx, name)?;
+        match dlq_exists(self) {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) = self.remove_topic(ctx, &dlq_name) {
+                    tracing::warn!(
+                        org_id = %ctx.org_id, topic = name, error = %e,
+                        "delete_topic: dead-letter topic re-created during the delete was not removed"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                org_id = %ctx.org_id, topic = name, error = %e,
+                "delete_topic: could not check for a re-created dead-letter topic"
+            ),
+        }
+        Ok(())
+    }
+
+    /// `delete_topic` for one topic, after the caller has been authorized.
+    fn remove_topic(&self, ctx: &BusCallContext, name: &str) -> Result<(), BusServiceError> {
         // PLAN §7.1 `max_bytes`: measured BEFORE the `bus_topics` row goes,
         // while `topic_config` can still say how many partitions to sum, and
         // before the handles are detached below. SUBTRACTED, not "drop the
@@ -4146,7 +4809,7 @@ impl BusService {
                 0
             }
         };
-        topics::delete_topic(&self.db, &self.instance_id, &ctx.org_id, name)?;
+        let removed_rules = topics::delete_topic(&self.db, &self.instance_id, &ctx.org_id, name)?;
         // M2 (PLAN-M2 §1e): stop replication and drop this topic's
         // assignments BEFORE detaching local handles/removing the
         // directory below — a feeder/follower stream still running against
@@ -4185,49 +4848,30 @@ impl BusService {
                 0
             }
         };
-        self.partitions.retain(|k, v| {
-            if k.0 == ctx.org_id && k.1 == name {
-                v.detach();
-                false
-            } else {
-                true
+        let LocalTopicPurge {
+            offset_keys_purged,
+            producer_seq_keys_purged,
+            discarded_keys_purged,
+            groups_purged,
+            log_removed,
+        } = {
+            let _incarnation = self.topic_incarnation_lock.lock();
+            self.purge_local_topic_state(&ctx.org_id, name)?
+        };
+        // The row is gone and every handle is detached, so the delete has
+        // happened; files that could not be removed now are an orphan
+        // directory the next start's sweep (`sweep_orphan_topic_dirs`)
+        // removes, and a re-created topic purges before its first open.
+        let released_bytes = match log_removed {
+            Ok(()) => released_bytes,
+            Err(e) => {
+                tracing::warn!(
+                    org_id = %ctx.org_id, topic = name, error = %e,
+                    "delete_topic: log directory not removed"
+                );
+                released_bytes.saturating_sub(self.topic_log_bytes(&ctx.org_id, name))
             }
-        });
-        self.detach_consumer_partitions(&ctx.org_id, Some(name));
-        // Dedup stores are mmapped: dropping the `Arc` here unmaps the file
-        // before it is unlinked below, rather than leaving the mapping open
-        // against a deleted inode.
-        self.dedup_stores
-            .remove(&(ctx.org_id.clone(), name.to_string()));
-        self.invalidate_topic_config_cache(&ctx.org_id, name);
-        self.round_robin
-            .remove(&(ctx.org_id.clone(), name.to_string()));
-        self.group_state.remove_topic(&ctx.org_id, name);
-        let offset_keys_purged = self.offsets.purge_topic(&ctx.org_id, name)?;
-        let producer_seq_keys_purged = self.producer_seq.purge_topic(&ctx.org_id, name)?;
-        // A no-op scan (0 rows) when `name` never had any discard markers
-        // (i.e. it is not a DLQ topic, or is one nobody ever discarded a
-        // record on) — mirrors `offsets`/`producer_seq` above, which pay
-        // the same harmless empty-prefix-scan cost for every non-DLQ topic
-        // deleted (M1-R2 review N-5, coordinator decision 2).
-        let discarded_keys_purged = self.discarded.purge_topic(&ctx.org_id, name)?;
-        let groups_purged =
-            crate::db::repository::bus_groups_delete_by_topic(&self.local_db, &ctx.org_id, name)?;
-        // Best-effort: stale history of a deleted topic only ever shows up in
-        // a re-created topic of the same name, which pruning clears in 24 h.
-        // Under `lag_history_lock`, after the `bus_topics` row is gone: a
-        // sampling round either wrote before this delete or sees the topic
-        // missing and drops its rows (`sample_lag_history`).
-        {
-            let _history = self.lag_history_lock.lock();
-            if let Err(e) = lag_history::delete_topic(&self.local_db, &ctx.org_id, name) {
-                tracing::warn!(topic = %name, error = %e, "lag history: delete for topic failed");
-            }
-        }
-        self.lag_trends
-            .retain(|(org, _, topic), _| !(org == &ctx.org_id && topic == name));
-        let dir = topics::topic_dir(&self.bus_dir, &ctx.org_id, name);
-        let _ = std::fs::remove_dir_all(&dir);
+        };
         // The segments measured at the top of this call are gone now.
         self.sub_org_stored_bytes(&ctx.org_id, released_bytes);
         let _ = crate::db::repository::log_audit(
@@ -4239,7 +4883,9 @@ impl BusService {
             Some(&audit_details(
                 &ctx.org_id,
                 Some(&format!(
-                    "offset_keys_purged={offset_keys_purged} producer_seq_keys_purged={producer_seq_keys_purged} discarded_keys_purged={discarded_keys_purged} groups_purged={groups_purged} assignments_deleted={assignments_deleted}"
+                    "offset_keys_purged={offset_keys_purged} producer_seq_keys_purged={producer_seq_keys_purged} discarded_keys_purged={discarded_keys_purged} groups_purged={groups_purged} assignments_deleted={assignments_deleted} acl_entries_removed={} field_policies_removed={}",
+                    removed_rules.acl_entries,
+                    removed_rules.field_policies.len(),
                 )),
             )),
             None,
@@ -4248,6 +4894,25 @@ impl BusService {
         Ok(())
     }
 
+    /// Moves `group`'s committed offset on `(topic, partition)` to `offset`,
+    /// forward or backward — the admin "change reading place" action.
+    ///
+    /// Leader-only, like every other consumer-offset read and write: a
+    /// follower's committed offsets are never read by a consumer, so a reset
+    /// written there would be accepted and then do nothing. `offset` must lie
+    /// in the partition's retained range `[earliest_offset, high_watermark]`.
+    ///
+    /// The group must exist on the topic (`bus_groups` row), else
+    /// `GroupNotFound`.
+    ///
+    /// Open consumer sessions of the group honour the reset (see
+    /// `OffsetResets`): their next `fetch` reads from the new place, and
+    /// `ConsumerHandle::commit` drops an acknowledgement of records fetched
+    /// before the reset (its doc states the exact rule). The move is replicated
+    /// through `note_offset_commit`, but followers apply offsets
+    /// monotonically (`apply_offsets`), so only a FORWARD move reaches them:
+    /// after a backward reset and a leader change the group resumes from the
+    /// followers' higher offset.
     pub fn reset_offset(
         &self,
         ctx: &BusCallContext,
@@ -4256,6 +4921,9 @@ impl BusService {
         partition: u32,
         offset: u64,
     ) -> Result<(), BusServiceError> {
+        // First: the name is part of NUL-separated fjall keys, so an
+        // unvalidated one could address another group's offsets.
+        validate_group_name(group)?;
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
@@ -4266,13 +4934,51 @@ impl BusService {
         // offset key for data that no longer has a corresponding topic row
         // (an admin re-issuing a stale reset request, or a UI action
         // replayed after the topic/org was already erased).
-        self.topic_config(&ctx.org_id, topic)?;
+        let cfg = self.topic_config(&ctx.org_id, topic)?;
+        check_partition_in_range(topic, partition, &cfg)?;
+        self.require_group_row(&ctx.org_id, group, topic)?;
+        let coordinator = self.replication();
+        check_leader_role(&coordinator, &ctx.org_id, topic, partition)?;
+        // Read straight off the partition: Admin is already authorized, and
+        // `partition_stats` would additionally demand Consume.
+        let stats = self.read_partition_stats(&ctx.org_id, topic, partition, &cfg)?;
+        if offset < stats.earliest_offset || offset > stats.high_watermark {
+            return Err(BusServiceError::InvalidArgument(format!(
+                "offset {offset} is outside partition {partition} of topic '{topic}': \
+                 the retained range is {}..={}",
+                stats.earliest_offset, stats.high_watermark
+            )));
+        }
+        // The group's commit mutex keeps a consumer `commit` from validating
+        // against the old offset and writing after this reset.
+        let lock = self
+            .commit_locks
+            .entry((ctx.org_id.clone(), group.to_string()))
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone();
+        let guard = lock.lock();
+        // Again under the lock: leadership may have moved while this call
+        // waited for it, and a follower's offset write is never read.
+        let coordinator = self.replication();
+        check_leader_role(&coordinator, &ctx.org_id, topic, partition)?;
         // `force_commit`, not `commit`: this is the one legitimate
         // path allowed to move an offset BACKWARD, gated on `bus.admin` and
         // audited right below — `commit`'s own monotonicity guard exists
         // specifically to keep every other caller off this move.
         self.offsets
             .force_commit(&ctx.org_id, group, topic, partition, offset, now_ms())?;
+        // After the write: a handle that sees the new seq must read the new
+        // committed offset when it reloads its cursor.
+        self.offset_resets.note((
+            ctx.org_id.clone(),
+            group.to_string(),
+            topic.to_string(),
+            partition,
+        ));
+        drop(guard);
+        if let Some(coordinator) = &coordinator {
+            coordinator.note_offset_commit(&ctx.org_id, group, topic, partition, offset, 0);
+        }
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.actor.as_deref(),
@@ -4559,12 +5265,19 @@ impl BusService {
         // `None` (no coordinator installed — M1, or a build that never
         // calls `set_replication`) skips this entirely: RF=1's publish path
         // is byte-for-byte the M1 path (PLAN-M2 §4.1 A1).
+        //
+        // The epoch each partition was admitted under travels to its append
+        // (`Partition::append_batch_as_leader`): leadership can move during
+        // the earlier partitions' quorum waits, and a write admitted in one
+        // term must not land in a log that meanwhile belongs to the next.
         let coordinator = self.replication();
+        let mut admitted_epochs: Vec<(u32, u32)> = Vec::new();
         if let Some(coordinator) = &coordinator {
             for (partition, _) in &groups {
-                coordinator
+                let epoch = coordinator
                     .preflight(&ctx.org_id, topic, *partition, cfg.acks)
                     .map_err(|e| map_repl_error(coordinator, &ctx.org_id, topic, *partition, e))?;
+                admitted_epochs.push((*partition, epoch));
             }
         }
 
@@ -4817,9 +5530,15 @@ impl BusService {
             // report and the same unit `run_retention_sweep` subtracts.
             // Read before `wire` is moved into the append.
             let appended_segment_bytes = wire.len() as u64;
-            let append = part
-                .append_batch(wire)
-                .map_err(|e| wrap_err(&acks, map_engine_error(e, topic, partition)))?;
+            let admitted = admitted_epochs
+                .iter()
+                .find(|(p, _)| *p == partition)
+                .map(|&(_, epoch)| epoch);
+            let append = match admitted {
+                Some(epoch) => part.append_batch_as_leader(wire, epoch),
+                None => part.append_batch(wire),
+            }
+            .map_err(|e| wrap_err(&acks, map_engine_error(e, topic, partition)))?;
             // Credited HERE, not after the loop: these bytes are durably on
             // this leader's disk from this point on, so a later failure in
             // this same call (`await_acks`, the producer-sequence record)
@@ -4996,6 +5715,23 @@ impl BusService {
         let cfg = self.authorized_topic(ctx, topic, "partition_stats")?;
         check_partition_in_range(topic, partition, &cfg)?;
         self.read_partition_stats(&ctx.org_id, topic, partition, &cfg)
+    }
+
+    /// This node's own handle on one partition of `topic`, whatever its
+    /// replication role, for reading the local replica's log directly —
+    /// comparing replicas byte for byte needs exactly that, and `peek` is
+    /// leader-only. Authorized like `partition_stats`. Opened through
+    /// `partition_handle`, so it checks the local log belongs to the topic
+    /// row's incarnation like every other open does.
+    pub fn local_partition(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+    ) -> Result<tentaflow_bus::Partition, BusServiceError> {
+        let cfg = self.authorized_topic(ctx, topic, "local_partition")?;
+        check_partition_in_range(topic, partition, &cfg)?;
+        self.partition_handle(&ctx.org_id, topic, partition, &cfg)
     }
 
     /// `partition_stats` for every partition of `topic`, authorized once —
@@ -5733,6 +6469,9 @@ impl BusService {
 
         // Phase 2: every topic passed validation — now perform the actual
         // side effects (`bus_groups` upsert, partition open).
+        // Before any per-partition seq is read, so a reset racing this call
+        // leaves the handle's generation behind and gets picked up.
+        let reset_generation = self.offset_resets.generation();
         let mut partitions = Vec::new();
         for (topic, topic_cfg, existing_row) in &checked {
             // register/refresh this group's `bus_groups` row so
@@ -5757,6 +6496,10 @@ impl BusService {
             let env_byte = environment_to_u8(topic_cfg.environment);
             for p in 0..topic_cfg.partitions {
                 let part = self.partition_handle(&ctx.org_id, topic, p, topic_cfg)?;
+                // Seq before the committed offset: a reset landing between
+                // the two reads then shows up as a moved seq and reloads the
+                // cursor, instead of being taken as already applied.
+                let applied_reset = self.offset_resets.seq(&ctx.org_id, group, topic, p);
                 let committed = self
                     .offsets
                     .committed_offset(&ctx.org_id, group, topic, p)?;
@@ -5777,7 +6520,7 @@ impl BusService {
                     // regardless of whether `self.partitions` still has an
                     // entry for this key.
                     handle: part,
-                    next_offset: AtomicU64::new(committed),
+                    cursor: parking_lot::Mutex::new(ConsumerCursor::new(committed, applied_reset)),
                     environment: env_byte,
                     gap_audited: std::sync::atomic::AtomicBool::new(false),
                 });
@@ -5834,6 +6577,8 @@ impl BusService {
             audit_windows: Arc::clone(&self.audit_windows),
             group_state: Arc::clone(&self.group_state),
             commit_locks: Arc::clone(&self.commit_locks),
+            offset_resets: Arc::clone(&self.offset_resets),
+            reset_generation: AtomicU64::new(reset_generation),
             purged_orgs: Arc::clone(&self.purged_orgs),
             purge_epoch: purge_epoch_before,
             replication: Arc::clone(&self.replication),
@@ -5972,7 +6717,16 @@ impl BusService {
                 field_policies::ActorKind::from_origin(&ctx.origin),
                 field_policies::Direction::Read,
             )? {
-                let format = payload_format::PayloadFormat::from_content_type(&cfg.content_type);
+                // A DLQ topic is created without its source's content type
+                // (`dlq_topic_options`), and its policy IS the source's
+                // (`field_policies::resolve`): the payload is read in the
+                // source's format, or an HL7 or XML record would be parsed as
+                // JSON and come back empty.
+                let content_type = match topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX) {
+                    Some(source) => self.topic_config(&ctx.org_id, source)?.content_type,
+                    None => cfg.content_type.clone(),
+                };
+                let format = payload_format::PayloadFormat::from_content_type(&content_type);
                 for rec in &mut records {
                     rec.payload = field_policies::project_read(&policy, format, &rec.payload);
                 }
@@ -6240,8 +6994,22 @@ impl BusService {
     }
 
     /// Republishes a DLQ record to its source topic with `dlq.retry_of` set
-    /// (PLAN §3.3 "Ponów"), attempts reset by virtue of being a normal
-    /// fresh publish.
+    /// (PLAN §3.3 "Ponów") and marks the DLQ record handled.
+    ///
+    /// What the republish is: a NEW record appended at the end of the
+    /// source topic (a new offset, after everything written since; the
+    /// same partition only when the record has a key), so EVERY consumer
+    /// group of the topic receives it — also the ones that processed the
+    /// original — and a consumer that fails it again counts its attempts
+    /// from zero. A record rejected at write time goes through the topic's
+    /// validation again and, still invalid, lands in the DLQ again as a new
+    /// record (`PublishResult` then accepts nothing).
+    ///
+    /// The DLQ record is marked handled (the same durable marker as
+    /// `dlq_discard`) only AFTER the republish succeeded, so a failed
+    /// republish leaves it listed; a record already handled, or one another
+    /// retry is republishing right now, is refused with `DlqRecordHandled`
+    /// instead of republished a second time.
     pub fn dlq_retry(
         &self,
         ctx: &BusCallContext,
@@ -6259,6 +7027,21 @@ impl BusService {
             .ok_or_else(|| {
                 BusServiceError::InvalidArgument(format!("'{dlq_topic}' is not a DLQ topic"))
             })?;
+        let handled = || BusServiceError::DlqRecordHandled {
+            topic: dlq_topic.to_string(),
+            partition: dlq_partition,
+            offset: dlq_offset,
+        };
+        let _claim = self
+            .dlq_retrying
+            .claim(&ctx.org_id, dlq_topic, dlq_partition, dlq_offset)
+            .ok_or_else(handled)?;
+        if self
+            .discarded
+            .is_discarded(&ctx.org_id, dlq_topic, dlq_partition, dlq_offset)?
+        {
+            return Err(handled());
+        }
         let dlq_cfg = self.topic_config(&ctx.org_id, dlq_topic)?;
         let part = self.partition_handle(&ctx.org_id, dlq_topic, dlq_partition, &dlq_cfg)?;
         let reader = part.open_reader();
@@ -6290,6 +7073,7 @@ impl BusService {
                 records: vec![retry_record],
             },
         )?;
+        self.mark_dlq_handled(ctx, source_topic, dlq_topic, dlq_partition, dlq_offset)?;
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.actor.as_deref(),
@@ -6298,7 +7082,9 @@ impl BusService {
             Some(source_topic),
             Some(&audit_details(
                 &ctx.org_id,
-                Some(&format!("dlq_topic={dlq_topic} dlq_offset={dlq_offset}")),
+                Some(&format!(
+                    "dlq_topic={dlq_topic} dlq_partition={dlq_partition} dlq_offset={dlq_offset}"
+                )),
             )),
             None,
             None,
@@ -6314,18 +7100,11 @@ impl BusService {
     /// compaction engine's job), and the record's bytes remain physically
     /// present in the DLQ topic's log until normal retention (default 30
     /// days, `dlq_topic_options`) removes the whole segment holding them.
-    /// What changed since the version of this doc the R2 review quoted:
-    /// discarding now writes a durable marker (`dlq::DiscardStore`) that
-    /// every caller-facing DLQ surface honors — `dlq_list`'s dispatch-layer
-    /// wrapper and `peek` filter a discarded offset out of what it returns,
-    /// `dlq_retry_all` skips it, and `dlq_depth` (the `StatsSnapshot` KPI)
-    /// no longer counts it. A discarded record can still be resurrected by
-    /// calling `dlq_retry` on its EXACT `(dlq_topic, partition, offset)`
-    /// directly (an explicit, single-record admin action naming the record
-    /// by coordinates is not the accidental "Ponów wszystkie brought back a
-    /// record I just discarded" failure mode the review reported) — a UI
-    /// surfacing this action again for an already-discarded row should make
-    /// that explicit.
+    /// Discarding writes a durable marker (`dlq::DiscardStore`) that every
+    /// caller-facing DLQ surface honors — `dlq_list`'s dispatch-layer
+    /// wrapper filters a discarded offset out of what it returns,
+    /// `dlq_retry_all` and `dlq_retry` skip it, and `dlq_depth` (the
+    /// `StatsSnapshot` KPI) no longer counts it.
     pub fn dlq_discard(
         &self,
         ctx: &BusCallContext,
@@ -6338,8 +7117,30 @@ impl BusService {
         self.authorizer
             .authorize(ctx, BusAction::Admin, dlq_topic)
             .map_err(|_| deny(BusAction::Admin, dlq_topic))?;
-        self.discarded
-            .mark(&ctx.org_id, dlq_topic, partition, offset, now_ms())?;
+        let source_topic = dlq_topic
+            .strip_prefix(dlq::DLQ_TOPIC_PREFIX)
+            .ok_or_else(|| {
+                BusServiceError::InvalidArgument(format!("'{dlq_topic}' is not a DLQ topic"))
+            })?;
+        // Refused like a second retry: a record already retried or discarded
+        // — or being republished right now — is not discarded (and audited)
+        // a second time.
+        let handled = || BusServiceError::DlqRecordHandled {
+            topic: dlq_topic.to_string(),
+            partition,
+            offset,
+        };
+        let _claim = self
+            .dlq_retrying
+            .claim(&ctx.org_id, dlq_topic, partition, offset)
+            .ok_or_else(handled)?;
+        if self
+            .discarded
+            .is_discarded(&ctx.org_id, dlq_topic, partition, offset)?
+        {
+            return Err(handled());
+        }
+        self.mark_dlq_handled(ctx, source_topic, dlq_topic, partition, offset)?;
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.actor.as_deref(),
@@ -6353,6 +7154,24 @@ impl BusService {
             None,
             None,
         );
+        Ok(())
+    }
+
+    /// Writes the durable "handled" marker of one DLQ record and hands it to
+    /// replication, so the followers stop listing it too.
+    fn mark_dlq_handled(
+        &self,
+        ctx: &BusCallContext,
+        source_topic: &str,
+        dlq_topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<(), BusServiceError> {
+        self.discarded
+            .mark(&ctx.org_id, dlq_topic, partition, offset, now_ms())?;
+        if let Some(coordinator) = self.replication() {
+            coordinator.note_dlq_handled(&ctx.org_id, source_topic, partition, offset);
+        }
         Ok(())
     }
 
@@ -6385,13 +7204,35 @@ impl BusService {
 
     // ---- Group administration (PLAN §8.2 `bus.group.pause`) --------------
 
-    /// Sets a group's paused bookkeeping flag (`bus_groups` table) and
-    /// audits the change. `ConsumerHandle::fetch` DOES consult this (via
-    /// `GroupStateCache`, invalidated right below) and refuses to serve a
-    /// paused group with `BusServiceError::GroupPaused` — a caller does not
-    /// need to poll `is_group_paused` itself before calling `fetch` to get
-    /// that enforcement, though doing so avoids paying for a `fetch` call
-    /// it already knows will be rejected.
+    /// `group`'s `bus_groups` row on `topic`, or `GroupNotFound`.
+    fn require_group_row(
+        &self,
+        org_id: &str,
+        group: &str,
+        topic: &str,
+    ) -> Result<crate::db::repository::DbBusGroup, BusServiceError> {
+        crate::db::repository::bus_group_get(&self.local_db, org_id, group, topic)?.ok_or_else(
+            || BusServiceError::GroupNotFound {
+                group: group.to_string(),
+                topic: topic.to_string(),
+            },
+        )
+    }
+
+    /// Sets a group's paused flag (`bus_groups` table) and audits the
+    /// change. `ConsumerHandle::fetch` consults it (via `GroupStateCache`,
+    /// invalidated right below) and refuses to serve a paused group with
+    /// `BusServiceError::GroupPaused`.
+    ///
+    /// The flag lives in THIS node's `tentabus.db` and is not replicated,
+    /// while `fetch` runs on each partition's leader. So the call is
+    /// refused with `NotLeader` unless this node leads EVERY partition of
+    /// the topic — a flag written anywhere else would be accepted and then
+    /// ignored by the node actually serving the group. After a leadership
+    /// change the new leader does not know the flag.
+    ///
+    /// Only an existing group (a `bus_groups` row, written when a consumer
+    /// opens a session) can be paused or resumed, else `GroupNotFound`.
     fn set_group_paused(
         &self,
         ctx: &BusCallContext,
@@ -6399,29 +7240,26 @@ impl BusService {
         topic: &str,
         paused: bool,
     ) -> Result<(), BusServiceError> {
+        validate_group_name(group)?;
         // `check_instance` here (not duplicated in `pause_group`/
-        // `resume_group`) covers both public wrappers, since this is the
-        // first statement either of them reaches.
+        // `resume_group`) covers both public wrappers.
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
             .authorize(ctx, BusAction::Admin, topic)
             .map_err(|_| deny(BusAction::Admin, topic))?;
-        let now = now_ms();
-        let commit_mode =
-            crate::db::repository::bus_group_get(&self.local_db, &ctx.org_id, group, topic)?
-                .map(|g| g.commit_mode)
-                .unwrap_or_else(|| groups::CommitMode::AutoAfterSuccess.as_str().to_string());
+        let cfg = self.topic_config(&ctx.org_id, topic)?;
+        let coordinator = self.replication();
+        for partition in 0..cfg.partitions {
+            check_leader_role(&coordinator, &ctx.org_id, topic, partition)?;
+        }
+        let row = self.require_group_row(&ctx.org_id, group, topic)?;
         crate::db::repository::bus_group_upsert(
             &self.local_db,
             &crate::db::repository::DbBusGroup {
-                org_id: ctx.org_id.clone(),
-                group_id: group.to_string(),
-                topic: topic.to_string(),
-                commit_mode,
                 paused,
-                created_at_ms: now,
-                updated_at_ms: now,
+                updated_at_ms: now_ms(),
+                ..row
             },
         )?;
         // Invalidate rather than update-in-place: simpler to reason about
@@ -6784,9 +7622,11 @@ impl BusService {
         self.detach_consumer_partitions(org_id, None);
         self.dedup_stores.retain(|k, _| k.0 != org_id);
         self.topic_config_cache.retain(|k, _| k.0 != org_id);
+        self.topic_incarnations.retain(|k, _| k.0 != org_id);
         self.round_robin.retain(|k, _| k.0 != org_id);
         self.publish_rates.retain(|k, _| k.0 != org_id);
         self.group_state.remove_org(org_id);
+        self.offset_resets.remove_org(org_id);
         self.audit_windows.remove_org(org_id);
         self.commit_locks.retain(|k, _| k.0 != org_id);
         self.quota.remove_org(org_id);
@@ -6933,10 +7773,26 @@ impl replication::glue::PartitionProvider for BusService {
         org: &str,
         topic: &str,
         partition: u32,
+        topic_generation: u64,
     ) -> Result<tentaflow_bus::Partition, ReplError> {
-        let cfg = self
+        let mut cfg = self
             .topic_config(org, topic)
             .map_err(|e| ReplError::Internal(e.to_string()))?;
+        if cfg.generation != topic_generation {
+            // A cached config can predate a re-creation this node has since
+            // materialized; the row is the reference, so read it again.
+            self.invalidate_topic_config_cache(org, topic);
+            cfg = self
+                .topic_config(org, topic)
+                .map_err(|e| ReplError::Internal(e.to_string()))?;
+        }
+        if cfg.generation != topic_generation {
+            return Err(ReplError::Internal(format!(
+                "placement of topic '{topic}' names incarnation {topic_generation}, \
+                 the topic row here is incarnation {}",
+                cfg.generation
+            )));
+        }
         self.partition_handle(org, topic, partition, &cfg)
             .map_err(|e| ReplError::Internal(e.to_string()))
     }
@@ -7033,7 +7889,10 @@ struct ConsumerPartition {
     /// at `open_consumer` time so `delete_topic`/`purge_org` can `detach()`
     /// it even after the map entry is gone.
     handle: tentaflow_bus::Partition,
-    next_offset: AtomicU64,
+    /// Fetch position and admin-reset bookkeeping — see `ConsumerCursor`.
+    /// Lock order: the group's commit mutex (`commit_locks`) first, when
+    /// both are taken.
+    cursor: parking_lot::Mutex<ConsumerCursor>,
     /// Snapshot of the topic's environment (PLAN §4.4 Z12) taken at
     /// `open_consumer` time, encoded via `environment_to_u8` — compared
     /// against the handle's `node_environment` on every `fetch`.
@@ -7083,6 +7942,11 @@ pub struct ConsumerHandle {
     group_state: Arc<GroupStateCache>,
     /// Shared with `BusService::commit_locks` — see that field's doc.
     commit_locks: CommitLocks,
+    /// Shared with `BusService::offset_resets` — see `OffsetResets`' doc.
+    offset_resets: Arc<OffsetResets>,
+    /// `OffsetResets::generation` this handle last applied to every one of
+    /// its partitions.
+    reset_generation: AtomicU64,
     /// Shared with `BusService::purged_orgs` — see that field's doc.
     purged_orgs: Arc<DashMap<String, u64>>,
     /// This handle's org's purge count at `open_consumer` time — compared
@@ -7168,6 +8032,86 @@ impl ConsumerHandle {
         Ok(())
     }
 
+    /// This group's commit mutex (see `BusService::commit_locks`), which
+    /// `BusService::reset_offset` also holds while it moves an offset.
+    fn commit_lock(&self) -> Arc<parking_lot::Mutex<()>> {
+        self.commit_locks
+            .entry((self.org_id.clone(), self.group.clone()))
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+            .clone()
+    }
+
+    /// Whether an admin reset happened anywhere since this handle last
+    /// applied resets — one atomic load, the no-reset fast path.
+    fn resets_pending(&self) -> bool {
+        self.reset_generation.load(Ordering::Acquire) != self.offset_resets.generation()
+    }
+
+    /// Applies admin offset resets made since this handle last looked:
+    /// every partition whose reset seq moved reloads its cursor from the
+    /// committed offset (`ConsumerCursor::reload`). The caller holds the
+    /// group's commit mutex, so no reset is half-written while this reads.
+    fn apply_offset_resets_locked(&self) -> Result<(), BusServiceError> {
+        let generation = self.offset_resets.generation();
+        if self.reset_generation.load(Ordering::Acquire) == generation {
+            return Ok(());
+        }
+        for cp in &self.partitions {
+            let seq = self
+                .offset_resets
+                .seq(&self.org_id, &self.group, &cp.topic, cp.partition);
+            let mut cursor = cp.cursor.lock();
+            if seq == cursor.applied_reset {
+                continue;
+            }
+            let committed = self.offsets.committed_offset(
+                &self.org_id,
+                &self.group,
+                &cp.topic,
+                cp.partition,
+            )?;
+            cursor.reload(committed, seq);
+            cp.gap_audited.store(false, Ordering::Release);
+        }
+        self.reset_generation.store(generation, Ordering::Release);
+        Ok(())
+    }
+
+    /// Moves `cp`'s cursor past the records `fetch` just read from `from`
+    /// up to `new_next`. `false` when a reset moved the cursor meanwhile:
+    /// those records are then not delivered, and nothing is committed.
+    ///
+    /// `AtMostOnce` commits here, under the group's commit mutex and after
+    /// applying pending resets under it: a reset that lands between reading
+    /// the cursor and this commit is seen as a moved cursor, so the commit
+    /// never overwrites it.
+    fn advance_cursor(
+        &self,
+        cp: &ConsumerPartition,
+        from: u64,
+        new_next: u64,
+    ) -> Result<bool, BusServiceError> {
+        if self.commit_mode != groups::CommitMode::AtMostOnce {
+            return Ok(cp.cursor.lock().advance(from, new_next));
+        }
+        let lock = self.commit_lock();
+        let _guard = lock.lock();
+        self.apply_offset_resets_locked()?;
+        let mut cursor = cp.cursor.lock();
+        if cursor.next != from {
+            return Ok(false);
+        }
+        self.offsets.commit(
+            &self.org_id,
+            &self.group,
+            &cp.topic,
+            cp.partition,
+            new_next,
+            now_ms(),
+        )?;
+        Ok(cursor.advance(from, new_next))
+    }
+
     /// Pull-based fetch (PLAN §5.3.7): polls every subscribed partition
     /// round-robin up to `max_bytes` total, long-polling up to
     /// `max_wait_ms` if nothing is available yet.
@@ -7210,6 +8154,11 @@ impl ConsumerHandle {
                 });
             }
         }
+        if self.resets_pending() {
+            let lock = self.commit_lock();
+            let _guard = lock.lock();
+            self.apply_offset_resets_locked()?;
+        }
         let deadline = Instant::now() + Duration::from_millis(max_wait_ms as u64);
         loop {
             let mut records = Vec::new();
@@ -7220,7 +8169,7 @@ impl ConsumerHandle {
                 }
                 self.check_environment(cp)?;
                 check_leader_role(&coordinator, &self.org_id, &cp.topic, cp.partition)?;
-                let from = cp.next_offset.load(Ordering::Acquire);
+                let from = cp.cursor.lock().next;
                 let batches = match cp
                     .reader
                     .fetch_from_offset(from, max_bytes.saturating_sub(consumed))
@@ -7263,6 +8212,7 @@ impl ConsumerHandle {
                     }
                     Err(other) => return Err(map_engine_error(other, &cp.topic, cp.partition)),
                 };
+                let (records_before, consumed_before) = (records.len(), consumed);
                 let mut new_next = from;
                 for view in &batches {
                     for rv in view.records_from(from) {
@@ -7285,18 +8235,11 @@ impl ConsumerHandle {
                     }
                     new_next = new_next.max(view.header().next_offset());
                 }
-                if new_next > from {
-                    cp.next_offset.store(new_next, Ordering::Release);
-                    if self.commit_mode == groups::CommitMode::AtMostOnce {
-                        self.offsets.commit(
-                            &self.org_id,
-                            &self.group,
-                            &cp.topic,
-                            cp.partition,
-                            new_next,
-                            now_ms(),
-                        )?;
-                    }
+                if new_next > from && !self.advance_cursor(cp, from, new_next)? {
+                    // An admin reset moved this partition while it was
+                    // read: those records belong to the old position.
+                    records.truncate(records_before);
+                    consumed = consumed_before;
                 }
             }
             if !records.is_empty() || Instant::now() >= deadline {
@@ -7384,15 +8327,28 @@ impl ConsumerHandle {
     /// a `committed_offset` that a first call's write loop is
     /// concurrently about to move past, and the two writes could interleave
     /// even though each one individually validated cleanly.
+    ///
+    /// Admin offset resets (`BusService::reset_offset`): pending resets are
+    /// applied first, under the same mutex `reset_offset` writes under, and
+    /// an entry that can only acknowledge records fetched BEFORE the latest
+    /// reset of its partition is DROPPED — not written, not an error, and
+    /// the cursor is not raised by it. Exactly, per partition
+    /// (`ConsumerCursor::accepts`):
+    /// - an offset below the reset's target is dropped: this handle has
+    ///   fetched nothing below it since the reset;
+    /// - while the handle replays below the position it had reached before
+    ///   the reset, an offset above what it has fetched since the reset is
+    ///   dropped (a fetch-ahead batch committed after the move back).
+    ///
+    /// Everything else is validated and written as usual. Not
+    /// distinguishable, hence accepted: a pre-reset acknowledgement at or
+    /// below what the handle has already re-fetched, and — once the replay
+    /// has passed the pre-reset position — any offset above it.
     pub fn commit(&self, offsets: &[(TopicPartition, u64)]) -> Result<(), BusServiceError> {
         self.revalidate()?;
         // M2 (PLAN-M2 §1e): consumption is leader-only.
         let coordinator = self.replication.read().clone();
-        let lock = self
-            .commit_locks
-            .entry((self.org_id.clone(), self.group.clone()))
-            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
-            .clone();
+        let lock = self.commit_lock();
         let _guard = lock.lock();
         // Checked UNDER the group's commit mutex, not before acquiring
         // it: `purge_org` bumps `purged_orgs` and only then goes on to
@@ -7405,6 +8361,10 @@ impl ConsumerHandle {
         if let Some((tp, _)) = offsets.first() {
             self.check_not_purged(&tp.topic)?;
         }
+        // Under the commit mutex, which `reset_offset` also holds while it
+        // writes: no reset can land between this and the writes below.
+        self.apply_offset_resets_locked()?;
+        let mut accepted = Vec::with_capacity(offsets.len());
         for (tp, offset) in offsets {
             let cp = self
                 .partitions
@@ -7416,6 +8376,14 @@ impl ConsumerHandle {
                 })?;
             self.check_environment(cp)?;
             check_leader_role(&coordinator, &self.org_id, &tp.topic, tp.partition)?;
+            if !cp.cursor.lock().accepts(*offset) {
+                tracing::debug!(
+                    org_id = %self.org_id, group = %self.group, topic = %tp.topic,
+                    partition = tp.partition, offset = *offset,
+                    "commit dropped: it acknowledges records fetched before an admin offset reset"
+                );
+                continue;
+            }
             let committed = self.offsets.committed_offset(
                 &self.org_id,
                 &self.group,
@@ -7430,15 +8398,16 @@ impl ConsumerHandle {
                     committed,
                 });
             }
+            accepted.push((tp, *offset, cp));
         }
         let now = now_ms();
-        for (tp, offset) in offsets {
+        for (tp, offset, cp) in accepted {
             self.offsets.commit(
                 &self.org_id,
                 &self.group,
                 &tp.topic,
                 tp.partition,
-                *offset,
+                offset,
                 now,
             )?;
             // K-M2-5: replicate this offset commit so a failover redelivers
@@ -7456,20 +8425,12 @@ impl ConsumerHandle {
                     &self.group,
                     &tp.topic,
                     tp.partition,
-                    *offset,
+                    offset,
                     0,
                 );
             }
-            if let Some(cp) = self
-                .partitions
-                .iter()
-                .find(|p| p.topic == tp.topic && p.partition == tp.partition)
-            {
-                let cur = cp.next_offset.load(Ordering::Acquire);
-                if *offset > cur {
-                    cp.next_offset.store(*offset, Ordering::Release);
-                }
-            }
+            let mut cursor = cp.cursor.lock();
+            cursor.next = cursor.next.max(offset);
         }
         Ok(())
     }
@@ -7515,7 +8476,7 @@ impl ConsumerHandle {
             earliest,
             now_ms(),
         )?;
-        cp.next_offset.store(earliest, Ordering::Release);
+        cp.cursor.lock().next = earliest;
         cp.gap_audited.store(false, Ordering::Release);
         Ok(earliest)
     }
@@ -8638,7 +9599,7 @@ mod tests {
         // The topic row is written directly, before any engine exists, so
         // the whole of this org's on-disk data predates the `BusService`
         // whose seed is under test.
-        topics::create_topic(
+        let cfg = topics::create_topic(
             &db,
             test_instance_id().as_str(),
             "org-1",
@@ -8650,7 +9611,11 @@ mod tests {
             crate::services::environment::get_node_environment(&db),
             now_ms(),
         )
-        .expect("create the topic row");
+        .expect("create the topic row").0;
+        // What `BusService::create_topic` does next: the log directory
+        // belongs to this incarnation. Without it the log written below is
+        // indistinguishable from a deleted incarnation's leftovers.
+        write_topic_incarnation(&bus_dir, "org-1", "seeded.topic", cfg.generation).unwrap();
 
         // Pre-seal several segments straight through the engine, bypassing
         // the fixed `RollPolicy::default()` `partition_handle` uses in
@@ -8729,6 +9694,227 @@ mod tests {
             svc.org_stored_bytes("org-1"),
             partition_stored_bytes(&part),
             "counter and engine must still agree once the sweep is done"
+        );
+    }
+
+    /// A topic deleted through the ledger by a build before v172 left its
+    /// log directory behind without a row. The next start removes it — and
+    /// only it: a topic whose row exists keeps its log, and a directory that
+    /// is not a topic log (no partition, no marker) is not touched.
+    #[test]
+    fn startup_removes_the_log_of_a_topic_with_no_row_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        crate::db::repository::bus_test_support::create_bus_tables(&db)
+            .expect("bus fixture tables");
+        let start = || {
+            BusService::new(BusInitConfig {
+                instance_id: test_instance_id(),
+                local_db: test_local_db(),
+                bus_dir: dir.path().join("bus"),
+                db: db.clone(),
+                authorizer: Arc::new(AllowAllAuthorizer),
+                retention_interval: None,
+                dedup_expected_rate_per_sec: 10_000,
+                partition_handle_lru: None,
+                publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+            })
+            .expect("bus service")
+        };
+        let ctx = test_ctx("org-1");
+        {
+            let svc = start();
+            for name in ["keep.topic", "gone.topic"] {
+                svc.create_topic(
+                    &ctx,
+                    name,
+                    topics::TopicOptions {
+                        partitions: Some(1),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                svc.publish(
+                    &ctx,
+                    name,
+                    PublishBatch {
+                        partition: Some(0),
+                        producer: None,
+                        records: vec![record("r")],
+                    },
+                )
+                .unwrap();
+            }
+            // What an earlier build's materializer did on a replica: the row
+            // goes, nothing else does.
+            crate::db::repository::bus_topic_delete(&db, svc.instance_id(), "org-1", "gone.topic")
+                .unwrap();
+        }
+        let bus_dir = dir.path().join("bus");
+        let stray = bus_dir.join("org-1").join("notes.dir");
+        std::fs::create_dir_all(stray.join("readme")).unwrap();
+
+        let svc = start();
+        assert!(!topics::topic_dir(&bus_dir, "org-1", "gone.topic").exists());
+        assert!(
+            stray.exists(),
+            "a directory that is not a topic log is left alone"
+        );
+        let stats = svc.partition_stats(&ctx, "keep.topic", 0).unwrap();
+        assert_eq!(stats.log_end_offset, 1, "a topic with a row keeps its log");
+    }
+
+    /// Swaps this node's `bus_topics` row for another incarnation of the
+    /// same name, the way the ledger does on a replica (the materializer
+    /// writes the row; nothing touches the log, the handles or the cache).
+    fn materialize_another_incarnation(svc: &BusService, org: &str, topic: &str) -> u64 {
+        let mut row = crate::db::repository::bus_topic_get(&svc.db, svc.instance_id(), org, topic)
+            .unwrap()
+            .expect("topic row");
+        row.generation += 1_000;
+        crate::db::repository::bus_topic_delete(&svc.db, svc.instance_id(), org, topic).unwrap();
+        crate::db::repository::bus_topic_create(&svc.db, &row).unwrap();
+        row.generation
+    }
+
+    /// A replica learns of a delete + re-create only through the ledger,
+    /// which never touches its log. Its first open of the new incarnation —
+    /// here a placement's replication handle, while the old incarnation's
+    /// handle is still cached from earlier writes — must find the old log,
+    /// its offsets and its stored bytes gone; the same incarnation later must
+    /// keep what it has written; and a placement of an older incarnation than
+    /// the row must be refused.
+    #[test]
+    fn a_placement_of_a_newer_topic_incarnation_drops_the_local_log_of_the_old_one() {
+        use replication::glue::PartitionProvider;
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.replica";
+        let first = svc
+            .create_topic(
+                &ctx,
+                topic,
+                topics::TopicOptions {
+                    partitions: Some(1),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        for i in 0..3 {
+            svc.publish(
+                &ctx,
+                topic,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record(&format!("old-{i}"))],
+                },
+            )
+            .unwrap();
+        }
+        svc.offsets
+            .commit("org-1", "workers", topic, 0, 3, 0)
+            .unwrap();
+        assert!(svc.org_stored_bytes("org-1") > 0);
+
+        let second = materialize_another_incarnation(&svc, "org-1", topic);
+        let part = PartitionProvider::partition(&svc, "org-1", topic, 0, second).unwrap();
+        assert_eq!(
+            part.log_end_offset(),
+            0,
+            "the old incarnation's log must be gone"
+        );
+        assert_eq!(svc.org_stored_bytes("org-1"), 0);
+        assert_eq!(
+            svc.offsets
+                .committed_offset("org-1", "workers", topic, 0)
+                .unwrap(),
+            0,
+            "the old incarnation's committed offset must not carry over"
+        );
+        assert_eq!(
+            read_topic_incarnation(&svc.bus_dir, "org-1", topic).unwrap(),
+            second
+        );
+
+        svc.publish(
+            &ctx,
+            topic,
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record("new-0")],
+            },
+        )
+        .unwrap();
+        let again = PartitionProvider::partition(&svc, "org-1", topic, 0, second).unwrap();
+        assert_eq!(
+            again.log_end_offset(),
+            1,
+            "the same incarnation keeps its log"
+        );
+
+        assert!(
+            PartitionProvider::partition(&svc, "org-1", topic, 0, first.generation).is_err(),
+            "a placement of an older incarnation must be refused"
+        );
+        assert_eq!(
+            PartitionProvider::partition(&svc, "org-1", topic, 0, second)
+                .unwrap()
+                .log_end_offset(),
+            1,
+            "a refused stale placement must not touch the current log"
+        );
+    }
+
+    /// The node that re-creates a topic deleted elsewhere still holds the
+    /// deleted incarnation's log from when it replicated it, and no
+    /// placement is involved in its own first write. That write must land in
+    /// an empty log, not after the deleted incarnation's records.
+    #[test]
+    fn the_first_local_write_of_a_new_incarnation_starts_an_empty_log() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.recreated";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for i in 0..3 {
+            svc.publish(
+                &ctx,
+                topic,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record(&format!("old-{i}"))],
+                },
+            )
+            .unwrap();
+        }
+        materialize_another_incarnation(&svc, "org-1", topic);
+        svc.invalidate_topic_config_cache("org-1", topic);
+
+        let ack = svc
+            .publish(
+                &ctx,
+                topic,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record("new-0")],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            ack.single_partition().map(|p| p.base_offset),
+            Some(0),
+            "the new incarnation must not append after the deleted one's records"
         );
     }
 
@@ -8829,6 +10015,15 @@ mod tests {
         let ctx = test_ctx("org-1");
         svc.create_topic(&ctx, "orders.paused", topics::TopicOptions::default())
             .unwrap();
+        svc.open_consumer(
+            &ctx,
+            "g1",
+            &["orders.paused".to_string()],
+            ConsumerConfig {
+                commit_mode: groups::CommitMode::Explicit,
+            },
+        )
+        .unwrap();
 
         assert!(!svc.is_group_paused("org-1", "g1", "orders.paused").unwrap());
         svc.pause_group(&ctx, "g1", "orders.paused").unwrap();
@@ -9958,6 +11153,159 @@ mod tests {
         );
     }
 
+    /// Sends `payloads` of `topic` (one partition, one delivery attempt) to
+    /// its DLQ through the real failure path; DLQ offsets 0..n follow.
+    fn fail_to_dlq(svc: &BusService, ctx: &BusCallContext, topic: &str, payloads: &[&str]) {
+        for (i, payload) in payloads.iter().enumerate() {
+            svc.publish(
+                ctx,
+                topic,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record(payload)],
+                },
+            )
+            .unwrap();
+            let fetched = FetchedRecordMeta {
+                topic: topic.to_string(),
+                partition: 0,
+                offset: i as u64,
+                timestamp_ms: now_ms(),
+                key: None,
+                headers: vec![],
+                payload: Bytes::from(payload.to_string()),
+                schema_id: 0,
+            };
+            svc.note_delivery_failure(
+                ctx,
+                "g",
+                topic,
+                0,
+                i as u64,
+                &fetched,
+                dlq::DlqReason::ConsumerError,
+                "err",
+            )
+            .unwrap();
+        }
+    }
+
+    /// A retried or discarded DLQ record is marked handled on this node AND
+    /// handed to replication with the source topic's partition, whose
+    /// `ReplOffsets` stream carries it to the followers; retrying a handled
+    /// record again is refused instead of republishing it a second time.
+    #[test]
+    fn dlq_retry_and_discard_mark_the_record_handled_and_hand_it_to_replication() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.retry-handled";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fail_to_dlq(&svc, &ctx, topic, &["a", "b"]);
+        let dlq_topic = dlq::dlq_topic_name(topic);
+
+        let coord = FakeCoordinator::leader(1);
+        svc.set_replication(coord.clone());
+        open_leader_writes(&svc, &ctx, topic, 0);
+
+        svc.dlq_discard(&ctx, &dlq_topic, 0, 0).unwrap();
+        svc.dlq_retry(&ctx, &dlq_topic, 0, 1).unwrap();
+        assert_eq!(
+            *coord.note_dlq_handled_calls.lock(),
+            vec![
+                ("org-1".to_string(), topic.to_string(), 0, 0),
+                ("org-1".to_string(), topic.to_string(), 0, 1),
+            ]
+        );
+        assert_eq!(
+            svc.dlq_discarded_offsets(&ctx, &dlq_topic, 0).unwrap(),
+            [0u64, 1].into_iter().collect::<std::collections::HashSet<u64>>()
+        );
+
+        for offset in [0, 1] {
+            assert!(
+                matches!(
+                    svc.dlq_retry(&ctx, &dlq_topic, 0, offset),
+                    Err(BusServiceError::DlqRecordHandled { .. })
+                ),
+                "a handled record ({offset}) is not republished again"
+            );
+            assert!(
+                matches!(
+                    svc.dlq_discard(&ctx, &dlq_topic, 0, offset),
+                    Err(BusServiceError::DlqRecordHandled { .. })
+                ),
+                "a handled record ({offset}) is not discarded again"
+            );
+        }
+        assert_eq!(
+            coord.note_dlq_handled_calls.lock().len(),
+            2,
+            "a refused change replicates nothing"
+        );
+        assert_eq!(
+            svc.partition_stats(&ctx, topic, 0).unwrap().high_watermark,
+            3,
+            "the two originals and exactly one republish"
+        );
+    }
+
+    /// A DLQ record of an HL7 topic is read in HL7 with the source topic's
+    /// field policy (`FP-reserved-bypass`): the DLQ topic itself carries no
+    /// content type, and reading its HL7 as JSON returned an empty payload.
+    #[test]
+    fn a_dlq_record_is_read_in_its_source_topics_format() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.hl7-dlq";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                content_type: Some("application/hl7-v2".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            topic,
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(&["MSH-9", "PID-3"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+        fail_to_dlq(
+            &svc,
+            &ctx,
+            topic,
+            &["MSH|^~\\&|LIS|LAB|HIS|H|20260923||ORU^R01|M1|P|2.5\rPID|1||80010112345||Kowalski^Jan"],
+        );
+
+        let peeked = svc
+            .peek(&ctx, &dlq::dlq_topic_name(topic), 0, 0, 10, PEEK_MAX_BYTES)
+            .unwrap();
+        let text = String::from_utf8(peeked.records[0].payload.to_vec()).unwrap();
+        assert!(text.contains("80010112345"), "an allowed field stays: {text:?}");
+        assert!(text.contains("ORU^R01"), "an allowed MSH field stays: {text:?}");
+        assert!(!text.contains("Kowalski"), "a hidden field stays hidden: {text:?}");
+    }
+
     // ---- Real discard (M1-R2 review N-5, coordinator decision 2) ------
 
     /// The discard marker `dlq_discard` writes must be durable — surviving
@@ -10141,7 +11489,7 @@ mod tests {
     fn two_phase_dedup_does_not_poison_store_on_failed_append() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
-        topics::create_topic(
+        let cfg = topics::create_topic(
             &svc.db,
             svc.instance_id(),
             &ctx.org_id,
@@ -10153,6 +11501,15 @@ mod tests {
             },
             NodeEnvironment::Prod,
             now_ms(),
+        )
+        .unwrap().0;
+        // What `BusService::create_topic` does next — see
+        // `org_stored_bytes_is_seeded_from_the_engine_and_debited_in_the_same_unit`.
+        write_topic_incarnation(
+            &svc.bus_dir,
+            &ctx.org_id,
+            "labs.dedup.failed-append",
+            cfg.generation,
         )
         .unwrap();
 
@@ -10950,47 +12307,50 @@ mod tests {
 
     // ---- topic config cache -----------------------------------------
 
+    /// `topics::CONFIG_GENERATION` is process-wide: a test running in
+    /// parallel that updates or deletes ITS OWN topic retires this
+    /// service's cache entries too, and each such bump legitimately costs
+    /// at most one reload of `events.cache` (the reload stamps the entry
+    /// with the generation it read). So the bounds below allow exactly one
+    /// extra load per bump observed in the measured window — run alone they
+    /// are exact (one load for eleven publishes), and they can never fail
+    /// because of another test's timing.
     #[test]
     fn topic_config_is_cached_after_first_publish() {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         svc.create_topic(&ctx, "events.cache", topics::TopicOptions::default())
             .unwrap();
-        let loads_after_create = svc.topic_config_db_loads();
-
-        svc.publish(
-            &ctx,
-            "events.cache",
-            PublishBatch {
-                partition: None,
-                producer: None,
-                records: vec![record("1")],
-            },
-        )
-        .unwrap();
-        let loads_after_first = svc.topic_config_db_loads();
-        assert_eq!(
-            loads_after_first,
-            loads_after_create + 1,
-            "the first publish warms the cache with exactly one SQLite read"
-        );
-
-        for i in 0..10 {
+        let publish = |payload: &str| {
             svc.publish(
                 &ctx,
                 "events.cache",
                 PublishBatch {
                     partition: None,
                     producer: None,
-                    records: vec![record(&format!("{i}"))],
+                    records: vec![record(payload)],
                 },
             )
             .unwrap();
+        };
+
+        let generation_before = topics::config_generation();
+        let loads_before = svc.topic_config_db_loads();
+        for i in 0..11 {
+            publish(&format!("{i}"));
+            if i == 0 {
+                assert!(
+                    svc.topic_config_db_loads() > loads_before,
+                    "the first publish must load the config"
+                );
+            }
         }
-        assert_eq!(
-            svc.topic_config_db_loads(),
-            loads_after_first,
-            "warm cache: zero further SQLite reads on the publish hot path"
+        let bumps = topics::config_generation() - generation_before;
+        assert!(
+            svc.topic_config_db_loads() - loads_before <= 1 + bumps,
+            "warm cache: one SQLite read for eleven publishes, plus at most one per \
+             config-generation bump ({bumps}) — got {}",
+            svc.topic_config_db_loads() - loads_before
         );
 
         // `update_topic` invalidates the cache: the NEXT publish re-loads.
@@ -11003,17 +12363,15 @@ mod tests {
             },
         )
         .unwrap();
-        svc.publish(
-            &ctx,
-            "events.cache",
-            PublishBatch {
-                partition: None,
-                producer: None,
-                records: vec![record("after-update")],
-            },
-        )
-        .unwrap();
-        assert_eq!(svc.topic_config_db_loads(), loads_after_first + 1);
+        let generation_before = topics::config_generation();
+        let loads_before = svc.topic_config_db_loads();
+        publish("after-update");
+        let bumps = topics::config_generation() - generation_before;
+        let loads = svc.topic_config_db_loads() - loads_before;
+        assert!(
+            (1..=1 + bumps).contains(&loads),
+            "the publish after an update re-loads once (plus one per bump: {bumps}) — got {loads}"
+        );
     }
 
     #[test]
@@ -12224,6 +13582,371 @@ mod tests {
         assert!(matches!(err, Err(BusServiceError::TopicNotFound { .. })));
     }
 
+    /// A one-partition topic holding five records and an open Explicit
+    /// consumer of group `g1` on it.
+    fn reset_fixture(svc: &BusService, ctx: &BusCallContext, topic: &str) -> ConsumerHandle {
+        one_partition_topic(svc, ctx, topic);
+        for i in 0..5 {
+            svc.publish(
+                ctx,
+                topic,
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(&format!("r-{i}"))],
+                },
+            )
+            .unwrap();
+        }
+        svc.open_consumer(
+            ctx,
+            "g1",
+            &[topic.to_string()],
+            ConsumerConfig {
+                commit_mode: groups::CommitMode::Explicit,
+            },
+        )
+        .unwrap()
+    }
+
+    fn tp0(topic: &str) -> TopicPartition {
+        TopicPartition {
+            topic: topic.to_string(),
+            partition: 0,
+        }
+    }
+
+    #[test]
+    fn an_open_consumer_fetches_from_the_place_an_admin_reset_it_to() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let handle = reset_fixture(&svc, &ctx, "orders.reset-live");
+        assert_eq!(handle.fetch(1 << 20, 0).unwrap().records.len(), 5);
+        handle.commit(&[(tp0("orders.reset-live"), 5)]).unwrap();
+
+        svc.reset_offset(&ctx, "g1", "orders.reset-live", 0, 0)
+            .unwrap();
+
+        let batch = handle.fetch(1 << 20, 0).unwrap();
+        let offsets: Vec<u64> = batch.records.iter().map(|r| r.offset).collect();
+        assert_eq!(
+            offsets,
+            vec![0, 1, 2, 3, 4],
+            "the open session must re-read from the reset place, not its old cursor"
+        );
+    }
+
+    #[test]
+    fn a_commit_of_records_fetched_before_a_backward_reset_does_not_undo_it() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let handle = reset_fixture(&svc, &ctx, "orders.reset-stale-up");
+        assert_eq!(handle.fetch(1 << 20, 0).unwrap().records.len(), 5);
+
+        svc.reset_offset(&ctx, "g1", "orders.reset-stale-up", 0, 0)
+            .unwrap();
+        handle
+            .commit(&[(tp0("orders.reset-stale-up"), 5)])
+            .expect("a pre-reset acknowledgement is dropped, not an error");
+
+        assert_eq!(
+            svc.offsets
+                .committed_offset("org-1", "g1", "orders.reset-stale-up", 0)
+                .unwrap(),
+            0,
+            "the stale commit must not move the group past the reset"
+        );
+        assert_eq!(
+            handle.fetch(1 << 20, 0).unwrap().records.len(),
+            5,
+            "the dropped commit also reloaded the cursor to the reset place"
+        );
+    }
+
+    fn committed(svc: &BusService, topic: &str) -> u64 {
+        svc.offsets
+            .committed_offset("org-1", "g1", topic, 0)
+            .unwrap()
+    }
+
+    fn fetched_offsets(handle: &ConsumerHandle, max_bytes: usize) -> Vec<u64> {
+        handle
+            .fetch(max_bytes, 0)
+            .unwrap()
+            .records
+            .iter()
+            .map(|r| r.offset)
+            .collect()
+    }
+
+    /// Forward move past records the program still holds: acknowledging
+    /// them is below the reset target, so it is dropped — every time, not
+    /// only before the handle applied the reset — and never an
+    /// `OffsetRegression`. Above the target the regression guard holds.
+    #[test]
+    fn a_commit_of_records_fetched_before_a_forward_reset_is_not_a_regression() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.reset-stale-down";
+        let handle = reset_fixture(&svc, &ctx, topic);
+        assert_eq!(fetched_offsets(&handle, 1), vec![0]);
+        assert_eq!(fetched_offsets(&handle, 1), vec![1]);
+
+        svc.reset_offset(&ctx, "g1", topic, 0, 5).unwrap();
+        for stale in [2, 2, 4] {
+            handle
+                .commit(&[(tp0(topic), stale)])
+                .expect("a pre-reset acknowledgement must not fail with OffsetRegression");
+            assert_eq!(committed(&svc, topic), 5, "commit({stale}) moved the reset");
+        }
+
+        for i in 5..7 {
+            svc.publish(
+                &ctx,
+                topic,
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(&format!("r-{i}"))],
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(fetched_offsets(&handle, 1 << 20), vec![5, 6]);
+        handle.commit(&[(tp0(topic), 7)]).unwrap();
+        assert!(matches!(
+            handle.commit(&[(tp0(topic), 6)]),
+            Err(BusServiceError::OffsetRegression { .. })
+        ));
+    }
+
+    /// Fetch-ahead: the program holds batch A, the admin moves the group
+    /// back, the program fetches again (applying the move) and only then
+    /// acknowledges A. That commit is above what it re-read since the move,
+    /// so it is dropped and does not raise the cursor; acknowledgements of
+    /// the re-read records are accepted, and once the replay has passed the
+    /// old position the offsets are ordinary again.
+    #[test]
+    fn a_fetch_ahead_batch_committed_after_a_backward_reset_is_dropped() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.reset-fetch-ahead";
+        let handle = reset_fixture(&svc, &ctx, topic);
+        assert_eq!(fetched_offsets(&handle, 1 << 20), vec![0, 1, 2, 3, 4]);
+
+        svc.reset_offset(&ctx, "g1", topic, 0, 1).unwrap();
+        assert_eq!(fetched_offsets(&handle, 1), vec![1]);
+        assert_eq!(fetched_offsets(&handle, 1), vec![2]);
+
+        handle
+            .commit(&[(tp0(topic), 5)])
+            .expect("a pre-reset acknowledgement is dropped, not an error");
+        assert_eq!(committed(&svc, topic), 1, "batch A undid the move back");
+        handle.commit(&[(tp0(topic), 3)]).unwrap();
+        assert_eq!(
+            committed(&svc, topic),
+            3,
+            "the re-read records are acknowledged"
+        );
+        handle.commit(&[(tp0(topic), 5)]).unwrap();
+        assert_eq!(
+            committed(&svc, topic),
+            3,
+            "still replaying below the old position: batch A stays dropped"
+        );
+        assert_eq!(
+            fetched_offsets(&handle, 1 << 20),
+            vec![3, 4],
+            "a dropped commit must not raise the cursor"
+        );
+        handle.commit(&[(tp0(topic), 5)]).unwrap();
+        assert_eq!(committed(&svc, topic), 5);
+    }
+
+    /// `AtMostOnce` commits inside `fetch`. A reset that lands after the
+    /// fetch read its cursor and before that commit must win: the commit is
+    /// not written, those records are not delivered, and the next fetch
+    /// reads from the reset place. Driven through `advance_cursor` — the
+    /// step `fetch` runs between reading records and committing them — so
+    /// the interleaving is exact, not timing-dependent.
+    #[test]
+    fn an_at_most_once_fetch_never_overwrites_a_reset_landing_mid_fetch() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.reset-amo";
+        one_partition_topic(&svc, &ctx, topic);
+        let publish = |from: u32, to: u32| {
+            for i in from..to {
+                svc.publish(
+                    &ctx,
+                    topic,
+                    PublishBatch {
+                        partition: None,
+                        producer: None,
+                        records: vec![record(&format!("r-{i}"))],
+                    },
+                )
+                .unwrap();
+            }
+        };
+        publish(0, 5);
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "g1",
+                &[topic.to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::AtMostOnce,
+                },
+            )
+            .unwrap();
+        assert_eq!(fetched_offsets(&handle, 1 << 20).len(), 5);
+        assert_eq!(committed(&svc, topic), 5);
+        publish(5, 10);
+
+        let cp = &handle.partitions[0];
+        let from = cp.cursor.lock().next;
+        assert_eq!(from, 5);
+        svc.reset_offset(&ctx, "g1", topic, 0, 0).unwrap();
+        assert!(
+            !handle.advance_cursor(cp, from, 10).unwrap(),
+            "the records read from the old cursor must not be delivered"
+        );
+        assert_eq!(
+            committed(&svc, topic),
+            0,
+            "the in-fetch commit overwrote the reset"
+        );
+
+        assert_eq!(
+            fetched_offsets(&handle, 1 << 20),
+            (0..10).collect::<Vec<u64>>()
+        );
+        assert_eq!(committed(&svc, topic), 10);
+    }
+
+    /// The group name is part of NUL-separated fjall keys: an admin action
+    /// must refuse a malformed one before looking anything up.
+    #[test]
+    fn admin_group_actions_refuse_a_malformed_group_name() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.bad-group";
+        let _handle = reset_fixture(&svc, &ctx, topic);
+        let forged = "g1\0orders.other";
+        assert!(matches!(
+            svc.reset_offset(&ctx, forged, topic, 0, 0),
+            Err(BusServiceError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            svc.pause_group(&ctx, forged, topic),
+            Err(BusServiceError::InvalidArgument(_))
+        ));
+        assert!(matches!(
+            svc.resume_group(&ctx, forged, topic),
+            Err(BusServiceError::InvalidArgument(_))
+        ));
+    }
+
+    /// Pause, resume and the offset move act on a consumer group that
+    /// exists; none of them creates one (which would also bypass the
+    /// `max_groups` quota `open_consumer` enforces).
+    #[test]
+    fn admin_group_actions_refuse_a_group_with_no_consumer_row() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.no-group";
+        one_partition_topic(&svc, &ctx, topic);
+        let not_found = |r: Result<(), BusServiceError>| {
+            matches!(r, Err(BusServiceError::GroupNotFound { .. }))
+        };
+        assert!(not_found(svc.pause_group(&ctx, "ghost", topic)));
+        assert!(not_found(svc.resume_group(&ctx, "ghost", topic)));
+        assert!(not_found(svc.reset_offset(&ctx, "ghost", topic, 0, 0)));
+        assert!(
+            crate::db::repository::bus_group_get(&svc.local_db, "org-1", "ghost", topic)
+                .unwrap()
+                .is_none(),
+            "a refused pause must not create a phantom group row"
+        );
+        assert!(
+            svc.offset_resets.seqs.is_empty(),
+            "a refused reset must not be noted"
+        );
+        assert!(matches!(
+            svc.pause_group(&ctx, "ghost", "orders.no-such-topic"),
+            Err(BusServiceError::TopicNotFound { .. })
+        ));
+    }
+
+    /// Offset-reset bookkeeping goes with the topic and with the org.
+    #[test]
+    fn offset_reset_seqs_are_dropped_with_their_topic_and_org() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let ctx2 = test_ctx("org-2");
+        let _a = reset_fixture(&svc, &ctx, "orders.seq-a");
+        let _b = reset_fixture(&svc, &ctx, "orders.seq-b");
+        let _c = reset_fixture(&svc, &ctx2, "orders.seq-c");
+        svc.reset_offset(&ctx, "g1", "orders.seq-a", 0, 0).unwrap();
+        svc.reset_offset(&ctx, "g1", "orders.seq-b", 0, 0).unwrap();
+        svc.reset_offset(&ctx2, "g1", "orders.seq-c", 0, 0).unwrap();
+        let keys = |svc: &BusService| {
+            let mut keys: Vec<(String, String)> = svc
+                .offset_resets
+                .seqs
+                .iter()
+                .map(|e| (e.key().0.clone(), e.key().2.clone()))
+                .collect();
+            keys.sort();
+            keys
+        };
+
+        svc.delete_topic(&ctx, "orders.seq-a").unwrap();
+        assert_eq!(
+            keys(&svc),
+            vec![
+                ("org-1".to_string(), "orders.seq-b".to_string()),
+                ("org-2".to_string(), "orders.seq-c".to_string()),
+            ]
+        );
+        svc.purge_org("org-2").unwrap();
+        assert_eq!(
+            keys(&svc),
+            vec![("org-1".to_string(), "orders.seq-b".to_string())]
+        );
+    }
+
+    #[test]
+    fn reset_offset_refuses_an_offset_outside_the_retained_range() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let _handle = reset_fixture(&svc, &ctx, "orders.reset-range");
+
+        let err = svc
+            .reset_offset(&ctx, "g1", "orders.reset-range", 0, 6)
+            .unwrap_err();
+        match err {
+            BusServiceError::InvalidArgument(message) => {
+                assert!(message.contains("0..=5"), "range not named: {message}")
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert!(matches!(
+            svc.reset_offset(&ctx, "g1", "orders.reset-range", 1, 0),
+            Err(BusServiceError::InvalidArgument(_))
+        ));
+        assert_eq!(
+            svc.offsets
+                .committed_offset("org-1", "g1", "orders.reset-range", 0)
+                .unwrap(),
+            0,
+            "a refused reset writes nothing"
+        );
+        svc.reset_offset(&ctx, "g1", "orders.reset-range", 0, 5)
+            .expect("the high watermark itself is inside the range");
+    }
+
     /// `seek_to_earliest`/`lag` must respect a detached partition the same
     /// way `fetch` already does: after `delete_topic`, both must return
     /// `TopicNotFound` instead of a stale/frozen `0` derived from an
@@ -13396,14 +15119,18 @@ mod tests {
         await_outcome: parking_lot::Mutex<AckOutcome>,
         #[allow(clippy::type_complexity)]
         note_offset_commit_calls: parking_lot::Mutex<Vec<(String, String, String, u32, u64, u32)>>,
+        note_dlq_handled_calls: parking_lot::Mutex<Vec<(String, String, u32, u64)>>,
         snapshot: parking_lot::Mutex<ReplicationSnapshot>,
         reassign_calls: parking_lot::Mutex<Vec<(String, String, Option<u32>)>>,
         local_node_id: parking_lot::Mutex<String>,
+        /// Overrides `role` for single partitions.
+        partition_roles: parking_lot::Mutex<std::collections::HashMap<u32, PartitionRole>>,
     }
 
     impl FakeCoordinator {
         fn leader(epoch: u32) -> Arc<Self> {
             Arc::new(Self {
+                partition_roles: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 role: parking_lot::Mutex::new(PartitionRole::Leader { epoch }),
                 preflight_err: parking_lot::Mutex::new(None),
                 await_outcome: parking_lot::Mutex::new(AckOutcome {
@@ -13412,6 +15139,7 @@ mod tests {
                     hw: 0,
                 }),
                 note_offset_commit_calls: parking_lot::Mutex::new(Vec::new()),
+                note_dlq_handled_calls: parking_lot::Mutex::new(Vec::new()),
                 snapshot: parking_lot::Mutex::new(ReplicationSnapshot::default()),
                 reassign_calls: parking_lot::Mutex::new(Vec::new()),
                 local_node_id: parking_lot::Mutex::new(String::new()),
@@ -13419,6 +15147,9 @@ mod tests {
         }
         fn set_role(&self, role: PartitionRole) {
             *self.role.lock() = role;
+        }
+        fn set_partition_role(&self, partition: u32, role: PartitionRole) {
+            self.partition_roles.lock().insert(partition, role);
         }
         fn set_preflight_err(&self, err: Option<ReplError>) {
             *self.preflight_err.lock() = err;
@@ -13434,9 +15165,21 @@ mod tests {
         }
     }
 
+    /// What a real leader handle does when it takes a partition over
+    /// (`Partition::open_leader_writes`): a `FakeCoordinator` admits writes
+    /// as leader, so the partition must accept them.
+    fn open_leader_writes(svc: &BusService, ctx: &BusCallContext, topic: &str, partition: u32) {
+        svc.local_partition(ctx, topic, partition)
+            .expect("partition")
+            .open_leader_writes();
+    }
+
     impl ReplicationCoordinator for FakeCoordinator {
-        fn role(&self, _org: &str, _topic: &str, _partition: u32) -> PartitionRole {
-            self.role.lock().clone()
+        fn role(&self, _org: &str, _topic: &str, partition: u32) -> PartitionRole {
+            match self.partition_roles.lock().get(&partition) {
+                Some(role) => role.clone(),
+                None => self.role.lock().clone(),
+            }
         }
         fn preflight(
             &self,
@@ -13486,6 +15229,14 @@ mod tests {
                 attempts,
             ));
         }
+        fn note_dlq_handled(&self, org: &str, source_topic: &str, dlq_partition: u32, offset: u64) {
+            self.note_dlq_handled_calls.lock().push((
+                org.to_string(),
+                source_topic.to_string(),
+                dlq_partition,
+                offset,
+            ));
+        }
         fn evict_node_from_replica_sets(
             &self,
             _node_id: &str,
@@ -13532,6 +15283,41 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    /// The partition moved on to term 4 — a newer leader's Hello fenced it,
+    /// or this node stepped down — after the coordinator admitted the
+    /// publish as leader of term 3. The write must be refused, not land in
+    /// a term-4 log stamped as if it belonged there.
+    #[test]
+    fn a_publish_admitted_in_an_older_term_than_the_partition_is_refused() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        one_partition_topic(&svc, &ctx, "orders.repl-fenced");
+        let coord = FakeCoordinator::leader(3);
+        svc.set_replication(coord);
+        let part = svc
+            .local_partition(&ctx, "orders.repl-fenced", 0)
+            .expect("partition");
+        part.open_leader_writes();
+        part.set_leader_epoch(4).unwrap();
+
+        let err = svc
+            .publish(
+                &ctx,
+                "orders.repl-fenced",
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record("stray")],
+                },
+            )
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("LeaderEpochStale"),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(part.log_end_offset(), 0);
     }
 
     #[test]
@@ -13657,6 +15443,7 @@ mod tests {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         one_partition_topic(&svc, &ctx, "orders.repl-ack-timeout");
+        open_leader_writes(&svc, &ctx, "orders.repl-ack-timeout", 0);
         let coord = FakeCoordinator::leader(1);
         coord.set_await_outcome(AckOutcome {
             acked_nodes: 1,
@@ -13709,6 +15496,7 @@ mod tests {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         one_partition_topic(&svc, &ctx, "orders.repl-ack-ok");
+        open_leader_writes(&svc, &ctx, "orders.repl-ack-ok", 0);
         let coord = FakeCoordinator::leader(1);
         coord.set_await_outcome(AckOutcome {
             acked_nodes: 2,
@@ -13915,6 +15703,201 @@ mod tests {
         }
     }
 
+    /// Partitions an update adds are placed like the ones the topic was
+    /// created with: an added partition with no assignment has no leader, and
+    /// `publish` refuses every write to it.
+    #[test]
+    fn update_topic_places_the_partitions_it_adds() {
+        let _guard = locked_ledger_fixture();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let conn = rusqlite::Connection::open_in_memory().expect("open db");
+        crate::db::migrations::run(&conn).expect("run migrations");
+        let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+        let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir: dir.path().join("bus"),
+            db: db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service");
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("self-node");
+        coord.set_snapshot(ReplicationSnapshot::default());
+        svc.set_replication(coord);
+        svc.set_assignment_store(Arc::new(
+            replication::assignment::SqliteLedgerAssignmentStore::new(db.clone()),
+        ));
+
+        let ctx = test_ctx("org-grow");
+        svc.create_topic(
+            &ctx,
+            "wyniki.grow",
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+        svc.update_topic(
+            &ctx,
+            "wyniki.grow",
+            topics::TopicOptions {
+                partitions: Some(4),
+                ..Default::default()
+            },
+        )
+        .expect("update_topic");
+
+        let store = replication::assignment::SqliteLedgerAssignmentStore::new(db);
+        let mut placed: Vec<u32> = store
+            .list_for_topic(svc.instance_id(), "org-grow", "wyniki.grow")
+            .expect("list_for_topic")
+            .iter()
+            .map(|a| a.partition)
+            .collect();
+        placed.sort_unstable();
+        assert_eq!(
+            placed,
+            vec![0, 1, 2, 3],
+            "the two added partitions must be placed too"
+        );
+    }
+
+    /// A partition whose placement did not happen when the topic was made
+    /// (here: no assignment store yet, as when the proposal failed) gets
+    /// its leader at the topic's next settings change, whatever it changes.
+    #[test]
+    fn update_topic_places_a_partition_left_without_a_leader() {
+        let _guard = locked_ledger_fixture();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let conn = rusqlite::Connection::open_in_memory().expect("open db");
+        crate::db::migrations::run(&conn).expect("run migrations");
+        let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+        let svc = BusService::new(BusInitConfig {
+            instance_id: test_instance_id(),
+            local_db: test_local_db(),
+            bus_dir: dir.path().join("bus"),
+            db: db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service");
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("self-node");
+        coord.set_snapshot(ReplicationSnapshot::default());
+        svc.set_replication(coord);
+
+        let ctx = test_ctx("org-unplaced");
+        svc.create_topic(
+            &ctx,
+            "wizyty.unplaced",
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+        svc.set_assignment_store(Arc::new(
+            replication::assignment::SqliteLedgerAssignmentStore::new(db.clone()),
+        ));
+        let store = replication::assignment::SqliteLedgerAssignmentStore::new(db);
+        let placed = |store: &replication::assignment::SqliteLedgerAssignmentStore| {
+            let mut p: Vec<u32> = store
+                .list_for_topic(svc.instance_id(), "org-unplaced", "wizyty.unplaced")
+                .expect("list_for_topic")
+                .iter()
+                .map(|a| a.partition)
+                .collect();
+            p.sort_unstable();
+            p
+        };
+        assert!(placed(&store).is_empty(), "nothing placed at creation");
+
+        svc.update_topic(
+            &ctx,
+            "wizyty.unplaced",
+            topics::TopicOptions {
+                max_delivery_attempts: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("update_topic");
+        assert_eq!(placed(&store), vec![0, 1]);
+    }
+
+    /// A reader that loaded the row before this node's own update committed
+    /// may put the old config back into the cache after the update removed
+    /// it; that entry must not be served.
+    #[test]
+    fn topic_config_does_not_serve_an_entry_read_before_this_nodes_update() {
+        let (_dir, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "wizyty.race", topics::TopicOptions::default())
+            .expect("create_topic");
+        let generation_seen = topics::config_generation();
+        let old = topics::get_topic(&svc.db, svc.instance_id(), "org-1", "wizyty.race")
+            .expect("read row")
+            .expect("row exists");
+
+        svc.update_topic(
+            &ctx,
+            "wizyty.race",
+            topics::TopicOptions {
+                max_delivery_attempts: Some(3),
+                ..Default::default()
+            },
+        )
+        .expect("update_topic");
+        // The late reader finishes now, inserting what it read.
+        svc.topic_config_cache.insert(
+            ("org-1".to_string(), "wizyty.race".to_string()),
+            (generation_seen, Arc::new(old)),
+        );
+
+        let served = svc.topic_config("org-1", "wizyty.race").expect("config");
+        assert_eq!(served.max_delivery_attempts, 3);
+    }
+
+    /// A topic row another node changed reaches this node through the sync
+    /// materializer, not through `update_topic`; the cached config must not
+    /// outlive it.
+    #[test]
+    fn topic_config_follows_a_row_changed_outside_this_engine() {
+        let (_dir, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        svc.create_topic(&ctx, "wizyty.cache", topics::TopicOptions::default())
+            .expect("create_topic");
+        let cached = svc.topic_config("org-1", "wizyty.cache").expect("config");
+        assert_eq!(cached.max_delivery_attempts, topics::DEFAULT_MAX_DELIVERY_ATTEMPTS);
+
+        let mut row = crate::db::repository::bus_topic_get(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "wizyty.cache",
+        )
+        .expect("read row")
+        .expect("row exists");
+        row.max_delivery_attempts = 2;
+        crate::db::repository::bus_topic_update(&svc.db, &row).expect("write row");
+        topics::bump_config_generation();
+
+        assert_eq!(
+            svc.topic_config("org-1", "wizyty.cache")
+                .expect("config")
+                .max_delivery_attempts,
+            2
+        );
+    }
+
     /// The same defect one layer down, found on a live node 06.09.2026:
     /// `create_topic` places its partitions, but the broker's OWN topics
     /// (`__bus.metrics`, `__dlq.<topic>`) were created through
@@ -14007,6 +15990,7 @@ mod tests {
             actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
             ..ctx.clone()
         };
+        open_leader_writes(&svc, &system_ctx, &dlq_name, 0);
         let res = svc
             .publish(
                 &system_ctx,
@@ -14049,6 +16033,7 @@ mod tests {
         let (_tmp, svc) = test_service();
         let ctx = test_ctx("org-1");
         one_partition_topic(&svc, &ctx, "orders.repl-commit-notify");
+        open_leader_writes(&svc, &ctx, "orders.repl-commit-notify", 0);
         let coord = FakeCoordinator::leader(1);
         svc.set_replication(coord.clone());
 
@@ -14094,6 +16079,123 @@ mod tests {
         assert_eq!(*partition, 0);
         assert_eq!(*offset, 2);
         assert_eq!(*attempts, 0);
+    }
+
+    /// A `bus_groups` row as `open_consumer` would leave it, written
+    /// directly: `open_consumer` refuses on a node that leads nothing.
+    fn insert_group_row(svc: &BusService, org: &str, group: &str, topic: &str) {
+        crate::db::repository::bus_group_upsert(
+            &svc.local_db,
+            &crate::db::repository::DbBusGroup {
+                org_id: org.to_string(),
+                group_id: group.to_string(),
+                topic: topic.to_string(),
+                commit_mode: groups::CommitMode::Explicit.as_str().to_string(),
+                paused: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+    }
+
+    /// The paused flag lives only in the local `bus_groups` table, and
+    /// `fetch` runs on each partition's leader: a pause written on a node
+    /// that does not lead every partition would be ignored where it matters.
+    #[test]
+    fn pause_and_resume_are_refused_unless_this_node_leads_every_partition() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "orders.repl-pause";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        insert_group_row(&svc, "org-1", "g1", topic);
+        let coord = FakeCoordinator::leader(1);
+        coord.set_partition_role(
+            1,
+            PartitionRole::Follower {
+                leader_node_id: "node-b".to_string(),
+                epoch: 1,
+            },
+        );
+        svc.set_replication(coord.clone());
+
+        for result in [
+            svc.pause_group(&ctx, "g1", topic),
+            svc.resume_group(&ctx, "g1", topic),
+        ] {
+            assert!(
+                matches!(result, Err(BusServiceError::NotLeader { .. })),
+                "unexpected result: {result:?}"
+            );
+        }
+        assert!(!svc.is_group_paused("org-1", "g1", topic).unwrap());
+
+        coord.set_partition_role(1, PartitionRole::Leader { epoch: 1 });
+        svc.pause_group(&ctx, "g1", topic).unwrap();
+        assert!(svc.is_group_paused("org-1", "g1", topic).unwrap());
+    }
+
+    #[test]
+    fn reset_offset_is_leader_only_and_replicated_to_followers() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        one_partition_topic(&svc, &ctx, "orders.repl-reset");
+        insert_group_row(&svc, "org-1", "g1", "orders.repl-reset");
+        open_leader_writes(&svc, &ctx, "orders.repl-reset", 0);
+        let coord = FakeCoordinator::leader(1);
+        svc.set_replication(coord.clone());
+        svc.publish(
+            &ctx,
+            "orders.repl-reset",
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record("x"), record("y")],
+            },
+        )
+        .unwrap();
+
+        svc.reset_offset(&ctx, "g1", "orders.repl-reset", 0, 2)
+            .unwrap();
+        assert_eq!(
+            *coord.note_offset_commit_calls.lock(),
+            vec![(
+                "org-1".to_string(),
+                "g1".to_string(),
+                "orders.repl-reset".to_string(),
+                0,
+                2,
+                0
+            )]
+        );
+
+        coord.set_role(PartitionRole::Follower {
+            leader_node_id: "node-b".to_string(),
+            epoch: 2,
+        });
+        let err = svc
+            .reset_offset(&ctx, "g1", "orders.repl-reset", 0, 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, BusServiceError::NotLeader { .. }),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            svc.offsets
+                .committed_offset("org-1", "g1", "orders.repl-reset", 0)
+                .unwrap(),
+            2,
+            "a follower must not write an offset nobody reads"
+        );
+        assert_eq!(coord.note_offset_commit_calls.lock().len(), 1);
     }
 
     #[test]
@@ -14360,6 +16462,8 @@ mod tests {
                 leader_epoch: 1,
                 environment: "dev".to_string(),
                 updated_at_ms: now_ms(),
+                topic_generation: 0,
+                epoch_slots: Default::default(),
             },
         )
         .unwrap();
@@ -14420,6 +16524,8 @@ mod tests {
                     leader_epoch: 1,
                     environment: "dev".to_string(),
                     updated_at_ms: now_ms(),
+                    topic_generation: 0,
+                    epoch_slots: Default::default(),
                 },
             )
             .unwrap();
@@ -17263,5 +19369,133 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The delete window promises that a topic's access entries, its
+    /// data-hiding rules and its unprocessed messages go with it. None of
+    /// them is keyed by the topic's incarnation, so anything left behind
+    /// would silently apply to a topic re-created under the same name.
+    #[test]
+    fn a_topic_recreated_under_the_same_name_inherits_no_access_rules_or_dead_letters() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let source = svc
+            .create_topic(&ctx, "faktury", topics::TopicOptions::default())
+            .unwrap();
+        svc.ensure_dlq_topic(&ctx, "faktury", &source).unwrap();
+        publish_to(&svc, &ctx, "__dlq.faktury", vec![record("{}"), record("{}")]);
+        let acl_id = crate::services::bus_authorizer::topic_acl_resource_id(
+            svc.instance_id(),
+            "org-1",
+            "faktury",
+        );
+        crate::db::repository::resource_permissions::set_with_action(
+            &svc.db, "topic", &acl_id, "user", "anna", "read", "deny",
+        )
+        .unwrap();
+        crate::db::repository::resource_permissions::set_with_action(
+            &svc.db, "topic", &acl_id, "group", "ksiegowosc", "*", "allow",
+        )
+        .unwrap();
+        let other_acl = crate::services::bus_authorizer::topic_acl_resource_id(
+            svc.instance_id(),
+            "org-1",
+            "zamowienia",
+        );
+        crate::db::repository::resource_permissions::set_with_action(
+            &svc.db, "topic", &other_acl, "user", "anna", "read", "deny",
+        )
+        .unwrap();
+        crate::db::repository::bus_field_policy_set(
+            &svc.db,
+            &crate::db::repository::DbBusFieldPolicy {
+                instance_id: svc.instance_id().to_string(),
+                org_id: "org-1".to_string(),
+                topic: "faktury".to_string(),
+                subject_type: "user".to_string(),
+                subject_id: "anna".to_string(),
+                direction: "read".to_string(),
+                fields_json: r#"["pesel"]"#.to_string(),
+                required_fields_json: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        )
+        .unwrap();
+
+        svc.delete_topic(&ctx, "faktury").unwrap();
+        let details: String = svc
+            .db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT details FROM audit_log WHERE action = 'bus.topic.delete' \
+                 AND resource = 'faktury' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            details.contains("acl_entries_removed=2 field_policies_removed=1"),
+            "the audit row says what went with the topic: {details}"
+        );
+        assert!(
+            svc.topic_config("org-1", "__dlq.faktury").is_err(),
+            "the dead-letter topic goes with its source"
+        );
+        assert!(!topics::topic_dir(&svc.bus_dir, "org-1", "__dlq.faktury").exists());
+
+        let source = svc
+            .create_topic(&ctx, "faktury", topics::TopicOptions::default())
+            .unwrap();
+        let entries = |id: &str| {
+            crate::db::repository::resource_permissions::list_for_resource(&svc.db, "topic", id)
+                .unwrap()
+                .len()
+        };
+        assert_eq!(
+            entries(&acl_id),
+            0,
+            "no access entry of the deleted topic applies to the new one"
+        );
+        assert!(crate::db::repository::bus_field_policy_list_for_topic(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "faktury"
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(entries(&other_acl), 1, "another topic's entries stay");
+        svc.ensure_dlq_topic(&ctx, "faktury", &source).unwrap();
+        assert_eq!(
+            svc.dlq_recency(&ctx, "__dlq.faktury", 0).unwrap().waiting,
+            0,
+            "the new topic starts with no unprocessed messages"
+        );
+    }
+
+    /// A delivery that read its source topic's config before the topic was
+    /// deleted must not bring the topic's dead-letter topic back.
+    #[test]
+    fn a_dead_letter_topic_is_not_created_for_a_deleted_source() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let source = svc
+            .create_topic(&ctx, "faktury", topics::TopicOptions::default())
+            .unwrap();
+        svc.delete_topic(&ctx, "faktury").unwrap();
+        assert!(matches!(
+            svc.ensure_dlq_topic(&ctx, "faktury", &source),
+            Err(BusServiceError::TopicNotFound { .. })
+        ));
+        assert!(crate::db::repository::bus_topic_get(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            "__dlq.faktury"
+        )
+        .unwrap()
+        .is_none());
     }
 }

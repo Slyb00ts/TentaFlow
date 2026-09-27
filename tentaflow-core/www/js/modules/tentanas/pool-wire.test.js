@@ -183,3 +183,16 @@ test('the layout plan\'s warning codes arrive through the real decoder and are w
   assert.deepEqual(body.warningCodes.map((c) => c.code), ['mixed_media'], 'the codes arrive');
   assert.deepEqual(planWarnings(body), ['SSD i HDD razem: vdev działa z prędkością najwolniejszego dysku.']);
 });
+
+// Owner decision (wave 7): the pool detail offers "Odłącz stary dysk" only on a
+// leaf the node marked `detachable` — a `#[serde(default)]` field an older
+// decoder would drop, and the button with it.
+test('a leaf the node marks detachable keeps the mark through the real decoder', { skip }, async () => {
+  const pool = { ...POOL, vdevs: [{ ...POOL.vdevs[0], disks: POOL.vdevs[0].disks.map((d, i) => ({ ...d, detachable: i === 0 })) }] };
+  const body = await throughTheClient('tentaNasPoolGetRequest', { name: 'tank' }, {
+    PoolGetResponse: { pool, properties: [], datasets: [], alerts: [], history: [] },
+  });
+  const disks = body.pool.vdevs[0].disks;
+  assert.equal(disks[0].detachable, true);
+  assert.ok(disks.slice(1).every((d) => d.detachable === false), 'the others are not detachable');
+});

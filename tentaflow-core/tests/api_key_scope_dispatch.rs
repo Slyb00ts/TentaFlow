@@ -420,3 +420,119 @@ async fn user_key_requires_existing_active_subject() {
         "refused because the subject does not exist: {resp:?}"
     );
 }
+
+/// A TentaBus topic row as the topic creator writes it.
+fn bus_topic(instance_id: &str, org_id: &str, name: &str) -> repository::DbBusTopic {
+    repository::DbBusTopic {
+        instance_id: instance_id.to_string(),
+        org_id: org_id.to_string(),
+        name: name.to_string(),
+        partitions: 1,
+        retention_ms: 1,
+        retention_bytes: 1,
+        cleanup_policy: "delete".to_string(),
+        delivery: "at_least_once".to_string(),
+        idempotency_key: None,
+        dedup_window_ms: 1,
+        max_delivery_attempts: 1,
+        retry_backoff_ms: 1,
+        schema_id: None,
+        validation: "none".to_string(),
+        content_type: "application/json".to_string(),
+        replication_factor: 1,
+        acks: "all".to_string(),
+        durability: "fsync_batch".to_string(),
+        max_inline_bytes: 1,
+        compression: "none".to_string(),
+        environment: "prod".to_string(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        durability_class: None,
+        generation: 1,
+    }
+}
+
+/// A topic rule written ahead of its topic would vanish, without an error or
+/// an audit row, when the topic is created — a deny silently turning into the
+/// default allow. Every path that writes one refuses a topic that does not
+/// exist; clearing needs no topic.
+#[tokio::test]
+async fn topic_rules_need_an_existing_topic_on_every_write_path() {
+    let state = AppState::for_test();
+    let ctx = admin_ctx(state.clone());
+    let uid = create_general_key(&ctx, "svc-topic", vec![]).await;
+    let missing = tentaflow_core::services::bus_authorizer::topic_acl_resource_id(
+        "tentabus-00000001",
+        "org-test",
+        "not.yet",
+    );
+    let scope_set = |resource_id: String| MessageBody::ApiKeyScopeSetRequest {
+        key_uid: uid.clone(),
+        resource_type: "topic".into(),
+        resource_id,
+        access_level: "deny".into(),
+        action: None,
+    };
+
+    let (_resp, is_err) = dispatch(&scope_set(missing.clone()), &ctx).await;
+    assert!(is_err, "an API-key topic scope needs its topic");
+
+    let (_resp, is_err) = dispatch(
+        &MessageBody::IamBody(tentaflow_protocol::IamPayload::ReqSetPermission {
+            resource_type: "topic".into(),
+            resource_id: missing.clone(),
+            subject_type: "user".into(),
+            subject_id: "anna".into(),
+            access_level: "deny".into(),
+        }),
+        &ctx,
+    )
+    .await;
+    assert!(is_err, "topic entries are not set through the generic IAM setter");
+
+    let req = MessageBody::ApiKeyCreateRequestBody(ApiKeyCreateRequest {
+        name: "svc-topic-seeded".to_string(),
+        key_type: "general".to_string(),
+        subject_id: None,
+        scope_resources: vec![ResourceRef {
+            resource_type: "topic".into(),
+            resource_id: missing.clone(),
+            action: None,
+        }],
+    });
+    let (_resp, is_err) = dispatch(&req, &ctx).await;
+    assert!(is_err, "a key cannot be seeded with a scope on a missing topic");
+
+    assert!(
+        repository::resource_permissions::list_for_resource(&state.db, "topic", &missing)
+            .unwrap()
+            .is_empty(),
+        "nothing was written for the missing topic"
+    );
+
+    // Once the topic exists the same scope is accepted, and it can be cleared.
+    repository::bus_topic_create(
+        &state.db,
+        &bus_topic("tentabus-00000001", "org-test", "not.yet"),
+    )
+    .unwrap();
+    let (resp, is_err) = dispatch(&scope_set(missing.clone()), &ctx).await;
+    assert!(!is_err, "{resp:?}");
+    assert_eq!(
+        repository::resource_permissions::list_for_resource(&state.db, "topic", &missing)
+            .unwrap()
+            .len(),
+        1
+    );
+    let (resp, is_err) = dispatch(
+        &MessageBody::ApiKeyScopeClearRequest {
+            key_uid: uid.clone(),
+            resource_type: "topic".into(),
+            resource_id: missing.clone(),
+            action: None,
+        },
+        &ctx,
+    )
+    .await;
+    assert!(!is_err, "{resp:?}");
+}

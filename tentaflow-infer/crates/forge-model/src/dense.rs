@@ -44,6 +44,44 @@ pub struct Dense<E> {
     positions: Vec<u32>,
 }
 
+/// Projekcje, których ogon wierszy może liczyć Neural Engine (EKS-A9).
+///
+/// Wyliczenie, a nie rola z formatu: model CoreML jest budowany dla TYCH
+/// siedmiu macierzy i dla żadnej innej, więc lista jest zamknięta z definicji.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AneProj {
+    Q,
+    K,
+    V,
+    O,
+    Gate,
+    Up,
+    Down,
+}
+
+/// Jedno wiązanie: która waga wykonawcy odpowiada której projekcji modelu
+/// CoreML, i jaki ma kształt.
+///
+/// Kształt idzie razem z indeksem, bo strona ANE zna tylko własny stały
+/// kształt: żeby sprawdzić, że ogon `ane_rows` wierszy modelu CoreML pasuje do
+/// wagi, musi wiedzieć, ile ta waga ma wierszy — a wykonawca nie odda tego
+/// modelowi, bo model nie ma jak o to zapytać bez bufora.
+///
+/// Definicja mieszka tu, a nie w `forge-kernels`: model nie zależy od
+/// kerneli (tylko odwrotnie, w testach), więc typ, który model ZWRACA, musi
+/// być z jego warstwy albo niższej. Silnik, który ma obie strony, przekazuje
+/// listę wykonawcy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AneBinding {
+    pub layer: u32,
+    pub proj: AneProj,
+    pub id: WeightId,
+    /// Szerokość wyjścia projekcji (liczba wierszy macierzy wag).
+    pub rows: u32,
+    /// Szerokość redukcji (liczba kolumn macierzy wag).
+    pub cols: u32,
+}
+
 /// Jeden token do dołożenia do sekwencji siedzącej w tym slocie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Feed {
@@ -414,6 +452,45 @@ impl<E: Executor + WeightStore> Dense<E> {
 
     pub fn shape(&self) -> DenseShape {
         self.shape
+    }
+
+    /// Projekcje każdej warstwy z ich kształtami — to, co strona CoreML
+    /// potrzebuje, żeby związać swoje modele z wagami wykonawcy.
+    ///
+    /// Siedem wpisów na warstwę z uwagą i gęstym FFN, w kolejności `AneProj`.
+    /// Warstwy rekurencyjne (DeltaNet) i mieszankowe (MoE) nie dają wpisów:
+    /// nie ma dla nich modelu ANE, a wpis bez modelu byłby obietnicą bez
+    /// pokrycia. Kształty są tymi, które podano wykonawcy przy wczytywaniu —
+    /// Q i O są prostokątne, gdy głowice nie wypełniają `hidden`.
+    pub fn projection_bindings(&self) -> Vec<AneBinding> {
+        let (h, qw, kvw, inter) = (
+            self.shape.hidden,
+            self.shape.attn_width(),
+            self.shape.kv_width(),
+            self.shape.inter,
+        );
+        let mut out = Vec::with_capacity(self.layers.len() * 7);
+        for (layer, ids) in (0u32..).zip(&self.layers) {
+            let bind = |proj, id, rows, cols| AneBinding {
+                layer,
+                proj,
+                id,
+                rows,
+                cols,
+            };
+            if let Mixer::Attention(a) = &ids.mixer {
+                out.push(bind(AneProj::Q, a.q, qw, h));
+                out.push(bind(AneProj::K, a.k, kvw, h));
+                out.push(bind(AneProj::V, a.v, kvw, h));
+                out.push(bind(AneProj::O, a.o, h, qw));
+            }
+            if let Ffn::Dense { gate, up, down } = ids.ffn {
+                out.push(bind(AneProj::Gate, gate, inter, h));
+                out.push(bind(AneProj::Up, up, inter, h));
+                out.push(bind(AneProj::Down, down, h, inter));
+            }
+        }
+        out
     }
 
     /// How many tokens the sequence in this slot already holds.

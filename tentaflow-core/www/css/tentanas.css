@@ -111,6 +111,12 @@
 .nas-root .job-sub { font-size: 12px; color: var(--text-3); }
 .nas-root .job-main tf-progress-bar { margin-top: 2px; }
 .nas-root .job-actions { display: flex; gap: 6px; }
+/* The disk lines of a multi-disk SMART job (wave 9b): one per disk, in run order. */
+.nas-root .job-disks, .nas-modal .job-disks { display: flex; flex-direction: column; gap: 4px; }
+.nas-root .job-disks:empty, .nas-modal .job-disks:empty { display: none; }
+.nas-root .job-disk, .nas-modal .job-disk { display: flex; align-items: center; gap: 8px; font-size: 12px; min-width: 0; }
+.nas-root .job-disk .mono, .nas-modal .job-disk .mono { flex: 0 0 auto; }
+.nas-root .job-disk-detail, .nas-modal .job-disk-detail { color: var(--text-3); overflow-wrap: anywhere; min-width: 0; }
 .nas-root .job-log { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; max-height: 320px; overflow: auto; white-space: pre-wrap; margin: 0; }
 @keyframes nas-spin { to { transform: rotate(360deg); } }
 
@@ -164,6 +170,9 @@
 .nas-root .alert-row .a-node { font-size: 12px; color: var(--text-3); margin-top: 2px; }
 .nas-root .alert-row .a-node summary { cursor: pointer; }
 .nas-root .alert-row .a-node-text { overflow-wrap: anywhere; }
+/* Conflict copy controls past the first few, folded (n02). */
+.nas-root .alert-row .a-copy-more { font-size: 12px; color: var(--text-3); }
+.nas-root .alert-row .a-copy-more summary { cursor: pointer; }
 
 /* Disk detail (n04): the physical-identification card — badge, fields, actions. */
 .nas-root .id-grid { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
@@ -338,10 +347,11 @@
    written as ONE patched string (dom-patch.js), and a tf-table takes its rows
    through a property the string cannot carry. */
 .nas-root .nas-folder-rows { display: flex; flex-direction: column; margin-top: 8px; }
-.nas-root .nas-folder-rows .fr { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--border); font-size: 12px; min-width: 0; }
+.nas-root .nas-folder-rows .fr { display: grid; grid-template-columns: minmax(0, 2fr) auto minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--border); font-size: 12px; min-width: 0; }
 .nas-root .nas-folder-rows .fr-head { border-top: 0; padding-top: 0; color: var(--text-3); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
 .nas-root .nas-folder-rows .fr-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
 .nas-root .nas-folder-rows .fr-sub { font-weight: 400; font-size: 11px; color: var(--text-3); overflow-wrap: anywhere; }
+.nas-root .nas-folder-rows .fr-used { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .nas-root .nas-folder-rows .fr-share { color: var(--text-2); overflow-wrap: anywhere; min-width: 0; }
 .nas-root .nas-folder-rows .fr-cache { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .nas-root .nas-folders .nas-folders-pinned { margin-top: 12px; }
@@ -431,6 +441,8 @@
 .nas-modal .loss-list .ll .icon { width: 14px; height: 14px; flex: 0 0 auto; margin-top: 1px; }
 .nas-modal .loss-list .ll.bad .icon { color: var(--danger); }
 .nas-modal .loss-list .ll.good .icon { color: var(--success); }
+/* A list that could not be checked (n17a: "none" and "unknown" differ). */
+.nas-modal .loss-list .ll.warn .icon { color: var(--warning); }
 
 /* Snapshot schedules (n10) and the tasks tab (n15). */
 /* n15 protection status: two stat-row columns side by side. */
@@ -534,4 +546,44 @@
   .nas-target-detail .stat-rows .sr { flex-direction: column; align-items: flex-start; gap: 4px; }
   .nas-target-detail .stat-rows .k { flex-basis: auto; }
   .nas-target-detail .stat-rows .v { justify-content: flex-start; text-align: left; }
+}
+
+/* n18c — the selected node stopped answering (tentanas/node-link.js). The card
+   is the shared connection overlay; this is only its TentaNas variant. The
+   whole app behind it blurs (the mockup's `.app-blurred` on `#app-root`), and
+   the platform overlay (9999) stays above it: losing the daemon outranks
+   losing a node. A class of its own, so the platform overlay's `app-blurred`
+   and this one never remove each other's. */
+.nas-link-lost {
+  filter: blur(4px) saturate(0.7);
+  pointer-events: none;
+  transition: filter 0.3s ease;
+}
+/* Above every dialog (tf-modal backdrop 9990, card 9991; tf-window stacks
+   from 1000) so a confirm left open when the node went away cannot be
+   clicked under the card — node-link.js also makes those dialogs inert —
+   and below the platform overlay (9999). */
+.conn-overlay.nas-conn { z-index: 9995; }
+.nas-conn-keep {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm, 6px);
+  background: rgba(34, 197, 94, 0.06);
+  border: 1px solid rgba(34, 197, 94, 0.25);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+  text-align: left;
+}
+.nas-conn-keep .icon {
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  flex-shrink: 0;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  color: var(--success);
 }

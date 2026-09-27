@@ -62,6 +62,8 @@
 // `replication::glue::PartitionProvider::instance_id` (== `BusService::
 // instance_id`, the one real instance identity `bus::replication` has).
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::db::repository::DbBusPartitionAssignment;
@@ -93,7 +95,35 @@ pub struct PartitionAssignment {
     pub isr: Vec<String>,
     pub leader_epoch: u32,
     pub updated_at_ms: i64,
+    /// Which incarnation of the topic this placement belongs to: the
+    /// `generation` of the topic row it was proposed for
+    /// (`DbBusTopic::generation`, the packed HLC of that incarnation's
+    /// creation; `0` for topics created before incarnations existed). A topic
+    /// deleted and created again under the same name starts over at epoch 1,
+    /// so epochs alone cannot order its placements against the deleted
+    /// incarnation's; the generation does
+    /// (`core_materializer::apply_bus_partition_assignment`). Appended with a
+    /// default: a peer that predates the field sends `0`, which is judged as
+    /// that pre-incarnation generation.
+    #[serde(default)]
+    pub topic_generation: u64,
+    /// Each node's epoch slot (`election::epoch_for`): the residue modulo
+    /// `election::EPOCH_SLOTS` of every epoch that node may lead. A member
+    /// keeps its slot for the life of the topic incarnation and a slot is
+    /// never handed to another node, so two rows of different replica sets —
+    /// a candidate still standing on the old one, a reassignment minted
+    /// against the new one — never mint the same epoch for different nodes.
+    /// Entries of nodes that left the set stay, reserving their slot.
+    /// Appended with a default: empty on rows written before it (or by a
+    /// peer that predates it), read as `resolved_epoch_slots` derives it.
+    #[serde(default)]
+    pub epoch_slots: BTreeMap<String, u32>,
 }
+
+/// A replica-set change needed a fresh epoch slot and every one of
+/// `election::EPOCH_SLOTS` is taken within this topic incarnation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochSlotsExhausted;
 
 impl From<DbBusPartitionAssignment> for PartitionAssignment {
     fn from(row: DbBusPartitionAssignment) -> Self {
@@ -107,11 +137,67 @@ impl From<DbBusPartitionAssignment> for PartitionAssignment {
             isr: row.isr,
             leader_epoch: row.leader_epoch,
             updated_at_ms: row.updated_at_ms,
+            topic_generation: row.topic_generation,
+            epoch_slots: row.epoch_slots,
         }
     }
 }
 
 impl PartitionAssignment {
+    /// The slot map this row mints epochs with. A row that carries none
+    /// (written before slots existed) gets one derived from itself alone —
+    /// the sorted replica set plus its leader, numbered from 0 — so every
+    /// node reading the same row derives the same map, and the first change
+    /// minted from it stores it.
+    pub fn resolved_epoch_slots(&self) -> BTreeMap<String, u32> {
+        if !self.epoch_slots.is_empty() {
+            return self.epoch_slots.clone();
+        }
+        let mut members: Vec<&str> = self.replicas.iter().map(String::as_str).collect();
+        members.push(&self.leader_node_id);
+        members.sort_unstable();
+        members.dedup();
+        members
+            .into_iter()
+            .filter(|m| !m.is_empty())
+            .zip(0u32..)
+            .map(|(m, slot)| (m.to_string(), slot))
+            .collect()
+    }
+
+    /// `node`'s epoch slot in this row, if it holds one.
+    pub fn epoch_slot(&self, node: &str) -> Option<u32> {
+        self.resolved_epoch_slots().get(node).copied()
+    }
+
+    /// Stamps this row with `base` (the slot map of the row it was derived
+    /// from) plus a fresh slot for every current replica or leader that
+    /// holds none — the lowest never used, so nobody inherits a slot a
+    /// former member may still be minting from on an older row.
+    pub fn claim_epoch_slots(
+        &mut self,
+        base: BTreeMap<String, u32>,
+    ) -> Result<(), EpochSlotsExhausted> {
+        let mut slots = base;
+        let mut next = slots.values().max().map_or(0, |max| max + 1);
+        let mut members: Vec<String> = self.replicas.clone();
+        members.push(self.leader_node_id.clone());
+        members.sort_unstable();
+        members.dedup();
+        for member in members.into_iter().filter(|m| !m.is_empty()) {
+            if slots.contains_key(&member) {
+                continue;
+            }
+            if next >= crate::bus::replication::election::EPOCH_SLOTS {
+                return Err(EpochSlotsExhausted);
+            }
+            slots.insert(member, next);
+            next += 1;
+        }
+        self.epoch_slots = slots;
+        Ok(())
+    }
+
     /// `bus_partition_assignments.environment` has no equivalent field on
     /// this frozen ledger type: `environment` is derived transitively from
     /// the topic's own row at materialization time
@@ -135,6 +221,8 @@ impl PartitionAssignment {
             leader_epoch: self.leader_epoch,
             environment: environment.into(),
             updated_at_ms: self.updated_at_ms,
+            topic_generation: self.topic_generation,
+            epoch_slots: self.epoch_slots.clone(),
         }
     }
 }
@@ -344,6 +432,8 @@ mod tests {
             isr: vec!["node-a".to_string()],
             leader_epoch: 2,
             updated_at_ms: 5_000,
+            topic_generation: 0,
+            epoch_slots: BTreeMap::from([("node-a".to_string(), 0), ("node-b".to_string(), 3)]),
         };
         let row = assignment.to_db_row("prod");
         assert_eq!(row.instance_id, assignment.instance_id);
@@ -358,6 +448,58 @@ mod tests {
         assert_eq!(row.updated_at_ms, assignment.updated_at_ms);
 
         assert_eq!(db_row(&row), assignment);
+    }
+
+    /// A row written before slots existed derives them from itself alone —
+    /// its sorted set plus its leader — and a change stamps them for good:
+    /// members keep their slots, a joiner gets one nobody held, a leaver's
+    /// stays reserved.
+    #[test]
+    fn epoch_slots_are_derived_once_and_never_change_hands() {
+        let mut row = test_assignment(0);
+        row.replicas = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        row.leader_node_id = "gone".to_string();
+        let derived = row.resolved_epoch_slots();
+        assert_eq!(
+            derived,
+            BTreeMap::from([
+                ("a".to_string(), 0),
+                ("b".to_string(), 1),
+                ("c".to_string(), 2),
+                ("gone".to_string(), 3),
+            ])
+        );
+
+        let mut next = row.clone();
+        next.replicas = vec!["a".to_string(), "d".to_string()];
+        next.leader_node_id = "a".to_string();
+        next.claim_epoch_slots(derived.clone()).unwrap();
+        assert_eq!(next.epoch_slot("a"), Some(0));
+        assert_eq!(
+            next.epoch_slot("c"),
+            Some(2),
+            "a leaver keeps its slot reserved"
+        );
+        assert_eq!(
+            next.epoch_slot("d"),
+            Some(4),
+            "a joiner gets one nobody held"
+        );
+        assert_eq!(
+            next.resolved_epoch_slots(),
+            next.epoch_slots,
+            "a stamped row is not re-derived from its new set"
+        );
+
+        let mut full = next.clone();
+        full.epoch_slots = (0..crate::bus::replication::election::EPOCH_SLOTS)
+            .map(|slot| (format!("n{slot}"), slot))
+            .collect();
+        full.replicas.push("late".to_string());
+        assert_eq!(
+            full.claim_epoch_slots(full.epoch_slots.clone()),
+            Err(EpochSlotsExhausted)
+        );
     }
 
     /// Mirrors `dispatch/environment.rs`'s `locked_env_fixture` pattern: one
@@ -417,6 +559,8 @@ mod tests {
             isr: vec!["node-a".to_string(), "node-b".to_string()],
             leader_epoch: 1,
             updated_at_ms: 1_000,
+            topic_generation: 0,
+            epoch_slots: BTreeMap::new(),
         }
     }
 
@@ -454,6 +598,7 @@ mod tests {
                 created_at_ms: 1,
                 updated_at_ms: 1,
                 durability_class: None,
+                generation: 0,
             },
         )
         .expect("seed parent bus_topic");
@@ -496,6 +641,7 @@ mod tests {
             created_at_ms: 1,
             updated_at_ms: 1,
             durability_class: None,
+            generation: 0,
         }
     }
 

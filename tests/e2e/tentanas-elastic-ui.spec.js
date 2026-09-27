@@ -601,6 +601,16 @@ test('Create pojedynczego cache zachowuje role, serial i payload planu', async (
   expect(requests[1].payload.cacheDiskIds).toEqual(['vdc']);
 });
 
+test('Podsumowanie kreatora na telefonie zachowuje linie między wierszami', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await openElastic(page);
+  await configureElastic(page, { cache: 'vdc' });
+  const rows = page.locator('#nas-pw-summary tbody tr');
+  await expect(rows.nth(1)).toBeVisible();
+  expect(await rows.nth(1).locator('td').first().evaluate((el) => getComputedStyle(el).borderTopWidth)).toBe('1px');
+  await page.locator('#nas-pw-summary').screenshot({ path: path.join(artifacts, 'pool-wizard-summary-390.png'), animations: 'disabled' });
+});
+
 test('Kreator odmawia cache bez NVMe i pokazuje powód', async ({ page }) => {
   await openElastic(page, { nvme: false });
   await page.locator('#nas-tab-body tf-button[data-act="create"]').click();

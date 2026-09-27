@@ -14,7 +14,7 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
-use crate::flow_engine::envelope::{FlowEnvelope, NodeInput};
+use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
@@ -28,6 +28,30 @@ pub const HISTORY_BASE_LEN_META: &str = "history_base_len";
 
 pub struct ConversationHistoryNodeAdapter;
 
+/// `envelope.meta` key naming the conversation a run continues, when it is not
+/// the run's own session. A background agent run is its own session (the run
+/// id), so a caller whose turns belong to one longer conversation — a Code
+/// Studio session — names it here, and history and persistence both follow it.
+pub const CONVERSATION_META_KEY: &str = "conversation_id";
+
+/// The conversation this node reads or writes: the node's own config, then the
+/// conversation the caller named, then the run's session.
+pub(crate) fn conversation_of(
+    node: &FlowNode,
+    envelope: &FlowEnvelope,
+    ctx: &ExecutionContext,
+) -> Option<String> {
+    let named = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    named(node.config.get("session_id"))
+        .or_else(|| named(envelope.meta.get(CONVERSATION_META_KEY)))
+        .or_else(|| ctx.session_id.clone())
+}
+
 impl ConversationHistoryNodeAdapter {
     pub fn new() -> Self {
         Self
@@ -40,16 +64,12 @@ impl ConversationHistoryNodeAdapter {
     /// a one-shot run has nothing to replay. Without the opt-in a missing
     /// session stays a hard error, so a chat flow that forgot to pass one still
     /// fails loudly instead of silently losing its memory.
-    fn pick_session(node: &FlowNode, ctx: &ExecutionContext) -> Result<Option<String>> {
-        if let Some(s) = node
-            .config
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
-            return Ok(Some(s.to_string()));
-        }
-        if let Some(s) = ctx.session_id.clone() {
+    fn pick_session(
+        node: &FlowNode,
+        envelope: &FlowEnvelope,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<String>> {
+        if let Some(s) = conversation_of(node, envelope, ctx) {
             return Ok(Some(s));
         }
         let required = node
@@ -95,7 +115,7 @@ impl NodeAdapter for ConversationHistoryNodeAdapter {
             .ok_or_else(|| anyhow!("conversation_history adapter: missing input edge"))?;
         let envelope = &input.envelope;
 
-        let session = Self::pick_session(node, ctx)?;
+        let session = Self::pick_session(node, envelope, ctx)?;
         let max = node
             .config
             .get("max_messages")
@@ -103,10 +123,15 @@ impl NodeAdapter for ConversationHistoryNodeAdapter {
             .map(|n| n as u32)
             .unwrap_or(DEFAULT_MAX_MESSAGES);
 
-        let history = match session {
+        let mut history = match session {
             Some(ref s) => ctx.history.recent(s, max).await?,
             None => Vec::new(),
         };
+        // The window is cut by count, so it can open on tool results whose
+        // assistant call fell outside it. A result with no call before it is
+        // refused by strict backends ("tool message must follow tool_calls").
+        let orphaned = history.iter().take_while(|m| m.role == ChatRole::Tool).count();
+        history.drain(..orphaned);
         let base_len = history.len();
 
         let mut out: FlowEnvelope = (**envelope).clone();
@@ -178,6 +203,24 @@ mod tests {
             *self.appended.lock().unwrap() += m.len();
             Ok(())
         }
+    }
+
+    /// A Code Studio turn continues the session's conversation, not the run's.
+    #[tokio::test]
+    async fn a_named_conversation_wins_over_the_run_session() {
+        let node = node(json!({}));
+        let mut envelope = FlowEnvelope::empty();
+        let mut ctx = stub_ctx();
+        ctx.session_id = Some("run-1".into());
+        assert_eq!(conversation_of(&node, &envelope, &ctx).as_deref(), Some("run-1"));
+        envelope.meta.insert(
+            CONVERSATION_META_KEY.into(),
+            serde_json::Value::String("code-session:s1".into()),
+        );
+        assert_eq!(
+            conversation_of(&node, &envelope, &ctx).as_deref(),
+            Some("code-session:s1")
+        );
     }
 
     #[tokio::test]

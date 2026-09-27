@@ -9,6 +9,8 @@ license.workspace = true
 # Kernele Metal dla TESTÓW. Sam model ich nie potrzebuje — nie zna wykonawcy,
 # więc buduje się wszędzie i tak samo.
 metal = ["forge-hal/metal", "forge-kernels/metal"]
+# Ramię ANE dla TESTÓW podziału trzech jednostek.
+ane = ["metal", "forge-kernels/ane"]
 
 [dependencies]
 forge-types.workspace = true

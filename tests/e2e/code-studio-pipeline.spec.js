@@ -37,7 +37,7 @@ function workThenAnswer() {
     tool('core.fs_write', {
       path: 'hello.py',
       content: '#!/usr/bin/env python3\nprint("Witaj z Code Studio")\n',
-      expected_sha256: '',
+      expected_blob_id: '',
     }),
     tool('core.exec', { argv: ['python3', 'hello.py'] }),
     say('Napisałem hello.py i uruchomiłem go.'),

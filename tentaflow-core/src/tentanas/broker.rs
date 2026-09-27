@@ -225,6 +225,10 @@ async fn run_with_stdin(
     // Validate against the catalog BEFORE choosing a channel: a bad device
     // name must fail the same way whether or not the node is armed.
     let plan = command.plan().map_err(catalog)?;
+    command.validate_payload(payload.unwrap_or_default()).map_err(catalog)?;
+    if let Some(out) = recorded(db, command, payload) {
+        return Ok((out, Channel::Helper));
+    }
     // A builtin has no argv to hand to `sudo`: the sequence lives in the
     // helper, so it always crosses the channel as a helper invocation.
     let exec = match &plan {
@@ -237,12 +241,7 @@ async fn run_with_stdin(
     // system, so it is not an invocation.
     if let Some(token) = explicit {
         record_invocation(db);
-        let out = match exec {
-            Some(resolved) => sudo_argv(token, resolved, payload, timeout).await?,
-            None => {
-                through_helper(&helper_binary()?, Some(token), command, payload, timeout).await?
-            }
-        };
+        let out = explicit_channel(command, exec, payload, token, timeout).await?;
         return Ok((out, Channel::Explicit));
     }
     match super::elevation::mode(db) {
@@ -273,6 +272,46 @@ async fn run_with_stdin(
             Ok((out, Channel::Interactive))
         }
         super::elevation::Mode::Unset => Err(BrokerError::Unarmed("privilege mode not configured")),
+    }
+}
+
+/// Runs one catalog command as root with a password the operator has just
+/// typed, for a surface outside TentaNas (the agent sandbox repair). There is
+/// no TentaNas instance behind it, so there is no configured channel to fall
+/// back on and no instance tally to count it in — the catalog, the payload
+/// check and `sudo -S` are exactly the TentaNas explicit path.
+pub async fn run_with_password(
+    command: &HelperCommand,
+    payload: Option<&[u8]>,
+    token: &ElevationToken,
+    timeout: Duration,
+) -> Result<CommandOutput, BrokerError> {
+    let plan = command.plan().map_err(catalog)?;
+    command.validate_payload(payload.unwrap_or_default()).map_err(catalog)?;
+    if payload.is_some() != command.reads_key_from_stdin() {
+        return Err(BrokerError::InvalidArgument(
+            "stdin payload does not match what the command takes".to_string(),
+        ));
+    }
+    let exec = match &plan {
+        Plan::Exec(resolved) => Some(resolved),
+        Plan::Builtin(_) => None,
+    };
+    explicit_channel(command, exec, payload, token, timeout).await
+}
+
+/// The explicit channel: an exec entry straight under `sudo -S`, a builtin
+/// through the helper binary under the same password.
+async fn explicit_channel(
+    command: &HelperCommand,
+    exec: Option<&tentanas_helper::Resolved>,
+    payload: Option<&[u8]>,
+    token: &ElevationToken,
+    timeout: Duration,
+) -> Result<CommandOutput, BrokerError> {
+    match exec {
+        Some(resolved) => sudo_argv(token, resolved, payload, timeout).await,
+        None => through_helper(&helper_binary()?, Some(token), command, payload, timeout).await,
     }
 }
 
@@ -416,6 +455,29 @@ fn is_elastic(command: &HelperCommand) -> bool {
         .is_some_and(|label| label.starts_with("elastic_"))
 }
 
+/// Whether this command WRITES an iSCSI or NVMe-oF target's allowlist or
+/// sessions — the commands whose behaviour a security fix changes inside the
+/// helper (0.17.1: an open TPG getting an allowlist is rebuilt, or the ACLs
+/// LIO cached for its former clients keep letting them in). An older helper
+/// accepts them and silently leaves that hole open, so they are gated like
+/// the Elastic operations (critic ACL-fix).
+///
+/// NOT the removals (`iscsi_target_remove`, `nvmet_subsystem_remove`): the
+/// delete path drops the row before it calls the helper, so a refused
+/// removal would leave a live export the app no longer knows about — and an
+/// older helper removes a target the same way. NOT the session read either.
+fn is_target_write(command: &HelperCommand) -> bool {
+    matches!(
+        command.builtin_label(),
+        Some("iscsi_target_apply" | "iscsi_session_reset" | "nvmet_subsystem_apply")
+    )
+}
+
+/// The commands that never reach a helper of another build.
+fn is_version_gated(command: &HelperCommand) -> bool {
+    is_elastic(command) || is_target_write(command)
+}
+
 /// The gate itself, over the version the probe read (`None` = unknown).
 ///
 /// UNKNOWN REFUSES, and that is the point of the third arm: a probe that fails
@@ -424,7 +486,7 @@ fn is_elastic(command: &HelperCommand) -> bool {
 /// where running it blind is worst. An older helper is refused for the same
 /// reason as a newer one: neither speaks this core's sequence.
 fn version_gate(command: &HelperCommand, installed: Option<&str>) -> Result<(), BrokerError> {
-    if !is_elastic(command) {
+    if !is_version_gated(command) {
         return Ok(());
     }
     let expected = tentanas_helper::VERSION;
@@ -475,7 +537,7 @@ async fn through_helper(
     // automatic mover, the startup restores and the privileged reads that are
     // not jobs at all (the cache and age probes). A check at the job-spawn
     // boundary would have missed the last of those.
-    if is_elastic(command) {
+    if is_version_gated(command) {
         version_gate(command, installed_version(helper).await.as_deref())?;
     }
     let mut cmd = Command::new("sudo");
@@ -530,10 +592,24 @@ async fn through_helper(
     }
 }
 
+/// Production has no test channel (`test_channel`, test builds only).
+#[cfg(not(test))]
+fn recorded(_db: &DbPool, _command: &HelperCommand, _payload: Option<&[u8]>) -> Option<CommandOutput> {
+    None
+}
+
+#[cfg(not(test))]
+fn recorded_channel(_db: &DbPool) -> bool {
+    false
+}
+
 /// Whether ANY channel could run a privileged command right now. Used by the
 /// sampler to decide whether SMART refresh is possible without producing an
 /// error per disk per tick.
 pub async fn channel_available(db: &DbPool) -> bool {
+    if recorded_channel(db) {
+        return true;
+    }
     match super::elevation::mode(db) {
         super::elevation::Mode::Helper => super::elevation::helper_status().await.state == "ok",
         super::elevation::Mode::Interactive => super::elevation::armed_token().is_some(),
@@ -580,7 +656,7 @@ mod tests {
         // A NEWER helper is refused for the same reason: neither build speaks
         // this core's sequence.
         assert!(matches!(
-            version_gate(&elastic, Some("0.15.0")),
+            version_gate(&elastic, Some("99.0.0")),
             Err(BrokerError::HelperVersion(_))
         ));
 
@@ -601,6 +677,36 @@ mod tests {
         assert!(!is_elastic(&share));
         for installed in [Some(tentanas_helper::VERSION), Some("0.12.0"), None] {
             version_gate(&share, installed).expect("a share writer is not gated");
+        }
+    }
+
+    /// The target writes are gated too (critic ACL-fix): an older helper
+    /// would accept `iscsi_target_apply` and leave the cached-dynamic-ACL hole
+    /// open without a word. The removals and the session read are not.
+    #[test]
+    fn the_version_gate_covers_the_target_writes_but_not_the_removals() {
+        let gated = [
+            HelperCommand::IscsiTargetApply {},
+            HelperCommand::IscsiSessionReset { initiator: "iqn.1994-05.com.redhat:vmhost-01".into() },
+            HelperCommand::NvmetSubsystemApply {},
+        ];
+        for command in &gated {
+            assert!(is_version_gated(command), "{:?}", command.builtin_label());
+            version_gate(command, Some(tentanas_helper::VERSION)).expect("the matching helper runs");
+            for installed in [Some("0.17.0"), None] {
+                let refused = version_gate(command, installed).expect_err("an older or unknown helper is refused");
+                let BrokerError::HelperVersion(why) = &refused else { panic!("{refused:?}") };
+                assert!(why.contains(HELPER_VERSION_MARKER), "{why}");
+            }
+        }
+        let free = [
+            HelperCommand::IscsiTargetRemove { iqn: "iqn.2026-09.local.tentaflow:helios.vm-store".into() },
+            HelperCommand::NvmetSubsystemRemove { nqn: "nqn.2026-09.local.tentaflow:helios.scratch".into() },
+            HelperCommand::NvmetSessionsRead {},
+        ];
+        for command in &free {
+            assert!(!is_version_gated(command), "{:?}", command.builtin_label());
+            version_gate(command, Some("0.17.0")).expect("a removal is never refused");
         }
     }
 
@@ -670,3 +776,108 @@ mod tests {
         assert_eq!(cached_version(path, now), None);
     }
 }
+
+// Kept after the tests module on purpose: the source scans above count
+// production call sites up to the first test-only attribute.
+#[cfg(test)]
+fn recorded(db: &DbPool, command: &HelperCommand, payload: Option<&[u8]>) -> Option<CommandOutput> {
+    test_channel::for_db(db).map(|r| r.run(command, payload))
+}
+
+#[cfg(test)]
+fn recorded_channel(db: &DbPool) -> bool {
+    test_channel::for_db(db).is_some()
+}
+
+/// A privilege channel for tests, bound to ONE database (the `Arc` it is
+/// registered for), so tests running side by side never see each other's:
+/// every privileged command a job sends on that node is recorded with its
+/// stdin payload (the generated smb.conf include, /etc/exports) and answers
+/// success, and nothing reaches the host. It exists so a job can be run
+/// end to end — the real apply, the real sweep, the real job — without root.
+#[cfg(test)]
+pub mod test_channel {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use tentanas_helper::HelperCommand;
+
+    use super::CommandOutput;
+    use crate::db::DbPool;
+
+    #[derive(Default)]
+    pub struct Recorder {
+        pub calls: Mutex<Vec<(String, Option<String>)>>,
+        /// Commands (by `cmd` name) that answer as a FAILED helper run with
+        /// this stderr instead of success — how a test drives an error path.
+        pub failing: Mutex<HashMap<String, String>>,
+    }
+
+    impl Recorder {
+        pub(super) fn run(&self, command: &HelperCommand, payload: Option<&[u8]>) -> CommandOutput {
+            let name = serde_json::to_value(command)
+                .ok()
+                .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(str::to_string))
+                .unwrap_or_default();
+            let payload = payload.map(|p| String::from_utf8_lossy(p).into_owned());
+            self.calls.lock().unwrap().push((name.clone(), payload));
+            match self.failing.lock().unwrap().get(&name) {
+                Some(stderr) => CommandOutput { code: 69, stdout: String::new(), stderr: stderr.clone() },
+                None => CommandOutput { code: 0, stdout: String::new(), stderr: String::new() },
+            }
+        }
+
+        /// Makes every later call named `command` fail with `stderr`.
+        pub fn fail(&self, command: &str, stderr: &str) {
+            self.failing.lock().unwrap().insert(command.to_string(), stderr.to_string());
+        }
+
+        /// The names of the calls made so far, in order.
+        pub fn names(&self) -> Vec<String> {
+            self.calls.lock().unwrap().iter().map(|(n, _)| n.clone()).collect()
+        }
+
+        /// The payload of the last call named `command`.
+        pub fn last_payload(&self, command: &str) -> Option<String> {
+            self.calls.lock().unwrap().iter().rev().find(|(n, _)| n == command).and_then(|(_, p)| p.clone())
+        }
+    }
+
+    fn registry() -> &'static Mutex<HashMap<usize, Arc<Recorder>>> {
+        static REG: OnceLock<Mutex<HashMap<usize, Arc<Recorder>>>> = OnceLock::new();
+        REG.get_or_init(Default::default)
+    }
+
+    /// Routes every privileged command sent for `db` into a new recorder,
+    /// until the returned guard is dropped (an address a dropped database
+    /// had can be handed to another test's database).
+    pub fn install(db: &DbPool) -> Installed {
+        let key = Arc::as_ptr(db) as *const () as usize;
+        let recorder = Arc::new(Recorder::default());
+        registry().lock().unwrap().insert(key, recorder.clone());
+        Installed { key, recorder }
+    }
+
+    pub struct Installed {
+        key: usize,
+        pub recorder: Arc<Recorder>,
+    }
+
+    impl std::ops::Deref for Installed {
+        type Target = Recorder;
+        fn deref(&self) -> &Recorder {
+            &self.recorder
+        }
+    }
+
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            registry().lock().unwrap().remove(&self.key);
+        }
+    }
+
+    pub(super) fn for_db(db: &DbPool) -> Option<Arc<Recorder>> {
+        registry().lock().unwrap().get(&(Arc::as_ptr(db) as *const () as usize)).cloned()
+    }
+}
+

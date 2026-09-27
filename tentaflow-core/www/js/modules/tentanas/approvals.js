@@ -12,7 +12,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, fmtAgo, fmtIn, fmtDate, errMessage, ADMIN_TIMEOUT_MS, jobAuthor } from '/js/modules/tentanas/format.js';
+import { T, sprite, fmtAgo, fmtIn, fmtDate, fmtDuration, fmtSchedule, errMessage, ADMIN_TIMEOUT_MS, jobAuthor, wordReasons, nodeTextTitle } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchHtml } from '/js/lib/dom-patch.js';
 import '/js/components/tf-table.js';
 import '/js/components/tf-chip.js';
@@ -31,21 +31,124 @@ import '/js/components/tf-window.js';
 // `elastic_replace_disk` is deliberately NOT here: disk replacement is
 // withdrawn, the node refuses the request before anything is parked, so a
 // label for it would describe an operation that cannot appear.
-const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import', 'elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover', 'elastic_fix', 'elastic_add_disk', 'elastic_add_disk_abort', 'elastic_destroy', 'elastic_schedule'];
+const OPERATIONS = ['pool_destroy', 'snapshot_release', 'share_delete', 'target_delete', 'config_import', 'elastic_create', 'elastic_restore', 'elastic_sync', 'elastic_scrub', 'elastic_mover', 'elastic_fix', 'elastic_add_disk', 'elastic_add_disk_abort', 'elastic_destroy', 'elastic_schedule', 'sharing_stop'];
 
 export const operationLabel = (op) => T('approvals.op_' + (OPERATIONS.includes(op) ? op : 'unknown'));
 
-// A parked operation's detail. The node writes a CODE (`text:<code>`,
-// `approvals::coded_detail`) where the sentence has to reach the approver in
-// their own language — above all the data-loss warning of a Sync over a
-// parity fault. Any other detail is shown as the node wrote it; a code this
-// build has no words for, too, rather than dropped.
+// A parked operation's detail in the approver's language (wave 6): the node
+// parks every request with its detail as a code and parameters
+// (`detailReasons`, `approvals::park`) beside its own English sentence, which
+// becomes the tooltip. Above all the data-loss warning of a Sync over a parity
+// fault has to reach a de/en/fr/es approver in words they read.
+//
+// An older node wrote only the sync's code, as `text:<code>` in `detail`;
+// every other older detail is its sentence, shown as written. A code this
+// build has no words for shows the sentence too, rather than nothing.
 const CODED_DETAIL = /^text:([a-z0-9_]+)$/;
-export function approvalDetail(detail) {
-  const code = CODED_DETAIL.exec(String(detail || ''))?.[1];
-  if (!code) return String(detail || '');
-  const words = T('approvals.detail_' + code);
-  return words === 'tentanas.approvals.detail_' + code ? String(detail) : words;
+
+// The schedules a config import overwrites, in the reader's language (critic
+// wave 6, MINOR 10): the node sends them as `[task, subject]` pairs
+// (`config_io::overwritten_schedules_json`) beside its own "scrub tank,
+// smart". The pairs are used only when they are every overwritten item and
+// every task has words here; otherwise the node's list is shown as sent.
+const IMPORT_TASKS = new Set(['scrub', 'trim', 'snapshot', 'smart']);
+function configImportItems(p) {
+  let pairs;
+  try { pairs = JSON.parse(String(p.schedules || '')); } catch { pairs = null; }
+  const whole = Array.isArray(pairs) && pairs.length > 0 && pairs.length === Number(p.count)
+    && pairs.every((x) => Array.isArray(x) && IMPORT_TASKS.has(x[0]) && (x[0] === 'smart' || x[1]));
+  if (!whole) return p.items;
+  return pairs.map(([task, subject]) => T('approvals.detail.config_import_task.' + task, { subject })).join(', ');
+}
+const SCHEDULE_TASKS = new Set(['mover', 'sync', 'scrub']);
+
+// n18d's stop of a node's sharing (wave 10): which shares and targets stop,
+// BY NAME — the asking organisation's; another organisation's arrive only
+// counted (`sharing::stop_detail`) and are said as counts.
+const countParam = (v) => (/^\d+$/.test(String(v ?? '')) ? Number(v) : null);
+function sharingStopWords(p) {
+  const otherShares = countParam(p.other_shares);
+  const otherTargets = countParam(p.other_targets);
+  if (otherShares === null || otherTargets === null) return null;
+  const list = (names, others, otherKey) => {
+    const parts = String(names || '').split(', ').filter(Boolean);
+    if (others > 0) parts.push(T(otherKey, { n: others }));
+    return parts.length ? parts.join(', ') : T('approvals.detail.sharing_stop_none');
+  };
+  return T('approvals.detail.sharing_stop', {
+    node: String(p.node || '').trim() || T('approvals.detail.sharing_stop_node_unnamed'),
+    shares: list(p.shares, otherShares, 'approvals.detail.sharing_stop_other_shares'),
+    targets: list(p.targets, otherTargets, 'approvals.detail.sharing_stop_other_targets'),
+  });
+}
+const yesNo = (v) => (v === 'true' ? T('approvals.detail.yes') : v === 'false' ? T('approvals.detail.no') : null);
+const DETAIL_WORDS = new Map([
+  ['pool_destroy', (p) => (p.pool ? T('approvals.detail.pool_destroy', { pool: p.pool }) : null)],
+  ['share_delete', (p) => (p.share && p.path ? T('approvals.detail.share_delete', { share: p.share, path: p.path }) : null)],
+  ['target_delete', (p) => (p.target ? T('approvals.detail.target_delete', { target: p.target, sources: p.sources || '—' }) : null)],
+  ['snapshot_release', (p) => {
+    if (!p.snapshot) return null;
+    // The author's reason is their own words, carried as written.
+    return p.reason
+      ? T('approvals.detail.snapshot_release_reason', { snapshot: p.snapshot, reason: p.reason })
+      : T('approvals.detail.snapshot_release', { snapshot: p.snapshot });
+  }],
+  ['config_import', (p) => {
+    if (!p.count || !p.items) return null;
+    return T('approvals.detail.config_import', { count: p.count, items: configImportItems(p) });
+  }],
+  ['elastic_create', (p) => (p.array ? T('approvals.detail.elastic_create', { array: p.array }) : null)],
+  ['elastic_sync', () => T('approvals.detail_elastic_sync')],
+  ['elastic_sync_over_fault', () => T('approvals.detail_elastic_sync_over_fault')],
+  ['elastic_scrub', () => T('approvals.detail.elastic_scrub')],
+  ['elastic_fix', (p) => {
+    // The disk by its kernel name, else by its number — never by the slot
+    // the request keys it by.
+    if (p.disk) return T('approvals.detail.elastic_fix', { disk: p.disk });
+    return /^\d+$/.test(String(p.number || '')) ? T('approvals.detail.elastic_fix_number', { n: p.number }) : T('approvals.detail.elastic_fix_unnamed');
+  }],
+  ['elastic_add_disk', (p) => (p.disk ? T('approvals.detail.elastic_add_disk', { disk: p.disk }) : T('approvals.detail.elastic_add_disk_unnamed'))],
+  ['elastic_add_disk_abort', () => T('approvals.detail.elastic_add_disk_abort')],
+  ['elastic_destroy', () => T('approvals.detail.elastic_destroy')],
+  ['sharing_stop', sharingStopWords],
+  // Another organisation's stop of this node (R2-2): the node only.
+  ['sharing_stop_other_org', (p) => T('approvals.detail.sharing_stop_other_org', {
+    node: String(p.node || '').trim() || T('approvals.detail.sharing_stop_node_unnamed'),
+  })],
+  ['elastic_mover', (p) => (yesNo(p.coupled_sync) ? T(p.coupled_sync === 'true' ? 'approvals.detail.elastic_mover_coupled' : 'approvals.detail.elastic_mover_uncoupled') : null)],
+  ['elastic_schedule', (p) => {
+    if (!SCHEDULE_TASKS.has(p.task) || !['true', 'false'].includes(p.enabled) || !p.every) return null;
+    const cadence = fmtSchedule({ every: p.every, hour: Number(p.hour) || 0, minute: Number(p.minute) || 0, weekday: Number(p.weekday) || 0, day: Number(p.day) || 1 });
+    const head = T(`approvals.detail.elastic_schedule_${p.enabled === 'true' ? 'arm' : 'keep_off'}`, {
+      task: T('approvals.detail.task_' + p.task),
+      cadence,
+    });
+    if (p.min_age_secs == null && p.cache_min_free_pct == null) return head;
+    const coupled = yesNo(p.coupled_sync);
+    if (!coupled || !/^\d+$/.test(String(p.min_age_secs)) || !/^\d+$/.test(String(p.cache_min_free_pct))) return null;
+    return T('approvals.detail.elastic_schedule_rules', {
+      head,
+      age: fmtDuration(Number(p.min_age_secs)),
+      pct: p.cache_min_free_pct,
+      coupled,
+    });
+  }],
+]);
+
+// `{ text, title }` of one approval's detail: the words, and the node's own
+// sentence as the tooltip when the words replace it. Accepts the approval,
+// or (an older caller) its bare `detail`.
+export function approvalDetail(approval) {
+  const a = typeof approval === 'string' ? { detail: approval } : approval || {};
+  const detail = String(a.detail || '');
+  const worded = wordReasons(a.detailReasons, DETAIL_WORDS);
+  if (worded) return { text: worded, title: CODED_DETAIL.test(detail) ? '' : nodeTextTitle(detail) };
+  const code = CODED_DETAIL.exec(detail)?.[1];
+  if (code) {
+    const legacy = wordReasons([{ code }], DETAIL_WORDS);
+    if (legacy) return { text: legacy, title: '' };
+  }
+  return { text: detail, title: '' };
 }
 
 const STATUS_TONE = {
@@ -104,7 +207,10 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
       const decider = a.decidedBy ? jobAuthor(a.decidedBy) : null;
       return {
         _approval: a,
-        operation: `<span class="tf-table__cell-title">${escapeHtml(operationLabel(a.operation))}</span><div class="tf-table__cell-sub">${escapeHtml(approvalDetail(a.detail))}</div>`,
+        operation: (() => {
+          const detail = approvalDetail(a);
+          return `<span class="tf-table__cell-title">${escapeHtml(operationLabel(a.operation))}</span><div class="tf-table__cell-sub"${detail.title ? ` title="${escapeAttr(detail.title)}"` : ''}>${escapeHtml(detail.text)}</div>`;
+        })(),
         subject: a.subject ? `<span class="tf-table__cell--mono">${escapeHtml(a.subject)}</span>` : '—',
         requested: `<span>${escapeHtml(fmtAgo(a.requestedAt))}</span><div class="tf-table__cell-sub">${escapeHtml(T('approvals.requested_by', { user: requester.label }))}</div>`,
         expires: `<span class="tf-table__cell--mono">${escapeHtml(a.status === 'pending' ? fmtIn(a.expiresAt) : fmtDate(a.expiresAt))}</span>`,
@@ -127,10 +233,13 @@ export function wireApprovals(screen, body, { onExecuted = null } = {}) {
       wrap.appendChild(note);
       return wrap;
     }
+    // Another organisation's stop blocks this node too: a platform admin
+    // may reject it, never approve it (the node refuses that anyway).
+    const foreign = (a.detailReasons || []).some((r) => r?.code === 'sharing_stop_other_org');
     for (const [act, icon, variant, label] of [
       ['approve', 'check', 'primary', T('approvals.approve')],
       ['reject', 'x', 'ghost', T('approvals.reject')],
-    ]) {
+    ].filter(([act]) => !(foreign && act === 'approve'))) {
       const b = document.createElement('tf-button');
       b.setAttribute('size', 'sm');
       b.setAttribute('variant', variant);

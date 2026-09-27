@@ -4,6 +4,7 @@
 // inside the field before the chosen value (the TentaBus instance picker:
 // "● INSTANCJA Produkcja"). The caption is the select's accessible name, the
 // dot follows its tone, and a select without either keeps its old markup.
+// `hint` puts one explanatory line under the field, like tf-input's.
 // =============================================================================
 
 import '../sdk-runtime/_dom-test-harness.js';
@@ -35,6 +36,15 @@ test('dot follows its tone; an unknown tone draws none', () => {
   assert.ok(el.querySelector('.tf-select-dot--err'));
   el.setAttribute('dot', 'bogus');
   assert.equal(el.querySelector('.tf-select-dot'), null);
+});
+
+test('hint shows one line under the field and goes away with the attribute', () => {
+  const el = mount({ hint: 'Starsze wiadomości są usuwane.' });
+  const hint = el.querySelector('.tf-hint');
+  assert.equal(hint.textContent, 'Starsze wiadomości są usuwane.');
+  assert.equal(hint.style.display, '');
+  el.removeAttribute('hint');
+  assert.equal(hint.style.display, 'none');
 });
 
 test('without prefix or dot the field is unchanged', () => {

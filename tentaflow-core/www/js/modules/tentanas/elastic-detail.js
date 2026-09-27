@@ -6,7 +6,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, fmtAgo, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, errDetail, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, wordReasons, nodeTextTitle, jobKindLabel } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchKeyedList, paintStatCards, SLOT, slotEl, setClass } from '/js/lib/dom-patch.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, dangerRowHtml, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
@@ -154,12 +154,86 @@ function attentionText(array) {
   return ATTENTION_CAUSES.includes(array?.attention) ? T(`elastic.attention_${array.attention}`) : '';
 }
 
+// The members a state sentence names, per role (`elastic::members_params`):
+// comma-separated kernel names, or "#<n>" for a member the node knows only by
+// its number — never its internal slot.
+const STATE_MEMBER_ROLES = ['data', 'cache', 'parity'];
+function stateMembers(p) {
+  const out = [];
+  for (const role of STATE_MEMBER_ROLES) {
+    for (const name of String(p[role] || '').split(',').map((n) => n.trim()).filter(Boolean)) {
+      const number = /^#(\d+)$/.exec(name)?.[1];
+      out.push(number
+        ? T(`elastic.state_member.${role}_number`, { n: number })
+        : T(`elastic.state_member.${role}`, { name }));
+    }
+  }
+  return out.join(', ');
+}
+const withMembers = (key) => (p) => {
+  const members = stateMembers(p);
+  return members ? T(key, { members }) : null;
+};
+
+// The array state's codes (`NasElasticArray::state_reasons`), in words.
+const STATE_WORDS = new Map([
+  ['mount_table_unknown', () => T('elastic.state_reason.mount_table_unknown')],
+  ['mergerfs_missing', () => T('elastic.state_reason.mergerfs_missing')],
+  ['snapraid_unusable', () => T('elastic.state_reason.snapraid_unusable')],
+  ['branches_unknown', withMembers('elastic.state_reason.branches_unknown')],
+  ['branches_mountable', withMembers('elastic.state_reason.branches_mountable')],
+  ['branches_gone', (p) => {
+    const members = stateMembers(p);
+    if (!members || !['serving', 'down'].includes(p.union)) return null;
+    return T(`elastic.state_reason.branches_gone_${p.union}`, { members });
+  }],
+  ['union_not_mounted', () => T('elastic.state_reason.union_not_mounted')],
+  ['no_parity', () => T('elastic.state_reason.no_parity')],
+  ['restart_required', () => T('elastic.state_reason.restart_required')],
+  ['checkpoint_unfinished', () => T('elastic.state_reason.checkpoint_unfinished')],
+  ['awaiting_confirmation', () => T('elastic.state_reason.awaiting_confirmation')],
+  ['service_not_online', () => T('elastic.state_reason.service_not_online')],
+  ['helper_failed', () => T('elastic.state_reason.helper_failed')],
+  // The sentences the array's row STORES (migration 23): an operation's
+  // error, named by the operation's kind, and a lost supervision.
+  ['operation_failed', (p) => {
+    const kind = p.operation === 'dissolve' ? 'destroy' : String(p.operation || '');
+    const key = 'elastic_' + kind;
+    const label = kind ? jobKindLabel(key) : key;
+    return label !== key
+      ? T('elastic.state_reason.operation_failed', { operation: label })
+      : T('elastic.state_reason.operation_failed_unnamed');
+  }],
+  ['supervision_lost', () => T('elastic.state_reason.supervision_lost')],
+]);
+
 // The sentence that explains the array's state: the helper's recorded cause
-// when there is one, otherwise the node's own detail. The cause replaces the
-// helper's raw text rather than sitting beside it — that text is the
-// helper's, in one language, and may name what a screen must not show.
+// when there is one, otherwise the node's detail in the reader's language
+// (its codes, wave 6), otherwise the node's own sentence as it came — a
+// sentence the node stored without codes (a config import's reason) or a
+// node too old to send them. The cause replaces the helper's raw text rather
+// than sitting beside it — that text is the helper's, in one language, and
+// may name what a screen must not show.
+//
+// An uncoded sentence (a row stored before migration 23 that no rule
+// recognised, an older node) is shown only through the id filter: a stored
+// error may name a by-id path or a WWN.
+// A sentence the node STORED without codes (an error no operation row holds,
+// a row older than migration 23) is one language and may name a path: it is
+// said generically, and the sentence — ids taken out — is the tooltip, the
+// way `helper_failed` is (wave-6 critic MINOR 4, left open in wave 6).
 export function elasticStateDetail(array) {
-  return attentionText(array) || array?.stateDetail || '';
+  const worded = attentionText(array) || wordReasons(array?.stateReasons, STATE_WORDS);
+  if (worded) return worded;
+  return nodeTextTitle(array?.stateDetail) ? T('elastic.state_reason.uncoded') : '';
+}
+
+// The node's own sentence, as the tooltip of the worded one — '' when the
+// screen already shows that sentence itself.
+export function elasticStateTitle(array) {
+  const shown = elasticStateDetail(array);
+  const own = nodeTextTitle(array?.stateDetail);
+  return own && shown !== own ? own : '';
 }
 
 // The unfinished add, if the array has one: the disk's live name, or "nowy
@@ -335,7 +409,10 @@ export function paintElasticCard(card, array, { admin = false, syncBusy = false 
 
   const stateDetail = elasticStateDetail(array);
   const reason = slotEl(card.querySelector('[data-slot="reason"]'), Boolean(stateDetail), 'reason', '<div class="pc-reason"></div>');
-  if (reason) setText(reason, stateDetail);
+  if (reason) {
+    setText(reason, stateDetail);
+    setAttr(reason, 'title', elasticStateTitle(array));
+  }
 
   const syncBlocked = elasticMaintenanceBlocker(array, admin);
   const sync = card.querySelector('[data-act="array-sync"]');
@@ -684,7 +761,7 @@ export function openSyncOverFaultDialog(screen, array, onDone) {
       <li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('elastic.sync_fault_loses'))}</span></li>
       <li class="ll">${sprite('shield')}<span>${escapeHtml(T('elastic.sync_fault_keeps'))}</span></li>
     </ul>
-    <div class="explain-box">${escapeHtml(T('elastic.sync_fault_explain'))}</div>`;
+    <div class="explain-box">${escapeHtml(T('elastic.sync_fault_explain'))} ${escapeHtml(T('elastic.sync_fault_unmeasured'))}</div>`;
   const win = openRetypeDialog({
     title: T('elastic.sync_fault_title', { name: array.name }),
     icon: 'alert',
@@ -982,6 +1059,8 @@ export function openFolderCacheDialog(screen, array, folder, onDone) {
       btn.removeAttribute('disabled');
       const errEl = win.querySelector('#nas-folder-error');
       errEl.textContent = errMessage(err);
+      // The node's own sentence behind a coded refusal, ids scrubbed.
+      setAttr(errEl, 'title', errDetail(err));
       errEl.hidden = false;
     }
   });
@@ -1016,9 +1095,41 @@ function folderSkeletonHtml(folder, admin) {
     : '<span data-f="folder-policy"></span>';
   return `<div class="fr" data-folder="${escapeAttr(folder.name)}">
     <span class="fr-name"><span class="mono">${escapeHtml(folder.name)}</span><span class="fr-sub mono" data-f="folder-path"></span></span>
+    <span class="fr-used num" data-f="folder-used"></span>
     <span class="fr-share" data-f="folder-share"></span>
     <span class="fr-cache">${cell}<span ${SLOT} data-slot="folder-pinned"></span></span>
   </div>`;
+}
+
+// Why a folder has no size, in the reader's language. The node measures
+// folders by walking the disks in the background, hours apart, so "not yet"
+// and "too many files to count in time" are ordinary answers, not faults.
+const FOLDER_USAGE_WORDS = new Map([
+  ['folder_usage_pending', () => T('elastic.folder_usage.pending')],
+  ['folder_usage_over_budget', (p) => T('elastic.folder_usage.over_budget', { entries: Number(p.entries || 0).toLocaleString(I18n.getLanguage()), minutes: p.minutes || '' })],
+  ['folder_usage_unreadable', () => T('elastic.folder_usage.unreadable')],
+  ['folder_usage_not_mounted', () => T('elastic.folder_usage.not_mounted')],
+  ['folder_usage_failed', () => T('elastic.folder_usage.failed')],
+  ['folder_usage_name_refused', () => T('elastic.folder_usage.name_refused')],
+]);
+
+/**
+ * One folder's "Użycie" cell: the measured bytes with their age as the
+ * tooltip, or "—" with the reason. A folder with no figure and no reason
+ * (an older node) says only that it was not measured.
+ */
+export function folderUsageCell(folder) {
+  const bytes = folder?.usedBytes;
+  if (bytes !== null && bytes !== undefined && Number.isFinite(Number(bytes))) {
+    return {
+      text: fmtBytes(Number(bytes)),
+      title: folder.usedMeasuredAt ? T('elastic.folder_usage.measured', { ago: fmtAgo(folder.usedMeasuredAt) }) : '',
+    };
+  }
+  return {
+    text: '—',
+    title: wordReasons(folder?.usedReasons, FOLDER_USAGE_WORDS) || T('elastic.folder_usage.unknown'),
+  };
 }
 
 function paintFolders(card, array, admin) {
@@ -1027,13 +1138,17 @@ function paintFolders(card, array, admin) {
   const table = slotEl(card.querySelector('[data-slot="folder-table"]'), folders.length > 0, 'table', '<div class="nas-folder-rows"></div>');
   if (table) {
     patchKeyedList(table, [
-      { key: 'head', html: `<div class="fr fr-head"><span>${escapeHtml(T('elastic.folders_col_name'))}</span><span>${escapeHtml(T('elastic.folders_col_share'))}</span><span>${escapeHtml(T('elastic.folders_col_cache'))}</span></div>` },
+      { key: 'head', html: `<div class="fr fr-head"><span>${escapeHtml(T('elastic.folders_col_name'))}</span><span>${escapeHtml(T('elastic.folders_col_used'))}</span><span>${escapeHtml(T('elastic.folders_col_share'))}</span><span>${escapeHtml(T('elastic.folders_col_cache'))}</span></div>` },
       ...folders.map((folder) => ({ key: `folder:${folder.name}`, html: folderSkeletonHtml(folder, admin) })),
     ]);
     const rows = [...table.children].slice(1);
     folders.forEach((folder, i) => {
       const r = rows[i];
       setText(field(r, 'folder-path'), folder.path || '');
+      const used = folderUsageCell(folder);
+      const usedEl = field(r, 'folder-used');
+      setText(usedEl, used.text);
+      setAttr(usedEl, 'title', used.title || null);
       setText(field(r, 'folder-share'), folder.shareLabel || T('elastic.folders_share_none'));
       setText(field(r, 'folder-policy'), cachePolicyLabel(folder.cachePolicy));
       const chip = slotEl(r.querySelector('[data-slot="folder-pinned"]'), folder.cachePolicy === 'only', 'pinned', '<tf-chip status="warn"></tf-chip>');
@@ -1138,6 +1253,8 @@ export function openMoverScheduleEditor(screen, array, onDone) {
       btn.removeAttribute('disabled');
       const errEl = win.querySelector('#nas-mover-error');
       errEl.textContent = errMessage(err);
+      // The node's own sentence behind a coded refusal, ids scrubbed.
+      setAttr(errEl, 'title', errDetail(err));
       errEl.hidden = false;
     }
   });
@@ -1418,6 +1535,7 @@ export async function drawElasticDetail(screen, body) {
     setAttr(chip, 'label', status.label);
     setText(field(pane, 'state-path'), array.unionPath || '');
     setText(field(pane, 'state-detail'), elasticStateDetail(array) || status.label);
+    setAttr(field(pane, 'state-detail'), 'title', elasticStateTitle(array));
     // F2: on a parity fault a Sync would pay for, what to do next and in
     // which order — the repair while a scrub's marks wait for it, then a
     // scrub that re-measures, and the Sync last, behind its confirm.

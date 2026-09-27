@@ -24,7 +24,8 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, errMessage, jobKindLabel, nodeLabel } from '/js/modules/tentanas/format.js';
+import { T, sprite, ADMIN_TIMEOUT_MS, fmtBytes, errMessage, jobKindLabel, nodeLabel, wordReasons, nodeTextTitle } from '/js/modules/tentanas/format.js';
+import { patchKeyedList } from '/js/lib/dom-patch.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -33,6 +34,38 @@ import '/js/components/tf-segmented.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-choice-card.js';
 import '/js/components/tf-checkbox.js';
+
+// Why this kernel can or cannot serve a block protocol, in the reader's
+// language (wave 6): `targets::kernel_support` / `dhchap_support` send the
+// reason as codes beside their English (`NasBlockCapabilities::*_reasons`,
+// `NasShareService::reasons`), and the English becomes the tooltip. An older
+// node sends only the sentence, shown as it came.
+const blockProtocolLabel = (protocol) => (protocol === 'nvmet' ? 'NVMe-oF' : protocol === 'iscsi' ? 'iSCSI' : String(protocol || ''));
+export const KERNEL_SUPPORT_WORDS = new Map([
+  ['protocol_unknown', (p) => (p.protocol ? T('wizard_target.kernel.protocol_unknown', { proto: p.protocol }) : null)],
+  ['configfs_present', (p) => (p.path ? T('wizard_target.kernel.configfs_present', { path: p.path }) : null)],
+  ['modules_available', (p) => (p.modules ? T('wizard_target.kernel.modules_available', { modules: p.modules }) : null)],
+  ['modules_missing', (p) => (p.modules && p.protocol ? T('wizard_target.kernel.modules_missing', { modules: p.modules, proto: blockProtocolLabel(p.protocol) }) : null)],
+  ['iser_module_missing', () => T('wizard_target.kernel.iser_module_missing')],
+  ['nvmet_rdma_module_missing', () => T('wizard_target.kernel.nvmet_rdma_module_missing')],
+  ['rdma_unavailable', () => T('wizard_target.kernel.rdma_unavailable')],
+  ['dhchap_available', (p) => (p.path ? T('wizard_target.kernel.dhchap_available', { path: p.path }) : null)],
+  ['dhchap_not_built', (p) => (p.path ? T('wizard_target.kernel.dhchap_not_built', { path: p.path }) : null)],
+  ['dhchap_not_mentioned', (p) => (p.path ? T('wizard_target.kernel.dhchap_not_mentioned', { path: p.path }) : null)],
+  ['kernel_config_missing', () => T('wizard_target.kernel.kernel_config_missing')],
+]);
+
+export function kernelSupportText(reasons, detail) {
+  return wordReasons(reasons, KERNEL_SUPPORT_WORDS) || String(detail || '');
+}
+
+// One "not available here" line: `key` words it around the reason, and the
+// node's own sentence is its tooltip when the reason was worded.
+export function kernelSupportLine(key, reasons, detail) {
+  const text = kernelSupportText(reasons, detail);
+  const title = text !== String(detail || '') ? nodeTextTitle(detail) : '';
+  return `<div class="muted"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(T(key, { detail: text }))}</div>`;
+}
 
 // A target name becomes the tail of the IQN/NQN and a configfs directory
 // component, so it is the lowercase subset both specifications allow.
@@ -408,6 +441,8 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     secretSet: Boolean(target?.auth?.secretSet),
     mutualSecretSet: Boolean(target?.auth?.mutualSecretSet),
     hostNqnText: (target?.initiators || []).join('\n'),
+    // "Opis" per host NQN (wave 12), beside each NQN the field holds.
+    hostDescriptions: { ...(target?.initiatorDescriptions || {}) },
     confirmAll: editing ? !editPortal.interface : false,
     // Opt-IN, always. The portal of an existing target moves only because
     // somebody asked, and a drifted portal is the one case where the wizard
@@ -442,7 +477,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
 
   // ----- step 1/3: the protocol (n14a) -----
   const stepType = () => {
-    const unavailable = (ok, detail) => (ok ? '' : `<div class="muted">${escapeHtml(T('wizard_target.unavailable', { detail: detail || '' }))}</div>`);
+    const unavailable = (ok, reasons, detail) => (ok ? '' : kernelSupportLine('wizard_target.unavailable', reasons, detail));
     return `
       <h2 class="wizard-section-title">${escapeHtml(T('wizard_target.type_title'))}</h2>
       <p class="wizard-section-sub">${escapeHtml(T('wizard_target.type_sub'))}</p>
@@ -450,8 +485,8 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
         <tf-choice-card value="iscsi" icon="target" heading="iSCSI" description="${escapeAttr(T('wizard_target.iscsi_desc'))}" ${editing || caps.iscsi === false ? 'disabled' : ''}></tf-choice-card>
         <tf-choice-card value="nvmet" icon="zap" heading="NVMe-oF" description="${escapeAttr(T('wizard_target.nvmet_desc'))}" ${editing || caps.nvmet === false ? 'disabled' : ''}></tf-choice-card>
       </tf-choice-group>
-      ${unavailable(caps.iscsi !== false, caps.iscsiDetail)}
-      ${unavailable(caps.nvmet !== false, caps.nvmetDetail)}
+      ${unavailable(caps.iscsi !== false, caps.iscsiReasons, caps.iscsiDetail)}
+      ${unavailable(caps.nvmet !== false, caps.nvmetReasons, caps.nvmetDetail)}
       <div class="form-grid-2 mt-md">
         <tf-input id="nas-tw-name" label="${escapeAttr(T('wizard_target.name_label'))}" placeholder="vm-store" autocomplete="off" spellcheck="false" value="${escapeAttr(state.name)}" hint="${escapeAttr(T('wizard_target.name_hint'))}" ${editing ? 'readonly' : ''}></tf-input>
       </div>`;
@@ -562,8 +597,40 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     return `
       <tf-input id="nas-tw-hosts" multiline rows="2" label="${escapeAttr(T('wizard_target.dhchap_hosts_label'))}" spellcheck="false" placeholder="nqn.2014-08.org.nvmexpress:uuid:…" value="${escapeAttr(state.hostNqnText)}" hint="${escapeAttr(T('wizard_target.dhchap_hosts_hint'))}"></tf-input>
       <div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T(state.method === 'none' ? 'wizard_target.dhchap_hosts_filter_note' : 'wizard_target.dhchap_hosts_note'))}</div></div>
-      <div id="nas-tw-hosts-warn">${hostAllowlistWarnings()}</div>`;
+      ${editing ? `<div class="wizard-warning" data-testid="nvmet-remove-note">${sprite('alert')}<div>${escapeHtml(T('targets.nvmet_remove_keeps_connection'))}</div></div>` : ''}
+      <div id="nas-tw-hosts-warn">${hostAllowlistWarnings()}</div>
+      <div id="nas-tw-host-descs" class="stack"></div>`;
   };
+
+  // One "Opis" field per NQN in the list (n19 allowlist "Opis", in the
+  // wizard too). Keyed by the NQN, so typing in the list above never rebuilds
+  // a description field that is already there — its value and caret stay.
+  const paintHostDescriptions = () => {
+    const host = win.querySelector('#nas-tw-host-descs');
+    if (!host) return;
+    const nqns = parseHostNqns(state.hostNqnText).filter((n) => !invalidHostNqns(n).length);
+    patchKeyedList(host, nqns.map((nqn) => ({
+      key: nqn,
+      // No `value` in the markup: it would change with every keystroke and
+      // make the list rebuild the very field being typed in. A NEW field gets
+      // its value from the state below — also after `draw()` rebuilt the step.
+      html: `<tf-input data-host="${escapeAttr(nqn)}" maxlength="80" label="${escapeAttr(T('wizard_target.host_description_label', { nqn }))}" placeholder="${escapeAttr(T('wizard_target.host_description_placeholder'))}"></tf-input>`,
+    })));
+    host.querySelectorAll('tf-input[data-host]').forEach((el) => {
+      if (el.dataset.wired) return;
+      el.dataset.wired = '1';
+      el.value = state.hostDescriptions[el.dataset.host] || '';
+      const store = () => { state.hostDescriptions[el.dataset.host] = String(el.value || ''); };
+      el.addEventListener('input', store);
+      el.addEventListener('change', store);
+    });
+  };
+
+  // The descriptions of the NQNs the request carries, trimmed; the node
+  // refuses one for an NQN that is not on the list.
+  const hostDescriptionsFor = (nqns) => Object.fromEntries(nqns
+    .map((n) => [n, String(state.hostDescriptions[n] || '').replace(/[\u0000-\u001f\u007f]+/g, ' ').trim()])
+    .filter(([, text]) => text));
 
   const authFields = () => {
     if (state.method === 'none') return '';
@@ -617,14 +684,14 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
         <tf-segmented id="nas-tw-transport" value="${escapeAttr(state.transport)}" size="sm">
           ${transports.map((t) => `<option value="${escapeAttr(t.value)}" ${t.ok ? '' : 'disabled'}>${escapeHtml(t.label)}</option>`).join('')}
         </tf-segmented>
-        ${chosen && !chosen.ok ? `<div class="muted">${escapeHtml(T('wizard_target.transport_unavailable', { detail: caps.rdmaDetail || '' }))}</div>` : ''}
+        ${chosen && !chosen.ok ? kernelSupportLine('wizard_target.transport_unavailable', caps.rdmaReasons, caps.rdmaDetail) : ''}
       </div>
       <div class="field mt-md" style="margin-bottom:0;">
         <label>${escapeHtml(T('wizard_target.auth_label'))}</label>
         <tf-segmented id="nas-tw-auth" value="${escapeAttr(state.method)}" size="sm">
           ${methods.map((m) => `<option value="${escapeAttr(m)}" ${dhchapOff && m !== 'none' ? 'disabled' : ''}>${escapeHtml(T(AUTH_LABEL_KEY[m]))}</option>`).join('')}
         </tf-segmented>
-        ${dhchapOff ? `<div class="muted">${escapeHtml(T('wizard_target.dhchap_unavailable', { detail: caps.dhchapDetail || '' }))}</div>` : ''}
+        ${dhchapOff ? kernelSupportLine('wizard_target.dhchap_unavailable', caps.dhchapReasons, caps.dhchapDetail) : ''}
       </div>
       ${authFields()}
       ${hostAllowlistFields()}
@@ -913,7 +980,9 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
       state.hostNqnText = v;
       const box = win.querySelector('#nas-tw-hosts-warn');
       if (box) box.innerHTML = hostAllowlistWarnings();
+      paintHostDescriptions();
     });
+    paintHostDescriptions();
     onText('nas-tw-user', (v) => { state.username = v.trim(); });
     onText('nas-tw-secret', (v) => { state.secret = v; });
     onText('nas-tw-muser', (v) => { state.mutualUsername = v.trim(); });
@@ -974,6 +1043,9 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
         // nvmet keeps the keys on the host objects of the allowlist, so the
         // node refuses an authenticated subsystem with no host NQN.
         initiators: state.protocol === 'nvmet' ? parseHostNqns(state.hostNqnText) : (target.initiators || []),
+        // NVMe-oF edits its list here, so its "Opis" rides along; an iSCSI
+        // edit does not touch the list and sends none (the node keeps it).
+        ...(state.protocol === 'nvmet' ? { initiatorDescriptions: hostDescriptionsFor(parseHostNqns(state.hostNqnText)) } : {}),
         portGroups: target.portGroups || [],
         confirmAllInterfaces: state.confirmAll,
         enabled: state.enabled,
@@ -989,6 +1061,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
       transports: transportsOf(state.transport),
       auth: auth(),
       initiators: state.protocol === 'nvmet' ? parseHostNqns(state.hostNqnText) : [],
+      initiatorDescriptions: state.protocol === 'nvmet' ? hostDescriptionsFor(parseHostNqns(state.hostNqnText)) : {},
       confirmAllInterfaces: state.confirmAll,
       enabled: state.enabled,
     };

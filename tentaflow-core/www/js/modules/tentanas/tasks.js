@@ -10,8 +10,8 @@
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import {
-  T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage,
-  jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, runDiskBatch, refusedBatchNames,
+  T, sprite, POLL_JOBS_MS, ADMIN_TIMEOUT_MS, fmtDate, fmtAgo, fmtIn, fmtDuration, parseServerTs, errMessage, errDetail, parseRefusal,
+  jobTone, jobKindLabel, jobCanCancel, fmtSchedule, nodeLabel, jobAuthor, nodeTextTitle, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, setClass, patchHtml, patchKeyedList } from '/js/lib/dom-patch.js';
 import { isOpaqueId, isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
@@ -53,27 +53,169 @@ const TRIM_ONLY = ['weekly', 'monthly'];
 // that must not be hidden just because it starts with `dev-`/`usb-`/`pci-`/…
 // or is all digits (a share named `dev-backups`, a pool `2024`).
 //
-// Returns `{ text }`, a plain string escaped by the caller.
+// Returns `{ text, words }`: a plain string escaped by the caller, and
+// whether it is WORDS ("nieznany dysk", "ostatnio sdk") rather than a name as
+// the node spells it — words are not set in the monospace face a device or
+// dataset name gets (critic wave 5, MINOR 10).
 export function jobSubject(j) {
   const subject = String(j?.subject || '').trim();
-  if (!subject) return { text: '' };
+  if (!subject) return { text: '', words: false };
+  // A multi-disk SMART job: `<short|long>|all` or `<short|long>|<names>`;
+  // the test kind is in its label (`jobKindLabel`).
+  if (j?.kind === SMART_BATCH_KIND) {
+    const rest = subject.includes('|') ? subject.slice(subject.indexOf('|') + 1) : subject;
+    if (rest === 'all') return { text: T('jobs.subject_all_disks'), words: true };
+    return { text: rest, words: false };
+  }
   const smart = j?.kind === 'smart_test';
-  if (smart ? isDiskIdShape(subject) : isOpaqueId(subject)) return { text: smart ? T('jobs.subject_unknown_disk') : '' };
-  if (j.subjectLastKnown) return { text: T('jobs.subject_last_known', { name: subject }) };
-  return { text: subject };
+  if (smart ? isDiskIdShape(subject) : isOpaqueId(subject)) return { text: smart ? T('jobs.subject_unknown_disk') : '', words: true };
+  if (j.subjectLastKnown) return { text: T('jobs.subject_last_known', { name: subject }), words: true };
+  return { text: subject, words: false };
 }
 
-// ===== A schedule's last outcome (n15 B2).
+// ===== The disk lines of a multi-disk job (`smart_test_batch`, wave 9b).
 //
-// The scheduler does not store an outcome: it stores its own sentence,
-// `started job <uuid>` or `failed to start: <error>` (scheduler.rs, for the
-// pool, Elastic and snapshot cadences alike). Feeding that sentence to
-// `schedules.result_*` printed the raw key with the UUID glued on, and no
-// "failed" chip could ever fire. The real outcome is the named job's status,
-// so it is resolved from the job itself; the job id never becomes text.
+// One SMART test over several disks is ONE job on the node, and each disk is
+// a line of it (`NasJob.disks`): its name — the kernel name, never an id; a
+// remembered one marked as such — its state, its progress and, when it did
+// not pass, why, worded from the node's code. Shared by the running-job row,
+// the history's result cell and the job-log window.
+export const SMART_BATCH_KIND = 'smart_test_batch';
+
+// The sharing stop and resume (n18d, wave 10) report their STEPS the same
+// way: one line per step — SMB/NFS shares, iSCSI/NVMe-oF targets, the
+// disable — its name the step's code, worded here.
+export const STEP_JOB_KINDS = new Set(['sharing_stop', 'sharing_resume']);
+
+/** Whether a job carries lines (disks of a SMART batch, steps of a sharing job). */
+export const hasJobLines = (j) => j?.kind === SMART_BATCH_KIND || STEP_JOB_KINDS.has(j?.kind);
+
+const DISK_LINE_TONE = {
+  pending: 'info', running: 'accent', passed: 'ok', done: 'ok', failed: 'err', incomplete: 'warn',
+  refused: 'warn', skipped: 'neutral', interrupted: 'warn', cancelled: 'warn',
+};
+
+function diskLineName(d, kind = SMART_BATCH_KIND) {
+  const name = String(d?.name || '').trim();
+  if (STEP_JOB_KINDS.has(kind)) {
+    const words = T('jobs.step.' + name);
+    return words === 'tentanas.jobs.step.' + name ? name : words;
+  }
+  if (!name) return T('jobs.subject_unknown_disk');
+  return d.lastKnown ? T('jobs.subject_last_known', { name }) : name;
+}
+
+/** Why a line did not pass, in the reader's language ('' when the state says it all). */
+export function diskLineReason(d) {
+  // Every reason the line carries: a sharing step that failed also says
+  // what its rollback could not put back (wave 10).
+  return (Array.isArray(d?.reasons) ? d.reasons : [])
+    .filter((reason) => reason?.code)
+    .map((reason) => {
+      const key = 'jobs.disk_reason.' + reason.code;
+      const words = T(key, rowListParams(reason.params || {}));
+      return words === 'tentanas.' + key ? '' : words;
+    })
+    .filter(Boolean)
+    .join('; ');
+}
+
+// A step reason that lists rows (`shares`/`targets` by name, `other_*`
+// counted — `sharing::rows_reason`) as one phrase in the reader's words.
+function rowListParams(p) {
+  if (!('other_shares' in p) && !('other_targets' in p)) return p;
+  const list = (names, others, otherKey) => {
+    const parts = String(names || '').split(', ').filter(Boolean);
+    const n = Number(others) || 0;
+    if (n > 0) parts.push(T(otherKey, { n }));
+    return parts.join(', ');
+  };
+  const rows = [
+    list(p.shares, p.other_shares, 'approvals.detail.sharing_stop_other_shares'),
+    list(p.targets, p.other_targets, 'approvals.detail.sharing_stop_other_targets'),
+  ].filter(Boolean).join(', ');
+  return { ...p, rows };
+}
+
+function diskLineState(d) {
+  const key = 'jobs.disk_state.' + String(d?.state || '');
+  const words = T(key);
+  return words === 'tentanas.' + key ? String(d?.state || '') : words;
+}
+
+/** "sdb: nie przeszedł — …" — one line of plain text, for a table cell. */
+export function diskLineText(d, kind = SMART_BATCH_KIND) {
+  const reason = diskLineReason(d);
+  const pct = d?.state === 'running' && d.progressPct != null ? ` ${Number(d.progressPct)}%` : '';
+  return `${diskLineName(d, kind)}: ${diskLineState(d)}${pct}${reason ? ' — ' + reason : ''}`;
+}
+
+const DISK_LINE_SKELETON = `<div class="job-disk"><span class="mono" data-role="name"></span> <tf-chip size="sm" data-role="state"></tf-chip> <span class="job-disk-detail" data-role="detail"></span></div>`;
+
+/**
+ * Paints the lines into `host`, patching only what moved: one element per
+ * line, kept across polls (keyed by position — the order the job runs them
+ * in never changes), and only a text or an attribute that changed is written.
+ */
+export function paintJobDisks(host, j) {
+  if (!host) return;
+  const disks = Array.isArray(j?.disks) ? j.disks : [];
+  patchKeyedList(host, disks.map((d, i) => ({ key: String(i), html: DISK_LINE_SKELETON })));
+  disks.forEach((d, i) => {
+    const line = host.children[i];
+    if (!line) return;
+    setText(line.querySelector('[data-role="name"]'), diskLineName(d, j.kind));
+    const chip = line.querySelector('[data-role="state"]');
+    setAttr(chip, 'status', DISK_LINE_TONE[d.state] || 'neutral');
+    setAttr(chip, 'label', diskLineState(d) + (d.state === 'running' && d.progressPct != null ? ` ${Number(d.progressPct)}%` : ''));
+    setText(line.querySelector('[data-role="detail"]'), diskLineReason(d));
+  });
+}
+
+/**
+ * The error a job row shows under its status, in the reader's words. A
+ * multi-disk job's own summary (`the self-test did not pass on 2 of 3
+ * disks`) is the node's English and says less than its lines, so it is not
+ * shown; the one error such a job shows is a privilege stop, which is the
+ * request's own.
+ */
+export function jobErrorText(j) {
+  if (!j?.error) return '';
+  if (j.kind === SMART_BATCH_KIND && Array.isArray(j.disks) && j.disks.length
+    && !j.disks.some((d) => (d.reasons || []).some((r) => r.code === 'privilege'))) return '';
+  return errMessage(j.error);
+}
+
+/** The node's own sentence behind a coded job error (wave 13), as the
+ *  tooltip of the worded line; ids scrubbed. */
+function errorTitleAttr(j) {
+  const detail = j?.error ? errDetail(j.error) : '';
+  return detail ? ` title="${escapeAttr(detail)}"` : '';
+}
+
+/** The history's result words of a multi-disk job: "18/18 OK" (n15). */
+function batchResultLabel(j) {
+  const disks = Array.isArray(j?.disks) ? j.disks : [];
+  const passed = disks.filter((d) => d.state === 'passed').length;
+  return T('jobs.batch_passed', { ok: passed, n: disks.length });
+}
+
+// ===== A schedule's last outcome (n15 B2, wave 6 B).
 //
-// Every sentence the scheduler stores (scheduler.rs; `last_result` is
-// written nowhere else):
+// A node of this build sends the outcome STRUCTURED (`NasScheduleRow`
+// `lastOutcome` 'started' | 'start_failed' | 'skipped', `lastJobStatus`,
+// `lastReason`, `lastDetail`; `scheduler::ScheduleOutcome`): the status of
+// the started job is read by the node, and the job id never reaches the
+// screen at all. That is the path taken whenever `lastOutcome` is set.
+//
+// An older node stores and sends only its own sentence, `started job <uuid>`
+// or `failed to start: <error>` (scheduler.rs, for the pool, Elastic and
+// snapshot cadences alike). Feeding that sentence to `schedules.result_*`
+// printed the raw key with the UUID glued on, and no "failed" chip could
+// ever fire. The real outcome is the named job's status, so it is resolved
+// from the job itself; the job id never becomes text.
+//
+// Every sentence an older scheduler stores (`last_result`):
 // - `started job <uuid>` — the pool scrub/TRIM, Elastic and snapshot
 //   cadences, when the spawn worked;
 // - `failed to start: <error>` — the same cadences, when it was refused;
@@ -85,9 +227,12 @@ export function jobSubject(j) {
 // - '' — never ran, and always for the SMART pair (dispatch sends none).
 // The bare words in RESULT_WORDS are an older stored form, still read.
 //
-// `statusOf(jobId)` returns the job's status, or null while it is not known
-// (not loaded yet, or the job is gone). Returns `{ label, failed, skipped,
-// title }`, or null when there is no outcome to show — never a raw key.
+// `row` is the schedule row (or, from an older caller, its bare
+// `lastResult`). `statusOf(jobId)` returns the job's status, or null while it
+// is not known (not loaded yet, or the job is gone) — asked only on the older
+// path. Returns `{ label, failed, skipped, title }`, or null when there is no
+// outcome to show — never a raw key. A `title` carrying the node's own
+// sentence has every id in it replaced (`nodeTextTitle`).
 const RESULT_WORDS = new Set(['ok', 'succeeded', 'failed', 'skipped']);
 const STARTED_JOB = /^started job (\S+)$/;
 const FAILED_TO_START = /^failed to start:?\s*/;
@@ -97,12 +242,55 @@ const JOB_STATUSES = new Set(['queued', 'running', 'succeeded', 'done', 'failed'
 // The statuses a job never leaves: only these may be cached for good.
 const FINISHED_JOB_STATUSES = new Set(['succeeded', 'done', 'failed', 'cancelled']);
 
-export function scheduleOutcome(lastResult, statusOf = () => null) {
+// Why a slot did not start, for its tooltip. A node of wave 13 sends a coded
+// refusal as `lastReason` (`refusal:<code>?k=v`, the sentence in
+// `lastDetail`): worded here in the reader's language. A detail that is
+// itself a wire refusal (stored by a build between the two) is worded the
+// same way; any other sentence is the node's own, ids scrubbed.
+function startFailedTitle(reason, detail) {
+  if (parseRefusal(reason)) {
+    const words = errMessage(reason);
+    if (!parseRefusal(words)) return words;
+  }
+  if (parseRefusal(detail)) return errMessage(detail);
+  return nodeTextTitle(detail);
+}
+
+function structuredOutcome(row) {
+  const reason = String(row.lastReason || '');
+  const detail = String(row.lastDetail || '');
+  switch (row.lastOutcome) {
+    case 'started': {
+      const status = String(row.lastJobStatus || '');
+      // A job that is gone (pruned) has no status: nothing to claim.
+      if (!JOB_STATUSES.has(status)) return null;
+      if (status === 'succeeded' || status === 'failed') {
+        return { label: T('schedules.result_' + status), failed: status === 'failed', skipped: false, title: '' };
+      }
+      return { label: T('jobs.status_' + status), failed: false, skipped: false, title: '' };
+    }
+    case 'start_failed':
+      return { label: T('schedules.result_failed'), failed: true, skipped: false, title: startFailedTitle(reason, detail) };
+    case 'skipped': {
+      const words = reason ? T('schedules.skip_' + reason) : '';
+      if (reason && words !== 'tentanas.schedules.skip_' + reason) {
+        return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: words, reason: words };
+      }
+      return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: nodeTextTitle(detail) };
+    }
+    default:
+      return null;
+  }
+}
+
+export function scheduleOutcome(row, statusOf = () => null) {
+  if (row && typeof row === 'object' && row.lastOutcome) return structuredOutcome(row);
+  const lastResult = row && typeof row === 'object' ? row.lastResult : row;
   const raw = String(lastResult || '').trim();
   if (!raw) return null;
   if (RESULT_WORDS.has(raw)) return { label: T('schedules.result_' + raw), failed: raw === 'failed', skipped: raw === 'skipped', title: '' };
   if (FAILED_TO_START.test(raw)) {
-    return { label: T('schedules.result_failed'), failed: true, skipped: false, title: raw.replace(FAILED_TO_START, '') };
+    return { label: T('schedules.result_failed'), failed: true, skipped: false, title: startFailedTitle('', raw.replace(FAILED_TO_START, '')) };
   }
   // The reason is the node's own sentence: it belongs in the tooltip, and
   // the row itself reads the translated word.
@@ -115,7 +303,7 @@ export function scheduleOutcome(lastResult, statusOf = () => null) {
     if (code && words !== 'tentanas.schedules.skip_' + code) {
       return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: words, reason: words };
     }
-    return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: why };
+    return { label: T('schedules.result_skipped'), failed: false, skipped: true, title: nodeTextTitle(why) };
   }
   const started = STARTED_JOB.exec(raw);
   const status = started ? statusOf(started[1]) : null;
@@ -144,9 +332,10 @@ export function jobRowSkeleton(j, subject = jobSubject(j)) {
     <div class="job-row" data-job="${escapeAttr(j.jobId)}">
       <div class="job-ico" data-role="ico"></div>
       <div class="job-main">
-        <div class="job-name">${escapeHtml(jobKindLabel(j.kind))} <span class="mono text-2">${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
+        <div class="job-name">${escapeHtml(jobKindLabel(j.kind, j.subject))} <span class="${subject.words ? '' : 'mono '}text-2">${escapeHtml(subject.text)}</span> <tf-chip data-role="status"></tf-chip></div>
         <div class="job-sub" data-role="sub"></div>
         ${j.progressPct != null ? `<tf-progress-bar data-role="progress" size="sm" tone="accent"></tf-progress-bar>` : ''}
+        ${hasJobLines(j) ? `<div class="job-disks" data-role="disks"></div>` : ''}
       </div>
       <div class="job-actions">
         <tf-button size="sm" variant="ghost" icon="file-text" data-act="log" title="${escapeAttr(T('jobs.log'))}"></tf-button>
@@ -167,17 +356,38 @@ export function paintJobRow(row, j) {
   const chip = row.querySelector('[data-role="status"]');
   setAttr(chip, 'status', jobTone(j.status));
   setAttr(chip, 'label', T('jobs.status_' + j.status));
-  const last = (j.log || []).slice(-1)[0] || '';
+  const last = jobLogLines((j.log || []).slice(-1))[0] || '';
   const author = jobAuthor(j.startedBy);
   const sub = row.querySelector('[data-role="sub"]');
   setText(sub, T('jobs.started_by', { by: author.label, t: fmtAgo(j.startedAt) }) + (last ? ' · ' + last : ''));
   if (j.progressPct != null) setAttr(row.querySelector('[data-role="progress"]'), 'value', Number(j.progressPct));
+  if (hasJobLines(j)) paintJobDisks(row.querySelector('[data-role="disks"]'), j);
+}
+
+// The history table's result cell. A multi-disk job reads "18/18 OK" and
+// lists the disks that did not pass, each with its own worded reason — the
+// node's summary sentence (`the self-test did not pass on 2 of 3 disks`) is
+// English and says less than the lines do. A privilege stop is the job's own
+// error and is shown as such.
+function historyResultHtml(j) {
+  if (j.kind === SMART_BATCH_KIND && Array.isArray(j.disks) && j.disks.length) {
+    const bad = j.disks.filter((d) => d.state !== 'passed');
+    const error = jobErrorText(j);
+    return `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(j.status === 'running' ? T('jobs.status_running') : batchResultLabel(j))}"></tf-chip>`
+      + (error ? `<div class="tf-table__cell-sub"${errorTitleAttr(j)}>${escapeHtml(error)}</div>` : '')
+      + (j.status !== 'running' && bad.length ? `<div class="tf-table__cell-sub">${escapeHtml(bad.map(diskLineText).join(' · '))}</div>` : '');
+  }
+  // A sharing job's steps that did not finish, each worded (wave 10).
+  const steps = STEP_JOB_KINDS.has(j.kind) && j.status !== 'running' && Array.isArray(j.disks)
+    ? j.disks.filter((d) => d.state !== 'done').map((d) => diskLineText(d, j.kind)) : [];
+  return `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub"${errorTitleAttr(j)}>${escapeHtml(errMessage(j.error))}</div>` : ''}${
+    steps.length ? `<div class="tf-table__cell-sub">${escapeHtml(steps.join(' · '))}</div>` : ''}`;
 }
 
 // The history table's task cell: the kind, and the subject under it.
 function historyTaskHtml(j) {
   const subject = jobSubject(j);
-  return `<span class="tf-table__cell-title">${escapeHtml(jobKindLabel(j.kind))}</span><div class="tf-table__cell-sub tf-table__cell-sub--mono">${escapeHtml(subject.text)}</div>`;
+  return `<span class="tf-table__cell-title">${escapeHtml(jobKindLabel(j.kind, j.subject))}</span><div class="tf-table__cell-sub${subject.words ? '' : ' tf-table__cell-sub--mono'}">${escapeHtml(subject.text)}</div>`;
 }
 
 export async function drawTasks(screen, body) {
@@ -259,7 +469,7 @@ export async function drawTasks(screen, body) {
       if (status !== null && !FINISHED_JOB_STATUSES.has(status)) jobsToReread.add(jobId);
     }
   }
-  const outcomeOf = (row) => scheduleOutcome(row?.lastResult, statusOf);
+  const outcomeOf = (row) => scheduleOutcome(row, statusOf);
   // A parked red-path operation is a task of this node like any other, so the
   // list sits with the jobs and shares their refresh cadence.
   const approvals = wireApprovals(screen, body, { onExecuted: () => refreshJobs() });
@@ -305,7 +515,7 @@ export async function drawTasks(screen, body) {
       node: `<span class="tf-table__cell--mono">${escapeHtml(nodeLabel(node))}</span>`,
       startedAt: `<span class="tf-table__cell--mono">${escapeHtml(fmtDate(j.startedAt))}</span>`,
       duration: `<span class="tf-table__cell--mono">${escapeHtml(jobDuration(j))}</span>`,
-      result: `<tf-chip size="sm" dot status="${jobTone(j.status)}" label="${escapeAttr(T('jobs.status_' + j.status))}"></tf-chip>${j.error ? `<div class="tf-table__cell-sub">${escapeHtml(errMessage(j.error))}</div>` : ''}`,
+      result: historyResultHtml(j),
     }));
   };
 
@@ -661,16 +871,13 @@ export async function drawTasks(screen, body) {
       followResponse(screen, res, refreshJobs, T('schedules.run_started', { name: it.name }));
       return;
     }
-    // "All disks" means one short test per disk that reports SMART; a single
-    // sudo prompt covers the whole batch. A disk that refuses per se (busy,
-    // a test already runs, the disk rejects the command) must not stop the
-    // batch: the old loop's bare `await` inside the `for` threw on the FIRST
-    // rejection, which aborted the whole callback and left every later disk
-    // silently untested (A6). A privilege/credential error is the opposite
-    // case — it will fail identically for every remaining disk, so it must
-    // stop the batch at once rather than replay the same rejected password
-    // against sudo once per disk (see `runDiskBatch` / `isBatchHaltError` in
-    // format.js, shared with the n03 bulk SMART action in tentanas.js).
+    // "All disks" is ONE request and ONE job on the node: every disk that
+    // reports SMART gets its short self-test, one sudo prompt covers them
+    // all, and the job has a line per disk. A disk that refuses (busy, a
+    // test already runs, the disk rejects the command) is a line of its own
+    // and the job goes on; a privilege/credential error stops the job at
+    // that disk — the node never replays a rejected password once per disk
+    // (`jobs::smart_self_test_batch`).
     let disks;
     try {
       disks = (await screen.nas('tentaNasDisksListRequest', {})).disks || [];
@@ -680,26 +887,21 @@ export async function drawTasks(screen, body) {
     }
     const targets = disks.filter((d) => d.smartAvailable);
     if (!targets.length) { toast(T('schedules.smart_no_disks'), 'warning'); return; }
-    let outcome;
+    let res;
     try {
-      outcome = await screen.withSudo((sudoPassword) => runDiskBatch(targets, (d) => screen.nas(
-        'tentaNasDiskSmartTestRequest', { diskId: d.diskId, kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS },
-      )), title);
+      res = await screen.withSudo((sudoPassword) => screen.nas(
+        'tentaNasDiskSmartTestBatchRequest', { diskIds: targets.map((d) => d.diskId), kind: 'short', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS },
+      ), title);
     } catch (e) {
-      // `withSudo` itself already catches and toasts every rejection from
-      // its callback — this is a defensive backstop, not the normal path.
+      // `withSudo` itself catches and toasts every rejection from its
+      // callback — this is a defensive backstop, not the normal path.
       toast(errMessage(e), 'error');
       return;
     }
-    // `outcome` is null both when the prompt was cancelled and when
-    // `runDiskBatch` halted the batch on a privilege/credential error —
-    // `withSudo`'s own catch already toasted that one error.
-    if (outcome === null) return;
-    if (outcome.started.length) toast(T('schedules.smart_started', { n: outcome.started.length }), 'success');
-    // The refusals are real per-disk data — each disk by name with the
-    // node's own reason — so they are listed, never dropped; the sentence
-    // around them is ours and translated.
-    if (outcome.refused.length) toast(T('jobs.smart_batch_refused', { n: outcome.refused.length, disks: refusedBatchNames(outcome.refused) }), 'warning');
+    // `res` is null when the prompt was cancelled or the request refused —
+    // `withSudo`'s own catch already said why.
+    if (!res) return;
+    followResponse(screen, res, refreshJobs, T('schedules.smart_started', { n: targets.length }));
     refreshJobs();
   };
 

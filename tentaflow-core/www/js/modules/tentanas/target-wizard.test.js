@@ -323,6 +323,34 @@ test('a kernel without CONFIG_NVME_TARGET_AUTH offers no DH-HMAC-CHAP and says w
   screen.dispose();
 });
 
+// Wave 6: the kernel's reason arrives as a code beside the node's English.
+// The wizard says it in the reader's language and keeps the English as the
+// tooltip; a node that sent only the sentence (the test above) shows it.
+test('the reason DH-HMAC-CHAP and a protocol are unavailable is worded from its code', async () => {
+  const screen = fakeScreen({});
+  const english = 'this kernel was built without CONFIG_NVME_TARGET_AUTH (/proc/config.gz)';
+  const win = openTargetWizard(screen, {
+    capabilities: caps({
+      iscsi: false,
+      iscsiDetail: 'this kernel has no target_core_mod, iscsi_target_mod — the iscsi target is not built for it',
+      iscsiReasons: [{ code: 'modules_missing', params: { modules: 'target_core_mod, iscsi_target_mod', protocol: 'iscsi' } }],
+      dhchap: false,
+      dhchapDetail: english,
+      dhchapReasons: [{ code: 'dhchap_not_built', params: { path: '/proc/config.gz' } }],
+    }),
+  });
+  await flush();
+  assert.match(win.textContent, /to jądro nie ma modułów target_core_mod, iscsi_target_mod — nie zbudowano go z targetem iSCSI/);
+  assert.doesNotMatch(win.textContent, /is not built for it/, 'the English is not the text');
+  typeInto(win.querySelector('#nas-tw-name'), 'scratch');
+  await flush();
+  click(nextButton(win));
+  await flush();
+  assert.match(win.textContent, /DH-HMAC-CHAP niedostępne: to jądro zbudowano bez CONFIG_NVME_TARGET_AUTH \(\/proc\/config\.gz\)/);
+  assert.ok(win.querySelector(`[title="${english}"]`), 'the English is the tooltip');
+  screen.dispose();
+});
+
 test('an RDMA transport the node cannot serve is disabled with the probe reason', async () => {
   const screen = fakeScreen({});
   const win = await toStepTwo(screen, { capabilities: caps({ iser: false, rdmaDetail: 'no RDMA device under /sys/class/infiniband' }) });
@@ -1368,4 +1396,48 @@ test('the addresses of an interface are a list, and the primary is the first of 
   // "Every interface" is not an interface, and it is spelled once.
   assert.equal(ALL_INTERFACES_ADDRESS, '0.0.0.0');
   assert.deepEqual(bindableAddresses(withAlias, ''), []);
+});
+
+test('each host NQN gets an Opis field that survives typing and rides along with the save (wave 12)', async () => {
+  let sent = null;
+  const target = {
+    targetId: 't2',
+    name: 'scratch',
+    protocol: 'nvmet',
+    wwn: 'nqn.2026-09.local.tentaflow:helios.scratch',
+    enabled: true,
+    luns: [{ index: 1, source: 'fast/scratch', sizeBytes: 1099511627776, thin: true, groupId: 1, sourceKind: 'zvol' }],
+    portals: [{ interface: 'storage0', address: '10.10.0.5', port: 4420, transport: 'tcp' }],
+    auth: { method: 'dhchap', secretSet: true },
+    initiators: ['nqn.2014-08.org.nvmexpress:uuid:stary'],
+    initiatorDescriptions: { 'nqn.2014-08.org.nvmexpress:uuid:stary': 'orion (compute)' },
+    portGroups: [{ groupId: 1, state: 'optimized', preferred: false }],
+  };
+  const screen = fakeScreen({
+    tentaNasTargetUpdateRequest: (payload) => { sent = payload; return { job: { jobId: 'j9', kind: 'target_update', subject: 'scratch' } }; },
+  });
+  const win = openTargetWizard(screen, { target, capabilities: caps() });
+  await flush();
+  // D8: editing the host list says a removed host stays connected.
+  assert.match(win.querySelector('[data-testid="nvmet-remove-note"]').textContent, /nie rozłącza hosta, który jest już połączony/);
+  const stored = win.querySelector('tf-input[data-host="nqn.2014-08.org.nvmexpress:uuid:stary"]');
+  assert.equal(stored.value, 'orion (compute)', 'the stored Opis is pre-filled');
+  typeInto(win.querySelector('#nas-tw-hosts'), 'nqn.2014-08.org.nvmexpress:uuid:stary\nnqn.2014-08.org.nvmexpress:uuid:nowy');
+  await flush();
+  assert.ok(win.querySelector('tf-input[data-host="nqn.2014-08.org.nvmexpress:uuid:stary"]') === stored, 'an existing Opis field is not rebuilt by typing the list');
+  const fresh = win.querySelector('tf-input[data-host="nqn.2014-08.org.nvmexpress:uuid:nowy"]');
+  typeInto(fresh, '  vega (backup) ');
+  await flush();
+  click(nextButton(win));
+  await flush();
+  click(nextButton(win));
+  await flush();
+  await flush();
+  assert.deepEqual(sent.initiators, ['nqn.2014-08.org.nvmexpress:uuid:stary', 'nqn.2014-08.org.nvmexpress:uuid:nowy']);
+  assert.deepEqual(sent.initiatorDescriptions, {
+    'nqn.2014-08.org.nvmexpress:uuid:stary': 'orion (compute)',
+    'nqn.2014-08.org.nvmexpress:uuid:nowy': 'vega (backup)',
+  });
+  await settled();
+  screen.dispose();
 });

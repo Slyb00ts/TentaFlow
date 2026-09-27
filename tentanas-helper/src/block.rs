@@ -46,6 +46,11 @@ pub const NVMET_CONFIGFS: &str = "/sys/kernel/config/nvmet";
 pub const ISCSI_PORT: u32 = 3260;
 pub const NVME_PORT: u32 = 4420;
 
+/// The head every IQN this app creates starts with (`targets::wwn_for` in the
+/// core). The per-session reset acts only on a target that carries it: a
+/// hand-made target on the same node is not the app's to touch.
+pub const APP_IQN_PREFIX: &str = "iqn.2026-09.local.tentaflow:";
+
 /// The single HBA index the app uses under `target/core/`. LIO numbers HBAs
 /// per plugin and the number carries no meaning — one is enough, and a fixed
 /// one keeps the plan a pure function of the desired state.
@@ -729,11 +734,14 @@ pub struct IscsiAclObserved {
     /// Whether `{acl}/info` describes a live session — `None` when this node
     /// could not read it, or read it empty.
     ///
-    /// TRAP this exists for: configfs offers NO way to tell an ACL this app
-    /// created from one LIO generated itself under `generate_node_acls = 1`
-    /// (there is no `dynamic_node_acl` attribute; `lio_target_initiator_attrs`
-    /// is `info`, `cmdsn_depth`, `tag` — measured). A connected one is
-    /// therefore assumed to be the kernel's business — see `prune_iscsi`.
+    /// Every directory under `acls/` is a STATIC ACL. MEASURED live on rig11
+    /// (MAJOR 27, 2026-09-26): an ACL LIO generates under
+    /// `generate_node_acls = 1` is not a configfs directory at all — `acls/`
+    /// stayed empty while the generated session ran, and the session was
+    /// visible only as a name in `{tpg}/dynamic_sessions`. So an unnamed ACL
+    /// here is a static one somebody (this app, an older build, or a hand)
+    /// created, never the kernel's own; see `prune_iscsi` for why it is still
+    /// removed only on a positive "no session" when there is no allowlist.
     ///
     /// The three states are NOT two. `Some(false)` is "this node read the
     /// file and LIO said nobody is logged in"; `None` is "this node does not
@@ -755,15 +763,187 @@ pub struct IscsiAclObserved {
 /// extra line from reading as a session.
 ///
 /// The idle sentence is MEASURED, read verbatim out of a real ACL's `info` on
-/// a live TPG — not inferred from the LIO source. It matters more than it
-/// looks: with no allowlist this string is the ONLY thing separating an ACL
-/// the app abandoned from one the kernel generated for a client that is
-/// logged in right now, because configfs publishes no `dynamic_*` attribute
-/// to tell them apart (also measured — the ACL carries only `cmdsn_depth`,
-/// `info` and `tag`).
+/// a live TPG — not inferred from the LIO source — and the active block was
+/// measured on rig11 with a logged-in initiator (MAJOR 27): see
+/// `parse_acl_info`. With no allowlist this string is what separates a stale
+/// static ACL (no session: safe to remove) from one a client is logged in
+/// through right now.
 pub fn acl_info_connected(info: &str) -> bool {
     let text = info.trim();
-    !text.is_empty() && !text.starts_with("No active iSCSI Session")
+    !text.is_empty() && !text.starts_with(ACL_INFO_IDLE)
+}
+
+/// LIO's idle answer in `{acl}/info`, followed by the initiator name.
+const ACL_INFO_IDLE: &str = "No active iSCSI Session for Initiator Endpoint: ";
+
+/// What one ACL's `info` says, parsed.
+///
+/// `session_id` is the LIO Session ID. It is an INTERNAL key: it increments on
+/// every login (measured 1 → 10 over nine resets), which is exactly what the
+/// core needs to notice a reconnect, and it never leaves the node — neither do
+/// the ISID and the TSIH, which are not even kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AclSession {
+    pub session_id: Option<u64>,
+    /// `TARG_SESS_STATE_` stripped: `LOGGED_IN`, `FAILED`, `FREE`, …
+    pub state: String,
+    /// One `TARG_CONN_STATE_` (stripped) per connection.
+    pub connection_states: Vec<String>,
+    /// The peer IP of each connection, in order (the first is the one shown).
+    /// The transport word after it (`TCP`, or `SCTP` for anything that is not
+    /// TCP — iSER included) is deliberately not kept.
+    pub addresses: Vec<String>,
+}
+
+/// `{acl}/info` as a three-state answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AclInfo {
+    /// LIO's idle sentence: positively nobody logged in.
+    Idle,
+    /// Anything else that is not empty: a session. Fields this parser did not
+    /// recognise stay empty — an unknown shape is "connected, fields unknown",
+    /// never "idle".
+    Active(AclSession),
+    /// Empty (or unreadable, at the caller): this node does not know.
+    Unknown,
+}
+
+/// Parses `{acl}/info`, line by line by prefix. The active shape, MEASURED on
+/// rig11 (kernel 7.0.0-34, 2026-09-26):
+///
+/// ```text
+/// InitiatorName: iqn.2004-10.com.ubuntu:01:35ed4c1b7a
+/// InitiatorAlias: storage
+/// LIO Session ID: 1   ISID: 0x00 02 3d 00 00 01  TSIH: 1  SessionType: Normal
+/// Session State: TARG_SESS_STATE_LOGGED_IN
+/// ---------------------[iSCSI Session Values]-----------------------
+///   CmdSN/WR  :  CmdSN/WC  :  ExpCmdSN  :  MaxCmdSN  :     ITT    :     TTT
+///  0x00000040   0x00000040   0x0000004a   0x00000089   0x0000004a   0x00000048
+/// ----------------------[iSCSI Connections]-------------------------
+/// CID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN
+///    Address 127.0.0.1 TCP  StatSN: 0x3cded8e9
+/// ```
+pub fn parse_acl_info(info: &str) -> AclInfo {
+    let text = info.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if text.is_empty() {
+        return AclInfo::Unknown;
+    }
+    if text.starts_with(ACL_INFO_IDLE) {
+        return AclInfo::Idle;
+    }
+    let mut session = AclSession::default();
+    for line in info.lines() {
+        if let Some(rest) = line.strip_prefix("LIO Session ID: ") {
+            session.session_id = session_id_line(rest);
+        } else if let Some(rest) = line.strip_prefix("Session State: TARG_SESS_STATE_") {
+            session.state = word(rest).unwrap_or_default();
+        } else if let Some(rest) = line.strip_prefix("CID: ") {
+            if let Some(state) = connection_line(rest) {
+                session.connection_states.push(state);
+            }
+        } else if let Some(address) = address_line(line) {
+            session.addresses.push(address);
+        }
+    }
+    AclInfo::Active(session)
+}
+
+/// A `\w+` word at the start of `text`, nothing after it but whitespace.
+fn word(text: &str) -> Option<String> {
+    let w = text.trim_end();
+    (!w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).then(|| w.to_string())
+}
+
+/// `(\d+)\s+ISID: 0x([0-9a-f]{2}( [0-9a-f]{2}){5})\s+TSIH: (\d+)\s+SessionType: (\w+)`
+/// after `LIO Session ID: `. Only the session id is returned; a line that does
+/// not have the whole shape yields none, so a changed format reads as
+/// "fields unknown" instead of a key built from the wrong number.
+fn session_id_line(rest: &str) -> Option<u64> {
+    let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    let id: u64 = digits.parse().ok()?;
+    let rest = &rest[digits.len()..];
+    let after_ws = rest.trim_start();
+    if after_ws.len() == rest.len() {
+        return None;
+    }
+    let isid = after_ws.strip_prefix("ISID: 0x")?;
+    // Six hex pairs separated by single spaces: 17 characters.
+    let (pairs, rest) = (isid.get(..17)?, &isid[17..]);
+    let ok_pairs = pairs.split(' ').count() == 6
+        && pairs
+            .split(' ')
+            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()));
+    if !ok_pairs {
+        return None;
+    }
+    let after = rest.trim_start();
+    if after.len() == rest.len() {
+        return None;
+    }
+    let tsih = after.strip_prefix("TSIH: ")?;
+    let tsih_digits = tsih.split(|c: char| !c.is_ascii_digit()).next()?;
+    if tsih_digits.is_empty() {
+        return None;
+    }
+    let rest = &tsih[tsih_digits.len()..];
+    let after = rest.trim_start();
+    if after.len() == rest.len() {
+        return None;
+    }
+    word(after.strip_prefix("SessionType: ")?)?;
+    Some(id)
+}
+
+/// `(\d+)\s+Connection State: TARG_CONN_STATE_(\w+)` after `CID: `.
+fn connection_line(rest: &str) -> Option<String> {
+    let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    if digits.is_empty() {
+        return None;
+    }
+    let tail = &rest[digits.len()..];
+    let after = tail.trim_start();
+    if after.len() == tail.len() {
+        return None;
+    }
+    word(after.strip_prefix("Connection State: TARG_CONN_STATE_")?)
+}
+
+/// `^\s+Address (\S+) (?:TCP|SCTP)\s+StatSN:` — the peer address.
+fn address_line(line: &str) -> Option<String> {
+    let body = line.trim_start();
+    if body.len() == line.len() {
+        return None;
+    }
+    let rest = body.strip_prefix("Address ")?;
+    let (address, tail) = rest.split_once(' ')?;
+    if address.is_empty() {
+        return None;
+    }
+    let tail = tail.strip_prefix("TCP").or_else(|| tail.strip_prefix("SCTP"))?;
+    let after = tail.trim_start();
+    if after.len() == tail.len() || !after.starts_with("StatSN:") {
+        return None;
+    }
+    Some(address.to_string())
+}
+
+/// The initiator names in a TPG's `dynamic_sessions`, VERBATIM.
+///
+/// MEASURED bytes on rig11 with one generated session:
+/// `b"iqn.2004-10.com.ubuntu:01:35ed4c1b7a\n\x00"` — one name per line PLUS a
+/// trailing NUL, and `b""` with none. Exactly that framing is removed: the
+/// trailing NULs, then one record per `\n`. Nothing INSIDE a record is
+/// trimmed (critic wave 12, R2-M1): a client that logged in as
+/// `iqn.x:evil ` (trailing space) must stay `iqn.x:evil `, or a reset would
+/// act on a different name, and a listed name plus a space must not read as
+/// the listed name. Such a record is not path-safe (`kernel_name_resettable`)
+/// and is reset by the TPG toggle instead (`enforce_allowlist`).
+pub fn parse_dynamic_sessions(text: &str) -> Vec<String> {
+    text.trim_end_matches('\0')
+        .split('\n')
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// What the kernel already holds for one iSCSI target.
@@ -775,6 +955,17 @@ pub struct IscsiObserved {
     pub acls: Vec<IscsiAclObserved>,
     /// Every portal directory under `{tpg}/np/` — `<address>:<port>`.
     pub portals: Vec<String>,
+    /// The initiators logged in through a GENERATED ACL right now, from
+    /// `{tpg}/dynamic_sessions` (`parse_dynamic_sessions`). Empty when the
+    /// file is absent, empty or unreadable.
+    ///
+    /// WHY the plan needs it (MAJOR 27 F3, measured): turning an open target
+    /// into an allowlisted one (`generate_node_acls` 1 → 0) does NOT drop the
+    /// generated sessions — one was still logged in 8 s later — so a client
+    /// that is not on the new list would keep its disk until it reconnected
+    /// by itself. `prune_iscsi` resets every name here that the allowlist
+    /// does not carry.
+    pub dynamic_sessions: Vec<String>,
     /// Every LUN directory under `{tpg}/lun/` with the symlinks inside it.
     pub luns: Vec<(String, Vec<String>)>,
     /// The backstores that will be left with nothing pointing at them once the
@@ -975,6 +1166,12 @@ pub fn observe_iscsi(root: &Path, spec: &IscsiTargetSpec) -> IscsiObserved {
             stale_devices.push((name.clone(), groups));
         }
     }
+    // Bytes, not a string read: the file ends in a NUL (measured), which is
+    // valid UTF-8 anyway, but a lossy read keeps one odd byte from turning the
+    // whole list into "unreadable".
+    let dynamic_sessions = std::fs::read(tpg.join("dynamic_sessions"))
+        .map(|bytes| parse_dynamic_sessions(&String::from_utf8_lossy(&bytes)))
+        .unwrap_or_default();
     IscsiObserved {
         devices,
         stale_devices,
@@ -982,6 +1179,7 @@ pub fn observe_iscsi(root: &Path, spec: &IscsiTargetSpec) -> IscsiObserved {
         acls,
         portals: child_dir_names(&tpg.join("np")),
         luns: lun_dirs,
+        dynamic_sessions,
     }
 }
 
@@ -1493,6 +1691,17 @@ fn linked_host_owners(root: &Path, host_nqn: &str, ignoring: Option<&str>) -> us
 ///     whoever logs in, and takes the credentials from the TPG-level `auth/`
 ///     directory. With CHAP that is still authenticated; without it the target
 ///     is open, which is what the wizard warns about in so many words.
+///
+/// SECURITY (MAJOR 27 F2): an EMPTY list therefore means OPEN, never "nobody".
+/// Removing the last allowlisted initiator used to take exactly this branch:
+/// the plan wrote `generate_node_acls = 1`, and the client the admin had just
+/// revoked was back in 2.2 s as a generated session (measured). The core
+/// refuses that edit before a row is written (`targets::last_initiator_refusal`);
+/// this plan refuses it once more, from the kernel's side, so that no other
+/// road to an empty list — a hand-edited row, an import over a live target, an
+/// older core — can open an allowlisted TPG either: a TPG that reads
+/// `generate_node_acls = 0` and still holds static ACLs is an allowlisted
+/// target, and an empty spec for it is refused, not applied.
 pub fn plan_iscsi(
     spec: &IscsiTargetSpec,
     observed: &IscsiObserved,
@@ -1500,6 +1709,22 @@ pub fn plan_iscsi(
     validate_iscsi(spec)?;
     if observed.devices.len() != spec.luns.len() {
         return Err(invalid("one observed backstore per LUN is required"));
+    }
+    let tpg_key = format!("{TARGET_CONFIGFS}/iscsi/{}/tpgt_1", spec.iqn);
+    if spec.initiators.is_empty()
+        && observed
+            .attrs
+            .get(&format!("{tpg_key}/attrib/generate_node_acls"))
+            .map(String::as_str)
+            == Some("0")
+        && !observed.acls.is_empty()
+    {
+        return Err(invalid(format!(
+            "{}: refusing to open an allowlisted target — the kernel holds an allowlist for it and \
+             this spec has none, which would let every initiator in; stop the target or keep at \
+             least one initiator",
+            spec.iqn
+        )));
     }
     let mut steps = Vec::new();
     let tpg = format!("{TARGET_CONFIGFS}/iscsi/{}/tpgt_1", spec.iqn);
@@ -1632,7 +1857,12 @@ pub fn plan_iscsi(
         if allowlisted { "0" } else { "1" },
     );
     // A generated ACL is kept only for the life of the session: the next login
-    // is authenticated again instead of inheriting a cached grant.
+    // is authenticated again instead of inheriting a cached grant. MEASURED on
+    // rig11 (2026-09-26): LIO FORCES this to 1 while `generate_node_acls = 1`
+    // (the write succeeds and reads back 1), so on an OPEN target every client
+    // that ever logged in leaves a cached ACL behind that nothing in configfs
+    // shows. It takes effect only once the list is on — and it does not clear
+    // what was cached before; `rebuild_open_tpg` does, on the switch.
     write(
         &mut steps,
         format!("{tpg}/attrib/cache_dynamic_acls"),
@@ -1684,18 +1914,13 @@ pub fn plan_iscsi(
     }
 
     // ----- the allowlist -----
+    //
+    // A name that is ALSO in `dynamic_sessions` (a listed client that logged
+    // in while the target was open) is converted to a static ACL by this very
+    // `mkdir`, and MEASURED to keep its session: same LIO Session ID, no
+    // reset. Only the names the list does NOT carry are reset, in the prune.
     for initiator in &spec.initiators {
-        let acl = format!("{tpg}/acls/{initiator}");
-        steps.push(ConfigfsStep::Mkdir(acl.clone()));
-        for lun in &spec.luns {
-            let mapped = format!("{acl}/lun_{}", lun.index);
-            steps.push(ConfigfsStep::Mkdir(mapped.clone()));
-            steps.push(ConfigfsStep::Symlink {
-                link: format!("{mapped}/{}", lun.name),
-                target: format!("{tpg}/lun/lun_{}", lun.index),
-            });
-        }
-        steps.extend(auth_steps(&format!("{acl}/auth"), &spec.auth));
+        steps.extend(acl_steps(spec, &tpg, initiator));
     }
 
     // ----- portals -----
@@ -1728,6 +1953,219 @@ pub fn plan_iscsi(
     // nothing performs.
     write(&mut steps, format!("{tpg}/enable"), "1");
     Ok(steps)
+}
+
+/// Whether an initiator name the KERNEL reported (`dynamic_sessions`) can be
+/// reset by `mkdir`+`rmdir acls/<name>`: non-empty, at most 223 bytes (LIO's
+/// `TRANSPORT_IQN_LEN`), visible ASCII (no space, no control byte), no `/`,
+/// and not `.` or `..`. Deliberately weaker than `validate_iqn`: a hostile
+/// client picks `…:ATTACKER` or `foo_bar`, and those are reset like any other.
+/// A name that fails this is never joined into a path; the TPG toggle resets
+/// it instead (`enforce_allowlist`).
+///
+/// Non-ASCII is refused too: the name is read through a lossy UTF-8
+/// conversion, so a non-ASCII byte sequence could come out as a DIFFERENT
+/// name, and `mkdir`+`rmdir` of that name would reset nobody while reporting
+/// success.
+pub fn kernel_name_path_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 223
+        && name != "."
+        && name != ".."
+        && name.bytes().all(|b| (0x21..0x7f).contains(&b) && b != b'/')
+}
+
+/// The coded head of an apply whose allowlist is written but whose excluded
+/// sessions could NOT be reset: the TPG toggle itself failed. The core raises
+/// the target's critical alert on it; a client must not stay connected in
+/// silence behind a screen that shows an allowlist.
+pub const UNRESETTABLE_SESSION: &str = "unresettable_session";
+
+/// The excluded generated sessions still logged in: every name of
+/// `dynamic_sessions` that the spec's allowlist does not carry, compared
+/// EXACTLY (a listed name plus a space is not listed).
+fn excluded_sessions(spec: &IscsiTargetSpec, dynamic: &[String]) -> Vec<String> {
+    if spec.initiators.is_empty() {
+        return Vec::new();
+    }
+    dynamic
+        .iter()
+        .filter(|n| !spec.initiators.iter().any(|i| i == *n))
+        .cloned()
+        .collect()
+}
+
+/// The post-condition of an allowlisted apply (MAJOR 27 F3, critic wave 12
+/// R2-M1): no client the allowlist excludes is still logged in.
+///
+/// Re-reads `{tpg}/dynamic_sessions` AFTER the plan ran. The plan already
+/// reset every excluded session whose name is resettable (`mkdir`+`rmdir`);
+/// what is left is a name that could not be used as a path, one the kernel
+/// reported in a shape nobody has measured, or a client that logged in
+/// between the observation and the `generate_node_acls = 0` write. For all of
+/// them the fallback is L3, measured on rig11 (§L.2): `enable` 1 → 0 → 1. The
+/// port keeps listening, every session of the target drops, the listed clients
+/// are back in about 2 s through their static ACLs, and with
+/// `generate_node_acls = 0` already written the excluded one cannot return.
+///
+/// `Ok(None)` — nothing was left; `Ok(Some(line))` — the toggle ran (a line for
+/// the job log: every session of the target was reset once); `Err` — the
+/// toggle itself failed, with the `unresettable_session` head, and the apply
+/// fails with it.
+#[cfg(unix)]
+pub fn enforce_allowlist(root: &Path, spec: &IscsiTargetSpec) -> Result<Option<String>, String> {
+    if spec.initiators.is_empty() {
+        return Ok(None);
+    }
+    let tpg = root.join("iscsi").join(&spec.iqn).join("tpgt_1");
+    let dynamic = std::fs::read(tpg.join("dynamic_sessions"))
+        .map(|bytes| parse_dynamic_sessions(&String::from_utf8_lossy(&bytes)))
+        .unwrap_or_default();
+    let left = excluded_sessions(spec, &dynamic);
+    if left.is_empty() {
+        return Ok(None);
+    }
+    let enable = tpg.join("enable");
+    let toggled = write_attr(&enable, "0").and_then(|()| write_attr(&enable, "1"));
+    match toggled {
+        Ok(()) => Ok(Some(format!(
+            "{}: {} client(s) not on the allowlist were still logged in ({}); every session of the \
+             target was reset once (enable 1 → 0 → 1) — listed clients reconnect by themselves, the \
+             excluded ones cannot",
+            spec.iqn,
+            left.len(),
+            left.iter().map(|n| format!("{n:?}")).collect::<Vec<_>>().join(", ")
+        ))),
+        Err(e) => {
+            // Whatever the first write did, try to leave the TPG serving: a
+            // target left disabled cuts every listed client off too.
+            let _ = write_attr(&enable, "1");
+            Err(format!(
+                "{UNRESETTABLE_SESSION}: {}: the allowlist is written, but {} client(s) not on it are \
+                 still logged in and the target's sessions could not be reset ({e}) — stop the target \
+                 to cut every client off",
+                spec.iqn,
+                left.len()
+            ))
+        }
+    }
+}
+
+/// The per-ACL part of `plan_iscsi` for ONE initiator: the ACL, its mapped
+/// LUNs linked to the TPG's LUNs, and its CHAP credentials.
+///
+/// One function because two operations build it: the apply, for every listed
+/// initiator, and the per-session reset (`plan_session_reset`), which removes
+/// one ACL and re-creates exactly this — so the ACL a reset leaves behind is
+/// byte for byte the one the next apply would have made.
+fn acl_steps(spec: &IscsiTargetSpec, tpg: &str, initiator: &str) -> Vec<ConfigfsStep> {
+    let acl = format!("{tpg}/acls/{initiator}");
+    let mut steps = vec![ConfigfsStep::Mkdir(acl.clone())];
+    for lun in &spec.luns {
+        let mapped = format!("{acl}/lun_{}", lun.index);
+        steps.push(ConfigfsStep::Mkdir(mapped.clone()));
+        steps.push(ConfigfsStep::Symlink {
+            link: format!("{mapped}/{}", lun.name),
+            target: format!("{tpg}/lun/lun_{}", lun.index),
+        });
+    }
+    steps.extend(auth_steps(&format!("{acl}/auth"), &spec.auth));
+    steps
+}
+
+/// Why a per-session reset was refused before any write. The `code` is the
+/// stable head of the helper's error line (`refused:<code>: …`), which the
+/// core maps to its coded refusal; the words after it are for the job log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetRefusal {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+impl std::fmt::Display for ResetRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "refused:{}: {}", self.code, self.detail)
+    }
+}
+
+/// The two halves of an `IscsiSessionReset`: dropping the one ACL (which
+/// drops its session within ~50 ms — measured), and re-creating it exactly as
+/// the apply would. Kept apart so the executor can tell "the session was not
+/// dropped" from "the initiator has LOST ACCESS" (the drop ran, the re-create
+/// did not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionResetPlan {
+    pub drop: Vec<ConfigfsStep>,
+    pub recreate: Vec<ConfigfsStep>,
+}
+
+/// Plans "Rozłącz" for one allowlisted iSCSI initiator: L1 of the MAJOR 27
+/// measurements, the one per-initiator mechanism measured on a live TPG
+/// (session back after 2.12 s / 2.10 s, one read stalled 1.96 s, no I/O
+/// error; the ACL gap itself 0.115 s).
+///
+/// Every refusal comes BEFORE any write, and each is a precondition the
+/// measurement fixed:
+///   * `not_app_target` — the WWN is not one this app creates;
+///   * `not_allowlisted` — the initiator is not in `spec.initiators`. That is
+///     what makes its ACL a STATIC one this plan can re-create; on a target
+///     with no allowlist the client's generated ACL is not a directory at all,
+///     and a static `mkdir`+`rmdir` there resets it into a client that logs
+///     straight back in (L4, owner decision D2: no reset without an allowlist);
+///   * `no_session` — `{acl}/info` does not POSITIVELY read a session. An
+///     unreadable or empty `info` is not a session to drop, and neither is the
+///     idle sentence.
+///
+/// NOT L2 (`cmdsn_depth` 64 → 65: restoring the depth is a second reset, and
+/// not restoring it is a lasting drift from the plan) and NOT L3 (`enable`
+/// 1 → 0 → 1 resets every session of the target).
+pub fn plan_session_reset(
+    spec: &IscsiTargetSpec,
+    initiator: &str,
+    observed: &IscsiObserved,
+) -> Result<SessionResetPlan, ResetRefusal> {
+    let refuse = |code: &'static str, detail: String| Err(ResetRefusal { code, detail });
+    if let Err(e) = validate_iqn(initiator).and_then(|()| validate_iscsi(spec)) {
+        return refuse("invalid", e.to_string());
+    }
+    if !spec.iqn.starts_with(APP_IQN_PREFIX) {
+        return refuse(
+            "not_app_target",
+            format!("{} is not a target this app created", spec.iqn),
+        );
+    }
+    if !spec.initiators.iter().any(|i| i == initiator) {
+        return refuse(
+            "not_allowlisted",
+            format!("{initiator} is not on the allowlist of {}", spec.iqn),
+        );
+    }
+    let Some(acl) = observed.acls.iter().find(|a| a.initiator == initiator) else {
+        return refuse(
+            "no_session",
+            format!("{initiator} has no ACL on {} — nothing is logged in through it", spec.iqn),
+        );
+    };
+    if acl.session != Some(true) {
+        return refuse(
+            "no_session",
+            format!("{initiator} has no session on {} to reset", spec.iqn),
+        );
+    }
+    let tpg = format!("{TARGET_CONFIGFS}/iscsi/{}/tpgt_1", spec.iqn);
+    let dir = format!("{tpg}/acls/{initiator}");
+    let mut drop = Vec::new();
+    for (mapped, links) in &acl.mapped {
+        for link in links {
+            drop.push(ConfigfsStep::Unlink(format!("{dir}/{mapped}/{link}")));
+        }
+        drop.push(ConfigfsStep::Rmdir(format!("{dir}/{mapped}")));
+    }
+    drop.push(ConfigfsStep::Rmdir(dir));
+    Ok(SessionResetPlan {
+        drop,
+        recreate: acl_steps(spec, &tpg, initiator),
+    })
 }
 
 /// Whether a `vpd_unit_serial` reading already carries this LUN's identity.
@@ -1807,17 +2245,22 @@ fn prune_iscsi(
     // means. The alternative is a client that keeps writing to a disk it is no
     // longer allowed to see.
     //
-    // TRAP: with NO allowlist the plan sets `generate_node_acls = 1`, and then
-    // LIO creates an ACL of its own for every initiator that logs in. configfs
-    // publishes nothing that tells those apart from ours (measured: an ACL
-    // carries `attrib/`, `auth/`, `param/`, `fabric_statistics/`,
-    // `cmdsn_depth`, `info`, `tag` — and no `dynamic_*` of any kind), so
-    // removing one by name would force-log-out a live client on every
-    // reconcile. The rule is therefore: with an allowlist, every unnamed ACL
-    // is ours and goes; with no allowlist, an ACL goes only when this node
-    // POSITIVELY read that it has no session — which is exactly the stale one
-    // this app left behind, carrying credentials that would still let its
-    // initiator in after the secret was changed.
+    // With NO allowlist the plan sets `generate_node_acls = 1`. The ACLs LIO
+    // generates then are NOT directories under `acls/` — MEASURED on rig11
+    // (MAJOR 27): `acls/` stayed empty while a generated session ran, and the
+    // client showed up only in `dynamic_sessions`. An earlier version of this
+    // comment assumed the kernel's ACLs sat here indistinguishable from ours;
+    // they do not appear here at all. Every directory here is therefore a
+    // STATIC ACL — this app's, an older build's, or a hand-made one.
+    //
+    // The rule that follows is still the careful one: with an allowlist,
+    // every unnamed ACL is ours to remove; with no allowlist, an ACL goes only
+    // when this node POSITIVELY read that it has no session. A static ACL with
+    // a live session on an open target is a client somebody let in by name,
+    // and `rmdir` would force-log it out on every reconcile — only for it to
+    // come straight back through the generated ACL (L4, measured: 2.14 s).
+    // The stale one — no session — carries credentials that would still let
+    // its initiator in after the secret was changed, and it goes.
     //
     // "Positively read" is the whole safety of it, and `session` is a
     // three-state for that reason: an `info` that could not be read, or read
@@ -1826,24 +2269,9 @@ fn prune_iscsi(
     // renames the attribute, the power to force-log-out every client of a
     // target on the next mutation of any target on the node.
     //
-    // TWO known limitations, neither of them measurable on the machine these
-    // observations come from (it has no `iscsiadm`, so no initiator ever
-    // logged in), both recorded rather than assumed away:
-    //
-    //   * the RACE. Between LIO creating a generated ACL during login and the
-    //     session being registered on it, `info` reads as "No active iSCSI
-    //     Session" — so a reconcile landing inside that window removes the ACL
-    //     of a client that is logging in right now. The window is
-    //     milliseconds, the consequence is one failed login that the initiator
-    //     retries, and the alternative (never removing an unnamed ACL) leaves
-    //     stale credentials serving forever. It is a deliberate trade, not an
-    //     unnoticed one — `targets.initiators_hint` says so in the UI, where
-    //     the operator who turns the allowlist off is standing.
-    //   * the SHAPE of `info` while a session IS active has never been
-    //     measured here; only the idle sentence has, verbatim. The predicate
-    //     is written to survive that: it matches the NEGATIVE sentence, so any
-    //     other text at all — including a shape nobody has seen — counts as a
-    //     session and keeps the ACL.
+    // One known limitation, recorded rather than assumed away: the predicate
+    // matches the NEGATIVE sentence, so any other text at all — including a
+    // shape nobody has seen — counts as a session and keeps the ACL.
     let allowlisted = !spec.initiators.is_empty();
     for acl in &observed.acls {
         if spec.initiators.iter().any(|i| *i == acl.initiator) {
@@ -1863,6 +2291,43 @@ fn prune_iscsi(
             "{tpg}/acls/{}",
             acl.initiator
         )));
+    }
+
+    // Generated sessions the new allowlist does not carry (MAJOR 27 F3).
+    // Switching an open target to an allowlist leaves them CONNECTED —
+    // measured: still logged in 8 s after `generate_node_acls` 1 → 0 — so a
+    // client that is not on the list kept its disk until it reconnected by
+    // itself. MEASURED mechanism: `mkdir acls/<name>` over the live generated
+    // session converts it to a static ACL WITHOUT a reset (same LIO Session
+    // ID), and the `rmdir` that follows drops it; with `generate_node_acls = 0`
+    // it cannot come back. Emitted whenever the list is on, not only on the
+    // apply that turns it on, so an apply that was interrupted between the
+    // two is finished by the next one.
+    //
+    // The name is the one the CLIENT declared and becomes a PATH. It is held
+    // to path safety only (`kernel_name_path_safe`), never to the IQN shape: a
+    // hostile client is exactly the one that logs in as `…:ATTACKER` or
+    // `foo_bar`, and skipping those would leave precisely it connected
+    // (critic wave 12, MAJOR 1). A name that is not resettable this way is
+    // never joined into a path: the executor's post-condition
+    // (`enforce_allowlist`) sees it still logged in and toggles the TPG.
+    if allowlisted {
+        for name in excluded_sessions(spec, &observed.dynamic_sessions) {
+            if !kernel_name_path_safe(&name) {
+                steps.push(ConfigfsStep::Note(format!(
+                    "{name:?} is logged in through a generated ACL, is not on the allowlist and cannot be \
+                     reset by name: the apply resets the target's sessions instead"
+                )));
+                continue;
+            }
+            let acl = format!("{tpg}/acls/{name}");
+            steps.push(ConfigfsStep::Note(format!(
+                "{name} is logged in through a generated ACL and is not on the allowlist: its \
+                 session is reset and it cannot log in again"
+            )));
+            steps.push(ConfigfsStep::Mkdir(acl.clone()));
+            steps.push(ConfigfsStep::Rmdir(acl));
+        }
     }
 
     // TPG LUNs, after every mapped LUN that pointed at them is gone.
@@ -2067,6 +2532,18 @@ pub fn plan_nvmet(
         return Err(invalid(
             "one observed nvmet namespace per namespace is required",
         ));
+    }
+    // SECURITY (MAJOR 27 F2, the nvmet side of `plan_iscsi`'s refusal): an
+    // empty host list means `attr_allow_any_host = 1`, so taking the last
+    // allowed host off a subsystem that holds an allowlist would open it to
+    // every host. The core refuses that edit first; this is the kernel-side
+    // backstop for any other road to an empty list.
+    if spec.allow_any_host && observed.allow_any_host == "0" && !observed.allowed_hosts.is_empty() {
+        return Err(invalid(format!(
+            "{}: refusing to open an allowlisted subsystem — the kernel holds an allowlist for it \
+             and this spec allows any host; stop the target or keep at least one host",
+            spec.nqn
+        )));
     }
     let mut steps = Vec::new();
     let sub = format!("{NVMET_CONFIGFS}/subsystems/{}", spec.nqn);
@@ -2894,7 +3371,14 @@ fn protect_attr(path: &Path) -> Option<String> {
 #[cfg(unix)]
 fn mkdir(path: &Path) -> Result<(), String> {
     match std::fs::create_dir(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // configfs creates an item's attribute files and default groups
+            // with it; a test that runs a whole apply on a plain directory
+            // tree asks for the same (`tests::emulate_configfs`).
+            #[cfg(test)]
+            tests::emulate_default_groups(path);
+            Ok(())
+        }
         // Already there: the apply is a reconcile, and an object that survived
         // the last run is the desired state, not an error.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -2979,6 +3463,90 @@ pub fn apply_plan(steps: &[ConfigfsStep]) -> Result<Vec<String>, String> {
         }
     }
     Ok(warnings)
+}
+
+/// A plan built for the production configfs root, aimed at `root` instead —
+/// the identity for the real root. It exists so the reset EXECUTOR, not only
+/// its plan, can run against a directory tree in a test.
+#[cfg(unix)]
+fn rebased(steps: &[ConfigfsStep], root: &Path) -> Vec<ConfigfsStep> {
+    let to = root.to_string_lossy().into_owned();
+    if to == TARGET_CONFIGFS {
+        return steps.to_vec();
+    }
+    let map = |p: &str| match p.strip_prefix(TARGET_CONFIGFS) {
+        Some(rest) => format!("{to}{rest}"),
+        None => p.to_string(),
+    };
+    steps
+        .iter()
+        .map(|step| match step {
+            ConfigfsStep::Mkdir(p) => ConfigfsStep::Mkdir(map(p)),
+            ConfigfsStep::Write { path, value, secret } => ConfigfsStep::Write {
+                path: map(path),
+                value: value.clone(),
+                secret: *secret,
+            },
+            ConfigfsStep::Protect(p) => ConfigfsStep::Protect(map(p)),
+            ConfigfsStep::Clear { path, sentinel } => ConfigfsStep::Clear {
+                path: map(path),
+                sentinel: sentinel.clone(),
+            },
+            ConfigfsStep::Symlink { link, target } => ConfigfsStep::Symlink {
+                link: map(link),
+                target: map(target),
+            },
+            ConfigfsStep::Note(n) => ConfigfsStep::Note(n.clone()),
+            ConfigfsStep::Unlink(p) => ConfigfsStep::Unlink(map(p)),
+            ConfigfsStep::Rmdir(p) => ConfigfsStep::Rmdir(map(p)),
+        })
+        .collect()
+}
+
+/// Executes "Rozłącz" for one initiator under `root` (the LIO configfs root in
+/// production): observe, plan (`plan_session_reset`, every refusal before any
+/// write), drop, re-create.
+///
+/// The re-create runs WHATEVER the drop did (critic wave 12, MAJOR 3). A drop
+/// that stopped half-way — the mapped LUN's link gone, its `rmdir` refused —
+/// would otherwise leave the client logged in through an ACL that maps no
+/// LUN. The re-create is the apply's own idempotent ACL part, so running it
+/// over a half-dropped ACL puts back exactly what is missing. The answer:
+///   * `Ok` — dropped and re-created;
+///   * `reset_incomplete: …` — the drop failed, the ACL is whole again;
+///   * `lost_access: …` — the ACL is NOT whole: the initiator cannot reach its
+///     disk until the target is applied again.
+///
+/// The core re-applies the target on every failure that is not a coded
+/// `refused:`, so both failure heads end in a repair.
+#[cfg(unix)]
+pub fn execute_session_reset(root: &Path, spec: &IscsiTargetSpec, initiator: &str) -> Result<String, String> {
+    let observed = observe_iscsi(root, spec);
+    let plan = plan_session_reset(spec, initiator, &observed).map_err(|r| r.to_string())?;
+    let drop = rebased(&plan.drop, root);
+    let recreate = rebased(&plan.recreate, root);
+    let dropped = apply_plan(&drop);
+    let restored = apply_plan(&recreate);
+    match (dropped, restored) {
+        (Ok(_), Ok(warnings)) => Ok(format!(
+            "{}{}\n{}iSCSI session of {initiator} on {} reset ({} configfs steps)",
+            render(&plan.drop),
+            render(&plan.recreate).trim_end(),
+            warnings.iter().map(|w| format!("{w}\n")).collect::<String>(),
+            spec.iqn,
+            kernel_step_count(&plan.drop) + kernel_step_count(&plan.recreate)
+        )),
+        (Err(e), Ok(_)) => Err(format!(
+            "reset_incomplete: the session of {initiator} on {} could not be dropped ({e}); its ACL \
+             was re-created as the apply makes it",
+            spec.iqn
+        )),
+        (_, Err(e)) => Err(format!(
+            "lost_access: the ACL of {initiator} could not be re-created, so the initiator has lost \
+             access to {} until the target is applied again: {e}",
+            spec.iqn
+        )),
+    }
 }
 
 #[cfg(unix)]
@@ -3123,6 +3691,231 @@ fn clear_plain_children(path: &Path) {
     }
 }
 
+/// What `tear_down_tpg` achieved.
+#[cfg(unix)]
+struct TpgTeardown {
+    /// Every object went, the TPG included.
+    gone: bool,
+    /// The `enable = 0` write went through: LIO refuses every login from then
+    /// on (MEASURED, L3) whatever the rest of the walk managed.
+    disabled: bool,
+    /// The backstores the LUNs linked to.
+    backstores: Vec<PathBuf>,
+}
+
+/// Takes one TPG out of LIO: disable, every ACL (mapped LUNs first), every
+/// portal, every LUN, then the TPG itself. Reports what went and the
+/// backstores the LUNs linked to — which it does NOT remove: the target
+/// teardown removes them, the open-TPG rebuild re-links them.
+///
+/// A failed disable is logged (`not disabled: …`) and the walk carries on:
+/// removing the portal still stops the listener, and the caller words its
+/// answer on `disabled`.
+#[cfg(unix)]
+fn tear_down_tpg(tpg: &Path, iqn: &str, log: &mut Vec<String>) -> TpgTeardown {
+    let mut gone = true;
+    let mut disabled = true;
+    // Stop accepting LOGINS first. Not an ordering requirement — MEASURED
+    // that every removal step below (unlink, `rmdir` of a mapped LUN, of a
+    // TPG LUN, of an ACL, of an `np`) succeeds on a live TPG that stays
+    // enabled afterwards, which is exactly what `prune_iscsi` relies on.
+    // What this buys is that no initiator can log in DURING the teardown
+    // and get a target that is halfway gone. The client that is already
+    // connected loses its disk either way: the TPG is going.
+    if let Err(e) = write_attr(&tpg.join("enable"), "0") {
+        log.push(format!("{iqn}: not disabled: {e}"));
+        disabled = false;
+    }
+
+    for acl in entries(&tpg.join("acls")) {
+        for mapped in acl_children_to_remove(&acl) {
+            for entry in entries(&mapped) {
+                if entry.is_symlink() {
+                    let _ = std::fs::remove_file(&entry);
+                }
+            }
+            gone &= rmdir(&mapped, log);
+        }
+        gone &= rmdir(&acl, log);
+    }
+
+    for np in entries(&tpg.join("np")) {
+        gone &= rmdir(&np, log);
+    }
+
+    let mut backstores: Vec<PathBuf> = Vec::new();
+    for lun in entries(&tpg.join("lun")) {
+        for entry in entries(&lun) {
+            if !entry.is_symlink() {
+                continue;
+            }
+            if let Ok(dev) = std::fs::read_link(&entry) {
+                backstores.push(dev);
+            }
+            let _ = std::fs::remove_file(&entry);
+        }
+        gone &= rmdir(&lun, log);
+    }
+    gone &= rmdir(tpg, log);
+    TpgTeardown { gone, disabled, backstores }
+}
+
+/// The coded head of an apply that had to rebuild an OPEN TPG before writing
+/// its allowlist (`rebuild_open_tpg`) and could not take it down completely.
+/// Nothing of the allowlist was written and the next apply retries the
+/// rebuild. The word after the head says what the kernel is left doing:
+/// `TPG_REBUILD_DISABLED` or `TPG_REBUILD_MAY_SERVE`.
+pub const TPG_REBUILD_FAILED: &str = "tpg_rebuild_failed";
+
+/// `tpg_rebuild_failed: disabled: …` — `enable = 0` went through: LIO refuses
+/// every login (measured, L3) until an apply succeeds. Nobody is served, the
+/// listed clients included.
+pub const TPG_REBUILD_DISABLED: &str = "tpg_rebuild_failed: disabled";
+
+/// `tpg_rebuild_failed: not_disabled: …` — neither the disable nor the whole
+/// teardown went through: the OLD, OPEN TPG may still accept logins, cached
+/// ACLs included, behind an allowlist the screen already shows. The core
+/// raises its critical alert on exactly this.
+pub const TPG_REBUILD_MAY_SERVE: &str = "tpg_rebuild_failed: not_disabled";
+
+/// Closes the cached-dynamic-ACL hole before an OPEN target gets an allowlist
+/// (backlog "cached dynamic ACLs on an open target", MEASURED on rig11
+/// 2026-09-26, kernel 7.0).
+///
+/// LIO forces `cache_dynamic_acls = 1` while `generate_node_acls = 1`
+/// (measured: the plan's `cache_dynamic_acls = 0` write reads back `1` on an
+/// open TPG). So the ACL LIO generated for a client that logged in while the
+/// target was open STAYS in the TPG's ACL list after that client logs out —
+/// with no session, no `dynamic_sessions` line and no directory under
+/// `acls/`: nothing in configfs names it. Measured: after the exact switch
+/// `plan_iscsi` performs (`generate_node_acls = 0`, `cache_dynamic_acls = 0`,
+/// a static ACL for a different initiator), the excluded client logged in
+/// AGAIN and read its disk. It stays in for as long as it keeps that session
+/// (only its logout frees the cached ACL, now that caching is off).
+///
+/// The three candidates, measured with a listed client doing I/O:
+///   * `enable` 1 → 0 → 1 — does NOT clear it (the excluded client got in),
+///     and resets every session anyway;
+///   * `mkdir`+`rmdir acls/<name>` — clears it with no effect on anyone else,
+///     but needs the NAME, and nothing in configfs lists a cached ACL: a
+///     client that logged in and out between two samples is unknowable;
+///   * rebuilding the TPG — clears every cached ACL whatever its name. Cost:
+///     every session of this target drops once (the listed client was back
+///     in ~2.2 s, one read stalled ~2 s, no I/O error), and the portal stops
+///     listening for ~0.3 s.
+///
+/// So: the rebuild, and only on the switch. It runs when the spec carries an
+/// allowlist, the TPG exists, and its `generate_node_acls` does NOT
+/// positively read `0` (open, or unreadable — a TPG that cannot be shown to
+/// be closed is treated as open). It takes the TPG down with the same walk as
+/// the target teardown and leaves the backstores (and the target directory)
+/// in place; the caller then observes and plans again, and the plan builds a
+/// fresh TPG whose `generate_node_acls = 0` is written before any portal
+/// exists. A fresh TPG holds no cached ACL.
+///
+/// It fails CLOSED: the TPG is disabled before anything is removed, and a
+/// teardown that stops half-way answers `tpg_rebuild_failed` before the
+/// allowlist is written — the target does not serve until an apply succeeds,
+/// and that apply sees the TPG still open and rebuilds again.
+///
+/// `Ok(None)` — nothing to do; `Ok(Some(line))` — rebuilt, a line for the job
+/// log; `Err` — the coded failure above.
+#[cfg(unix)]
+pub fn rebuild_open_tpg(root: &Path, spec: &IscsiTargetSpec) -> Result<Option<String>, String> {
+    if spec.initiators.is_empty() {
+        return Ok(None);
+    }
+    // The name becomes a path below; the apply validated the spec already,
+    // this keeps the function safe on its own.
+    validate_iqn(&spec.iqn).map_err(|e| e.to_string())?;
+    let tpg = root.join("iscsi").join(&spec.iqn).join("tpgt_1");
+    if !tpg.is_dir() {
+        return Ok(None);
+    }
+    let generate = attr(&tpg.join("attrib"), "generate_node_acls");
+    if generate.as_deref() == Some("0") {
+        return Ok(None);
+    }
+    let mut log = Vec::new();
+    let teardown = tear_down_tpg(&tpg, &spec.iqn, &mut log);
+    // Every line the walk wrote is a failure (`not disabled`, `not removed`),
+    // and every one reaches the answer: a failed disable is the most
+    // important fact in it.
+    let failures = log.join("; ");
+    if !teardown.gone {
+        let (head, state) = if teardown.disabled {
+            (
+                TPG_REBUILD_DISABLED,
+                "logins are switched off (enable = 0), so no client — listed or not — is served until an \
+                 apply succeeds",
+            )
+        } else {
+            (
+                TPG_REBUILD_MAY_SERVE,
+                "logins could NOT be switched off, so the old OPEN portal group may still accept any \
+                 client, including one the allowlist excludes — stop the target",
+            )
+        };
+        return Err(format!(
+            "{head}: {}: the target was open and had to be rebuilt before its allowlist could take \
+             effect, but its portal group could not be taken down completely ({failures}); the \
+             allowlist was NOT written and {state}",
+            spec.iqn,
+        ));
+    }
+    Ok(Some(format!(
+        "{}: the target was open (generate_node_acls = {}) and now gets an allowlist: its portal \
+         group was rebuilt so that no ACL LIO cached for a client of the open target survives \
+         (every session of the target was reset once; listed clients reconnect by themselves){}",
+        spec.iqn,
+        generate.as_deref().unwrap_or("unreadable"),
+        if failures.is_empty() { String::new() } else { format!(" [{failures}]") }
+    )))
+}
+
+/// `IscsiTargetApply` under `root` (the LIO configfs root in production):
+/// observe, plan, rebuild an open TPG that gets an allowlist, apply, check the
+/// allowlist's post-condition. Here rather than in `actions` so the whole
+/// sequence runs against a fake configfs in a test.
+///
+/// Observed HERE, not by the core: between a preview and this apply another
+/// request may have changed what the kernel holds, and a plan built for the
+/// wrong state either writes an attribute LIO refuses or removes an object
+/// somebody else just created.
+#[cfg(unix)]
+pub fn execute_iscsi_apply(root: &Path, spec: &IscsiTargetSpec) -> Result<String, String> {
+    let mut plan = plan_iscsi(spec, &observe_iscsi(root, spec)).map_err(|e| e.to_string())?;
+    // An OPEN target that now gets an allowlist is rebuilt first, or the ACLs
+    // LIO cached for its former clients keep letting them in (measured on
+    // rig11 — see `rebuild_open_tpg`). Only after the plan above accepted the
+    // spec, so a refusal never costs a teardown; and then observed and planned
+    // AGAIN — the first plan was diffed against the old TPG and would skip
+    // writes the fresh one needs.
+    let rebuilt = rebuild_open_tpg(root, spec)?;
+    if rebuilt.is_some() {
+        plan = plan_iscsi(spec, &observe_iscsi(root, spec)).map_err(|e| e.to_string())?;
+    }
+    // The warnings are the credential-mode check (see `protect_attr`). They go
+    // into the job log ABOVE the summary line, because a key that stayed
+    // world-readable is the one thing about this apply an admin has to act on.
+    let warnings = apply_plan(&rebased(&plan, root))?;
+    // The post-condition of an allowlist (MAJOR 27 F3): no excluded client is
+    // still logged in. Re-read AFTER the plan, and the TPG toggled when one
+    // is — see `enforce_allowlist`. Only a failed toggle fails the apply.
+    let enforced = enforce_allowlist(root, spec)?;
+    // The rendered plan goes into the job log — `render` is the only rendering
+    // there is and it prints `***` for every secret.
+    Ok(format!(
+        "{}{}\n{}{}iSCSI target {} applied ({} configfs steps)",
+        rebuilt.map(|line| format!("{line}\n")).unwrap_or_default(),
+        render(&plan).trim_end(),
+        warnings.iter().map(|w| format!("{w}\n")).collect::<String>(),
+        enforced.map(|line| format!("{line}\n")).unwrap_or_default(),
+        spec.iqn,
+        kernel_step_count(&plan)
+    ))
+}
+
 /// Takes one app-created iSCSI target out of LIO, backstores included.
 ///
 /// Only the named target is touched: a node that also runs a hand-made target
@@ -3143,47 +3936,8 @@ pub fn remove_iscsi(root: &Path, iqn: &str) -> Result<Vec<String>, String> {
     }
     let tpg = target.join("tpgt_1");
     if tpg.is_dir() {
-        // Stop accepting LOGINS first. Not an ordering requirement — MEASURED
-        // that every removal step below (unlink, `rmdir` of a mapped LUN, of a
-        // TPG LUN, of an ACL, of an `np`) succeeds on a live TPG that stays
-        // enabled afterwards, which is exactly what `prune_iscsi` relies on.
-        // What this buys is that no initiator can log in DURING the teardown
-        // and get a target that is halfway gone. The client that is already
-        // connected loses its disk either way: the whole target is going.
-        if let Err(e) = write_attr(&tpg.join("enable"), "0") {
-            log.push(format!("{iqn}: not disabled: {e}"));
-        }
-
-        for acl in entries(&tpg.join("acls")) {
-            for mapped in acl_children_to_remove(&acl) {
-                for entry in entries(&mapped) {
-                    if entry.is_symlink() {
-                        let _ = std::fs::remove_file(&entry);
-                    }
-                }
-                gone &= rmdir(&mapped, &mut log);
-            }
-            gone &= rmdir(&acl, &mut log);
-        }
-
-        for np in entries(&tpg.join("np")) {
-            gone &= rmdir(&np, &mut log);
-        }
-
-        let mut backstores: Vec<PathBuf> = Vec::new();
-        for lun in entries(&tpg.join("lun")) {
-            for entry in entries(&lun) {
-                if !entry.is_symlink() {
-                    continue;
-                }
-                if let Ok(dev) = std::fs::read_link(&entry) {
-                    backstores.push(dev);
-                }
-                let _ = std::fs::remove_file(&entry);
-            }
-            gone &= rmdir(&lun, &mut log);
-        }
-        gone &= rmdir(&tpg, &mut log);
+        let TpgTeardown { gone: tpg_gone, backstores, .. } = tear_down_tpg(&tpg, iqn, &mut log);
+        gone &= tpg_gone;
         gone &= rmdir(&target, &mut log);
 
         for dev in backstores {
@@ -5818,5 +6572,661 @@ mod tests {
             secrets_seen >= 3,
             "the rule was checked against {secrets_seen} secret writes — it has to see some"
         );
+    }
+
+    // ----- MAJOR 27 (wave 12): sessions, F2, F3 and the per-session reset -----
+
+    /// The exact bytes rig11 returned for `dynamic_sessions` with one
+    /// generated session, from `reviews/artifacts/major27-2026-09-26/
+    /// dynamic-sessions-bytes.log` (`b'iqn.2004-10.com.ubuntu:01:35ed4c1b7a\n\x00'`).
+    const DYNAMIC_SESSIONS_ONE: &[u8] = b"iqn.2004-10.com.ubuntu:01:35ed4c1b7a\n\x00";
+
+    /// The active `info` rig11 printed, verbatim (§L.1).
+    const ACL_INFO_ACTIVE: &str = "InitiatorName: iqn.2004-10.com.ubuntu:01:35ed4c1b7a\n\
+InitiatorAlias: storage\n\
+LIO Session ID: 1   ISID: 0x00 02 3d 00 00 01  TSIH: 1  SessionType: Normal\n\
+Session State: TARG_SESS_STATE_LOGGED_IN\n\
+---------------------[iSCSI Session Values]-----------------------\n  \
+CmdSN/WR  :  CmdSN/WC  :  ExpCmdSN  :  MaxCmdSN  :     ITT    :     TTT\n \
+0x00000040   0x00000040   0x0000004a   0x00000089   0x0000004a   0x00000048\n\
+----------------------[iSCSI Connections]-------------------------\n\
+CID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN\n   \
+Address 127.0.0.1 TCP  StatSN: 0x3cded8e9\n";
+
+    #[test]
+    fn the_trailing_nul_of_dynamic_sessions_is_not_a_session() {
+        let text = String::from_utf8(DYNAMIC_SESSIONS_ONE.to_vec()).expect("utf-8");
+        assert_eq!(parse_dynamic_sessions(&text), vec!["iqn.2004-10.com.ubuntu:01:35ed4c1b7a"]);
+        // No session: the file is empty although `stat` says 4096.
+        assert!(parse_dynamic_sessions("").is_empty());
+        assert!(parse_dynamic_sessions("\0").is_empty());
+        // Two sessions, the NUL after the last line only.
+        assert_eq!(parse_dynamic_sessions("iqn.a:x\niqn.b:y\n\0").len(), 2);
+        // Nothing inside a record is trimmed: a trailing space or a tab is
+        // part of the name the client declared (critic wave 12, R2-M1).
+        assert_eq!(parse_dynamic_sessions("iqn.x:evil \n\0"), vec!["iqn.x:evil "]);
+        assert_eq!(parse_dynamic_sessions(" iqn.x:a\tb\n"), vec![" iqn.x:a\tb"]);
+    }
+
+    #[test]
+    fn the_measured_acl_info_parses_into_state_and_address_and_an_internal_key() {
+        let AclInfo::Active(session) = parse_acl_info(ACL_INFO_ACTIVE) else {
+            panic!("the measured active block is a session");
+        };
+        assert_eq!(session.session_id, Some(1));
+        assert_eq!(session.state, "LOGGED_IN");
+        assert_eq!(session.connection_states, vec!["LOGGED_IN"]);
+        assert_eq!(session.addresses, vec!["127.0.0.1"]);
+        // The session id increments per login (measured 1 → 10); the ten is
+        // read as ten, not as its first digit.
+        let tenth = ACL_INFO_ACTIVE.replace("LIO Session ID: 1 ", "LIO Session ID: 10 ");
+        let AclInfo::Active(tenth) = parse_acl_info(&tenth) else { panic!("active") };
+        assert_eq!(tenth.session_id, Some(10));
+        // iSER prints SCTP (anything that is not TCP): the address is kept,
+        // the word is not.
+        let iser = ACL_INFO_ACTIVE.replace("127.0.0.1 TCP", "10.10.0.21 SCTP");
+        let AclInfo::Active(iser) = parse_acl_info(&iser) else { panic!("active") };
+        assert_eq!(iser.addresses, vec!["10.10.0.21"]);
+
+        assert_eq!(
+            parse_acl_info("No active iSCSI Session for Initiator Endpoint: iqn.2004-10.com.ubuntu:01:35ed4c1b7a\n"),
+            AclInfo::Idle
+        );
+        assert_eq!(parse_acl_info(""), AclInfo::Unknown);
+        assert_eq!(parse_acl_info("\n\0"), AclInfo::Unknown);
+        // A shape nobody has seen is a session with unknown fields — never idle.
+        assert_eq!(parse_acl_info("Something new\n"), AclInfo::Active(AclSession::default()));
+        // A session line that lost its shape yields no key rather than a wrong one.
+        let broken = ACL_INFO_ACTIVE.replace("ISID: 0x00 02 3d 00 00 01", "ISID: 0x0002");
+        let AclInfo::Active(broken) = parse_acl_info(&broken) else { panic!("active") };
+        assert_eq!(broken.session_id, None);
+        assert_eq!(broken.state, "LOGGED_IN");
+        // The Address line needs its leading whitespace and the StatSN tail.
+        let unindented = ACL_INFO_ACTIVE.replace("   Address 127.0.0.1", "Address 127.0.0.1");
+        let AclInfo::Active(unindented) = parse_acl_info(&unindented) else { panic!("active") };
+        assert!(unindented.addresses.is_empty());
+    }
+
+    /// A TPG as LIO holds it while it is ALLOWLISTED: `generate_node_acls = 0`
+    /// and one static ACL with its default groups and mapped LUN.
+    fn allowlisted_tpg(tree: &TempTree, tpg_rel: &str, initiator: &str, info: &str) {
+        tree.attr(&format!("{tpg_rel}/attrib/generate_node_acls"), "0\n");
+        tree.attr(&format!("{tpg_rel}/enable"), "1\n");
+        let mapped = tree.dir(&format!("{tpg_rel}/acls/{initiator}/lun_0"));
+        let target_lun = tree.dir(&format!("{tpg_rel}/lun/lun_0"));
+        std::os::unix::fs::symlink(&target_lun, mapped.join("tentanas_vm_store_lun0")).expect("mapped link");
+        for group in ["attrib", "auth", "param", "fabric_statistics"] {
+            tree.dir(&format!("{tpg_rel}/acls/{initiator}/{group}"));
+        }
+        tree.attr(&format!("{tpg_rel}/acls/{initiator}/info"), info);
+    }
+
+    #[test]
+    fn removing_the_last_initiator_never_opens_an_allowlisted_tpg() {
+        // SECURITY (MAJOR 27 F2): an empty list is `generate_node_acls = 1`,
+        // i.e. OPEN — measured: the revoked client was back in 2.2 s.
+        let tree = TempTree::new("f2-open");
+        let tpg_rel = "iscsi/iqn.2026-09.pl.euvic:helios.vm-store/tpgt_1";
+        allowlisted_tpg(&tree, tpg_rel, "iqn.1998-01.com.vmware:esx01", ACL_INFO_ACTIVE);
+        let emptied = iscsi(mutual_chap(), vec![]);
+        let observed = observe_iscsi(&tree.0, &emptied);
+        let refused = plan_iscsi(&emptied, &observed).expect_err("an allowlisted TPG is never opened");
+        assert!(refused.to_string().contains("refusing to open an allowlisted target"), "{refused}");
+        // The idle ACL is no excuse either: the list is still the list.
+        tree.attr(&format!("{tpg_rel}/acls/iqn.1998-01.com.vmware:esx01/info"),
+            "No active iSCSI Session for Initiator Endpoint: iqn.1998-01.com.vmware:esx01\n");
+        let observed = observe_iscsi(&tree.0, &emptied);
+        assert!(plan_iscsi(&emptied, &observed).is_err());
+
+        // An OPEN target stays appliable: generated ACLs are no directories,
+        // so its `acls/` is empty…
+        let open = TempTree::new("f2-open-ok");
+        open.attr(&format!("{tpg_rel}/attrib/generate_node_acls"), "1\n");
+        let observed = observe_iscsi(&open.0, &emptied);
+        assert!(plan_iscsi(&emptied, &observed).is_ok());
+        // …and so is a first apply, where the fresh TPG reads 0 and has no ACL.
+        let first = TempTree::new("f2-first");
+        first.attr(&format!("{tpg_rel}/attrib/generate_node_acls"), "0\n");
+        let observed = observe_iscsi(&first.0, &emptied);
+        let text = render(&plan_iscsi(&emptied, &observed).expect("first apply"));
+        assert!(text.contains("/attrib/generate_node_acls = 1\n"), "{text}");
+        // Keeping one initiator is always fine.
+        let kept = iscsi(mutual_chap(), vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        let observed = observe_iscsi(&tree.0, &kept);
+        assert!(plan_iscsi(&kept, &observed).is_ok());
+    }
+
+    #[test]
+    fn removing_the_last_host_never_opens_an_allowlisted_subsystem() {
+        let spec = nvmet(vec![], true);
+        let mut observed = fresh_nvmet(1, 1);
+        observed.allow_any_host = "0".into();
+        observed.allowed_hosts = vec!["nqn.2014-08.org.nvmexpress:uuid:9f2c0000-0000-0000-0000-00000000a17b".into()];
+        let refused = plan_nvmet(&spec, &observed).expect_err("never opened");
+        assert!(refused.to_string().contains("refusing to open an allowlisted subsystem"), "{refused}");
+        // A subsystem that is already open, or brand new, applies.
+        observed.allowed_hosts.clear();
+        assert!(plan_nvmet(&spec, &observed).is_ok());
+        observed.allow_any_host = "1".into();
+        assert!(plan_nvmet(&spec, &observed).is_ok());
+    }
+
+    #[test]
+    fn an_allowlist_on_an_open_target_resets_the_generated_sessions_it_does_not_list() {
+        // MAJOR 27 F3: `generate_node_acls` 1 → 0 leaves generated sessions
+        // connected (measured 8 s). The plan converts each unlisted one with
+        // `mkdir acls/<name>` (measured: no reset) and drops it with `rmdir`.
+        let tree = TempTree::new("f3");
+        let tpg_rel = "iscsi/iqn.2026-09.pl.euvic:helios.vm-store/tpgt_1";
+        tree.attr(&format!("{tpg_rel}/attrib/generate_node_acls"), "1\n");
+        let mut bytes = b"iqn.1998-01.com.vmware:esx01\n".to_vec();
+        bytes.extend_from_slice(DYNAMIC_SESSIONS_ONE);
+        std::fs::write(tree.0.join(format!("{tpg_rel}/dynamic_sessions")), &bytes).expect("dynamic_sessions");
+        let spec = iscsi(mutual_chap(), vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        let observed = observe_iscsi(&tree.0, &spec);
+        assert_eq!(
+            observed.dynamic_sessions,
+            vec!["iqn.1998-01.com.vmware:esx01", "iqn.2004-10.com.ubuntu:01:35ed4c1b7a"],
+            "the trailing NUL is not a session"
+        );
+        let text = render(&plan_iscsi(&spec, &observed).expect("plan"));
+        let root = "/sys/kernel/config/target";
+        let off = text.find(&format!("write {root}/{tpg_rel}/attrib/generate_node_acls = 0\n")).expect("allowlist on");
+        let unlisted = "iqn.2004-10.com.ubuntu:01:35ed4c1b7a";
+        let convert = text.find(&format!("mkdir {root}/{tpg_rel}/acls/{unlisted}\n")).expect("converted");
+        let drop = text.find(&format!("rmdir {root}/{tpg_rel}/acls/{unlisted}\n")).expect("dropped");
+        assert!(off < convert && convert < drop, "{text}");
+        // The listed one is converted by its ordinary ACL creation and is
+        // never removed.
+        assert!(!text.contains(&format!("rmdir {root}/{tpg_rel}/acls/iqn.1998-01.com.vmware:esx01\n")), "{text}");
+        // An open target resets nobody.
+        let open = iscsi(mutual_chap(), vec![]);
+        let observed = observe_iscsi(&tree.0, &open);
+        let text = render(&plan_iscsi(&open, &observed).expect("plan"));
+        assert!(!text.contains(&format!("/acls/{unlisted}")), "{text}");
+        // A hostile client picks a name that is not IQN-shaped; it is reset
+        // all the same (critic wave 12, MAJOR 1).
+        std::fs::write(
+            tree.0.join(format!("{tpg_rel}/dynamic_sessions")),
+            b"iqn.2026-01.x:ATTACKER\nfoo_bar\n\0",
+        )
+        .expect("write");
+        let observed = observe_iscsi(&tree.0, &spec);
+        let text = render(&plan_iscsi(&spec, &observed).expect("plan"));
+        let off = text.find(&format!("write {root}/{tpg_rel}/attrib/generate_node_acls = 0\n")).expect("allowlist on");
+        for hostile in ["iqn.2026-01.x:ATTACKER", "foo_bar"] {
+            let convert = text.find(&format!("mkdir {root}/{tpg_rel}/acls/{hostile}\n")).unwrap_or_else(|| panic!("{hostile} converted:\n{text}"));
+            let drop = text.find(&format!("rmdir {root}/{tpg_rel}/acls/{hostile}\n")).unwrap_or_else(|| panic!("{hostile} dropped:\n{text}"));
+            assert!(off < convert && convert < drop, "{text}");
+        }
+        // A name that is not resettable by name never becomes a path, and
+        // the apply is NOT refused (critic wave 12, R2-M1): the plan goes
+        // through and the executor's post-condition toggles the TPG.
+        for unsafe_name in [&b"../../core\n\0"[..], b"a/b\n", b"..\n", b"caf\xc3\xa9\n", b"iqn.x:evil \n", b"iqn.1998-01.com.vmware:esx01 \n"] {
+            std::fs::write(tree.0.join(format!("{tpg_rel}/dynamic_sessions")), unsafe_name).expect("write");
+            let observed = observe_iscsi(&tree.0, &spec);
+            let text = render(&plan_iscsi(&spec, &observed).expect("the allowlist is applied"));
+            assert!(!text.contains("acls/../") && !text.contains("acls/a/b") && !text.contains("acls/café"), "{text}");
+            assert!(!text.contains("acls/iqn.x:evil"), "no mkdir on a different (trimmed) name: {text}");
+            assert!(!text.contains("acls/iqn.1998-01.com.vmware:esx01 "), "{text}");
+            assert!(text.contains("cannot be reset by name"), "{text}");
+            assert!(text.contains(&format!("write {root}/{tpg_rel}/attrib/generate_node_acls = 0\n")), "{text}");
+        }
+        assert!(kernel_name_path_safe("iqn.2026-01.x:ATTACKER") && kernel_name_path_safe("foo_bar"));
+        assert!(!kernel_name_path_safe(&"a".repeat(224)) && !kernel_name_path_safe(""));
+        assert!(!kernel_name_path_safe("iqn.x:evil ") && !kernel_name_path_safe("iqn.x:\u{7}"));
+    }
+
+    fn app_spec(initiators: Vec<String>) -> IscsiTargetSpec {
+        IscsiTargetSpec {
+            iqn: "iqn.2026-09.local.tentaflow:helios.vm-store".into(),
+            ..iscsi(mutual_chap(), initiators)
+        }
+    }
+
+    #[test]
+    fn a_session_reset_drops_one_acl_and_recreates_exactly_what_the_apply_makes() {
+        let tree = TempTree::new("reset");
+        let initiator = "iqn.1994-05.com.redhat:vmhost-01";
+        let spec = app_spec(vec![initiator.into(), "iqn.1994-05.com.redhat:vmhost-02".into()]);
+        let tpg_rel = format!("iscsi/{}/tpgt_1", spec.iqn);
+        allowlisted_tpg(&tree, &tpg_rel, initiator, ACL_INFO_ACTIVE);
+        let observed = observe_iscsi(&tree.0, &spec);
+        let plan = plan_session_reset(&spec, initiator, &observed).expect("a live allowlisted session");
+        let root = "/sys/kernel/config/target";
+        let acl = format!("{root}/{tpg_rel}/acls/{initiator}");
+        assert_eq!(
+            plan.drop,
+            vec![
+                ConfigfsStep::Unlink(format!("{acl}/lun_0/tentanas_vm_store_lun0")),
+                ConfigfsStep::Rmdir(format!("{acl}/lun_0")),
+                ConfigfsStep::Rmdir(acl.clone()),
+            ],
+            "L1: the mapped link, the mapped LUN, the ACL — nothing else, no default group"
+        );
+        // The re-create is the apply's own ACL part for that initiator.
+        let apply = plan_iscsi(&spec, &observed).expect("apply");
+        let from_apply: Vec<ConfigfsStep> = apply
+            .iter()
+            .filter(|s| s.path().starts_with(&format!("{acl}")) && !matches!(s, ConfigfsStep::Rmdir(_) | ConfigfsStep::Unlink(_)))
+            .cloned()
+            .collect();
+        assert_eq!(plan.recreate, from_apply);
+        // CHAP comes back with it, and redacted in every rendering.
+        let text = render(&plan.recreate);
+        assert!(text.contains(&format!("write {acl}/auth/password = ***\n")), "{text}");
+        assert!(text.contains(&format!("protect {acl}/auth/password = 0600\n")), "{text}");
+        assert!(!text.contains("sekret"), "{text}");
+        // The other initiator is untouched.
+        assert!(!render(&plan.drop).contains("vmhost-02"));
+    }
+
+    #[test]
+    fn a_session_reset_is_refused_before_any_write_unless_every_precondition_holds() {
+        let tree = TempTree::new("reset-refused");
+        let initiator = "iqn.1994-05.com.redhat:vmhost-01";
+        let spec = app_spec(vec![initiator.into()]);
+        let tpg_rel = format!("iscsi/{}/tpgt_1", spec.iqn);
+        allowlisted_tpg(&tree, &tpg_rel, initiator, ACL_INFO_ACTIVE);
+        let observed = observe_iscsi(&tree.0, &spec);
+        let code = |spec: &IscsiTargetSpec, who: &str, observed: &IscsiObserved| {
+            plan_session_reset(spec, who, observed).expect_err("refused").code
+        };
+        // A hand-made target on the same node.
+        let foreign = IscsiTargetSpec { iqn: "iqn.2003-01.org.linux-iscsi:handmade".into(), ..spec.clone() };
+        assert_eq!(code(&foreign, initiator, &observed), "not_app_target");
+        // D2: no reset without an allowlist, and none for a name not on it.
+        assert_eq!(code(&app_spec(vec![]), initiator, &observed), "not_allowlisted");
+        assert_eq!(code(&spec, "iqn.1994-05.com.redhat:stranger", &observed), "not_allowlisted");
+        // A path-like name dies in validation.
+        assert_eq!(code(&spec, "../../core", &observed), "invalid");
+        // Idle, empty and unreadable `info` are not a session to drop.
+        let info = tree.0.join(format!("{tpg_rel}/acls/{initiator}/info"));
+        std::fs::write(&info, format!("No active iSCSI Session for Initiator Endpoint: {initiator}\n")).expect("idle");
+        assert_eq!(code(&spec, initiator, &observe_iscsi(&tree.0, &spec)), "no_session");
+        std::fs::write(&info, "").expect("empty");
+        assert_eq!(code(&spec, initiator, &observe_iscsi(&tree.0, &spec)), "no_session");
+        std::fs::remove_file(&info).expect("unreadable");
+        assert_eq!(code(&spec, initiator, &observe_iscsi(&tree.0, &spec)), "no_session");
+        // No ACL at all.
+        assert_eq!(code(&spec, initiator, &IscsiObserved { devices: observed.devices.clone(), ..Default::default() }), "no_session");
+        // The refusal line carries the stable head the core maps.
+        let line = plan_session_reset(&spec, "iqn.1994-05.com.redhat:stranger", &observed).expect_err("refused").to_string();
+        assert!(line.starts_with("refused:not_allowlisted: "), "{line}");
+    }
+
+    /// A LIVE allowlisted ACL on a plain directory tree, the way configfs
+    /// presents one: default groups, the `auth/` attribute files, `info` with a
+    /// session and the mapped LUN linked to the TPG's LUN.
+    fn live_acl(tree: &TempTree, spec: &IscsiTargetSpec, initiator: &str) -> PathBuf {
+        let tpg_rel = format!("iscsi/{}/tpgt_1", spec.iqn);
+        allowlisted_tpg(tree, &tpg_rel, initiator, ACL_INFO_ACTIVE);
+        for name in ["userid", "password", "userid_mutual", "password_mutual"] {
+            tree.attr(&format!("{tpg_rel}/acls/{initiator}/auth/{name}"), "");
+        }
+        tree.0.join(format!("{tpg_rel}/acls/{initiator}"))
+    }
+
+    #[test]
+    fn the_reset_executor_restores_a_half_dropped_acl_and_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = TempTree::new("reset-exec-partial");
+        let initiator = "iqn.1994-05.com.redhat:vmhost-01";
+        let spec = app_spec(vec![initiator.into()]);
+        let acl = live_acl(&tree, &spec, initiator);
+        // The ACL directory refuses removals: the mapped link goes, the
+        // `rmdir lun_0` inside it fails — a drop that stopped half-way.
+        std::fs::set_permissions(&acl, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let probe = acl.join("probe");
+        if std::fs::create_dir(&probe).is_ok() {
+            // Running as root: the permission cannot stop anything here.
+            let _ = std::fs::remove_dir(&probe);
+            std::fs::set_permissions(&acl, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            return;
+        }
+        let outcome = execute_session_reset(&tree.0, &spec, initiator);
+        std::fs::set_permissions(&acl, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+        let error = outcome.expect_err("the drop failed");
+        assert!(error.starts_with("reset_incomplete: "), "{error}");
+        // …and the client's LUN is mapped again: the link the drop removed is back.
+        let link = acl.join("lun_0/tentanas_vm_store_lun0");
+        assert!(link.symlink_metadata().is_ok(), "the mapped LUN is linked again");
+    }
+
+    #[test]
+    fn the_reset_executor_reports_lost_access_when_the_acl_cannot_come_back() {
+        let tree = TempTree::new("reset-exec-lost");
+        let initiator = "iqn.1994-05.com.redhat:vmhost-01";
+        let spec = app_spec(vec![initiator.into()]);
+        let acl = live_acl(&tree, &spec, initiator);
+        // On a plain filesystem the re-created ACL has no `auth/` attribute
+        // files (configfs would create them), so its CHAP writes fail: the
+        // drop went through and the ACL is NOT whole — the one answer that
+        // means the initiator cannot reach its disk.
+        let error = execute_session_reset(&tree.0, &spec, initiator).expect_err("not whole");
+        assert!(error.starts_with("lost_access: "), "{error}");
+        assert!(acl.is_dir(), "the ACL directory itself was re-created");
+        assert!(!error.contains("sekret"), "no secret in the error: {error}");
+        // A refusal writes nothing and keeps its coded head.
+        let untouched = TempTree::new("reset-exec-refused");
+        let acl = live_acl(&untouched, &spec, initiator);
+        let refused = execute_session_reset(&untouched.0, &spec, "iqn.1994-05.com.redhat:stranger").expect_err("refused");
+        assert!(refused.starts_with("refused:not_allowlisted: "), "{refused}");
+        assert!(acl.join("lun_0/tentanas_vm_store_lun0").symlink_metadata().is_ok());
+    }
+
+    /// The post-condition of an allowlisted apply, on the fake configfs:
+    /// nothing excluded left → nothing toggled; something left → the TPG is
+    /// toggled 1 → 0 → 1; the toggle failing → the coded failure.
+    #[test]
+    fn the_allowlist_post_condition_toggles_the_tpg_only_when_an_excluded_client_is_left() {
+        let tree = TempTree::new("enforce");
+        let listed = "iqn.1998-01.com.vmware:esx01";
+        let spec = iscsi(mutual_chap(), vec![listed.into()]);
+        let tpg_rel = "iscsi/iqn.2026-09.pl.euvic:helios.vm-store/tpgt_1";
+        let enable = tree.0.join(format!("{tpg_rel}/enable"));
+        let sessions = tree.0.join(format!("{tpg_rel}/dynamic_sessions"));
+        // `enable` starts on a value neither write produces, so a test can
+        // tell "never written" from "written 0 then 1".
+        let reset = || tree.attr(&format!("{tpg_rel}/enable"), "untouched");
+        reset();
+        // The re-read finds nothing excluded (the plan's mkdir+rmdir did its
+        // job, or only the listed client is there): no toggle.
+        for left in [&b""[..], b"iqn.1998-01.com.vmware:esx01\n\0"] {
+            std::fs::write(&sessions, left).expect("sessions");
+            assert_eq!(enforce_allowlist(&tree.0, &spec), Ok(None));
+            assert_eq!(std::fs::read_to_string(&enable).expect("enable"), "untouched");
+        }
+        // Something excluded is still there — a whitespace name the plan
+        // could not reset, a listed name plus a space, a non-ASCII name: the
+        // TPG is toggled and the apply succeeds.
+        for left in [&b"iqn.x:evil \n\0"[..], b"iqn.1998-01.com.vmware:esx01 \n\0", b"caf\xc3\xa9\n\0"] {
+            reset();
+            std::fs::write(&sessions, left).expect("sessions");
+            let line = enforce_allowlist(&tree.0, &spec).expect("toggled").expect("a log line");
+            assert!(line.contains("enable 1 → 0 → 1"), "{line}");
+            assert_eq!(std::fs::read_to_string(&enable).expect("enable"), "1", "left serving");
+        }
+        // No allowlist: nothing is excluded, nothing is toggled.
+        reset();
+        assert_eq!(enforce_allowlist(&tree.0, &iscsi(mutual_chap(), vec![])), Ok(None));
+        assert_eq!(std::fs::read_to_string(&enable).expect("enable"), "untouched");
+    }
+
+    #[test]
+    fn a_toggle_that_fails_fails_the_apply_with_the_coded_reason() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = TempTree::new("enforce-fail");
+        let spec = iscsi(mutual_chap(), vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        let tpg_rel = "iscsi/iqn.2026-09.pl.euvic:helios.vm-store/tpgt_1";
+        tree.attr(&format!("{tpg_rel}/enable"), "1");
+        tree.attr(&format!("{tpg_rel}/dynamic_sessions"), "iqn.x:evil \n\0");
+        let enable = tree.0.join(format!("{tpg_rel}/enable"));
+        std::fs::set_permissions(&enable, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        if std::fs::OpenOptions::new().write(true).open(&enable).is_ok() {
+            return; // root: the mode cannot stop the write here
+        }
+        let error = enforce_allowlist(&tree.0, &spec).expect_err("the toggle failed");
+        assert!(error.starts_with("unresettable_session: "), "{error}");
+        assert!(error.contains("stop the target"), "{error}");
+    }
+
+    thread_local! {
+        /// Whether `mkdir` on this test thread creates what configfs would
+        /// create with the item. Off unless a test asks: every other test's
+        /// fixture builds its shapes by hand.
+        static CONFIGFS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Makes `mkdir` behave like configfs for the rest of this test thread.
+    fn emulate_configfs() {
+        CONFIGFS.with(|on| on.set(true));
+    }
+
+    /// The attribute files and default groups LIO creates with an item, with
+    /// the kernel's defaults, for the items an iSCSI apply makes. Only the
+    /// ones the apply reads or writes: a missing one makes a write fail, which
+    /// is what keeps this honest.
+    pub(super) fn emulate_default_groups(path: &Path) {
+        if !CONFIGFS.with(|on| on.get()) {
+            return;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let parent = path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let file = |rel: &str, value: &str| {
+            let f = path.join(rel);
+            std::fs::create_dir_all(f.parent().expect("parent")).expect("group");
+            std::fs::write(f, value).expect("attribute");
+        };
+        let auth = || {
+            for n in ["userid", "password", "userid_mutual", "password_mutual"] {
+                file(&format!("auth/{n}"), "");
+            }
+        };
+        if name.starts_with("tpgt_") {
+            file("enable", "0\n");
+            file("dynamic_sessions", "");
+            file("attrib/generate_node_acls", "0\n");
+            file("attrib/cache_dynamic_acls", "0\n");
+            file("attrib/demo_mode_write_protect", "1\n");
+            file("attrib/authentication", "1\n");
+            file("param/AuthMethod", "CRC32C,None\n");
+            auth();
+            for group in ["lun", "acls", "np"] {
+                std::fs::create_dir_all(path.join(group)).expect("group");
+            }
+        } else if parent == "lun" && name.starts_with("lun_") {
+            file("alua_tg_pt_gp", "");
+        } else if parent == "acls" {
+            file("info", &format!("No active iSCSI Session for Initiator Endpoint: {name}\n"));
+            file("cmdsn_depth", "64\n");
+            auth();
+            for group in ["attrib", "param", "fabric_statistics"] {
+                std::fs::create_dir_all(path.join(group)).expect("group");
+            }
+        } else if parent == "np" {
+            file("iser", "0\n");
+        } else if parent == "alua" {
+            for n in ["tg_pt_gp_id", "alua_access_type", "alua_access_state", "preferred"] {
+                file(n, "");
+            }
+        }
+    }
+
+    /// An OPEN target on the fake configfs, the way the product leaves one:
+    /// `generate_node_acls = 1`, a LUN linked to a CONFIGURED backstore, a
+    /// portal, and a marker standing for what configfs cannot show — the ACL
+    /// LIO cached for a client that logged in while the target was open and
+    /// logged out. Only removing the TPG itself removes it.
+    ///
+    /// The backstore is a configured, enabled device with its serial, and its
+    /// own attribute files are READ-ONLY: on real LIO a second `control` or
+    /// `enable = 1` on it is EEXIST, so a re-plan that rewrote it would break
+    /// the target after a successful teardown. Here that write fails.
+    fn open_tpg(tree: &TempTree, spec: &IscsiTargetSpec) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let tpg_rel = format!("iscsi/{}/tpgt_1", spec.iqn);
+        let dev = tree.dir("core/iblock_0/tentanas_vm_store_lun0");
+        tree.attr("core/iblock_0/tentanas_vm_store_lun0/control", "");
+        tree.attr("core/iblock_0/tentanas_vm_store_lun0/enable", "1\n");
+        tree.attr(
+            "core/iblock_0/tentanas_vm_store_lun0/wwn/vpd_unit_serial",
+            "T10 VPD Unit Serial Number: 0191f2c0-0000-7000-8000-000000000001\n",
+        );
+        for rel in ["control", "enable", "wwn/vpd_unit_serial"] {
+            std::fs::set_permissions(dev.join(rel), std::fs::Permissions::from_mode(0o444)).expect("read-only");
+        }
+        for (n, v) in [("tg_pt_gp_id", "1\n"), ("alua_access_type", "Implicit\n"), ("alua_access_state", "0\n"), ("preferred", "0\n")] {
+            tree.attr(&format!("core/iblock_0/tentanas_vm_store_lun0/alua/tentanas_gp1/{n}"), v);
+        }
+        // What the open plan wrote, so a STALE plan (diffed against this TPG)
+        // would skip these writes on the fresh one.
+        tree.attr(&format!("{tpg_rel}/attrib/generate_node_acls"), "1\n");
+        tree.attr(&format!("{tpg_rel}/attrib/cache_dynamic_acls"), "1\n");
+        tree.attr(&format!("{tpg_rel}/attrib/demo_mode_write_protect"), "0\n");
+        tree.attr(&format!("{tpg_rel}/attrib/authentication"), "1\n");
+        tree.attr(&format!("{tpg_rel}/param/AuthMethod"), "CHAP\n");
+        tree.attr(&format!("{tpg_rel}/enable"), "1\n");
+        tree.attr(&format!("{tpg_rel}/dynamic_sessions"), "");
+        let lun = tree.dir(&format!("{tpg_rel}/lun/lun_0"));
+        std::os::unix::fs::symlink(&dev, lun.join("tentanas_vm_store_lun0")).expect("lun link");
+        tree.attr(&format!("{tpg_rel}/lun/lun_0/alua_tg_pt_gp"), "");
+        tree.attr(&format!("{tpg_rel}/np/10.10.0.5:3260/iser"), "0\n");
+        let cached = tree.0.join(format!("{tpg_rel}/cached_dynamic_acl_of_a_former_client"));
+        std::fs::write(&cached, "").expect("marker");
+        (tree.0.join(tpg_rel), dev, cached)
+    }
+
+    /// The backstore's own attribute files, as the fixture left them.
+    fn assert_backstore_untouched(dev: &Path) {
+        assert_eq!(std::fs::read_to_string(dev.join("enable")).expect("enable"), "1\n");
+        assert_eq!(std::fs::read_to_string(dev.join("control")).expect("control"), "");
+        assert!(std::fs::read_to_string(dev.join("wwn/vpd_unit_serial")).expect("serial").ends_with("000000000001\n"));
+    }
+
+    /// MEASURED on rig11 (2026-09-26): after the switch `plan_iscsi` makes, a
+    /// client that had logged in and out while the target was open got in
+    /// again; `enable` 1 → 0 → 1 did not stop it, rebuilding the TPG did.
+    /// This runs the WHOLE `IscsiTargetApply` sequence on the fake configfs.
+    #[test]
+    fn the_apply_rebuilds_an_open_tpg_that_gets_an_allowlist_end_to_end() {
+        let tree = TempTree::new("apply-rebuild");
+        let listed = "iqn.1998-01.com.vmware:esx01";
+        let spec = app_spec(vec![listed.into()]);
+        let (tpg, dev, cached) = open_tpg(&tree, &spec);
+        emulate_configfs();
+
+        let out = execute_iscsi_apply(&tree.0, &spec).expect("applied");
+        assert!(out.starts_with(&format!("{}: the target was open (generate_node_acls = 1)", spec.iqn)), "{out}");
+        assert!(!cached.exists(), "the cached ACL went with the old TPG");
+        let read = |rel: &str| std::fs::read_to_string(tpg.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
+        // The fresh TPG is CLOSED and fully written — including what a stale
+        // plan, diffed against the old TPG, would have skipped.
+        assert_eq!(read("attrib/generate_node_acls"), "0");
+        assert_eq!(read("attrib/cache_dynamic_acls"), "0");
+        assert_eq!(read("attrib/demo_mode_write_protect"), "0", "{out}");
+        assert_eq!(read("attrib/authentication"), "1");
+        assert_eq!(read("param/AuthMethod"), "CHAP");
+        assert_eq!(read("enable"), "1");
+        assert_eq!(read("np/10.10.0.5:3260/iser"), "0");
+        assert!(tpg.join(format!("acls/{listed}/lun_0/tentanas_vm_store_lun0")).symlink_metadata().is_ok());
+        assert_eq!(std::fs::read_link(tpg.join("lun/lun_0/tentanas_vm_store_lun0")).expect("lun link"), dev);
+        // The backstore was re-linked, never rewritten.
+        assert_backstore_untouched(&dev);
+        for line in out.lines().filter(|l| l.starts_with("write ") && l.contains("/core/")) {
+            assert!(line.contains("/alua/"), "only ALUA group lines may touch core/: {line}");
+        }
+        assert!(!out.contains("sekret"), "no secret in the job log");
+
+        // A second apply on the now-allowlisted TPG rebuilds nothing.
+        std::fs::write(&cached, "").expect("marker");
+        let again = execute_iscsi_apply(&tree.0, &spec).expect("applied again");
+        assert!(!again.contains("was open"), "{again}");
+        assert!(cached.exists(), "the steady state tears nothing down");
+    }
+
+    #[test]
+    fn only_an_open_or_unreadable_tpg_with_an_allowlisted_spec_is_rebuilt() {
+        let listed = || app_spec(vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        // Already allowlisted (reads 0): the ordinary apply, nothing torn down.
+        let closed = TempTree::new("rebuild-closed");
+        let spec = listed();
+        let (tpg, _, cached) = open_tpg(&closed, &spec);
+        closed.attr(&format!("iscsi/{}/tpgt_1/attrib/generate_node_acls", spec.iqn), "0\n");
+        assert_eq!(rebuild_open_tpg(&closed.0, &spec), Ok(None));
+        assert!(tpg.is_dir() && cached.exists());
+        // A spec WITHOUT an allowlist keeps the target open: no rebuild.
+        let open = TempTree::new("rebuild-open-spec");
+        let spec = app_spec(vec![]);
+        let (tpg, _, cached) = open_tpg(&open, &spec);
+        assert_eq!(rebuild_open_tpg(&open.0, &spec), Ok(None));
+        assert!(tpg.is_dir() && cached.exists());
+        // No TPG yet (first apply, or after a reboot): nothing cached, nothing to do.
+        let fresh = TempTree::new("rebuild-fresh");
+        assert_eq!(rebuild_open_tpg(&fresh.0, &listed()), Ok(None));
+        // `generate_node_acls` unreadable: a TPG that cannot be shown to be
+        // closed is treated as open.
+        let unknown = TempTree::new("rebuild-unknown");
+        let spec = listed();
+        let (tpg, dev, cached) = open_tpg(&unknown, &spec);
+        std::fs::remove_file(tpg.join("attrib/generate_node_acls")).expect("unreadable");
+        let line = rebuild_open_tpg(&unknown.0, &spec).expect("rebuilt").expect("a log line");
+        assert!(line.contains("generate_node_acls = unreadable"), "{line}");
+        assert!(!tpg.exists() && !cached.exists());
+        assert!(tpg.parent().expect("target").is_dir(), "the target directory stays");
+        assert_backstore_untouched(&dev);
+        // A path-like name never reaches the filesystem.
+        let spec = IscsiTargetSpec { iqn: "../../core".into(), ..listed() };
+        assert!(rebuild_open_tpg(&unknown.0, &spec).is_err());
+    }
+
+    /// Makes `dir` refuse removals of its entries; `false` when this process
+    /// runs as root and the mode cannot stop anything.
+    fn refuse_removals(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        let probe = dir.join("probe");
+        if std::fs::create_dir(&probe).is_ok() {
+            let _ = std::fs::remove_dir(&probe);
+            allow_removals(dir);
+            return false;
+        }
+        true
+    }
+
+    fn allow_removals(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+    }
+
+    #[test]
+    fn a_rebuild_that_cannot_take_the_tpg_down_fails_closed_before_the_allowlist() {
+        let tree = TempTree::new("rebuild-fail");
+        let spec = app_spec(vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        let (tpg, _, _) = open_tpg(&tree, &spec);
+        let np = tpg.join("np");
+        if !refuse_removals(&np) {
+            return;
+        }
+        let outcome = rebuild_open_tpg(&tree.0, &spec);
+        allow_removals(&np);
+        let error = outcome.expect_err("the teardown stopped short");
+        // The disable went through: the answer says so, and only so.
+        assert!(error.starts_with("tpg_rebuild_failed: disabled: "), "{error}");
+        assert!(error.contains("NOT written") && error.contains("no client"), "{error}");
+        assert!(error.contains("not removed"), "the failing step is named: {error}");
+        assert!(np.join("10.10.0.5:3260").is_dir(), "the portal stayed");
+        // The retry sees what configfs would show: the TPG still there and
+        // still OPEN (the plain-FS fallback may have cleared its files; the
+        // kernel would not have), so it rebuilds again.
+        tree.attr(&format!("iscsi/{}/tpgt_1/attrib/generate_node_acls", spec.iqn), "1\n");
+        let line = rebuild_open_tpg(&tree.0, &spec).expect("retried").expect("a log line");
+        assert!(line.contains("generate_node_acls = 1"), "{line}");
+        assert!(!tpg.exists());
+    }
+
+    /// M-2 (critic): when even `enable = 0` failed and the teardown stopped
+    /// short, the old OPEN TPG may still accept anyone. The answer must say
+    /// that, carry the `not disabled` line, and use the head the core raises
+    /// its critical alert on.
+    #[test]
+    fn a_rebuild_that_could_not_disable_says_the_target_may_still_serve() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = TempTree::new("rebuild-not-disabled");
+        let spec = app_spec(vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        let (tpg, _, _) = open_tpg(&tree, &spec);
+        let enable = tpg.join("enable");
+        std::fs::set_permissions(&enable, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+        let np = tpg.join("np");
+        if std::fs::OpenOptions::new().write(true).open(&enable).is_ok() || !refuse_removals(&np) {
+            return; // root
+        }
+        let outcome = rebuild_open_tpg(&tree.0, &spec);
+        allow_removals(&np);
+        let error = outcome.expect_err("neither disabled nor removed");
+        assert!(error.starts_with(&format!("{TPG_REBUILD_MAY_SERVE}: ")), "{error}");
+        assert!(error.contains("not disabled"), "the failed disable is in the answer: {error}");
+        assert!(error.contains("may still accept"), "{error}");
+        assert!(!error.contains("no client"), "it does not claim nobody is served: {error}");
     }
 }

@@ -217,3 +217,85 @@ test('a robot package fills its connection params from the vendor account', asyn
   assert.ok(!JSON.stringify(sent.payload).includes('hunter2'), 'the vendor password never reaches the install');
   AddonsScreen.unmount();
 });
+
+// ----- n18d: switching an app off first says what that does -----------------
+
+const tentanasInstance = {
+  addonId: 'tentanas-1a2b3c4d', name: 'tentanas', displayName: 'TentaNas', isEnabled: true, isSystem: false,
+  runtime: 'native', packageId: 'tentanas', packageVersion: '1.0.0', backgroundOnDisable: true,
+};
+const preview = {
+  addonId: 'tentanas-1a2b3c4d', displayName: 'TentaNas', nodeName: 'helios', backgroundOnDisable: true,
+  consequences: [
+    { kind: 'tentanas_api_closed', effect: 'stops', countVars: {}, names: [] },
+    { kind: 'tentanas_smb_shares_continue', effect: 'continues', countVars: { n: 2 }, names: [] },
+    { kind: 'tentanas_nfs_shares_continue', effect: 'continues', countVars: { n: 1 }, names: [] },
+    { kind: 'tentanas_schedules_stop', effect: 'stops', countVars: { n: 3 }, names: [] },
+    { kind: 'tentanas_arrays_mounted', effect: 'kept', countVars: { n: 1 }, names: ['media'] },
+  ],
+};
+
+async function mountList(over = {}) {
+  calls.length = 0;
+  stubTransport(fixtures({ addonsListRequest: { addons: [tentanasInstance] }, addonDisablePreviewRequest: preview, addonToggleRequest: { ok: true, enabled: false }, ...over }));
+  document.body.innerHTML = '<div id="main"></div>';
+  document.getElementById('main').innerHTML = AddonsScreen.render();
+  await AddonsScreen.mount({});
+  await flush();
+  const toggle = document.querySelector('tf-toggle[data-role="enabled"]');
+  assert.ok(toggle, 'the enable switch is on the card');
+  return toggle;
+}
+
+function switchOff(toggle) {
+  toggle.removeAttribute('checked');
+  toggle.dispatchEvent(new window.CustomEvent('change', { detail: { checked: false }, bubbles: true }));
+}
+
+test('switching TentaNas off shows its real consequences on this node, worded, and nothing is sent until confirmed', async () => {
+  const toggle = await mountList();
+  switchOff(toggle);
+  for (let i = 0; i < 4; i += 1) await flush();
+  const win = [...document.querySelectorAll('tf-window')].at(-1);
+  assert.ok(win, 'the confirmation opened');
+  assert.equal(win._titleEl.textContent, 'Wyłącz TentaNas');
+  const text = win.textContent;
+  assert.match(text, /Skutki na węźle helios:/);
+  assert.match(text, /2 udziały SMB nadal serwują dane/);
+  assert.match(text, /1 udział NFS nadal serwuje dane/);
+  assert.doesNotMatch(text, /\b0 /, 'no zero clause');
+  assert.match(text, /3 harmonogramy .* się zatrzyma/);
+  assert.match(text, /Macierz Elastic pozostaje zamontowana: media/);
+  assert.doesNotMatch(text, /tentanas_|addon_disable\./, 'no raw code and no raw key');
+  assert.ok(!calls.some((c) => c.kind === 'addonToggleRequest'), 'nothing is disabled while the dialog is open');
+
+  win.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'cancel' }, cancelable: true }));
+  for (let i = 0; i < 3; i += 1) await flush();
+  assert.ok(toggle.hasAttribute('checked'), 'dismissed: the switch is back on');
+  assert.ok(!calls.some((c) => c.kind === 'addonToggleRequest'), 'dismissed: nothing sent');
+  AddonsScreen.unmount();
+});
+
+test('confirming the dialog disables the app', async () => {
+  const toggle = await mountList();
+  switchOff(toggle);
+  for (let i = 0; i < 4; i += 1) await flush();
+  const win = [...document.querySelectorAll('tf-window')].at(-1);
+  win.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  for (let i = 0; i < 4; i += 1) await flush();
+  const sent = calls.find((c) => c.kind === 'addonToggleRequest');
+  assert.deepEqual(sent?.payload, { addonId: 'tentanas-1a2b3c4d', enabled: false });
+  AddonsScreen.unmount();
+});
+
+test('an app with nothing to say is switched off without a dialog, as before', async () => {
+  const toggle = await mountList({
+    addonDisablePreviewRequest: { addonId: 'tentanas-1a2b3c4d', displayName: 'TentaNas', nodeName: 'helios', backgroundOnDisable: false, consequences: [] },
+  });
+  document.querySelectorAll('tf-window').forEach((w) => w.remove());
+  switchOff(toggle);
+  for (let i = 0; i < 4; i += 1) await flush();
+  assert.equal(document.querySelectorAll('tf-window').length, 0, 'no dialog');
+  assert.ok(calls.some((c) => c.kind === 'addonToggleRequest'), 'disabled at once');
+  AddonsScreen.unmount();
+});

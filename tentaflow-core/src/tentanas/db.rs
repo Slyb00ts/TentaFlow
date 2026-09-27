@@ -19,6 +19,7 @@ use crate::db::DbPool;
 use std::collections::BTreeMap;
 use tentanas_helper::elastic::{ElasticClaim, ElasticCreateSpec, ElasticDiskSpec, ElasticOwner, ElasticResult};
 use super::jobs::ElasticJobIntent;
+use super::refusal::{require, DiskWords, Refusal};
 
 const APP: &str = "tentanas";
 
@@ -35,6 +36,49 @@ macro_rules! default_elastic_scrub_schedule_json {
         r#"{"every":"monthly","hour":4,"minute":0,"weekday":0,"day":15}"#
     };
 }
+
+/// The English a parked Elastic Sync is stored with (`dispatch` `park`), one
+/// spelling for the park and for migration 23, which gives an older build's
+/// `text:<code>` alert this sentence in place of the code.
+///
+/// FROZEN WITH MIGRATION 23. Both macros are spliced into that migration's SQL,
+/// and a released migration is never edited (see `MIGRATIONS`): changing a
+/// word here would silently change what a fresh install runs, and an
+/// apostrophe would end the SQL string literal it sits in. The park may get a
+/// new sentence only through a NEW constant; the test
+/// `migration_23_sentences_are_frozen` and the const assertion below hold
+/// these two to their released text.
+macro_rules! sync_over_fault_text {
+    () => {
+        "syncs parity over an unrepaired scrub fault: the earlier version of every file deleted or \
+         changed since the previous Sync can no longer be restored from parity; unchanged files \
+         stay repairable"
+    };
+}
+macro_rules! sync_text {
+    () => {
+        "syncs parity with the data disks"
+    };
+}
+pub const SYNC_OVER_FAULT_TEXT: &str = sync_over_fault_text!();
+pub const SYNC_TEXT: &str = sync_text!();
+
+/// Whether `text` can sit inside a single-quoted SQL literal as it is.
+const fn sql_literal_safe(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(
+    sql_literal_safe(SYNC_OVER_FAULT_TEXT) && sql_literal_safe(SYNC_TEXT),
+    "a sentence spliced into migration 23's SQL may not contain an apostrophe"
+);
 
 /// Append-only. A released step is never edited: the runner records applied
 /// versions per file and only executes the ones above the recorded maximum.
@@ -921,6 +965,156 @@ the next reconcile replaces this with the current count'
         ON nas_elastic_operations(array_id) WHERE state = 'running';
     CREATE UNIQUE INDEX nas_elastic_operation_origin
         ON nas_elastic_operations(array_id) WHERE kind IN ('create','import');",
+), (
+    23,
+    // Wave 6: the node's remaining sentences as CODES the screens word in the
+    // reader's language, beside the sentence the log and the tooltip keep
+    // (`tentanas::CodedText`, the pattern migration 21 gave the alerts).
+    //   * `nas_targets.state_reasons` — `targets::target_state`'s detail as
+    //     `NasHealthReason[]` JSON. Old rows keep '[]' until the next apply
+    //     judges them again (every reconcile tick), and their sentence is
+    //     shown as it is meanwhile.
+    //   * `nas_pending_approvals.detail_reasons` — the parked request's
+    //     detail as a code (`tentanas::CodedText`). A row an older build
+    //     parked with `text:<code>` in `detail` (the Elastic Sync) gets that
+    //     code here, so the screens read one form; every other old row keeps
+    //     '[]' and its sentence.
+    //   * `nas_elastic_arrays.state_reasons` — the sentence an array's row
+    //     stores: an operation's error ('operation_failed' {operation}, the
+    //     operation's kind, found by the error it wrote) or the node's own
+    //     "supervision lost" ('supervision_lost'). A stored sentence neither
+    //     rule recognises keeps '[]' and is shown through the id filter.
+    //   * the two constant sentences a config import writes into a target it
+    //     imports disabled are coded as the import codes them now.
+    //   * the ALERT an older build raised with a parked Sync keeps
+    //     `text:<code>` as its detail (the tooltip, the node's-text section):
+    //     it gets the English the park writes now.
+    concat!("ALTER TABLE nas_targets ADD COLUMN state_reasons TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE nas_pending_approvals ADD COLUMN detail_reasons TEXT NOT NULL DEFAULT '[]';
+    ALTER TABLE nas_elastic_arrays ADD COLUMN state_reasons TEXT NOT NULL DEFAULT '[]';
+    UPDATE nas_pending_approvals
+       SET detail_reasons = json_array(json_object('code', substr(detail, 6), 'params', json_object()))
+     WHERE detail IN ('text:elastic_sync', 'text:elastic_sync_over_fault');
+    UPDATE nas_alerts SET detail = CASE detail
+           WHEN 'text:elastic_sync_over_fault' THEN '", sync_over_fault_text!(), "'
+           ELSE '", sync_text!(), "' END
+     WHERE subject_kind = 'approval' AND detail IN ('text:elastic_sync', 'text:elastic_sync_over_fault');
+    UPDATE nas_targets SET state_reasons = '[{\"code\":\"import_secret_needed\",\"params\":{}}]'
+     WHERE state = 'disabled' AND state_reasons = '[]'
+       AND state_detail = 'the authentication secret has to be entered again after an import';
+    UPDATE nas_targets SET state_reasons = '[{\"code\":\"import_all_interfaces\",\"params\":{}}]'
+     WHERE state = 'disabled' AND state_reasons = '[]'
+       AND state_detail = 'this target was exported on every interface (0.0.0.0) — pick an interface of this node before enabling it';
+    UPDATE nas_elastic_arrays SET state_reasons = '[{\"code\":\"supervision_lost\",\"params\":{}}]'
+     WHERE state_detail = 'Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O';
+    UPDATE nas_elastic_arrays
+       SET state_reasons = json_array(json_object('code', 'operation_failed', 'params', json_object('operation',
+           (SELECT o.kind FROM nas_elastic_operations o
+             WHERE o.array_id = nas_elastic_arrays.array_id AND o.error = nas_elastic_arrays.state_detail
+             ORDER BY o.created_at DESC, o.operation_id DESC LIMIT 1))))
+     WHERE state_detail <> '' AND state_reasons = '[]'
+       AND EXISTS (SELECT 1 FROM nas_elastic_operations o
+                    WHERE o.array_id = nas_elastic_arrays.array_id AND o.error = nas_elastic_arrays.state_detail);"),
+), (
+    24,
+    // Wave 8: a share's state detail as codes too (`shares::share_state`),
+    // beside the sentence the log and the tooltip keep. An old row keeps '[]'
+    // until the next apply judges it again, and its sentence is shown as it
+    // is meanwhile.
+    "ALTER TABLE nas_shares ADD COLUMN state_reasons TEXT NOT NULL DEFAULT '[]';",
+), (
+    25,
+    // Wave 9a round 2: the pools this node has seen imported. Only such a
+    // pool is waited for at boot, and alerted when it does not come back
+    // (`disks::pool_import_alerts`): a label left on a disk by a destroyed
+    // pool, or carried in on a foreign disk, is no pool of this node. The
+    // GUID is kept to tell a pool from a later one of the same name; it is
+    // never shown. A destroy or export by TentaNas removes the row.
+    "CREATE TABLE nas_known_pools (
+        name TEXT PRIMARY KEY,
+        guid TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+    );",
+), (
+    26,
+    // Wave 9b: one SMART job over several disks (`smart_test_batch`). Each
+    // disk is a line of its job, in the order the job runs them. The line is
+    // also what keeps a second self-test off a disk the batch is testing:
+    // `insert_job_full` refuses a `smart_test` on a disk whose line is
+    // pending or running in a running job, and a batch marks such a disk
+    // 'refused' in the same transaction that claims the others. `name` is
+    // the kernel name when the job was started, the fallback the screen
+    // shows marked as last-known once the disk has left the inventory.
+    "CREATE TABLE nas_job_disks (
+        job_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        disk_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        state TEXT NOT NULL,
+        progress_pct INTEGER,
+        reasons TEXT NOT NULL DEFAULT '[]',
+        PRIMARY KEY (job_id, position)
+    );
+    CREATE INDEX nas_job_disks_disk ON nas_job_disks(disk_id, state);",
+), (
+    27,
+    // Wave 9b: alert forwarding per organisation. The queue is no longer one
+    // `forwarded_at` mark per row — a node-wide alert now goes to EVERY
+    // organisation's target — but one cursor per target over the rows' own
+    // monotonic keys (`nas_alerts.rowid`: alerts are never deleted;
+    // `nas_access_events.event_id`: AUTOINCREMENT). `target` is the
+    // organisation id, or '' for the node-wide target kept from before.
+    // `enabled_at` is the switch-on the cursor was placed for: forwarding
+    // sends what was raised while it was on, and a target switched on again
+    // starts from that moment instead of replaying the pause.
+    //
+    // The node-wide cursor starts where the old queue stood — after the last
+    // node-wide alert already sent, so nothing is sent twice and nothing
+    // waiting is dropped. `forwarded_at` stays in the schema, unused.
+    "CREATE TABLE nas_forward_cursors (
+        target TEXT PRIMARY KEY,
+        enabled_at TEXT NOT NULL,
+        alert_rowid INTEGER NOT NULL,
+        access_id INTEGER NOT NULL,
+        last_sent_at TEXT,
+        last_error TEXT NOT NULL DEFAULT ''
+    );
+    INSERT INTO nas_forward_cursors (target, enabled_at, alert_rowid, access_id, last_sent_at, last_error)
+    SELECT '', '',
+           COALESCE((SELECT MIN(rowid) - 1 FROM nas_alerts WHERE forwarded_at IS NULL AND org_id IS NULL),
+                    (SELECT MAX(rowid) FROM nas_alerts), 0),
+           COALESCE((SELECT MAX(event_id) FROM nas_access_events), 0),
+           (SELECT value FROM nas_settings WHERE key = 'forward_last_sent_at'),
+           COALESCE((SELECT value FROM nas_settings WHERE key = 'forward_last_error'), '');",
+), (
+    28,
+    // Wave 9b round 2: the access half of a cursor has its own start. A
+    // target that asks for the access lines later receives the lines
+    // collected from then on, not the whole retained log (critic MINOR 1).
+    "ALTER TABLE nas_forward_cursors ADD COLUMN access_enabled_at TEXT NOT NULL DEFAULT '';",
+), (
+    29,
+    // Wave 12 (MAJOR 27, n19): "Opis" per allowlisted initiator, and the
+    // session sampler behind "Ostatnie połączenie" and the session duration.
+    // The kernel keeps no login or connection date anywhere (measured), so
+    // the node records its own sightings: `session_key` is internal (the LIO
+    // Session ID, which increments on every login; nvmet: cntlid@address;
+    // empty for a generated iSCSI session) and never leaves the node.
+    // `target_seen_since` is when recording started: before it there is no
+    // record, and the screen says so instead of "never".
+    "ALTER TABLE nas_target_initiators ADD COLUMN description TEXT NOT NULL DEFAULT '';
+    CREATE TABLE nas_target_initiator_seen (
+        target_id TEXT NOT NULL,
+        initiator TEXT NOT NULL,
+        session_key TEXT NOT NULL,
+        session_since TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        last_address TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (target_id, initiator)
+    ) WITHOUT ROWID;
+    INSERT OR IGNORE INTO nas_settings (key, value, updated_at)
+    VALUES ('target_seen_since', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
 )];
 
 /// The owner migration 20 gives a legacy share, target or account it cannot
@@ -955,6 +1149,68 @@ fn write(pool: &DbPool) -> Result<parking_lot::MutexGuard<'_, Connection>> {
     pool.write().map_err(|e| anyhow!("tentanas db lock: {e}"))
 }
 
+// ----- pools this node has imported -----------------------------------------------
+
+/// Records every pool `zpool list` shows imported (name → GUID). A pool of
+/// the same name with a new GUID replaces the old record. Written only when
+/// something changed, so a pass over unchanged pools is one read.
+pub fn remember_pools(pool: &DbPool, imported: &std::collections::HashMap<String, String>) -> Result<()> {
+    if imported.is_empty() {
+        return Ok(());
+    }
+    let known: std::collections::HashMap<String, String> = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        let mut stmt = conn.prepare_cached("SELECT name, guid FROM nas_known_pools")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let changed: Vec<(&String, &String)> =
+        imported.iter().filter(|(name, guid)| known.get(*name) != Some(*guid)).collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let conn = write(pool)?;
+    let at = now();
+    for (name, guid) in changed {
+        conn.execute(
+            "INSERT INTO nas_known_pools (name, guid, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(name) DO UPDATE SET guid = excluded.guid, last_seen_at = excluded.last_seen_at",
+            params![name, guid, at],
+        )?;
+    }
+    Ok(())
+}
+
+/// The names of the pools this node has seen imported.
+pub fn known_pool_names(pool: &DbPool) -> Result<std::collections::HashSet<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT name FROM nas_known_pools")?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(names)
+}
+
+/// Every known pool (name → GUID), for naming a pool GUID in a log line.
+pub fn known_pools(pool: &DbPool) -> Result<Vec<(String, String)>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT name, guid FROM nas_known_pools")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// TentaNas destroyed or exported the pool: it is meant to be absent, and a
+/// label it left behind is waited for by nobody.
+pub fn forget_pool(pool: &DbPool, name: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute("DELETE FROM nas_known_pools WHERE name = ?1", params![name])?;
+    Ok(())
+}
+
 // ----- settings ---------------------------------------------------------------
 
 pub fn setting(pool: &DbPool, key: &str) -> Result<Option<String>> {
@@ -975,6 +1231,13 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         params![key, value, now()],
     )?;
+    Ok(())
+}
+
+/// Removes a setting; a key that is not there is not an error.
+pub fn delete_setting(pool: &DbPool, key: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute("DELETE FROM nas_settings WHERE key = ?1", params![key])?;
     Ok(())
 }
 
@@ -1410,6 +1673,7 @@ fn alert_owner_sql(kind: &str, subject: &str) -> String {
          WHEN 'elastic-array' THEN COALESCE((SELECT org_id FROM nas_elastic_arrays WHERE name = {subject}), '') \
          WHEN 'approval' THEN COALESCE((SELECT org_id FROM nas_pending_approvals WHERE request_id = {subject}), '') \
          WHEN 'target' THEN COALESCE((SELECT org_id FROM nas_targets WHERE name = {subject}), '') \
+         WHEN 'share' THEN COALESCE((SELECT org_id FROM nas_shares WHERE name = {subject}), '') \
          END"
     )
 }
@@ -1638,6 +1902,20 @@ pub fn open_alert_severity(pool: &DbPool, dedupe_key: &str) -> Result<Option<Str
         .optional()?)
 }
 
+/// When the OPEN alert under `dedupe_key` was raised, `None` when none is
+/// open. A target's portal drift says since when the address has been
+/// elsewhere from it (N19b).
+pub fn open_alert_raised_at(pool: &DbPool, dedupe_key: &str) -> Result<Option<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT raised_at FROM nas_alerts WHERE dedupe_key = ?1 AND resolved_at IS NULL",
+            params![dedupe_key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
 pub fn ack_alert(pool: &DbPool, alert_id: &str) -> Result<bool> {
     let conn = write(pool)?;
     let n = conn.execute(
@@ -1766,6 +2044,7 @@ fn job_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<NasJob> {
         // Stored subjects are what the job was spawned on; whether a shown
         // name is only remembered is decided on the way out (`name_jobs`).
         subject_last_known: false,
+        disks: Vec::new(),
     })
 }
 
@@ -1905,6 +2184,23 @@ macro_rules! unresolved_elastic_operation {
 }
 const UNRESOLVED_ELASTIC_OPERATION: &str =
     unresolved_elastic_operation!("'sync','scrub','mover','fix','add_disk','replace_disk'");
+/// Whether the array's CREATE has not brought it to life (`?1` the array
+/// id): the create operation is still running, or closed without success,
+/// and no Restore has succeeded after it. An adopted array (`import`) is
+/// complete by definition, and so is one whose failed create a Restore
+/// finished.
+///
+/// WHY the scheduler needs this and the admission does not have it: a
+/// failed create closes `needs_attention` (`finish_elastic_operation`), and
+/// `parity_admission` admits a Sync or a Scrub on `needs_attention` — rightly,
+/// for a failed parity run, which is what they settle. On a half-made array
+/// the default scrub (written with the array row) would run all the same.
+const CREATION_UNFINISHED: &str = "EXISTS(SELECT 1 FROM nas_elastic_operations c
+    WHERE c.array_id = ?1 AND c.kind = 'create' AND c.state <> 'succeeded'
+      AND NOT EXISTS(SELECT 1 FROM nas_elastic_operations r
+          WHERE r.array_id = c.array_id AND r.kind = 'restore' AND r.state = 'succeeded'
+            AND (r.created_at, r.operation_id) > (c.created_at, c.operation_id)))";
+
 /// The same, for every kind but the mover's own runs.
 const UNRESOLVED_NON_MOVER_OPERATION: &str =
     unresolved_elastic_operation!("'sync','scrub','fix','add_disk','replace_disk'");
@@ -2015,6 +2311,41 @@ pub fn insert_job_owned(
     intent: Option<&ElasticJobIntent>,
     owner: Option<&str>,
 ) -> Result<()> {
+    insert_job_full(pool, job, intent, owner, &[])
+}
+
+/// Whether a SMART self-test runs on this disk now: a `smart_test` job on it,
+/// or its line in a multi-disk job that has not finished with it yet. A
+/// second self-test would ABORT the first (see `insert_job_full`).
+fn self_test_running_on(conn: &Connection, disk_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM nas_jobs
+                        WHERE kind = 'smart_test' AND subject = ?1 AND status = 'running')
+             OR EXISTS(SELECT 1 FROM nas_job_disks d JOIN nas_jobs j ON j.job_id = d.job_id
+                        WHERE d.disk_id = ?1 AND j.status = 'running'
+                          AND d.state IN ('pending', 'running'))",
+        params![disk_id],
+        |r| r.get(0),
+    )?)
+}
+
+/// `insert_job_owned` plus the disk lines of a multi-disk job
+/// (`smart_test_batch`, migration 26): `disks` is `(disk_id, kernel name)` in
+/// the order the job will run them. A disk a self-test already runs on is
+/// written 'refused' with the code `self_test_running`, in the SAME
+/// transaction that claims the others — so two batches, or a batch and a
+/// single test, can never both start a test on one disk.
+pub fn insert_job_full(
+    pool: &DbPool,
+    job: &NasJob,
+    intent: Option<&ElasticJobIntent>,
+    owner: Option<&str>,
+    disks: &[(String, String)],
+) -> Result<()> {
+    // Lines belong to a multi-disk SMART job (one per disk) and to the two
+    // step jobs of the sharing stop and resume (one per step, wave 10).
+    anyhow::ensure!(disks.is_empty() || job.kind == SMART_BATCH_KIND || super::sharing::is_step_kind(&job.kind),
+        "Linie dysków ma tylko zadanie {SMART_BATCH_KIND}");
     anyhow::ensure!(owner.is_none() || !job.kind.starts_with("elastic_"),
         "Zadanie Elastic należy do organizacji swojej macierzy; jawny właściciel jest odrzucany");
     anyhow::ensure!(owner.is_none_or(|org| !org.is_empty()),
@@ -2024,7 +2355,7 @@ pub fn insert_job_owned(
     if intent.is_some() {
         let closing:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_settings WHERE key='elastic_teardown_started')",
             [],|r| r.get(0))?;
-        anyhow::ensure!(!closing,"Rozpoczęto usuwanie instancji; odmowa nowej intencji Elastic");
+        require(!closing, elastic_teardown_refusal)?;
     }
     // A second self-test on a disk that is already running one would ABORT the
     // first (ATA, SPC and NVMe all behave this way), and the long test spans
@@ -2034,14 +2365,10 @@ pub fn insert_job_owned(
     // transaction, and only here are the check and the insert one atomic step.
     // Scoped to `smart_test` because no other kind serialises on its subject
     // this way — a pool takes two scrubs, a dataset two snapshots.
+    // A multi-disk job's line counts as well (`self_test_running_on`).
     if job.kind == "smart_test" {
-        let running: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM nas_jobs
-             WHERE kind = 'smart_test' AND subject = ?1 AND status = 'running')",
-            params![job.subject],
-            |r| r.get(0),
-        )?;
-        anyhow::ensure!(!running, "Na tym dysku trwa już autotest SMART; odmowa drugiego");
+        anyhow::ensure!(!self_test_running_on(&tx, &job.subject)?,
+            "Na tym dysku trwa już autotest SMART; odmowa drugiego");
     }
     tx.execute(
         "INSERT INTO nas_jobs (job_id, kind, subject, status, progress_pct, started_by,
@@ -2059,12 +2386,29 @@ pub fn insert_job_owned(
             owner
         ],
     )?;
+    for (position, (disk_id, name)) in disks.iter().enumerate() {
+        // A batch line with no name is a disk the node never knew (critic
+        // wave 9b, MINOR 12): refused as such, never tested, never counted
+        // as a running self-test.
+        let (state, reasons) = if job.kind == SMART_BATCH_KIND && name.is_empty() {
+            ("refused", vec![super::disks::coded_reason("disk_unknown", &[])])
+        } else if job.kind == SMART_BATCH_KIND && self_test_running_on(&tx, disk_id)? {
+            ("refused", vec![super::disks::coded_reason("self_test_running", &[])])
+        } else {
+            ("pending", Vec::new())
+        };
+        tx.execute(
+            "INSERT INTO nas_job_disks (job_id, position, disk_id, name, state, reasons)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![job.job_id, position as i64, disk_id, name, state, serde_json::to_string(&reasons)?],
+        )?;
+    }
     if let Some(intent) = intent {
         let (array_id, operation_id, kind, request) = match intent {
             ElasticJobIntent::Create(spec) => {
                 spec.validate()?;
                 anyhow::ensure!(job.kind == "elastic_create" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji create");
+                    "the job does not match the create intent");
                 tx.execute("INSERT INTO nas_elastic_arrays
                     (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at)
                     VALUES (?1,?2,?3,?4,?5,'creating','',?6,?6)",
@@ -2079,9 +2423,9 @@ pub fn insert_job_owned(
             ElasticJobIntent::Restore { owner, array_id, operation_id } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_restore" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji restore");
+                    "the job does not match the restore intent");
                 anyhow::ensure!(uuid::Uuid::parse_str(operation_id)?.to_string() == *operation_id,
-                    "Niekanoniczny identyfikator operacji");
+                    "the operation id is not canonical");
                 (array_id, operation_id, "restore", serde_json::to_string(&tentanas_helper::HelperCommand::ElasticRestore {
                     array_id: array_id.clone(), owner: owner.clone() })?)
             }
@@ -2089,18 +2433,20 @@ pub fn insert_job_owned(
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 let action = super::elastic::snapraid_kind(kind);
                 anyhow::ensure!(job.kind == format!("elastic_{action}") && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji SnapRAID");
-                anyhow::ensure!(!spec.parity.is_empty(), "Macierz bez parity nie wykonuje SnapRAID");
+                    "the job does not match the SnapRAID intent");
+                require(!spec.parity.is_empty(), || {
+                    Refusal::not_available("elastic_no_parity", "The array has no parity, so SnapRAID has nothing to check or write")
+                })?;
                 if let Some(disk) = super::elastic::snapraid_disk(kind) {
                     // The repair's disk is checked against the array HERE, in
                     // the transaction that reserves the operation: a row that
                     // could only ever produce a refusal must not be written,
                     // and the helper's own refusal would arrive as a failed job
                     // with no sentence the admin can act on.
-                    anyhow::ensure!(
+                    require(
                         spec.data.iter().enumerate().any(|(index, _)|
                             tentanas_helper::elastic::data_branch_name(index + 1) == disk),
-                        "Macierz nie ma dysku danych '{disk}'");
+                        || no_such_data_disk(disk))?;
                 }
                 let state: String = tx.query_row("SELECT state FROM nas_elastic_arrays WHERE array_id=?1",
                     params![array_id], |r| r.get(0))?;
@@ -2113,7 +2459,7 @@ pub fn insert_job_owned(
                 // refusing the repair here would make the unresolved operation
                 // permanent and the array unrepairable through the product.
                 let _ = unresolved;
-                anyhow::ensure!(
+                require(
                     if super::elastic::snapraid_disk(kind).is_some() {
                         matches!(state.as_str(), "active" | "needs_attention")
                     } else {
@@ -2122,13 +2468,13 @@ pub fn insert_job_owned(
                         // array such a run left behind (`parity_admission`).
                         parity_admission(&tx, array_id, &state)?
                     },
-                    "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                    elastic_unresolved_refusal)?;
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
                 // Only a Sync may carry the acknowledgement; a Scrub or a Fix
                 // that claimed one would be a request the helper never reads.
                 anyhow::ensure!(
                     acknowledge_parity_fault.is_none() || *kind == tentanas_helper::elastic::ElasticSnapraidKind::Sync,
-                    "Potwierdzenie błędu parity dotyczy tylko Sync"
+                    "only a Sync carries a parity fault acknowledgement"
                 );
                 if let Some(fault) = acknowledge_parity_fault {
                     tentanas_helper::elastic::validate_elastic_uuid(fault)?;
@@ -2145,7 +2491,7 @@ pub fn insert_job_owned(
             ElasticJobIntent::AddDisk { owner, array_id, operation_id, disk } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_add_disk" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji dodania dysku");
+                    "the job does not match the disk add intent");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
                 // The array the add would PRODUCE has to be a legal array: the
                 // 32-device ceiling and the identity uniqueness are checked on
@@ -2170,13 +2516,13 @@ pub fn insert_job_owned(
                 // anything, so repeating the command is what finishes the work
                 // — and refusing it here would leave a disk half-joined with no
                 // way through the product to either finish or undo it.
-                anyhow::ensure!(
+                require(
                     if retry {
                         matches!(state.as_str(), "active" | "needs_attention")
                     } else {
                         state == "active" && !unresolved
                     },
-                    "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                    elastic_unresolved_refusal)?;
                 // The attempt this one resumes keeps holding the array until
                 // the resume SUCCEEDS (`finish_elastic_add_disk`): a resume
                 // the helper refuses must leave the add pinned, or the disk
@@ -2196,14 +2542,22 @@ pub fn insert_job_owned(
             ElasticJobIntent::AddDiskAbort { owner, array_id, operation_id, disk } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_add_disk_abort" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji wycofania dodania dysku");
+                    "the job does not match the disk add undo intent");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
-                anyhow::ensure!(pinned_add(&tx, array_id)?.as_ref() == Some(disk),
-                    "Macierz nie ma niedokończonego dodania tego dysku");
+                require(pinned_add(&tx, array_id)?.as_ref() == Some(disk), || {
+                    Refusal::not_available(
+                        "elastic_nothing_to_undo",
+                        "The array has no unfinished add of this disk; there is nothing to undo",
+                    )
+                })?;
                 let state: String = tx.query_row("SELECT state FROM nas_elastic_arrays WHERE array_id=?1",
                     params![array_id], |r| r.get(0))?;
-                anyhow::ensure!(matches!(state.as_str(), "active" | "needs_attention"),
-                    "Wycofanie dodania dysku wymaga macierzy aktywnej albo wymagającej uwagi");
+                require(matches!(state.as_str(), "active" | "needs_attention"), || {
+                    Refusal::not_available(
+                        "elastic_array_not_ready",
+                        "The array has to be enabled and active, or need attention",
+                    )
+                })?;
                 let command = super::elastic::add_disk_abort_command(owner, array_id, operation_id, disk);
                 (array_id, operation_id, "add_disk_abort", serde_json::to_string(&command)?)
             }
@@ -2219,14 +2573,12 @@ pub fn insert_job_owned(
             // `dispatch::tentanas::elastic_replace_disk` carries the list of
             // what that task still has to solve.
             ElasticJobIntent::ReplaceDisk { .. } => {
-                anyhow::bail!(
-                    "Wymiana dysku nie jest udostępniona w tej wersji; operacja nie została otwarta"
-                );
+                return Err(replace_withdrawn_refusal().into());
             }
             ElasticJobIntent::Dissolve { owner, array_id, operation_id } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_destroy" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji rozwiązania");
+                    "the job does not match the dissolve intent");
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
                 let command = super::elastic::dissolve_command(owner, array_id, operation_id);
                 (array_id, operation_id, "dissolve", serde_json::to_string(&command)?)
@@ -2234,7 +2586,7 @@ pub fn insert_job_owned(
             ElasticJobIntent::Mover { owner, array_id, operation_id, resume_operation_id, rules, coupled_sync } => {
                 let spec = elastic_spec(&tx, owner, array_id)?;
                 anyhow::ensure!(job.kind == "elastic_mover" && job.subject == spec.name,
-                    "Zadanie nie odpowiada intencji movera");
+                    "the job does not match the mover intent");
                 // DELIBERATELY no parity guard, unlike SnapRAID: moving files
                 // off the cache is worth doing on an array with no parity at
                 // all, and the helper simply skips the coupled sync there.
@@ -2246,7 +2598,7 @@ pub fn insert_job_owned(
                 // sync on top of that unknown. An unresolved MOVER does not: the
                 // next run is what finishes or reverses what it left.
                 let (admitted, _) = mover_admission(&tx, array_id, &state)?;
-                anyhow::ensure!(admitted, "Macierz ma niepotwierdzoną operację; brak ponowienia");
+                require(admitted, elastic_unresolved_refusal)?;
                 tentanas_helper::elastic::validate_elastic_uuid(operation_id)?;
                 tentanas_helper::elastic::validate_elastic_uuid(resume_operation_id)?;
                 // The same distinctness `validate_observation` demands of the
@@ -2254,13 +2606,13 @@ pub fn insert_job_owned(
                 // produce a refused answer never reaches the journal.
                 anyhow::ensure!(resume_operation_id != operation_id
                     && *resume_operation_id != spec.operation_id && *operation_id != spec.operation_id,
-                    "Resume movera musi mieć osobną operację");
+                    "a mover resume needs an operation of its own");
                 let command = super::elastic::mover_command(owner, array_id, operation_id,
                     resume_operation_id, rules, *coupled_sync);
                 (array_id, operation_id, "mover", serde_json::to_string(&command)?)
             }
         };
-        anyhow::ensure!(request.len() < 16 * 1024, "Intencja Elastic przekracza limit");
+        anyhow::ensure!(request.len() < 16 * 1024, "the Elastic intent exceeds its size limit");
         tx.execute("INSERT INTO nas_elastic_operations
             (operation_id,array_id,job_id,kind,state,request_json,error,created_at)
             VALUES (?1,?2,?3,?4,'running',?5,'',?6)",
@@ -2269,6 +2621,83 @@ pub fn insert_job_owned(
     // After the intent: a create's array row is written above, in this tx.
     stamp_elastic_job_org(&tx, &job.job_id, &job.kind, &job.subject)?;
     tx.commit()?;
+    Ok(())
+}
+
+/// The job kind of one SMART self-test run over several disks.
+pub const SMART_BATCH_KIND: &str = "smart_test_batch";
+
+/// A multi-disk SMART job's subject: `<short|long>|all` for the scheduled
+/// run over every disk (n15 "SMART short — wszystkie"), `<short|long>|<kernel
+/// names>` for a chosen set. The screen words the test kind and "all"; the
+/// names are rebuilt from the job's lines when it is shown.
+pub fn smart_batch_subject(long: bool, names: Option<&[String]>) -> String {
+    let kind = if long { "long" } else { "short" };
+    match names {
+        None => format!("{kind}|all"),
+        Some(names) => format!("{kind}|{}", names.join(", ")),
+    }
+}
+
+/// Whether a self-test runs on this disk now (see `self_test_running_on`).
+/// A read, on the read connection (critic R4): the scheduler asks it once per
+/// disk per pass, and the claim itself stays in `insert_job_full`'s write
+/// transaction.
+pub fn self_test_busy(pool: &DbPool, disk_id: &str) -> Result<bool> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    self_test_running_on(&conn, disk_id)
+}
+
+/// One disk line of a multi-disk job as stored (migration 26). `disk_id` is
+/// the node's key for the disk and never leaves it; the screen gets a name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobDiskRow {
+    pub position: i64,
+    pub disk_id: String,
+    pub name: String,
+    pub state: String,
+    pub progress_pct: Option<u8>,
+    pub reasons: Vec<NasHealthReason>,
+}
+
+/// The disk lines of one job, in run order. Empty for every other kind.
+pub fn job_disks(pool: &DbPool, job_id: &str) -> Result<Vec<JobDiskRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT position, disk_id, name, state, progress_pct, reasons
+           FROM nas_job_disks WHERE job_id = ?1 ORDER BY position",
+    )?;
+    let rows = stmt
+        .query_map(params![job_id], |r| {
+            let reasons: String = r.get(5)?;
+            Ok(JobDiskRow {
+                position: r.get(0)?,
+                disk_id: r.get(1)?,
+                name: r.get(2)?,
+                state: r.get(3)?,
+                progress_pct: r.get::<_, Option<i64>>(4)?.map(|v| v.clamp(0, 100) as u8),
+                reasons: serde_json::from_str(&reasons).unwrap_or_default(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Moves one line of a multi-disk job on.
+pub fn set_job_disk(
+    pool: &DbPool,
+    job_id: &str,
+    position: i64,
+    state: &str,
+    progress_pct: Option<u8>,
+    reasons: &[NasHealthReason],
+) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_job_disks SET state = ?3, progress_pct = ?4, reasons = ?5
+          WHERE job_id = ?1 AND position = ?2",
+        params![job_id, position, state, progress_pct.map(i64::from), serde_json::to_string(reasons)?],
+    )?;
     Ok(())
 }
 
@@ -2425,15 +2854,20 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
         if update_array {
             anyhow::ensure!(
                 tx.execute(
-                    "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4
-                WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                    &format!(
+                        "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4,
+                         state_reasons={}
+                         WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                        stored_state_reasons_sql("?3", "(SELECT kind FROM nas_elastic_operations WHERE operation_id=?7)")
+                    ),
                     params![
                         spec.array_id,
                         array_state,
                         final_error.as_deref().unwrap_or(""),
                         at,
                         spec.owner.org_id,
-                        spec.owner.addon_id
+                        spec.owner.addon_id,
+                        operation_id
                     ]
                 )? == 1,
                 "Utracono macierz operacji SnapRAID"
@@ -2498,15 +2932,20 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
         if let Some(array_state) = array_state {
             anyhow::ensure!(
                 tx.execute(
-                    "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4
-                WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                    &format!(
+                        "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4,
+                         state_reasons={}
+                         WHERE array_id=?1 AND org_id=?5 AND addon_id=?6",
+                        stored_state_reasons_sql("?3", "(SELECT kind FROM nas_elastic_operations WHERE operation_id=?7)")
+                    ),
                     params![
                         spec.array_id,
                         array_state,
                         final_error.as_deref().unwrap_or(""),
                         at,
                         spec.owner.org_id,
-                        spec.owner.addon_id
+                        spec.owner.addon_id,
+                        operation_id
                     ]
                 )? == 1,
                 "Utracono macierz operacji movera"
@@ -2830,12 +3269,21 @@ pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
     // exposure and the "short-lived self-test job" follow-up on this function.
     for job_id in candidates.into_iter().filter(|id| !running.contains_key(id)) {
         tx.execute("UPDATE nas_elastic_arrays SET state='needs_attention',
-        state_detail='Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O', updated_at=?1
+        state_detail='Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O', updated_at=?1,
+        state_reasons='[{\"code\":\"supervision_lost\",\"params\":{}}]'
         WHERE array_id IN (SELECT array_id FROM nas_elastic_operations WHERE state='running' AND job_id=?2)",
         params![now(),job_id])?;
         tx.execute("UPDATE nas_elastic_operations SET state='needs_attention',
         error=?3, finished_at=?1
         WHERE state='running' AND job_id=?2", params![now(),job_id,ORPHANED_OPERATION_ERROR])?;
+        // A multi-disk job's unfinished lines end with it: nothing follows
+        // those disks any more, and a line left 'running' would keep refusing
+        // every later self-test on its disk (`self_test_running_on`).
+        tx.execute(
+            "UPDATE nas_job_disks SET state = 'interrupted'
+              WHERE job_id = ?1 AND state IN ('pending', 'running')",
+            params![job_id],
+        )?;
         changed += tx.execute(
         "UPDATE nas_jobs SET status = 'failed', error = 'interrupted by core restart',
                 finished_at = ?1
@@ -2907,10 +3355,11 @@ fn elastic_spec(conn: &Connection, owner: &ElasticOwner, array_id: &str) -> Resu
 
 pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::elastic::ElasticArrayRow>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    let headers = conn.prepare("SELECT array_id,state,state_detail,created_at,updated_at
+    let headers = conn.prepare("SELECT array_id,state,state_detail,created_at,updated_at,state_reasons
         FROM nas_elastic_arrays WHERE org_id=?1 AND addon_id=?2 ORDER BY name")?
         .query_map(params![owner.org_id,owner.addon_id], |r| Ok((r.get::<_,String>(0)?,
-            r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?)))?
+            r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,
+            r.get::<_,String>(5)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     // The parity-errors count is read from a DATE window, never from the tail
     // of the short display history: a run with errors that is still inside the
@@ -2920,7 +3369,10 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
     let parity_since = (chrono::Utc::now()
         - chrono::Duration::days(i64::from(super::elastic::PARITY_ERRORS_WINDOW_DAYS) + 1))
     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    headers.into_iter().map(|(array_id,state,state_detail,created_at,updated_at)| {
+    headers.into_iter().map(|(array_id,state,state_detail,created_at,updated_at,state_reasons)| {
+        // A column that does not read as codes is no codes: the sentence is
+        // still there, and the screen shows it through the id filter.
+        let state_reasons: Vec<NasHealthReason> = serde_json::from_str(&state_reasons).unwrap_or_default();
         let spec = elastic_spec(&conn, owner, &array_id)?;
         // The folders are DISCOVERED, not stored: the union is published on
         // the host, so its real top level is one unprivileged `read_dir` away,
@@ -2965,6 +3417,9 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
             unresolved_operation: conn.query_row(
                 &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
                 params![array_id], |r| r.get(0))?,
+            creation_unfinished: conn.query_row(
+                &format!("SELECT {CREATION_UNFINISHED}"),
+                params![array_id], |r| r.get(0))?,
             mover_settles_unresolved: mover_admission(&conn, &array_id, &state)?.1,
             // What the button on the screen may offer: a Sync or a Scrub is
             // admitted on the array a failed parity run left behind, and the UI
@@ -2972,7 +3427,7 @@ pub fn elastic_arrays(pool: &DbPool, owner: &ElasticOwner) -> Result<Vec<super::
             parity_run_available: parity_admission(&conn, &array_id, &state)?,
             mover_failed_runs: mover_failed_runs(&conn, &array_id)?,
             pending_add: pinned_add(&conn, &array_id)?,
-            create_spec: Some(spec), state, state_detail, created_at, updated_at,
+            create_spec: Some(spec), state, state_detail, state_reasons, created_at, updated_at,
             ..Default::default()
         })
     }).collect()
@@ -3238,6 +3693,25 @@ pub fn elastic_array_names_of_org(pool: &DbPool, org_id: &str) -> Result<std::co
     Ok(names)
 }
 
+/// Every organisation that owns something on this node: an Elastic Array, a
+/// share or a block target. The set the sole-organisation rule for rows
+/// whose owner is gone is judged against (dispatch `org_viewer`, owner
+/// decision 2026-09-26). A ZFS pool has no owner record — `zpool create`
+/// runs node-wide — so it counts for nobody. A failed read is an error,
+/// never an empty set: an empty set would make the asker "the only one".
+pub fn orgs_with_resources(pool: &DbPool) -> Result<std::collections::BTreeSet<String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT org_id FROM nas_elastic_arrays WHERE org_id <> ''
+         UNION SELECT org_id FROM nas_shares WHERE org_id <> ''
+         UNION SELECT org_id FROM nas_targets WHERE org_id <> ''",
+    )?;
+    let orgs = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
+    Ok(orgs)
+}
+
 pub fn elastic_claims(pool: &DbPool) -> Result<Vec<ElasticClaim>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
     let rows = conn.prepare("SELECT array_id,org_id,addon_id FROM nas_elastic_arrays ORDER BY array_id")?
@@ -3260,12 +3734,77 @@ pub fn elastic_claims(pool: &DbPool) -> Result<Vec<ElasticClaim>> {
 /// inventory has it, else its place in the array ("danych 2") — never its
 /// disk id, WWN or serial (owner's rule: no ids in the GUI, and a refusal is
 /// a toast).
-fn member_words(role: &str, slot: i64, disk: &ElasticDiskSpec) -> String {
-    super::disks::disk_name(&disk.disk_id).unwrap_or_else(|| match role {
-        "data" => format!("danych {slot}"),
-        "parity" => format!("parity {slot}"),
-        _ => "cache".to_string(),
-    })
+fn member_words(role: &str, slot: i64, disk: &ElasticDiskSpec) -> DiskWords {
+    if let Some(name) = super::disks::disk_name(&disk.disk_id) {
+        return DiskWords::Kernel(name);
+    }
+    let slot = usize::try_from(slot).unwrap_or_default();
+    match role {
+        "data" => DiskWords::Data(slot),
+        "parity" => DiskWords::Parity(slot),
+        _ => DiskWords::Cache,
+    }
+}
+
+// ----- the Elastic refusals the admin reads (wave 13, `super::refusal`) --------
+
+/// The instance is being uninstalled: no new Elastic operation, no adoption.
+pub(crate) fn elastic_teardown_refusal() -> Refusal {
+    Refusal::not_available(
+        "elastic_teardown_started",
+        "This instance is being uninstalled; no new Elastic Array operation is started",
+    )
+}
+
+/// An operation of the array is still unresolved, and this one would start
+/// on top of it.
+pub(crate) fn elastic_unresolved_refusal() -> Refusal {
+    Refusal::not_available(
+        "elastic_operation_unresolved",
+        "The array has an unresolved operation; resolve it before starting another",
+    )
+}
+
+/// The array the request names is already recorded in this instance.
+pub(crate) fn elastic_already_adopted() -> Refusal {
+    Refusal::conflict("elastic_already_adopted", "This array is already recorded in this instance")
+}
+
+/// Disk replacement is withdrawn (round 4, owner's decision).
+pub(crate) fn replace_withdrawn_refusal() -> Refusal {
+    Refusal::not_available(
+        "elastic_replace_withdrawn",
+        "Disk replacement is not available in this version; no operation was opened",
+    )
+}
+
+/// A repair named a data slot (`d3`) the array does not have — named by its
+/// number, never by the slot key.
+pub(crate) fn no_such_data_disk(slot: &str) -> Refusal {
+    let words = match DiskWords::member(slot, "") {
+        words @ DiskWords::Data(_) => words,
+        _ => DiskWords::Unnamed,
+    };
+    let text = match &words {
+        DiskWords::Data(_) => format!("The array has no {}", words.english()),
+        _ => "The array has no such data disk".to_string(),
+    };
+    Refusal::bad_request("elastic_no_such_data_disk", text).disk(words)
+}
+
+/// How a refusal names a disk by its id: the live kernel name, else the
+/// model this node last saw it with. Never the id.
+fn refusal_disk_words(conn: &Connection, disk_id: &str) -> DiskWords {
+    if let Some(name) = super::disks::disk_name(disk_id) {
+        return DiskWords::Kernel(name);
+    }
+    conn.query_row("SELECT model FROM nas_disks WHERE disk_id=?1", params![disk_id], |r| r.get::<_, String>(0))
+        .optional()
+        .ok()
+        .flatten()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .map_or(DiskWords::Unnamed, DiskWords::Model)
 }
 
 fn elastic_disk_slots(spec: &ElasticCreateSpec) -> Result<Vec<(&'static str, i64, &ElasticDiskSpec)>> {
@@ -3318,9 +3857,17 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
         params![disk.disk_id, disk.expected_uuid],
         |r| r.get(0),
     )?;
-    // Named by its kernel name while the inventory has it, never by its id.
-    let words = super::disks::disk_name(&disk.disk_id).map_or_else(|| "Ten dysk".to_string(), |name| format!("Dysk {name}"));
-    anyhow::ensure!(!claimed, "{words} należy już do macierzy tej instancji");
+    // Named by its kernel name while the inventory has it, else by its
+    // model — never by its id. No array is named: it may be another
+    // organisation's.
+    let words = refusal_disk_words(tx, &disk.disk_id);
+    require(!claimed, || {
+        Refusal::conflict(
+            "elastic_disk_member",
+            format!("{} already belongs to an Elastic Array of this instance", words.english()),
+        )
+        .disk(words.clone())
+    })?;
     for value in [
         Some(disk.disk_id.as_str()),
         disk.wwn.as_deref(),
@@ -3334,10 +3881,16 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
             params![value],
             |r| r.get(0),
         )?;
-        anyhow::ensure!(
-            !reserved,
-            "{words} jest już zarezerwowany przez macierz tej instancji (po WWN lub numerze seryjnym)"
-        );
+        require(!reserved, || {
+            Refusal::conflict(
+                "elastic_disk_reserved",
+                format!(
+                    "{} is already reserved by an Elastic Array of this instance (by its WWN or serial number)",
+                    words.english()
+                ),
+            )
+            .disk(words.clone())
+        })?;
     }
     // Another add of this array that stopped part-way holds the slot and —
     // more importantly — the filesystem UUID its mkfs was given. A retry has
@@ -3358,16 +3911,37 @@ fn reserve_added_disk(tx: &Connection, array_id: &str, disk: &ElasticDiskSpec) -
     // over the same slot: the disk ends up joined to the live union with no
     // member row, because the loser's `finish_elastic_add_disk` finds no
     // running operation of its own. Wait for the verdict instead.
-    anyhow::ensure!(
-        state != "running",
-        "Dodanie dysku {} do tej macierzy jest w toku; poczekaj na jego wynik",
-        held.disk_id
-    );
-    anyhow::ensure!(
-        held == *disk,
-        "Poprzednie dodanie dysku {} nie zostało zakończone; powtórz je tym samym dyskiem",
-        held.disk_id
-    );
+    // The disk that add holds is named by its kernel name, else by the data
+    // slot it takes (the next one), else by its model.
+    let held_words = || -> Result<DiskWords> {
+        if let Some(name) = super::disks::disk_name(&held.disk_id) {
+            return Ok(DiskWords::Kernel(name));
+        }
+        let next: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(slot),0)+1 FROM nas_elastic_disks WHERE array_id=?1 AND role='data'",
+            params![array_id],
+            |r| r.get(0),
+        )?;
+        Ok(usize::try_from(next).map_or_else(|_| refusal_disk_words(tx, &held.disk_id), DiskWords::Data))
+    };
+    if state == "running" {
+        let words = held_words()?;
+        return Err(Refusal::not_available(
+            "elastic_add_running",
+            format!("Adding {} to this array is in progress; wait for its result", words.english()),
+        )
+        .disk(words)
+        .into());
+    }
+    if held != *disk {
+        let words = held_words()?;
+        return Err(Refusal::not_available(
+            "elastic_add_other_unfinished",
+            format!("The earlier add of {} has not finished; repeat it with the same disk", words.english()),
+        )
+        .disk(words)
+        .into());
+    }
     Ok(true)
 }
 
@@ -3552,7 +4126,7 @@ pub fn finish_elastic_replace_disk(
         params![operation_id, serde_json::to_string(observed)?, at],
     )?;
     tx.execute(
-        "UPDATE nas_elastic_arrays SET state='active',state_detail='',updated_at=?2
+        "UPDATE nas_elastic_arrays SET state='active',state_detail='',state_reasons='[]',updated_at=?2
          WHERE array_id=?1",
         params![array_id, at],
     )?;
@@ -3661,7 +4235,7 @@ pub fn settle_undone_add(
     )?;
     if observed.stage == tentanas_helper::elastic::ElasticStage::Ready && !unresolved {
         tx.execute(
-            "UPDATE nas_elastic_arrays SET state='active',state_detail='',updated_at=?2 WHERE array_id=?1",
+            "UPDATE nas_elastic_arrays SET state='active',state_detail='',state_reasons='[]',updated_at=?2 WHERE array_id=?1",
             params![array_id, at],
         )?;
     }
@@ -3710,7 +4284,10 @@ pub fn finish_elastic_add_disk_abort(
     )?;
     let ready = observed.stage == tentanas_helper::elastic::ElasticStage::Ready && !unresolved;
     tx.execute(
-        "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4 WHERE array_id=?1",
+        &format!(
+            "UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4,state_reasons={} WHERE array_id=?1",
+            stored_state_reasons_sql("?3", "'add_disk_abort'")
+        ),
         params![
             array_id,
             if ready { "active" } else { "needs_attention" },
@@ -3809,7 +4386,7 @@ pub fn finish_elastic_add_disk(
         params![operation_id, serde_json::to_string(observed)?, at],
     )?;
     tx.execute(
-        "UPDATE nas_elastic_arrays SET state='active',state_detail='',updated_at=?2
+        "UPDATE nas_elastic_arrays SET state='active',state_detail='',state_reasons='[]',updated_at=?2
          WHERE array_id=?1",
         params![array_id, at],
     )?;
@@ -3853,6 +4430,8 @@ pub fn delete_elastic_array(pool: &DbPool, owner: &ElasticOwner, array_id: &str)
         "DELETE FROM nas_elastic_mover_settings WHERE array_id=?1",
         "DELETE FROM nas_elastic_folder_cache WHERE array_id=?1",
         "DELETE FROM nas_elastic_operations WHERE array_id=?1",
+        // The folder-usage reading kept across restarts (`elastic::FolderUsageCache`).
+        "DELETE FROM nas_settings WHERE key = 'folder_usage:' || ?1",
     ] {
         tx.execute(statement, params![array_id])?;
     }
@@ -3913,27 +4492,43 @@ pub fn elastic_import(pool: &DbPool, spec: &ElasticCreateSpec, started_by: &str)
     let closing: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM nas_settings WHERE key='elastic_teardown_started')",
         [], |r| r.get(0))?;
-    anyhow::ensure!(!closing, "Rozpoczęto usuwanie instancji; odmowa adopcji macierzy");
+    require(!closing, elastic_teardown_refusal)?;
     let known: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays WHERE array_id=?1)",
         params![spec.array_id], |r| r.get(0))?;
-    anyhow::ensure!(!known, "Ta macierz jest już zapisana w tej instancji");
+    require(!known, elastic_already_adopted)?;
     let name_taken: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays WHERE name=?1)",
         params![spec.name], |r| r.get(0))?;
-    anyhow::ensure!(!name_taken, "Nazwa macierzy jest już zajęta w tej instancji");
+    require(!name_taken, || {
+        Refusal::conflict("elastic_name_taken", format!("The array name {} is already taken in this instance", spec.name))
+            .param("array", &spec.name)
+    })?;
     for (role, slot, disk) in elastic_disk_slots(spec)? {
         let words = member_words(role, slot, disk);
         let claimed: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM nas_elastic_disks WHERE disk_id=?1 OR expected_uuid=?2)",
             params![disk.disk_id, disk.expected_uuid], |r| r.get(0))?;
-        anyhow::ensure!(!claimed,
-            "Dysk {words} należy już do innej macierzy tej instancji");
+        require(!claimed, || {
+            Refusal::conflict(
+                "elastic_member_claimed",
+                format!("{} already belongs to another Elastic Array of this instance", words.english()),
+            )
+            .disk(words.clone())
+        })?;
         for value in [Some(disk.disk_id.as_str()), disk.wwn.as_deref(), disk.serial.as_deref()]
             .into_iter().flatten() {
             let reserved: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM nas_elastic_disk_aliases WHERE value=?1)",
                 params![value], |r| r.get(0))?;
-            anyhow::ensure!(!reserved,
-                "Dysk {words} jest już zarezerwowany przez inną macierz tej instancji (po WWN lub numerze seryjnym)");
+            require(!reserved, || {
+                Refusal::conflict(
+                    "elastic_member_reserved",
+                    format!(
+                        "{} is already reserved by another Elastic Array of this instance (by its WWN or serial number)",
+                        words.english()
+                    ),
+                )
+                .disk(words.clone())
+            })?;
         }
     }
     let job_id = uuid::Uuid::now_v7().to_string();
@@ -3996,17 +4591,32 @@ pub fn finish_elastic_operation(pool: &DbPool, owner: &ElasticOwner, operation_i
     }
     tx.execute("UPDATE nas_elastic_operations SET state=?2,result_json=?3,error=?4,finished_at=?5
         WHERE operation_id=?1",params![operation_id,if success {"succeeded"} else {"needs_attention"},json,detail,at])?;
-    tx.execute("UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4 WHERE array_id=?1",
-        params![array_id,if success {"active"} else {"needs_attention"},detail,at])?;
+    tx.execute(&format!("UPDATE nas_elastic_arrays SET state=?2,state_detail=?3,updated_at=?4,state_reasons={}
+        WHERE array_id=?1", stored_state_reasons_sql("?3", "?5")),
+        params![array_id,if success {"active"} else {"needs_attention"},detail,at,kind])?;
     tx.commit()?;
     Ok(())
+}
+
+/// The codes of a sentence an operation stores as its array's
+/// `state_detail` (migration 23), as an SQL expression: '[]' when the detail
+/// is empty (the operation succeeded), else `operation_failed` with the
+/// operation's kind — the stored sentence is the operation's error, which
+/// the screen shows only as the tooltip of the worded line.
+fn stored_state_reasons_sql(detail: &str, kind: &str) -> String {
+    format!(
+        "CASE WHEN {detail} = '' THEN '[]' ELSE json_array(json_object('code', 'operation_failed', \
+         'params', json_object('operation', COALESCE({kind}, '')))) END"
+    )
 }
 
 pub fn fail_elastic_job(pool: &DbPool, job_id: &str, detail: &str) -> Result<()> {
     let mut conn = write(pool)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    tx.execute("UPDATE nas_elastic_arrays SET state='needs_attention',state_detail=?2,updated_at=?3
+    tx.execute(&format!("UPDATE nas_elastic_arrays SET state='needs_attention',state_detail=?2,updated_at=?3,
+        state_reasons={}
         WHERE array_id IN (SELECT array_id FROM nas_elastic_operations WHERE job_id=?1 AND state='running')",
+        stored_state_reasons_sql("?2", "(SELECT kind FROM nas_elastic_operations WHERE job_id=?1 AND state='running')")),
         params![job_id,detail,now()])?;
     tx.execute("UPDATE nas_elastic_operations SET state='needs_attention',error=?2,finished_at=?3
         WHERE job_id=?1 AND state='running'",params![job_id,detail,now()])?;
@@ -4692,6 +5302,18 @@ fn elastic_snapraid_config(
 /// Every array of every owner on this node, for the scheduler — which has a
 /// database and no request, so it cannot be handed an `ElasticOwner` the way
 /// a handler is.
+/// Every Elastic Array of the node as `(name, owning organisation, state)`,
+/// by name — what the disable confirmation needs to name the asking
+/// organisation's arrays and only count the others.
+pub fn elastic_array_owners(pool: &DbPool) -> Result<Vec<(String, String, String)>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached("SELECT name, org_id, state FROM nas_elastic_arrays ORDER BY name")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 pub fn elastic_arrays_all(pool: &DbPool) -> Result<Vec<super::elastic::ElasticArrayRow>> {
     let owners = {
         let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
@@ -4914,7 +5536,8 @@ pub struct ApprovalRow {
 
 const APPROVAL_COLUMNS: &str = "request_id, operation, subject, detail, payload_json, status, \
                                 org_id, addon_id, requested_by, requested_at, expires_at, \
-                                decided_by, decided_at, decision_note, decision_job_id";
+                                decided_by, decided_at, decision_note, decision_job_id, \
+                                detail_reasons";
 
 fn approval_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
     Ok(ApprovalRow {
@@ -4933,6 +5556,9 @@ fn approval_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ApprovalRow> {
             decision_job_id: r.get(14)?,
             // Only the handler knows who is asking.
             is_own_request: false,
+            // A column that does not read as codes is no codes: the
+            // sentence is still there to show.
+            detail_reasons: serde_json::from_str(&r.get::<_, String>(15)?).unwrap_or_default(),
         },
         payload_json: r.get(4)?,
         org_id: r.get(6)?,
@@ -4946,8 +5572,8 @@ pub fn insert_approval(pool: &DbPool, row: &ApprovalRow) -> Result<()> {
     conn.execute(
         "INSERT INTO nas_pending_approvals
             (request_id, operation, subject, detail, payload_json, status, org_id, addon_id,
-             requested_by, requested_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             requested_by, requested_at, expires_at, detail_reasons)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             a.request_id,
             a.operation,
@@ -4959,7 +5585,8 @@ pub fn insert_approval(pool: &DbPool, row: &ApprovalRow) -> Result<()> {
             row.addon_id,
             a.requested_by,
             a.requested_at,
-            a.expires_at
+            a.expires_at,
+            serde_json::to_string(&a.detail_reasons)?
         ],
     )?;
     Ok(())
@@ -4995,6 +5622,22 @@ pub fn list_approvals(pool: &DbPool, org_id: &str, include_closed: bool) -> Resu
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![org_id], approval_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every PENDING request of one operation on this node, whatever its
+/// organisation — only for the sharing stop, whose foreign rows a platform
+/// admin sees stripped (`approvals::foreign_pending_stops`).
+pub fn list_pending_of_operation(pool: &DbPool, operation: &str) -> Result<Vec<ApprovalRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let sql = format!(
+        "SELECT {APPROVAL_COLUMNS} FROM nas_pending_approvals WHERE operation = ?1 AND status = 'pending' \
+         ORDER BY requested_at DESC LIMIT 50"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![operation], approval_from_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -5068,6 +5711,45 @@ pub fn smart_schedule(pool: &DbPool) -> Result<NasSmartSchedule> {
 
 pub fn set_smart_schedule(pool: &DbPool, schedule: &NasSmartSchedule) -> Result<()> {
     set_setting(pool, SETTING_SMART_SCHEDULE, &serde_json::to_string(schedule)?)
+}
+
+/// An admin's save of the SMART schedule — the switch, the two cadences and
+/// the deadlines they arm — applied to the document AS IT IS NOW, in one
+/// write transaction, and returned as written.
+///
+/// WHY not read, change, write: the document also holds the scheduler's run
+/// stamps (`last_*_at`), and a tick that ran between the handler's read and
+/// its write used to lose them to the handler's older copy — the Tasks tab
+/// then said a test that did run never had. Only the fields the admin sets
+/// are taken from the save; the stamps are whatever the document holds when
+/// the save lands (`record_smart_tick` is the other half of the same rule).
+pub fn save_smart_schedule(
+    pool: &DbPool,
+    enabled: bool,
+    short: &NasSchedule,
+    long: &NasSchedule,
+    next_short_at: Option<String>,
+    next_long_at: Option<String>,
+) -> Result<NasSmartSchedule> {
+    let mut conn = write(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut next: NasSmartSchedule = tx
+        .query_row("SELECT value FROM nas_settings WHERE key = ?1", params![SETTING_SMART_SCHEDULE], |r| r.get::<_, String>(0))
+        .optional()?
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    next.enabled = enabled;
+    next.short = short.clone();
+    next.long = long.clone();
+    next.next_short_at = next_short_at;
+    next.next_long_at = next_long_at;
+    tx.execute(
+        "INSERT INTO nas_settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![SETTING_SMART_SCHEDULE, serde_json::to_string(&next)?, now()],
+    )?;
+    tx.commit()?;
+    Ok(next)
 }
 
 /// The scheduler's write-back of one SMART tick, applied to the schedule AS IT
@@ -5216,9 +5898,9 @@ pub const SETTING_AUDIT_DETAIL: &str = "access_audit_detail";
 /// share edit does not reload the host's audit rules (same trick as the ksmbd
 /// and exports documents).
 pub const SETTING_AUDIT_RULES: &str = "audit_rules_document";
-/// When the forwarder last delivered a batch, and why it last failed.
-pub const SETTING_FORWARD_SENT_AT: &str = "forward_last_sent_at";
-pub const SETTING_FORWARD_ERROR: &str = "forward_last_error";
+// `forward_last_sent_at` / `forward_last_error` were the single target's
+// outcome before wave 9b; migration 27 moved them onto the node-wide cursor
+// (`nas_forward_cursors`), which is where every target keeps its own.
 
 const ACCESS_COLUMNS: &str =
     "event_id, at, share, user, client, operation, result, target, detail";
@@ -5402,13 +6084,16 @@ pub fn prune_access_events(pool: &DbPool) -> Result<usize> {
 
 // ----- forwarding the alert pipeline outwards (§5.9) -------------------------------
 
-/// One row waiting to leave this node: an alert or an audited access, already
+/// One row leaving this node: an alert or an audited access, already
 /// flattened into what both transports send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardRow {
     /// 'alert' | 'access'.
     pub kind: &'static str,
     pub id: String,
+    /// The row's monotonic key (`nas_alerts.rowid`, `nas_access_events.event_id`),
+    /// which the target's cursor advances over.
+    pub seq: i64,
     pub at: String,
     /// 'info' | 'warning' | 'critical'.
     pub severity: String,
@@ -5417,108 +6102,234 @@ pub struct ForwardRow {
     pub detail: String,
 }
 
-/// NODE-WIDE alerts (`org_id IS NULL`) that have not been forwarded yet,
-/// oldest first. An alert is forwarded when it is RAISED, so a row already
-/// acknowledged is still sent: the external collector's job is to see what
-/// happened, not what the admin has since read.
-///
-/// An organisation's alert (an Elastic Array's, a parked request's, or ''
-/// for an owner that is gone — migration 18) never reaches the shared
-/// target, and the filter is part of THIS query on purpose: the owner is
-/// stamped in the statement that inserts the row (`raise_alert`), so no row
-/// can be selected here without its owner. Reading the owned ids first and
-/// the batch second let an owned alert raised in between slip into the batch.
-pub fn unforwarded_alerts(pool: &DbPool, limit: u32) -> Result<Vec<ForwardRow>> {
-    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    let mut stmt = conn.prepare_cached(
-        "SELECT alert_id, raised_at, severity, subject_kind, subject_id, title, detail
-           FROM nas_alerts WHERE forwarded_at IS NULL AND org_id IS NULL
-          ORDER BY raised_at LIMIT ?1",
-    )?;
-    let rows = stmt
-        .query_map(params![limit], |r| {
-            Ok(ForwardRow {
-                kind: "alert",
-                id: r.get(0)?,
-                at: r.get(1)?,
-                severity: r.get(2)?,
-                subject: format!("{}:{}", r.get::<_, String>(3)?, r.get::<_, String>(4)?),
-                summary: r.get(5)?,
-                detail: r.get(6)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+/// Where one forwarding target stands on this node (migration 27). `target`
+/// is an organisation id, or `FORWARD_NODE_TARGET` for the node-wide target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardCursor {
+    /// The switch-on this cursor was placed for (the stored setting's).
+    pub enabled_at: String,
+    /// Every alert up to this rowid has been sent — or was not this target's.
+    pub alert_rowid: i64,
+    /// Likewise for the access lines, by `event_id`.
+    pub access_id: i64,
+    pub last_sent_at: Option<String>,
+    pub last_error: String,
+    /// When the access lines this cursor follows were asked for ('' before
+    /// they ever were, migration 28).
+    pub access_enabled_at: String,
 }
 
-/// Marks what actually left the node. Called AFTER a successful send, so a
-/// crash in between replays a row instead of dropping it.
-pub fn mark_forwarded(pool: &DbPool, rows: &[ForwardRow]) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let mut conn = write(pool)?;
-    let tx = conn.transaction()?;
-    let stamp = now();
-    for row in rows {
-        let sql = if row.kind == "alert" {
-            "UPDATE nas_alerts SET forwarded_at = ?2 WHERE alert_id = ?1"
-        } else {
-            "UPDATE nas_access_events SET forwarded_at = ?2 WHERE event_id = ?1"
-        };
-        tx.execute(sql, params![row.id, stamp])?;
-    }
-    tx.commit()?;
+/// The cursor key of the node-wide target kept from before targets were per
+/// organisation. No organisation id is empty, so it cannot collide.
+pub const FORWARD_NODE_TARGET: &str = "";
+
+pub fn forward_cursor(pool: &DbPool, target: &str) -> Result<Option<ForwardCursor>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn
+        .query_row(
+            "SELECT enabled_at, alert_rowid, access_id, last_sent_at, last_error, access_enabled_at
+               FROM nas_forward_cursors WHERE target = ?1",
+            params![target],
+            |r| {
+                Ok(ForwardCursor {
+                    enabled_at: r.get(0)?,
+                    alert_rowid: r.get(1)?,
+                    access_id: r.get(2)?,
+                    last_sent_at: r.get(3)?,
+                    last_error: r.get(4)?,
+                    access_enabled_at: r.get(5)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Places a target's cursor for the switch-on at `enabled_at`: what was
+/// raised BEFORE it is not this target's to send. Forwarding sends what
+/// happens while it is on — a target switched on for the first time does not
+/// receive the node's whole history, and one switched on again does not
+/// receive what happened while it was off.
+pub fn place_forward_cursor(pool: &DbPool, target: &str, enabled_at: &str) -> Result<ForwardCursor> {
+    let conn = write(pool)?;
+    conn.execute(
+        "INSERT INTO nas_forward_cursors (target, enabled_at, alert_rowid, access_id, last_sent_at, last_error)
+         VALUES (?1, ?2,
+                 COALESCE((SELECT MAX(rowid) FROM nas_alerts WHERE raised_at < ?2), 0),
+                 COALESCE((SELECT MAX(event_id) FROM nas_access_events WHERE at < ?2), 0),
+                 NULL, '')
+         ON CONFLICT(target) DO UPDATE SET enabled_at = excluded.enabled_at,
+                 alert_rowid = excluded.alert_rowid, access_id = excluded.access_id,
+                 last_error = '', access_enabled_at = ''",
+        params![target, enabled_at],
+    )?;
+    drop(conn);
+    forward_cursor(pool, target)?.ok_or_else(|| anyhow!("forward cursor vanished"))
+}
+
+/// The last access line collected before `since`: where the access half of
+/// a cursor starts when the lines are asked for at `since`.
+pub fn access_floor(pool: &DbPool, since: &str) -> Result<i64> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(event_id), 0) FROM nas_access_events WHERE at < ?1",
+        params![since],
+        |r| r.get(0),
+    )?)
+}
+
+/// Places the ACCESS half of `target`'s cursor for access lines asked for at
+/// `since` (critic wave 9b, MINOR 1): the retained log from before is not
+/// this target's to receive.
+pub fn place_forward_access(pool: &DbPool, target: &str, since: &str) -> Result<ForwardCursor> {
+    let floor = access_floor(pool, since)?;
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_forward_cursors SET access_id = ?2, access_enabled_at = ?3 WHERE target = ?1",
+        params![target, floor, since],
+    )?;
+    drop(conn);
+    forward_cursor(pool, target)?.ok_or_else(|| anyhow!("forward cursor vanished"))
+}
+
+/// Forgets a target's cursor (the retired node-wide target, deleted).
+pub fn delete_forward_cursor(pool: &DbPool, target: &str) -> Result<()> {
+    write(pool)?.execute("DELETE FROM nas_forward_cursors WHERE target = ?1", params![target])?;
     Ok(())
 }
 
-/// Settles every organisation's alert still in the queue, in one statement:
-/// they are never sent (`unforwarded_alerts`), and left unmarked they would
-/// sit in the queue for good. Returns how many were settled.
-///
-/// Every file-access line is settled here too. Since migration 20 each one
-/// belongs to the organisation that owns its share — it names that tenant's
-/// share, account, client address and file — and the forwarding target is
-/// ONE fleet-wide setting any organisation's admin may point at its own
-/// collector, so an access line is withheld exactly like an owned alert
-/// until targets are per organisation (backlog). No
-/// `unforwarded_access_events` exists any more for the same reason
-/// `unforwarded_alerts` filters in its own statement: a query that can hand
-/// out a tenant's line is one caller away from sending it.
-pub fn settle_withheld_alerts(pool: &DbPool) -> Result<usize> {
-    let mut conn = write(pool)?;
-    let tx = conn.transaction()?;
-    let stamp = now();
-    let alerts = tx.execute(
-        "UPDATE nas_alerts SET forwarded_at = ?1 WHERE forwarded_at IS NULL AND org_id IS NOT NULL",
-        params![stamp],
-    )?;
-    let access = tx.execute(
-        "UPDATE nas_access_events SET forwarded_at = ?1 WHERE forwarded_at IS NULL",
-        params![stamp],
-    )?;
-    tx.commit()?;
-    Ok(alerts + access)
+/// The alert rows one target receives: the node-wide target only node-wide
+/// alerts (`org_id IS NULL`); an organisation's target exactly what that
+/// organisation may READ (`VISIBLE_TO_ORG_SQL`): its own alerts and the
+/// node-wide ones. Never another organisation's, never the '' rows whose
+/// owner is gone — the sole-organisation reading of those is a screen rule
+/// and is not extended to a collector outside the product.
+fn alert_scope_sql(target: &str) -> &'static str {
+    if target == FORWARD_NODE_TARGET {
+        "org_id IS NULL"
+    } else {
+        "(org_id IS NULL OR (org_id = ?3 AND ?3 <> ''))"
+    }
 }
 
-/// How many rows still wait to be SENT, so the settings card can show a
-/// backlog instead of a silent stall.
-///
-/// An organisation's alert is never sent, so it is not pending: counting it
-/// would show every tenant a backlog of other tenants' alerts that never
-/// drains while forwarding is off. Counted here, in SQL, rather than by
-/// loading every such id — a set that grew without bound for as long as
-/// forwarding stayed off. File-access lines are never pending for the same
-/// reason (each belongs to an organisation, `settle_withheld_alerts`), so the
-/// access switch no longer adds anything to this figure.
-pub fn forward_pending(pool: &DbPool) -> Result<u32> {
+/// The next rows `target` has not been sent, oldest first: alerts past its
+/// alert cursor and — for an organisation that asked for them — the access
+/// lines of its OWN shares past its access cursor. The owner filter is part
+/// of the query itself: the owner is stamped by the statement that inserts a
+/// row, so no row can be selected here without it.
+pub fn forward_batch(
+    pool: &DbPool,
+    target: &str,
+    include_access: bool,
+    cursor: &ForwardCursor,
+    limit: u32,
+) -> Result<Vec<ForwardRow>> {
     let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
-    let total: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM nas_alerts WHERE forwarded_at IS NULL AND org_id IS NULL",
-        [],
-        |r| r.get(0),
+    let mut stmt = conn.prepare(&format!(
+        "SELECT rowid, alert_id, raised_at, severity, subject_kind, subject_id, title, detail
+           FROM nas_alerts WHERE rowid > ?1 AND {}
+          ORDER BY rowid LIMIT ?2",
+        alert_scope_sql(target)
+    ))?;
+    let map = |r: &rusqlite::Row<'_>| {
+        Ok(ForwardRow {
+            kind: "alert",
+            seq: r.get(0)?,
+            id: r.get(1)?,
+            at: r.get(2)?,
+            severity: r.get(3)?,
+            subject: format!("{}:{}", r.get::<_, String>(4)?, r.get::<_, String>(5)?),
+            summary: r.get(6)?,
+            detail: r.get(7)?,
+        })
+    };
+    let mut rows = if target == FORWARD_NODE_TARGET {
+        stmt.query_map(params![cursor.alert_rowid, limit], map)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        stmt.query_map(params![cursor.alert_rowid, limit, target], map)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if include_access && target != FORWARD_NODE_TARGET {
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {ACCESS_COLUMNS} FROM nas_access_events
+              WHERE event_id > ?1 AND org_id = ?3 AND ?3 <> ''
+              ORDER BY event_id LIMIT ?2"
+        ))?;
+        let access = stmt
+            .query_map(params![cursor.access_id, limit, target], access_event_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|e| ForwardRow {
+                kind: "access",
+                id: e.event_id.to_string(),
+                seq: e.event_id as i64,
+                at: e.at,
+                // A refused access is the one worth waking a collector for.
+                severity: if e.result == "fail" { "warning" } else { "info" }.to_string(),
+                subject: format!("share:{}", e.share),
+                summary: format!("{} {} {} on {} by {}", e.operation, e.result, e.target, e.share, e.user),
+                detail: e.detail,
+            })
+            .collect::<Vec<_>>();
+        rows.extend(access);
+    }
+    Ok(rows)
+}
+
+/// Moves `target`'s cursor past what actually left the node. Called AFTER a
+/// successful send, so a crash in between repeats a row instead of dropping
+/// it (at least once, on purpose).
+pub fn advance_forward_cursor(pool: &DbPool, target: &str, sent: &[ForwardRow]) -> Result<()> {
+    let alert = sent.iter().filter(|r| r.kind == "alert").map(|r| r.seq).max();
+    let access = sent.iter().filter(|r| r.kind == "access").map(|r| r.seq).max();
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_forward_cursors
+            SET alert_rowid = MAX(alert_rowid, COALESCE(?2, alert_rowid)),
+                access_id = MAX(access_id, COALESCE(?3, access_id)),
+                last_sent_at = CASE WHEN ?2 IS NULL AND ?3 IS NULL THEN last_sent_at ELSE ?4 END,
+                last_error = ''
+          WHERE target = ?1",
+        params![target, alert, access, now()],
     )?;
-    Ok(total.max(0) as u32)
+    Ok(())
+}
+
+/// Why the last attempt for `target` failed ('' clears it).
+pub fn record_forward_error(pool: &DbPool, target: &str, error: &str) -> Result<()> {
+    let conn = write(pool)?;
+    conn.execute(
+        "UPDATE nas_forward_cursors SET last_error = ?2 WHERE target = ?1",
+        params![target, error],
+    )?;
+    Ok(())
+}
+
+/// How many rows still wait to be sent to `target`, so the settings card can
+/// show a backlog instead of a silent stall. Counted in SQL over the same
+/// scope `forward_batch` hands out — another organisation's rows are never
+/// in it.
+pub fn forward_pending(pool: &DbPool, target: &str, include_access: bool, cursor: &ForwardCursor) -> Result<u32> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let sql = format!(
+        "SELECT COUNT(*) FROM nas_alerts WHERE rowid > ?1 AND {}",
+        alert_scope_sql(target).replace("?3", "?2")
+    );
+    let alerts: i64 = if target == FORWARD_NODE_TARGET {
+        conn.query_row(&sql, params![cursor.alert_rowid], |r| r.get(0))?
+    } else {
+        conn.query_row(&sql, params![cursor.alert_rowid, target], |r| r.get(0))?
+    };
+    let access: i64 = if include_access && target != FORWARD_NODE_TARGET {
+        conn.query_row(
+            "SELECT COUNT(*) FROM nas_access_events WHERE event_id > ?1 AND org_id = ?2 AND ?2 <> ''",
+            params![cursor.access_id, target],
+            |r| r.get(0),
+        )?
+    } else {
+        0
+    };
+    Ok((alerts + access).max(0) as u32)
 }
 
 // ----- shares --------------------------------------------------------------------
@@ -5540,12 +6351,15 @@ pub struct ShareRow {
     pub nfs: Option<NasNfsOptions>,
     pub state: String,
     pub state_detail: String,
+    /// `state_detail` as codes (`shares::share_state`, migration 24).
+    pub state_reasons: Vec<NasHealthReason>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const SHARE_COLUMNS: &str = "share_id, name, protocol, source_path, dataset, enabled, \
-                             fleet_mount, options_json, state, state_detail, created_at, updated_at";
+                             fleet_mount, options_json, state, state_detail, created_at, updated_at, \
+                             state_reasons";
 
 fn share_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRow> {
     let protocol: String = r.get(2)?;
@@ -5568,6 +6382,7 @@ fn share_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShareRow> {
         state_detail: r.get(9)?,
         created_at: r.get(10)?,
         updated_at: r.get(11)?,
+        state_reasons: serde_json::from_str(&r.get::<_, String>(12)?).unwrap_or_default(),
         protocol,
     })
 }
@@ -5717,13 +6532,14 @@ pub fn upsert_share(pool: &DbPool, org_id: &str, share: &ShareRow) -> Result<()>
     let written = tx.execute(
         "INSERT INTO nas_shares (share_id, name, protocol, source_path, dataset, enabled,
                                  fleet_mount, options_json, state, state_detail, created_at,
-                                 updated_at, org_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                                 updated_at, org_id, state_reasons)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(share_id) DO UPDATE SET
             source_path = excluded.source_path, dataset = excluded.dataset,
             enabled = excluded.enabled, fleet_mount = excluded.fleet_mount,
             options_json = excluded.options_json, state = excluded.state,
-            state_detail = excluded.state_detail, updated_at = excluded.updated_at
+            state_detail = excluded.state_detail, state_reasons = excluded.state_reasons,
+            updated_at = excluded.updated_at
          WHERE nas_shares.org_id = excluded.org_id",
         params![
             share.share_id,
@@ -5738,7 +6554,8 @@ pub fn upsert_share(pool: &DbPool, org_id: &str, share: &ShareRow) -> Result<()>
             share.state_detail,
             share.created_at,
             share.updated_at,
-            org_id
+            org_id,
+            serde_json::to_string(&share.state_reasons)?
         ],
     )?;
     // Dropping the transaction rolls it back: nothing of the refused write
@@ -5760,11 +6577,11 @@ pub fn upsert_share(pool: &DbPool, org_id: &str, share: &ShareRow) -> Result<()>
     Ok(())
 }
 
-pub fn set_share_state(pool: &DbPool, share_id: &str, state: &str, detail: &str) -> Result<()> {
+pub fn set_share_state(pool: &DbPool, share_id: &str, state: &str, detail: &str, reasons: &[NasHealthReason]) -> Result<()> {
     let conn = write(pool)?;
     conn.execute(
-        "UPDATE nas_shares SET state = ?2, state_detail = ?3 WHERE share_id = ?1",
-        params![share_id, state, detail],
+        "UPDATE nas_shares SET state = ?2, state_detail = ?3, state_reasons = ?4 WHERE share_id = ?1",
+        params![share_id, state, detail, serde_json::to_string(reasons)?],
     )?;
     Ok(())
 }
@@ -5819,6 +6636,9 @@ pub struct TargetRow {
     pub portals: Vec<NasTargetPortal>,
     pub port_groups: Vec<NasTargetPortGroup>,
     pub initiators: Vec<String>,
+    /// "Opis" per initiator (migration 29): non-empty entries, keys on
+    /// `initiators`.
+    pub initiator_descriptions: BTreeMap<String, String>,
     pub auth_method: String,
     pub auth_username: String,
     pub auth_secret: String,
@@ -5828,6 +6648,8 @@ pub struct TargetRow {
     pub dhchap_dhgroup: String,
     pub state: String,
     pub state_detail: String,
+    /// `state_detail` as codes (migration 23, `targets::target_state`).
+    pub state_reasons: Vec<NasHealthReason>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -5835,7 +6657,7 @@ pub struct TargetRow {
 const TARGET_COLUMNS: &str = "target_id, name, protocol, wwn, enabled, spec_json, auth_method, \
                               auth_username, auth_secret, auth_mutual_username, \
                               auth_mutual_secret, dhchap_hash, dhchap_dhgroup, state, \
-                              state_detail, created_at, updated_at";
+                              state_detail, created_at, updated_at, state_reasons";
 
 fn target_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
     let spec: String = r.get(5)?;
@@ -5850,6 +6672,7 @@ fn target_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
         portals: spec.portals,
         port_groups: spec.port_groups,
         initiators: Vec::new(),
+        initiator_descriptions: BTreeMap::new(),
         auth_method: r.get(6)?,
         auth_username: r.get(7)?,
         auth_secret: r.get(8)?,
@@ -5859,6 +6682,9 @@ fn target_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
         dhchap_dhgroup: r.get(12)?,
         state: r.get(13)?,
         state_detail: r.get(14)?,
+        // A column that does not read as codes is no codes: the sentence is
+        // still there to show.
+        state_reasons: serde_json::from_str(&r.get::<_, String>(17)?).unwrap_or_default(),
         created_at: r.get(15)?,
         updated_at: r.get(16)?,
     })
@@ -5877,6 +6703,153 @@ pub fn target_initiators(pool: &DbPool, target_id: &str) -> Result<Vec<String>> 
     Ok(rows)
 }
 
+/// The "Opis" of every initiator of one target that has one.
+pub fn target_initiator_descriptions(pool: &DbPool, target_id: &str) -> Result<BTreeMap<String, String>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT initiator, description FROM nas_target_initiators
+         WHERE target_id = ?1 AND description <> '' ORDER BY initiator",
+    )?;
+    let rows = stmt
+        .query_map(params![target_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+    Ok(rows)
+}
+
+fn fill_allowlist(pool: &DbPool, target: &mut TargetRow) -> Result<()> {
+    target.initiators = target_initiators(pool, &target.target_id)?;
+    target.initiator_descriptions = target_initiator_descriptions(pool, &target.target_id)?;
+    Ok(())
+}
+
+/// One row of the session sampler (migration 29). `session_key` is internal
+/// and never leaves the node.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetSeenRow {
+    pub initiator: String,
+    pub session_key: String,
+    pub session_since: String,
+    pub last_seen_at: String,
+    pub last_address: String,
+}
+
+/// Every initiator the sampler has seen on one target.
+pub fn target_seen(pool: &DbPool, target_id: &str) -> Result<Vec<TargetSeenRow>> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT initiator, session_key, session_since, last_seen_at, last_address
+         FROM nas_target_initiator_seen WHERE target_id = ?1 ORDER BY initiator",
+    )?;
+    let rows = stmt
+        .query_map(params![target_id], |r| {
+            Ok(TargetSeenRow {
+                initiator: r.get(0)?,
+                session_key: r.get(1)?,
+                session_since: r.get(2)?,
+                last_seen_at: r.get(3)?,
+                last_address: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// The `session_key` of a row whose session ENDED: the initiator was absent
+/// from a measured reading. No real key is ever this string (keys are a boot
+/// id plus a number, or empty for a generated session), so the next sighting
+/// always starts a new session.
+pub const SEEN_SESSION_CLOSED: &str = "-";
+
+/// How far `last_seen_at` may lag behind a session that is still up before
+/// the sampler writes it again. The tick reads every 20 s; writing each read
+/// was one transaction per target per tick for a date the screen shows to
+/// the minute (critic wave 12, MINOR 10).
+pub const SEEN_REFRESH_SECS: i64 = 60;
+
+/// One sampler pass over one target: `seen` is EVERY session the node just
+/// read — a MEASURED reading, the caller never calls with an unknown one — as
+/// `(initiator, session key, address)`. Returns how many rows it wrote.
+///
+/// The rules (§4.2, and critic wave 12 MAJOR 2):
+///   * a new initiator, a different key, or a key after a CLOSED row → a new
+///     session: `session_since` = now;
+///   * the same key → the same session; `last_seen_at` moves only when it is
+///     at least `SEEN_REFRESH_SECS` old, or the address changed;
+///   * an initiator with an open row that is NOT in the reading has
+///     disconnected: its row is closed (`SEEN_SESSION_CLOSED`), `last_seen_at`
+///     stays — which is what makes it "Ostatnie połączenie". Without this a
+///     client that came back after a gap under the same key (a reboot of the
+///     node restarts LIO's session ids at 1; an open target's key is always
+///     empty) kept its first-ever start as the "at least" of a session minutes
+///     old.
+///
+/// Nothing is written when nothing changed.
+pub fn record_target_seen(pool: &DbPool, target_id: &str, seen: &[(String, String, String)], at: &str) -> Result<usize> {
+    let existing = target_seen(pool, target_id)?;
+    let now = chrono::DateTime::parse_from_rfc3339(at).ok();
+    let stale = |last: &str| match (now, chrono::DateTime::parse_from_rfc3339(last).ok()) {
+        (Some(now), Some(last)) => (now - last).num_seconds() >= SEEN_REFRESH_SECS,
+        _ => true,
+    };
+    // (initiator, key, since, last, address) to upsert, and initiators to close.
+    let mut upserts: Vec<(&str, &str, String, &str, String)> = Vec::new();
+    for (initiator, key, address) in seen {
+        match existing.iter().find(|r| r.initiator == *initiator) {
+            Some(row) if row.session_key != SEEN_SESSION_CLOSED && row.session_key == *key => {
+                let moved = !address.is_empty() && *address != row.last_address;
+                if moved || stale(&row.last_seen_at) {
+                    let address = if address.is_empty() { row.last_address.clone() } else { address.clone() };
+                    upserts.push((initiator, key, row.session_since.clone(), at, address));
+                }
+            }
+            Some(row) => {
+                let address = if address.is_empty() { row.last_address.clone() } else { address.clone() };
+                upserts.push((initiator, key, at.to_string(), at, address));
+            }
+            None => upserts.push((initiator, key, at.to_string(), at, address.clone())),
+        }
+    }
+    let closes: Vec<&str> = existing
+        .iter()
+        .filter(|r| r.session_key != SEEN_SESSION_CLOSED)
+        .filter(|r| !seen.iter().any(|(i, _, _)| *i == r.initiator))
+        .map(|r| r.initiator.as_str())
+        .collect();
+    if upserts.is_empty() && closes.is_empty() {
+        return Ok(0);
+    }
+    let mut conn = write(pool)?;
+    let tx = conn.transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO nas_target_initiator_seen
+                (target_id, initiator, session_key, session_since, last_seen_at, last_address)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(target_id, initiator) DO UPDATE SET
+                session_key = excluded.session_key,
+                session_since = excluded.session_since,
+                last_seen_at = excluded.last_seen_at,
+                last_address = excluded.last_address",
+        )?;
+        for (initiator, key, since, last, address) in &upserts {
+            stmt.execute(params![target_id, initiator, key, since, last, address])?;
+        }
+        let mut close = tx.prepare_cached(
+            "UPDATE nas_target_initiator_seen SET session_key = ?3 WHERE target_id = ?1 AND initiator = ?2",
+        )?;
+        for initiator in &closes {
+            close.execute(params![target_id, initiator, SEEN_SESSION_CLOSED])?;
+        }
+    }
+    tx.commit()?;
+    Ok(upserts.len() + closes.len())
+}
+
+/// When this node started recording block-target sessions (migration 29).
+pub fn target_seen_since(pool: &DbPool) -> Result<String> {
+    Ok(setting(pool, "target_seen_since")?.unwrap_or_default())
+}
+
 /// EVERY target of the node, whoever owns it. For the node's own work only —
 /// the configfs reconcile, the restore after a reboot, the zvol and host-NQN
 /// collision checks — which must see every object in the kernel. Anything
@@ -5892,9 +6865,36 @@ pub fn list_targets(pool: &DbPool) -> Result<Vec<TargetRow>> {
         rows
     };
     for target in targets.iter_mut() {
-        target.initiators = target_initiators(pool, &target.target_id)?;
+        fill_allowlist(pool, target)?;
     }
     Ok(targets)
+}
+
+/// The shares and block targets NOT owned by `org_id` — every other
+/// organisation's, and any row nobody owns. For the one check that has to
+/// see them without naming them: whether a pool about to be destroyed holds
+/// another tenant's resources (`pools::holds_resources`, dispatch
+/// `pool_destroy`). The rows never leave the node.
+pub fn resources_of_other_orgs(pool: &DbPool, org_id: &str) -> Result<(Vec<ShareRow>, Vec<TargetRow>)> {
+    let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+    let shares = conn
+        .prepare_cached(&format!("SELECT {SHARE_COLUMNS} FROM nas_shares WHERE NOT ({OWNED_BY_SQL})"))?
+        .query_map(params![org_id], share_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let targets = conn
+        .prepare_cached(&format!("SELECT {TARGET_COLUMNS} FROM nas_targets WHERE NOT ({OWNED_BY_SQL})"))?
+        .query_map(params![org_id], target_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // `target_from_row` reads a spec it cannot parse as "no LUNs", which is
+    // right for a list and wrong here: a target whose LUNs are unknown may be
+    // on the pool. Such a row makes the whole answer unreadable (critic wave
+    // 9a, MINOR 6).
+    let mut specs = conn.prepare_cached(&format!("SELECT spec_json FROM nas_targets WHERE NOT ({OWNED_BY_SQL})"))?;
+    for spec in specs.query_map(params![org_id], |r| r.get::<_, String>(0))? {
+        serde_json::from_str::<TargetSpec>(&spec?)
+            .map_err(|e| anyhow!("the record of another organisation's target is unreadable ({e})"))?;
+    }
+    Ok((shares, targets))
 }
 
 /// The targets `org_id` owns — the only list a tenant is ever shown.
@@ -5910,7 +6910,7 @@ pub fn list_targets_of_org(pool: &DbPool, org_id: &str) -> Result<Vec<TargetRow>
         rows
     };
     for target in targets.iter_mut() {
-        target.initiators = target_initiators(pool, &target.target_id)?;
+        fill_allowlist(pool, target)?;
     }
     Ok(targets)
 }
@@ -5938,7 +6938,7 @@ pub fn target(pool: &DbPool, org_id: &str, target_id: &str) -> Result<Option<Tar
     };
     match row {
         Some(mut target) => {
-            target.initiators = target_initiators(pool, &target.target_id)?;
+            fill_allowlist(pool, &mut target)?;
             Ok(Some(target))
         }
         None => Ok(None),
@@ -5977,8 +6977,8 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
                                   auth_method, auth_username, auth_secret,
                                   auth_mutual_username, auth_mutual_secret, dhchap_hash,
                                   dhchap_dhgroup, state, state_detail, created_at, updated_at,
-                                  org_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                                  org_id, state_reasons)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(target_id) DO UPDATE SET
             enabled = excluded.enabled, spec_json = excluded.spec_json,
             auth_method = excluded.auth_method, auth_username = excluded.auth_username,
@@ -5987,7 +6987,7 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
             auth_mutual_secret = excluded.auth_mutual_secret,
             dhchap_hash = excluded.dhchap_hash, dhchap_dhgroup = excluded.dhchap_dhgroup,
             state = excluded.state, state_detail = excluded.state_detail,
-            updated_at = excluded.updated_at
+            state_reasons = excluded.state_reasons, updated_at = excluded.updated_at
          WHERE nas_targets.org_id = excluded.org_id",
         params![
             target.target_id,
@@ -6007,7 +7007,8 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
             target.state_detail,
             target.created_at,
             target.updated_at,
-            org_id
+            org_id,
+            serde_json::to_string(&target.state_reasons)?
         ],
     )?;
     anyhow::ensure!(written == 1, "target not found");
@@ -6017,21 +7018,29 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
     )?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT OR REPLACE INTO nas_target_initiators (target_id, initiator) VALUES (?1, ?2)",
+            "INSERT OR REPLACE INTO nas_target_initiators (target_id, initiator, description)
+             VALUES (?1, ?2, ?3)",
         )?;
         for initiator in &target.initiators {
-            stmt.execute(params![target.target_id, initiator])?;
+            let description = target
+                .initiator_descriptions
+                .get(initiator)
+                .map(String::as_str)
+                .unwrap_or("");
+            stmt.execute(params![target.target_id, initiator, description])?;
         }
     }
     tx.commit()?;
     Ok(())
 }
 
-pub fn set_target_state(pool: &DbPool, target_id: &str, state: &str, detail: &str) -> Result<()> {
+/// The judged state of one target: the sentence and its codes, written
+/// together so the two cannot describe different verdicts.
+pub fn set_target_state(pool: &DbPool, target_id: &str, state: &str, detail: &str, reasons: &[NasHealthReason]) -> Result<()> {
     let conn = write(pool)?;
     conn.execute(
-        "UPDATE nas_targets SET state = ?2, state_detail = ?3 WHERE target_id = ?1",
-        params![target_id, state, detail],
+        "UPDATE nas_targets SET state = ?2, state_detail = ?3, state_reasons = ?4 WHERE target_id = ?1",
+        params![target_id, state, detail, serde_json::to_string(reasons)?],
     )?;
     Ok(())
 }
@@ -6048,6 +7057,12 @@ pub fn delete_target(pool: &DbPool, org_id: &str, target_id: &str) -> Result<boo
     if removed == 1 {
         tx.execute(
             "DELETE FROM nas_target_initiators WHERE target_id = ?1",
+            params![target_id],
+        )?;
+        // The sampler's rows go with the target (§4.2): a target created later
+        // under the same id must not inherit a "last seen".
+        tx.execute(
+            "DELETE FROM nas_target_initiator_seen WHERE target_id = ?1",
             params![target_id],
         )?;
     }
@@ -6329,7 +7344,7 @@ mod tests {
 
         // Same array, offered a second time.
         let again = elastic_import(&pool, &created, "admin").unwrap_err().to_string();
-        assert!(again.contains("już zapisana w tej instancji"), "{again}");
+        assert!(again.starts_with("refusal:elastic_already_adopted "), "{again}");
 
         // A different array that wants a disk this one already holds. The
         // UNIQUE columns would refuse it as a raw SQL error; the point of the
@@ -6338,7 +7353,7 @@ mod tests {
         let mut overlapping = super::super::elastic::tests::create_spec("archiwum");
         overlapping.data[0] = created.data[0].clone();
         let taken = elastic_import(&pool, &overlapping, "admin").unwrap_err().to_string();
-        assert!(taken.contains("Dysk danych 1 "), "the refusal names the disk: {taken}");
+        assert!(taken.starts_with("refusal:elastic_member_claimed?data=1 "), "the refusal names the disk: {taken}");
         assert!(!taken.contains(&created.data[0].disk_id), "and never by its id: {taken}");
 
         // Only the filesystem UUID is shared: still a refusal, because that
@@ -6351,7 +7366,7 @@ mod tests {
         let mut renamed = super::super::elastic::tests::create_spec("produkt");
         renamed.owner = previous_owner();
         let name = elastic_import(&pool, &renamed, "admin").unwrap_err().to_string();
-        assert!(name.contains("Nazwa macierzy jest już zajęta"), "{name}");
+        assert!(name.starts_with("refusal:elastic_name_taken?array=produkt "), "{name}");
 
         assert_eq!(
             (rows("nas_elastic_arrays"), rows("nas_elastic_disks"), rows("nas_elastic_disk_aliases"), rows("nas_jobs")),
@@ -7680,7 +8695,7 @@ mod tests {
         let (row, intent, _) = replace_job(&spec, "d1", &fresh);
         let refused = insert_job(&p, &row, Some(&intent)).unwrap_err();
         assert!(
-            refused.to_string().contains("Wymiana dysku"),
+            refused.to_string().starts_with("refusal:elastic_replace_withdrawn "),
             "{refused}"
         );
 
@@ -8061,8 +9076,8 @@ mod tests {
             .expect_err("a member of another array is not free");
             // Refused in words, and without the disk's id (iteration-5 minor 3).
             assert!(
-                error.to_string().contains("należy już do macierzy")
-                    || error.to_string().contains("zarezerwowany"),
+                error.to_string().starts_with("refusal:elastic_disk_member")
+                    || error.to_string().starts_with("refusal:elastic_disk_reserved"),
                 "{error}"
             );
             assert!(!error.to_string().contains(&taken.disk_id), "{error}");
@@ -8157,7 +9172,9 @@ mod tests {
         // its own. The wait has to be for the verdict.
         let (racing_job, racing_intent, _) = start(&added);
         let racing = insert_job(&p, &racing_job, Some(&racing_intent)).unwrap_err();
-        assert!(racing.to_string().contains("jest w toku"), "{racing}");
+        // Named by the data slot it takes, never by its id.
+        assert!(racing.to_string().starts_with("refusal:elastic_add_running?data="), "{racing}");
+        assert!(!racing.to_string().contains(&added.disk_id), "{racing}");
         assert!(super::super::db::job(&p, &racing_job.job_id).unwrap().is_none());
         // The in-flight row is still running and still holds the array.
         let running: String = p
@@ -8195,9 +9212,11 @@ mod tests {
         let (other_job, other_intent, _) = start(&other);
         let refused = insert_job(&p, &other_job, Some(&other_intent)).unwrap_err();
         assert!(
-            refused.to_string().contains("powtórz je tym samym dyskiem"),
+            refused.to_string().starts_with("refusal:elastic_add_other_unfinished?data=")
+                && refused.to_string().contains("repeat it with the same disk"),
             "{refused}"
         );
+        assert!(!refused.to_string().contains(&added.disk_id), "{refused}");
 
         // THE SAME DISK is admitted, on an array that needs attention.
         assert_eq!(
@@ -9066,8 +10085,11 @@ mod tests {
             .unwrap();
         // Migracje 1–8 mają 19 tabel; schema9 dodaje cztery tabele Elastic,
         // schema13 harmonogramy Elastic i ustawienia movera (E2-10),
-        // a schema16 polityki cache folderów.
-        assert_eq!(n, 26);
+        // a schema16 polityki cache folderów, schema25 the known pools,
+        // schema26 the disk lines of a multi-disk job, schema27 the
+        // forwarding cursors (schema28 only adds a column), schema29 the
+        // block-target session sampler.
+        assert_eq!(n, 30);
     }
 
     #[test]
@@ -9106,6 +10128,7 @@ mod tests {
                 "iqn.1998-01.com.vmware:esx02".into(),
                 "iqn.1998-01.com.vmware:esx01".into(),
             ],
+            initiator_descriptions: Default::default(),
             auth_method: "mutual-chap".into(),
             auth_username: "vmware01".into(),
             auth_secret: "encb:ciphertext-one".into(),
@@ -9114,13 +10137,16 @@ mod tests {
             dhchap_hash: String::new(),
             dhchap_dhgroup: String::new(),
             state: "disabled".into(),
-            state_detail: String::new(),
+            state_detail: "the authentication secret has to be entered again after an import".into(),
+            // Migration 23: the codes are stored with the sentence.
+            state_reasons: vec![super::super::disks::coded_reason("import_secret_needed", &[])],
             created_at: now(),
             updated_at: now(),
         };
         upsert_target(&p, "org-a", &row).unwrap();
 
         let back = target(&p, "org-a", "t1").unwrap().expect("target");
+        assert_eq!(back.state_reasons, row.state_reasons, "the codes come back as written");
         assert_eq!(back.luns, row.luns);
         assert_eq!(back.portals, row.portals);
         // The ALUA/ANA port group state survives the database (R8).
@@ -9136,11 +10162,14 @@ mod tests {
         assert_eq!(back.auth_secret, "encb:ciphertext-one");
         assert_eq!(back.auth_mutual_secret, "encb:ciphertext-two");
 
-        set_target_state(&p, "t1", "active", "").unwrap();
+        set_target_state(&p, "t1", "active", "", &[]).unwrap();
         assert_eq!(list_targets(&p).unwrap()[0].state, "active");
         assert_eq!(target_counts(&p, "org-a").unwrap(), (1, 0));
-        set_target_state(&p, "t1", "error", "nvmet missing").unwrap();
+        let missing = super::super::disks::coded_reason("target_kernel_missing", &[("protocol", "nvmet".to_string())]);
+        set_target_state(&p, "t1", "error", "nvmet missing", std::slice::from_ref(&missing)).unwrap();
         assert_eq!(target_counts(&p, "org-a").unwrap(), (1, 1));
+        let judged = &list_targets(&p).unwrap()[0];
+        assert_eq!((judged.state_detail.as_str(), judged.state_reasons.clone()), ("nvmet missing", vec![missing]));
 
         // A second target may not claim the same name or the same WWN: both
         // are also configfs object names.
@@ -9250,6 +10279,7 @@ mod tests {
             nfs: None,
             state: "active".into(),
             state_detail: String::new(),
+            state_reasons: Vec::new(),
             created_at: now(),
             updated_at: now(),
         };
@@ -9284,7 +10314,16 @@ mod tests {
         assert!(share_grants(&p, "s1").unwrap().is_empty());
         assert!(!delete_share_user(&p, "org-a", "anna").unwrap());
 
-        set_share_state(&p, "s1", "error", "source path is not mounted").unwrap();
+        // Wave 8 (migration 24): the state's codes are kept beside the
+        // sentence and read back with the row.
+        let unmounted = [super::super::disks::coded_reason("share_source_unmounted", &[])];
+        set_share_state(&p, "s1", "error", "source path is not mounted", &unmounted).unwrap();
+        let judged = share_by_name(&p, "projekty").unwrap().expect("row");
+        assert_eq!(judged.state_reasons, unmounted);
+        assert_eq!(judged.state_detail, "source path is not mounted");
+        // An admin's rewrite of the share carries them too.
+        upsert_share(&p, "org-a", &judged).unwrap();
+        assert_eq!(share_by_name(&p, "projekty").unwrap().expect("row").state_reasons, unmounted);
         assert_eq!(share_counts(&p, "org-a").unwrap(), (1, 1));
         assert!(delete_share(&p, "org-a", "s1").unwrap());
         assert_eq!(share_counts(&p, "org-a").unwrap(), (0, 0));
@@ -9320,6 +10359,7 @@ mod tests {
             error: None,
             log: vec![],
             subject_last_known: false,
+            disks: Vec::new(),
         };
         insert_job(&p, &j, None).unwrap();
         append_job_log(&p, "j1", "first").unwrap();
@@ -10755,6 +11795,14 @@ mod tests {
         assert_eq!(list_alerts(&p, true).unwrap()[0].subject_id, "vm-c");
     }
 
+    /// Critic wave 13, MINOR 7: a slot of no known shape reads as a
+    /// sentence, not "The array has no the disk".
+    #[test]
+    fn a_missing_data_slot_is_named_by_its_number_or_not_at_all() {
+        assert_eq!(no_such_data_disk("d9").wire(), "refusal:elastic_no_such_data_disk?data=9 The array has no data disk no. 9");
+        assert_eq!(no_such_data_disk("x7").wire(), "refusal:elastic_no_such_data_disk The array has no such data disk");
+    }
+
     /// Iteration-5 minor 3: an adoption or add refused over a disk another
     /// array holds is a toast, and it named the disk by its id (`wwn-…`) or
     /// by the alias it collided on. It names the disk's place instead when
@@ -10768,11 +11816,12 @@ mod tests {
             bytes: 1,
             expected_uuid: "33333333-3333-4333-8333-333333333333".into(),
         };
-        assert_eq!(member_words("data", 2, &disk), "danych 2");
-        assert_eq!(member_words("parity", 1, &disk), "parity 1");
-        assert_eq!(member_words("cache", 1, &disk), "cache");
+        assert_eq!(member_words("data", 2, &disk), DiskWords::Data(2));
+        assert_eq!(member_words("parity", 1, &disk), DiskWords::Parity(1));
+        assert_eq!(member_words("cache", 1, &disk), DiskWords::Cache);
         for words in [member_words("data", 2, &disk), member_words("cache", 1, &disk)] {
-            assert!(!words.contains("wwn-") && !words.contains("WD-7788") && !words.contains("3333"), "{words}");
+            let wire = Refusal::conflict("elastic_member_claimed", words.english()).disk(words).wire();
+            assert!(!wire.contains("wwn-") && !wire.contains("WD-7788") && !wire.contains("3333"), "{wire}");
         }
     }
 
@@ -10814,6 +11863,167 @@ mod tests {
         assert_eq!(stored.last_long_at.as_deref(), Some("2026-09-25T04:00:05Z"), "but the run it started is recorded");
     }
 
+    /// The other half of the same race (wave-5 minor, wave 6): the admin's
+    /// save read the document, a tick recorded the tests it started, and the
+    /// save wrote its older copy back — the Tasks tab then said a test that
+    /// did run never had. The save now lands on the document as it is: the
+    /// switch, the cadences and their deadlines are the admin's, the run
+    /// stamps whatever the ticks recorded.
+    #[test]
+    fn an_admin_save_keeps_the_run_stamps_a_tick_recorded() {
+        let p = pool();
+        let daily = |hour| NasSchedule { every: "daily".into(), hour, minute: 0, weekday: 0, day: 1 };
+        let read = NasSmartSchedule { enabled: true, short: daily(3), long: daily(4), ..Default::default() };
+        set_smart_schedule(&p, &read).unwrap();
+        // A tick lands after the admin's dialog was opened.
+        let ticked = NasSmartSchedule {
+            last_short_at: Some("2026-09-24T03:00:05Z".into()),
+            last_long_at: Some("2026-09-24T04:00:05Z".into()),
+            ..read.clone()
+        };
+        record_smart_tick(&p, &read, &ticked).unwrap();
+
+        let saved = save_smart_schedule(
+            &p,
+            true,
+            &daily(5),
+            &daily(6),
+            Some("2026-09-25T05:00:00Z".into()),
+            Some("2026-09-25T06:00:00Z".into()),
+        )
+        .unwrap();
+        assert_eq!(saved, smart_schedule(&p).unwrap(), "the answer is what was written");
+        assert_eq!((saved.short.hour, saved.long.hour), (5, 6), "the admin's cadences");
+        assert_eq!(saved.next_short_at.as_deref(), Some("2026-09-25T05:00:00Z"));
+        assert_eq!(saved.last_short_at, ticked.last_short_at, "the tick's short run is kept");
+        assert_eq!(saved.last_long_at, ticked.last_long_at, "the tick's long run is kept");
+
+        // Switching the tests off disarms them and still keeps the history.
+        let off = save_smart_schedule(&p, false, &daily(5), &daily(6), None, None).unwrap();
+        assert!(!off.enabled && off.next_short_at.is_none() && off.next_long_at.is_none());
+        assert_eq!(off.last_long_at, ticked.last_long_at);
+    }
+
+    /// Migration 23: an approval parked by an older build with its detail as
+    /// `text:<code>` (the Elastic Sync) reads back with that code as its
+    /// coded detail; a sentence stays a sentence with no codes.
+    #[test]
+    fn migration_23_codes_an_older_text_detail() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..22]).unwrap();
+        for (id, detail) in [("r-sync", "text:elastic_sync_over_fault"), ("r-pool", "destroys the pool 'tank'")] {
+            conn.execute(
+                "INSERT INTO nas_pending_approvals
+                    (request_id, operation, subject, detail, payload_json, status, org_id, addon_id,
+                     requested_by, requested_at, expires_at)
+                 VALUES (?1, 'x', 's', ?2, '{}', 'pending', 'org-a', 'tentanas', 'u', 't0', 't9')",
+                params![id, detail],
+            )
+            .unwrap();
+        }
+        // MINOR 6: the alert that older park raised carries the code as its
+        // detail — its tooltip and node-text section.
+        conn.execute(
+            "INSERT INTO nas_alerts (alert_id, severity, subject_kind, subject_id, title, detail, raised_at, dedupe_key, org_id)
+             VALUES ('a-sync', 'warning', 'approval', 'r-sync', 't', 'text:elastic_sync_over_fault', 't0', 'approval:r-sync', 'org-a')",
+            [],
+        )
+        .unwrap();
+        // MINOR 7: targets an older import wrote disabled, with its sentences.
+        for (id, name, detail) in [
+            ("t-secret", "a", "the authentication secret has to be entered again after an import"),
+            ("t-all", "b", "this target was exported on every interface (0.0.0.0) — pick an interface of this node before enabling it"),
+            ("t-other", "c", "something else"),
+        ] {
+            conn.execute(
+                "INSERT INTO nas_targets (target_id, name, protocol, wwn, enabled, spec_json, auth_method, state, state_detail, created_at, updated_at, org_id)
+                 VALUES (?1, ?2, 'iscsi', ?2, 0, '{}', 'none', 'disabled', ?3, 't0', 't0', 'org-a')",
+                params![id, name, detail],
+            )
+            .unwrap();
+        }
+        // MINOR 4: the sentences an array's row stores.
+        conn.execute_batch(
+            "INSERT INTO nas_elastic_arrays
+               (array_id,org_id,addon_id,name,filesystem,state,state_detail,created_at,updated_at) VALUES
+               ('arr-lost','org-a','nas','lost','xfs','needs_attention','Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O','t','t'),
+               ('arr-sync','org-a','nas','synced','xfs','needs_attention','snapraid: /dev/disk/by-id/wwn-0x5000c500a1b2c3d4 read error','t','t'),
+               ('arr-odd','org-a','nas','odd','xfs','needs_attention','a sentence no operation wrote','t','t');
+             INSERT INTO nas_jobs (job_id,kind,subject,status,started_by,started_at,log) VALUES
+               ('j-sync','elastic_sync','synced','failed','u','t','');
+             INSERT INTO nas_elastic_operations
+               (operation_id,array_id,job_id,kind,state,request_json,result_json,error,created_at,finished_at) VALUES
+               ('op-s','arr-sync','j-sync','sync','needs_attention','{}',NULL,'snapraid: /dev/disk/by-id/wwn-0x5000c500a1b2c3d4 read error','t1','t2');",
+        )
+        .unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+
+        let reasons_of = |sql: &str, id: &str| -> String {
+            conn.query_row(sql, params![id], |r| r.get::<_, String>(0)).unwrap()
+        };
+        let array = |id| reasons_of("SELECT state_reasons FROM nas_elastic_arrays WHERE array_id = ?1", id);
+        assert_eq!(array("arr-lost"), r#"[{"code":"supervision_lost","params":{}}]"#);
+        assert_eq!(array("arr-sync"), r#"[{"code":"operation_failed","params":{"operation":"sync"}}]"#);
+        assert_eq!(array("arr-odd"), "[]", "a sentence no rule knows stays uncoded");
+        let target = |id| reasons_of("SELECT state_reasons FROM nas_targets WHERE target_id = ?1", id);
+        assert_eq!(target("t-secret"), r#"[{"code":"import_secret_needed","params":{}}]"#);
+        assert_eq!(target("t-all"), r#"[{"code":"import_all_interfaces","params":{}}]"#);
+        assert_eq!(target("t-other"), "[]");
+        assert_eq!(
+            reasons_of("SELECT detail FROM nas_alerts WHERE alert_id = ?1", "a-sync"),
+            SYNC_OVER_FAULT_TEXT,
+            "the alert reads the sentence, not the code"
+        );
+
+        let p = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let sync = approval(&p, "r-sync").unwrap().unwrap().approval;
+        assert_eq!(sync.detail_reasons, vec![super::super::disks::coded_reason("elastic_sync_over_fault", &[])]);
+        let pool = approval(&p, "r-pool").unwrap().unwrap().approval;
+        assert!(pool.detail_reasons.is_empty(), "{:?}", pool.detail_reasons);
+        assert_eq!(pool.detail, "destroys the pool 'tank'");
+    }
+
+    /// R2-2: migration 23 carries these two sentences inside its SQL, so they
+    /// are part of a released migration and may never change. Pinned byte for
+    /// byte here, and found quoted in the migration's own text.
+    #[test]
+    fn migration_23_sentences_are_frozen() {
+        assert_eq!(
+            SYNC_OVER_FAULT_TEXT,
+            "syncs parity over an unrepaired scrub fault: the earlier version of every file deleted or \
+             changed since the previous Sync can no longer be restored from parity; unchanged files \
+             stay repairable"
+        );
+        assert_eq!(SYNC_TEXT, "syncs parity with the data disks");
+        assert!(sql_literal_safe(SYNC_OVER_FAULT_TEXT) && sql_literal_safe(SYNC_TEXT));
+        assert!(!sql_literal_safe("it's"), "the guard must see an apostrophe");
+        let sql = MIGRATIONS.iter().find(|(v, _)| *v == 23).expect("migration 23").1;
+        assert!(sql.contains(&format!("THEN '{SYNC_OVER_FAULT_TEXT}'")), "{sql}");
+        assert!(sql.contains(&format!("ELSE '{SYNC_TEXT}' END")), "{sql}");
+    }
+
+    /// MINOR 4: every writer of an array's stored sentence writes its codes
+    /// with it — an operation's error is `operation_failed` {operation}, a
+    /// lost supervision `supervision_lost` — and a success clears both.
+    #[test]
+    fn an_arrays_stored_sentence_is_written_with_its_codes() {
+        let p = pool();
+        let spec = tenant_array(&p, "org-a", "alpha");
+        let job_id: String = p
+            .read()
+            .unwrap()
+            .query_row("SELECT job_id FROM nas_elastic_operations WHERE kind = 'create'", [], |r| r.get(0))
+            .unwrap();
+        fail_elastic_job(&p, &job_id, "mkfs.xfs failed on /dev/disk/by-id/wwn-0x5000c500a1b2c3d4").unwrap();
+        let row = elastic_arrays(&p, &spec.owner).unwrap().remove(0);
+        assert_eq!(row.state_detail, "mkfs.xfs failed on /dev/disk/by-id/wwn-0x5000c500a1b2c3d4");
+        assert_eq!(
+            row.state_reasons,
+            vec![super::super::disks::coded_reason("operation_failed", &[("operation", "create".to_string())])]
+        );
+    }
+
+
     /// Owner decision (wave 5): the jobs and alerts of a dissolved array
     /// (owner '' since migration 18) are shown when the node has exactly one
     /// organisation — they can only have been its own — and stay hidden from
@@ -10850,5 +12060,100 @@ mod tests {
         write(&p).unwrap().execute("UPDATE nas_jobs SET org_id = 'org-b' WHERE job_id = ?1", params![theirs.job_id]).unwrap();
         assert!(job_for_org(&p, sole, &theirs.job_id).unwrap().is_none());
         assert!(ack_alert_for_org(&p, sole, &list_alerts_for_org(&p, sole, false).unwrap()[0].alert_id).unwrap());
+    }
+
+    // ----- wave 9b: the disk lines of a multi-disk SMART job ---------------
+
+    fn batch_job() -> NasJob {
+        plain_job(SMART_BATCH_KIND, "sda, sdb")
+    }
+
+    /// A second self-test on a disk would ABORT the first. A batch's line is
+    /// a self-test on its disk exactly like a `smart_test` job: a batch that
+    /// names a disk already testing marks it refused in the transaction that
+    /// claims the others, and a single test on a disk a running batch holds
+    /// is refused — until that job has finished with it.
+    #[test]
+    fn a_batch_line_keeps_a_second_self_test_off_its_disk() {
+        let p = pool();
+        let single = plain_job("smart_test", "sn-a");
+        insert_job(&p, &single, None).unwrap();
+        let batch = batch_job();
+        insert_job_full(&p, &batch, None, None, &[("sn-a".into(), "sda".into()), ("sn-b".into(), "sdb".into())]).unwrap();
+        let lines = job_disks(&p, &batch.job_id).unwrap();
+        assert_eq!(lines.iter().map(|l| (l.name.as_str(), l.state.as_str())).collect::<Vec<_>>(),
+            vec![("sda", "refused"), ("sdb", "pending")]);
+        assert_eq!(lines[0].reasons[0].code, "self_test_running");
+
+        // sdb is the batch's now: a single test on it is refused.
+        assert!(insert_job(&p, &plain_job("smart_test", "sn-b"), None).is_err());
+        // So is a second batch's line — refused, not claimed twice.
+        let second = batch_job();
+        insert_job_full(&p, &second, None, None, &[("sn-b".into(), "sdb".into())]).unwrap();
+        assert_eq!(job_disks(&p, &second.job_id).unwrap()[0].state, "refused");
+
+        // The line finished: the disk is free again.
+        set_job_disk(&p, &batch.job_id, 1, "passed", None, &[]).unwrap();
+        insert_job(&p, &plain_job("smart_test", "sn-b"), None).unwrap();
+        // Lines belong to the multi-disk kind only.
+        assert!(insert_job_full(&p, &plain_job("pool_scrub", "tank"), None, None, &[("sn-c".into(), "sdc".into())]).is_err());
+    }
+
+    /// A restarted core fails the jobs it lost, and their unfinished lines
+    /// with them: a line left running would refuse every later self-test on
+    /// its disk for good.
+    #[test]
+    fn an_orphaned_batch_releases_its_disks() {
+        let p = pool();
+        let batch = batch_job();
+        insert_job_full(&p, &batch, None, None, &[("sn-a".into(), "sda".into()), ("sn-b".into(), "sdb".into())]).unwrap();
+        set_job_disk(&p, &batch.job_id, 0, "passed", None, &[]).unwrap();
+        set_job_disk(&p, &batch.job_id, 1, "running", Some(40), &[]).unwrap();
+        fail_orphaned_jobs(&p).unwrap();
+        let states: Vec<String> = job_disks(&p, &batch.job_id).unwrap().into_iter().map(|l| l.state).collect();
+        assert_eq!(states, vec!["passed", "interrupted"]);
+        insert_job(&p, &plain_job("smart_test", "sn-b"), None).unwrap();
+    }
+
+    // ----- wave 9b: the forwarding cursors -----------------------------------
+
+    /// Migration 27 places the node-wide cursor where the old single queue
+    /// stood: after the node-wide alerts already sent, before the first one
+    /// still waiting — so the upgrade neither repeats nor drops a line — and
+    /// carries the last outcome over. Run against a database that holds the
+    /// pre-27 state, the way an upgraded node does.
+    #[test]
+    fn migration_27_continues_the_node_wide_queue_where_it_stood() {
+        let p = pool();
+        {
+            let conn = write(&p).unwrap();
+            conn.execute_batch(
+                "DROP TABLE nas_forward_cursors;
+                 INSERT INTO nas_alerts (alert_id,severity,subject_kind,subject_id,title,detail,raised_at,dedupe_key,forwarded_at,org_id) VALUES
+                   ('a1','warning','disk','a','Disk sda','','2026-09-01T00:00:00Z','k1','2026-09-01T00:01:00Z',NULL),
+                   ('a2','warning','elastic-array','x','Macierz x','','2026-09-01T00:02:00Z','k2',NULL,'org-a'),
+                   ('a3','warning','disk','b','Disk sdb','','2026-09-01T00:03:00Z','k3',NULL,NULL),
+                   ('a4','warning','disk','c','Disk sdc','','2026-09-01T00:04:00Z','k4',NULL,NULL);
+                 INSERT INTO nas_settings (key,value,updated_at) VALUES
+                   ('forward_last_sent_at','2026-09-01T00:01:00Z','2026-09-01T00:01:00Z'),
+                   ('forward_last_error','the webhook answered 502','2026-09-01T00:05:00Z');",
+            )
+            .unwrap();
+            for version in [27, 28] {
+                let sql = MIGRATIONS.iter().find(|(v, _)| *v == version).map(|(_, sql)| *sql).unwrap();
+                conn.execute_batch(sql).unwrap();
+            }
+        }
+        let cursor = forward_cursor(&p, FORWARD_NODE_TARGET).unwrap().unwrap();
+        let a3: i64 = p.read().unwrap()
+            .query_row("SELECT rowid FROM nas_alerts WHERE alert_id = 'a3'", [], |r| r.get(0)).unwrap();
+        assert_eq!(cursor.alert_rowid, a3 - 1, "the first node-wide alert still waiting is next");
+        assert_eq!(cursor.enabled_at, "", "the stored setting from before has no switch-on of its own");
+        assert_eq!(cursor.last_sent_at.as_deref(), Some("2026-09-01T00:01:00Z"));
+        assert_eq!(cursor.last_error, "the webhook answered 502");
+        let batch = forward_batch(&p, FORWARD_NODE_TARGET, true, &cursor, 10).unwrap();
+        assert_eq!(batch.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), vec!["a3", "a4"],
+            "the sent one is not repeated and the organisation's one never was the node's");
+        assert_eq!(forward_pending(&p, FORWARD_NODE_TARGET, true, &cursor).unwrap(), 2);
     }
 }

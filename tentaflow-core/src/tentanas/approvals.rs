@@ -23,6 +23,7 @@ use anyhow::{anyhow, Result};
 use tentaflow_protocol::tentanas::{NasApprovalSettings, NasPendingApproval, TentaNasPayload};
 
 use super::db as store;
+use super::CodedText;
 use crate::db::DbPool;
 
 /// The operations that route through approval. Each is one arm of
@@ -86,6 +87,13 @@ pub const OP_ELASTIC_DESTROY: &str = "elastic_destroy";
 /// exactly the privileged work the per-kind operations guard, deferred and
 /// repeating, so one admin alone must not be able to arm one.
 pub const OP_ELASTIC_SCHEDULE: &str = "elastic_schedule";
+
+/// Stopping every share and target of ONE node and then disabling TentaNas
+/// (n18d "Wyłącz i zatrzymaj udostępnianie…", wave 10). Always parked, and
+/// released only by another PLATFORM admin: the disable is the platform's
+/// switch (`AddonToggleRequest` is `#[policy(Admin)]`), and the stop reaches
+/// every organisation's shares on the node, not only the approver's.
+pub const OP_SHARING_STOP: &str = "sharing_stop";
 
 /// How long a parked operation stays approvable when nobody configured it.
 /// A day is long enough for a colleague in another timezone and short enough
@@ -288,11 +296,16 @@ pub fn second_pair_available(a: &Actor<'_>) -> bool {
 ///
 /// The payload is stored WITHOUT its sudo password — a password never reaches
 /// disk (§3.4) — so the approver supplies their own when the operation runs.
+///
+/// `detail` is what the approver decides on, in both forms (`CodedText`): the
+/// code the approver's screen words in the approver's language, and the
+/// node's own sentence the audit row, the alert's forwarded text and the
+/// tooltip keep. A bare sentence is accepted (uncoded) and shown as written.
 pub fn park(
     a: &Actor<'_>,
     operation: &str,
     subject: &str,
-    detail: &str,
+    detail: impl Into<CodedText>,
     payload: &TentaNasPayload,
 ) -> Result<NasPendingApproval> {
     park_shown(a, operation, subject, subject, detail, payload)
@@ -309,16 +322,18 @@ pub fn park_shown(
     operation: &str,
     subject: &str,
     shown_subject: &str,
-    detail: &str,
+    detail: impl Into<CodedText>,
     payload: &TentaNasPayload,
 ) -> Result<NasPendingApproval> {
+    let detail: CodedText = detail.into();
     let ttl_hours = settings(a.main_db, a.checker, a.org_id, a.addon_id).ttl_hours;
     let now = chrono::Utc::now();
     let approval = NasPendingApproval {
         request_id: uuid::Uuid::now_v7().to_string(),
         operation: operation.to_string(),
         subject: subject.to_string(),
-        detail: detail.to_string(),
+        detail: detail.text.clone(),
+        detail_reasons: detail.reasons.clone(),
         status: "pending".to_string(),
         requested_by: a.user_id.to_string(),
         requested_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -343,7 +358,7 @@ pub fn park_shown(
         "warning",
         "approval",
         &approval.request_id,
-        &approval_alert_text(operation, subject, shown_subject, detail),
+        &approval_alert_text(operation, subject, shown_subject, &detail.text),
     );
     audit_as(a, "nas.approval.requested", &approval, "pending");
     Ok(approval)
@@ -402,6 +417,55 @@ pub fn reject(
     let _ = store::resolve_alert(a.nas_db, &alert_key(request_id));
     audit_as(a, "nas.approval.rejected", &row.approval, "rejected");
     Ok(row.approval)
+}
+
+/// The pending sharing stops parked in OTHER organisations on this node
+/// (critic wave 10, R2-2). A stop blocks the whole node, so a platform admin
+/// of any organisation must be able to see one and reject it — but not read
+/// it: the row carries the node only, with a neutral coded detail; the
+/// author, the other organisation's share names and the payload stay out.
+pub fn foreign_pending_stops(a: &Actor<'_>) -> Result<Vec<NasPendingApproval>> {
+    expire_due(a.main_db, a.nas_db, a.node_id);
+    Ok(store::list_pending_of_operation(a.nas_db, OP_SHARING_STOP)?
+        .into_iter()
+        .filter(|row| row.org_id != a.org_id)
+        .map(|row| {
+            let node = row.approval.subject.clone();
+            NasPendingApproval {
+                detail: "a stop of this node's sharing, requested in another organisation, waits for approval".to_string(),
+                detail_reasons: vec![super::disks::coded_reason("sharing_stop_other_org", &[("node", node)])],
+                requested_by: String::new(),
+                decided_by: None,
+                decision_note: String::new(),
+                is_own_request: false,
+                ..row.approval
+            }
+        })
+        .collect())
+}
+
+/// Rejects a pending sharing stop parked in ANOTHER organisation — the
+/// only foreign request anyone may decide, and only by rejecting it. The
+/// caller's platform role is the dispatcher's check.
+pub fn reject_foreign_stop(a: &Actor<'_>, request_id: &str, note: &str) -> Result<NasPendingApproval, ApprovalError> {
+    let row = store::approval(a.nas_db, request_id).ok().flatten().ok_or(ApprovalError::NotFound)?;
+    if row.approval.operation != OP_SHARING_STOP || row.org_id == a.org_id {
+        return Err(ApprovalError::NotFound);
+    }
+    if row.approval.status != "pending" {
+        return Err(ApprovalError::Closed(row.approval.status));
+    }
+    if !store::close_approval(a.nas_db, request_id, "rejected", Some(a.user_id), note).unwrap_or(false) {
+        return Err(ApprovalError::Closed("closed".to_string()));
+    }
+    let _ = store::resolve_alert(a.nas_db, &alert_key(request_id));
+    let mut approval = row.approval;
+    approval.status = "rejected".to_string();
+    approval.decided_by = Some(a.user_id.to_string());
+    // Audited under the request's own organisation: that is whose request
+    // it was.
+    audit(a.main_db, &row.org_id, a.addon_id, a.node_id, a.user_id, "nas.approval.rejected", &approval, "rejected");
+    Ok(approval)
 }
 
 /// Records what the approved operation started. A job id makes the row point
@@ -521,14 +585,6 @@ fn approval_alert_text(operation: &str, subject: &str, shown_subject: &str, deta
 /// or, when it is empty, the operation alone. Also what the read boundary
 /// rewrites a config import's stored title to once it has resolved the node
 /// (`dispatch::tentanas::alerts_list`).
-/// A parked operation's `detail` as a CODE the approver's screen words in
-/// the approver's language (`approvals.detail_<code>`, `approvals.js`),
-/// instead of a sentence in one language: `text:<code>`. The approvals list
-/// shows a detail that is not such a code as it was written.
-pub fn coded_detail(code: &str) -> String {
-    format!("text:{code}")
-}
-
 pub fn approval_alert_title(shown_subject: &str) -> String {
     if shown_subject.trim().is_empty() {
         "a red-path operation waits for a second admin".to_string()

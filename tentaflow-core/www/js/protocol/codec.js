@@ -2960,12 +2960,11 @@ export const encode = {
 
   /**
    * BusPayload::TopicCreateRequest. payload: { name, options: {...BusTopicOptionsWire} }
-   * (M02 creator). `options` is normally already SNAKE_CASE
-   * (`buildTopicOptionsWire` in `modules/tentabus.js`), but `camelToSnakePayload`
-   * is applied first so a caller using the friendlier `durabilityClass` payload
-   * key (owner decision B's `durability_class` option, 'standard' | 'critical')
-   * — or any other camelCase key — still reaches
-   * `serde_json::from_str::<BusTopicOptionsWire>` correctly; an already-
+   * (the topic creator, `buildTopicCreateRequest` in
+   * `modules/tentabus/topic-creator.js`, sends camelCase keys).
+   * `camelToSnakePayload` turns every camelCase key (`durabilityClass`,
+   * `retentionMs`, …) into the snake_case one
+   * `serde_json::from_str::<BusTopicOptionsWire>` expects; an already-
    * snake_case key round-trips unchanged.
    *
    * `options.durability` accepts one more value on TOP of the concrete
@@ -3095,6 +3094,24 @@ export const encode = {
       String(payload.mode ?? 'earliest'),
       offset,
       tsMs,
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::OffsetForTimestampRequest (bus.read + Consume on the topic, read-only):
+   * the first offset of `partition` whose record timestamp is >= tsMs (the high watermark
+   * when none) — lets the reset dialog state how many messages a "from a chosen time"
+   * move would re-read or skip before the admin confirms. payload: { instanceId, topic,
+   * partition, tsMs }. Answers BusOffsetForTimestampResponse { offset }.
+   */
+  busOffsetForTimestampRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusOffsetForTimestampRequest(
+      encode._busInstanceId(payload),
+      String(payload.topic ?? ''),
+      Number(payload.partition ?? 0),
+      BigInt(payload.tsMs ?? payload.ts_ms ?? 0),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -3289,22 +3306,6 @@ export const encode = {
     const body = _wasm.encodeBusReplicaListRequest(
       encode._busInstanceId(payload),
       payload.topic == null ? undefined : String(payload.topic),
-    );
-    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
-  },
-
-  /**
-   * BusPayload::ReassignRequest (Admin — M06 replica-set change). payload: { topic,
-   * partition?, replicas }. `partition` omitted/null targets every partition of `topic`;
-   * a number targets one. `replicas` is the new replica node_id set.
-   */
-  busReassignRequest(correlationId, payload = {}, sequence = 1) {
-    assertReady();
-    const body = _wasm.encodeBusReassignRequest(
-      encode._busInstanceId(payload),
-      String(payload.topic ?? ''),
-      payload.partition == null ? undefined : Number(payload.partition),
-      (payload.replicas ?? []).map(String),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -5600,7 +5601,13 @@ export const encode = {
   /** MessageBody::AddonUninstallRequest — odinstalowuje addon. */
   addonUninstallRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeAddonUninstallRequest(String(payload.addonId ?? ''));
+    // `acknowledgedNodes`: the peers the admin proceeds without, each with
+    // its name retyped (wave-9b critic, MAJOR A).
+    const acks = Array.isArray(payload.acknowledgedNodes) ? payload.acknowledgedNodes : [];
+    const body = _wasm.encodeAddonUninstallRequestJson(JSON.stringify({
+      addon_id: String(payload.addonId ?? ''),
+      acknowledged_nodes: acks.map((a) => ({ node_id: String(a.nodeId ?? ''), confirm_name: String(a.confirmName ?? '') })),
+    }));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -5613,6 +5620,58 @@ export const encode = {
   addonTeardownPlanRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeAddonTeardownPlanRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonTeardownStatusRequest — where the uninstall stands on the node that answers (forwarded per node). */
+  addonTeardownStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonTeardownStatusRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonTeardownArmRequest — arms the answering node's privilege channel for its teardown (n18a, mode B). payload: { addonId, sudoPassword } */
+  addonTeardownArmRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      addon_id: csText(payload.addonId ?? payload.addon_id),
+      sudo_password: csText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeAddonTeardownArmRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonTeardownDisarmRequest — drops the teardown password the answering node holds. payload: { addonId } */
+  addonTeardownDisarmRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonTeardownDisarmRequest(String(payload.addonId ?? ''));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::AddonDisablePreviewRequest — what disabling the instance does on the answering node (n18d). */
+  addonDisablePreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeAddonDisablePreviewRequest(String(payload.addonId ?? ''));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -8463,6 +8522,18 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /**
+   * MessageBody::CodeStudioBody(ProcessSandboxRepairRequest). payload:
+   * { sudoPassword }. Runs on the node the request is addressed to
+   * (`targetNodeId` option), so a peer is repaired by its own root.
+   */
+  codeStudioProcessSandboxRepairRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { sudo_password: String(payload.sudoPassword ?? payload.sudo_password ?? '') };
+    const body = _wasm.encodeCodeStudioProcessSandboxRepairRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   // -------------------------------------------------------------------------
   // Node environment identity + manual config-bundle pull (ROADMAP Z12)
   // -------------------------------------------------------------------------
@@ -9086,6 +9157,17 @@ export const encode = {
   },
 
   /**
+   * MessageBody::TentaNasBody(SharingStopRequest) — n18d "Wyłącz i zatrzymaj
+   * udostępnianie…" (wave 10): a four-eyes request for the answering node.
+   * No fields; answers with ApprovalPendingResponse.
+   */
+  tentaNasSharingStopRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeTentaNasSharingStopRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
    * MessageBody::TentaNasBody(DiskWipePlanRequest) — read-only, but privileged:
    * the refusals name this node's pools, arrays and journal owners.
    */
@@ -9353,6 +9435,19 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaNasBody(DiskSmartTestBatchRequest). payload: { diskIds: string[], kind: 'short'|'long', sudoPassword? } — one job over every disk; answers with JobResponse. */
+  tentaNasDiskSmartTestBatchRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const ids = payload.diskIds ?? payload.disk_ids;
+    const request = {
+      disk_ids: csTextList(ids),
+      kind: csText(payload.kind, 'short'),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasDiskSmartTestBatchRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaNasBody(DiskLocateRequest). payload: { diskId, enable } */
   tentaNasDiskLocateRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
@@ -9539,6 +9634,19 @@ export const encode = {
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
     const body = _wasm.encodeTentaNasPoolDeviceStateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(PoolDetachRequest) — `zpool detach` of the disk a hot
+   *  spare replaced (`NasVdevDisk.detachable`). payload: { name, device, sudoPassword? } */
+  tentaNasPoolDetachRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      name: csText(payload.name),
+      device: csText(payload.device),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasPoolDetachRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9876,12 +9984,13 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::TentaNasBody(TargetsListRequest). payload: {} — the block targets of n12
-   *  plus what this node can serve (LIO, nvmet, iSER, NVMe-oF/RDMA, DH-HMAC-CHAP), its
-   *  interfaces and the zvols the wizard may export. */
+  /** MessageBody::TentaNasBody(TargetsListRequest). payload: { summary? } — the block
+   *  targets of n12 plus what this node can serve (LIO, nvmet, iSER, NVMe-oF/RDMA,
+   *  DH-HMAC-CHAP), its interfaces and the zvols the wizard may export. `summary: true` is
+   *  the fleet poll's light answer: targets and service rows, no capabilities. */
   tentaNasTargetsListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
-    const body = _wasm.encodeTentaNasTargetsListRequest(JSON.stringify({}));
+    const body = _wasm.encodeTentaNasTargetsListRequest(JSON.stringify({ summary: payload.summary === true }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -9913,6 +10022,8 @@ export const encode = {
       // the very first request — dropping them here would make every
       // authenticated NVMe-oF target impossible to create.
       initiators: csTextList(payload.initiators),
+      // "Opis" per entry (wave 12); a key off the list is refused by the node.
+      initiator_descriptions: csTextMap(payload.initiatorDescriptions ?? payload.initiator_descriptions) ?? {},
       confirm_all_interfaces: Boolean(payload.confirmAllInterfaces ?? payload.confirm_all_interfaces),
       enabled: payload.enabled == null ? true : Boolean(payload.enabled),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
@@ -9939,12 +10050,30 @@ export const encode = {
       repick_portal: Boolean(payload.repickPortal ?? payload.repick_portal),
       auth: csTargetAuth(payload.auth),
       initiators: csTextList(payload.initiators),
+      // "Opis" (wave 12): absent → null, which the node reads as "keep the
+      // stored descriptions"; a map replaces them.
+      initiator_descriptions: csTextMap(payload.initiatorDescriptions ?? payload.initiator_descriptions),
       port_groups: csTargetPortGroups(payload.portGroups ?? payload.port_groups),
       confirm_all_interfaces: Boolean(payload.confirmAllInterfaces ?? payload.confirm_all_interfaces),
       enabled: payload.enabled == null ? true : Boolean(payload.enabled),
       sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
     };
     const body = _wasm.encodeTentaNasTargetUpdateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::TentaNasBody(TargetSessionResetRequest) — n19 "Rozłącz" (wave 12): reset
+   *  the iSCSI session of ONE allowlisted initiator, named by its IQN (no session id
+   *  exists on the wire); `revoke` also takes it off the allowlist. JobResponse. */
+  tentaNasTargetSessionResetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      target_id: csText(payload.targetId ?? payload.target_id),
+      initiator: csText(payload.initiator),
+      revoke: Boolean(payload.revoke),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasTargetSessionResetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
@@ -10075,7 +10204,7 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::TentaNasBody(AlertForwardSetRequest). payload: { enabled, syslogTarget?, webhookUrl?, includeAccess? } */
+  /** MessageBody::TentaNasBody(AlertForwardSetRequest). payload: { enabled, syslogTarget?, webhookUrl?, includeAccess?, nodeWide? } — nodeWide false sets the asking organisation's own target. */
   tentaNasAlertForwardSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const request = {
@@ -10083,6 +10212,7 @@ export const encode = {
       syslog_target: csText(payload.syslogTarget ?? payload.syslog_target),
       webhook_url: csText(payload.webhookUrl ?? payload.webhook_url),
       include_access: Boolean(payload.includeAccess ?? payload.include_access),
+      node_wide: Boolean(payload.nodeWide ?? payload.node_wide),
     };
     const body = _wasm.encodeTentaNasAlertForwardSetRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -10768,6 +10898,12 @@ function csOptText(value) {
 
 function csTextList(value) {
   return Array.isArray(value) ? value.map((v) => String(v)) : [];
+}
+
+/** Optional string→string map: absent becomes JSON null (serde `None`). */
+function csTextMap(value) {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) return null;
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [String(k), v == null ? '' : String(v)]));
 }
 
 /** Optional numeric field: absent becomes JSON null, which serde reads as None. */

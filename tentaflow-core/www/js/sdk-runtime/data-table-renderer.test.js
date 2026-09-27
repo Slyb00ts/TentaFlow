@@ -233,6 +233,43 @@ test('Table selectable=single row click emits selection_change', () => {
   assert(tr.classList.contains('selected'));
 });
 
+// Iteration-5 MAJOR 2: in single mode the highlight is ONE row — picking b
+// after a leaves a unticked — and a page change never shows rows c/d as
+// selected because a/b sat in those slots before.
+test('Table selectable=single highlights one row and a page change carries no stale highlight', () => {
+  setup();
+  const store = makeStore();
+  const rows = [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }];
+  let revision = 0;
+  const snapshot = (page, sel) => store.applySnapshot({
+    entries: [
+      { path: PATH('rows'), value: rows },
+      { path: PATH('page'), value: page },
+      { path: PATH('sel'), value: sel },
+    ],
+    state_revision: revision++, truncated: false,
+  });
+  snapshot(1, null);
+  const engine = makeEngine(store);
+  const el = engine.render(comp(TABLE_TAG, tableFields({
+    columns: [col({ id: 'id' })],
+    selectMode: 'single',
+    selectedIdsBind: { kind: 'bound', path: PATH('sel') },
+    pagination: [[0, 2], [1, PATH('page')], [2, false]],
+  })));
+  const sr = mount(el);
+  const marks = () => [...sr.querySelectorAll('tbody tr')].map((tr) => `${tr.querySelector('td').textContent}:${tr.classList.contains('selected') ? 'S' : '-'}`).join(' ');
+  sr.querySelectorAll('tbody tr')[0].click();
+  assertEq(marks(), 'a:S b:-');
+  snapshot(1, 'a');
+  sr.querySelectorAll('tbody tr')[1].click();
+  assertEq(marks(), 'a:- b:S', 'the highlight moves, it is not added');
+  snapshot(1, 'b');
+  assertEq(marks(), 'a:- b:S');
+  snapshot(2, 'b');
+  assertEq(marks(), 'c:- d:-', 'the next page carries no highlight of the slots');
+});
+
 test('Table selectable=multi merges clicked row into bound selection', () => {
   setup();
   const store = makeStore();

@@ -12,6 +12,7 @@ PLATFORM="${1:-$(detect_platform)}"
 BACKENDS="${WHISPER_CPP_BACKENDS:-auto}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake
+resolve_macos_sdk "$PLATFORM"
 # Resolved here (parent shell) so the PATH/CUDACXX exports reach cmake.
 resolve_gpu_toolchains
 

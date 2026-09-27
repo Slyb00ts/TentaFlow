@@ -10,6 +10,7 @@
 // stubbed here.
 
 pub mod batch;
+pub mod epochs;
 pub mod error;
 pub mod index;
 pub mod meta;

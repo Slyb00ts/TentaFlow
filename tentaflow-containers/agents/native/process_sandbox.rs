@@ -24,6 +24,12 @@ mod linux_sandbox_net;
 pub enum SandboxUnavailable {
     /// No `/usr/bin/sandbox-exec` (macOS) and no `/usr/bin/bwrap` (Linux).
     NoSandboxBinary,
+    /// `bwrap` is installed but the kernel refuses it the unprivileged user
+    /// namespace it confines with. Ubuntu 23.10+ ships
+    /// `kernel.apparmor_restrict_unprivileged_userns=1`, which denies it to any
+    /// program without an AppArmor profile granting `userns` — the binary being
+    /// present said nothing about whether it could run.
+    UserNamespacesDenied,
     /// The macOS supervisor entry point never ran in this process, so nothing
     /// can own the resource coalition of its descendants.
     SupervisorNotInitialized,
@@ -39,6 +45,10 @@ impl std::fmt::Display for SandboxUnavailable {
         f.write_str(match self {
             Self::NoSandboxBinary => {
                 "process sandbox unavailable: requires macOS sandbox-exec or Linux /usr/bin/bwrap"
+            }
+            Self::UserNamespacesDenied => {
+                "process sandbox unavailable: the kernel denies /usr/bin/bwrap an unprivileged \
+                 user namespace (AppArmor restricts unprivileged user namespaces)"
             }
             Self::SupervisorNotInitialized => {
                 "this executable has not initialized the process supervisor entry point"
@@ -62,15 +72,20 @@ impl std::error::Error for SandboxUnavailable {}
 /// The three macOS facts are `Option` because a Linux node has none of that
 /// machinery. It cannot fail on launchd, and a sentinel "fine" would be exactly
 /// the conflation of "not applicable" with "verified" these causes exist to
-/// undo.
+/// undo. `user_namespaces` is the Linux fact, `None` on macOS for the same
+/// reason.
 fn classify(
     sandbox_binary: bool,
+    user_namespaces: Option<bool>,
     supervisor_initialized: Option<bool>,
     coalition: Option<u64>,
     launchd_domain: Option<bool>,
 ) -> Result<(), SandboxUnavailable> {
     if !sandbox_binary {
         return Err(SandboxUnavailable::NoSandboxBinary);
+    }
+    if user_namespaces == Some(false) {
+        return Err(SandboxUnavailable::UserNamespacesDenied);
     }
     if supervisor_initialized == Some(false) {
         return Err(SandboxUnavailable::SupervisorNotInitialized);
@@ -82,6 +97,41 @@ fn classify(
         return Err(SandboxUnavailable::GuiSessionRequired);
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const BWRAP: &str = "/usr/bin/bwrap";
+
+/// How long a namespace probe answers for. The availability question is asked
+/// on every node-info refresh and every workspace create; one short process per
+/// window is what keeps the answer honest without forking on each ask.
+#[cfg(target_os = "linux")]
+const USERNS_PROBE_TTL: Duration = Duration::from_secs(30);
+
+#[cfg(target_os = "linux")]
+static USERNS_PROBE: std::sync::Mutex<Option<(Instant, bool)>> = std::sync::Mutex::new(None);
+
+/// Whether `bwrap` can actually create the namespaces the sandbox runs in, by
+/// running it with the same `--unshare-all` the real policy uses. Checking that
+/// the binary exists reported a working sandbox on every Ubuntu that denies it
+/// user namespaces, and the first real launch then failed with no reason shown.
+#[cfg(target_os = "linux")]
+fn bwrap_can_unshare() -> bool {
+    let mut cached = USERNS_PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, answer)) = *cached {
+        if at.elapsed() < USERNS_PROBE_TTL {
+            return answer;
+        }
+    }
+    let answer = std::process::Command::new(BWRAP)
+        .args(["--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "/bin/true"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    *cached = Some((Instant::now(), answer));
+    answer
 }
 
 /// A private temporary directory whose owner is PROVABLE.
@@ -769,13 +819,32 @@ impl ProcessSandbox {
         #[cfg(target_os = "macos")]
         return macos_supervisor::check_available();
         #[cfg(target_os = "linux")]
-        // Linux confines by pid namespace and bind mounts, so `bwrap` is the
-        // whole requirement and there is no supervisor, coalition or window
-        // server to probe — those `None`s carry that absence, they are not a
-        // check passed.
-        return classify(Path::new("/usr/bin/bwrap").is_file(), None, None, None);
+        // Linux confines by namespaces and bind mounts, so a `bwrap` that can
+        // create them is the whole requirement and there is no supervisor,
+        // coalition or window server to probe — those `None`s carry that
+        // absence, they are not a check passed.
+        return {
+            let binary = Path::new(BWRAP).is_file();
+            classify(
+                binary,
+                binary.then(bwrap_can_unshare),
+                None,
+                None,
+                None,
+            )
+        };
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         return Err(SandboxUnavailable::NoSandboxBinary);
+    }
+
+    /// Drops the cached namespace probe, so the next `check_available` measures
+    /// again. Called after something changed the answer on purpose — installing
+    /// the AppArmor profile — instead of waiting out the cache.
+    pub fn forget_availability_probe() {
+        #[cfg(target_os = "linux")]
+        {
+            *USERNS_PROBE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -1242,12 +1311,28 @@ mod tests {
         ];
         for (binary, initialized, coalition, domain, expected) in table {
             assert_eq!(
-                classify(*binary, *initialized, *coalition, *domain),
+                classify(*binary, None, *initialized, *coalition, *domain),
                 *expected,
                 "binary={binary} initialized={initialized:?} coalition={coalition:?} \
                  domain={domain:?}"
             );
         }
+    }
+
+    /// A Linux `bwrap` that is present but denied its namespaces is a refusal
+    /// of its own, not a working sandbox; a missing binary still outranks it,
+    /// since there is nothing to deny anything to.
+    #[test]
+    fn a_denied_namespace_is_its_own_refusal() {
+        assert_eq!(
+            classify(true, Some(false), None, None, None),
+            Err(SandboxUnavailable::UserNamespacesDenied)
+        );
+        assert_eq!(classify(true, Some(true), None, None, None), Ok(()));
+        assert_eq!(
+            classify(false, Some(false), None, None, None),
+            Err(SandboxUnavailable::NoSandboxBinary)
+        );
     }
 
     /// Every `.to_string()` consumer — the node picker's diagnostic, the deploy
@@ -1735,6 +1820,15 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn linux_sandbox_carries_its_proxy_without_sharing_the_network() {
+        // A policy is only built where the sandbox can run: the availability
+        // probe starts bwrap for real, so a host denying unprivileged
+        // namespaces refuses the policy before there is an argv to inspect.
+        if let Some(reason) = unprivileged_netns_denial() {
+            eprintln!(
+                "SKIP linux_sandbox_carries_its_proxy_without_sharing_the_network: {reason}"
+            );
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("project");
         let private = root.path().join("profile");

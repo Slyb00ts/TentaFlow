@@ -38,17 +38,32 @@ pub struct Problem {
     /// four on everything else, so "which form" stops being a question about
     /// shape alone.
     pub bits: u32,
+    /// Wiersze OGONA macierzy, które liczy Neural Engine: `[rows - ane_rows, rows)`.
+    ///
+    /// Zero oznacza „brak ramienia ANE" i tak konstruuje problem każdy, kto
+    /// nie ma dla tej wagi skompilowanego modelu CoreML. Liczba jest STAŁA —
+    /// zaszyta w kształcie modelu CoreML przy jego budowie — więc nie jest
+    /// polityką jak udział CPU, tylko faktem o wadze. `split_rows` wymaga
+    /// wielokrotności bloku `QMG_BN` i wartości mniejszej niż `rows`, a
+    /// poniżej progu wsadu zeruje ją: dekodowanie nigdy nie idzie na ANE.
+    pub ane_rows: u32,
 }
 
 impl Problem {
-    /// The common case: four-bit weights.
+    /// The common case: four-bit weights, no ANE arm.
     pub fn new(tokens: u32, rows: u32, cols: u32) -> Self {
         Self {
             tokens,
             rows,
             cols,
             bits: 4,
+            ane_rows: 0,
         }
+    }
+
+    /// Ten sam problem z ogonem `ane_rows` wierszy oddanym Neural Engine.
+    pub fn with_ane_rows(self, ane_rows: u32) -> Self {
+        Self { ane_rows, ..self }
     }
 }
 
@@ -159,15 +174,29 @@ mod metal_forms {
         /// large enough to pay for the command buffer that starting the GPU
         /// early costs.
         MatrixUnitsSharedWithCpu,
+        /// Trzy jednostki naraz: GPU na czele, CPU w środku, Neural Engine na
+        /// OGONIE wierszy. Ogon ANE jest stały (zaszyty w modelu CoreML), więc
+        /// ta forma istnieje tylko dla wag, które taki model mają, i tylko dla
+        /// wsadów, przy których podział w ogóle się opłaca.
+        MatrixUnitsSharedWithCpuAndAne,
     }
 
-    /// How the rows of one product are divided between the two units.
+    /// How the rows of one product are divided between the units.
+    ///
+    /// Układ jest zawsze ten sam: GPU `[0, gpu)`, CPU `[gpu, gpu + cpu)`,
+    /// ANE `[rows - ane, rows)`. Kontrakt: `gpu + cpu + ane == rows`,
+    /// `gpu % QMG_BN == 0` i `(gpu + cpu) % QMG_BN == 0`, bo kernel
+    /// macierzowy pisze całe bloki wierszy, a ogon ANE zaczyna się tam, gdzie
+    /// kończy się ostatni blok, który mógłby napisać ktokolwiek inny.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct RowSplit {
         /// Rows `[0, gpu_rows)` — the matrix-unit kernel.
         pub gpu_rows: u32,
-        /// Rows `[gpu_rows, rows)` — Accelerate on the CPU.
+        /// Rows `[gpu_rows, gpu_rows + cpu_rows)` — Accelerate on the CPU.
+        /// Zero, gdy CPU się nie kwalifikuje, a ANE i tak bierze ogon.
         pub cpu_rows: u32,
+        /// Rows `[rows - ane_rows, rows)` — the Neural Engine. Zero without it.
+        pub ane_rows: u32,
     }
 
     /// Fraction of rows left to the GPU, as a function of the batch.
@@ -212,30 +241,64 @@ mod metal_forms {
     /// between +10,9% at 256 and -17% at 128, which is where this cut sits.
     const MIN_SPLIT_TOKENS: u32 = 256;
 
-    /// Where the boundary falls, or `None` when the whole product stays on the
-    /// GPU. Every shape is allowed to answer `None`; that is the fallback and
-    /// it is always correct.
+    /// Where the boundaries fall, or `None` when the whole product stays on
+    /// the GPU. Every shape is allowed to answer `None`; that is the fallback
+    /// and it is always correct.
+    ///
+    /// Ogon ANE (`p.ane_rows`) jest odejmowany NAJPIERW i progi opłacalności
+    /// CPU liczą się na tym, co zostaje: to reszta jest dzielona między GPU i
+    /// CPU, a nie cała macierz. Gdy CPU się nie kwalifikuje, a ogon ANE jest,
+    /// GPU bierze całą resztę i podział wciąż istnieje. Poniżej progu wsadu
+    /// ogon jest zerowany bez względu na wejście — dekodowanie jest
+    /// ograniczone pasmem i żadna trzecia jednostka mu nie pomoże (EKS-A9,
+    /// przy małym T ANE czyta wagi na każde wywołanie) — więc wtedy GPU
+    /// liczy wszystko, jak bez ANE.
+    ///
+    /// Ogon niewyrównany do bloku albo nie mniejszy niż `rows` to odmowa
+    /// (`None`), nie przycięcie: model CoreML ma stały kształt, a przycięty
+    /// ogon liczyłby inne wiersze, niż ten model oddaje.
     pub fn split_rows(p: &Problem) -> Option<RowSplit> {
+        let block = crate::msl::QMG_BN;
+        if p.tokens < MIN_SPLIT_TOKENS {
+            return None;
+        }
+        if p.ane_rows > 0 && (!p.ane_rows.is_multiple_of(block) || p.ane_rows >= p.rows) {
+            return None;
+        }
+        let remaining = p.rows - p.ane_rows;
+        // Granica GPU/CPU pada na blok, a ogon ANE też jest blokowy, więc
+        // reszta musi się składać z całych bloków — inaczej ostatni blok GPU
+        // wjechałby w wiersze ANE. Bez ogona kształt sprawdza `qmg_fits`.
+        if p.ane_rows > 0 && !remaining.is_multiple_of(block) {
+            return None;
+        }
+        let ane_only = || {
+            (p.ane_rows > 0).then_some(RowSplit {
+                gpu_rows: remaining,
+                cpu_rows: 0,
+                ane_rows: p.ane_rows,
+            })
+        };
         // The CPU unpacker has complete decoders for both affine code widths.
         // Other widths stay on the GPU until their high-bit layout is carried
         // through this contract; using only low nibbles would change the model.
         if !matches!(p.bits, 4 | 6) {
-            return None;
+            return ane_only();
         }
-        let work = 2 * u64::from(p.rows) * u64::from(p.cols) * u64::from(p.tokens);
-        if p.tokens < MIN_SPLIT_TOKENS || work < MIN_SPLIT_WORK {
-            return None;
+        let work = 2 * u64::from(remaining) * u64::from(p.cols) * u64::from(p.tokens);
+        if work < MIN_SPLIT_WORK {
+            return ane_only();
         }
         // The kernel writes whole blocks of QMG_BN rows, so the boundary has to
         // fall on one or the GPU would overwrite the CPU's rows.
-        let gpu = ((p.rows as f32 * gpu_row_share(p.tokens)) as u32 / crate::msl::QMG_BN)
-            * crate::msl::QMG_BN;
-        if gpu == 0 || gpu >= p.rows {
-            return None;
+        let gpu = ((remaining as f32 * gpu_row_share(p.tokens)) as u32 / block) * block;
+        if gpu == 0 || gpu >= remaining {
+            return ane_only();
         }
         Some(RowSplit {
             gpu_rows: gpu,
-            cpu_rows: p.rows - gpu,
+            cpu_rows: remaining - gpu,
+            ane_rows: p.ane_rows,
         })
     }
 
@@ -273,6 +336,15 @@ mod metal_forms {
     pub const MATMUL_FORMS: Registry<MatmulForm> = Registry {
         op: "qmatmul",
         variants: &[
+            Variant {
+                name: "qmg_matrix_units_shared_with_cpu_and_ane",
+                form: MatmulForm::MatrixUnitsSharedWithCpuAndAne,
+                // Tylko gdy podział ma NIEZEROWY ogon ANE: bez niego ten wpis
+                // nie ma nic do dodania i przepuszcza problem niżej, więc dla
+                // `ane_rows == 0` rejestr odpowiada dokładnie tak jak przedtem.
+                applies: |p| qmg_serves(p) && split_rows(p).is_some_and(|s| s.ane_rows > 0),
+                because: "EKS-A9: 1,54 + 6,58 + 0,45 TFLOPS współbieżnie",
+            },
             Variant {
                 name: "qmg_matrix_units_shared_with_cpu",
                 form: MatmulForm::MatrixUnitsSharedWithCpu,
@@ -415,6 +487,7 @@ mod metal_forms {
                 rows,
                 cols,
                 bits: 6,
+                ane_rows: 0,
             };
             assert!(split_rows(&six(256, 11264, 4096)).is_some());
             assert!(split_rows(&six(1024, 4096, 11264)).is_some());
@@ -451,6 +524,139 @@ mod metal_forms {
             assert!(
                 at(256).gpu_rows > at(512).gpu_rows,
                 "udział GPU nie maleje z rosnącym wsadem"
+            );
+        }
+
+        /// Kształty Bielika z ogonem ANE: suma wierszy się domyka, granice
+        /// padają na bloki, a udział GPU liczy się z RESZTY, nie z całości.
+        #[test]
+        fn the_ane_tail_comes_off_first_and_the_rest_is_split_as_before() {
+            let block = crate::msl::QMG_BN;
+            for &(rows, cols, ane) in &[
+                (11264u32, 4096u32, 3072u32),
+                (4096, 11264, 1024),
+                (4096, 4096, 1024),
+                (4096, 4096, 64),
+            ] {
+                for tokens in [256u32, 512, 1024] {
+                    let p = Problem::new(tokens, rows, cols).with_ane_rows(ane);
+                    let s = split_rows(&p).expect("ogon ANE to zawsze jakiś podział");
+                    assert_eq!(s.ane_rows, ane, "{p:?}");
+                    assert_eq!(s.gpu_rows + s.cpu_rows + s.ane_rows, rows, "{p:?}");
+                    assert_eq!(s.gpu_rows % block, 0, "{p:?}");
+                    assert_eq!((s.gpu_rows + s.cpu_rows) % block, 0, "{p:?}");
+                    assert!(s.gpu_rows > 0, "{p:?}: GPU bez pracy");
+                    // Reszta dzieli się DOKŁADNIE tak, jak dzieliłaby się
+                    // macierz o tylu wierszach bez ANE.
+                    let without = split_rows(&Problem::new(tokens, rows - ane, cols));
+                    match without {
+                        Some(w) => {
+                            assert_eq!((w.gpu_rows, w.cpu_rows), (s.gpu_rows, s.cpu_rows), "{p:?}");
+                        }
+                        None => assert_eq!((s.gpu_rows, s.cpu_rows), (rows - ane, 0), "{p:?}"),
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn below_the_batch_threshold_the_ane_tail_is_zeroed_whatever_the_caller_said() {
+            // Dekodowanie i małe wsady: GPU bierze wszystko, jak bez ANE.
+            for tokens in [1u32, 8, 32, 128, 255] {
+                let p = Problem::new(tokens, 11264, 4096).with_ane_rows(3072);
+                assert!(split_rows(&p).is_none(), "{p:?}");
+                let form = MATMUL_FORMS.pick(&p).unwrap().form;
+                assert_ne!(form, MatmulForm::MatrixUnitsSharedWithCpuAndAne, "{p:?}");
+                assert_ne!(form, MatmulForm::MatrixUnitsSharedWithCpu, "{p:?}");
+                assert_eq!(
+                    form,
+                    MATMUL_FORMS
+                        .pick(&Problem::new(tokens, 11264, 4096))
+                        .unwrap()
+                        .form,
+                    "{p:?}: ogon ANE zmienił wybór poniżej progu"
+                );
+            }
+        }
+
+        #[test]
+        fn the_cpu_drops_out_when_what_is_left_after_the_ane_tail_is_too_small() {
+            // k/v: 1024 wierszy z ogonem 512 zostawia 512 x 4096 x 256 — o rząd
+            // za mało pracy na granicę bufora poleceń. ANE zostaje, CPU nie.
+            let p = Problem::new(256, 1024, 4096).with_ane_rows(512);
+            let s = split_rows(&p).expect("ogon ANE bez CPU to nadal podział");
+            assert_eq!(
+                s,
+                RowSplit {
+                    gpu_rows: 512,
+                    cpu_rows: 0,
+                    ane_rows: 512
+                }
+            );
+            assert_eq!(
+                MATMUL_FORMS.pick(&p).unwrap().form,
+                MatmulForm::MatrixUnitsSharedWithCpuAndAne
+            );
+            // Szerokość kodu, której CPU nie dekoduje, też wyłącza tylko CPU.
+            let eight = Problem {
+                bits: 8,
+                ..Problem::new(1024, 11264, 4096).with_ane_rows(3072)
+            };
+            let s = split_rows(&eight).expect("ANE nie zależy od dekodera CPU");
+            assert_eq!(
+                s,
+                RowSplit {
+                    gpu_rows: 8192,
+                    cpu_rows: 0,
+                    ane_rows: 3072
+                }
+            );
+            // Bez ogona ten sam brak pracy oznacza brak podziału — jak dotąd.
+            assert!(split_rows(&Problem::new(256, 1024, 4096)).is_none());
+        }
+
+        #[test]
+        fn a_misaligned_or_oversized_ane_tail_is_refused_not_trimmed() {
+            let at = |ane| split_rows(&Problem::new(512, 11264, 4096).with_ane_rows(ane));
+            assert!(at(3072).is_some(), "kontrola: wyrównany ogon przechodzi");
+            assert!(at(3000).is_none(), "ogon nie na bloku");
+            assert!(at(32).is_none(), "pół bloku");
+            assert!(at(11264).is_none(), "ogon równy całości");
+            assert!(at(11264 + 64).is_none(), "ogon większy niż macierz");
+            // Odmowa spada na formę bez ANE, a nie na błąd w środku przebiegu.
+            let p = Problem::new(512, 11264, 4096).with_ane_rows(3000);
+            let form = MATMUL_FORMS.pick(&p).unwrap().form;
+            assert_eq!(form, MatmulForm::MatrixUnits);
+            // Reszta niewyrównana do bloku również: 4096 - 64 = 4032 jest
+            // blokowe, ale 4100 - 64 nie.
+            assert!(split_rows(&Problem::new(512, 4100, 4096).with_ane_rows(64)).is_none());
+        }
+
+        #[test]
+        fn the_ane_form_sits_first_and_is_picked_only_with_a_tail() {
+            assert_eq!(
+                MATMUL_FORMS.variants[0].form,
+                MatmulForm::MatrixUnitsSharedWithCpuAndAne,
+                "forma z trzema jednostkami ma być pierwsza — jest najszybsza"
+            );
+            let with = Problem::new(512, 11264, 4096).with_ane_rows(3072);
+            assert_eq!(
+                MATMUL_FORMS.pick(&with).unwrap().form,
+                MatmulForm::MatrixUnitsSharedWithCpuAndAne
+            );
+            let without = Problem::new(512, 11264, 4096);
+            assert_eq!(
+                MATMUL_FORMS.pick(&without).unwrap().form,
+                MatmulForm::MatrixUnitsSharedWithCpu,
+                "bez ogona wybór ma być ten, co dotąd"
+            );
+            assert_eq!(
+                split_rows(&without).unwrap(),
+                RowSplit {
+                    gpu_rows: 7872,
+                    cpu_rows: 3392,
+                    ane_rows: 0
+                }
             );
         }
 

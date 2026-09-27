@@ -75,6 +75,12 @@ pub struct NodeSummary {
     /// quietly missing a disk shelf. Per tenant, like `arrays_total`.
     #[serde(default)]
     pub arrays_unmeasured: u32,
+    /// Until when the mode-B channel is armed, at `updated_at`
+    /// (`NasNodeInfo::armed_until`). Node hardware state, like
+    /// `elevation_mode`, so every tenant may read it. Defaulted for a row an
+    /// older build wrote.
+    #[serde(default)]
+    pub armed_until: Option<String>,
 }
 
 /// The capability labels of a node, from the same feature probe the
@@ -254,6 +260,56 @@ fn local_array_readings() -> &'static parking_lot::RwLock<BTreeMap<String, Optio
     READINGS.get_or_init(Default::default)
 }
 
+/// `used` and `avail` of every pool's ROOT dataset, by pool name, from
+/// `zfs list -Hp -d 0 -t filesystem -o name,used,avail`.
+///
+/// A line that is not three fields, or whose numbers do not parse, is
+/// dropped: its pool then has no reading, which `pool_bytes` counts as
+/// nothing rather than as a guess.
+fn parse_root_datasets(text: &str) -> BTreeMap<String, (u64, u64)> {
+    text.lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').map(str::trim).collect();
+            let [name, used, avail] = fields.as_slice() else {
+                return None;
+            };
+            Some(((*name).to_string(), (used.parse().ok()?, avail.parse().ok()?)))
+        })
+        .collect()
+}
+
+/// One `zfs list` for the root dataset of every pool on the node. Depth 0
+/// with no dataset named lists exactly the pools' roots, so this costs one
+/// process however many pools there are — the same budget as the row's one
+/// `zpool list`.
+async fn pool_root_usage() -> BTreeMap<String, (u64, u64)> {
+    match super::zfs::zfs(&["list", "-Hp", "-d", "0", "-t", "filesystem", "-o", "name,used,avail"]).await {
+        Ok(text) => parse_root_datasets(&text),
+        Err(e) => {
+            tracing::debug!("tentanas: zfs list of pool roots failed: {e}");
+            BTreeMap::new()
+        }
+    }
+}
+
+/// The pools' (capacity, used) in the node screen's unit: each pool's root
+/// dataset, `used + avail` against `used` — exactly what `pools::assemble`
+/// puts into `NasPool::usable_bytes` / `used_bytes` and the n02 capacity
+/// tile sums.
+///
+/// NOT `zpool list`'s SIZE/ALLOC. Those are RAW: parity and padding
+/// included, so a 6×8 TB RAIDZ2 reads as ~44 TiB on the fleet card while its
+/// own screen says ~29 TiB, and the two screens of one node disagreed by a
+/// third (M6). A pool with no root reading contributes nothing to either
+/// figure, as it does on the node screen (`root.map_or(0, …)`), so the two
+/// screens still agree when one read fails.
+fn pool_bytes(pools: &[super::pools::PoolListRow], roots: &BTreeMap<String, (u64, u64)>) -> (u64, u64) {
+    pools
+        .iter()
+        .filter_map(|p| roots.get(&p.name))
+        .fold((0, 0), |(cap, used), (root_used, avail)| (cap + root_used + avail, used + root_used))
+}
+
 /// Warnings and failures of the node's disks, counted APART. `health` below
 /// already tells the two states apart; one shared counter beside it let a
 /// dead disk travel to the fleet row as a warning.
@@ -280,6 +336,11 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
     // One `zpool list` is enough for the fleet row: the full pool view costs a
     // `zpool status` per pool and the header only needs counts and states.
     let pools = super::pools::list_rows().await.unwrap_or_default();
+    let (pool_capacity, pool_used) = if pools.is_empty() {
+        (0, 0)
+    } else {
+        pool_bytes(&pools, &pool_root_usage().await)
+    };
     let pool_critical = pools
         .iter()
         .any(|p| matches!(p.state.as_str(), "faulted" | "unavail" | "removed"));
@@ -325,9 +386,11 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         // every parity disk made the node look emptier than it was. What is
         // summed is the storage the node actually serves: here its ZFS pools
         // (node hardware, every tenant's to see), and at read time the asking
-        // tenant's own measured Elastic Arrays (`scope_local_arrays`).
-        capacity_bytes: pools.iter().map(|p| p.size_bytes).sum::<u64>(),
-        used_bytes: pools.iter().map(|p| p.alloc_bytes).sum::<u64>(),
+        // tenant's own measured Elastic Arrays (`scope_local_arrays`). The
+        // pools are counted in USABLE bytes, the unit of the node screen
+        // (`pool_bytes`), never zpool's raw size.
+        capacity_bytes: pool_capacity,
+        used_bytes: pool_used,
         features: feature_labels(env.as_ref()),
         // Host facts of the node card's subtitle come from the environment
         // probe, the one source the Environment tab already reads them from.
@@ -339,6 +402,7 @@ pub async fn local_summary(db: &DbPool) -> NodeSummary {
         // Per tenant, so never published (see the field).
         arrays_total: 0,
         arrays_unmeasured: 0,
+        armed_until: super::elevation::armed_until(),
         updated_at: super::db::now(),
     }
 }
@@ -402,21 +466,29 @@ pub fn scope_local_arrays(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) 
     true
 }
 
-/// Puts the asking organisation's own shares on THIS node's row: their count,
-/// and "warning" when one of them is in `error` (a share the node cannot
-/// export is a node problem the fleet view has to show — for the tenant it
-/// belongs to). The same shape and the same limits as `scope_local_alerts`:
-/// the published row carries no share figure at all, only the local row can
-/// be completed, and a remote row keeps 0 — it undercounts the tenant's
-/// shares there but never reveals another tenant's. A failed read leaves the
-/// row as published.
+/// Puts the asking organisation's own shared resources on THIS node's row:
+/// its SMB/NFS shares AND its iSCSI/NVMe-oF targets, counted together, and
+/// "warning" when one of them is in `error` (a share the node cannot export,
+/// or a target it cannot serve, is a node problem the fleet view has to show
+/// — for the tenant it belongs to). The Sharing tab lists both kinds and the
+/// mockups count them as one figure (n01 "Share 6" = 2×SMB · 2×NFS · iSCSI ·
+/// NVMe-oF); counting shares alone left every block target out of the node
+/// card, the tab badge and the fleet total.
 ///
-/// Returns whether the read succeeded (`scope_local_org_figures`).
+/// The same shape and the same limits as `scope_local_alerts`: the published
+/// row carries no such figure at all, only the local row can be completed,
+/// and a remote row keeps 0 — it undercounts the tenant's resources there but
+/// never reveals another tenant's. A failed read of EITHER table leaves the
+/// row as published: half a count is not a count.
+///
+/// Returns whether both reads succeeded (`scope_local_org_figures`).
 pub fn scope_local_shares(nodes: &mut [NasNodeInfo], db: &DbPool, org_id: &str) -> bool {
-    let Ok((total, errors)) = super::db::share_counts(db, org_id) else {
+    let (Ok((shares, share_errors)), Ok((targets, target_errors))) =
+        (super::db::share_counts(db, org_id), super::db::target_counts(db, org_id))
+    else {
         return false;
     };
-    add_own_shares(nodes, total, errors);
+    add_own_shares(nodes, shares + targets, share_errors + target_errors);
     true
 }
 
@@ -475,43 +547,11 @@ fn prefixed_map(db: &DbPool, addon_id: &str, prefix: &str) -> HashMap<String, St
         .collect()
 }
 
-/// THE PEER STORE NEVER HOLDS THIS NODE. `seed_discovered_peer` returns early
-/// on `node_id == local_node_id`, so asking it for the local hostname always
-/// answers `None` and the fallback used to publish the 64-hex node id as the
-/// node's NAME — on every install, in every fleet view. The machine's own
-/// hostname is what the rest of the core already shows for itself, so it is
-/// what this asks first for the local row.
-///
-/// A peer the store has no hostname for (paired, offline since this node
-/// started) falls back to the name the sync registry recorded for it, and
-/// then to NOTHING. An empty name is deliberate: the 64-hex node id used to
-/// fill that gap and was printed as the node's name on every fleet surface,
-/// while the screen has one helper (`nodeLabel`) that says "Węzeł bez nazwy"
-/// and keeps the id in a tooltip.
+/// A node's name for the screen — the platform rule
+/// (`dispatch::app_route::node_display_name`), which every fleet surface
+/// shares with the app platform's own node lists.
 pub(crate) fn node_name(ctx: &HandlerContext, node_id: &str) -> String {
-    if node_id == ctx.state.local_node_id.to_string() {
-        let local = crate::mesh::node_info_collector::local_hostname();
-        if !local.is_empty() && local != "unknown" {
-            return local;
-        }
-    }
-    ctx.state
-        .mesh_peer_store
-        .get_hostname(node_id)
-        .filter(|n| !n.is_empty())
-        .or_else(|| registry_name(ctx, node_id))
-        .unwrap_or_default()
-}
-
-/// `sync_nodes.display_name` of one node, when the registry has a non-empty
-/// one. Asked only after the peer store came up empty, so a healthy fleet
-/// never pays for it.
-fn registry_name(ctx: &HandlerContext, node_id: &str) -> Option<String> {
-    crate::db::repository::lookup_sync_node_info(&ctx.state.db, &[node_id.to_string()])
-        .ok()?
-        .remove(node_id)
-        .map(|(name, _)| name.trim().to_string())
-        .filter(|name| !name.is_empty())
+    crate::dispatch::app_route::node_display_name(ctx, node_id)
 }
 
 /// This node plus every trust-paired peer, each with its instance status
@@ -542,6 +582,10 @@ pub fn nodes(ctx: &HandlerContext, addon_id: &str) -> Vec<NasNodeInfo> {
                 .get(&node_id)
                 .and_then(|v| serde_json::from_str::<NodeSummary>(v).ok())
                 .unwrap_or_default();
+            // This node answers from its own slot, which is exact; a peer's is
+            // what its last summary said (republished within a tick of an arm
+            // or a disarm, `disks::request_summary_refresh`).
+            let armed = if node_id == local_id { super::elevation::armed_until() } else { s.armed_until.clone() };
             NasNodeInfo {
                 node_name: node_name(ctx, &node_id),
                 is_local: node_id == local_id,
@@ -566,6 +610,12 @@ pub fn nodes(ctx: &HandlerContext, addon_id: &str) -> Vec<NasNodeInfo> {
                 arrays_unmeasured: s.arrays_unmeasured,
                 // Set by `scope_local_org_figures`, on this node's row only.
                 per_org_counted: false,
+                armed_until: armed.clone(),
+                // Counted here, by the answering node's clock, so the browser
+                // never compares an instant with its own (MINOR 11). A peer's
+                // instant is judged by this node's clock — nodes of one mesh
+                // keep time far closer than an arbitrary browser does.
+                armed_secs_left: super::elevation::armed_secs_left(armed.as_deref()),
                 updated_at: (!s.updated_at.is_empty()).then_some(s.updated_at),
                 node_id,
             }
@@ -704,6 +754,46 @@ mod tests {
         assert_eq!(s.disks_critical, 0);
         assert_eq!(s.arrays_total, 0);
         assert_eq!(s.arrays_unmeasured, 0);
+        assert_eq!(s.armed_until, None, "an older row promises no held password");
+    }
+
+    /// MAJOR 17: the published row carries until when mode B is armed, and a
+    /// peer's row hands it on unchanged — the front compares it with the clock.
+    #[test]
+    fn the_summary_carries_armed_until_to_the_fleet_row() {
+        let summary = NodeSummary {
+            elevation_mode: "interactive".into(),
+            armed_until: Some("2026-09-25T10:15:00Z".into()),
+            updated_at: "2026-09-25 10:00:00".into(),
+            ..Default::default()
+        };
+        let back: NodeSummary = serde_json::from_str(&serde_json::to_string(&summary).unwrap()).unwrap();
+        assert_eq!(back.armed_until.as_deref(), Some("2026-09-25T10:15:00Z"));
+        // The wire struct's field is defaulted too: a node before wave 7 sends
+        // no `armed_until` and still decodes.
+        let row: NasNodeInfo = serde_json::from_str(
+            r#"{"node_id":"n","node_name":"vega","is_local":false,"online":true,"instance_status":"ready",
+            "health":"ok","os_name":"","zfs_version":null,"elevation_mode":"interactive","disks_total":0,
+            "disks_warning":0,"pools_total":0,"shares_total":0,"alerts_active":0,"capacity_bytes":0,
+            "used_bytes":0,"updated_at":null}"#,
+        )
+        .expect("an older fleet row decodes");
+        assert_eq!(row.armed_until, None);
+        assert_eq!(row.armed_secs_left, None, "an older row sends no remaining seconds");
+    }
+
+    /// Critic wave 7, MINOR 11: the seconds left are counted by the node's
+    /// clock when it answers — a browser adds them to the moment it received
+    /// the answer instead of comparing the instant with its own clock.
+    #[test]
+    fn the_seconds_left_of_an_armed_channel_are_counted_by_the_node() {
+        use super::super::elevation::armed_secs_left;
+        let at = |secs: i64| (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let left = armed_secs_left(Some(&at(600))).expect("armed");
+        assert!((598..=600).contains(&left), "{left}");
+        assert_eq!(armed_secs_left(Some(&at(-30))), Some(0), "a past instant has nothing left");
+        assert_eq!(armed_secs_left(None), None);
+        assert_eq!(armed_secs_left(Some("garbage")), None);
     }
 
     /// The published row carries pools only; THIS node's row gets the asking
@@ -824,6 +914,45 @@ mod tests {
         }
     }
 
+    /// `zfs list -Hp -d 0 -t filesystem -o name,used,avail` of a node with a
+    /// RAIDZ2 pool and a mirror. `tank`'s zpool SIZE is raw (48 TB of disks);
+    /// its root dataset offers 32 TB of it after parity.
+    const ROOTS: &str = "tank\t23947342946304\t11234567890123\nfast\t989560464998\t989560464998\n";
+
+    fn pool_row(name: &str, size: u64, alloc: u64) -> super::super::pools::PoolListRow {
+        super::super::pools::PoolListRow { name: name.into(), size_bytes: size, alloc_bytes: alloc, ..Default::default() }
+    }
+
+    /// M6: the fleet card and the node screen sum the SAME unit — the root
+    /// dataset's used + avail — so n01's "28.9 / 44.8 TiB" is n02's. zpool's
+    /// raw SIZE/ALLOC (parity included) must not reach either figure.
+    #[test]
+    fn pool_capacity_is_the_usable_figure_the_node_screen_shows() {
+        let roots = parse_root_datasets(ROOTS);
+        assert_eq!(roots.len(), 2);
+        let pools = [
+            pool_row("tank", 47_999_999_999_999, 35_000_000_000_000),
+            pool_row("fast", 1_999_844_147_200, 989_560_464_998),
+        ];
+        let (cap, used) = pool_bytes(&pools, &roots);
+        assert_eq!(used, 23_947_342_946_304 + 989_560_464_998);
+        assert_eq!(cap, 23_947_342_946_304 + 11_234_567_890_123 + 989_560_464_998 * 2);
+        assert_ne!(cap, pools.iter().map(|p| p.size_bytes).sum::<u64>(), "raw zpool size leaked into the fleet row");
+    }
+
+    /// A pool whose root dataset was not read adds nothing — the node
+    /// screen's `root.map_or(0, …)` — and a malformed line is no reading.
+    #[test]
+    fn a_pool_without_a_root_reading_adds_nothing() {
+        let roots = parse_root_datasets("tank\t100\t900\nbroken\tx\t1\nshort\t5\n");
+        assert_eq!(roots.len(), 1, "{roots:?}");
+        let pools = [pool_row("tank", 5_000, 1_000), pool_row("broken", 7_000, 7), pool_row("gone", 9_000, 9)];
+        assert_eq!(pool_bytes(&pools, &roots), (1_000, 100));
+        // A root dataset without a pool row (a pool exported between the two
+        // reads) is not capacity either.
+        assert_eq!(pool_bytes(&pools[1..], &roots), (0, 0));
+    }
+
     /// The published row carries no share figure (every tenant reads it);
     /// the local row gets the asking tenant's own count and turns "warning"
     /// only for a broken share of THAT tenant — never downgrading a worse
@@ -845,7 +974,7 @@ mod tests {
         super::super::db::upsert_share(&db, "org-a", &share("a1", "projekty")).unwrap();
         super::super::db::upsert_share(&db, "org-b", &share("b1", "kadry")).unwrap();
         super::super::db::upsert_share(&db, "org-b", &share("b2", "place")).unwrap();
-        super::super::db::set_share_state(&db, "b2", "error", "source path is not mounted").unwrap();
+        super::super::db::set_share_state(&db, "b2", "error", "source path is not mounted", &[]).unwrap();
 
         let rows = || {
             vec![
@@ -865,6 +994,62 @@ mod tests {
         critical[0].health = "critical".into();
         scope_local_shares(&mut critical, &db, "org-b");
         assert_eq!(critical[0].health, "critical");
+    }
+
+    /// M7 / MAJOR 11: a block target is a shared resource of the Sharing tab
+    /// like a share, so the local row counts the caller's targets too (n01
+    /// "Share 6" = 2×SMB · 2×NFS · iSCSI · NVMe-oF), another tenant's never,
+    /// and a target in `error` makes the row a warning as a broken share does.
+    /// A failed target read is not a count of the shares alone.
+    #[test]
+    fn the_local_row_counts_the_callers_targets_with_its_shares() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::db::migrate(&conn).unwrap();
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let share = super::super::db::ShareRow {
+            share_id: "a1".into(),
+            name: "projekty".into(),
+            protocol: "smb".into(),
+            source_path: "/mnt/tank/projekty".into(),
+            state: "active".into(),
+            ..Default::default()
+        };
+        super::super::db::upsert_share(&db, "org-a", &share).unwrap();
+        let target = |id: &str, name: &str, protocol: &str| super::super::db::TargetRow {
+            target_id: id.into(),
+            name: name.into(),
+            protocol: protocol.into(),
+            wwn: format!("iqn.2026-09.io.tentaflow:helios:{name}"),
+            enabled: true,
+            state: "active".into(),
+            created_at: super::super::db::now(),
+            updated_at: super::super::db::now(),
+            ..Default::default()
+        };
+        super::super::db::upsert_target(&db, "org-a", &target("t1", "vm-store", "iscsi")).unwrap();
+        super::super::db::upsert_target(&db, "org-a", &target("t2", "scratch", "nvmet")).unwrap();
+        super::super::db::upsert_target(&db, "org-b", &target("t3", "kadry", "iscsi")).unwrap();
+
+        let rows = || vec![NasNodeInfo { is_local: true, health: "ok".into(), ..Default::default() }];
+        let mut a = rows();
+        assert!(scope_local_shares(&mut a, &db, "org-a"));
+        assert_eq!((a[0].shares_total, a[0].health.as_str()), (3, "ok"), "1 share + 2 own targets, not org B's");
+
+        super::super::db::set_target_state(&db, "t2", "error", "nvmet missing", &[]).unwrap();
+        let mut a = rows();
+        scope_local_shares(&mut a, &db, "org-a");
+        assert_eq!((a[0].shares_total, a[0].health.as_str()), (3, "warning"), "a broken target is the tenant's warning");
+        let mut b = rows();
+        scope_local_shares(&mut b, &db, "org-b");
+        assert_eq!((b[0].shares_total, b[0].health.as_str()), (1, "ok"), "org A's broken target is not B's warning");
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::db::migrate(&conn).unwrap();
+        conn.execute_batch("DROP TABLE nas_targets;").unwrap();
+        let broken: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let mut c = rows();
+        assert!(!scope_local_shares(&mut c, &broken, "org-a"), "a failed target read is not a counted figure");
+        assert_eq!(c[0].shares_total, 0);
     }
 
     /// `per_org_counted` is what lets the front tell a real 0 from a figure

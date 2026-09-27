@@ -1279,6 +1279,9 @@ mod tests {
         ) {
             unimplemented!("not exercised by the environment-switch eviction hook")
         }
+        fn note_dlq_handled(&self, _org: &str, _source_topic: &str, _dlq_partition: u32, _offset: u64) {
+            unimplemented!("not exercised by the environment-switch eviction hook")
+        }
         fn evict_node_from_replica_sets(
             &self,
             _node_id: &str,

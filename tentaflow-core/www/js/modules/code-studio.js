@@ -37,6 +37,8 @@ import '/js/components/tf-stat-card.js';
 import '/js/components/tf-progress-bar.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-spinner.js';
+import '/js/components/tf-alert.js';
+import { repairProcessSandbox, sandboxRepairable, sandboxRepairProblem } from '/js/lib/sandbox-repair.js';
 
 // Autonomy modes ordered by capability (§9.5). `autonomous` has no enforcement
 // point in native mode, so the wizard removes it there and the server rejects
@@ -995,6 +997,11 @@ function openWizard() {
             heading="${escapeAttr(t('mode_container'))}"
             description="${escapeAttr(t('mode_container_lead'))}"></tf-choice-card>
         </tf-choice-group>
+        <tf-alert tone="warning" id="cs-wz-sandbox-repair" hidden>
+          <div slot="actions">
+            <tf-button variant="primary" size="sm" icon="shield" data-act="sandbox-repair">${escapeHtml(I18n.t('sandbox_repair.action'))}</tf-button>
+          </div>
+        </tf-alert>
         <div class="cs-field-hint">${escapeHtml(t('mode_immutable_hint'))}</div>
       </div>
       <div class="cs-field" id="cs-wz-image-field" hidden>
@@ -1170,6 +1177,13 @@ function openWizard() {
     group.querySelector('[value=trusted_native]').disabled = wz.repoKind === 'local';
     container.note = containerNote(node, supports);
     group.value = wz.execMode;
+    // A cause the node repairs itself is offered as a repair right under the
+    // blocked card, not only named in its note.
+    const repair = byId('cs-wz-sandbox-repair');
+    const repairable = process.disabled
+      && sandboxRepairable(node?.processSandboxCause ?? node?.process_sandbox_cause);
+    repair.hidden = !repairable;
+    if (repairable) repair.setAttribute('message', sandboxRepairProblem(node?.name ?? ''));
   };
 
   // In native mode the two unenforceable options are REMOVED from the lists —
@@ -1237,6 +1251,23 @@ function openWizard() {
     if (supports !== true && wz.execMode === 'container') wz.execMode = 'process_sandbox';
     renderModes();
     renderPolicySelects();
+  });
+  byId('cs-wz-sandbox-repair').querySelector('[data-act="sandbox-repair"]').addEventListener('click', async () => {
+    const node = nodeById(wz.nodeId);
+    if (!node) return;
+    const outcome = await repairProcessSandbox({
+      nodeId: node.nodeId ?? node.node_id,
+      nodeName: node.name ?? '',
+      isLocal: (node.isLocal ?? node.is_local) === true,
+    });
+    if (!outcome) return;
+    // The node's own measurement after the repair replaces what the picker
+    // was told before it.
+    node.supportsProcessSandbox = node.supports_process_sandbox = true;
+    node.processSandboxCause = node.process_sandbox_cause = null;
+    node.processSandboxReason = node.process_sandbox_reason = null;
+    toast(I18n.t('sandbox_repair.done'), 'success');
+    renderModes();
   });
   byId('cs-wz-image').addEventListener('input', (e) => { wz.containerImage = String(e.detail?.value ?? ''); });
   byId('cs-wz-autonomy').addEventListener('change', (e) => { wz.autonomyCeiling = String(e.detail?.value ?? 'normal'); });

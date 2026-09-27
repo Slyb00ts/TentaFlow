@@ -21,6 +21,26 @@ use super::payload_format::PayloadFormat;
 use super::schema_registry::SchemaType;
 use super::BusServiceError;
 
+/// Moves whenever a topic row changes under this node without passing
+/// through its own `BusService` — a create, update or delete another node
+/// made, applied by `sync::core_materializer`. `BusService::topic_config`
+/// keeps a cached config only while this is still the value it read before
+/// loading that config, so a setting changed on one node reaches every node
+/// that hosts a copy instead of waiting for a restart there.
+static CONFIG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current value of [`CONFIG_GENERATION`].
+pub fn config_generation() -> u64 {
+    CONFIG_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Invalidates every cached topic config of every instance on this node.
+/// Called after the row change is committed: a reader that loaded the old row
+/// before the commit cached it under the previous value and reloads.
+pub fn bump_config_generation() {
+    CONFIG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 /// PLAN §7.1 `name`: `^[a-z0-9]([a-z0-9.\-]{1,126})$`. Internal topics
 /// (`__dlq.<topic>`, `__bus.metrics`) deliberately fall outside this and use
 /// `validate_internal_topic_name` instead — the leading `__` is a reserved
@@ -761,6 +781,12 @@ pub struct TopicConfig {
     pub environment: NodeEnvironment,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Which incarnation of this name the config belongs to
+    /// (`DbBusTopic::generation`): stamped by `from_options` at creation,
+    /// never changed by an update. Every placement of the topic carries it
+    /// (`PartitionAssignment::topic_generation`), and so does the local log
+    /// directory (`BusService::ensure_topic_incarnation`).
+    pub generation: u64,
 }
 
 /// Partial overrides for `create_topic`/`update_topic`; unset fields fall
@@ -872,6 +898,9 @@ impl TopicConfig {
             environment,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
+            // The creator's HLC is past every delete it has observed, so an
+            // incarnation created after a delete always sorts after it.
+            generation: repository::bus_topic_generation_at(&crate::sync::runtime::core_hlc_now()),
         };
         validate_ranges(&cfg)?;
         Ok(cfg)
@@ -1036,6 +1065,7 @@ impl From<&TopicConfig> for DbBusTopic {
             created_at_ms: c.created_at_ms,
             updated_at_ms: c.updated_at_ms,
             durability_class: c.durability_class.map(|k| k.as_str().to_string()),
+            generation: c.generation,
         }
     }
 }
@@ -1088,6 +1118,7 @@ impl TryFrom<DbBusTopic> for TopicConfig {
                 .ok_or_else(|| bad("environment", &row.environment))?,
             created_at_ms: row.created_at_ms,
             updated_at_ms: row.updated_at_ms,
+            generation: row.generation,
         })
     }
 }
@@ -1276,7 +1307,7 @@ pub fn create_topic(
     opts: TopicOptions,
     environment: NodeEnvironment,
     now_ms: i64,
-) -> Result<TopicConfig, BusServiceError> {
+) -> Result<(TopicConfig, repository::RemovedTopicRules), BusServiceError> {
     validate_user_topic_name(name)?;
     reject_idempotency_key(&opts)?;
     reject_fire_and_forget(&opts)?;
@@ -1297,8 +1328,8 @@ pub fn create_topic(
         validation_touched,
         None,
     )?;
-    repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
-    Ok(cfg)
+    let removed = repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
+    Ok((cfg, removed))
 }
 
 /// Internal variant for broker-owned topics (`__dlq.<topic>`), bypassing the
@@ -1317,7 +1348,20 @@ pub fn create_internal_topic(
         return TopicConfig::try_from(existing);
     }
     let cfg = TopicConfig::from_options(instance_id, org_id, name, opts, environment, now_ms)?;
-    repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
+    match name.strip_prefix(crate::bus::dlq::DLQ_TOPIC_PREFIX) {
+        // A dead-letter topic exists only beside its source: a delivery that
+        // read the source before it was deleted must not bring the DLQ back.
+        Some(source) => {
+            if !repository::bus_dlq_topic_create(db, &DbBusTopic::from(&cfg), source)? {
+                return Err(BusServiceError::TopicNotFound {
+                    name: source.to_string(),
+                });
+            }
+        }
+        None => {
+            repository::bus_topic_create(db, &DbBusTopic::from(&cfg))?;
+        }
+    }
     Ok(cfg)
 }
 
@@ -1414,19 +1458,20 @@ pub fn update_topic(
     Ok(cfg)
 }
 
+/// Deletes the topic row with its access entries and data-hiding rules;
+/// returns what went with it.
 pub fn delete_topic(
     db: &DbPool,
     instance_id: &str,
     org_id: &str,
     name: &str,
-) -> Result<(), BusServiceError> {
+) -> Result<repository::RemovedTopicRules, BusServiceError> {
     if repository::bus_topic_get(db, instance_id, org_id, name)?.is_none() {
         return Err(BusServiceError::TopicNotFound {
             name: name.to_string(),
         });
     }
-    repository::bus_topic_delete(db, instance_id, org_id, name)?;
-    Ok(())
+    Ok(repository::bus_topic_delete(db, instance_id, org_id, name)?)
 }
 
 pub fn list_topics(
@@ -2309,7 +2354,7 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("at_least_once must stay accepted");
+        .expect("at_least_once must stay accepted").0;
         assert_eq!(cfg.delivery, DeliveryMode::AtLeastOnce);
     }
 
@@ -2327,7 +2372,7 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("create topic");
+        .expect("create topic").0;
 
         let err = update_topic(
             &db,
@@ -2464,7 +2509,7 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("delete must stay accepted");
+        .expect("delete must stay accepted").0;
         assert_eq!(cfg.cleanup_policy, CleanupPolicy::Delete);
     }
 
@@ -2480,7 +2525,7 @@ mod tests {
             NodeEnvironment::Prod,
             1_000,
         )
-        .expect("create topic");
+        .expect("create topic").0;
 
         let err = update_topic(
             &db,

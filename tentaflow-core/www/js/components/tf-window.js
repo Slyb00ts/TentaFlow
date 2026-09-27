@@ -15,6 +15,16 @@
 //       Metody: win.close(force=false) — wymusza zamkniecie, z force=true
 //       pomija event close-request.
 //
+//       Event `closed` — fired once the window has left the document, however
+//       it went (close(), Escape, a router clearing the screen, remove()), so
+//       the code that opened it can release what it held.
+//
+//       The `modal` attribute puts a dimmed, blurred backdrop behind the
+//       window for as long as it is in the document: the page underneath is
+//       shown but out of reach, and the backdrop leaves with the window
+//       however it closes. Tab and Shift+Tab stay inside a modal window;
+//       it takes focus when it opens and gives it back when it goes.
+//
 //       The `sheet` attribute — on a phone (<= 640px) the window docks to the
 //       bottom edge as a bottom sheet instead of floating in the middle. Pure
 //       CSS (controls.css, `:host([sheet])`), so there is no JS logic here.
@@ -57,6 +67,7 @@ class TfWindow extends HTMLElement {
     this._bodyEl = null;
     this._footerEl = null;
     this._resizeHandle = null;
+    this._backdrop = null;
 
     this._drag = null;
     this._resize = null;
@@ -79,6 +90,16 @@ class TfWindow extends HTMLElement {
   }
 
   connectedCallback() {
+    if (this.hasAttribute('modal') && !this._backdrop) {
+      this._backdrop = document.createElement('div');
+      this._backdrop.className = 'tf-window-backdrop';
+      this.before(this._backdrop);
+      // The opener may sit inside a shadow root (a row button of tf-table).
+      let opener = document.activeElement;
+      while (opener?.shadowRoot?.activeElement) opener = opener.shadowRoot.activeElement;
+      this._returnFocus = opener;
+      requestAnimationFrame(() => { if (this.isConnected && !this.contains(document.activeElement)) this.focusFirst(); });
+    }
     if (!this._win) this._build();
     this._applyAttrs();
     this._positionInitial();
@@ -102,6 +123,15 @@ class TfWindow extends HTMLElement {
   }
 
   disconnectedCallback() {
+    // A window moved to another parent is disconnected and connected again at
+    // once; only one that stays out of the document has closed.
+    queueMicrotask(() => { if (!this.isConnected) this.dispatchEvent(new CustomEvent('closed')); });
+    if (this._backdrop) {
+      this._backdrop.remove();
+      this._backdrop = null;
+      if (this._returnFocus?.isConnected) this._returnFocus.focus?.();
+      this._returnFocus = null;
+    }
     window.removeEventListener('pointermove', this._onPointerMove);
     window.removeEventListener('pointerup', this._onPointerUp);
     window.removeEventListener('resize', this._onViewportResize);
@@ -370,21 +400,52 @@ class TfWindow extends HTMLElement {
   }
 
   _onKeyDown(e) {
-    if (e.key !== 'Escape') return;
+    if (e.key !== 'Escape' && !(e.key === 'Tab' && this.hasAttribute('modal'))) return;
     if (this._closing || !this._win) return;
     if (this._win.classList.contains('minimized')) return;
     // Only the top-most window reacts; lower windows ignore ESC so the
     // stack behaves like a true modal pile.
+    if (!this._isTopmost()) return;
+    if (e.key === 'Tab') { this._trapTab(e); return; }
+    this.close();
+  }
+
+  _isTopmost() {
     const mine = parseInt(this._win.style.zIndex || '0', 10);
-    const all = document.querySelectorAll('tf-window');
     let topZ = mine;
-    all.forEach((w) => {
+    document.querySelectorAll('tf-window').forEach((w) => {
       if (w === this || !w._win) return;
       const z = parseInt(w._win.style.zIndex || '0', 10);
       if (z > topZ) topZ = z;
     });
-    if (mine < topZ) return;
-    this.close();
+    return mine >= topZ;
+  }
+
+  // Focusable controls of a modal window in Tab order: its header controls,
+  // then the slotted body and footer. The page behind is out of reach.
+  _focusables() {
+    const sel = 'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
+    const visible = (el) => el.getClientRects().length > 0 && !el.closest('[hidden]');
+    return [...this._shadow.querySelectorAll('.tf-window-control'), ...this.querySelectorAll(sel)].filter(visible);
+  }
+
+  /** Focuses the first control of the body (a window whose content was redrawn keeps the keyboard in it). */
+  focusFirst() {
+    const first = this._focusables().find((el) => !el.classList.contains('tf-window-control'));
+    first?.focus();
+  }
+
+  _trapTab(e) {
+    const items = this._focusables();
+    if (!items.length) { e.preventDefault(); return; }
+    const active = document.activeElement === this ? this._shadow.activeElement : document.activeElement;
+    const inside = active && (this.contains(active) || this._shadow.contains(active));
+    const i = items.indexOf(active);
+    let next = null;
+    if (!inside) next = e.shiftKey ? items[items.length - 1] : items[0];
+    else if (e.shiftKey && i <= 0) next = items[items.length - 1];
+    else if (!e.shiftKey && i === items.length - 1) next = items[0];
+    if (next) { e.preventDefault(); next.focus(); }
   }
 
   _onViewportResize() {
@@ -402,9 +463,13 @@ class TfWindow extends HTMLElement {
     this._recenterIfNeeded();
   }
 
+  // A modal window's backdrop sits right under it, so it also covers every
+  // window opened before it (the folder picker under a folder-name prompt),
+  // not only the page: those are out of reach until the modal one goes.
   _bringToFront() {
-    _zCounter += 1;
+    _zCounter += 2;
     this._win.style.zIndex = String(_zCounter);
+    if (this._backdrop) this._backdrop.style.zIndex = String(_zCounter - 1);
   }
 
   // ========== controls ==========

@@ -54,20 +54,36 @@ const PRELUDE = `
   const tCalls = [];
   const t = (key, params) => { tCalls.push([key, params]); return key; };
   const wz = { nodeId: '', execMode: 'process_sandbox', repoKind: 'empty' };
-  const elements = {};
+  const elements = {
+    'cs-wz-sandbox-repair': {
+      hidden: true,
+      message: '',
+      setAttribute(name, value) { if (name === 'message') this.message = value; },
+    },
+  };
 `;
+
+// The repair helpers the module imports from lib/sandbox-repair.js. That
+// module loads i18n, which fetches a locale on import, so these tests hand in
+// stand-ins with the same contract: only `user_namespaces_denied` repairs.
+const sandboxRepairable = (cause) => cause === 'user_namespaces_denied';
+const sandboxRepairProblem = (node) => `sandbox_repair.problem_userns:${node}`;
 
 function build(names) {
   const body = names.map((n) => cut(source, n)).join('\n');
   // eslint-disable-next-line no-new-func
-  return new Function(`${PRELUDE}\n${body}\nreturn { ${names.join(', ')}, elements, state, wz, tCalls };`)();
+  return new Function(
+    'sandboxRepairable',
+    'sandboxRepairProblem',
+    `${PRELUDE}\n${body}\nreturn { ${names.join(', ')}, elements, state, wz, tCalls };`,
+  )(sandboxRepairable, sandboxRepairProblem);
 }
 
 // One fake choice group per test: the three cards the wizard renders, plus the
 // `value` assignment `renderModes` finishes with. Both isolation modes sit on
 // the SAME fake row, because a node's two advertisements must be readable
 // together — that is how the picker paints them.
-function paintCards(node, wzOverrides = {}) {
+function paintCards(node, wzOverrides = {}, onApi = null) {
   const api = build(['nodeById', 'processSandboxNote', 'containerNote', 'containerFactKey', 'renderModes']);
   const card = () => ({ disabled: false, note: '', title: '' });
   const group = {
@@ -84,6 +100,7 @@ function paintCards(node, wzOverrides = {}) {
   api.wz.nodeId = String(node.nodeId ?? node.node_id);
   Object.assign(api.wz, wzOverrides);
   api.renderModes();
+  onApi?.(api);
   return group.cards;
 }
 
@@ -164,6 +181,37 @@ test('renderModes: a local node without a GUI session blocks the card in the rea
   assert.equal(card.disabled, true);
   assert.equal(card.note, 'mode_process_gui_session');
   assert.equal(card.title, RAW, 'the probe sentence stays reachable for diagnosis');
+});
+
+// A kernel that denies bwrap its namespaces is the one cause the node repairs
+// itself, so the blocked card gets the repair right under it; a cause no
+// password fixes gets no button.
+test('renderModes: a repairable cause offers the repair, another cause does not', () => {
+  let alert = null;
+  paintCards({
+    nodeId: 'spark',
+    name: 'spark-002',
+    isLocal: true,
+    supportsProcessSandbox: false,
+    processSandboxCause: 'user_namespaces_denied',
+  }, {}, (api) => { alert = api.elements['cs-wz-sandbox-repair']; });
+  assert.equal(alert.hidden, false);
+  assert.equal(alert.message, 'sandbox_repair.problem_userns:spark-002', 'the alert names the node');
+
+  paintCards({
+    nodeId: 'mac',
+    isLocal: true,
+    supportsProcessSandbox: false,
+    processSandboxCause: 'gui_session_required',
+  }, {}, (api) => { alert = api.elements['cs-wz-sandbox-repair']; });
+  assert.equal(alert.hidden, true);
+
+  paintCards({
+    nodeId: 'ok',
+    isLocal: true,
+    supportsProcessSandbox: true,
+  }, {}, (api) => { alert = api.elements['cs-wz-sandbox-repair']; });
+  assert.equal(alert.hidden, true, 'a working sandbox has nothing to repair');
 });
 
 test('renderModes: a missing sandbox binary blocks the card with the generic sentence', () => {

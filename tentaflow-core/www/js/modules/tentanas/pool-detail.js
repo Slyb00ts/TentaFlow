@@ -11,7 +11,7 @@ import { TfWindow } from '/js/components/tf-window.js';
 import {
   T, poolCrumbTail, sprite, POLL_POOLS_MS, POLL_JOB_MODAL_MS, IO_WINDOW_SECS, ADMIN_TIMEOUT_MS, parseServerTs,
   fmtDate, fmtIn, fmtDuration, fmtBytes, fmtMBps, fmtRatio, pct, healthClass, errMessage,
-  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel, firstDiskReasonWord, leafDisplayName,
+  layoutLabel, stateTone, stateLabel, fmtSchedule, KIND_BADGE, diskHealthChipLabel, firstDiskReasonWord, leafDisplayName, leafEmbeddedName, jobLogLines,
 } from '/js/modules/tentanas/format.js';
 import { isDiskIdShape } from '/js/modules/tentanas/machine-id.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, paintJobLog, SLOT, slotEl, setClass, setRowsIfChanged } from '/js/lib/dom-patch.js';
@@ -344,6 +344,12 @@ function onPaneClick(e, root, screen, state, refresh) {
       if (d) openReplaceWizard(screen, { pool: p, vdev: v, disk: d, freeDisks: free, disks: state.disks, onDone: refresh });
       return;
     }
+    case 'detach': {
+      const v = (p.vdevs || []).find((x) => (x.disks || []).some((y) => y.name === el.dataset.device));
+      const d = (v?.disks || []).find((x) => x.name === el.dataset.device);
+      if (d) detachDisk(screen, p, d, leafEmbeddedName(d, inventoryFor(inventoryOf(state.disks || []), d), leafPosition(v, d)), refresh);
+      return;
+    }
     case 'offline':
     case 'online':
     case 'clear': {
@@ -378,8 +384,26 @@ async function deviceAction(screen, p, action, device, shown, refresh) {
     const ok = await TfWindow.confirm({ title: T('pool.disk_offline'), message: T('pool.disk_offline_confirm', { device: shown, ft: p.faultTolerance }), confirmLabel: T('pool.disk_offline'), cancelLabel: I18n.t('common.cancel'), danger: true });
     if (!ok) return;
   }
-  const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolDeviceStateRequest', { name: p.name, device, action, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.disk_' + action));
+  // zpool's refusal names the leaf as the request did ("cannot offline
+  // 12156453278383891134: no valid replicas"): the toast names it as the cell.
+  const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolDeviceStateRequest', { name: p.name, device, action, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.disk_' + action), undefined, (id) => (id === device ? shown : ''));
   followResponse(screen, res, refresh, T('pool.disk_' + action + '_done', { device: shown }));
+}
+
+// Owner decision (wave 7): `zpool detach` of the disk a hot spare replaced.
+// The confirm names the disk as its cell does (`shown`, never an id); the
+// request names the leaf as zpool knows it, and the node re-checks it.
+async function detachDisk(screen, p, d, shown, refresh) {
+  const ok = await TfWindow.confirm({
+    title: T('pool.disk_detach'),
+    message: T('pool.disk_detach_confirm', { device: shown, pool: p.name }),
+    confirmLabel: T('pool.disk_detach'),
+    cancelLabel: I18n.t('common.cancel'),
+    danger: true,
+  });
+  if (!ok) return;
+  const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolDetachRequest', { name: p.name, device: d.name, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('pool.disk_detach'), undefined, (id) => (id === d.name ? shown : ''));
+  followResponse(screen, res, refresh, T('pool.disk_detach_done', { device: shown }));
 }
 
 async function exportPool(screen, p, force) {
@@ -590,6 +614,10 @@ function diskButtons(d, v, admin, freeCount) {
     if (d.state === 'online') out.push(btn('offline', 'ban', T('pool.disk_offline'), dev));
     else if (d.state === 'offline') out.push(btn('online', 'play', T('pool.disk_online'), dev));
     if (leafErrors(d)) out.push(btn('clear', 'check', T('pool.disk_clear'), dev));
+    // The disk a hot spare replaced stays in the pool until it is detached;
+    // the node says when that is safe (`detachable`: the spare is ONLINE and
+    // no resilver runs) and refuses any other leaf itself.
+    if (d.detachable === true) out.push(btn('detach', 'arrow-out', T('pool.disk_detach'), dev));
   }
   if (d.diskId) out.push({ ...btn('disk', 'chevron-right', T('disks.details'), `data-disk="${escapeAttr(d.diskId)}"`), key: 'disk:' + d.diskId });
   return out;
@@ -1125,7 +1153,7 @@ export function openPoolDestroyDialog(screen, pool, datasets, onDone, disks = []
   const bodyHtml = `
     <div class="wizard-warning danger">${sprite('alert')}<div>${T('destroy_pool.warning', { name: escapeHtml(pool.name) })}</div></div>
     <ul class="loss-list">
-      ${shown.map((d) => `<li class="ll bad">${sprite('trash')}<span><b>${escapeHtml(d.name)}</b> — ${escapeHtml(fmtBytes(d.usedBytes))}</span></li>`).join('')}
+      ${shown.map((d) => `<li class="ll bad" data-dataset="${escapeAttr(d.name)}">${sprite('trash')}<span><b>${escapeHtml(d.name)}</b> — ${escapeHtml(fmtBytes(d.usedBytes))}<span data-role="stops"></span></span></li>`).join('')}
       ${more > 0 ? `<li class="ll bad">${sprite('trash')}<span>${escapeHtml(T('destroy_pool.more', { n: more }))}</span></li>` : ''}
       <li class="ll bad">${sprite('trash')}<span><b>${escapeHtml(T('destroy_pool.snapshots', { n: pool.snapshotCount }))}</b></span></li>
     </ul>
@@ -1155,35 +1183,58 @@ const onPool = (pool, name) => name === pool.name || String(name || '').startsWi
 const underMount = (datasets, path) => datasets.some((d) => d.mountpoint && d.mountpoint !== '/' && String(path || '').startsWith(d.mountpoint.replace(/\/$/, '') + '/'));
 
 // n17a (M15): what else dies with the pool — every share and block target of
-// this organisation whose data lives on it, one line each, as the mockup
-// lists them. Read when the dialog opens (the lists are the Sharing tab's own
-// reads); a list that cannot be read adds nothing rather than guessing, and
-// the lines land in their own slot so the dialog is never rebuilt.
+// this organisation whose data lives on it, as the mockup lists them. Read
+// when the dialog opens (the lists are the Sharing tab's own reads). A share
+// or target on a dataset the list already shows joins that dataset's line
+// ("tank/projekty — 16.5 TiB · share SMB „projekty” przestanie działać na 3
+// węzłach floty"); any other gets a line of its own. A list that cannot be
+// read says so — "none" and "could not check" must not look alike — and the
+// list says whose resources it names: another organisation's are not this
+// admin's to see (critic wave 5, MINOR 4). Everything lands in its own slot,
+// so the dialog is never rebuilt.
 export async function paintPoolDependents(screen, win, pool, datasets) {
   const host = win?.querySelector('[data-role="dependents"]');
   if (!host) return;
+  const read = (kind, key) => screen.nas(kind, {}).then((r) => r[key] || [], () => null);
   const [shares, targets] = await Promise.all([
-    screen.nas('tentaNasSharesListRequest', {}).then((r) => r.shares || []).catch(() => []),
-    screen.nas('tentaNasTargetsListRequest', {}).then((r) => r.targets || []).catch(() => []),
+    read('tentaNasSharesListRequest', 'shares'),
+    read('tentaNasTargetsListRequest', 'targets'),
   ]);
   if (!win.isConnected) return;
+  const stops = new Map(); // shown dataset name -> the sentences joined to its line
   const items = [];
-  for (const s of shares) {
+  const place = (where, key, text) => {
+    const row = [...win.querySelectorAll('[data-dataset]')].find((li) => li.dataset.dataset === where);
+    if (row) stops.set(where, [...(stops.get(where) || []), text]);
+    else items.push({ key, html: `<li class="ll bad">${sprite('trash')}<span><b>${escapeHtml(where)}</b> — ${escapeHtml(text)}</span></li>` });
+  };
+  for (const s of shares || []) {
     const where = s.dataset && onPool(pool, s.dataset) ? s.dataset : underMount(datasets, s.sourcePath) ? s.sourcePath : null;
     if (!where) continue;
-    items.push({
-      key: 'share:' + s.name,
-      html: `<li class="ll bad">${sprite('trash')}<span><b>${escapeHtml(where)}</b> — ${escapeHtml(T('destroy_pool.share_stops', { protocol: String(s.protocol || '').toUpperCase(), name: s.name }))}</span></li>`,
-    });
+    const protocol = String(s.protocol || '').toUpperCase();
+    // Every node of the fleet that mounts it loses it too (n17a "na 3
+    // węzłach floty").
+    const nodes = (s.mounts || []).filter((m) => m.state === 'mounted').length;
+    place(where, 'share:' + s.name, nodes
+      ? T('destroy_pool.share_stops_fleet', { protocol, name: s.name, n: nodes })
+      : T('destroy_pool.share_stops', { protocol, name: s.name }));
   }
-  for (const t of targets) {
+  for (const t of targets || []) {
     const lun = (t.luns || []).find((l) => (l.sourceKind === 'zvol' ? onPool(pool, l.source) : underMount(datasets, l.source)));
     if (!lun) continue;
-    items.push({
-      key: 'target:' + t.name,
-      html: `<li class="ll bad">${sprite('trash')}<span><b>${escapeHtml(lun.source)}</b> — ${escapeHtml(T('destroy_pool.target_stops', { protocol: targetProtocolLabel(t.protocol), name: t.name }))}</span></li>`,
-    });
+    // Who loses the disk: the allowlist, in the protocol's own noun (n17a
+    // "(2 initiatory)").
+    const n = (t.initiators || []).length;
+    const who = n ? ` (${T(t.protocol === 'nvmet' ? 'fleet.target_hosts' : 'fleet.target_initiators', { n })})` : '';
+    place(lun.source, 'target:' + t.name, T('destroy_pool.target_stops', { protocol: targetProtocolLabel(t.protocol), name: t.name }) + who);
   }
+  for (const li of win.querySelectorAll('[data-dataset]')) {
+    const joined = stops.get(li.dataset.dataset);
+    setText(li.querySelector('[data-role="stops"]'), joined ? ` · ${joined.join(' · ')}` : '');
+  }
+  if (shares === null) items.push({ key: 'unchecked:shares', html: `<li class="ll warn">${sprite('alert')}<span>${escapeHtml(T('destroy_pool.shares_unchecked'))}</span></li>` });
+  if (targets === null) items.push({ key: 'unchecked:targets', html: `<li class="ll warn">${sprite('alert')}<span>${escapeHtml(T('destroy_pool.targets_unchecked'))}</span></li>` });
+  items.push({ key: 'scope', html: `<li class="ll">${sprite('info')}<span>${escapeHtml(T('destroy_pool.dependents_scope'))}</span></li>` });
   patchKeyedList(host, items);
 }
 
@@ -1368,6 +1419,8 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
   // `disk.name` (the GUID/by-id text), which is what the server needs to
   // find it.
   const oldDiskLabel = leafDisplayName(disk, inventoryFor(inventoryOf(disks), disk), leafPosition(vdev, disk));
+  // For the sentences that already say "disk" before the name.
+  const oldDiskNamed = leafEmbeddedName(disk, inventoryFor(inventoryOf(disks), disk), leafPosition(vdev, disk));
   const minBytes = Number(disk.sizeBytes) || 0;
   const byId = new Map(disks.map((d) => [d.diskId, d]));
   const candidates = [
@@ -1378,7 +1431,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
   const steps = [T('replace.step_pick'), T('replace.step_run'), T('replace.step_resilver')];
   const win = document.createElement('tf-window');
   win.className = 'nas-modal';
-  win.setAttribute('title', T('replace.title', { device: oldDiskLabel, pool: pool.name, layout: layoutLabel(vdev.kind) }));
+  win.setAttribute('title', T('replace.title', { device: oldDiskNamed, pool: pool.name, layout: layoutLabel(vdev.kind) }));
   win.setAttribute('icon', 'refresh');
   win.setAttribute('buttons', 'close');
   win.setAttribute('draggable', '');
@@ -1416,7 +1469,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
       case 'pick': return `
         <div class="stack" id="nas-rp-list">${candidates.map(optionHtml).join('') || `<div class="muted">${escapeHtml(T('pools.no_free_disks'))}</div>`}</div>
         <div class="explain-box mt-md" id="nas-rp-explain">${explainHtml()}</div>
-        <div class="wizard-warning mt-md">${sprite('alert')}<div>${escapeHtml(T('replace.warning', { device: oldDiskLabel }))}</div></div>`;
+        <div class="wizard-warning mt-md">${sprite('alert')}<div>${escapeHtml(T('replace.warning', { device: oldDiskNamed }))}</div></div>`;
       case 'run': return `
         <h2 class="wizard-section-title">${escapeHtml(T('replace.run_title', { old: oldDiskLabel, new: state.pick.name }))}</h2>
         <p class="wizard-section-sub">${escapeHtml(T('replace.sub_run'))}</p>
@@ -1426,7 +1479,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
         <h2 class="wizard-section-title">${escapeHtml(T('replace.step_resilver'))}</h2>
         <p class="wizard-section-sub">${escapeHtml(T('replace.sub_resilver'))}</p>
         <tf-progress-bar tone="accent"></tf-progress-bar>
-        ${warningHtml('info', T('replace.warning', { device: oldDiskLabel }))}
+        ${warningHtml('info', T('replace.warning', { device: oldDiskNamed }))}
         <pre class="job-log mono mt-sm"></pre>`;
       default: {
         const ok = state.result.ok;
@@ -1480,7 +1533,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
     const log = stepBody.querySelector('.job-log');
     if (log) {
       setAttr(log, 'hidden', !state.job);
-      paintJobLog(log, state.job?.log);
+      paintJobLog(log, jobLogLines(state.job?.log));
     }
 
     // Footer buttons are keyed: "Anuluj" and "Wstecz" are the same nodes for
@@ -1536,7 +1589,7 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
   const next = async () => {
     if (state.result) { win.close(); return; }
     if (state.step !== 0 || !state.pick) return;
-    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolReplaceDiskRequest', { name: pool.name, old: disk.name, diskId: state.pick.diskId, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('replace.title', { device: oldDiskLabel, pool: pool.name, layout: layoutLabel(vdev.kind) }));
+    const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasPoolReplaceDiskRequest', { name: pool.name, old: disk.name, diskId: state.pick.diskId, sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('replace.title', { device: oldDiskNamed, pool: pool.name, layout: layoutLabel(vdev.kind) }));
     if (!res) return;
     state.step = 1;
     state.job = res.job || null;
@@ -1626,11 +1679,11 @@ export function openReplaceWizard(screen, { pool, vdev, disk, freeDisks, disks =
     state.result = failed
       ? { ok: false, detail: T('pools.scrub_errors', { n: Number(state.scan.errors) || 0 }) }
       // A replace onto a HOT SPARE leaves the old leaf in the pool's `spare-N`
-      // group until `zpool detach`, which this version does not run (the
-      // command comes with the next helper release): saying it "can be
-      // pulled" would be false. A replace onto a free disk detaches the old
-      // leaf itself when the resilver ends.
-      : { ok: true, detail: T(state.pick?.spare ? 'replace.done_detail_spare' : 'replace.done_detail', { device: oldDiskLabel, new: state.pick?.name || '' }) };
+      // group until `zpool detach`: the text sends the admin to the
+      // "Odłącz stary dysk" action on that leaf (helper 0.15.0), and says
+      // it can be pulled only after that. A replace onto a free disk detaches
+      // the old leaf itself when the resilver ends.
+      : { ok: true, detail: (state.pick?.spare ? T('replace.done_detail_spare', { device: oldDiskNamed, new: state.pick?.name || '' }) : T('replace.done_detail', { device: oldDiskLabel, new: state.pick?.name || '' })) };
     paint();
     if (onDone) onDone(state.job);
   };

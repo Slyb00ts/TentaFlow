@@ -116,7 +116,7 @@
 //! what it is worth now and how to delete it).
 //!
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -129,6 +129,7 @@ use tentaflow_bus::{BatchBuilder, RecordInput};
 use tentaflow_protocol::environment::NodeEnvironment;
 
 use tentaflow_core::bus::replication::assignment::PartitionAssignment;
+use tentaflow_core::bus::replication::election::LogPosition;
 use tentaflow_core::bus::replication::follower::FollowerConfig;
 use tentaflow_core::bus::replication::frames::{self, ReplFrame, ReplHello, ReplReject};
 use tentaflow_core::bus::replication::glue::{
@@ -219,7 +220,7 @@ fn ctx() -> BusCallContext {
 /// replica of that assignment as having acknowledged the resulting op, so
 /// `admitted_by_majority` sees majority without this test needing to model
 /// outbox delivery latency. One instance, shared (`Arc`) across all three
-/// nodes' `ReplicationManagerConfig`.
+/// nodes, each reaching it through its own `NodeLedger`.
 ///
 /// ACK SEMANTICS, modeled deliberately after the REAL ledger's weakness:
 /// an outbox ack means "the peer received and processed the op" — a
@@ -237,6 +238,36 @@ struct SharedLedger {
     rows: Mutex<HashMap<PartitionKey, PartitionAssignment>>,
     acked: Mutex<HashMap<OperationId, Vec<String>>>,
     next_op: Mutex<u8>,
+    /// `Some` while the ledger is split (`split`): every node sees and
+    /// writes only its own copy, taken from `rows` when the split began,
+    /// and nobody else acknowledges its ops — the sync ledger across a
+    /// network partition. `heal` merges the copies back by the admission
+    /// rule.
+    views: Mutex<Option<HashMap<String, HashMap<PartitionKey, PartitionAssignment>>>>,
+    /// A candidate whose next `propose` blocks until released
+    /// (`hold_propose`) — an election paused between its `LeoQuery` round
+    /// and its proposal, while another one runs.
+    hold: Mutex<Option<ProposeHold>>,
+}
+
+struct ProposeHold {
+    node: String,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+/// The materializer's admission rule (`core_materializer::
+/// apply_bus_partition_assignment`): a strictly higher epoch, or the same
+/// epoch with a lower leader node id.
+fn admits(stored: Option<&PartitionAssignment>, incoming: &PartitionAssignment) -> bool {
+    match stored {
+        None => true,
+        Some(stored) => {
+            incoming.leader_epoch > stored.leader_epoch
+                || (incoming.leader_epoch == stored.leader_epoch
+                    && incoming.leader_node_id < stored.leader_node_id)
+        }
+    }
 }
 
 impl SharedLedger {
@@ -245,6 +276,8 @@ impl SharedLedger {
             rows: Mutex::new(HashMap::new()),
             acked: Mutex::new(HashMap::new()),
             next_op: Mutex::new(1),
+            views: Mutex::new(None),
+            hold: Mutex::new(None),
         })
     }
 
@@ -256,9 +289,118 @@ impl SharedLedger {
         let key = (a.org_id.clone(), a.topic.clone(), a.partition);
         self.rows.lock().insert(key, a);
     }
+
+    fn split(&self) {
+        *self.views.lock() = Some(HashMap::new());
+    }
+
+    fn heal(&self) {
+        let Some(views) = self.views.lock().take() else {
+            return;
+        };
+        let mut rows = self.rows.lock();
+        let mut nodes: Vec<_> = views.into_iter().collect();
+        nodes.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, view) in nodes {
+            for (key, row) in view {
+                if admits(rows.get(&key), &row) {
+                    rows.insert(key, row);
+                }
+            }
+        }
+    }
+
+    /// Blocks `node`'s next `propose` until the returned sender fires (or is
+    /// dropped); the returned receiver fires once that `propose` is waiting.
+    fn hold_propose(
+        &self,
+        node: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *self.hold.lock() = Some(ProposeHold {
+            node: node.to_string(),
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
+    }
+
+    /// The rows `node` sees: its own copy while split, the shared map
+    /// otherwise.
+    fn rows_seen_by(&self, node: &str) -> HashMap<PartitionKey, PartitionAssignment> {
+        let mut views = self.views.lock();
+        match views.as_mut() {
+            Some(views) => views
+                .entry(node.to_string())
+                .or_insert_with(|| self.rows.lock().clone())
+                .clone(),
+            None => self.rows.lock().clone(),
+        }
+    }
+
+    fn propose_by(&self, node: &str, assignment: PartitionAssignment) -> OperationId {
+        let hold = {
+            let mut hold = self.hold.lock();
+            if hold.as_ref().is_some_and(|h| h.node == node) {
+                hold.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hold) = hold {
+            let _ = hold.entered.send(());
+            let _ = hold.release.recv();
+        }
+        let key = (
+            assignment.org_id.clone(),
+            assignment.topic.clone(),
+            assignment.partition,
+        );
+        let mut n = self.next_op.lock();
+        let id = OperationId::from_hash([*n; 32]);
+        *n = n.wrapping_add(1).max(1);
+        drop(n);
+        let mut views = self.views.lock();
+        let acked = match views.as_mut() {
+            Some(views) => {
+                let view = views
+                    .entry(node.to_string())
+                    .or_insert_with(|| self.rows.lock().clone());
+                if admits(view.get(&key), &assignment) {
+                    view.insert(key, assignment);
+                }
+                // Nobody is reachable across the split.
+                Vec::new()
+            }
+            None => {
+                let mut rows = self.rows.lock();
+                if admits(rows.get(&key), &assignment) {
+                    rows.insert(key, assignment.clone());
+                }
+                // "majority = acks from the other two fakes": every replica
+                // of the assignment is immediately reported as acknowledged
+                // for this op — ADMITTED OR NOT (see the ACK SEMANTICS note
+                // on the struct: the real ledger acks a gate-rejected
+                // assignment op too, which is why majority alone cannot make
+                // a promotion exclusive).
+                assignment.replicas.clone()
+            }
+        };
+        drop(views);
+        self.acked.lock().insert(id, acked);
+        id
+    }
 }
 
-impl AssignmentStore for SharedLedger {
+/// One node's handle on the `SharedLedger`: what that node's manager and
+/// assignment poll read and write through.
+struct NodeLedger {
+    node: String,
+    shared: Arc<SharedLedger>,
+}
+
+impl AssignmentStore for NodeLedger {
     fn get(
         &self,
         instance_id: &str,
@@ -267,11 +409,10 @@ impl AssignmentStore for SharedLedger {
         partition: u32,
     ) -> Result<Option<PartitionAssignment>, ReplError> {
         Ok(self
-            .rows
-            .lock()
-            .get(&(org.to_string(), topic.to_string(), partition))
-            .filter(|a| a.instance_id == instance_id)
-            .cloned())
+            .shared
+            .rows_seen_by(&self.node)
+            .remove(&(org.to_string(), topic.to_string(), partition))
+            .filter(|a| a.instance_id == instance_id))
     }
 
     fn list_for_topic(
@@ -281,11 +422,10 @@ impl AssignmentStore for SharedLedger {
         topic: &str,
     ) -> Result<Vec<PartitionAssignment>, ReplError> {
         Ok(self
-            .rows
-            .lock()
-            .values()
+            .shared
+            .rows_seen_by(&self.node)
+            .into_values()
             .filter(|a| a.instance_id == instance_id && a.org_id == org && a.topic == topic)
-            .cloned()
             .collect())
     }
 
@@ -295,49 +435,26 @@ impl AssignmentStore for SharedLedger {
         node_id: &str,
     ) -> Result<Vec<PartitionAssignment>, ReplError> {
         Ok(self
-            .rows
-            .lock()
-            .values()
+            .shared
+            .rows_seen_by(&self.node)
+            .into_values()
             .filter(|a| a.instance_id == instance_id && a.replicas.iter().any(|r| r == node_id))
-            .cloned()
             .collect())
     }
 
     fn propose(&self, assignment: PartitionAssignment) -> Result<OperationId, ReplError> {
-        let key = (
-            assignment.org_id.clone(),
-            assignment.topic.clone(),
-            assignment.partition,
-        );
-        let mut rows = self.rows.lock();
-        let admitted = match rows.get(&key) {
-            None => true,
-            Some(stored) => {
-                assignment.leader_epoch > stored.leader_epoch
-                    || (assignment.leader_epoch == stored.leader_epoch
-                        && assignment.leader_node_id < stored.leader_node_id)
-            }
-        };
-        let mut n = self.next_op.lock();
-        let id = OperationId::from_hash([*n; 32]);
-        *n = n.wrapping_add(1).max(1);
-        if admitted {
-            rows.insert(key, assignment.clone());
-        }
-        drop(rows);
-        // "majority = acks from the other two fakes": every replica of the
-        // assignment is immediately reported as acknowledged for this op —
-        // ADMITTED OR NOT (see the ACK SEMANTICS note on the struct: the
-        // real ledger acks a gate-rejected assignment op too, which is why
-        // majority alone cannot make a promotion exclusive).
-        self.acked.lock().insert(id, assignment.replicas.clone());
-        Ok(id)
+        Ok(self.shared.propose_by(&self.node, assignment))
     }
 }
 
-impl LedgerAdmission for SharedLedger {
+impl LedgerAdmission for NodeLedger {
     fn admitted_by(&self, op_id: OperationId) -> Vec<String> {
-        self.acked.lock().get(&op_id).cloned().unwrap_or_default()
+        self.shared
+            .acked
+            .lock()
+            .get(&op_id)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -359,6 +476,11 @@ struct TransportRegistry {
     /// asserts on to make the rejection "visible", not just inferred from a
     /// timeout.
     env_gate_rejections: AtomicU32,
+    /// Node pairs that cannot reach each other (`cut`): a dial between them
+    /// fails the way a dial across a network partition does. Streams
+    /// already open are not severed — the scenarios cut links before any
+    /// stream between the pair exists.
+    cut: Mutex<Vec<(String, String)>>,
 }
 
 impl TransportRegistry {
@@ -366,7 +488,23 @@ impl TransportRegistry {
         Arc::new(Self {
             peers: Mutex::new(HashMap::new()),
             env_gate_rejections: AtomicU32::new(0),
+            cut: Mutex::new(Vec::new()),
         })
+    }
+
+    fn cut(&self, a: &str, b: &str) {
+        self.cut.lock().push((a.to_string(), b.to_string()));
+    }
+
+    fn heal(&self) {
+        self.cut.lock().clear();
+    }
+
+    fn is_cut(&self, a: &str, b: &str) -> bool {
+        self.cut
+            .lock()
+            .iter()
+            .any(|(x, y)| (x == a && y == b) || (x == b && y == a))
     }
 
     fn register(
@@ -400,6 +538,12 @@ struct DuplexTransport {
 #[async_trait::async_trait]
 impl Transport for DuplexTransport {
     async fn open_stream(&self, node_id: &str) -> Result<(BusRecv, BusSend), ReplError> {
+        if self.registry.is_cut(&self.local_node_id, node_id) {
+            return Err(ReplError::Internal(format!(
+                "network partition between '{}' and '{node_id}'",
+                self.local_node_id
+            )));
+        }
         let (manager, target_env) = {
             let peers = self.registry.peers.lock();
             let entry = peers
@@ -433,9 +577,10 @@ impl Transport for DuplexTransport {
 
 struct TestNode {
     id: String,
+    db: DbPool,
     svc: Arc<BusService>,
     manager: Arc<ReplicationManager>,
-    ledger: Arc<SharedLedger>,
+    ledger: Arc<NodeLedger>,
     _bus_dir: TempDir,
     _db_dir: TempDir,
 }
@@ -519,6 +664,10 @@ fn build_node(
         follower_config(),
     ));
     let audit = Arc::new(AuditLogReplAudit::new(db.clone(), id));
+    let ledger = Arc::new(NodeLedger {
+        node: id.to_string(),
+        shared: ledger,
+    });
 
     let manager = ReplicationManager::new(ReplicationManagerConfig {
         instance_id: TEST_INSTANCE_ID.to_string(),
@@ -539,6 +688,7 @@ fn build_node(
 
     TestNode {
         id: id.to_string(),
+        db,
         svc,
         manager,
         ledger,
@@ -553,6 +703,11 @@ fn build_node(
 /// SQLite-backed ledger to poll) — short intervals so a real election
 /// reaches every node within a couple hundred ms of wall time.
 fn spawn_background_loops(node: &TestNode) {
+    spawn_lease_check_loop(node);
+    spawn_assignment_poll_loop(node);
+}
+
+fn spawn_lease_check_loop(node: &TestNode) {
     let manager = Arc::clone(&node.manager);
     let shutdown = manager.shutdown_token();
     tokio::spawn(async move {
@@ -564,7 +719,9 @@ fn spawn_background_loops(node: &TestNode) {
             }
         }
     });
+}
 
+fn spawn_assignment_poll_loop(node: &TestNode) {
     let manager = Arc::clone(&node.manager);
     let ledger = Arc::clone(&node.ledger);
     let local_node_id = node.id.clone();
@@ -594,7 +751,22 @@ fn spawn_background_loops(node: &TestNode) {
     });
 }
 
-fn assignment(replicas: &[&str], leader: &str, epoch: u32, partition: u32) -> PartitionAssignment {
+/// The incarnation of the test topic `node` holds — what every placement of
+/// it must name (`PartitionAssignment::topic_generation`).
+fn topic_generation(node: &TestNode) -> u64 {
+    tentaflow_core::db::repository::bus_topic_get(&node.db, TEST_INSTANCE_ID, ORG, TOPIC)
+        .expect("read topic row")
+        .expect("topic row")
+        .generation
+}
+
+fn assignment(
+    generation: u64,
+    replicas: &[&str],
+    leader: &str,
+    epoch: u32,
+    partition: u32,
+) -> PartitionAssignment {
     PartitionAssignment {
         instance_id: TEST_INSTANCE_ID.to_string(),
         org_id: ORG.to_string(),
@@ -605,6 +777,8 @@ fn assignment(replicas: &[&str], leader: &str, epoch: u32, partition: u32) -> Pa
         isr: replicas.iter().map(|s| s.to_string()).collect(),
         leader_epoch: epoch,
         updated_at_ms: 0,
+        topic_generation: generation,
+        epoch_slots: Default::default(),
     }
 }
 
@@ -620,6 +794,23 @@ fn assignment(replicas: &[&str], leader: &str, epoch: u32, partition: u32) -> Pa
 async fn build_cluster(
     partitions: u32,
     acks: Acks,
+) -> (Vec<TestNode>, Arc<SharedLedger>, Arc<TransportRegistry>) {
+    let cluster = build_cluster_placed(partitions, acks, &["A", "B", "C"], "A").await;
+    for node in &cluster.0 {
+        spawn_background_loops(node);
+    }
+    cluster
+}
+
+/// `build_cluster` with the epoch-1 placement given: `replicas` (a subset of
+/// A/B/C) led by `leader`, which may name a node that is not there — a
+/// leader already gone when the scenario starts. Spawns no background loop;
+/// the scenario picks the ones it runs.
+async fn build_cluster_placed(
+    partitions: u32,
+    acks: Acks,
+    replicas: &[&str],
+    leader: &str,
 ) -> (Vec<TestNode>, Arc<SharedLedger>, Arc<TransportRegistry>) {
     init_tracing();
     let ledger = SharedLedger::new();
@@ -644,31 +835,37 @@ async fn build_cluster(
     );
     let nodes = vec![a, b, c];
 
-    for node in &nodes {
-        node.svc
-            .create_topic(
-                &ctx(),
-                TOPIC,
-                TopicOptions {
-                    partitions: Some(partitions),
-                    replication_factor: Some(3),
-                    acks: Some(acks),
-                    ..Default::default()
-                },
-            )
-            .expect("create_topic");
+    // Created once, on A, and its row copied to B and C the way the ledger
+    // replicates it: one incarnation, the one every placement names.
+    nodes[0]
+        .svc
+        .create_topic(
+            &ctx(),
+            TOPIC,
+            TopicOptions {
+                partitions: Some(partitions),
+                replication_factor: Some(replicas.len() as u32),
+                acks: Some(acks),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+    let row =
+        tentaflow_core::db::repository::bus_topic_get(&nodes[0].db, TEST_INSTANCE_ID, ORG, TOPIC)
+            .expect("read topic row")
+            .expect("topic row");
+    for node in &nodes[1..] {
+        tentaflow_core::db::repository::bus_topic_create(&node.db, &row)
+            .expect("replicate topic row");
     }
+    let generation = row.generation;
 
     for p in 0..partitions {
-        let a0 = assignment(&["A", "B", "C"], "A", 1, p);
+        let a0 = assignment(generation, replicas, leader, 1, p);
         ledger.seed(a0.clone());
         for node in &nodes {
             node.manager.apply_assignment(a0.clone()).await;
         }
-    }
-
-    for node in &nodes {
-        spawn_background_loops(node);
     }
 
     (nodes, ledger, registry)
@@ -699,9 +896,13 @@ async fn wait_for_hello_handshake(nodes: &[TestNode], partitions: u32, timeout: 
         let mut state = Vec::new();
         let leader_isr = a.manager.snapshot(ORG, Some(TOPIC)).partitions;
         for p in 0..partitions {
-            let b_epoch = PartitionProvider::partition(b.svc.as_ref(), ORG, TOPIC, p)
+            let b_epoch = b
+                .svc
+                .local_partition(&ctx(), TOPIC, p)
                 .map(|part| part.leader_epoch());
-            let c_epoch = PartitionProvider::partition(c.svc.as_ref(), ORG, TOPIC, p)
+            let c_epoch = c
+                .svc
+                .local_partition(&ctx(), TOPIC, p)
                 .map(|part| part.leader_epoch());
             let isr = leader_isr
                 .iter()
@@ -717,10 +918,12 @@ async fn wait_for_hello_handshake(nodes: &[TestNode], partitions: u32, timeout: 
     let ok = wait_until(timeout, || {
         let leader_isr = a.manager.snapshot(ORG, Some(TOPIC)).partitions;
         (0..partitions).all(|p| {
-            PartitionProvider::partition(b.svc.as_ref(), ORG, TOPIC, p)
+            b.svc
+                .local_partition(&ctx(), TOPIC, p)
                 .map(|part| part.leader_epoch() == 1)
                 .unwrap_or(false)
-                && PartitionProvider::partition(c.svc.as_ref(), ORG, TOPIC, p)
+                && c.svc
+                    .local_partition(&ctx(), TOPIC, p)
                     .map(|part| part.leader_epoch() == 1)
                     .unwrap_or(false)
                 && leader_isr
@@ -790,7 +993,9 @@ async fn publish_text(
 /// `peek` is leader-only, and this must also work on a follower to prove
 /// byte-identical replication).
 fn read_all_payloads(node: &TestNode, partition: u32) -> Vec<Vec<u8>> {
-    let part = PartitionProvider::partition(node.svc.as_ref(), ORG, TOPIC, partition)
+    let part = node
+        .svc
+        .local_partition(&ctx(), TOPIC, partition)
         .expect("partition handle");
     part.open_reader()
         .fetch_from_offset(0, 16 * 1024 * 1024)
@@ -817,13 +1022,15 @@ fn committed_group_offset(node: &TestNode, group: &str, partition: u32) -> u64 {
 }
 
 fn log_end_offset(node: &TestNode, partition: u32) -> u64 {
-    PartitionProvider::partition(node.svc.as_ref(), ORG, TOPIC, partition)
+    node.svc
+        .local_partition(&ctx(), TOPIC, partition)
         .expect("partition handle")
         .log_end_offset()
 }
 
 fn high_watermark(node: &TestNode, partition: u32) -> u64 {
-    PartitionProvider::partition(node.svc.as_ref(), ORG, TOPIC, partition)
+    node.svc
+        .local_partition(&ctx(), TOPIC, partition)
         .expect("partition handle")
         .high_watermark()
 }
@@ -965,6 +1172,8 @@ async fn publish_refuses_with_not_enough_replicas_once_both_followers_are_down()
         isr: vec!["A".to_string()],
         leader_epoch: 2,
         updated_at_ms: 0,
+        topic_generation: topic_generation(a),
+        epoch_slots: Default::default(),
     });
 
     // The epoch-2 row keeps A as leader, so A re-stamps its entry in place
@@ -1079,6 +1288,7 @@ async fn z12_environment_mismatch_is_rejected_by_the_transport_gate_and_by_hello
             leader_epoch: 1,
             replicas: vec!["PROD".to_string(), "TEST".to_string()],
             environment: NodeEnvironment::Prod, // mismatches TEST's own local_env
+            topic_generation: Some(0),
         }),
     )
     .await
@@ -1509,7 +1719,10 @@ async fn a_replica_ahead_of_the_leader_is_truncated_back_when_its_stream_reopens
     let chain = read_all_payloads(a, 0);
 
     // C grows past the chain; B and A stay at 5.
-    let c_part = PartitionProvider::partition(c.svc.as_ref(), ORG, TOPIC, 0).expect("C partition");
+    let c_part = c
+        .svc
+        .local_partition(&ctx(), TOPIC, 0)
+        .expect("C partition");
     c_part
         .append_batch_async(one_text_batch("ghost-1"))
         .await
@@ -1526,7 +1739,7 @@ async fn a_replica_ahead_of_the_leader_is_truncated_back_when_its_stream_reopens
     // streams for it (the same path `apply_assignment_leader_dials_...`
     // covers).
     a.manager
-        .apply_assignment(assignment(&["A", "B", "C"], "A", 2, 0))
+        .apply_assignment(assignment(topic_generation(a), &["A", "B", "C"], "A", 2, 0))
         .await;
 
     assert!(
@@ -1946,6 +2159,34 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         ) -> Result<Box<dyn FollowerRunner>, ReplError> {
             unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
         }
+        fn undialed_lease(&self) -> Duration {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
+        fn leader_lease(&self) -> Duration {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
+        fn election_stagger(&self) -> Duration {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
+        fn fence_to_epoch(
+            &self,
+            _assignment: &PartitionAssignment,
+            _epoch: u32,
+        ) -> Result<u32, ReplError> {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
+        fn cut_to_committed(
+            &self,
+            _assignment: &PartitionAssignment,
+        ) -> Result<LogPosition, ReplError> {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
+        fn local_log_position(
+            &self,
+            _assignment: &PartitionAssignment,
+        ) -> Result<LogPosition, ReplError> {
+            unimplemented!("this test only ever reaches Reject/UnknownInstance verdicts")
+        }
     }
 
     struct NoopAudit;
@@ -2011,6 +2252,8 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
             isr: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
             leader_epoch: 5,
             updated_at_ms: 0,
+            topic_generation: 0,
+            epoch_slots: Default::default(),
         })
         .await;
     mgr_b
@@ -2024,6 +2267,8 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
             isr: vec!["B_LOCAL".to_string(), "Y_LEADER".to_string()],
             leader_epoch: 9,
             updated_at_ms: 0,
+            topic_generation: 0,
+            epoch_slots: Default::default(),
         })
         .await;
 
@@ -2097,6 +2342,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         leader_epoch: 4,
         replicas: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
         environment: NodeEnvironment::Prod,
+        topic_generation: Some(0),
     })
     .await;
     assert!(!ack.accepted);
@@ -2124,6 +2370,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         leader_epoch: 8,
         replicas: vec!["B_LOCAL".to_string(), "Y_LEADER".to_string()],
         environment: NodeEnvironment::Prod,
+        topic_generation: Some(0),
     })
     .await;
     assert!(!ack.accepted);
@@ -2146,6 +2393,7 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
         leader_epoch: 4,
         replicas: vec!["A_LOCAL".to_string(), "X_LEADER".to_string()],
         environment: NodeEnvironment::Prod,
+        topic_generation: Some(0),
     })
     .await;
     assert!(!ack.accepted);
@@ -2154,4 +2402,332 @@ async fn router_demux_never_lets_a_hello_for_one_instance_reach_another_instance
     // Cleanup runs via `_cleanup`'s `Drop` (declared right after
     // `register_manager` above) — on this normal-exit path AND on any
     // panic between here and there, per this test's own T3 finding.
+}
+
+// ===== Scenario: an epoch names exactly one leader's chain ================
+
+/// Records every moment two nodes lead the same epoch, for as long as it
+/// runs. An epoch is what the protocol ranks and reconciles logs by, so two
+/// leaders sharing one leave two chains under one number.
+struct SameEpochWatch {
+    stop: Arc<AtomicBool>,
+    seen: Arc<Mutex<Vec<String>>>,
+    /// Every (node, epoch) leadership seen, so a scenario can assert which
+    /// path it took.
+    led: Arc<Mutex<std::collections::BTreeSet<(String, u32)>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SameEpochWatch {
+    fn start(nodes: &[TestNode]) -> Self {
+        let managers: Vec<(String, Arc<ReplicationManager>)> = nodes
+            .iter()
+            .map(|n| (n.id.clone(), Arc::clone(&n.manager)))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let led = Arc::new(Mutex::new(std::collections::BTreeSet::new()));
+        let task = {
+            let stop = Arc::clone(&stop);
+            let seen = Arc::clone(&seen);
+            let led = Arc::clone(&led);
+            tokio::spawn(async move {
+                while !stop.load(Ordering::SeqCst) {
+                    let mut leaders: HashMap<u32, Vec<&str>> = HashMap::new();
+                    for (id, manager) in &managers {
+                        if let PartitionRole::Leader { epoch } = manager.role(ORG, TOPIC, 0) {
+                            leaders.entry(epoch).or_default().push(id);
+                            led.lock().insert((id.clone(), epoch));
+                        }
+                    }
+                    for (epoch, ids) in leaders {
+                        if ids.len() > 1 {
+                            let mut seen = seen.lock();
+                            let line = format!("epoch {epoch} led by {ids:?}");
+                            if !seen.contains(&line) {
+                                seen.push(line);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+        };
+        Self {
+            stop,
+            seen,
+            led,
+            task,
+        }
+    }
+
+    /// Stops watching: the moments two nodes led one epoch, and every node
+    /// that led at all.
+    async fn finish(self) -> (Vec<String>, Vec<String>) {
+        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.task.await;
+        let seen = self.seen.lock().clone();
+        let mut leaders: Vec<String> = self.led.lock().iter().map(|(id, _)| id.clone()).collect();
+        leaders.dedup();
+        (seen, leaders)
+    }
+}
+
+/// Publishes `payload` through `node` until one attempt is acknowledged.
+async fn publish_until_accepted(node: &TestNode, payload: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        let attempt =
+            tokio::time::timeout(Duration::from_secs(2), publish_text(node, Some(0), payload))
+                .await;
+        if matches!(attempt, Ok(Ok(ref res)) if res.accepted == 1) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// The node that leads and has a publish of `payload` acknowledged through
+/// it, once one does.
+async fn leader_accepting<'a>(
+    nodes: &'a [TestNode],
+    payload: &str,
+    timeout: Duration,
+) -> Option<&'a TestNode> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        for node in nodes {
+            if matches!(
+                node.manager.role(ORG, TOPIC, 0),
+                PartitionRole::Leader { .. }
+            ) && publish_until_accepted(node, payload, Duration::from_millis(500)).await
+            {
+                return Some(node);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+fn text_payloads(node: &TestNode) -> Vec<String> {
+    read_all_payloads(node, 0)
+        .into_iter()
+        .map(|p| String::from_utf8(p).expect("utf-8 payload"))
+        .collect()
+}
+
+/// The traced wedge. RF=3, the epoch-1 leader is gone and nobody follows
+/// anyone. `held` stands first and asks C for its log — A and B cannot
+/// reach each other — and its proposal is held back while `other` stands,
+/// is elected, and commits records through C. Then `held` proposes.
+///
+/// Before epochs were unique, both stood for epoch 2: with A held, the
+/// ledger admitted it second (equal epoch, lower node id) and it promoted
+/// too — two leaders of epoch 2, C switching to A within one epoch, and A's
+/// handshake trying to cut the records C had committed under B. Now the two
+/// candidacies stand for different epochs (A's slot deals 64, B's 65), and
+/// C, having told the first one what its log held, refuses any leader below
+/// the term it promised. `other_leads` names which path the variant must
+/// take: the second candidate stands above the held one, leads and commits
+/// while the held one later yields — or it hears the held one's promise
+/// and stands down, and only the held one ever leads. Either way one epoch
+/// has one leader, every acknowledged record survives, and the partition
+/// converges.
+async fn two_candidacies_from_one_term_leave_one_leader_per_epoch(
+    held: &str,
+    other: &str,
+    other_leads: bool,
+) {
+    let (nodes, ledger, registry) =
+        build_cluster_placed(1, Acks::Quorum, &["A", "B", "C"], "D").await;
+    for node in &nodes {
+        spawn_assignment_poll_loop(node);
+    }
+    let watch = SameEpochWatch::start(&nodes);
+    let key: PartitionKey = (ORG.to_string(), TOPIC.to_string(), 0);
+    registry.cut("A", "B");
+
+    let (entered, release) = ledger.hold_propose(held);
+    let held_manager = Arc::clone(&find_node(&nodes, held).manager);
+    let held_key = key.clone();
+    let held_election = tokio::spawn(async move { held_manager.run_election(held_key).await });
+    let reached =
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(10)).is_ok())
+            .await
+            .expect("wait for the held proposal");
+    assert!(reached, "{held}'s candidacy never reached its proposal");
+
+    let other_node = find_node(&nodes, other);
+    other_node.manager.run_election(key.clone()).await;
+    let mut acknowledged = Vec::new();
+    if matches!(
+        other_node.manager.role(ORG, TOPIC, 0),
+        PartitionRole::Leader { .. }
+    ) {
+        for i in 0..3 {
+            let payload = format!("{other}-term-{i}");
+            assert!(
+                publish_until_accepted(other_node, &payload, Duration::from_secs(10)).await,
+                "{other} leads but never had {payload} acknowledged"
+            );
+            acknowledged.push(payload);
+        }
+    }
+
+    let _ = release.send(());
+    held_election.await.expect("held election task");
+    registry.heal();
+    for node in &nodes {
+        spawn_lease_check_loop(node);
+    }
+
+    let leader = leader_accepting(&nodes, "after-heal", Duration::from_secs(20)).await;
+    let converged = match leader {
+        Some(leader) => {
+            wait_until(Duration::from_secs(15), || {
+                let log = read_all_payloads(leader, 0);
+                nodes.iter().all(|n| read_all_payloads(n, 0) == log)
+            })
+            .await
+        }
+        None => false,
+    };
+    let (same_epoch, leaders) = watch.finish().await;
+    let mut violated = Vec::new();
+    if !same_epoch.is_empty() {
+        violated.push(format!("two leaders held one epoch: {same_epoch:?}"));
+    }
+    // Which path: the second candidate led and had its records
+    // acknowledged, or it stood down and only the held one ever led.
+    let expected_leaders = if other_leads {
+        vec![other.to_string()]
+    } else {
+        vec![held.to_string()]
+    };
+    if leaders != expected_leaders {
+        violated.push(format!(
+            "expected only {expected_leaders:?} to lead, saw {leaders:?}"
+        ));
+    }
+    if acknowledged.is_empty() == other_leads {
+        violated.push(format!(
+            "acknowledged through {other}: {acknowledged:?} (expected {})",
+            if other_leads { "some" } else { "none" }
+        ));
+    }
+    match leader {
+        None => violated.push("no leader accepted a quorum write after the heal".to_string()),
+        Some(leader) => {
+            if !converged {
+                violated.push(format!(
+                    "the replicas' logs never converged: {:?}",
+                    nodes
+                        .iter()
+                        .map(|n| (n.id.clone(), text_payloads(n)))
+                        .collect::<Vec<_>>()
+                ));
+            }
+            let log = text_payloads(leader);
+            for payload in &acknowledged {
+                if !log.contains(payload) {
+                    violated.push(format!("acknowledged {payload} is gone: {log:?}"));
+                }
+            }
+        }
+    }
+    shutdown_all(&nodes);
+    assert!(violated.is_empty(), "{violated:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_candidacies_from_one_term_leave_one_leader_per_epoch_when_a_is_held() {
+    // B's slot deals the higher epoch: B stands above held A and leads.
+    two_candidacies_from_one_term_leave_one_leader_per_epoch("A", "B", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_candidacies_from_one_term_leave_one_leader_per_epoch_when_b_is_held() {
+    // Held B stands above A: A hears C's promise to B and stands down.
+    two_candidacies_from_one_term_leave_one_leader_per_epoch("B", "A", false).await;
+}
+
+/// RF=2 across a split: the leader of epoch 1 is gone, A and B can reach
+/// neither each other nor each other's ledger ops, and each alone may lead
+/// (the owner's availability decision, `election::availability_quorum`).
+/// Both elect, both take writes. Before epochs were unique both stood for
+/// epoch 2, and after the heal the loser's log was judged a prefix of the
+/// winner's because it named the same epoch — it kept its own records at
+/// offsets the winner had written different ones to: two replicas, one
+/// epoch, two histories, and nothing reporting it. Now the two leaderships
+/// carry different epochs; the newer one wins, and the loser's unreplicated
+/// writes are dropped (the accepted RF=2 risk) instead of surviving as a
+/// silent divergence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_rf2_split_where_both_replicas_lead_heals_onto_one_chain() {
+    let (nodes, ledger, registry) = build_cluster_placed(1, Acks::All, &["A", "B"], "C").await;
+    for node in &nodes {
+        spawn_assignment_poll_loop(node);
+    }
+    let watch = SameEpochWatch::start(&nodes);
+    let key: PartitionKey = (ORG.to_string(), TOPIC.to_string(), 0);
+    let a = find_node(&nodes, "A");
+    let b = find_node(&nodes, "B");
+    registry.cut("A", "B");
+    ledger.split();
+
+    tokio::join!(
+        a.manager.run_election(key.clone()),
+        b.manager.run_election(key.clone())
+    );
+    for (node, side, count) in [(a, "a", 2u32), (b, "b", 3u32)] {
+        assert!(
+            matches!(
+                node.manager.role(ORG, TOPIC, 0),
+                PartitionRole::Leader { .. }
+            ),
+            "{} did not lead its side of the split: {:?}",
+            node.id,
+            node.manager.role(ORG, TOPIC, 0)
+        );
+        for i in 0..count {
+            let payload = format!("{side}-side-{i}");
+            assert!(
+                publish_until_accepted(node, &payload, Duration::from_secs(10)).await,
+                "{} never had {payload} acknowledged",
+                node.id
+            );
+        }
+    }
+
+    registry.heal();
+    ledger.heal();
+    let one_chain = wait_until(Duration::from_secs(20), || {
+        let a_leads = matches!(a.manager.role(ORG, TOPIC, 0), PartitionRole::Leader { .. });
+        let b_leads = matches!(b.manager.role(ORG, TOPIC, 0), PartitionRole::Leader { .. });
+        let a_log = read_all_payloads(a, 0);
+        a_leads != b_leads && !a_log.is_empty() && a_log == read_all_payloads(b, 0)
+    })
+    .await;
+    let (same_epoch, _) = watch.finish().await;
+    let (a_log, b_log) = (text_payloads(a), text_payloads(b));
+    shutdown_all(&nodes);
+    let mut violated = Vec::new();
+    if !same_epoch.is_empty() {
+        violated.push(format!("two leaders held one epoch: {same_epoch:?}"));
+    }
+    if !one_chain {
+        violated.push(format!(
+            "the replicas never settled on one chain: A={a_log:?} B={b_log:?}"
+        ));
+    }
+    let from_a = a_log.iter().filter(|p| p.starts_with("a-side")).count();
+    let from_b = a_log.iter().filter(|p| p.starts_with("b-side")).count();
+    if (from_a, from_b) != (2, 0) && (from_a, from_b) != (0, 3) {
+        violated.push(format!(
+            "the surviving chain must be exactly one side's: {a_log:?}"
+        ));
+    }
+    assert!(violated.is_empty(), "{violated:#?}");
 }

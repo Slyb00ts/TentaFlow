@@ -160,6 +160,11 @@ async function refreshPools(screen, body, state) {
     state.completed.add(source);
     renderPools(screen, body, state);
   }));
+  // Both lists answered: the tab badge takes this count too, so a pool
+  // created or destroyed here is counted at once (critic wave 5, MINOR 5).
+  if (state.isCurrent() && epoch === state.epoch && ['zfs', 'elastic'].every((k) => state.completed.has(k) && !state.errors[k])) {
+    screen.setPoolsCount?.(state.pools.length + state.arrays.length);
+  }
 }
 
 function renderPools(screen, body, state) {

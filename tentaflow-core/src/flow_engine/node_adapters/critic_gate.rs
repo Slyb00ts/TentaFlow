@@ -93,6 +93,35 @@ fn collect_strings(value: &Value, out: &mut Vec<String>) {
     }
 }
 
+/// Whether `text` states the approval `marker` as a verdict rather than merely
+/// mentioning it. Case-insensitive, so a reviewer that shouts or whispers its
+/// approval is still understood.
+///
+/// Models wrap a verdict in prose far more often than they emit it bare
+/// ("Przejrzałem plan. BEZ UWAG", "Werdykt: BEZ UWAG"), so the marker may sit
+/// anywhere — but it has to open a line or follow punctuation. A reviewer that
+/// wrote "nie mogę napisać BEZ UWAG" while listing blocking faults was read as
+/// approving: the marker there is the object of a sentence, preceded by a word.
+fn states_verdict(text: &str, marker: &str) -> bool {
+    let text = text.to_lowercase();
+    let marker = marker.to_lowercase();
+    if marker.is_empty() {
+        return false;
+    }
+    text.match_indices(&marker).any(|(at, _)| {
+        let before = &text[..at];
+        // Markdown emphasis, quotes and spacing do not count as what precedes
+        // the verdict: "**BEZ UWAG**" is as bare as "BEZ UWAG".
+        let trimmed = before.trim_end_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '*' | '_' | '#' | '>' | '`' | '"' | '\'' | '„' | '”' | '«')
+        });
+        before[trimmed.len()..].contains('\n')
+            || trimmed.chars().next_back().map_or(true, |c| {
+                matches!(c, '.' | ':' | ',' | ';' | '!' | '?' | '-' | '–' | '—' | '(')
+            })
+    })
+}
+
 impl Default for CriticGateNodeAdapter {
     fn default() -> Self {
         Self::new()
@@ -127,10 +156,7 @@ impl NodeAdapter for CriticGateNodeAdapter {
         let output_variable = Self::config_str(node, "output_variable", DEFAULT_OUTPUT_VARIABLE);
 
         let text = Self::verdict_text(envelope, &verdict_var);
-        // Case-insensitive so a reviewer that shouts or whispers its approval is
-        // still understood; the marker is matched as a substring because models
-        // wrap a verdict in a sentence far more often than they emit it bare.
-        let approved = !text.is_empty() && text.to_lowercase().contains(&marker.to_lowercase());
+        let approved = states_verdict(&text, &marker);
 
         let mut out: FlowEnvelope = (**envelope).clone();
         out.meta
@@ -223,6 +249,35 @@ mod tests {
             ])),
         );
         assert_eq!(exits(&run(&node(json!({})), env).await), Some(true));
+    }
+
+    /// Naming the marker is not approving. A reviewer listing blocking faults
+    /// said it could not write the marker yet, and the substring match took
+    /// that sentence as the approval that ends the loop.
+    #[tokio::test]
+    async fn a_marker_mentioned_inside_a_sentence_is_not_an_approval() {
+        for text in [
+            "1. Brak uruchomienia testów.\n\nDopóki nie ma zielonego przebiegu, nie mogę napisać BEZ UWAG.",
+            "Napiszę bez uwag, gdy testy przejdą.",
+        ] {
+            let env = envelope_with("critic_verdict", FlowValue::Text(text.into()));
+            assert_eq!(exits(&run(&node(json!({})), env).await), Some(false), "{text}");
+        }
+    }
+
+    /// The verdict still counts where reviewers actually put it: bare, in bold,
+    /// on its own line after the reasoning, or behind a label.
+    #[tokio::test]
+    async fn a_stated_verdict_is_an_approval_wherever_it_stands() {
+        for text in [
+            "BEZ UWAG",
+            "**BEZ UWAG**\n\nUzasadnienie: plan pokrywa zlecenie.",
+            "Przeczytałem oba pliki i porównałem je ze zleceniem\nBEZ UWAG",
+            "Werdykt: bez uwag.",
+        ] {
+            let env = envelope_with("critic_verdict", FlowValue::Text(text.into()));
+            assert_eq!(exits(&run(&node(json!({})), env).await), Some(true), "{text}");
+        }
     }
 
     /// An absent variable is NOT an approval. Treating "nothing" as "no

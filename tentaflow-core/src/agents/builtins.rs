@@ -712,9 +712,10 @@ impl CoreToolName {
                 name: self.public_name().to_string(),
                 description: "Write a file in the repository, creating it or replacing its \
                               whole content. To replace an EXISTING file you must first read it \
-                              and pass its `expected_sha256` — a mismatch means someone else \
-                              changed the file and the write is refused instead of overwriting \
-                              their work. For a small change prefer core.fs_edit."
+                              and pass the `blob_id` core.fs_read returned as `expected_blob_id` \
+                              — a mismatch means someone else changed the file and the write is \
+                              refused instead of overwriting their work. For a small change \
+                              prefer core.fs_edit."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -727,11 +728,11 @@ impl CoreToolName {
                             "type": "string",
                             "description": "The complete new content of the file."
                         },
-                        "expected_sha256": {
+                        "expected_blob_id": {
                             "type": "string",
-                            "description": "SHA-256 of the content you read, for an existing \
-                                            file. Pass \"\" (empty) to assert the file does not \
-                                            exist yet."
+                            "description": "The `blob_id` core.fs_read returned for an existing \
+                                            file — copy it, never compute it. Pass \"\" (empty) \
+                                            to assert the file does not exist yet."
                         }
                     },
                     "required": ["path", "content"]
@@ -742,8 +743,8 @@ impl CoreToolName {
                 description: "Replace one exact literal occurrence in a file. `old_string` must \
                               appear EXACTLY ONCE — if it matches zero or several times the \
                               edit is refused, so include enough surrounding lines to make it \
-                              unique. Pass `expected_sha256` from your read of the file so a \
-                              concurrent change cannot be clobbered."
+                              unique. Pass the `blob_id` from your read of the file as \
+                              `expected_blob_id` so a concurrent change cannot be clobbered."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -760,9 +761,9 @@ impl CoreToolName {
                             "type": "string",
                             "description": "Replacement text."
                         },
-                        "expected_sha256": {
+                        "expected_blob_id": {
                             "type": "string",
-                            "description": "SHA-256 of the file content you read."
+                            "description": "The `blob_id` core.fs_read returned for this file."
                         }
                     },
                     "required": ["path", "old_string", "new_string"]
@@ -771,8 +772,9 @@ impl CoreToolName {
             CoreToolName::FsMove => LlmToolSpec {
                 name: self.public_name().to_string(),
                 description: "Rename or move a file inside the repository. Both paths stay \
-                              inside the tree. Pass `expected_sha256` of the source so the move \
-                              is refused if the file changed since you read it."
+                              inside the tree. Pass the source's `blob_id` as \
+                              `expected_blob_id` so the move is refused if the file changed \
+                              since you read it."
                     .to_string(),
                 parameters: serde_json::json!({
                     "type": "object",
@@ -785,9 +787,9 @@ impl CoreToolName {
                             "type": "string",
                             "description": "New repository-relative path."
                         },
-                        "expected_sha256": {
+                        "expected_blob_id": {
                             "type": "string",
-                            "description": "SHA-256 of the source file content you read."
+                            "description": "The `blob_id` core.fs_read returned for the source."
                         }
                     },
                     "required": ["from", "to"]
@@ -795,8 +797,8 @@ impl CoreToolName {
             },
             CoreToolName::FsDelete => LlmToolSpec {
                 name: self.public_name().to_string(),
-                description: "Delete a file from the repository. Pass `expected_sha256` of the \
-                              content you read — deleting a file that changed meanwhile is \
+                description: "Delete a file from the repository. Pass the `blob_id` you read \
+                              as `expected_blob_id` — deleting a file that changed meanwhile is \
                               refused. Deleting a directory requires `recursive: true`."
                     .to_string(),
                 parameters: serde_json::json!({
@@ -806,9 +808,9 @@ impl CoreToolName {
                             "type": "string",
                             "description": "Repository-relative path to delete."
                         },
-                        "expected_sha256": {
+                        "expected_blob_id": {
                             "type": "string",
-                            "description": "SHA-256 of the file content you read."
+                            "description": "The `blob_id` core.fs_read returned for this file."
                         },
                         "recursive": {
                             "type": "boolean",
