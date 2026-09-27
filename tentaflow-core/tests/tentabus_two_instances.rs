@@ -325,6 +325,7 @@ fn two_tentabus_instances_never_see_each_others_data() {
                 environment: "prod".to_string(),
                 updated_at_ms: now_ms(),
                 topic_generation: 0,
+                epoch_slots: Default::default(),
             },
         )
         .expect("seed partition assignment");

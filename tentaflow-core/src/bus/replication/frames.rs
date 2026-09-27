@@ -431,6 +431,18 @@ pub struct ReplLeoQuery {
     pub topic: String,
     pub partition: u32,
     pub known_epoch: u32,
+    /// The epoch the querying candidate stands for
+    /// (`election::epoch_for`). A replier with no live leader to defer to
+    /// promises it: it raises its partition's recognized epoch to it
+    /// (`Partition::set_leader_epoch`, durable), and from then on refuses
+    /// every leader of an earlier term — Raft's vote. Without it a leader of
+    /// a lower term could still commit through a replica after that replica
+    /// told a higher-term candidate what its log held, and the candidate,
+    /// elected on that stale answer, would then have to cut records a
+    /// majority acknowledged. Appended: `None` from a candidate that predates
+    /// it, which is answered without a promise, as before.
+    #[serde(default)]
+    pub candidate_epoch: Option<u32>,
 }
 
 /// Everything after `in_isr` is appended. A peer on an older build omits it
@@ -484,6 +496,22 @@ pub struct ReplLeoReply {
     /// from a peer that predates it.
     #[serde(default)]
     pub leader_alive: bool,
+    /// The newest term the replier promised. Asked for a promise
+    /// (`ReplLeoQuery::candidate_epoch`), the epoch its partition recognizes
+    /// afterwards — the candidate's when it promised it, higher when it had
+    /// already promised a newer candidacy. A candidate hearing a higher one
+    /// stands down and next stands above it
+    /// (`election::AbandonReason::NewerTerm`). Appended: `None` from a peer
+    /// that predates it or has promised nothing.
+    #[serde(default)]
+    pub promised_epoch: Option<u32>,
+    /// The replier understands `ReplLeoQuery::candidate_epoch`: asked for a
+    /// promise, it either made one (`promised_epoch`) or its answer must not
+    /// count toward a vote. Always `true` from this build; `false` from a
+    /// peer that predates promises, whose answer a vote still counts — see
+    /// the CHANGELOG upgrade note.
+    #[serde(default)]
+    pub promises: bool,
 }
 
 /// K-M2-5: consumer-group offset/attempts/discard state, replicated
@@ -1066,6 +1094,7 @@ mod tests {
             topic: "orders".into(),
             partition: 3,
             known_epoch: 6,
+            candidate_epoch: Some(8),
         });
         assert_eq!(roundtrip(lq.clone()).await, lq);
 
@@ -1079,6 +1108,8 @@ mod tests {
             ineligible: true,
             committed: None,
             leader_alive: false,
+            promised_epoch: Some(8),
+            promises: true,
         });
         assert_eq!(roundtrip(lr.clone()).await, lr);
 
@@ -1480,7 +1511,38 @@ mod tests {
                 ineligible: false,
                 committed: None,
                 leader_alive: false,
+                promised_epoch: None,
+                promises: false,
             }
         );
+    }
+
+    /// A candidate built before `candidate_epoch` existed still decodes, and
+    /// asks for no promise.
+    #[test]
+    fn a_leo_query_without_a_candidate_epoch_still_decodes() {
+        #[derive(Serialize)]
+        struct OlderLeoQuery {
+            instance_id: String,
+            org_id: String,
+            topic: String,
+            partition: u32,
+            known_epoch: u32,
+        }
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(
+            &OlderLeoQuery {
+                instance_id: "tentabus-00000001".into(),
+                org_id: "org-1".into(),
+                topic: "orders".into(),
+                partition: 2,
+                known_epoch: 4,
+            },
+            &mut bytes,
+        )
+        .expect("encode");
+        let query: ReplLeoQuery = ciborium::de::from_reader(bytes.as_slice()).expect("decode");
+        assert_eq!(query.known_epoch, 4);
+        assert_eq!(query.candidate_epoch, None);
     }
 }

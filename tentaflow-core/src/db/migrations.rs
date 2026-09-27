@@ -1091,6 +1091,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bus_topic_tombstones",
             MigrationStep::Sql(BUS_TOPIC_TOMBSTONES),
         ),
+        (
+            175,
+            "bus_assignment_epoch_slots",
+            MigrationStep::Sql(BUS_ASSIGNMENT_EPOCH_SLOTS),
+        ),
     ]
 }
 
@@ -9926,6 +9931,14 @@ CREATE TABLE IF NOT EXISTS bus_topic_tombstones (
 /// (`core_materializer::bus_topic_op_wins`). Every placement records
 /// the incarnation it was proposed for (`topic_generation`). `0` on both is
 /// the incarnation of every topic created before this migration.
+/// v175 — each replica's epoch slot per partition
+/// (`bus::replication::assignment::PartitionAssignment::epoch_slots`), a JSON
+/// object. Existing rows start empty: the replication layer derives their
+/// slots from the row itself and stores them with the next change it mints.
+const BUS_ASSIGNMENT_EPOCH_SLOTS: &str = r#"
+ALTER TABLE bus_partition_assignments ADD COLUMN epoch_slots TEXT NOT NULL DEFAULT '{}';
+"#;
+
 const BUS_TOPIC_INCARNATIONS: &str = r#"
 ALTER TABLE bus_topics ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE bus_partition_assignments ADD COLUMN topic_generation INTEGER NOT NULL DEFAULT 0;

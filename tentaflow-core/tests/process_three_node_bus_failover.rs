@@ -2124,6 +2124,7 @@ async fn handle_child_command(
                 )?
                 .ok_or_else(|| anyhow::anyhow!("ASSIGN: topic {topic} not here"))?
                 .generation,
+                epoch_slots: Default::default(),
             };
             let op_id = assignment_store.propose(&assignment)?;
             // `propose` only appends to the ledger + queues this node's

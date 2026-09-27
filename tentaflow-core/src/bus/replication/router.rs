@@ -372,7 +372,7 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                 .ok()
                 .and_then(|id| managers().get(&id).map(|e| e.value().clone()));
             match target {
-                Some(mgr) => mgr.answer_leo_query(query, send).await,
+                Some(mgr) => mgr.answer_leo_query(&remote_hex, query, send).await,
                 None => {
                     tracing::warn!(
                         peer = %remote_hex,
@@ -390,6 +390,8 @@ pub async fn route_stream(remote_hex: String, mut recv: BusRecv, mut send: BusSe
                         ineligible: true,
                         committed: None,
                         leader_alive: false,
+                        promised_epoch: None,
+                        promises: true,
                     });
                     let _ = frames::write_frame(&mut send, &reply).await;
                 }
@@ -535,11 +537,14 @@ mod tests {
         fn leader_lease(&self) -> Duration {
             unimplemented!("decoy fixture: never driven")
         }
+        fn election_stagger(&self) -> Duration {
+            unimplemented!("decoy fixture: never driven")
+        }
         fn fence_to_epoch(
             &self,
             _assignment: &PartitionAssignment,
             _epoch: u32,
-        ) -> Result<(), ReplError> {
+        ) -> Result<u32, ReplError> {
             unimplemented!("decoy fixture: never driven")
         }
         fn cut_to_committed(
@@ -738,6 +743,7 @@ mod tests {
                 topic: "orders".to_string(),
                 partition: 0,
                 known_epoch: 5,
+                candidate_epoch: None,
             }),
         )
         .await

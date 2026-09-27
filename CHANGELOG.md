@@ -20,6 +20,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   confirms. During a rolling upgrade an idle partition whose majority still
   runs the older release keeps those records hidden until the next publish
   reaches a majority.
+- **One leader per TentaBus epoch holds only between upgraded nodes.** An older
+  node still proposes the next epoch number, which can equal one an upgraded
+  node proposes; the two are then ordered by node id as before. An older
+  candidate asks no replica for a promise and an older replica makes none. An
+  upgraded candidate still counts an older replica's answer toward its
+  majority — it could not have promised anything — so elections do not stall
+  while a cluster is upgraded; a replica only refuses leaders of an earlier term
+  once both it and the candidate run this release. Any row an older node writes
+  carries no epoch slots: upgraded nodes keep the slots they already store for
+  that topic incarnation, and a node such a row adds holds no slot — it does not
+  stand for election until an upgraded leader's next change stores one. A
+  partition never stamped by an upgraded node derives its slots from its own
+  replica set. Migration 175 adds the slot column. New replication fields are
+  appended to existing frames, so mixed nodes keep replicating during a rolling
+  upgrade.
 
 ### TentaBus
 
@@ -107,6 +122,35 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   records visible within about one heartbeat, with no publish needed. While
   fewer than a majority of nodes run this release, the records stay hidden
   until a record of the new leader's term reaches a majority.
+- A leader epoch now names exactly one leader. Two replicas electing
+  themselves at the same time could both lead under the same epoch number; the
+  node-id tie-break settled which one won only after both had written. At RF≥3
+  a replica could then switch leaders within one epoch and be told to cut
+  records a majority had already committed; at RF=2 across a network split the
+  losing replica kept its own records at offsets the winner had written
+  different ones to, without any error. Every node of a partition now holds a
+  fixed epoch slot, kept in the partition's placement (up to 64 per topic
+  incarnation; a node that leaves keeps its slot reserved, so a replica-set
+  change never hands one to another node), and only ever proposes epochs of its
+  own slot — also while a candidate on the old replica set races a change on
+  the new one. Adding a node to a partition's replica set is now refused on any
+  node but the partition's leader (`bus.not_leader`), which makes such changes
+  one at a time; removing nodes and deleting topics still work anywhere. Two
+  changes minted from one placement at once now settle on the same one on every
+  node. An election asks the other replicas twice: first without
+  commitment, and — only if it would win — again, when each replica promises
+  the candidate's epoch on disk, to that candidate alone, and refuses every
+  leader of an earlier one from then on. Only answers that carry the promise
+  count toward the majority, so a replica restarted before it knew the
+  partition no longer lends its vote. A candidate that hears of a newer promise
+  stands down and waits a random fraction of the lease before standing above
+  it; replicas whose leases ran out together also stand at random moments.
+  After an RF=2 split the newer leadership wins and the other side's
+  unreplicated writes are dropped, as documented for RF=2. Epoch numbers now
+  grow by up to 64 per election; an election can take up to a quarter of the
+  leader lease longer, plus one more election-query timeout (300 ms) when a
+  replica does not answer. A replica-set change that would need a 65th slot
+  for one topic incarnation is refused; recreate the topic instead.
 
 ## [0.3.0-beta] — 2026-09-24
 

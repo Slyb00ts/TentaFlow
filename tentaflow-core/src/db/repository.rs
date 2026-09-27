@@ -31445,6 +31445,10 @@ pub struct DbBusPartitionAssignment {
     /// topic_generation`.
     #[serde(default)]
     pub topic_generation: u64,
+    /// See `bus::replication::assignment::PartitionAssignment::epoch_slots`
+    /// (JSON object column, migration v175).
+    #[serde(default)]
+    pub epoch_slots: std::collections::BTreeMap<String, u32>,
 }
 
 fn decode_bus_assignment_node_list(raw: String, column: &str) -> rusqlite::Result<Vec<String>> {
@@ -31460,6 +31464,7 @@ fn decode_bus_assignment_node_list(raw: String, column: &str) -> rusqlite::Resul
 fn map_bus_assignment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusPartitionAssignment> {
     let replicas_raw: String = row.get(5)?;
     let isr_raw: String = row.get(6)?;
+    let slots_raw: String = row.get(11)?;
     Ok(DbBusPartitionAssignment {
         instance_id: row.get(0)?,
         org_id: row.get(1)?,
@@ -31472,11 +31477,18 @@ fn map_bus_assignment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusPart
         environment: row.get(8)?,
         updated_at_ms: row.get(9)?,
         topic_generation: row.get::<_, i64>(10)? as u64,
+        epoch_slots: serde_json::from_str(&slots_raw).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                11,
+                rusqlite::types::Type::Text,
+                format!("bus_partition_assignments.epoch_slots is not a JSON object: {e}").into(),
+            )
+        })?,
     })
 }
 
 const BUS_ASSIGNMENT_COLUMNS: &str = "instance_id, org_id, topic, partition, leader_node_id, \
-    replicas, isr, leader_epoch, environment, updated_at_ms, topic_generation";
+    replicas, isr, leader_epoch, environment, updated_at_ms, topic_generation, epoch_slots";
 
 pub fn bus_assignment_get(
     pool: &DbPool,
@@ -31580,15 +31592,16 @@ pub fn bus_assignment_upsert(pool: &DbPool, row: &DbBusPartitionAssignment) -> R
     let conn = acquire(pool)?;
     let replicas_json = serde_json::to_string(&row.replicas)?;
     let isr_json = serde_json::to_string(&row.isr)?;
+    let slots_json = serde_json::to_string(&row.epoch_slots)?;
     conn.execute(
         &format!(
             "INSERT INTO bus_partition_assignments ({BUS_ASSIGNMENT_COLUMNS}) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
              ON CONFLICT(instance_id, org_id, topic, partition) DO UPDATE SET \
              leader_node_id = excluded.leader_node_id, replicas = excluded.replicas, \
              isr = excluded.isr, leader_epoch = excluded.leader_epoch, \
              environment = excluded.environment, updated_at_ms = excluded.updated_at_ms, \
-             topic_generation = excluded.topic_generation"
+             topic_generation = excluded.topic_generation, epoch_slots = excluded.epoch_slots"
         ),
         rusqlite::params![
             row.instance_id,
@@ -31602,6 +31615,7 @@ pub fn bus_assignment_upsert(pool: &DbPool, row: &DbBusPartitionAssignment) -> R
             row.environment,
             row.updated_at_ms,
             row.topic_generation as i64,
+            slots_json,
         ],
     )?;
     Ok(())
@@ -32985,6 +32999,7 @@ pub mod bus_test_support {
                 environment TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 topic_generation INTEGER NOT NULL DEFAULT 0,
+                epoch_slots TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY (instance_id, org_id, topic, partition)
             );
             CREATE INDEX IF NOT EXISTS idx_bus_assign_node
@@ -33810,6 +33825,7 @@ mod bus_repository_tests {
                 environment: "prod".to_string(),
                 updated_at_ms: 1,
                 topic_generation: 0,
+                epoch_slots: Default::default(),
             },
         )
         .expect("seed assignment");
@@ -34089,6 +34105,7 @@ mod bus_repository_tests {
             environment: "test".to_string(),
             updated_at_ms: 1_000,
             topic_generation: 0,
+            epoch_slots: Default::default(),
         }
     }
 

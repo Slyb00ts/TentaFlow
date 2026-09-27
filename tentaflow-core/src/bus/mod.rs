@@ -1316,6 +1316,7 @@ fn map_repl_error(
         },
         ReplError::NoAssignment { .. }
         | ReplError::NotAReplica { .. }
+        | ReplError::NotPartitionLeader { .. }
         | ReplError::EpochFenced { .. } => match coordinator.role(org, topic, partition) {
             PartitionRole::Leader { epoch } => {
                 // Raced: the coordinator says Leader now even though
@@ -1702,6 +1703,18 @@ pub enum ReplError {
     },
     #[error("leader epoch fenced: this node is at {have}, request carries {requested}")]
     EpochFenced { have: u32, requested: u32 },
+    /// A change only the partition's leader may make — adding a node to its
+    /// replica set, which hands that node an epoch slot — was asked of
+    /// another node.
+    #[error(
+        "'{topic}'/{partition}: only its leader '{leader}' may add nodes to its replica set; \
+         make the change on that node"
+    )]
+    NotPartitionLeader {
+        topic: String,
+        partition: u32,
+        leader: String,
+    },
     #[error("replication coordinator internal error: {0}")]
     Internal(String),
 }
@@ -4130,6 +4143,7 @@ impl BusService {
                 leader_epoch: 1,
                 updated_at_ms: now_ms(),
                 topic_generation,
+                epoch_slots: Default::default(),
             };
             match store.propose(&assignment) {
                 Ok(_) => placed += 1,
@@ -15367,6 +15381,7 @@ mod tests {
                 environment: "dev".to_string(),
                 updated_at_ms: now_ms(),
                 topic_generation: 0,
+                epoch_slots: Default::default(),
             },
         )
         .unwrap();
@@ -15428,6 +15443,7 @@ mod tests {
                     environment: "dev".to_string(),
                     updated_at_ms: now_ms(),
                     topic_generation: 0,
+                    epoch_slots: Default::default(),
                 },
             )
             .unwrap();

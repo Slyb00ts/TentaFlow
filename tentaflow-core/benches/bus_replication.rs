@@ -418,6 +418,7 @@ async fn build_replicated_trio(
         leader_epoch: 1,
         updated_at_ms: now_ms(),
         topic_generation: 0,
+        epoch_slots: Default::default(),
     };
 
     let mut followers: HashMap<String, Arc<GlueFollowerFactory>> = HashMap::new();
@@ -1033,6 +1034,7 @@ fn gate_p9(_c: &mut Criterion) {
                 leader_epoch: 1,
                 updated_at_ms: now_ms(),
                 topic_generation: 0,
+                epoch_slots: Default::default(),
             };
 
             let mut followers: HashMap<String, Arc<GlueFollowerFactory>> = HashMap::new();

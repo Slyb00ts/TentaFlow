@@ -4578,23 +4578,29 @@ struct AssignmentApplied {
 /// `incoming.leader_epoch > stored.leader_epoch`, or on a tie,
 /// `incoming.leader_node_id < stored.leader_node_id` (lowest node id wins
 /// the tie — the same rule `election.rs`, wave 1 agent EL, uses to pick a
-/// candidate when `LeoQuery` also ties). No stored row yet: always
-/// admitted.
+/// candidate when `LeoQuery` also ties), and on the same epoch AND leader
+/// — two replica-set changes minted from one row, e.g. two evictions made
+/// on different nodes at once — the later HLC: the outer gate already let
+/// only an op newer than the stored row's through. No stored row yet:
+/// always admitted.
 ///
 /// A rejected (stale-epoch) op returns `Ok(0)` — "applied but no-op", the
 /// same convention the outer HLC gate itself uses for a stale op — NOT an
-/// error. Note this means `apply_core_operation` still advances
-/// `core_resource_versions` for this resource_id afterwards regardless of
-/// this function's return value (that bump is unconditional in the caller,
-/// not gated on `rows > 0`): a stale-epoch op still moves the HLC-LWW
-/// watermark forward. Accepted tradeoff, not a bug: the only way this bites
-/// is a LATER op that legitimately carries a HIGHER epoch but (through
-/// clock skew) an OLDER HLC than the stale one — it would then be rejected
-/// by the OUTER gate first and never reach this function at all. Given
-/// epoch only advances on a real election (K-M2-3's `LeoQuery`/majority
-/// handshake takes far longer than realistic clock skew), this is treated
-/// as acceptable rather than worth complicating the shared HLC-LWW gate
-/// every OTHER resource kind also relies on.
+/// error, and it does not take the resource's slot in the HLC-LWW order
+/// (`AssignmentApplied::orders_the_resource`). So the order's watermark is
+/// always the HLC of the row actually stored, which is what makes "the later
+/// HLC wins" above the same verdict on every node whatever order the two ops
+/// arrive in: a stale op that arrived in between cannot raise the watermark
+/// past the later of the two and have it refused on one node only. What the
+/// outer gate still decides alone: an op of a higher epoch whose HLC is older
+/// than the stored row's (clock skew larger than an election takes) is
+/// refused there — accepted, as elections take far longer than realistic
+/// skew.
+///
+/// An incoming row without epoch slots (written by a node that predates
+/// them) keeps the slots stored for the same topic incarnation: re-deriving
+/// them from its replica set would hand a departed member's reserved slot
+/// to someone else.
 fn apply_bus_partition_assignment(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
@@ -4692,13 +4698,13 @@ fn apply_bus_partition_assignment(
                 Some((stored_epoch, stored_leader)) => {
                     incoming.leader_epoch > *stored_epoch
                         || (incoming.leader_epoch == *stored_epoch
-                            && incoming.leader_node_id < *stored_leader)
+                            && incoming.leader_node_id <= *stored_leader)
                 }
             };
             if !admit {
                 return Ok(AssignmentApplied {
                     rows: 0,
-                    orders_the_resource: true,
+                    orders_the_resource: false,
                 });
             }
             // The parent topic's row carries `environment`
@@ -4729,15 +4735,21 @@ fn apply_bus_partition_assignment(
                 .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
             let isr_json = serde_json::to_string(&incoming.isr)
                 .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            let slots_json = serde_json::to_string(&incoming.epoch_slots)
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
             tx.execute(
                 "INSERT INTO bus_partition_assignments \
                  (instance_id, org_id, topic, partition, leader_node_id, replicas, isr, \
-                  leader_epoch, environment, updated_at_ms, topic_generation) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+                  leader_epoch, environment, updated_at_ms, topic_generation, epoch_slots) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
                  ON CONFLICT(instance_id, org_id, topic, partition) DO UPDATE SET \
                  leader_node_id = excluded.leader_node_id, replicas = excluded.replicas, \
                  isr = excluded.isr, leader_epoch = excluded.leader_epoch, \
                  environment = excluded.environment, updated_at_ms = excluded.updated_at_ms, \
+                 epoch_slots = CASE \
+                   WHEN excluded.epoch_slots = '{}' \
+                    AND topic_generation = excluded.topic_generation \
+                   THEN epoch_slots ELSE excluded.epoch_slots END, \
                  topic_generation = excluded.topic_generation",
                 rusqlite::params![
                     incoming.instance_id,
@@ -4751,6 +4763,7 @@ fn apply_bus_partition_assignment(
                     environment,
                     incoming.updated_at_ms,
                     incoming.topic_generation as i64,
+                    slots_json,
                 ],
             )
             .map_err(sql_error)
@@ -7417,6 +7430,7 @@ mod tests {
             leader_epoch,
             updated_at_ms: 1_000,
             topic_generation: 0,
+            epoch_slots: Default::default(),
         }
     }
 
@@ -8639,6 +8653,79 @@ mod tests {
                 .leader_node_id,
             "node-a"
         );
+    }
+
+    /// Review round 6, F1: two replica-set changes minted from one row carry
+    /// the same epoch and leader. Every node must keep the same one — the
+    /// later HLC — whatever order they arrive in, even with a stale
+    /// lower-epoch op of a still later HLC arriving in between (which used to
+    /// raise the HLC watermark past the later change on one node only).
+    #[test]
+    fn two_changes_of_one_epoch_and_leader_settle_on_the_later_everywhere() {
+        let mut first = test_assignment("org-1", "orders.created", 0, "node-l", 5);
+        first.replicas = vec!["node-l".to_string(), "node-x".to_string()];
+        let mut second = first.clone();
+        second.replicas = vec!["node-l".to_string(), "node-y".to_string()];
+        let stale = test_assignment("org-1", "orders.created", 0, "node-l", 4);
+        let op = |a: &crate::bus::replication::assignment::PartitionAssignment, wall: i64| {
+            let mut op = bus_assignment_op(a, ActionType::Insert);
+            op.body.hlc_timestamp.wall_time_ms = wall;
+            op
+        };
+        let (first_op, second_op, stale_op) = (op(&first, 10), op(&second, 20), op(&stale, 30));
+        let settle = |order: [&SyncOperation; 3]| {
+            let db = bus_db();
+            let topic_op = bus_topic_op(
+                &bus_topic_row("org-1", "orders.created"),
+                ActionType::Insert,
+            );
+            apply_core_operation(&db, &topic_op).unwrap();
+            for op in order {
+                apply_core_operation(&db, op).unwrap();
+            }
+            repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders.created", 0)
+                .unwrap()
+                .unwrap()
+                .replicas
+        };
+        assert_eq!(settle([&first_op, &stale_op, &second_op]), second.replicas);
+        assert_eq!(settle([&second_op, &stale_op, &first_op]), second.replicas);
+        assert_eq!(settle([&second_op, &first_op, &stale_op]), second.replicas);
+    }
+
+    /// Review round 6, F3: a row an older node writes carries no epoch slots.
+    /// The stored ones stay — re-derived from the new set they would hand a
+    /// departed member's reserved slot to someone else — unless the row is
+    /// of another topic incarnation.
+    #[test]
+    fn a_row_without_epoch_slots_keeps_the_stored_ones() {
+        let db = bus_db();
+        let topic_op = bus_topic_op(
+            &bus_topic_row("org-1", "orders.created"),
+            ActionType::Insert,
+        );
+        apply_core_operation(&db, &topic_op).unwrap();
+        let mut stamped = test_assignment("org-1", "orders.created", 0, "node-l", 5);
+        stamped.epoch_slots = BTreeMap::from([
+            ("node-l".to_string(), 0),
+            ("node-b".to_string(), 1),
+            ("node-gone".to_string(), 2),
+        ]);
+        let mut first = bus_assignment_op(&stamped, ActionType::Insert);
+        first.body.hlc_timestamp.wall_time_ms = 10;
+        apply_core_operation(&db, &first).unwrap();
+
+        let mut older_build = test_assignment("org-1", "orders.created", 0, "node-l", 6);
+        older_build.replicas = vec!["node-l".to_string(), "node-new".to_string()];
+        let mut second = bus_assignment_op(&older_build, ActionType::Insert);
+        second.body.hlc_timestamp.wall_time_ms = 20;
+        assert_eq!(apply_core_operation(&db, &second).unwrap(), 1);
+        let stored =
+            repository::bus_assignment_get(&db, "tentabus-00000001", "org-1", "orders.created", 0)
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored.leader_epoch, 6);
+        assert_eq!(stored.epoch_slots, stamped.epoch_slots);
     }
 
     #[test]

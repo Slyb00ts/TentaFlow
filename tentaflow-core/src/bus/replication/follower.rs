@@ -622,6 +622,8 @@ where
                             // Asked on the live stream itself: the leader is
                             // the one asking.
                             leader_alive: true,
+                            promised_epoch: None,
+                            promises: true,
                         };
                         write_frame(&mut writer, &ReplFrame::LeoReply(reply)).await?;
                     }
@@ -1396,6 +1398,48 @@ mod tests {
         assert_eq!(partition.log_epoch(), 1);
     }
 
+    /// A promise survives a restart that loses the replication manager's
+    /// memory of it: a replica that promised epoch 5 to a candidate
+    /// (`FollowerRunnerFactory::fence_to_epoch`) and restarted before any
+    /// leader dialed still refuses the leader of an earlier term that dials
+    /// first — the partition itself recognizes the promised term.
+    #[tokio::test]
+    async fn a_promise_made_before_a_restart_refuses_an_earlier_terms_hello() {
+        let part_dir = tempfile::tempdir().unwrap();
+        {
+            let partition = open_partition(part_dir.path());
+            partition.set_leader_epoch(5).unwrap();
+        }
+        let partition = open_partition(part_dir.path());
+        assert_eq!(partition.leader_epoch(), 5, "the promise is on disk");
+        let (_store_dir, stores) = open_stores();
+        let (mut leader, follower_io) = tokio::io::duplex(64 * 1024);
+        let (follower_reader, follower_writer) = tokio::io::split(follower_io);
+        let handle = tokio::spawn(run_follower_stream(
+            follower_reader,
+            follower_writer,
+            partition,
+            stores,
+            NodeEnvironment::Prod,
+            expected(),
+            fast_config(),
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        ));
+        write_frame(
+            &mut leader,
+            &ReplFrame::Hello(hello(4, NodeEnvironment::Prod)),
+        )
+        .await
+        .unwrap();
+        let ack = match read_frame(&mut leader).await.unwrap() {
+            ReplFrame::HelloAck(a) => a,
+            other => panic!("expected HelloAck, got {other:?}"),
+        };
+        assert!(!ack.accepted);
+        assert_eq!(ack.reject, Some(ReplReject::StaleEpoch { have: 5 }));
+        handle.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn stale_epoch_hello_is_rejected() {
         let part_dir = tempfile::tempdir().unwrap();
@@ -1687,6 +1731,7 @@ mod tests {
                 topic: TOPIC.to_string(),
                 partition: PART,
                 known_epoch: 1,
+                candidate_epoch: None,
             }),
         )
         .await
@@ -1772,6 +1817,7 @@ mod tests {
                 topic: TOPIC.to_string(),
                 partition: PART,
                 known_epoch: 5,
+                candidate_epoch: None,
             }),
         )
         .await
@@ -1877,6 +1923,7 @@ mod tests {
                 topic: TOPIC.to_string(),
                 partition: PART,
                 known_epoch: 2,
+                candidate_epoch: None,
             }),
         )
         .await
@@ -2111,6 +2158,7 @@ mod tests {
                 topic: TOPIC.to_string(),
                 partition: PART,
                 known_epoch: 1,
+                candidate_epoch: None,
             }),
         )
         .await

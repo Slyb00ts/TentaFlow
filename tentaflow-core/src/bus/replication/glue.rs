@@ -873,18 +873,29 @@ impl FollowerRunnerFactory for GlueFollowerFactory {
         self.config.leader_lease
     }
 
+    /// A quarter of the lease: long enough that replicas whose leases ran
+    /// out together rarely ask in the same instant, short against the
+    /// failover the lease already costs.
+    fn election_stagger(&self) -> Duration {
+        self.config.leader_lease / 4
+    }
+
     fn fence_to_epoch(
         &self,
         assignment: &PartitionAssignment,
         epoch: u32,
-    ) -> Result<(), ReplError> {
+    ) -> Result<u32, ReplError> {
         let partition = self.open_partition(assignment)?;
-        if partition.leader_epoch() >= epoch {
-            return Ok(());
+        match partition.set_leader_epoch(epoch) {
+            // Raised on the writer thread, so no append of an earlier term
+            // lands once this returns.
+            Ok(()) | Err(tentaflow_bus::BusError::LeaderEpochStale { .. }) => {
+                Ok(partition.leader_epoch())
+            }
+            Err(e) => Err(ReplError::Internal(format!(
+                "fencing the partition at epoch {epoch}: {e}"
+            ))),
         }
-        partition.set_leader_epoch(epoch).map_err(|e| {
-            ReplError::Internal(format!("fencing the partition at epoch {epoch}: {e}"))
-        })
     }
 
     fn cut_to_committed(&self, assignment: &PartitionAssignment) -> Result<LogPosition, ReplError> {
@@ -1340,6 +1351,7 @@ mod tests {
             leader_epoch: epoch,
             updated_at_ms: 0,
             topic_generation: 0,
+            epoch_slots: Default::default(),
         }
     }
 
@@ -1835,6 +1847,31 @@ mod tests {
 
         stop(serving).await;
         stop(superseded).await;
+    }
+
+    /// A promise is the partition's recognized epoch, raised durably and
+    /// never lowered: a later promise of an earlier term reports the newer
+    /// one, which is how a candidate learns it was outbid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_promise_raises_the_recognized_epoch_and_reports_a_newer_one() {
+        let provider = FakeNodeProvider::new();
+        let term = assignment(&["a", "b", "c"], "a", &["a", "b", "c"], 3);
+        let part = provider.partition("org-1", "orders", 0, 0).unwrap();
+        part.set_leader_epoch(3).unwrap();
+        let factory = GlueFollowerFactory::new(
+            "b",
+            NodeEnvironment::Prod,
+            Arc::clone(&provider) as Arc<dyn PartitionProvider>,
+            fast_follower_config(),
+        );
+        assert_eq!(factory.fence_to_epoch(&term, 5).unwrap(), 5);
+        assert_eq!(part.leader_epoch(), 5);
+        assert_eq!(
+            factory.fence_to_epoch(&term, 4).unwrap(),
+            5,
+            "an earlier term is answered with the newer promise"
+        );
+        assert_eq!(part.leader_epoch(), 5, "never lowered");
     }
 
     /// X1, the RF=3 scenario end to end over real partitions and streams:

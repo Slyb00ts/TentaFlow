@@ -36,6 +36,24 @@
 // epoch-monotonic admission gate (agent L, `core_materializer.rs`, out of
 // this file's scope). LeoQuery/tie-break only improve which node wins and
 // how fast — never whether an unsafe promotion can succeed.
+//
+// A ledger ack proves delivery, not a vote: two candidacies can both collect
+// a majority of acks, and at RF ≤ 2 one replica alone admits. So an epoch is
+// made a Raft term by two rules of its own. It names one leader: epochs are
+// dealt round-robin over fixed per-node slots that never change hands
+// (`epoch_for`, `PartitionAssignment::epoch_slots`), so concurrent
+// candidacies never mint the same number, whatever replica set each stands
+// on. And a replica that answers a candidacy promises its term
+// (`candidacy_epoch`, `ReplLeoQuery::candidate_epoch`) — durably, on its
+// partition — and follows no leader of an earlier term from then on; a
+// candidate hearing a newer promise stands down
+// (`AbandonReason::NewerTerm`). In the round that asks for promises only a
+// reply that carries one counts toward the majority. The logs an election
+// compared then stay the logs its majority holds: no earlier term can commit
+// through them after they answered. Promises are asked for only in a second round
+// (`ReplicationManager::run_election`), after a first that asks for none
+// shows the candidacy would propose — Raft's pre-vote, so a candidate that
+// defers or loses fences nobody out.
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -91,12 +109,52 @@ pub fn availability_quorum(replication_factor: usize) -> usize {
     }
 }
 
-/// Next leader epoch. Saturates instead of wrapping: an epoch that has
-/// climbed to `u32::MAX` (billions of failovers on one partition) already
-/// signals something else is badly wrong, and wrapping back to 0 would let
-/// a long-dead old leader's stale epoch look current again.
-pub fn next_epoch(current: u32) -> u32 {
-    current.saturating_add(1)
+/// How many epoch slots a partition has (`PartitionAssignment::epoch_slots`)
+/// — the most distinct nodes that may ever lead one topic incarnation's
+/// partition, far above the largest replication factor (7). Fixed, never
+/// derived from a replica set: two rows of different sets must deal epochs
+/// by the same modulus, or their slots overlap.
+pub const EPOCH_SLOTS: u32 = 64;
+
+/// The first epoch after `current` in epoch slot `slot`: epochs are dealt
+/// round-robin over `EPOCH_SLOTS`, and a node only ever mints in its own
+/// slot (`PartitionAssignment::epoch_slot`). Two nodes minting from the same
+/// term — two self-elections that did not hear each other, which at RF ≤ 2
+/// need no one else's consent (`availability_quorum`), or a candidacy on an
+/// old row racing a reassignment minted on a new one — therefore never land
+/// on the same number, and an epoch names exactly one leader's chain.
+/// Everything that compares epochs relies on that: a log written in the
+/// leader's own epoch is taken for a prefix of its chain
+/// (`LogPosition::kept_end`), a follower confirms a leader's term by its
+/// number alone, and the newer of two leaderships is simply the higher
+/// number.
+///
+/// The one exception is saturation: an epoch never wraps, so once no epoch
+/// of `slot` is left below `u32::MAX` every slot mints `u32::MAX` itself.
+/// That takes tens of millions of elections on one partition and signals
+/// something else badly wrong; wrapping instead would let a long-dead
+/// leader's stale epoch look current again.
+pub fn epoch_for(current: u32, slot: u32) -> u32 {
+    let n = u64::from(EPOCH_SLOTS);
+    let slot = u64::from(slot % EPOCH_SLOTS);
+    let first = u64::from(current) + 1;
+    let epoch = first + (slot + n - first % n) % n;
+    u32::try_from(epoch).unwrap_or(u32::MAX)
+}
+
+/// The epoch a candidacy in slot `slot` stands for: the first of its own
+/// after both the term its assignment names (`current`) and the newest term
+/// its partition was promised (`promised`) — unless that promise is its own
+/// earlier candidacy, which nobody has outbid since. Standing again for that
+/// same term keeps every promise already made to it valid, and a candidate
+/// that cannot reach a majority does not climb one term per lease tick.
+/// Epochs being unique per slot (`epoch_for`), a promise in the
+/// candidate's own slot can only be its own.
+pub fn candidacy_epoch(current: u32, promised: u32, slot: u32) -> u32 {
+    if promised > current && epoch_for(promised - 1, slot) == promised {
+        return promised;
+    }
+    epoch_for(current.max(promised), slot)
 }
 
 /// Where one replica's local log stands, as an election compares it.
@@ -264,6 +322,11 @@ pub enum AbandonReason {
     /// out of that replier; it steps down and stands itself instead
     /// (`manager.rs`'s quorum-lease step-down).
     Outranked { by: String },
+    /// A replier had already promised a newer term than this candidacy's
+    /// (`ReplLeoReply::promised_epoch`): another candidate stands above it,
+    /// and a replica that promised that term refuses every leader below it.
+    /// The next attempt stands above `epoch`.
+    NewerTerm { epoch: u32 },
 }
 
 /// One action `PromotionState::step` asks the caller (`manager.rs`) to
@@ -272,9 +335,10 @@ pub enum AbandonReason {
 /// from the resulting state.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromotionAction {
-    /// Query every OTHER replica's `leo` (K-M2-3). `to` never includes
-    /// `self_id`.
-    SendLeoQuery { to: Vec<String> },
+    /// Query every OTHER replica's `leo` (K-M2-3) on behalf of a candidacy
+    /// for `epoch`; a replier that promises it follows no leader of an
+    /// earlier term from then on. `to` never includes `self_id`.
+    SendLeoQuery { to: Vec<String>, epoch: u32 },
     /// Submit this assignment as a ledger operation
     /// (`AssignmentStore::propose`).
     ProposeAssignment(PartitionAssignment),
@@ -308,7 +372,12 @@ pub enum PromotionState {
         partition: u32,
         topic_generation: u64,
         self_id: String,
-        current_epoch: u32,
+        /// The epoch this candidacy stands for (`candidacy_epoch`), fixed when it
+        /// starts: repliers promise exactly this term.
+        epoch: u32,
+        /// The round asks every replier to promise `epoch`
+        /// (`PromotionEvent::LeaseExpired::vote`).
+        vote: bool,
         own: LogPosition,
         isr: Vec<String>,
         replicas: Vec<String>,
@@ -363,7 +432,16 @@ pub enum PromotionEvent {
         /// proposal so replicas admit it into the same incarnation.
         topic_generation: u64,
         self_id: String,
-        current_epoch: u32,
+        /// The epoch this candidacy stands for (`candidacy_epoch`). The
+        /// caller computes it: its own partition must promise it before the
+        /// log in `own` is read, so nothing an earlier term appends after
+        /// that read can land.
+        epoch: u32,
+        /// Whether this round asks every replier to promise `epoch` (the
+        /// vote) or asks for nothing (the pre-vote). In a vote only a reply
+        /// that promised exactly `epoch` counts: an answer that promised
+        /// nothing describes a log an earlier term may still append to.
+        vote: bool,
         /// This node's own local log.
         own: LogPosition,
         isr: Vec<String>,
@@ -394,6 +472,14 @@ pub enum PromotionEvent {
         /// runs an election: picking it as the winner would leave every
         /// candidate deferring to a node that never proposes.
         can_stand: bool,
+        /// The newest term the replier promised
+        /// (`ReplLeoReply::promised_epoch`); `None` from a replier that
+        /// promised nothing.
+        promised: Option<u32>,
+        /// The replier understands promises (`ReplLeoReply::promises`). One
+        /// that predates them is counted as before in a vote, since it
+        /// could not have promised anything; see the CHANGELOG upgrade note.
+        promises: bool,
     },
     /// A previously-scheduled deadline elapsed (or a poll tick fired before
     /// it — `step` re-checks `now` against the state's own deadline either
@@ -434,7 +520,8 @@ impl PromotionState {
                     partition,
                     topic_generation,
                     self_id,
-                    current_epoch,
+                    epoch,
+                    vote,
                     own,
                     isr,
                     replicas,
@@ -463,7 +550,8 @@ impl PromotionState {
                         partition,
                         topic_generation,
                         self_id,
-                        current_epoch,
+                        epoch,
+                        vote,
                         own,
                         isr,
                         replicas,
@@ -471,7 +559,7 @@ impl PromotionState {
                         ineligible: Vec::new(),
                         deadline,
                     },
-                    vec![PromotionAction::SendLeoQuery { to }],
+                    vec![PromotionAction::SendLeoQuery { to, epoch }],
                 )
             }
 
@@ -483,7 +571,8 @@ impl PromotionState {
                     partition,
                     topic_generation,
                     self_id,
-                    current_epoch,
+                    epoch,
+                    vote,
                     own,
                     isr,
                     replicas,
@@ -496,8 +585,26 @@ impl PromotionState {
                     log,
                     in_isr: _,
                     can_stand,
+                    promised,
+                    promises,
                 },
             ) => {
+                // Epochs are unique per leader (`epoch_for`), so a promise
+                // of exactly this epoch is this candidacy's own.
+                if let Some(newer) = promised.filter(|p| *p > epoch) {
+                    return (
+                        PromotionState::Abandoned {
+                            reason: AbandonReason::NewerTerm { epoch: newer },
+                        },
+                        Vec::new(),
+                    );
+                }
+                // A vote counts only a replier bound by it: one that
+                // promised nothing (a restart that does not know the
+                // partition yet, a verdict that changed while it answered)
+                // may still follow a leader of an earlier term, which could
+                // then commit through it past the log it reported here.
+                let unbound = vote && promises && promised != Some(epoch);
                 // Recorded regardless of the replying node's own `in_isr`
                 // self-report: candidacy safety comes entirely from
                 // `choose_candidate` filtering against THIS node's own
@@ -506,7 +613,7 @@ impl PromotionState {
                 // not hide a replica that is genuinely ahead of us and
                 // therefore needs a `Truncate` (K-M2-1), nor one that has
                 // caught back up to `own.committed` and belongs in `new_isr`.
-                if replicas.iter().any(|r| r == &node_id) {
+                if !unbound && replicas.iter().any(|r| r == &node_id) {
                     ineligible.retain(|id| *id != node_id);
                     if !can_stand {
                         ineligible.push(node_id.clone());
@@ -524,7 +631,8 @@ impl PromotionState {
                         partition,
                         topic_generation,
                         self_id,
-                        current_epoch,
+                        epoch,
+                        vote,
                         own,
                         isr,
                         replicas,
@@ -544,7 +652,8 @@ impl PromotionState {
                     partition,
                     topic_generation,
                     self_id,
-                    current_epoch,
+                    epoch,
+                    vote,
                     own,
                     isr,
                     replicas,
@@ -563,7 +672,8 @@ impl PromotionState {
                             partition,
                             topic_generation,
                             self_id,
-                            current_epoch,
+                            epoch,
+                            vote,
                             own,
                             isr,
                             replicas,
@@ -640,9 +750,10 @@ impl PromotionState {
                             leader_node_id: self_id.clone(),
                             replicas: replicas.clone(),
                             isr: new_isr,
-                            leader_epoch: next_epoch(current_epoch),
+                            leader_epoch: epoch,
                             updated_at_ms: now_ms,
                             topic_generation,
+                            epoch_slots: Default::default(),
                         };
                         let action = PromotionAction::ProposeAssignment(assignment.clone());
                         (
@@ -797,11 +908,63 @@ mod tests {
         assert_eq!(min_isr_required(5), 3);
     }
 
+    /// A replica's slot as a row written before slots existed derives it:
+    /// its position in the sorted set.
+    fn slot_in(replicas: &[&str], node: &str) -> u32 {
+        let mut sorted = replicas.to_vec();
+        sorted.sort_unstable();
+        sorted.iter().position(|r| *r == node).expect("a member") as u32
+    }
+
     #[test]
-    fn next_epoch_increments_and_saturates() {
-        assert_eq!(next_epoch(0), 1);
-        assert_eq!(next_epoch(41), 42);
-        assert_eq!(next_epoch(u32::MAX), u32::MAX);
+    fn epoch_for_deals_epochs_round_robin_over_fixed_slots() {
+        assert_eq!(epoch_for(0, 0), 64);
+        assert_eq!(epoch_for(0, 1), 1);
+        assert_eq!(epoch_for(0, 2), 2);
+        assert_eq!(epoch_for(64, 0), 128, "strictly after `current`");
+        assert_eq!(epoch_for(65, 2), 66);
+        assert_eq!(epoch_for(66, 2), 130);
+        assert_eq!(epoch_for(7, 63), 63);
+        // Saturation, the one documented exception: every slot mints the
+        // last epoch once none of its own is left below it.
+        assert_eq!(epoch_for(u32::MAX - 1, 0), u32::MAX);
+        assert_eq!(epoch_for(u32::MAX - 1, 5), u32::MAX);
+        assert_eq!(epoch_for(u32::MAX, 5), u32::MAX);
+    }
+
+    #[test]
+    fn a_candidacy_stands_above_every_promise_but_its_own() {
+        assert_eq!(candidacy_epoch(1, 0, 0), 64);
+        assert_eq!(
+            candidacy_epoch(1, 64, 0),
+            64,
+            "its own earlier candidacy: the same term again"
+        );
+        assert_eq!(
+            candidacy_epoch(1, 65, 0),
+            128,
+            "another candidate's promise: above it"
+        );
+        assert_eq!(
+            candidacy_epoch(70, 64, 0),
+            128,
+            "a promise the ledger has moved past is no candidacy any more"
+        );
+        assert_eq!(candidacy_epoch(65, 65, 1), 129);
+    }
+
+    /// Nodes that stand from the same term without hearing each other — the
+    /// RF <= 2 split, where neither needs the other's consent — never claim
+    /// the same epoch number, from any term, whatever their slots.
+    #[test]
+    fn nodes_standing_from_one_term_never_mint_the_same_epoch() {
+        for current in (0..200u32).chain(u32::MAX - 200..u32::MAX - 64) {
+            let minted: HashSet<u32> = (0..EPOCH_SLOTS)
+                .map(|slot| epoch_for(current, slot))
+                .collect();
+            assert_eq!(minted.len(), EPOCH_SLOTS as usize, "current={current}");
+            assert!(minted.iter().all(|e| *e > current));
+        }
     }
 
     // ---- choose_candidate --------------------------------------------------
@@ -930,7 +1093,8 @@ mod tests {
             partition: 0,
             topic_generation: 7,
             self_id: s(self_id),
-            current_epoch: epoch,
+            epoch: epoch_for(epoch, slot_in(replicas, self_id)),
+            vote: false,
             own: log(epoch, own_leo, own_hw),
             isr: ss(isr),
             replicas: ss(replicas),
@@ -956,7 +1120,8 @@ mod tests {
         assert_eq!(
             actions,
             vec![PromotionAction::SendLeoQuery {
-                to: ss(&["l", "f2"])
+                to: ss(&["l", "f2"]),
+                epoch: 64
             }]
         );
         assert!(matches!(state, PromotionState::Querying { .. }));
@@ -968,6 +1133,8 @@ mod tests {
             log: log(5, 80, 80),
             in_isr: true,
             can_stand: true,
+            promised: None,
+            promises: true,
         });
         assert!(actions.is_empty());
 
@@ -982,7 +1149,7 @@ mod tests {
             other => panic!("expected exactly one ProposeAssignment, got {other:?}"),
         };
         assert_eq!(assignment.leader_node_id, "f1");
-        assert_eq!(assignment.leader_epoch, 6);
+        assert_eq!(assignment.leader_epoch, 64);
         assert_eq!(assignment.updated_at_ms, 1_000);
         assert_eq!(
             assignment.topic_generation, 7,
@@ -1007,11 +1174,11 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                PromotionAction::SetLeaderEpoch(6),
+                PromotionAction::SetLeaderEpoch(64),
                 PromotionAction::StartFeeders,
             ]
         );
-        assert!(matches!(state, PromotionState::Promoted { epoch: 6 }));
+        assert!(matches!(state, PromotionState::Promoted { epoch: 64 }));
     }
 
     #[test]
@@ -1040,12 +1207,16 @@ mod tests {
             log: log(1, 70, 40),
             in_isr: false,
             can_stand: true,
+            promised: None,
+            promises: true,
         });
         let (state, actions) = state.step(PromotionEvent::LeoReply {
             node_id: s("c"),
             log: log(1, 45, 45),
             in_isr: true,
             can_stand: true,
+            promised: None,
+            promises: true,
         });
         assert!(actions.is_empty());
         let (state, actions) = state.step(PromotionEvent::Timeout {
@@ -1068,7 +1239,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                PromotionAction::SetLeaderEpoch(2),
+                PromotionAction::SetLeaderEpoch(64),
                 PromotionAction::StartFeeders,
                 // Truncated back to OUR leo (50), not to "b"'s own 70 —
                 // see `Querying -> Proposing`'s `truncate_targets` doc.
@@ -1122,6 +1293,8 @@ mod tests {
             log: log(1, 99, 99),
             in_isr: true,
             can_stand: true,
+            promised: None,
+            promises: true,
         });
         let (state, actions) = state.step(PromotionEvent::Timeout {
             now: t0 + LEO_QUERY_TIMEOUT,
@@ -1158,6 +1331,8 @@ mod tests {
             log: log(0, 5, 5),
             in_isr: true,
             can_stand: true,
+            promised: None,
+            promises: true,
         });
         let (state, _) = state.step(PromotionEvent::Timeout {
             now: t0 + LEO_QUERY_TIMEOUT,
@@ -1239,6 +1414,8 @@ mod tests {
                 log: log(4, 1, 1),
                 in_isr: true,
                 can_stand: true,
+                promised: None,
+                promises: true,
             });
         assert!(actions.is_empty());
         assert!(matches!(state, PromotionState::Promoted { epoch: 4 }));
@@ -1283,7 +1460,8 @@ mod tests {
             partition: 0,
             topic_generation: 7,
             self_id: s("x"),
-            current_epoch: 2,
+            epoch: epoch_for(2, slot_in(&["x", "y", "z"], "x")),
+            vote: false,
             own: log(1, 120, 90),
             isr: ss(&["x", "y", "z"]),
             replicas: ss(&["x", "y", "z"]),
@@ -1294,6 +1472,8 @@ mod tests {
             log: log(2, 100, 100),
             in_isr: true,
             can_stand: true,
+            promised: None,
+            promises: true,
         });
         let (state, actions) = state.step(PromotionEvent::Timeout {
             now: t0 + LEO_QUERY_TIMEOUT,
@@ -1323,7 +1503,8 @@ mod tests {
             partition: 0,
             topic_generation: 7,
             self_id: s("z"),
-            current_epoch: 2,
+            epoch: epoch_for(2, slot_in(&["x", "y", "z"], "z")),
+            vote: false,
             own: log(2, 100, 100),
             isr: ss(&["x", "z"]),
             replicas: ss(&["x", "y", "z"]),
@@ -1334,6 +1515,8 @@ mod tests {
             log: log(1, 95, 90),
             in_isr: true,
             can_stand: true,
+            promised: None,
+            promises: true,
         });
         let (state, actions) = state.step(PromotionEvent::Timeout {
             now: t0 + LEO_QUERY_TIMEOUT,
@@ -1359,7 +1542,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![
-                PromotionAction::SetLeaderEpoch(3),
+                PromotionAction::SetLeaderEpoch(66),
                 PromotionAction::StartFeeders,
                 PromotionAction::SendTruncate {
                     node: s("x"),
@@ -1390,6 +1573,8 @@ mod tests {
             log: log(1, 48, 40),
             in_isr: true,
             can_stand: false,
+            promised: None,
+            promises: true,
         });
         let (state, actions) = state.step(PromotionEvent::Timeout {
             now: t0 + LEO_QUERY_TIMEOUT,
@@ -1434,6 +1619,8 @@ mod tests {
             log: log(2, 100, 100),
             in_isr: true,
             can_stand: false,
+            promised: None,
+            promises: true,
         });
         let (state, actions) = state.step(PromotionEvent::Timeout {
             now: t0 + LEO_QUERY_TIMEOUT,
@@ -1468,6 +1655,8 @@ mod tests {
             log: log(1, 30, 20),
             in_isr: true,
             can_stand: true,
+            promised: None,
+            promises: true,
         });
         let (state, _) = state.step(PromotionEvent::Timeout {
             now: t0 + LEO_QUERY_TIMEOUT,
@@ -1540,7 +1729,142 @@ mod tests {
         assert!(matches!(state, PromotionState::Proposing { .. }));
         assert!(matches!(
             actions.as_slice(),
-            [PromotionAction::ProposeAssignment(a)] if a.leader_node_id == "b" && a.leader_epoch == 5
+            [PromotionAction::ProposeAssignment(a)] if a.leader_node_id == "b" && a.leader_epoch == 65
+        ));
+    }
+
+    /// A replier that already promised a newer term than this candidacy's
+    /// stops it before it proposes: that replier refuses every leader below
+    /// the promised term, so winning here would elect a leader it never
+    /// follows. A promise of exactly this candidacy's epoch is its own.
+    #[test]
+    fn a_reply_promising_a_newer_term_abandons_the_candidacy() {
+        let t0 = Instant::now();
+        let (state, actions) = PromotionState::Idle.step(lease_expired(
+            &["a", "b", "c"],
+            &["a", "b", "c"],
+            "a",
+            1,
+            5,
+            5,
+            t0,
+        ));
+        assert_eq!(
+            actions,
+            vec![PromotionAction::SendLeoQuery {
+                to: ss(&["b", "c"]),
+                epoch: 64
+            }]
+        );
+        let (state, _) = state.step(PromotionEvent::LeoReply {
+            node_id: s("b"),
+            log: log(1, 5, 5),
+            in_isr: true,
+            can_stand: true,
+            promised: Some(64),
+            promises: true,
+        });
+        assert!(
+            matches!(state, PromotionState::Querying { .. }),
+            "its own promise"
+        );
+        let (state, _) = state.step(PromotionEvent::LeoReply {
+            node_id: s("c"),
+            log: log(1, 5, 5),
+            in_isr: true,
+            can_stand: true,
+            promised: Some(65),
+            promises: true,
+        });
+        assert!(matches!(
+            state,
+            PromotionState::Abandoned {
+                reason: AbandonReason::NewerTerm { epoch: 65 }
+            }
+        ));
+        let (_, actions) = state.step(PromotionEvent::Timeout {
+            now: t0 + LEO_QUERY_TIMEOUT,
+            now_ms: 1,
+        });
+        assert!(actions.is_empty(), "an abandoned candidacy never proposes");
+    }
+
+    /// The restarted-replica case: R answers a vote without knowing the
+    /// partition (or its verdict changed mid-answer), so it promised
+    /// nothing. Counted, it made a majority with the candidate alone, and a
+    /// leader of an earlier term could still commit through R past the log
+    /// R reported. In a vote only a promise of exactly this epoch counts; a
+    /// replier that predates promises is counted as before.
+    #[test]
+    fn a_vote_counts_only_repliers_bound_by_it() {
+        let t0 = Instant::now();
+        let vote = |own_leo| {
+            let mut event =
+                lease_expired(&["l", "r", "x"], &["l", "r", "x"], "x", 5, own_leo, 0, t0);
+            if let PromotionEvent::LeaseExpired { vote, .. } = &mut event {
+                *vote = true;
+            }
+            event
+        };
+        let epoch = epoch_for(5, slot_in(&["l", "r", "x"], "x"));
+        let reply = |promised, promises| PromotionEvent::LeoReply {
+            node_id: s("r"),
+            log: log(5, 0, 0),
+            in_isr: true,
+            can_stand: true,
+            promised,
+            promises,
+        };
+        let timeout = PromotionEvent::Timeout {
+            now: t0 + LEO_QUERY_TIMEOUT,
+            now_ms: 1,
+        };
+
+        let (state, _) = PromotionState::Idle.step(vote(10));
+        let (state, _) = state.step(reply(None, true));
+        let (state, actions) = state.step(timeout.clone());
+        assert!(actions.is_empty(), "{actions:?}");
+        assert!(matches!(
+            state,
+            PromotionState::Abandoned {
+                reason: AbandonReason::TooFewReplies {
+                    answered: 1,
+                    required: 2
+                }
+            }
+        ));
+
+        let (state, _) = PromotionState::Idle.step(vote(10));
+        let (state, _) = state.step(reply(Some(epoch), true));
+        let (_, actions) = state.step(timeout.clone());
+        assert!(matches!(
+            actions.as_slice(),
+            [PromotionAction::ProposeAssignment(a)] if a.leader_epoch == epoch
+        ));
+
+        let (state, _) = PromotionState::Idle.step(vote(10));
+        let (state, _) = state.step(reply(None, false));
+        let (_, actions) = state.step(timeout.clone());
+        assert!(
+            matches!(actions.as_slice(), [PromotionAction::ProposeAssignment(_)]),
+            "a replier that predates promises counts as before"
+        );
+
+        // The pre-vote asks for nothing and counts every answer.
+        let (state, _) = PromotionState::Idle.step(lease_expired(
+            &["l", "r", "x"],
+            &["l", "r", "x"],
+            "x",
+            5,
+            10,
+            0,
+            t0,
+        ));
+        let (state, _) = state.step(reply(None, true));
+        let (_, actions) = state.step(timeout);
+        assert!(matches!(
+            actions.as_slice(),
+            [PromotionAction::ProposeAssignment(_)]
         ));
     }
 }

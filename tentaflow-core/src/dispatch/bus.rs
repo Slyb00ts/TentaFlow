@@ -539,6 +539,17 @@ fn map_repl_error(e: ReplError) -> ProtocolError {
             ProtocolErrorCode::Conflict,
             format!("bus.not_leader: epoch fenced have={have} requested={requested}"),
         ),
+        ReplError::NotPartitionLeader {
+            topic,
+            partition,
+            leader,
+        } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!(
+                "bus.not_leader: only the leader '{leader}' of '{topic}'/{partition} may add \
+                 nodes to its replica set"
+            ),
+        ),
         ReplError::Internal(msg) => {
             ProtocolError::internal(format!("bus.replication_internal_error: {msg}"))
         }
