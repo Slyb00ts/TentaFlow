@@ -7220,7 +7220,11 @@
         "module_absent": "modułu {module} nie ma w drzewie modułów jądra",
         "anyraid_not_in_zfs": "{zfs} na tym węźle nie obsługuje AnyRAID",
         "anyraid_supported_not_offered": "AnyRAID obsługiwane przez {zfs}, jeszcze niedostępne w TentaNas",
-        "anyraid_unreadable": "Nie udało się sprawdzić, czy {zfs} na tym węźle obsługuje AnyRAID"
+        "anyraid_unreadable": "Nie udało się sprawdzić, czy {zfs} na tym węźle obsługuje AnyRAID",
+        "rdma_device_yes": "{device} ({netdev}, {addresses}): łącze {state} — przyjmie portal RDMA",
+        "rdma_device_port_down": "{device} ({netdev}, {addresses}): łącze {state} — klienci nie połączą się przez RDMA, dopóki łącze nie będzie ACTIVE",
+        "rdma_device_no_address": "{device} ({netdev}): łącze {state}, brak adresu IPv4 — nie przyjmie portalu RDMA",
+        "rdma_device_no_netdev": "{device}: łącze {state}, brak interfejsu sieciowego — nie przyjmie portalu RDMA"
       }
     },
     "feature": {
@@ -9130,7 +9134,14 @@
       "reset_no_allowlist": "Rozłączenie pojedynczej sesji wymaga listy dozwolonych initiatorów: bez niej klient loguje się ponownie od razu, a jądro nie podaje adresu ani stanu sesji.",
       "reset_nvmet_no_debugfs": "Rozłączenie pojedynczego hosta NVMe-oF jest niedostępne na tym węźle: jądro nie publikuje kontrolerów (brak CONFIG_NVME_TARGET_DEBUGFS), a usunięcie hosta z listy go nie rozłącza.",
       "reset_nvmet_unmeasured": "Rozłączenie pojedynczego hosta NVMe-oF nie jest jeszcze dostępne: mechanizm nie został zmierzony, a usunięcie hosta z listy go nie rozłącza.",
-      "last_seen_hint": "{ago} — z dokładnością do ok. minuty: węzeł odświeża ten czas co najwyżej raz na minutę."
+      "last_seen_hint": "{ago} — z dokładnością do ok. minuty: węzeł odświeża ten czas co najwyżej raz na minutę.",
+      "portal_exposure_rdma": "Nasłuch RDMA",
+      "listen_no_rdma_device": "Brak nasłuchu — żadne urządzenie RDMA nie ma tego adresu, więc jądro odrzuca nasłuch RDMA",
+      "listen_listener_lost": "Brak nasłuchu — konfiguracja jest w jądrze, ale nasłuchu RDMA nie ma (np. urządzenie RDMA zniknęło). Wraca dopiero po ponownym utworzeniu portalu: zatrzymaj i wznów target",
+      "listen_on_devices": "urządzenie RDMA: {devices}",
+      "transport_word_tcp": "TCP",
+      "transport_word_iser": "iSER (RDMA)",
+      "transport_word_rdma": "RDMA"
     },
     "wizard_target": {
       "title": "Nowy target",
@@ -9243,7 +9254,9 @@
         "kernel_config_missing": "to jądro nie publikuje swojej konfiguracji (brak /proc/config.gz i /boot/config-*), więc obsługi DH-HMAC-CHAP nie da się potwierdzić — kreator nie oferuje tego, czego nie może potwierdzić"
       },
       "host_description_label": "Opis — {nqn}",
-      "host_description_placeholder": "np. orion (compute)"
+      "host_description_placeholder": "np. orion (compute)",
+      "transport_no_rdma_device": "Interfejs {iface} nie ma urządzenia RDMA — jądro odrzuca nasłuch RDMA na jego adresie. Wybierz TCP albo interfejs z kartą RDMA.",
+      "transport_rdma_link_down": "Urządzenie RDMA {device} na interfejsie {iface} ma nieaktywne łącze — klienci nie połączą się przez RDMA."
     },
     "journal_owner": {
       "this_instance": "ta instancja TentaNas",
@@ -9366,7 +9379,8 @@
       "elastic_folder_not_found": "Folderu {folder} nie ma w tej macierzy",
       "elastic_folders_unreadable": "Nie można odczytać listy folderów macierzy — polityka cache nie została zapisana",
       "elastic_folder_policy_limit": "Najwyżej {limit} folderów tej macierzy może mieć własną politykę cache",
-      "elastic_namespace_unconfirmed": "Nie udało się potwierdzić, że przestrzeń montowania tej nazwy jest wolna — spróbuj ponownie"
+      "elastic_namespace_unconfirmed": "Nie udało się potwierdzić, że przestrzeń montowania tej nazwy jest wolna — spróbuj ponownie",
+      "target_rdma_no_device": "Interfejs {interface} nie ma urządzenia RDMA — jądro odrzuca nasłuch RDMA na adresie {address}. Wybierz TCP albo interfejs z kartą RDMA."
     },
     "unreachable": {
       "title": "Węzeł {node} niedostępny",

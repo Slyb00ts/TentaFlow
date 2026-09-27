@@ -7327,7 +7327,11 @@
         "module_absent": "{module} est absent de l’arborescence des modules de ce noyau",
         "anyraid_not_in_zfs": "{zfs} sur ce nœud ne prend pas en charge AnyRAID",
         "anyraid_supported_not_offered": "AnyRAID pris en charge par {zfs}, pas encore disponible dans TentaNas",
-        "anyraid_unreadable": "Impossible de vérifier si {zfs} sur ce nœud prend en charge AnyRAID"
+        "anyraid_unreadable": "Impossible de vérifier si {zfs} sur ce nœud prend en charge AnyRAID",
+        "rdma_device_yes": "{device} ({netdev}, {addresses}) : lien {state} — peut porter un portail RDMA",
+        "rdma_device_port_down": "{device} ({netdev}, {addresses}) : lien {state} — les clients ne pourront pas se connecter en RDMA tant que le lien n’est pas ACTIVE",
+        "rdma_device_no_address": "{device} ({netdev}) : lien {state}, pas d’adresse IPv4 — ne peut pas porter de portail RDMA",
+        "rdma_device_no_netdev": "{device} : lien {state}, pas d’interface réseau — ne peut pas porter de portail RDMA"
       }
     },
     "feature": {
@@ -7863,7 +7867,14 @@
       "reset_no_allowlist": "Déconnecter une seule session exige une liste d’autorisation : sans elle, le client se reconnecte aussitôt, et le noyau ne donne ni l’adresse ni l’état de la session.",
       "reset_nvmet_no_debugfs": "Déconnecter un seul hôte NVMe-oF n’est pas possible sur ce nœud : le noyau ne publie pas ses contrôleurs (pas de CONFIG_NVME_TARGET_DEBUGFS), et retirer l’hôte de la liste ne le déconnecte pas.",
       "reset_nvmet_unmeasured": "Déconnecter un seul hôte NVMe-oF n’est pas encore possible : le mécanisme n’a pas été mesuré, et retirer l’hôte de la liste ne le déconnecte pas.",
-      "last_seen_hint": "{ago} — à une minute près environ : le nœud actualise cette heure au plus une fois par minute."
+      "last_seen_hint": "{ago} — à une minute près environ : le nœud actualise cette heure au plus une fois par minute.",
+      "portal_exposure_rdma": "Écoute RDMA",
+      "listen_no_rdma_device": "Pas d’écoute — aucun périphérique RDMA ne porte cette adresse, le noyau refuse donc l’écoute RDMA",
+      "listen_listener_lost": "Pas d’écoute — le noyau garde la configuration mais n’a pas d’écoute RDMA (p. ex. le périphérique RDMA a disparu). Elle ne revient que lorsque le portail est recréé : arrêtez puis reprenez la cible",
+      "listen_on_devices": "périphérique RDMA : {devices}",
+      "transport_word_tcp": "TCP",
+      "transport_word_iser": "iSER (RDMA)",
+      "transport_word_rdma": "RDMA"
     },
     "wizard_target": {
       "title": "Nouvelle cible",
@@ -7976,7 +7987,9 @@
         "kernel_config_missing": "ce noyau ne publie aucune configuration (ni /proc/config.gz ni /boot/config-*), la prise en charge de DH-HMAC-CHAP ne peut donc pas être confirmée — l’assistant ne propose pas ce qu’il ne peut pas confirmer"
       },
       "host_description_label": "Description — {nqn}",
-      "host_description_placeholder": "p. ex. orion (compute)"
+      "host_description_placeholder": "p. ex. orion (compute)",
+      "transport_no_rdma_device": "L’interface {iface} n’a pas de périphérique RDMA — le noyau refuse une écoute RDMA sur son adresse. Choisissez TCP ou une interface avec une carte RDMA.",
+      "transport_rdma_link_down": "Le périphérique RDMA {device} de l’interface {iface} a un lien inactif — les clients ne pourront pas se connecter en RDMA."
     },
     "journal_owner": {
       "this_instance": "cette instance TentaNas",
@@ -8099,7 +8112,8 @@
       "elastic_folder_not_found": "Il n’y a pas de dossier {folder} dans cette grappe",
       "elastic_folders_unreadable": "La liste des dossiers de la grappe ne peut pas être lue — la politique de cache n’a pas été enregistrée",
       "elastic_folder_policy_limit": "Au plus {limit} dossiers de cette grappe peuvent avoir leur propre politique de cache",
-      "elastic_namespace_unconfirmed": "Il n’a pas pu être confirmé que l’espace de montage de ce nom est libre — réessayez"
+      "elastic_namespace_unconfirmed": "Il n’a pas pu être confirmé que l’espace de montage de ce nom est libre — réessayez",
+      "target_rdma_no_device": "L’interface {interface} n’a pas de périphérique RDMA — le noyau refuse une écoute RDMA sur {address}. Choisissez TCP ou une interface avec une carte RDMA."
     },
     "unreachable": {
       "title": "Nœud {node} injoignable",

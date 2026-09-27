@@ -7327,7 +7327,11 @@
         "module_absent": "{module} no está en el árbol de módulos de este kernel",
         "anyraid_not_in_zfs": "{zfs} en este nodo no admite AnyRAID",
         "anyraid_supported_not_offered": "AnyRAID compatible con {zfs}, aún no disponible en TentaNas",
-        "anyraid_unreadable": "No se pudo comprobar si {zfs} en este nodo admite AnyRAID"
+        "anyraid_unreadable": "No se pudo comprobar si {zfs} en este nodo admite AnyRAID",
+        "rdma_device_yes": "{device} ({netdev}, {addresses}): enlace {state} — admite un portal RDMA",
+        "rdma_device_port_down": "{device} ({netdev}, {addresses}): enlace {state} — los clientes no podrán conectarse por RDMA hasta que el enlace esté ACTIVE",
+        "rdma_device_no_address": "{device} ({netdev}): enlace {state}, sin dirección IPv4 — no admite un portal RDMA",
+        "rdma_device_no_netdev": "{device}: enlace {state}, sin interfaz de red — no admite un portal RDMA"
       }
     },
     "feature": {
@@ -7863,7 +7867,14 @@
       "reset_no_allowlist": "Desconectar una única sesión requiere una lista de iniciadores permitidos: sin ella el cliente vuelve a iniciar sesión al instante, y el kernel no da la dirección ni el estado de la sesión.",
       "reset_nvmet_no_debugfs": "Desconectar un único host NVMe-oF no es posible en este nodo: el kernel no publica sus controladores (sin CONFIG_NVME_TARGET_DEBUGFS), y quitar el host de la lista no lo desconecta.",
       "reset_nvmet_unmeasured": "Desconectar un único host NVMe-oF todavía no es posible: el mecanismo no se ha medido, y quitar el host de la lista no lo desconecta.",
-      "last_seen_hint": "{ago} — con una precisión de un minuto aproximadamente: el nodo actualiza esta hora como mucho una vez por minuto."
+      "last_seen_hint": "{ago} — con una precisión de un minuto aproximadamente: el nodo actualiza esta hora como mucho una vez por minuto.",
+      "portal_exposure_rdma": "Escucha RDMA",
+      "listen_no_rdma_device": "Sin escucha — ningún dispositivo RDMA tiene esta dirección, así que el kernel rechaza la escucha RDMA",
+      "listen_listener_lost": "Sin escucha — el kernel conserva la configuración pero no tiene escucha RDMA (p. ej., el dispositivo RDMA desapareció). Solo vuelve cuando el portal se crea de nuevo: detén y reanuda el target",
+      "listen_on_devices": "dispositivo RDMA: {devices}",
+      "transport_word_tcp": "TCP",
+      "transport_word_iser": "iSER (RDMA)",
+      "transport_word_rdma": "RDMA"
     },
     "wizard_target": {
       "title": "Nuevo destino",
@@ -7976,7 +7987,9 @@
         "kernel_config_missing": "este kernel no publica su configuración (no hay /proc/config.gz ni /boot/config-*), así que no se puede confirmar DH-HMAC-CHAP: el asistente no ofrece lo que no puede confirmar"
       },
       "host_description_label": "Descripción — {nqn}",
-      "host_description_placeholder": "p. ej. orion (compute)"
+      "host_description_placeholder": "p. ej. orion (compute)",
+      "transport_no_rdma_device": "La interfaz {iface} no tiene dispositivo RDMA — el kernel rechaza una escucha RDMA en su dirección. Elige TCP o una interfaz con tarjeta RDMA.",
+      "transport_rdma_link_down": "El dispositivo RDMA {device} de la interfaz {iface} tiene el enlace inactivo — los clientes no podrán conectarse por RDMA."
     },
     "journal_owner": {
       "this_instance": "esta instancia de TentaNas",
@@ -8099,7 +8112,8 @@
       "elastic_folder_not_found": "No existe la carpeta {folder} en esta matriz",
       "elastic_folders_unreadable": "No se puede leer la lista de carpetas de la matriz — la política de caché no se ha guardado",
       "elastic_folder_policy_limit": "Como máximo {limit} carpetas de esta matriz pueden tener su propia política de caché",
-      "elastic_namespace_unconfirmed": "No se pudo confirmar que el espacio de montaje de este nombre esté libre — inténtelo de nuevo"
+      "elastic_namespace_unconfirmed": "No se pudo confirmar que el espacio de montaje de este nombre esté libre — inténtelo de nuevo",
+      "target_rdma_no_device": "La interfaz {interface} no tiene dispositivo RDMA — el kernel rechaza una escucha RDMA en {address}. Elige TCP o una interfaz con tarjeta RDMA."
     },
     "unreachable": {
       "title": "Nodo {node} inaccesible",

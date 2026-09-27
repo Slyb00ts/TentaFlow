@@ -7327,7 +7327,11 @@
         "module_absent": "{module} fehlt im Modulbaum dieses Kernels",
         "anyraid_not_in_zfs": "{zfs} auf diesem Knoten unterstützt AnyRAID nicht",
         "anyraid_supported_not_offered": "AnyRAID wird von {zfs} unterstützt, ist in TentaNas aber noch nicht verfügbar",
-        "anyraid_unreadable": "Konnte nicht prüfen, ob {zfs} auf diesem Knoten AnyRAID unterstützt"
+        "anyraid_unreadable": "Konnte nicht prüfen, ob {zfs} auf diesem Knoten AnyRAID unterstützt",
+        "rdma_device_yes": "{device} ({netdev}, {addresses}): Verbindung {state} — kann ein RDMA-Portal tragen",
+        "rdma_device_port_down": "{device} ({netdev}, {addresses}): Verbindung {state} — Clients können sich erst über RDMA verbinden, wenn die Verbindung ACTIVE ist",
+        "rdma_device_no_address": "{device} ({netdev}): Verbindung {state}, keine IPv4-Adresse — kann kein RDMA-Portal tragen",
+        "rdma_device_no_netdev": "{device}: Verbindung {state}, keine Netzwerkschnittstelle — kann kein RDMA-Portal tragen"
       }
     },
     "feature": {
@@ -7863,7 +7867,14 @@
       "reset_no_allowlist": "Eine einzelne Sitzung zu trennen erfordert eine Zulassungsliste: Ohne sie meldet sich der Client sofort wieder an, und der Kernel nennt weder Adresse noch Zustand der Sitzung.",
       "reset_nvmet_no_debugfs": "Einen einzelnen NVMe-oF-Host zu trennen ist auf diesem Knoten nicht möglich: Der Kernel veröffentlicht seine Controller nicht (kein CONFIG_NVME_TARGET_DEBUGFS), und den Host aus der Liste zu entfernen trennt ihn nicht.",
       "reset_nvmet_unmeasured": "Einen einzelnen NVMe-oF-Host zu trennen ist noch nicht möglich: Der Mechanismus ist nicht vermessen, und den Host aus der Liste zu entfernen trennt ihn nicht.",
-      "last_seen_hint": "{ago} — auf etwa eine Minute genau: der Knoten aktualisiert diese Zeit höchstens einmal pro Minute."
+      "last_seen_hint": "{ago} — auf etwa eine Minute genau: der Knoten aktualisiert diese Zeit höchstens einmal pro Minute.",
+      "portal_exposure_rdma": "RDMA-Listener",
+      "listen_no_rdma_device": "Lauscht nicht — kein RDMA-Gerät besitzt diese Adresse, daher lehnt der Kernel den RDMA-Listener ab",
+      "listen_listener_lost": "Lauscht nicht — der Kernel behält die Konfiguration, hat aber keinen RDMA-Listener (z. B. ist das RDMA-Gerät verschwunden). Er kehrt erst zurück, wenn das Portal neu angelegt wird: Target stoppen und fortsetzen",
+      "listen_on_devices": "RDMA-Gerät: {devices}",
+      "transport_word_tcp": "TCP",
+      "transport_word_iser": "iSER (RDMA)",
+      "transport_word_rdma": "RDMA"
     },
     "wizard_target": {
       "title": "Neues Target",
@@ -7976,7 +7987,9 @@
         "kernel_config_missing": "dieser Kernel veröffentlicht keine Konfiguration (kein /proc/config.gz, kein /boot/config-*), daher lässt sich DH-HMAC-CHAP nicht bestätigen — der Assistent bietet nichts an, was er nicht bestätigen kann"
       },
       "host_description_label": "Beschreibung — {nqn}",
-      "host_description_placeholder": "z. B. orion (compute)"
+      "host_description_placeholder": "z. B. orion (compute)",
+      "transport_no_rdma_device": "Die Schnittstelle {iface} hat kein RDMA-Gerät — der Kernel lehnt einen RDMA-Listener auf ihrer Adresse ab. Wählen Sie TCP oder eine Schnittstelle mit RDMA-Karte.",
+      "transport_rdma_link_down": "Das RDMA-Gerät {device} an der Schnittstelle {iface} hat keine aktive Verbindung — Clients können sich nicht über RDMA verbinden."
     },
     "journal_owner": {
       "this_instance": "diese TentaNas-Instanz",
@@ -8099,7 +8112,8 @@
       "elastic_folder_not_found": "In diesem Array gibt es keinen Ordner {folder}",
       "elastic_folders_unreadable": "Die Ordnerliste des Arrays kann nicht gelesen werden — die Cache-Richtlinie wurde nicht gespeichert",
       "elastic_folder_policy_limit": "Höchstens {limit} Ordner dieses Arrays können eine eigene Cache-Richtlinie haben",
-      "elastic_namespace_unconfirmed": "Es konnte nicht bestätigt werden, dass der Einhängebereich dieses Namens frei ist — versuche es erneut"
+      "elastic_namespace_unconfirmed": "Es konnte nicht bestätigt werden, dass der Einhängebereich dieses Namens frei ist — versuche es erneut",
+      "target_rdma_no_device": "Die Schnittstelle {interface} hat kein RDMA-Gerät — der Kernel lehnt einen RDMA-Listener auf {address} ab. Wählen Sie TCP oder eine Schnittstelle mit RDMA-Karte."
     },
     "unreachable": {
       "title": "Knoten {node} nicht erreichbar",

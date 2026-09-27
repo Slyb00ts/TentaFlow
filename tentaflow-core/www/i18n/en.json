@@ -7169,7 +7169,11 @@
         "module_absent": "{module} is not in this kernel’s module tree",
         "anyraid_not_in_zfs": "{zfs} on this node does not support AnyRAID",
         "anyraid_supported_not_offered": "AnyRAID supported by {zfs}, not yet available in TentaNas",
-        "anyraid_unreadable": "Could not check whether {zfs} on this node supports AnyRAID"
+        "anyraid_unreadable": "Could not check whether {zfs} on this node supports AnyRAID",
+        "rdma_device_yes": "{device} ({netdev}, {addresses}): link {state} — can carry an RDMA portal",
+        "rdma_device_port_down": "{device} ({netdev}, {addresses}): link {state} — clients cannot connect over RDMA until the link is ACTIVE",
+        "rdma_device_no_address": "{device} ({netdev}): link {state}, no IPv4 address — cannot carry an RDMA portal",
+        "rdma_device_no_netdev": "{device}: link {state}, no network interface — cannot carry an RDMA portal"
       }
     },
     "feature": {
@@ -9079,7 +9083,14 @@
       "reset_no_allowlist": "Disconnecting a single session needs an initiator allowlist: without one the client logs straight back in, and the kernel gives no session address or state.",
       "reset_nvmet_no_debugfs": "Disconnecting a single NVMe-oF host is not available on this node: the kernel does not publish its controllers (no CONFIG_NVME_TARGET_DEBUGFS), and removing the host from the list does not disconnect it.",
       "reset_nvmet_unmeasured": "Disconnecting a single NVMe-oF host is not available yet: the mechanism has not been measured, and removing the host from the list does not disconnect it.",
-      "last_seen_hint": "{ago} — accurate to about a minute: the node refreshes this time at most once a minute."
+      "last_seen_hint": "{ago} — accurate to about a minute: the node refreshes this time at most once a minute.",
+      "portal_exposure_rdma": "RDMA listener",
+      "listen_no_rdma_device": "Not listening — no RDMA device holds this address, so the kernel refuses the RDMA listener",
+      "listen_listener_lost": "Not listening — the kernel keeps the configuration but has no RDMA listener (e.g. the RDMA device went away). It returns only when the portal is created again: stop and resume the target",
+      "listen_on_devices": "RDMA device: {devices}",
+      "transport_word_tcp": "TCP",
+      "transport_word_iser": "iSER (RDMA)",
+      "transport_word_rdma": "RDMA"
     },
     "wizard_target": {
       "title": "New target",
@@ -9192,7 +9203,9 @@
         "kernel_config_missing": "this kernel publishes no configuration (no /proc/config.gz, no /boot/config-*), so DH-HMAC-CHAP support cannot be confirmed — the wizard does not offer what it cannot confirm"
       },
       "host_description_label": "Description — {nqn}",
-      "host_description_placeholder": "e.g. orion (compute)"
+      "host_description_placeholder": "e.g. orion (compute)",
+      "transport_no_rdma_device": "Interface {iface} has no RDMA device — the kernel refuses an RDMA listener on its address. Choose TCP or an interface with an RDMA card.",
+      "transport_rdma_link_down": "RDMA device {device} on interface {iface} has an inactive link — clients cannot connect over RDMA."
     },
     "journal_owner": {
       "this_instance": "this TentaNas instance",
@@ -9315,7 +9328,8 @@
       "elastic_folder_not_found": "There is no folder {folder} in this array",
       "elastic_folders_unreadable": "The array’s folder list cannot be read — the cache policy was not saved",
       "elastic_folder_policy_limit": "At most {limit} folders of this array can have their own cache policy",
-      "elastic_namespace_unconfirmed": "The mount namespace of this name could not be confirmed free — try again"
+      "elastic_namespace_unconfirmed": "The mount namespace of this name could not be confirmed free — try again",
+      "target_rdma_no_device": "Interface {interface} has no RDMA device — the kernel refuses an RDMA listener on {address}. Choose TCP or an interface with an RDMA card."
     },
     "unreachable": {
       "title": "Node {node} unreachable",
