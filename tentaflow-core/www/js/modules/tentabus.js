@@ -6,10 +6,9 @@
 // Kopie i nody) with their counters, the address (`#/tentabus?instance=…&tab=
 // …&topic=…&section=…&group=…&gtopic=…`, see modules/tentabus/routes.js) and
 // the polling every tab reads. Przegląd, Topiki with a topic's page (Stan,
-// Ustawienia, Partycje i kopie), Odbiorcy with a consumer's page (Stan,
-// Miejsce czytania, Ustawienia), Wzory wiadomości and Kopie i nody live in
-// modules/tentabus/*. Nieprzetworzone below is the M1/M2 view (unprocessed
-// messages per topic) until its U4 package replaces it.
+// Ustawienia, Nieprzetworzone, Partycje i kopie), Odbiorcy with a consumer's
+// page (Stan, Miejsce czytania, Ustawienia), Nieprzetworzone wiadomości,
+// Wzory wiadomości and Kopie i nody live in modules/tentabus/*.
 //
 // Every request names its instance (`BusEnvelope.instance_id`): `mount`
 // resolves `state.instanceId` from `?instance=` (or the same-screen instance
@@ -39,10 +38,10 @@ import { openSettingsWindow } from '/js/modules/tentabus/topic-settings.js';
 import { openLeaderTransfer, transferChoices } from '/js/modules/tentabus/partitions.js';
 import { drawReplication } from '/js/modules/tentabus/replication.js';
 import { drawConsumers, consumerKey } from '/js/modules/tentabus/consumers.js';
-import { drawConsumerDetail, positionRows, DLQ_PAGE, consumerDlq } from '/js/modules/tentabus/consumer-detail.js';
+import { drawConsumerDetail, positionRows, consumerDlq } from '/js/modules/tentabus/consumer-detail.js';
 import { openOffsetMove, movedText } from '/js/modules/tentabus/offset-move.js';
-import { bytesToPreviewText, headerText } from '/js/modules/tentabus/payload.js';
-import { confirmDialog } from '/js/lib/confirm-dialog.js';
+import { drawUnprocessed, unprocessedRecord, unprocessedTopics, mergeNewest, retryAllPlan, topicConsumers, messageName, receiversText, UNPROCESSED_PAGE, LIST_STEP } from '/js/modules/tentabus/unprocessed.js';
+import { openUnprocessedView, openRetryOne, openDiscardOne, openRetryAll } from '/js/modules/tentabus/unprocessed-windows.js';
 import '/js/components/tf-breadcrumb.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-tabs.js';
@@ -69,22 +68,13 @@ const TAB_ICONS = { overview: 'gauge', topics: 'share', groups: 'users', dlq: 'i
 // down and rebuilding it, keeping scroll position, in-progress search text,
 // table sort and focus intact across a tab switch.
 const VIEW_SLOTS = ['overview', 'topics', 'groups', 'dlq', 'schemas', 'detail', 'consumer', 'replication'];
-const DLQ_RETRY_ALL_MAX = 500;
+// "Ponów wszystkie" republishes up to 500 messages one by one on the server.
+const RETRY_ALL_TIMEOUT_MS = 120_000;
 // =============================================================================
 // Pure helpers — no DOM, no ApiBinary. Unit-tested from
 // `tentabus.request-builders.test.js` by brace-extraction (services.js-style),
 // since this module pulls in DOM-only custom-element imports at load time.
 // =============================================================================
-
-function clampInt(v, min, max, fallback) {
-  const n = Math.trunc(Number(v));
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, n));
-}
-
-function clampDlqRetryAllMax(v) {
-  return clampInt(v, 1, DLQ_RETRY_ALL_MAX, 100);
-}
 
 // W9 (SUM/tentabus/PLAN-APP-PLATFORM.md §3.1/§9i): every TentaBus request
 // names its instance — there is no "current bus" once instances exist, and
@@ -116,7 +106,7 @@ function isInternalGroupId(groupId) {
   return typeof groupId === 'string' && groupId.startsWith('tf-');
 }
 
-// Per-partition paging cursor for the NEXT `MessagesBrowse`/`DlqList` page
+// Per-partition paging cursor for the NEXT `DlqList` page
 // (tor U task 1/2's `partitions[]` + `fromOffsets`): only partitions that
 // reported `hasMore` carry a cursor forward, at their own `nextOffset` — a
 // partition that already reached its high watermark is simply omitted, not
@@ -125,41 +115,6 @@ function buildFromOffsetsForNextPage(partitions) {
   return (Array.isArray(partitions) ? partitions : [])
     .filter((p) => p.hasMore)
     .map((p) => ({ partition: p.partition, offset: p.nextOffset }));
-}
-
-// The broker's own `__*` topics (the unprocessed-message stores themselves,
-// metrics) are never a source to pick.
-function dlqSourceTopicOptions(topics) {
-  return (Array.isArray(topics) ? topics : [])
-    .filter((t) => !(t.isDlq ?? t.is_dlq) && !String(t.name || '').startsWith('__'))
-    .map((t) => ({ value: t.name, label: t.name }));
-}
-
-// R3-1 (KRYTYK-M1-R3.md, P1: "DLQ tab is empty on every entry"): the SINGLE,
-// pure, unit-tested decision of "what should the selected DLQ source topic
-// become". Root cause of R3-1 was that `paintDlqSourceOptions()` (a paint-time
-// function) ALSO mutated `state.dlqSource` as a side effect purely to give the
-// `<tf-select>` a sensible display default — so by the time `setTab`'s guard
-// asked "is a source already selected?" the answer was already "yes" (set one
-// render step earlier), the guard never fired, `selectDlqSource`/
-// `loadDlqRecords` never ran, and `state.dlqRecords` stayed `null` forever —
-// which `paintDlqTable` rendered as `host.innerHTML = ''`, a silently empty
-// tab with no spinner, no error, no way out short of manually changing the
-// select (which is the only code path that still called `selectDlqSource`).
-// This function has NO side effects — it only computes a value — so it is
-// safe to call from every place that can make the DLQ tab visible or change
-// its candidate topic list (`ensureDlqTabReady`, called from both `setTab`
-// and `loadTopics`) without risking the same race again: there is exactly one
-// function, `ensureDlqTabReady`, that ever ACTS on this value.
-// A kept choice must still name a listed topic (an address can carry a stale
-// or foreign one); the default is the topic with the most unprocessed
-// messages in the stats snapshot, then the first topic.
-function resolveDlqEntrySource(currentSource, topics, statsTopics = []) {
-  const options = dlqSourceTopicOptions(topics);
-  if (currentSource && (!options.length || options.some((o) => o.value === currentSource))) return currentSource;
-  const depth = new Map((statsTopics || []).map((t) => [t.topic, Number(t.dlqDepth) || 0]));
-  const best = options.reduce((top, o) => (top == null || (depth.get(o.value) || 0) > (depth.get(top.value) || 0) ? o : top), null);
-  return best ? best.value : '';
 }
 
 // Extracts the stable `bus.<code>` token `dispatch/bus.rs::map_bus_error`
@@ -173,8 +128,8 @@ function resolveDlqEntrySource(currentSource, topics, statsTopics = []) {
 // bus.invalid_topic_config: partitions must be 1-256, got 999") — so
 // `bus.<code>` sits AFTER a "protocol error <Kind>: " prefix, never at
 // index 0. A leading `^bus\.` anchor never matched that shape and silently
-// disabled every one of the 35 translated `tentabus.errors.*` codes (5
-// locales) plus the DLQ "not found yet" empty-state branch below.
+// disabled every one of the translated `tentabus.errors.*` codes (5 locales)
+// plus the "no unprocessed message yet" branch of the unprocessed lists.
 function busErrorCode(message) {
   const m = /\bbus\.([a-z0-9_]+)/.exec(String(message || ''));
   return m ? m[1] : null;
@@ -229,7 +184,7 @@ const NO_CAPABILITIES = { canRead: false, canWrite: false, canAdmin: false, isSi
 // capabilities: BusCapabilitiesWire }`). Reading the envelope flat (the
 // earlier bug) always yields `undefined` for every field, so every
 // `canAdmin()`/`isSiteAdmin()` check fails closed — hiding "Nowy topik",
-// edit/delete and DLQ retry/discard for EVERY
+// edit/delete and moving leadership for EVERY
 // user including a site admin. This also accepts an already-flat shape
 // (`{ canRead, ... }` with no `.capabilities`) so a future wire
 // simplification degrades to "read the fields" instead of re-introducing
@@ -324,23 +279,22 @@ const state = {
   consumerMoved: new Set(),
   consumerBusy: false,
 
-  dlqSource: '',
-  dlqRecords: null,
-  dlqPartitions: [], // BusBrowsePartitionInfoWire[] — per-partition earliest/hwm/nextOffset/hasMore
-  dlqHasMore: false,
-  dlqNextOffset: 0,
-  dlqLoading: false,
-  // R3-1 (KRYTYK-M1-R3.md): translated message from the last FAILED first-page
-  // load, or `null` when the last attempt succeeded (or none has run yet).
-  // Distinguishes "never loaded" from "loaded and failed" so `paintDlqTable`
-  // can render an error box with a retry button instead of treating both the
-  // same way `dlqRecords == null` used to (a silently empty container).
-  dlqError: null,
+  // Nieprzetworzone wiadomości — see `freshUnprocessed`.
+  unprocessed: freshUnprocessed(),
 
   // What the frame (header card, tab counters) and Przegląd read beside the
   // stats snapshot — see `freshShellState`.
   shell: freshShellState(),
 };
+
+// The unprocessed messages the tab and a topic's section show: per topic its
+// newest pages (`null` while the first one loads; `{ records, hasMore,
+// partitions, error }`), and what the reader may do there (`{ canAdmin,
+// adminLabels, maxAttempts }` from the topic's own answer); the rows each
+// list shows, and the note over the tab.
+function freshUnprocessed() {
+  return { byTopic: new Map(), access: new Map(), asked: new Map(), shown: LIST_STEP, sectionShown: LIST_STEP, notice: null };
+}
 
 // `null` = that source has not answered yet (the figure is left out), never
 // a guessed zero.
@@ -362,13 +316,13 @@ function freshShellState() {
   };
 }
 
-// `canAdmin` gates every instance-level change: creating and deleting topics,
-// retry/discard of unprocessed messages and moving a partition's leadership
-// from Kopie i nody. It is `bus.admin` in the instance matrix AND the org
+// `canAdmin` gates every instance-level change: creating and deleting topics
+// and moving a partition's leadership from Kopie i nody. It is `bus.admin` in the instance matrix AND the org
 // Admin role — what every such handler's `gate_admin` checks — and fails
 // closed before `busCapabilitiesRequest` answers. A topic's page, a consumer
-// (pause, resume, moving its reading place) and its list row gate on the
-// topic's own administration instead, which also honours the topic's ACL.
+// (pause, resume, moving its reading place), its list row and the retry and
+// discard of a topic's unprocessed messages gate on the topic's own
+// administration instead, which also honours the topic's ACL.
 function canAdmin() {
   return state.capabilities?.canAdmin === true;
 }
@@ -500,7 +454,6 @@ const TentaBusScreen = {
     state.instanceLabel = target.title;
     state.shell.instances = instances.filter((a) => a.enabled || a.addonId === target.addonId);
     state.tab = route.tab;
-    if (route.dlqTopic) state.dlqSource = route.dlqTopic;
 
     try {
       state.capabilities = unwrapCapabilities(await ApiBinary.one('busCapabilitiesRequest', { instanceId: requireInstanceId(state.instanceId) }));
@@ -545,11 +498,9 @@ const TentaBusScreen = {
     state.groups = null;
     state.groupsError = null;
     closeConsumer();
-    state.dlqSource = '';
-    state.dlqRecords = null;
-    state.dlqPartitions = [];
-    state.dlqLoading = false;
-    state.dlqError = null;
+    state.unprocessed = freshUnprocessed();
+    unprocessedTurns.clear();
+    unprocessedLoads.clear();
     state.shell = freshShellState();
   },
 };
@@ -664,7 +615,6 @@ function syncLocation() {
     section,
     group: consumer?.group || null,
     groupTopic: consumer?.topic || null,
-    dlqTopic: state.tab === 'dlq' ? state.dlqSource || null : null,
   }));
 }
 
@@ -780,7 +730,10 @@ async function refreshAll() {
     state.consumerMoved = new Set();
     consumerDlqDue = true;
     loadConsumer(consumerKey(state.view.group, state.view.topic));
-  } else if (state.tab === 'dlq') loadDlqRecords(true);
+  }
+  // Every unprocessed list is asked again, the open one first.
+  state.unprocessed.asked = new Map();
+  ensureUnprocessed();
   renderPanel();
 }
 
@@ -808,14 +761,8 @@ const tabContext = {
     else if (action.kind === 'topic') { setTab('topics'); openTopicDetail(action.topic, DEFAULT_SECTION); }
     else if (action.kind === 'group') openConsumer(action.group, action.topic);
     else if (action.kind === 'dlq') {
-      // Chosen BEFORE the tab opens, so the tab's own default pick does not
-      // start a second, racing load of another topic.
-      if (action.topic && action.topic !== state.dlqSource) {
-        state.dlqSource = action.topic;
-        state.dlqRecords = null;
-        state.dlqPartitions = [];
-      }
-      setTab('dlq');
+      // A topic's unprocessed messages are dealt with in its own section.
+      if (action.topic) { setTab('topics'); openTopicDetail(action.topic, 'dlq'); } else setTab('dlq');
     }
     else if (action.kind === 'retry') refreshAll();
   },
@@ -841,10 +788,11 @@ function setTab(id) {
   else if (state.view?.kind === 'consumer-detail') closeConsumer();
   if (id !== 'topics') state.topicsNotice = null;
   if (id !== 'replication') { state.replicationNotice = null; state.justMoved = new Set(); }
+  if (id !== 'dlq') { state.unprocessed.notice = null; state.unprocessed.shown = LIST_STEP; }
   state.tab = id;
   renderPanel();
   if (id === 'groups' && state.groups == null) loadGroups();
-  if (id === 'dlq') ensureDlqTabReady();
+  if (id === 'dlq') ensureUnprocessed();
 }
 
 // Persistent per-view container inside `#tb-panel`, keyed by `VIEW_SLOTS`
@@ -884,7 +832,7 @@ function renderPanel() {
   if (activeKey === 'topics') { drawTopics(activeEl, topicsContext); return; }
   if (activeKey === 'groups') { drawConsumers(activeEl, consumersContext); return; }
   if (activeKey === 'consumer') { drawConsumerDetail(activeEl, consumerContext); return; }
-  if (activeKey === 'dlq') { renderDlqTab(activeEl); return; }
+  if (activeKey === 'dlq') { drawUnprocessed(activeEl, unprocessedContext); return; }
   if (activeKey === 'replication') { drawReplication(activeEl, replicationContext); return; }
 }
 
@@ -951,7 +899,7 @@ async function refreshStats() {
     if (state.tab === 'overview' && !state.view) renderPanel();
     return;
   }
-  ensureDlqTabReady();
+  ensureUnprocessed();
   const rate = userRate(state.stats);
   pushRateSample(state.shell.ratePoints, state.shell.statsAt, rate);
   paintShell();
@@ -960,7 +908,7 @@ async function refreshStats() {
     pushOverviewSample(body, rate, state.shell.statsAt);
     renderPanel();
   }
-  if (state.tab === 'topics' && !state.view) renderPanel();
+  if ((state.tab === 'topics' || state.tab === 'dlq') && !state.view) renderPanel();
   if (state.tab === 'groups' && !state.view) {
     // A consumer that connected since the list answered shows up in the
     // snapshot first: the list is asked again so its row can be drawn.
@@ -1064,14 +1012,6 @@ async function loadTopics() {
   paintShell();
   refreshReplicas();
   if (state.tab === 'overview' && !state.view) renderPanel();
-  // Covers the race where a user switches to the DLQ tab BEFORE this initial
-  // `loadTopics()` (kicked off in parallel from `mount()`) resolves: `setTab`'s
-  // own `ensureDlqTabReady()` call ran too early to see any topics yet, so the
-  // tab would otherwise sit on its loading placeholder forever once topics
-  // finally arrive. Calling the SAME single-source-of-truth helper here (not
-  // a second, divergent code path) keeps `state.dlqSource` deterministic
-  // regardless of which of the two triggers fires first (R3-1).
-  if (state.tab === 'dlq') ensureDlqTabReady();
 }
 
 const topicsContext = {
@@ -1176,27 +1116,6 @@ function openTopicDeleteWindow(name) {
   });
 }
 
-function msToDate(ms) {
-  if (ms == null) return '—';
-  const d = new Date(Number(ms));
-  if (Number.isNaN(d.getTime())) return '—';
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
-
-// P3-14 (KRYTYK-M1-R2.md): the DLQ record detail's raw header dump rendered
-// `dlq.first_failed_at_ms`/`dlq.last_failed_at_ms` as a bare epoch
-// ("1787862468957") — every OTHER millisecond timestamp in this module goes
-// through `msToDate`, these two just happened to be decoded like any other
-// header's bytes. Only touches `_at_ms`-suffixed keys whose decoded text is
-// purely numeric, so a non-numeric or unrelated header is never mangled.
-function formatHeaderValue(key, text) {
-  if (typeof key === 'string' && key.endsWith('_at_ms') && /^\d+$/.test(text)) {
-    return msToDate(Number(text));
-  }
-  return text;
-}
-
 // =============================================================================
 // A topic's page (Topiki › <topic>): its sections, the settings windows and
 // moving a partition's leadership. The page itself is modules/tentabus/
@@ -1209,10 +1128,12 @@ function openTopicDetail(name, section = DEFAULT_SECTION) {
     state.detailError = null;
     state.detailNotice = null;
     state.justMoved = new Set();
+    state.unprocessed.sectionShown = LIST_STEP;
   }
   state.view = { kind: 'topic-detail', name, section: TOPIC_SECTIONS.includes(section) ? section : DEFAULT_SECTION };
   renderPanel();
   loadTopicDetail(name);
+  ensureUnprocessed();
 }
 
 function closeTopicDetail() {
@@ -1269,6 +1190,8 @@ const detailContext = {
       lagSeries: sh.lagSeries,
       notice: state.detailNotice,
       justMoved: state.justMoved,
+      unprocessed: state.unprocessed.byTopic.get(state.view.name) ?? null,
+      unprocessedShown: state.unprocessed.sectionShown,
       instanceLabel: state.instanceLabel,
       nowMs: Date.now(),
     };
@@ -1277,17 +1200,25 @@ const detailContext = {
     const name = state.view?.name;
     if (!name) return;
     if (action.kind === 'back') { setTab('topics'); return; }
-    if (action.kind === 'section') {
-      if (!TOPIC_SECTIONS.includes(action.section) || action.section === state.view.section) return;
-      state.view.section = action.section;
+    if (action.kind === 'section' || action.kind === 'dlq') {
+      const section = action.kind === 'dlq' ? 'dlq' : action.section;
+      if (!TOPIC_SECTIONS.includes(section) || section === state.view.section) return;
+      state.view.section = section;
       state.detailNotice = null;
+      state.unprocessed.sectionShown = LIST_STEP;
       renderPanel();
-    } else if (action.kind === 'preview') openTopicPreview(name);
+      ensureUnprocessed();
+    } else if (action.kind === 'unp-view') openUnprocessedWindow('view', name, action.key);
+    else if (action.kind === 'unp-retry') openUnprocessedWindow('retry', name, action.key);
+    else if (action.kind === 'unp-discard') openUnprocessedWindow('discard', name, action.key);
+    else if (action.kind === 'unp-retry-all') openUnprocessedRetryAll(name, 'topic');
+    else if (action.kind === 'unp-more') showMoreUnprocessed(name);
+    else if (action.kind === 'unp-reload') loadUnprocessedTopic(name);
+    else if (action.kind === 'preview') openTopicPreview(name);
     else if (action.kind === 'delete') openTopicDeleteWindow(name);
     else if (action.kind === 'change') openTopicSettings(name, action.card);
     else if (action.kind === 'transfer') openPartitionTransfer(name, action.partition, 'topic');
     else if (action.kind === 'group') openConsumer(action.group, name);
-    else if (action.kind === 'dlq') tabContext.go({ kind: 'dlq', topic: name });
     else if (action.kind === 'retry') { state.detailError = null; renderPanel(); loadTopicDetail(name); }
   },
 };
@@ -1366,21 +1297,6 @@ const replicationContext = {
     else if (action.kind === 'transfer') openPartitionTransfer(action.topic, action.partition, 'replication');
   },
 };
-
-// Per-partition summary chips above the unprocessed-message table: which
-// message numbers each partition still keeps.
-function partitionSummaryHtml(partitions) {
-  if (!partitions?.length) return '';
-  const chips = partitions.map((p) => {
-    const first = Number(p.earliestOffset) || 0;
-    const next = Number(p.highWatermark) || 0;
-    const label = next > first
-      ? T('partitions_summary_chip', { partition: p.partition, from: fmtCount(first), to: fmtCount(next - 1) })
-      : T('partitions_summary_chip_empty', { partition: p.partition });
-    return `<span class="tf-chip tf-chip--outline info" title="${escapeAttr(T('partitions_summary_chip_title', { partition: p.partition, next: fmtCount(next) }))}">${escapeHtml(label)}</span>`;
-  }).join('');
-  return `<div class="tb-partition-summary">${chips}</div>`;
-}
 
 // =============================================================================
 // Odbiorcy (T05): the list lives in modules/tentabus/consumers.js, a
@@ -1469,7 +1385,7 @@ async function fetchConsumer(instanceId, group, topic) {
   const [dlqResp, history] = await Promise.allSettled([
     !readDlq ? Promise.resolve(null)
       : topicDetail?.access?.canRead
-      ? ApiBinary.one('busDlqListRequest', { instanceId: iid, sourceTopic: topic, limit: DLQ_PAGE, newestFirst: true })
+      ? ApiBinary.one('busDlqListRequest', { instanceId: iid, sourceTopic: topic, limit: UNPROCESSED_PAGE, newestFirst: true })
       : Promise.reject(new Error('no read access')),
     ApiBinary.one('busLagHistoryRequest', { instanceId: iid, group, topic, sinceMs: nowMs - 10 * 60_000 }),
   ]);
@@ -1638,314 +1554,265 @@ function openConsumerMove(partition) {
 }
 
 // =============================================================================
-// DLQ (M05) — a topic filtered by the `__dlq.` prefix, per PLAN §3.3.
+// Nieprzetworzone wiadomości (T06, a topic's section): modules/tentabus/
+// unprocessed.js draws them and unprocessed-windows.js holds the windows; the
+// shell loads each topic's newest pages and says where each move leads.
+//
+// Reading unprocessed messages is a message read the server audits
+// (`bus.messages.browse`), so a topic's list is asked again only when what
+// the stats snapshot counts for it changed since it was asked, on "Odśwież"
+// and after a change made here — never on every poll.
 // =============================================================================
 
-function renderDlqTab(panel) {
-  const rebuilt = ensureSkeleton(panel, 'dlq', dlqSkeletonHtml);
-  if (rebuilt) wireDlqSkeleton(panel);
-  paintDlqSourceOptions();
-  paintDlqTable();
+// Only the newest answer per topic lands: a reload started after a retry
+// must not be overwritten by the page asked before it.
+const unprocessedTurns = new Map();
+// The load each topic has in flight, so a change can wait for the one a
+// stats poll already started instead of asking a second time.
+const unprocessedLoads = new Map();
+
+/** Asks for `topic`'s newest unprocessed messages, or (`more`) the page after those loaded. */
+function loadUnprocessedTopic(topic, options = {}) {
+  const load = fetchUnprocessedTopic(topic, options);
+  unprocessedLoads.set(topic, load);
+  return load;
 }
 
-function dlqSkeletonHtml() {
-  return `
-    <div class="tb-toolbar" id="tb-dlq-toolbar" hidden>
-      <tf-select id="tb-dlq-source" label="${escapeAttr(T('dlq_source_label'))}"></tf-select>
-      <span class="tb-spacer"></span>
-      ${canAdmin() ? `<tf-button variant="danger" icon="rotate" id="tb-dlq-retry-all" hidden>${escapeHtml(T('dlq_retry_all'))}</tf-button>` : ''}
-    </div>
-    <div class="tb-card">
-      <div class="tb-c-body" id="tb-dlq-body"></div>
-    </div>
-  `;
-}
-
-function wireDlqSkeleton(panel) {
-  const select = panel.querySelector('#tb-dlq-source');
-  select?.addEventListener('change', (e) => selectDlqSource(e.detail?.value || ''));
-  panel.querySelector('#tb-dlq-retry-all')?.addEventListener('click', () => confirmDlqRetryAll());
-}
-
-// Paints the `<tf-select>`'s options/display value only — no longer touches
-// `state.dlqSource` (R3-1's root cause: this used to pick the same default
-// as a PAINT-time side effect, which raced `setTab`'s "has a source been
-// selected yet?" guard and always won, so the guard's own selection —  the
-// only call site that actually loaded records — never ran). `select.value`
-// alone is allowed to preview `options[0]` before `state.dlqSource` is set
-// (purely cosmetic, the dropdown cannot be legitimately blank once options
-// exist) — `ensureDlqTabReady` below is what actually commits that choice.
-function paintDlqSourceOptions() {
-  const select = byId('tb-dlq-source');
-  if (!select) return;
-  const options = dlqSourceTopicOptions(state.topics);
-  select.setOptions(options, state.dlqSource || options[0]?.value || '');
-  // No topic, nothing to pick: the toolbar (and its card) goes away.
-  const toolbar = byId('tb-dlq-toolbar');
-  if (toolbar) toolbar.hidden = !(state.topicsLoaded && options.length > 0);
-}
-
-// "Ponów wszystkie" only when it has something to retry in the chosen topic.
-function paintDlqRetryAll() {
-  const btn = byId('tb-dlq-retry-all');
-  if (btn) btn.hidden = !(state.dlqSource && (state.dlqRecords || []).length > 0);
-}
-
-// R3-1: the only function that ACTS on `resolveDlqEntrySource`'s answer —
-// called from exactly two entry points (`setTab` on tab switch,
-// `loadTopics` for the "topics arrived after the tab was already open" race)
-// so there is no third path that can silently disagree with it. Idempotent:
-// re-entering the tab with an already-loaded source is a no-op.
-function ensureDlqTabReady() {
-  if (state.tab !== 'dlq' || state.view) return;
-  // The default choice needs both the topic list and the snapshot's counts;
-  // `loadTopics` and the first stats poll each call back in here.
-  if (!state.topicsLoaded || !state.stats) return;
-  paintDlqSourceOptions();
-  const next = resolveDlqEntrySource(state.dlqSource, state.topics, state.stats.topics);
-  if (next !== state.dlqSource) {
-    selectDlqSource(next);
-    return;
-  }
-  // With no source (no topics) the load settles on "nothing to show" at once.
-  if (state.dlqRecords == null && !state.dlqLoading) loadDlqRecords(true);
-}
-
-function selectDlqSource(topicName) {
-  state.dlqSource = topicName;
-  state.dlqRecords = null;
-  state.dlqPartitions = [];
-  paintDlqSourceOptions();
-  syncLocation();
-  loadDlqRecords(true);
-}
-
-async function loadDlqRecords(isFirstPage = true) {
-  if (!state.dlqSource) { state.dlqRecords = []; state.dlqPartitions = []; state.dlqError = null; paintDlqTable(); return; }
-  state.dlqLoading = isFirstPage;
-  if (isFirstPage) state.dlqError = null;
-  paintDlqTable();
-  const fromOffsets = isFirstPage ? undefined : buildFromOffsetsForNextPage(state.dlqPartitions);
+async function fetchUnprocessedTopic(topic, { more = false }) {
+  const instanceId = state.instanceId;
+  if (!instanceId) return;
+  const turn = (unprocessedTurns.get(topic) || 0) + 1;
+  unprocessedTurns.set(topic, turn);
+  const u = state.unprocessed;
+  const prev = u.byTopic.get(topic) || null;
+  const total = Number(findTopicStats(state.stats?.topics, topic)?.dlqDepth) || 0;
+  if (!more) u.asked.set(topic, total);
+  if (!prev && !more) u.byTopic.set(topic, null);
+  const fromOffsets = more && prev ? buildFromOffsetsForNextPage(prev.partitions) : [];
+  let entry;
   try {
     const resp = await ApiBinary.one('busDlqListRequest', {
-      instanceId: requireInstanceId(state.instanceId),
-      sourceTopic: state.dlqSource,
-      limit: 100,
-      fromOffsets: fromOffsets && fromOffsets.length ? fromOffsets : undefined,
+      instanceId: requireInstanceId(instanceId),
+      sourceTopic: topic,
+      limit: UNPROCESSED_PAGE,
+      newestFirst: true,
+      fromOffsets: fromOffsets.length ? fromOffsets : undefined,
     });
-    state.dlqRecords = isFirstPage ? (resp.records || []) : [...(state.dlqRecords || []), ...(resp.records || [])];
-    state.dlqHasMore = !!resp.hasMore;
-    state.dlqNextOffset = resp.nextOffset;
-    state.dlqPartitions = resp.partitions || [];
-    state.dlqError = null;
+    const records = (resp?.records || []).map((r) => unprocessedRecord(topic, r));
+    entry = { records: more && prev ? [...prev.records, ...records] : records, hasMore: Boolean(resp?.hasMore), partitions: resp?.partitions || [], error: null };
   } catch (err) {
-    // "DLQ never used yet" is expected for a healthy topic (D7's empty rows)
-    // — render an empty state instead of a scary toast for that one code.
-    if (busErrorCode(err?.message) === 'topic_not_found') {
-      state.dlqRecords = [];
-      state.dlqPartitions = [];
-      state.dlqError = null;
-    } else {
-      // R3-1: keep the FAILURE reason around (not just a toast, which the
-      // user can miss/dismiss) so `paintDlqTable` can render a real error
-      // state with a retry action instead of leaving `dlqRecords == null`
-      // indistinguishable from "still loading" / "never asked yet".
-      const message = mapBusErrorMessage(err?.message, T);
-      toast(message, 'error');
-      if (isFirstPage) { state.dlqRecords = null; state.dlqError = message; }
-    }
+    // A topic whose messages were all processed never needed the store.
+    entry = busErrorCode(err?.message) === 'topic_not_found'
+      ? { records: [], hasMore: false, partitions: [], error: null }
+      : { records: prev?.records || [], hasMore: Boolean(prev?.hasMore), partitions: prev?.partitions || [], error: describeBusError(err) };
   }
-  state.dlqLoading = false;
-  paintDlqTable();
+  if (state.instanceId !== instanceId || unprocessedTurns.get(topic) !== turn) return;
+  u.byTopic.set(topic, entry);
+  renderUnprocessedViews();
 }
 
-const DLQ_REASON_TONE = {
-  schema_violation: 'warn',
-  consumer_error: 'err',
-  consumer_timeout: 'warn',
-  permission_denied: 'err',
-  payload_too_large: 'warn',
-  blob_missing: 'info',
+/** What the reader may do with `topic`'s messages, from the topic's own answer. */
+async function loadUnprocessedAccess(topic) {
+  const instanceId = state.instanceId;
+  try {
+    const d = await ApiBinary.one('busTopicDetailRequest', { instanceId: requireInstanceId(instanceId), name: topic });
+    if (state.instanceId !== instanceId) return;
+    state.unprocessed.access.set(topic, {
+      canAdmin: d?.access?.canAdmin === true,
+      adminLabels: d?.adminLabels || [],
+      maxAttempts: Number(d?.topic?.maxDeliveryAttempts) || null,
+    });
+  } catch {
+    // Without the topic's answer the tile offers no change (fails closed).
+    return;
+  }
+  renderUnprocessedViews();
+}
+
+/**
+ * Loads what the open unprocessed view needs and is not up to date: on the
+ * tab every topic that has unprocessed messages, on a topic's page its own.
+ */
+function ensureUnprocessed() {
+  if (!state.instanceId || !state.stats) return;
+  const u = state.unprocessed;
+  const stale = (topic, total) => !u.byTopic.has(topic) || u.asked.get(topic) !== total;
+  if (state.view?.kind === 'topic-detail') {
+    if (currentSection() !== 'dlq') return;
+    const topic = state.view.name;
+    const total = Number(findTopicStats(state.stats.topics, topic)?.dlqDepth) || 0;
+    if (stale(topic, total)) loadUnprocessedTopic(topic);
+    return;
+  }
+  if (state.view || state.tab !== 'dlq') return;
+  for (const { topic, total } of unprocessedTopics(state.stats)) {
+    if (stale(topic, total)) loadUnprocessedTopic(topic);
+    if (!u.access.has(topic)) loadUnprocessedAccess(topic);
+  }
+}
+
+function renderUnprocessedViews() {
+  if ((!state.view && state.tab === 'dlq') || (state.view?.kind === 'topic-detail' && currentSection() === 'dlq')) renderPanel();
+}
+
+const unprocessedContext = {
+  view() {
+    const sh = state.shell;
+    return {
+      stats: state.stats,
+      byTopic: state.unprocessed.byTopic,
+      access: state.unprocessed.access,
+      shown: state.unprocessed.shown,
+      notice: state.unprocessed.notice,
+      error: sh.statsError,
+      errorKind: sh.statsError ? loadErrorKind(sh.statsError) : null,
+      instanceLabel: state.instanceLabel,
+      nowMs: Date.now(),
+    };
+  },
+  go(action) {
+    if (action.kind === 'topic') { setTab('topics'); openTopicDetail(action.topic, 'dlq'); }
+    else if (action.kind === 'retry-all') openUnprocessedRetryAll(action.topic, 'instance');
+    else if (action.kind === 'more') showMoreUnprocessed(null);
+    else if (action.kind === 'retry') { state.unprocessed.asked = new Map(); ensureUnprocessed(); }
+  },
 };
 
-function paintDlqTable() {
-  const host = byId('tb-dlq-body');
-  if (!host) return;
-  paintDlqRetryAll();
-  if (state.dlqLoading) {
-    host.innerHTML = `<div class="tb-state"><tf-spinner size="sm"></tf-spinner>${escapeHtml(T('loading'))}</div>`;
+/**
+ * "Wczytaj więcej" of the tab (`topic` = null) or of a topic's section: ten
+ * more rows, and the next page of a topic once its loaded rows run out.
+ */
+function showMoreUnprocessed(topic) {
+  const u = state.unprocessed;
+  if (topic) {
+    u.sectionShown += LIST_STEP;
+    const entry = u.byTopic.get(topic);
+    if (entry && entry.hasMore && entry.records.length < u.sectionShown) loadUnprocessedTopic(topic, { more: true });
+  } else {
+    u.shown += LIST_STEP;
+    const entries = unprocessedTopics(state.stats).map(({ topic: t }) => ({ topic: t, records: u.byTopic.get(t)?.records || [], hasMore: Boolean(u.byTopic.get(t)?.hasMore) }));
+    const { rows, pending } = mergeNewest(entries);
+    if (pending && rows.length < u.shown) loadUnprocessedTopic(pending, { more: true });
+  }
+  renderPanel();
+}
+
+/** Where a change to `topic`'s messages was made: the tab or the topic's own section. */
+function unprocessedSurface(topic) {
+  if (state.view?.kind === 'topic-detail' && state.view.name === topic) return 'topic';
+  return !state.view && state.tab === 'dlq' ? 'instance' : 'other';
+}
+
+// After a retry or discard: the note where it was made, and every counter
+// (the header card, the main tab, the section menu, the tiles) from a fresh
+// stats snapshot together with the topic's list asked again.
+async function afterUnprocessedChange(topic, surface, notice) {
+  const instanceId = state.instanceId;
+  const u = state.unprocessed;
+  const before = unprocessedTurns.get(topic) || 0;
+  // The fresh snapshot usually starts the topic's reload itself (its count
+  // moved); only a change the count does not show asks again here.
+  await refreshStats();
+  if (state.instanceId !== instanceId) return;
+  if ((unprocessedTurns.get(topic) || 0) > before) await unprocessedLoads.get(topic);
+  else await loadUnprocessedTopic(topic);
+  if (state.instanceId !== instanceId) return;
+  const here = unprocessedSurface(topic);
+  if (here === 'topic' && surface === 'topic') state.detailNotice = { section: 'dlq', ...notice };
+  else if (here === 'instance' && surface === 'instance') u.notice = notice;
+  else toast(notice.title, notice.tone === 'success' ? 'success' : 'warning');
+  renderPanel();
+}
+
+function unprocessedMaxAttempts(topic) {
+  if (state.view?.kind === 'topic-detail' && state.view.name === topic && state.detail?.topic) return Number(state.detail.topic.maxDeliveryAttempts) || null;
+  return state.unprocessed.access.get(topic)?.maxAttempts ?? null;
+}
+
+function unprocessedCanAdmin(topic) {
+  if (state.view?.kind === 'topic-detail' && state.view.name === topic) return state.detail?.access?.canAdmin === true;
+  return state.unprocessed.access.get(topic)?.canAdmin === true;
+}
+
+/** "Pokaż", "Ponów" or "Odrzuć" of one message of `topic` (`key` = its row). */
+function openUnprocessedWindow(kind, topic, key) {
+  const rec = (state.unprocessed.byTopic.get(topic)?.records || []).find((r) => r.key === key);
+  if (!rec) return;
+  const canAdmin = unprocessedCanAdmin(topic);
+  const instanceId = state.instanceId;
+  const surface = unprocessedSurface(topic);
+  const maxAttempts = unprocessedMaxAttempts(topic);
+  const nowMs = Date.now();
+  if (kind === 'view') {
+    openUnprocessedView({
+      rec,
+      maxAttempts,
+      nowMs,
+      onRetry: canAdmin && !rec.atWrite ? () => openUnprocessedWindow('retry', topic, key) : null,
+      onDiscard: canAdmin ? () => openUnprocessedWindow('discard', topic, key) : null,
+    });
     return;
   }
-  if (state.dlqRecords == null) {
-    // R3-1: this used to be `host.innerHTML = ''` — a silently blank card
-    // that gave no cue whether the tab was still loading, had failed, or was
-    // simply broken. Not loading + `dlqRecords == null` now means exactly one
-    // thing: the last first-page attempt failed (`loadDlqRecords` only ever
-    // leaves this combination behind on a non-"topic_not_found" error) — show
-    // the reason and a retry button rather than nothing. A transient instant
-    // before the first load even starts (state reset, load not yet kicked
-    // off) falls back to the same loading copy as the spinner branch above.
-    host.innerHTML = state.dlqError
-      ? `<div class="tb-state tb-state--error">
-           ${sprite('alert')}<span>${escapeHtml(state.dlqError)}</span>
-           <tf-button variant="secondary" size="sm" icon="rotate" id="tb-dlq-reload">${escapeHtml(T('dlq_load_error_retry'))}</tf-button>
-         </div>`
-      : `<div class="tb-state"><tf-spinner size="sm"></tf-spinner>${escapeHtml(T('loading'))}</div>`;
-    host.querySelector('#tb-dlq-reload')?.addEventListener('click', () => loadDlqRecords(true));
-    return;
+  if (!canAdmin) return;
+  const coords = { instanceId: requireInstanceId(instanceId), sourceTopic: topic, partition: rec.dlqPartition, offset: rec.dlqOffset };
+  const what = messageName(rec, nowMs);
+  if (kind === 'retry') {
+    const consumers = topicConsumers(state.stats, topic);
+    openRetryOne({
+      rec,
+      topic,
+      consumers,
+      maxAttempts,
+      nowMs,
+      retry: async () => Number((await ApiBinary.action('busDlqRetryRequest', coords))?.accepted),
+      describeError: describeBusError,
+      onDone: (accepted) => afterUnprocessedChange(topic, surface, accepted === 0
+        ? { tone: 'warning', title: T('unprocessed.retry.rejected_again_title'), text: T('unprocessed.retry.rejected_again_text', { what, topic }) }
+        : { tone: 'success', title: T('unprocessed.retry.done_title'), text: `${T('unprocessed.retry.done_text', { what, topic })} ${receiversText(consumers)}` }),
+    });
+  } else {
+    openDiscardOne({
+      rec,
+      topic,
+      discard: () => ApiBinary.action('busDlqDiscardRequest', coords),
+      describeError: describeBusError,
+      onDone: () => afterUnprocessedChange(topic, surface, { tone: 'success', title: T('unprocessed.discard.done_title'), text: T('unprocessed.discard.done_text', { what }) }),
+    });
   }
-  if (state.dlqRecords.length === 0) {
-    const empty = state.dlqSource ? T('dlq_empty_for_topic') : T('dlq_all_processed_sub');
-    host.innerHTML = `${state.dlqSource ? partitionSummaryHtml(state.dlqPartitions) : ''}
-      <tf-empty-state badge icon="inbox" title="${escapeAttr(T('dlq_all_processed_title'))}" message="${escapeAttr(empty)}"></tf-empty-state>`;
-    return;
-  }
-  const admin = canAdmin();
-  // One tf-table: on a phone it turns into cards, so every row's actions stay
-  // reachable; the error text and the attempts give way first.
-  const rows = state.dlqRecords.map((r, idx) => {
-    const reason = headerText(r.headers, 'dlq.reason') || 'unknown';
-    const errorMsg = headerText(r.headers, 'dlq.error_message') || '';
-    return {
-      when: msToDate(r.timestampMs),
-      source: T('dlq_source_cell', { partition: r.partition, number: fmtCount(r.offset) }),
-      reason: { status: DLQ_REASON_TONE[reason] || 'info', variant: 'outline', label: T(`dlq_reason_${reason}`) },
-      attempts: headerText(r.headers, 'dlq.attempts') || '—',
-      error: errorMsg,
-      _idx: idx,
-      _key: `${r.partition}:${r.offset}`,
-    };
-  });
-  host.innerHTML = `
-    ${admin ? '' : `<div class="tb-gap-note">${sprite('info')}${escapeHtml(T('dlq_admin_required'))}</div>`}
-    ${partitionSummaryHtml(state.dlqPartitions)}
-    <tf-table id="tb-dlq-table">
-      <tf-column key="when" label="${escapeAttr(T('dlq_col_timestamp'))}" nowrap></tf-column>
-      <tf-column key="source" label="${escapeAttr(T('dlq_col_source'))}" nowrap></tf-column>
-      <tf-column key="reason" label="${escapeAttr(T('dlq_col_reason'))}" renderer="chip"></tf-column>
-      <tf-column key="attempts" label="${escapeAttr(T('dlq_col_attempts'))}" hide-below="900"></tf-column>
-      <tf-column key="error" label="${escapeAttr(T('dlq_col_error'))}" hide-below="1200" fill></tf-column>
-    </tf-table>
-    <div id="tb-dlq-detail"></div>
-    ${state.dlqHasMore ? `<tf-button variant="secondary" id="tb-dlq-more" style="margin-top:10px">${escapeHtml(T('preview_load_more'))}</tf-button>` : ''}
-  `;
-  const table = host.querySelector('#tb-dlq-table');
-  table.rowActionsKey = (row) => `${row._key}:${row._idx}:${admin}`;
-  table.rowActions = (row) => {
-    const wrap = document.createElement('div');
-    wrap.className = 'tf-table__row-actions';
-    const button = (icon, label, act) => {
-      const btn = document.createElement('tf-button');
-      btn.setAttribute('variant', 'ghost');
-      btn.setAttribute('size', 'sm');
-      btn.setAttribute('icon', icon);
-      btn.dataset.act = act;
-      btn.textContent = label;
-      btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        const record = state.dlqRecords[row._idx];
-        if (act === 'view') toggleDlqDetail(host, row._idx);
-        else if (act === 'retry') dlqRetry(record);
-        else confirmDlqDiscard(record);
+}
+
+/** "Ponów wszystkie" of one topic, from its tile (`instance`) or its section (`topic`). */
+function openUnprocessedRetryAll(topic, from) {
+  if (!unprocessedCanAdmin(topic)) return;
+  const entry = state.unprocessed.byTopic.get(topic);
+  if (!entry) return;
+  const instanceId = state.instanceId;
+  const total = Number(findTopicStats(state.stats?.topics, topic)?.dlqDepth) || 0;
+  const plan = retryAllPlan({ total, records: entry.records, hasMore: entry.hasMore });
+  if (plan.retryable === 0) return;
+  const consumers = topicConsumers(state.stats, topic);
+  openRetryAll({
+    topic,
+    plan,
+    consumers,
+    maxAttempts: unprocessedMaxAttempts(topic),
+    retryAll: () => ApiBinary.action('busDlqRetryAllRequest', { instanceId: requireInstanceId(instanceId), sourceTopic: topic, maxRecords: plan.batch }, { timeoutMs: RETRY_ALL_TIMEOUT_MS }),
+    describeError: describeBusError,
+    onDone: (resp) => {
+      const retried = Number(resp?.retried) || 0;
+      const failed = Number(resp?.failed) || 0;
+      const text = [
+        retried > 0 ? T('unprocessed.retry_all.done_text', { topic, n: retried }) : T('unprocessed.retry_all.done_none_text'),
+        retried > 0 ? receiversText(consumers, retried !== 1) : '',
+        failed > 0 ? T('unprocessed.retry_all.done_failed', { count: fmtCount(failed), n: failed }) : '',
+      ].filter(Boolean).join(' ');
+      afterUnprocessedChange(topic, from, {
+        tone: failed > 0 || retried === 0 ? 'warning' : 'success',
+        title: retried > 0 ? T('unprocessed.retry_all.done_title', { count: fmtCount(retried), n: retried }) : T('unprocessed.retry_all.done_none_title'),
+        text,
       });
-      wrap.appendChild(btn);
-    };
-    button('eye', T('preview_action_view'), 'view');
-    if (admin) {
-      button('rotate', T('dlq_action_retry'), 'retry');
-      button('close', T('dlq_action_discard'), 'discard');
-    }
-    return wrap;
-  };
-  table.rows = rows;
-  host.querySelector('#tb-dlq-more')?.addEventListener('click', () => loadDlqRecords(false));
-}
-
-// "Szczegóły" of one message: its envelope headers and the start of its
-// payload, under the table (a second click on the same row closes it).
-function toggleDlqDetail(host, idx) {
-  const panel = host.querySelector('#tb-dlq-detail');
-  if (!panel) return;
-  if (panel.dataset.idx === String(idx)) {
-    panel.dataset.idx = '';
-    panel.innerHTML = '';
-    return;
-  }
-  const record = state.dlqRecords[idx];
-  const allHeaders = (record.headers || [])
-    .map((h) => [h.key, formatHeaderValue(h.key, bytesToPreviewText(h.value, 512))]);
-  panel.dataset.idx = String(idx);
-  panel.innerHTML = `
-    <div class="tb-dlq-detail">
-      <div>
-        <strong>${escapeHtml(T('dlq_source_cell', { partition: record.partition, number: fmtCount(record.offset) }))}</strong>
-        <dl class="tb-header-list">
-          ${allHeaders.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('')}
-        </dl>
-      </div>
-      <div>
-        <strong>${escapeHtml(T('preview_payload_title'))}</strong>
-        <div class="tb-payload-preview">${record.isBlobRef ? escapeHtml(T('preview_blobref_hint')) : escapeHtml(bytesToPreviewText(record.payloadPreview))}</div>
-      </div>
-    </div>
-  `;
-}
-
-async function dlqRetry(record) {
-  try {
-    await ApiBinary.action('busDlqRetryRequest', { instanceId: requireInstanceId(state.instanceId), sourceTopic: state.dlqSource, partition: record.partition, offset: record.offset });
-    toast(T('dlq_retry_done'), 'success');
-    await loadDlqRecords();
-  } catch (err) {
-    toast(mapBusErrorMessage(err?.message, T), 'error');
-  }
-}
-
-// N-5 (KRYTYK-M1-R2.md): the confirm/toast text used to claim a permanent
-// tombstone delete ("trwale odrzucony (tombstone)" / "Usunięto.") that
-// `bus::dlq_discard` never performed — it only recorded an audit-level
-// acknowledgment while the record stayed fully readable. The backend fix
-// (POSTEP.md's "Decyzje koordynatora po krytyku R2" #2) makes discard real
-// but non-destructive: a durable (org, dlq-topic, partition, offset) marker
-// that `DlqList`/retry-all/`dlq_depth` all skip, while the record's bytes
-// stay in the log until retention expiry. `confirmLabel` uses the same
-// "Odrzuć"/"Discard" label as the row action instead of the generic
-// delete label, since this is not a delete.
-async function confirmDlqDiscard(record) {
-  const ok = await confirmDialog({
-    title: T('dlq_discard_confirm_title'),
-    lead: T('dlq_discard_confirm_body'),
-    confirmLabel: T('dlq_action_discard'),
-    cancelLabel: T('common_cancel'),
-    variant: 'danger',
+    },
   });
-  if (!ok) return;
-  try {
-    await ApiBinary.action('busDlqDiscardRequest', { instanceId: requireInstanceId(state.instanceId), sourceTopic: state.dlqSource, partition: record.partition, offset: record.offset });
-    toast(T('dlq_discard_done'), 'success');
-    await loadDlqRecords();
-  } catch (err) {
-    toast(mapBusErrorMessage(err?.message, T), 'error');
-  }
-}
-
-async function confirmDlqRetryAll() {
-  if (!state.dlqSource) return;
-  const ok = await confirmDialog({
-    title: T('dlq_retry_all_confirm_title'),
-    lead: T('dlq_retry_all_confirm_body', { topic: state.dlqSource, max: DLQ_RETRY_ALL_MAX }),
-    confirmLabel: T('dlq_retry_all'),
-    cancelLabel: T('common_cancel'),
-    variant: 'primary',
-  });
-  if (!ok) return;
-  try {
-    const resp = await ApiBinary.action('busDlqRetryAllRequest', { instanceId: requireInstanceId(state.instanceId), sourceTopic: state.dlqSource, maxRecords: clampDlqRetryAllMax(DLQ_RETRY_ALL_MAX) });
-    toast(T('dlq_retry_all_result', { retried: resp.retried, failed: resp.failed }), 'success');
-    await loadDlqRecords();
-  } catch (err) {
-    toast(mapBusErrorMessage(err?.message, T), 'error');
-  }
 }
 
 export default TentaBusScreen;

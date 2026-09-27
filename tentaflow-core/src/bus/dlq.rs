@@ -605,6 +605,58 @@ impl DiscardStore {
     }
 }
 
+/// DLQ records a `dlq_retry` is republishing (or a `dlq_discard` is
+/// marking) right now. The durable
+/// "handled" marker is written only AFTER the republish succeeded (a crash
+/// in between leaves the record listed, never lost), so without this set
+/// two retries of one record racing each other — a double click, "Ponów"
+/// beside "Ponów wszystkie", two admins — would both pass the marker check
+/// and republish it twice.
+#[derive(Default)]
+pub struct RetryClaims {
+    in_flight: parking_lot::Mutex<std::collections::HashSet<(String, String, u32, u64)>>,
+}
+
+/// Holds one record's claim; dropping it releases the claim.
+pub struct RetryClaim<'a> {
+    claims: &'a RetryClaims,
+    key: (String, String, u32, u64),
+}
+
+impl RetryClaims {
+    /// Claims `(org, dlq_topic, partition, offset)`, or `None` when another
+    /// retry of the same record holds it.
+    pub fn claim(
+        &self,
+        org_id: &str,
+        dlq_topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Option<RetryClaim<'_>> {
+        let key = (org_id.to_string(), dlq_topic.to_string(), partition, offset);
+        if !self.in_flight.lock().insert(key.clone()) {
+            return None;
+        }
+        Some(RetryClaim { claims: self, key })
+    }
+}
+
+impl Drop for RetryClaim<'_> {
+    fn drop(&mut self) {
+        self.claims.in_flight.lock().remove(&self.key);
+    }
+}
+
+/// Whether a DLQ record was rejected when it was written (a schema
+/// violation of a `validation = dlq` topic, `build_publish_violation_record`)
+/// rather than given up on by a consumer. Republishing such a record runs
+/// the same validation again, so "Ponów wszystkie" leaves it where it is.
+pub fn rejected_at_write(headers: &[(Bytes, Bytes)]) -> bool {
+    headers
+        .iter()
+        .any(|(k, _)| k.as_ref() == b"dlq.rejected_at_ms")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

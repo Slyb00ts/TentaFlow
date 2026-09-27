@@ -32,6 +32,7 @@ import { valueRow, settingsCard } from '/js/modules/tentabus/topic-settings.js';
 import { commitModeLabel, commitModeHint } from '/js/modules/tentabus/consumers.js';
 import { partitionPlace, lastRead, lastMessage } from '/js/modules/tentabus/offset-move.js';
 import { headerText } from '/js/modules/tentabus/payload.js';
+import { UNPROCESSED_PAGE } from '/js/modules/tentabus/unprocessed.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-button.js';
@@ -47,8 +48,6 @@ const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}
 
 const SECTION_ICONS = { state: 'gauge', position: 'history', settings: 'settings' };
 const HOUR_MS = 3_600_000;
-/** The unprocessed-message page the page reads (`DlqListRequest.limit`, the server's ceiling). */
-export const DLQ_PAGE = 100;
 
 /**
  * The consumer's own unprocessed messages among the newest page of its
@@ -269,7 +268,7 @@ function tiles(host, k, nowMs) {
   let dlqDelta = '';
   if (k.dlq) {
     dlqDelta = T('detail.state.kpi_dlq_hour', { count: fmtCount(k.dlq.lastHour), n: k.dlq.lastHour });
-    if (k.dlq.partial) dlqDelta = `${dlqDelta} · ${T('consumer.kpi_dlq_partial', { count: fmtCount(DLQ_PAGE) })}`;
+    if (k.dlq.partial) dlqDelta = `${dlqDelta} · ${T('consumer.kpi_dlq_partial', { count: fmtCount(UNPROCESSED_PAGE) })}`;
   } else dlqDelta = T('consumer.kpi_dlq_unknown');
   paintStatCards(host, [
     {

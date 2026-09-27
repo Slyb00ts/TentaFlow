@@ -277,6 +277,9 @@ pub trait LeaderHandle: Send + Sync {
     /// K-M2-5: records a consumer group's offset commit for `ReplOffsets`
     /// coalescing.
     fn note_offset_commit(&self, group: &str, partition: u32, offset: u64, attempts: u32);
+    /// A DLQ record of this partition's `__dlq.<topic>` was retried or
+    /// discarded, for `ReplOffsets` coalescing next to the commits.
+    fn note_offset_discarded(&self, offset: u64);
     /// K-M2-1: truncates `node`'s tail down to `to_offset` (a replica ahead
     /// of the new leader's own `leo` — see `election.rs`'s header).
     fn send_truncate(&self, node: &str, to_offset: u64);
@@ -3374,6 +3377,15 @@ impl ReplicationCoordinator for ReplicationManager {
         }
     }
 
+    fn note_dlq_handled(&self, org: &str, source_topic: &str, dlq_partition: u32, offset: u64) {
+        let key: PartitionKey = (org.to_string(), source_topic.to_string(), dlq_partition);
+        if let Some(entry) = self.registry.get(&key) {
+            if let Some(leader) = entry.leader.as_ref() {
+                leader.note_offset_discarded(offset);
+            }
+        }
+    }
+
     fn evict_node_from_replica_sets(
         &self,
         node_id: &str,
@@ -4079,6 +4091,8 @@ mod tests {
         hw: AtomicU64,
         leo: AtomicU64,
         truncated: Mutex<Vec<(String, u64)>>,
+        /// DLQ offsets handed to `note_offset_discarded`.
+        discarded: Mutex<Vec<u64>>,
         stopped: AtomicBool,
         stale_epoch: AtomicU32,
         /// How long `await_acks` blocks before answering — stands in for a
@@ -4114,6 +4128,7 @@ mod tests {
                 hw: AtomicU64::new(hw),
                 leo: AtomicU64::new(leo),
                 truncated: Mutex::new(Vec::new()),
+                discarded: Mutex::new(Vec::new()),
                 stopped: AtomicBool::new(false),
                 stale_epoch: AtomicU32::new(0),
                 ack_hold: Mutex::new(Duration::ZERO),
@@ -4179,6 +4194,9 @@ mod tests {
             }
         }
         fn note_offset_commit(&self, _group: &str, _partition: u32, _offset: u64, _attempts: u32) {}
+        fn note_offset_discarded(&self, offset: u64) {
+            self.discarded.lock().push(offset);
+        }
         fn send_truncate(&self, node: &str, to_offset: u64) {
             self.truncated.lock().push((node.to_string(), to_offset));
         }
@@ -4268,6 +4286,9 @@ mod tests {
         fn note_offset_commit(&self, group: &str, partition: u32, offset: u64, attempts: u32) {
             self.0
                 .note_offset_commit(group, partition, offset, attempts)
+        }
+        fn note_offset_discarded(&self, offset: u64) {
+            self.0.note_offset_discarded(offset)
         }
         fn send_truncate(&self, node: &str, to_offset: u64) {
             self.0.send_truncate(node, to_offset)
@@ -4785,6 +4806,26 @@ mod tests {
             vec![("f2".to_string(), 5)],
             "the derived truncate target must reach the handle that owns f2's stream"
         );
+    }
+
+    /// A DLQ record retried or discarded on the node leading the source
+    /// topic's partition of the same number reaches that partition's leader
+    /// handle, whose `ReplOffsets` stream carries it to the followers; a
+    /// partition this node does not lead has no stream to carry it.
+    #[tokio::test]
+    async fn a_handled_dlq_record_reaches_the_leader_handle_of_the_source_partition() {
+        let fx = build("l");
+        let led = assignment("org", "orders", 0, "l", &["l", "f1"], &["l", "f1"], 3);
+        fx.assignments.seed(led.clone());
+        fx.manager.apply_assignment(led).await;
+
+        fx.manager.note_dlq_handled("org", "orders", 0, 7);
+        fx.manager.note_dlq_handled("org", "orders", 1, 8);
+        fx.manager.note_dlq_handled("org", "other", 0, 9);
+
+        let handles = fx.leader_factory.handles.lock();
+        let handle = handles.last().expect("leading the partition spawns its handle");
+        assert_eq!(*handle.discarded.lock(), vec![7]);
     }
 
     // ---- no majority: abandon, then retryable -----------------------------

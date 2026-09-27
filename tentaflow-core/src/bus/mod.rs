@@ -837,6 +837,16 @@ pub enum BusServiceError {
     /// enforced.
     #[error("'{topic}' is already a DLQ topic; a DLQ-of-a-DLQ is not allowed")]
     DlqOfDlqNotAllowed { topic: String },
+    /// `dlq_retry`/`dlq_discard` of a DLQ record that was already retried
+    /// or discarded, or that a retry is republishing right now. Refused
+    /// instead of acted on again: every republish is a new message that
+    /// every consumer of the source topic receives.
+    #[error("DLQ record {partition}/{offset} of '{topic}' was already retried or discarded")]
+    DlqRecordHandled {
+        topic: String,
+        partition: u32,
+        offset: u64,
+    },
     /// `tentaflow_bus::BusError::PartitionPoisoned`: a group-commit fsync
     /// failed after that group had already rolled to a new segment, so the
     /// partition's writer thread refuses every further append until the
@@ -1839,6 +1849,13 @@ pub trait ReplicationCoordinator: Send + Sync {
         offset: u64,
         attempts: u32,
     );
+    /// Records that the DLQ record at `(dlq_partition, offset)` of
+    /// `__dlq.<source_topic>` was retried or discarded, so the followers
+    /// stop listing it too. It rides the `ReplOffsets` stream of the SOURCE
+    /// topic's partition with the same number (the follower applies it to
+    /// `__dlq.<source_topic>`), and only a node leading that partition has
+    /// a stream to send it on.
+    fn note_dlq_handled(&self, org: &str, source_topic: &str, dlq_partition: u32, offset: u64);
     /// Removes `node_id` from every replica set it belongs to (PLAN §4.4:
     /// environment-change fencing) — returns the number of assignments
     /// touched.
@@ -2236,6 +2253,8 @@ pub struct BusService {
     /// Durable set of DLQ records marked "handled" via `dlq_discard` — see
     /// `dlq::DiscardStore`'s doc (M1-R2 review N-5, coordinator decision 2).
     discarded: Arc<dlq::DiscardStore>,
+    /// DLQ records a retry or a discard is acting on right now.
+    dlq_retrying: dlq::RetryClaims,
     partitions: DashMap<PartitionKey, tentaflow_bus::Partition>,
     /// Serializes every read-check-purge-write of a topic's incarnation
     /// marker with `delete_topic`'s own purge: two partitions of one
@@ -2795,6 +2814,7 @@ impl BusService {
             offsets,
             producer_seq,
             discarded,
+            dlq_retrying: dlq::RetryClaims::default(),
             partitions: DashMap::new(),
             topic_incarnation_lock: parking_lot::Mutex::new(()),
             topic_incarnations: DashMap::new(),
@@ -6697,7 +6717,16 @@ impl BusService {
                 field_policies::ActorKind::from_origin(&ctx.origin),
                 field_policies::Direction::Read,
             )? {
-                let format = payload_format::PayloadFormat::from_content_type(&cfg.content_type);
+                // A DLQ topic is created without its source's content type
+                // (`dlq_topic_options`), and its policy IS the source's
+                // (`field_policies::resolve`): the payload is read in the
+                // source's format, or an HL7 or XML record would be parsed as
+                // JSON and come back empty.
+                let content_type = match topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX) {
+                    Some(source) => self.topic_config(&ctx.org_id, source)?.content_type,
+                    None => cfg.content_type.clone(),
+                };
+                let format = payload_format::PayloadFormat::from_content_type(&content_type);
                 for rec in &mut records {
                     rec.payload = field_policies::project_read(&policy, format, &rec.payload);
                 }
@@ -6965,8 +6994,22 @@ impl BusService {
     }
 
     /// Republishes a DLQ record to its source topic with `dlq.retry_of` set
-    /// (PLAN §3.3 "Ponów"), attempts reset by virtue of being a normal
-    /// fresh publish.
+    /// (PLAN §3.3 "Ponów") and marks the DLQ record handled.
+    ///
+    /// What the republish is: a NEW record appended at the end of the
+    /// source topic (a new offset, after everything written since; the
+    /// same partition only when the record has a key), so EVERY consumer
+    /// group of the topic receives it — also the ones that processed the
+    /// original — and a consumer that fails it again counts its attempts
+    /// from zero. A record rejected at write time goes through the topic's
+    /// validation again and, still invalid, lands in the DLQ again as a new
+    /// record (`PublishResult` then accepts nothing).
+    ///
+    /// The DLQ record is marked handled (the same durable marker as
+    /// `dlq_discard`) only AFTER the republish succeeded, so a failed
+    /// republish leaves it listed; a record already handled, or one another
+    /// retry is republishing right now, is refused with `DlqRecordHandled`
+    /// instead of republished a second time.
     pub fn dlq_retry(
         &self,
         ctx: &BusCallContext,
@@ -6984,6 +7027,21 @@ impl BusService {
             .ok_or_else(|| {
                 BusServiceError::InvalidArgument(format!("'{dlq_topic}' is not a DLQ topic"))
             })?;
+        let handled = || BusServiceError::DlqRecordHandled {
+            topic: dlq_topic.to_string(),
+            partition: dlq_partition,
+            offset: dlq_offset,
+        };
+        let _claim = self
+            .dlq_retrying
+            .claim(&ctx.org_id, dlq_topic, dlq_partition, dlq_offset)
+            .ok_or_else(handled)?;
+        if self
+            .discarded
+            .is_discarded(&ctx.org_id, dlq_topic, dlq_partition, dlq_offset)?
+        {
+            return Err(handled());
+        }
         let dlq_cfg = self.topic_config(&ctx.org_id, dlq_topic)?;
         let part = self.partition_handle(&ctx.org_id, dlq_topic, dlq_partition, &dlq_cfg)?;
         let reader = part.open_reader();
@@ -7015,6 +7073,7 @@ impl BusService {
                 records: vec![retry_record],
             },
         )?;
+        self.mark_dlq_handled(ctx, source_topic, dlq_topic, dlq_partition, dlq_offset)?;
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.actor.as_deref(),
@@ -7023,7 +7082,9 @@ impl BusService {
             Some(source_topic),
             Some(&audit_details(
                 &ctx.org_id,
-                Some(&format!("dlq_topic={dlq_topic} dlq_offset={dlq_offset}")),
+                Some(&format!(
+                    "dlq_topic={dlq_topic} dlq_partition={dlq_partition} dlq_offset={dlq_offset}"
+                )),
             )),
             None,
             None,
@@ -7039,18 +7100,11 @@ impl BusService {
     /// compaction engine's job), and the record's bytes remain physically
     /// present in the DLQ topic's log until normal retention (default 30
     /// days, `dlq_topic_options`) removes the whole segment holding them.
-    /// What changed since the version of this doc the R2 review quoted:
-    /// discarding now writes a durable marker (`dlq::DiscardStore`) that
-    /// every caller-facing DLQ surface honors — `dlq_list`'s dispatch-layer
-    /// wrapper and `peek` filter a discarded offset out of what it returns,
-    /// `dlq_retry_all` skips it, and `dlq_depth` (the `StatsSnapshot` KPI)
-    /// no longer counts it. A discarded record can still be resurrected by
-    /// calling `dlq_retry` on its EXACT `(dlq_topic, partition, offset)`
-    /// directly (an explicit, single-record admin action naming the record
-    /// by coordinates is not the accidental "Ponów wszystkie brought back a
-    /// record I just discarded" failure mode the review reported) — a UI
-    /// surfacing this action again for an already-discarded row should make
-    /// that explicit.
+    /// Discarding writes a durable marker (`dlq::DiscardStore`) that every
+    /// caller-facing DLQ surface honors — `dlq_list`'s dispatch-layer
+    /// wrapper filters a discarded offset out of what it returns,
+    /// `dlq_retry_all` and `dlq_retry` skip it, and `dlq_depth` (the
+    /// `StatsSnapshot` KPI) no longer counts it.
     pub fn dlq_discard(
         &self,
         ctx: &BusCallContext,
@@ -7063,8 +7117,30 @@ impl BusService {
         self.authorizer
             .authorize(ctx, BusAction::Admin, dlq_topic)
             .map_err(|_| deny(BusAction::Admin, dlq_topic))?;
-        self.discarded
-            .mark(&ctx.org_id, dlq_topic, partition, offset, now_ms())?;
+        let source_topic = dlq_topic
+            .strip_prefix(dlq::DLQ_TOPIC_PREFIX)
+            .ok_or_else(|| {
+                BusServiceError::InvalidArgument(format!("'{dlq_topic}' is not a DLQ topic"))
+            })?;
+        // Refused like a second retry: a record already retried or discarded
+        // — or being republished right now — is not discarded (and audited)
+        // a second time.
+        let handled = || BusServiceError::DlqRecordHandled {
+            topic: dlq_topic.to_string(),
+            partition,
+            offset,
+        };
+        let _claim = self
+            .dlq_retrying
+            .claim(&ctx.org_id, dlq_topic, partition, offset)
+            .ok_or_else(handled)?;
+        if self
+            .discarded
+            .is_discarded(&ctx.org_id, dlq_topic, partition, offset)?
+        {
+            return Err(handled());
+        }
+        self.mark_dlq_handled(ctx, source_topic, dlq_topic, partition, offset)?;
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.actor.as_deref(),
@@ -7078,6 +7154,24 @@ impl BusService {
             None,
             None,
         );
+        Ok(())
+    }
+
+    /// Writes the durable "handled" marker of one DLQ record and hands it to
+    /// replication, so the followers stop listing it too.
+    fn mark_dlq_handled(
+        &self,
+        ctx: &BusCallContext,
+        source_topic: &str,
+        dlq_topic: &str,
+        partition: u32,
+        offset: u64,
+    ) -> Result<(), BusServiceError> {
+        self.discarded
+            .mark(&ctx.org_id, dlq_topic, partition, offset, now_ms())?;
+        if let Some(coordinator) = self.replication() {
+            coordinator.note_dlq_handled(&ctx.org_id, source_topic, partition, offset);
+        }
         Ok(())
     }
 
@@ -11059,6 +11153,159 @@ mod tests {
         );
     }
 
+    /// Sends `payloads` of `topic` (one partition, one delivery attempt) to
+    /// its DLQ through the real failure path; DLQ offsets 0..n follow.
+    fn fail_to_dlq(svc: &BusService, ctx: &BusCallContext, topic: &str, payloads: &[&str]) {
+        for (i, payload) in payloads.iter().enumerate() {
+            svc.publish(
+                ctx,
+                topic,
+                PublishBatch {
+                    partition: Some(0),
+                    producer: None,
+                    records: vec![record(payload)],
+                },
+            )
+            .unwrap();
+            let fetched = FetchedRecordMeta {
+                topic: topic.to_string(),
+                partition: 0,
+                offset: i as u64,
+                timestamp_ms: now_ms(),
+                key: None,
+                headers: vec![],
+                payload: Bytes::from(payload.to_string()),
+                schema_id: 0,
+            };
+            svc.note_delivery_failure(
+                ctx,
+                "g",
+                topic,
+                0,
+                i as u64,
+                &fetched,
+                dlq::DlqReason::ConsumerError,
+                "err",
+            )
+            .unwrap();
+        }
+    }
+
+    /// A retried or discarded DLQ record is marked handled on this node AND
+    /// handed to replication with the source topic's partition, whose
+    /// `ReplOffsets` stream carries it to the followers; retrying a handled
+    /// record again is refused instead of republishing it a second time.
+    #[test]
+    fn dlq_retry_and_discard_mark_the_record_handled_and_hand_it_to_replication() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.retry-handled";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fail_to_dlq(&svc, &ctx, topic, &["a", "b"]);
+        let dlq_topic = dlq::dlq_topic_name(topic);
+
+        let coord = FakeCoordinator::leader(1);
+        svc.set_replication(coord.clone());
+        open_leader_writes(&svc, &ctx, topic, 0);
+
+        svc.dlq_discard(&ctx, &dlq_topic, 0, 0).unwrap();
+        svc.dlq_retry(&ctx, &dlq_topic, 0, 1).unwrap();
+        assert_eq!(
+            *coord.note_dlq_handled_calls.lock(),
+            vec![
+                ("org-1".to_string(), topic.to_string(), 0, 0),
+                ("org-1".to_string(), topic.to_string(), 0, 1),
+            ]
+        );
+        assert_eq!(
+            svc.dlq_discarded_offsets(&ctx, &dlq_topic, 0).unwrap(),
+            [0u64, 1].into_iter().collect::<std::collections::HashSet<u64>>()
+        );
+
+        for offset in [0, 1] {
+            assert!(
+                matches!(
+                    svc.dlq_retry(&ctx, &dlq_topic, 0, offset),
+                    Err(BusServiceError::DlqRecordHandled { .. })
+                ),
+                "a handled record ({offset}) is not republished again"
+            );
+            assert!(
+                matches!(
+                    svc.dlq_discard(&ctx, &dlq_topic, 0, offset),
+                    Err(BusServiceError::DlqRecordHandled { .. })
+                ),
+                "a handled record ({offset}) is not discarded again"
+            );
+        }
+        assert_eq!(
+            coord.note_dlq_handled_calls.lock().len(),
+            2,
+            "a refused change replicates nothing"
+        );
+        assert_eq!(
+            svc.partition_stats(&ctx, topic, 0).unwrap().high_watermark,
+            3,
+            "the two originals and exactly one republish"
+        );
+    }
+
+    /// A DLQ record of an HL7 topic is read in HL7 with the source topic's
+    /// field policy (`FP-reserved-bypass`): the DLQ topic itself carries no
+    /// content type, and reading its HL7 as JSON returned an empty payload.
+    #[test]
+    fn a_dlq_record_is_read_in_its_source_topics_format() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.hl7-dlq";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                content_type: Some("application/hl7-v2".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        field_policies::set_policy(
+            &svc.db,
+            svc.instance_id(),
+            "org-1",
+            topic,
+            "any",
+            field_policies::SUBJECT_ANY,
+            field_policies::Direction::Read,
+            &set_field_set(&["MSH-9", "PID-3"]),
+            &set_field_set(&[]),
+        )
+        .unwrap();
+        fail_to_dlq(
+            &svc,
+            &ctx,
+            topic,
+            &["MSH|^~\\&|LIS|LAB|HIS|H|20260923||ORU^R01|M1|P|2.5\rPID|1||80010112345||Kowalski^Jan"],
+        );
+
+        let peeked = svc
+            .peek(&ctx, &dlq::dlq_topic_name(topic), 0, 0, 10, PEEK_MAX_BYTES)
+            .unwrap();
+        let text = String::from_utf8(peeked.records[0].payload.to_vec()).unwrap();
+        assert!(text.contains("80010112345"), "an allowed field stays: {text:?}");
+        assert!(text.contains("ORU^R01"), "an allowed MSH field stays: {text:?}");
+        assert!(!text.contains("Kowalski"), "a hidden field stays hidden: {text:?}");
+    }
+
     // ---- Real discard (M1-R2 review N-5, coordinator decision 2) ------
 
     /// The discard marker `dlq_discard` writes must be durable — surviving
@@ -14872,6 +15119,7 @@ mod tests {
         await_outcome: parking_lot::Mutex<AckOutcome>,
         #[allow(clippy::type_complexity)]
         note_offset_commit_calls: parking_lot::Mutex<Vec<(String, String, String, u32, u64, u32)>>,
+        note_dlq_handled_calls: parking_lot::Mutex<Vec<(String, String, u32, u64)>>,
         snapshot: parking_lot::Mutex<ReplicationSnapshot>,
         reassign_calls: parking_lot::Mutex<Vec<(String, String, Option<u32>)>>,
         local_node_id: parking_lot::Mutex<String>,
@@ -14891,6 +15139,7 @@ mod tests {
                     hw: 0,
                 }),
                 note_offset_commit_calls: parking_lot::Mutex::new(Vec::new()),
+                note_dlq_handled_calls: parking_lot::Mutex::new(Vec::new()),
                 snapshot: parking_lot::Mutex::new(ReplicationSnapshot::default()),
                 reassign_calls: parking_lot::Mutex::new(Vec::new()),
                 local_node_id: parking_lot::Mutex::new(String::new()),
@@ -14978,6 +15227,14 @@ mod tests {
                 partition,
                 offset,
                 attempts,
+            ));
+        }
+        fn note_dlq_handled(&self, org: &str, source_topic: &str, dlq_partition: u32, offset: u64) {
+            self.note_dlq_handled_calls.lock().push((
+                org.to_string(),
+                source_topic.to_string(),
+                dlq_partition,
+                offset,
             ));
         }
         fn evict_node_from_replica_sets(

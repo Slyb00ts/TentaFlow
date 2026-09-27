@@ -857,6 +857,8 @@ const VISITS_RECORDS: usize = 600;
 const INVOICES_RECORDS: usize = 400;
 /// Unprocessed messages of `wyniki-badan`, all failed within the last hour.
 const RESULTS_UNPROCESSED: u64 = 14;
+/// Visits `rejestracja-online` gives up on (a third is rejected at write).
+const VISITS_UNPROCESSED: usize = 2;
 /// Minutes of rising lag history written for the lagging consumer.
 const RISING_MINUTES: i64 = 25;
 
@@ -1079,7 +1081,9 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
         );
     }
 
-    // ---- wizyty: JSON bound to the pattern, a consumer slightly behind ------
+    // ---- wizyty: JSON checked against the pattern, a consumer slightly
+    // behind; one visit the pattern rejected at write and two the consumer
+    // gave up on are unprocessed ------------------------------------------
     if ensure_topic(
         svc,
         db,
@@ -1089,17 +1093,59 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
             partitions: Some(3),
             content_type: Some("application/json".to_string()),
             schema_id: Some(VISIT_SCHEMA.to_string()),
+            validation: Some(topics::ValidationMode::Dlq),
             ..Default::default()
         },
     ) {
         publish_generated(svc, ctx, VISITS_TOPIC, VISITS_RECORDS, true, visit_json);
-        consume_fraction(
+        svc.publish(
+            ctx,
+            VISITS_TOPIC,
+            PublishBatch {
+                partition: None,
+                producer: None,
+                records: vec![PublishRecord {
+                    key: Some(Bytes::from_static(b"P-0999")),
+                    headers: seed_headers(),
+                    payload: Bytes::from_static(
+                        br#"{"termin":"2026-09-28T14:30:00","lekarz":"L-03"}"#,
+                    ),
+                    timestamp_ms: now_ms(),
+                    schema_id: 0,
+                }],
+            },
+        )
+        .expect("publish a visit the pattern rejects");
+        let cfg = topics::get_topic(db, svc.instance_id(), &ctx.org_id, VISITS_TOPIC)
+            .expect("get_topic")
+            .expect("wizyty exists");
+        let (records, committed) = consume_fraction(
             ctx,
             REGISTRATION_GROUP,
             VISITS_TOPIC,
             groups::CommitMode::AutoAfterSuccess,
             0.9,
         );
+        let (&partition, recs) = records
+            .iter()
+            .find(|(p, recs)| committed[p] as usize + VISITS_UNPROCESSED <= recs.len())
+            .expect("a partition of wizyty with visits left to fail");
+        let first = committed[&partition];
+        for offset in first..first + VISITS_UNPROCESSED as u64 {
+            for _ in 0..cfg.max_delivery_attempts {
+                svc.note_delivery_failure(
+                    ctx,
+                    REGISTRATION_GROUP,
+                    VISITS_TOPIC,
+                    partition,
+                    offset,
+                    &recs[offset as usize],
+                    dlq::DlqReason::ConsumerError,
+                    "system rejestracji odrzucił wizytę: termin jest już zajęty",
+                )
+                .expect("note_delivery_failure");
+            }
+        }
     }
 
     // ---- faktury: XML, the billing system paused with everything waiting ----

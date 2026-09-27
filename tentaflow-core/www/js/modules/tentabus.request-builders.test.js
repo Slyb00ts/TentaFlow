@@ -2,7 +2,8 @@
 // File: modules/tentabus.request-builders.test.js
 // Description: Unit tests for tentabus.js's pure helpers — request builders
 //       (replica list, leader transfer, the per-partition
-//       `buildFromOffsetsForNextPage` cursor), the stats join
+//       `buildFromOffsetsForNextPage` cursor of the unprocessed-message
+//       pages), the stats join
 //       (`findTopicStats`) and the server-error-code mapper
 //       (`busErrorCode`/`mapBusErrorMessage`).
 //       tentabus.js imports DOM-only custom-element modules at load time
@@ -69,20 +70,13 @@ function cutConst(src, name) {
   return src.slice(start, semi + 1);
 }
 
-const CONSTS = ['DLQ_RETRY_ALL_MAX', 'NO_CAPABILITIES'];
+const CONSTS = ['NO_CAPABILITIES'];
 
 const NAMES = [
   'requireInstanceId',
-  'clampInt', 'clampDlqRetryAllMax',
-  'dlqSourceTopicOptions',
   'busErrorCode', 'mapBusErrorMessage', 'findTopicStats', 'buildFromOffsetsForNextPage',
   'unwrapCapabilities',
   'isInternalGroupId',
-  // task 4 (P3-14, DLQ header date formatting):
-  'formatHeaderValue', 'msToDate',
-  // R3-1 (KRYTYK-M1-R3.md, P1: DLQ tab empty on entry) — the single, pure
-  // state-transition helper `ensureDlqTabReady` acts on:
-  'resolveDlqEntrySource',
   // Replication request builders and the `not_leader` hint extractor.
   'buildReplicaListRequest', 'buildLeaderTransferRequest',
   'extractNotLeaderHint',
@@ -114,25 +108,6 @@ test('requireInstanceId throws for a missing/empty/non-string instance id', () =
 });
 
 // ---------------------------------------------------------------------------
-// clampInt / clampReplicationFactor / clampDlqRetryAllMax
-// ---------------------------------------------------------------------------
-
-test('clampInt clamps within [min,max] and falls back on non-finite input', () => {
-  assert.equal(helpers.clampInt(5, 1, 10, 0), 5);
-  assert.equal(helpers.clampInt(-3, 1, 10, 0), 1);
-  assert.equal(helpers.clampInt(99, 1, 10, 0), 10);
-  assert.equal(helpers.clampInt('abc', 1, 10, 7), 7);
-  assert.equal(helpers.clampInt(3.9, 1, 10, 0), 3, 'truncates toward zero, does not round');
-});
-
-test('clampDlqRetryAllMax stays within the server-enforced [1,500] bound', () => {
-  assert.equal(helpers.clampDlqRetryAllMax(0), 1);
-  assert.equal(helpers.clampDlqRetryAllMax(500), 500);
-  assert.equal(helpers.clampDlqRetryAllMax(10000), 500);
-  assert.equal(helpers.clampDlqRetryAllMax(undefined), 100);
-});
-
-// ---------------------------------------------------------------------------
 // The broker's internal `tf-*` consumer groups, left out again client-side
 // on top of the server hiding them.
 // ---------------------------------------------------------------------------
@@ -143,24 +118,6 @@ test('isInternalGroupId recognizes the tf-* prefix used by internal probes', () 
   assert.equal(helpers.isInternalGroupId('notifier'), false);
   assert.equal(helpers.isInternalGroupId(''), false);
   assert.equal(helpers.isInternalGroupId(null), false);
-});
-
-// ---------------------------------------------------------------------------
-// formatHeaderValue (P3-14) — DLQ record detail's `dlq.*_at_ms` headers
-// render as a formatted date instead of a raw epoch, exactly like every
-// other millisecond timestamp `msToDate` already formats elsewhere.
-// ---------------------------------------------------------------------------
-
-test('formatHeaderValue formats a numeric "_at_ms"-suffixed header as a date', () => {
-  const formatted = helpers.formatHeaderValue('dlq.first_failed_at_ms', '1787862468957');
-  assert.equal(formatted, helpers.msToDate(1787862468957));
-  assert.notEqual(formatted, '1787862468957');
-});
-
-test('formatHeaderValue leaves non-"_at_ms" and non-numeric values untouched', () => {
-  assert.equal(helpers.formatHeaderValue('dlq.reason', 'schema_violation'), 'schema_violation');
-  assert.equal(helpers.formatHeaderValue('dlq.first_failed_at_ms', 'not-a-number'), 'not-a-number');
-  assert.equal(helpers.formatHeaderValue(null, '123'), '123');
 });
 
 // ---------------------------------------------------------------------------
@@ -180,7 +137,8 @@ test('findTopicStats returns null when the topic is not (yet) in the snapshot', 
 });
 
 // ---------------------------------------------------------------------------
-// buildFromOffsetsForNextPage — M08/M05 per-partition paging cursor.
+// buildFromOffsetsForNextPage — the per-partition cursor of the next page of
+// a topic's unprocessed messages.
 // ---------------------------------------------------------------------------
 
 test('buildFromOffsetsForNextPage carries forward only partitions that reported hasMore', () => {
@@ -203,8 +161,8 @@ test('buildFromOffsetsForNextPage returns an empty array once every partition is
 // capabilities: { canRead, canWrite, canAdmin, isSiteAdmin } }`. Reading
 // that object flat (the P1-1 bug) always yields `undefined` for every
 // field, so `canAdmin()`/`isSiteAdmin()` fail closed for EVERY session
-// including a site admin, hiding "Nowy topik"/edit/delete/pause-resume/DLQ
-// retry-discard/offset-reset everywhere at once.
+// including a site admin, hiding "Nowy topik"/edit/delete/moving leadership
+// everywhere at once.
 // ---------------------------------------------------------------------------
 
 test('unwrapCapabilities unwraps the real BusCapabilitiesResponse envelope shape', () => {
@@ -229,54 +187,6 @@ test('unwrapCapabilities fails closed to NO_CAPABILITIES for null/undefined/garb
   assert.deepEqual(helpers.unwrapCapabilities(undefined), helpers.NO_CAPABILITIES);
   assert.deepEqual(helpers.unwrapCapabilities({}), helpers.NO_CAPABILITIES);
   assert.deepEqual(helpers.unwrapCapabilities({ variant: 'BusCapabilitiesResponse' }), helpers.NO_CAPABILITIES);
-});
-
-// ---------------------------------------------------------------------------
-// Lag math
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// DLQ source options / byte preview / headers / BlobRef detection
-// ---------------------------------------------------------------------------
-
-test('dlqSourceTopicOptions excludes __dlq.* topics (isDlq=true)', () => {
-  const opts = helpers.dlqSourceTopicOptions([
-    { name: 'lab.wyniki.scchs', isDlq: false },
-    { name: '__dlq.lab.wyniki.scchs', isDlq: true },
-  ]);
-  assert.deepEqual(opts, [{ value: 'lab.wyniki.scchs', label: 'lab.wyniki.scchs' }]);
-});
-
-// ---------------------------------------------------------------------------
-// resolveDlqEntrySource (R3-1, KRYTYK-M1-R3.md's P1 blocker) — the state
-// transition `ensureDlqTabReady` is built around. This is a pure function on
-// purpose: the bug it fixes was a PAINT-time side effect
-// (`paintDlqSourceOptions` used to also assign `state.dlqSource`) racing a
-// guard that only checked whether `state.dlqSource` was already truthy —
-// the side effect always won, so the guard's own `selectDlqSource` call
-// (the only place that triggered `loadDlqRecords`) never ran and the DLQ
-// tab stayed on `dlqRecords === null` forever. A helper with no side effects
-// cannot have that race: callers decide what to DO with its answer.
-// ---------------------------------------------------------------------------
-
-test('resolveDlqEntrySource picks the first non-DLQ topic when nothing is selected yet', () => {
-  const topics = [
-    { name: '__dlq.lab.results', isDlq: true },
-    { name: 'lab.results', isDlq: false },
-    { name: 'orders.created', isDlq: false },
-  ];
-  assert.equal(helpers.resolveDlqEntrySource('', topics), 'lab.results');
-  assert.equal(helpers.resolveDlqEntrySource(null, topics), 'lab.results');
-});
-
-test('resolveDlqEntrySource keeps an already-selected source untouched', () => {
-  const topics = [{ name: 'lab.results', isDlq: false }, { name: 'orders.created', isDlq: false }];
-  assert.equal(helpers.resolveDlqEntrySource('orders.created', topics), 'orders.created');
-});
-
-test('resolveDlqEntrySource degrades to "" when no source topic exists yet (topics still loading, or an org with only DLQ topics)', () => {
-  assert.equal(helpers.resolveDlqEntrySource('', []), '');
-  assert.equal(helpers.resolveDlqEntrySource('', [{ name: '__dlq.x', isDlq: true }]), '');
 });
 
 // ---------------------------------------------------------------------------
@@ -338,8 +248,8 @@ const ERROR_CODES = [
   'payload_too_large', 'dedup_key_required', 'producer_fenced', 'environment_mismatch',
   'invalid_argument', 'invalid_field', 'not_subscribed', 'offset_regression',
   'offset_out_of_range', 'offset_reset_mode_unsupported', 'group_paused',
-  'dlq_of_dlq_not_allowed', 'partition_poisoned', 'partial_publish', 'blocking_task_failed',
-  'max_groups_exceeded',
+  'dlq_of_dlq_not_allowed', 'dlq_record_handled', 'partition_poisoned', 'partial_publish',
+  'blocking_task_failed', 'max_groups_exceeded',
 ];
 
 for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
@@ -350,21 +260,6 @@ for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], [
       assert.notEqual(mapped, `tentabus.errors.${code}`, `${locName} is missing errors.${code}`);
       assert.ok(mapped.length > 0);
     }
-  });
-}
-
-// R3-1's DLQ-load error state (`dlq_load_error_retry`) in every locale, plus
-// R3-5's confirm body still carrying both placeholders after its wording was
-// extended to mention that discarded records are skipped.
-for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {
-  test(`tentabus.${locName}.json has a non-empty dlq_load_error_retry`, () => {
-    assert.ok(dict.tentabus.dlq_load_error_retry?.length > 0, `${locName} is missing dlq_load_error_retry`);
-  });
-
-  test(`tentabus.${locName}.json's dlq_retry_all_confirm_body keeps both {max}/{topic} placeholders`, () => {
-    const body = dict.tentabus.dlq_retry_all_confirm_body;
-    assert.ok(body.includes('{max}'), `${locName} dlq_retry_all_confirm_body lost {max}`);
-    assert.ok(body.includes('{topic}'), `${locName} dlq_retry_all_confirm_body lost {topic}`);
   });
 }
 

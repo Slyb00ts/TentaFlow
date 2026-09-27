@@ -93,9 +93,10 @@ test('the page: back link, title with what the topic carries, the vertical menu 
   assert.equal(body.querySelector('[data-role="desc"]').textContent, 'HL7 v2 · bez wzoru');
   const menu = body.querySelector('[data-role="menu"]');
   assert.equal(menu.getAttribute('orientation'), 'vertical');
-  assert.deepEqual([...menu.querySelectorAll('tf-tab')].map((t) => t.id), ['state', 'settings', 'partitions']);
+  assert.deepEqual([...menu.querySelectorAll('tf-tab')].map((t) => t.id), ['state', 'settings', 'dlq', 'partitions']);
   assert.equal(menu.querySelector('tf-tab#partitions').getAttribute('count'), '2');
-  assert.deepEqual([...body.querySelectorAll('[data-section]')].map((s) => [s.dataset.section, s.hidden]), [['state', false], ['settings', true], ['partitions', true]]);
+  assert.equal(menu.querySelector('tf-tab#dlq').getAttribute('count'), '14', 'the unprocessed count of the stats snapshot');
+  assert.deepEqual([...body.querySelectorAll('[data-section]')].map((s) => [s.dataset.section, s.hidden]), [['state', false], ['settings', true], ['dlq', true], ['partitions', true]]);
   body.querySelector('[data-go="back"]').click();
   assert.deepEqual(moves, [{ kind: 'back' }]);
 });
@@ -121,7 +122,18 @@ test('moving between sections goes through the shell; the phone list offers the 
   body.querySelector('[data-role="menu"] tf-tab#settings > button').click();
   assert.deepEqual(moves.at(-1), { kind: 'section', section: 'settings' });
   const pick = body.querySelector('[data-role="pick"]');
-  assert.deepEqual([...pick.querySelectorAll('select option')].map((o) => o.textContent), ['Stan', 'Ustawienia', 'Partycje i kopie']);
+  assert.deepEqual([...pick.querySelectorAll('select option')].map((o) => o.textContent), ['Stan', 'Ustawienia', 'Nieprzetworzone', 'Partycje i kopie']);
+});
+
+test('Nieprzetworzone is a section of the page; Stan\'s "Zobacz i ponów" leads to it', () => {
+  const { body, moves } = mount();
+  body.querySelector('[data-section="state"] .tb-alert [data-go="dlq"]').click();
+  assert.deepEqual(moves.at(-1), { kind: 'dlq' });
+  const { body: dlq } = mount({ section: 'dlq' });
+  const host = dlq.querySelector('[data-section="dlq"]');
+  assert.equal(host.hidden, false);
+  assert.match(host.querySelector('.section-card-head').textContent, /Nieprzetworzone wiadomości/);
+  assert.ok(host.querySelector('tf-spinner'), 'the list loads when the section opens');
 });
 
 test('without read access: only Ustawienia, the preview closed with its reason, who can change the topic', () => {
@@ -129,6 +141,8 @@ test('without read access: only Ustawienia, the preview closed with its reason, 
   const menu = body.querySelector('[data-role="menu"]');
   assert.ok(menu.querySelector('tf-tab#state').hasAttribute('disabled'));
   assert.ok(menu.querySelector('tf-tab#partitions').hasAttribute('disabled'));
+  assert.ok(menu.querySelector('tf-tab#dlq').hasAttribute('disabled'));
+  assert.equal(menu.querySelector('tf-tab#dlq').getAttribute('count'), null, 'no count the reader may not read');
   assert.equal(menu.getAttribute('value'), 'settings');
   assert.ok(body.querySelector('[data-role="preview"]').hasAttribute('disabled'));
   assert.match(body.querySelector('[data-role="preview-note"]').textContent, /prawa czytania topiku wyniki-badan/);

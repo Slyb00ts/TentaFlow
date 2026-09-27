@@ -15,43 +15,43 @@ test('the six main tabs, overview first and default', () => {
 });
 
 test('parse: defaults, known tabs, unknown tabs', () => {
-  assert.deepEqual(parseRoute({ instance: 'tentabus-1a2b3c4d' }), { instance: 'tentabus-1a2b3c4d', tab: 'overview', topic: null, section: null, group: null, groupTopic: null, dlqTopic: null });
+  assert.deepEqual(parseRoute({ instance: 'tentabus-1a2b3c4d' }), { instance: 'tentabus-1a2b3c4d', tab: 'overview', topic: null, section: null, group: null, groupTopic: null });
   assert.equal(parseRoute({ tab: 'schemas' }).tab, 'schemas');
   assert.equal(parseRoute({ tab: 'nonsense' }).tab, 'overview');
   assert.equal(parseRoute({}).instance, null);
 });
 
 test('parse: a topic forces Topiki, a consumer forces Odbiorcy', () => {
-  assert.deepEqual(parseRoute({ tab: 'dlq', topic: 'wizyty' }), { instance: null, tab: 'topics', topic: 'wizyty', section: 'state', group: null, groupTopic: null, dlqTopic: null });
-  assert.deepEqual(parseRoute({ group: 'app', gtopic: 'wizyty' }), { instance: null, tab: 'groups', topic: null, section: 'state', group: 'app', groupTopic: 'wizyty', dlqTopic: null });
+  assert.deepEqual(parseRoute({ tab: 'dlq', topic: 'wizyty' }), { instance: null, tab: 'topics', topic: 'wizyty', section: 'state', group: null, groupTopic: null });
+  assert.deepEqual(parseRoute({ group: 'app', gtopic: 'wizyty' }), { instance: null, tab: 'groups', topic: null, section: 'state', group: 'app', groupTopic: 'wizyty' });
 });
 
-test('the unprocessed-messages source travels only with its tab', () => {
-  assert.equal(parseRoute({ tab: 'dlq', source: 'wizyty' }).dlqTopic, 'wizyty');
-  assert.equal(parseRoute({ tab: 'groups', source: 'wizyty' }).dlqTopic, null);
-  assert.deepEqual(routeParams({ instance: 'i', tab: 'topics', dlqTopic: 'wizyty' }), { instance: 'i', tab: 'topics' });
+test('the unprocessed messages of a topic are its own section, not a source of the instance tab', () => {
+  assert.deepEqual(routeParams({ instance: 'i', tab: 'dlq' }), { instance: 'i', tab: 'dlq' });
+  assert.deepEqual(parseRoute({ instance: 'i', tab: 'dlq', source: 'wizyty' }), { instance: 'i', tab: 'dlq', topic: null, section: null, group: null, groupTopic: null });
+  assert.deepEqual(routeParams({ instance: 'i', topic: 'wizyty', section: 'dlq' }), { instance: 'i', tab: 'topics', topic: 'wizyty', section: 'dlq' });
 });
 
 test('build: short addresses, and every view survives a round trip', () => {
   assert.deepEqual(routeParams({ instance: 'i', tab: 'overview' }), { instance: 'i' });
   assert.deepEqual(routeParams({ instance: 'i', tab: 'replication' }), { instance: 'i', tab: 'replication' });
   for (const view of [
-    { instance: 'i', tab: 'dlq', topic: null, section: null, group: null, groupTopic: null, dlqTopic: null },
-    { instance: 'i', tab: 'dlq', topic: null, section: null, group: null, groupTopic: null, dlqTopic: 'wyniki-badan' },
-    { instance: 'i', tab: 'topics', topic: 'wyniki-badan', section: 'state', group: null, groupTopic: null, dlqTopic: null },
-    { instance: 'i', tab: 'topics', topic: 'wyniki-badan', section: 'settings', group: null, groupTopic: null, dlqTopic: null },
-    { instance: 'i', tab: 'topics', topic: 'wyniki-badan', section: 'partitions', group: null, groupTopic: null, dlqTopic: null },
-    { instance: 'i', tab: 'groups', topic: null, section: 'state', group: 'system-rozliczen', groupTopic: 'faktury', dlqTopic: null },
-    { instance: 'i', tab: 'groups', topic: null, section: 'position', group: 'system-rozliczen', groupTopic: 'faktury', dlqTopic: null },
-    { instance: 'i', tab: 'groups', topic: null, section: 'settings', group: 'system-rozliczen', groupTopic: 'faktury', dlqTopic: null },
-    { instance: 'i', tab: 'overview', topic: null, section: null, group: null, groupTopic: null, dlqTopic: null },
+    { instance: 'i', tab: 'dlq', topic: null, section: null, group: null, groupTopic: null },
+    { instance: 'i', tab: 'topics', topic: 'wyniki-badan', section: 'state', group: null, groupTopic: null },
+    { instance: 'i', tab: 'topics', topic: 'wyniki-badan', section: 'settings', group: null, groupTopic: null },
+    { instance: 'i', tab: 'topics', topic: 'wyniki-badan', section: 'dlq', group: null, groupTopic: null },
+    { instance: 'i', tab: 'topics', topic: 'wyniki-badan', section: 'partitions', group: null, groupTopic: null },
+    { instance: 'i', tab: 'groups', topic: null, section: 'state', group: 'system-rozliczen', groupTopic: 'faktury' },
+    { instance: 'i', tab: 'groups', topic: null, section: 'position', group: 'system-rozliczen', groupTopic: 'faktury' },
+    { instance: 'i', tab: 'groups', topic: null, section: 'settings', group: 'system-rozliczen', groupTopic: 'faktury' },
+    { instance: 'i', tab: 'overview', topic: null, section: null, group: null, groupTopic: null },
   ]) {
     assert.deepEqual(parseRoute(routeParams(view)), view);
   }
 });
 
 test('a topic opens on its first section; the section stays out of the address until it is another', () => {
-  assert.deepEqual(TOPIC_SECTIONS, ['state', 'settings', 'partitions']);
+  assert.deepEqual(TOPIC_SECTIONS, ['state', 'settings', 'dlq', 'partitions']);
   assert.equal(DEFAULT_SECTION, 'state');
   assert.equal(parseRoute({ topic: 'faktury', section: 'nonsense' }).section, 'state');
   assert.equal(parseRoute({ tab: 'overview', section: 'settings' }).section, null, 'a section without a topic means nothing');

@@ -4,9 +4,10 @@
 // topiki", the topic's name with what it carries and checks, "Podgląd
 // wiadomości" on the right, then a vertical section menu (tf-tabs
 // orientation="vertical"; a "Sekcja: …" list on a phone) beside exactly one
-// section: Stan, Ustawienia, Partycje i kopie. Sections are read views; every
-// change goes through a window (topic-settings.js, partitions.js) and comes
-// back as a "Zapisano …" note over the section it changed.
+// section: Stan, Ustawienia, Nieprzetworzone, Partycje i kopie. Sections are
+// read views; every change goes through a window (topic-settings.js,
+// unprocessed-windows.js, partitions.js) and comes back as a note over the
+// section it changed.
 //
 // Rights come from `TopicDetailResponse.access`: without administration the
 // page shows no change buttons and says who can change the topic
@@ -25,6 +26,7 @@ import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
 import { paintStateSection } from '/js/modules/tentabus/topic-state.js';
 import { settingsHtml, whoCanChange } from '/js/modules/tentabus/topic-settings.js';
 import { partitionRows, transferBlocker, copyChipHtml, rangeText, unavailableText } from '/js/modules/tentabus/partitions.js';
+import { paintUnprocessedSection } from '/js/modules/tentabus/unprocessed.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-button.js';
@@ -35,9 +37,9 @@ import '/js/components/tf-spinner.js';
 
 const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}"/></svg>`;
 
-const SECTION_ICONS = { state: 'gauge', settings: 'settings', partitions: 'layers' };
+const SECTION_ICONS = { state: 'gauge', settings: 'settings', dlq: 'inbox', partitions: 'layers' };
 /** Sections that show messages or their numbers: closed to a reader without read access. */
-const READ_SECTIONS = new Set(['state', 'partitions']);
+const READ_SECTIONS = new Set(['state', 'dlq', 'partitions']);
 
 /**
  * Loads a topic's page data so that only the newest answer lands: a poll
@@ -123,10 +125,13 @@ function missingHtml(name) {
 /**
  * Draws or repaints the page from `ctx.view()` = `{ name, detail, error,
  * errorKind, section, stats, subjects, capabilities, nodes, replicaTopics,
- * replicaLags, lagSeries, notice, justMoved, instanceLabel, nowMs }`.
+ * replicaLags, lagSeries, notice, justMoved, unprocessed, unprocessedShown,
+ * instanceLabel, nowMs }`.
  * `ctx.go(action)`: `{ kind: 'back' | 'preview' | 'delete' | 'retry' }`,
  * `{ kind: 'section', section }`, `{ kind: 'change', card }`,
- * `{ kind: 'group', group }`, `{ kind: 'dlq' }`, `{ kind: 'transfer', partition }`.
+ * `{ kind: 'group', group }`, `{ kind: 'dlq' }`, `{ kind: 'transfer', partition }`,
+ * and the unprocessed section's `{ kind: 'unp-view' | 'unp-retry' |
+ * 'unp-discard', key }`, `{ kind: 'unp-retry-all' | 'unp-more' | 'unp-reload' }`.
  */
 export function drawTopicDetail(body, ctx) {
   const view = ctx.view();
@@ -188,10 +193,12 @@ function paintPage(body, view, ctx) {
   setText(note, access.canRead ? '' : T('detail.preview_no_read', { name: topic.name }));
 
   const menu = body.querySelector('[data-role="menu"]');
+  const unprocessed = Number((view.stats?.topics || []).find((t) => t.topic === topic.name)?.dlqDepth) || 0;
+  const counts = { partitions: fmtCount(topic.partitions), dlq: access.canRead && unprocessed > 0 ? fmtCount(unprocessed) : null };
   for (const s of TOPIC_SECTIONS) {
     const tab = menu.querySelector(`tf-tab#${s}`);
     setAttr(tab, 'disabled', !sectionOpen(s, access));
-    setAttr(tab, 'count', s === 'partitions' ? fmtCount(topic.partitions) : null);
+    setAttr(tab, 'count', counts[s] ?? null);
   }
   if (menu.getAttribute('value') !== section) menu.value = section;
   const pick = body.querySelector('[data-role="pick"]');
@@ -216,9 +223,11 @@ function paintPage(body, view, ctx) {
     access,
     adminLabels: detail.adminLabels || [],
     notice: view.notice?.section === section ? view.notice : null,
+    shown: view.unprocessedShown,
   };
   if (section === 'state') paintStateSection(host, sectionView);
   else if (section === 'settings') patchHtml(host, settingsHtml(sectionView));
+  else if (section === 'dlq') paintUnprocessedSection(host, sectionView, ctx);
   else paintPartitionsSection(host, sectionView, ctx);
 }
 

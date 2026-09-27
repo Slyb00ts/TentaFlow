@@ -389,6 +389,14 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         BusServiceError::DlqOfDlqNotAllowed { topic } => {
             ProtocolError::bad_request(format!("bus.dlq_of_dlq_not_allowed: '{topic}'"))
         }
+        BusServiceError::DlqRecordHandled {
+            topic,
+            partition,
+            offset,
+        } => ProtocolError::new(
+            ProtocolErrorCode::Conflict,
+            format!("bus.dlq_record_handled: '{topic}' {partition}/{offset}"),
+        ),
         BusServiceError::PartitionPoisoned { topic, partition } => ProtocolError::internal(
             format!("bus.partition_poisoned: '{topic}'/{partition}"),
         ),
@@ -990,16 +998,21 @@ fn peek_topic(
 }
 
 /// `DlqListRequest { newest_first: true }`: pages a DLQ BACKWARDS, newest
-/// arrival first. `ends` holds each partition's EXCLUSIVE upper bound (a
-/// partition absent from it starts at its high watermark). Every partition
-/// contributes its newest `limit` records below its bound; those per-
-/// partition lists (offset-descending) are merged by always taking the head
-/// with the latest `dlq::arrival_ms`, and the merge stops at `limit`. Taking
-/// only heads means what a partition contributed is always a contiguous
-/// run just below its bound, so its `next_offset` (the lowest offset taken,
-/// or the unchanged bound) is the exact bound of the next page: no record is
-/// skipped or repeated across pages even when two partitions' arrival clocks
-/// interleave. The top-level `next_offset` is the lowest per-partition one.
+/// arrival first, over the records still waiting — a record retried or
+/// discarded (`dlq_discarded_offsets`) is skipped, so a page is never short
+/// or empty only because the newest records were already handled. `ends`
+/// holds each partition's EXCLUSIVE upper bound (a partition absent from
+/// it starts at its high watermark). Every partition contributes its newest
+/// `limit` waiting records below its bound; those per-partition lists
+/// (offset-descending) are merged by always taking the head with the latest
+/// `dlq::arrival_ms`, and the merge stops at `limit`. Taking only heads
+/// means what a partition contributed is always the run of waiting records
+/// just below its bound, so its `next_offset` (the lowest offset taken, or
+/// the unchanged bound) is the exact bound of the next page: no record is
+/// skipped or repeated across pages even when two partitions' arrival
+/// clocks interleave. `has_more` says whether a waiting record is left
+/// below that bound. The top-level `next_offset` is the lowest
+/// per-partition one.
 fn peek_dlq_newest_first(
     bctx: &BusCallContext,
     dlq_topic: &str,
@@ -1028,6 +1041,7 @@ fn peek_dlq_newest_first(
         earliest: u64,
         high_watermark: u64,
         end: u64,
+        handled: std::collections::HashSet<u64>,
         /// Offset-descending.
         records: std::collections::VecDeque<bus::FetchedRecordMeta>,
         taken_low: Option<u64>,
@@ -1037,18 +1051,31 @@ fn peek_dlq_newest_first(
         let stats = svc
             .partition_stats(bctx, dlq_topic, partition)
             .map_err(map_bus_error)?;
+        let handled = svc
+            .dlq_discarded_offsets(bctx, dlq_topic, partition)
+            .map_err(map_bus_error)?;
         let end = ends
             .get(&partition)
             .copied()
             .unwrap_or(stats.high_watermark)
             .min(stats.high_watermark);
-        let start = end.saturating_sub(limit as u64).max(stats.earliest_offset);
+        // The lowest offset of the `limit` newest waiting records below
+        // `end`, found from the handled set alone — no record is read to
+        // step over the handled ones.
+        let mut start = end;
+        let mut waiting = 0usize;
+        while start > stats.earliest_offset && waiting < limit {
+            start -= 1;
+            if !handled.contains(&start) {
+                waiting += 1;
+            }
+        }
         // `peek` stops at its byte budget, which would drop the NEWEST end
         // of the window — keep reading up to `end` so the page is always
         // the run directly below the bound.
         let mut in_window: Vec<bus::FetchedRecordMeta> = Vec::new();
         let mut cursor = start;
-        while cursor < end {
+        while waiting > 0 && cursor < end {
             let peeked = svc
                 .peek(
                     bctx,
@@ -1062,7 +1089,12 @@ fn peek_dlq_newest_first(
             let Some(highest) = peeked.records.iter().map(|r| r.offset).max() else {
                 break;
             };
-            in_window.extend(peeked.records.into_iter().filter(|r| r.offset < end));
+            in_window.extend(
+                peeked
+                    .records
+                    .into_iter()
+                    .filter(|r| r.offset < end && !handled.contains(&r.offset)),
+            );
             cursor = highest + 1;
         }
         in_window.sort_by(|a, b| b.offset.cmp(&a.offset));
@@ -1072,6 +1104,7 @@ fn peek_dlq_newest_first(
             earliest: stats.earliest_offset,
             high_watermark: stats.high_watermark,
             end,
+            handled,
             records,
             taken_low: None,
         });
@@ -1097,7 +1130,12 @@ fn peek_dlq_newest_first(
     let mut lowest_next = u64::MAX;
     for w in &windows {
         let next_offset = w.taken_low.unwrap_or(w.end);
-        let has_more = next_offset > w.earliest;
+        let handled_below = w
+            .handled
+            .iter()
+            .filter(|&&o| o >= w.earliest && o < next_offset)
+            .count() as u64;
+        let has_more = next_offset.saturating_sub(w.earliest) > handled_below;
         any_has_more |= has_more;
         lowest_next = lowest_next.min(next_offset);
         partitions_wire.push(BusBrowsePartitionInfoWire {
@@ -2383,7 +2421,18 @@ async fn dlq_retry_all_v1(
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
     let dlq_topic = dlq::dlq_topic_name(&source_topic);
-    let max_records = max_records.clamp(1, DLQ_RETRY_ALL_MAX);
+    let max_records = max_records.clamp(1, DLQ_RETRY_ALL_MAX) as usize;
+
+    // Every single retry below needs administration of the topic; asked
+    // once here, so a caller without it is refused instead of answered
+    // "0 retried, N failed".
+    let (_, _, topic_admin) = g.svc.topic_access(&bctx, &dlq_topic);
+    if !topic_admin {
+        return Err(map_bus_error(BusServiceError::PermissionDenied {
+            action: bus::BusAction::Admin.as_str(),
+            topic: dlq_topic,
+        }));
+    }
 
     let dlq_topic_for_cfg = dlq_topic.clone();
     let partitions = run_blocking(move || {
@@ -2400,26 +2449,8 @@ async fn dlq_retry_all_v1(
 
     let bctx2 = bctx.clone();
     let dlq_topic2 = dlq_topic.clone();
-    let dlq_topic2b = dlq_topic.clone();
-    let empty_starts = std::collections::HashMap::new();
-    // M1-R2 review N-5, coordinator decision 2: a discarded record must
-    // never come back via "Ponów wszystkie" (the exact failure mode the
-    // review reproduced — a record "discarded" minutes earlier reappeared
-    // in the source topic through this exact call). Filtered out of the
-    // page BEFORE any retry runs, same helper `DlqList` uses. This can
-    // retry fewer than `max_records` non-discarded records in one call if
-    // the page itself contained discarded ones — the same "one page, not a
-    // guaranteed exact-N batch" shape `peek`-based paging already has.
     let records = run_blocking(move || {
-        let (records, _, _, _) = peek_topic(
-            &bctx2,
-            &dlq_topic2,
-            partitions,
-            &empty_starts,
-            max_records,
-            None,
-        )?;
-        filter_out_discarded(&bctx2, &dlq_topic2b, records)
+        retryable_dlq_records(&bctx2, &dlq_topic2, partitions, max_records)
     })
     .await?;
 
@@ -2428,17 +2459,91 @@ async fn dlq_retry_all_v1(
         let bctx3 = bctx.clone();
         let dlq_topic3 = dlq_topic.clone();
         let svc = g.svc.clone();
-        let outcome = run_blocking(move || {
-            svc.dlq_retry(&bctx3, &dlq_topic3, rv.partition, rv.offset)
-                .map_err(map_bus_error)
-        })
-        .await;
+        let outcome =
+            run_blocking(move || Ok(svc.dlq_retry(&bctx3, &dlq_topic3, rv.partition, rv.offset)))
+                .await?;
         match outcome {
             Ok(_) => retried += 1,
+            // Retried or discarded by someone else since it was read: not
+            // this call's failure, and never republished twice.
+            Err(BusServiceError::DlqRecordHandled { .. }) => {}
             Err(_) => failed += 1,
         }
     }
     Ok(BusPayload::DlqRetryAllResponse { retried, failed })
+}
+
+/// The oldest `max_records` records of `dlq_topic` "Ponów wszystkie" acts
+/// on, partition by partition: waiting ones only (a retried or discarded
+/// record is never republished again — M1-R2 review N-5), and never one
+/// rejected at write time (`dlq::rejected_at_write`), which the topic's
+/// validation would only send back as a new record. Reads on past pages
+/// made only of such records, so a batch is never short because the oldest
+/// records were already handled; the handled ones at the head of a
+/// partition are stepped over from the handled set alone, without reading
+/// them.
+fn retryable_dlq_records(
+    bctx: &BusCallContext,
+    dlq_topic: &str,
+    partitions: u32,
+    max_records: usize,
+) -> Result<Vec<bus::FetchedRecordMeta>, ProtocolError> {
+    let svc = instance_service(&bctx.instance_id)?;
+    let mut handled = std::collections::HashMap::new();
+    let mut starts = std::collections::HashMap::new();
+    let mut ends = std::collections::HashMap::new();
+    for partition in 0..partitions {
+        let stats = svc
+            .partition_stats(bctx, dlq_topic, partition)
+            .map_err(map_bus_error)?;
+        let set = svc
+            .dlq_discarded_offsets(bctx, dlq_topic, partition)
+            .map_err(map_bus_error)?;
+        let mut first = stats.earliest_offset;
+        while first < stats.high_watermark && set.contains(&first) {
+            first += 1;
+        }
+        starts.insert(partition, first);
+        ends.insert(partition, stats.high_watermark);
+        handled.insert(partition, set);
+    }
+    let mut picked = Vec::new();
+    let unread = |starts: &std::collections::HashMap<u32, u64>| {
+        starts.iter().any(|(p, &s)| s < ends[p])
+    };
+    while picked.len() < max_records && unread(&starts) {
+        let (records, _, _, partitions_wire) = peek_topic(
+            bctx,
+            dlq_topic,
+            partitions,
+            &starts,
+            max_records as u32,
+            None,
+        )?;
+        picked.extend(
+            records
+                .into_iter()
+                .filter(|r| {
+                    !handled[&r.partition].contains(&r.offset)
+                        && !dlq::rejected_at_write(&r.headers)
+                })
+                .take(max_records - picked.len()),
+        );
+        let mut moved = false;
+        for p in partitions_wire {
+            let set = &handled[&p.partition];
+            let mut next = p.next_offset.min(ends[&p.partition]);
+            while next < ends[&p.partition] && set.contains(&next) {
+                next += 1;
+            }
+            moved |= next != starts[&p.partition];
+            starts.insert(p.partition, next);
+        }
+        if !moved {
+            break;
+        }
+    }
+    Ok(picked)
 }
 
 // =============================================================================
@@ -5617,6 +5722,7 @@ mod tests {
             _attempts: u32,
         ) {
         }
+        fn note_dlq_handled(&self, _org: &str, _source_topic: &str, _dlq_partition: u32, _offset: u64) {}
         fn evict_node_from_replica_sets(
             &self,
             _node_id: &str,
@@ -7396,6 +7502,227 @@ mod tests {
         )
         .await;
         topic
+    }
+
+    /// A one-partition topic whose first `failed` records each exhausted
+    /// their single delivery attempt of group "g": DLQ offsets 0..failed.
+    async fn topic_with_failed_records(ctx: &HandlerContext, failed: u64) -> String {
+        let inst = fixture_instance_id();
+        let topic = format!("wyniki.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        let g = gate_read(ctx, inst.as_str()).expect("gate");
+        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(ctx, &g), topic.clone());
+        tokio::task::spawn_blocking(move || {
+            for i in 0..failed {
+                let payload = Bytes::from(format!("payload-{i}"));
+                svc.publish(
+                    &bctx,
+                    &t,
+                    bus::PublishBatch {
+                        partition: Some(0),
+                        producer: None,
+                        records: vec![bus::PublishRecord {
+                            key: None,
+                            headers: vec![],
+                            payload: payload.clone(),
+                            timestamp_ms: bus::now_ms(),
+                            schema_id: 0,
+                        }],
+                    },
+                )
+                .expect("publish");
+                let fetched = bus::FetchedRecordMeta {
+                    topic: t.clone(),
+                    partition: 0,
+                    offset: i,
+                    timestamp_ms: bus::now_ms(),
+                    key: None,
+                    headers: vec![],
+                    payload,
+                    schema_id: 0,
+                };
+                svc.note_delivery_failure(
+                    &bctx,
+                    "g",
+                    &t,
+                    0,
+                    i,
+                    &fetched,
+                    dlq::DlqReason::ConsumerError,
+                    "boom",
+                )
+                .expect("to the DLQ");
+            }
+        })
+        .await
+        .expect("setup task");
+        topic
+    }
+
+    async fn source_high_watermark(ctx: &HandlerContext, topic: &str) -> u64 {
+        let g = gate_read(ctx, fixture_instance_id().as_str()).expect("gate");
+        let (svc, bctx, t) = (g.svc.clone(), bus_ctx(ctx, &g), topic.to_string());
+        tokio::task::spawn_blocking(move || svc.partition_stats(&bctx, &t, 0).unwrap().high_watermark)
+            .await
+            .unwrap()
+    }
+
+    async fn dlq_depth(ctx: &HandlerContext, topic: &str) -> u64 {
+        match stats_snapshot_v1(ctx, fixture_instance_id().as_str()).await.unwrap() {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
+                snapshot.topics.iter().find(|t| t.topic == topic).unwrap().dlq_depth
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    async fn retry_all(ctx: &HandlerContext, topic: &str, max: u32) -> (u32, u32) {
+        match dlq_retry_all_v1(ctx, fixture_instance_id().as_str(), topic.to_string(), max)
+            .await
+            .expect("retry all")
+        {
+            BusPayload::DlqRetryAllResponse { retried, failed } => (retried, failed),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// "Ponów" takes the message off the list and the counters, and a
+    /// second "Ponów" of it — or "Ponów wszystkie" after it — does not send
+    /// it to the topic's consumers again.
+    #[tokio::test]
+    async fn a_retried_dlq_record_leaves_the_list_and_is_never_republished_twice() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = topic_with_failed_records(&ctx, 3).await;
+        assert_eq!(source_high_watermark(&ctx, &topic).await, 3);
+
+        dlq_retry_v1(&ctx, inst.as_str(), topic.clone(), 0, 1)
+            .await
+            .expect("retry");
+        assert_eq!(dlq_list_offsets(&ctx, topic.clone()).await, vec![0, 2]);
+        assert_eq!(dlq_depth(&ctx, &topic).await, 2);
+        let err = dlq_retry_v1(&ctx, inst.as_str(), topic.clone(), 0, 1)
+            .await
+            .expect_err("a retried record is not retried again");
+        assert!(err.message.contains("bus.dlq_record_handled"), "{}", err.message);
+        assert_eq!(source_high_watermark(&ctx, &topic).await, 4);
+
+        assert_eq!(retry_all(&ctx, &topic, 10).await, (2, 0));
+        assert_eq!(retry_all(&ctx, &topic, 10).await, (0, 0));
+        assert_eq!(dlq_depth(&ctx, &topic).await, 0);
+        assert!(dlq_list_offsets(&ctx, topic.clone()).await.is_empty());
+        assert_eq!(
+            source_high_watermark(&ctx, &topic).await,
+            6,
+            "each unprocessed message went back exactly once"
+        );
+    }
+
+    /// "Ponów wszystkie" reads past records already handled at the head of
+    /// the DLQ: a batch is not empty only because the oldest ones were
+    /// retried or discarded before.
+    #[tokio::test]
+    async fn dlq_retry_all_reaches_past_handled_records() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = topic_with_failed_records(&ctx, 7).await;
+        for offset in 0..5 {
+            dlq_discard_v1(&ctx, inst.as_str(), topic.clone(), 0, offset)
+                .await
+                .expect("discard");
+        }
+        assert_eq!(retry_all(&ctx, &topic, 2).await, (2, 0));
+        assert_eq!(dlq_depth(&ctx, &topic).await, 0);
+    }
+
+    /// A message rejected when it was written stays where it is: the
+    /// topic's validation would only send it back as a new record.
+    #[tokio::test]
+    async fn dlq_retry_all_leaves_records_rejected_at_write() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let topic = topic_with_rejected_records(&ctx, 3).await;
+        assert_eq!(retry_all(&ctx, &topic, 10).await, (0, 0));
+        assert_eq!(dlq_list_offsets(&ctx, topic.clone()).await, vec![0, 1, 2]);
+        assert_eq!(dlq_depth(&ctx, &topic).await, 3);
+    }
+
+    /// Without administration of the topic "Ponów wszystkie" is refused as
+    /// a whole instead of answering "0 retried, N failed".
+    #[tokio::test]
+    async fn dlq_retry_all_without_topic_administration_is_refused() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, user_id) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = topic_with_failed_records(&ctx, 2).await;
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            user_id,
+            "deny".to_string(),
+            "admin".to_string(),
+        )
+        .await
+        .expect("deny administration");
+        let err = dlq_retry_all_v1(&ctx, inst.as_str(), topic.clone(), 10)
+            .await
+            .expect_err("refused");
+        assert!(err.message.contains("bus.permission_denied"), "{}", err.message);
+        assert_eq!(source_high_watermark(&ctx, &topic).await, 2);
+    }
+
+    /// The newest page skips the handled records instead of coming back
+    /// short or empty when the newest messages were already retried.
+    #[tokio::test]
+    async fn dlq_list_newest_first_skips_the_newest_handled_records() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = topic_with_rejected_records(&ctx, 7).await;
+        for offset in [4, 5, 6] {
+            dlq_discard_v1(&ctx, inst.as_str(), topic.clone(), 0, offset)
+                .await
+                .expect("discard");
+        }
+        let page = |from: Vec<BusPartitionOffsetWire>| {
+            let ctx = &ctx;
+            let topic = topic.clone();
+            async move {
+                match dlq_list_v1(ctx, fixture_instance_id().as_str(), topic, None, from, 3, None, true)
+                    .await
+                    .expect("dlq list")
+                {
+                    BusPayload::DlqListResponse { result } => result,
+                    other => panic!("unexpected response: {other:?}"),
+                }
+            }
+        };
+        let first = page(vec![]).await;
+        assert_eq!(first.records.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![3, 2, 1]);
+        assert!(first.has_more);
+        let next = first
+            .partitions
+            .iter()
+            .map(|p| BusPartitionOffsetWire { partition: p.partition, offset: p.next_offset })
+            .collect();
+        let second = page(next).await;
+        assert_eq!(second.records.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![0]);
+        assert!(!second.has_more);
     }
 
     /// `newest_first` pages a DLQ backwards: following each partition's

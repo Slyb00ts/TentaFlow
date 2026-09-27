@@ -38,6 +38,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Unprocessed messages screen: per-topic tiles, one merged list, and Pokaż /
+  Ponów / Odrzuć / Ponów wszystkie windows, plus a Nieprzetworzone section on
+  the topic page; counters refresh everywhere after a change. A retried
+  message is taken off the list, retry-all skips messages rejected at write
+  and refuses users without topic administration, and HL7/XML previews are
+  read in the source topic's format under its data-hiding rules. Known
+  limits: with more than one partition "Wczytaj więcej" can repeat rows, a
+  retry or discard is not restricted to the node leading the partition and
+  its marker does not reach every copy, and a failure between republishing
+  and marking can leave the message listed, so it can be retried twice.
 - New Topics screen: a filterable list, a three-step creator (content kind,
   partitions, message pattern), deletion that asks for the name to be retyped
   and says what goes with the topic, and a message preview.

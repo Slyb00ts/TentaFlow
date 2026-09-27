@@ -759,6 +759,10 @@ impl LeaderHandle for GlueLeaderHandle {
         self.0.leader.note_offset_commit(group, offset, attempts);
     }
 
+    fn note_offset_discarded(&self, offset: u64) {
+        self.0.leader.note_offset_discarded(offset);
+    }
+
     fn send_truncate(&self, node: &str, to_offset: u64) {
         if let Some(tx) = self.0.truncate_senders.lock().get(node) {
             let _ = tx.send(to_offset);
