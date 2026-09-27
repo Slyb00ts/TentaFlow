@@ -238,6 +238,9 @@ thirparty/
 # Poufne nagrania klienta — NIE commitować (tylko lokalnie do testow rtsp-sim)
 /tools/rtsp-sim/clips/
 
+# Snapshot vLLM is generated locally by scripts/update-vllm-recipes.sh.
+tentaflow-core/vllm-recipes/recipes.json.gz
+
 # Benchmark/experiment scratch
 /scratch/
 
