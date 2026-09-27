@@ -355,6 +355,35 @@ fn feature_detail(features: &[FeatureState], id: &str) -> String {
         .unwrap_or_default()
 }
 
+pub const RDMA_NO_DEVICE: &str = "target_rdma_no_device";
+
+/// An RDMA transport (iSER, NVMe-oF over RDMA) on an address that no RDMA
+/// device holds, refused BEFORE anything is written: the kernel refuses it
+/// anyway — MEASURED on rig11 2026-09-27, the nvmet port link and the
+/// `iser = 1` write both fail with `ENODEV` — and it would do so after the
+/// zvol and the TPG already exist. The every-interface portal (`0.0.0.0`)
+/// and an address the picker does not list are left to the other rules.
+pub fn rdma_portal_refusal(portal: &NasTargetPortal, interfaces: &[NasBlockInterface]) -> Option<super::refusal::Refusal> {
+    if !matches!(portal.transport.as_str(), "iser" | "rdma") || portal.address == "0.0.0.0" {
+        return None;
+    }
+    let listed = interfaces.iter().find(|i| i.address == portal.address)?;
+    if !listed.rdma_device.is_empty() {
+        return None;
+    }
+    Some(
+        super::refusal::Refusal::bad_request(
+            RDMA_NO_DEVICE,
+            format!(
+                "{} has no RDMA device, and the kernel refuses an RDMA listener on {} (ENODEV)",
+                listed.name, portal.address
+            ),
+        )
+        .param("interface", &listed.name)
+        .param("address", &portal.address),
+    )
+}
+
 /// The interfaces the portal picker offers (n14 step 2).
 ///
 /// `shared` marks the one carrying the default route: that is the LAN, and a
@@ -369,6 +398,15 @@ pub fn interfaces() -> Vec<NasBlockInterface> {
         .filter(|d| d.active && !d.netdev.is_empty())
         .map(|d| d.netdev.clone())
         .collect();
+    // Any port state: "no device here" is what the kernel refuses (ENODEV,
+    // measured), a DOWN port is only a link nobody reaches yet.
+    let device_of = |netdev: &str| {
+        rdma.devices
+            .iter()
+            .find(|d| d.netdev == netdev)
+            .map(|d| d.device.clone())
+            .unwrap_or_default()
+    };
     let default_route = default_route_interface();
     let mut out = Vec::new();
     let networks = sysinfo::Networks::new_with_refreshed_list();
@@ -385,6 +423,7 @@ pub fn interfaces() -> Vec<NasBlockInterface> {
             let supported = net.addr.is_ipv4();
             out.push(NasBlockInterface {
                 rdma: rdma_netdevs.iter().any(|n| n == name),
+                rdma_device: device_of(name),
                 shared: default_route.as_deref() == Some(name.as_str()),
                 supported,
                 name: name.clone(),
@@ -1316,6 +1355,9 @@ fn validate_options_with(
                 "a portal on every interface (0.0.0.0) needs an explicit confirmation — \
                  pick a storage interface instead"
             ));
+        }
+        if let Some(refusal) = rdma_portal_refusal(portal, &caps.interfaces) {
+            return Err(refusal.into());
         }
         match (target.protocol.as_str(), portal.transport.as_str()) {
             ("iscsi", "tcp") => {}
@@ -3939,6 +3981,9 @@ pub struct SessionReading {
     pub identity: String,
     pub address: String,
     pub state: String,
+    /// 'tcp' | 'iser' | 'rdma', or '' where the kernel does not say
+    /// (`session_transport`, `nvmet_port_transport`).
+    pub transport: String,
     pub key: String,
 }
 
@@ -3979,6 +4024,7 @@ pub fn readings_from(target: &TargetRow, nvmet: &block::NvmetSessions) -> (Vec<S
                     address: c.host_traddr.clone(),
                     // `state` verbatim (`ready` measured) and never branched on.
                     state: c.state.clone(),
+                    transport: nvmet_port_transport(Path::new(block::NVMET_CONFIGFS), &c.port),
                     // `cntlid` is reused by nvmet, so it is not unique alone.
                     key: session_key(boot_id(), &format!("{}@{}", c.cntlid, c.host_traddr)),
                 })
@@ -4006,6 +4052,35 @@ fn to_wire_session(target: &TargetRow, r: &SessionReading) -> NasShareSession {
         connected_at: None,
         address: if allowlisted { r.address.clone() } else { String::new() },
         state: if allowlisted { r.state.clone() } else { String::new() },
+        transport: if allowlisted { r.transport.clone() } else { String::new() },
+    }
+}
+
+/// What an iSCSI session runs over, from the transport word LIO prints after
+/// its address. MEASURED on rig11 (2026-09-27): a TCP login reads `TCP`, an
+/// iSER login reads `SCTP` — LIO has no SCTP, it prints that word for every
+/// connection that is not TCP. The only other non-TCP transport LIO has is
+/// the Chelsio offload (`np/…/cxgbit`), which this app never switches on, so
+/// on a portal whose transport is iSER the non-TCP word IS iSER; anywhere
+/// else it is not known and says so ('').
+pub fn session_transport(word: Option<&str>, portal_transport: &str) -> &'static str {
+    match word {
+        Some("TCP") => "tcp",
+        Some("SCTP") if portal_transport == "iser" => "iser",
+        _ => "",
+    }
+}
+
+/// The transport of the nvmet port a controller came in on (`ports/<id>/
+/// addr_trtype`, unprivileged): 'tcp' | 'rdma' as nvmet names them, '' when
+/// the controller named no port or the port cannot be read.
+fn nvmet_port_transport(root: &Path, port: &str) -> String {
+    if port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+        return String::new();
+    }
+    match read_attr(&root.join("ports").join(port).join("addr_trtype")) {
+        Ok(Some(t)) if matches!(t.as_str(), "tcp" | "rdma") => t,
+        _ => String::new(),
     }
 }
 
@@ -4092,9 +4167,13 @@ fn iscsi_readings_in(root: &Path, target: &TargetRow) -> (Vec<SessionReading>, b
                 if out.iter().any(|s| s.identity == initiator) {
                     continue;
                 }
+                // The target's one portal (`validate_options`) says whether a
+                // non-TCP word can be iSER at all.
+                let portal_transport = target.portals.first().map(|p| p.transport.as_str()).unwrap_or("");
                 out.push(SessionReading {
                     identity: initiator,
                     address: session.addresses.first().cloned().unwrap_or_default(),
+                    transport: session_transport(session.transports.first().map(String::as_str), portal_transport).to_string(),
                     state: session.state,
                     // The LIO Session ID increments on every login (measured
                     // 1 → 10 over nine resets), which is what makes it the
@@ -4338,14 +4417,41 @@ fn listen_sockets_in(proc_root: &Path) -> Option<Vec<(std::net::IpAddr, u16)>> {
     Some(out)
 }
 
-/// "Nasłuch targetu", one entry per portal of the row.
+/// "Nasłuch targetu": one entry per listener of each portal of the row —
+/// an iSCSI portal with iSER has two (the TCP socket and the RDMA listener).
 pub fn listen_states(target: &TargetRow) -> Vec<tentaflow_protocol::tentanas::NasTargetListen> {
+    // The RDMA reads (a netlink dump, the sysfs probe) only when a portal
+    // needs them: a TCP-only target costs exactly what it did before.
+    let rdma = if target.portals.iter().any(|p| matches!(p.transport.as_str(), "iser" | "rdma")) {
+        RdmaView {
+            cm_ids: super::rdma::cm_ids().map_err(|e| tracing::debug!("RDMA listeners: {e}")),
+            probe: super::rdma::probe(),
+        }
+    } else {
+        RdmaView::default()
+    };
     listen_states_in(
         target,
         Path::new(block::TARGET_CONFIGFS),
         Path::new(block::NVMET_CONFIGFS),
         Path::new("/proc"),
+        &rdma,
     )
+}
+
+/// What the kernel says about RDMA for one "Nasłuch" read: its CM ids (or
+/// that they could not be read) and the node's RDMA devices.
+#[derive(Debug, Clone)]
+pub struct RdmaView {
+    pub cm_ids: std::result::Result<Vec<super::rdma::CmId>, ()>,
+    pub probe: super::rdma::Probe,
+}
+
+impl Default for RdmaView {
+    /// Nothing read: an RDMA state computed from it is "Nie zmierzono".
+    fn default() -> Self {
+        Self { cm_ids: Err(()), probe: super::rdma::Probe::default() }
+    }
 }
 
 /// Reads a configfs attribute: `Ok(None)` when it does not exist, `Err` when
@@ -4359,30 +4465,46 @@ fn read_attr(path: &Path) -> std::result::Result<Option<String>, ()> {
     }
 }
 
+fn listen_entry(portal: &NasTargetPortal, transport: &str, state: &str, devices: Vec<String>) -> tentaflow_protocol::tentanas::NasTargetListen {
+    tentaflow_protocol::tentanas::NasTargetListen {
+        address: portal.address.clone(),
+        port: portal.port,
+        transport: transport.to_string(),
+        state: state.to_string(),
+        rdma_devices: devices,
+    }
+}
+
 fn listen_states_in(
     target: &TargetRow,
     iscsi_root: &Path,
     nvmet_root: &Path,
     proc_root: &Path,
+    rdma: &RdmaView,
 ) -> Vec<tentaflow_protocol::tentanas::NasTargetListen> {
     let sockets = listen_sockets_in(proc_root);
-    target
-        .portals
-        .iter()
-        .map(|portal| {
-            let state = if target.protocol == "nvmet" {
-                nvmet_listen_state(target, portal, nvmet_root, sockets.as_deref())
+    let mut out = Vec::new();
+    for portal in &target.portals {
+        if target.protocol == "nvmet" {
+            if portal.transport == "rdma" {
+                let (state, devices) = nvmet_rdma_listen_state(target, portal, nvmet_root, rdma);
+                out.push(listen_entry(portal, "rdma", state, devices));
             } else {
-                iscsi_listen_state(target, portal, iscsi_root, sockets.as_deref())
-            };
-            tentaflow_protocol::tentanas::NasTargetListen {
-                address: portal.address.clone(),
-                port: portal.port,
-                transport: portal.transport.clone(),
-                state: state.to_string(),
+                let state = nvmet_listen_state(target, portal, nvmet_root, sockets.as_deref());
+                out.push(listen_entry(portal, &portal.transport, state, Vec::new()));
             }
-        })
-        .collect()
+        } else {
+            // Every iSCSI portal opens its TCP socket, iSER or not (measured:
+            // the np's TCP LISTEN row stays with `iser = 1`).
+            let state = iscsi_listen_state(target, portal, iscsi_root, sockets.as_deref());
+            out.push(listen_entry(portal, "tcp", state, Vec::new()));
+            if portal.transport == "iser" {
+                let (state, devices) = iscsi_iser_listen_state(target, portal, iscsi_root, rdma);
+                out.push(listen_entry(portal, "iser", state, devices));
+            }
+        }
+    }
+    out
 }
 
 /// iSCSI (§L.4, measured): `mkdir np/<ip>:<port>` starts the kernel listener
@@ -4407,20 +4529,107 @@ fn iscsi_listen_state(
         }
         Err(_) => return "unknown",
     }
-    match read_attr(&np.join("iser")) {
-        Ok(Some(v)) if v == "1" => return "rdma",
-        Ok(_) => {}
-        Err(()) => return "unknown",
-    }
     let Some(sockets) = sockets else { return "unknown" };
     if !listens_on(sockets, &portal.address, portal.port) {
         return "not_listening";
     }
+    tpg_enable_state(&tpg)
+}
+
+/// `listening` / `target_disabled` from the TPG's `enable`, `unknown` when it
+/// cannot be read.
+fn tpg_enable_state(tpg: &Path) -> &'static str {
     match read_attr(&tpg.join("enable")) {
         Ok(Some(v)) if v == "1" => "listening",
         Ok(Some(_)) => "target_disabled",
         _ => "unknown",
     }
+}
+
+/// The state of a listener configfs does NOT ask for: an address no RDMA
+/// device holds is the kernel's refusal (ENODEV, measured) and says so;
+/// otherwise nothing asked for it.
+fn rdma_not_configured(portal: &NasTargetPortal, rdma: &RdmaView) -> &'static str {
+    if super::rdma::device_for_address(&rdma.probe, &portal.address).is_none() {
+        "no_rdma_device"
+    } else {
+        "not_listening"
+    }
+}
+
+/// The RDMA listener of a portal configfs asks for, from the kernel's CM
+/// table: listening on these devices, or `listener_lost` — MEASURED on rig11
+/// (2026-09-27): after the RDMA device went away the port link and
+/// `iser = 1` stayed in configfs and the listener did not come back when the
+/// device did; only creating the portal again restored it.
+fn rdma_listener(
+    portal: &NasTargetPortal,
+    owner: &str,
+    rdma: &RdmaView,
+) -> std::result::Result<Vec<String>, ()> {
+    let ids = rdma.cm_ids.as_ref().map_err(|_| ())?;
+    Ok(super::rdma::listening_devices(ids, owner, &portal.address, portal.port))
+}
+
+/// iSER (RDMA listeners §R, measured): `iser = 1` on the np starts an
+/// `ib_isert` listener on the RDMA device that holds the address; the write
+/// is refused (`ENODEV`) and reads back `0` when no device does; `enable = 0`
+/// keeps it open, like the TCP socket.
+fn iscsi_iser_listen_state(
+    target: &TargetRow,
+    portal: &NasTargetPortal,
+    root: &Path,
+    rdma: &RdmaView,
+) -> (&'static str, Vec<String>) {
+    let tpg = root.join("iscsi").join(&target.wwn).join("tpgt_1");
+    let np = tpg.join("np").join(format!("{}:{}", portal.address, portal.port));
+    match std::fs::metadata(&np) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return ("unknown", Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (rdma_not_configured(portal, rdma), Vec::new()),
+        Err(_) => return ("unknown", Vec::new()),
+    }
+    match read_attr(&np.join("iser")) {
+        Ok(Some(v)) if v == "1" => {}
+        Ok(_) => return (rdma_not_configured(portal, rdma), Vec::new()),
+        Err(()) => return ("unknown", Vec::new()),
+    }
+    match rdma_listener(portal, super::rdma::OWNER_ISERT, rdma) {
+        Err(()) => ("unknown", Vec::new()),
+        Ok(devices) if devices.is_empty() => ("listener_lost", Vec::new()),
+        Ok(devices) => (tpg_enable_state(&tpg), devices),
+    }
+}
+
+/// The `ports/<id>` of an nvmet portal: the one whose `addr_*` match it.
+/// `Ok(None)` when there is none, `Err` when the ports cannot be listed.
+fn nvmet_port_of(portal: &NasTargetPortal, root: &Path) -> std::result::Result<Option<std::path::PathBuf>, ()> {
+    let ports = match std::fs::read_dir(root.join("ports")) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    for port in ports.flatten() {
+        let dir = port.path();
+        let (Ok(Some(trtype)), Ok(Some(traddr)), Ok(Some(trsvcid))) = (
+            read_attr(&dir.join("addr_trtype")),
+            read_attr(&dir.join("addr_traddr")),
+            read_attr(&dir.join("addr_trsvcid")),
+        ) else {
+            continue;
+        };
+        if trtype == portal.transport && traddr == portal.address && trsvcid == portal.port.to_string() {
+            return Ok(Some(dir));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the port of this portal links this subsystem. `Err` on a read
+/// that failed.
+fn nvmet_linked(target: &TargetRow, portal: &NasTargetPortal, root: &Path) -> std::result::Result<bool, ()> {
+    Ok(nvmet_port_of(portal, root)?
+        .is_some_and(|dir| dir.join("subsystems").join(&target.wwn).symlink_metadata().is_ok()))
 }
 
 /// nvmet (§L.4, measured): a port listens from its FIRST subsystem link and
@@ -4433,40 +4642,38 @@ fn nvmet_listen_state(
     root: &Path,
     sockets: Option<&[(std::net::IpAddr, u16)]>,
 ) -> &'static str {
-    if portal.transport == "rdma" {
-        return "rdma";
-    }
-    let ports = match std::fs::read_dir(root.join("ports")) {
-        Ok(read) => read,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return "not_listening",
-        Err(_) => return "unknown",
-    };
-    let mut linked = false;
-    for port in ports.flatten() {
-        let dir = port.path();
-        let (Ok(Some(trtype)), Ok(Some(traddr)), Ok(Some(trsvcid))) = (
-            read_attr(&dir.join("addr_trtype")),
-            read_attr(&dir.join("addr_traddr")),
-            read_attr(&dir.join("addr_trsvcid")),
-        ) else {
-            continue;
-        };
-        if trtype != portal.transport || traddr != portal.address || trsvcid != portal.port.to_string() {
-            continue;
-        }
-        if dir.join("subsystems").join(&target.wwn).symlink_metadata().is_ok() {
-            linked = true;
-            break;
-        }
-    }
-    if !linked {
-        return "not_listening";
+    match nvmet_linked(target, portal, root) {
+        Err(()) => return "unknown",
+        Ok(false) => return "not_listening",
+        Ok(true) => {}
     }
     let Some(sockets) = sockets else { return "unknown" };
     if listens_on(sockets, &portal.address, portal.port) {
         "listening"
     } else {
         "not_listening"
+    }
+}
+
+/// nvmet over RDMA (RDMA listeners §R, measured): the same first-link /
+/// last-link rule as TCP — the `nvmet_rdma` listener appeared at the link
+/// (25 ms) and was gone at the unlink — and a link on an address no RDMA
+/// device holds is refused (`ENODEV`), so it never exists.
+fn nvmet_rdma_listen_state(
+    target: &TargetRow,
+    portal: &NasTargetPortal,
+    root: &Path,
+    rdma: &RdmaView,
+) -> (&'static str, Vec<String>) {
+    match nvmet_linked(target, portal, root) {
+        Err(()) => return ("unknown", Vec::new()),
+        Ok(false) => return (rdma_not_configured(portal, rdma), Vec::new()),
+        Ok(true) => {}
+    }
+    match rdma_listener(portal, super::rdma::OWNER_NVMET, rdma) {
+        Err(()) => ("unknown", Vec::new()),
+        Ok(devices) if devices.is_empty() => ("listener_lost", Vec::new()),
+        Ok(devices) => ("listening", devices),
     }
 }
 
@@ -8147,7 +8354,7 @@ mod tests {
         // The rows rig11 printed (§L.4): 127.0.0.1:3260 and :4420 listening.
         let tcp = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n   0: 0100007F:0CBC 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 100 0 0 10 0\n   1: 0100007F:1144 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 0 1 0000000000000000 100 0 0 10 0\n";
         write(&tree, "proc/net/tcp", tcp.as_bytes());
-        let state = |row: &TargetRow| listen_states_in(row, &tree.0, &tree.0, &tree.0.join("proc"))[0].state.clone();
+        let state = |row: &TargetRow| listen_states_in(row, &tree.0, &tree.0, &tree.0.join("proc"), &RdmaView::default())[0].state.clone();
         assert_eq!(state(&row), "not_listening", "no np: nothing of this target listens");
         tree.dir(&format!("{tpg}/np/127.0.0.1:3260"));
         write(&tree, &format!("{tpg}/np/127.0.0.1:3260/iser"), b"0\n");
@@ -8156,8 +8363,10 @@ mod tests {
         // Measured L3: the port stays open while the TPG is disabled.
         write(&tree, &format!("{tpg}/enable"), b"0\n");
         assert_eq!(state(&row), "target_disabled");
+        // The TCP socket does not care about `iser` (measured: it stays with
+        // `iser = 1`); the RDMA listener is its own entry (next test).
         write(&tree, &format!("{tpg}/np/127.0.0.1:3260/iser"), b"1\n");
-        assert_eq!(state(&row), "rdma");
+        assert_eq!(state(&row), "target_disabled");
         write(&tree, &format!("{tpg}/np/127.0.0.1:3260/iser"), b"0\n");
         // The kernel did not bind: np present, no LISTEN row.
         write(&tree, "proc/net/tcp", b"  sl  local_address rem_address   st\n");
@@ -8174,7 +8383,7 @@ mod tests {
         let mut nvme = target("nvmet");
         nvme.portals = vec![NasTargetPortal { interface: "lo".into(), address: "127.0.0.1".into(), port: 4420, transport: "tcp".into() }];
         write(&tree, "proc/net/tcp", tcp.as_bytes());
-        let nstate = |row: &TargetRow| listen_states_in(row, &tree.0, &tree.0, &tree.0.join("proc"))[0].state.clone();
+        let nstate = |row: &TargetRow| listen_states_in(row, &tree.0, &tree.0, &tree.0.join("proc"), &RdmaView::default())[0].state.clone();
         assert_eq!(nstate(&nvme), "not_listening");
         for (name, value) in [("addr_trtype", "tcp\n"), ("addr_traddr", "127.0.0.1\n"), ("addr_trsvcid", "4420\n")] {
             write(&tree, &format!("ports/2701/{name}"), value.as_bytes());
@@ -8184,8 +8393,178 @@ mod tests {
         tree.dir(&format!("subsystems/{}", nvme.wwn));
         std::os::unix::fs::symlink(tree.0.join("subsystems").join(&nvme.wwn), tree.0.join("ports/2701/subsystems").join(&nvme.wwn)).expect("link");
         assert_eq!(nstate(&nvme), "listening");
+        // An RDMA portal is never "not measured" any more: here the tcp port
+        // does not match it, and no RDMA device holds the address.
         nvme.portals[0].transport = "rdma".into();
-        assert_eq!(nstate(&nvme), "rdma");
+        assert_eq!(nstate(&nvme), "no_rdma_device");
+    }
+
+    fn cm(owner: &str, state: &str, src: &str) -> super::super::rdma::CmId {
+        super::super::rdma::CmId {
+            device: "m27rxe".into(),
+            state: state.into(),
+            src: Some(src.parse().unwrap()),
+            dst: Some("0.0.0.0:0".parse().unwrap()),
+            owner: owner.into(),
+        }
+    }
+
+    fn rxe_view(ids: std::result::Result<Vec<super::super::rdma::CmId>, ()>) -> RdmaView {
+        RdmaView {
+            cm_ids: ids,
+            probe: super::super::rdma::Probe {
+                devices: vec![super::super::rdma::RdmaDevice {
+                    device: "m27rxe".into(),
+                    state: "ACTIVE".into(),
+                    active: true,
+                    netdev: "enp5s0".into(),
+                    addresses: vec!["192.168.11.11".into()],
+                }],
+                module_loaded: true,
+                module_available: true,
+            },
+        }
+    }
+
+    #[test]
+    fn rdma_listening_is_read_from_the_kernels_cm_table_not_from_configfs() {
+        // The states rig11 showed (RDMA listeners 2026-09-27, round 2).
+        let tree = TempTree::new("listen-rdma");
+        let mut row = target("iscsi");
+        row.portals = vec![NasTargetPortal { interface: "enp5s0".into(), address: "192.168.11.11".into(), port: 3260, transport: "iser".into() }];
+        let tpg = format!("iscsi/{}/tpgt_1", row.wwn);
+        let np = format!("{tpg}/np/192.168.11.11:3260");
+        write(&tree, "proc/net/tcp", b"  sl  local_address rem_address   st\n   0: 0B0BA8C0:0CBC 00000000:0000 0A 0\n");
+        let listening = Ok(vec![
+            cm("nvmet_rdma", "LISTEN", "192.168.11.11:4420"),
+            cm("ib_isert", "LISTEN", "192.168.11.11:3260"),
+        ]);
+        let read = |row: &TargetRow, view: &RdmaView| {
+            listen_states_in(row, &tree.0, &tree.0, &tree.0.join("proc"), view)
+                .into_iter()
+                .map(|l| (l.transport, l.state, l.rdma_devices))
+                .collect::<Vec<_>>()
+        };
+        let entry = |t: &str, s: &str, d: &[&str]| (t.to_string(), s.to_string(), d.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+
+        // No np: neither listener; with no RDMA device on the address the
+        // RDMA one says why the kernel would refuse it.
+        assert_eq!(read(&row, &rxe_view(listening.clone())), vec![entry("tcp", "not_listening", &[]), entry("iser", "not_listening", &[])]);
+        assert_eq!(read(&row, &RdmaView { cm_ids: Ok(Vec::new()), ..Default::default() })[1].1, "no_rdma_device");
+        // The np exists and `iser` reads 0 (the write was refused with
+        // ENODEV, measured): TCP listens, RDMA does not.
+        tree.dir(&np);
+        write(&tree, &format!("{np}/iser"), b"0\n");
+        write(&tree, &format!("{tpg}/enable"), b"1\n");
+        assert_eq!(read(&row, &RdmaView { cm_ids: Ok(Vec::new()), ..Default::default() }), vec![entry("tcp", "listening", &[]), entry("iser", "no_rdma_device", &[])]);
+        // `iser = 1` and the kernel's ib_isert listener on the device.
+        write(&tree, &format!("{np}/iser"), b"1\n");
+        assert_eq!(read(&row, &rxe_view(listening.clone())), vec![entry("tcp", "listening", &[]), entry("iser", "listening", &["m27rxe"])]);
+        // Measured B5: the TPG disabled keeps the RDMA listener open too.
+        write(&tree, &format!("{tpg}/enable"), b"0\n");
+        assert_eq!(read(&row, &rxe_view(listening.clone()))[1], entry("iser", "target_disabled", &["m27rxe"]));
+        write(&tree, &format!("{tpg}/enable"), b"1\n");
+        // Measured E5: configfs still says `iser = 1`, the kernel has no
+        // listener — lost, never "listening".
+        assert_eq!(read(&row, &rxe_view(Ok(vec![cm("nvmet_rdma", "LISTEN", "192.168.11.11:4420")])))[1], entry("iser", "listener_lost", &[]));
+        // A connected id is not a listener, and another port is not this one.
+        assert_eq!(read(&row, &rxe_view(Ok(vec![cm("ib_isert", "CONNECT", "192.168.11.11:3260")])))[1].1, "listener_lost");
+        assert_eq!(read(&row, &rxe_view(Ok(vec![cm("ib_isert", "LISTEN", "192.168.11.11:3261")])))[1].1, "listener_lost");
+        // The CM table could not be read: not measured.
+        assert_eq!(read(&row, &rxe_view(Err(())))[1], entry("iser", "unknown", &[]));
+
+        // NVMe-oF over RDMA: the port's link, then the kernel's listener.
+        let mut nvme = target("nvmet");
+        nvme.portals = vec![NasTargetPortal { interface: "enp5s0".into(), address: "192.168.11.11".into(), port: 4420, transport: "rdma".into() }];
+        assert_eq!(read(&nvme, &rxe_view(listening.clone())), vec![entry("rdma", "not_listening", &[])]);
+        assert_eq!(read(&nvme, &RdmaView { cm_ids: Ok(Vec::new()), ..Default::default() })[0].1, "no_rdma_device");
+        for (name, value) in [("addr_trtype", "rdma\n"), ("addr_traddr", "192.168.11.11\n"), ("addr_trsvcid", "4420\n")] {
+            write(&tree, &format!("ports/2711/{name}"), value.as_bytes());
+        }
+        tree.dir("ports/2711/subsystems");
+        assert_eq!(read(&nvme, &rxe_view(listening.clone()))[0].1, "not_listening", "a port without our link");
+        tree.dir(&format!("subsystems/{}", nvme.wwn));
+        std::os::unix::fs::symlink(tree.0.join("subsystems").join(&nvme.wwn), tree.0.join("ports/2711/subsystems").join(&nvme.wwn)).expect("link");
+        assert_eq!(read(&nvme, &rxe_view(listening.clone())), vec![entry("rdma", "listening", &["m27rxe"])]);
+        assert_eq!(read(&nvme, &rxe_view(Ok(Vec::new())))[0].1, "listener_lost");
+        assert_eq!(read(&nvme, &rxe_view(Err(())))[0].1, "unknown");
+        // TCP rows of an nvmet target never read the CM table: the same
+        // answer with nothing RDMA read at all.
+        nvme.portals[0].transport = "tcp".into();
+        assert_eq!(read(&nvme, &RdmaView::default())[0].0, "tcp");
+    }
+
+    #[test]
+    fn a_session_says_what_it_runs_over_only_where_the_kernel_does() {
+        assert_eq!(session_transport(Some("TCP"), "tcp"), "tcp");
+        assert_eq!(session_transport(Some("TCP"), "iser"), "tcp", "an iSER portal takes TCP logins too");
+        assert_eq!(session_transport(Some("SCTP"), "iser"), "iser");
+        // Not TCP on a portal without iSER: LIO's word says "not TCP" and
+        // nothing more.
+        assert_eq!(session_transport(Some("SCTP"), "tcp"), "");
+        assert_eq!(session_transport(None, "iser"), "");
+
+        // Through the reader, from the `info` rig11 printed for an iSER login.
+        let tree = TempTree::new("acl-iser");
+        let mut row = target("iscsi");
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        row.portals = vec![NasTargetPortal { interface: "enp5s0".into(), address: "192.168.11.11".into(), port: 3260, transport: "iser".into() }];
+        let info = INFO_ACTIVE.replace("Address 10.10.0.21 TCP", "Address 10.10.0.21 SCTP");
+        write(&tree, &format!("iscsi/{}/tpgt_1/acls/iqn.1994-05.com.redhat:vmhost-01/info", row.wwn), info.as_bytes());
+        let (readings, _) = iscsi_readings_in(&tree.0, &row);
+        assert_eq!(readings[0].transport, "iser");
+        assert_eq!(to_wire_session(&row, &readings[0]).transport, "iser");
+        // D2: not on a target without an allowlist.
+        let mut open = row.clone();
+        open.initiators.clear();
+        assert_eq!(to_wire_session(&open, &readings[0]).transport, "");
+
+        // NVMe-oF: the nvmet port the controller came in on.
+        write(&tree, "ports/2711/addr_trtype", b"rdma\n");
+        write(&tree, "ports/2712/addr_trtype", b"tcp\n");
+        assert_eq!(nvmet_port_transport(&tree.0, "2711"), "rdma");
+        assert_eq!(nvmet_port_transport(&tree.0, "2712"), "tcp");
+        assert_eq!(nvmet_port_transport(&tree.0, "9"), "");
+        assert_eq!(nvmet_port_transport(&tree.0, ""), "");
+        assert_eq!(nvmet_port_transport(&tree.0, "../2711"), "", "a port id is digits");
+    }
+
+    #[test]
+    fn an_rdma_portal_on_an_interface_without_an_rdma_device_is_refused_before_any_write() {
+        let interfaces = vec![
+            NasBlockInterface { name: "enp5s0".into(), address: "192.168.11.11".into(), supported: true, ..Default::default() },
+            NasBlockInterface {
+                name: "enp4s0np0".into(),
+                address: "10.10.0.5".into(),
+                supported: true,
+                rdma_device: "rocep4s0".into(),
+                ..Default::default()
+            },
+        ];
+        let mut caps = caps();
+        caps.interfaces = interfaces.clone();
+        let mut iser = target("iscsi");
+        iser.portals = vec![portal_for("iscsi", "enp5s0", "192.168.11.11", "iser")];
+        let refused = validate_options(&iser, &[], &caps, false).expect_err("refused");
+        let refusal = super::super::refusal::Refusal::find(&refused).expect("coded");
+        assert_eq!(refusal.code, RDMA_NO_DEVICE);
+        assert_eq!(
+            refused.to_string().split(' ').next(),
+            Some("refusal:target_rdma_no_device?interface=enp5s0&address=192.168.11.11")
+        );
+        // The same address over TCP is fine; the interface with a device
+        // (link state aside) takes RDMA.
+        iser.portals[0].transport = "tcp".into();
+        assert!(validate_options(&iser, &[], &caps, false).is_ok());
+        iser.portals = vec![portal_for("iscsi", "enp4s0np0", "10.10.0.5", "iser")];
+        assert!(validate_options(&iser, &[], &caps, false).is_ok());
+        let mut nvme = target("nvmet");
+        nvme.portals = vec![portal_for("nvmet", "enp5s0", "192.168.11.11", "rdma"), portal_for("nvmet", "enp5s0", "192.168.11.11", "tcp")];
+        assert!(validate_options(&nvme, &[], &caps, false).is_err());
+        // Every interface at once and an address the picker does not list
+        // are other rules' business.
+        assert!(rdma_portal_refusal(&portal_for("nvmet", "", "", "rdma"), &interfaces).is_none());
+        assert!(rdma_portal_refusal(&portal_for("nvmet", "x", "10.9.9.9", "rdma"), &interfaces).is_none());
     }
 
     #[test]

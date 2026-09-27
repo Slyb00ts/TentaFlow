@@ -28,6 +28,20 @@ export const FEATURE_DETAIL_WORDS = new Map([
   // Device and interface names are what the admin reads on the hardware:
   // they are shown as the node measured them.
   ['rdma_devices', (p) => (need(p.devices) ? p.devices : null)],
+  // One per RDMA device (RDMA listeners 2026-09-27): whether its interface
+  // can carry an RDMA portal. The kernel refuses an RDMA listener on an
+  // address no RDMA device holds (ENODEV, measured), so an interface without
+  // an address cannot carry one at all.
+  ['rdma_device', (p) => {
+    if (!need(p.device, p.state)) return null;
+    switch (p.portal) {
+      case 'yes': return need(p.netdev, p.addresses) ? T('env.detail.rdma_device_yes', p) : null;
+      case 'port_down': return need(p.netdev, p.addresses) ? T('env.detail.rdma_device_port_down', p) : null;
+      case 'no_address': return need(p.netdev) ? T('env.detail.rdma_device_no_address', p) : null;
+      case 'no_netdev': return T('env.detail.rdma_device_no_netdev', p);
+      default: return null;
+    }
+  }],
   ['ksmbd_no_interface', () => T('env.detail.ksmbd_no_interface')],
   ['ksmbd_exposed', (p) => (need(p.interfaces) ? T('env.detail.ksmbd_exposed', { interfaces: p.interfaces }) : null)],
   ['ksmbd_tools_missing', (p) => (need(p.tools, p.listener) ? T('env.detail.ksmbd_tools_missing', { tools: p.tools, listener: p.listener }) : null)],

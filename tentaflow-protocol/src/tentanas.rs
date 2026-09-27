@@ -1371,6 +1371,14 @@ pub struct NasShareSession {
     /// cntlid is ever carried.
     #[serde(default)]
     pub state: String,
+    /// Block targets (RDMA listeners, 2026-09-27): what the session runs
+    /// over — 'tcp' | 'iser' (iSCSI) | 'rdma' (NVMe-oF) — and '' where the
+    /// kernel does not say. iSCSI: LIO's `info` prints `TCP`, or `SCTP` for
+    /// every other transport (measured with an iSER login), and the portal's
+    /// iSER flag says which one that is. NVMe-oF: the transport of the nvmet
+    /// port the controller came in on. Empty wherever `address` is.
+    #[serde(default)]
+    pub transport: String,
 }
 
 /// A file share of this node as the Sharing tab lists it. Exactly one of
@@ -1681,19 +1689,31 @@ pub struct NasTargetInitiatorSeen {
     pub session_since: String,
 }
 
-/// "Nasłuch targetu" for one portal (wave 12), read by the node itself from
-/// configfs and `/proc/net/tcp{,6}`.
+/// "Nasłuch targetu" for one listener of a portal (wave 12), read by the node
+/// itself from configfs, `/proc/net/tcp{,6}` and — for RDMA — the kernel's
+/// RDMA connection-manager table (netlink, unprivileged; RDMA listeners
+/// 2026-09-27). An iSCSI portal with iSER has TWO listeners and two entries:
+/// `transport` 'tcp' (the socket every iSCSI portal opens) and 'iser'.
 ///
-/// `state`: 'listening' (the portal is bound and logins are accepted) |
-/// 'target_disabled' (iSCSI: the port is open and the TPG is disabled, so
-/// logins are refused — measured) | 'not_listening' | 'rdma' (an RDMA portal:
-/// not measured, D6) | 'unknown' (a read failed).
+/// `state`: 'listening' (bound, and logins are accepted) | 'target_disabled'
+/// (iSCSI: open while the TPG is disabled, so logins are refused — measured
+/// for TCP, and the iSER listener stays open the same way) | 'not_listening' |
+/// 'no_rdma_device' (an RDMA listener on an address no RDMA device holds: the
+/// kernel refuses it with ENODEV — measured) | 'listener_lost' (configfs still
+/// asks for the RDMA listener and the kernel has none: measured after the
+/// RDMA device went away; it comes back only when the portal is created
+/// again) | 'unknown' (a read failed) | 'rdma' (from a node before this
+/// field was measured: "not measured").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NasTargetListen {
     pub address: String,
     pub port: u32,
     pub transport: String,
     pub state: String,
+    /// The RDMA devices the listener is bound on, by kernel name
+    /// (`rocep4s0`); empty for a TCP listener and for one that is not there.
+    #[serde(default)]
+    pub rdma_devices: Vec<String>,
 }
 
 /// One interface the portal picker of the wizard offers (n14 step 2).
@@ -1701,9 +1721,14 @@ pub struct NasTargetListen {
 pub struct NasBlockInterface {
     pub name: String,
     pub address: String,
-    /// The interface has an RDMA device, so iSER / NVMe-oF over RDMA can be
-    /// offered on it.
+    /// The interface has an RDMA device with an ACTIVE port, so iSER /
+    /// NVMe-oF over RDMA can be offered on it.
     pub rdma: bool,
+    /// The kernel name of the RDMA device on this interface, whatever its
+    /// port state (`rocep4s0`); empty when there is none — and then the
+    /// kernel refuses an RDMA listener on this address (ENODEV, measured).
+    #[serde(default)]
+    pub rdma_device: String,
     /// This interface carries the node's default route, so it is the LAN and
     /// not a dedicated storage network — the wizard warns about a target
     /// without authentication on it.
@@ -4787,6 +4812,7 @@ mod tests {
                 connected_at: Some("2026-09-26T10:00:00Z".into()),
                 address: "10.10.0.21".into(),
                 state: "LOGGED_IN".into(),
+                transport: "iser".into(),
             }],
             config_preview: String::new(),
             initiators_seen: vec![NasTargetInitiatorSeen {
@@ -4795,12 +4821,22 @@ mod tests {
                 session_since: "2026-09-26T10:00:00Z".into(),
             }],
             seen_since: "2026-09-26T09:00:00Z".into(),
-            listen: vec![NasTargetListen {
-                address: "10.10.0.5".into(),
-                port: 3260,
-                transport: "tcp".into(),
-                state: "target_disabled".into(),
-            }],
+            listen: vec![
+                NasTargetListen {
+                    address: "10.10.0.5".into(),
+                    port: 3260,
+                    transport: "tcp".into(),
+                    state: "target_disabled".into(),
+                    rdma_devices: Vec::new(),
+                },
+                NasTargetListen {
+                    address: "10.10.0.5".into(),
+                    port: 3260,
+                    transport: "iser".into(),
+                    state: "listening".into(),
+                    rdma_devices: vec!["rocep4s0".into()],
+                },
+            ],
         });
         let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode")).expect("decode");
         assert_eq!(back, body);
@@ -4817,7 +4853,16 @@ mod tests {
             panic!("variant");
         };
         assert_eq!((sessions[0].address.as_str(), sessions[0].state.as_str()), ("", ""));
+        assert_eq!(sessions[0].transport, "", "no transport from a node before the RDMA measurements");
         assert!(listen.is_empty() && initiators_seen.is_empty() && seen_since.is_empty());
+        // A wave-12 listen entry (no RDMA devices, the unmeasured 'rdma'
+        // state) still decodes.
+        let wave12: NasTargetListen = serde_json::from_value(serde_json::json!({
+            "address": "10.10.0.5", "port": 4420, "transport": "rdma", "state": "rdma"
+        }))
+        .expect("decode");
+        assert!(wave12.rdma_devices.is_empty());
+        assert_eq!(wave12.state, "rdma");
 
         // "Rozłącz": the initiator by its IQN, `revoke` false unless asked.
         let reset: TentaNasPayload = serde_json::from_value(serde_json::json!({

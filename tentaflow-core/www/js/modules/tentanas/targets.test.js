@@ -1179,10 +1179,10 @@ test('the NVMe-oF allowlist follows n19b and says a removed host stays connected
   // The UUID is cut in the middle as n19 shows it.
   assert.match(hosts.rows[0].shown, /uuid:9f2c…a17b/);
   assert.match(win.querySelector('[data-testid="nvmet-remove-note"]').textContent, /nie rozłącza hosta, który jest już połączony/);
-  // Two portals name themselves; RDMA is not measured (D6).
-  const listen = win.querySelector('[data-testid="portal_exposure"]').textContent;
-  assert.match(listen, /4420 \(TCP\) — Brak nasłuchu/);
-  assert.match(listen, /RDMA \(RoCE\)\) — Nie zmierzono \(RDMA\)/);
+  // The TCP listener and — its own row — the RDMA one; this answer is from
+  // a node before the RDMA measurements, so RDMA reads "not measured".
+  assert.equal(win.querySelector('[data-testid="portal_exposure"]').textContent, 'Brak nasłuchu');
+  assert.equal(win.querySelector('[data-testid="portal_exposure_rdma"]').textContent, 'Nie zmierzono (RDMA)');
   // Without debugfs the reset note names the missing kernel option.
   assert.match(win.querySelector('[data-testid="reset-note"]').textContent, /CONFIG_NVME_TARGET_DEBUGFS/);
   screen.dispose();
@@ -1353,9 +1353,49 @@ test('the Nasłuch words, the last-seen cell and the reset reasons are total fun
   assert.equal(listenText(undefined), 'Nie zmierzono');
   assert.equal(listenText([{ state: 'something-new' }]), 'Nie zmierzono', 'an unknown state is never guessed');
   assert.equal(listenText([{ state: 'rdma' }]), 'Nie zmierzono (RDMA)');
+  // RDMA listeners 2026-09-27: the measured states, the device by kernel name.
+  assert.equal(listenText([{ state: 'listening', transport: 'iser', rdmaDevices: ['rocep4s0'] }]), 'Nasłuch aktywny · urządzenie RDMA: rocep4s0');
+  assert.equal(listenText([{ state: 'target_disabled', transport: 'iser', rdmaDevices: ['rocep4s0'] }]), 'Port otwarty, target wyłączony — logowania odrzucane · urządzenie RDMA: rocep4s0');
+  assert.match(listenText([{ state: 'listener_lost', transport: 'rdma', rdmaDevices: [] }]), /zatrzymaj i wznów target$/);
+  assert.match(listenText([{ state: 'no_rdma_device', transport: 'rdma' }]), /jądro odrzuca nasłuch RDMA$/);
+  assert.equal(listenText([{ state: 'brand-new', rdmaDevices: ['rocep4s0'] }]), 'Nie zmierzono', 'no device list after a state nobody worded');
+  assert.equal(
+    listenText([{ address: '10.10.0.5', port: 4420, transport: 'tcp', state: 'listening' }, { address: '10.10.0.5', port: 4420, transport: 'rdma', state: 'listening', rdmaDevices: ['mlx5_0'] }]),
+    '10.10.0.5:4420 (TCP) — Nasłuch aktywny; 10.10.0.5:4420 (RDMA) — Nasłuch aktywny · urządzenie RDMA: mlx5_0',
+  );
   assert.match(lastSeenHtml(nvmetTarget(), [], [], '', 'x'), /—/, 'unmeasured sessions: a dash, not "brak zapisu"');
   assert.equal(resetUnavailableText(iscsiTarget()), '');
   assert.match(resetUnavailableText(iscsiTarget({ initiators: [] })), /listy dozwolonych/);
   assert.match(sessionStateHtml('FAILED'), /status="warn"/);
   assert.match(sessionStateHtml(''), /—/);
+});
+
+test('the RDMA listener is its own Nasłuch row, patched in place, and a session names its transport', async () => {
+  const { sessionAddressHtml } = await import('./targets.js');
+  assert.equal(sessionAddressHtml({ address: '' }), '<span class="text-3">—</span>');
+  assert.equal(sessionAddressHtml({ address: '10.10.0.21' }), '<span class="mono">10.10.0.21</span>', 'no transport from the node: none shown');
+  assert.match(sessionAddressHtml({ address: '10.10.0.21', transport: 'tcp' }), /10\.10\.0\.21<\/span> <span class="text-xs text-3" data-testid="session-transport">TCP</);
+  assert.equal(sessionAddressHtml({ address: '10.10.0.21', transport: 'quantum' }), '<span class="mono">10.10.0.21</span>');
+
+  const target = iscsiTarget({ portals: [{ interface: 'storage0', address: '10.10.0.5', port: 3260, transport: 'iser' }] });
+  const tcp = { address: '10.10.0.5', port: 3260, transport: 'tcp', state: 'listening', rdmaDevices: [] };
+  const first = { target, sessions: [{ ...liveSession(VMHOST1), transport: 'iser' }], configPreview: '', listen: [tcp, { address: '10.10.0.5', port: 3260, transport: 'iser', state: 'listening', rdmaDevices: ['rocep4s0'] }] };
+  const second = { ...first, listen: [tcp, { address: '10.10.0.5', port: 3260, transport: 'iser', state: 'listener_lost', rdmaDevices: [] }] };
+  const screen = detailScreen([first, second]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    assert.equal(win.querySelector('[data-testid="portal_exposure"]').textContent, 'Nasłuch aktywny');
+    const rdma = win.querySelector('[data-testid="portal_exposure_rdma"]');
+    assert.equal(rdma.textContent, 'Nasłuch aktywny · urządzenie RDMA: rocep4s0');
+    const sessions = win.querySelector('#nas-td-sessions');
+    assert.match(sessions.rows[0].address, /iSER \(RDMA\)/);
+    await runPoll(screen);
+    const after = win.querySelector('[data-testid="portal_exposure_rdma"]');
+    assert.ok(after === rdma, 'the RDMA row is patched in place, not rebuilt');
+    assert.match(after.textContent, /^Brak nasłuchu — konfiguracja jest w jądrze/);
+  } finally {
+    screen.dispose();
+  }
 });

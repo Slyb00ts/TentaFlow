@@ -126,20 +126,41 @@ const AUTH_LABEL_KEY = {
   none: 'wizard_target.auth_none',
 };
 
-/** The transports a protocol can offer on THIS node, with the probe's reason. */
-export function transportOptions(protocol, caps) {
+/**
+ * Why RDMA cannot be offered on the chosen portal interface although the
+ * node can serve it, or '' when it can (or when the portal is every
+ * interface at once, or none is chosen yet). MEASURED (RDMA listeners
+ * 2026-09-27): the kernel refuses an RDMA listener on an address no RDMA
+ * device holds (ENODEV), and a device whose link is not ACTIVE reaches
+ * nobody.
+ */
+export function interfaceRdmaGap(caps, interfaceName) {
+  if (!interfaceName) return '';
+  const iface = (caps?.interfaces || []).find((i) => i.name === interfaceName);
+  if (!iface || iface.rdma) return '';
+  if (iface.rdmaDevice) return T('wizard_target.transport_rdma_link_down', { iface: interfaceName, device: iface.rdmaDevice });
+  return T('wizard_target.transport_no_rdma_device', { iface: interfaceName });
+}
+
+/**
+ * The transports a protocol can offer on THIS node — and, with an interface
+ * name, on the interface the portal will bind — each with `ok`.
+ */
+export function transportOptions(protocol, caps, interfaceName) {
+  const onInterface = !interfaceRdmaGap(caps, interfaceName);
   if (protocol === 'nvmet') {
+    const rdma = Boolean(caps?.nvmeRdma) && onInterface;
     return [
       { value: 'tcp', label: T('wizard_target.transport_tcp'), ok: true },
-      { value: 'rdma', label: T('wizard_target.transport_rdma'), ok: Boolean(caps?.nvmeRdma) },
-      { value: 'tcp+rdma', label: T('wizard_target.transport_tcp_rdma'), ok: Boolean(caps?.nvmeRdma) },
+      { value: 'rdma', label: T('wizard_target.transport_rdma'), ok: rdma },
+      { value: 'tcp+rdma', label: T('wizard_target.transport_tcp_rdma'), ok: rdma },
     ];
   }
   // iSER is a FLAG on the iSCSI portal, not a second portal: the login is TCP
   // either way and the initiator asks to switch afterwards (§5.5a).
   return [
     { value: 'tcp', label: T('wizard_target.transport_tcp'), ok: true },
-    { value: 'iser', label: T('wizard_target.transport_iser'), ok: Boolean(caps?.iser) },
+    { value: 'iser', label: T('wizard_target.transport_iser'), ok: Boolean(caps?.iser) && onInterface },
   ];
 }
 
@@ -658,8 +679,10 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     const methods = AUTH_METHODS[state.protocol] || AUTH_METHODS.iscsi;
     const dhchapOff = state.protocol === 'nvmet' && caps.dhchap === false;
     const shared = sharedWithoutAuth(caps, state.portalInterface, state.method);
-    const transports = transportOptions(state.protocol, caps);
+    const transports = transportOptions(state.protocol, caps, state.portalInterface);
     const chosen = transports.find((t) => t.value === state.transport);
+    const nodeRdma = state.protocol === 'nvmet' ? Boolean(caps?.nvmeRdma) : Boolean(caps?.iser);
+    const rdmaGap = interfaceRdmaGap(caps, state.portalInterface);
     return `
       <h2 class="wizard-section-title">${escapeHtml(T('wizard_target.source_title'))}</h2>
       <p class="wizard-section-sub">${escapeHtml(T('wizard_target.source_sub'))}</p>
@@ -684,7 +707,11 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
         <tf-segmented id="nas-tw-transport" value="${escapeAttr(state.transport)}" size="sm">
           ${transports.map((t) => `<option value="${escapeAttr(t.value)}" ${t.ok ? '' : 'disabled'}>${escapeHtml(t.label)}</option>`).join('')}
         </tf-segmented>
-        ${chosen && !chosen.ok ? kernelSupportLine('wizard_target.transport_unavailable', caps.rdmaReasons, caps.rdmaDetail) : ''}
+        ${chosen && !chosen.ok
+          ? (nodeRdma && rdmaGap
+            ? `<div class="wizard-warning mt-sm" data-testid="transport-interface-gap">${sprite('alert')}<div>${escapeHtml(rdmaGap)}</div></div>`
+            : kernelSupportLine('wizard_target.transport_unavailable', caps.rdmaReasons, caps.rdmaDetail))
+          : ''}
       </div>
       <div class="field mt-md" style="margin-bottom:0;">
         <label>${escapeHtml(T('wizard_target.auth_label'))}</label>
@@ -876,7 +903,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
       if (!state.source && parseSize(state.newSizeText) <= 0) return false;
       // §5.5(a): every interface is possible and never silent.
       if (state.portalInterface === '' && !state.confirmAll) return false;
-      const transports = transportOptions(state.protocol, caps);
+      const transports = transportOptions(state.protocol, caps, state.portalInterface);
       if (!transports.some((t) => t.value === state.transport && t.ok)) return false;
       // Shape-checked here and not only in `secretOk`, because the allowlist
       // is offered on the unauthenticated path too and the node refuses a

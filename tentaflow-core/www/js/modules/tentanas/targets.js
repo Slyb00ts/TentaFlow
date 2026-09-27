@@ -489,21 +489,38 @@ const LISTEN_KEYS = {
   listening: 'targets.listen_listening',
   target_disabled: 'targets.listen_target_disabled',
   not_listening: 'targets.listen_not_listening',
+  // RDMA listeners 2026-09-27: read from the kernel's RDMA CM table.
+  no_rdma_device: 'targets.listen_no_rdma_device',
+  listener_lost: 'targets.listen_listener_lost',
+  // From a node before that measurement: its RDMA portals were not measured.
   rdma: 'targets.listen_rdma',
 };
 
+/** A listener's or a session's transport as one short word ("iSER (RDMA)"). */
+const TRANSPORT_WORD = { tcp: 'targets.transport_word_tcp', iser: 'targets.transport_word_iser', rdma: 'targets.transport_word_rdma' };
+export const transportWord = (transport) => (TRANSPORT_WORD[transport] ? T(TRANSPORT_WORD[transport]) : '');
+
+/** An RDMA listener — its own row in "Portal i transport". */
+export const isRdmaListen = (l) => l?.transport === 'iser' || l?.transport === 'rdma';
+
 /**
- * "Nasłuch targetu" (MAJOR 27 §L.7): the node's per-portal reading of
- * configfs and `/proc/net/tcp`. One portal reads as its state; several name
- * their portal first. A state this build does not know — or none at all
- * (an older node) — is "Nie zmierzono", never a guess.
+ * "Nasłuch targetu" (MAJOR 27 §L.7): the node's per-listener reading of
+ * configfs, `/proc/net/tcp` and — for RDMA — the kernel's RDMA CM table.
+ * One listener reads as its state; several name their portal first. The
+ * RDMA devices a listener is bound on follow its state by kernel name. A
+ * state this build does not know — or none at all (an older node) — is
+ * "Nie zmierzono", never a guess.
  */
 export function listenText(listen) {
   const list = Array.isArray(listen) ? listen : [];
-  const word = (l) => T(LISTEN_KEYS[l?.state] || 'targets.listen_unknown');
+  const word = (l) => {
+    const text = T(LISTEN_KEYS[l?.state] || 'targets.listen_unknown');
+    const devices = (Array.isArray(l?.rdmaDevices) ? l.rdmaDevices : []).filter(Boolean);
+    return devices.length && l?.state in LISTEN_KEYS ? `${text} · ${T('targets.listen_on_devices', { devices: devices.join(', ') })}` : text;
+  };
   if (!list.length) return T('targets.listen_unknown');
   if (list.length === 1) return word(list[0]);
-  return list.map((l) => `${l.address}:${l.port} (${transportLabel(l.transport)}) — ${word(l)}`).join('; ');
+  return list.map((l) => `${l.address}:${l.port} (${transportWord(l.transport) || transportLabel(l.transport)}) — ${word(l)}`).join('; ');
 }
 
 /**
@@ -515,6 +532,16 @@ export function sessionDurationHtml(connectedAt, now = Date.now()) {
   if (!since) return '<span class="text-3">—</span>';
   const text = fmtDuration(Math.max(0, (now - since.getTime()) / 1000));
   return `<span title="${escapeAttr(T('targets.duration_hint', { since: fmtDate(connectedAt) }))}">${escapeHtml(text)}</span>`;
+}
+
+/**
+ * A session's "Adres" with what it runs over after it ("10.10.0.21 iSER
+ * (RDMA)") — only where the node read the transport from the kernel.
+ */
+export function sessionAddressHtml(s) {
+  if (!s?.address) return '<span class="text-3">—</span>';
+  const word = transportWord(s.transport);
+  return `<span class="mono">${escapeHtml(s.address)}</span>${word ? ` <span class="text-xs text-3" data-testid="session-transport">${escapeHtml(word)}</span>` : ''}`;
 }
 
 /** A session's "Stan" as the kernel names it (`LOGGED_IN`, nvmet `ready`). */
@@ -806,7 +833,10 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       ['targets.portal_current_addresses', Array.isArray(interfaces) ? bindableAddresses(state.capabilities, portal.interface).join(', ') || '—' : T('targets.portal_unknown')],
       ['targets.portal_actual', !portal.interface ? T('targets.all_interfaces') : owners ? owners.join(', ') || T('targets.portal_no_owner') : T('targets.portal_unknown')],
       ['targets.portal_transport', [...new Set(t.portals.map((p) => transportLabel(p.transport)))].join(' + ')],
-      ['targets.portal_exposure', listenText(state.listen)],
+      // The TCP socket(s) and — as their own row, RDMA listeners 2026-09-27 —
+      // the RDMA listener(s): an iSER portal has one of each.
+      ['targets.portal_exposure', listenText((state.listen || []).filter((l) => !isRdmaListen(l)))],
+      ...((state.listen || []).some(isRdmaListen) ? [['targets.portal_exposure_rdma', listenText(state.listen.filter(isRdmaListen))]] : []),
     ] : [];
     const rowSpec = ([key, value]) => ({ key, label: T(key), value, testid: key.slice('targets.'.length), mono: true });
     paintValueRows(win.querySelector('[data-part="portal-a"]'), portalRows.slice(0, 3).map(rowSpec));
@@ -876,7 +906,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
         _identity: s.user || '',
         _resettable: resettable && (t.initiators || []).includes(s.user),
         identity: s.user ? hostIdentityHtml(s.user) : `<span class="text-3">${escapeHtml(T('targets.session_unnamed'))}</span>`,
-        address: s.address ? `<span class="mono">${escapeHtml(s.address)}</span>` : '<span class="text-3">—</span>',
+        address: sessionAddressHtml(s),
         duration: sessionDurationHtml(s.connectedAt, now),
         state: sessionStateHtml(s.state),
       })));

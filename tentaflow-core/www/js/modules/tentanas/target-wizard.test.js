@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const {
-  openTargetWizard, targetNameValid, parseSize, transportOptions, transportsOf,
+  openTargetWizard, targetNameValid, parseSize, transportOptions, transportsOf, interfaceRdmaGap,
   sharedWithoutAuth, AUTH_METHODS, defaultTransport, defaultMethod, parseHostNqns, WWN_AUTHORITY,
   primaryAddress, sharedHostTargets, sharedHostNqns, sharedHostNeighbours, sharedHostWarning,
   authenticates, bindableAddresses, ALL_INTERFACES_ADDRESS, invalidHostNqns, iqnHostPart,
@@ -104,6 +104,19 @@ test('the transports offered are the ones the node probed, per protocol', () => 
   assert.deepEqual(transportOptions('nvmet', noRdma).map((t) => t.ok), [true, false, false]);
   assert.deepEqual(transportsOf('tcp+rdma'), ['tcp', 'rdma']);
   assert.deepEqual(transportsOf('iser'), ['iser']);
+  // RDMA listeners 2026-09-27: the kernel refuses an RDMA listener on an
+  // address no RDMA device holds (ENODEV, measured), so with the portal's
+  // interface chosen RDMA is offered only where a card with an ACTIVE link is.
+  assert.deepEqual(transportOptions('iscsi', caps(), 'storage0').map((t) => t.ok), [true, true]);
+  assert.deepEqual(transportOptions('iscsi', caps(), 'lan0').map((t) => t.ok), [true, false]);
+  assert.deepEqual(transportOptions('nvmet', caps(), 'lan0').map((t) => t.ok), [true, false, false]);
+  assert.deepEqual(transportOptions('nvmet', caps(), '').map((t) => t.ok), [true, true, true], 'every interface at once: the node decides');
+  assert.equal(interfaceRdmaGap(caps(), 'storage0'), '');
+  assert.equal(interfaceRdmaGap(caps(), 'lan0'), 'Interfejs lan0 nie ma urządzenia RDMA — jądro odrzuca nasłuch RDMA na jego adresie. Wybierz TCP albo interfejs z kartą RDMA.');
+  const down = caps({ interfaces: [{ name: 'enp4s0np0', address: '10.10.0.7', rdma: false, rdmaDevice: 'rocep4s0', shared: false, supported: true }] });
+  assert.equal(interfaceRdmaGap(down, 'enp4s0np0'), 'Urządzenie RDMA rocep4s0 na interfejsie enp4s0np0 ma nieaktywne łącze — klienci nie połączą się przez RDMA.');
+  assert.deepEqual(transportOptions('iscsi', down, 'enp4s0np0').map((t) => t.ok), [true, false]);
+  assert.equal(interfaceRdmaGap(caps(), 'gone0'), '', 'an interface the node did not list is the drift rule\'s business');
   // Each protocol has its own authentication vocabulary.
   assert.deepEqual(AUTH_METHODS.iscsi, ['chap', 'mutual-chap', 'none']);
   assert.deepEqual(AUTH_METHODS.nvmet, ['dhchap', 'dhchap-bidi', 'none']);

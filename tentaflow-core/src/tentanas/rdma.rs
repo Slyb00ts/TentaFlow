@@ -17,6 +17,17 @@
 //       shelling out would add a package dependency to a question sysfs
 //       already answers, and would make the probe fail on a node where RDMA
 //       works but the tool is not installed.
+//
+//       RDMA LISTENERS (`cm_ids`, measured on rig11 2026-09-27, "RDMA
+//       listeners" in the MAJOR 27 measurements): an nvmet-rdma port or an
+//       iSER portal listens through the RDMA connection manager, which `ss`
+//       and `/proc/net/tcp` never see, and configfs keeps claiming a listener
+//       the kernel has dropped (device removed and re-added: the port link and
+//       `iser = 1` stay, the listener does not come back). The one place the
+//       kernel publishes it is the RDMA netlink resource dump — the request
+//       `rdma res show cm_id` makes — and it answers an UNPRIVILEGED reader
+//       byte for byte like root. That question sysfs cannot answer, so this
+//       file speaks the netlink itself rather than depending on the tool.
 // =============================================================================
 
 use std::path::Path;
@@ -56,6 +67,29 @@ pub struct RdmaDevice {
 }
 
 impl RdmaDevice {
+    /// Whether an RDMA portal (an nvmet-rdma port, an iSER flag) can listen on
+    /// this device, as the Environment row says it per interface:
+    ///
+    /// - `no_netdev` / `no_address`: a portal binds an IPv4 ADDRESS, and the
+    ///   kernel refuses one no RDMA device carries — MEASURED on rig11
+    ///   2026-09-27: the nvmet port link and the `iser = 1` write both fail
+    ///   with `ENODEV` on 192.168.11.11 while no RDMA device held it;
+    /// - `port_down`: the device holds an address but its link is not
+    ///   ACTIVE, so no client reaches it (whether the kernel would bind the
+    ///   listener there is NOT measured — rig11's ports have no address);
+    /// - `yes`: an ACTIVE port with an address.
+    pub fn portal_verdict(&self) -> &'static str {
+        if self.netdev.is_empty() {
+            "no_netdev"
+        } else if self.addresses.is_empty() {
+            "no_address"
+        } else if !self.active {
+            "port_down"
+        } else {
+            "yes"
+        }
+    }
+
     /// One line for the Environment row's detail column.
     fn describe(&self) -> String {
         let mut out = format!("{} {}", self.device, self.state);
@@ -170,6 +204,56 @@ pub fn module_in_tree(module: &str) -> bool {
         })
 }
 
+/// The netdev an RDMA port carries traffic on, from the port's own GID
+/// attributes (`ports/<n>/gid_attrs/ndevs/0`).
+///
+/// MEASURED on rig11 (2026-09-27): `enp4s0np0` / `enp141s0np0` for the mlx5
+/// ports (link DOWN, no address), `lo` / `enp5s0` for a Soft-RoCE link. The
+/// RoCE enumerator finds a netdev through `/sys/class/net/<if>/device/
+/// infiniband`, which a Soft-RoCE (`rdma_rxe`) device does not have — so
+/// without this a software RDMA device read as "no interface", and the
+/// portal picker never offered RDMA on the interface it runs on.
+fn port_netdev(device: &str) -> String {
+    let ports = format!("{INFINIBAND_CLASS}/{device}/ports");
+    let Ok(entries) = std::fs::read_dir(&ports) else {
+        return String::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+        .iter()
+        .find_map(|port| {
+            std::fs::read_to_string(format!("{ports}/{port}/gid_attrs/ndevs/0"))
+                .ok()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+        })
+        .unwrap_or_default()
+}
+
+/// Every IPv4 address of one netdev, the loopback excluded (the portal
+/// picker lists the same set).
+fn netdev_ipv4(netdev: &str) -> Vec<String> {
+    let networks = sysinfo::Networks::new_with_refreshed_list();
+    let mut out = Vec::new();
+    for (name, data) in networks.iter() {
+        if name != netdev {
+            continue;
+        }
+        for net in data.ip_networks() {
+            if let std::net::IpAddr::V4(v4) = net.addr {
+                if !v4.is_loopback() && !out.contains(&v4.to_string()) {
+                    out.push(v4.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Reads the node's RDMA state. Linux-only: `/sys/class/infiniband` does not
 /// exist anywhere else, and the probe answers "no devices" there, which is
 /// what the limited mode of §3.3 already says about those platforms.
@@ -184,20 +268,24 @@ pub fn probe() -> Probe {
             let device = entry.file_name().to_string_lossy().into_owned();
             let state = device_state(&device);
             let iface = interfaces.iter().find(|i| i.roce_device == device);
-            let addresses = iface
-                .map(|i| {
-                    i.ipv4
-                        .iter()
-                        .cloned()
-                        .chain(i.ipv4_aliases.iter().cloned())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let (netdev, addresses) = match iface {
+                Some(i) => (
+                    i.netdev.clone(),
+                    i.ipv4.iter().cloned().chain(i.ipv4_aliases.iter().cloned()).collect(),
+                ),
+                // A device the enumerator does not map (Soft-RoCE): its own
+                // port says which netdev it runs on.
+                None => {
+                    let netdev = port_netdev(&device);
+                    let addresses = if netdev.is_empty() { Vec::new() } else { netdev_ipv4(&netdev) };
+                    (netdev, addresses)
+                }
+            };
             devices.push(RdmaDevice {
                 active: state == "ACTIVE",
                 device,
                 state,
-                netdev: iface.map(|i| i.netdev.clone()).unwrap_or_default(),
+                netdev,
                 addresses,
             });
         }
@@ -208,6 +296,20 @@ pub fn probe() -> Probe {
         module_loaded: module_loaded(RPCRDMA_MODULE),
         module_available: module_in_tree(RPCRDMA_MODULE),
     }
+}
+
+/// The RDMA device (any port state) whose netdev holds `address`, if one does.
+/// The question the kernel asks before it binds an RDMA listener — no such
+/// device is its `ENODEV` (measured). `0.0.0.0` is every device.
+pub fn device_for_address(probe: &Probe, address: &str) -> Option<String> {
+    if address == "0.0.0.0" {
+        return probe.devices.first().map(|d| d.device.clone());
+    }
+    probe
+        .devices
+        .iter()
+        .find(|d| d.addresses.iter().any(|a| a == address))
+        .map(|d| d.device.clone())
 }
 
 /// Whether a kernel module is loaded right now. Shared with the ksmbd probe.
@@ -258,7 +360,22 @@ pub fn describe_coded(probe: &Probe) -> (&'static str, CodedText) {
     } else {
         "ok"
     };
-    (status, CodedText::new("rdma_devices", &[("devices", devices.clone())], devices).and(module))
+    // One code per device, so the screen can say per INTERFACE whether it
+    // can carry an RDMA portal; the English sentence stays the one list.
+    let mut coded = CodedText { text: devices, reasons: Vec::new() };
+    coded.reasons.extend(probe.devices.iter().map(|d| {
+        super::disks::coded_reason(
+            "rdma_device",
+            &[
+                ("device", d.device.clone()),
+                ("state", d.state.clone()),
+                ("netdev", d.netdev.clone()),
+                ("addresses", d.addresses.join(", ")),
+                ("portal", d.portal_verdict().to_string()),
+            ],
+        )
+    }));
+    (status, coded.and(module))
 }
 
 /// Replaces the generic feature probe's answer for the RDMA row.
@@ -290,6 +407,297 @@ pub fn available(features: &[FeatureState]) -> bool {
     features
         .iter()
         .any(|f| f.id == FEATURE_ID && f.status == "ok")
+}
+
+// =============================================================================
+// RDMA CM ids: who listens and who is connected over RDMA (netlink `nldev`)
+// =============================================================================
+
+/// One RDMA connection-manager id as the kernel's resource tracker lists it.
+///
+/// Only what a screen may use is kept: the device (a kernel name), the state,
+/// the addresses and the kernel module that owns it. The id number, the QP
+/// number and the owning PID the dump also carries are dropped here, so they
+/// cannot reach the wire by accident (no ids in the GUI).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmId {
+    /// `rocep4s0`, `m27rxe`, …
+    pub device: String,
+    /// The CM state as `rdma res show` names it: `LISTEN`, `CONNECT`, …
+    pub state: String,
+    pub src: Option<std::net::SocketAddr>,
+    pub dst: Option<std::net::SocketAddr>,
+    /// The kernel module that owns a kernel CM id (`nvmet_rdma`, `ib_isert`,
+    /// `nvme_rdma`, `ib_iser`); empty for one a user-space process owns.
+    pub owner: String,
+}
+
+/// The kernel module names that own a target's listeners and connections
+/// (`KBUILD_MODNAME`), as measured on rig11.
+pub const OWNER_NVMET: &str = "nvmet_rdma";
+pub const OWNER_ISERT: &str = "ib_isert";
+
+/// `enum rdma_cm_state` (kernel `cma_priv.h`), in the order iproute2 prints it.
+const CM_STATES: [&str; 11] = [
+    "IDLE",
+    "ADDR_QUERY",
+    "ADDR_RESOLVED",
+    "ROUTE_QUERY",
+    "ROUTE_RESOLVED",
+    "CONNECT",
+    "DISCONNECT",
+    "ADDR_BOUND",
+    "LISTEN",
+    "DEVICE_REMOVAL",
+    "DESTROYING",
+];
+
+// uapi `rdma/rdma_netlink.h` (values checked against the header; the dump
+// below is the request `rdma res show cm_id` makes).
+const NETLINK_RDMA: i32 = 20;
+const RDMA_NL_NLDEV: u16 = 5;
+const NLDEV_CMD_GET: u16 = 1;
+const NLDEV_CMD_RES_CM_ID_GET: u16 = 11;
+const ATTR_DEV_INDEX: u16 = 1;
+const ATTR_DEV_NAME: u16 = 2;
+const ATTR_RES_STATE: u16 = 27;
+const ATTR_RES_KERN_NAME: u16 = 29;
+const ATTR_RES_CM_ID: u16 = 30;
+const ATTR_RES_CM_ID_ENTRY: u16 = 31;
+const ATTR_RES_SRC_ADDR: u16 = 33;
+const ATTR_RES_DST_ADDR: u16 = 34;
+const NLMSG_ERROR: u16 = 2;
+const NLMSG_DONE: u16 = 3;
+/// `nla_type` without `NLA_F_NESTED` / `NLA_F_NET_BYTEORDER`.
+const NLA_TYPE_MASK: u16 = 0x3fff;
+
+const fn nldev_type(cmd: u16) -> u16 {
+    (RDMA_NL_NLDEV << 10) + cmd
+}
+
+/// The attributes of one netlink payload: `(type, value)`, in order.
+fn attributes(mut buf: &[u8]) -> Vec<(u16, &[u8])> {
+    let mut out = Vec::new();
+    while buf.len() >= 4 {
+        let len = u16::from_ne_bytes([buf[0], buf[1]]) as usize;
+        let kind = u16::from_ne_bytes([buf[2], buf[3]]) & NLA_TYPE_MASK;
+        if len < 4 || len > buf.len() {
+            break;
+        }
+        out.push((kind, &buf[4..len]));
+        let aligned = (len + 3) & !3;
+        buf = &buf[aligned.min(buf.len())..];
+    }
+    out
+}
+
+/// The data messages of one dump reply for `kind`: `Ok(payloads)`, or the
+/// kernel's errno when it answered `NLMSG_ERROR`. `done` says whether the
+/// dump's end marker was in these bytes.
+fn messages(mut buf: &[u8], kind: u16) -> (std::result::Result<Vec<&[u8]>, i32>, bool) {
+    let mut out = Vec::new();
+    while buf.len() >= 16 {
+        let len = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let msg_type = u16::from_ne_bytes([buf[4], buf[5]]);
+        if len < 16 || len > buf.len() {
+            break;
+        }
+        let payload = &buf[16..len];
+        match msg_type {
+            NLMSG_DONE => return (Ok(out), true),
+            NLMSG_ERROR => {
+                let errno = payload.get(..4).map(|b| i32::from_ne_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0);
+                return if errno == 0 { (Ok(out), true) } else { (Err(-errno), true) };
+            }
+            t if t == kind => out.push(payload),
+            _ => {}
+        }
+        buf = &buf[((len + 3) & !3).min(buf.len())..];
+    }
+    (Ok(out), false)
+}
+
+fn attr_u32(value: &[u8]) -> Option<u32> {
+    value.get(..4).map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn attr_str(value: &[u8]) -> String {
+    let end = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+    String::from_utf8_lossy(&value[..end]).into_owned()
+}
+
+/// A `__kernel_sockaddr_storage` as the dump writes it: the family in host
+/// order, the port in network order.
+fn sockaddr(value: &[u8]) -> Option<std::net::SocketAddr> {
+    let family = u16::from_ne_bytes([*value.first()?, *value.get(1)?]);
+    let port = u16::from_be_bytes([*value.get(2)?, *value.get(3)?]);
+    match i32::from(family) {
+        libc::AF_INET => {
+            let ip: [u8; 4] = value.get(4..8)?.try_into().ok()?;
+            Some(std::net::SocketAddr::from((ip, port)))
+        }
+        libc::AF_INET6 => {
+            let ip: [u8; 16] = value.get(8..24)?.try_into().ok()?;
+            Some(std::net::SocketAddr::from((ip, port)))
+        }
+        _ => None,
+    }
+}
+
+/// The devices of an `RDMA_NLDEV_CMD_GET` dump: `(index, name)`.
+fn parse_devices(bytes: &[u8]) -> std::result::Result<Vec<(u32, String)>, i32> {
+    let (msgs, _) = messages(bytes, nldev_type(NLDEV_CMD_GET));
+    let mut out = Vec::new();
+    for payload in msgs? {
+        let attrs = attributes(payload);
+        let index = attrs.iter().find(|(k, _)| *k == ATTR_DEV_INDEX).and_then(|(_, v)| attr_u32(v));
+        let name = attrs.iter().find(|(k, _)| *k == ATTR_DEV_NAME).map(|(_, v)| attr_str(v));
+        if let (Some(index), Some(name)) = (index, name) {
+            out.push((index, name));
+        }
+    }
+    Ok(out)
+}
+
+/// The CM ids of an `RDMA_NLDEV_CMD_RES_CM_ID_GET` dump of one device.
+fn parse_cm_ids(bytes: &[u8]) -> std::result::Result<Vec<CmId>, i32> {
+    let (msgs, _) = messages(bytes, nldev_type(NLDEV_CMD_RES_CM_ID_GET));
+    let mut out = Vec::new();
+    for payload in msgs? {
+        let attrs = attributes(payload);
+        let device = attrs.iter().find(|(k, _)| *k == ATTR_DEV_NAME).map(|(_, v)| attr_str(v)).unwrap_or_default();
+        for (_, table) in attrs.iter().filter(|(k, _)| *k == ATTR_RES_CM_ID) {
+            for (_, entry) in attributes(table).into_iter().filter(|(k, _)| *k == ATTR_RES_CM_ID_ENTRY) {
+                let mut id = CmId { device: device.clone(), state: String::new(), src: None, dst: None, owner: String::new() };
+                for (kind, value) in attributes(entry) {
+                    match kind {
+                        ATTR_RES_STATE => {
+                            id.state = value
+                                .first()
+                                .map(|s| CM_STATES.get(*s as usize).map(|n| n.to_string()).unwrap_or_else(|| format!("STATE_{s}")))
+                                .unwrap_or_default();
+                        }
+                        ATTR_RES_SRC_ADDR => id.src = sockaddr(value),
+                        ATTR_RES_DST_ADDR => id.dst = sockaddr(value),
+                        ATTR_RES_KERN_NAME => id.owner = attr_str(value),
+                        _ => {}
+                    }
+                }
+                out.push(id);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One `NLM_F_DUMP` request on a fresh NETLINK_RDMA socket; every byte of
+/// the reply up to its end marker. A 2 s receive timeout: a screen read
+/// must never hang on a kernel that does not answer.
+#[cfg(target_os = "linux")]
+fn nldev_dump(cmd: u16, device_index: Option<u32>) -> std::io::Result<Vec<u8>> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: plain socket syscalls on a descriptor this function owns; every
+    // pointer handed to the kernel points at a live, correctly sized local.
+    unsafe {
+        let raw = libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, NETLINK_RDMA);
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let fd = OwnedFd::from_raw_fd(raw);
+        let timeout = libc::timeval { tv_sec: 2, tv_usec: 0 };
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&timeout as *const libc::timeval).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+        let mut local: libc::sockaddr_nl = std::mem::zeroed();
+        local.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+        if libc::bind(
+            fd.as_raw_fd(),
+            (&local as *const libc::sockaddr_nl).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        ) < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut request = Vec::with_capacity(24);
+        let len: u32 = if device_index.is_some() { 24 } else { 16 };
+        request.extend_from_slice(&len.to_ne_bytes());
+        request.extend_from_slice(&nldev_type(cmd).to_ne_bytes());
+        request.extend_from_slice(&((libc::NLM_F_REQUEST | libc::NLM_F_DUMP) as u16).to_ne_bytes());
+        request.extend_from_slice(&1u32.to_ne_bytes());
+        request.extend_from_slice(&0u32.to_ne_bytes());
+        if let Some(index) = device_index {
+            request.extend_from_slice(&8u16.to_ne_bytes());
+            request.extend_from_slice(&ATTR_DEV_INDEX.to_ne_bytes());
+            request.extend_from_slice(&index.to_ne_bytes());
+        }
+        if libc::send(fd.as_raw_fd(), request.as_ptr().cast(), request.len(), 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0);
+            if n < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if n == 0 {
+                return Ok(out);
+            }
+            let chunk = &buf[..n as usize];
+            out.extend_from_slice(chunk);
+            if messages(chunk, nldev_type(cmd)).1 {
+                return Ok(out);
+            }
+        }
+    }
+}
+
+/// Every RDMA CM id of this node, across all devices. `Err` when the dump
+/// could not be read — "nobody listens" and "could not look" are different
+/// answers, and the screen says "Nie zmierzono" for the second.
+///
+/// MEASURED on rig11 (2026-09-27): an unprivileged reader gets exactly what
+/// root gets; a node without RDMA devices answers an empty list.
+#[cfg(target_os = "linux")]
+pub fn cm_ids() -> std::result::Result<Vec<CmId>, String> {
+    let bytes = nldev_dump(NLDEV_CMD_GET, None).map_err(|e| format!("RDMA netlink: {e}"))?;
+    let devices = parse_devices(&bytes).map_err(|errno| format!("RDMA netlink device list: errno {errno}"))?;
+    let mut out = Vec::new();
+    for (index, name) in devices {
+        let bytes = nldev_dump(NLDEV_CMD_RES_CM_ID_GET, Some(index)).map_err(|e| format!("RDMA netlink {name}: {e}"))?;
+        out.extend(parse_cm_ids(&bytes).map_err(|errno| format!("RDMA netlink {name}: errno {errno}"))?);
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn cm_ids() -> std::result::Result<Vec<CmId>, String> {
+    Err("RDMA netlink exists on Linux only".to_string())
+}
+
+/// The devices on which `owner` LISTENs on `address:port`: the address
+/// itself, or a wildcard listener of that port. MEASURED: a listener bound
+/// to a device's address is ONE entry on that device; one bound to a
+/// loopback address is one entry per RDMA device.
+pub fn listening_devices(ids: &[CmId], owner: &str, address: &str, port: u32) -> Vec<String> {
+    let wanted: Option<std::net::IpAddr> = address.parse().ok();
+    let mut out: Vec<String> = ids
+        .iter()
+        .filter(|id| id.state == "LISTEN" && id.owner == owner)
+        .filter(|id| {
+            id.src.is_some_and(|src| {
+                u32::from(src.port()) == port && (Some(src.ip()) == wanted || src.ip().is_unspecified())
+            })
+        })
+        .map(|id| id.device.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]
@@ -383,9 +791,18 @@ mod tests {
             module_loaded: true,
             module_available: true,
         });
-        assert_eq!(coded.reasons[0].code, "rdma_devices");
-        assert_eq!(coded.reasons[0].params.get("devices").map(String::as_str), Some("mlx5_0 ACTIVE (enp1s0f0np0 10.10.0.5)"));
+        // One code per device, so the row can say per interface whether an
+        // RDMA portal can listen there.
+        assert_eq!(coded.reasons[0].code, "rdma_device");
+        let p = &coded.reasons[0].params;
+        assert_eq!(p.get("device").map(String::as_str), Some("mlx5_0"));
+        assert_eq!(p.get("state").map(String::as_str), Some("ACTIVE"));
+        assert_eq!(p.get("netdev").map(String::as_str), Some("enp1s0f0np0"));
+        assert_eq!(p.get("addresses").map(String::as_str), Some("10.10.0.5"));
+        assert_eq!(p.get("portal").map(String::as_str), Some("yes"));
         assert_eq!(coded.reasons[1].code, "module_loaded");
+        // The sentence is still the one list.
+        assert_eq!(coded.text, "mlx5_0 ACTIVE (enp1s0f0np0 10.10.0.5) · rpcrdma loaded (provides svcrdma/xprtrdma)");
 
         let empty = Probe {
             devices: Vec::new(),
@@ -453,5 +870,111 @@ mod tests {
             status: "ok".to_string(),
             ..Default::default()
         }]));
+    }
+
+    #[test]
+    fn the_portal_verdict_per_device_is_what_the_kernel_measured() {
+        // rig11's mlx5 ports: a netdev, no address, link DOWN.
+        assert_eq!(device("rocep4s0", "DOWN", "enp4s0np0", "").portal_verdict(), "no_address");
+        assert_eq!(device("mlx5_2", "ACTIVE", "", "").portal_verdict(), "no_netdev");
+        assert_eq!(device("mlx5_0", "DOWN", "enp1s0f0np0", "10.10.0.5").portal_verdict(), "port_down");
+        assert_eq!(device("m27rxe", "ACTIVE", "enp5s0", "192.168.11.11").portal_verdict(), "yes");
+        // The address → device question the kernel asks before binding.
+        let probe = Probe {
+            devices: vec![device("rocep4s0", "DOWN", "enp4s0np0", ""), device("m27rxe", "ACTIVE", "enp5s0", "192.168.11.11")],
+            module_loaded: true,
+            module_available: true,
+        };
+        assert_eq!(device_for_address(&probe, "192.168.11.11").as_deref(), Some("m27rxe"));
+        assert_eq!(device_for_address(&probe, "10.10.0.5"), None);
+        assert_eq!(device_for_address(&probe, "0.0.0.0").as_deref(), Some("rocep4s0"));
+        assert_eq!(device_for_address(&Probe::default(), "0.0.0.0"), None);
+    }
+
+    /// The netlink bytes rig11 answered, verbatim (`cmid.py --raw`, RDMA
+    /// listeners 2026-09-27): every message of one dump, end marker included.
+    const DEVICES: &str = include_str!("../../tests/fixtures/rdma-nldev-devices.hex");
+    const LAN_LISTEN: &str = include_str!("../../tests/fixtures/rdma-nldev-cmid-lan-listen.hex");
+    const ISER_CONNECTED: &str = include_str!("../../tests/fixtures/rdma-nldev-cmid-iser-connected.hex");
+    const LOOPBACK_LISTEN: &str = include_str!("../../tests/fixtures/rdma-nldev-cmid-loopback-listen.hex");
+
+    fn hex(text: &str) -> Vec<u8> {
+        let text = text.trim();
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    #[test]
+    fn the_measured_device_dump_names_every_rdma_device() {
+        let devices = parse_devices(&hex(DEVICES)).expect("no errno");
+        assert_eq!(
+            devices,
+            vec![(0, "rocep4s0".to_string()), (1, "rocep141s0".to_string()), (4, "m27rxe".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_listener_on_an_address_is_one_entry_on_the_device_that_holds_it() {
+        let ids = parse_cm_ids(&hex(LAN_LISTEN)).expect("no errno");
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert_eq!(ids[0].device, "m27rxe");
+        assert_eq!(ids[0].state, "LISTEN");
+        assert_eq!(ids[0].owner, OWNER_NVMET);
+        assert_eq!(ids[0].src, Some("192.168.11.11:4420".parse().unwrap()));
+        assert_eq!(ids[0].dst, Some("0.0.0.0:0".parse().unwrap()));
+        assert_eq!(ids[1].owner, OWNER_ISERT);
+        assert_eq!(ids[1].src, Some("192.168.11.11:3260".parse().unwrap()));
+        assert_eq!(listening_devices(&ids, OWNER_NVMET, "192.168.11.11", 4420), vec!["m27rxe"]);
+        assert_eq!(listening_devices(&ids, OWNER_ISERT, "192.168.11.11", 3260), vec!["m27rxe"]);
+        // The other module's listener, another port or another address is
+        // not this portal's listener.
+        assert!(listening_devices(&ids, OWNER_ISERT, "192.168.11.11", 4420).is_empty());
+        assert!(listening_devices(&ids, OWNER_NVMET, "192.168.11.11", 3260).is_empty());
+        assert!(listening_devices(&ids, OWNER_NVMET, "10.10.0.5", 4420).is_empty());
+    }
+
+    #[test]
+    fn an_iser_session_is_a_connected_cm_id_of_ib_isert_with_the_initiator_as_peer() {
+        let ids = parse_cm_ids(&hex(ISER_CONNECTED)).expect("no errno");
+        let target_side: Vec<&CmId> = ids.iter().filter(|i| i.state == "CONNECT" && i.owner == OWNER_ISERT).collect();
+        assert_eq!(target_side.len(), 1, "{ids:?}");
+        assert_eq!(target_side[0].src.map(|a| a.port()), Some(3260));
+        assert_eq!(target_side[0].dst.map(|a| a.ip().to_string()).as_deref(), Some("192.168.11.11"));
+        // The initiator's own half (the test ran on one host) is `ib_iser`.
+        assert_eq!(ids.iter().filter(|i| i.state == "CONNECT" && i.owner == "ib_iser").count(), 1);
+        // The listeners are still there while the session runs.
+        assert_eq!(listening_devices(&ids, OWNER_ISERT, "192.168.11.11", 3260), vec!["m27rxe"]);
+    }
+
+    #[test]
+    fn a_loopback_listener_is_listed_on_every_device_without_a_port() {
+        // Round 1: 127.0.0.1 bound on rocep4s0 although its link is DOWN.
+        let ids = parse_cm_ids(&hex(LOOPBACK_LISTEN)).expect("no errno");
+        assert_eq!(ids.len(), 2, "{ids:?}");
+        assert!(ids.iter().all(|i| i.device == "rocep4s0" && i.state == "LISTEN"));
+        assert_eq!(listening_devices(&ids, OWNER_NVMET, "127.0.0.1", 4420), vec!["rocep4s0"]);
+        assert_eq!(listening_devices(&ids, OWNER_ISERT, "127.0.0.1", 3260), vec!["rocep4s0"]);
+    }
+
+    #[test]
+    fn a_netlink_error_is_an_errno_and_short_bytes_are_not_a_panic() {
+        // NLMSG_ERROR carrying -EPERM (1).
+        let mut error = Vec::new();
+        error.extend_from_slice(&36u32.to_ne_bytes());
+        error.extend_from_slice(&NLMSG_ERROR.to_ne_bytes());
+        error.extend_from_slice(&0u16.to_ne_bytes());
+        error.extend_from_slice(&[0u8; 8]);
+        error.extend_from_slice(&(-1i32).to_ne_bytes());
+        error.extend_from_slice(&[0u8; 16]);
+        assert_eq!(parse_cm_ids(&error), Err(1));
+        assert_eq!(parse_devices(&error), Err(1));
+        let bytes = hex(LAN_LISTEN);
+        for cut in [0, 3, 15, 16, 40, 200, bytes.len() - 1] {
+            let _ = parse_cm_ids(&bytes[..cut]);
+        }
+        // A cut inside the only data message yields nothing, never garbage.
+        assert_eq!(parse_cm_ids(&bytes[..200]), Ok(Vec::new()));
     }
 }

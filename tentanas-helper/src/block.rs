@@ -790,9 +790,18 @@ pub struct AclSession {
     /// One `TARG_CONN_STATE_` (stripped) per connection.
     pub connection_states: Vec<String>,
     /// The peer IP of each connection, in order (the first is the one shown).
-    /// The transport word after it (`TCP`, or `SCTP` for anything that is not
-    /// TCP — iSER included) is deliberately not kept.
     pub addresses: Vec<String>,
+    /// The transport word LIO prints after each address, verbatim and in the
+    /// same order: `TCP`, or `SCTP` for EVERY connection that is not TCP.
+    ///
+    /// MEASURED on rig11 (2026-09-27, RDMA listeners §R.3): an iSER login over
+    /// Soft-RoCE reads `Address 192.168.11.11 SCTP  StatSN: …` — LIO has no
+    /// SCTP transport at all, its `info` writer just prints `SCTP` for anything
+    /// that is not `ISCSI_TCP` (iSER, and the Chelsio offload `cxgbit`). So the
+    /// word says "TCP or not", and only the portal it came in on can say which
+    /// "not" it was (`targets::session_transport`).
+    #[serde(default)]
+    pub transports: Vec<String>,
 }
 
 /// `{acl}/info` as a three-state answer.
@@ -841,8 +850,9 @@ pub fn parse_acl_info(info: &str) -> AclInfo {
             if let Some(state) = connection_line(rest) {
                 session.connection_states.push(state);
             }
-        } else if let Some(address) = address_line(line) {
+        } else if let Some((address, transport)) = address_line(line) {
             session.addresses.push(address);
+            session.transports.push(transport);
         }
     }
     AclInfo::Active(session)
@@ -908,8 +918,9 @@ fn connection_line(rest: &str) -> Option<String> {
     word(after.strip_prefix("Connection State: TARG_CONN_STATE_")?)
 }
 
-/// `^\s+Address (\S+) (?:TCP|SCTP)\s+StatSN:` — the peer address.
-fn address_line(line: &str) -> Option<String> {
+/// `^\s+Address (\S+) (TCP|SCTP)\s+StatSN:` — the peer address and the
+/// transport word.
+fn address_line(line: &str) -> Option<(String, String)> {
     let body = line.trim_start();
     if body.len() == line.len() {
         return None;
@@ -919,12 +930,17 @@ fn address_line(line: &str) -> Option<String> {
     if address.is_empty() {
         return None;
     }
-    let tail = tail.strip_prefix("TCP").or_else(|| tail.strip_prefix("SCTP"))?;
+    // `SCTP` first: `TCP` is not a prefix of it, but keeping the longer word
+    // first makes the order not matter to the next reader.
+    let (transport, tail) = match tail.strip_prefix("SCTP") {
+        Some(rest) => ("SCTP", rest),
+        None => ("TCP", tail.strip_prefix("TCP")?),
+    };
     let after = tail.trim_start();
     if after.len() == tail.len() || !after.starts_with("StatSN:") {
         return None;
     }
-    Some(address.to_string())
+    Some((address.to_string(), transport.to_string()))
 }
 
 /// The initiator names in a TPG's `dynamic_sessions`, VERBATIM.
@@ -6593,6 +6609,19 @@ CmdSN/WR  :  CmdSN/WC  :  ExpCmdSN  :  MaxCmdSN  :     ITT    :     TTT\n \
 CID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN\n   \
 Address 127.0.0.1 TCP  StatSN: 0x3cded8e9\n";
 
+    /// The `info` of an iSER session, verbatim: rig11, Soft-RoCE on enp5s0,
+    /// open-iscsi iface `transport_name = iser` (RDMA listeners §R.3).
+    const ACL_INFO_ISER: &str = "InitiatorName: iqn.2004-10.com.ubuntu:01:35ed4c1b7a\n\
+InitiatorAlias: storage\n\
+LIO Session ID: 1   ISID: 0x00 02 3d 00 00 13  TSIH: 1  SessionType: Normal\n\
+Session State: TARG_SESS_STATE_LOGGED_IN\n\
+---------------------[iSCSI Session Values]-----------------------\n  \
+CmdSN/WR  :  CmdSN/WC  :  ExpCmdSN  :  MaxCmdSN  :     ITT    :     TTT\n \
+0x00000040   0x00000040   0x0000004a   0x00000089   0x0000004a   0x00000048\n\
+----------------------[iSCSI Connections]-------------------------\n\
+CID: 0  Connection State: TARG_CONN_STATE_LOGGED_IN\n   \
+Address 192.168.11.11 SCTP  StatSN: 0xd5371dc2\n";
+
     #[test]
     fn the_trailing_nul_of_dynamic_sessions_is_not_a_session() {
         let text = String::from_utf8(DYNAMIC_SESSIONS_ONE.to_vec()).expect("utf-8");
@@ -6617,16 +6646,23 @@ Address 127.0.0.1 TCP  StatSN: 0x3cded8e9\n";
         assert_eq!(session.state, "LOGGED_IN");
         assert_eq!(session.connection_states, vec!["LOGGED_IN"]);
         assert_eq!(session.addresses, vec!["127.0.0.1"]);
+        assert_eq!(session.transports, vec!["TCP"]);
         // The session id increments per login (measured 1 → 10); the ten is
         // read as ten, not as its first digit.
         let tenth = ACL_INFO_ACTIVE.replace("LIO Session ID: 1 ", "LIO Session ID: 10 ");
         let AclInfo::Active(tenth) = parse_acl_info(&tenth) else { panic!("active") };
         assert_eq!(tenth.session_id, Some(10));
-        // iSER prints SCTP (anything that is not TCP): the address is kept,
-        // the word is not.
-        let iser = ACL_INFO_ACTIVE.replace("127.0.0.1 TCP", "10.10.0.21 SCTP");
-        let AclInfo::Active(iser) = parse_acl_info(&iser) else { panic!("active") };
-        assert_eq!(iser.addresses, vec!["10.10.0.21"]);
+        // iSER prints SCTP (anything that is not TCP): the address and the
+        // word are both kept, in the same order.
+        let AclInfo::Active(iser) = parse_acl_info(ACL_INFO_ISER) else { panic!("active") };
+        assert_eq!(iser.addresses, vec!["192.168.11.11"]);
+        assert_eq!(iser.transports, vec!["SCTP"]);
+        assert_eq!(iser.state, "LOGGED_IN");
+        assert_eq!(iser.session_id, Some(1));
+        // A word that is neither is not an Address line at all.
+        let odd = ACL_INFO_ACTIVE.replace("127.0.0.1 TCP", "10.10.0.21 RDMA");
+        let AclInfo::Active(odd) = parse_acl_info(&odd) else { panic!("active") };
+        assert!(odd.addresses.is_empty() && odd.transports.is_empty());
 
         assert_eq!(
             parse_acl_info("No active iSCSI Session for Initiator Endpoint: iqn.2004-10.com.ubuntu:01:35ed4c1b7a\n"),

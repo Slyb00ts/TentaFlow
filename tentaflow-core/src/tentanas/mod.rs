@@ -980,12 +980,18 @@ mod tests {
             ),
             // Wave 7: the Environment rows (`NasEnvironment::feature_reasons`).
             ("src/tentanas/environment.rs", "CodedText::new(", vec!["www/js/modules/tentanas/feature-words.js"]),
+            // RDMA listeners 2026-09-27: one `coded_reason("rdma_device"` per
+            // device joins the row's `CodedText::new` codes (scanned below).
             ("src/tentanas/rdma.rs", "CodedText::new(", vec!["www/js/modules/tentanas/feature-words.js"]),
             ("src/tentanas/ksmbd.rs", "CodedText::new(", vec!["www/js/modules/tentanas/feature-words.js"]),
             ("src/dispatch/tentanas.rs", "CodedText::new(", vec!["www/js/modules/tentanas/approvals.js"]),
         ];
         for (rust, call, screens) in cases {
-            let codes = codes_in(&read(rust), call);
+            let mut codes = codes_in(&read(rust), call);
+            if rust == "src/tentanas/rdma.rs" {
+                codes.extend(codes_in(&read(rust), "coded_reason("));
+                assert!(codes.contains("rdma_device"), "{codes:?}");
+            }
             assert!(codes.len() >= 5, "{rust}: the scan found {codes:?}");
             let words: String = screens.iter().map(|s| read(s)).collect();
             for code in &codes {

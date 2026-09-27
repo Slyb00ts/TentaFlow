@@ -1,0 +1,34 @@
+{
+  "total_samples": 37174,
+  "train_samples": 35316,
+  "val_samples": 1858,
+  "breakdown": {
+    "polish_instruction": {
+      "count": 28300,
+      "percentage": 76.13,
+      "subsets": {
+        "bielik_distill_10k": 10300,
+        "aya_polish": 10000,
+        "owca_polish": 8000
+      }
+    },
+    "english_replay_buffer": {
+      "count": 5000,
+      "percentage": 13.45,
+      "subsets": {
+        "gsm8k_reasoning": 5000
+      }
+    },
+    "tentaflow_anchors": {
+      "count": 3874,
+      "percentage": 10.42,
+      "subsets": {
+        "guard_tool_intent": 3874
+      }
+    }
+  },
+  "output_files": {
+    "train": "/mnt/d/repos/TentaFlow/tentaflow-models/data_pl/processed/train_pl_combined.jsonl",
+    "val": "/mnt/d/repos/TentaFlow/tentaflow-models/data_pl/processed/val_pl_combined.jsonl"
+  }
+}
