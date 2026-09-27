@@ -150,7 +150,7 @@ jobs:
         with:
           name: native-libs-windows-x86_64-${{ matrix.backend }}
           path: native-libs/windows-x86_64
-          retention-days: 1
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # build — one per archive. The CUDA archive links the CUDA llama.cpp/whisper

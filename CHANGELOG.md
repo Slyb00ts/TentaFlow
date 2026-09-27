@@ -1,194 +1,176 @@
 # Changelog
 
-Notable changes to TentaFlow.
+Najważniejsze zmiany w TentaFlow.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0-beta] — 2026-09-27
 
-### Upgrade notes
+Zmiany od tagu `v0.3.0-beta` do `v0.4.0-beta`. Wydanie testowe.
+Tag `v0.3.0-beta` nie zakończył się publikacją artefaktów wydania na GitHubie.
+Dla instalacji z ostatniego opublikowanego wydania `v0.1.0-beta` obowiązują
+również opisane poniżej zmiany i uwagi aktualizacyjne wersji 0.2.0 oraz 0.3.0.
 
-- **TentaBus replication safety needs every node on this release.** The
-  protection against losing acknowledged records holds only once every node of
-  a cluster runs it: an older node sends neither log epochs nor committed
-  offsets and is judged by offsets alone, as before. Partitions written by an
-  older release open with no recorded epochs and a committed offset of 0, so
-  the first leader to reach them re-feeds more than it would otherwise.
-- **Upgrade TentaBus followers before leaders.** At RF≥3 with `acks=quorum` or
-  `acks=all`, an upgraded leader shows consumers the records it re-fed after a
-  failover only once a majority confirms its term, and an older follower never
-  confirms. During a rolling upgrade an idle partition whose majority still
-  runs the older release keeps those records hidden until the next publish
-  reaches a majority.
-- **One leader per TentaBus epoch holds only between upgraded nodes.** An older
-  node still proposes the next epoch number, which can equal one an upgraded
-  node proposes; the two are then ordered by node id as before. An older
-  candidate asks no replica for a promise and an older replica makes none. An
-  upgraded candidate still counts an older replica's answer toward its
-  majority — it could not have promised anything — so elections do not stall
-  while a cluster is upgraded; a replica only refuses leaders of an earlier term
-  once both it and the candidate run this release. Any row an older node writes
-  carries no epoch slots: upgraded nodes keep the slots they already store for
-  that topic incarnation, and a node such a row adds holds no slot — it does not
-  stand for election until an upgraded leader's next change stores one. A
-  partition never stamped by an upgraded node derives its slots from its own
-  replica set. Migration 175 adds the slot column. New replication fields are
-  appended to existing frames, so mixed nodes keep replicating during a rolling
-  upgrade.
+### Aktualizacja i zgodność
+
+- **Zaktualizuj wszystkie węzły TentaBus, zaczynając od replik podrzędnych,
+  a kończąc na liderach.** Pełna ochrona zatwierdzonych wiadomości oraz zasada
+  jednego lidera na epokę wymagają nowej wersji na każdym węźle. Starsze węzły
+  nie zapisują epok ani zatwierdzonych offsetów i nie składają trwałych obietnic
+  wyborczych; podczas aktualizacji mieszany klaster nie ma pełnych gwarancji.
+  Nowy lider może wstrzymać widoczność odtworzonych wiadomości do potwierdzenia
+  jego kadencji przez większość nowych replik lub zapisu nowej wiadomości przez
+  większość. Stare partycje zaczynają z zatwierdzonym offsetem 0, co zwiększa
+  zakres ponownej synchronizacji.
+- Migracje bazy obejmują zwalnianie nazw usuniętych workspace'ów (171), generacje
+  tematów i porządkowanie pozostałości TentaBus (172–174) oraz trwałe przydziały
+  epok replik (175). Partycje zapisują epoki w `partition.epochs` i zatwierdzony
+  offset w rozszerzonym `partition.meta`.
+- Narzędzia plikowe agentów zwracają teraz `blob_id` i przyjmują
+  `expected_blob_id`, zamiast `sha256` i `expected_sha256`. To identyfikator
+  obiektu Git kopiowany z wyniku odczytu. Własne prompty i wywołania narzędzi
+  wymagają dostosowania; niezmodyfikowany prompt dostarczany z aplikacją jest
+  aktualizowany automatycznie.
+- `tentanas-helper` ma wersję `0.17.2`; nowe operacje i diagnostyka wymagają
+  aktualnego helpera na zarządzanym węźle.
 
 ### TentaBus
 
-- Unprocessed messages screen: per-topic tiles, one merged list, and Pokaż /
-  Ponów / Odrzuć / Ponów wszystkie windows, plus a Nieprzetworzone section on
-  the topic page; counters refresh everywhere after a change. A retried
-  message is taken off the list, retry-all skips messages rejected at write
-  and refuses users without topic administration, and HL7/XML previews are
-  read in the source topic's format under its data-hiding rules. Known
-  limits: with more than one partition "Wczytaj więcej" can repeat rows, a
-  retry or discard is not restricted to the node leading the partition and
-  its marker does not reach every copy, and a failure between republishing
-  and marking can leave the message listed, so it can be retried twice.
-- New Topics screen: a filterable list, a three-step creator (content kind,
-  partitions, message pattern), deletion that asks for the name to be retyped
-  and says what goes with the topic, and a message preview.
-- A topic now has its own page: Stan (traffic, what waits, what needs
-  attention and who reads it), Ustawienia (every setting read out, each group
-  changed in its own window that says what the change will do) and Partycje i
-  kopie (which node leads each partition, its copies, moving the leadership).
-  The Kopie i nody tab shows the nodes, the partitions that need attention and
-  the leadership changes; changing a partition's copies by hand is gone.
-- New Odbiorcy screen: the consumers with what waits for each, filters for
-  the ones behind and the paused ones, pause and resume in the row. A
-  consumer's page shows Stan (what waits and whether it grows, reading rate,
-  its own unprocessed messages, what needs attention), Miejsce czytania (per
-  partition the last message read and what waits, with "Przesuń", whose
-  window counts how many messages will be read again or skipped before it is
-  confirmed) and Ustawienia (how the program confirms, set by the program
-  itself and shown locked).
-- Moving a consumer's reading place now takes effect for a program that is
-  reading at that moment: it continues from the new place at its next fetch,
-  and a confirmation of messages it fetched before the move no longer undoes
-  the move (or fails, after a move forward). The move is refused on a node
-  that does not lead the partition and for a number the topic no longer
-  keeps, and a move forward reaches the other nodes' copies.
-- Pausing and resuming a consumer now needs the same rights as moving its
-  reading place (the instance's administration, the organisation's Admin role
-  and the right to administer the topic), and both refuse a consumer that has
-  never connected instead of creating it. A pause is refused on a node that
-  does not lead every partition of the topic; it is not copied to the other
-  nodes, so after a change of leading node the consumer reads again.
-- Consumers of a topic the user may not read are no longer listed, counted in
-  the statistics or found by name.
-- Partitions added to an existing topic now get a leader like the ones it was
-  created with, and so does any partition left without one; any settings
-  change of the topic places them. Before, on a node with replication every
-  write to such a partition was refused.
-- A topic setting changed on one node now takes effect on the other nodes
-  right away, and on the node itself even when a read raced the change.
-  Before, they could keep serving the old settings until restarted.
-- Moving a partition's leadership or changing which nodes hold its copies now
-  needs the right to administer that topic, like changing its settings.
-- The Kopie i nody view leaves out the partitions, message numbers and
-  leadership history of topics the user may not read, with and without
-  replication; asking for such a topic alone is refused. Before, a replicated
-  node showed them to anyone with access to the bus, and a single node showed
-  an empty tab to a user refused one topic.
-- The retry and retention windows no longer promise what the server does not
-  do: pauses between attempts are handed to the consumer's program (TentaFlow
-  flows retry at once), attempts count only for consumers that report
-  failures, and the organisation's compliance rules can keep old messages
-  longer.
-- Tables with row lines keep them on a phone, and card-style tables on a
-  phone no longer overflow their card or draw stray lines.
-- A permission granted or refused in an application's permission table now
-  applies at once. Before, it could take up to five minutes to take effect.
-- Deleting a topic now removes its access entries, its data-hiding rules and
-  its unprocessed-messages topic on every node, so a topic created again under
-  the same name inherits none of them. Previously they survived and applied to
-  the new topic.
-- A topic access entry can only be set for an existing topic, on every path
-  (TentaBus, API-key scopes, key creation); the generic permission editor no
-  longer accepts topics. Before, a deny set ahead of the topic silently
-  disappeared when the topic was created.
-- An access change received from another node now also stops consumers
-  already reading on this node; before, only a local change was re-checked.
-- Fixed two leaders serving one partition at once: a node could accept another
-  leader's announcement and still promote itself (present in `0.3.0-beta`).
-- A topic deleted and created again under the same name is a new incarnation
-  on every node: a node wipes the old incarnation's data before opening the new
-  one, a leader of the old incarnation cannot take over a replica of the new
-  one, and nodes agree on the incarnation under concurrent create and delete.
-  Assignments and directories left by topics deleted before this release are
-  cleaned up at migration and startup.
-- A follower learns a raised commit offset immediately instead of at the next
-  heartbeat, removing a delay of up to one heartbeat (about 0.5 s) before a
-  record acknowledged without a following batch reaches followers' consumers.
-- Replication records, for every record, the leader epoch it was first written
-  in (a new `partition.epochs` file per partition) and ranks logs by the epoch
-  of their last record; a majority-derived committed offset (appended to
-  `partition.meta` after the unchanged 30-byte v1 record, so a downgraded
-  binary still reads its own fields) bounds every reconciliation, and an
-  election needs replies from a majority of replicas. A deposed or hung leader
-  can no longer win with an unreplicated tail, overwrite committed records, or
-  keep writing after it lost leadership; a node that lost an election stands
-  again when the winner fails.
-- Partitions with a replication factor of 2 now favour availability, like
-  Kafka: when one replica is down, the surviving in-sync replica keeps leading
-  (or is elected) and keeps accepting `acks=leader` and `acks=all` writes;
-  `acks=quorum` still needs both replicas. Accepted risk: a write acknowledged
-  only by the survivor is lost if the survivor is lost too; and a plain network
-  split between the two replicas — no node has to fail — lets both lead at once
-  until they reach each other again and one is fenced. The newer leadership
-  wins, and the losing side's writes that never reached the winner are dropped.
-  Partitions with three or more replicas keep requiring a majority.
-- `acks=all` waits for the live in-sync replicas (never fewer than a majority
-  at RF≥3) instead of the ISR recorded in the ledger, so a dead follower no
-  longer blocks `acks=all` writes.
-- At RF≥3 with `acks=quorum` or `acks=all`, consumers no longer read records
-  of an earlier leader term that a re-elected leader re-fed to a majority
-  before they were committed; a stale later-term replica could still win the
-  next election and replace them. A new leader claims its term when it starts
-  serving and followers confirm the claim once their logs reach it (an entry
-  in `partition.epochs` that holds no record, so consumers see no extra
-  message and offsets are unchanged); a majority confirming makes those
-  records visible within about one heartbeat, with no publish needed. While
-  fewer than a majority of nodes run this release, the records stay hidden
-  until a record of the new leader's term reaches a majority.
-- A leader epoch now names exactly one leader. Two replicas electing
-  themselves at the same time could both lead under the same epoch number; the
-  node-id tie-break settled which one won only after both had written. At RF≥3
-  a replica could then switch leaders within one epoch and be told to cut
-  records a majority had already committed; at RF=2 across a network split the
-  losing replica kept its own records at offsets the winner had written
-  different ones to, without any error. Every node of a partition now holds a
-  fixed epoch slot, kept in the partition's placement (up to 64 per topic
-  incarnation; a node that leaves keeps its slot reserved, so a replica-set
-  change never hands one to another node), and only ever proposes epochs of its
-  own slot — also while a candidate on the old replica set races a change on
-  the new one. Adding a node to a partition's replica set is now refused on any
-  node but the partition's leader (`bus.not_leader`), which makes such changes
-  one at a time; removing nodes and deleting topics still work anywhere. Two
-  changes minted from one placement at once now settle on the same one on every
-  node. An election asks the other replicas twice: first without
-  commitment, and — only if it would win — again, when each replica promises
-  the candidate's epoch on disk, to that candidate alone, and refuses every
-  leader of an earlier one from then on. Only answers that carry the promise
-  count toward the majority, so a replica restarted before it knew the
-  partition no longer lends its vote. A candidate that hears of a newer promise
-  stands down and waits a random fraction of the lease before standing above
-  it; replicas whose leases ran out together also stand at random moments.
-  After an RF=2 split the newer leadership wins and the other side's
-  unreplicated writes are dropped, as documented for RF=2. Epoch numbers now
-  grow by up to 64 per election; an election can take up to a quarter of the
-  leader lease longer, plus one more election-query timeout (300 ms) when a
-  replica does not answer. A replica-set change that would need a 65th slot
-  for one topic incarnation is refused; recreate the topic instead.
+- Nowe ekrany tematów, odbiorców oraz nieprzetworzonych wiadomości: filtrowanie,
+  kreator tematu, podgląd wiadomości, usuwanie z potwierdzeniem nazwy,
+  szczegóły ustawień i partycji, opóźnienia odbiorców, wstrzymywanie odczytu
+  oraz ponawianie i odrzucanie nieprzetworzonych wiadomości.
+- Przesuwanie miejsca czytania według numeru, początku, końca lub czasu pokazuje
+  liczbę wiadomości do powtórzenia albo pominięcia. Działa także dla aktywnego
+  odbiorcy: stare potwierdzenie nie cofa zmiany, a nowe pobranie używa nowej pozycji.
+- Widok „Kopie i nody” pokazuje liderów, repliki, problemy i historię zmian.
+  Nowe partycje otrzymują liderów; zmiany ustawień trafiają od razu do innych
+  węzłów. Usunięto ręczne przestawianie zestawu replik w interfejsie.
+- Uprawnienia tematów obejmują widoczność odbiorców, statystyki, informacje
+  o replikach i przenoszenie lidera. Zmiany uprawnień aplikacji działają od razu,
+  także po synchronizacji z innego węzła. Usunięcie tematu usuwa jego reguły,
+  zasady ukrywania danych i kolejkę nieprzetworzonych wiadomości.
+- Ponowne utworzenie tematu o tej samej nazwie tworzy nową generację:
+  stare dane i liderzy nie przechodzą do nowego tematu.
+- Poprawiono wybory lidera, rozstrzyganie rozbieżnych logów, blokowanie zapisów
+  przez odsuniętego lidera oraz natychmiastowe przekazywanie zatwierdzonego
+  offsetu replikom. Dla co najmniej trzech replik wybory wymagają większości;
+  odtworzone wiadomości wcześniejszej kadencji pozostają niewidoczne, dopóki
+  większość nie potwierdzi nowej kadencji.
+- Epoka identyfikuje jednego lidera dzięki stałym slotom i trwałym obietnicom
+  wyborczym. Dodanie repliki wymaga lidera partycji; limit wynosi 64 przydzielone
+  sloty na generację tematu, bez ponownego używania slotów usuniętych węzłów.
+  Po wyczerpaniu limitu trzeba odtworzyć temat. Wybory mogą potrwać dłużej
+  o losowe opóźnienie do jednej czwartej dzierżawy lidera i dodatkowe oczekiwanie
+  na odpowiedź wyborczą (300 ms).
+- `acks=all` czeka na żywe, zsynchronizowane repliki, przy co najmniej trzech
+  kopiach zachowując wymóg większości. Dla dwóch kopii ocalała replika przyjmuje
+  `acks=leader` i `acks=all`; `acks=quorum` nadal wymaga obu.
+
+### TentaNAS
+
+- Rozbudowano diagnostykę RDMA/iSER: wykrywanie urządzeń, rzeczywistego nasłuchu
+  oraz transportu aktywnych sesji. Kreator targetów weryfikuje interfejs sieciowy;
+  ekran sesji rozróżnia połączenia iSCSI i iSER oraz pozwala rozłączać iSCSI.
+- Zaostrzono listy dozwolonych inicjatorów i zamykanie dynamicznych uprawnień
+  po przejściu z otwartego dostępu na listę dozwolonych. Dodano wykrywanie
+  zdalnych LUN-ów i ochronę operacji niszczenia przed przekroczeniem organizacji.
+- Wyłączanie i odinstalowywanie dodatku pokazuje konsekwencje na poszczególnych
+  węzłach, status dostępności i potwierdzenia. Zatrzymanie udostępniania oraz
+  wyłączenie mogą wymagać zatwierdzenia przez drugą osobę; ponowne włączenie
+  przywraca udostępnianie. Odliczanie potwierdzenia pochodzi z węzła.
+- Poprawiono raportowanie użytecznej pojemności, liczby targetów, zajętości
+  folderów, znanych pul i niedostępnych węzłów. Dodano rozpoznawanie AnyRAID
+  oraz odłączanie dysku z puli ZFS.
+- Poprawiono zadania rozruchowe, scrub i SMART; dodano zbiorcze zadanie SMART
+  oraz przekazywanie alertów organizacji z kontrolą adresów chroniącą przed SSRF.
+- Komunikaty odmowy, stanów i harmonogramów mają kody oraz parametry tłumaczeń.
+  Dialogi i logi używają czytelnych nazw, a diagnostyka RDMA otrzymała tłumaczenia.
+
+### Code Studio i agenci
+
+- Kolejne tury sesji zachowują rozmowę. Nowa sesja przypina bieżącą, zapisaną
+  wersję procesu agentowego, a podagenci otrzymują pierwotne zadanie użytkownika.
+- Następne rundy planowania, implementacji i recenzji otrzymują wcześniejsze
+  uwagi krytyka oraz wyniki testera. Odmowa zawierająca frazę „BEZ UWAG” nie
+  zostaje uznana za akceptację; awaria wszystkich oczekiwanych podagentów
+  kończy proces z rzeczywistą przyczyną.
+- Usunięto limit 50 uruchomień na sesję oraz domyślny godzinny termin zakończenia
+  orkiestratora. Własne limity operatora są zachowane, a pętle recenzji korzystają
+  ze swoich budżetów. Odpowiedź ucięta przez limit tokenów nie oznacza sukcesu.
+- Strumień pokazuje odpowiedź agenta, trwające myślenie, czas i aktualne narzędzie.
+  Akceptacja zmian kończy oczekującą recenzję; pytanie nie zasłania całej rozmowy.
+  Usunięcie workspace'u zwalnia jego nazwę.
+- Na Linuksie wykrywanie sandboxa sprawdza rzeczywiste uruchomienie `bwrap`.
+  Administrator może naprawić profil AppArmor z dashboardu, również na zdalnym
+  węźle, podając hasło sudo. Błędy logowania CLI pokazują końcówkę wyjścia
+  procesu po usunięciu sekwencji terminala i zamaskowaniu sekretów.
+
+### Modele, RAG i inferencja
+
+- Natywne osadzanie modeli GGUF do embeddingów i rerankingu przez llama.cpp
+  rzeczywiście ładuje model, obsługuje ranking par zapytanie–dokument i zwalnia
+  model przy zatrzymaniu. Modele pomocnicze mogą działać obok załadowanego LLM.
+- Wyszukiwanie wektorowe pomija nieistniejące pola projekcji bez usuwania filtrów;
+  błędy wykonania flow zachowują pełny łańcuch przyczyn.
+- Rozmowy przekazywane przez mesh zachowują wymianę narzędzi i raportują zużycie
+  tokenów. Parser rozpoznaje DSML DeepSeek, także warianty mieszane z JSON
+  i argumenty zagnieżdżone w pojedynczym polu `arguments`.
+- W `tentaflow-infer` dodano integrację CoreML/Apple Neural Engine do obliczeń
+  prefill, eksport odpowiednio przygotowanych modeli oraz pomiary na Apple
+  Silicon. Ta ścieżka wymaga wyeksportowanych modeli CoreML; nie oznacza
+  automatycznej obsługi dowolnego modelu przez ANE.
+- Poprawiono tensor parallelism CUDA i kernele NVFP4 oraz odświeżono receptury
+  konfiguracji vLLM.
+- Dodano dane, benchmarki i skrypty przygotowania, ewaluacji oraz treningu QLoRA
+  dla adaptacji modeli do języka polskiego. Są to narzędzia treningowe,
+  a nie nowe wytrenowane wagi dostarczane z aplikacją.
+
+### Platformy i zarządzanie węzłami
+
+- W procesie wydania wydłużono przechowywanie artefaktów bibliotek natywnych
+  z jednego do siedmiu dni, aby pozostawały dostępne dla późniejszych etapów
+  kompilacji. Numer wersji aplikacji Android ustawiono na `0.4.0-beta`.
+- Linux: sherpa-onnx i pozostałe moduły korzystają ze współdzielonego ONNX Runtime,
+  co usuwa konflikt ABI powodujący awarię startu `free(): invalid pointer`.
+  Pełne archiwa zawierają `libonnxruntime.so.1`; wariant GPU ARM64 korzysta
+  z ONNX Runtime 1.30.0 dla CUDA 13.
+- macOS: budowanie bibliotek natywnych wybiera SDK aktywnego Xcode.
+- Zdalne zatrzymywanie wdrożenia klastrowego trafia do węzła z jego rekordem;
+  wydłużono czas na zdalne operacje usług. Widok mesh zachowuje rodzaj węzła
+  i oznaczenie operatora.
+- Poprawiono tabele na telefonach, okna modalne i ukrywanie `tf-alert`.
+
+### Znane ograniczenia
+
+- Wydanie obejmuje Linux x86_64 i ARM64, macOS Apple Silicon, Windows x86_64
+  oraz Android ARM64. Nie zawiera kompilacji dla iOS ani macOS Intel.
+  Dostępne warianty akceleracji zależą od platformy i załączonych archiwów.
+- APK Android jest podpisany kluczem debug i przeznaczony do instalacji ręcznej.
+  Przyszła wersja z innym kluczem podpisu nie zaktualizuje go w miejscu.
+- TentaBus z dwiema replikami preferuje dostępność: podział sieci może pozostawić
+  dwóch liderów. Po połączeniu wygrywa nowsze przywództwo, a nieprzesłane zapisy
+  przegranej strony przepadają. Utrata jedynej pozostałej repliki również może
+  oznaczać utratę zatwierdzonych tylko przez nią wiadomości.
+- Wstrzymanie odbiorcy i cofnięcie jego miejsca czytania nie są utrwalane na
+  wszystkich replikach i nie przetrwają zmiany lidera.
+- Lista nieprzetworzonych wiadomości może powtarzać wiersze przy stronicowaniu
+  wielu partycji. Ponowienie/odrzucenie nie wymaga jeszcze lidera, a oznaczenie
+  obsługi nie dociera do każdej kopii. Awaria między ponownym publikowaniem
+  a zapisaniem oznaczenia może pozwolić na powtórne ponowienie wiadomości.
+  Ponawianie zbiorcze nie gwarantuje kolejności od najstarszej wiadomości między
+  partycjami; ponownie odrzucony zapis może zostać policzony jako ponowiony.
+  Tekst błędu odbiorcy nie podlega regułom ukrywania pól. Odczyt listy przegląda
+  także obsłużone rekordy w swoim oknie, co może zwiększać koszt odczytu.
+
+[Pełne porównanie zmian 0.3.0 → 0.4.0](https://github.com/Slyb00ts/TentaFlow/compare/v0.3.0-beta...v0.4.0-beta).
 
 ## [0.3.0-beta] — 2026-09-24
 
-Changes since `0.2.0-beta`. That tag never produced a published release (its
-builds failed), so this is the first release published after `0.1.0-beta`: the
-`0.2.0-beta` notes below apply to it as well.
+Zmiany od tagu `0.2.0-beta`. Tagi `0.2.0-beta` i `0.3.0-beta` zostały
+przygotowane, ale ich procesy wydania nie zakończyły się publikacją artefaktów.
+Ostatnim opublikowanym wydaniem pozostało `0.1.0-beta`; przy aktualizacji
+obowiązują również poniższe uwagi wersji `0.2.0-beta`.
 
 ### Upgrade notes
 

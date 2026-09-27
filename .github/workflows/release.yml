@@ -260,7 +260,7 @@ jobs:
         with:
           name: native-libs-${{ matrix.platform }}-${{ matrix.backend }}
           path: native-libs/${{ matrix.platform }}
-          retention-days: 1
+          retention-days: 7
 
   # ---------------------------------------------------------------------------
   # build — one job per edition. Both link the same native-libs.
@@ -1031,5 +1031,5 @@ jobs:
             sideloading. A future properly signed build cannot upgrade it in place, so
             uninstall it before installing one.
 
-            What changed: [CHANGELOG.md](https://github.com/Slyb00ts/TentaFlow/blob/main/CHANGELOG.md).
+            What changed: [CHANGELOG.md](https://github.com/Slyb00ts/TentaFlow/blob/${{ github.ref_name }}/CHANGELOG.md).
           generate_release_notes: true

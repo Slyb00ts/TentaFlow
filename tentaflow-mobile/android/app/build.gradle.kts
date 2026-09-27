@@ -15,8 +15,8 @@ android {
         applicationId = "ai.tentaflow.mobile"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.2.0-beta"
+        versionCode = 4
+        versionName = "0.4.0-beta"
 
         ndk {
             abiFilters += nativeAbis
