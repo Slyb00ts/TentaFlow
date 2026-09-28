@@ -14,7 +14,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
 const {
-  openTargetWizard, targetNameValid, parseSize, transportOptions, transportsOf, interfaceRdmaGap,
+  openTargetWizard, targetNameValid, parseSize, transportOptions, transportsOf, interfaceRdmaGap, interfaceRdmaWarning,
   sharedWithoutAuth, AUTH_METHODS, defaultTransport, defaultMethod, parseHostNqns, WWN_AUTHORITY,
   primaryAddress, sharedHostTargets, sharedHostNqns, sharedHostNeighbours, sharedHostWarning,
   authenticates, bindableAddresses, ALL_INTERFACES_ADDRESS, invalidHostNqns, iqnHostPart,
@@ -113,9 +113,14 @@ test('the transports offered are the ones the node probed, per protocol', () => 
   assert.deepEqual(transportOptions('nvmet', caps(), '').map((t) => t.ok), [true, true, true], 'every interface at once: the node decides');
   assert.equal(interfaceRdmaGap(caps(), 'storage0'), '');
   assert.equal(interfaceRdmaGap(caps(), 'lan0'), 'Interfejs lan0 nie ma urządzenia RDMA — jądro odrzuca nasłuch RDMA na jego adresie. Wybierz TCP albo interfejs z kartą RDMA.');
+  // Owner decision 2026-09-28: a device whose link is down WARNS and does
+  // not block — only "no RDMA device" (the kernel's ENODEV) blocks.
   const down = caps({ interfaces: [{ name: 'enp4s0np0', address: '10.10.0.7', rdma: false, rdmaDevice: 'rocep4s0', shared: false, supported: true }] });
-  assert.equal(interfaceRdmaGap(down, 'enp4s0np0'), 'Urządzenie RDMA rocep4s0 na interfejsie enp4s0np0 ma nieaktywne łącze — klienci nie połączą się przez RDMA.');
-  assert.deepEqual(transportOptions('iscsi', down, 'enp4s0np0').map((t) => t.ok), [true, false]);
+  assert.equal(interfaceRdmaGap(down, 'enp4s0np0'), '');
+  assert.equal(interfaceRdmaWarning(down, 'enp4s0np0'), 'Urządzenie RDMA rocep4s0 na interfejsie enp4s0np0 ma nieaktywne łącze — target zostanie zapisany, ale klienci nie połączą się przez RDMA, dopóki łącze nie wstanie.');
+  assert.equal(interfaceRdmaWarning(caps(), 'lan0'), '', 'no device is the blocking gap, not this warning');
+  assert.equal(interfaceRdmaWarning(caps(), 'storage0'), '');
+  assert.deepEqual(transportOptions('iscsi', down, 'enp4s0np0').map((t) => t.ok), [true, true]);
   assert.equal(interfaceRdmaGap(caps(), 'gone0'), '', 'an interface the node did not list is the drift rule\'s business');
   // Each protocol has its own authentication vocabulary.
   assert.deepEqual(AUTH_METHODS.iscsi, ['chap', 'mutual-chap', 'none']);
@@ -1452,5 +1457,136 @@ test('each host NQN gets an Opis field that survives typing and rides along with
     'nqn.2014-08.org.nvmexpress:uuid:nowy': 'vega (backup)',
   });
   await settled();
+  screen.dispose();
+});
+
+// RDMA listeners 2026-09-27, rendered: the kernel refuses an RDMA listener on
+// an address no RDMA device holds (ENODEV, measured on rig11), so the wizard
+// disables iSER / NVMe-oF over RDMA on such an interface and says why BY
+// INTERFACE — not with the node-wide probe reason, which would claim the node
+// has no RDMA when it has, just not on this card.
+const iserTarget = (portal, over = {}) => ({
+  targetId: 't-rdma',
+  name: 'vm-rdma',
+  protocol: 'iscsi',
+  wwn: 'iqn.2026-09.local.tentaflow:helios.vm-rdma',
+  enabled: true,
+  luns: [{ index: 0, source: 'tank/vm-store', sizeBytes: 2199023255552, thin: true, groupId: 1, sourceKind: 'zvol' }],
+  portals: [portal],
+  auth: { method: 'mutual-chap', username: 'vmware01', mutualUsername: 'helios', secretSet: true, mutualSecretSet: true },
+  initiators: ['iqn.1998-01.com.vmware:esx01'],
+  portGroups: [{ groupId: 1, state: 'optimized', preferred: false }],
+  ...over,
+});
+// The built buttons when tf-segmented has built them — it consumes the
+// <option>s and used to drop their `disabled` on the way, leaving a live,
+// clickable iSER (tf-segmented.disabled-option.test.js). After a redraw
+// happy-dom connects the element before parsing its children, so the options
+// are still unread there and they are what the wizard wrote.
+const transportDisabled = (win) => {
+  const el = win.querySelector('#nas-tw-transport');
+  const built = [...el.querySelectorAll('.tf-seg-opt')];
+  return built.length
+    ? built.map((b) => [b.dataset.value, b.disabled])
+    : [...el.querySelectorAll('option')].map((o) => [o.value, o.hasAttribute('disabled')]);
+};
+const gapBox = (win) => win.querySelector('[data-testid="transport-interface-gap"]');
+
+test('moving an iSER portal onto an interface without an RDMA device disables iSER and names the interface', async () => {
+  const screen = fakeScreen({});
+  const win = openTargetWizard(screen, { target: iserTarget({ interface: 'storage0', address: '10.10.0.5', port: 3260, transport: 'iser' }), capabilities: caps() });
+  await flush();
+  assert.deepEqual(transportDisabled(win), [['tcp', false], ['iser', false]]);
+  assert.equal(gapBox(win), null, 'the card with an RDMA device: nothing to say');
+  assert.ok(!nextButton(win).hasAttribute('disabled'));
+
+  setValue(win.querySelector('#nas-tw-iface'), 'lan0');
+  await flush();
+  // An edit keeps its transport across the interface switch, so the choice
+  // the node would refuse is still selected — and blocked, with the reason.
+  assert.equal(win.querySelector('#nas-tw-transport').getAttribute('value'), 'iser');
+  assert.deepEqual(transportDisabled(win), [['tcp', false], ['iser', true]]);
+  assert.equal(
+    gapBox(win).textContent.trim(),
+    'Interfejs lan0 nie ma urządzenia RDMA — jądro odrzuca nasłuch RDMA na jego adresie. Wybierz TCP albo interfejs z kartą RDMA.',
+  );
+  assert.doesNotMatch(win.textContent, /RDMA niedostępne:/, 'not the node-wide probe reason: this node HAS RDMA');
+  assert.ok(nextButton(win).hasAttribute('disabled'), 'a portal the kernel refuses cannot be saved');
+
+  setValue(win.querySelector('#nas-tw-transport'), 'tcp');
+  await flush();
+  assert.equal(gapBox(win), null);
+  assert.ok(!nextButton(win).hasAttribute('disabled'), 'TCP on the same interface is fine');
+  screen.dispose();
+});
+
+test('an RDMA device whose link is not ACTIVE is named by its kernel name and warned about, never blocked (owner decision 2026-09-28)', async () => {
+  const downCaps = caps({
+    interfaces: [
+      { name: 'lan0', address: '192.168.1.5', rdma: false, rdmaDevice: '', shared: true, supported: true },
+      { name: 'enp4s0np0', address: '10.10.0.7', rdma: false, rdmaDevice: 'rocep4s0', shared: false, supported: true },
+    ],
+  });
+  const screen = fakeScreen({});
+  const win = openTargetWizard(screen, {
+    target: iserTarget(
+      { interface: 'enp4s0np0', address: '10.10.0.7', port: 4420, transport: 'rdma' },
+      { protocol: 'nvmet', wwn: 'nqn.2026-09.local.tentaflow:helios.vm-rdma', auth: { method: 'none' }, initiators: [] },
+    ),
+    capabilities: downCaps,
+  });
+  await flush();
+  assert.equal(win.querySelector('#nas-tw-transport').getAttribute('value'), 'rdma');
+  assert.deepEqual(transportDisabled(win), [['tcp', false], ['rdma', false], ['tcp+rdma', false]]);
+  assert.equal(gapBox(win), null, 'nothing blocks');
+  const warning = win.querySelector('[data-testid="transport-link-down"]');
+  assert.equal(
+    warning.textContent.trim(),
+    'Urządzenie RDMA rocep4s0 na interfejsie enp4s0np0 ma nieaktywne łącze — target zostanie zapisany, ale klienci nie połączą się przez RDMA, dopóki łącze nie wstanie.',
+  );
+  assert.ok(!nextButton(win).hasAttribute('disabled'), 'an edit of a target on a down link can still be saved');
+  // No GID, QP number or node id: the device is shown by its kernel name only.
+  assert.doesNotMatch(warning.textContent, /fe80:|[0-9a-f]{8}-[0-9a-f]{4}-/i);
+  // TCP chosen: nothing about RDMA to warn of.
+  setValue(win.querySelector('#nas-tw-transport'), 'tcp');
+  await flush();
+  assert.equal(win.querySelector('[data-testid="transport-link-down"]'), null);
+  screen.dispose();
+});
+
+test('a node without RDMA at all says so with the probe reason, not an interface sentence', async () => {
+  const screen = fakeScreen({});
+  const win = openTargetWizard(screen, {
+    target: iserTarget({ interface: 'storage0', address: '10.10.0.5', port: 3260, transport: 'iser' }),
+    capabilities: caps({ iser: false, rdmaDetail: 'no RDMA device under /sys/class/infiniband' }),
+  });
+  await flush();
+  assert.deepEqual(transportDisabled(win), [['tcp', false], ['iser', true]]);
+  assert.equal(gapBox(win), null, 'storage0 has a card; the NODE cannot serve iSER');
+  assert.match(win.textContent, /RDMA niedostępne:/);
+  assert.ok(nextButton(win).hasAttribute('disabled'));
+  screen.dispose();
+});
+
+test('a new target never lands on a transport its interface cannot carry', async () => {
+  const screen = fakeScreen({});
+  const win = await toStepTwo(screen);
+  assert.equal(win.querySelector('#nas-tw-transport').getAttribute('value'), 'iser');
+  setValue(win.querySelector('#nas-tw-iface'), 'lan0');
+  await flush();
+  // The default follows the interface (§5.5a), so no refusal WARNING is
+  // needed on the create path — but the disabled iSER option says why
+  // (critic RDMA r1, MINOR 6).
+  assert.equal(win.querySelector('#nas-tw-transport').getAttribute('value'), 'tcp');
+  assert.deepEqual(transportDisabled(win), [['tcp', false], ['iser', true]]);
+  assert.equal(gapBox(win), null);
+  assert.equal(
+    win.querySelector('[data-testid="transport-disabled-reason"]')?.textContent.trim(),
+    'Interfejs lan0 nie ma urządzenia RDMA — jądro odrzuca nasłuch RDMA na jego adresie. Wybierz TCP albo interfejs z kartą RDMA.',
+  );
+  // Back on an interface with a card: nothing disabled, nothing to explain.
+  setValue(win.querySelector('#nas-tw-iface'), 'storage0');
+  await flush();
+  assert.equal(win.querySelector('[data-testid="transport-disabled-reason"]'), null);
   screen.dispose();
 });

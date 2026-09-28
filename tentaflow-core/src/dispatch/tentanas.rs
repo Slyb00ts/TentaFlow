@@ -3244,6 +3244,17 @@ async fn target_get(ctx: &HandlerContext, target_id: &str) -> Result<MessageBody
         Ok(text) => text,
         Err(e) => format!("this target cannot be rendered into a configfs plan: {e}"),
     };
+    // "Nasłuch" and the RDMA connections: configfs, `/proc` and netlink
+    // reads with a receive timeout, off the async runtime (critic RDMA r1,
+    // MINOR 7). A read that could not run is "Nie zmierzono", not an error
+    // of the whole view.
+    let reading_row = row.clone();
+    let rdma = tokio::task::spawn_blocking(move || tentanas::targets::rdma_reading(&reading_row))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("tentanas: target listeners not read: {e}");
+            tentanas::targets::TargetRdmaReading { peers_state: "unknown", ..Default::default() }
+        });
     Ok(tn(P::TargetGetResponse {
         target: tentanas::targets::to_protocol(&row, sessions.len() as u32, known),
         sessions,
@@ -3257,7 +3268,9 @@ async fn target_get(ctx: &HandlerContext, target_id: &str) -> Result<MessageBody
             })
             .collect(),
         seen_since,
-        listen: tentanas::targets::listen_states(&row),
+        listen: rdma.listen,
+        rdma_peers: rdma.peers,
+        rdma_peers_state: rdma.peers_state.to_string(),
     }))
 }
 

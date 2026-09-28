@@ -49,13 +49,16 @@ class TfSegmented extends HTMLElement {
   // innerHTML, which would leave the built buttons in place and the new
   // options unread. `list` is [{value,label,variant,icon}]; `selected` keeps
   // the pick when it is still in the new list, otherwise the first option
-  // wins — a segmented control always has a value.
+  // wins — a segmented control always has a value. `disabled` on one option
+  // shows it and refuses to select it (the current value may still be a
+  // disabled one: an edit that kept a choice the context no longer allows).
   setOptions(list, selected) {
     this._options = (list || []).map((o) => ({
       value: o.value ?? '',
       variant: (o.variant || 'neutral').toLowerCase(),
       icon: (o.icon || '').trim(),
       label: o.label ?? String(o.value ?? ''),
+      disabled: Boolean(o.disabled),
     }));
     this._buildFromOptions();
     const values = this._options.map((o) => o.value);
@@ -74,6 +77,9 @@ class TfSegmented extends HTMLElement {
       variant: (o.getAttribute('variant') || 'neutral').toLowerCase(),
       icon: (o.getAttribute('icon') || '').trim(),
       label: o.textContent || '',
+      // Per-option `disabled` was dropped here before, so a wizard option the
+      // node cannot serve rendered as a live button.
+      disabled: o.hasAttribute('disabled'),
     }));
     optEls.forEach((o) => o.remove());
   }
@@ -100,6 +106,7 @@ class TfSegmented extends HTMLElement {
       btn.dataset.variant = opt.variant;
       btn.setAttribute('role', 'radio');
       btn.setAttribute('aria-checked', 'false');
+      if (opt.disabled) btn.dataset.unavailable = '';
       if (opt.icon) {
         const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
         svg.setAttribute('class', 'tf-seg-icon');
@@ -138,7 +145,7 @@ class TfSegmented extends HTMLElement {
       btn.classList.toggle('active', active);
       btn.setAttribute('aria-checked', active ? 'true' : 'false');
       btn.tabIndex = active ? 0 : -1;
-      btn.disabled = disabled;
+      btn.disabled = disabled || 'unavailable' in btn.dataset;
     }
   }
 
@@ -151,7 +158,8 @@ class TfSegmented extends HTMLElement {
   _onKey(e) {
     if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
     e.preventDefault();
-    const btns = Array.from(this._container.querySelectorAll('.tf-seg-opt'));
+    // Keyboard moves between the options that can be chosen.
+    const btns = Array.from(this._container.querySelectorAll('.tf-seg-opt')).filter((b) => !b.disabled);
     if (btns.length === 0) return;
     const curIdx = btns.findIndex((b) => b.dataset.value === this.value);
     let nextIdx = curIdx;

@@ -6776,6 +6776,11 @@
         "target_rebuild_not_disabled": {
           "title": "Target {target}: the old open target may still accept any client",
           "detail": "The target was open and had to be rebuilt before its new allowlist could take effect. The rebuild stopped short and the target could not even be disabled, so the allowlist is NOT in force and any client may still log in. Stop the target."
+        },
+        "target_listener_lost": {
+          "title": "Target {target}: RDMA listener is gone",
+          "detail": "Clients cannot connect over RDMA ({transport}, {portal}). Stop and resume the target — the portal and its listener are created again.",
+          "detail_shared": "Clients cannot connect over RDMA ({transport}, {portal}). Other targets share the listener: it returns only once every target on it has been stopped and then resumed."
         }
       },
       "node_text": "The node's text",
@@ -9042,7 +9047,9 @@
         "portal_moved_head_no_address": "The target’s portal is no longer where it was pinned. The address {address} belonged to interface {interface}, which is on this node but has no address now (link down or a lost DHCP lease).",
         "portal_moved_silent_since": "Since {since} it has been on {elsewhere}. The target is not in the kernel, so nothing listens at that address — the export is not reachable on {elsewhere} and will not be moved there automatically.",
         "portal_moved_reachable_since": "Since {since} it has been on {elsewhere}, which nobody picked for this target — the export is reachable there.",
-        "sharing_suspended": "Sharing on this node was stopped together with disabling TentaNas — the target returns to the kernel when TentaNas is enabled again. In mode B it returns once the privilege channel is armed."
+        "sharing_suspended": "Sharing on this node was stopped together with disabling TentaNas — the target returns to the kernel when TentaNas is enabled again. In mode B it returns once the privilege channel is armed.",
+        "listener_lost": "The {transport} listener on {portal} is gone although the kernel configuration asks for it — clients cannot connect over RDMA. It returns when the portal is created again: stop and resume the target.",
+        "listener_lost_shared": "The {transport} listener on {portal} is gone although the kernel configuration asks for it — clients cannot connect over RDMA. Other targets of this node share it: it returns only once every target on it has been stopped and then resumed."
       },
       "host_state": "State",
       "host_connected": "Connected",
@@ -9090,7 +9097,15 @@
       "listen_on_devices": "RDMA device: {devices}",
       "transport_word_tcp": "TCP",
       "transport_word_iser": "iSER (RDMA)",
-      "transport_word_rdma": "RDMA"
+      "transport_word_rdma": "RDMA",
+      "listen_listener_lost_shared": "Not listening — the kernel keeps the configuration but has no RDMA listener (e.g. the RDMA device went away). Other targets of this node share this listener, so stopping and resuming one is not enough: it returns once every target on it has been stopped and then resumed",
+      "portal_iser": "iSER (RDMA)",
+      "portal_iser_off": "off",
+      "rdma_peers_title": "RDMA connections from the kernel's RDMA table — one per queue; these are addresses, not named hosts",
+      "rdma_peer": "{n} {n|RDMA connection|RDMA connections} from {peer}",
+      "rdma_peers_none": "No RDMA connections",
+      "rdma_peers_shared": "Other targets share this RDMA port — the kernel's RDMA table does not say which connections belong to this target, so none are shown",
+      "rdma_peers_unknown": "RDMA connections not measured"
     },
     "wizard_target": {
       "title": "New target",
@@ -9205,7 +9220,7 @@
       "host_description_label": "Description — {nqn}",
       "host_description_placeholder": "e.g. orion (compute)",
       "transport_no_rdma_device": "Interface {iface} has no RDMA device — the kernel refuses an RDMA listener on its address. Choose TCP or an interface with an RDMA card.",
-      "transport_rdma_link_down": "RDMA device {device} on interface {iface} has an inactive link — clients cannot connect over RDMA."
+      "transport_rdma_link_down": "RDMA device {device} on interface {iface} has an inactive link — the target will be saved, but clients cannot connect over RDMA until the link comes up."
     },
     "journal_owner": {
       "this_instance": "this TentaNas instance",

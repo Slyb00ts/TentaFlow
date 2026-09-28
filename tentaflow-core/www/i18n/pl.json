@@ -6827,6 +6827,11 @@
         "target_rebuild_not_disabled": {
           "title": "Target {target}: stary, otwarty target może wciąż przyjmować dowolnego klienta",
           "detail": "Target był otwarty i przed wejściem w życie nowej listy dozwolonych trzeba było go przebudować. Przebudowa zatrzymała się w połowie, a targetu nie udało się nawet wyłączyć, więc lista dozwolonych NIE obowiązuje i każdy klient może się nadal zalogować. Zatrzymaj target."
+        },
+        "target_listener_lost": {
+          "title": "Target {target}: nasłuch RDMA zniknął",
+          "detail": "Klienci nie połączą się przez RDMA ({transport}, {portal}). Zatrzymaj i wznów target — portal i nasłuch powstaną od nowa.",
+          "detail_shared": "Klienci nie połączą się przez RDMA ({transport}, {portal}). Nasłuch dzielą inne targety: wraca dopiero, gdy wszystkie targety na nim zostaną zatrzymane, a potem wznowione."
         }
       },
       "node_text": "Treść węzła",
@@ -9093,7 +9098,9 @@
         "portal_moved_head_no_address": "Portal targetu nie jest już tam, gdzie go przypięto. Adres {address} należał do interfejsu {interface}, który jest na tym węźle, ale nie ma teraz żadnego adresu (łącze wyłączone albo utracona dzierżawa DHCP).",
         "portal_moved_silent_since": "Od {since} znajduje się na {elsewhere}. Target nie jest w jądrze, więc pod tym adresem nic nie nasłuchuje — eksport nie jest osiągalny na {elsewhere} i nie zostanie tam przepięty automatycznie.",
         "portal_moved_reachable_since": "Od {since} jest na {elsewhere}, którego nikt nie wybrał dla tego targetu — eksport jest tam osiągalny.",
-        "sharing_suspended": "Udostępnianie na tym węźle zatrzymano razem z wyłączeniem TentaNas — target wróci do jądra po ponownym włączeniu. W trybie B wraca, gdy kanał uprawnień zostanie uzbrojony."
+        "sharing_suspended": "Udostępnianie na tym węźle zatrzymano razem z wyłączeniem TentaNas — target wróci do jądra po ponownym włączeniu. W trybie B wraca, gdy kanał uprawnień zostanie uzbrojony.",
+        "listener_lost": "Nasłuch {transport} na {portal} zniknął, choć konfiguracja jądra go wymaga — klienci nie połączą się przez RDMA. Wraca po ponownym utworzeniu portalu: zatrzymaj i wznów target.",
+        "listener_lost_shared": "Nasłuch {transport} na {portal} zniknął, choć konfiguracja jądra go wymaga — klienci nie połączą się przez RDMA. Dzielą go inne targety tego węzła: wraca dopiero, gdy wszystkie targety na nim zostaną zatrzymane, a potem wznowione."
       },
       "host_state": "Stan",
       "host_connected": "Połączony",
@@ -9141,7 +9148,15 @@
       "listen_on_devices": "urządzenie RDMA: {devices}",
       "transport_word_tcp": "TCP",
       "transport_word_iser": "iSER (RDMA)",
-      "transport_word_rdma": "RDMA"
+      "transport_word_rdma": "RDMA",
+      "listen_listener_lost_shared": "Brak nasłuchu — konfiguracja jest w jądrze, ale nasłuchu RDMA nie ma (np. urządzenie RDMA zniknęło). Ten nasłuch dzielą inne targety tego węzła, więc zatrzymanie i wznowienie jednego nie wystarczy: wraca, gdy wszystkie targety na nim zostaną zatrzymane, a potem wznowione",
+      "portal_iser": "iSER (RDMA)",
+      "portal_iser_off": "wyłączony",
+      "rdma_peers_title": "Połączenia RDMA z tablicy RDMA jądra — po jednym na kolejkę; to adresy, nie nazwane hosty",
+      "rdma_peer": "{n} {n|połączenie RDMA|połączenia RDMA|połączeń RDMA} z {peer}",
+      "rdma_peers_none": "Brak połączeń RDMA",
+      "rdma_peers_shared": "Port RDMA dzielą inne targety — tablica RDMA jądra nie mówi, które połączenia należą do tego targetu, więc żadne nie są pokazane",
+      "rdma_peers_unknown": "Połączeń RDMA nie zmierzono"
     },
     "wizard_target": {
       "title": "Nowy target",
@@ -9256,7 +9271,7 @@
       "host_description_label": "Opis — {nqn}",
       "host_description_placeholder": "np. orion (compute)",
       "transport_no_rdma_device": "Interfejs {iface} nie ma urządzenia RDMA — jądro odrzuca nasłuch RDMA na jego adresie. Wybierz TCP albo interfejs z kartą RDMA.",
-      "transport_rdma_link_down": "Urządzenie RDMA {device} na interfejsie {iface} ma nieaktywne łącze — klienci nie połączą się przez RDMA."
+      "transport_rdma_link_down": "Urządzenie RDMA {device} na interfejsie {iface} ma nieaktywne łącze — target zostanie zapisany, ale klienci nie połączą się przez RDMA, dopóki łącze nie wstanie."
     },
     "journal_owner": {
       "this_instance": "ta instancja TentaNas",

@@ -163,6 +163,13 @@ const TARGET_STATE_WORDS = new Map([
     return `${head} ${T('targets.state_reason.portal_moved_reachable' + sinceKey, { elsewhere: p.elsewhere, since })} ${T('targets.state_reason.portal_moved_tail')}`;
   }],
   ['target_not_exported', () => T('targets.state_reason.not_exported')],
+  // The tick found this active target's RDMA listener gone (critic RDMA r1,
+  // MAJOR 2); `shared`: other targets use the same listener.
+  ['target_listener_lost', (p) => {
+    const word = transportWord(p.transport);
+    if (!p.address || !/^\d+$/.test(String(p.port || '')) || !word || !['true', 'false'].includes(p.shared)) return null;
+    return T(`targets.state_reason.listener_lost${p.shared === 'true' ? '_shared' : ''}`, { transport: word, portal: `${p.address}:${p.port}` });
+  }],
   // The node's sharing was stopped with the disable (n18d, wave 10).
   ['sharing_suspended', () => T('targets.state_reason.sharing_suspended')],
   ['target_no_auth', () => T('targets.state_reason.no_auth')],
@@ -492,6 +499,9 @@ const LISTEN_KEYS = {
   // RDMA listeners 2026-09-27: read from the kernel's RDMA CM table.
   no_rdma_device: 'targets.listen_no_rdma_device',
   listener_lost: 'targets.listen_listener_lost',
+  // Other targets share the lost listener (an nvmet port, an iSCSI np):
+  // stopping this one alone does not bring it back.
+  listener_lost_shared: 'targets.listen_listener_lost_shared',
   // From a node before that measurement: its RDMA portals were not measured.
   rdma: 'targets.listen_rdma',
 };
@@ -536,11 +546,12 @@ export function sessionDurationHtml(connectedAt, now = Date.now()) {
 
 /**
  * A session's "Adres" with what it runs over after it ("10.10.0.21 iSER
- * (RDMA)") — only where the node read the transport from the kernel.
+ * (RDMA)") — only where the node read the transport from the kernel, and
+ * only when it is not plain TCP: n19 shows a TCP session as its address.
  */
 export function sessionAddressHtml(s) {
   if (!s?.address) return '<span class="text-3">—</span>';
-  const word = transportWord(s.transport);
+  const word = s.transport === 'tcp' ? '' : transportWord(s.transport);
   return `<span class="mono">${escapeHtml(s.address)}</span>${word ? ` <span class="text-xs text-3" data-testid="session-transport">${escapeHtml(word)}</span>` : ''}`;
 }
 
@@ -615,7 +626,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     // draft that the "Zapisz" button sends with the list (`descriptionsDirty`).
     descriptions: {}, descriptionsDirty: false,
     // The sampler's "Ostatnie połączenie" and the per-portal "Nasłuch".
-    seen: [], seenSince: '', listen: [],
+    seen: [], seenSince: '', listen: [], rdmaPeers: [], rdmaPeersState: '',
   };
   let loadSeq = 0;
   // TargetGet-only reads since the list was last read (see LIST_EVERY_POLLS).
@@ -656,6 +667,8 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       state.seen = r.initiatorsSeen || [];
       state.seenSince = r.seenSince || '';
       state.listen = r.listen || [];
+      state.rdmaPeers = Array.isArray(r.rdmaPeers) ? r.rdmaPeers : [];
+      state.rdmaPeersState = String(r.rdmaPeersState || '');
       state.error = '';
       if (!hasDraft && state.initiatorsText === requestDraft) {
         state.initiatorsText = (r.target.initiators || []).join('\n');
@@ -837,6 +850,8 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       // the RDMA listener(s): an iSER portal has one of each.
       ['targets.portal_exposure', listenText((state.listen || []).filter((l) => !isRdmaListen(l)))],
       ...((state.listen || []).some(isRdmaListen) ? [['targets.portal_exposure_rdma', listenText(state.listen.filter(isRdmaListen))]] : []),
+      // n19: an iSCSI target without iSER says so ("iSER (RDMA): wyłączony").
+      ...(t.protocol !== 'nvmet' && !t.portals.some((p) => p.transport === 'iser') ? [['targets.portal_iser', T('targets.portal_iser_off')]] : []),
     ] : [];
     const rowSpec = ([key, value]) => ({ key, label: T(key), value, testid: key.slice('targets.'.length), mono: true });
     paintValueRows(win.querySelector('[data-part="portal-a"]'), portalRows.slice(0, 3).map(rowSpec));
@@ -916,6 +931,10 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     } else {
       setText(slotEl(sessionsHost, true, 'none', '<div class="muted"></div>'), sessionsEmptyText(t));
     }
+
+    // NVMe-oF over RDMA (owner decision 2026-09-28): connections per peer
+    // address from the kernel's RDMA table, which names no host.
+    paintRdmaPeers(win.querySelector('[data-part="rdma-peers"]'), t.protocol === 'nvmet' ? state.rdmaPeers : [], t.protocol === 'nvmet' ? state.rdmaPeersState : '');
 
     // Where "Rozłącz" is not offered, the sessions card says why (D2/D4).
     const resetNote = resetUnavailableText(t);
@@ -1093,6 +1112,7 @@ function targetDetailHtml(admin, protocol) {
     <section class="nas-target-card">
     <div class="section-card-head"><h3 class="title">${sprite('users')} ${escapeHtml(T('targets.sessions_title'))}</h3> <tf-chip size="sm" status="neutral" data-f="sessions-chip"></tf-chip></div>
     <div data-part="sessions" ${SLOT}></div>
+    <div data-part="rdma-peers" data-testid="rdma-peers"></div>
     <div data-part="reset-note" ${SLOT}></div>
     </section>
     <section class="nas-target-card">
@@ -1155,6 +1175,35 @@ function interfacesSectionHtml() {
       <tf-column key="network" label="${escapeAttr(T('targets.portal_network'))}"></tf-column>
     </tf-table>
   </div>`;
+}
+
+/**
+ * The lines of NVMe-oF over RDMA connections ("49 połączeń RDMA z
+ * 192.168.11.21"), or what stands in for them: none, a port other targets
+ * share (whose connections are whose is not in the kernel's table), not
+ * measured. Nothing at all where the node had nothing to say (`''`, and any
+ * state this build does not know). Keyed by portal and peer; only the count
+ * text moves.
+ */
+export function rdmaPeerLines(peers, peersState) {
+  const list = Array.isArray(peers) ? peers : [];
+  if (peersState === 'measured') {
+    if (!list.length) return [{ key: 'none', text: T('targets.rdma_peers_none') }];
+    return list.map((p) => ({ key: `peer:${p.address}:${p.port}:${p.peer}`, text: T('targets.rdma_peer', { n: Number(p.connections) || 0, peer: p.peer }) }));
+  }
+  if (peersState === 'shared_port') return [{ key: 'shared', text: T('targets.rdma_peers_shared') }];
+  if (peersState === 'unknown') return [{ key: 'unknown', text: T('targets.rdma_peers_unknown') }];
+  return [];
+}
+
+function paintRdmaPeers(host, peers, peersState) {
+  if (!host) return;
+  const lines = rdmaPeerLines(peers, peersState);
+  patchKeyedList(host, lines.length ? [
+    { key: 'title', html: `<p class="text-xs text-3">${escapeHtml(T('targets.rdma_peers_title'))}</p>` },
+    ...lines.map((l) => ({ key: l.key, html: '<p class="muted" data-testid="rdma-peer"></p>' })),
+  ] : []);
+  lines.forEach((l, i) => setText(host.children[i + 1], l.text));
 }
 
 // Label/value rows keyed by what they name: a row is built when it first

@@ -252,7 +252,7 @@ const ALERT_PARAMS = {
   health: 'warning', name: 'sdq', name_source: 'live', operation: 'pool_destroy', subject: 'tank', array: 'media',
   runs: '4', oldest_secs: '32400', limit_secs: '28800', cause: 'files_busy', count: '2', alerted: '1',
   sweep_failed: 'true', error: 'EIO', target: 'vm-a', pool: 'tank', disks: '3', minutes: '10', attempts: '2', share: 'projekty',
-  phase: 'stopping',
+  phase: 'stopping', address: '192.168.11.11', port: '4420', transport: 'rdma', shared: 'false',
 };
 const A = (code, params = ALERT_PARAMS, extra = {}) => ({
   alertId: 'a1', severity: 'warning', subjectKind: 'disk', subjectId: 'x', title: 'English title', detail: 'English detail', code, params, reasons: [], ...extra,
@@ -717,4 +717,13 @@ test('jobLogLines hides every id a log line carries and keeps names and sizes', 
   } finally {
     await I18n.setLanguage('pl');
   }
+});
+
+test('a lost RDMA listener alert names the target and gives the remedy that fits a shared listener', () => {
+  const lost = (shared) => alertText(A('target_listener_lost', { target: 'vm-a', address: '10.10.0.5', port: '4420', transport: 'rdma', shared }));
+  assert.equal(lost('false').title, 'Target vm-a: nasłuch RDMA zniknął');
+  assert.match(lost('false').detail, /\(RDMA, 10\.10\.0\.5:4420\)\. Zatrzymaj i wznów target/);
+  assert.match(lost('true').detail, /Nasłuch dzielą inne targety: wraca dopiero, gdy wszystkie targety na nim zostaną zatrzymane/);
+  assert.doesNotMatch(lost('true').detail, /Zatrzymaj i wznów target/);
+  assert.equal(alertText(A('target_listener_lost', { target: 'vm-a', address: '10.10.0.5', port: '4420', transport: 'tcp', shared: 'false' })).known, false, 'not an RDMA transport: the node text');
 });

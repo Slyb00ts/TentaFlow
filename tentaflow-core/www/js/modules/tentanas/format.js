@@ -705,6 +705,18 @@ const ALERT_WORDS = new Map([
     const t = textParams(p, ['target']);
     return t ? { title: T('alerts.code.target_portal_moved.title', t), detail: T('alerts.code.target_portal_moved.detail') } : null;
   }],
+  // The tick found an active target's RDMA listener gone (critic RDMA r1,
+  // MAJOR 2); `shared`: other targets use the same listener.
+  ['target_listener_lost', (p) => {
+    const t = textParams(p, ['target', 'address']);
+    const n = numParams(p, ['port']);
+    if (!t || !n || !['iser', 'rdma'].includes(p.transport) || !['true', 'false'].includes(p.shared)) return null;
+    const words = { transport: T(`targets.transport_word_${p.transport}`), portal: `${t.address}:${n.port}` };
+    return {
+      title: T('alerts.code.target_listener_lost.title', { target: t.target }),
+      detail: T(`alerts.code.target_listener_lost.detail${p.shared === 'true' ? '_shared' : ''}`, words),
+    };
+  }],
   ['target_not_applied', targetFailure('target_not_applied')],
   ['target_still_in_kernel', targetFailure('target_still_in_kernel')],
   // Wave 12: an allowlist refused because an excluded client cannot be reset.

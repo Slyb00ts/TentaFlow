@@ -30,7 +30,7 @@ if (!skip) {
 await import('./_test-setup.js');
 const { featureDetail } = await import('./feature-words.js');
 const { listenText, isRdmaListen, sessionAddressHtml } = await import('./targets.js');
-const { transportOptions, interfaceRdmaGap } = await import('./target-wizard.js');
+const { transportOptions, interfaceRdmaGap, interfaceRdmaWarning } = await import('./target-wizard.js');
 const { parseRefusal, refusalWords } = await import('./format.js');
 
 after(async () => {
@@ -125,6 +125,27 @@ test('a lost RDMA listener and an address without an RDMA device read as the ker
   assert.match(listenText([{ ...body.listen[0], state: 'no_rdma_device' }]), /żadne urządzenie RDMA nie ma tego adresu/);
 });
 
+test('NVMe-oF over RDMA connections per peer address and their state survive the real decoder', { skip }, async () => {
+  const { rdmaPeerLines } = await import('./targets.js');
+  const body = await throughTheClient('tentaNasTargetGetRequest', { target_id: 't-rdma' }, 'TargetGetResponse', {
+    target: nasTarget('nvmet', [{ interface: 'enp5s0', address: '192.168.11.11', port: 4420, transport: 'rdma' }]),
+    sessions: [],
+    config_preview: '',
+    listen: [{ address: '192.168.11.11', port: 4420, transport: 'rdma', state: 'listener_lost_shared', rdma_devices: [] }],
+    rdma_peers: [{ address: '192.168.11.11', port: 4420, peer: '192.168.11.21', connections: 49 }],
+    rdma_peers_state: 'measured',
+  });
+  assert.deepEqual(body.rdmaPeers, [{ address: '192.168.11.11', port: 4420, peer: '192.168.11.21', connections: 49 }], 'the decoder keeps rdmaPeers');
+  assert.equal(body.rdmaPeersState, 'measured', 'the decoder keeps rdmaPeersState');
+  assert.deepEqual(rdmaPeerLines(body.rdmaPeers, body.rdmaPeersState).map((l) => l.text), ['49 połączeń RDMA z 192.168.11.21']);
+  assert.match(listenText(body.listen), /Ten nasłuch dzielą inne targety tego węzła/);
+  // An older node sends neither: nothing is said.
+  const old = await throughTheClient('tentaNasTargetGetRequest', { target_id: 't-rdma' }, 'TargetGetResponse', {
+    target: nasTarget('nvmet', []), sessions: [], config_preview: '',
+  });
+  assert.deepEqual(rdmaPeerLines(old.rdmaPeers, old.rdmaPeersState), []);
+});
+
 test('an interface without an RDMA device is not offered RDMA, from the decoded capabilities', { skip }, async () => {
   const body = await throughTheClient('tentaNasTargetsListRequest', {}, 'TargetsListResponse', {
     targets: [],
@@ -142,10 +163,11 @@ test('an interface without an RDMA device is not offered RDMA, from the decoded 
   const caps = body.capabilities;
   assert.deepEqual(caps.interfaces.map((i) => i.rdmaDevice), ['', 'rocep4s0', 'mlx5_0'], 'the decoder keeps rdmaDevice');
   assert.deepEqual(transportOptions('iscsi', caps, 'enp5s0').map((t) => t.ok), [true, false]);
-  assert.deepEqual(transportOptions('nvmet', caps, 'enp4s0np0').map((t) => t.ok), [true, false, false]);
+  assert.deepEqual(transportOptions('nvmet', caps, 'enp4s0np0').map((t) => t.ok), [true, true, true], 'a down link warns, it does not block');
   assert.deepEqual(transportOptions('nvmet', caps, 'storage0').map((t) => t.ok), [true, true, true]);
   assert.match(interfaceRdmaGap(caps, 'enp5s0'), /^Interfejs enp5s0 nie ma urządzenia RDMA/);
-  assert.match(interfaceRdmaGap(caps, 'enp4s0np0'), /rocep4s0 na interfejsie enp4s0np0 ma nieaktywne łącze/);
+  assert.equal(interfaceRdmaGap(caps, 'enp4s0np0'), '');
+  assert.match(interfaceRdmaWarning(caps, 'enp4s0np0'), /rocep4s0 na interfejsie enp4s0np0 ma nieaktywne łącze — target zostanie zapisany/);
   assert.equal(interfaceRdmaGap(caps, ''), '', 'every interface at once is not one card');
 });
 

@@ -522,6 +522,11 @@ pub struct NasAlert {
     /// - 'targets_sweep_stale' {} — the node-wide target sweep alert as a
     ///   restart (and migration 21) leaves it: no count measured yet;
     /// - 'target_portal_moved' {target};
+    /// - 'target_listener_lost' {target, address, port, transport: 'iser' |
+    ///   'rdma', shared: 'true' | 'false'} — an active target's RDMA
+    ///   listener is gone from the kernel's CM table while configfs still
+    ///   asks for it (read on every tick); `shared`: other targets use the
+    ///   same listener;
     /// - 'target_not_applied' {target, error?} — `error` is the kernel's
     ///   text, a tooltip only, and absent when it names another
     ///   organisation's object;
@@ -1669,7 +1674,11 @@ pub struct NasTarget {
     /// interface, interface_state: 'addressed' | 'no_address' | 'missing',
     /// current? (only when the interface holds addresses), elsewhere?,
     /// in_kernel}, 'target_not_exported' {},
-    /// 'target_no_auth' {}, and the config import's 'import_*' reasons. Empty
+    /// 'target_listener_lost' {address, port, transport: 'iser' | 'rdma',
+    /// shared: 'true' | 'false'} (an active target whose RDMA listener the
+    /// kernel dropped; the state is then 'error'; `shared` — other targets
+    /// use the same listener, so stopping this one alone does not bring it
+    /// back), 'target_no_auth' {}, and the config import's 'import_*' reasons. Empty
     /// from an older node and for a row stored before the codes — the
     /// sentence is then all there is.
     #[serde(default)]
@@ -1702,8 +1711,11 @@ pub struct NasTargetInitiatorSeen {
 /// kernel refuses it with ENODEV — measured) | 'listener_lost' (configfs still
 /// asks for the RDMA listener and the kernel has none: measured after the
 /// RDMA device went away; it comes back only when the portal is created
-/// again) | 'unknown' (a read failed) | 'rdma' (from a node before this
-/// field was measured: "not measured").
+/// again) | 'listener_lost_shared' (the same, on a listener other targets
+/// share — an nvmet port other subsystems are linked to, an iSCSI portal
+/// other portal groups ask iSER on: it comes back only after every target on
+/// it is stopped) | 'unknown' (a read failed) | 'rdma' (from a node before
+/// this field was measured: "not measured").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NasTargetListen {
     pub address: String,
@@ -1714,6 +1726,23 @@ pub struct NasTargetListen {
     /// (`rocep4s0`); empty for a TCP listener and for one that is not there.
     #[serde(default)]
     pub rdma_devices: Vec<String>,
+}
+
+/// NVMe-oF over RDMA connections of one peer address on one of a target's
+/// RDMA ports, from the kernel's RDMA connection-manager table (owner
+/// decision 2026-09-28). The table names no host — no NQN, no controller —
+/// and carries one connection per queue (measured: 49 for one connect), so
+/// this is an address and a count, never a named session. No CM id, QP
+/// number or PID is carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NasTargetRdmaPeer {
+    /// The target's portal address and port the connections came in on.
+    pub address: String,
+    pub port: u32,
+    /// The connecting host's address.
+    pub peer: String,
+    /// How many connections (queues) that address holds there.
+    pub connections: u32,
 }
 
 /// One interface the portal picker of the wizard offers (n14 step 2).
@@ -3331,6 +3360,17 @@ pub enum TentaNasPayload {
         /// "Nasłuch targetu", one entry per portal (wave 12).
         #[serde(default)]
         listen: Vec<NasTargetListen>,
+        /// NVMe-oF over RDMA: connections per peer address on the target's
+        /// RDMA port(s), from the kernel's RDMA CM table.
+        #[serde(default)]
+        rdma_peers: Vec<NasTargetRdmaPeer>,
+        /// What `rdma_peers` is: '' (no linked RDMA port — nothing to say) |
+        /// 'measured' (the list is complete; empty = no connection) |
+        /// 'shared_port' (the port is linked by other targets too, and the
+        /// table cannot tell whose connections are whose, so none are
+        /// listed) | 'unknown' (the table or configfs could not be read).
+        #[serde(default)]
+        rdma_peers_state: String,
     },
     /// Wizard "create" (n14). `source` is the zvol as ZFS names it;
     /// `create_size_bytes` > 0 creates it first (n14's "+ Nowy zvol").
@@ -4770,6 +4810,8 @@ mod tests {
             initiators_seen: Vec::new(),
             seen_since: String::new(),
             listen: Vec::new(),
+            rdma_peers: Vec::new(),
+            rdma_peers_state: String::new(),
         });
         let bytes = crate::cbor::encode(&body).expect("encode");
         let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");
@@ -4837,6 +4879,13 @@ mod tests {
                     rdma_devices: vec!["rocep4s0".into()],
                 },
             ],
+            rdma_peers: vec![NasTargetRdmaPeer {
+                address: "192.168.11.11".into(),
+                port: 4420,
+                peer: "192.168.11.21".into(),
+                connections: 49,
+            }],
+            rdma_peers_state: "measured".into(),
         });
         let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode")).expect("decode");
         assert_eq!(back, body);
@@ -4849,9 +4898,10 @@ mod tests {
             }
         }))
         .expect("an older answer decodes");
-        let TentaNasPayload::TargetGetResponse { sessions, listen, initiators_seen, seen_since, .. } = old else {
+        let TentaNasPayload::TargetGetResponse { sessions, listen, initiators_seen, seen_since, rdma_peers, rdma_peers_state, .. } = old else {
             panic!("variant");
         };
+        assert!(rdma_peers.is_empty() && rdma_peers_state.is_empty(), "no RDMA peers from an older node");
         assert_eq!((sessions[0].address.as_str(), sessions[0].state.as_str()), ("", ""));
         assert_eq!(sessions[0].transport, "", "no transport from a node before the RDMA measurements");
         assert!(listen.is_empty() && initiators_seen.is_empty() && seen_since.is_empty());

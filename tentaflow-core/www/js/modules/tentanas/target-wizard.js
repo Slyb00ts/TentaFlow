@@ -131,15 +131,27 @@ const AUTH_LABEL_KEY = {
  * node can serve it, or '' when it can (or when the portal is every
  * interface at once, or none is chosen yet). MEASURED (RDMA listeners
  * 2026-09-27): the kernel refuses an RDMA listener on an address no RDMA
- * device holds (ENODEV), and a device whose link is not ACTIVE reaches
- * nobody.
+ * device holds (ENODEV) — the one case that blocks.
  */
 export function interfaceRdmaGap(caps, interfaceName) {
   if (!interfaceName) return '';
   const iface = (caps?.interfaces || []).find((i) => i.name === interfaceName);
-  if (!iface || iface.rdma) return '';
-  if (iface.rdmaDevice) return T('wizard_target.transport_rdma_link_down', { iface: interfaceName, device: iface.rdmaDevice });
+  if (!iface || iface.rdma || iface.rdmaDevice) return '';
   return T('wizard_target.transport_no_rdma_device', { iface: interfaceName });
+}
+
+/**
+ * A warning, never a block (owner decision 2026-09-28): the interface HAS an
+ * RDMA device, but its link is not ACTIVE, so no client reaches the listener
+ * until it comes up. Whether the kernel binds the listener there is not
+ * measured, and the node accepts it; blocking would keep an admin from
+ * saving any edit of an iSER target while its storage link is down.
+ */
+export function interfaceRdmaWarning(caps, interfaceName) {
+  if (!interfaceName) return '';
+  const iface = (caps?.interfaces || []).find((i) => i.name === interfaceName);
+  if (!iface || iface.rdma || !iface.rdmaDevice) return '';
+  return T('wizard_target.transport_rdma_link_down', { iface: interfaceName, device: iface.rdmaDevice });
 }
 
 /**
@@ -683,6 +695,15 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     const chosen = transports.find((t) => t.value === state.transport);
     const nodeRdma = state.protocol === 'nvmet' ? Boolean(caps?.nvmeRdma) : Boolean(caps?.iser);
     const rdmaGap = interfaceRdmaGap(caps, state.portalInterface);
+    const rdmaWarning = interfaceRdmaWarning(caps, state.portalInterface);
+    const rdmaChosen = state.transport !== 'tcp';
+    // Critic RDMA r1, MINOR 6: an option shown disabled says why, on the
+    // create path too — the same sentence the chosen one would get.
+    const disabledWhy = !(chosen && !chosen.ok) && transports.some((t) => !t.ok)
+      ? (nodeRdma && rdmaGap
+        ? `<div class="hint mt-sm" data-testid="transport-disabled-reason">${escapeHtml(rdmaGap)}</div>`
+        : `<div class="hint mt-sm" data-testid="transport-disabled-reason">${kernelSupportLine('wizard_target.transport_unavailable', caps.rdmaReasons, caps.rdmaDetail)}</div>`)
+      : '';
     return `
       <h2 class="wizard-section-title">${escapeHtml(T('wizard_target.source_title'))}</h2>
       <p class="wizard-section-sub">${escapeHtml(T('wizard_target.source_sub'))}</p>
@@ -712,6 +733,8 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
             ? `<div class="wizard-warning mt-sm" data-testid="transport-interface-gap">${sprite('alert')}<div>${escapeHtml(rdmaGap)}</div></div>`
             : kernelSupportLine('wizard_target.transport_unavailable', caps.rdmaReasons, caps.rdmaDetail))
           : ''}
+        ${disabledWhy}
+        ${rdmaChosen && chosen?.ok && rdmaWarning ? `<div class="wizard-warning mt-sm" data-testid="transport-link-down">${sprite('alert')}<div>${escapeHtml(rdmaWarning)}</div></div>` : ''}
       </div>
       <div class="field mt-md" style="margin-bottom:0;">
         <label>${escapeHtml(T('wizard_target.auth_label'))}</label>

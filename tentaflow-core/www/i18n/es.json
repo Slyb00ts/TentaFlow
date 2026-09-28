@@ -7054,6 +7054,11 @@
         "target_rebuild_not_disabled": {
           "title": "Target {target}: el antiguo target abierto puede seguir aceptando a cualquier cliente",
           "detail": "El target estaba abierto y había que reconstruirlo antes de que su nueva lista de permitidos entrara en vigor. La reconstrucción se detuvo a medias y ni siquiera se pudo desactivar el target, así que la lista de permitidos NO está en vigor y cualquier cliente puede seguir conectándose. Detén el target."
+        },
+        "target_listener_lost": {
+          "title": "Target {target}: la escucha RDMA desapareció",
+          "detail": "Los clientes no pueden conectarse por RDMA ({transport}, {portal}). Detén y reanuda el target — el portal y su escucha se crean de nuevo.",
+          "detail_shared": "Los clientes no pueden conectarse por RDMA ({transport}, {portal}). Otros targets comparten la escucha: solo vuelve cuando todos los targets que la usan se han detenido y luego reanudado."
         }
       },
       "node_text": "Texto del nodo",
@@ -7826,7 +7831,9 @@
         "portal_moved_head_no_address": "El portal del destino ya no está donde se fijó. La dirección {address} pertenecía a la interfaz {interface}, que está en este nodo pero ahora no tiene ninguna dirección (enlace caído o concesión DHCP perdida).",
         "portal_moved_silent_since": "Desde {since} está en {elsewhere}. El destino no está en el kernel, así que nada escucha en esa dirección: la exportación no es accesible en {elsewhere} y no se trasladará allí automáticamente.",
         "portal_moved_reachable_since": "Desde {since} está en {elsewhere}, que nadie eligió para este destino: la exportación es accesible allí.",
-        "sharing_suspended": "La compartición en este nodo se detuvo junto con la desactivación de TentaNas — el destino vuelve al núcleo cuando TentaNas se activa de nuevo. En el modo B vuelve en cuanto se arma el canal de privilegios."
+        "sharing_suspended": "La compartición en este nodo se detuvo junto con la desactivación de TentaNas — el destino vuelve al núcleo cuando TentaNas se activa de nuevo. En el modo B vuelve en cuanto se arma el canal de privilegios.",
+        "listener_lost": "La escucha {transport} en {portal} desapareció aunque la configuración del kernel la pide — los clientes no pueden conectarse por RDMA. Vuelve cuando el portal se crea de nuevo: detén y reanuda el target.",
+        "listener_lost_shared": "La escucha {transport} en {portal} desapareció aunque la configuración del kernel la pide — los clientes no pueden conectarse por RDMA. Otros targets de este nodo la comparten: solo vuelve cuando todos los targets que la usan se han detenido y luego reanudado."
       },
       "host_state": "Estado",
       "host_connected": "Conectado",
@@ -7874,7 +7881,15 @@
       "listen_on_devices": "dispositivo RDMA: {devices}",
       "transport_word_tcp": "TCP",
       "transport_word_iser": "iSER (RDMA)",
-      "transport_word_rdma": "RDMA"
+      "transport_word_rdma": "RDMA",
+      "listen_listener_lost_shared": "Sin escucha — el kernel conserva la configuración pero no tiene escucha RDMA (p. ej., el dispositivo RDMA desapareció). Otros targets de este nodo comparten esta escucha, así que detener y reanudar uno no basta: vuelve cuando todos los targets que la usan se han detenido y luego reanudado",
+      "portal_iser": "iSER (RDMA)",
+      "portal_iser_off": "desactivado",
+      "rdma_peers_title": "Conexiones RDMA de la tabla RDMA del kernel — una por cola; son direcciones, no hosts con nombre",
+      "rdma_peer": "{n} {n|conexión RDMA|conexiones RDMA} desde {peer}",
+      "rdma_peers_none": "Sin conexiones RDMA",
+      "rdma_peers_shared": "Otros targets comparten este puerto RDMA — la tabla RDMA del kernel no indica qué conexiones pertenecen a este target, así que no se muestra ninguna",
+      "rdma_peers_unknown": "Conexiones RDMA no medidas"
     },
     "wizard_target": {
       "title": "Nuevo destino",
@@ -7989,7 +8004,7 @@
       "host_description_label": "Descripción — {nqn}",
       "host_description_placeholder": "p. ej. orion (compute)",
       "transport_no_rdma_device": "La interfaz {iface} no tiene dispositivo RDMA — el kernel rechaza una escucha RDMA en su dirección. Elige TCP o una interfaz con tarjeta RDMA.",
-      "transport_rdma_link_down": "El dispositivo RDMA {device} de la interfaz {iface} tiene el enlace inactivo — los clientes no podrán conectarse por RDMA."
+      "transport_rdma_link_down": "El dispositivo RDMA {device} de la interfaz {iface} tiene el enlace inactivo — el target se guardará, pero los clientes no podrán conectarse por RDMA hasta que el enlace se active."
     },
     "journal_owner": {
       "this_instance": "esta instancia de TentaNas",

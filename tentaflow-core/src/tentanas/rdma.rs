@@ -258,6 +258,17 @@ fn netdev_ipv4(netdev: &str) -> Vec<String> {
 /// exist anywhere else, and the probe answers "no devices" there, which is
 /// what the limited mode of §3.3 already says about those platforms.
 pub fn probe() -> Probe {
+    Probe {
+        devices: devices(),
+        module_loaded: module_loaded(RPCRDMA_MODULE),
+        module_available: module_in_tree(RPCRDMA_MODULE),
+    }
+}
+
+/// The RDMA devices of this node, without the `rpcrdma` module questions
+/// `probe` also answers: a listener read only needs to know which device
+/// holds an address, and the module check scans `modules.dep`.
+pub fn devices() -> Vec<RdmaDevice> {
     let mut devices = Vec::new();
     if let Ok(entries) = std::fs::read_dir(INFINIBAND_CLASS) {
         // The RoCE enumerator already maps netdev → RDMA device and collects
@@ -291,11 +302,7 @@ pub fn probe() -> Probe {
         }
     }
     devices.sort_by(|a, b| a.device.cmp(&b.device));
-    Probe {
-        devices,
-        module_loaded: module_loaded(RPCRDMA_MODULE),
-        module_available: module_in_tree(RPCRDMA_MODULE),
-    }
+    devices
 }
 
 /// The RDMA device (any port state) whose netdev holds `address`, if one does.
@@ -455,6 +462,10 @@ const CM_STATES: [&str; 11] = [
 // uapi `rdma/rdma_netlink.h` (values checked against the header; the dump
 // below is the request `rdma res show cm_id` makes).
 const NETLINK_RDMA: i32 = 20;
+// Address families in the Linux netlink ABI, fixed regardless of the OS the
+// parser is built on (libc::AF_INET6 is 30 on macOS, 23 on Windows).
+const LINUX_AF_INET: u16 = 2;
+const LINUX_AF_INET6: u16 = 10;
 const RDMA_NL_NLDEV: u16 = 5;
 const NLDEV_CMD_GET: u16 = 1;
 const NLDEV_CMD_RES_CM_ID_GET: u16 = 11;
@@ -531,12 +542,12 @@ fn attr_str(value: &[u8]) -> String {
 fn sockaddr(value: &[u8]) -> Option<std::net::SocketAddr> {
     let family = u16::from_ne_bytes([*value.first()?, *value.get(1)?]);
     let port = u16::from_be_bytes([*value.get(2)?, *value.get(3)?]);
-    match i32::from(family) {
-        libc::AF_INET => {
+    match family {
+        LINUX_AF_INET => {
             let ip: [u8; 4] = value.get(4..8)?.try_into().ok()?;
             Some(std::net::SocketAddr::from((ip, port)))
         }
-        libc::AF_INET6 => {
+        LINUX_AF_INET6 => {
             let ip: [u8; 16] = value.get(8..24)?.try_into().ok()?;
             Some(std::net::SocketAddr::from((ip, port)))
         }
@@ -656,26 +667,88 @@ fn nldev_dump(cmd: u16, device_index: Option<u32>) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Every RDMA CM id of this node, across all devices. `Err` when the dump
-/// could not be read — "nobody listens" and "could not look" are different
-/// answers, and the screen says "Nie zmierzono" for the second.
+/// What one read of the CM table found: the ids of every device that
+/// answered, and the devices whose own dump failed.
+///
+/// PER DEVICE, not all-or-nothing (critic RDMA r1, MINOR 8): the device list
+/// and each device's ids are separate dumps, so a device removed between the
+/// two answers `ENODEV` for its own — it is gone, and so are its ids, which
+/// is exactly what "no ids from it" says. Any OTHER failure of one device's
+/// dump leaves that device `unread`: a listener that is not among the ids
+/// read may be on it, so "lost" cannot be claimed while one is (see
+/// `targets::rdma_listener`), but every other listener still reads as what it
+/// is instead of the whole table turning into "Nie zmierzono".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CmTable {
+    pub ids: Vec<CmId>,
+    /// Devices whose dump failed for a reason other than being gone.
+    pub unread: Vec<String>,
+}
+
+/// The kernel's "no such device" — what a device removed since the device
+/// list answers for its own dump.
+const ENODEV: i32 = 19;
+
+/// One device's dump failed: its errno when there is one.
+#[derive(Debug)]
+enum DumpError {
+    Io(std::io::Error),
+    Errno(i32),
+}
+
+impl DumpError {
+    fn gone(&self) -> bool {
+        match self {
+            DumpError::Io(e) => e.raw_os_error() == Some(ENODEV),
+            DumpError::Errno(errno) => *errno == ENODEV,
+        }
+    }
+}
+
+/// The CM ids of `devices`, each read by `dump` (the netlink dump in
+/// production, fixtures in the tests), isolated per device.
+fn collect_cm_ids(
+    devices: Vec<(u32, String)>,
+    mut dump: impl FnMut(u32) -> std::io::Result<Vec<u8>>,
+) -> CmTable {
+    let mut table = CmTable::default();
+    for (index, name) in devices {
+        let read = dump(index)
+            .map_err(DumpError::Io)
+            .and_then(|bytes| parse_cm_ids(&bytes).map_err(DumpError::Errno));
+        match read {
+            Ok(ids) => table.ids.extend(ids),
+            Err(e) if e.gone() => {
+                tracing::debug!("RDMA netlink {name}: gone since the device list");
+            }
+            Err(e) => {
+                tracing::debug!("RDMA netlink {name}: {e:?}");
+                table.unread.push(name);
+            }
+        }
+    }
+    table
+}
+
+/// Every RDMA CM id of this node, across all devices. `Err` when not even
+/// the device list could be read — "nobody listens" and "could not look" are
+/// different answers, and the screen says "Nie zmierzono" for the second.
+/// One device that fails is isolated (`CmTable::unread`).
 ///
 /// MEASURED on rig11 (2026-09-27): an unprivileged reader gets exactly what
 /// root gets; a node without RDMA devices answers an empty list.
+///
+/// BLOCKING: up to one netlink dump per device, each with a 2 s receive
+/// timeout. Async callers run it on `spawn_blocking`.
 #[cfg(target_os = "linux")]
-pub fn cm_ids() -> std::result::Result<Vec<CmId>, String> {
+pub fn cm_ids() -> std::result::Result<CmTable, String> {
     let bytes = nldev_dump(NLDEV_CMD_GET, None).map_err(|e| format!("RDMA netlink: {e}"))?;
     let devices = parse_devices(&bytes).map_err(|errno| format!("RDMA netlink device list: errno {errno}"))?;
-    let mut out = Vec::new();
-    for (index, name) in devices {
-        let bytes = nldev_dump(NLDEV_CMD_RES_CM_ID_GET, Some(index)).map_err(|e| format!("RDMA netlink {name}: {e}"))?;
-        out.extend(parse_cm_ids(&bytes).map_err(|errno| format!("RDMA netlink {name}: errno {errno}"))?);
-    }
-    Ok(out)
+    Ok(collect_cm_ids(devices, |index| nldev_dump(NLDEV_CMD_RES_CM_ID_GET, Some(index))))
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn cm_ids() -> std::result::Result<Vec<CmId>, String> {
+pub fn cm_ids() -> std::result::Result<CmTable, String> {
     Err("RDMA netlink exists on Linux only".to_string())
 }
 
@@ -698,6 +771,33 @@ pub fn listening_devices(ids: &[CmId], owner: &str, address: &str, port: u32) ->
     out.sort();
     out.dedup();
     out
+}
+
+/// Whether `id` is on this portal's `address:port` (or the portal is every
+/// address, `0.0.0.0`, and only the port has to match).
+fn on_portal(id: &CmId, address: &str, port: u32) -> bool {
+    let wanted: Option<std::net::IpAddr> = address.parse().ok();
+    let every = wanted.is_some_and(|ip| ip.is_unspecified());
+    id.src.is_some_and(|src| u32::from(src.port()) == port && (every || Some(src.ip()) == wanted))
+}
+
+/// The connected peers of `owner` on `address:port`: one entry per peer
+/// address with how many CM ids in `CONNECT` it holds there, sorted by
+/// address.
+///
+/// MEASURED on rig11 (2026-09-27, E3): an NVMe-oF host connected over RDMA
+/// is one target-side `nvmet_rdma` CM id PER QUEUE (49 for one connect, the
+/// admin queue included), each with the port as `src` and the host's
+/// address as `dst`. The table names no host — no NQN, no controller — so a
+/// count of connections per address is all it can honestly say.
+pub fn connected_peers(ids: &[CmId], owner: &str, address: &str, port: u32) -> Vec<(String, u32)> {
+    let mut peers: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for id in ids.iter().filter(|id| id.state == "CONNECT" && id.owner == owner && on_portal(id, address, port)) {
+        if let Some(dst) = id.dst.filter(|d| !d.ip().is_unspecified()) {
+            *peers.entry(dst.ip().to_string()).or_default() += 1;
+        }
+    }
+    peers.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -897,6 +997,9 @@ mod tests {
     const LAN_LISTEN: &str = include_str!("../../tests/fixtures/rdma-nldev-cmid-lan-listen.hex");
     const ISER_CONNECTED: &str = include_str!("../../tests/fixtures/rdma-nldev-cmid-iser-connected.hex");
     const LOOPBACK_LISTEN: &str = include_str!("../../tests/fixtures/rdma-nldev-cmid-loopback-listen.hex");
+    // Round 2 E3 (`cmid-raw-nvmet-connected.json`): the m27rxe dump, two
+    // data messages and the end marker, while one host was connected.
+    const NVMET_CONNECTED: &str = include_str!("../../tests/fixtures/rdma-nldev-cmid-nvmet-connected.hex");
 
     fn hex(text: &str) -> Vec<u8> {
         let text = text.trim();
@@ -904,6 +1007,41 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
             .collect()
+    }
+
+    #[test]
+    fn sockaddr_decodes_linux_ipv4_family_and_network_order_port() {
+        let mut bytes = [0u8; 16];
+        bytes[..2].copy_from_slice(&2u16.to_ne_bytes());
+        bytes[2..8].copy_from_slice(&[0x11, 0x44, 192, 168, 11, 11]);
+
+        assert_eq!(sockaddr(&bytes), Some("192.168.11.11:4420".parse().unwrap()));
+    }
+
+    #[test]
+    fn sockaddr_decodes_linux_ipv6_family_and_network_order_port() {
+        let mut bytes = [0u8; 28];
+        bytes[..2].copy_from_slice(&10u16.to_ne_bytes());
+        bytes[2..4].copy_from_slice(&[0x0c, 0xbc]);
+        bytes[8..24].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+
+        assert_eq!(sockaddr(&bytes), Some("[2001:db8::1]:3260".parse().unwrap()));
+    }
+
+    #[test]
+    fn sockaddr_rejects_truncated_addresses_and_non_linux_families() {
+        for (family, required_len) in [(2u16, 8), (10u16, 24)] {
+            let mut bytes = [0u8; 28];
+            bytes[..2].copy_from_slice(&family.to_ne_bytes());
+            for len in 0..required_len {
+                assert_eq!(sockaddr(&bytes[..len]), None);
+            }
+        }
+        for family in [0u16, 23, 30, u16::MAX] {
+            let mut bytes = [0u8; 28];
+            bytes[..2].copy_from_slice(&family.to_ne_bytes());
+            assert_eq!(sockaddr(&bytes), None);
+        }
     }
 
     #[test]
@@ -958,16 +1096,22 @@ mod tests {
         assert_eq!(listening_devices(&ids, OWNER_ISERT, "127.0.0.1", 3260), vec!["rocep4s0"]);
     }
 
-    #[test]
-    fn a_netlink_error_is_an_errno_and_short_bytes_are_not_a_panic() {
-        // NLMSG_ERROR carrying -EPERM (1).
+    /// An `NLMSG_ERROR` reply carrying `-errno`.
+    fn nl_error(errno: i32) -> Vec<u8> {
         let mut error = Vec::new();
         error.extend_from_slice(&36u32.to_ne_bytes());
         error.extend_from_slice(&NLMSG_ERROR.to_ne_bytes());
         error.extend_from_slice(&0u16.to_ne_bytes());
         error.extend_from_slice(&[0u8; 8]);
-        error.extend_from_slice(&(-1i32).to_ne_bytes());
+        error.extend_from_slice(&(-errno).to_ne_bytes());
         error.extend_from_slice(&[0u8; 16]);
+        error
+    }
+
+    #[test]
+    fn a_netlink_error_is_an_errno_and_short_bytes_are_not_a_panic() {
+        // NLMSG_ERROR carrying -EPERM (1).
+        let error = nl_error(1);
         assert_eq!(parse_cm_ids(&error), Err(1));
         assert_eq!(parse_devices(&error), Err(1));
         let bytes = hex(LAN_LISTEN);
@@ -976,5 +1120,64 @@ mod tests {
         }
         // A cut inside the only data message yields nothing, never garbage.
         assert_eq!(parse_cm_ids(&bytes[..200]), Ok(Vec::new()));
+    }
+
+    /// Critic RDMA r1, MINOR 8: a device removed between the device list and
+    /// its own dump answers ENODEV — as a netlink errno or as the socket's
+    /// error — and takes only ITS ids with it; any other failure of one
+    /// device marks that device unread and leaves the rest of the table.
+    #[test]
+    fn one_device_failing_its_dump_does_not_blank_the_other_devices() {
+        let devices = parse_devices(&hex(DEVICES)).expect("no errno");
+        let table = collect_cm_ids(devices.clone(), |index| match index {
+            0 => Err(std::io::Error::from_raw_os_error(ENODEV)),
+            1 => Ok(nl_error(ENODEV)),
+            _ => Ok(hex(LAN_LISTEN)),
+        });
+        assert_eq!(table.unread, Vec::<String>::new(), "a device that is gone is not 'unread'");
+        assert_eq!(listening_devices(&table.ids, OWNER_NVMET, "192.168.11.11", 4420), vec!["m27rxe"]);
+
+        let table = collect_cm_ids(devices.clone(), |index| match index {
+            0 => Ok(nl_error(1)),
+            1 => Err(std::io::Error::from_raw_os_error(11)),
+            _ => Ok(hex(LAN_LISTEN)),
+        });
+        assert_eq!(table.unread, vec!["rocep4s0".to_string(), "rocep141s0".to_string()]);
+        assert_eq!(listening_devices(&table.ids, OWNER_ISERT, "192.168.11.11", 3260), vec!["m27rxe"]);
+
+        // And every device answering is the whole table.
+        let table = collect_cm_ids(devices, |index| if index == 4 { Ok(hex(LAN_LISTEN)) } else { Ok(Vec::new()) });
+        assert_eq!((table.ids.len(), table.unread.len()), (2, 0));
+    }
+
+    /// Round 2 E3 (measured): one `nvme connect -t rdma` is 49 target-side
+    /// `nvmet_rdma` CONNECT ids from the host's address, one per queue; the
+    /// host's own `nvme_rdma` half and the iSER listener are not counted.
+    #[test]
+    fn an_nvmet_rdma_host_is_one_connection_per_queue_counted_by_its_address() {
+        let ids = parse_cm_ids(&hex(NVMET_CONNECTED)).expect("no errno");
+        assert_eq!(ids.iter().filter(|i| i.state == "CONNECT").count(), 98, "both halves were dumped");
+        assert_eq!(connected_peers(&ids, OWNER_NVMET, "192.168.11.11", 4420), vec![("192.168.11.11".to_string(), 49)]);
+        assert_eq!(connected_peers(&ids, OWNER_NVMET, "0.0.0.0", 4420), vec![("192.168.11.11".to_string(), 49)]);
+        assert!(connected_peers(&ids, OWNER_NVMET, "192.168.11.11", 4421).is_empty());
+        assert!(connected_peers(&ids, OWNER_NVMET, "10.10.0.5", 4420).is_empty());
+        assert!(connected_peers(&ids, OWNER_ISERT, "192.168.11.11", 3260).is_empty());
+        assert_eq!(listening_devices(&ids, OWNER_NVMET, "192.168.11.11", 4420), vec!["m27rxe"]);
+    }
+
+    /// The live netlink path on this host: it must answer, and answer whole,
+    /// wherever an RDMA device exists. Skips (passes without asserting) on a
+    /// host without one — there NETLINK_RDMA may not even be registered.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_live_cm_table_reads_on_a_host_with_rdma_devices() {
+        let present = std::fs::read_dir(INFINIBAND_CLASS).map(|d| d.count()).unwrap_or(0);
+        if present == 0 {
+            eprintln!("skipped: no RDMA device in {INFINIBAND_CLASS}");
+            return;
+        }
+        let table = cm_ids().expect("the CM table reads where RDMA devices exist");
+        assert!(table.unread.is_empty(), "every device answered: {table:?}");
+        assert!(table.ids.iter().all(|id| !id.device.is_empty() && !id.state.is_empty()), "{table:?}");
     }
 }

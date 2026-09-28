@@ -1374,7 +1374,9 @@ test('the RDMA listener is its own Nasłuch row, patched in place, and a session
   const { sessionAddressHtml } = await import('./targets.js');
   assert.equal(sessionAddressHtml({ address: '' }), '<span class="text-3">—</span>');
   assert.equal(sessionAddressHtml({ address: '10.10.0.21' }), '<span class="mono">10.10.0.21</span>', 'no transport from the node: none shown');
-  assert.match(sessionAddressHtml({ address: '10.10.0.21', transport: 'tcp' }), /10\.10\.0\.21<\/span> <span class="text-xs text-3" data-testid="session-transport">TCP</);
+  // n19 shows a TCP session as its address only (critic RDMA r1, MINOR 4).
+  assert.equal(sessionAddressHtml({ address: '10.10.0.21', transport: 'tcp' }), '<span class="mono">10.10.0.21</span>');
+  assert.match(sessionAddressHtml({ address: '10.10.0.21', transport: 'rdma' }), /10\.10\.0\.21<\/span> <span class="text-xs text-3" data-testid="session-transport">RDMA</);
   assert.equal(sessionAddressHtml({ address: '10.10.0.21', transport: 'quantum' }), '<span class="mono">10.10.0.21</span>');
 
   const target = iscsiTarget({ portals: [{ interface: 'storage0', address: '10.10.0.5', port: 3260, transport: 'iser' }] });
@@ -1397,5 +1399,97 @@ test('the RDMA listener is its own Nasłuch row, patched in place, and a session
     assert.match(after.textContent, /^Brak nasłuchu — konfiguracja jest w jądrze/);
   } finally {
     screen.dispose();
+  }
+});
+
+// ----- Critic RDMA r1 round 2 / owner decisions 2026-09-28 -------------------
+
+test('a lost RDMA listener is worded as the tick judged it, shared or not, and only then', async () => {
+  const { targetStateText, listenText } = await import('./targets.js');
+  const lost = (shared) => iscsiTarget({
+    state: 'error',
+    stateDetail: 'the RDMA listener on 10.10.0.5:3260 (iser) is gone …',
+    stateReasons: [{ code: 'target_listener_lost', params: { address: '10.10.0.5', port: '3260', transport: 'iser', shared } }],
+  });
+  assert.equal(
+    targetStateText(lost('false')),
+    'Nasłuch iSER (RDMA) na 10.10.0.5:3260 zniknął, choć konfiguracja jądra go wymaga — klienci nie połączą się przez RDMA. Wraca po ponownym utworzeniu portalu: zatrzymaj i wznów target.',
+  );
+  // MINOR 3: a shared listener does not promise that one stop/resume fixes it.
+  const shared = targetStateText(lost('true'));
+  assert.match(shared, /wszystkie targety na nim zostaną zatrzymane/);
+  assert.doesNotMatch(shared, /zatrzymaj i wznów target/);
+  // A malformed parameter falls back to the node's own sentence.
+  assert.equal(targetStateText(iscsiTarget({ stateDetail: 'node text', stateReasons: [{ code: 'target_listener_lost', params: { address: '10.10.0.5', port: 'x', transport: 'iser', shared: 'false' } }] })), 'node text');
+  assert.match(listenText([{ state: 'listener_lost_shared', transport: 'iser' }]), /Ten nasłuch dzielą inne targety tego węzła/);
+  assert.doesNotMatch(listenText([{ state: 'listener_lost_shared', transport: 'iser' }]), /: zatrzymaj i wznów target$/);
+});
+
+test('n19: an iSCSI target without iSER shows "iSER (RDMA): wyłączony", an iSER one does not', async () => {
+  const screen = detailScreen([{ target: iscsiTarget(), sessions: [], configPreview: '', listen: [] }]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const row = win.querySelector('[data-testid="portal_iser"]');
+    assert.equal(row?.textContent, 'wyłączony');
+    assert.equal(row.parentElement.querySelector('.k').textContent, 'iSER (RDMA)');
+  } finally {
+    screen.dispose();
+  }
+  const iser = detailScreen([{ target: iscsiTarget({ portals: [{ interface: 'storage0', address: '10.10.0.5', port: 3260, transport: 'iser' }] }), sessions: [], configPreview: '', listen: [] }]);
+  try {
+    const win = openTargetDetail(iser, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    assert.equal(win.querySelector('[data-testid="portal_iser"]'), null);
+  } finally {
+    iser.dispose();
+  }
+});
+
+test('NVMe-oF over RDMA connections read as counts per address, patched in place, and never name a shared port\'s hosts', async () => {
+  const { rdmaPeerLines } = await import('./targets.js');
+  const peer = (p, n) => ({ address: '10.10.0.5', port: 4420, peer: p, connections: n });
+  assert.deepEqual(rdmaPeerLines([peer('10.10.0.21', 49), peer('10.10.0.22', 1)], 'measured').map((l) => l.text), [
+    '49 połączeń RDMA z 10.10.0.21',
+    '1 połączenie RDMA z 10.10.0.22',
+  ]);
+  assert.deepEqual(rdmaPeerLines([], 'measured').map((l) => l.text), ['Brak połączeń RDMA']);
+  assert.match(rdmaPeerLines([peer('10.10.0.21', 3)], 'shared_port')[0].text, /nie mówi, które połączenia należą do tego targetu/);
+  assert.equal(rdmaPeerLines([peer('10.10.0.21', 3)], 'shared_port').length, 1, 'a shared port lists nobody');
+  assert.deepEqual(rdmaPeerLines([], 'unknown').map((l) => l.text), ['Połączeń RDMA nie zmierzono']);
+  assert.deepEqual(rdmaPeerLines([], ''), [], 'nothing to say: no line');
+  assert.deepEqual(rdmaPeerLines([peer('10.10.0.21', 3)], 'brand-new'), [], 'a state this build does not know says nothing');
+
+  const base = { target: nvmetTarget(), sessions: [], configPreview: '', listen: [] };
+  const screen = detailScreen([
+    { ...base, rdmaPeers: [peer('10.10.0.21', 48)], rdmaPeersState: 'measured' },
+    { ...base, rdmaPeers: [peer('10.10.0.21', 49)], rdmaPeersState: 'measured' },
+  ]);
+  try {
+    const win = openTargetDetail(screen, 't2', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const line = win.querySelector('[data-testid="rdma-peer"]');
+    assert.equal(line.textContent, '48 połączeń RDMA z 10.10.0.21');
+    await runPoll(screen);
+    const after = win.querySelector('[data-testid="rdma-peer"]');
+    assert.ok(after === line, 'the line is patched in place, not rebuilt');
+    assert.equal(after.textContent, '49 połączeń RDMA z 10.10.0.21');
+    // No CM id, QP number or GID can reach the line: it has none on the wire.
+    assert.doesNotMatch(win.querySelector('[data-testid="rdma-peers"]').textContent, /fe80:|qpn|[0-9a-f]{8}-[0-9a-f]{4}-/i);
+  } finally {
+    screen.dispose();
+  }
+  // An iSCSI target never shows the block, whatever the node sent.
+  const iscsi = detailScreen([{ target: iscsiTarget(), sessions: [], configPreview: '', listen: [], rdmaPeers: [peer('10.10.0.21', 1)], rdmaPeersState: 'measured' }]);
+  try {
+    const win = openTargetDetail(iscsi, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    assert.equal(win.querySelector('[data-testid="rdma-peer"]'), null);
+  } finally {
+    iscsi.dispose();
   }
 });

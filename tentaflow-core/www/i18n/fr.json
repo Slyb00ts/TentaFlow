@@ -7054,6 +7054,11 @@
         "target_rebuild_not_disabled": {
           "title": "Cible {target} : l’ancienne cible ouverte accepte peut-être encore n’importe quel client",
           "detail": "La cible était ouverte et devait être reconstruite avant que sa nouvelle liste d’autorisation prenne effet. La reconstruction s’est arrêtée en cours de route et la cible n’a même pas pu être désactivée : la liste d’autorisation n’est donc PAS appliquée et n’importe quel client peut encore se connecter. Arrêtez la cible."
+        },
+        "target_listener_lost": {
+          "title": "Cible {target} : l’écoute RDMA a disparu",
+          "detail": "Les clients ne peuvent pas se connecter en RDMA ({transport}, {portal}). Arrêtez puis reprenez la cible — le portail et son écoute sont recréés.",
+          "detail_shared": "Les clients ne peuvent pas se connecter en RDMA ({transport}, {portal}). D’autres cibles partagent l’écoute : elle ne revient qu’une fois toutes les cibles qui l’utilisent arrêtées puis reprises."
         }
       },
       "node_text": "Texte du nœud",
@@ -7826,7 +7831,9 @@
         "portal_moved_head_no_address": "Le portail de la cible n’est plus là où il a été épinglé. L’adresse {address} appartenait à l’interface {interface}, présente sur ce nœud mais sans aucune adresse pour l’instant (lien coupé ou bail DHCP perdu).",
         "portal_moved_silent_since": "Depuis {since}, elle est sur {elsewhere}. La cible n’est pas dans le noyau, rien n’écoute donc à cette adresse — l’export n’est pas accessible sur {elsewhere} et n’y sera pas rebasculé automatiquement.",
         "portal_moved_reachable_since": "Depuis {since}, elle est sur {elsewhere}, que personne n’a choisie pour cette cible — l’export y est accessible.",
-        "sharing_suspended": "Le partage sur ce nœud a été arrêté avec la désactivation de TentaNas — la cible revient dans le noyau quand TentaNas est réactivé. En mode B, elle revient dès que le canal de privilèges est armé."
+        "sharing_suspended": "Le partage sur ce nœud a été arrêté avec la désactivation de TentaNas — la cible revient dans le noyau quand TentaNas est réactivé. En mode B, elle revient dès que le canal de privilèges est armé.",
+        "listener_lost": "L’écoute {transport} sur {portal} a disparu alors que la configuration du noyau la demande — les clients ne peuvent pas se connecter en RDMA. Elle revient lorsque le portail est recréé : arrêtez puis reprenez la cible.",
+        "listener_lost_shared": "L’écoute {transport} sur {portal} a disparu alors que la configuration du noyau la demande — les clients ne peuvent pas se connecter en RDMA. D’autres cibles de ce nœud la partagent : elle ne revient qu’une fois toutes les cibles qui l’utilisent arrêtées puis reprises."
       },
       "host_state": "État",
       "host_connected": "Connecté",
@@ -7874,7 +7881,15 @@
       "listen_on_devices": "périphérique RDMA : {devices}",
       "transport_word_tcp": "TCP",
       "transport_word_iser": "iSER (RDMA)",
-      "transport_word_rdma": "RDMA"
+      "transport_word_rdma": "RDMA",
+      "listen_listener_lost_shared": "Pas d’écoute — le noyau garde la configuration mais n’a pas d’écoute RDMA (p. ex. le périphérique RDMA a disparu). D’autres cibles de ce nœud partagent cette écoute, donc arrêter et reprendre une seule ne suffit pas : elle revient une fois toutes les cibles qui l’utilisent arrêtées puis reprises",
+      "portal_iser": "iSER (RDMA)",
+      "portal_iser_off": "désactivé",
+      "rdma_peers_title": "Connexions RDMA issues de la table RDMA du noyau — une par file ; ce sont des adresses, pas des hôtes nommés",
+      "rdma_peer": "{n} {n|connexion RDMA|connexions RDMA} depuis {peer}",
+      "rdma_peers_none": "Aucune connexion RDMA",
+      "rdma_peers_shared": "D’autres cibles partagent ce port RDMA — la table RDMA du noyau ne dit pas quelles connexions appartiennent à cette cible, donc aucune n’est affichée",
+      "rdma_peers_unknown": "Connexions RDMA non mesurées"
     },
     "wizard_target": {
       "title": "Nouvelle cible",
@@ -7989,7 +8004,7 @@
       "host_description_label": "Description — {nqn}",
       "host_description_placeholder": "p. ex. orion (compute)",
       "transport_no_rdma_device": "L’interface {iface} n’a pas de périphérique RDMA — le noyau refuse une écoute RDMA sur son adresse. Choisissez TCP ou une interface avec une carte RDMA.",
-      "transport_rdma_link_down": "Le périphérique RDMA {device} de l’interface {iface} a un lien inactif — les clients ne pourront pas se connecter en RDMA."
+      "transport_rdma_link_down": "Le périphérique RDMA {device} de l’interface {iface} a un lien inactif — la cible sera enregistrée, mais les clients ne pourront pas se connecter en RDMA tant que le lien n’est pas actif."
     },
     "journal_owner": {
       "this_instance": "cette instance TentaNas",

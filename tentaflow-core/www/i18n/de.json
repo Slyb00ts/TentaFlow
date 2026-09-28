@@ -7054,6 +7054,11 @@
         "target_rebuild_not_disabled": {
           "title": "Target {target}: das alte, offene Target nimmt möglicherweise noch jeden Client an",
           "detail": "Das Target war offen und musste neu aufgebaut werden, bevor seine neue Zulassungsliste wirken konnte. Der Neuaufbau brach ab, und das Target ließ sich nicht einmal deaktivieren, daher gilt die Zulassungsliste NICHT und jeder Client kann sich weiterhin anmelden. Halte das Target an."
+        },
+        "target_listener_lost": {
+          "title": "Target {target}: RDMA-Listener ist verschwunden",
+          "detail": "Clients können sich nicht über RDMA verbinden ({transport}, {portal}). Target stoppen und fortsetzen — Portal und Listener werden neu angelegt.",
+          "detail_shared": "Clients können sich nicht über RDMA verbinden ({transport}, {portal}). Andere Targets teilen sich den Listener: Er kehrt erst zurück, wenn alle Targets darauf gestoppt und danach fortgesetzt wurden."
         }
       },
       "node_text": "Text des Knotens",
@@ -7826,7 +7831,9 @@
         "portal_moved_head_no_address": "Das Portal des Targets ist nicht mehr dort, wo es festgelegt wurde. Die Adresse {address} gehörte zur Schnittstelle {interface}, die auf diesem Knoten vorhanden ist, aber derzeit keine Adresse hat (Link getrennt oder DHCP-Lease verloren).",
         "portal_moved_silent_since": "Seit {since} liegt sie auf {elsewhere}. Das Target ist nicht im Kernel, daher lauscht unter dieser Adresse nichts — der Export ist auf {elsewhere} nicht erreichbar und wird dort nicht automatisch neu gebunden.",
         "portal_moved_reachable_since": "Seit {since} liegt sie auf {elsewhere}, das niemand für dieses Target gewählt hat — der Export ist dort erreichbar.",
-        "sharing_suspended": "Die Freigabe auf diesem Knoten wurde zusammen mit der Deaktivierung von TentaNas gestoppt — das Target kehrt in den Kernel zurück, sobald TentaNas wieder aktiviert wird. Im Modus B kehrt es zurück, sobald der Rechtekanal scharfgeschaltet ist."
+        "sharing_suspended": "Die Freigabe auf diesem Knoten wurde zusammen mit der Deaktivierung von TentaNas gestoppt — das Target kehrt in den Kernel zurück, sobald TentaNas wieder aktiviert wird. Im Modus B kehrt es zurück, sobald der Rechtekanal scharfgeschaltet ist.",
+        "listener_lost": "Der {transport}-Listener auf {portal} ist verschwunden, obwohl die Kernel-Konfiguration ihn verlangt — Clients können sich nicht über RDMA verbinden. Er kehrt zurück, wenn das Portal neu angelegt wird: Target stoppen und fortsetzen.",
+        "listener_lost_shared": "Der {transport}-Listener auf {portal} ist verschwunden, obwohl die Kernel-Konfiguration ihn verlangt — Clients können sich nicht über RDMA verbinden. Andere Targets dieses Knotens teilen ihn: Er kehrt erst zurück, wenn alle Targets darauf gestoppt und danach fortgesetzt wurden."
       },
       "host_state": "Status",
       "host_connected": "Verbunden",
@@ -7874,7 +7881,15 @@
       "listen_on_devices": "RDMA-Gerät: {devices}",
       "transport_word_tcp": "TCP",
       "transport_word_iser": "iSER (RDMA)",
-      "transport_word_rdma": "RDMA"
+      "transport_word_rdma": "RDMA",
+      "listen_listener_lost_shared": "Lauscht nicht — der Kernel behält die Konfiguration, hat aber keinen RDMA-Listener (z. B. ist das RDMA-Gerät verschwunden). Andere Targets dieses Knotens teilen sich diesen Listener, daher genügt es nicht, eines zu stoppen und fortzusetzen: Er kehrt zurück, wenn alle Targets darauf gestoppt und danach fortgesetzt wurden",
+      "portal_iser": "iSER (RDMA)",
+      "portal_iser_off": "aus",
+      "rdma_peers_title": "RDMA-Verbindungen aus der RDMA-Tabelle des Kernels — eine pro Queue; das sind Adressen, keine benannten Hosts",
+      "rdma_peer": "{n} {n|RDMA-Verbindung|RDMA-Verbindungen} von {peer}",
+      "rdma_peers_none": "Keine RDMA-Verbindungen",
+      "rdma_peers_shared": "Andere Targets teilen sich diesen RDMA-Port — die RDMA-Tabelle des Kernels sagt nicht, welche Verbindungen zu diesem Target gehören, daher wird keine angezeigt",
+      "rdma_peers_unknown": "RDMA-Verbindungen nicht gemessen"
     },
     "wizard_target": {
       "title": "Neues Target",
@@ -7989,7 +8004,7 @@
       "host_description_label": "Beschreibung — {nqn}",
       "host_description_placeholder": "z. B. orion (compute)",
       "transport_no_rdma_device": "Die Schnittstelle {iface} hat kein RDMA-Gerät — der Kernel lehnt einen RDMA-Listener auf ihrer Adresse ab. Wählen Sie TCP oder eine Schnittstelle mit RDMA-Karte.",
-      "transport_rdma_link_down": "Das RDMA-Gerät {device} an der Schnittstelle {iface} hat keine aktive Verbindung — Clients können sich nicht über RDMA verbinden."
+      "transport_rdma_link_down": "Das RDMA-Gerät {device} an der Schnittstelle {iface} hat keine aktive Verbindung — das Target wird gespeichert, aber Clients können sich erst über RDMA verbinden, wenn die Verbindung steht."
     },
     "journal_owner": {
       "this_instance": "diese TentaNas-Instanz",

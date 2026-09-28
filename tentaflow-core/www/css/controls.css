@@ -809,6 +809,8 @@ tf-tabs {
   transform: none;
 }
 .tf-segmented.tf-segmented-disabled { opacity: 0.5; pointer-events: none; }
+/* One option the context does not allow: visible, not choosable. */
+.tf-segmented .tf-seg-opt[disabled] { opacity: 0.45; cursor: not-allowed; }
 .tf-segmented .tf-seg-opt:focus-visible {
   outline: 2px solid var(--tf-accent-1);
   outline-offset: 2px;
