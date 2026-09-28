@@ -6830,8 +6830,8 @@
         },
         "target_listener_lost": {
           "title": "Target {target}: nasłuch RDMA zniknął",
-          "detail": "Klienci nie połączą się przez RDMA ({transport}, {portal}). Zatrzymaj i wznów target — portal i nasłuch powstaną od nowa.",
-          "detail_shared": "Klienci nie połączą się przez RDMA ({transport}, {portal}). Nasłuch dzielą inne targety: wraca dopiero, gdy wszystkie targety na nim zostaną zatrzymane, a potem wznowione."
+          "detail": "Klienci nie połączą się przez {transport} na {portal}. Zatrzymaj i wznów target — portal i nasłuch powstaną od nowa.",
+          "detail_shared": "Klienci nie połączą się przez {transport} na {portal}. Nasłuch dzielą inne targety: wraca dopiero, gdy wszystkie targety na nim zostaną zatrzymane, a potem wznowione."
         }
       },
       "node_text": "Treść węzła",

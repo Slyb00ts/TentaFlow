@@ -7057,8 +7057,8 @@
         },
         "target_listener_lost": {
           "title": "Target {target}: la escucha RDMA desapareció",
-          "detail": "Los clientes no pueden conectarse por RDMA ({transport}, {portal}). Detén y reanuda el target — el portal y su escucha se crean de nuevo.",
-          "detail_shared": "Los clientes no pueden conectarse por RDMA ({transport}, {portal}). Otros targets comparten la escucha: solo vuelve cuando todos los targets que la usan se han detenido y luego reanudado."
+          "detail": "Los clientes no pueden conectarse por {transport} en {portal}. Detén y reanuda el target — el portal y su escucha se crean de nuevo.",
+          "detail_shared": "Los clientes no pueden conectarse por {transport} en {portal}. Otros targets comparten la escucha: solo vuelve cuando todos los targets que la usan se han detenido y luego reanudado."
         }
       },
       "node_text": "Texto del nodo",

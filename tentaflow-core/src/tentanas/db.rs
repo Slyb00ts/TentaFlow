@@ -1771,8 +1771,30 @@ pub fn raise_coded_alert(
 ) -> Result<bool> {
     let params_json = serde_json::to_string(&text.params)?;
     let reasons_json = serde_json::to_string(&text.reasons)?;
-    let conn = write(pool)?;
     let owner = alert_owner_sql("?5", "?6");
+    // Read first, the way `resolve_alert` does (critic RDMA r2, nit c): the
+    // judgement re-raises every open target alert on every tick, sweep and
+    // apply, and an open row that already says exactly this — same text,
+    // codes, subject and owner — needs no write connection at all. The
+    // condition is the exact negation of the refresh's WHERE below, so
+    // whatever that UPDATE would have changed still takes the write path.
+    let current: bool = {
+        let conn = pool.read().map_err(|e| anyhow!("tentanas db read: {e}"))?;
+        conn.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM nas_alerts
+                     WHERE dedupe_key = ?1 AND resolved_at IS NULL
+                       AND severity = ?2 AND title = ?3 AND detail = ?4 AND org_id IS ({owner})
+                       AND subject_id = ?6 AND code = ?7 AND params = ?8 AND reasons = ?9)"
+            ),
+            params![dedupe_key, severity, text.title, text.detail, subject_kind, subject_id, text.code, params_json, reasons_json],
+            |row| row.get(0),
+        )?
+    };
+    if current {
+        return Ok(false);
+    }
+    let conn = write(pool)?;
     // Bound once and reused for the refresh's `raised_at` below: the insert
     // path still calls `now()` itself, so this is not a shared timestamp,
     // only a name that does not shadow the function.
@@ -11616,6 +11638,42 @@ mod tests {
     /// The codes are part of an alert's text: an open row raised uncoded (an
     /// older build) is coded by the next raise even when its English did not
     /// change, keeping its `raised_at`; an identical raise writes nothing.
+    /// Critic RDMA r2, nit c: an identical raise does not even take the
+    /// write connection — the judgement re-raises every open target alert on
+    /// every tick. Proved on a file database with a read pool: the raise
+    /// completes while this thread holds the writer.
+    #[test]
+    fn an_identical_raise_does_not_take_the_write_connection() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("nas.db");
+        let conn = rusqlite::Connection::open(&path).expect("open");
+        conn.pragma_update(None, "journal_mode", "WAL").expect("wal");
+        migrate(&conn).expect("migrate");
+        let p: DbPool = std::sync::Arc::new(crate::db::Db::with_read_pool(conn, &path).expect("pool"));
+        let text = AlertText::new("target_listener_lost", "Target vm-a: its RDMA listener is gone", "gone").param("target", "vm-a");
+        assert!(raise_coded_alert(&p, "target:t1:listener", "warning", "target", "vm-a", &text).unwrap());
+
+        let raise = |p: DbPool, text: AlertText| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(raise_coded_alert(&p, "target:t1:listener", "warning", "target", "vm-a", &text).map_err(|e| e.to_string()));
+            });
+            rx
+        };
+        let writer = p.write().unwrap();
+        let same = raise(p.clone(), text.clone());
+        assert_eq!(
+            same.recv_timeout(std::time::Duration::from_secs(10)).expect("an identical raise waited for the writer"),
+            Ok(false)
+        );
+        // A changed text does need the writer: it waits until it is free.
+        let changed = raise(p.clone(), text.clone().param("address", "10.10.0.5"));
+        assert!(changed.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "a refresh writes");
+        drop(writer);
+        assert_eq!(changed.recv_timeout(std::time::Duration::from_secs(10)).expect("refresh"), Ok(false));
+        assert_eq!(list_alerts(&p, true).unwrap()[0].params.get("address").map(String::as_str), Some("10.10.0.5"));
+    }
+
     #[test]
     fn a_raise_codes_an_open_uncoded_row_in_place_and_an_identical_one_writes_nothing() {
         let p = pool();

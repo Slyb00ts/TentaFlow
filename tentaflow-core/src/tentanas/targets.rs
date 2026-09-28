@@ -363,6 +363,11 @@ pub const RDMA_NO_DEVICE: &str = "target_rdma_no_device";
 /// `iser = 1` write both fail with `ENODEV` — and it would do so after the
 /// zvol and the TPG already exist. The every-interface portal (`0.0.0.0`)
 /// and an address the picker does not list are left to the other rules.
+///
+/// "No RDMA device" is asked of the interface's `rdma_device`, which
+/// `interfaces` resolves through the stacking too: a VLAN over a RoCE NIC
+/// and a bond of RoCE NICs have one (`rdma::netdev_devices`, from the
+/// kernel's GID table — critic RDMA r2, MINOR 4), so they are not refused.
 pub fn rdma_portal_refusal(portal: &NasTargetPortal, interfaces: &[NasBlockInterface]) -> Option<super::refusal::Refusal> {
     if !matches!(portal.transport.as_str(), "iser" | "rdma") || portal.address == "0.0.0.0" {
         return None;
@@ -391,21 +396,19 @@ pub fn rdma_portal_refusal(portal: &NasTargetPortal, interfaces: &[NasBlockInter
 /// reaches — which is the warning §5.5(c) asks for. It is computed here, from
 /// the routing table, rather than guessed from a name.
 pub fn interfaces() -> Vec<NasBlockInterface> {
-    let rdma = super::rdma::probe();
-    let rdma_netdevs: Vec<String> = rdma
-        .devices
-        .iter()
-        .filter(|d| d.active && !d.netdev.is_empty())
-        .map(|d| d.netdev.clone())
-        .collect();
+    // The device carrying each netdev, a VLAN or a bond on a RoCE NIC
+    // included (`rdma::netdev_devices`, critic RDMA r2 MINOR 4) — the map
+    // the device list was built with, not a second sysfs walk (r3 MINOR 1),
+    // and without `probe`'s `rpcrdma` module questions, which nothing here
+    // asks.
+    let (devices, carried) = super::rdma::devices_with_netdevs();
     // Any port state: "no device here" is what the kernel refuses (ENODEV,
     // measured), a DOWN port is only a link nobody reaches yet.
-    let device_of = |netdev: &str| {
-        rdma.devices
-            .iter()
-            .find(|d| d.netdev == netdev)
-            .map(|d| d.device.clone())
-            .unwrap_or_default()
+    let device_of = |netdev: &str| carried.get(netdev).cloned().unwrap_or_default();
+    let active = |netdev: &str| {
+        carried
+            .get(netdev)
+            .is_some_and(|device| devices.iter().any(|d| &d.device == device && d.active))
     };
     let default_route = default_route_interface();
     let mut out = Vec::new();
@@ -422,7 +425,7 @@ pub fn interfaces() -> Vec<NasBlockInterface> {
             // portal picker with no explanation at all.
             let supported = net.addr.is_ipv4();
             out.push(NasBlockInterface {
-                rdma: rdma_netdevs.iter().any(|n| n == name),
+                rdma: active(name),
                 rdma_device: device_of(name),
                 shared: default_route.as_deref() == Some(name.as_str()),
                 supported,
@@ -1831,7 +1834,7 @@ fn judge_listeners(
     // The verdict stays: the object is in the kernel, and re-applying it
     // would write the same `iser = 1` / port link and recreate nothing.
     let gone = if state == "active" {
-        lost.of(&target.target_id)
+        lost.of(target)
     } else {
         lost.forget(&target.target_id);
         Vec::new()
@@ -2666,6 +2669,8 @@ impl Executor {
         explicit: Option<&ElevationToken>,
         log: &mut Vec<String>,
     ) -> Result<()> {
+        // A kernel change the tick's RDMA reading must not outlive (MINOR 2).
+        let _change = LostListeners::global().changing(&target.target_id);
         match self {
             Executor::Helper => apply_one(db, cipher, target, explicit, log).await,
             #[cfg(test)]
@@ -2680,6 +2685,7 @@ impl Executor {
         explicit: Option<&ElevationToken>,
         log: &mut Vec<String>,
     ) -> Result<()> {
+        let _change = LostListeners::global().changing(&target.target_id);
         match self {
             Executor::Helper => remove_one(db, target, explicit, log).await,
             #[cfg(test)]
@@ -2868,6 +2874,29 @@ async fn apply_report(
     Ok(report)
 }
 
+/// Every row of this node and its judgement (`evaluate_rows` with the
+/// production facts), made on `spawn_blocking`: the judgement is sysfs (the
+/// RDMA device list and its netdev map), `modules.dep`, `stat`s and SQLite,
+/// none of which belongs on the async runtime (critic RDMA r3, MINOR 1).
+async fn judge_off_runtime(db: &DbPool) -> Result<(Vec<TargetRow>, BTreeMap<String, Disposition>, Vec<String>)> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut targets = store::list_targets(&db)?;
+        let mut log = Vec::new();
+        let disposition = evaluate_rows(
+            &db,
+            &mut targets,
+            &kernel_can_serve,
+            RetryMemory::global(),
+            LostListeners::global(),
+            &mut log,
+        )?;
+        Ok((targets, disposition, log))
+    })
+    .await
+    .map_err(|e| anyhow!("the judgement did not finish: {e}"))?
+}
+
 /// Takes out of the kernel every row the node has judged `Remove` and whose
 /// removal is due.
 ///
@@ -2905,16 +2934,7 @@ async fn apply_report(
 /// (`Sweep::failed`). `Err` is the sweep itself failing, which names no target.
 pub async fn sweep_removals(db: &DbPool, explicit: Option<&ElevationToken>) -> Result<Sweep> {
     let _guard = apply_lock().lock().await;
-    let mut targets = store::list_targets(db)?;
-    let mut log = Vec::new();
-    let disposition = evaluate_rows(
-        db,
-        &mut targets,
-        &kernel_can_serve,
-        RetryMemory::global(),
-        LostListeners::global(),
-        &mut log,
-    )?;
+    let (targets, disposition, _) = judge_off_runtime(db).await?;
     let mut out = Vec::new();
     // Every row: this is the node's own reconcile, the serving side, and its
     // log goes to the node log only.
@@ -3034,16 +3054,7 @@ pub async fn sweep_applies(
     explicit: Option<&ElevationToken>,
 ) -> Result<Sweep> {
     let _guard = apply_lock().lock().await;
-    let mut targets = store::list_targets(db)?;
-    let mut log = Vec::new();
-    let disposition = evaluate_rows(
-        db,
-        &mut targets,
-        &kernel_can_serve,
-        RetryMemory::global(),
-        LostListeners::global(),
-        &mut log,
-    )?;
+    let (targets, disposition, _) = judge_off_runtime(db).await?;
     let mut out = Vec::new();
     let mut failed: Vec<TargetFailure> = Vec::new();
     for target in rows_to_apply(
@@ -3056,7 +3067,9 @@ pub async fn sweep_applies(
             "{}: judged active but not in this node's kernel, applying it",
             target.name
         ));
+        let change = LostListeners::global().changing(&target.target_id);
         let outcome = apply_one(db, cipher, target, explicit, &mut out).await;
+        drop(change);
         note_apply_outcome(&target.target_id, outcome.is_ok());
         if let Err(e) = outcome {
             out.push(format!("{}: {e}", target.name));
@@ -3686,13 +3699,18 @@ pub fn start_restore(main_db: DbPool, db: DbPool) {
                 if let Err(e) = tokio::task::spawn_blocking(move || refresh_lost_listeners(&reading)).await {
                     tracing::warn!("tentanas: RDMA listeners not read: {e}");
                 }
-                match evaluate(&db) {
-                    Ok(seen) => {
+                // Off the async runtime too (critic RDMA r3, MINOR 1): the
+                // judgement is sysfs (the RDMA device list and its netdev
+                // map), `modules.dep`, `stat`s and SQLite — all blocking.
+                let judging = db.clone();
+                match tokio::task::spawn_blocking(move || evaluate(&judging)).await {
+                    Ok(Ok(seen)) => {
                         for line in &seen.log {
                             tracing::info!("tentanas targets: {line}");
                         }
                         pending = seen;
                     }
+                    Ok(Err(e)) => tracing::warn!("tentanas: target state not evaluated: {e}"),
                     Err(e) => tracing::warn!("tentanas: target state not evaluated: {e}"),
                 }
                 // The session sampler (MAJOR 27): iSCSI on every tick, from
@@ -4515,7 +4533,7 @@ pub struct TargetRdmaReading {
 /// RDMA device with a 2 s receive timeout. `target_get` runs it on
 /// `spawn_blocking`. The `rpcrdma` module scan of `rdma::probe` is not made:
 /// only the device list is needed here.
-pub fn rdma_reading(target: &TargetRow) -> TargetRdmaReading {
+pub fn rdma_reading(db: &DbPool, target: &TargetRow) -> TargetRdmaReading {
     // The RDMA reads only when a portal needs them: a TCP-only target costs
     // exactly what it did before.
     let rdma = if target.portals.iter().any(|p| matches!(p.transport.as_str(), "iser" | "rdma")) {
@@ -4526,7 +4544,15 @@ pub fn rdma_reading(target: &TargetRow) -> TargetRdmaReading {
     } else {
         RdmaView::default()
     };
-    let (peers, peers_state) = rdma_peers_in(target, Path::new(block::NVMET_CONFIGFS), &rdma);
+    // Every row of the node, whoever owns it: the peers of a port another
+    // target asks for are not attributable (`rdma_peers_in`). Unreadable
+    // means "not measured", never "nobody else".
+    let rows = if target.protocol == "nvmet" && target.portals.iter().any(|p| p.transport == "rdma") {
+        store::list_targets(db).map_err(|e| tracing::debug!("RDMA connections: {e}")).ok()
+    } else {
+        None
+    };
+    let (peers, peers_state) = rdma_peers_in(target, rows.as_deref(), Path::new(block::NVMET_CONFIGFS), &rdma);
     TargetRdmaReading {
         listen: listen_states_in(
             target,
@@ -4559,16 +4585,26 @@ impl Default for RdmaView {
 // Lost RDMA listeners on the tick (critic RDMA r1, MAJOR 2)
 // -----------------------------------------------------------------------------
 
-/// The RDMA listeners of `target` that configfs asks for and the kernel's CM
-/// table does not have (`listener_lost*`). Only the RDMA half: the TCP
+/// One target's part of a tick's reading: the RDMA listeners of `target`
+/// that configfs asks for and the kernel's CM table does not have
+/// (`listener_lost*`), and the RDMA portals it could NOT look at (a configfs
+/// read or a device dump that failed: `unknown`). Only the RDMA half: the TCP
 /// socket of a portal is the drift and apply rules' business.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ListenerReading {
+    pub(crate) lost: Vec<tentaflow_protocol::tentanas::NasTargetListen>,
+    /// `(address, port, transport)` of every RDMA listener whose state is
+    /// "could not look".
+    pub(crate) unknown: Vec<(String, u32, String)>,
+}
+
 fn lost_listeners_in(
     target: &TargetRow,
     iscsi_root: &Path,
     nvmet_root: &Path,
     rdma: &RdmaView,
-) -> Vec<tentaflow_protocol::tentanas::NasTargetListen> {
-    let mut out = Vec::new();
+) -> ListenerReading {
+    let mut out = ListenerReading::default();
     for portal in &target.portals {
         let (transport, (state, _)) = match (target.protocol.as_str(), portal.transport.as_str()) {
             ("nvmet", "rdma") => ("rdma", nvmet_rdma_listen_state(target, portal, nvmet_root, rdma)),
@@ -4577,10 +4613,27 @@ fn lost_listeners_in(
             _ => continue,
         };
         if state.starts_with("listener_lost") {
-            out.push(listen_entry(portal, transport, state, Vec::new()));
+            out.lost.push(listen_entry(portal, transport, state, Vec::new()));
+        } else if state == "unknown" {
+            out.unknown.push((portal.address.clone(), portal.port, transport.to_string()));
         }
     }
     out
+}
+
+/// Whether a remembered lost listener names a listener `target` still has:
+/// the same `address:port` and RDMA transport as one of its portals now.
+fn names_a_portal_of(target: &TargetRow, listen: &tentaflow_protocol::tentanas::NasTargetListen) -> bool {
+    target.portals.iter().any(|p| {
+        p.address == listen.address
+            && p.port == listen.port
+            && match (target.protocol.as_str(), p.transport.as_str()) {
+                ("nvmet", "rdma") => listen.transport == "rdma",
+                ("nvmet", _) => false,
+                (_, "iser") => listen.transport == "iser",
+                _ => false,
+            }
+    })
 }
 
 /// The last tick's reading of lost RDMA listeners, per target id.
@@ -4597,13 +4650,43 @@ fn lost_listeners_in(
 /// that recreates the listener is not reported lost until the next tick has
 /// looked again.
 ///
+/// "COULD NOT LOOK" KEEPS WHAT WAS THERE (critic RDMA r2, MINOR 1). A tick
+/// whose target list or CM table could not be read, or a target whose
+/// listener state is `unknown` (an unreadable configfs attribute, a device
+/// whose own dump failed), is neither "lost" nor "found back": the previous
+/// entry stays, so the alert is not closed and re-raised with a new
+/// `raised_at` and without the admin's acknowledgement, and the chip does not
+/// go error → active → error.
+///
+/// A READING OLDER THAN A KERNEL CHANGE IS DISCARDED (critic RDMA r2, MINOR
+/// 2). The refresh runs outside the apply lock, so a stop and a resume (or a
+/// portal re-applied elsewhere) can land while it reads, and its answer —
+/// "configfs asks, the CM table has nothing" — is then about a listener that
+/// no longer exists. Every kernel change of a target moves its generation
+/// (`KernelChange`, taken around every apply and removal under the apply
+/// lock; `forget`), a change IN FLIGHT makes it odd, and the refresh keeps
+/// its answer for a target only when that generation was even when it began
+/// and is the same when it merges. Otherwise the target keeps what it had —
+/// nothing, after a stop. A portal edit is also covered by `of`, which only
+/// returns entries naming a portal the row still has.
+///
 /// One instance per caller-supplied memory; `global()` is the process-wide
 /// one, a test makes its own (the shape of `GraceClock` and `RetryMemory`).
-pub(crate) struct LostListeners(std::sync::Mutex<BTreeMap<String, Vec<tentaflow_protocol::tentanas::NasTargetListen>>>);
+pub(crate) struct LostListeners(std::sync::Mutex<LostMemory>);
+
+#[derive(Default)]
+struct LostMemory {
+    lost: BTreeMap<String, Vec<tentaflow_protocol::tentanas::NasTargetListen>>,
+    /// Per target id; absent is 0. Odd while a kernel change is in flight.
+    generations: BTreeMap<String, u64>,
+}
+
+/// The generations a reading began under (`LostListeners::generations`).
+pub(crate) type Generations = BTreeMap<String, u64>;
 
 impl LostListeners {
     pub(crate) fn new() -> Self {
-        Self(std::sync::Mutex::new(BTreeMap::new()))
+        Self(std::sync::Mutex::new(LostMemory::default()))
     }
 
     fn global() -> &'static Self {
@@ -4611,37 +4694,126 @@ impl LostListeners {
         LOST.get_or_init(LostListeners::new)
     }
 
-    /// The whole reading of one tick: every target not in it has nothing lost.
-    pub(crate) fn replace(&self, reading: BTreeMap<String, Vec<tentaflow_protocol::tentanas::NasTargetListen>>) {
-        if let Ok(mut lost) = self.0.lock() {
-            *lost = reading;
-        }
+    /// Taken BEFORE a reading starts: what `merge` compares against.
+    pub(crate) fn generations(&self) -> Generations {
+        self.0.lock().map(|m| m.generations.clone()).unwrap_or_default()
     }
 
-    fn of(&self, target_id: &str) -> Vec<tentaflow_protocol::tentanas::NasTargetListen> {
-        self.0.lock().ok().and_then(|lost| lost.get(target_id).cloned()).unwrap_or_default()
+    /// One tick's reading, `None` when it could not look at all. Per target:
+    /// a reading begun during or before a kernel change of it is dropped
+    /// (the entry it had stays); otherwise its lost listeners are the ones
+    /// found, plus the remembered ones on portals it could not look at. A
+    /// target the reading does not name (not enabled, not in the kernel, no
+    /// RDMA portal) has nothing lost.
+    pub(crate) fn merge(&self, began: &Generations, reading: Option<BTreeMap<String, ListenerReading>>) {
+        let Some(reading) = reading else { return };
+        let Ok(mut memory) = self.0.lock() else { return };
+        let generation = |m: &LostMemory, id: &str| m.generations.get(id).copied().unwrap_or(0);
+        let settled = |m: &LostMemory, id: &str| {
+            let then = began.get(id).copied().unwrap_or(0);
+            then % 2 == 0 && then == generation(m, id)
+        };
+        let mut next = BTreeMap::new();
+        for (id, previous) in &memory.lost {
+            if !settled(&memory, id) {
+                next.insert(id.clone(), previous.clone());
+            }
+        }
+        for (id, found) in reading {
+            if !settled(&memory, &id) {
+                continue;
+            }
+            let mut lost = found.lost;
+            if let Some(previous) = memory.lost.get(&id) {
+                lost.extend(previous.iter().filter(|l| {
+                    found.unknown.iter().any(|(address, port, transport)| {
+                        *address == l.address && *port == l.port && *transport == l.transport
+                    })
+                }).cloned());
+            }
+            if !lost.is_empty() {
+                next.insert(id, lost);
+            }
+        }
+        memory.lost = next;
+    }
+
+    /// The whole reading of one tick, taken with no kernel change in flight.
+    #[cfg(test)]
+    pub(crate) fn replace(&self, reading: BTreeMap<String, Vec<tentaflow_protocol::tentanas::NasTargetListen>>) {
+        let began = self.generations();
+        self.merge(
+            &began,
+            Some(reading.into_iter().map(|(id, lost)| (id, ListenerReading { lost, unknown: Vec::new() })).collect()),
+        );
+    }
+
+    /// The remembered lost listeners of `target` that still name one of its
+    /// portals (a portal edited since the reading is not reported by its old
+    /// `address:port`).
+    fn of(&self, target: &TargetRow) -> Vec<tentaflow_protocol::tentanas::NasTargetListen> {
+        self.0
+            .lock()
+            .ok()
+            .and_then(|lost| lost.lost.get(&target.target_id).cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| names_a_portal_of(target, l))
+            .collect()
     }
 
     fn forget(&self, target_id: &str) {
-        if let Ok(mut lost) = self.0.lock() {
-            lost.remove(target_id);
+        if let Ok(mut memory) = self.0.lock() {
+            memory.lost.remove(target_id);
+            *memory.generations.entry(target_id.to_string()).or_insert(0) += 2;
         }
+    }
+
+    /// Moves `target_id`'s generation by one: the start (to odd) or the end
+    /// (to even) of a kernel change.
+    fn bump(&self, target_id: &str) {
+        if target_id.is_empty() {
+            return;
+        }
+        if let Ok(mut memory) = self.0.lock() {
+            *memory.generations.entry(target_id.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// A kernel change of `target_id` is in flight until the guard drops.
+    fn changing(&'static self, target_id: &str) -> KernelChange {
+        self.bump(target_id);
+        KernelChange { lost: self, target_id: target_id.to_string() }
+    }
+}
+
+/// An apply or a removal of one target in progress (`LostListeners`,
+/// MINOR 2). Ends on drop, so an error or a cancelled future ends it too.
+struct KernelChange {
+    lost: &'static LostListeners,
+    target_id: String,
+}
+
+impl Drop for KernelChange {
+    fn drop(&mut self) {
+        self.lost.bump(&self.target_id);
     }
 }
 
 /// One tick's reading: the lost RDMA listeners of every enabled target this
 /// node's kernel holds with an RDMA portal. No such target: no netlink at
-/// all. The CM table unreadable: nothing is claimed lost ("could not look"
-/// is not "lost").
+/// all. The target list or the CM table unreadable: `None`, "could not
+/// look", which keeps the previous reading (MINOR 1) — not "lost", and not
+/// "found back" either.
 ///
 /// BLOCKING: one pass over the CM table (the device list plus one dump per
 /// RDMA device) and configfs reads. The tick runs it on `spawn_blocking`.
-fn read_lost_listeners(db: &DbPool) -> BTreeMap<String, Vec<tentaflow_protocol::tentanas::NasTargetListen>> {
+fn read_lost_listeners(db: &DbPool) -> Option<BTreeMap<String, ListenerReading>> {
     let targets = match store::list_targets(db) {
         Ok(targets) => targets,
         Err(e) => {
             tracing::warn!("tentanas targets: RDMA listeners not read: {e}");
-            return BTreeMap::new();
+            return None;
         }
     };
     let candidates: Vec<&TargetRow> = targets
@@ -4650,28 +4822,32 @@ fn read_lost_listeners(db: &DbPool) -> BTreeMap<String, Vec<tentaflow_protocol::
         .filter(|t| object_in_kernel(t))
         .collect();
     if candidates.is_empty() {
-        return BTreeMap::new();
+        return Some(BTreeMap::new());
     }
     let rdma = match super::rdma::cm_ids() {
         Ok(table) => RdmaView { cm_ids: Ok(table), probe: super::rdma::Probe::default() },
         Err(e) => {
             tracing::debug!("tentanas targets: RDMA listeners: {e}");
-            return BTreeMap::new();
+            return None;
         }
     };
-    candidates
-        .into_iter()
-        .map(|t| {
-            let lost = lost_listeners_in(t, Path::new(block::TARGET_CONFIGFS), Path::new(block::NVMET_CONFIGFS), &rdma);
-            (t.target_id.clone(), lost)
-        })
-        .filter(|(_, lost)| !lost.is_empty())
-        .collect()
+    Some(
+        candidates
+            .into_iter()
+            .map(|t| {
+                let found = lost_listeners_in(t, Path::new(block::TARGET_CONFIGFS), Path::new(block::NVMET_CONFIGFS), &rdma);
+                (t.target_id.clone(), found)
+            })
+            .collect(),
+    )
 }
 
 /// The tick's refresh of `LostListeners`. Blocking — see `read_lost_listeners`.
+/// The generations are taken BEFORE anything is read.
 pub fn refresh_lost_listeners(db: &DbPool) {
-    LostListeners::global().replace(read_lost_listeners(db));
+    let lost = LostListeners::global();
+    let began = lost.generations();
+    lost.merge(&began, read_lost_listeners(db));
 }
 
 /// The state detail of an ACTIVE target whose RDMA listener is lost: what is
@@ -4706,13 +4882,43 @@ fn listener_alert_key(target_id: &str) -> String {
 /// per RDMA portal this subsystem is linked on, the connected peers by
 /// address with their connection (queue) count.
 ///
-/// The CM table knows ports, not subsystems. A port linked by ANOTHER
-/// subsystem too carries both targets' hosts, and naming them here would show
-/// one organisation another's clients — so a shared port says so
-/// (`shared_port`) and lists nobody. `''` when the target has no linked RDMA
-/// port, `unknown` when the table (or configfs) could not be read.
+/// ONLY PEERS THAT CAN BE ATTRIBUTED TO THIS TARGET (critic RDMA r2, MINOR
+/// 3). The CM table knows ports, not subsystems: every `nvmet_rdma` id on the
+/// port is counted, whoever it came for. What reaches a port, FROM THE KERNEL
+/// SOURCE (drivers/nvme/target, not measured on rig11):
+///
+/// - the RDMA CM connection of every queue is ACCEPTED before the Fabrics
+///   Connect command on it names a subsystem (`nvmet_rdma_queue_connect`),
+///   so a host of ANY subsystem the port serves — and one about to be
+///   refused — holds ids there;
+/// - every enabled port also serves the DISCOVERY subsystem. A discovery
+///   controller is an admin queue only: the host asks for no I/O queues and
+///   the discovery subsystem has `max_qid = 0`, so it is exactly ONE id per
+///   controller (`nvme-stas`, `connect … --persistent` keep it open);
+/// - an I/O controller is the admin queue plus at least one I/O queue: two
+///   ids or more (measured, E3: 49 for one connect);
+/// - unlinking a subsystem from a port deletes its controllers on that port
+///   (`nvmet_port_del_ctrls`); its hosts then retry, and each attempt is one
+///   admin-queue id the Fabrics Connect refuses.
+///
+/// So the list is withheld (`shared_port`, the existing rule) when the port —
+/// or another port the CM table cannot tell apart from it: the same service
+/// id on the same address or on `0.0.0.0` — is linked by another subsystem
+/// NOW, or is asked for by another target row of this node, stopped or not
+/// (a stopped target's hosts keep retrying). And a peer with ONE id is never
+/// listed: it is a discovery controller or a connect not (yet) accepted,
+/// neither of which names this target.
+///
+/// LIMITS, stated rather than hidden: a peer holding two discovery
+/// controllers from one address would pass the count; a subsystem linked by
+/// hand (not a row of this app) and unlinked before the read is not seen;
+/// and an I/O host of this target that also runs persistent discovery is
+/// counted one id high. What could leak is an address, never a name.
+/// `''` when the target has no linked RDMA port, `unknown` when the table,
+/// configfs or the target list could not be read.
 fn rdma_peers_in(
     target: &TargetRow,
+    rows: Option<&[TargetRow]>,
     nvmet_root: &Path,
     rdma: &RdmaView,
 ) -> (Vec<tentaflow_protocol::tentanas::NasTargetRdmaPeer>, &'static str) {
@@ -4736,12 +4942,29 @@ fn rdma_peers_in(
             }
             Ok((true, _)) => {}
         }
+        let Some(rows) = rows else { return (Vec::new(), "unknown") };
+        let other_row = rows.iter().any(|row| {
+            row.target_id != target.target_id
+                && row.protocol == "nvmet"
+                && row.portals.iter().any(|p| p.transport == "rdma" && p.port == portal.port && addresses_overlap(&p.address, &portal.address))
+        });
+        let other_port = match nvmet_overlapping_port_linked(portal, &port, nvmet_root) {
+            Err(()) => return (Vec::new(), "unknown"),
+            Ok(linked) => linked,
+        };
+        if other_row || other_port {
+            state = "shared_port";
+            continue;
+        }
         let Ok(table) = rdma.cm_ids.as_ref() else { return (Vec::new(), "unknown") };
         // An unread device may hold connections this count would miss.
         if !table.unread.is_empty() {
             return (Vec::new(), "unknown");
         }
         for (peer, connections) in super::rdma::connected_peers(&table.ids, super::rdma::OWNER_NVMET, &portal.address, portal.port) {
+            if connections < 2 {
+                continue;
+            }
             peers.push(tentaflow_protocol::tentanas::NasTargetRdmaPeer {
                 address: portal.address.clone(),
                 port: portal.port,
@@ -4754,6 +4977,57 @@ fn rdma_peers_in(
         }
     }
     (peers, state)
+}
+
+/// Whether two portal addresses reach the same RDMA CM ids: the same
+/// address, or either one is every address (`0.0.0.0`).
+fn addresses_overlap(a: &str, b: &str) -> bool {
+    a == b || a == "0.0.0.0" || b == "0.0.0.0"
+}
+
+/// Whether ANOTHER nvmet RDMA port with this portal's service id and an
+/// overlapping address (`addresses_overlap`) links any subsystem: its ids
+/// are on the same `address:port` in the CM table. `Err` on a failed read.
+///
+/// An address attribute that exists and cannot be read is `Err` too (critic
+/// RDMA r3, nit a): that port may be a lookalike, and "unreadable" is "not
+/// measured", never "nobody else". It is asked only while the port could
+/// still match: an unreadable address on a TCP port changes nothing. A
+/// missing attribute is not a port the kernel listens on.
+fn nvmet_overlapping_port_linked(portal: &NasTargetPortal, own: &Path, root: &Path) -> std::result::Result<bool, ()> {
+    let ports = match std::fs::read_dir(root.join("ports")) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(()),
+    };
+    for port in ports {
+        let dir = port.map_err(|_| ())?.path();
+        if dir == own {
+            continue;
+        }
+        let Some(trtype) = read_attr(&dir.join("addr_trtype"))? else { continue };
+        if trtype != "rdma" {
+            continue;
+        }
+        let Some(trsvcid) = read_attr(&dir.join("addr_trsvcid"))? else { continue };
+        if trsvcid != portal.port.to_string() {
+            continue;
+        }
+        let Some(traddr) = read_attr(&dir.join("addr_traddr"))? else { continue };
+        if !addresses_overlap(&traddr, &portal.address) {
+            continue;
+        }
+        match std::fs::read_dir(dir.join("subsystems")) {
+            Ok(mut links) => {
+                if links.next().is_some() {
+                    return Ok(true);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(false)
 }
 
 /// Reads a configfs attribute: `Ok(None)` when it does not exist, `Err` when
@@ -5312,7 +5586,9 @@ async fn apply_one_now(
 ) -> Result<Vec<String>> {
     let _guard = apply_lock().lock().await;
     let mut log = Vec::new();
+    let change = LostListeners::global().changing(&target.target_id);
     let outcome = apply_one(db, cipher, target, explicit, &mut log).await;
+    drop(change);
     note_apply_outcome(&target.target_id, outcome.is_ok());
     outcome.map(|()| log)
 }
@@ -8885,7 +9161,7 @@ mod tests {
     #[test]
     fn a_lost_listener_other_targets_share_is_told_apart_from_one_that_is_its_own() {
         let tree = TempTree::new("listen-shared");
-        let read = |row: &TargetRow| lost_listeners_in(row, &tree.0, &tree.0, &rxe_view(Ok(Vec::new())));
+        let read = |row: &TargetRow| lost_listeners_in(row, &tree.0, &tree.0, &rxe_view(Ok(Vec::new()))).lost;
 
         let mut nvme = target("nvmet");
         nvme.portals = vec![NasTargetPortal { interface: "enp5s0".into(), address: "192.168.11.11".into(), port: 4420, transport: "rdma".into() }];
@@ -8909,7 +9185,7 @@ mod tests {
         write(&tree, "iscsi/iqn.2026-09.local.tentaflow:helios.b/tpgt_1/np/192.168.11.11:3260/iser", b"1\n");
         assert_eq!(read(&iser)[0].state, "listener_lost_shared");
         // Found listening: nothing is lost, shared or not.
-        assert!(lost_listeners_in(&iser, &tree.0, &tree.0, &rxe_view(Ok(vec![cm("ib_isert", "LISTEN", "192.168.11.11:3260")]))).is_empty());
+        assert!(lost_listeners_in(&iser, &tree.0, &tree.0, &rxe_view(Ok(vec![cm("ib_isert", "LISTEN", "192.168.11.11:3260")]))).lost.is_empty());
         // The TCP transport of an nvmet target is not an RDMA listener.
         nvme.portals[0].transport = "tcp".into();
         assert!(read(&nvme).is_empty());
@@ -8931,7 +9207,11 @@ mod tests {
         let state = |v: &RdmaView| nvmet_rdma_listen_state(&nvme, &nvme.portals[0], &tree.0, v);
         assert_eq!(state(&view(Vec::new())), ("unknown", Vec::new()));
         assert_eq!(state(&view(vec![cm("nvmet_rdma", "LISTEN", "192.168.11.11:4420")])), ("listening", vec!["m27rxe".to_string()]));
-        assert!(lost_listeners_in(&nvme, &tree.0, &tree.0, &view(Vec::new())).is_empty(), "the tick claims nothing");
+        assert_eq!(
+            lost_listeners_in(&nvme, &tree.0, &tree.0, &view(Vec::new())),
+            ListenerReading { lost: Vec::new(), unknown: vec![("192.168.11.11".into(), 4420, "rdma".into())] },
+            "the tick claims nothing lost, and says it could not look"
+        );
     }
 
     /// Owner decision 2026-09-28: NVMe-oF over RDMA connections come from
@@ -8954,19 +9234,49 @@ mod tests {
         ids.push(connected("ib_isert", "192.168.11.11:3260", "192.168.11.24:40100"));
         // A user-space CM id on the same address and port is not nvmet's.
         ids.push(connected("", "192.168.11.11:4420", "192.168.11.30:40200"));
-        let peers = |view: &RdmaView| {
-            let (peers, state) = rdma_peers_in(&nvme, &tree.0, view);
+        let alone = vec![nvme.clone()];
+        let peers_with = |rows: Option<&[TargetRow]>, view: &RdmaView| {
+            let (peers, state) = rdma_peers_in(&nvme, rows, &tree.0, view);
             (peers.into_iter().map(|p| (p.peer, p.connections, p.port)).collect::<Vec<_>>(), state)
         };
+        let peers = |view: &RdmaView| peers_with(Some(&alone), view);
         // Not linked yet: nothing to say.
         assert_eq!(peers(&rxe_view(Ok(ids.clone()))), (Vec::new(), ""));
         nvmet_port(&tree, "2711", "rdma", "192.168.11.11", 4420, &[&nvme.wwn]);
-        assert_eq!(
-            peers(&rxe_view(Ok(ids.clone()))),
-            (vec![("192.168.11.21".to_string(), 3, 4420), ("192.168.11.22".to_string(), 1, 4420)], "measured")
-        );
+        // 192.168.11.22 holds ONE id: a discovery controller or a connect not
+        // accepted — nothing names this target (critic RDMA r2, MINOR 3).
+        assert_eq!(peers(&rxe_view(Ok(ids.clone()))), (vec![("192.168.11.21".to_string(), 3, 4420)], "measured"));
         assert_eq!(peers(&rxe_view(Ok(Vec::new()))), (Vec::new(), "measured"), "a measured zero");
         assert_eq!(peers(&rxe_view(Err(()))), (Vec::new(), "unknown"));
+        assert_eq!(peers_with(None, &rxe_view(Ok(ids.clone()))), (Vec::new(), "unknown"), "the target list unread");
+
+        // Another target row asking for the same port — stopped, so not
+        // linked, its hosts retrying — withholds the list; on `0.0.0.0` too.
+        // One on another service id does not.
+        let mut stopped = target("nvmet");
+        stopped.target_id = "0191f2c0-0000-7000-8000-0000000000b2".into();
+        stopped.enabled = false;
+        stopped.portals = vec![NasTargetPortal { interface: "enp5s0".into(), address: "192.168.11.11".into(), port: 4421, transport: "rdma".into() }];
+        let rows = |s: &TargetRow| vec![nvme.clone(), s.clone()];
+        assert_eq!(peers_with(Some(&rows(&stopped)), &rxe_view(Ok(ids.clone()))).1, "measured", "another service id");
+        stopped.portals[0].port = 4420;
+        assert_eq!(peers_with(Some(&rows(&stopped)), &rxe_view(Ok(ids.clone()))), (Vec::new(), "shared_port"));
+        stopped.portals[0].address = "0.0.0.0".into();
+        assert_eq!(peers_with(Some(&rows(&stopped)), &rxe_view(Ok(ids.clone()))), (Vec::new(), "shared_port"));
+        stopped.portals[0].transport = "tcp".into();
+        assert_eq!(peers_with(Some(&rows(&stopped)), &rxe_view(Ok(ids.clone()))).1, "measured", "a TCP portal is not in the CM table");
+
+        // Another nvmet PORT the CM table cannot tell apart (same service
+        // id, every address) linked by another subsystem: withheld; unlinked,
+        // it does not matter.
+        nvmet_port(&tree, "2712", "rdma", "0.0.0.0", 4420, &[]);
+        assert_eq!(peers(&rxe_view(Ok(ids.clone()))).1, "measured");
+        let hand = "nqn.2026-09.local.byhand:disk";
+        tree.dir(&format!("subsystems/{hand}"));
+        std::os::unix::fs::symlink(tree.0.join("subsystems").join(hand), tree.0.join("ports/2712/subsystems").join(hand)).expect("link");
+        assert_eq!(peers(&rxe_view(Ok(ids.clone()))), (Vec::new(), "shared_port"));
+        std::fs::remove_file(tree.0.join("ports/2712/subsystems").join(hand)).expect("unlink");
+        assert_eq!(peers(&rxe_view(Ok(ids.clone()))).1, "measured");
         // Another subsystem on the same port: whose connections are whose
         // is not in the table, so none are listed.
         let other = "nqn.2026-09.local.tentaflow:helios.other";
@@ -8976,7 +9286,42 @@ mod tests {
         // iSCSI never carries this list.
         let mut iser = target("iscsi");
         iser.portals[0].transport = "iser".into();
-        assert_eq!(rdma_peers_in(&iser, &tree.0, &rxe_view(Ok(Vec::new()))).1, "");
+        assert_eq!(rdma_peers_in(&iser, Some(&alone), &tree.0, &rxe_view(Ok(Vec::new()))).1, "");
+    }
+
+    /// Critic RDMA r3, nit a: another nvmet port whose address cannot be
+    /// read may be a lookalike on the same `address:port`, so its peers are
+    /// "not measured" (withheld), never listed as if it were not there.
+    #[test]
+    fn an_unreadable_lookalike_port_address_withholds_the_peers() {
+        let tree = TempTree::new("rdma-peers-unreadable");
+        let mut nvme = target("nvmet");
+        nvme.portals = vec![NasTargetPortal { interface: "enp5s0".into(), address: "192.168.11.11".into(), port: 4420, transport: "rdma".into() }];
+        let ids = vec![
+            cm("nvmet_rdma", "LISTEN", "192.168.11.11:4420"),
+            connected("nvmet_rdma", "192.168.11.11:4420", "192.168.11.21:40000"),
+            connected("nvmet_rdma", "192.168.11.11:4420", "192.168.11.21:40001"),
+        ];
+        let alone = vec![nvme.clone()];
+        let peers = || rdma_peers_in(&nvme, Some(&alone), &tree.0, &rxe_view(Ok(ids.clone())));
+        nvmet_port(&tree, "2711", "rdma", "192.168.11.11", 4420, &[&nvme.wwn]);
+        nvmet_port(&tree, "2712", "rdma", "192.168.11.11", 4420, &["nqn.2026-09.local.byhand:disk"]);
+        assert_eq!(peers().1, "shared_port", "the readable lookalike");
+        // Its address unreadable (a directory reads as an error, not as
+        // NotFound): unknown, nothing listed.
+        std::fs::remove_file(tree.0.join("ports/2712/addr_traddr")).expect("rm");
+        tree.dir("ports/2712/addr_traddr");
+        assert_eq!(peers(), (Vec::new(), "unknown"));
+        // The same on its transport or its service id.
+        std::fs::remove_dir(tree.0.join("ports/2712/addr_traddr")).expect("rmdir");
+        write(&tree, "ports/2712/addr_traddr", b"192.168.11.11\n");
+        std::fs::remove_file(tree.0.join("ports/2712/addr_trsvcid")).expect("rm");
+        tree.dir("ports/2712/addr_trsvcid");
+        assert_eq!(peers(), (Vec::new(), "unknown"));
+        // An unreadable address on a TCP port cannot be a lookalike.
+        write(&tree, "ports/2712/addr_trtype", b"tcp\n");
+        assert_eq!(peers().1, "measured");
+        assert_eq!(peers().0.len(), 1);
     }
 
     /// Critic RDMA r1, MAJOR 2: an ACTIVE target whose RDMA listener the
@@ -9042,6 +9387,163 @@ mod tests {
         assert_eq!(judge_listeners(&db, &row, "active", CodedText::default(), &lost, &mut log).0, "active");
         assert!(store::list_alerts(&db, true).expect("alerts").is_empty());
         assert!(log.is_empty(), "{log:?}");
+    }
+
+    fn lost_entry(address: &str, port: u32, transport: &str) -> tentaflow_protocol::tentanas::NasTargetListen {
+        tentaflow_protocol::tentanas::NasTargetListen {
+            address: address.into(),
+            port,
+            transport: transport.into(),
+            state: "listener_lost".into(),
+            rdma_devices: Vec::new(),
+        }
+    }
+
+    /// Critic RDMA r2, MINOR 1: "could not look" — the whole reading (the
+    /// target list or the CM table unreadable) or one portal's state
+    /// (`unknown`: a device whose dump failed) — keeps the previous lost
+    /// listener. The alert is neither closed nor re-raised: same row, same
+    /// `raised_at`, the admin's acknowledgement kept, the state stays `error`.
+    #[test]
+    fn a_reading_that_could_not_look_keeps_the_lost_listener_and_its_acknowledged_alert() {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let mut row = target("nvmet");
+        row.portals = vec![
+            NasTargetPortal { interface: "enp5s0".into(), address: "192.168.11.11".into(), port: 4420, transport: "rdma".into() },
+            NasTargetPortal { interface: "enp6s0".into(), address: "192.168.12.11".into(), port: 4420, transport: "rdma".into() },
+        ];
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let lost = LostListeners::new();
+        let mut log = Vec::new();
+        let judge = |lost: &LostListeners, log: &mut Vec<String>| judge_listeners(&db, &row, "active", CodedText::default(), lost, log).0;
+        let reading = |lost: Vec<tentaflow_protocol::tentanas::NasTargetListen>, unknown: Vec<(String, u32, String)>| {
+            Some(BTreeMap::from([(row.target_id.clone(), ListenerReading { lost, unknown })]))
+        };
+
+        let began = lost.generations();
+        lost.merge(&began, reading(vec![lost_entry("192.168.11.11", 4420, "rdma")], Vec::new()));
+        assert_eq!(judge(&lost, &mut log), "error");
+        let alert = store::list_alerts(&db, true).expect("alerts").remove(0);
+        assert!(store::ack_alert(&db, &alert.alert_id).expect("ack"));
+        let acked = store::list_alerts(&db, true).expect("alerts").remove(0);
+        assert!(acked.acked_at.is_some());
+        let unchanged = |log: &mut Vec<String>, why: &str| {
+            assert_eq!(judge(&lost, log), "error", "{why}");
+            let now = store::list_alerts(&db, true).expect("alerts");
+            assert_eq!(now.len(), 1, "{why}: {now:?}");
+            assert_eq!(
+                (&now[0].alert_id, &now[0].raised_at, &now[0].acked_at, &now[0].resolved_at),
+                (&acked.alert_id, &acked.raised_at, &acked.acked_at, &None),
+                "{why}"
+            );
+        };
+
+        // The target list or the CM table could not be read.
+        lost.merge(&lost.generations(), None);
+        unchanged(&mut log, "nothing read");
+        // The lost portal's device dump failed: `unknown` keeps it; the
+        // other portal is read and fine.
+        lost.merge(&lost.generations(), reading(Vec::new(), vec![("192.168.11.11".into(), 4420, "rdma".into())]));
+        unchanged(&mut log, "its portal unknown");
+        // `unknown` on ANOTHER portal does not keep this one alive...
+        lost.merge(&lost.generations(), reading(Vec::new(), vec![("192.168.12.11".into(), 4420, "rdma".into())]));
+        assert_eq!(judge(&lost, &mut log), "active", "found back where it could look");
+        assert!(store::list_alerts(&db, true).expect("alerts").is_empty());
+        // ...and a found-lost portal next to an unknown one keeps both.
+        lost.merge(&lost.generations(), reading(vec![lost_entry("192.168.11.11", 4420, "rdma")], Vec::new()));
+        lost.merge(
+            &lost.generations(),
+            reading(vec![lost_entry("192.168.12.11", 4420, "rdma")], vec![("192.168.11.11".into(), 4420, "rdma".into())]),
+        );
+        let mut kept: Vec<String> = lost.of(&row).iter().map(|l| l.address.clone()).collect();
+        kept.sort();
+        assert_eq!(kept, vec!["192.168.11.11", "192.168.12.11"]);
+        // A reading that no longer names the target (stopped, out of the
+        // kernel): nothing is lost.
+        lost.merge(&lost.generations(), Some(BTreeMap::new()));
+        assert!(lost.of(&row).is_empty());
+        assert!(log.is_empty(), "{log:?}");
+    }
+
+    /// Critic RDMA r2, MINOR 2: the tick's reading runs outside the apply
+    /// lock. One that began before (or during) a kernel change of the target
+    /// — a stop, a resume, a re-apply — is dropped for that target, and the
+    /// entry it had stays; one taken after is kept. A portal edited since
+    /// the reading is not reported by its old address.
+    #[test]
+    fn a_reading_older_than_a_kernel_change_of_the_target_does_not_resurrect_a_lost_listener() {
+        let lost: &'static LostListeners = Box::leak(Box::new(LostListeners::new()));
+        let mut row = target("iscsi");
+        row.portals = vec![NasTargetPortal { interface: "enp5s0".into(), address: "192.168.11.11".into(), port: 3260, transport: "iser".into() }];
+        let id = row.target_id.clone();
+        let gone = || Some(BTreeMap::from([(id.clone(), ListenerReading { lost: vec![lost_entry("192.168.11.11", 3260, "iser")], unknown: Vec::new() })]));
+
+        // Stop (the judgement's `forget`) and resume while it read.
+        let began = lost.generations();
+        lost.forget(&id);
+        drop(lost.changing(&id));
+        lost.merge(&began, gone());
+        assert!(lost.of(&row).is_empty(), "the stop removed it, the old reading does not put it back");
+
+        // A reading that merges while an apply is in flight, or that began
+        // during one, is dropped too.
+        let began = lost.generations();
+        let apply = lost.changing(&id);
+        lost.merge(&began, gone());
+        assert!(lost.of(&row).is_empty(), "merged during the apply");
+        let during = lost.generations();
+        drop(apply);
+        lost.merge(&during, gone());
+        assert!(lost.of(&row).is_empty(), "began during the apply");
+
+        // Nothing changed while it read: kept.
+        lost.merge(&lost.generations(), gone());
+        assert_eq!(lost.of(&row).len(), 1);
+        // A kernel change during the next reading keeps what was there
+        // rather than dropping it (MINOR 1's rule: not "found back").
+        let began = lost.generations();
+        drop(lost.changing(&id));
+        lost.merge(&began, Some(BTreeMap::new()));
+        assert_eq!(lost.of(&row).len(), 1);
+
+        // The portal moved to another address: the old entry names nothing.
+        row.portals[0].address = "192.168.11.12".into();
+        assert!(lost.of(&row).is_empty());
+        row.portals[0].address = "192.168.11.11".into();
+        row.portals[0].transport = "tcp".into();
+        assert!(lost.of(&row).is_empty(), "no longer iSER");
+    }
+
+    /// MINOR 2 on the production path: every apply and removal through the
+    /// executor is a kernel change the tick's reading must not outlive.
+    #[tokio::test]
+    async fn an_apply_and_a_removal_through_the_executor_drop_a_reading_that_began_before_them() {
+        let (db, kernel) = crowded_node();
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let mut row = store::list_targets(&db).expect("rows").remove(0);
+        row.target_id = format!("{}-minor2", row.target_id);
+        row.portals[0].transport = "iser".into();
+        let entry = || Some(BTreeMap::from([(row.target_id.clone(), ListenerReading { lost: vec![lost_entry(&row.portals[0].address, row.portals[0].port, "iser")], unknown: Vec::new() })]));
+        let global = LostListeners::global();
+        let executor = Executor::Rendering(kernel);
+        let mut log = Vec::new();
+
+        let began = global.generations();
+        let _ = executor.apply(&db, &cipher, &row, None, &mut log).await;
+        global.merge(&began, entry());
+        assert!(global.of(&row).is_empty(), "began before the apply");
+
+        let began = global.generations();
+        let _ = executor.remove(&db, &row, None, &mut log).await;
+        global.merge(&began, entry());
+        assert!(global.of(&row).is_empty(), "began before the removal");
+
+        // The control: with no change in between, the same reading is kept.
+        global.merge(&global.generations(), entry());
+        assert_eq!(global.of(&row).len(), 1);
+        global.forget(&row.target_id);
     }
 
     #[test]

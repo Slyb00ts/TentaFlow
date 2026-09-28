@@ -1434,6 +1434,10 @@ test('n19: an iSCSI target without iSER shows "iSER (RDMA): wyłączony", an iSE
     const row = win.querySelector('[data-testid="portal_iser"]');
     assert.equal(row?.textContent, 'wyłączony');
     assert.equal(row.parentElement.querySelector('.k').textContent, 'iSER (RDMA)');
+    // Muted like the mockup (color: var(--text-3)), not mono like an address.
+    assert.ok(row.classList.contains('text-3'), row.className);
+    assert.ok(!row.classList.contains('mono'), row.className);
+    assert.ok(win.querySelector('[data-testid="portal_configured"]').classList.contains('mono'), 'the address rows stay mono');
   } finally {
     screen.dispose();
   }

@@ -7057,8 +7057,8 @@
         },
         "target_listener_lost": {
           "title": "Cible {target} : l’écoute RDMA a disparu",
-          "detail": "Les clients ne peuvent pas se connecter en RDMA ({transport}, {portal}). Arrêtez puis reprenez la cible — le portail et son écoute sont recréés.",
-          "detail_shared": "Les clients ne peuvent pas se connecter en RDMA ({transport}, {portal}). D’autres cibles partagent l’écoute : elle ne revient qu’une fois toutes les cibles qui l’utilisent arrêtées puis reprises."
+          "detail": "Les clients ne peuvent pas se connecter en {transport} sur {portal}. Arrêtez puis reprenez la cible — le portail et son écoute sont recréés.",
+          "detail_shared": "Les clients ne peuvent pas se connecter en {transport} sur {portal}. D’autres cibles partagent l’écoute : elle ne revient qu’une fois toutes les cibles qui l’utilisent arrêtées puis reprises."
         }
       },
       "node_text": "Texte du nœud",

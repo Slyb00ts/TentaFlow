@@ -851,9 +851,10 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       ['targets.portal_exposure', listenText((state.listen || []).filter((l) => !isRdmaListen(l)))],
       ...((state.listen || []).some(isRdmaListen) ? [['targets.portal_exposure_rdma', listenText(state.listen.filter(isRdmaListen))]] : []),
       // n19: an iSCSI target without iSER says so ("iSER (RDMA): wyłączony").
-      ...(t.protocol !== 'nvmet' && !t.portals.some((p) => p.transport === 'iser') ? [['targets.portal_iser', T('targets.portal_iser_off')]] : []),
+      // Muted like the mockup's "wyłączony": a value that says "nothing here".
+      ...(t.protocol !== 'nvmet' && !t.portals.some((p) => p.transport === 'iser') ? [['targets.portal_iser', T('targets.portal_iser_off'), 'muted']] : []),
     ] : [];
-    const rowSpec = ([key, value]) => ({ key, label: T(key), value, testid: key.slice('targets.'.length), mono: true });
+    const rowSpec = ([key, value, look]) => ({ key, label: T(key), value, testid: key.slice('targets.'.length), mono: look !== 'muted', muted: look === 'muted' });
     paintValueRows(win.querySelector('[data-part="portal-a"]'), portalRows.slice(0, 3).map(rowSpec));
     paintValueRows(win.querySelector('[data-part="portal-b"]'), portalRows.slice(3).map(rowSpec));
     slotEl(win.querySelector('[data-part="portal-refresh"]'), !drifted, 'refresh', `<tf-button size="sm" variant="secondary" icon="refresh" data-act="refresh">${escapeHtml(T('targets.portal_refresh'))}</tf-button>`);
@@ -1213,7 +1214,7 @@ function paintValueRows(host, specs) {
   if (!host) return;
   patchKeyedList(host, specs.map((s) => ({
     key: s.key,
-    html: `<div class="sr"><span class="k">${escapeHtml(s.label)}</span><span class="v${s.mono ? ' mono' : ''}"${s.testid ? ` data-testid="${escapeAttr(s.testid)}"` : ''}></span></div>`,
+    html: `<div class="sr"><span class="k">${escapeHtml(s.label)}</span><span class="v${s.mono ? ' mono' : ''}${s.muted ? ' text-3' : ''}"${s.testid ? ` data-testid="${escapeAttr(s.testid)}"` : ''}></span></div>`,
   })));
   specs.forEach((s, i) => setText(host.children[i]?.querySelector('.v'), s.value));
 }

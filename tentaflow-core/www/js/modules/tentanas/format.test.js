@@ -722,8 +722,26 @@ test('jobLogLines hides every id a log line carries and keeps names and sizes', 
 test('a lost RDMA listener alert names the target and gives the remedy that fits a shared listener', () => {
   const lost = (shared) => alertText(A('target_listener_lost', { target: 'vm-a', address: '10.10.0.5', port: '4420', transport: 'rdma', shared }));
   assert.equal(lost('false').title, 'Target vm-a: nasłuch RDMA zniknął');
-  assert.match(lost('false').detail, /\(RDMA, 10\.10\.0\.5:4420\)\. Zatrzymaj i wznów target/);
+  assert.match(lost('false').detail, /^Klienci nie połączą się przez RDMA na 10\.10\.0\.5:4420\. Zatrzymaj i wznów target/);
   assert.match(lost('true').detail, /Nasłuch dzielą inne targety: wraca dopiero, gdy wszystkie targety na nim zostaną zatrzymane/);
   assert.doesNotMatch(lost('true').detail, /Zatrzymaj i wznów target/);
   assert.equal(alertText(A('target_listener_lost', { target: 'vm-a', address: '10.10.0.5', port: '4420', transport: 'tcp', shared: 'false' })).known, false, 'not an RDMA transport: the node text');
+});
+
+test('a lost iSER listener alert nests no parentheses, in every language (critic RDMA r2, nit a)', async () => {
+  const iser = (shared) => alertText(A('target_listener_lost', { target: 'vm-a', address: '10.10.0.5', port: '3260', transport: 'iser', shared })).detail;
+  assert.match(iser('false'), /^Klienci nie połączą się przez iSER \(RDMA\) na 10\.10\.0\.5:3260\. /);
+  try {
+    for (const lang of ['pl', 'en', 'de', 'fr', 'es']) {
+      await I18n.setLanguage(lang);
+      for (const shared of ['false', 'true']) {
+        const detail = iser(shared);
+        assert.match(detail, /iSER \(RDMA\)/, `${lang}: ${detail}`);
+        assert.match(detail, /10\.10\.0\.5:3260/, `${lang}: ${detail}`);
+        assert.doesNotMatch(detail, /\([^)]*\(/, `${lang} nests parentheses: ${detail}`);
+      }
+    }
+  } finally {
+    await I18n.setLanguage('pl');
+  }
 });

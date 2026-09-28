@@ -269,6 +269,13 @@ pub fn probe() -> Probe {
 /// `probe` also answers: a listener read only needs to know which device
 /// holds an address, and the module check scans `modules.dep`.
 pub fn devices() -> Vec<RdmaDevice> {
+    devices_with_netdevs().0
+}
+
+/// `devices`, and the netdev → device map (`netdev_devices`) it was built
+/// with, so a caller that needs both reads sysfs once (critic RDMA r3,
+/// MINOR 1: `targets::interfaces` used to walk it a second time).
+pub fn devices_with_netdevs() -> (Vec<RdmaDevice>, std::collections::BTreeMap<String, String>) {
     let mut devices = Vec::new();
     if let Ok(entries) = std::fs::read_dir(INFINIBAND_CLASS) {
         // The RoCE enumerator already maps netdev → RDMA device and collects
@@ -302,7 +309,193 @@ pub fn devices() -> Vec<RdmaDevice> {
         }
     }
     devices.sort_by(|a, b| a.device.cmp(&b.device));
-    devices
+    // The addresses of the netdevs stacked on a device (a VLAN, a bond:
+    // `netdev_devices`) are the device's too: an RDMA listener binds there.
+    let stacked = netdev_devices(&devices);
+    if stacked.len() > devices.iter().filter(|d| !d.netdev.is_empty()).count() {
+        let networks = sysinfo::Networks::new_with_refreshed_list();
+        for (name, data) in networks.iter() {
+            let Some(owner) = stacked.get(name) else { continue };
+            let Some(device) = devices.iter_mut().find(|d| &d.device == owner) else { continue };
+            if device.netdev == *name {
+                continue;
+            }
+            for net in data.ip_networks() {
+                if let std::net::IpAddr::V4(v4) = net.addr {
+                    if !v4.is_loopback() && !device.addresses.contains(&v4.to_string()) {
+                        device.addresses.push(v4.to_string());
+                    }
+                }
+            }
+        }
+    }
+    (devices, stacked)
+}
+
+const NET_CLASS: &str = "/sys/class/net";
+
+/// Every netdev of the node that an RDMA device carries, mapped to that
+/// device: the device's own netdev, and the netdevs STACKED on it — a VLAN
+/// over a RoCE NIC, a bond whose slaves are RoCE NICs (critic RDMA r1/r2,
+/// MINOR 4: keyed by the netdev name alone, both were refused).
+///
+/// FROM THE KERNEL SOURCE (drivers/infiniband/core/roce_gid_mgmt.c and
+/// cma.c), not measured — rig11 has neither a VLAN nor a bond on its RoCE
+/// ports: the RoCE GID table of a port holds entries for the port's netdev
+/// AND for its upper devices (a VLAN on it; a bond master while the port's
+/// netdev is an active slave), each entry naming its netdev
+/// (`ports/<n>/gid_attrs/ndevs/<i>`). An RDMA CM bind to an address checks
+/// that table for a GID of that address ON the netdev holding it — which is
+/// why a listener on a VLAN address works, and why the table is asked first
+/// here: it is the kernel's own answer, and for an active-backup bond it
+/// names the device of the slave that carries traffic.
+///
+/// The `lower_*` links of `/sys/class/net/<if>` are the fallback, walked
+/// down to a netdev an RDMA device holds: they answer when the GID table
+/// has no entry for the upper device yet (no address on it at the moment
+/// of the read). They may name a bond's BACKUP slave; the kernel's ENODEV
+/// at apply time stays the last word, and a portal this admits wrongly
+/// fails there as it did before the refusal existed.
+fn netdev_devices(devices: &[RdmaDevice]) -> std::collections::BTreeMap<String, String> {
+    netdev_devices_in(devices, Path::new(NET_CLASS), Path::new(INFINIBAND_CLASS))
+}
+
+fn netdev_devices_in(devices: &[RdmaDevice], net_root: &Path, ib_root: &Path) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for d in devices.iter().filter(|d| !d.netdev.is_empty()) {
+        out.entry(d.netdev.clone()).or_insert_with(|| d.device.clone());
+    }
+    // The whole GID table is `gid_tbl_len` (256 on mlx5) reads per port,
+    // almost all of them empty entries that fail — MEASURED on rig11
+    // 2026-09-28: 25-28 ms per walk for 2 ports (critic RDMA r3, MINOR 1).
+    // Every entry names the port's netdev or an UPPER device of it
+    // (roce_gid_mgmt.c), and the kernel links every upper it knows as
+    // `upper_<name>` in the lower one's directory. So a device none of whose
+    // netdevs has an `upper_*` link has nothing in its table but those
+    // netdevs themselves: its ports' first entries say which, and the table
+    // is walked only for a device that has a stacked netdev.
+    let mut stacked = false;
+    for d in devices {
+        let device_dir = ib_root.join(&d.device);
+        let mut own = port_netdevs(&device_dir);
+        if !d.netdev.is_empty() {
+            own.insert(d.netdev.clone());
+        }
+        for netdev in &own {
+            out.entry(netdev.clone()).or_insert_with(|| d.device.clone());
+        }
+        if !own.iter().any(|netdev| has_upper(net_root, netdev)) {
+            continue;
+        }
+        stacked = true;
+        for netdev in gid_netdevs(&device_dir) {
+            out.entry(netdev).or_insert_with(|| d.device.clone());
+        }
+    }
+    // The stacking links, for the netdevs still unresolved. A chain of
+    // `lower_*` links that reaches an RDMA netdev ends in an `upper_*` link
+    // on that netdev, so with none there is nothing to find.
+    if !stacked {
+        return out;
+    }
+    let Ok(entries) = sysfs_read_dir(net_root) else { return out };
+    let names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    for name in names {
+        if out.contains_key(&name) {
+            continue;
+        }
+        if let Some(device) = lower_device(&out, net_root, &name) {
+            out.insert(name, device);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The sysfs reads `netdev_devices_in` made on this thread: a test counts
+    /// them instead of timing them.
+    static SYSFS_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn sysfs_read_dir(path: &Path) -> std::io::Result<std::fs::ReadDir> {
+    #[cfg(test)]
+    SYSFS_READS.with(|c| c.set(c.get() + 1));
+    std::fs::read_dir(path)
+}
+
+fn sysfs_read(path: &Path) -> std::io::Result<String> {
+    #[cfg(test)]
+    SYSFS_READS.with(|c| c.set(c.get() + 1));
+    std::fs::read_to_string(path)
+}
+
+/// The netdev each port of one RDMA device carries: the first entry of the
+/// port's GID table (`ndevs/0`, what `port_netdev` reads). One read per port.
+fn port_netdevs(device_dir: &Path) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(ports) = sysfs_read_dir(&device_dir.join("ports")) else { return out };
+    for port in ports.flatten() {
+        if let Ok(name) = sysfs_read(&port.path().join("gid_attrs").join("ndevs").join("0")) {
+            let name = name.trim();
+            if !name.is_empty() {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Whether some device is stacked on `netdev` (a VLAN, a bond master, a
+/// macvlan): the kernel's `upper_<name>` link in its directory.
+fn has_upper(net_root: &Path, netdev: &str) -> bool {
+    let Ok(entries) = sysfs_read_dir(&net_root.join(netdev)) else { return false };
+    entries.flatten().any(|e| e.file_name().to_string_lossy().starts_with("upper_"))
+}
+
+/// The netdev names the GID table of one RDMA device lists, over all its
+/// ports. An empty entry reads as an error and is skipped.
+fn gid_netdevs(device_dir: &Path) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(ports) = sysfs_read_dir(&device_dir.join("ports")) else { return out };
+    for port in ports.flatten() {
+        let Ok(entries) = sysfs_read_dir(&port.path().join("gid_attrs").join("ndevs")) else { continue };
+        for entry in entries.flatten() {
+            if let Ok(name) = sysfs_read(&entry.path()) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The RDMA device under `netdev` through its `lower_<name>` links, breadth
+/// first (a VLAN over a bond over two NICs is two levels), with a bound on
+/// the walk so a malformed tree cannot loop.
+fn lower_device(known: &std::collections::BTreeMap<String, String>, net_root: &Path, netdev: &str) -> Option<String> {
+    let mut queue = std::collections::VecDeque::from([netdev.to_string()]);
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(name) = queue.pop_front() {
+        if !seen.insert(name.clone()) || seen.len() > 32 {
+            continue;
+        }
+        if name != netdev {
+            if let Some(device) = known.get(&name) {
+                return Some(device.clone());
+            }
+        }
+        let Ok(entries) = sysfs_read_dir(&net_root.join(&name)) else { continue };
+        let mut lowers: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_string_lossy().strip_prefix("lower_").map(str::to_string))
+            .collect();
+        lowers.sort();
+        queue.extend(lowers);
+    }
+    None
 }
 
 /// The RDMA device (any port state) whose netdev holds `address`, if one does.
@@ -935,6 +1128,134 @@ mod tests {
         // The down port's address must never be published: a peer mounting it
         // would hang instead of falling back.
         assert_eq!(probe.addresses(), vec!["10.10.0.5".to_string()]);
+    }
+
+    /// Critic RDMA r2, MINOR 4: a VLAN over a RoCE NIC and a bond of RoCE
+    /// NICs resolve to the RDMA device under them — first from the kernel's
+    /// GID table (which names the upper netdev), else down the `lower_*`
+    /// links; an interface with no RDMA underneath stays without one.
+    #[test]
+    fn a_vlan_or_a_bond_on_a_roce_nic_resolves_to_its_rdma_device() {
+        let root = tempfile::tempdir().expect("tmp");
+        let net = root.path().join("net");
+        let ib = root.path().join("infiniband");
+        let mkdir = |p: std::path::PathBuf| std::fs::create_dir_all(p).expect("dir");
+        let file = |p: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
+            std::fs::write(p, text).expect("write");
+        };
+        for nic in ["enp4s0np0", "enp141s0np0", "eno1", "veth0"] {
+            mkdir(net.join(nic));
+        }
+        // The kernel links both ends: `lower_<x>` in the upper device,
+        // `upper_<y>` in the lower one.
+        let stack = |upper: &str, lower: &str| {
+            mkdir(net.join(upper).join(format!("lower_{lower}")));
+            mkdir(net.join(lower).join(format!("upper_{upper}")));
+        };
+        // storage.100 on enp4s0np0 (8021q links its lower device).
+        stack("storage.100", "enp4s0np0");
+        // bond0 over both mlx5 ports; storage.200 on bond0; a VLAN on a
+        // NIC without RDMA.
+        stack("bond0", "enp4s0np0");
+        stack("bond0", "enp141s0np0");
+        stack("storage.200", "bond0");
+        stack("lan.5", "eno1");
+        let devices = vec![
+            device("rocep4s0", "DOWN", "enp4s0np0", ""),
+            device("rocep141s0", "DOWN", "enp141s0np0", ""),
+        ];
+
+        let map = netdev_devices_in(&devices, &net, &ib);
+        let of = |map: &std::collections::BTreeMap<String, String>, n: &str| map.get(n).cloned();
+        assert_eq!(of(&map, "enp4s0np0").as_deref(), Some("rocep4s0"));
+        assert_eq!(of(&map, "storage.100").as_deref(), Some("rocep4s0"), "a VLAN on the NIC");
+        assert_eq!(of(&map, "bond0").as_deref(), Some("rocep141s0"), "the first slave (sorted) of the bond");
+        assert_eq!(of(&map, "storage.200").as_deref(), Some("rocep141s0"), "a VLAN on the bond");
+        assert_eq!(of(&map, "lan.5"), None);
+        assert_eq!(of(&map, "eno1"), None);
+        assert_eq!(of(&map, "veth0"), None);
+
+        // The GID table is the kernel's own answer and wins: the active
+        // slave of an active-backup bond is the one whose table lists it.
+        file(ib.join("rocep4s0/ports/1/gid_attrs/ndevs/0"), "enp4s0np0\n");
+        file(ib.join("rocep4s0/ports/1/gid_attrs/ndevs/3"), "bond0\n");
+        std::fs::create_dir_all(ib.join("rocep141s0/ports/1/gid_attrs/ndevs")).expect("dir");
+        // An unused entry reads as an error in sysfs; a directory stands in.
+        mkdir(ib.join("rocep141s0/ports/1/gid_attrs/ndevs/0"));
+        let map = netdev_devices_in(&devices, &net, &ib);
+        assert_eq!(of(&map, "bond0").as_deref(), Some("rocep4s0"));
+        assert_eq!(of(&map, "storage.200").as_deref(), Some("rocep4s0"), "through the bond the table named");
+        // An upper the table names with no lower link to follow here (a
+        // macvlan: the gate still sees its `upper_mv0`).
+        mkdir(net.join("enp141s0np0/upper_mv0"));
+        file(ib.join("rocep141s0/ports/1/gid_attrs/ndevs/5"), "mv0\n");
+        assert_eq!(of(&netdev_devices_in(&devices, &net, &ib), "mv0").as_deref(), Some("rocep141s0"));
+
+        // A loop in a malformed tree ends.
+        mkdir(net.join("a/lower_b"));
+        mkdir(net.join("b/lower_a"));
+        assert_eq!(of(&netdev_devices_in(&devices, &net, &ib), "a"), None);
+    }
+
+    /// Critic RDMA r3, MINOR 1: with nothing stacked on an RDMA netdev the
+    /// GID table (256 entries per port, almost all empty) is not walked —
+    /// the map comes from the ports' first entries — and with a VLAN on one
+    /// NIC only that device's table is.
+    #[test]
+    fn the_gid_table_is_walked_only_for_a_device_with_a_stacked_netdev() {
+        let root = tempfile::tempdir().expect("tmp");
+        let net = root.path().join("net");
+        let ib = root.path().join("infiniband");
+        let mkdir = |p: std::path::PathBuf| std::fs::create_dir_all(p).expect("dir");
+        let file = |p: std::path::PathBuf, text: &str| {
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("dir");
+            std::fs::write(p, text).expect("write");
+        };
+        for nic in ["enp4s0np0", "enp141s0np0", "eno1", "docker0", "veth0"] {
+            mkdir(net.join(nic));
+        }
+        // Stacking elsewhere (a bridge port) does not open any GID table.
+        mkdir(net.join("veth0/upper_docker0"));
+        mkdir(net.join("docker0/lower_veth0"));
+        // rig11's shape: one port per device, entry 0 names the NIC, the
+        // other 255 are empty (an error to read; a directory stands in).
+        for (device, nic) in [("rocep4s0", "enp4s0np0"), ("rocep141s0", "enp141s0np0")] {
+            let ndevs = ib.join(device).join("ports/1/gid_attrs/ndevs");
+            file(ndevs.join("0"), &format!("{nic}\n"));
+            for i in 1..256 {
+                mkdir(ndevs.join(i.to_string()));
+            }
+        }
+        let devices = vec![
+            device("rocep4s0", "DOWN", "enp4s0np0", ""),
+            device("rocep141s0", "DOWN", "enp141s0np0", ""),
+        ];
+        let counted = |devices: &[RdmaDevice]| {
+            SYSFS_READS.with(|c| c.set(0));
+            let map = netdev_devices_in(devices, &net, &ib);
+            (map, SYSFS_READS.with(|c| c.get()))
+        };
+
+        let (map, reads) = counted(&devices);
+        let expected: std::collections::BTreeMap<String, String> =
+            [("enp141s0np0", "rocep141s0"), ("enp4s0np0", "rocep4s0")].map(|(n, d)| (n.to_string(), d.to_string())).into();
+        assert_eq!(map, expected);
+        // Per device: its ports, one entry per port, its netdev's directory.
+        assert_eq!(reads, 6, "no GID table walked");
+        // A device the enumerator gave no netdev (Soft-RoCE) is still found
+        // from its port.
+        let rxe = vec![device("rocep4s0", "DOWN", "", "")];
+        assert_eq!(counted(&rxe).0.get("enp4s0np0").map(String::as_str), Some("rocep4s0"));
+
+        // A VLAN on one NIC: that device's table is walked, the other's not.
+        mkdir(net.join("enp4s0np0/upper_storage.100"));
+        mkdir(net.join("storage.100/lower_enp4s0np0"));
+        std::fs::remove_dir(ib.join("rocep4s0/ports/1/gid_attrs/ndevs/1")).expect("rm");
+        file(ib.join("rocep4s0/ports/1/gid_attrs/ndevs/1"), "storage.100\n");
+        let (map, reads) = counted(&devices);
+        assert_eq!(map.get("storage.100").map(String::as_str), Some("rocep4s0"));
+        assert!(reads > 256 && reads < 512, "one table of 256 entries, not two: {reads}");
     }
 
     #[test]

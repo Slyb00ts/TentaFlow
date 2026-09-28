@@ -7057,8 +7057,8 @@
         },
         "target_listener_lost": {
           "title": "Target {target}: RDMA-Listener ist verschwunden",
-          "detail": "Clients können sich nicht über RDMA verbinden ({transport}, {portal}). Target stoppen und fortsetzen — Portal und Listener werden neu angelegt.",
-          "detail_shared": "Clients können sich nicht über RDMA verbinden ({transport}, {portal}). Andere Targets teilen sich den Listener: Er kehrt erst zurück, wenn alle Targets darauf gestoppt und danach fortgesetzt wurden."
+          "detail": "Clients können sich nicht über {transport} mit {portal} verbinden. Target stoppen und fortsetzen — Portal und Listener werden neu angelegt.",
+          "detail_shared": "Clients können sich nicht über {transport} mit {portal} verbinden. Andere Targets teilen sich den Listener: Er kehrt erst zurück, wenn alle Targets darauf gestoppt und danach fortgesetzt wurden."
         }
       },
       "node_text": "Text des Knotens",

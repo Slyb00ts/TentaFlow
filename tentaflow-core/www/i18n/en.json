@@ -6779,8 +6779,8 @@
         },
         "target_listener_lost": {
           "title": "Target {target}: RDMA listener is gone",
-          "detail": "Clients cannot connect over RDMA ({transport}, {portal}). Stop and resume the target — the portal and its listener are created again.",
-          "detail_shared": "Clients cannot connect over RDMA ({transport}, {portal}). Other targets share the listener: it returns only once every target on it has been stopped and then resumed."
+          "detail": "Clients cannot connect over {transport} on {portal}. Stop and resume the target — the portal and its listener are created again.",
+          "detail_shared": "Clients cannot connect over {transport} on {portal}. Other targets share the listener: it returns only once every target on it has been stopped and then resumed."
         }
       },
       "node_text": "The node's text",

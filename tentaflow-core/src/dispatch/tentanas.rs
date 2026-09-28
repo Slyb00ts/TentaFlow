@@ -3249,7 +3249,8 @@ async fn target_get(ctx: &HandlerContext, target_id: &str) -> Result<MessageBody
     // MINOR 7). A read that could not run is "Nie zmierzono", not an error
     // of the whole view.
     let reading_row = row.clone();
-    let rdma = tokio::task::spawn_blocking(move || tentanas::targets::rdma_reading(&reading_row))
+    let reading_db = g.db.clone();
+    let rdma = tokio::task::spawn_blocking(move || tentanas::targets::rdma_reading(&reading_db, &reading_row))
         .await
         .unwrap_or_else(|e| {
             tracing::warn!("tentanas: target listeners not read: {e}");
