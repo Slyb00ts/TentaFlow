@@ -176,6 +176,29 @@ export function receiversText(consumers, plural = false) {
   return T(`unprocessed.retry.receivers_all${suffix}`, { names: listFormat(consumers) });
 }
 
+/**
+ * What "Ponów wszystkie" reports after `DlqRetryAllResponse { retried,
+ * failed, skippedRejected }`: `{ tone, title, text }`. Messages rejected at
+ * write that it read are left on the list and named, so the operator
+ * discards them instead of retrying again for nothing.
+ */
+export function retryAllDoneNotice({ topic, resp, consumers }) {
+  const retried = Number(resp?.retried) || 0;
+  const failed = Number(resp?.failed) || 0;
+  const skipped = Number(resp?.skippedRejected) || 0;
+  const text = [
+    retried > 0 ? T('unprocessed.retry_all.done_text', { topic, n: retried }) : T('unprocessed.retry_all.done_none_text'),
+    retried > 0 ? receiversText(consumers, retried !== 1) : '',
+    failed > 0 ? T('unprocessed.retry_all.done_failed', { count: fmtCount(failed), n: failed }) : '',
+    skipped > 0 ? T('unprocessed.retry_all.done_skipped', { count: fmtCount(skipped), n: skipped }) : '',
+  ].filter(Boolean).join(' ');
+  return {
+    tone: failed > 0 || skipped > 0 || retried === 0 ? 'warning' : 'success',
+    title: retried > 0 ? T('unprocessed.retry_all.done_title', { count: fmtCount(retried), n: retried }) : T('unprocessed.retry_all.done_none_title'),
+    text,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Table rows
 // ---------------------------------------------------------------------------

@@ -1065,6 +1065,11 @@ pub enum BusPayload {
     DlqRetryAllResponse {
         retried: u32,
         failed: u32,
+        /// Messages rejected at write this call read and left listed:
+        /// retrying them would only reject them again, so the operator is
+        /// told to discard them instead.
+        #[serde(default)]
+        skipped_rejected: u32,
     },
 
     AclListRequest {
@@ -1766,6 +1771,7 @@ mod tests {
         round_trip(BusPayload::DlqRetryAllResponse {
             retried: 40,
             failed: 6,
+            skipped_rejected: 3,
         });
     }
 

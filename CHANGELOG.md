@@ -18,7 +18,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   liczy jako nieponowioną. Tekst błędu odbiorcy jest ukryty przed osobami,
   które obejmują zasady ukrywania danych topiku. Lista czyta tylko wiadomości,
   które pokazuje, i trzyma z nich jedynie podgląd treści, a „Ponów wszystkie”
-  czyta ograniczoną liczbę wiadomości na raz.
+  czyta ograniczoną liczbę wiadomości na raz i podaje, ile wiadomości
+  odrzuconych przy zapisie zostawiło na liście, by można je było odrzucić.
+- Ponowiona wiadomość, którą wzór topiku znów odrzuca, trafia z powrotem do
+  tej samej partycji nieprzetworzonych wiadomości. Jeśli jej nowej kopii nie
+  uda się zapisać, ponowienie jest odmawiane, a wiadomość zostaje na liście —
+  wcześniej znikała. Liczba wiadomości skierowanych do nieprzetworzonych przy
+  zapisie (`schema_rejected`) obejmuje teraz tylko te, których kopię zapisano;
+  nieudany zapis kopii liczy metryka błędów zapisu kwarantanny.
 - Ponowienie, które reguła jednorazowego dostarczenia topiku (klucz
   idempotencji) odrzuciłaby jako powtórzenie oryginału, jest odmawiane,
   a wiadomość zostaje na liście — wcześniej znikała z listy, nie wracając do

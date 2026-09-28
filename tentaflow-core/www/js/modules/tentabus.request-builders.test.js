@@ -254,7 +254,7 @@ const ERROR_CODES = [
   'invalid_argument', 'invalid_field', 'not_subscribed', 'offset_regression',
   'offset_out_of_range', 'offset_reset_mode_unsupported', 'group_paused',
   'dlq_of_dlq_not_allowed', 'dlq_record_handled', 'dlq_retry_deduplicated',
-  'dlq_retry_source_not_leader', 'partition_poisoned', 'partial_publish',
+  'dlq_retry_source_not_leader', 'dlq_retry_requarantine_failed', 'partition_poisoned', 'partial_publish',
   'blocking_task_failed', 'max_groups_exceeded',
 ];
 

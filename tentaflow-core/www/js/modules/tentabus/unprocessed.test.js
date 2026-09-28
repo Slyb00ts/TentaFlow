@@ -20,7 +20,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 
 const {
   unprocessedRecord, mergeNewest, commonReason, retryAllPlan, attemptsText, sourceText, whoCanRetry, receiversText,
-  unprocessedTopics, drawUnprocessed, paintUnprocessedSection, LIST_STEP,
+  unprocessedTopics, drawUnprocessed, paintUnprocessedSection, LIST_STEP, retryAllDoneNotice,
 } = await import('./unprocessed.js');
 const { openUnprocessedView, openRetryOne, openDiscardOne, openRetryAll, retryImpact, retryAllImpact } = await import('./unprocessed-windows.js');
 
@@ -358,4 +358,15 @@ test('"Ponów wszystkie" counts what goes back, what stays and the limit of one 
   win.close(true);
   const big = retryAllImpact({ topic: 'wyniki-badan', consumers: [], plan: { retryable: 900, atWrite: 0, batch: 500, rest: 400, exact: false }, maxAttempts: 5 });
   assert.match(norm(big.join(' ')), /Na liście zostanie 400 wiadomości\./);
+});
+
+test('"Ponów wszystkie" names the messages rejected at write it left, so they get discarded', () => {
+  const notice = retryAllDoneNotice({ topic: 'wizyty', resp: { retried: 0, failed: 0, skippedRejected: 3 }, consumers: [] });
+  assert.equal(notice.tone, 'warning');
+  assert.equal(notice.title, 'Nic nie ponowiono');
+  assert.match(norm(notice.text), /3 wiadomości odrzucone przy zapisie zostały na liście/);
+  assert.match(norm(notice.text), /Odrzuć je/);
+  const clean = retryAllDoneNotice({ topic: 'wizyty', resp: { retried: 2, failed: 0 }, consumers: [] });
+  assert.equal(clean.tone, 'success');
+  assert.doesNotMatch(norm(clean.text), /odrzucon/);
 });

@@ -856,6 +856,15 @@ pub enum BusServiceError {
         partition: u32,
         offset: u64,
     },
+    /// `dlq_retry`: the source topic's validation rejected the republish
+    /// again and its new quarantine copy could not be written (logged and
+    /// counted by `publish`). The DLQ record stays listed.
+    #[error("DLQ record {partition}/{offset} of '{topic}' was rejected again and its new DLQ copy could not be written")]
+    DlqRetryRequarantineFailed {
+        topic: String,
+        partition: u32,
+        offset: u64,
+    },
     /// `dlq_retry`: this node leads the DLQ partition but not the source
     /// partition the record goes back to, and a write cannot be forwarded.
     #[error("partition {partition} of '{topic}' is led by {leader_node_id:?}, not this node; retry there")]
@@ -1281,9 +1290,11 @@ pub fn dlq_republished(result: &PublishResult) -> bool {
 }
 
 /// Whether a `dlq_retry` publish left the record somewhere: back in its
-/// topic (`dlq_republished`) or in the DLQ again as a new record
-/// (`schema_rejected`). Only then is the original marked handled; anything
-/// else (the topic's idempotency key dropped it) would lose it.
+/// topic (`dlq_republished`) or in the DLQ again as a new record, WRITTEN
+/// (`schema_rejected` counts only a quarantine copy that landed). Only then
+/// is the original marked handled; anything else — the topic's idempotency
+/// key dropped it, or its new quarantine copy failed to write — would lose
+/// it.
 fn dlq_retry_settled(result: &PublishResult) -> bool {
     dlq_republished(result) || result.schema_rejected > 0
 }
@@ -1632,9 +1643,11 @@ pub struct PublishResult {
     /// layer 2.
     pub partitions: Vec<PartitionAck>,
     /// PLAN-F3 §4.5: records diverted to `__dlq.<topic>` by
-    /// `validation = dlq` schema enforcement — 0 for `off`/`warn` (a `warn`
-    /// violation is counted in `schema_violations_total`, not here: it was
-    /// still ACCEPTED). A batch that was entirely diverted returns
+    /// `validation = dlq` schema enforcement and written there — 0 for
+    /// `off`/`warn` (a `warn` violation is counted in
+    /// `schema_violations_total`, not here: it was still ACCEPTED). A
+    /// violation whose quarantine write failed is dropped, not diverted: it
+    /// is counted in `schema_dlq_write_failures_total` and audited, not here. A batch that was entirely diverted returns
     /// `Ok(PublishResult { accepted: 0, schema_rejected: N, .. })`, not an
     /// error — quarantine is a per-record data-quality decision, never a
     /// whole-batch rejection (unlike a field-policy violation).
@@ -5077,7 +5090,22 @@ impl BusService {
         &self,
         ctx: &BusCallContext,
         topic: &str,
+        batch: PublishBatch,
+    ) -> Result<PublishResult, BusServiceError> {
+        self.publish_routed(ctx, topic, batch, None)
+    }
+
+    /// `publish`, with the partition of `__dlq.<topic>` a `validation = dlq`
+    /// schema violation is quarantined to: `None` spreads them like any
+    /// keyless write, `Some(p)` pins them to `p` — `dlq_retry` passes the
+    /// DLQ partition it already leads, so a record its validation rejects
+    /// again cannot fail to land for want of another partition's leader.
+    fn publish_routed(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
         mut batch: PublishBatch,
+        quarantine_partition: Option<u32>,
     ) -> Result<PublishResult, BusServiceError> {
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
@@ -5187,7 +5215,6 @@ impl BusService {
                                     version = resolved.version, detail = %detail,
                                     "schema violation (dlq mode): record diverted to DLQ"
                                 );
-                                schema_rejected += 1;
                                 violations.push(dlq::build_publish_violation_record(
                                     topic,
                                     "schema_violation",
@@ -5256,12 +5283,18 @@ impl BusService {
                         &quarantine_ctx,
                         &dlq_topic,
                         PublishBatch {
-                            partition: None,
+                            partition: quarantine_partition,
                             producer: None,
                             records: violations,
                         },
                     )
                 });
+                // Counted only once the quarantine copies are written: a
+                // record whose copy failed was dropped, not diverted, and a
+                // caller (`dlq_retry`) must be able to tell the two apart.
+                if dlq_result.is_ok() {
+                    schema_rejected = violation_count as u32;
+                }
                 if let Err(e) = dlq_result {
                     self.schema_dlq_write_failures_total
                         .fetch_add(1, Ordering::Relaxed);
@@ -7194,7 +7227,10 @@ impl BusService {
     /// refused with `DlqRetryDeduplicated` and the record stays listed:
     /// that rule is the topic owner's promise that one key is delivered
     /// once per window, and a retry is not exempt from it — it can be
-    /// retried once the window has passed.
+    /// retried once the window has passed. A republish the validation
+    /// rejects again goes to this same DLQ partition (`publish_routed`), and
+    /// if that copy cannot be written the retry is refused with
+    /// `DlqRetryRequarantineFailed`, the record again staying listed.
     ///
     /// Exactly-once against a failure in the middle: the republish carries
     /// the record's own producer identity (`dlq::retry_producer_id`), so a
@@ -7287,7 +7323,7 @@ impl BusService {
             });
         }
         let retry_record = dlq::build_retry_record(&original, dlq_topic, dlq_offset);
-        let result = self.publish(
+        let result = self.publish_routed(
             ctx,
             source_topic,
             PublishBatch {
@@ -7299,12 +7335,22 @@ impl BusService {
                 }),
                 records: vec![retry_record],
             },
+            Some(dlq_partition),
         )?;
         if !dlq_retry_settled(&result) {
-            return Err(BusServiceError::DlqRetryDeduplicated {
-                topic: dlq_topic.to_string(),
-                partition: dlq_partition,
-                offset: dlq_offset,
+            let (topic, partition, offset) = (dlq_topic.to_string(), dlq_partition, dlq_offset);
+            return Err(if result.deduplicated > 0 {
+                BusServiceError::DlqRetryDeduplicated {
+                    topic,
+                    partition,
+                    offset,
+                }
+            } else {
+                BusServiceError::DlqRetryRequarantineFailed {
+                    topic,
+                    partition,
+                    offset,
+                }
             });
         }
         self.mark_dlq_handled(ctx, dlq_topic, dlq_partition, dlq_offset)?;
@@ -11749,6 +11795,144 @@ mod tests {
         assert_eq!(lens, vec![8, 5]);
     }
 
+    /// A topic with `validation = dlq` whose one record (`{"id":"a"}` on
+    /// partition 0) a consumer gave up on with `failed_payload`, which the
+    /// topic's schema rejects: a retry republishes the invalid payload.
+    fn topic_with_an_invalid_failure(
+        svc: &BusService,
+        ctx: &BusCallContext,
+        topic: &str,
+        partitions: u32,
+        failed_payload: &str,
+    ) {
+        register_schema(svc, "org-1", "wynik", SCHEMA_V1_ID_REQUIRED);
+        svc.create_topic(
+            ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(partitions),
+                max_delivery_attempts: Some(1),
+                schema_id: Some("wynik".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        svc.publish(
+            ctx,
+            topic,
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record(r#"{"id":"a"}"#)],
+            },
+        )
+        .unwrap();
+        let fetched = FetchedRecordMeta {
+            topic: topic.to_string(),
+            partition: 0,
+            offset: 0,
+            timestamp_ms: now_ms(),
+            key: None,
+            headers: vec![],
+            payload: Bytes::from(failed_payload.to_string()),
+            schema_id: 0,
+        };
+        svc.note_delivery_failure(
+            ctx,
+            "g",
+            topic,
+            0,
+            0,
+            &fetched,
+            dlq::DlqReason::ConsumerError,
+            "err",
+        )
+        .unwrap();
+    }
+
+    /// A retry the topic's validation rejects again sends its new copy to
+    /// the DLQ partition the retried record sits on — the one this node was
+    /// just checked to lead — not to whichever partition a keyless write
+    /// would rotate to, which another node may lead.
+    #[test]
+    fn a_retry_rejected_again_lands_on_its_own_dlq_partition() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.retry-requarantine";
+        topic_with_an_invalid_failure(&svc, &ctx, topic, 2, r#"{"x":1}"#);
+        let dlq_topic = dlq::dlq_topic_name(topic);
+        let hw = |p| {
+            svc.partition_stats(&ctx, &dlq_topic, p)
+                .unwrap()
+                .high_watermark
+        };
+        assert_eq!(
+            (hw(0), hw(1)),
+            (1, 0),
+            "the failure went to DLQ partition 0"
+        );
+
+        let coord = FakeCoordinator::leader(1);
+        coord.topic_partition_roles.lock().insert(
+            (dlq_topic.clone(), 1),
+            PartitionRole::Follower {
+                leader_node_id: "node-b".to_string(),
+                epoch: 1,
+            },
+        );
+        svc.set_replication(coord.clone());
+        open_leader_writes(&svc, &ctx, topic, 0);
+        open_leader_writes(&svc, &ctx, &dlq_topic, 0);
+
+        let result = svc.dlq_retry(&ctx, &dlq_topic, 0, 0).unwrap();
+        assert_eq!(result.schema_rejected, 1);
+        assert_eq!(
+            (hw(0), hw(1)),
+            (2, 0),
+            "the new copy sits next to the old one"
+        );
+        assert!(svc
+            .discarded
+            .is_discarded("org-1", &dlq_topic, 0, 0)
+            .unwrap());
+    }
+
+    /// A retry the validation rejects again whose new DLQ copy cannot be
+    /// written left the message nowhere: the retry is refused and the old
+    /// record stays listed instead of being marked handled and lost.
+    #[test]
+    fn a_retry_whose_new_dlq_copy_fails_keeps_the_record_listed() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.retry-requarantine-fails";
+        let big_invalid = format!(
+            r#"{{"x":"{}"}}"#,
+            "x".repeat(topics::MIN_MAX_INLINE_BYTES + 1_000)
+        );
+        topic_with_an_invalid_failure(&svc, &ctx, topic, 1, &big_invalid);
+        let dlq_topic = dlq::dlq_topic_name(topic);
+        svc.update_topic(
+            &ctx,
+            &dlq_topic,
+            topics::TopicOptions {
+                max_inline_bytes: Some(topics::MIN_MAX_INLINE_BYTES),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        match svc.dlq_retry(&ctx, &dlq_topic, 0, 0) {
+            Err(BusServiceError::DlqRetryRequarantineFailed { offset: 0, .. }) => {}
+            other => panic!("expected DlqRetryRequarantineFailed, got {other:?}"),
+        }
+        assert!(!svc
+            .discarded
+            .is_discarded("org-1", &dlq_topic, 0, 0)
+            .unwrap());
+        assert_eq!(svc.schema_dlq_write_failures_total(), 1);
+    }
+
     /// The republish is keyed by the DLQ record itself
     /// (`dlq::retry_producer_id`): when it reached the source topic but the
     /// handled marker did not (a crash or a failed marker write in between —
@@ -15733,6 +15917,10 @@ mod tests {
         /// Overrides `role` for every partition of one topic; wins over
         /// `partition_roles`.
         topic_roles: parking_lot::Mutex<std::collections::HashMap<String, PartitionRole>>,
+        /// Overrides `role` — and `preflight` — for one partition of one
+        /// topic; wins over the other overrides.
+        topic_partition_roles:
+            parking_lot::Mutex<std::collections::HashMap<(String, u32), PartitionRole>>,
     }
 
     impl FakeCoordinator {
@@ -15740,6 +15928,7 @@ mod tests {
             Arc::new(Self {
                 partition_roles: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 topic_roles: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                topic_partition_roles: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 role: parking_lot::Mutex::new(PartitionRole::Leader { epoch }),
                 preflight_err: parking_lot::Mutex::new(None),
                 await_outcome: parking_lot::Mutex::new(AckOutcome {
@@ -15785,6 +15974,13 @@ mod tests {
 
     impl ReplicationCoordinator for FakeCoordinator {
         fn role(&self, _org: &str, topic: &str, partition: u32) -> PartitionRole {
+            if let Some(role) = self
+                .topic_partition_roles
+                .lock()
+                .get(&(topic.to_string(), partition))
+            {
+                return role.clone();
+            }
             if let Some(role) = self.topic_roles.lock().get(topic) {
                 return role.clone();
             }
@@ -15802,6 +15998,20 @@ mod tests {
         ) -> Result<u32, ReplError> {
             if let Some(e) = self.preflight_err.lock().clone() {
                 return Err(e);
+            }
+            if let Some(role) = self
+                .topic_partition_roles
+                .lock()
+                .get(&(topic.to_string(), partition))
+            {
+                return match role {
+                    PartitionRole::Leader { epoch } => Ok(*epoch),
+                    _ => Err(ReplError::NotAReplica {
+                        topic: topic.to_string(),
+                        partition,
+                        node_id: "local".to_string(),
+                    }),
+                };
             }
             match &*self.role.lock() {
                 PartitionRole::Leader { epoch } => Ok(*epoch),
@@ -18456,7 +18666,10 @@ mod tests {
             result.accepted, 1,
             "a DLQ write failure must not drop the already-valid record"
         );
-        assert_eq!(result.schema_rejected, 1);
+        assert_eq!(
+            result.schema_rejected, 0,
+            "a violation whose quarantine copy failed was dropped, not diverted"
+        );
         assert_eq!(
             svc.schema_dlq_write_failures_total(),
             1,

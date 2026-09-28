@@ -12070,10 +12070,15 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
         BP::DlqDiscardRequest { .. } => set(obj, "variant", "BusDlqDiscardRequest".into()),
         BP::DlqDiscardResponse => set(obj, "variant", "BusDlqDiscardResponse".into()),
         BP::DlqRetryAllRequest { .. } => set(obj, "variant", "BusDlqRetryAllRequest".into()),
-        BP::DlqRetryAllResponse { retried, failed } => {
+        BP::DlqRetryAllResponse {
+            retried,
+            failed,
+            skipped_rejected,
+        } => {
             set(obj, "variant", "BusDlqRetryAllResponse".into());
             set(obj, "retried", (retried as f64).into());
             set(obj, "failed", (failed as f64).into());
+            set(obj, "skippedRejected", (skipped_rejected as f64).into());
         }
         BP::AclListRequest { .. } => set(obj, "variant", "BusAclListRequest".into()),
         BP::AclListResponse { entries } => {

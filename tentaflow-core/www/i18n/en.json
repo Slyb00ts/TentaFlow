@@ -10880,7 +10880,8 @@
       "replication_internal_error": "Internal server-side replication error.",
       "dlq_record_handled": "This message was already retried or discarded — refresh the list.",
       "dlq_retry_deduplicated": "The topic delivers a message once per window and this one was already delivered in it — it can be retried once the window has passed. The message stays on the list.",
-      "dlq_retry_source_not_leader": "This node does not lead the topic partition the message goes back to — retry it on the node that leads it."
+      "dlq_retry_source_not_leader": "This node does not lead the topic partition the message goes back to — retry it on the node that leads it.",
+      "dlq_retry_requarantine_failed": "The topic's pattern rejected the message again and its new copy could not be saved among the unprocessed ones — the message stays on the list."
     },
     "shell": {
       "instance": "Instance",
@@ -11670,7 +11671,8 @@
         "done_text": "{n|It|They} went back to topic {topic} as {n|a new message|new messages}.",
         "done_none_title": "Nothing retried",
         "done_none_text": "There were no messages to retry on the list.",
-        "done_failed": "{count} {n|message|messages} could not be retried — {n|it stays|they stay} on the list."
+        "done_failed": "{count} {n|message|messages} could not be retried — {n|it stays|they stay} on the list.",
+        "done_skipped": "{count} {n|message|messages} rejected at write {n|was|were} left on the list — a retry would only reject {n|it|them} again. Discard {n|it|them} if {n|it is|they are} not needed."
       },
       "retry_all_n": "Retry all ({count})",
       "tile_common": "most often: {reason}",

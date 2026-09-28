@@ -9645,7 +9645,8 @@
       "replication_internal_error": "Interner Replikationsfehler auf dem Server.",
       "dlq_record_handled": "Diese Nachricht wurde bereits wiederholt oder verworfen — aktualisieren Sie die Liste.",
       "dlq_retry_deduplicated": "Das Topic stellt eine Nachricht einmal pro Zeitfenster zu, und diese wurde darin bereits zugestellt — sie kann nach Ablauf des Fensters erneut gesendet werden. Die Nachricht bleibt in der Liste.",
-      "dlq_retry_source_not_leader": "Dieser Node führt die Partition des Topics nicht, in die die Nachricht zurückgeht — wiederhole sie auf dem Node, der sie führt."
+      "dlq_retry_source_not_leader": "Dieser Node führt die Partition des Topics nicht, in die die Nachricht zurückgeht — wiederhole sie auf dem Node, der sie führt.",
+      "dlq_retry_requarantine_failed": "Das Muster des Topics hat die Nachricht erneut abgelehnt, und ihre neue Kopie konnte nicht unter den unverarbeiteten gespeichert werden — die Nachricht bleibt in der Liste."
     },
     "shell": {
       "instance": "Instanz",
@@ -10435,7 +10436,8 @@
         "done_text": "{n|Sie ist|Sie sind} als {n|neue Nachricht|neue Nachrichten} zu Topic {topic} zurückgekehrt.",
         "done_none_title": "Nichts wiederholt",
         "done_none_text": "Auf der Liste gab es keine Nachrichten zum Wiederholen.",
-        "done_failed": "{count} {n|Nachricht konnte|Nachrichten konnten} nicht wiederholt werden — {n|sie bleibt|sie bleiben} auf der Liste."
+        "done_failed": "{count} {n|Nachricht konnte|Nachrichten konnten} nicht wiederholt werden — {n|sie bleibt|sie bleiben} auf der Liste.",
+        "done_skipped": "{count} beim Schreiben {n|abgelehnte Nachricht blieb|abgelehnte Nachrichten blieben} in der Liste — ein erneuter Versuch würde {n|sie|sie} nur wieder ablehnen. Verwirf {n|sie|sie}, wenn {n|sie nicht gebraucht wird|sie nicht gebraucht werden}."
       },
       "retry_all_n": "Alle wiederholen ({count})",
       "tile_common": "am häufigsten: {reason}",

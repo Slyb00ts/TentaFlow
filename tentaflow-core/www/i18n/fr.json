@@ -9645,7 +9645,8 @@
       "replication_internal_error": "Erreur interne de réplication côté serveur.",
       "dlq_record_handled": "Ce message a déjà été relancé ou rejeté — actualisez la liste.",
       "dlq_retry_deduplicated": "Le topic ne livre un message qu’une fois par fenêtre et celui-ci y a déjà été livré — il pourra être relancé une fois la fenêtre passée. Le message reste dans la liste.",
-      "dlq_retry_source_not_leader": "Ce node ne dirige pas la partition du topic vers laquelle le message retourne — relancez-le sur le node qui la dirige."
+      "dlq_retry_source_not_leader": "Ce node ne dirige pas la partition du topic vers laquelle le message retourne — relancez-le sur le node qui la dirige.",
+      "dlq_retry_requarantine_failed": "Le modèle du topic a de nouveau rejeté le message et sa nouvelle copie n’a pas pu être enregistrée parmi les messages non traités — le message reste dans la liste."
     },
     "shell": {
       "instance": "Instance",
@@ -10435,7 +10436,8 @@
         "done_text": "{n|Il est revenu|Ils sont revenus} dans le topic {topic} comme {n|nouveau message|nouveaux messages}.",
         "done_none_title": "Rien de relancé",
         "done_none_text": "Il n'y avait aucun message à relancer dans la liste.",
-        "done_failed": "{count} {n|message n'a pas pu|messages n'ont pas pu} être relancés — {n|il reste|ils restent} dans la liste."
+        "done_failed": "{count} {n|message n'a pas pu|messages n'ont pas pu} être relancés — {n|il reste|ils restent} dans la liste.",
+        "done_skipped": "{count} {n|message rejeté|messages rejetés} à l’écriture {n|est resté|sont restés} dans la liste — une relance {n|le|les} rejetterait à nouveau. {n|Supprimez-le|Supprimez-les} s’{n|il n’est|ils ne sont} pas {n|nécessaire|nécessaires}."
       },
       "retry_all_n": "Tout relancer ({count})",
       "tile_common": "le plus souvent : {reason}",

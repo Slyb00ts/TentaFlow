@@ -10880,7 +10880,8 @@
       "replication_internal_error": "Wewnętrzny błąd replikacji na serwerze.",
       "dlq_record_handled": "Tę wiadomość już ponowiono albo odrzucono — odśwież listę.",
       "dlq_retry_deduplicated": "Topik ma regułę jednorazowego dostarczenia i tę wiadomość już raz dostarczono w jej oknie — ponowienie jest możliwe po upływie tego okna. Wiadomość zostaje na liście.",
-      "dlq_retry_source_not_leader": "Ten node nie prowadzi partycji topiku, do której wiadomość ma wrócić — ponów ją na nodzie, który ją prowadzi."
+      "dlq_retry_source_not_leader": "Ten node nie prowadzi partycji topiku, do której wiadomość ma wrócić — ponów ją na nodzie, który ją prowadzi.",
+      "dlq_retry_requarantine_failed": "Wzór topiku znów odrzucił wiadomość, a jej nowej kopii nie udało się zapisać wśród nieprzetworzonych — wiadomość zostaje na liście."
     },
     "shell": {
       "instance": "Instancja",
@@ -11670,7 +11671,8 @@
         "done_text": "{n|Wróciła|Wróciły|Wróciły} do topiku {topic} jako {n|nowa|nowe|nowe}.",
         "done_none_title": "Nic nie ponowiono",
         "done_none_text": "Na liście nie było wiadomości do ponowienia.",
-        "done_failed": "{count} {n|wiadomości|wiadomości|wiadomości} nie udało się ponowić — {n|została|zostały|zostały} na liście."
+        "done_failed": "{count} {n|wiadomości|wiadomości|wiadomości} nie udało się ponowić — {n|została|zostały|zostały} na liście.",
+        "done_skipped": "{count} {n|wiadomość odrzucona|wiadomości odrzucone|wiadomości odrzuconych} przy zapisie {n|została|zostały|zostało} na liście — ponowienie znów by {n|ją|je|je} odrzuciło. Odrzuć {n|ją|je|je}, jeśli nie {n|jest potrzebna|są potrzebne|są potrzebne}."
       },
       "retry_all_n": "Ponów wszystkie ({count})",
       "tile_common": "najczęściej: {reason}",

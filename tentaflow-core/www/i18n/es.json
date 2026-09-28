@@ -9645,7 +9645,8 @@
       "replication_internal_error": "Error interno de replicación en el servidor.",
       "dlq_record_handled": "Este mensaje ya se reintentó o descartó — actualice la lista.",
       "dlq_retry_deduplicated": "El topic entrega un mensaje una vez por ventana y este ya se entregó en ella: podrá reintentarse cuando pase la ventana. El mensaje sigue en la lista.",
-      "dlq_retry_source_not_leader": "Este node no dirige la partición del topic a la que vuelve el mensaje: reinténtalo en el node que la dirige."
+      "dlq_retry_source_not_leader": "Este node no dirige la partición del topic a la que vuelve el mensaje: reinténtalo en el node que la dirige.",
+      "dlq_retry_requarantine_failed": "El patrón del topic volvió a rechazar el mensaje y su nueva copia no pudo guardarse entre los no procesados: el mensaje sigue en la lista."
     },
     "shell": {
       "instance": "Instancia",
@@ -10435,7 +10436,8 @@
         "done_text": "{n|Volvió|Volvieron} al topic {topic} como {n|mensaje nuevo|mensajes nuevos}.",
         "done_none_title": "No se reintentó nada",
         "done_none_text": "En la lista no había mensajes para reintentar.",
-        "done_failed": "{count} {n|mensaje no se pudo|mensajes no se pudieron} reintentar — {n|queda|quedan} en la lista."
+        "done_failed": "{count} {n|mensaje no se pudo|mensajes no se pudieron} reintentar — {n|queda|quedan} en la lista.",
+        "done_skipped": "{count} {n|mensaje rechazado|mensajes rechazados} al escribir {n|quedó|quedaron} en la lista: un reintento solo {n|lo|los} volvería a rechazar. {n|Descártalo|Descártalos} si no {n|es necesario|son necesarios}."
       },
       "retry_all_n": "Reintentar todos ({count})",
       "tile_common": "lo más frecuente: {reason}",

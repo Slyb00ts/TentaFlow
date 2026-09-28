@@ -115,10 +115,11 @@ const BROWSE_MAX_RECORDS: u32 = 100;
 /// "Ponów wszystkie" — bounded batch, never "retry the entire DLQ" in one
 /// call).
 const DLQ_RETRY_ALL_MAX: u32 = 500;
-/// Waiting DLQ records one "Ponów wszystkie" reads at most, spread over the
-/// partitions (never fewer than the batch per partition): records rejected
-/// at write stay listed and are read again on every call, so without a cap
-/// a DLQ full of them would be scanned whole each time.
+/// Waiting DLQ records one "Ponów wszystkie" reads at most, in total over
+/// all partitions: records rejected at write stay listed and are read again
+/// on every call, so without a cap a DLQ full of them would be scanned whole
+/// each time. The ones it read are reported (`skipped_rejected`) so the
+/// operator learns to discard them.
 const DLQ_RETRY_ALL_SCAN_MAX: usize = 5_000;
 
 fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
@@ -401,6 +402,14 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         } => ProtocolError::new(
             ProtocolErrorCode::Conflict,
             format!("bus.dlq_record_handled: '{topic}' {partition}/{offset}"),
+        ),
+        BusServiceError::DlqRetryRequarantineFailed {
+            topic,
+            partition,
+            offset,
+        } => ProtocolError::new(
+            ProtocolErrorCode::NotAvailable,
+            format!("bus.dlq_retry_requarantine_failed: '{topic}' {partition}/{offset}"),
         ),
         BusServiceError::DlqRetryDeduplicated {
             topic,
@@ -2556,9 +2565,14 @@ async fn dlq_retry_all_v1(
 
     let bctx2 = bctx.clone();
     let dlq_topic2 = dlq_topic.clone();
-    let scan_cap = max_records.max(DLQ_RETRY_ALL_SCAN_MAX / partitions.max(1) as usize);
-    let records = run_blocking(move || {
-        retryable_dlq_records(&bctx2, &dlq_topic2, partitions, max_records, scan_cap)
+    let (records, skipped_rejected) = run_blocking(move || {
+        retryable_dlq_records(
+            &bctx2,
+            &dlq_topic2,
+            partitions,
+            max_records,
+            DLQ_RETRY_ALL_SCAN_MAX,
+        )
     })
     .await?;
 
@@ -2580,7 +2594,11 @@ async fn dlq_retry_all_v1(
             Err(_) => failed += 1,
         }
     }
-    Ok(BusPayload::DlqRetryAllResponse { retried, failed })
+    Ok(BusPayload::DlqRetryAllResponse {
+        retried,
+        failed,
+        skipped_rejected,
+    })
 }
 
 /// The oldest `max_records` records of `dlq_topic` "Ponów wszystkie" acts
@@ -2588,13 +2606,16 @@ async fn dlq_retry_all_v1(
 /// waiting ones only (a retried or discarded record is never republished
 /// again — M1-R2 review N-5), and never one rejected at write time
 /// (`dlq::rejected_at_write`), which the topic's validation would only send
-/// back as a new record. Each partition contributes its oldest
-/// `max_records` such records among at most `scan_cap` waiting ones —
+/// back as a new record. At most `scan_cap` waiting records are read in
+/// total, each partition getting an even share of what is left of it when
+/// its turn comes (what one partition does not use goes to the next) —
 /// located from the handled set alone and read as ranges of waiting offsets
 /// (`BusService::peek_runs`, keeping no payload), so handled records are
 /// never read and one call reads a bounded number of records whatever sits
-/// at the head — and the union is ordered by arrival and cut at
-/// `max_records`. Only coordinates come back: `dlq_retry` reads the record
+/// at the heads. Each partition contributes its oldest `max_records` such
+/// records within its share; the union is ordered by arrival and cut at
+/// `max_records`. Only coordinates come back, with the number of records
+/// rejected at write that were read and left: `dlq_retry` reads the record
 /// itself.
 fn retryable_dlq_records(
     bctx: &BusCallContext,
@@ -2602,10 +2623,13 @@ fn retryable_dlq_records(
     partitions: u32,
     max_records: usize,
     scan_cap: usize,
-) -> Result<Vec<(u32, u64)>, ProtocolError> {
+) -> Result<(Vec<(u32, u64)>, u32), ProtocolError> {
     let svc = instance_service(&bctx.instance_id)?;
     let mut picked: Vec<(i64, u32, u64)> = Vec::new();
+    let mut budget = scan_cap;
+    let mut skipped_rejected = 0u32;
     for partition in 0..partitions {
+        let share = budget.div_ceil((partitions - partition) as usize);
         let stats = svc
             .partition_stats(bctx, dlq_topic, partition)
             .map_err(map_bus_error)?;
@@ -2616,12 +2640,12 @@ fn retryable_dlq_records(
             .collect();
         let mut cursor = stats.earliest_offset;
         let (mut found, mut scanned) = (0usize, 0usize);
-        while found < max_records && scanned < scan_cap {
+        while found < max_records && scanned < share {
             let runs = waiting_runs(
                 cursor,
                 stats.high_watermark,
                 &handled,
-                (max_records - found).min(scan_cap - scanned),
+                (max_records - found).min(share - scanned),
                 RunsFrom::Oldest,
             );
             let Some(read_to) = runs.last().map(|r| r.end) else {
@@ -2635,7 +2659,9 @@ fn retryable_dlq_records(
                 .peek_runs(bctx, dlq_topic, partition, &runs, 0)
                 .map_err(map_bus_error)?;
             for record in peeked.records {
-                if !dlq::rejected_at_write(&record.headers) {
+                if dlq::rejected_at_write(&record.headers) {
+                    skipped_rejected += 1;
+                } else {
                     found += 1;
                     picked.push((
                         dlq::arrival_ms(&record.headers, record.timestamp_ms),
@@ -2646,13 +2672,17 @@ fn retryable_dlq_records(
             }
             cursor = read_to;
         }
+        budget -= scanned;
     }
     picked.sort_unstable();
     picked.truncate(max_records);
-    Ok(picked
-        .into_iter()
-        .map(|(_, partition, offset)| (partition, offset))
-        .collect())
+    Ok((
+        picked
+            .into_iter()
+            .map(|(_, partition, offset)| (partition, offset))
+            .collect(),
+        skipped_rejected,
+    ))
 }
 
 // =============================================================================
@@ -5749,7 +5779,9 @@ mod tests {
         .await
         .expect("retry all");
         match retry_all {
-            BusPayload::DlqRetryAllResponse { retried, failed } => {
+            BusPayload::DlqRetryAllResponse {
+                retried, failed, ..
+            } => {
                 assert_eq!(
                     retried, 2,
                     "the discarded record must be skipped, not retried"
@@ -7696,12 +7728,17 @@ mod tests {
         }
     }
 
-    async fn retry_all(ctx: &HandlerContext, topic: &str, max: u32) -> (u32, u32) {
+    /// `(retried, failed, skipped_rejected)` of one "Ponów wszystkie".
+    async fn retry_all(ctx: &HandlerContext, topic: &str, max: u32) -> (u32, u32, u32) {
         match dlq_retry_all_v1(ctx, fixture_instance_id().as_str(), topic.to_string(), max)
             .await
             .expect("retry all")
         {
-            BusPayload::DlqRetryAllResponse { retried, failed } => (retried, failed),
+            BusPayload::DlqRetryAllResponse {
+                retried,
+                failed,
+                skipped_rejected,
+            } => (retried, failed, skipped_rejected),
             other => panic!("unexpected response: {other:?}"),
         }
     }
@@ -7728,8 +7765,8 @@ mod tests {
         assert!(err.message.contains("bus.dlq_record_handled"), "{}", err.message);
         assert_eq!(source_high_watermark(&ctx, &topic).await, 4);
 
-        assert_eq!(retry_all(&ctx, &topic, 10).await, (2, 0));
-        assert_eq!(retry_all(&ctx, &topic, 10).await, (0, 0));
+        assert_eq!(retry_all(&ctx, &topic, 10).await, (2, 0, 0));
+        assert_eq!(retry_all(&ctx, &topic, 10).await, (0, 0, 0));
         assert_eq!(dlq_depth(&ctx, &topic).await, 0);
         assert!(dlq_list_offsets(&ctx, topic.clone()).await.is_empty());
         assert_eq!(
@@ -7753,18 +7790,20 @@ mod tests {
                 .await
                 .expect("discard");
         }
-        assert_eq!(retry_all(&ctx, &topic, 2).await, (2, 0));
+        assert_eq!(retry_all(&ctx, &topic, 2).await, (2, 0, 0));
         assert_eq!(dlq_depth(&ctx, &topic).await, 0);
     }
 
     /// A message rejected when it was written stays where it is: the
-    /// topic's validation would only send it back as a new record.
+    /// topic's validation would only send it back as a new record. The
+    /// answer says how many were left, so the operator knows to discard
+    /// them instead of clicking "Ponów wszystkie" again.
     #[tokio::test]
     async fn dlq_retry_all_leaves_records_rejected_at_write() {
         let (_guard, db) = bus_fixture();
         let (ctx, _org_id, _) = admin_session(&db);
         let topic = topic_with_rejected_records(&ctx, 3).await;
-        assert_eq!(retry_all(&ctx, &topic, 10).await, (0, 0));
+        assert_eq!(retry_all(&ctx, &topic, 10).await, (0, 0, 3));
         assert_eq!(dlq_list_offsets(&ctx, topic.clone()).await, vec![0, 1, 2]);
         assert_eq!(dlq_depth(&ctx, &topic).await, 3);
     }
@@ -8006,7 +8045,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(retry_all(&ctx, &topic, 1).await, (1, 0));
+        assert_eq!(retry_all(&ctx, &topic, 1).await, (1, 0, 0));
         let left = match dlq_list_v1(
             &ctx,
             fixture_instance_id().as_str(),
@@ -8062,7 +8101,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(retry_all(&ctx, &topic, 1).await, (0, 1));
+        assert_eq!(retry_all(&ctx, &topic, 1).await, (0, 1, 0));
         match dlq_retry_v1(&ctx, inst.as_str(), topic.clone(), 0, 1)
             .await
             .expect("retry")
@@ -8128,13 +8167,37 @@ mod tests {
         let g = gate_read(&ctx, fixture_instance_id().as_str()).expect("gate");
         let (bctx, t) = (bus_ctx(&ctx, &g), dlq_topic.clone());
         let before = browsed_records(&db, &dlq_topic);
-        let picked = tokio::task::spawn_blocking(move || {
+        let (picked, skipped) = tokio::task::spawn_blocking(move || {
             retryable_dlq_records(&bctx, &t, 1, 10, 2).expect("pick")
         })
         .await
         .unwrap();
         assert!(picked.is_empty());
+        assert_eq!(skipped, 2);
         assert_eq!(browsed_records(&db, &dlq_topic) - before, 2);
+    }
+
+    /// The read cap is one budget for the whole call, shared by the
+    /// partitions — not a cap per partition that grows with their number.
+    #[tokio::test]
+    async fn dlq_retry_all_shares_one_read_budget_across_partitions() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let mut failures = vec![(key_on_partition(0), "a"); 5];
+        failures.extend(vec![(key_on_partition(1), "b"); 5]);
+        let topic =
+            two_partition_topic_with_failures(&ctx, BusTopicOptionsWire::default(), failures).await;
+        let dlq_topic = dlq::dlq_topic_name(&topic);
+        let g = gate_read(&ctx, fixture_instance_id().as_str()).expect("gate");
+        let (bctx, t) = (bus_ctx(&ctx, &g), dlq_topic.clone());
+        let before = browsed_records(&db, &dlq_topic);
+        let (picked, _) = tokio::task::spawn_blocking(move || {
+            retryable_dlq_records(&bctx, &t, 2, 10, 4).expect("pick")
+        })
+        .await
+        .unwrap();
+        assert_eq!(picked.len(), 4);
+        assert_eq!(browsed_records(&db, &dlq_topic) - before, 4);
     }
 
     /// `newest_first` pages a DLQ backwards: following each partition's

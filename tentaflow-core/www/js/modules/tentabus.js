@@ -40,7 +40,7 @@ import { drawReplication } from '/js/modules/tentabus/replication.js';
 import { drawConsumers, consumerKey } from '/js/modules/tentabus/consumers.js';
 import { drawConsumerDetail, positionRows, consumerDlq } from '/js/modules/tentabus/consumer-detail.js';
 import { openOffsetMove, movedText } from '/js/modules/tentabus/offset-move.js';
-import { drawUnprocessed, unprocessedRecord, unprocessedTopics, mergeNewest, retryAllPlan, topicConsumers, messageName, receiversText, UNPROCESSED_PAGE, LIST_STEP } from '/js/modules/tentabus/unprocessed.js';
+import { drawUnprocessed, unprocessedRecord, unprocessedTopics, mergeNewest, retryAllPlan, topicConsumers, messageName, receiversText, retryAllDoneNotice, UNPROCESSED_PAGE, LIST_STEP } from '/js/modules/tentabus/unprocessed.js';
 import { openUnprocessedView, openRetryOne, openDiscardOne, openRetryAll } from '/js/modules/tentabus/unprocessed-windows.js';
 import '/js/components/tf-breadcrumb.js';
 import '/js/components/tf-button.js';
@@ -1801,18 +1801,7 @@ function openUnprocessedRetryAll(topic, from) {
     retryAll: () => ApiBinary.action('busDlqRetryAllRequest', { instanceId: requireInstanceId(instanceId), sourceTopic: topic, maxRecords: plan.batch }, { timeoutMs: RETRY_ALL_TIMEOUT_MS }),
     describeError: describeBusError,
     onDone: (resp) => {
-      const retried = Number(resp?.retried) || 0;
-      const failed = Number(resp?.failed) || 0;
-      const text = [
-        retried > 0 ? T('unprocessed.retry_all.done_text', { topic, n: retried }) : T('unprocessed.retry_all.done_none_text'),
-        retried > 0 ? receiversText(consumers, retried !== 1) : '',
-        failed > 0 ? T('unprocessed.retry_all.done_failed', { count: fmtCount(failed), n: failed }) : '',
-      ].filter(Boolean).join(' ');
-      afterUnprocessedChange(topic, from, {
-        tone: failed > 0 || retried === 0 ? 'warning' : 'success',
-        title: retried > 0 ? T('unprocessed.retry_all.done_title', { count: fmtCount(retried), n: retried }) : T('unprocessed.retry_all.done_none_title'),
-        text,
-      });
+      afterUnprocessedChange(topic, from, retryAllDoneNotice({ topic, resp, consumers }));
     },
   });
 }
