@@ -2109,7 +2109,7 @@ wpisy tej instancji — konsumenci pozostalych instancji zyja dalej.
 | Permission | `bus.publish`, resource = `topic` |
 | Risk | B |
 | Input | `topic`, `records: [{key?, headers?, payload}]` (do 1000 rekordow / 8 MB — `PayloadKind::BusBatch`), `create_if_missing?`, `instance_id?` (patrz "Wybor instancji TentaBus") |
-| Output | `published = <u32>` (`PublishResult::accepted`, zsumowane po wszystkich partycjach), `schema_rejected = <u32>` (`PublishResult::schema_rejected` — rekordy odrzucone przez walidacje schematu i przekierowane do `__dlq.<topic>` przy `validation = dlq`, PLAN-F3 §4.5; `0` dla tematu bez schematu) |
+| Output | `published = <u32>` (`PublishResult::accepted`, zsumowane po wszystkich partycjach), `schema_rejected = <u32>` (`PublishResult::schema_rejected` — rekordy odrzucone przez walidacje schematu i przekierowane do `__dlq.<topic>` przy `validation = dlq`, PLAN-F3 §4.5; `0` dla tematu bez schematu; liczy tylko rekordy, ktorych kopie zapisano w DLQ), `schema_dropped = <u32>` (`PublishResult::schema_dropped` — rekordy odrzucone przez walidacje, ktorych kopii nie udalo sie zapisac w DLQ: utracone, ani opublikowane, ani w DLQ) |
 
 ```toml
 topic = "orders.created"
@@ -2209,7 +2209,7 @@ let published = tentaflow_sdk::bus_publish("orders.created", &[record.clone()], 
 
 // Wiecej niz jedna wlaczona instancja — trzeba ja nazwac, inaczej
 // `Operation` (5). `bus_publish_on` zwraca pelny `BusPublishOutcome`
-// (`published` + `schema_rejected`), tak jak `bus_publish_ex`.
+// (`published`, `schema_rejected`, `schema_dropped`), tak jak `bus_publish_ex`.
 let outcome = tentaflow_sdk::bus_publish_on(
     "tentabus-1a2b3c4d",
     "orders.created",

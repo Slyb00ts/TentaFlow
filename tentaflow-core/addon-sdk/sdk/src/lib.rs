@@ -3479,6 +3479,10 @@ pub struct BusPublishOutcome {
     /// under `validation = dlq` — `0` for a topic with no bound schema, or
     /// `validation` other than `dlq` (SUM/tentabus/PLAN-F3.md §4).
     pub schema_rejected: u32,
+    /// Records that failed schema validation under `validation = dlq` and
+    /// whose quarantine copy could not be written: neither published nor in
+    /// the DLQ — lost.
+    pub schema_dropped: u32,
 }
 
 fn bus_publish_input(
@@ -3531,8 +3535,8 @@ pub fn bus_publish(
 }
 
 /// Same as [`bus_publish`], but returns the full [`BusPublishOutcome`]
-/// (published count AND schema-rejected count) instead of just the
-/// published count.
+/// (published, schema-rejected and schema-dropped counts) instead of just
+/// the published count.
 pub fn bus_publish_ex(
     topic: &str,
     records: &[BusRecord],
@@ -3568,6 +3572,7 @@ fn bus_publish_on_inner(
     Ok(BusPublishOutcome {
         published: out.published,
         schema_rejected: out.schema_rejected,
+        schema_dropped: out.schema_dropped,
     })
 }
 

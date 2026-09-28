@@ -106,6 +106,9 @@ pub struct BusPublishInput {
 /// a host that DOES send it (minicbor's `#[cbor(map)]` skips unrecognized
 /// keys) — see `tests::old_payload_without_schema_rejected_decodes_as_zero`/
 /// `tests::old_decoder_tolerates_an_unknown_schema_rejected_key`.
+/// `schema_dropped` is `PublishResult::schema_dropped`: records that failed
+/// validation and whose quarantine copy could not be written — lost.
+/// Defaulted the same way (key 2 absent from an older host decodes as 0).
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 #[cbor(map)]
 pub struct BusPublishOutput {
@@ -114,6 +117,9 @@ pub struct BusPublishOutput {
     #[n(1)]
     #[cbor(default)]
     pub schema_rejected: u32,
+    #[n(2)]
+    #[cbor(default)]
+    pub schema_dropped: u32,
 }
 
 // -----------------------------------------------------------------------------
@@ -280,6 +286,7 @@ mod tests {
         roundtrip(&BusPublishOutput {
             published: 1,
             schema_rejected: 2,
+            schema_dropped: 1,
         });
     }
 
@@ -302,6 +309,7 @@ mod tests {
         let back: BusPublishOutput = minicbor::decode(&buf).unwrap();
         assert_eq!(back.published, 7);
         assert_eq!(back.schema_rejected, 0);
+        assert_eq!(back.schema_dropped, 0);
     }
 
     #[test]
@@ -313,6 +321,7 @@ mod tests {
         let new = BusPublishOutput {
             published: 3,
             schema_rejected: 1,
+            schema_dropped: 1,
         };
         let mut buf = Vec::new();
         minicbor::encode(&new, &mut buf).unwrap();

@@ -1647,11 +1647,17 @@ pub struct PublishResult {
     /// `off`/`warn` (a `warn` violation is counted in
     /// `schema_violations_total`, not here: it was still ACCEPTED). A
     /// violation whose quarantine write failed is dropped, not diverted: it
-    /// is counted in `schema_dlq_write_failures_total` and audited, not here. A batch that was entirely diverted returns
+    /// is counted in `schema_dropped` (and `schema_dlq_write_failures_total`,
+    /// and audited), not here. A batch that was entirely diverted returns
     /// `Ok(PublishResult { accepted: 0, schema_rejected: N, .. })`, not an
     /// error — quarantine is a per-record data-quality decision, never a
     /// whole-batch rejection (unlike a field-policy violation).
     pub schema_rejected: u32,
+    /// Records of `validation = dlq` that failed validation AND whose
+    /// quarantine copy could not be written: neither appended nor in the
+    /// DLQ — lost. Reported so no caller mistakes a lost record for one
+    /// that landed somewhere.
+    pub schema_dropped: u32,
 }
 
 impl PublishResult {
@@ -5162,6 +5168,7 @@ impl BusService {
         // dedup/quota, same up-front placement as the field-policy block
         // above (§3 rule 6: field policy first, schema second).
         let mut schema_rejected: u32 = 0;
+        let mut schema_dropped: u32 = 0;
         if cfg.validation != topics::ValidationMode::Off {
             let subject = cfg
                 .schema_id
@@ -5294,6 +5301,8 @@ impl BusService {
                 // caller (`dlq_retry`) must be able to tell the two apart.
                 if dlq_result.is_ok() {
                     schema_rejected = violation_count as u32;
+                } else {
+                    schema_dropped = violation_count as u32;
                 }
                 if let Err(e) = dlq_result {
                     self.schema_dlq_write_failures_total
@@ -5323,6 +5332,7 @@ impl BusService {
                     deduplicated: 0,
                     partitions: Vec::new(),
                     schema_rejected,
+                    schema_dropped,
                 });
             }
         }
@@ -5753,6 +5763,7 @@ impl BusService {
             deduplicated: total_deduplicated,
             partitions: acks,
             schema_rejected,
+            schema_dropped,
         })
     }
 
@@ -18669,6 +18680,10 @@ mod tests {
         assert_eq!(
             result.schema_rejected, 0,
             "a violation whose quarantine copy failed was dropped, not diverted"
+        );
+        assert_eq!(
+            result.schema_dropped, 1,
+            "and the caller is told it was lost"
         );
         assert_eq!(
             svc.schema_dlq_write_failures_total(),

@@ -24,8 +24,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   tej samej partycji nieprzetworzonych wiadomości. Jeśli jej nowej kopii nie
   uda się zapisać, ponowienie jest odmawiane, a wiadomość zostaje na liście —
   wcześniej znikała. Liczba wiadomości skierowanych do nieprzetworzonych przy
-  zapisie (`schema_rejected`) obejmuje teraz tylko te, których kopię zapisano;
-  nieudany zapis kopii liczy metryka błędów zapisu kwarantanny.
+  zapisie (`schema_rejected`) obejmuje teraz tylko te, których kopię zapisano.
+  Wiadomości, których kopii nie udało się zapisać — utracone, ani
+  opublikowane, ani wśród nieprzetworzonych — podaje nowe pole
+  `schema_dropped` w odpowiedzi REST publikacji, w wyniku funkcji hosta
+  `bus_publish_v1` (SDK Rust i .NET) oraz w metadanych bloku przepływu
+  (`bus_publish_schema_dropped`).
 - Ponowienie, które reguła jednorazowego dostarczenia topiku (klucz
   idempotencji) odrzuciłaby jako powtórzenie oryginału, jest odmawiane,
   a wiadomość zostaje na liście — wcześniej znikała z listy, nie wracając do

@@ -546,6 +546,7 @@ pub fn bus_publish_v1(
             let out = BusPublishOutput {
                 published: r.accepted,
                 schema_rejected: r.schema_rejected,
+                schema_dropped: r.schema_dropped,
             };
             write_cbor_capped(
                 &memory,

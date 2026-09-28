@@ -129,6 +129,23 @@ public class BusDecodeTests
         var result = Bus.DecodePublishOutput(w.ToArray());
         Assert.Equal(42u, result.Published);
         Assert.Equal(0u, result.SchemaRejected);
+        Assert.Equal(0u, result.SchemaDropped);
+    }
+
+    [Fact]
+    public void PublishOutput_DecodesSchemaDropped()
+    {
+        var w = new CborWriter(16);
+        w.WriteMapHeader(3);
+        w.WriteUInt(0);
+        w.WriteUInt(0);
+        w.WriteUInt(1);
+        w.WriteUInt(0);
+        w.WriteUInt(2);
+        w.WriteUInt(1);
+        var result = Bus.DecodePublishOutput(w.ToArray());
+        Assert.Equal(0u, result.Published);
+        Assert.Equal(1u, result.SchemaDropped);
     }
 
     [Fact]
@@ -156,7 +173,7 @@ public class BusDecodeTests
         w.WriteUInt(9);
         w.WriteUInt(1);
         w.WriteUInt(1);
-        w.WriteUInt(2);
+        w.WriteUInt(3);
         w.WriteText("future-field");
         var result = Bus.DecodePublishOutput(w.ToArray());
         Assert.Equal(9u, result.Published);

@@ -45,7 +45,7 @@ use crate::bus::groups::CommitMode;
 use crate::bus::instance::BusInstanceId;
 use crate::bus::{
     self, BusCallContext, BusServiceError, ConsumerConfig, FetchedRecordMeta, PublishBatch,
-    PublishRecord, TopicPartition,
+    PublishRecord, PublishResult, TopicPartition,
 };
 use crate::dispatch::app_gate::{self, SoleInstanceError};
 use crate::routing::router::Router;
@@ -678,11 +678,10 @@ pub async fn handle_publish(
     match result {
         Ok(r) => {
             // `schema_rejected` (PLAN-F3 §4.5): records quarantined to the
-            // DLQ under `validation = dlq`; additive, always present.
-            let body = serde_json::json!({
-                "published": r.accepted,
-                "schema_rejected": r.schema_rejected,
-            });
+            // DLQ under `validation = dlq`; `schema_dropped`: records that
+            // failed validation and whose quarantine copy could not be
+            // written — lost. Both additive, always present.
+            let body = publish_response_json(&r);
             Ok(json_response(
                 StatusCode::OK,
                 serde_json::to_vec(&body).unwrap_or_default(),
@@ -690,6 +689,15 @@ pub async fn handle_publish(
         }
         Err(e) => Ok(map_bus_error(&e)),
     }
+}
+
+/// The body of a successful publish.
+fn publish_response_json(r: &PublishResult) -> serde_json::Value {
+    serde_json::json!({
+        "published": r.accepted,
+        "schema_rejected": r.schema_rejected,
+        "schema_dropped": r.schema_dropped,
+    })
 }
 
 // ---- GET /v1/bus/instances/{instance_id}/topics/{topic}/records ------------
@@ -1246,5 +1254,23 @@ mod tests {
                     .to_bytes()
                     .to_vec()
             })
+    }
+
+    /// A publish whose schema-violating record could not be quarantined
+    /// says so: `schema_dropped` next to `published`/`schema_rejected`.
+    #[test]
+    fn publish_response_reports_dropped_records() {
+        let body = publish_response_json(&PublishResult {
+            duplicate: false,
+            accepted: 1,
+            deduplicated: 0,
+            partitions: Vec::new(),
+            schema_rejected: 0,
+            schema_dropped: 2,
+        });
+        assert_eq!(
+            body,
+            serde_json::json!({"published": 1, "schema_rejected": 0, "schema_dropped": 2})
+        );
     }
 }

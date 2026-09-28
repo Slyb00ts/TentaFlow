@@ -251,26 +251,38 @@ impl NodeAdapter for BusPublishNodeAdapter {
         let mut out = (*input.envelope).clone();
         out.meta
             .insert("bus_publish_topic".into(), serde_json::json!(topic));
-        // PLAN-F3 §4.5: how many of this call's records (always exactly 1
-        // here, a single-record batch) were diverted to `__dlq.<topic>` for
-        // failing schema validation under `validation = dlq`, rather than
-        // published. Always present (unlike `bus_publish_partition`/
-        // `_offset` below, which only exist when something actually landed
-        // in a partition) so a downstream flow node can branch on a
-        // record that was quarantined instead of appended.
-        out.meta.insert(
-            "bus_publish_schema_rejected".into(),
-            serde_json::json!(result.schema_rejected),
-        );
-        if let Some(ack) = result.single_partition() {
-            out.meta.insert(
-                "bus_publish_partition".into(),
-                serde_json::json!(ack.partition),
-            );
-            out.meta
-                .insert("bus_publish_offset".into(), serde_json::json!(ack.base_offset));
-        }
+        record_publish_outcome(&mut out, &result);
         Ok(out)
+    }
+}
+
+/// Writes what became of the published record into `out.meta`.
+/// `bus_publish_schema_rejected` (PLAN-F3 §4.5): how many of this call's
+/// records (always exactly 1 here, a single-record batch) were diverted to
+/// `__dlq.<topic>` for failing schema validation under `validation = dlq`.
+/// `bus_publish_schema_dropped`: how many failed validation AND could not be
+/// quarantined — lost, neither appended nor in the DLQ. Both are always
+/// present, unlike `bus_publish_partition`/`_offset`, which exist only when
+/// the record actually landed in a partition — so a downstream node can
+/// branch on appended / quarantined / lost.
+fn record_publish_outcome(out: &mut FlowEnvelope, result: &bus::PublishResult) {
+    out.meta.insert(
+        "bus_publish_schema_rejected".into(),
+        serde_json::json!(result.schema_rejected),
+    );
+    out.meta.insert(
+        "bus_publish_schema_dropped".into(),
+        serde_json::json!(result.schema_dropped),
+    );
+    if let Some(ack) = result.single_partition() {
+        out.meta.insert(
+            "bus_publish_partition".into(),
+            serde_json::json!(ack.partition),
+        );
+        out.meta.insert(
+            "bus_publish_offset".into(),
+            serde_json::json!(ack.base_offset),
+        );
     }
 }
 
@@ -382,5 +394,29 @@ mod tests {
         let headers = build_headers(&n, &scope).unwrap();
         assert!(headers.contains(&("content-type".to_string(), Bytes::from("application/json"))));
         assert!(headers.contains(&("x-org".to_string(), Bytes::from("cmc"))));
+    }
+
+    /// A record that failed validation and could not be quarantined is
+    /// reported as lost — not as appended (no partition/offset) and not as
+    /// quarantined.
+    #[test]
+    fn a_dropped_record_is_reported_as_lost_not_appended() {
+        let mut out = FlowEnvelope::empty();
+        let dropped = bus::PublishResult {
+            duplicate: false,
+            accepted: 0,
+            deduplicated: 0,
+            partitions: Vec::new(),
+            schema_rejected: 0,
+            schema_dropped: 1,
+        };
+        record_publish_outcome(&mut out, &dropped);
+        assert_eq!(out.meta["bus_publish_schema_dropped"], serde_json::json!(1));
+        assert_eq!(
+            out.meta["bus_publish_schema_rejected"],
+            serde_json::json!(0)
+        );
+        assert!(!out.meta.contains_key("bus_publish_partition"));
+        assert!(!out.meta.contains_key("bus_publish_offset"));
     }
 }

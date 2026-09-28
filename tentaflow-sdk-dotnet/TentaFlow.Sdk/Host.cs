@@ -727,6 +727,12 @@ public sealed class BusPublishResult
     /// schema, or `validation` other than `dlq`. `0` by default so an OLDER
     /// host that never sends key 1 decodes as "no schema enforcement ran".</summary>
     public uint SchemaRejected { get; init; }
+
+    /// <summary>Records that failed schema validation under
+    /// `validation = dlq` and whose quarantine copy could not be written:
+    /// neither published nor in the DLQ — lost. `0` from an older host that
+    /// never sends key 2.</summary>
+    public uint SchemaDropped { get; init; }
 }
 
 public static class Bus
@@ -817,7 +823,8 @@ public static class Bus
         return w;
     }
 
-    // Wire: CBOR BusPublishOutput {0: published, 1: schema_rejected}.
+    // Wire: CBOR BusPublishOutput {0: published, 1: schema_rejected,
+    // 2: schema_dropped}. Keys 1 and 2 may be absent from an older host.
     // `schema_rejected` (key 1) is absent from a pre-F3 host's payload —
     // defaults to 0 below, same as `#[cbor(default)]` on the Rust side.
     // An unrecognized key (future field) is skipped via `Value.Decode`,
@@ -828,6 +835,7 @@ public static class Bus
         int n = r.ReadMapHeader();
         uint published = 0;
         uint schemaRejected = 0;
+        uint schemaDropped = 0;
         for (int i = 0; i < n; i++)
         {
             ulong k = r.ReadUInt();
@@ -839,12 +847,21 @@ public static class Bus
             {
                 schemaRejected = (uint)r.ReadUInt();
             }
+            else if (k == 2)
+            {
+                schemaDropped = (uint)r.ReadUInt();
+            }
             else
             {
                 Value.Decode(r);
             }
         }
-        return new BusPublishResult { Published = published, SchemaRejected = schemaRejected };
+        return new BusPublishResult
+        {
+            Published = published,
+            SchemaRejected = schemaRejected,
+            SchemaDropped = schemaDropped,
+        };
     }
 
     /// <summary>
