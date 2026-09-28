@@ -40,7 +40,7 @@
 // outstanding un-replicated data, and it needs no extra bookkeeping beyond
 // what the feeder already tracks per batch sent.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -238,20 +238,31 @@ pub type ProducerMarkLookup = Arc<dyn Fn(u64) -> OutboundBatchMeta + Send + Sync
 /// partition that is not a DLQ partition.
 pub type HandledOffsetsLookup = Arc<dyn Fn(u64) -> Vec<u64> + Send + Sync>;
 
-/// Queues `lookup`'s full marker set of `partition` for the next `Offsets`
-/// frame (`HandledOffsetsLookup`'s doc).
-fn queue_handled_offsets(
+/// Handled markers one `Offsets` frame carries at most. A full marker set
+/// (`HandledOffsetsLookup`) can be arbitrarily large, and a frame above
+/// `MAX_FRAME_BYTES` would end the stream on every reconnect for good; at
+/// ~15 CBOR bytes per `(partition, offset)` this stays near 1 MiB.
+const DISCARDS_PER_OFFSETS_FRAME: usize = 65_536;
+
+/// Queues `lookup`'s full marker set for the next `Offsets` frames
+/// (`HandledOffsetsLookup`'s doc). The set is read from the local store on
+/// the blocking pool, not on this stream's task, and merged into
+/// `pending_discards`, a set, so a marker already queued is sent once.
+async fn queue_handled_offsets(
     lookup: &Option<HandledOffsetsLookup>,
-    partition: u32,
     earliest_offset: u64,
-    pending_discards: &mut Vec<(u32, u64)>,
+    pending_discards: &mut BTreeSet<u64>,
 ) {
-    if let Some(lookup) = lookup {
-        pending_discards.extend(
-            lookup(earliest_offset)
-                .into_iter()
-                .map(|offset| (partition, offset)),
-        );
+    let Some(lookup) = lookup else {
+        return;
+    };
+    let lookup = Arc::clone(lookup);
+    match tokio::task::spawn_blocking(move || lookup(earliest_offset)).await {
+        Ok(offsets) => pending_discards.extend(offsets),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "replication: reading the DLQ partition's handled markers did not finish"
+        ),
     }
 }
 
@@ -1291,13 +1302,13 @@ where
 
     let mut inflight = InFlightTracker::default();
     let mut pending_commits: Vec<(String, u32, u64, u32)> = Vec::new();
-    let mut pending_discards: Vec<(u32, u64)> = Vec::new();
+    let mut pending_discards: BTreeSet<u64> = BTreeSet::new();
     queue_handled_offsets(
         &handled_offsets,
-        leader.partition_id(),
         reader_handle.earliest_offset(),
         &mut pending_discards,
-    );
+    )
+    .await;
     let mut last_frame_sent_at = Instant::now();
     // The highest `hw` any frame on this stream has carried: the follower
     // applies it monotonically, so anything at or below it is old news.
@@ -1398,7 +1409,7 @@ where
                         pending_commits.push((group, leader.partition_id(), offset, attempts));
                     }
                     Ok(OffsetNote::Discarded { offset }) => {
-                        pending_discards.push((leader.partition_id(), offset));
+                        pending_discards.insert(offset);
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // K-M2-5 already tolerates a bounded replication
@@ -1410,10 +1421,10 @@ where
                         // whole marker set goes out again instead.
                         queue_handled_offsets(
                             &handled_offsets,
-                            leader.partition_id(),
                             reader_handle.earliest_offset(),
                             &mut pending_discards,
-                        );
+                        )
+                        .await;
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // `leader` outlives this task in every real
@@ -1451,11 +1462,26 @@ where
 
             _ = offsets_ticker.tick() => {
                 if !pending_commits.is_empty() || !pending_discards.is_empty() {
-                    write_frame(&mut writer, &ReplFrame::Offsets(ReplOffsets {
-                        leader_epoch: leader.epoch(),
-                        commits: std::mem::take(&mut pending_commits),
-                        discarded: std::mem::take(&mut pending_discards),
-                    })).await?;
+                    let partition = leader.partition_id();
+                    let discards: Vec<(u32, u64)> = std::mem::take(&mut pending_discards)
+                        .into_iter()
+                        .map(|offset| (partition, offset))
+                        .collect();
+                    let mut commits = std::mem::take(&mut pending_commits);
+                    let mut rest = discards.as_slice();
+                    loop {
+                        let (chunk, tail) =
+                            rest.split_at(rest.len().min(DISCARDS_PER_OFFSETS_FRAME));
+                        write_frame(&mut writer, &ReplFrame::Offsets(ReplOffsets {
+                            leader_epoch: leader.epoch(),
+                            commits: std::mem::take(&mut commits),
+                            discarded: chunk.to_vec(),
+                        })).await?;
+                        rest = tail;
+                        if rest.is_empty() {
+                            break;
+                        }
+                    }
                     last_frame_sent_at = Instant::now();
                 }
             }
@@ -2950,7 +2976,7 @@ mod tests {
         leader.note_offset_discarded(4);
         let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
         let (_tx, rx) = mpsc::unbounded_channel();
-        let lookup: HandledOffsetsLookup = Arc::new(|_earliest| vec![4, 7]);
+        let lookup: HandledOffsetsLookup = Arc::new(|_earliest| vec![7, 4, 4]);
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
@@ -2994,6 +3020,69 @@ mod tests {
             }
             other => panic!("expected Offsets, got {other:?}"),
         }
+
+        drop(foll_r);
+        drop(foll_w);
+        let _ = handle.await;
+    }
+
+    /// A marker set larger than one frame goes out as several `Offsets`
+    /// frames of at most `DISCARDS_PER_OFFSETS_FRAME` markers each, so it
+    /// never reaches `MAX_FRAME_BYTES` and kills the stream.
+    #[tokio::test]
+    async fn a_large_marker_set_is_sent_in_bounded_frames() {
+        let part = temp_partition("handled-chunks");
+        let mut config = fast_config();
+        config.heartbeat_interval = Duration::from_secs(10);
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, config);
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let total = DISCARDS_PER_OFFSETS_FRAME as u64 + 10;
+        let lookup: HandledOffsetsLookup = Arc::new(move |_earliest| (0..total).collect());
+
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(
+                leader2,
+                "f1".into(),
+                leader_r,
+                leader_w,
+                None,
+                Some(lookup),
+                rx,
+            )
+            .await
+        });
+
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        write_frame(
+            &mut foll_w,
+            &ReplFrame::HelloAck(ReplHelloAck {
+                accepted: true,
+                follower_leo: 0,
+                follower_hw: 0,
+                follower_epoch: TEST_EPOCH,
+                environment: NodeEnvironment::Prod,
+                reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let mut sizes = Vec::new();
+        while sizes.iter().sum::<usize>() < total as usize {
+            let frame = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut foll_r))
+                .await
+                .expect("timed out waiting for Offsets")
+                .unwrap();
+            match frame {
+                ReplFrame::Offsets(offsets) => sizes.push(offsets.discarded.len()),
+                other => panic!("expected Offsets, got {other:?}"),
+            }
+        }
+        assert_eq!(sizes, vec![DISCARDS_PER_OFFSETS_FRAME, 10]);
 
         drop(foll_r);
         drop(foll_w);

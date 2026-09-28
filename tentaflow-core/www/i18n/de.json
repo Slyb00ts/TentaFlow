@@ -9643,7 +9643,9 @@
       "authorizer_instance_mismatch": "Die Berechtigungsprüfung ist mit einer anderen TentaBus-Instanz verbunden als die Engine — ein Konfigurationsfehler auf dem Server.",
       "invalid_instance_id": "Ungültige TentaBus-Instanz-ID.",
       "replication_internal_error": "Interner Replikationsfehler auf dem Server.",
-      "dlq_record_handled": "Diese Nachricht wurde bereits wiederholt oder verworfen — aktualisieren Sie die Liste."
+      "dlq_record_handled": "Diese Nachricht wurde bereits wiederholt oder verworfen — aktualisieren Sie die Liste.",
+      "dlq_retry_deduplicated": "Das Topic stellt eine Nachricht einmal pro Zeitfenster zu, und diese wurde darin bereits zugestellt — sie kann nach Ablauf des Fensters erneut gesendet werden. Die Nachricht bleibt in der Liste.",
+      "dlq_retry_source_not_leader": "Dieser Node führt die Partition des Topics nicht, in die die Nachricht zurückgeht — wiederhole sie auf dem Node, der sie führt."
     },
     "shell": {
       "instance": "Instanz",

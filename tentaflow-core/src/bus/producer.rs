@@ -179,6 +179,37 @@ impl ProducerSeqStore {
         Ok(())
     }
 
+    /// Deletes one producer's sequence on `(org_id, topic, partition)` — a
+    /// `dlq_retry` identity (`dlq::retry_producer_id`) whose DLQ record
+    /// retention has removed, so nothing can retry it again.
+    pub fn remove(
+        &self,
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+        producer_id: &str,
+    ) -> Result<(), BusServiceError> {
+        self.keyspace
+            .remove(Self::key(org_id, topic, partition, producer_id))?;
+        Ok(())
+    }
+
+    /// Whether `producer_id` has a recorded sequence on `(org_id, topic,
+    /// partition)`.
+    #[cfg(test)]
+    pub(crate) fn contains(
+        &self,
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+        producer_id: &str,
+    ) -> bool {
+        self.keyspace
+            .get(Self::key(org_id, topic, partition, producer_id))
+            .map(|v| v.is_some())
+            .unwrap_or(false)
+    }
+
     /// Deletes every producer-sequence key for `(org_id, topic)`, across
     /// every partition/producer — called by `BusService::delete_topic` so a
     /// later `create_topic` of the SAME name starts every producer's

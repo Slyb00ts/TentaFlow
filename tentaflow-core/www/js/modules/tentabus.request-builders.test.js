@@ -253,7 +253,8 @@ const ERROR_CODES = [
   'payload_too_large', 'dedup_key_required', 'producer_fenced', 'environment_mismatch',
   'invalid_argument', 'invalid_field', 'not_subscribed', 'offset_regression',
   'offset_out_of_range', 'offset_reset_mode_unsupported', 'group_paused',
-  'dlq_of_dlq_not_allowed', 'dlq_record_handled', 'partition_poisoned', 'partial_publish',
+  'dlq_of_dlq_not_allowed', 'dlq_record_handled', 'dlq_retry_deduplicated',
+  'dlq_retry_source_not_leader', 'partition_poisoned', 'partial_publish',
   'blocking_task_failed', 'max_groups_exceeded',
 ];
 
@@ -361,6 +362,18 @@ test('mapBusErrorMessage falls back to the plain translated message when errors.
     makeNotLeaderTranslate({ withHint: false }),
   );
   assert.equal(msg, 'Ten node nie jest liderem tej partycji.');
+});
+
+test('mapBusErrorMessage names the leader of the source partition a retried message goes back to', () => {
+  const msg = helpers.mapBusErrorMessage(
+    "protocol error Conflict: bus.dlq_retry_source_not_leader: 'wizyty'/1 leader_node_id=gcm-core-02",
+    (path, params) => {
+      if (path === 'errors.dlq_retry_source_not_leader') return pl.tentabus.errors.dlq_retry_source_not_leader;
+      if (path === 'errors.not_leader_hint') return `Prowadzi ją teraz: ${params.node}.`;
+      return `tentabus.${path}`;
+    },
+  );
+  assert.equal(msg, `${pl.tentabus.errors.dlq_retry_source_not_leader} Prowadzi ją teraz: gcm-core-02.`);
 });
 
 // ---------------------------------------------------------------------------

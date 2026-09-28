@@ -175,6 +175,22 @@ pub fn compute_backoff_ms(attempts: u32, base_ms: u32, cap_ms: u32, jitter_seed:
     (capped + delta).clamp(0, cap_ms as i64) as u32
 }
 
+/// The headers of `original` a DLQ copy keeps: every one but the broker's
+/// own namespaces. `tf.*` is the publish provenance boundary
+/// (`bus/mod.rs`'s `RESERVED_HEADER_PREFIX`); `dlq.*` is the envelope this
+/// module writes, and the DLQ reads it by its first match
+/// (`rejected_at_write`, `arrival_ms`, `dlq.source_partition`) — a copy a
+/// producer put on its own record, or a `dlq.retry_of` of a record that
+/// failed again, would otherwise stand in for the broker's values.
+fn carried_headers(original: &PublishRecord) -> Vec<(String, Bytes)> {
+    original
+        .headers
+        .iter()
+        .filter(|(k, _)| !k.starts_with("tf.") && !k.starts_with("dlq."))
+        .cloned()
+        .collect()
+}
+
 /// Builds the DLQ copy of a failed record: same key/payload, the union of
 /// its original headers plus the `dlq.*` error envelope (PLAN §3.3).
 ///
@@ -199,12 +215,7 @@ pub fn build_dlq_record(
     original: &PublishRecord,
 ) -> PublishRecord {
     let truncated = truncate_to_byte_budget(error_message, MAX_ERROR_MESSAGE_BYTES);
-    let mut headers: Vec<(String, Bytes)> = original
-        .headers
-        .iter()
-        .filter(|(k, _)| !k.starts_with("tf."))
-        .cloned()
-        .collect();
+    let mut headers = carried_headers(original);
     headers.push((
         "dlq.source_topic".to_string(),
         Bytes::from(source_topic.to_string()),
@@ -279,12 +290,7 @@ pub fn build_publish_violation_record(
     original: &PublishRecord,
 ) -> PublishRecord {
     let truncated = truncate_to_byte_budget(error_message, MAX_ERROR_MESSAGE_BYTES);
-    let mut headers: Vec<(String, Bytes)> = original
-        .headers
-        .iter()
-        .filter(|(k, _)| !k.starts_with("tf."))
-        .cloned()
-        .collect();
+    let mut headers = carried_headers(original);
     headers.push((
         "dlq.source_topic".to_string(),
         Bytes::from(source_topic.to_string()),
@@ -514,6 +520,30 @@ impl DiscardStore {
         Ok(())
     }
 
+    /// `mark` for many `(partition, offset)` markers of one topic with one
+    /// durable persist for the whole set — a replicated marker set can hold
+    /// tens of thousands of them (`ReplOffsets.discarded`).
+    pub fn mark_many(
+        &self,
+        org_id: &str,
+        dlq_topic: &str,
+        markers: &[(u32, u64)],
+        now_ms: i64,
+    ) -> Result<(), BusServiceError> {
+        if markers.is_empty() {
+            return Ok(());
+        }
+        let value = encode(&DiscardRecord {
+            discarded_at_ms: now_ms,
+        })?;
+        for &(partition, offset) in markers {
+            self.keyspace
+                .insert(Self::key(org_id, dlq_topic, partition, offset), &value)?;
+        }
+        self.db.persist(PersistMode::SyncData)?;
+        Ok(())
+    }
+
     pub fn is_discarded(
         &self,
         org_id: &str,
@@ -526,12 +556,8 @@ impl DiscardStore {
     }
 
     /// Every offset currently marked discarded for `(dlq_topic, partition)`
-    /// at or above `earliest_offset`. Entries BELOW `earliest_offset` name a
-    /// DLQ record retention has already physically removed (the whole
-    /// segment holding it is gone) — dead weight with nothing left to
-    /// filter out of any read, so this opportunistically deletes them
-    /// during the same scan rather than requiring a dedicated sweep (PLAN's
-    /// retention scan itself never visits this keyspace).
+    /// at or above `earliest_offset`. Read-only: markers below it are left
+    /// for `prune_below`.
     pub fn discarded_offsets(
         &self,
         org_id: &str,
@@ -541,24 +567,55 @@ impl DiscardStore {
     ) -> Result<std::collections::HashSet<u64>, BusServiceError> {
         let prefix = Self::partition_prefix(org_id, dlq_topic, partition);
         let mut live = std::collections::HashSet::new();
-        let mut stale: Vec<Vec<u8>> = Vec::new();
         for guard in self.keyspace.prefix(&prefix) {
             let key = guard.key()?;
-            let offset_bytes = &key[prefix.len()..];
-            let Ok(offset_arr) = <[u8; 8]>::try_from(offset_bytes) else {
-                continue;
-            };
-            let offset = u64::from_be_bytes(offset_arr);
-            if offset < earliest_offset {
-                stale.push(key.to_vec());
-            } else {
-                live.insert(offset);
+            if let Some(offset) = Self::offset_of(&key, prefix.len()) {
+                if offset >= earliest_offset {
+                    live.insert(offset);
+                }
             }
         }
-        for k in stale {
-            self.keyspace.remove(k)?;
-        }
         Ok(live)
+    }
+
+    /// Deletes the markers of `(dlq_topic, partition)` below
+    /// `earliest_offset` and returns their offsets. They name DLQ records
+    /// retention has already physically removed (the whole segment holding
+    /// them is gone) — dead weight with nothing left to filter out of any
+    /// read, removed opportunistically by the readers of the marker set
+    /// rather than by a dedicated sweep (PLAN's retention scan itself never
+    /// visits this keyspace). The caller drops what else belonged to those
+    /// records (`BusService::handled_offsets`).
+    pub fn prune_below(
+        &self,
+        org_id: &str,
+        dlq_topic: &str,
+        partition: u32,
+        earliest_offset: u64,
+    ) -> Result<Vec<u64>, BusServiceError> {
+        let prefix = Self::partition_prefix(org_id, dlq_topic, partition);
+        let mut stale = Vec::new();
+        for guard in self.keyspace.prefix(&prefix) {
+            let key = guard.key()?;
+            match Self::offset_of(&key, prefix.len()) {
+                Some(offset) if offset < earliest_offset => stale.push((key.to_vec(), offset)),
+                // Keys are offset-ordered (big-endian): the rest is live.
+                Some(_) => break,
+                None => {}
+            }
+        }
+        let mut pruned = Vec::with_capacity(stale.len());
+        for (key, offset) in stale {
+            self.keyspace.remove(key)?;
+            pruned.push(offset);
+        }
+        Ok(pruned)
+    }
+
+    fn offset_of(key: &[u8], prefix_len: usize) -> Option<u64> {
+        <[u8; 8]>::try_from(&key[prefix_len..])
+            .ok()
+            .map(u64::from_be_bytes)
     }
 
     /// Deletes every discard marker for `(org_id, dlq_topic)` — called by
@@ -991,6 +1048,65 @@ mod tests {
         assert!(find("dlq.correlation_id").is_none());
     }
 
+    /// A producer cannot forge the DLQ envelope: `dlq.*` headers on its own
+    /// record are dropped from both DLQ copies, so the broker's values are
+    /// the only ones the DLQ reads (a forged `dlq.rejected_at_ms` would make
+    /// a consumer failure look rejected at write and skip "Ponów
+    /// wszystkie"; a forged arrival or partition would misplace it).
+    #[test]
+    fn dlq_copies_drop_producer_supplied_dlq_headers() {
+        let original = PublishRecord {
+            key: None,
+            headers: vec![
+                ("dlq.rejected_at_ms".to_string(), Bytes::from_static(b"1")),
+                (
+                    "dlq.last_failed_at_ms".to_string(),
+                    Bytes::from_static(b"2"),
+                ),
+                ("dlq.source_partition".to_string(), Bytes::from_static(b"9")),
+                ("app.kept".to_string(), Bytes::from_static(b"yes")),
+            ],
+            payload: Bytes::from_static(b"{}"),
+            timestamp_ms: 1_000,
+            schema_id: 0,
+        };
+        let failed = build_dlq_record(
+            "orders",
+            0,
+            5,
+            "g",
+            3,
+            10,
+            20,
+            DlqReason::ConsumerError,
+            "boom",
+            &original,
+        );
+        let wire = |rec: &PublishRecord| -> Vec<(Bytes, Bytes)> {
+            rec.headers
+                .iter()
+                .map(|(k, v)| (Bytes::from(k.clone()), v.clone()))
+                .collect()
+        };
+        assert!(!rejected_at_write(&wire(&failed)));
+        assert_eq!(arrival_ms(&wire(&failed), 0), 20);
+        let count =
+            |rec: &PublishRecord, name: &str| rec.headers.iter().filter(|(k, _)| k == name).count();
+        assert_eq!(count(&failed, "dlq.source_partition"), 1);
+        assert_eq!(count(&failed, "app.kept"), 1);
+
+        let rejected = build_publish_violation_record(
+            "orders",
+            "schema_violation",
+            "bad",
+            &test_producer_ctx(None, None),
+            &original,
+        );
+        assert_eq!(count(&rejected, "dlq.rejected_at_ms"), 1);
+        assert_eq!(count(&rejected, "dlq.source_partition"), 0);
+        assert_ne!(arrival_ms(&wire(&rejected), 0), 1);
+    }
+
     /// Review finding #5: the quarantine write itself runs under a broker
     /// `SYSTEM_ACTOR` context (`bus/mod.rs`'s `quarantine_ctx`), so without
     /// carrying the ORIGINAL producer's own actor/correlation id forward
@@ -1123,11 +1239,27 @@ mod tests {
             .discarded_offsets("org-1", "__dlq.orders", 0, 5)
             .unwrap();
         assert_eq!(live, std::collections::HashSet::from([5, 9]));
+        assert_eq!(
+            store.prune_below("org-1", "__dlq.orders", 0, 5).unwrap(),
+            vec![1]
+        );
 
         // The stale entry was actually removed, not just filtered out of
         // this one call's result.
         assert!(!store.is_discarded("org-1", "__dlq.orders", 0, 1).unwrap());
         assert!(store.is_discarded("org-1", "__dlq.orders", 0, 5).unwrap());
+    }
+
+    #[test]
+    fn mark_many_marks_every_marker_of_the_set() {
+        let (_dir, db) = temp_db();
+        let store = DiscardStore::open(&db).unwrap();
+        store
+            .mark_many("org-1", "__dlq.orders", &[(0, 3), (1, 4), (0, 3)], 1_000)
+            .unwrap();
+        assert!(store.is_discarded("org-1", "__dlq.orders", 0, 3).unwrap());
+        assert!(store.is_discarded("org-1", "__dlq.orders", 1, 4).unwrap());
+        assert!(!store.is_discarded("org-1", "__dlq.orders", 0, 4).unwrap());
     }
 
     #[test]

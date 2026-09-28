@@ -17,15 +17,34 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   wiadomości ze wszystkich partycji, a wiadomość znów odrzuconą przez wzór
   liczy jako nieponowioną. Tekst błędu odbiorcy jest ukryty przed osobami,
   które obejmują zasady ukrywania danych topiku. Lista czyta tylko wiadomości,
-  które pokazuje.
+  które pokazuje, i trzyma z nich jedynie podgląd treści, a „Ponów wszystkie”
+  czyta ograniczoną liczbę wiadomości na raz.
+- Ponowienie, które reguła jednorazowego dostarczenia topiku (klucz
+  idempotencji) odrzuciłaby jako powtórzenie oryginału, jest odmawiane,
+  a wiadomość zostaje na liście — wcześniej znikała z listy, nie wracając do
+  topiku. Można ją ponowić po upływie okna tej reguły.
+- Nagłówki `dlq.*` dodane przez producenta nie przechodzą do kopii
+  nieprzetworzonej wiadomości, więc nie podszyją się pod dane szyny.
 - Oznaczenie obsługi przechodzi teraz strumieniem replikacji partycji
   nieprzetworzonych wiadomości: w klastrze, w którym część nodów ma jeszcze
   wersję 0.4.0-beta, oznaczenia nie docierają do kopii do czasu aktualizacji
   wszystkich nodów.
-- Znane ograniczenie: ochrona przed powtórnym zapisem przerwanego ponowienia
-  działa na nodzie prowadzącym partycję topiku; jeśli między przerwaniem
-  a kolejnym ponowieniem prowadzenie tej partycji przejmie inny node, wiadomość
-  może trafić do topiku drugi raz.
+- Znane ograniczenia:
+  - Ponowienie wymaga, by ten sam node prowadził partycję nieprzetworzonych
+    wiadomości i partycję topiku, do której wiadomość wraca; zapis nie jest
+    przekazywany między nodami. W przeciwnym razie ponowienie jest odmawiane
+    z nazwą noda prowadzącego partycję topiku.
+  - Ochrona przed powtórnym zapisem przerwanego ponowienia działa na nodzie
+    prowadzącym partycję topiku; jeśli między przerwaniem a kolejnym
+    ponowieniem prowadzenie tej partycji przejmie inny node, wiadomość może
+    trafić do topiku drugi raz.
+  - Oznaczenie obsługi jest wysyłane do kopii co 0,5 s i nie czeka na ich
+    potwierdzenie. Jeśli prowadzenie partycji nieprzetworzonych wiadomości
+    przejmie inny node, zanim oznaczenie do niego dotarło (utrata noda
+    w tym oknie albo kopia niepołączona od chwili oznaczenia do zmiany
+    prowadzenia), ponowiona lub odrzucona wiadomość wraca na listę na nowym
+    nodzie i może zostać ponowiona jeszcze raz, także przez „Ponów wszystkie”.
+    Nowy prowadzący nie pobiera oznaczeń od pozostałych kopii.
 
 ## [0.4.0-beta] — 2026-09-27
 

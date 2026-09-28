@@ -9643,7 +9643,9 @@
       "authorizer_instance_mismatch": "La vérification des droits est rattachée à une autre instance TentaBus que le moteur — erreur de configuration côté serveur.",
       "invalid_instance_id": "Identifiant d'instance TentaBus invalide.",
       "replication_internal_error": "Erreur interne de réplication côté serveur.",
-      "dlq_record_handled": "Ce message a déjà été relancé ou rejeté — actualisez la liste."
+      "dlq_record_handled": "Ce message a déjà été relancé ou rejeté — actualisez la liste.",
+      "dlq_retry_deduplicated": "Le topic ne livre un message qu’une fois par fenêtre et celui-ci y a déjà été livré — il pourra être relancé une fois la fenêtre passée. Le message reste dans la liste.",
+      "dlq_retry_source_not_leader": "Ce node ne dirige pas la partition du topic vers laquelle le message retourne — relancez-le sur le node qui la dirige."
     },
     "shell": {
       "instance": "Instance",

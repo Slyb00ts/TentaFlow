@@ -847,6 +847,23 @@ pub enum BusServiceError {
         partition: u32,
         offset: u64,
     },
+    /// `dlq_retry`: the source topic's idempotency key dropped the
+    /// republish as a duplicate of the original, still inside its dedup
+    /// window. The DLQ record stays listed.
+    #[error("DLQ record {partition}/{offset} of '{topic}' was dropped by the source topic's idempotency key; retry after its dedup window")]
+    DlqRetryDeduplicated {
+        topic: String,
+        partition: u32,
+        offset: u64,
+    },
+    /// `dlq_retry`: this node leads the DLQ partition but not the source
+    /// partition the record goes back to, and a write cannot be forwarded.
+    #[error("partition {partition} of '{topic}' is led by {leader_node_id:?}, not this node; retry there")]
+    DlqRetrySourceNotLeader {
+        topic: String,
+        partition: u32,
+        leader_node_id: Option<String>,
+    },
     /// `tentaflow_bus::BusError::PartitionPoisoned`: a group-commit fsync
     /// failed after that group had already rolled to a new segment, so the
     /// partition's writer thread refuses every further append until the
@@ -1261,6 +1278,31 @@ fn max_groups_exceeded(org_id: &str, max: u32, current: u32) -> BusServiceError 
 /// record instead (`schema_rejected`), which is not a retry that happened.
 pub fn dlq_republished(result: &PublishResult) -> bool {
     result.accepted > 0 || result.duplicate
+}
+
+/// Whether a `dlq_retry` publish left the record somewhere: back in its
+/// topic (`dlq_republished`) or in the DLQ again as a new record
+/// (`schema_rejected`). Only then is the original marked handled; anything
+/// else (the topic's idempotency key dropped it) would lose it.
+fn dlq_retry_settled(result: &PublishResult) -> bool {
+    dlq_republished(result) || result.schema_rejected > 0
+}
+
+/// A reader's field-policy READ projection (`BusService::read_projection`),
+/// resolved once per read and applied record by record.
+struct ReadProjection {
+    policy: field_policies::FieldPolicy,
+    format: payload_format::PayloadFormat,
+    dlq: bool,
+}
+
+impl ReadProjection {
+    fn apply(&self, rec: &mut FetchedRecordMeta) {
+        rec.payload = field_policies::project_read(&self.policy, self.format, &rec.payload);
+        if self.dlq {
+            dlq::hide_error_message(&mut rec.headers);
+        }
+    }
 }
 
 /// One engine record of `view` as the `FetchedRecordMeta` a stateless read
@@ -5923,9 +5965,7 @@ impl BusService {
         earliest: u64,
         high_watermark: u64,
     ) -> Result<(u64, std::collections::HashSet<u64>), BusServiceError> {
-        let discarded = self
-            .discarded
-            .discarded_offsets(org_id, dlq_topic, partition, earliest)?;
+        let discarded = self.handled_offsets(org_id, dlq_topic, partition, earliest)?;
         let discarded_live = discarded
             .iter()
             .filter(|&&o| o >= earliest && o < high_watermark)
@@ -6687,16 +6727,25 @@ impl BusService {
             }
         }
 
-        self.finish_peek(
-            ctx,
-            topic,
-            &cfg,
-            &format!(
-                "partition={partition} from_offset={from_offset} count={}",
-                records.len()
-            ),
-            &mut records,
-        )?;
+        if !records.is_empty() {
+            self.audit_browse(
+                ctx,
+                topic,
+                &format!(
+                    "partition={partition} from_offset={from_offset} count={}",
+                    records.len()
+                ),
+            );
+            // Field policy read projection (SUM/tentabus/POLITYKI-POL.md,
+            // "hide only"): applied AFTER the audit above, so the browse
+            // audit trail still reflects the real record count regardless of
+            // what a policy later hides from the payload.
+            if let Some(projection) = self.read_projection(ctx, topic, &cfg)? {
+                for rec in records.iter_mut() {
+                    projection.apply(rec);
+                }
+            }
+        }
         Ok(PeekResult {
             records,
             high_watermark,
@@ -6708,18 +6757,24 @@ impl BusService {
     /// record whose offset lies in one of `runs` (each `start..end`,
     /// ascending and disjoint), and nothing between them — the ranges are
     /// read directly, so the records between two ranges are never fetched.
-    /// Unlike `peek` a range is read to its end (no record/byte budget
-    /// cuts it short), so a caller bounds the work by the ranges it passes.
-    /// Same authorization, leader rule, audit (one `bus.messages.browse`
-    /// row for the whole call) and field-policy projection as `peek`.
+    /// Unlike `peek` a range is read to its end (no record count cuts it
+    /// short), so a caller bounds the work by the ranges it passes; what
+    /// the result HOLDS is bounded by `payload_keep`: each payload is
+    /// projected through the reader's field policy and then cut to at most
+    /// `payload_keep` bytes (copied, so the fetched batch is freed), one
+    /// record at a time — a DLQ list keeps a preview, "Ponów wszystkie" only
+    /// the coordinates and headers. Same authorization, leader rule and
+    /// audit (one `bus.messages.browse` row for the whole call) as `peek`.
     pub fn peek_runs(
         &self,
         ctx: &BusCallContext,
         topic: &str,
         partition: u32,
         runs: &[std::ops::Range<u64>],
+        payload_keep: usize,
     ) -> Result<PeekResult, BusServiceError> {
         let (cfg, part) = self.peek_partition(ctx, topic, partition)?;
+        let projection = self.read_projection(ctx, topic, &cfg)?;
         let reader = part.open_reader();
         let high_watermark = reader.high_watermark();
         let earliest_offset = reader.earliest_offset();
@@ -6734,11 +6789,17 @@ impl BusService {
                 let before = cursor;
                 'batches: for view in &batches {
                     for rv in view.records_from(cursor) {
-                        let rec = fetched_record(topic, partition, view, rv?);
+                        let mut rec = fetched_record(topic, partition, view, rv?);
                         if rec.offset >= end {
                             break 'batches;
                         }
                         cursor = rec.offset + 1;
+                        if let Some(projection) = &projection {
+                            projection.apply(&mut rec);
+                        }
+                        if rec.payload.len() > payload_keep {
+                            rec.payload = Bytes::copy_from_slice(&rec.payload[..payload_keep]);
+                        }
                         records.push(rec);
                     }
                 }
@@ -6747,18 +6808,17 @@ impl BusService {
                 }
             }
         }
-
-        self.finish_peek(
-            ctx,
-            topic,
-            &cfg,
-            &format!(
-                "partition={partition} ranges={} count={}",
-                runs.len(),
-                records.len()
-            ),
-            &mut records,
-        )?;
+        if !records.is_empty() {
+            self.audit_browse(
+                ctx,
+                topic,
+                &format!(
+                    "partition={partition} ranges={} count={}",
+                    runs.len(),
+                    records.len()
+                ),
+            );
+        }
         Ok(PeekResult {
             records,
             high_watermark,
@@ -6798,41 +6858,36 @@ impl BusService {
         Ok((cfg, part))
     }
 
-    /// Audits a stateless read that returned records and projects them
-    /// through the reader's field policy (`peek`, `peek_runs`).
-    fn finish_peek(
-        &self,
-        ctx: &BusCallContext,
-        topic: &str,
-        cfg: &topics::TopicConfig,
-        audit_detail: &str,
-        records: &mut [FetchedRecordMeta],
-    ) -> Result<(), BusServiceError> {
-        if records.is_empty() {
-            // P3-5 follow-up: an empty read (nothing at/past the requested
-            // offsets on this partition) is not a data access and must not
-            // add to the `bus.messages.browse` audit trail (this is exactly
-            // what a multi-partition browse hits on every partition that
-            // has no records yet — see `peek`'s doc).
-            return Ok(());
-        }
+    /// The `bus.messages.browse` row of a stateless read that returned
+    /// records. P3-5 follow-up: a read that returned nothing is not a data
+    /// access and writes no row (see `peek`'s doc).
+    fn audit_browse(&self, ctx: &BusCallContext, topic: &str, detail: &str) {
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.actor.as_deref(),
             None,
             "bus.messages.browse",
             Some(topic),
-            Some(&audit_details(&ctx.org_id, Some(audit_detail))),
+            Some(&audit_details(&ctx.org_id, Some(detail))),
             None,
             None,
         );
+    }
 
-        // Field policy read projection (SUM/tentabus/POLITYKI-POL.md,
-        // "hide only"): applied AFTER the audit above, so the browse audit
-        // trail still reflects the real record count regardless of what a
-        // policy later hides from the payload. `None` costs one indexed
-        // point lookup and leaves every record untouched.
-        if let Some(policy) = field_policies::resolve(
+    /// The reader's field-policy READ projection of `topic`, `None` when no
+    /// rule restricts this reader (one indexed point lookup). A DLQ topic is
+    /// created without its source's content type (`dlq_topic_options`), and
+    /// its policy IS the source's (`field_policies::resolve`): the payload
+    /// is read in the source's format, or an HL7 or XML record would be
+    /// parsed as JSON and come back empty. Its error text falls under the
+    /// same rule (`dlq::hide_error_message`).
+    fn read_projection(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        cfg: &topics::TopicConfig,
+    ) -> Result<Option<ReadProjection>, BusServiceError> {
+        let Some(policy) = field_policies::resolve(
             &self.db,
             &self.instance_id,
             &ctx.org_id,
@@ -6840,27 +6895,20 @@ impl BusService {
             ctx.actor.as_deref().unwrap_or(""),
             field_policies::ActorKind::from_origin(&ctx.origin),
             field_policies::Direction::Read,
-        )? {
-            // A DLQ topic is created without its source's content type
-            // (`dlq_topic_options`), and its policy IS the source's
-            // (`field_policies::resolve`): the payload is read in the
-            // source's format, or an HL7 or XML record would be parsed as
-            // JSON and come back empty. Its error text falls under the same
-            // rule (`dlq::hide_error_message`).
-            let dlq_source = topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX);
-            let content_type = match dlq_source {
-                Some(source) => self.topic_config(&ctx.org_id, source)?.content_type,
-                None => cfg.content_type.clone(),
-            };
-            let format = payload_format::PayloadFormat::from_content_type(&content_type);
-            for rec in records.iter_mut() {
-                rec.payload = field_policies::project_read(&policy, format, &rec.payload);
-                if dlq_source.is_some() {
-                    dlq::hide_error_message(&mut rec.headers);
-                }
-            }
-        }
-        Ok(())
+        )?
+        else {
+            return Ok(None);
+        };
+        let dlq_source = topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX);
+        let content_type = match dlq_source {
+            Some(source) => self.topic_config(&ctx.org_id, source)?.content_type,
+            None => cfg.content_type.clone(),
+        };
+        Ok(Some(ReadProjection {
+            policy,
+            format: payload_format::PayloadFormat::from_content_type(&content_type),
+            dlq: dlq_source.is_some(),
+        }))
     }
 
     // ---- DLQ (PLAN §3.3) --------------------------------------------------
@@ -7132,7 +7180,21 @@ impl BusService {
     ///
     /// Leader-only, like every other change of a partition's state: the
     /// handled marker belongs to the DLQ partition, whose leader replicates
-    /// it to the partition's other copies (`note_dlq_handled`).
+    /// it to the partition's other copies (`note_dlq_handled`), and the
+    /// republish is a write to the source partition, which only its leader
+    /// accepts. The bus has no forwarding of a write to another node (a
+    /// producer redirects itself on `NotLeader`), so when the two partitions
+    /// are led by different nodes the retry is refused with
+    /// `DlqRetrySourceNotLeader`, naming the source partition's leader.
+    ///
+    /// The marker is written only when the message is back in its topic or
+    /// was sent back to the DLQ as a new record by the topic's validation
+    /// (`dlq_retry_settled`). A republish the topic's idempotency key drops
+    /// as a duplicate of the original (still inside the dedup window) is
+    /// refused with `DlqRetryDeduplicated` and the record stays listed:
+    /// that rule is the topic owner's promise that one key is delivered
+    /// once per window, and a retry is not exempt from it — it can be
+    /// retried once the window has passed.
     ///
     /// Exactly-once against a failure in the middle: the republish carries
     /// the record's own producer identity (`dlq::retry_producer_id`), so a
@@ -7212,6 +7274,18 @@ impl BusService {
                     partition_for_key(producer_id.as_bytes(), source_cfg.partitions)
                 }),
         };
+        if let Err(BusServiceError::NotLeader { leader_node_id, .. }) = check_leader_role(
+            &self.replication(),
+            &ctx.org_id,
+            source_topic,
+            target_partition,
+        ) {
+            return Err(BusServiceError::DlqRetrySourceNotLeader {
+                topic: source_topic.to_string(),
+                partition: target_partition,
+                leader_node_id,
+            });
+        }
         let retry_record = dlq::build_retry_record(&original, dlq_topic, dlq_offset);
         let result = self.publish(
             ctx,
@@ -7226,6 +7300,13 @@ impl BusService {
                 records: vec![retry_record],
             },
         )?;
+        if !dlq_retry_settled(&result) {
+            return Err(BusServiceError::DlqRetryDeduplicated {
+                topic: dlq_topic.to_string(),
+                partition: dlq_partition,
+                offset: dlq_offset,
+            });
+        }
         self.mark_dlq_handled(ctx, dlq_topic, dlq_partition, dlq_offset)?;
         let _ = crate::db::repository::log_audit(
             &self.db,
@@ -7355,8 +7436,45 @@ impl BusService {
             .partition_stats(ctx, dlq_topic, partition)
             .map(|s| s.earliest_offset)
             .unwrap_or(0);
+        self.handled_offsets(&ctx.org_id, dlq_topic, partition, earliest)
+    }
+
+    /// The handled markers of one DLQ partition at or above `earliest`,
+    /// after dropping those below it together with the retry producer
+    /// identities (`dlq::retry_producer_id`) of the records they named:
+    /// retention removed those records, so no retry of them can come again
+    /// and their `producer_seq` entries would otherwise stay forever. A
+    /// retry landed on one source partition, not known here, so each
+    /// partition's entry is removed (a point delete each).
+    fn handled_offsets(
+        &self,
+        org_id: &str,
+        dlq_topic: &str,
+        partition: u32,
+        earliest: u64,
+    ) -> Result<std::collections::HashSet<u64>, BusServiceError> {
+        let pruned = self
+            .discarded
+            .prune_below(org_id, dlq_topic, partition, earliest)?;
+        if !pruned.is_empty() {
+            if let Some(source_topic) = dlq_topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX) {
+                let dlq_generation = self.topic_config(org_id, dlq_topic)?.generation;
+                let source_partitions = self.topic_config(org_id, source_topic)?.partitions;
+                for offset in pruned {
+                    let producer_id = dlq::retry_producer_id(dlq_generation, partition, offset);
+                    for source_partition in 0..source_partitions {
+                        self.producer_seq.remove(
+                            org_id,
+                            source_topic,
+                            source_partition,
+                            &producer_id,
+                        )?;
+                    }
+                }
+            }
+        }
         self.discarded
-            .discarded_offsets(&ctx.org_id, dlq_topic, partition, earliest)
+            .discarded_offsets(org_id, dlq_topic, partition, earliest)
     }
 
     // ---- Group administration (PLAN §8.2 `bus.group.pause`) --------------
@@ -11480,6 +11598,157 @@ mod tests {
         );
     }
 
+    /// A republish the source topic's idempotency key drops as a duplicate
+    /// of the original leaves nothing anywhere: the retry is refused and the
+    /// record stays listed instead of being marked handled and lost.
+    #[test]
+    fn a_retry_dropped_by_the_idempotency_key_keeps_the_record_listed() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.retry-dedup";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                idempotency_key: Some("payload.order_id".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fail_to_dlq(&svc, &ctx, topic, &[r#"{"order_id":"a"}"#]);
+        let dlq_topic = dlq::dlq_topic_name(topic);
+
+        match svc.dlq_retry(&ctx, &dlq_topic, 0, 0) {
+            Err(BusServiceError::DlqRetryDeduplicated { offset: 0, .. }) => {}
+            other => panic!("expected DlqRetryDeduplicated, got {other:?}"),
+        }
+        assert!(!svc
+            .discarded
+            .is_discarded("org-1", &dlq_topic, 0, 0)
+            .unwrap());
+        assert_eq!(
+            svc.partition_stats(&ctx, topic, 0).unwrap().high_watermark,
+            1
+        );
+    }
+
+    /// The republish is a write to the source partition, which only its
+    /// leader accepts and no node forwards: led elsewhere, the retry is
+    /// refused naming that leader, and nothing is marked.
+    #[test]
+    fn a_retry_names_the_source_partitions_leader_when_this_node_is_not_it() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.retry-source-leader";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fail_to_dlq(&svc, &ctx, topic, &["a"]);
+        let dlq_topic = dlq::dlq_topic_name(topic);
+        let coord = FakeCoordinator::leader(1);
+        coord.topic_roles.lock().insert(
+            topic.to_string(),
+            PartitionRole::Follower {
+                leader_node_id: "node-b".to_string(),
+                epoch: 1,
+            },
+        );
+        svc.set_replication(coord.clone());
+
+        match svc.dlq_retry(&ctx, &dlq_topic, 0, 0) {
+            Err(BusServiceError::DlqRetrySourceNotLeader {
+                partition: 0,
+                leader_node_id,
+                ..
+            }) => assert_eq!(leader_node_id.as_deref(), Some("node-b")),
+            other => panic!("expected DlqRetrySourceNotLeader, got {other:?}"),
+        }
+        assert!(coord.note_dlq_handled_calls.lock().is_empty());
+    }
+
+    /// When retention removes a retried DLQ record, its handled marker goes
+    /// and so does the retry's producer identity in `producer_seq` — no
+    /// retry of that record can come again, and the entry would otherwise
+    /// stay forever.
+    #[test]
+    fn a_retry_identity_expires_with_its_dlq_record() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.retry-expiry";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(2),
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fail_to_dlq(&svc, &ctx, topic, &["a"]);
+        let dlq_topic = dlq::dlq_topic_name(topic);
+        let dlq_partition = (0..2)
+            .find(|&p| {
+                svc.partition_stats(&ctx, &dlq_topic, p)
+                    .unwrap()
+                    .high_watermark
+                    > 0
+            })
+            .expect("the failure reached the DLQ");
+        svc.dlq_retry(&ctx, &dlq_topic, dlq_partition, 0).unwrap();
+        let generation = svc.topic_config("org-1", &dlq_topic).unwrap().generation;
+        let producer_id = dlq::retry_producer_id(generation, dlq_partition, 0);
+        assert!(svc.producer_seq.contains("org-1", topic, 0, &producer_id));
+
+        // Retention moved the DLQ partition's floor past the record.
+        let live = svc
+            .handled_offsets("org-1", &dlq_topic, dlq_partition, 1)
+            .unwrap();
+        assert!(live.is_empty());
+        assert!(!svc.producer_seq.contains("org-1", topic, 0, &producer_id));
+    }
+
+    /// `peek_runs` keeps at most `payload_keep` bytes of each payload, so
+    /// what a list or "Ponów wszystkie" holds is bounded however large the
+    /// messages are.
+    #[test]
+    fn peek_runs_keeps_only_the_asked_part_of_each_payload() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.peek-runs-keep";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        svc.publish(
+            &ctx,
+            topic,
+            PublishBatch {
+                partition: Some(0),
+                producer: None,
+                records: vec![record(&"x".repeat(10_000)), record("short")],
+            },
+        )
+        .unwrap();
+        let read = svc.peek_runs(&ctx, topic, 0, &[0..2], 8).unwrap();
+        let lens: Vec<usize> = read.records.iter().map(|r| r.payload.len()).collect();
+        assert_eq!(lens, vec![8, 5]);
+    }
+
     /// The republish is keyed by the DLQ record itself
     /// (`dlq::retry_producer_id`): when it reached the source topic but the
     /// handled marker did not (a crash or a failed marker write in between —
@@ -15461,12 +15730,16 @@ mod tests {
         local_node_id: parking_lot::Mutex<String>,
         /// Overrides `role` for single partitions.
         partition_roles: parking_lot::Mutex<std::collections::HashMap<u32, PartitionRole>>,
+        /// Overrides `role` for every partition of one topic; wins over
+        /// `partition_roles`.
+        topic_roles: parking_lot::Mutex<std::collections::HashMap<String, PartitionRole>>,
     }
 
     impl FakeCoordinator {
         fn leader(epoch: u32) -> Arc<Self> {
             Arc::new(Self {
                 partition_roles: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                topic_roles: parking_lot::Mutex::new(std::collections::HashMap::new()),
                 role: parking_lot::Mutex::new(PartitionRole::Leader { epoch }),
                 preflight_err: parking_lot::Mutex::new(None),
                 await_outcome: parking_lot::Mutex::new(AckOutcome {
@@ -15511,7 +15784,10 @@ mod tests {
     }
 
     impl ReplicationCoordinator for FakeCoordinator {
-        fn role(&self, _org: &str, _topic: &str, partition: u32) -> PartitionRole {
+        fn role(&self, _org: &str, topic: &str, partition: u32) -> PartitionRole {
+            if let Some(role) = self.topic_roles.lock().get(topic) {
+                return role.clone();
+            }
             match self.partition_roles.lock().get(&partition) {
                 Some(role) => role.clone(),
                 None => self.role.lock().clone(),

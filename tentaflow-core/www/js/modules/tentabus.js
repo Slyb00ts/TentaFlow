@@ -152,7 +152,9 @@ function mapBusErrorMessage(message, translate) {
       // nothing convention as the rest of this function, so a coordinator
       // who has not pasted the M2 i18n block yet gets the plain generic
       // message instead of a literal dotted key glued onto it).
-      if (code === 'not_leader') {
+      // The retry of an unprocessed message names the leader of the topic
+      // partition it goes back to the same way.
+      if (code === 'not_leader' || code === 'dlq_retry_source_not_leader') {
         const hintNode = extractNotLeaderHint(message);
         if (hintNode) {
           const hintText = translate('errors.not_leader_hint', { node: hintNode });

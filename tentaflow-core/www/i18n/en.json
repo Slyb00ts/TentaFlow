@@ -10878,7 +10878,9 @@
       "authorizer_instance_mismatch": "The permission check is wired to a different TentaBus instance than the engine — a server-side configuration error.",
       "invalid_instance_id": "Invalid TentaBus instance id.",
       "replication_internal_error": "Internal server-side replication error.",
-      "dlq_record_handled": "This message was already retried or discarded — refresh the list."
+      "dlq_record_handled": "This message was already retried or discarded — refresh the list.",
+      "dlq_retry_deduplicated": "The topic delivers a message once per window and this one was already delivered in it — it can be retried once the window has passed. The message stays on the list.",
+      "dlq_retry_source_not_leader": "This node does not lead the topic partition the message goes back to — retry it on the node that leads it."
     },
     "shell": {
       "instance": "Instance",

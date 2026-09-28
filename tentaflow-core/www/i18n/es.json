@@ -9643,7 +9643,9 @@
       "authorizer_instance_mismatch": "La comprobación de permisos está conectada a una instancia de TentaBus distinta del motor — error de configuración en el servidor.",
       "invalid_instance_id": "Identificador de instancia de TentaBus no válido.",
       "replication_internal_error": "Error interno de replicación en el servidor.",
-      "dlq_record_handled": "Este mensaje ya se reintentó o descartó — actualice la lista."
+      "dlq_record_handled": "Este mensaje ya se reintentó o descartó — actualice la lista.",
+      "dlq_retry_deduplicated": "El topic entrega un mensaje una vez por ventana y este ya se entregó en ella: podrá reintentarse cuando pase la ventana. El mensaje sigue en la lista.",
+      "dlq_retry_source_not_leader": "Este node no dirige la partición del topic a la que vuelve el mensaje: reinténtalo en el node que la dirige."
     },
     "shell": {
       "instance": "Instancia",

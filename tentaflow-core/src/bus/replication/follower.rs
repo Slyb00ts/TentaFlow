@@ -607,7 +607,19 @@ where
                         }
                     }
                     ReplFrame::Offsets(offsets) => {
-                        apply_offsets(&stores, &expected.org_id, &expected.topic, offsets)?;
+                        // fjall writes with an fsync per frame: on the
+                        // blocking pool, not on this stream's task.
+                        let (stores, org_id, topic) =
+                            (stores.clone(), expected.org_id.clone(), expected.topic.clone());
+                        tokio::task::spawn_blocking(move || {
+                            apply_offsets(&stores, &org_id, &topic, offsets)
+                        })
+                        .await
+                        .map_err(|e| {
+                            FollowerError::Store(BusServiceError::Fjall(format!(
+                                "applying an Offsets frame did not finish: {e}"
+                            )))
+                        })??;
                     }
                     ReplFrame::LeoQuery(_query) => {
                         let reply = ReplLeoReply {
@@ -795,11 +807,9 @@ fn apply_offsets(
             .offsets
             .set_delivery_attempts(org_id, &group, topic, partition, offset, attempts, None)?;
     }
-    for (partition, offset) in frame.discarded {
-        stores
-            .discarded
-            .mark(org_id, topic, partition, offset, now)?;
-    }
+    stores
+        .discarded
+        .mark_many(org_id, topic, &frame.discarded, now)?;
     Ok(())
 }
 
