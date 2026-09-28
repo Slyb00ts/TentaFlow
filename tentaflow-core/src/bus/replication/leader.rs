@@ -229,6 +229,32 @@ pub struct OutboundBatchMeta {
 /// `OutboundBatchMeta::default()` (no producer mark on any batch).
 pub type ProducerMarkLookup = Arc<dyn Fn(u64) -> OutboundBatchMeta + Send + Sync>;
 
+/// Every handled-record marker (`dlq::DiscardStore`) of the DLQ partition
+/// this leader streams, at or above the given earliest retained offset. A
+/// marker note (`OffsetNote::Discarded`) reaches only the streams open when
+/// it is written, so each follower stream sends this whole set when it
+/// starts and again whenever it missed notes (`RecvError::Lagged`): a
+/// follower that was away still ends up with every marker. `None` for a
+/// partition that is not a DLQ partition.
+pub type HandledOffsetsLookup = Arc<dyn Fn(u64) -> Vec<u64> + Send + Sync>;
+
+/// Queues `lookup`'s full marker set of `partition` for the next `Offsets`
+/// frame (`HandledOffsetsLookup`'s doc).
+fn queue_handled_offsets(
+    lookup: &Option<HandledOffsetsLookup>,
+    partition: u32,
+    earliest_offset: u64,
+    pending_discards: &mut Vec<(u32, u64)>,
+) {
+    if let Some(lookup) = lookup {
+        pending_discards.extend(
+            lookup(earliest_offset)
+                .into_iter()
+                .map(|offset| (partition, offset)),
+        );
+    }
+}
+
 fn compute_min_isr(replica_count: usize) -> u32 {
     (replica_count as u32) / 2 + 1
 }
@@ -1148,6 +1174,7 @@ pub async fn run_follower_stream<R, W>(
     reader: R,
     mut writer: W,
     producer_mark: Option<ProducerMarkLookup>,
+    handled_offsets: Option<HandledOffsetsLookup>,
     mut truncate_rx: mpsc::UnboundedReceiver<u64>,
 ) -> Result<(), FollowerStreamError>
 where
@@ -1265,6 +1292,12 @@ where
     let mut inflight = InFlightTracker::default();
     let mut pending_commits: Vec<(String, u32, u64, u32)> = Vec::new();
     let mut pending_discards: Vec<(u32, u64)> = Vec::new();
+    queue_handled_offsets(
+        &handled_offsets,
+        leader.partition_id(),
+        reader_handle.earliest_offset(),
+        &mut pending_discards,
+    );
     let mut last_frame_sent_at = Instant::now();
     // The highest `hw` any frame on this stream has carried: the follower
     // applies it monotonically, so anything at or below it is old news.
@@ -1371,7 +1404,16 @@ where
                         // K-M2-5 already tolerates a bounded replication
                         // delay; a burst that outran this channel's
                         // capacity just merges into the next coalesced
-                        // frame instead of being replayed note-by-note.
+                        // frame instead of being replayed note-by-note. A
+                        // later commit supersedes a lost one, a lost
+                        // handled-record marker nothing would resend — the
+                        // whole marker set goes out again instead.
+                        queue_handled_offsets(
+                            &handled_offsets,
+                            leader.partition_id(),
+                            reader_handle.earliest_offset(),
+                            &mut pending_discards,
+                        );
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // `leader` outlives this task in every real
@@ -1513,7 +1555,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let hello = match read_frame(&mut foll_r).await.unwrap() {
@@ -1563,7 +1605,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -1611,7 +1653,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -1673,7 +1715,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -1734,7 +1776,7 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f2".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f2".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -2056,7 +2098,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -2131,7 +2173,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -2640,7 +2682,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -2693,7 +2735,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -2765,7 +2807,7 @@ mod tests {
         let (_tx, rx) = mpsc::unbounded_channel();
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -2846,7 +2888,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -2894,6 +2936,70 @@ mod tests {
         let _ = handle.await;
     }
 
+    /// A follower stream of a DLQ partition starts by sending every handled
+    /// marker the partition already has, so a follower that was away when a
+    /// marker was noted (the note reaches only the streams open then) still
+    /// receives it.
+    #[tokio::test]
+    async fn a_follower_stream_starts_with_every_handled_marker() {
+        let part = temp_partition("handled-resync");
+        let mut config = fast_config();
+        config.heartbeat_interval = Duration::from_secs(10);
+        let leader = make_leader(part, &["leader", "f1"], Acks::Quorum, config);
+        // Written while no stream was open: no note will ever carry it.
+        leader.note_offset_discarded(4);
+        let ((leader_r, leader_w), (mut foll_r, mut foll_w)) = split_duplex();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let lookup: HandledOffsetsLookup = Arc::new(|_earliest| vec![4, 7]);
+
+        let leader2 = leader.clone();
+        let handle = tokio::spawn(async move {
+            run_follower_stream(
+                leader2,
+                "f1".into(),
+                leader_r,
+                leader_w,
+                None,
+                Some(lookup),
+                rx,
+            )
+            .await
+        });
+
+        let _hello = read_frame(&mut foll_r).await.unwrap();
+        write_frame(
+            &mut foll_w,
+            &ReplFrame::HelloAck(ReplHelloAck {
+                accepted: true,
+                follower_leo: 0,
+                follower_hw: 0,
+                follower_epoch: TEST_EPOCH,
+                environment: NodeEnvironment::Prod,
+                reject: None,
+                follower_log_epoch: None,
+                follower_committed: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let frame = tokio::time::timeout(Duration::from_millis(500), read_frame(&mut foll_r))
+            .await
+            .expect("timed out waiting for Offsets")
+            .unwrap();
+        match frame {
+            ReplFrame::Offsets(offsets) => {
+                assert!(offsets.commits.is_empty());
+                assert_eq!(offsets.discarded, vec![(0, 4), (0, 7)]);
+            }
+            other => panic!("expected Offsets, got {other:?}"),
+        }
+
+        drop(foll_r);
+        drop(foll_w);
+        let _ = handle.await;
+    }
+
     #[tokio::test]
     async fn truncate_request_is_forwarded_with_the_current_epoch() {
         let part = temp_partition("truncate");
@@ -2903,7 +3009,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();
@@ -2954,7 +3060,7 @@ mod tests {
 
         let leader2 = leader.clone();
         let handle = tokio::spawn(async move {
-            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, rx).await
+            run_follower_stream(leader2, "f1".into(), leader_r, leader_w, None, None, rx).await
         });
 
         let _hello = read_frame(&mut foll_r).await.unwrap();

@@ -141,17 +141,22 @@ test('findTopicStats returns null when the topic is not (yet) in the snapshot', 
 // a topic's unprocessed messages.
 // ---------------------------------------------------------------------------
 
-test('buildFromOffsetsForNextPage carries forward only partitions that reported hasMore', () => {
+test('buildFromOffsetsForNextPage carries every partition forward, an exhausted one at its own bound', () => {
+  // Partition 1 has nothing left below 30: without its cursor the server
+  // would start it at its high watermark and list its newest messages again.
   const partitions = [
     { partition: 0, earliestOffset: 0, highWatermark: 500, nextOffset: 150, hasMore: true },
-    { partition: 1, earliestOffset: 0, highWatermark: 30, nextOffset: 30, hasMore: false },
+    { partition: 1, earliestOffset: 0, highWatermark: 60, nextOffset: 30, hasMore: false },
   ];
-  assert.deepEqual(helpers.buildFromOffsetsForNextPage(partitions), [{ partition: 0, offset: 150 }]);
+  assert.deepEqual(helpers.buildFromOffsetsForNextPage(partitions), [
+    { partition: 0, offset: 150 },
+    { partition: 1, offset: 30 },
+  ]);
 });
 
-test('buildFromOffsetsForNextPage returns an empty array once every partition is exhausted', () => {
-  assert.deepEqual(helpers.buildFromOffsetsForNextPage([{ partition: 0, hasMore: false, nextOffset: 10 }]), []);
+test('buildFromOffsetsForNextPage returns an empty array without partitions', () => {
   assert.deepEqual(helpers.buildFromOffsetsForNextPage(null), []);
+  assert.deepEqual(helpers.buildFromOffsetsForNextPage([]), []);
 });
 
 // ---------------------------------------------------------------------------

@@ -34,7 +34,7 @@ use super::frames::{
     read_frame, write_frame, FrameReader, ReplAck, ReplCodecError, ReplFrame, ReplHello,
     ReplHelloAck, ReplLeoReply, ReplOffsets, ReplReject,
 };
-use crate::bus::dlq::{self, DiscardStore};
+use crate::bus::dlq::DiscardStore;
 use crate::bus::groups::GroupOffsetStore;
 use crate::bus::producer::{ProducerIdentity, ProducerSeqStore};
 use crate::bus::BusServiceError;
@@ -746,7 +746,10 @@ async fn send_ack<W: AsyncWrite + Unpin>(
 /// DLQ-discard stores. `org_id`/`topic` come from this stream's `Hello`
 /// context — the frame itself carries neither (it is already scoped to one
 /// (org, topic, partition) stream), only `group`/`partition`/`offset`/
-/// `attempts` per commit and `partition`/`offset` per discard.
+/// `attempts` per commit and `partition`/`offset` per discard. A discard
+/// names a record of THIS stream's own partition: DLQ records are handled
+/// on the leader of their DLQ partition and ride that partition's stream
+/// (`ReplicationCoordinator::note_dlq_handled`).
 ///
 /// OFFSET MONOTONICITY (K-M2-1/K-M2-5 "never regress"): this calls
 /// `GroupOffsetStore::commit`, which already rejects `offset < committed`
@@ -792,13 +795,10 @@ fn apply_offsets(
             .offsets
             .set_delivery_attempts(org_id, &group, topic, partition, offset, attempts, None)?;
     }
-    if !frame.discarded.is_empty() {
-        let dlq_topic = dlq::dlq_topic_name(topic);
-        for (partition, offset) in frame.discarded {
-            stores
-                .discarded
-                .mark(org_id, &dlq_topic, partition, offset, now)?;
-        }
+    for (partition, offset) in frame.discarded {
+        stores
+            .discarded
+            .mark(org_id, topic, partition, offset, now)?;
     }
     Ok(())
 }
@@ -2037,10 +2037,7 @@ mod tests {
             10,
             "committed offset must stay at the forward value, never regress to 4"
         );
-        assert!(stores
-            .discarded
-            .is_discarded(ORG, &dlq::dlq_topic_name(TOPIC), PART, 3)
-            .unwrap());
+        assert!(stores.discarded.is_discarded(ORG, TOPIC, PART, 3).unwrap());
 
         drop(leader);
         let _ = handle.await.unwrap();

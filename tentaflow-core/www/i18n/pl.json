@@ -11706,6 +11706,7 @@
         "truncated": "pokazano początek treści",
         "blob": "Treść to załączony plik: {size}, {mime}.",
         "rules": "Obowiązują tu te same zasady ukrywania danych co na topiku, z którego wiadomość pochodzi.",
+        "error_hidden": "ukryty przez zasady ukrywania danych tego topiku",
         "audit": "Odczyt nieprzetworzonych wiadomości zapisuje się w dzienniku audytu.",
         "close": "Zamknij"
       },

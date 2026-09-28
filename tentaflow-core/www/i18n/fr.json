@@ -10471,6 +10471,7 @@
         "truncated": "le début du contenu est affiché",
         "blob": "Le contenu est un fichier joint : {size}, {mime}.",
         "rules": "Les mêmes règles de masquage des données s'appliquent ici que dans le topic d'où provient le message.",
+        "error_hidden": "masqué par les règles de masquage des données de ce topic",
         "audit": "La lecture des messages non traités est inscrite au journal d'audit.",
         "close": "Fermer"
       },

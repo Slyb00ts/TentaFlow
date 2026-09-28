@@ -10471,6 +10471,7 @@
         "truncated": "se muestra el comienzo del contenido",
         "blob": "El contenido es un archivo adjunto: {size}, {mime}.",
         "rules": "Aquí se aplican las mismas reglas de ocultación de datos que en el topic del que procede el mensaje.",
+        "error_hidden": "oculto por las reglas de ocultación de datos de este topic",
         "audit": "La lectura de mensajes sin procesar se registra en el registro de auditoría.",
         "close": "Cerrar"
       },

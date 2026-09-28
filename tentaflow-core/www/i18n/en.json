@@ -11706,6 +11706,7 @@
         "truncated": "the beginning of the body is shown",
         "blob": "The body is an attached file: {size}, {mime}.",
         "rules": "The same data-hiding rules apply here as on the topic the message comes from.",
+        "error_hidden": "hidden by this topic's data-hiding rules",
         "audit": "Reading unprocessed messages is recorded in the audit log.",
         "close": "Close"
       },

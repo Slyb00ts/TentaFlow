@@ -52,7 +52,8 @@ use crate::bus::replication::follower::{
 };
 use crate::bus::replication::frames::{ReplHello, ReplProducerMark, ReplReject};
 use crate::bus::replication::leader::{
-    self, FollowerStreamError, LeaderConfig, OutboundBatchMeta, PartitionLeader, ProducerMarkLookup,
+    self, FollowerStreamError, HandledOffsetsLookup, LeaderConfig, OutboundBatchMeta,
+    PartitionLeader, ProducerMarkLookup,
 };
 use crate::bus::replication::manager::{
     BusRecv, BusSend, FollowerRunner, FollowerRunnerFactory, LeaderHandle, LeaderHandleFactory,
@@ -521,6 +522,45 @@ fn producer_mark_lookup(
     })
 }
 
+/// `leader::HandledOffsetsLookup` of a DLQ partition over this node's own
+/// marker store, `None` for any other partition. Best-effort like
+/// `producer_mark_lookup`: a torn-down engine or an unreadable store sends
+/// no markers this time, and the next stream start or lag sends them again.
+fn handled_offsets_lookup(
+    provider: Weak<dyn PartitionProvider>,
+    org: String,
+    topic: String,
+    partition: u32,
+) -> Option<HandledOffsetsLookup> {
+    if !topic.starts_with(crate::bus::dlq::DLQ_TOPIC_PREFIX) {
+        return None;
+    }
+    Some(Arc::new(move |earliest_offset| {
+        let Some(provider) = provider.upgrade() else {
+            return Vec::new();
+        };
+        match provider.follower_stores().discarded.discarded_offsets(
+            &org,
+            &topic,
+            partition,
+            earliest_offset,
+        ) {
+            Ok(offsets) => {
+                let mut offsets: Vec<u64> = offsets.into_iter().collect();
+                offsets.sort_unstable();
+                offsets
+            }
+            Err(e) => {
+                tracing::warn!(
+                    org_id = %org, topic = %topic, partition, error = %e,
+                    "replication: reading the DLQ partition's handled markers failed"
+                );
+                Vec::new()
+            }
+        }
+    }))
+}
+
 /// One follower's reconnect-supervised stream lifecycle (module doc's
 /// "DIAL DIRECTION / RECONNECT OWNERSHIP" section): runs `leader::
 /// run_follower_stream` to completion, then either stops for good
@@ -583,12 +623,20 @@ fn spawn_follower_supervisor(
                 partition_id,
             );
 
+            let handled_lookup = handled_offsets_lookup(
+                Weak::clone(&provider),
+                org_id.clone(),
+                topic.clone(),
+                partition_id,
+            );
+
             let result = leader::run_follower_stream(
                 Arc::clone(&shared.leader),
                 node_id.clone(),
                 recv,
                 send,
                 Some(mark_lookup),
+                handled_lookup,
                 truncate_rx,
             )
             .await;

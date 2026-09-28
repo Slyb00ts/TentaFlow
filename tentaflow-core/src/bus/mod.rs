@@ -581,7 +581,7 @@ fn write_windowed_audit(
 /// major versions, so a routine `cargo update` could have remapped live
 /// data. `blake3` has no such disclaimer and is exercised here purely as a
 /// fixed bit-mixing function, not for any cryptographic property.
-fn partition_for_key(key: &[u8], partitions: u32) -> u32 {
+pub(crate) fn partition_for_key(key: &[u8], partitions: u32) -> u32 {
     let hash = blake3::hash(key);
     let mut first8 = [0u8; 8];
     first8.copy_from_slice(&hash.as_bytes()[..8]);
@@ -1254,6 +1254,35 @@ fn max_groups_exceeded(org_id: &str, max: u32, current: u32) -> BusServiceError 
 /// `Throttled` keeps its existing translation (dropping the returned batch
 /// bytes, which every caller of this function already owns a copy of).
 /// Every other variant passes through as `Engine`.
+/// Whether a `dlq_retry` put the record back into its source topic: appended
+/// now, or found already appended by an earlier attempt (`duplicate` — the
+/// record's producer identity, `dlq::retry_producer_id`). A record the
+/// topic's validation rejected again was sent back to the DLQ as a new
+/// record instead (`schema_rejected`), which is not a retry that happened.
+pub fn dlq_republished(result: &PublishResult) -> bool {
+    result.accepted > 0 || result.duplicate
+}
+
+/// One engine record of `view` as the `FetchedRecordMeta` a stateless read
+/// (`BusService::peek`, `BusService::peek_runs`) returns.
+fn fetched_record(
+    topic: &str,
+    partition: u32,
+    view: &tentaflow_bus::BatchView,
+    rv: tentaflow_bus::RecordView,
+) -> FetchedRecordMeta {
+    FetchedRecordMeta {
+        topic: topic.to_string(),
+        partition,
+        offset: view.header().base_offset + rv.offset_delta as u64,
+        timestamp_ms: view.header().base_timestamp_ms + rv.ts_delta_ms as i64,
+        key: rv.key,
+        headers: rv.headers.into_iter().collect(),
+        payload: rv.payload,
+        schema_id: rv.schema_id,
+    }
+}
+
 fn map_engine_error(err: tentaflow_bus::BusError, topic: &str, partition: u32) -> BusServiceError {
     match err {
         tentaflow_bus::BusError::PartitionDetached => BusServiceError::TopicNotFound {
@@ -1849,13 +1878,14 @@ pub trait ReplicationCoordinator: Send + Sync {
         offset: u64,
         attempts: u32,
     );
-    /// Records that the DLQ record at `(dlq_partition, offset)` of
-    /// `__dlq.<source_topic>` was retried or discarded, so the followers
-    /// stop listing it too. It rides the `ReplOffsets` stream of the SOURCE
-    /// topic's partition with the same number (the follower applies it to
-    /// `__dlq.<source_topic>`), and only a node leading that partition has
-    /// a stream to send it on.
-    fn note_dlq_handled(&self, org: &str, source_topic: &str, dlq_partition: u32, offset: u64);
+    /// Records that the DLQ record at `(partition, offset)` of `dlq_topic`
+    /// was retried or discarded, so the partition's other copies stop
+    /// listing it too. It rides the `ReplOffsets` stream of that DLQ
+    /// partition itself — whose followers are exactly the nodes holding a
+    /// copy of the record — and a follower stream (re)started later is
+    /// first sent every marker of the partition, so one that was away when
+    /// the marker was written still receives it.
+    fn note_dlq_handled(&self, org: &str, dlq_topic: &str, partition: u32, offset: u64);
     /// Removes `node_id` from every replica set it belongs to (PLAN §4.4:
     /// environment-change fencing) — returns the number of assignments
     /// touched.
@@ -2540,7 +2570,9 @@ pub struct BusService {
 /// counts as a replica even when the snapshot has no OTHER same-env peer yet
 /// (a brand-new single-node mesh).
 fn healthy_node_count(same_env_peers: usize) -> u32 {
-    u32::try_from(same_env_peers).unwrap_or(u32::MAX).saturating_add(1)
+    u32::try_from(same_env_peers)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
 }
 
 /// Owner decision `9l-a-rf-default`: RF = min(3, nodes in the environment).
@@ -5932,8 +5964,8 @@ impl BusService {
             if discarded.contains(&offset) {
                 continue;
             }
-            last_arrival_ms = read_record_stamp(reader, offset, dlq_topic, partition)?
-                .map(|s| s.arrival_ms);
+            last_arrival_ms =
+                read_record_stamp(reader, offset, dlq_topic, partition)?.map(|s| s.arrival_ms);
             break;
         }
 
@@ -6041,11 +6073,16 @@ impl BusService {
     ) -> Result<(Vec<lag_history::GroupSeries>, Vec<lag_history::DlqSeries>), BusServiceError> {
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
-        let readable = |t: &str| self.authorizer.authorize(ctx, BusAction::Consume, t).is_ok();
-        let groups = lag_history::group_series(&self.local_db, &ctx.org_id, since_ms, topic, group)?
-            .into_iter()
-            .filter(|s| readable(&s.topic))
-            .collect();
+        let readable = |t: &str| {
+            self.authorizer
+                .authorize(ctx, BusAction::Consume, t)
+                .is_ok()
+        };
+        let groups =
+            lag_history::group_series(&self.local_db, &ctx.org_id, since_ms, topic, group)?
+                .into_iter()
+                .filter(|s| readable(&s.topic))
+                .collect();
         let dlqs = if group.is_some() {
             Vec::new()
         } else {
@@ -6168,10 +6205,13 @@ impl BusService {
             let mut committed_total = 0u64;
             let mut complete = true;
             for p in 0..cfg.partitions {
-                let committed = self
-                    .offsets
-                    .committed_offset(&row.org_id, &row.group_id, &row.topic, p);
-                match (self.passive_partition_offsets(&row.org_id, &row.topic, p), committed) {
+                let committed =
+                    self.offsets
+                        .committed_offset(&row.org_id, &row.group_id, &row.topic, p);
+                match (
+                    self.passive_partition_offsets(&row.org_id, &row.topic, p),
+                    committed,
+                ) {
                     (Some((_, high_watermark)), Ok(committed)) => {
                         lag_total += high_watermark.saturating_sub(committed);
                         committed_total += committed;
@@ -6626,6 +6666,115 @@ impl BusService {
         max_records: usize,
         max_bytes: usize,
     ) -> Result<PeekResult, BusServiceError> {
+        let (cfg, part) = self.peek_partition(ctx, topic, partition)?;
+        let max_records = max_records.min(PEEK_MAX_RECORDS);
+        let max_bytes = max_bytes.min(PEEK_MAX_BYTES);
+
+        let reader = part.open_reader();
+        let high_watermark = reader.high_watermark();
+        let earliest_offset = reader.earliest_offset();
+        let batches = reader
+            .fetch_from_offset(from_offset, max_bytes)
+            .map_err(|e| map_engine_error(e, topic, partition))?;
+
+        let mut records = Vec::new();
+        'batches: for view in &batches {
+            for rv in view.records_from(from_offset) {
+                if records.len() >= max_records {
+                    break 'batches;
+                }
+                records.push(fetched_record(topic, partition, view, rv?));
+            }
+        }
+
+        self.finish_peek(
+            ctx,
+            topic,
+            &cfg,
+            &format!(
+                "partition={partition} from_offset={from_offset} count={}",
+                records.len()
+            ),
+            &mut records,
+        )?;
+        Ok(PeekResult {
+            records,
+            high_watermark,
+            earliest_offset,
+        })
+    }
+
+    /// `peek` over several offset ranges of one partition at once: every
+    /// record whose offset lies in one of `runs` (each `start..end`,
+    /// ascending and disjoint), and nothing between them — the ranges are
+    /// read directly, so the records between two ranges are never fetched.
+    /// Unlike `peek` a range is read to its end (no record/byte budget
+    /// cuts it short), so a caller bounds the work by the ranges it passes.
+    /// Same authorization, leader rule, audit (one `bus.messages.browse`
+    /// row for the whole call) and field-policy projection as `peek`.
+    pub fn peek_runs(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+        runs: &[std::ops::Range<u64>],
+    ) -> Result<PeekResult, BusServiceError> {
+        let (cfg, part) = self.peek_partition(ctx, topic, partition)?;
+        let reader = part.open_reader();
+        let high_watermark = reader.high_watermark();
+        let earliest_offset = reader.earliest_offset();
+        let mut records = Vec::new();
+        for run in runs {
+            let mut cursor = run.start.max(earliest_offset);
+            let end = run.end.min(high_watermark);
+            while cursor < end {
+                let batches = reader
+                    .fetch_from_offset(cursor, PEEK_MAX_BYTES)
+                    .map_err(|e| map_engine_error(e, topic, partition))?;
+                let before = cursor;
+                'batches: for view in &batches {
+                    for rv in view.records_from(cursor) {
+                        let rec = fetched_record(topic, partition, view, rv?);
+                        if rec.offset >= end {
+                            break 'batches;
+                        }
+                        cursor = rec.offset + 1;
+                        records.push(rec);
+                    }
+                }
+                if cursor == before {
+                    break;
+                }
+            }
+        }
+
+        self.finish_peek(
+            ctx,
+            topic,
+            &cfg,
+            &format!(
+                "partition={partition} ranges={} count={}",
+                runs.len(),
+                records.len()
+            ),
+            &mut records,
+        )?;
+        Ok(PeekResult {
+            records,
+            high_watermark,
+            earliest_offset,
+        })
+    }
+
+    /// The checks every stateless read makes before touching a partition
+    /// (`peek`, `peek_runs`): `Consume` on the topic, its environment, the
+    /// partition in range, and this node leading it.
+    fn peek_partition(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        partition: u32,
+    ) -> Result<(topics::TopicConfig, tentaflow_bus::Partition), BusServiceError> {
         self.check_instance(ctx)?;
         topics::validate_org_id(&ctx.org_id)?;
         self.authorizer
@@ -6645,99 +6794,73 @@ impl BusService {
         // M2 (PLAN-M2 §1e): `peek` is a read, same as `fetch` — leader-only
         // under the same rule.
         check_leader_role(&self.replication(), &ctx.org_id, topic, partition)?;
-        let max_records = max_records.min(PEEK_MAX_RECORDS);
-        let max_bytes = max_bytes.min(PEEK_MAX_BYTES);
-
         let part = self.partition_handle(&ctx.org_id, topic, partition, &cfg)?;
-        let reader = part.open_reader();
-        let high_watermark = reader.high_watermark();
-        let earliest_offset = reader.earliest_offset();
-        let batches = reader
-            .fetch_from_offset(from_offset, max_bytes)
-            .map_err(|e| map_engine_error(e, topic, partition))?;
+        Ok((cfg, part))
+    }
 
-        let mut records = Vec::new();
-        'batches: for view in &batches {
-            for rv in view.records_from(from_offset) {
-                if records.len() >= max_records {
-                    break 'batches;
-                }
-                let rv = rv?;
-                let offset = view.header().base_offset + rv.offset_delta as u64;
-                records.push(FetchedRecordMeta {
-                    topic: topic.to_string(),
-                    partition,
-                    offset,
-                    timestamp_ms: view.header().base_timestamp_ms + rv.ts_delta_ms as i64,
-                    key: rv.key.clone(),
-                    headers: rv.headers.iter().cloned().collect(),
-                    payload: rv.payload.clone(),
-                    schema_id: rv.schema_id,
-                });
-            }
+    /// Audits a stateless read that returned records and projects them
+    /// through the reader's field policy (`peek`, `peek_runs`).
+    fn finish_peek(
+        &self,
+        ctx: &BusCallContext,
+        topic: &str,
+        cfg: &topics::TopicConfig,
+        audit_detail: &str,
+        records: &mut [FetchedRecordMeta],
+    ) -> Result<(), BusServiceError> {
+        if records.is_empty() {
+            // P3-5 follow-up: an empty read (nothing at/past the requested
+            // offsets on this partition) is not a data access and must not
+            // add to the `bus.messages.browse` audit trail (this is exactly
+            // what a multi-partition browse hits on every partition that
+            // has no records yet — see `peek`'s doc).
+            return Ok(());
         }
-
-        // P3-5 follow-up: only an actual data access — at least one record
-        // returned — gets an audit row. An empty read (nothing at/past
-        // `from_offset` on this partition) is not a data access and must
-        // not add to the `bus.messages.browse` audit trail (this is exactly
-        // what a multi-partition browse hits on every partition that has no
-        // records yet — see this fn's doc).
-        if !records.is_empty() {
-            let _ = crate::db::repository::log_audit(
-                &self.db,
-                ctx.actor.as_deref(),
-                None,
-                "bus.messages.browse",
-                Some(topic),
-                Some(&audit_details(
-                    &ctx.org_id,
-                    Some(&format!(
-                        "partition={partition} from_offset={from_offset} count={}",
-                        records.len()
-                    )),
-                )),
-                None,
-                None,
-            );
-        }
+        let _ = crate::db::repository::log_audit(
+            &self.db,
+            ctx.actor.as_deref(),
+            None,
+            "bus.messages.browse",
+            Some(topic),
+            Some(&audit_details(&ctx.org_id, Some(audit_detail))),
+            None,
+            None,
+        );
 
         // Field policy read projection (SUM/tentabus/POLITYKI-POL.md,
         // "hide only"): applied AFTER the audit above, so the browse audit
         // trail still reflects the real record count regardless of what a
         // policy later hides from the payload. `None` costs one indexed
         // point lookup and leaves every record untouched.
-        if !records.is_empty() {
-            if let Some(policy) = field_policies::resolve(
-                &self.db,
-                &self.instance_id,
-                &ctx.org_id,
-                topic,
-                ctx.actor.as_deref().unwrap_or(""),
-                field_policies::ActorKind::from_origin(&ctx.origin),
-                field_policies::Direction::Read,
-            )? {
-                // A DLQ topic is created without its source's content type
-                // (`dlq_topic_options`), and its policy IS the source's
-                // (`field_policies::resolve`): the payload is read in the
-                // source's format, or an HL7 or XML record would be parsed as
-                // JSON and come back empty.
-                let content_type = match topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX) {
-                    Some(source) => self.topic_config(&ctx.org_id, source)?.content_type,
-                    None => cfg.content_type.clone(),
-                };
-                let format = payload_format::PayloadFormat::from_content_type(&content_type);
-                for rec in &mut records {
-                    rec.payload = field_policies::project_read(&policy, format, &rec.payload);
+        if let Some(policy) = field_policies::resolve(
+            &self.db,
+            &self.instance_id,
+            &ctx.org_id,
+            topic,
+            ctx.actor.as_deref().unwrap_or(""),
+            field_policies::ActorKind::from_origin(&ctx.origin),
+            field_policies::Direction::Read,
+        )? {
+            // A DLQ topic is created without its source's content type
+            // (`dlq_topic_options`), and its policy IS the source's
+            // (`field_policies::resolve`): the payload is read in the
+            // source's format, or an HL7 or XML record would be parsed as
+            // JSON and come back empty. Its error text falls under the same
+            // rule (`dlq::hide_error_message`).
+            let dlq_source = topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX);
+            let content_type = match dlq_source {
+                Some(source) => self.topic_config(&ctx.org_id, source)?.content_type,
+                None => cfg.content_type.clone(),
+            };
+            let format = payload_format::PayloadFormat::from_content_type(&content_type);
+            for rec in records.iter_mut() {
+                rec.payload = field_policies::project_read(&policy, format, &rec.payload);
+                if dlq_source.is_some() {
+                    dlq::hide_error_message(&mut rec.headers);
                 }
             }
         }
-
-        Ok(PeekResult {
-            records,
-            high_watermark,
-            earliest_offset,
-        })
+        Ok(())
     }
 
     // ---- DLQ (PLAN §3.3) --------------------------------------------------
@@ -6997,19 +7120,30 @@ impl BusService {
     /// (PLAN §3.3 "Ponów") and marks the DLQ record handled.
     ///
     /// What the republish is: a NEW record appended at the end of the
-    /// source topic (a new offset, after everything written since; the
-    /// same partition only when the record has a key), so EVERY consumer
-    /// group of the topic receives it — also the ones that processed the
-    /// original — and a consumer that fails it again counts its attempts
-    /// from zero. A record rejected at write time goes through the topic's
-    /// validation again and, still invalid, lands in the DLQ again as a new
-    /// record (`PublishResult` then accepts nothing).
+    /// source topic (a new offset, after everything written since) so EVERY
+    /// consumer group of the topic receives it — also the ones that
+    /// processed the original — and a consumer that fails it again counts
+    /// its attempts from zero. It lands on the partition its key hashes to,
+    /// or — keyless — on the partition the original came from, so every
+    /// attempt at republishing one record targets the same partition. A
+    /// record rejected at write time goes through the topic's validation
+    /// again and, still invalid, lands in the DLQ again as a new record
+    /// (`PublishResult` then accepts nothing — `dlq_republished`).
     ///
-    /// The DLQ record is marked handled (the same durable marker as
-    /// `dlq_discard`) only AFTER the republish succeeded, so a failed
-    /// republish leaves it listed; a record already handled, or one another
-    /// retry is republishing right now, is refused with `DlqRecordHandled`
-    /// instead of republished a second time.
+    /// Leader-only, like every other change of a partition's state: the
+    /// handled marker belongs to the DLQ partition, whose leader replicates
+    /// it to the partition's other copies (`note_dlq_handled`).
+    ///
+    /// Exactly-once against a failure in the middle: the republish carries
+    /// the record's own producer identity (`dlq::retry_producer_id`), so a
+    /// second republish of a record whose first one reached the log — a
+    /// crash, or a failed marker write, between the append and the marker
+    /// below — is answered `Duplicate` by the source partition instead of
+    /// appended again, and only the marker is written then. The marker
+    /// itself follows the republish (a failed republish leaves the record
+    /// listed, never lost); a record already handled, or one another retry
+    /// on this node is acting on right now, is refused with
+    /// `DlqRecordHandled`.
     pub fn dlq_retry(
         &self,
         ctx: &BusCallContext,
@@ -7027,6 +7161,7 @@ impl BusService {
             .ok_or_else(|| {
                 BusServiceError::InvalidArgument(format!("'{dlq_topic}' is not a DLQ topic"))
             })?;
+        check_leader_role(&self.replication(), &ctx.org_id, dlq_topic, dlq_partition)?;
         let handled = || BusServiceError::DlqRecordHandled {
             topic: dlq_topic.to_string(),
             partition: dlq_partition,
@@ -7043,6 +7178,7 @@ impl BusService {
             return Err(handled());
         }
         let dlq_cfg = self.topic_config(&ctx.org_id, dlq_topic)?;
+        let source_cfg = self.topic_config(&ctx.org_id, source_topic)?;
         let part = self.partition_handle(&ctx.org_id, dlq_topic, dlq_partition, &dlq_cfg)?;
         let reader = part.open_reader();
         let batches = reader.fetch_from_offset(dlq_offset, 8 * 1024 * 1024)?;
@@ -7063,17 +7199,34 @@ impl BusService {
             timestamp_ms: view.header().base_timestamp_ms + rv.ts_delta_ms as i64,
             schema_id: rv.schema_id,
         };
+        let producer_id = dlq::retry_producer_id(dlq_cfg.generation, dlq_partition, dlq_offset);
+        let target_partition = match &original.key {
+            Some(key) => partition_for_key(key, source_cfg.partitions),
+            None => original
+                .headers
+                .iter()
+                .find(|(k, _)| k == "dlq.source_partition")
+                .and_then(|(_, v)| std::str::from_utf8(v).ok()?.parse::<u32>().ok())
+                .filter(|p| *p < source_cfg.partitions)
+                .unwrap_or_else(|| {
+                    partition_for_key(producer_id.as_bytes(), source_cfg.partitions)
+                }),
+        };
         let retry_record = dlq::build_retry_record(&original, dlq_topic, dlq_offset);
         let result = self.publish(
             ctx,
             source_topic,
             PublishBatch {
-                partition: None,
-                producer: None,
+                partition: Some(target_partition),
+                producer: Some(producer::ProducerIdentity {
+                    producer_id,
+                    epoch: 0,
+                    base_seq: 0,
+                }),
                 records: vec![retry_record],
             },
         )?;
-        self.mark_dlq_handled(ctx, source_topic, dlq_topic, dlq_partition, dlq_offset)?;
+        self.mark_dlq_handled(ctx, dlq_topic, dlq_partition, dlq_offset)?;
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.actor.as_deref(),
@@ -7083,7 +7236,9 @@ impl BusService {
             Some(&audit_details(
                 &ctx.org_id,
                 Some(&format!(
-                    "dlq_topic={dlq_topic} dlq_partition={dlq_partition} dlq_offset={dlq_offset}"
+                    "dlq_topic={dlq_topic} dlq_partition={dlq_partition} dlq_offset={dlq_offset} \
+                     republished={}",
+                    dlq_republished(&result)
                 )),
             )),
             None,
@@ -7104,7 +7259,8 @@ impl BusService {
     /// caller-facing DLQ surface honors — `dlq_list`'s dispatch-layer
     /// wrapper filters a discarded offset out of what it returns,
     /// `dlq_retry_all` and `dlq_retry` skip it, and `dlq_depth` (the
-    /// `StatsSnapshot` KPI) no longer counts it.
+    /// `StatsSnapshot` KPI) no longer counts it. Leader-only, like
+    /// `dlq_retry`.
     pub fn dlq_discard(
         &self,
         ctx: &BusCallContext,
@@ -7117,11 +7273,12 @@ impl BusService {
         self.authorizer
             .authorize(ctx, BusAction::Admin, dlq_topic)
             .map_err(|_| deny(BusAction::Admin, dlq_topic))?;
-        let source_topic = dlq_topic
-            .strip_prefix(dlq::DLQ_TOPIC_PREFIX)
-            .ok_or_else(|| {
-                BusServiceError::InvalidArgument(format!("'{dlq_topic}' is not a DLQ topic"))
-            })?;
+        if !dlq_topic.starts_with(dlq::DLQ_TOPIC_PREFIX) {
+            return Err(BusServiceError::InvalidArgument(format!(
+                "'{dlq_topic}' is not a DLQ topic"
+            )));
+        }
+        check_leader_role(&self.replication(), &ctx.org_id, dlq_topic, partition)?;
         // Refused like a second retry: a record already retried or discarded
         // — or being republished right now — is not discarded (and audited)
         // a second time.
@@ -7140,7 +7297,7 @@ impl BusService {
         {
             return Err(handled());
         }
-        self.mark_dlq_handled(ctx, source_topic, dlq_topic, partition, offset)?;
+        self.mark_dlq_handled(ctx, dlq_topic, partition, offset)?;
         let _ = crate::db::repository::log_audit(
             &self.db,
             ctx.actor.as_deref(),
@@ -7158,11 +7315,11 @@ impl BusService {
     }
 
     /// Writes the durable "handled" marker of one DLQ record and hands it to
-    /// replication, so the followers stop listing it too.
+    /// the DLQ partition's replication stream, so its other copies stop
+    /// listing it too.
     fn mark_dlq_handled(
         &self,
         ctx: &BusCallContext,
-        source_topic: &str,
         dlq_topic: &str,
         partition: u32,
         offset: u64,
@@ -7170,7 +7327,7 @@ impl BusService {
         self.discarded
             .mark(&ctx.org_id, dlq_topic, partition, offset, now_ms())?;
         if let Some(coordinator) = self.replication() {
-            coordinator.note_dlq_handled(&ctx.org_id, source_topic, partition, offset);
+            coordinator.note_dlq_handled(&ctx.org_id, dlq_topic, partition, offset);
         }
         Ok(())
     }
@@ -9611,7 +9768,8 @@ mod tests {
             crate::services::environment::get_node_environment(&db),
             now_ms(),
         )
-        .expect("create the topic row").0;
+        .expect("create the topic row")
+        .0;
         // What `BusService::create_topic` does next: the log directory
         // belongs to this incarnation. Without it the log written below is
         // indistinguishable from a deleted incarnation's leftovers.
@@ -11192,9 +11350,10 @@ mod tests {
     }
 
     /// A retried or discarded DLQ record is marked handled on this node AND
-    /// handed to replication with the source topic's partition, whose
-    /// `ReplOffsets` stream carries it to the followers; retrying a handled
-    /// record again is refused instead of republishing it a second time.
+    /// handed to replication with its own DLQ partition, whose
+    /// `ReplOffsets` stream carries it to that partition's copies; retrying
+    /// a handled record again is refused instead of republishing it a
+    /// second time.
     #[test]
     fn dlq_retry_and_discard_mark_the_record_handled_and_hand_it_to_replication() {
         let (_tmp, svc) = test_service();
@@ -11222,13 +11381,16 @@ mod tests {
         assert_eq!(
             *coord.note_dlq_handled_calls.lock(),
             vec![
-                ("org-1".to_string(), topic.to_string(), 0, 0),
-                ("org-1".to_string(), topic.to_string(), 0, 1),
-            ]
+                ("org-1".to_string(), dlq_topic.clone(), 0, 0),
+                ("org-1".to_string(), dlq_topic.clone(), 0, 1),
+            ],
+            "the marker rides the DLQ partition's own stream"
         );
         assert_eq!(
             svc.dlq_discarded_offsets(&ctx, &dlq_topic, 0).unwrap(),
-            [0u64, 1].into_iter().collect::<std::collections::HashSet<u64>>()
+            [0u64, 1]
+                .into_iter()
+                .collect::<std::collections::HashSet<u64>>()
         );
 
         for offset in [0, 1] {
@@ -11257,6 +11419,125 @@ mod tests {
             3,
             "the two originals and exactly one republish"
         );
+    }
+
+    /// Retry and discard change the DLQ partition's state, so — like an
+    /// offset reset — only its leader may make them: on a follower both are
+    /// refused with `NotLeader`, nothing is republished and no marker is
+    /// written or replicated.
+    #[test]
+    fn dlq_retry_and_discard_are_refused_off_the_dlq_partitions_leader() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.retry-leader";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fail_to_dlq(&svc, &ctx, topic, &["a"]);
+        let dlq_topic = dlq::dlq_topic_name(topic);
+
+        let coord = FakeCoordinator::leader(1);
+        coord.set_role(PartitionRole::Follower {
+            leader_node_id: "node-b".to_string(),
+            epoch: 1,
+        });
+        svc.set_replication(coord.clone());
+
+        for outcome in [
+            svc.dlq_retry(&ctx, &dlq_topic, 0, 0).map(|_| ()),
+            svc.dlq_discard(&ctx, &dlq_topic, 0, 0),
+        ] {
+            match outcome {
+                Err(BusServiceError::NotLeader { leader_node_id, .. }) => {
+                    assert_eq!(leader_node_id.as_deref(), Some("node-b"));
+                }
+                other => panic!("expected NotLeader, got {other:?}"),
+            }
+        }
+        assert!(coord.note_dlq_handled_calls.lock().is_empty());
+        assert!(!svc
+            .discarded
+            .is_discarded("org-1", &dlq_topic, 0, 0)
+            .unwrap());
+        assert_eq!(
+            svc.read_partition_stats(
+                "org-1",
+                topic,
+                0,
+                &svc.topic_config("org-1", topic).unwrap()
+            )
+            .unwrap()
+            .high_watermark,
+            1,
+            "only the original, nothing republished"
+        );
+    }
+
+    /// The republish is keyed by the DLQ record itself
+    /// (`dlq::retry_producer_id`): when it reached the source topic but the
+    /// handled marker did not (a crash or a failed marker write in between —
+    /// here the marker is removed after the fact), the record is listed
+    /// again, and retrying it only writes the marker — the source partition
+    /// answers `Duplicate` instead of appending a second copy.
+    #[test]
+    fn a_retry_whose_marker_was_lost_is_not_republished_again() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.retry-once";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(2),
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fail_to_dlq(&svc, &ctx, topic, &["a"]);
+        let dlq_topic = dlq::dlq_topic_name(topic);
+        let dlq_partition = (0..2)
+            .find(|&p| {
+                svc.partition_stats(&ctx, &dlq_topic, p)
+                    .unwrap()
+                    .high_watermark
+                    > 0
+            })
+            .expect("the failure reached the DLQ");
+        let source_hw = |svc: &BusService| {
+            (0..2)
+                .map(|p| svc.partition_stats(&ctx, topic, p).unwrap().high_watermark)
+                .sum::<u64>()
+        };
+
+        let first = svc.dlq_retry(&ctx, &dlq_topic, dlq_partition, 0).unwrap();
+        assert!(dlq_republished(&first) && !first.duplicate);
+        assert_eq!(source_hw(&svc), 2, "the original and its republish");
+        assert_eq!(
+            first.single_partition().map(|a| a.partition),
+            Some(0),
+            "a keyless record goes back to the partition it came from"
+        );
+
+        svc.discarded.purge_topic("org-1", &dlq_topic).unwrap();
+        let again = svc.dlq_retry(&ctx, &dlq_topic, dlq_partition, 0).unwrap();
+        assert!(
+            again.duplicate,
+            "the source partition recognized the republish"
+        );
+        assert!(dlq_republished(&again), "it is back in its topic, once");
+        assert_eq!(source_hw(&svc), 2, "no second copy was appended");
+        assert!(svc
+            .discarded
+            .is_discarded("org-1", &dlq_topic, dlq_partition, 0)
+            .unwrap());
     }
 
     /// A DLQ record of an HL7 topic is read in HL7 with the source topic's
@@ -11301,9 +11582,63 @@ mod tests {
             .peek(&ctx, &dlq::dlq_topic_name(topic), 0, 0, 10, PEEK_MAX_BYTES)
             .unwrap();
         let text = String::from_utf8(peeked.records[0].payload.to_vec()).unwrap();
-        assert!(text.contains("80010112345"), "an allowed field stays: {text:?}");
-        assert!(text.contains("ORU^R01"), "an allowed MSH field stays: {text:?}");
-        assert!(!text.contains("Kowalski"), "a hidden field stays hidden: {text:?}");
+        assert!(
+            text.contains("80010112345"),
+            "an allowed field stays: {text:?}"
+        );
+        assert!(
+            text.contains("ORU^R01"),
+            "an allowed MSH field stays: {text:?}"
+        );
+        assert!(
+            !text.contains("Kowalski"),
+            "a hidden field stays hidden: {text:?}"
+        );
+
+        // The consumer's error text is free text the rule cannot vet field
+        // by field (it may quote the hidden value), so it is blanked too.
+        let header = |name: &[u8]| {
+            peeked.records[0]
+                .headers
+                .iter()
+                .find(|(k, _)| k.as_ref() == name)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(header(b"dlq.error_message"), Some(Bytes::new()));
+        assert_eq!(
+            header(dlq::ERROR_MESSAGE_HIDDEN_HEADER.as_bytes()),
+            Some(Bytes::from_static(b"1"))
+        );
+    }
+
+    /// Without a data-hiding rule the consumer's error text is shown as
+    /// written.
+    #[test]
+    fn a_dlq_records_error_text_is_shown_without_a_read_rule() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let topic = "labs.error-text";
+        svc.create_topic(
+            &ctx,
+            topic,
+            topics::TopicOptions {
+                partitions: Some(1),
+                max_delivery_attempts: Some(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fail_to_dlq(&svc, &ctx, topic, &["{}"]);
+        let peeked = svc
+            .peek(&ctx, &dlq::dlq_topic_name(topic), 0, 0, 10, PEEK_MAX_BYTES)
+            .unwrap();
+        let headers = &peeked.records[0].headers;
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k.as_ref() == b"dlq.error_message" && v.as_ref() == b"err"));
+        assert!(!headers
+            .iter()
+            .any(|(k, _)| k.as_ref() == dlq::ERROR_MESSAGE_HIDDEN_HEADER.as_bytes()));
     }
 
     // ---- Real discard (M1-R2 review N-5, coordinator decision 2) ------
@@ -11502,7 +11837,8 @@ mod tests {
             NodeEnvironment::Prod,
             now_ms(),
         )
-        .unwrap().0;
+        .unwrap()
+        .0;
         // What `BusService::create_topic` does next — see
         // `org_stored_bytes_is_seeded_from_the_engine_and_debited_in_the_same_unit`.
         write_topic_incarnation(
@@ -15229,11 +15565,11 @@ mod tests {
                 attempts,
             ));
         }
-        fn note_dlq_handled(&self, org: &str, source_topic: &str, dlq_partition: u32, offset: u64) {
+        fn note_dlq_handled(&self, org: &str, dlq_topic: &str, partition: u32, offset: u64) {
             self.note_dlq_handled_calls.lock().push((
                 org.to_string(),
-                source_topic.to_string(),
-                dlq_partition,
+                dlq_topic.to_string(),
+                partition,
                 offset,
             ));
         }
@@ -15876,7 +16212,10 @@ mod tests {
         svc.create_topic(&ctx, "wizyty.cache", topics::TopicOptions::default())
             .expect("create_topic");
         let cached = svc.topic_config("org-1", "wizyty.cache").expect("config");
-        assert_eq!(cached.max_delivery_attempts, topics::DEFAULT_MAX_DELIVERY_ATTEMPTS);
+        assert_eq!(
+            cached.max_delivery_attempts,
+            topics::DEFAULT_MAX_DELIVERY_ATTEMPTS
+        );
 
         let mut row = crate::db::repository::bus_topic_get(
             &svc.db,
@@ -18820,7 +19159,12 @@ mod tests {
 
     // ---- PLAN-UI-20260923 B1 / B1b -----------------------------------------
 
-    fn publish_to(svc: &BusService, ctx: &BusCallContext, topic: &str, records: Vec<PublishRecord>) {
+    fn publish_to(
+        svc: &BusService,
+        ctx: &BusCallContext,
+        topic: &str,
+        records: Vec<PublishRecord>,
+    ) {
         svc.publish(
             ctx,
             topic,
@@ -18851,7 +19195,12 @@ mod tests {
                 },
             )
             .unwrap();
-        publish_to(&svc, &ctx, "orders", vec![record("a"), record("b"), record("c")]);
+        publish_to(
+            &svc,
+            &ctx,
+            "orders",
+            vec![record("a"), record("b"), record("c")],
+        );
         handle
             .commit(&[(
                 TopicPartition {
@@ -18878,11 +19227,14 @@ mod tests {
         // creating a row for it.
         let ghost = svc.group_lag(&ctx, "never-opened", "orders").unwrap();
         assert_eq!(ghost.iter().map(|p| p.lag).sum::<u64>(), 3);
-        assert!(
-            crate::db::repository::bus_group_get(&svc.local_db, "org-1", "never-opened", "orders")
-                .unwrap()
-                .is_none()
-        );
+        assert!(crate::db::repository::bus_group_get(
+            &svc.local_db,
+            "org-1",
+            "never-opened",
+            "orders"
+        )
+        .unwrap()
+        .is_none());
     }
 
     /// Owner decision 23.09 ("Wycofanie wzoru"): deprecating a subject is a
@@ -19021,7 +19373,10 @@ mod tests {
         let ctx = test_ctx("org-1");
         svc.create_topic(&ctx, "orders", topics::TopicOptions::default())
             .unwrap();
-        assert_eq!(svc.partition_earliest_timestamp(&ctx, "orders", 0).unwrap(), None);
+        assert_eq!(
+            svc.partition_earliest_timestamp(&ctx, "orders", 0).unwrap(),
+            None
+        );
         let mut first = record("a");
         first.timestamp_ms = 1_700_000_000_000;
         let mut second = record("b");
@@ -19078,8 +19433,7 @@ mod tests {
         assert_eq!(trend.rising_since_ms, Some(t0));
         assert_eq!(trend.consume_rate_per_min, Some(0));
 
-        let (groups_series, dlq_series) =
-            svc.lag_history(&ctx, Some("faktury"), None, 0).unwrap();
+        let (groups_series, dlq_series) = svc.lag_history(&ctx, Some("faktury"), None, 0).unwrap();
         assert_eq!(groups_series.len(), 1);
         assert_eq!(
             groups_series[0]
@@ -19097,7 +19451,8 @@ mod tests {
         svc.lag_trends.clear();
         svc.refresh_lag_trends();
         assert_eq!(
-            svc.lag_trend("org-1", "ksiegowosc", "faktury").rising_since_ms,
+            svc.lag_trend("org-1", "ksiegowosc", "faktury")
+                .rising_since_ms,
             Some(t0)
         );
 
@@ -19134,13 +19489,17 @@ mod tests {
             .unwrap(),
         );
         svc.sample_lag_history(1_800_000_000_000);
-        assert!(!lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            !lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
+                .unwrap()
+                .is_empty()
+        );
         svc.purge_org("org-1").unwrap();
-        assert!(lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -19231,7 +19590,10 @@ mod tests {
 
         let (groups, dlqs) = no_dlq.lag_history(&ctx, Some("wyniki"), None, 0).unwrap();
         assert_eq!(groups.len(), 1);
-        assert!(dlqs.is_empty(), "the DLQ series needs Consume on __dlq.<topic>");
+        assert!(
+            dlqs.is_empty(),
+            "the DLQ series needs Consume on __dlq.<topic>"
+        );
         drop(no_dlq);
 
         let no_topic = BusService::new(config(
@@ -19242,14 +19604,20 @@ mod tests {
         let (groups, _) = no_topic.lag_history(&ctx, Some("wyniki"), None, 0).unwrap();
         assert!(groups.is_empty());
         let (groups, _) = no_topic.lag_history(&ctx, None, Some("g1"), 0).unwrap();
-        assert!(groups.is_empty(), "a group filter must not bypass the topic check");
+        assert!(
+            groups.is_empty(),
+            "a group filter must not bypass the topic check"
+        );
     }
 
     /// Reading offsets passively never creates anything on disk.
     #[test]
     fn passive_partition_offsets_never_create_a_partition() {
         let (_tmp, svc) = test_service();
-        assert_eq!(svc.passive_partition_offsets("org-1", "gone", 0), Some((0, 0)));
+        assert_eq!(
+            svc.passive_partition_offsets("org-1", "gone", 0),
+            Some((0, 0))
+        );
         let dir = topics::partition_dir(&svc.bus_dir, "org-1", "gone", 0);
         assert!(!dir.exists());
         assert!(!topics::topic_dir(&svc.bus_dir, "org-1", "gone").exists());
@@ -19288,9 +19656,11 @@ mod tests {
         }));
         svc.sample_lag_history(1_800_000_000_000);
 
-        assert!(lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
+                .unwrap()
+                .is_empty()
+        );
         assert!(lag_history::dlq_series(&svc.local_db, "org-1", 0, None)
             .unwrap()
             .is_empty());
@@ -19299,9 +19669,11 @@ mod tests {
         // Later rounds keep it that way.
         svc.sample_lag_history(1_800_000_060_000);
         assert!(!topics::topic_dir(&svc.bus_dir, "org-1", "faktury").exists());
-        assert!(lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
-            .unwrap()
-            .is_empty());
+        assert!(
+            lag_history::group_series(&svc.local_db, "org-1", 0, None, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The same race with real threads: a sampler running in a loop while
@@ -19383,7 +19755,12 @@ mod tests {
             .create_topic(&ctx, "faktury", topics::TopicOptions::default())
             .unwrap();
         svc.ensure_dlq_topic(&ctx, "faktury", &source).unwrap();
-        publish_to(&svc, &ctx, "__dlq.faktury", vec![record("{}"), record("{}")]);
+        publish_to(
+            &svc,
+            &ctx,
+            "__dlq.faktury",
+            vec![record("{}"), record("{}")],
+        );
         let acl_id = crate::services::bus_authorizer::topic_acl_resource_id(
             svc.instance_id(),
             "org-1",
@@ -19394,7 +19771,13 @@ mod tests {
         )
         .unwrap();
         crate::db::repository::resource_permissions::set_with_action(
-            &svc.db, "topic", &acl_id, "group", "ksiegowosc", "*", "allow",
+            &svc.db,
+            "topic",
+            &acl_id,
+            "group",
+            "ksiegowosc",
+            "*",
+            "allow",
         )
         .unwrap();
         let other_acl = crate::services::bus_authorizer::topic_acl_resource_id(

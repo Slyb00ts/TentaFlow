@@ -283,6 +283,18 @@ test('"Pokaż": the failure, the times and the body as the reader may see it; th
   assert.deepEqual(led, ['retry']);
 });
 
+test('"Pokaż" says the error text is hidden when the topic\'s data-hiding rules blank it for the reader', () => {
+  const r = consumerFailure({ offset: 7, atMs: NOW - 5 * MIN });
+  r.headers = r.headers
+    .map((h) => (h.key === 'dlq.error_message' ? { key: h.key, value: [] } : h))
+    .concat(headers({ 'dlq.error_message_hidden': '1' }));
+  const rec = unprocessedRecord('wyniki-badan', r);
+  assert.equal(rec.errorHidden, true);
+  const win = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });
+  assert.match(norm(win.textContent), /Opis błęduukryty przez zasady ukrywania danych tego topiku/);
+  win.close(true);
+});
+
 test('"Pokaż" of a reader has no buttons that change anything', () => {
   const rec = unprocessedRecord('wizyty', writeRejection({ offset: 3, atMs: NOW - MIN }));
   const win = openUnprocessedView({ rec, maxAttempts: 5, nowMs: NOW });

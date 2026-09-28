@@ -606,12 +606,12 @@ impl DiscardStore {
 }
 
 /// DLQ records a `dlq_retry` is republishing (or a `dlq_discard` is
-/// marking) right now. The durable
-/// "handled" marker is written only AFTER the republish succeeded (a crash
-/// in between leaves the record listed, never lost), so without this set
-/// two retries of one record racing each other — a double click, "Ponów"
-/// beside "Ponów wszystkie", two admins — would both pass the marker check
-/// and republish it twice.
+/// marking) right now. The durable "handled" marker is written only AFTER
+/// the republish succeeded (a crash in between leaves the record listed,
+/// never lost, and `retry_producer_id` turns its next retry into a no-op),
+/// so without this set two retries of one record racing each other on one
+/// node — a double click, "Ponów" beside "Ponów wszystkie", two admins —
+/// would both pass the marker check before either republish landed.
 #[derive(Default)]
 pub struct RetryClaims {
     in_flight: parking_lot::Mutex<std::collections::HashSet<(String, String, u32, u64)>>,
@@ -655,6 +655,47 @@ pub fn rejected_at_write(headers: &[(Bytes, Bytes)]) -> bool {
     headers
         .iter()
         .any(|(k, _)| k.as_ref() == b"dlq.rejected_at_ms")
+}
+
+/// The producer identity (`producer::ProducerIdentity::producer_id`, at
+/// epoch 0 and sequence 0) a `dlq_retry` republishes one DLQ record under.
+/// It names the record — the DLQ topic's incarnation (`TopicConfig::
+/// generation`, so a DLQ deleted and re-created with offsets starting over
+/// never collides with its predecessor), partition and offset — which makes
+/// the republish idempotent: the source partition's `producer_seq` answers
+/// a second republish of the same record `Duplicate` instead of appending
+/// it again, however the first one ended (a crash or a failed marker write
+/// after the append included). The `tf-` prefix keeps it apart from the
+/// identities of real producers.
+pub fn retry_producer_id(dlq_generation: u64, dlq_partition: u32, dlq_offset: u64) -> String {
+    format!("tf-dlq-retry/{dlq_generation}/{dlq_partition}/{dlq_offset}")
+}
+
+/// Set on a DLQ record whose `dlq.error_message` was blanked for this
+/// reader (`hide_error_message`).
+pub const ERROR_MESSAGE_HIDDEN_HEADER: &str = "dlq.error_message_hidden";
+
+/// Blanks a DLQ record's `dlq.error_message` for a reader under a
+/// data-hiding (field policy) READ rule and marks it with
+/// `ERROR_MESSAGE_HIDDEN_HEADER`. The text is written by a consumer or by
+/// the schema validator and routinely quotes the payload's values (a
+/// rejected PESEL, a field that failed a pattern); it is free text, so no
+/// field rule can prove which part of it is allowed — fail closed, the same
+/// way `field_policies::project_read` empties a payload it cannot parse.
+pub fn hide_error_message(headers: &mut Vec<(Bytes, Bytes)>) {
+    let mut had_message = false;
+    for (k, v) in headers.iter_mut() {
+        if k.as_ref() == b"dlq.error_message" {
+            *v = Bytes::new();
+            had_message = true;
+        }
+    }
+    if had_message {
+        headers.push((
+            Bytes::from_static(ERROR_MESSAGE_HIDDEN_HEADER.as_bytes()),
+            Bytes::from_static(b"1"),
+        ));
+    }
 }
 
 #[cfg(test)]

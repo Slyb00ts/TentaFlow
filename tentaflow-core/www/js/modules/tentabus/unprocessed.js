@@ -66,6 +66,8 @@ export function unprocessedRecord(topic, r) {
     atWrite: rejectedMs != null,
     attempts: asNumber(h('dlq.attempts')),
     errorMessage: h('dlq.error_message') || '',
+    // The server blanks the text for a reader under the topic's data-hiding rules.
+    errorHidden: h('dlq.error_message_hidden') === '1',
     writtenMs: Number(r.timestampMs),
     firstFailedMs: asNumber(h('dlq.first_failed_at_ms')),
     lastFailedMs,

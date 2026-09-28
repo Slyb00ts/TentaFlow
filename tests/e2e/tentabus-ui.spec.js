@@ -1748,7 +1748,9 @@ test('U4 Pokaż: the failure in words and the body with the topic\'s hidden fiel
     const win = unpWindow(page, 'tb-unp-view');
     await expect(win).toHaveCount(1);
     await expect(win).toContainText('Program odbiorcy zgłosił błąd');
-    await expect(win).toContainText('system rejestracji odrzucił wizytę: termin jest już zajęty');
+    // The consumer's error text may quote a hidden value; under a hiding rule it is not shown.
+    await expect(win).toContainText(/Opis błędu\s*ukryty przez zasady ukrywania danych tego topiku/);
+    await expect(win).not.toContainText('termin jest już zajęty');
     await expect(win).toContainText(/Próby\s*5 z 5/);
     await expect(win).toContainText('Obowiązują tu te same zasady ukrywania danych');
     const body = await win.locator('[data-role="payload"]').textContent();

@@ -10471,6 +10471,7 @@
         "truncated": "der Anfang des Inhalts wird angezeigt",
         "blob": "Der Inhalt ist eine angehängte Datei: {size}, {mime}.",
         "rules": "Hier gelten dieselben Regeln zum Ausblenden von Daten wie im Topic, aus dem die Nachricht stammt.",
+        "error_hidden": "durch die Regeln zum Ausblenden von Daten dieses Topics ausgeblendet",
         "audit": "Das Lesen unverarbeiteter Nachrichten wird im Audit-Protokoll festgehalten.",
         "close": "Schließen"
       },

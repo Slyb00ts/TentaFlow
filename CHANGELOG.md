@@ -4,6 +4,29 @@ Najważniejsze zmiany w TentaFlow.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### TentaBus
+
+- Nieprzetworzone wiadomości: usunięto ograniczenia opisane w wydaniu 0.4.0-beta.
+  „Wczytaj więcej” nie powtarza wierszy przy wielu partycjach. Ponowienie
+  i odrzucenie wykonuje tylko node prowadzący partycję nieprzetworzonych
+  wiadomości, a oznaczenie obsługi trafia do każdej jej kopii, także tej, która
+  była niedostępna. Ponowienie przerwane po zapisaniu wiadomości w topiku
+  nie zapisze jej drugi raz. „Ponów wszystkie” zaczyna od najstarszych
+  wiadomości ze wszystkich partycji, a wiadomość znów odrzuconą przez wzór
+  liczy jako nieponowioną. Tekst błędu odbiorcy jest ukryty przed osobami,
+  które obejmują zasady ukrywania danych topiku. Lista czyta tylko wiadomości,
+  które pokazuje.
+- Oznaczenie obsługi przechodzi teraz strumieniem replikacji partycji
+  nieprzetworzonych wiadomości: w klastrze, w którym część nodów ma jeszcze
+  wersję 0.4.0-beta, oznaczenia nie docierają do kopii do czasu aktualizacji
+  wszystkich nodów.
+- Znane ograniczenie: ochrona przed powtórnym zapisem przerwanego ponowienia
+  działa na nodzie prowadzącym partycję topiku; jeśli między przerwaniem
+  a kolejnym ponowieniem prowadzenie tej partycji przejmie inny node, wiadomość
+  może trafić do topiku drugi raz.
+
 ## [0.4.0-beta] — 2026-09-27
 
 Zmiany od tagu `v0.3.0-beta` do `v0.4.0-beta`. Wydanie testowe.

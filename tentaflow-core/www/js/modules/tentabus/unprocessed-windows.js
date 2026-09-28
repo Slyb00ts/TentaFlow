@@ -67,7 +67,9 @@ export function recordFacts(rec, maxAttempts, nowMs = Date.now()) {
     [T('unprocessed.view.k_reason'), reasonHtml(rec)],
   ];
   // What the pattern check reports is the validator's own technical text.
-  if (rec.errorMessage) facts.push([T(rec.atWrite ? 'unprocessed.view.k_error_at_write' : 'unprocessed.view.k_error'), escapeHtml(rec.errorMessage)]);
+  const errorKey = rec.atWrite ? 'unprocessed.view.k_error_at_write' : 'unprocessed.view.k_error';
+  if (rec.errorHidden) facts.push([T(errorKey), escapeHtml(T('unprocessed.view.error_hidden'))]);
+  else if (rec.errorMessage) facts.push([T(errorKey), escapeHtml(rec.errorMessage)]);
   facts.push([T('unprocessed.view.k_attempts'), escapeHtml(attemptsText(rec, maxAttempts))]);
   if (rec.atWrite) {
     facts.push([T('unprocessed.view.k_rejected'), when(rec.rejectedMs)]);

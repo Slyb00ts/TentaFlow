@@ -106,14 +106,14 @@ function isInternalGroupId(groupId) {
   return typeof groupId === 'string' && groupId.startsWith('tf-');
 }
 
-// Per-partition paging cursor for the NEXT `DlqList` page
-// (tor U task 1/2's `partitions[]` + `fromOffsets`): only partitions that
-// reported `hasMore` carry a cursor forward, at their own `nextOffset` — a
-// partition that already reached its high watermark is simply omitted, not
-// re-sent with a stale offset.
+// Per-partition paging cursor for the NEXT newest-first `DlqList` page
+// (`partitions[]` + `fromOffsets`): EVERY partition carries its own
+// `nextOffset` forward, also one with nothing left (`hasMore` false) —
+// below that bound it has nothing waiting, so it stays exhausted. The server
+// starts a partition missing from `fromOffsets` at its high watermark, so
+// leaving an exhausted one out would list its newest messages again.
 function buildFromOffsetsForNextPage(partitions) {
   return (Array.isArray(partitions) ? partitions : [])
-    .filter((p) => p.hasMore)
     .map((p) => ({ partition: p.partition, offset: p.nextOffset }));
 }
 

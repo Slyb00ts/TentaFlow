@@ -3377,8 +3377,8 @@ impl ReplicationCoordinator for ReplicationManager {
         }
     }
 
-    fn note_dlq_handled(&self, org: &str, source_topic: &str, dlq_partition: u32, offset: u64) {
-        let key: PartitionKey = (org.to_string(), source_topic.to_string(), dlq_partition);
+    fn note_dlq_handled(&self, org: &str, dlq_topic: &str, partition: u32, offset: u64) {
+        let key: PartitionKey = (org.to_string(), dlq_topic.to_string(), partition);
         if let Some(entry) = self.registry.get(&key) {
             if let Some(leader) = entry.leader.as_ref() {
                 leader.note_offset_discarded(offset);
@@ -4808,23 +4808,25 @@ mod tests {
         );
     }
 
-    /// A DLQ record retried or discarded on the node leading the source
-    /// topic's partition of the same number reaches that partition's leader
-    /// handle, whose `ReplOffsets` stream carries it to the followers; a
-    /// partition this node does not lead has no stream to carry it.
+    /// A DLQ record retried or discarded reaches the leader handle of its
+    /// OWN DLQ partition — the stream whose followers hold copies of the
+    /// record — not the source topic's partition of the same number, whose
+    /// replicas may be other nodes entirely.
     #[tokio::test]
-    async fn a_handled_dlq_record_reaches_the_leader_handle_of_the_source_partition() {
+    async fn a_handled_dlq_record_reaches_the_leader_handle_of_its_dlq_partition() {
         let fx = build("l");
-        let led = assignment("org", "orders", 0, "l", &["l", "f1"], &["l", "f1"], 3);
+        let led = assignment("org", "__dlq.orders", 0, "l", &["l", "f1"], &["l", "f1"], 3);
         fx.assignments.seed(led.clone());
         fx.manager.apply_assignment(led).await;
 
-        fx.manager.note_dlq_handled("org", "orders", 0, 7);
-        fx.manager.note_dlq_handled("org", "orders", 1, 8);
-        fx.manager.note_dlq_handled("org", "other", 0, 9);
+        fx.manager.note_dlq_handled("org", "__dlq.orders", 0, 7);
+        fx.manager.note_dlq_handled("org", "__dlq.orders", 1, 8);
+        fx.manager.note_dlq_handled("org", "orders", 0, 9);
 
         let handles = fx.leader_factory.handles.lock();
-        let handle = handles.last().expect("leading the partition spawns its handle");
+        let handle = handles
+            .last()
+            .expect("leading the partition spawns its handle");
         assert_eq!(*handle.discarded.lock(), vec![7]);
     }
 
