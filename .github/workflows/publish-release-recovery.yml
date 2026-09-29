@@ -1,0 +1,57 @@
+# =============================================================================
+# Plik: publish-release-recovery.yml
+# Opis: Publikuje beta.1 po kontroli kompletu pakietów i ich pochodzenia.
+# =============================================================================
+name: Publish recovered release beta.1
+on:
+  push:
+    branches: [ci/arrow-configure-beta1]
+    paths:
+      - .github/workflows/publish-release-recovery.yml
+      - scripts/ci-local/publish-release-recovery.py
+permissions: {}
+concurrency:
+  group: publish-release-v0.4.0-beta.1
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+    env:
+      LINUX_RUN_ID: "36555501270"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Free disk for release archives
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Verify source jobs, artifacts and APK
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-local/publish-release-recovery.py prepare --linux-run-id "$LINUX_RUN_ID"
+      - name: Upload draft, verify remote bytes and publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          EXPECTED_MANIFEST_SHA256: ${{ steps.prepare.outputs.manifest_sha256 }}
+        run: python3 scripts/ci-local/publish-release-recovery.py publish --manifest-sha256 "$EXPECTED_MANIFEST_SHA256"
+      - name: Preserve publication evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-recovery-publication-evidence
+          path: |
+            release-recovery/prepared.json
+            release-recovery/draft-release-id.txt
+          if-no-files-found: ignore
+          retention-days: 7
