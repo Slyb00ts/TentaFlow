@@ -112,6 +112,28 @@ test('no locale carries a value with its diacritics stripped', () => {
   }
 });
 
+// The owner decided (2026-09-29) that every German TentaNas text addresses the
+// reader formally ("Sie"). The informal forms are matched as whole words:
+// `deinstalliert` / `Deinstallation` must NOT trip it, which is why the `dein`
+// family is spelled out instead of a `dein\w*` wildcard. Imperatives without a
+// pronoun ("Wähle", "Gib … ein") cannot be found by a word list and were
+// converted by hand; this guard covers the pronouns and possessives.
+const INFORMAL_DE = /(?<!\p{L})(du|dich|dir|dein|deine|deinen|deinem|deiner|deines)(?!\p{L})/iu;
+
+test('German TentaNas texts address the reader formally (no du/dich/dir/dein*)', () => {
+  // The whole `tentanas` namespace plus every TentaNas-owned key that lives in
+  // a shared group (`addon_uninstall.entries.tentanas_*`, `apps.tentanas.*`, …).
+  const owned = flatten(bundles.de).filter((key) => key.split('.').some((part) => part.includes('tentanas')));
+  assert.ok(owned.length > reference.length, 'the scan covers the namespace and the shared-group keys');
+  const offenders = [];
+  for (const key of owned) {
+    const value = String(dig(bundles.de, key)).replace(/\{[^}]*\}/g, ' ');
+    const hit = INFORMAL_DE.exec(value);
+    if (hit) offenders.push(`${key}: "${hit[1]}" in ${value}`);
+  }
+  assert.deepEqual(offenders, [], 'informal German address left in TentaNas texts');
+});
+
 test('interpolation placeholders match the Polish source in every locale', () => {
   for (const key of reference) {
     const full = `${NAMESPACE}.${key}`;
