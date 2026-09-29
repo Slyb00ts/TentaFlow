@@ -361,6 +361,37 @@ def prepare(linux_run):
     print(f'Gotowe: 13 pakietów, 13 sum, 4 instalatory i manifest; SHA256 manifestu: {digest}')
 
 
+
+def report_api_error(error):
+    raw = error.read(16385)
+    try:
+        payload = json.loads(raw) if len(raw) <= 16384 else {}
+    except (ValueError, UnicodeDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    details = {key: payload[key] for key in ['message', 'errors', 'documentation_url'] if key in payload}
+    headers = error.headers or {}
+    for key in ['X-Accepted-GitHub-Permissions', 'Retry-After',
+                'X-RateLimit-Remaining', 'X-RateLimit-Reset']:
+        if headers.get(key) is not None:
+            details[key] = headers[key]
+    text = json.dumps(details, ensure_ascii=False)
+    token = os.environ.get('GITHUB_TOKEN')
+    if token:
+        text = text.replace(token, '[REDACTED]')
+    text = re.sub(r'\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b', '[REDACTED]', text)
+    text = re.sub(r'(?i)Bearer\s+[^\s\\"\']+', 'Bearer [REDACTED]', text)
+    text = re.sub(r'(?i)((?:token|secret|password|api[_-]?key|authorization)["\']?\s*[:=]\s*["\']?)[^\s"\',}\\]+', r'\1[REDACTED]', text)
+    # Adresy z parametrami mogą zawierać podpis uprawniający do pobrania pliku.
+    text = re.sub(r'https?://[^\s"\'\\]*\?[^\s"\'\\]*', '[REDACTED_URL]', text)
+    text = text[:6000]
+    for offset in range(0, len(text), 2000):
+        escaped = text[offset:offset + 2000].replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+        print(f'::notice title=GitHub API HTTP {error.code}::{escaped}')
+    return text
+
+
 def mutation(method, path, body):
     request = Request(f'https://api.github.com/repos/{native.REPOSITORY}/{path}',
                       data=json.dumps(body).encode(), method=method, headers={
@@ -375,7 +406,8 @@ def mutation(method, path, body):
                     'Nieoczekiwany status zapisu GitHub API')
             return json.load(response)
     except HTTPError as error:
-        raise RuntimeError(f'GitHub zapis odrzucony: HTTP {error.code}') from None
+        details = report_api_error(error)
+        raise RuntimeError(f'GitHub zapis odrzucony: HTTP {error.code}; {details}') from None
 
 
 def upload(release_id, path):
