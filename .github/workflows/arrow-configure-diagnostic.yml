@@ -1,8 +1,8 @@
 # =============================================================================
 # Plik: arrow-configure-diagnostic.yml
-# Opis: Odtwarza konfigurację Arrow na ARM64 w środowisku CUDA 12.8.
+# Opis: Buduje pełną bibliotekę zvec na ARM64 w środowisku CUDA 12.8.
 # =============================================================================
-name: Diagnostyka konfiguracji Arrow ARM64 CUDA12
+name: Diagnostyka pełnego buildu zvec ARM64 CUDA12
 'on':
   push:
     branches:
@@ -14,9 +14,9 @@ name: Diagnostyka konfiguracji Arrow ARM64 CUDA12
 permissions:
   contents: read
 jobs:
-  configure:
+  build-zvec:
     runs-on: ubuntu-22.04-arm
-    timeout-minutes: 45
+    timeout-minutes: 180
     steps:
     - uses: actions/checkout@v4
       with:
@@ -55,7 +55,7 @@ jobs:
         echo "/usr/local/cuda-$(echo 12-8 | tr - .)/bin" >> "$GITHUB_PATH"
         echo "CUDA_HOME=/usr/local/cuda-$(echo 12-8 | tr - .)" >> "$GITHUB_ENV"
         df -h /
-    - name: Konfiguracja Arrow bez kompilacji zvec
+    - name: Pełna kompilacja zvec i jego zależności
       env:
         LLAMA_CPP_BACKENDS: cuda
         WHISPER_CPP_BACKENDS: cuda
@@ -63,25 +63,17 @@ jobs:
         ONNXRUNTIME_GPU: '0'
       run: |
         set -euo pipefail
-        python3 - <<'PYTHON'
-        from pathlib import Path
-        path = Path("scripts/build-zvec.sh")
-        source = path.read_text()
-        old = '        ninja zvec_c_api -j"$(nproc)" )'
-        new = ('        ninja thirdparty/arrow/arrow/src/ARROW.BUILD-stamp/ARROW.BUILD-configure )'
-               '\n      exit 0')
-        assert source.count(old) == 1, "Niejednoznaczny cel natywnej kompilacji zvec"
-        path.write_text(source.replace(old, new))
-        PYTHON
         command -v gcc-11 g++-11 ninja
         python3 -c 'import subprocess; v = subprocess.check_output(["cmake", "--version"], text=True).split()[2]; major, minor = map(int, v.split(".")[:2]); assert major == 3 and minor >= 26, v'
         bash -n scripts/build-zvec.sh
-        ./scripts/build-zvec.sh linux-aarch64
-    - name: Zapis logów Arrow
+        ./scripts/native-libs/build-all.sh --platform linux-aarch64 --only zvec 2>&1 | tee zvec-build.log
+    - name: Zapis logów pełnego buildu zvec
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: arrow-configure-linux-aarch64-cuda12
-        path: /tmp/zvec-build/build_zvec/thirdparty/arrow/arrow/src/ARROW.BUILD-stamp/*.log
+        name: zvec-build-linux-aarch64-cuda12
+        path: |
+          zvec-build.log
+          /tmp/zvec-build/build_zvec/**/*-stamp/*.log
         if-no-files-found: ignore
         retention-days: 3
