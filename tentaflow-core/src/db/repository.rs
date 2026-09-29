@@ -32417,6 +32417,13 @@ pub(crate) fn publish_bus_schema_subject_capture(
 /// created it, and its row, deprecations included, must not be overwritten.
 pub fn bus_schema_subject_insert(pool: &DbPool, row: &DbBusSchemaSubject) -> Result<bool> {
     let conn = acquire(pool)?;
+    clear_bus_schema_subject_tombstone(
+        &conn,
+        &row.instance_id,
+        &row.org_id,
+        &row.subject,
+        row.generation,
+    )?;
     let inserted = conn.execute(
         &format!(
             "INSERT INTO bus_schema_subjects ({BUS_SCHEMA_SUBJECT_COLUMNS}) VALUES \
@@ -32551,6 +32558,62 @@ pub fn bus_schema_subject_list(
 /// FK — enabled on every production connection, `db::init` — does the same
 /// when this delete op materializes on a replica, so versions never need
 /// their own delete capture.
+/// Records that the incarnation `generation` of a subject was deleted, so an
+/// op about it arriving later — from a node that had not seen the delete —
+/// cannot bring it back (`core_materializer::bus_schema_subject_op_wins`).
+/// Never lowered: an older delete arriving late keeps the newer one.
+pub(crate) fn record_bus_schema_subject_tombstone(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+    generation: u64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO bus_schema_subject_tombstones (instance_id, org_id, subject, generation) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(instance_id, org_id, subject) DO UPDATE SET \
+         generation = MAX(generation, excluded.generation)",
+        rusqlite::params![instance_id, org_id, subject, generation as i64],
+    )?;
+    Ok(())
+}
+
+/// The newest deleted incarnation of a subject name, if one was deleted.
+pub(crate) fn bus_schema_subject_tombstone(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+) -> Result<Option<u64>> {
+    Ok(conn
+        .query_row(
+            "SELECT generation FROM bus_schema_subject_tombstones \
+             WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3",
+            rusqlite::params![instance_id, org_id, subject],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .map(|g| g as u64))
+}
+
+/// Drops the tombstone of a name once an incarnation newer than the deleted
+/// one exists: from then on the row itself carries the order.
+pub(crate) fn clear_bus_schema_subject_tombstone(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+    below: u64,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM bus_schema_subject_tombstones \
+         WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 AND generation < ?4",
+        rusqlite::params![instance_id, org_id, subject, below as i64],
+    )?;
+    Ok(())
+}
+
 pub fn bus_schema_subject_delete(
     pool: &DbPool,
     instance_id: &str,
@@ -32573,6 +32636,7 @@ pub fn bus_schema_subject_delete(
         "DELETE FROM bus_schema_subjects WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3",
         rusqlite::params![instance_id, org_id, subject],
     )?;
+    record_bus_schema_subject_tombstone(&conn, instance_id, org_id, subject, row.generation)?;
     drop(conn);
     let _ = publish_bus_schema_subject_capture(
         pool,
@@ -32614,6 +32678,11 @@ pub fn bus_schema_subject_delete_by_org(
                 map_bus_schema_subject_row,
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        // A purge leaves no record of the subjects' names behind.
+        conn.execute(
+            "DELETE FROM bus_schema_subject_tombstones WHERE instance_id = ?1 AND org_id = ?2",
+            rusqlite::params![instance_id, org_id],
+        )?;
         rows
     };
     for row in &rows {
@@ -32650,6 +32719,10 @@ pub fn bus_schema_subjects_delete_by_instance(pool: &DbPool, instance_id: &str) 
         let rows = stmt
             .query_map(rusqlite::params![instance_id], map_bus_schema_subject_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        conn.execute(
+            "DELETE FROM bus_schema_subject_tombstones WHERE instance_id = ?1",
+            rusqlite::params![instance_id],
+        )?;
         rows
     };
     for row in &rows {
@@ -33139,6 +33212,13 @@ pub mod bus_test_support {
                 updated_at_ms INTEGER NOT NULL,
                 deprecated_versions_json TEXT NOT NULL DEFAULT '[]',
                 generation INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (instance_id, org_id, subject)
+            );
+            CREATE TABLE IF NOT EXISTS bus_schema_subject_tombstones (
+                instance_id TEXT NOT NULL,
+                org_id TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                generation INTEGER NOT NULL,
                 PRIMARY KEY (instance_id, org_id, subject)
             );
             CREATE TABLE IF NOT EXISTS bus_schema_versions (

@@ -161,32 +161,49 @@ fn version_info(row: &DbBusSchemaVersion, deprecated: &[DeprecatedVersion]) -> V
 /// replicate insert-if-absent and never change, the subject row replicates
 /// LWW — and this list as a union on top of that
 /// (`core_materializer::apply_bus_schema_subject`), taking the later of each
-/// timestamp. A deprecation is never taken back, so a union loses none; a
-/// hard delete is recorded as `removed_at_ms` (a tombstone) rather than by
-/// dropping the entry, so a deprecation still travelling from a node that
-/// had not seen the delete stays covered by it — and a version registered
-/// again with the same content under the freed number starts active. An
-/// entry deprecates its version while `deprecated_at_ms` is later than any
-/// `removed_at_ms` (`is_active`).
+/// stamp. A deprecation is never taken back, so a union loses none; a hard
+/// delete is recorded as `removed_at` (a tombstone) rather than by dropping
+/// the entry, so a deprecation still travelling from a node that had not
+/// seen the delete stays covered by it — and a version registered again with
+/// the same content under the freed number starts active. An entry
+/// deprecates its version while `deprecated_at` is later than any
+/// `removed_at` (`is_active`).
+///
+/// Both stamps are packed ledger HLCs (`ledger_stamp`), not wall-clock
+/// times: they are compared across nodes, and wall clocks that disagree
+/// would drop a real deprecation or keep a stale one. The HLC is past every
+/// op this node has seen, so an event recorded here after it saw another
+/// node's is ordered after it. `deprecated_at_ms` on the wire is the stamp's
+/// wall-clock part (`stamp_wall_ms`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeprecatedVersion {
     pub version: u32,
     #[serde(default)]
     pub content_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub deprecated_at_ms: Option<i64>,
+    pub deprecated_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub removed_at_ms: Option<i64>,
+    pub removed_at: Option<u64>,
 }
 
 impl DeprecatedVersion {
     fn is_active(&self) -> bool {
-        match (self.deprecated_at_ms, self.removed_at_ms) {
+        match (self.deprecated_at, self.removed_at) {
             (Some(deprecated), Some(removed)) => deprecated > removed,
             (Some(_), None) => true,
             (None, _) => false,
         }
     }
+}
+
+/// A stamp on the ledger's clock, packed like a topic's incarnation.
+fn ledger_stamp() -> u64 {
+    repository::bus_topic_generation_at(&crate::sync::runtime::core_hlc_now())
+}
+
+/// The wall-clock milliseconds of a packed stamp — what a reader is shown.
+fn stamp_wall_ms(stamp: u64) -> i64 {
+    (stamp >> 16) as i64
 }
 
 /// Decodes a `deprecated_versions_json` value; `None` (a payload from a
@@ -217,71 +234,59 @@ pub fn encode_deprecated_versions(list: Vec<DeprecatedVersion>) -> String {
 }
 
 /// The union of two lists: one entry per (version, content) with the later
-/// of each timestamp. Per version number only the newest tombstone that no
-/// deprecation outlives is kept, so a number deleted and registered again
-/// many times does not grow the list without bound.
+/// of each stamp. Every tombstone is kept — dropping one would let a late
+/// deprecation of that content revive — so the list grows with the
+/// distinct contents a number has held, which hard deletes alone produce.
 pub fn merge_deprecated_versions(
     a: Vec<DeprecatedVersion>,
     b: Vec<DeprecatedVersion>,
 ) -> Vec<DeprecatedVersion> {
-    let mut merged: std::collections::BTreeMap<(u32, String), (Option<i64>, Option<i64>)> =
+    let mut merged: std::collections::BTreeMap<(u32, String), (Option<u64>, Option<u64>)> =
         std::collections::BTreeMap::new();
     for d in a.into_iter().chain(b) {
         let at = merged.entry((d.version, d.content_hash)).or_default();
-        at.0 = at.0.max(d.deprecated_at_ms);
-        at.1 = at.1.max(d.removed_at_ms);
+        at.0 = at.0.max(d.deprecated_at);
+        at.1 = at.1.max(d.removed_at);
     }
-    let entries: Vec<DeprecatedVersion> = merged
+    merged
         .into_iter()
-        .map(|((version, content_hash), (deprecated_at_ms, removed_at_ms))| DeprecatedVersion {
+        .map(|((version, content_hash), (deprecated_at, removed_at))| DeprecatedVersion {
             version,
             content_hash,
-            deprecated_at_ms,
-            removed_at_ms,
+            deprecated_at,
+            removed_at,
         })
-        .collect();
-    let mut newest_tombstone: std::collections::BTreeMap<u32, (Option<i64>, &str)> =
-        std::collections::BTreeMap::new();
-    for d in entries.iter().filter(|d| !d.is_active()) {
-        let key = (d.removed_at_ms, d.content_hash.as_str());
-        let slot = newest_tombstone.entry(d.version).or_insert(key);
-        *slot = (*slot).max(key);
-    }
-    let keep: Vec<bool> = entries
-        .iter()
-        .map(|d| {
-            d.is_active()
-                || newest_tombstone.get(&d.version)
-                    == Some(&(d.removed_at_ms, d.content_hash.as_str()))
-        })
-        .collect();
-    entries
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(d, keep)| keep.then_some(d))
         .collect()
 }
 
-fn deprecated_at(list: &[DeprecatedVersion], version: &DbBusSchemaVersion) -> Option<i64> {
+fn entry_for<'a>(
+    list: &'a [DeprecatedVersion],
+    version: &DbBusSchemaVersion,
+) -> Option<&'a DeprecatedVersion> {
     list.iter()
-        .find(|d| {
-            d.version == version.version && d.content_hash == version.content_hash && d.is_active()
-        })
-        .and_then(|d| d.deprecated_at_ms)
+        .find(|d| d.version == version.version && d.content_hash == version.content_hash)
 }
 
-/// `list` with `version` deprecated or removed at `at_ms`.
+/// When `version` was deprecated (wall-clock ms), `None` while it is active.
+fn deprecated_at(list: &[DeprecatedVersion], version: &DbBusSchemaVersion) -> Option<i64> {
+    entry_for(list, version)
+        .filter(|d| d.is_active())
+        .and_then(|d| d.deprecated_at)
+        .map(stamp_wall_ms)
+}
+
+/// `list` with `version` deprecated or removed at `stamp`.
 fn record_version_event(
     list: Vec<DeprecatedVersion>,
     version: &DbBusSchemaVersion,
     removed: bool,
-    at_ms: i64,
+    stamp: u64,
 ) -> Vec<DeprecatedVersion> {
     let event = DeprecatedVersion {
         version: version.version,
         content_hash: version.content_hash.clone(),
-        deprecated_at_ms: (!removed).then_some(at_ms),
-        removed_at_ms: removed.then_some(at_ms),
+        deprecated_at: (!removed).then_some(stamp),
+        removed_at: removed.then_some(stamp),
     };
     merge_deprecated_versions(list, vec![event])
 }
@@ -931,11 +936,14 @@ pub fn delete(
             if deprecated_at(&list, &version_row).is_some() {
                 return Ok(false);
             }
-            let now = crate::bus::now_ms();
+            // Past a tombstone of this very content (deleted and registered
+            // again), or the deprecation would not count.
+            let removed = entry_for(&list, &version_row).and_then(|d| d.removed_at);
+            let stamp = ledger_stamp().max(removed.map_or(0, |r| r + 1));
             row.deprecated_versions_json = Some(encode_deprecated_versions(
-                record_version_event(list, &version_row, false, now),
+                record_version_event(list, &version_row, false, stamp),
             ));
-            row.updated_at_ms = now;
+            row.updated_at_ms = crate::bus::now_ms();
             changed = true;
             Ok(true)
         })?;
@@ -1005,11 +1013,10 @@ pub fn delete(
             // covered by it, and cannot reach the same content registered
             // again under the freed number.
             modify_subject(db, instance_id, org_id, subject, |_, row| {
-                let now = crate::bus::now_ms();
                 row.deprecated_versions_json = Some(encode_deprecated_versions(
-                    record_version_event(subject_deprecations(row)?, &removed, true, now),
+                    record_version_event(subject_deprecations(row)?, &removed, true, ledger_stamp()),
                 ));
-                row.updated_at_ms = now;
+                row.updated_at_ms = crate::bus::now_ms();
                 Ok(true)
             })?;
             bump_generation();
@@ -2406,7 +2413,79 @@ mod tests {
         let list = parse_deprecated_versions("orders", subject.deprecated_versions_json.as_deref())
             .unwrap();
         assert_eq!(list.len(), 1, "one tombstone for v3: {list:?}");
-        assert!(list[0].removed_at_ms.is_some());
+        assert!(list[0].removed_at.is_some());
         assert_ne!(subject.generation, 0, "a subject names its incarnation");
+    }
+
+    /// A tombstone stamped by a node whose clock runs ahead does not swallow
+    /// a later deprecation made here: events are stamped on the ledger's
+    /// clock and a deprecation is placed past the tombstone of its own
+    /// content. What the wire shows is still a wall-clock time.
+    #[test]
+    fn a_deprecation_after_a_tombstone_from_a_clock_ahead_still_counts() {
+        let db = three_versions();
+        let v1 = repository::bus_schema_version_get(&db, INST, "org-1", "orders", 1)
+            .unwrap()
+            .unwrap();
+        let far_ahead = repository::bus_topic_generation_at(
+            &crate::sync::ledger::HybridLogicalTimestamp {
+                wall_time_ms: crate::bus::now_ms() + 3_600_000,
+                logical: 0,
+                node_id: "node-ahead".to_string(),
+            },
+        );
+        repository::bus_schema_subject_modify(&db, INST, "org-1", "orders", |_, row| {
+            row.deprecated_versions_json = Some(encode_deprecated_versions(vec![DeprecatedVersion {
+                version: 1,
+                content_hash: v1.content_hash.clone(),
+                deprecated_at: None,
+                removed_at: Some(far_ahead),
+            }]));
+            Ok(true)
+        })
+        .unwrap();
+        let before = crate::bus::now_ms();
+        delete(&db, INST, "org-1", "orders", Some(1), true).unwrap();
+        let deprecated = list_versions(&db, INST, "org-1", "orders").unwrap()[0].deprecated_at_ms;
+        let shown = deprecated.expect("the deprecation counts");
+        assert!(
+            shown >= before && shown <= crate::bus::now_ms() + 3_600_000,
+            "a wall-clock time, not a packed stamp: {shown}"
+        );
+        assert_eq!(effective(&db), 3);
+    }
+
+    /// Every tombstone is kept, one per content: dropping the older content's
+    /// would let its late deprecation revive.
+    #[test]
+    fn a_tombstone_of_each_content_survives_the_merge() {
+        let tombstone = |hash: &str, at: u64| DeprecatedVersion {
+            version: 3,
+            content_hash: hash.to_string(),
+            deprecated_at: None,
+            removed_at: Some(at),
+        };
+        let merged = merge_deprecated_versions(
+            vec![tombstone("a", 50), tombstone("b", 60)],
+            vec![DeprecatedVersion {
+                version: 3,
+                content_hash: "a".to_string(),
+                deprecated_at: Some(40),
+                removed_at: None,
+            }],
+        );
+        assert_eq!(merged.len(), 2);
+        let content_a = DbBusSchemaVersion {
+            instance_id: INST.to_string(),
+            org_id: "org-1".to_string(),
+            subject: "orders".to_string(),
+            version: 3,
+            schema_text: String::new(),
+            content_hash: "a".to_string(),
+            schema_ref_id: 1,
+            created_by: None,
+            created_at_ms: 0,
+        };
+        assert_eq!(deprecated_at(&merged, &content_a), None, "the late deprecation stays covered");
     }
 }

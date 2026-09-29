@@ -4398,20 +4398,48 @@ fn apply_bus_schema_subject(
     match operation.body.action {
         ActionType::Insert | ActionType::Update => {
             let held = held_schema_subject(tx, &row)?;
-            // Within one incarnation the deprecations merge and the subject's
-            // own deprecation and authorship stay; a newer incarnation (the
-            // name deleted and registered again) replaces them, since nothing
-            // said about the deleted subject applies to the new one.
-            let deprecations = match held {
-                Some(held) if row.generation == 0 || row.generation == held.generation => {
-                    row.generation = held.generation;
+            let relation = held
+                .as_ref()
+                .map(|h| subject_relation(h.generation, row.generation));
+            let deprecations = match (held, relation) {
+                // Within one incarnation the deprecations merge and the
+                // subject's own deprecation and authorship stay.
+                (Some(held), Some(SubjectRelation::Same)) => {
                     row.deprecated_at_ms = held.deprecated_at_ms.or(row.deprecated_at_ms);
                     row.created_by = held.created_by.or(row.created_by);
                     row.created_at_ms = held.created_at_ms;
                     merge_deprecated_versions(held.deprecations, incoming)
                 }
-                _ => incoming,
+                // A peer from before incarnations cannot say which one it
+                // writes about: its other fields go by LWW, but nothing it
+                // says deprecated reaches the incarnation held here — it may
+                // be about the deleted one.
+                (Some(held), Some(SubjectRelation::Unknown)) => {
+                    row.generation = held.generation;
+                    row.deprecated_at_ms = held.deprecated_at_ms;
+                    row.created_by = held.created_by;
+                    row.created_at_ms = held.created_at_ms;
+                    held.deprecations
+                }
+                // A newer incarnation — the name deleted and registered
+                // again — replaces the held one whole, its versions
+                // included: nothing said about the deleted subject applies.
+                (Some(_), _) => {
+                    drop_schema_versions_of_older_incarnation(tx, &row)?;
+                    incoming
+                }
+                (None, _) => incoming,
             };
+            if row.generation != 0 {
+                crate::db::repository::clear_bus_schema_subject_tombstone(
+                    tx,
+                    &row.instance_id,
+                    &row.org_id,
+                    &row.subject,
+                    row.generation,
+                )
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            }
             tx.execute(
                 "INSERT INTO bus_schema_subjects \
                  (instance_id, org_id, subject, schema_type, compatibility, deprecated_at_ms, \
@@ -4446,15 +4474,68 @@ fn apply_bus_schema_subject(
         // subject)` removes this subject's versions on every replica the
         // same way it does locally
         // (`db::repository::bus_schema_subject_delete`'s doc) — no separate
-        // version-delete op is ever minted for a cascaded row.
-        ActionType::Delete => tx
-            .execute(
+        // version-delete op is ever minted for a cascaded row. The removed
+        // incarnation is recorded, so a later op about it cannot bring it
+        // back.
+        ActionType::Delete => {
+            let removed = held_schema_subject(tx, &row)?
+                .map_or(row.generation, |held| held.generation);
+            crate::db::repository::record_bus_schema_subject_tombstone(
+                tx,
+                &row.instance_id,
+                &row.org_id,
+                &row.subject,
+                removed,
+            )
+            .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            tx.execute(
                 "DELETE FROM bus_schema_subjects WHERE instance_id = ?1 AND org_id = ?2 \
                  AND subject = ?3",
                 rusqlite::params![row.instance_id, row.org_id, row.subject],
             )
-            .map_err(sql_error),
+            .map_err(sql_error)
+        }
     }
+}
+
+/// How an op's subject row relates to the one held here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectRelation {
+    /// The same incarnation, or both from before incarnations.
+    Same,
+    /// The op is from a build before incarnations (`0`) while the held row
+    /// names one: it cannot tell which incarnation it concerns.
+    Unknown,
+    /// Another incarnation — one that won the order, i.e. a newer one, or a
+    /// stamped one over a held row from before incarnations.
+    Other,
+}
+
+fn subject_relation(held: u64, incoming: u64) -> SubjectRelation {
+    match (held, incoming) {
+        (h, i) if h == i => SubjectRelation::Same,
+        (_, 0) => SubjectRelation::Unknown,
+        _ => SubjectRelation::Other,
+    }
+}
+
+/// When an incarnation replaces the held one, the versions registered under
+/// the deleted one go first: `resolve_effective` must never validate with
+/// them, and a new version would collide with their numbers. Versions carry
+/// no incarnation of their own; one created before the new incarnation's
+/// creation belongs to an older one (both stamps come from the node that
+/// registered the subject again, which created it after deleting the old).
+fn drop_schema_versions_of_older_incarnation(
+    tx: &rusqlite::Transaction<'_>,
+    row: &crate::db::repository::DbBusSchemaSubject,
+) -> LedgerResult<()> {
+    tx.execute(
+        "DELETE FROM bus_schema_versions WHERE instance_id = ?1 AND org_id = ?2 \
+         AND subject = ?3 AND created_at_ms < ?4",
+        rusqlite::params![row.instance_id, row.org_id, row.subject, row.created_at_ms],
+    )
+    .map_err(sql_error)?;
+    Ok(())
 }
 
 use crate::bus::schema_registry::registry::{
@@ -4541,9 +4622,10 @@ fn decode_bus_schema_subject(
 /// incarnation first (`DbBusSchemaSubject::generation`), and by HLC only
 /// within one. A subject deleted and registered again is a new incarnation;
 /// an edit of the deleted one — even one stamped later, from a node that had
-/// not seen the delete — must not overwrite it. A row from a build before
-/// incarnations (`0`) is judged within the held one; with nothing held the
-/// HLC alone decides, as for any other LWW resource.
+/// not seen the delete — must not overwrite it, and a deleted incarnation
+/// (`bus_schema_subject_tombstones`) never comes back. Where either side is
+/// from a build before incarnations (`0`) nothing says which incarnation it
+/// concerns, and the HLC alone decides, as for any other LWW resource.
 fn bus_schema_subject_op_wins(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
@@ -4568,18 +4650,27 @@ fn bus_schema_subject_op_wins(
         )
         .optional()
         .map_err(sql_error)?;
-    let Some(held) = held.map(|g| g as u64) else {
-        return hlc_wins();
-    };
-    let incoming = if row.generation == 0 {
-        held
-    } else {
-        row.generation
-    };
-    match incoming.cmp(&held) {
-        std::cmp::Ordering::Greater => Ok(true),
-        std::cmp::Ordering::Less => Ok(false),
-        std::cmp::Ordering::Equal => hlc_wins(),
+    let incoming = row.generation;
+    if let Some(held) = held.map(|g| g as u64) {
+        if held == 0 || incoming == 0 {
+            return hlc_wins();
+        }
+        return match incoming.cmp(&held) {
+            std::cmp::Ordering::Greater => Ok(true),
+            std::cmp::Ordering::Less => Ok(false),
+            std::cmp::Ordering::Equal => hlc_wins(),
+        };
+    }
+    let deleted = crate::db::repository::bus_schema_subject_tombstone(
+        tx,
+        &row.instance_id,
+        &row.org_id,
+        &row.subject,
+    )
+    .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+    match deleted {
+        Some(deleted) if deleted != 0 && incoming != 0 => Ok(incoming > deleted),
+        _ => hlc_wins(),
     }
 }
 
@@ -4588,7 +4679,9 @@ fn bus_schema_subject_op_wins(
 /// know of: they are merged into the stored row (and the subject's own
 /// deprecation, once made, is kept) while every other field stays the
 /// winner's. An op about another incarnation — a deleted subject whose name
-/// was registered again — changes nothing. Returns the rows changed.
+/// was registered again — or one that cannot say which (a peer from before
+/// incarnations over a stamped row) changes nothing. Returns the rows
+/// changed.
 fn merge_losing_bus_schema_subject(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
@@ -4602,7 +4695,7 @@ fn merge_losing_bus_schema_subject(
     let Some(held) = held_schema_subject(tx, &row)? else {
         return Ok(0);
     };
-    if row.generation != 0 && row.generation != held.generation {
+    if subject_relation(held.generation, row.generation) != SubjectRelation::Same {
         return Ok(0);
     }
     let merged = encode_deprecated_versions(merge_deprecated_versions(held.deprecations, incoming));
@@ -9698,7 +9791,7 @@ mod tests {
     }
 
     fn deprecation(version: u32, at_ms: i64) -> String {
-        format!(r#"{{"version":{version},"content_hash":"hash-{version}","deprecated_at_ms":{at_ms}}}"#)
+        format!(r#"{{"version":{version},"content_hash":"hash-{version}","deprecated_at":{at_ms}}}"#)
     }
 
     /// `orders` with versions 1–3 (content `hash-<n>`) on a fresh node.
@@ -9813,7 +9906,7 @@ mod tests {
     }
 
     fn removal(version: u32, hash: &str, at_ms: i64) -> String {
-        format!(r#"{{"version":{version},"content_hash":"{hash}","removed_at_ms":{at_ms}}}"#)
+        format!(r#"{{"version":{version},"content_hash":"{hash}","removed_at":{at_ms}}}"#)
     }
 
     fn active_deprecations(db: &crate::db::DbPool) -> Vec<(u32, u32)> {
@@ -9970,5 +10063,159 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn held_subject(db: &crate::db::DbPool) -> Option<repository::DbBusSchemaSubject> {
+        repository::bus_schema_subject_get(db, "tentabus-00000001", "org-1", "orders").unwrap()
+    }
+
+    /// A peer from before incarnations (generation `0`) writing a subject
+    /// held here as a stamped incarnation: its other fields land by LWW, but
+    /// nothing it says deprecated reaches the held incarnation — it may be
+    /// about a deleted one.
+    #[test]
+    fn an_op_from_before_incarnations_never_deprecates_a_stamped_subject() {
+        let db = bus_db();
+        let mut held = schema_subject_row_for_test("org-1", "orders");
+        held.generation = generation_at(2_000);
+        apply_core_operation(&db, &at(bus_schema_subject_op(&held, ActionType::Insert), 2_000))
+            .unwrap();
+        let mut legacy = schema_subject_row_for_test("org-1", "orders");
+        legacy.compatibility = "full".to_string();
+        legacy.deprecated_at_ms = Some(2_500);
+        legacy.deprecated_versions_json = Some(format!("[{}]", deprecation(1, 2_500)));
+        let mut op = at(bus_schema_subject_op(&legacy, ActionType::Update), 3_000);
+        op.body.hlc_timestamp.node_id = "node-old".to_string();
+        apply_core_operation(&db, &op).unwrap();
+        let after = held_subject(&db).unwrap();
+        assert_eq!(after.compatibility, "full", "the other fields go by LWW");
+        assert_eq!(after.generation, held.generation);
+        assert_eq!(after.deprecated_at_ms, None);
+        assert_eq!(after.deprecated_versions_json.as_deref(), Some("[]"));
+    }
+
+    /// A held row from before incarnations against a stamped op: the HLC
+    /// decides, not the stamp — an older stamped op does not win just by
+    /// carrying one.
+    #[test]
+    fn a_stamped_op_over_a_row_from_before_incarnations_goes_by_hlc() {
+        let db = bus_db();
+        let legacy = schema_subject_row_for_test("org-1", "orders");
+        apply_core_operation(&db, &at(bus_schema_subject_op(&legacy, ActionType::Insert), 3_000))
+            .unwrap();
+        let mut stamped = schema_subject_row_for_test("org-1", "orders");
+        stamped.generation = generation_at(1_000);
+        stamped.compatibility = "full".to_string();
+        apply_core_operation(&db, &at(bus_schema_subject_op(&stamped, ActionType::Update), 2_000))
+            .unwrap();
+        let after = held_subject(&db).unwrap();
+        assert_eq!((after.generation, after.compatibility.as_str()), (0, "backward"));
+    }
+
+    /// A deleted subject stays deleted: an op about its incarnation arriving
+    /// later — stamped after the delete, from a node that missed it — does
+    /// not bring it back, while a newer incarnation does come in.
+    #[test]
+    fn a_deleted_subject_is_not_brought_back_by_a_late_edit() {
+        let db = bus_db();
+        let mut first = schema_subject_row_for_test("org-1", "orders");
+        first.generation = generation_at(1_000);
+        apply_core_operation(&db, &at(bus_schema_subject_op(&first, ActionType::Insert), 1_000))
+            .unwrap();
+        apply_core_operation(&db, &at(bus_schema_subject_op(&first, ActionType::Delete), 2_000))
+            .unwrap();
+        let mut late = first.clone();
+        late.compatibility = "full".to_string();
+        let mut op = at(bus_schema_subject_op(&late, ActionType::Update), 3_000);
+        op.body.hlc_timestamp.node_id = "node-c".to_string();
+        apply_core_operation(&db, &op).unwrap();
+        assert!(held_subject(&db).is_none(), "the deleted incarnation stays deleted");
+
+        let mut second = schema_subject_row_for_test("org-1", "orders");
+        second.generation = generation_at(2_500);
+        apply_core_operation(&db, &at(bus_schema_subject_op(&second, ActionType::Insert), 2_500))
+            .unwrap();
+        assert_eq!(held_subject(&db).unwrap().generation, second.generation);
+    }
+
+    /// The same, when the delete was made on this node: the local delete
+    /// leaves the tombstone the order consults.
+    #[test]
+    fn a_locally_deleted_subject_is_not_brought_back_by_a_late_edit() {
+        let db = bus_db();
+        crate::bus::schema_registry::registry::register(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+            crate::bus::schema_registry::SchemaType::JsonSchema,
+            r#"{"type":"object"}"#,
+            None,
+            None,
+        )
+        .unwrap();
+        let before = held_subject(&db).unwrap();
+        crate::bus::schema_registry::registry::delete(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+            None,
+            false,
+        )
+        .unwrap();
+        let mut late = before.clone();
+        late.compatibility = "full".to_string();
+        // Later than the local delete on the ledger's clock without moving
+        // the process-wide clock ahead of the wall — other tests stamp
+        // relative to it.
+        let mut op = bus_schema_subject_op(&late, ActionType::Update);
+        let mut stamp = crate::sync::runtime::core_hlc_now();
+        stamp.logical += 1;
+        stamp.node_id = "node-c".to_string();
+        op.body.hlc_timestamp = stamp;
+        op.body.actor_node_id = "node-c".to_string();
+        apply_core_operation(&db, &op).unwrap();
+        assert!(held_subject(&db).is_none());
+    }
+
+    /// A newer incarnation replacing the held one takes the deleted one's
+    /// versions with it: validation never resolves to a version of the
+    /// deleted subject, and the new incarnation's versions land.
+    #[test]
+    fn a_new_incarnation_drops_the_versions_of_the_one_it_replaces() {
+        let db = bus_db();
+        let mut first = schema_subject_row_for_test("org-1", "orders");
+        first.generation = generation_at(1_000);
+        first.created_at_ms = 1_000;
+        apply_core_operation(&db, &at(bus_schema_subject_op(&first, ActionType::Insert), 1_000))
+            .unwrap();
+        let mut old_v1 = schema_version_row_for_test("org-1", "orders", 1, "hash-old", 801);
+        old_v1.created_at_ms = 1_000;
+        apply_core_operation(&db, &at(bus_schema_version_op(&old_v1, ActionType::Insert), 1_000))
+            .unwrap();
+
+        let mut second = schema_subject_row_for_test("org-1", "orders");
+        second.generation = generation_at(2_000);
+        second.created_at_ms = 2_000;
+        apply_core_operation(&db, &at(bus_schema_subject_op(&second, ActionType::Insert), 2_000))
+            .unwrap();
+        let resolve = |db: &crate::db::DbPool| {
+            crate::bus::schema_registry::registry::resolve_effective(
+                db,
+                "tentabus-00000001",
+                "org-1",
+                "orders",
+            )
+            .unwrap()
+            .map(|e| e.schema_ref_id)
+        };
+        assert_eq!(resolve(&db), None, "no version of the deleted subject validates");
+
+        let mut new_v1 = schema_version_row_for_test("org-1", "orders", 1, "hash-new", 802);
+        new_v1.created_at_ms = 2_000;
+        apply_core_operation(&db, &at(bus_schema_version_op(&new_v1, ActionType::Insert), 2_000))
+            .unwrap();
+        assert_eq!(resolve(&db), Some(802));
     }
 }

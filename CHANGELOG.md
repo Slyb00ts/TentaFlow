@@ -28,14 +28,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   `bus_topics.created_by`, `bus_schema_subjects.deprecated_versions_json`
   i `bus_schema_subjects.generation` (wcielenie wzoru: wzór usunięty
   i zarejestrowany ponownie jest nowym wzorem, do którego nie trafia nic,
-  co dotyczyło poprzedniego).
+  co dotyczyło poprzedniego, łącznie z jego wersjami) oraz tabelę
+  `bus_schema_subject_tombstones` (usunięty wzór nie wraca po spóźnionej
+  zmianie z innego noda). Czasy wycofania i usunięcia wersji są znaczone
+  zegarem synchronizacji (HLC), nie zegarem ściennym noda.
   Opis i autor synchronizują się w wierszu topiku (ostatni zapis wygrywa,
   autor zostaje ustalony przy tworzeniu). Wycofania wersji i wycofanie całego
   wzoru synchronizują się jako suma: dwa jednoczesne wycofania na różnych
   nodach przetrwają oba, a zapis z noda, który jeszcze nie widział wycofania,
   go nie cofa; wersja usunięta na stałe nie wraca jako wycofana. W klastrze
   z nodami w starszej wersji ich zmiany topiku i wzoru nie czyszczą opisu ani
-  wycofań zapisanych na nowszych nodach; starsze nody same nie znają opisów
+  wycofań zapisanych na nowszych nodach, a wycofania wysłane przez starszy
+  node nie trafiają do wzoru znanego nowszym nodom jako konkretne wcielenie; starsze nody same nie znają opisów
   ani wycofanych wersji (dla nich wzór sprawdza zawsze najnowszą wersję),
   więc do czasu aktualizacji wszystkich nodów instancji walidacja może się
   między nimi różnić. Opis spoza limitów tej wersji (np. dłuższy niż
