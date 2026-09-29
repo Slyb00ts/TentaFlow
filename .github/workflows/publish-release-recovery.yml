@@ -4,11 +4,7 @@
 # =============================================================================
 name: Publish recovered release beta.1
 on:
-  push:
-    branches: [ci/arrow-configure-beta1]
-    paths:
-      - .github/workflows/publish-release-recovery.yml
-      - scripts/ci-local/publish-release-recovery.py
+  workflow_dispatch:
 permissions: {}
 concurrency:
   group: publish-release-v0.4.0-beta.1

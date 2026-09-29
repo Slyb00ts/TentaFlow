@@ -257,20 +257,9 @@ def notes():
     body = '\n'.join(line[12:] if line.startswith('            ') else line
                      for line in body.rstrip().splitlines())
     body = body.replace('${{ github.ref_name }}', TAG)
-    return body + f'''\n\n## Pochodzenie kompilacji\n\nKod aplikacji odpowiada tagowi `{TAG}` (`{SOURCE_SHA}`).
-Windows i macOS pochodzą z pierwotnego przebiegu wydania. Linux został zbudowany
-ponownie z tego samego kodu, z wykorzystaniem sprawdzonych bibliotek natywnych.
-Android pochodzi z osobnego, udanego przebiegu: kompilacja używa jednego zadania
-Cargo, wyłączonego LTO, 16 jednostek generowania kodu i dodatkowych 16 GiB swapu.
-Receptura Androida pochodzi z `{ANDROID_SHA}`; kod aplikacji i zależności są zgodne
-z tagiem. Nie deklarujemy identyczności binarnej z pierwotną recepturą tagu.
-
-Pierwotny workflow zawiera nieudane zadania. Ich wyniki zastępują udane przebiegi
-Linux i Android wymienione w załączonym `{PROVENANCE_FILE}`, razem z SHA źródeł,
-identyfikatorami zadań, artefaktów i sumami kontrolnymi.
-
-Pełny changelog 0.3.0 → 0.4.0 beta: [CHANGELOG.md](https://github.com/{native.REPOSITORY}/blob/{TAG}/CHANGELOG.md).
-'''
+    return body + (f"\n\nBuild provenance: [release-provenance.json]"
+                   f"(https://github.com/{native.REPOSITORY}/releases/download/"
+                   f"{TAG}/{PROVENANCE_FILE}).\n")
 
 
 def job_records(proof):

@@ -1,0 +1,25 @@
+# ============ File: update-release-description.yml — Publish the reviewed English release description. ============
+name: Update beta.1 release description
+on:
+  push:
+    branches: [ci/arrow-configure-beta1]
+    paths:
+      - .github/workflows/update-release-description.yml
+permissions: {}
+concurrency:
+  group: publish-release-v0.4.0-beta.1
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Update description and verify unchanged assets
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-local/update-release-description.py
