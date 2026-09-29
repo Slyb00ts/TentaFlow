@@ -1,0 +1,86 @@
+# =============================================================================
+# Plik: job-logs-diagnostic.yml
+# Opis: Pobiera autoryzowane logi CI i publikuje zredagowaną diagnostykę.
+# =============================================================================
+name: Diagnostyka logów wcześniejszych buildów
+'on':
+  push:
+    branches:
+    - ci/arrow-configure-beta1
+    paths:
+    - .github/workflows/job-logs-diagnostic.yml
+  workflow_dispatch: {}
+permissions: {}
+jobs:
+  logs:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        job_id:
+        - '108627534699'
+        - '109290168068'
+    steps:
+    - name: Pobranie i redakcja logów zadania
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        JOB_ID: ${{ matrix.job_id }}
+      run: |
+        set -euo pipefail
+        mkdir -p diagnostics
+        raw_log="$(mktemp)"
+        trap 'rm -f "$raw_log"' EXIT
+        curl --fail --silent --show-error --location --max-time 120 --retry 2 \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/jobs/$JOB_ID/logs" \
+          --output "$raw_log"
+        python3 - "$raw_log" <<'PYTHON'
+        import os
+        from pathlib import Path
+        import re
+        import sys
+
+        text = Path(sys.argv[1]).read_text(errors="replace")
+        text = text.replace(os.environ["GITHUB_TOKEN"], "[REDACTED]")
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+        text = re.sub(r"(?i)Bearer\s+[^\s\"']+", "Bearer [REDACTED]", text)
+        text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b", "[REDACTED]", text)
+        text = re.sub(r"(?i)((?:token|secret|password|api[_-]?key|authorization)[\"']?\s*[:=]\s*[\"']?)[^\s\"']+", r"\1[REDACTED]", text)
+        text = re.sub(r"https?://[^\s\"']+[?][^\s\"']*(?:sig|signature|token|credential|key)=[^\s\"']+", "[REDACTED_URL]", text, flags=re.I)
+        job_id = os.environ["JOB_ID"]
+        Path(f"diagnostics/job-{job_id}.log").write_text(text)
+        lines = text.splitlines()
+        error = re.compile(r"error|fatal|killed|SIGTERM|out[ -]of[ -]memory|No space|exit code", re.I)
+        indices = set()
+        for index, line in enumerate(lines):
+            if error.search(line):
+                indices.update(range(max(0, index - 2), min(len(lines), index + 4)))
+        context = "\n".join(f"{index + 1}: {lines[index]}" for index in sorted(indices))[-7800:]
+        tail = "\n".join(lines[-100:])[-7800:]
+        message = f"Job {job_id} — kontekst błędów:\n{context}\nOstatnie 100 linii (limit znaków):\n{tail}"
+        chunks = []
+        chunk = ""
+        for char in message:
+            encoded = {"%": "%25", "\r": "%0D", "\n": "%0A"}.get(char, char)
+            if len(chunk) + len(encoded) > 2800:
+                chunks.append(chunk)
+                chunk = ""
+            chunk += encoded
+        if chunk:
+            chunks.append(chunk)
+        for index, chunk in enumerate(chunks, 1):
+            print(f"::notice title=Diagnostyka job {job_id} ({index}/{len(chunks)})::{chunk}")
+        PYTHON
+    - name: Zapis zredagowanych logów
+      uses: actions/upload-artifact@v4
+      with:
+        name: diagnostic-job-${{ matrix.job_id }}
+        path: diagnostics/*.log
+        retention-days: 3
+        if-no-files-found: error

@@ -7,6 +7,9 @@ name: Diagnostyka konfiguracji Arrow ARM64 CUDA12
   push:
     branches:
     - ci/arrow-configure-beta1
+    paths:
+    - .github/workflows/arrow-configure-diagnostic.yml
+    - scripts/build-zvec.sh
   workflow_dispatch: {}
 permissions:
   contents: read
