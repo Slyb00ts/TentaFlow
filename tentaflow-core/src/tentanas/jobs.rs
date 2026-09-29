@@ -477,12 +477,12 @@ where
         } else {
             body(handle).await
           }
-        }).catch_unwind().await.unwrap_or_else(|_| Err(anyhow!("Przerwanie wykonawcy zadania; stan I/O niepotwierdzony")));
+        }).catch_unwind().await.unwrap_or_else(|_| Err(anyhow!("The job executor was aborted; the I/O state is not confirmed")));
         if !cancellable && !self_closing {
             if let Err(error) = &outcome {
                 if let Err(persist) = store::fail_elastic_job(&db,&job_id,&error.to_string()) {
-                    tracing::error!("tentanas job {job_id}: nie utrwalono needs_attention: {persist}");
-                    outcome = Err(anyhow!("{error}; nie utrwalono needs_attention: {persist}"));
+                    tracing::error!("tentanas job {job_id}: needs_attention was not persisted: {persist}");
+                    outcome = Err(anyhow!("{error}; needs_attention was not persisted: {persist}"));
                 }
             }
         }
@@ -494,7 +494,7 @@ where
         };
         if let Err(e) = store::finish_job(&db, &job_id, status, error.as_deref()) {
             tracing::warn!("tentanas job {job_id}: finish write failed: {e}");
-            outcome = Err(anyhow!("Nie utrwalono zakończenia zadania: {e}"));
+            outcome = Err(anyhow!("The job's end was not persisted: {e}"));
         }
         running()
             .lock()

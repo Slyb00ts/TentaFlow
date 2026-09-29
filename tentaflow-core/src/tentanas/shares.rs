@@ -720,7 +720,7 @@ pub fn readable_datasets(
         // A node with no ZFS at all has no listing to read: nothing to lose.
         Err(super::broker::BrokerError::ToolMissing(_)) if trigger == ApplyTrigger::Resume => Ok(Vec::new()),
         Err(error) if trigger != ApplyTrigger::Change => Err(anyhow!(
-            "Nie można odczytać listy datasetów ZFS ({error}); konfiguracje share pozostają bez zmian"
+            "The ZFS dataset list could not be read ({error}); the share configs stay as they are"
         )),
         Err(_) => Ok(Vec::new()),
     }
@@ -741,7 +741,7 @@ pub fn transient_reading<D>(shares: &[ShareRow], computed: &[(&'static str, D)])
         .collect();
     (!dropped.is_empty()).then(|| {
         format!(
-            "Odczyt noda nie potwierdza źródeł działających share ({}); konfiguracje pozostają bez zmian",
+            "The node's reading does not confirm the sources of serving shares ({}); the configs stay as they are",
             dropped.join(", ")
         )
     })
@@ -1631,7 +1631,7 @@ mod tests {
         let refusal = readable_datasets(unreadable(), ApplyTrigger::Startup)
             .expect_err("the startup rewrite refuses a reading it does not have")
             .to_string();
-        assert!(refusal.contains("datasetów ZFS") && refusal.contains("pozostają bez zmian"), "{refusal}");
+        assert!(refusal.contains("ZFS dataset list") && refusal.contains("stay as they are"), "{refusal}");
         assert_eq!(readable_datasets(unreadable(), ApplyTrigger::Change).expect("an admin's change goes on").len(), 0);
         for trigger in [ApplyTrigger::Startup, ApplyTrigger::Change] {
             let listed = vec![dataset("tank", "/mnt/tank", true)];
@@ -1655,7 +1655,7 @@ mod tests {
         // Whatever the node answered — an unreadable listing, or a listing
         // without this share's pool — the refusal says the configs were left
         // alone, and they were.
-        assert!(error.to_string().contains("pozostają bez zmian"), "{error}");
+        assert!(error.to_string().contains("stay as they are"), "{error}");
         let stored = store::list_shares(&db).expect("shares");
         assert_eq!((stored[0].state.as_str(), stored[0].state_detail.as_str()), ("active", ""));
     }

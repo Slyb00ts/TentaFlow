@@ -534,6 +534,17 @@ test('przerwany sync nie jest błędem ani powodem naprawy', async () => {
   }
 });
 
+// Wave 15: a failed run's detail can be its job's coded error; the history
+// row words it (and keeps the node's sentence), never printing the wire.
+test('a failed run whose detail is a coded error reads as its words in the history', async () => {
+  const detail = 'refusal:elastic_result_unconfirmed The SnapRAID result was not confirmed: A sync without parity';
+  const { screen, body } = await mount(array({ state: 'needs_attention', snapraid: { history: [{ kind: 'sync', outcome: 'needs_attention', detail }] } }));
+  const text = body.querySelector('.nas-snapraid-history').textContent;
+  assert.doesNotMatch(text, /refusal:/);
+  assert.match(text, /Nie udało się potwierdzić wyniku przebiegu, więc macierz wymaga uwagi — The SnapRAID result was not confirmed/);
+  screen.dispose();
+});
+
 const cacheDisk = { ...disk, diskId: 'serial-3', name: 'c1', kind: 'nvme', mountpoint: '/mnt/tentanas-branches/media/cache/c1' };
 const moverArray = (overrides = {}, mover = {}) => array({
   cacheDisks: [cacheDisk],

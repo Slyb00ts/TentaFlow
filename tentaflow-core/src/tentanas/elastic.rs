@@ -60,7 +60,7 @@ use tentanas_helper::HelperCommand;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
 use super::{db as store, jobs, CodedText};
-use super::refusal::{DiskWords, Refusal};
+use super::refusal::{require, DiskWords, Refusal};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// The machine kind of §5.3, next to a ZFS pool's `zfs`. The SPEC fixes the
@@ -460,7 +460,7 @@ pub struct ElasticArrayRow {
 
 impl ElasticArrayRow {
     pub fn persisted_spec(&self) -> Result<&ElasticCreateSpec> {
-        self.create_spec.as_ref().ok_or_else(|| anyhow!("Brak utrwalonej intencji macierzy"))
+        self.create_spec.as_ref().ok_or_else(|| anyhow!("The array has no persisted intent"))
     }
 
     pub fn data(&self) -> impl Iterator<Item = &BranchRow> {
@@ -1204,21 +1204,21 @@ pub fn conflict_alert(array: &str, conflicts: &[ElasticConflict]) -> Option<stor
         .iter()
         .map(|conflict| {
             let other = match kept_place(array, &conflict.kept) {
-                ("quarantine", Some(disk)) => format!("kopia w kwarantannie na dysku cache {disk}"),
-                ("data", Some(disk)) => format!("pod tą samą ścieżką na dysku danych {disk}"),
-                _ => "na jednym z dysków macierzy".to_string(),
+                ("quarantine", Some(disk)) => format!("a quarantined copy on cache disk {disk}"),
+                ("data", Some(disk)) => format!("at the same path on data disk {disk}"),
+                _ => "on one of the array's disks".to_string(),
             };
-            format!("{}: wersja widoczna {}, druga wersja: {other}", conflict.path, conflict.visible)
+            format!("{}: visible version {}, the other version: {other}", conflict.path, conflict.visible)
         })
         .collect::<Vec<_>>()
         .join("; ");
     Some(
         store::AlertText::new(
             "elastic_conflict",
-            format!("Pliki zachowane w dwóch wersjach: {}", conflicts.len()),
+            format!("Files kept in two versions: {}", conflicts.len()),
             format!(
-                "Przerwane przenoszenie zostawiło dwie wersje plików i żadna nie została usunięta. \
-                 Porównaj je i usuń zbędną; alert zniknie, gdy zostanie jedna. {lines}"
+                "An interrupted move left two versions of these files and neither was deleted. \
+                 Compare them and delete the one you do not need; the alert goes when one is left. {lines}"
             ),
         )
         .param("array", array)
@@ -1418,7 +1418,7 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
         // cache could not be measured" would drop what this node does know,
         // next to a byte figure the card already shows.
         //
-        // Wording canon (plan §5.3b), verbatim and in Polish: a size and a
+        // Wording canon (plan §5.3b), in English since wave 15: a size and a
         // mechanism, never a duration. Naming only the cache half would promise
         // the next sync closes the window, which is false for files whose
         // coupled sync already failed.
@@ -1430,12 +1430,12 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
         // 0 next to "unprotected bytes" is worse than no answer). `parity_stale`
         // still guards the arm — an unconfirmed sync is not "protected" — but
         // it no longer selects a sentence that asserts a quantity.
-        let waiting = "na cache bez parity (czeka na mover): ochronę domyka najbliższy sync, \
-             który mover uruchamia zaraz po przenosinach";
-        let unmeasured = "ten node nie zmierzył, ile czeka na cache";
-        let moved = "pliki już przeniesione przez mover także są poza parity: ich sprzężony sync \
-             nie potwierdził ochrony, domknie ją dopiero kolejny udany sync";
-        let unconfirmed = "sprzężony sync nie potwierdził ochrony; domknie ją dopiero kolejny udany sync";
+        let waiting = "on the cache without parity (waiting for the mover): the next sync, which the \
+             mover starts right after moving, closes the protection";
+        let unmeasured = "this node has not measured how much waits on the cache";
+        let moved = "files the mover already moved are outside parity too: their coupled sync did \
+             not confirm protection, and only the next successful sync closes it";
+        let unconfirmed = "the coupled sync did not confirm protection; only the next successful sync closes it";
         let cache_clause = if cache_bytes.is_some_and(|bytes| bytes > 0) {
             Some(waiting)
         } else if cache_bytes.is_none() {
@@ -1460,7 +1460,7 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
                 // Unreachable: the arm is entered only when a half is open. A
                 // future guard edit must degrade the wording of one card, never
                 // panic the whole array listing.
-                debug_assert!(false, "okno bez otwartej połowy");
+                debug_assert!(false, "a window with no open half");
                 unconfirmed.to_string()
             }
         };
@@ -1490,39 +1490,39 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
     let (status, detail) = if !parity_present {
         (
             "unprotected",
-            "ta macierz nie ma dysku parity: awaria dysku traci jego pliki".to_string(),
+            "this array has no parity disk: a failed disk loses its files".to_string(),
         )
     } else if observed.last_sync_at.is_none() {
         (
             "window_open",
-            "brak potwierdzonego sync: ochrona parity nie została potwierdzona".to_string(),
+            "no confirmed sync: parity protection has not been confirmed".to_string(),
         )
     } else if observed.parity_errors.is_some_and(|errors| errors > 0) {
         (
             "unknown",
-            "wykryto błędy parity; nie można potwierdzić ochrony danych".to_string(),
+            "parity errors were found; data protection cannot be confirmed".to_string(),
         )
     } else if fault_tolerance.is_none() {
         (
             "unknown",
-            with_window("brak pełnego pomiaru dostępności i poprawności parity"),
+            with_window("parity availability and correctness are not fully measured"),
         )
     } else if fault_tolerance.map(usize::from) != Some(array.parity.len()) {
         (
             "unknown",
-            with_window("brakuje dysku parity; pełna skonfigurowana ochrona nie jest dostępna"),
+            with_window("a parity disk is missing; the full configured protection is not available"),
         )
     } else if let Some(detail) = window_clause.clone() {
         ("window_open", detail)
     } else if cache_bytes.is_none() {
         (
             "unknown",
-            "ten node nie zmierzył, ile czeka na cache".to_string(),
+            "this node has not measured how much waits on the cache".to_string(),
         )
     } else if observed.moved_unsynced_bytes.is_some_and(|bytes| bytes > 0) {
         (
             "window_open",
-            "dane na dyskach danych nie są objęte ostatnim sync; opróżnienie cache nie zamyka okna bez ochrony".to_string(),
+            "data on the data disks is not covered by the last sync; emptying the cache does not close the unprotected window".to_string(),
         )
     } else if observed.moved_unsynced_bytes.is_none() {
         // NOT a live path in production: the producer sets this from
@@ -1533,7 +1533,7 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
         // rather than borrowing the sentence below.
         (
             "unknown",
-            "nie zmierzono zmian na dyskach danych od ostatniego sync".to_string(),
+            "changes on the data disks since the last sync were not measured".to_string(),
         )
     } else {
         (
@@ -1550,8 +1550,8 @@ pub fn protection(array: &ElasticArrayRow, observed: &ArrayObservation) -> NasEl
             // what was measured and stops there, and names the vintage of the
             // protection instead of implying it covers this moment.
             "protected",
-            "mover nie zostawił danych poza ostatnim sync, cache jest pusty, a parity dostępna \
-             bez zgłoszonych błędów; ochrona obejmuje stan z ostatniego sync"
+            "the mover left no data outside the last sync, the cache is empty and parity is \
+             available with no reported errors; protection covers the state of the last sync"
                 .to_string(),
         )
     };
@@ -1740,22 +1740,22 @@ pub fn cache_stuck_verdict(
         return CacheStuckVerdict::Keep;
     }
     let (cause, reason) = if array.unresolved_operation {
-        ("unresolved_operation", "przenoszenie wstrzymuje nierozwiązana operacja tej macierzy")
+        ("unresolved_operation", "an unresolved operation of this array holds the mover back")
     } else if age.due_files == 0 {
-        ("files_busy", "najstarsze pliki są otwarte albo przypisane do nieudanego przeniesienia, więc nie mogą zostać przeniesione")
+        ("files_busy", "the oldest files are open or tied to a failed move, so they cannot be moved")
     } else if restricted_to_schedule(array) {
-        ("schedule_window", "przenoszenie jest ograniczone do okna harmonogramu")
+        ("schedule_window", "moving is restricted to the schedule's window")
     } else if last_run_moved_nothing(array) {
-        ("last_run_moved_nothing", "ostatnie przenoszenie nie zabrało z cache żadnego pliku (sprawdź jego wynik w historii zadań, np. brak miejsca na dyskach danych)")
+        ("last_run_moved_nothing", "the last move took no file off the cache (check its result in the task history, e.g. no space on the data disks)")
     } else {
-        ("not_started", "automatyczne przenoszenie nie mogło wystartować (sprawdź stan macierzy)")
+        ("not_started", "the automatic move could not start (check the array's state)")
     };
     CacheStuckVerdict::Raise(
         store::AlertText::new(
             "elastic_cache_stuck",
-            format!("Pliki zbyt długo czekają na cache macierzy {}", array.name),
+            format!("Files have waited too long on the cache of array {}", array.name),
             format!(
-                "Najstarszy plik czeka na dysku cache {} (alarm po {}) i do przeniesienia na dyski danych nie chroni go parity: {reason}.",
+                "The oldest file has waited on the cache disk for {} (alarm after {}), and until it is moved to the data disks parity does not protect it: {reason}.",
                 wait_text(oldest),
                 wait_text(limit)
             ),
@@ -1771,7 +1771,7 @@ pub fn cache_stuck_verdict(
 /// rewritten on every probe, and minute precision would rewrite it every time.
 fn wait_text(secs: u64) -> String {
     match secs {
-        s if s >= 2 * 86_400 => format!("{} dni", s / 86_400),
+        s if s >= 2 * 86_400 => format!("{} days", s / 86_400),
         s if s >= 3_600 => format!("{} h", s / 3_600),
         s => format!("{} min", s / 60),
     }
@@ -2134,7 +2134,7 @@ impl FolderUsageProber for HelperFolderUsageProber<'_> {
         let (out, _) = super::broker::run_privileged(self.db, &command, None, FOLDER_USAGE_TIMEOUT).await?;
         ensure!(
             out.success() && out.stdout.len() < 256 * 1024,
-            "Nie można zmierzyć folderów macierzy (kod {})",
+            "The array's folders could not be measured (code {})",
             out.code
         );
         Ok(serde_json::from_str(&out.stdout)?)
@@ -2148,14 +2148,14 @@ fn folder_figures(
     folders: &[String],
     usage: tentanas_helper::elastic::ElasticFolderUsage,
 ) -> Result<BTreeMap<String, FolderFigure>> {
-    ensure!(usage.folders.len() == folders.len(), "pomiar folderów nie odpowiada zapytaniu");
+    ensure!(usage.folders.len() == folders.len(), "the folder measurement does not answer the question asked");
     let mut figures = BTreeMap::new();
     for (asked, answer) in folders.iter().zip(usage.folders) {
-        ensure!(&answer.name == asked, "pomiar folderów nie odpowiada zapytaniu");
+        ensure!(&answer.name == asked, "the folder measurement does not answer the question asked");
         let figure = match (answer.bytes, answer.gap) {
             (Some(bytes), None) => FolderFigure::Bytes(bytes),
             (None, Some(gap)) => FolderFigure::Gap(gap),
-            _ => anyhow::bail!("pomiar folderu {asked} jest sprzeczny"),
+            _ => anyhow::bail!("the measurement of folder {asked} contradicts itself"),
         };
         figures.insert(answer.name, figure);
     }
@@ -3095,7 +3095,7 @@ pub(crate) fn mover_to_protocol(run: &ElasticMoverRun) -> NasMoverRun {
             .collect::<Vec<_>>()
             .join("; ");
         let summary = format!(
-            "pominięto {}, odmówiono {}: {issues}",
+            "skipped {}, refused {}: {issues}",
             run.skipped_files, run.refused_files
         );
         detail = if detail.is_empty() { summary } else { format!("{detail}; {summary}") };
@@ -3107,12 +3107,12 @@ pub(crate) fn mover_to_protocol(run: &ElasticMoverRun) -> NasMoverRun {
             .stuck_records
             .iter()
             .take(3)
-            .map(|record| format!("{} (operacja {})", record.path, record.operation_id))
+            .map(|record| format!("{} (operation {})", record.path, record.operation_id))
             .collect::<Vec<_>>()
             .join("; ");
         // Paths whose full record the helper no longer shows are still skipped.
         let hidden = if run.stuck_hidden > 0 {
-            format!(" (+{} bez pełnego rekordu)", run.stuck_hidden)
+            format!(" (+{} without a full record)", run.stuck_hidden)
         } else {
             String::new()
         };
@@ -3120,13 +3120,13 @@ pub(crate) fn mover_to_protocol(run: &ElasticMoverRun) -> NasMoverRun {
         // skipped at all. The array's lifetime figure lives on the state, not
         // here, so a later clean run says nothing.
         let evicted = if run.stuck_evicted > 0 {
-            format!("; wyparto z listy pominięć: {}", run.stuck_evicted)
+            format!("; evicted from the skip list: {}", run.stuck_evicted)
         } else {
             String::new()
         };
         let listed = if records.is_empty() { String::new() } else { format!(": {records}") };
         let summary =
-            format!("utknięte rekordy: {}{hidden}{listed}{evicted}", run.stuck_records.len());
+            format!("stuck records: {}{hidden}{listed}{evicted}", run.stuck_records.len());
         detail = if detail.is_empty() { summary } else { format!("{detail}; {summary}") };
     }
     NasMoverRun {
@@ -3299,7 +3299,7 @@ pub fn to_protocol(
             config_path: if array.parity.is_empty() { String::new() } else { config_path(&array.name) },
             last_sync: array.last_sync_run.clone().or_else(|| observed.last_sync_at.as_ref().map(|at| tentaflow_protocol::tentanas::NasSnapraidRun {
                 kind: "sync".to_string(), started_at: String::new(), finished_at: Some(at.clone()),
-                outcome: "ok".to_string(), detail: "Potwierdzony checkpoint helpera; nie jest pomiarem późniejszych zapisów".to_string(),
+                outcome: "ok".to_string(), detail: "The helper's confirmed checkpoint; not a measurement of later writes".to_string(),
                 errors: None,
                 ..Default::default()
             })),
@@ -3680,7 +3680,7 @@ pub fn repair_alert_key(array: &str) -> String {
 pub fn repair_evidence(array: &NasElasticArray) -> Option<String> {
     let run = unresolved_parity_run(array)?;
     Some(format!(
-        "scrub macierzy zaznaczył {} błędów i nic ich nie naprawiło",
+        "the array's scrub marked {} errors and nothing has repaired them",
         run.errors.unwrap_or_default()
     ))
 }
@@ -3747,7 +3747,7 @@ fn health_of(
     if conflicts > 0 {
         return (
             "warning",
-            format!("{conflicts} plików zostało w dwóch wersjach po przerwanym przenoszeniu; szczegóły w alercie"),
+            format!("{conflicts} files were left in two versions by an interrupted move; the alert has the details"),
         );
     }
     if protection.status == "unprotected" {
@@ -3764,17 +3764,17 @@ pub fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) ->
         result.array_id == spec.array_id
             && result.operation_id == spec.operation_id
             && result.owner == spec.owner,
-        "Odpowiedź helpera dotyczy innej intencji lub właściciela"
+        "The helper's answer is about another intent or owner"
     );
     ensure!(
         result.disks.len() == spec.data.len() + usize::from(spec.cache.is_some()) + spec.parity.len(),
-        "Niepełny zestaw obserwacji dysków"
+        "The helper's answer does not observe every disk of the array"
     );
     if let Some(service) = &result.service {
         tentanas_helper::elastic::validate_elastic_uuid(&service.operation_id)?;
         ensure!(
             service.operation_id != spec.operation_id,
-            "Operacja service nie może zastępować Create"
+            "A service operation cannot stand in for Create"
         );
     }
     // The slot of an add the helper reports as unfinished is the journal's
@@ -3785,7 +3785,7 @@ pub fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) ->
         ensure!(
             spec.data.last().is_some_and(|last| last.disk_id == add.disk_id)
                 && add.branch == tentanas_helper::elastic::data_branch_name(spec.data.len()),
-            "Niedokończone dodanie nie wskazuje ostatniego dysku danych"
+            "The unfinished add does not name the last data disk"
         );
     }
     let unconfirmed_slot = result
@@ -3809,13 +3809,13 @@ pub fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) ->
             ),
             ElasticRole::Cache => ("cache", 1, spec.cache.as_ref()),
         };
-        let expected = expected.ok_or_else(|| anyhow!("Obca rola w odpowiedzi helpera"))?;
+        let expected = expected.ok_or_else(|| anyhow!("The helper's answer names a role the array does not have"))?;
         ensure!(
             seen.insert((role, index)),
-            "Powtórzona rola w odpowiedzi helpera"
+            "The helper's answer repeats a role"
         );
         if Some(disk.role) == unconfirmed_slot {
-            ensure!(disk.mounted != Some(true), "Zamontowany dysk bez potwierdzonego formatowania");
+            ensure!(disk.mounted != Some(true), "A mounted disk without a confirmed format");
             continue;
         }
         ensure!(
@@ -3826,7 +3826,7 @@ pub fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) ->
                     .filesystem
                     .as_deref()
                     .is_none_or(|value| value == spec.filesystem.as_str()),
-            "Obca tożsamość filesystemu w obserwacji"
+            "The observation carries a foreign filesystem identity"
         );
         if disk.mounted == Some(true)
             || (disk.device_present == Some(true) && disk.mounted == Some(false))
@@ -3835,53 +3835,53 @@ pub fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) ->
                 disk.device_present == Some(true)
                     && disk.observed_uuid.as_deref() == Some(expected.expected_uuid.as_str())
                     && disk.filesystem.as_deref() == Some(spec.filesystem.as_str()),
-                "Mount bez potwierdzonej tożsamości filesystemu"
+                "A mount without a confirmed filesystem identity"
             );
         }
         if let Some(size) = disk.size_bytes {
             ensure!(
                 disk.used_bytes.is_none_or(|n| n <= size)
                     && disk.free_bytes.is_none_or(|n| n <= size),
-                "Sprzeczne statystyki filesystemu"
+                "Contradictory filesystem statistics"
             );
         }
     }
     if let Some(at) = &result.sync_completed_at {
         chrono::DateTime::parse_from_rfc3339(at)?;
-        ensure!(!spec.parity.is_empty(), "Sync bez parity");
+        ensure!(!spec.parity.is_empty(), "A sync without parity");
     }
     if let Some(run) = &result.last_mover {
         tentanas_helper::elastic::validate_elastic_uuid(&run.operation_id)?;
         tentanas_helper::elastic::validate_elastic_uuid(&run.resume_operation_id)?;
-        ensure!(run.operation_id != spec.operation_id, "Mover nie może zastępować Create");
+        ensure!(run.operation_id != spec.operation_id, "A mover run cannot stand in for Create");
         ensure!(run.resume_operation_id != run.operation_id && run.resume_operation_id != spec.operation_id,
-            "Resume movera musi mieć osobną operację");
+            "The mover's resume needs an operation of its own");
         let mover_started = chrono::DateTime::parse_from_rfc3339(&run.started_at)?;
         let mover_finished = run.finished_at.as_ref().map(|at| chrono::DateTime::parse_from_rfc3339(at)).transpose()?;
         ensure!(mover_finished.is_none_or(|finished| finished >= mover_started),
-            "Mover ma odwrócony czas");
+            "The mover run ends before it starts");
         // A run ends at Complete, or as NeedsAttention once the next run (or
         // the Resume of an older helper's Hold) closed it.
         ensure!(matches!(run.phase, ElasticMoverPhase::Complete | ElasticMoverPhase::NeedsAttention)
             || run.finished_at.is_none(),
-            "Nieukończony mover nie może mieć czasu końca");
+            "An unfinished mover run cannot have an end time");
         if run.phase == ElasticMoverPhase::Complete {
-            ensure!(run.finished_at.is_some(), "Ukończony mover bez czasu końca");
+            ensure!(run.finished_at.is_some(), "A completed mover run without an end time");
         }
         let reported = |kind| run.issues.iter().filter(|issue| issue.kind == kind).count() as u64;
         ensure!(reported(ElasticMoverIssueKind::Skipped) <= run.skipped_files
             && reported(ElasticMoverIssueKind::Refused) <= run.refused_files,
-            "Mover raportuje więcej plików niż jego liczniki");
+            "The mover reports more files than its counters");
         if let Some(sync) = &run.coupled_sync {
-            ensure!(sync.kind == ElasticSnapraidKind::Sync, "Mover ma nieprawidłowy typ sync");
-            ensure!(sync.operation_id == run.operation_id, "Sync movera należy do innej operacji");
+            ensure!(sync.kind == ElasticSnapraidKind::Sync, "The mover's sync has the wrong kind");
+            ensure!(sync.operation_id == run.operation_id, "The mover's sync belongs to another operation");
             tentanas_helper::elastic::validate_elastic_uuid(&sync.operation_id)?;
             let sync_started = chrono::DateTime::parse_from_rfc3339(&sync.started_at)?;
             let sync_finished = sync.finished_at.as_ref().map(|at| chrono::DateTime::parse_from_rfc3339(at)).transpose()?;
-            ensure!(sync_started >= mover_started, "Sync movera rozpoczyna się przed moverem");
-            ensure!(sync_finished.is_none_or(|finished| finished >= sync_started), "Sync ma odwrócony czas");
+            ensure!(sync_started >= mover_started, "The mover's sync starts before the mover");
+            ensure!(sync_finished.is_none_or(|finished| finished >= sync_started), "The sync ends before it starts");
             ensure!(mover_finished.is_none_or(|finished| sync_finished.is_some_and(|sync_end| sync_end <= finished)),
-                "Sync kończy się poza moverem");
+                "The sync ends outside the mover run");
             if run.phase == ElasticMoverPhase::Complete {
                 // A Sync that met files changing under it completes a run too:
                 // parity stays marked out of date and the next Sync covers them.
@@ -3894,21 +3894,21 @@ pub fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) ->
                     && partial_sync_counters(sync)
                     && result.parity_stale;
                 ensure!(sync_finished.is_some() && (clean || changed_files),
-                    "Mover ukończony bez udanego sync");
+                    "A completed mover run without a successful sync");
             }
         }
     }
     ensure!(result.parity_stale == result.stale_parity_bytes.is_some(),
-        "Niespójny znacznik nieaktualnej parity");
+        "An inconsistent stale-parity flag");
     ensure!(!result.restart_required || result.stage != ElasticStage::Ready,
-        "Macierz czekająca na restart nie jest gotowa");
+        "An array waiting for a restart is not ready");
     for record in result.stuck_records.iter()
         .chain(result.last_mover.iter().flat_map(|run| run.stuck_records.iter()))
     {
         tentanas_helper::elastic::validate_elastic_uuid(&record.operation_id)?;
     }
     if result.parity_stale {
-        ensure!(!spec.parity.is_empty(), "Nieaktualna parity macierzy bez parity");
+        ensure!(!spec.parity.is_empty(), "Stale parity on an array without parity");
     }
     if result.stage == ElasticStage::Ready {
         if let Some(service) = &result.service {
@@ -3916,7 +3916,7 @@ pub fn validate_observation(spec: &ElasticCreateSpec, result: &ElasticResult) ->
                 service.mode == ElasticServiceMode::Online
                     && !service.pending
                     && result.union_readonly == Some(false),
-                "Ready bez potwierdzonego trybu service RW"
+                "Ready without a confirmed read-write service mode"
             );
         }
     }
@@ -3940,12 +3940,12 @@ pub fn validate_result(spec: &ElasticCreateSpec, result: &ElasticResult) -> Resu
                 .disks
                 .iter()
                 .all(|disk| disk.device_present == Some(true) && disk.mounted == Some(true)),
-            "Ready bez potwierdzenia wszystkich filesystemów"
+            "Ready without every filesystem confirmed"
         );
         ensure!(
             result.union_mounted == Some(true)
                 && (spec.parity.is_empty() || result.sync_completed_at.is_some()),
-            "Ready bez unii lub potwierdzonego sync"
+            "Ready without the union or a confirmed sync"
         );
     }
     Ok(())
@@ -3960,13 +3960,13 @@ pub async fn claims(db: &DbPool, name: Option<&str>, explicit: Option<&Elevation
     // file to look at.
     ensure!(
         out.success() && out.stdout.len() < 64 * 1024,
-        "Nie można odczytać rezerwacji roota (kod {}): {}",
+        "The root's reservations could not be read (code {}): {}",
         out.code,
         helper_detail(&out.stderr)
     );
     let result: ElasticClaimsResult = serde_json::from_str(&out.stdout)?;
     ensure!(name.is_none() || (result.name_claimed.is_some() && result.namespace_clear.is_some()),
-        "Nie potwierdzono dostępności przestrzeni nazw");
+        "The namespace's availability was not confirmed");
     Ok(result)
 }
 
@@ -4478,8 +4478,8 @@ async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id:
     run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>) -> Result<()> {
     let result = async {
         let out = run.await?;
-        ensure!(out.success(), "Helper Elastic zwrócił błąd {}",out.code);
-        ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
+        ensure!(out.success(), "The Elastic helper exited with code {}",out.code);
+        ensure!(out.stdout.len() < 64 * 1024, "The Elastic answer exceeds its size limit");
         let result: ElasticResult = serde_json::from_str(&out.stdout)?;
         // A Restore of an array an add is unfinished on answers with the
         // add's disk counted (K5); the add itself is what finishes it.
@@ -4492,28 +4492,39 @@ async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id:
         Ok(result) => {
             store::finish_elastic_operation(h.db(), &spec.owner, &operation_id, Ok(&result))?;
             if result.stage != ElasticStage::Ready {
-                let detail = result.detail.as_deref().unwrap_or("Macierz wymaga interwencji; rezerwacje zachowane");
+                let detail = result.detail.as_deref().unwrap_or("The array needs intervention; its reservations are kept");
                 // The helper's own text, when it gave one, is shown as-is;
                 // without it the screen words the default itself.
-                let text = store::AlertText::new("elastic_needs_attention", "Macierz wymaga interwencji", detail)
+                let text = store::AlertText::new("elastic_needs_attention", "The array needs intervention", detail)
                     .param("array", &spec.name);
                 let text = match result.detail.as_deref() {
                     Some(helper) => text.param("helper_detail", helper),
                     None => text,
                 };
                 store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec.name, &text)?;
-                return Err(anyhow!(detail.to_string()));
+                // Create and Restore share this body; a Create runs under the
+                // intent's own operation id, a Restore under a fresh one, so
+                // the words say which of the two ended this way (critic wave
+                // 15, MINOR 2).
+                // Each code is spelled at its constructor, so the scans that
+                // demand words for every code the node sends see both.
+                let refusal = if operation_id == spec.operation_id {
+                    Refusal::not_available("elastic_create_needs_attention", detail)
+                } else {
+                    Refusal::not_available("elastic_restore_needs_attention", detail)
+                };
+                return Err(refusal.into());
             }
             store::resolve_alert(h.db(), &key)?;
             h.progress(100);
             Ok(())
         }
         Err(error) => {
-            let detail = format!("{error}; utrata odpowiedzi nie dowodzi zatrzymania I/O");
+            let detail = format!("{error}; a lost answer does not prove that I/O stopped");
             store::finish_elastic_operation(h.db(), &spec.owner, &operation_id, Err(&detail))?;
             // Refused as busy, nothing ran: no alert, and the caller asks again.
             if !error.to_string().contains(tentanas_helper::elastic::ELASTIC_BUSY) {
-                let text = store::AlertText::new("elastic_result_unconfirmed", "Niepotwierdzony wynik macierzy", &detail)
+                let text = store::AlertText::new("elastic_result_unconfirmed", "The array's result is not confirmed", &detail)
                     .param("array", &spec.name)
                     .param("error", &error);
                 store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec.name, &text)?;
@@ -4649,22 +4660,22 @@ pub fn validate_snapraid_result(
     let run = &result.run;
     ensure!(
         run.operation_id == operation_id && run.kind == *kind,
-        "Obca operacja SnapRAID"
+        "The SnapRAID answer is about another operation"
     );
     tentanas_helper::elastic::validate_elastic_uuid(&run.operation_id)?;
     ensure!(
         operation_id != spec.operation_id,
-        "Operacja SnapRAID nie może zastępować Create"
+        "A SnapRAID operation cannot stand in for Create"
     );
     let started = chrono::DateTime::parse_from_rfc3339(&run.started_at)?;
     let finished = chrono::DateTime::parse_from_rfc3339(
         run.finished_at
             .as_deref()
-            .ok_or_else(|| anyhow!("Brak końca operacji SnapRAID"))?,
+            .ok_or_else(|| anyhow!("The SnapRAID operation has no end time"))?,
     )?;
     ensure!(
         finished >= started && run.detail.as_ref().is_none_or(|d| d.len() < 8192),
-        "Niespójny czas lub opis wyniku SnapRAID"
+        "The SnapRAID result's times or description are inconsistent"
     );
     match run.outcome {
         // A REFUSAL WROTE NOTHING (I5), whatever stage the array stands in:
@@ -4700,7 +4711,7 @@ pub fn validate_snapraid_result(
                     && (run.detail.as_deref() != Some("fault_unacknowledged")
                         || *kind == ElasticSnapraidKind::Sync)
                     && result.state.last_run.as_ref() != Some(run),
-                "Niepotwierdzona odmowa przed scrub"
+                "An unconfirmed refusal before the run"
             );
         }
         ElasticSnapraidOutcome::Succeeded => {
@@ -4726,7 +4737,7 @@ pub fn validate_snapraid_result(
                         || (run.errors_file == Some(0)
                             && run.errors_io == Some(0)
                             && run.errors_data == Some(0))),
-                "Niepotwierdzony sukces SnapRAID"
+                "An unconfirmed SnapRAID success"
             );
             if *kind == ElasticSnapraidKind::Scrub {
                 ensure!(
@@ -4734,13 +4745,13 @@ pub fn validate_snapraid_result(
                         .zip(run.checked_blocks)
                         .is_some_and(|(total, checked)| checked > 0 && checked <= total)
                         && run.accessed_mb.is_some(),
-                    "Scrub nie potwierdził pełnego zakresu"
+                    "The scrub did not confirm its full range"
                 );
             }
             if *kind == ElasticSnapraidKind::Sync {
                 ensure!(
                     result.state.sync_completed_at == run.finished_at,
-                    "Inny checkpoint sync"
+                    "Another sync checkpoint"
                 );
             }
             if let ElasticSnapraidKind::Fix { disk } = kind {
@@ -4749,7 +4760,7 @@ pub fn validate_snapraid_result(
                 // one would date the array's protection to the repair.
                 ensure!(
                     result.state.sync_completed_at.as_ref() != run.finished_at.as_ref(),
-                    "Naprawa nie zapisuje checkpointu sync"
+                    "A repair writes no sync checkpoint"
                 );
                 ensure!(
                     spec.data
@@ -4757,7 +4768,7 @@ pub fn validate_snapraid_result(
                         .enumerate()
                         .any(|(index, _)| tentanas_helper::elastic::data_branch_name(index + 1)
                             == *disk),
-                    "Naprawa wskazała dysk, którego macierz nie ma"
+                    "The repair names a disk the array does not have"
                 );
             }
         }
@@ -4772,14 +4783,14 @@ pub fn validate_snapraid_result(
                     && partial_sync_counters(run)
                     && result.state.parity_stale
                     && result.state.sync_completed_at != run.finished_at,
-                "Niepotwierdzony częściowy sync"
+                "An unconfirmed partial sync"
             );
         }
         ElasticSnapraidOutcome::Failed | ElasticSnapraidOutcome::NeedsAttention => {
             ensure!(
                 result.state.stage == ElasticStage::NeedsAttention
                     && result.state.last_run.as_ref() == Some(run),
-                "Błąd SnapRAID nie zachował nieukończonej operacji"
+                "A SnapRAID failure did not keep the unfinished operation"
             );
         }
         // A repair that ran to its end and wrote NOTHING. It is only ever a
@@ -4792,11 +4803,11 @@ pub fn validate_snapraid_result(
                     && run.exit_code == Some(0)
                     && run.detail.as_ref().is_some_and(|detail| !detail.is_empty())
                     && result.state.sync_completed_at.as_ref() != run.finished_at.as_ref(),
-                "Niepotwierdzona naprawa bez efektu"
+                "An unconfirmed repair without effect"
             );
         }
         ElasticSnapraidOutcome::Running => {
-            return Err(anyhow!("Helper nie dostarczył terminalnego wyniku"));
+            return Err(anyhow!("The helper delivered no terminal result"));
         }
     }
     Ok(())
@@ -4812,7 +4823,7 @@ async fn execute_snapraid_job(
     let output = run.await?;
     ensure!(
         output.success() && output.stdout.len() < 64 * 1024,
-        "Brak wiarygodnego wyniku SnapRAID"
+        "No trustworthy SnapRAID result"
     );
     let result: ElasticSnapraidResult = serde_json::from_str(&output.stdout)?;
     // While an add is pinned the helper's journal counts its disk too, and a
@@ -4827,15 +4838,17 @@ async fn execute_snapraid_job(
             return Err(anyhow!(refusal));
         }
     }
-    ensure!(
+    // The job's error line is worded by the screen from the code; the
+    // helper's own sentence, when it gave one, is its tooltip.
+    require(
         matches!(result.run.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial),
-        "{}",
-        result
-            .run
-            .detail
-            .as_deref()
-            .unwrap_or("Operacja SnapRAID nie zakończyła się sukcesem")
-    );
+        || {
+            Refusal::not_available(
+                "elastic_snapraid_failed",
+                result.run.detail.as_deref().unwrap_or("The SnapRAID run did not succeed"),
+            )
+        },
+    )?;
     Ok(())
 }
 
@@ -4878,7 +4891,7 @@ pub fn validate_mover_result(
         validate_result(spec, &result.state)?;
         ensure!(
             result.state.stage == ElasticStage::Ready,
-            "Ukończony mover bez macierzy gotowej do pracy"
+            "A completed mover run without a ready array"
         );
     } else {
         validate_observation(spec, &result.state)?;
@@ -4888,21 +4901,21 @@ pub fn validate_mover_result(
     // operation id, so it cannot tell this answer apart from an older run the
     // helper still reports as `last_mover`. Without it a mover job could be
     // closed by the result of the previous one.
-    ensure!(run.operation_id == operation_id, "Obca operacja movera");
+    ensure!(run.operation_id == operation_id, "The mover answer is about another operation");
     ensure!(
         result.state.last_mover.as_ref() == Some(run),
-        "Wynik movera nie jest stanem macierzy"
+        "The mover result is not the array's state"
     );
     ensure!(
         run.detail.as_ref().is_none_or(|d| d.len() < 8192),
-        "Zbyt długi opis wyniku movera"
+        "The mover result's description is too long"
     );
     // A terminal answer is Complete, or NeedsAttention: closed, or left for the
     // next run with something unresolved. Anything still moving is the helper
     // failing to deliver a verdict.
     ensure!(
         matches!(run.phase, ElasticMoverPhase::Complete | ElasticMoverPhase::NeedsAttention),
-        "Helper nie dostarczył terminalnego wyniku movera"
+        "The helper delivered no terminal mover result"
     );
     Ok(())
 }
@@ -4916,7 +4929,7 @@ async fn execute_mover_job(
     let output = run.await?;
     ensure!(
         output.success() && output.stdout.len() < 64 * 1024,
-        "Brak wiarygodnego wyniku movera"
+        "No trustworthy mover result"
     );
     let result: ElasticMoverResult = serde_json::from_str(&output.stdout)?;
     validate_mover_result(spec, operation_id, &result)?;
@@ -4924,15 +4937,13 @@ async fn execute_mover_job(
     if let Err(error) = record_conflict_alert(h.db(), &spec.name, &result.state.conflicts) {
         tracing::warn!("tentanas mover: conflict alert of {} not recorded: {error}", spec.name);
     }
-    ensure!(
-        result.run.phase == ElasticMoverPhase::Complete,
-        "{}",
-        result
-            .run
-            .detail
-            .as_deref()
-            .unwrap_or("Mover nie zakończył przenoszenia")
-    );
+    // Worded by the screen from the code, the helper's sentence as its tooltip.
+    require(result.run.phase == ElasticMoverPhase::Complete, || {
+        Refusal::not_available(
+            "elastic_mover_unfinished",
+            result.run.detail.as_deref().unwrap_or("The mover did not finish moving the files"),
+        )
+    })?;
     Ok(())
 }
 
@@ -5069,7 +5080,7 @@ pub fn answered_spec(
     }
     match pinned {
         Some(disk) if result.disks.len() == members + 1 => spec_with_added_disk(spec, disk),
-        _ => Err(anyhow!("Niepełny zestaw obserwacji dysków")),
+        _ => Err(anyhow!("The helper's answer does not observe every disk of the array")),
     }
 }
 
@@ -5106,18 +5117,18 @@ pub fn spec_with_replaced_disk(
         .iter()
         .enumerate()
         .position(|(index, _)| tentanas_helper::elastic::data_branch_name(index + 1) == branch)
-        .ok_or_else(|| anyhow!("Macierz nie ma dysku danych '{branch}'"))?;
+        .ok_or_else(|| anyhow!("The array has no data disk '{branch}'"))?;
     let old = &spec.data[slot];
     ensure!(
         disk.bytes >= old.bytes,
-        "Dysk zamienny jest mniejszy niż slot '{branch}' ({} < {})",
+        "The replacement disk is smaller than slot '{branch}' ({} < {})",
         disk.bytes,
         old.bytes
     );
     if let Some(parity) = spec.parity.iter().map(|parity| parity.bytes).min() {
         ensure!(
             disk.bytes <= parity,
-            "Dysk zamienny jest większy niż parity macierzy; parity nie pokryłaby go w całości"
+            "The replacement disk is larger than the array's parity; parity would not cover all of it"
         );
     }
     let mut after = spec.clone();
@@ -5160,33 +5171,33 @@ pub fn validate_replace_result(
 ) -> Result<()> {
     ensure!(
         result.branch == branch && result.disk == *disk,
-        "Wymiana dotyczy innego slotu lub dysku"
+        "The replacement answer is about another slot or disk"
     );
     validate_result(spec_after, &result.state)?;
     let (rebuild_id, sync_id) = operation_ids;
     let rebuild_kind = ElasticSnapraidKind::Fix { disk: branch.to_string() };
     ensure!(
         result.rebuild.operation_id == rebuild_id && result.rebuild.kind == rebuild_kind,
-        "Obca operacja odbudowy"
+        "The rebuild answer is about another operation"
     );
     ensure!(
         result.sync.operation_id == sync_id && result.sync.kind == ElasticSnapraidKind::Sync,
-        "Obca operacja sync po odbudowie"
+        "The post-rebuild sync is about another operation"
     );
     // The rebuild WROTE the disk back: a run that recovered nothing is not a
     // rebuild, and the helper reports that as its own outcome.
     ensure!(
         result.rebuild.outcome == ElasticSnapraidOutcome::Succeeded,
-        "Odbudowa dysku nie zakończyła się sukcesem"
+        "The disk rebuild did not succeed"
     );
     ensure!(
         matches!(result.sync.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial),
-        "Sync po odbudowie nie zakończył się sukcesem"
+        "The sync after the rebuild did not succeed"
     );
     // The array's own state has to agree that the Sync is the last one it ran.
     ensure!(
         result.state.last_run.as_ref() == Some(&result.sync),
-        "Stan macierzy nie potwierdza sync po odbudowie"
+        "The array's state does not confirm the sync after the rebuild"
     );
     Ok(())
 }
@@ -5201,8 +5212,8 @@ pub fn replacement_blocker(array: &NasElasticArray, branch: &str) -> Option<Stri
     let slot = array.data_disks.iter().find(|member| member.name == branch)?;
     if slot.device_present == Some(true) && slot.health != "failing" {
         return Some(format!(
-            "dysk '{branch}' jest obecny na tym nodzie i nie zgłasza awarii: jeśli ma błędy, \
-             użyj naprawy z parity, a wymianę uruchom po jego odłączeniu"
+            "disk '{branch}' is present on this node and reports no failure: if it has errors, \
+             repair it from parity, and start a replacement after it is detached"
         ));
     }
     None
@@ -5291,8 +5302,8 @@ async fn execute_replace_disk_job(
     let key = format!("elastic:{}:replace-disk", spec_after.array_id);
     let result = async {
         let out = run.await?;
-        ensure!(out.success(), "Helper Elastic zwrócił błąd {}", out.code);
-        ensure!(out.stdout.len() < 256 * 1024, "Odpowiedź Elastic przekracza limit");
+        ensure!(out.success(), "The Elastic helper exited with code {}", out.code);
+        ensure!(out.stdout.len() < 256 * 1024, "The Elastic answer exceeds its size limit");
         let result: tentanas_helper::elastic::ElasticReplaceResult = serde_json::from_str(&out.stdout)?;
         validate_replace_result(spec_after, branch, disk, snapraid_ids, &result)?;
         Ok::<_, anyhow::Error>(result)
@@ -5314,8 +5325,8 @@ async fn execute_replace_disk_job(
         Ok(result) => {
             store::resolve_alert(h.db(), &key)?;
             h.log(format!(
-                "odbudowano {branch}: {}",
-                result.rebuild.detail.as_deref().unwrap_or("bez opisu")
+                "rebuilt {branch}: {}",
+                result.rebuild.detail.as_deref().unwrap_or("no description")
             ));
             h.progress(100);
             Ok(())
@@ -5327,9 +5338,9 @@ async fn execute_replace_disk_job(
             // command may be asked again with the SAME identity — which the
             // request row above is what records.
             let _ = spec_before;
-            let detail = format!("{error}; wymiana dysku nie została potwierdzona");
+            let detail = format!("{error}; the disk replacement was not confirmed");
             store::finish_elastic_operation(h.db(), &spec_after.owner, operation_id, Err(&detail))?;
-            let text = store::AlertText::new("elastic_replace_unconfirmed", "Niepotwierdzona wymiana dysku", &detail)
+            let text = store::AlertText::new("elastic_replace_unconfirmed", "The disk replacement is not confirmed", &detail)
                 .param("array", &spec_after.name)
                 .param("error", &error);
             store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name, &text)?;
@@ -5403,8 +5414,8 @@ async fn execute_add_disk_job(
     let key = format!("elastic:{}:add-disk", spec_after.array_id);
     let verdict = async {
         let out = run.await?;
-        ensure!(out.success(), "Helper Elastic zwrócił błąd {}", out.code);
-        ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
+        ensure!(out.success(), "The Elastic helper exited with code {}", out.code);
+        ensure!(out.stdout.len() < 64 * 1024, "The Elastic answer exceeds its size limit");
         let result: ElasticResult = serde_json::from_str(&out.stdout)?;
         add_disk_verdict(spec_before, spec_after, result)
     }
@@ -5429,10 +5440,10 @@ async fn execute_add_disk_job(
         Ok(AddVerdict::Stopped(result)) => {
             let detail = result
                 .detail
-                .unwrap_or_else(|| "Dodanie dysku wymaga interwencji; rezerwacje zachowane".into());
-            let detail = format!("{detail}; dysk nie został dopisany do macierzy");
+                .unwrap_or_else(|| "The disk add needs intervention; its reservations are kept".into());
+            let detail = format!("{detail}; the disk was not added to the array");
             store::finish_elastic_operation(h.db(), &spec_after.owner, operation_id, Err(&detail))?;
-            let text = store::AlertText::new("elastic_add_disk_unconfirmed", "Niepotwierdzone dodanie dysku", &detail)
+            let text = store::AlertText::new("elastic_add_disk_unconfirmed", "The disk add is not confirmed", &detail)
                 .param("array", &spec_after.name)
                 .param("error", &detail);
             store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name, &text)?;
@@ -5454,9 +5465,9 @@ async fn execute_add_disk_job(
             Ok(())
         }
         Err(error) => {
-            let detail = format!("{error}; dysk nie został dopisany do macierzy");
+            let detail = format!("{error}; the disk was not added to the array");
             store::finish_elastic_operation(h.db(), &spec_after.owner, operation_id, Err(&detail))?;
-            let text = store::AlertText::new("elastic_add_disk_unconfirmed", "Niepotwierdzone dodanie dysku", &detail)
+            let text = store::AlertText::new("elastic_add_disk_unconfirmed", "The disk add is not confirmed", &detail)
                 .param("array", &spec_after.name)
                 .param("error", &error);
             store::raise_coded_alert(h.db(), &key, "warning", "elastic-array", &spec_after.name, &text)?;
@@ -5514,8 +5525,8 @@ async fn execute_add_disk_abort_job(
     let key = format!("elastic:{}:add-disk", spec.array_id);
     let answer = async {
         let out = run.await?;
-        ensure!(out.success(), "Helper Elastic zwrócił błąd {}", out.code);
-        ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
+        ensure!(out.success(), "The Elastic helper exited with code {}", out.code);
+        ensure!(out.stdout.len() < 64 * 1024, "The Elastic answer exceeds its size limit");
         let result: ElasticResult = serde_json::from_str(&out.stdout)?;
         validate_observation(&answered_spec(spec, Some(disk), &result)?, &result)?;
         Ok::<_, anyhow::Error>(result)
@@ -5543,14 +5554,14 @@ async fn execute_add_disk_abort_job(
         // stays pinned and may be undone again or resumed.
         Ok(result) => anyhow!(result
             .detail
-            .unwrap_or_else(|| "Wycofanie dodawania dysku wymaga interwencji".into())),
+            .unwrap_or_else(|| "Undoing the disk add needs intervention".into())),
         Err(error) => error,
     };
-    let detail = format!("{error}; dodawanie dysku pozostaje niedokończone");
+    let detail = format!("{error}; the disk add stays unfinished");
     store::finish_elastic_operation(h.db(), &spec.owner, operation_id, Err(&detail))?;
     let text = store::AlertText::new(
         "elastic_add_disk_abort_unconfirmed",
-        "Niepotwierdzone wycofanie dodawania dysku",
+        "Undoing the disk add is not confirmed",
         &detail,
     )
     .param("array", &spec.name)
@@ -5605,15 +5616,15 @@ pub fn validate_dissolve_result(
             && result.owner == spec.owner
             && result.name == spec.name
             && result.operation_id == operation_id,
-        "Odpowiedź rozwiązania dotyczy innej macierzy lub operacji"
+        "The dissolve answer is about another array or operation"
     );
-    ensure!(result.data_kept, "Helper nie potwierdził zachowania danych");
+    ensure!(result.data_kept, "The helper did not confirm that the data is kept");
     ensure!(
         result.released.first().map(String::as_str)
             == Some(tentanas_helper::elastic::union_path(&spec.name).as_str()),
-        "Rozwiązanie nie zwolniło unii jako pierwszej"
+        "The dissolve did not release the union first"
     );
-    ensure!(result.steps.len() < 64 * 1024, "Za duży plan rozwiązania");
+    ensure!(result.steps.len() < 64 * 1024, "The dissolve plan exceeds its size limit");
     Ok(())
 }
 
@@ -5625,15 +5636,15 @@ async fn execute_dissolve_job(
     run: impl std::future::Future<Output = Result<super::broker::CommandOutput>>,
 ) -> Result<()> {
     let out = run.await?;
-    ensure!(out.success(), "Helper Elastic zwrócił błąd {}", out.code);
-    ensure!(out.stdout.len() < 64 * 1024, "Odpowiedź Elastic przekracza limit");
+    ensure!(out.success(), "The Elastic helper exited with code {}", out.code);
+    ensure!(out.stdout.len() < 64 * 1024, "The Elastic answer exceeds its size limit");
     let result: ElasticDissolveResult = serde_json::from_str(&out.stdout)?;
     validate_dissolve_result(spec, operation_id, &result)?;
     for line in result.steps.lines() {
         h.log(line);
     }
     for path in &result.released {
-        h.log(format!("zwolniono {path}"));
+        h.log(format!("released {path}"));
     }
     // ONLY after the node has stopped serving the array. Deleting the rows
     // first would leave a union with no supervision: nothing would know the
@@ -5721,7 +5732,7 @@ async fn observe_array(db: &DbPool, array: &ElasticArrayRow) -> Result<ElasticRe
     let spec = array.persisted_spec()?;
     let (out, _) = super::broker::run_privileged(db, &HelperCommand::ElasticInspect {
         array_id: spec.array_id.clone(),owner:spec.owner.clone() }, None,Duration::from_secs(30)).await?;
-    ensure!(out.success() && out.stdout.len() < 64 * 1024, "Nie można odczytać macierzy");
+    ensure!(out.success() && out.stdout.len() < 64 * 1024, "The array could not be read");
     let result: ElasticResult = serde_json::from_str(&out.stdout)?;
     validate_observation(&answered_spec(spec, array.pending_add.as_ref(), &result)?, &result)?;
     Ok(result)
@@ -5787,7 +5798,7 @@ pub async fn observe_cache_age(db: &DbPool, array: &ElasticArrayRow) -> Result<E
         super::broker::run_privileged(db, &command, None, Duration::from_secs(10 * 60)).await?;
     ensure!(
         out.success() && out.stdout.len() < 4 * 1024,
-        "Nie można zmierzyć plików czekających na cache (kod {})",
+        "The files waiting on the cache could not be measured (code {})",
         out.code
     );
     Ok(serde_json::from_str(&out.stdout)?)
@@ -5927,7 +5938,7 @@ pub async fn list(db: &DbPool, owner: &ElasticOwner) -> Result<Vec<NasElasticArr
     for mut array in rows {
         let observed = match &environment {
             Ok(_) => observe_array(db,&array).await,
-            Err(error) => Err(anyhow!("Brak pomiaru środowiska: {error}")),
+            Err(error) => Err(anyhow!("The environment was not measured: {error}")),
         };
         if let Ok(result) = &observed {
             reconcile_undone_add(db, &mut array, result);
@@ -6054,7 +6065,7 @@ where
         let answer = match tokio::time::timeout(restore_wait, finished).await {
             Ok(answer) => answer,
             Err(_) => {
-                let text = format!("{}: przywracanie nie odpowiedziało w czasie {restore_wait:?}", row.name);
+                let text = format!("{}: the restore did not answer within {restore_wait:?}", row.name);
                 tracing::warn!("tentanas Elastic startup: {text}");
                 failures.push(text);
                 break;
@@ -6078,7 +6089,7 @@ where
                 failures.push(format!("{}: {error}", row.name));
             }
             Err(_) => {
-                failures.push(format!("{}: Brak potwierdzenia zakończenia przywracania", row.name));
+                failures.push(format!("{}: the restore's end was not confirmed", row.name));
                 return Err(anyhow::anyhow!(failures.join("; ")));
             }
         }
@@ -6139,7 +6150,7 @@ pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
                 return restore_then_rewrite_shares(
                     restore_startup_rows(&rows, |row, completion| {
                         if !super::instance_should_run(&main_db,&db) {
-                            anyhow::bail!("Instancja nie jest aktywna; przywracanie zatrzymane");
+                            anyhow::bail!("The instance is not active; the restore stopped");
                         }
                         spawn_restore(&db,row,STARTED_BY_STARTUP,None,Some(completion))
                     }),
@@ -6148,8 +6159,8 @@ pub fn start_restore(main_db: DbPool, db: DbPool, owner: ElasticOwner) {
             }
             for row in rows {
                 let spec = row.persisted_spec()?;
-                let text = store::AlertText::new("elastic_restore_waiting", "Macierz oczekuje na przywrócenie",
-                    "Brak bezobsługowego kanału roota; wymagane jawne Przywróć").param("array", &row.name);
+                let text = store::AlertText::new("elastic_restore_waiting", "The array is waiting to be restored",
+                    "No unattended root channel; an explicit Restore is required").param("array", &row.name);
                 store::raise_coded_alert(&db,&format!("elastic:{}:restore",spec.array_id),"warning",
                     "elastic-array",&row.name,&text)?;
             }
@@ -6440,7 +6451,7 @@ pub(crate) mod tests {
         assert!(spec_with_replaced_disk(&spec, "d1", &small)
             .expect_err("too small")
             .to_string()
-            .contains("mniejszy"));
+            .contains("smaller"));
         let mut huge = fresh.clone();
         huge.bytes = spec.parity[0].bytes + 1;
         assert!(spec_with_replaced_disk(&spec, "d1", &huge)
@@ -6567,8 +6578,8 @@ pub(crate) mod tests {
     #[test]
     fn a_replacement_is_refused_while_the_slot_still_has_its_disk() {
         let present = observed_array();
-        assert!(replacement_blocker(&present, "d1").is_some_and(|why| why.contains("obecny")
-            && why.contains("naprawy")));
+        assert!(replacement_blocker(&present, "d1").is_some_and(|why| why.contains("is present")
+            && why.contains("repair it from parity")));
 
         // GONE: the case the operation exists for.
         let mut absent = observed_array();
@@ -6703,11 +6714,11 @@ pub(crate) mod tests {
         let array = array();
         let eighteen_gib = 18 * 1024 * 1024 * 1024;
         // Only the cache half: the canonical clause, verbatim.
-        let canon = "na cache bez parity (czeka na mover)";
+        let canon = "on the cache without parity (waiting for the mover)";
         let cache_only = protection(&array, &all_mounted(&array, eighteen_gib));
         assert_eq!(cache_only.status, "window_open");
         assert!(cache_only.detail.contains(canon), "{}", cache_only.detail);
-        assert!(!cache_only.detail.contains("przeniesione przez mover"), "{}", cache_only.detail);
+        assert!(!cache_only.detail.contains("the mover already moved"), "{}", cache_only.detail);
         // Only the moved half — and the cache is MEASURED as empty, so nothing
         // may claim files are waiting on it.
         let mut moved = all_mounted(&array, 0);
@@ -6716,8 +6727,8 @@ pub(crate) mod tests {
         let moved_only = protection(&array, &moved);
         assert_eq!(moved_only.status, "window_open");
         assert_eq!(moved_only.cache_unprotected_bytes, Some(0));
-        assert!(moved_only.detail.contains("przeniesione przez mover"), "{}", moved_only.detail);
-        assert!(!moved_only.detail.contains("na cache"), "pusty cache nie czeka: {}", moved_only.detail);
+        assert!(moved_only.detail.contains("the mover already moved"), "{}", moved_only.detail);
+        assert!(!moved_only.detail.contains("on the cache"), "pusty cache nie czeka: {}", moved_only.detail);
         // Both halves: the cache half must not promise the window closes for
         // files whose coupled sync already failed.
         let mut both = all_mounted(&array, eighteen_gib);
@@ -6728,7 +6739,7 @@ pub(crate) mod tests {
         assert_eq!(open.cache_unprotected_bytes, Some(eighteen_gib));
         assert_eq!(open.moved_unsynced_bytes, Some(4096));
         assert!(open.detail.contains(canon), "{}", open.detail);
-        assert!(open.detail.contains("przeniesione przez mover"), "{}", open.detail);
+        assert!(open.detail.contains("the mover already moved"), "{}", open.detail);
         // The fourth combination: the cache figure is unknown AND the moved
         // half is known bad. The known fact must survive, beside the bytes the
         // card shows for it.
@@ -6749,8 +6760,8 @@ pub(crate) mod tests {
         assert_eq!(unmeasured.cache_unprotected_bytes, None, "figura cache pozostaje nieznana");
         assert_eq!(unmeasured.moved_unsynced_bytes, Some(4096));
         assert_eq!(unmeasured.status, "window_open", "znany zły fakt bije niezmierzony");
-        assert!(unmeasured.detail.contains("przeniesione przez mover"), "{}", unmeasured.detail);
-        assert!(unmeasured.detail.contains("nie zmierzył"), "{}", unmeasured.detail);
+        assert!(unmeasured.detail.contains("the mover already moved"), "{}", unmeasured.detail);
+        assert!(unmeasured.detail.contains("has not measured"), "{}", unmeasured.detail);
         assert!(!unmeasured.detail.contains(canon), "nie wiadomo, ile czeka: {}", unmeasured.detail);
         // A stale sync with NOTHING measured as moved must not claim moved
         // files, whatever the cache half says.
@@ -6763,7 +6774,7 @@ pub(crate) mod tests {
         assert_eq!(waiting_only.moved_unsynced_bytes, Some(0));
         assert!(waiting_only.detail.contains(canon), "{}", waiting_only.detail);
         assert!(!waiting_only.detail.contains(quantity), "zero nie jest ilością: {}", waiting_only.detail);
-        assert!(waiting_only.detail.contains("nie potwierdził ochrony"), "{}", waiting_only.detail);
+        assert!(waiting_only.detail.contains("did not confirm protection"), "{}", waiting_only.detail);
         // Both halves at zero: an empty cache and a stale sync that moved
         // nothing. Neither sentence may assert a quantity.
         let mut both_zero = all_mounted(&array, 0);
@@ -6772,9 +6783,9 @@ pub(crate) mod tests {
         let silent = protection(&array, &both_zero);
         assert_eq!(silent.status, "window_open");
         assert_eq!((silent.cache_unprotected_bytes, silent.moved_unsynced_bytes), (Some(0), Some(0)));
-        assert!(!silent.detail.contains("na cache"), "{}", silent.detail);
+        assert!(!silent.detail.contains("on the cache"), "{}", silent.detail);
         assert!(!silent.detail.contains(quantity), "{}", silent.detail);
-        assert!(silent.detail.contains("nie potwierdził ochrony"), "{}", silent.detail);
+        assert!(silent.detail.contains("did not confirm protection"), "{}", silent.detail);
         // An unmeasured cache beside a stale sync that moved nothing says both
         // of those things and claims neither figure.
         let mut blind_zero = both_zero.clone();
@@ -6795,9 +6806,9 @@ pub(crate) mod tests {
         clean.moved_unsynced_bytes = Some(0);
         let protected = protection(&array, &clean);
         assert_eq!(protected.status, "protected", "{}", protected.detail);
-        assert!(!protected.detail.contains("pomiar nie wykazał"), "{}", protected.detail);
+        assert!(!protected.detail.contains("measurement showed"), "{}", protected.detail);
         assert_eq!(blind_silent.cache_unprotected_bytes, None);
-        assert!(blind_silent.detail.contains("nie zmierzył"), "{}", blind_silent.detail);
+        assert!(blind_silent.detail.contains("has not measured"), "{}", blind_silent.detail);
         assert!(!blind_silent.detail.contains(quantity), "{}", blind_silent.detail);
         // The banned phrasing stays banned in every combination, every sentence
         // on this card is in one language, and all of them read as fragments
@@ -6812,8 +6823,11 @@ pub(crate) mod tests {
             blind_silent.detail,
             protected.detail,
         ] {
-            assert!(!detail.contains("godz") && !detail.contains("niezsynchronizowan"), "{detail}");
-            assert!(!detail.contains("the cache") && !detail.contains("parity disk"), "{detail}");
+            // A size and a mechanism, never a duration (wave 15: the canon is
+            // English, so the banned words are the English ones), and no
+            // Polish left behind in any of them.
+            assert!(!detail.contains("hour") && !detail.contains("unsynced"), "{detail}");
+            assert!(!detail.chars().any(|c| "ąćęłńóśźżĄĆĘŁŃÓŚŹŻ".contains(c)), "{detail}");
             assert!(
                 detail.chars().next().is_some_and(|first| !first.is_uppercase()),
                 "zdania tej karty zaczynają się małą literą: {detail}"
@@ -6930,7 +6944,7 @@ pub(crate) mod tests {
         assert_eq!(wire.snapraid.parity_errors, Some(3));
         assert_eq!(wire.protection.status, "unknown");
         assert!(
-            wire.protection.detail.contains("wykryto błędy parity"),
+            wire.protection.detail.contains("parity errors were found"),
             "{}",
             wire.protection.detail
         );
@@ -6976,7 +6990,7 @@ pub(crate) mod tests {
             assert_eq!(wire.snapraid.parity_errors, None, "{case}");
             assert_eq!(wire.protection.status, "unknown", "{case}");
             assert!(
-                wire.protection.detail.contains("brak pełnego pomiaru"),
+                wire.protection.detail.contains("not fully measured"),
                 "{case}: {}",
                 wire.protection.detail
             );
@@ -7012,7 +7026,7 @@ pub(crate) mod tests {
         assert_eq!(wire.snapraid.parity_errors, Some(4));
         assert_eq!(wire.protection.status, "unknown");
         assert!(
-            wire.protection.detail.contains("wykryto błędy parity"),
+            wire.protection.detail.contains("parity errors were found"),
             "{}",
             wire.protection.detail
         );
@@ -7048,7 +7062,7 @@ pub(crate) mod tests {
         assert_eq!(wire.snapraid.parity_errors, None);
         assert_eq!(wire.protection.status, "unknown");
         assert!(
-            wire.protection.detail.contains("brak pełnego pomiaru"),
+            wire.protection.detail.contains("not fully measured"),
             "{}",
             wire.protection.detail
         );
@@ -7119,12 +7133,12 @@ pub(crate) mod tests {
         assert_eq!(health_of(&protected, &[], &[], &[], "active", 0).0, "ok");
         let (health, reason) = health_of(&protected, &[], &[], &[], "active", 1);
         assert_eq!(health, "warning");
-        assert!(reason.contains("dwóch wersjach"), "{reason}");
+        assert!(reason.contains("two versions"), "{reason}");
         let mut result = ready_result(&spec);
         result.conflicts = vec![conflict.clone()];
         let observed = observed_protocol(&store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap(), &BTreeMap::new(), Ok(result), &[]);
         assert!(
-            observed.health_reason.contains("dwóch wersjach"),
+            observed.health_reason.contains("left in two versions"),
             "the observation carries the conflicts to the health: {} {}",
             observed.health,
             observed.health_reason
@@ -7133,13 +7147,13 @@ pub(crate) mod tests {
             store::list_alerts(db, true)
                 .unwrap()
                 .into_iter()
-                .filter(|alert| alert.subject_id == spec.name && alert.title.starts_with("Pliki zachowane w dwóch wersjach"))
+                .filter(|alert| alert.subject_id == spec.name && alert.title.starts_with("Files kept in two versions"))
                 .collect::<Vec<_>>()
         };
         record_conflict_alert(&db, &spec.name, &[conflict.clone()]).unwrap();
         let alerts = conflict_alerts(&db);
         assert_eq!(alerts.len(), 1);
-        for place in ["docs/report.odt", "/mnt/conflicted/docs/report.odt", "kopia w kwarantannie na dysku cache c1"] {
+        for place in ["docs/report.odt", "/mnt/conflicted/docs/report.odt", "a quarantined copy on cache disk c1"] {
             assert!(alerts[0].detail.contains(place), "{place}: {}", alerts[0].detail);
         }
         // Wave-4 critic M2: the quarantine name carries the operation's uuid,
@@ -7264,11 +7278,11 @@ pub(crate) mod tests {
         };
         let wire = mover_to_protocol(&run);
         assert_eq!(wire.outcome, "partial");
-        assert!(wire.detail.contains("utknięte rekordy: 1: foto/a.jpg"), "{}", wire.detail);
+        assert!(wire.detail.contains("stuck records: 1: foto/a.jpg"), "{}", wire.detail);
         let mut evicted = run.clone();
         evicted.stuck_evicted = 3;
         assert!(
-            mover_to_protocol(&evicted).detail.contains("wyparto z listy pominięć: 3"),
+            mover_to_protocol(&evicted).detail.contains("evicted from the skip list: 3"),
             "{}",
             mover_to_protocol(&evicted).detail
         );
@@ -7283,12 +7297,12 @@ pub(crate) mod tests {
         clean.refused_files = 0;
         clean.phase = ElasticMoverPhase::Complete;
         let detail = mover_to_protocol(&clean).detail;
-        assert!(!detail.contains("utknięte rekordy"), "{detail}");
-        assert!(!detail.contains("wyparto"), "{detail}");
+        assert!(!detail.contains("stuck records"), "{detail}");
+        assert!(!detail.contains("evicted"), "{detail}");
         let mut summarised = run.clone();
         summarised.stuck_hidden = 2;
         assert!(
-            mover_to_protocol(&summarised).detail.contains("utknięte rekordy: 1 (+2 bez pełnego rekordu)"),
+            mover_to_protocol(&summarised).detail.contains("stuck records: 1 (+2 without a full record)"),
             "{}",
             mover_to_protocol(&summarised).detail
         );
@@ -7596,7 +7610,7 @@ pub(crate) mod tests {
             let wire = mover_to_protocol(&mover);
             assert_eq!(wire.outcome, outcome, "{:?}", mover.phase);
             if mover.refused_files > 0 {
-                assert!(wire.detail.contains("odmówiono 2"), "{}", wire.detail);
+                assert!(wire.detail.contains("refused 2"), "{}", wire.detail);
                 assert!(wire.detail.contains("foto/link-0.jpg: mover odmawia symlinku"), "{}", wire.detail);
             } else {
                 assert!(wire.detail.is_empty(), "{}", wire.detail);
@@ -8022,7 +8036,7 @@ pub(crate) mod tests {
         ) else {
             panic!("a file ten days old is past the threshold");
         };
-        assert!(!detail.contains("nierozwiązana operacja"), "{detail}");
+        assert!(!detail.contains("an unresolved operation"), "{detail}");
     }
 
     /// The manual Sync runs with the share writable too. One that met changing
@@ -8173,6 +8187,12 @@ pub(crate) mod tests {
                 if case == "complete" { "succeeded" } else { "failed" },
                 "{case}"
             );
+            // Wave 15: a run left unfinished is a coded job error (the
+            // helper's sentence, or the English default, as its detail).
+            if case == "attention" {
+                let error = terminal.error.clone().unwrap_or_default();
+                assert!(error.starts_with("refusal:elastic_mover_unfinished "), "{error}");
+            }
             let array = store::elastic_array(&db, &spec.owner, &spec.name).unwrap().unwrap();
             assert_eq!(
                 array.state,
@@ -8847,7 +8867,7 @@ pub(crate) mod tests {
         })
         .await;
         let error = result.expect_err("the hanging array is reported").to_string();
-        assert!(error.contains("hangs") && error.contains("nie odpowiedziało"), "{error}");
+        assert!(error.contains("hangs") && error.contains("did not answer"), "{error}");
         assert_eq!(calls, vec!["hangs".to_string(), "second".to_string()], "the next array is still attempted");
         assert_eq!(held.len(), 2, "no completion was ever answered");
         // The gate: pending while the queue is young, open once it is too old.
@@ -8909,7 +8929,7 @@ pub(crate) mod tests {
             let error = result.expect_err("reported").to_string();
             if missing_completion {
                 assert_eq!(calls, 1);
-                assert!(error.contains("Brak potwierdzenia"), "{error}");
+                assert!(error.contains("end was not confirmed"), "{error}");
             } else {
                 assert_eq!(calls, 2);
                 assert!(error.contains("first: Odmowa") && error.contains("second: Odmowa"), "{error}");
@@ -9096,6 +9116,11 @@ pub(crate) mod tests {
                 if case == "failed" { "needs_attention" } else { "active" },
                 "{case}"
             );
+            // Wave 15: a run the helper judged failed is a coded job error.
+            if case == "failed" {
+                let error = terminal.error.clone().unwrap_or_default();
+                assert!(error.starts_with("refusal:elastic_snapraid_failed"), "{error}");
+            }
             let run = &array.snapraid_history[0];
             assert_eq!(run.job_id.as_deref(), Some(job.job_id.as_str()));
             assert_eq!(run.operation_id.as_deref(), Some(operation_id.as_str()));
@@ -9176,6 +9201,68 @@ pub(crate) mod tests {
             assert_eq!(state,"needs_attention");
             assert_eq!(conn.query_row("SELECT COUNT(*) FROM nas_elastic_disk_aliases",[],|r|r.get::<_,i64>(0)).unwrap(),6);
         }
+    }
+
+    /// The Restore side of the same body: a Restore the helper answers with
+    /// an array that needs attention is worded as a Restore.
+    #[tokio::test]
+    async fn a_restore_that_ends_needing_attention_is_worded_as_a_restore() {
+        let spec = mover_spec("restore-halfway");
+        let db = settled_database(&spec);
+        let operation_id = uuid::Uuid::now_v7().to_string();
+        assert_ne!(operation_id, spec.operation_id, "a Restore runs under its own operation");
+        let mut answer = ready_result(&spec);
+        answer.stage = ElasticStage::NeedsAttention;
+        answer.detail = None;
+        let stdout = serde_json::to_string(&answer).unwrap();
+        let (completion, finished) = tokio::sync::oneshot::channel();
+        let (work_spec, work_id) = (spec.clone(), operation_id.clone());
+        let job = jobs::spawn(&db, "elastic_restore", &spec.name, "test",
+            Some(jobs::ElasticJobIntent::Restore {
+                owner: spec.owner.clone(),
+                array_id: spec.array_id.clone(),
+                operation_id: operation_id.clone(),
+            }),
+            Some(completion),
+            move |h| async move {
+                execute_job(&h, work_spec, work_id, async {
+                    Ok(super::super::broker::CommandOutput { code: 0, stdout, stderr: String::new() })
+                }).await
+            }).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(2), finished).await.unwrap().unwrap();
+        assert!(outcome.is_err());
+        let error = store::job(&db, &job.job_id).unwrap().unwrap().error.unwrap_or_default();
+        assert!(error.starts_with("refusal:elastic_restore_needs_attention "), "{error}");
+    }
+
+    /// Critic wave 15, MINOR 2: a Create the helper answers with an array
+    /// that needs attention says so as a Create, not as a Restore.
+    #[tokio::test]
+    async fn a_create_that_ends_needing_attention_is_not_worded_as_a_restore() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        store::migrate(&conn).unwrap();
+        let db = Arc::new(crate::db::Db::from_connection(conn));
+        let spec = create_spec("halfway");
+        let mut answer = ready_result(&spec);
+        answer.stage = ElasticStage::NeedsAttention;
+        answer.detail = None;
+        validate_result(&spec, &answer).expect("a legal answer that needs attention");
+        let stdout = serde_json::to_string(&answer).unwrap();
+        let work_spec = spec.clone();
+        let job = jobs::spawn(&db, "elastic_create", &spec.name, "test",
+            Some(jobs::ElasticJobIntent::Create(spec.clone())), None, move |h| async move {
+                execute_job(&h, work_spec.clone(), work_spec.operation_id.clone(), async {
+                    Ok(super::super::broker::CommandOutput { code: 0, stdout, stderr: String::new() })
+                }).await
+            }).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store::job(&db, &job.job_id).unwrap().unwrap().finished_at.is_some() { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let error = store::job(&db, &job.job_id).unwrap().unwrap().error.unwrap_or_default();
+        assert!(error.starts_with("refusal:elastic_create_needs_attention "), "{error}");
     }
 
     fn disk(name: &str, size: u64) -> NasDisk {
@@ -9673,7 +9760,7 @@ pub(crate) mod tests {
         assert_eq!(p.fault_tolerance, Some(1));
         assert_eq!(p.protected_as_of.as_deref(), Some("2026-09-06T14:06:00Z"));
         assert!(
-            p.detail.contains("na cache bez parity (czeka na mover)"),
+            p.detail.contains("on the cache without parity (waiting for the mover)"),
             "the sentence the UI builds has to come from here: {}",
             p.detail
         );
@@ -9694,17 +9781,17 @@ pub(crate) mod tests {
         // it is not a scan of the array, and an MFS write landing straight on a
         // data branch is invisible to every probe this node has.
         assert!(
-            p.detail.contains("mover nie zostawił danych poza ostatnim sync"),
+            p.detail.contains("the mover left no data outside the last sync"),
             "{}",
             p.detail
         );
         assert!(
-            p.detail.contains("ochrona obejmuje stan z ostatniego sync"),
+            p.detail.contains("protection covers the state of the last sync"),
             "the sentence has to name the vintage of what is protected: {}",
             p.detail
         );
         assert!(
-            !p.detail.contains("pomiar nie wykazał"),
+            !p.detail.contains("measurement showed"),
             "a measurement nobody took must not be claimed: {}",
             p.detail
         );
@@ -9768,7 +9855,7 @@ pub(crate) mod tests {
     fn a_measured_open_window_survives_an_unmeasured_fault_tolerance() {
         let a = array();
         let eighteen_gib = 18 * 1024 * 1024 * 1024;
-        let canon = "na cache bez parity (czeka na mover)";
+        let canon = "on the cache without parity (waiting for the mover)";
         for case in ["parity_errors_unknown", "mounts_unknown", "parity_unreadable"] {
             let mut observed = all_mounted(&a, eighteen_gib);
             match case {
@@ -9789,7 +9876,7 @@ pub(crate) mod tests {
             assert_eq!(p.status, "unknown", "{case}");
             assert_eq!(p.cache_unprotected_bytes, Some(eighteen_gib), "{case}");
             assert!(
-                p.detail.contains("brak pełnego pomiaru"),
+                p.detail.contains("not fully measured"),
                 "{case}: {}",
                 p.detail
             );
@@ -9815,7 +9902,7 @@ pub(crate) mod tests {
         let p = protection(&two, &gone);
         assert_eq!(p.fault_tolerance, Some(1));
         assert_eq!(p.status, "unknown");
-        assert!(p.detail.contains("brakuje dysku parity"), "{}", p.detail);
+        assert!(p.detail.contains("a parity disk is missing"), "{}", p.detail);
         assert!(
             p.detail.contains(canon),
             "a measured window must survive a missing parity disk: {}",
@@ -9829,13 +9916,13 @@ pub(crate) mod tests {
         stale.moved_unsynced_bytes = Some(4096);
         let p = protection(&a, &stale);
         assert_eq!(p.status, "unknown");
-        assert!(p.detail.contains("brak pełnego pomiaru"), "{}", p.detail);
-        assert!(p.detail.contains("przeniesione przez mover"), "{}", p.detail);
+        assert!(p.detail.contains("not fully measured"), "{}", p.detail);
+        assert!(p.detail.contains("the mover already moved"), "{}", p.detail);
         // And with nothing open, the arm keeps exactly the sentence it had.
         let mut closed = all_mounted(&a, 0);
         closed.parity_errors = None;
         let p = protection(&a, &closed);
-        assert_eq!(p.detail, "brak pełnego pomiaru dostępności i poprawności parity");
+        assert_eq!(p.detail, "parity availability and correctness are not fully measured");
     }
 
     /// OWNER DECISION (2026-09-12), pinned: a cache this node could NOT measure,
@@ -9873,17 +9960,17 @@ pub(crate) mod tests {
                 p.detail
             );
             // Both halves are said: the cache is unmeasured AND parity is stale.
-            assert!(p.detail.contains("nie zmierzył"), "{case}: {}", p.detail);
+            assert!(p.detail.contains("has not measured"), "{case}: {}", p.detail);
             assert!(
-                p.detail.contains("nie potwierdził ochrony")
-                    || p.detail.contains("przeniesione przez mover"),
+                p.detail.contains("did not confirm protection")
+                    || p.detail.contains("the mover already moved"),
                 "{case}: {}",
                 p.detail
             );
             // The drift guard: falling through to the unmeasured-cache arm
             // below would drop the confirmed half entirely.
             assert_ne!(
-                p.detail, "ten node nie zmierzył, ile czeka na cache",
+                p.detail, "this node has not measured how much waits on the cache",
                 "{case}: potwierdzona nieaktualna parity nie może zniknąć"
             );
         }
@@ -10189,8 +10276,8 @@ pub(crate) mod tests {
             CacheStuckVerdict::Raise(text) => {
                 assert!(text.title.contains("media"), "{}", text.title);
                 assert!(text.detail.contains("9 h"), "{}", text.detail);
-                assert!(text.detail.contains("alarm po 8 h"), "{}", text.detail);
-                assert!(text.detail.contains("otwarte"), "{}", text.detail);
+                assert!(text.detail.contains("alarm after 8 h"), "{}", text.detail);
+                assert!(text.detail.contains("open or tied"), "{}", text.detail);
                 // The same, coded: the waits cut to the unit the sentence
                 // shows, and the cause as a word the screen translates.
                 assert_eq!(text.code, "elastic_cache_stuck");
@@ -10210,7 +10297,7 @@ pub(crate) mod tests {
         let CacheStuckVerdict::Raise(text) = cache_stuck_verdict(&a, &aged(2, Some(limit)), false) else {
             panic!("an unresolved operation past the threshold is stuck");
         };
-        assert!(text.detail.contains("nierozwiązana operacja"), "{}", text.detail);
+        assert!(text.detail.contains("an unresolved operation"), "{}", text.detail);
         assert_eq!(text.params.get("cause").map(String::as_str), Some("unresolved_operation"));
         // A minute later the sentence reads the same, so the coded row must
         // too — or every probe would rewrite the open alert.

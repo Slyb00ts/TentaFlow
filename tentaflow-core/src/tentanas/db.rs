@@ -1137,7 +1137,7 @@ pub const SETTING_SMART_SCHEDULE: &str = "smart_schedule";
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "synchronous", "FULL")?;
     anyhow::ensure!(conn.pragma_query_value(None, "synchronous", |r| r.get::<_, i64>(0))? == 2,
-        "NAS wymaga synchronous=FULL");
+        "TentaNas needs synchronous=FULL");
     crate::addon::app_db::run_versioned_migrations(conn, APP, MIGRATIONS)
 }
 
@@ -2170,10 +2170,19 @@ const JOB_COLUMNS: &str = "job_id, kind, subject, status, progress_pct, started_
 /// run that did not address it.
 macro_rules! orphaned_operation_error {
     () => {
+        "Core supervision was lost; the root journal has to be read"
+    };
+}
+/// The same marker as written by a core before wave 15, in Polish. A row
+/// `fail_orphaned_jobs` closed then still carries it, and it has to keep
+/// reading as interrupted: this literal is stored data, not a message.
+macro_rules! legacy_orphaned_operation_error {
+    () => {
         "Utracono nadzór core; wymagany odczyt journala roota"
     };
 }
 const ORPHANED_OPERATION_ERROR: &str = orphaned_operation_error!();
+const LEGACY_ORPHANED_OPERATION_ERROR: &str = legacy_orphaned_operation_error!();
 
 macro_rules! unresolved_elastic_operation {
     ($kinds:literal) => {
@@ -2185,9 +2194,11 @@ macro_rules! unresolved_elastic_operation {
             $kinds,
             ")
       AND o.state = 'needs_attention'
-      AND NOT (o.kind IN ('sync','scrub') AND (o.result_json IS NULL OR o.error = '",
+      AND NOT (o.kind IN ('sync','scrub') AND (o.result_json IS NULL OR o.error IN ('",
             orphaned_operation_error!(),
-            "'))
+            "', '",
+            legacy_orphaned_operation_error!(),
+            "')))
       AND NOT EXISTS(
         SELECT 1 FROM nas_elastic_operations f
         WHERE f.array_id = o.array_id AND f.state = 'succeeded'
@@ -2367,11 +2378,11 @@ pub fn insert_job_full(
     // Lines belong to a multi-disk SMART job (one per disk) and to the two
     // step jobs of the sharing stop and resume (one per step, wave 10).
     anyhow::ensure!(disks.is_empty() || job.kind == SMART_BATCH_KIND || super::sharing::is_step_kind(&job.kind),
-        "Linie dysków ma tylko zadanie {SMART_BATCH_KIND}");
+        "Only a {SMART_BATCH_KIND} job or a sharing step job has disk lines");
     anyhow::ensure!(owner.is_none() || !job.kind.starts_with("elastic_"),
-        "Zadanie Elastic należy do organizacji swojej macierzy; jawny właściciel jest odrzucany");
+        "An Elastic job belongs to its array's organisation; an explicit owner is refused");
     anyhow::ensure!(owner.is_none_or(|org| !org.is_empty()),
-        "Pusty identyfikator organizacji nie jest właścicielem");
+        "An empty organisation id is not an owner");
     let mut conn = write(pool)?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     if intent.is_some() {
@@ -2389,8 +2400,7 @@ pub fn insert_job_full(
     // this way — a pool takes two scrubs, a dataset two snapshots.
     // A multi-disk job's line counts as well (`self_test_running_on`).
     if job.kind == "smart_test" {
-        anyhow::ensure!(!self_test_running_on(&tx, &job.subject)?,
-            "Na tym dysku trwa już autotest SMART; odmowa drugiego");
+        require(!self_test_running_on(&tx, &job.subject)?, smart_self_test_running_refusal)?;
     }
     tx.execute(
         "INSERT INTO nas_jobs (job_id, kind, subject, status, progress_pct, started_by,
@@ -2742,14 +2752,14 @@ pub fn set_job_progress(pool: &DbPool, job_id: &str, status: &str, pct: Option<u
     Ok(())
 }
 
-/// Whether a job failed because the helper found another Elastic command
-/// holding the lock (`tentanas_helper::elastic::ELASTIC_BUSY`). The age probe
-/// walks a whole cache under that lock, so a manual Sync or mover started
-/// meanwhile meets it; such a refusal ran nothing and must not leave an
-/// unresolved operation behind.
-/// Whether the job's error means NOTHING RAN on the array: another Elastic
-/// command held the helper's lock, or the node refused to talk to a helper of
-/// another build than this core (`broker::HELPER_VERSION_MARKER`).
+/// Whether the error — of the job being closed, or one stored on a `failed`
+/// operation row (`elastic_runs`) — means NOTHING RAN on the array: another
+/// Elastic command held the helper's lock
+/// (`tentanas_helper::elastic::ELASTIC_BUSY`; the age probe walks a whole
+/// cache under that lock, so a manual Sync or mover started meanwhile meets
+/// it), or the node refused to talk to a helper of
+/// another build than this core (`broker::HELPER_VERSION_MARKER`, or
+/// `LEGACY_HELPER_VERSION_MARKER` on a row an older core stored).
 ///
 /// Both close the operation row as `failed` and leave the array untouched,
 /// which is the difference between a refusal and a fault. The version refusal
@@ -2761,7 +2771,15 @@ fn nothing_ran(error: Option<&str>) -> bool {
     error.is_some_and(|error| {
         error.contains(tentanas_helper::elastic::ELASTIC_BUSY)
             || error.contains(super::broker::HELPER_VERSION_MARKER)
+            || error.contains(super::broker::LEGACY_HELPER_VERSION_MARKER)
     })
+}
+
+/// The job error of a SnapRAID or mover run whose result this core could not
+/// confirm: the array is left needing attention, and the screen words the
+/// code; the sentence (why) is its tooltip.
+fn result_unconfirmed(sentence: impl Into<String>) -> String {
+    Refusal::not_available("elastic_result_unconfirmed", sentence).wire()
 }
 
 pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>) -> Result<()> {
@@ -2780,9 +2798,9 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
     if let Some((operation_id, spec, kind, candidate)) = maintenance {
         let validated = candidate
             .as_deref()
-            .ok_or_else(|| anyhow!("Brak wyniku operacji SnapRAID"))
+            .ok_or_else(|| anyhow!("The SnapRAID operation recorded no result"))
             .and_then(|json| {
-                anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik SnapRAID");
+                anyhow::ensure!(json.len() < 64 * 1024, "The SnapRAID result exceeds its size limit");
                 let result: tentanas_helper::elastic::ElasticSnapraidResult =
                     serde_json::from_str(json)?;
                 let answered =
@@ -2845,16 +2863,19 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
             Err(_) if candidate.is_none() && super::elastic::snapraid_disk(&kind).is_none() => {
                 final_status = "failed".into();
                 if final_error.is_none() {
-                    final_error = Some("Brak wyniku operacji SnapRAID".into());
+                    final_error = Some(
+                        Refusal::not_available("elastic_run_no_result", "The SnapRAID operation recorded no result")
+                            .wire(),
+                    );
                 }
                 ("needs_attention", false, "active")
             }
             other => {
                 final_status = "failed".into();
                 if let Err(cause) = other {
-                    final_error = Some(format!("Niepotwierdzony wynik SnapRAID: {cause}"));
+                    final_error = Some(result_unconfirmed(format!("The SnapRAID result was not confirmed: {cause}")));
                 } else if final_error.is_none() {
-                    final_error = Some("Niezgodny terminalny wynik SnapRAID".into());
+                    final_error = Some(result_unconfirmed("The SnapRAID result does not match how its job ended"));
                 }
                 ("needs_attention", true, "needs_attention")
             }
@@ -2871,7 +2892,7 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                     job_id
                 ]
             )? == 1,
-            "Utracono running operację SnapRAID"
+            "The running SnapRAID operation row is gone"
         );
         if update_array {
             anyhow::ensure!(
@@ -2892,16 +2913,16 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                         operation_id
                     ]
                 )? == 1,
-                "Utracono macierz operacji SnapRAID"
+                "The array of the SnapRAID operation is gone"
             );
         }
     }
     if let Some((operation_id, spec, candidate)) = mover {
         let validated = candidate
             .as_deref()
-            .ok_or_else(|| anyhow!("Brak wyniku operacji movera"))
+            .ok_or_else(|| anyhow!("The mover operation recorded no result"))
             .and_then(|json| {
-                anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik movera");
+                anyhow::ensure!(json.len() < 64 * 1024, "The mover result exceeds its size limit");
                 let result: tentanas_helper::elastic::ElasticMoverResult =
                     serde_json::from_str(json)?;
                 super::elastic::validate_mover_result(&spec, &operation_id, &result)?;
@@ -2930,9 +2951,9 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
             other => {
                 final_status = "failed".into();
                 if let Err(cause) = other {
-                    final_error = Some(format!("Niepotwierdzony wynik movera: {cause}"));
+                    final_error = Some(result_unconfirmed(format!("The mover result was not confirmed: {cause}")));
                 } else if final_error.is_none() {
-                    final_error = Some("Niezgodny terminalny wynik movera".into());
+                    final_error = Some(result_unconfirmed("The mover result does not match how its job ended"));
                 }
                 ("needs_attention", Some("needs_attention"))
             }
@@ -2949,7 +2970,7 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                     job_id
                 ]
             )? == 1,
-            "Utracono running operację movera"
+            "The running mover operation row is gone"
         );
         if let Some(array_state) = array_state {
             anyhow::ensure!(
@@ -2970,7 +2991,7 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
                         operation_id
                     ]
                 )? == 1,
-                "Utracono macierz operacji movera"
+                "The array of the mover operation is gone"
             );
         }
     }
@@ -2982,12 +3003,12 @@ pub fn finish_job(pool: &DbPool, job_id: &str, status: &str, error: Option<&str>
     )?;
     anyhow::ensure!(
         !requires_row || changed == 1,
-        "Nie utrwalono końca dokładnie jednego joba SnapRAID"
+        "The end of exactly one SnapRAID job was not persisted"
     );
     tx.commit()?;
     anyhow::ensure!(
         status != "succeeded" || final_status == "succeeded",
-        "Nie potwierdzono sukcesu zadania SnapRAID"
+        "The SnapRAID job's success was not confirmed"
     );
     Ok(())
 }
@@ -3030,7 +3051,7 @@ fn snapraid_operation(conn: &Connection, job_id: &str) -> Result<Option<Snapraid
             .unwrap_or(false);
         anyhow::ensure!(
             !is_maintenance,
-            "Brak dokładnie jednej running operacji SnapRAID"
+            "There is not exactly one running SnapRAID operation"
         );
         return Ok(None);
     };
@@ -3041,7 +3062,7 @@ fn snapraid_operation(conn: &Connection, job_id: &str) -> Result<Option<Snapraid
         job_kind == format!("elastic_{action}")
             && subject == spec.name
             && request.len() < 16 * 1024,
-        "Niezgodna intencja zadania SnapRAID"
+        "The SnapRAID job does not match its intent"
     );
     let command: tentanas_helper::HelperCommand = serde_json::from_str(&request)?;
     // A repair's disk is part of its KIND, and the only record of it is the
@@ -3061,11 +3082,11 @@ fn snapraid_operation(conn: &Connection, job_id: &str) -> Result<Option<Snapraid
         ("fix", tentanas_helper::HelperCommand::ElasticFix { disk, .. }) => {
             tentanas_helper::elastic::ElasticSnapraidKind::Fix { disk: disk.clone() }
         }
-        _ => anyhow::bail!("Zmienione żądanie operacji SnapRAID"),
+        _ => anyhow::bail!("The SnapRAID operation's stored request has changed"),
     };
     anyhow::ensure!(
         command == super::elastic::snapraid_command(&owner, &array_id, &operation_id, &kind, acknowledged.as_deref()),
-        "Zmienione żądanie operacji SnapRAID"
+        "The SnapRAID operation's stored request has changed"
     );
     Ok(Some((operation_id, spec, kind, candidate)))
 }
@@ -3086,18 +3107,18 @@ pub fn record_snapraid_result(
         |r| r.get(0),
     )?;
     let (stored_id, spec, kind, candidate) =
-        snapraid_operation(&tx, &job_id)?.ok_or_else(|| anyhow!("Brak intencji SnapRAID"))?;
+        snapraid_operation(&tx, &job_id)?.ok_or_else(|| anyhow!("No SnapRAID intent"))?;
     anyhow::ensure!(
         stored_id == operation_id && candidate.is_none(),
-        "Wynik operacji już zapisano"
+        "The operation's result is already recorded"
     );
     let answered =
         super::elastic::answered_spec(&spec, pinned_add(&tx, &spec.array_id)?.as_ref(), &result.state)?;
     super::elastic::validate_snapraid_result(&answered, operation_id, &kind, result)?;
     let json = serde_json::to_string(result)?;
-    anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik SnapRAID");
+    anyhow::ensure!(json.len() < 64 * 1024, "The SnapRAID result exceeds its size limit");
     anyhow::ensure!(tx.execute("UPDATE nas_elastic_operations SET result_json=?2 WHERE operation_id=?1 AND state='running' AND result_json IS NULL",
-        params![operation_id,json])? == 1, "Nie zapisano kandydata SnapRAID");
+        params![operation_id,json])? == 1, "The SnapRAID result candidate was not recorded");
     tx.commit()?;
     Ok(())
 }
@@ -3126,7 +3147,7 @@ fn mover_operation(conn: &Connection, job_id: &str) -> Result<Option<MoverOperat
             )
             .optional()?
             .unwrap_or(false);
-        anyhow::ensure!(!is_mover, "Brak dokładnie jednej running operacji movera");
+        anyhow::ensure!(!is_mover, "There is not exactly one running mover operation");
         return Ok(None);
     };
     let owner = ElasticOwner { org_id, addon_id };
@@ -3134,7 +3155,7 @@ fn mover_operation(conn: &Connection, job_id: &str) -> Result<Option<MoverOperat
     tentanas_helper::elastic::validate_elastic_uuid(&operation_id)?;
     anyhow::ensure!(
         job_kind == "elastic_mover" && subject == spec.name && request.len() < 16 * 1024,
-        "Niezgodna intencja zadania movera"
+        "The mover job does not match its intent"
     );
     // The stored request is the command the body ran. Its rules come from the
     // array row and cannot be re-derived from the spec, so what is checked here
@@ -3145,7 +3166,7 @@ fn mover_operation(conn: &Connection, job_id: &str) -> Result<Option<MoverOperat
         matches!(&command, tentanas_helper::HelperCommand::ElasticMover {
             array_id: stored_array, owner: stored_owner, operation_id: stored_operation, ..
         } if *stored_array == array_id && *stored_owner == owner && *stored_operation == operation_id),
-        "Zmienione żądanie operacji movera"
+        "The mover operation's stored request has changed"
     );
     Ok(Some((operation_id, spec, candidate)))
 }
@@ -3166,16 +3187,16 @@ pub fn record_mover_result(
         |r| r.get(0),
     )?;
     let (stored_id, spec, candidate) =
-        mover_operation(&tx, &job_id)?.ok_or_else(|| anyhow!("Brak intencji movera"))?;
+        mover_operation(&tx, &job_id)?.ok_or_else(|| anyhow!("No mover intent"))?;
     anyhow::ensure!(
         stored_id == operation_id && candidate.is_none(),
-        "Wynik operacji już zapisano"
+        "The operation's result is already recorded"
     );
     super::elastic::validate_mover_result(&spec, operation_id, result)?;
     let json = serde_json::to_string(result)?;
-    anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik movera");
+    anyhow::ensure!(json.len() < 64 * 1024, "The mover result exceeds its size limit");
     anyhow::ensure!(tx.execute("UPDATE nas_elastic_operations SET result_json=?2 WHERE operation_id=?1 AND state='running' AND result_json IS NULL",
-        params![operation_id,json])? == 1, "Nie zapisano kandydata movera");
+        params![operation_id,json])? == 1, "The mover result candidate was not recorded");
     tx.commit()?;
     Ok(())
 }
@@ -3291,7 +3312,7 @@ pub fn fail_orphaned_jobs(pool: &DbPool) -> Result<usize> {
     // exposure and the "short-lived self-test job" follow-up on this function.
     for job_id in candidates.into_iter().filter(|id| !running.contains_key(id)) {
         tx.execute("UPDATE nas_elastic_arrays SET state='needs_attention',
-        state_detail='Utracono nadzór core; stan zadania nie dowodzi zakończenia I/O', updated_at=?1,
+        state_detail='Core supervision was lost; the job state does not prove that I/O ended', updated_at=?1,
         state_reasons='[{\"code\":\"supervision_lost\",\"params\":{}}]'
         WHERE array_id IN (SELECT array_id FROM nas_elastic_operations WHERE state='running' AND job_id=?2)",
         params![now(),job_id])?;
@@ -3326,11 +3347,11 @@ fn elastic_spec(conn: &Connection, owner: &ElasticOwner, array_id: &str) -> Resu
          JOIN nas_elastic_operations o ON o.array_id=a.array_id AND o.kind IN ('create','import')
          WHERE a.array_id=?1 AND a.org_id=?2 AND a.addon_id=?3",
         params![array_id,owner.org_id,owner.addon_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
-    anyhow::ensure!(json.len() < 16 * 1024, "Zapis Elastic przekracza limit");
+    anyhow::ensure!(json.len() < 16 * 1024, "The Elastic record exceeds its size limit");
     let spec: ElasticCreateSpec = serde_json::from_str(&json)?;
     spec.validate()?;
     anyhow::ensure!(spec.owner == *owner && spec.array_id == array_id && spec.name == name
-        && spec.filesystem.as_str() == filesystem, "Niezgodna tożsamość zapisanej macierzy");
+        && spec.filesystem.as_str() == filesystem, "The stored array's identity does not match");
     let mut expected_aliases = std::collections::BTreeSet::new();
     let mut expected_disks = Vec::new();
     for (role, disks) in [("data", &spec.data), ("parity", &spec.parity)] {
@@ -3371,7 +3392,7 @@ fn elastic_spec(conn: &Connection, owner: &ElasticOwner, array_id: &str) -> Resu
             r.get::<_,String>(2)?,r.get::<_,i64>(3)?)))?
         .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
     anyhow::ensure!(actual_disks == expected_disks && actual_aliases == expected_aliases,
-        "Rezerwacje dysków nie odpowiadają intencji Elastic");
+        "The disk reservations do not match the Elastic intent");
     Ok(spec)
 }
 
@@ -3533,11 +3554,13 @@ fn elastic_runs(
         // a fault with counters (the LOW inconsistency of the third review).
         let interrupted = state == "needs_attention"
             && kind != "fix"
-            && (json.is_none() || value.detail == ORPHANED_OPERATION_ERROR);
+            && (json.is_none()
+                || value.detail == ORPHANED_OPERATION_ERROR
+                || value.detail == LEGACY_ORPHANED_OPERATION_ERROR);
         if state != "running" {
             let decoded = json
                 .as_deref()
-                .ok_or_else(|| anyhow!("Brak potwierdzonego wyniku"))
+                .ok_or_else(|| anyhow!("No confirmed result"))
                 .and_then(|json| {
                     let mut result: ElasticSnapraidResult = serde_json::from_str(json)?;
                     let pinned = pinned_add(conn, &spec.array_id)?;
@@ -3580,7 +3603,7 @@ fn elastic_runs(
                     value.finished_at = run.finished_at;
                     value.outcome = match run.outcome {
                         ElasticSnapraidOutcome::Running => {
-                            return Err(anyhow!("Nieterminalna historia SnapRAID"));
+                            return Err(anyhow!("A non-terminal SnapRAID history row"));
                         }
                         outcome => super::elastic::snapraid_outcome_to_protocol(outcome),
                     };
@@ -3613,7 +3636,7 @@ fn elastic_runs(
                 _ => {
                     anyhow::ensure!(
                         state == "needs_attention",
-                        "Niespójna utrwalona historia SnapRAID"
+                        "The persisted SnapRAID history is inconsistent"
                     );
                     value.finished_at = None;
                 }
@@ -3673,7 +3696,7 @@ fn mover_runs(
     let mut history = Vec::new();
     for row in rows {
         let (operation_id, state, json) = row?;
-        anyhow::ensure!(json.len() < 64 * 1024, "Za duży wynik movera");
+        anyhow::ensure!(json.len() < 64 * 1024, "The mover result exceeds its size limit");
         let decoded = serde_json::from_str::<tentanas_helper::elastic::ElasticMoverResult>(&json)
             .map_err(anyhow::Error::from)
             .and_then(|result| {
@@ -3691,8 +3714,8 @@ fn mover_runs(
             // of the array's measured state visible. The drop is logged so an
             // operator can see it even though the strip cannot say it.
             Err(error) => tracing::warn!(
-                "tentanas mover history: pominięto nieczytelną operację {operation_id} \
-                 (stan {state}): {error}"
+                "tentanas mover history: skipped an unreadable operation {operation_id} \
+                 (state {state}): {error}"
             ),
         }
     }
@@ -3769,6 +3792,16 @@ fn member_words(role: &str, slot: i64, disk: &ElasticDiskSpec) -> DiskWords {
 }
 
 // ----- the Elastic refusals the admin reads (wave 13, `super::refusal`) --------
+
+/// A second SMART self-test on a disk that is already running one: it would
+/// abort the first. The subject is the disk's id, so the refusal names no
+/// disk; the admin started it from that disk's own view.
+fn smart_self_test_running_refusal() -> Refusal {
+    Refusal::conflict(
+        "smart_self_test_running",
+        "A SMART self-test is already running on this disk; a second one is refused",
+    )
+}
 
 /// The instance is being uninstalled: no new Elastic operation, no adoption.
 pub(crate) fn elastic_teardown_refusal() -> Refusal {
@@ -4003,7 +4036,7 @@ fn latest_add_disk(
     };
     match serde_json::from_str::<tentanas_helper::HelperCommand>(&json)? {
         tentanas_helper::HelperCommand::ElasticAddDisk { disk, .. } => Ok(Some((state, disk))),
-        _ => Err(anyhow!("Niezgodna intencja dodania dysku")),
+        _ => Err(anyhow!("The disk add does not match its intent")),
     }
 }
 
@@ -4028,7 +4061,7 @@ fn latest_replace_disk(
         tentanas_helper::HelperCommand::ElasticReplaceDisk { branch, disk, .. } => {
             Ok(Some((state, branch, disk)))
         }
-        _ => Err(anyhow!("Niezgodna intencja wymiany dysku")),
+        _ => Err(anyhow!("The disk replacement does not match its intent")),
     }
 }
 
@@ -4092,7 +4125,7 @@ pub fn finish_elastic_replace_disk(
             .data
             .iter()
             .position(|member| member.disk_id == disk.disk_id)
-            .ok_or_else(|| anyhow!("Wymieniony dysk nie jest w zapisanej intencji"))?
+            .ok_or_else(|| anyhow!("The replaced disk is not in the stored intent"))?
             + 1,
     )?;
     tx.execute(
@@ -4126,20 +4159,20 @@ pub fn finish_elastic_replace_disk(
         }
     }
     let json = serde_json::to_string(&after)?;
-    anyhow::ensure!(json.len() < 16 * 1024, "Intencja Elastic przekracza limit");
+    anyhow::ensure!(json.len() < 16 * 1024, "The Elastic intent exceeds its size limit");
     anyhow::ensure!(
         tx.execute(
             "UPDATE nas_elastic_operations SET request_json=?2
              WHERE array_id=?1 AND kind IN ('create','import')",
             params![array_id, json]
         )? == 1,
-        "Brak jednej operacji źródłowej macierzy"
+        "The array does not have exactly one source operation"
     );
     // The read-back is the proof the writes agree: it is the very function
     // every later read of this array goes through.
     anyhow::ensure!(
         elastic_spec(&tx, owner, &array_id)? == after,
-        "Zapis wymiany dysku nie odtworzył intencji macierzy"
+        "The disk replacement record does not reproduce the array's intent"
     );
     let at = now();
     tx.execute(
@@ -4211,7 +4244,7 @@ pub fn refuse_elastic_operation(
                AND array_id IN (SELECT array_id FROM nas_elastic_arrays WHERE org_id=?4 AND addon_id=?5)",
             params![operation_id, error, now(), owner.org_id, owner.addon_id],
         )? == 1,
-        "Utracono running operację Elastic"
+        "The running Elastic operation row is gone"
     );
     tx.commit()?;
     Ok(())
@@ -4239,7 +4272,7 @@ pub fn settle_undone_add(
     anyhow::ensure!(
         observed.pending_add.is_none()
             && !matches!(observed.attention, Some(tentanas_helper::elastic::ElasticAttention::AddDisk { .. })),
-        "Helper nadal zgłasza niedokończone dodanie"
+        "The helper still reports the unfinished add"
     );
     if pinned_add(&tx, array_id)?.is_none() {
         return Ok(());
@@ -4248,7 +4281,7 @@ pub fn settle_undone_add(
     tx.execute(
         "UPDATE nas_elastic_operations SET state='failed',error=?2,finished_at=COALESCE(finished_at,?3)
          WHERE array_id=?1 AND kind='add_disk' AND state='needs_attention'",
-        params![array_id, "wycofane: helper nie przechowuje już tego dodania", at],
+        params![array_id, "undone: the helper no longer keeps this add", at],
     )?;
     let unresolved: bool = tx.query_row(
         &format!("SELECT {UNRESOLVED_ELASTIC_OPERATION}"),
@@ -4287,12 +4320,12 @@ pub fn finish_elastic_add_disk_abort(
     )?;
     let spec = elastic_spec(&tx, owner, &array_id)?;
     super::elastic::validate_observation(&spec, observed)?;
-    anyhow::ensure!(observed.pending_add.is_none(), "Helper nadal zgłasza niedokończone dodanie");
+    anyhow::ensure!(observed.pending_add.is_none(), "The helper still reports the unfinished add");
     let at = now();
     tx.execute(
         "UPDATE nas_elastic_operations SET state='failed',error=?2,finished_at=COALESCE(finished_at,?3)
          WHERE array_id=?1 AND kind='add_disk' AND state='needs_attention'",
-        params![array_id, format!("wycofane operacją {operation_id}"), at],
+        params![array_id, "undone by a later undo of this add", at],
     )?;
     tx.execute(
         "UPDATE nas_elastic_operations SET state='succeeded',result_json=?2,error='',finished_at=?3
@@ -4377,20 +4410,20 @@ pub fn finish_elastic_add_disk(
         }
     }
     let json = serde_json::to_string(&after)?;
-    anyhow::ensure!(json.len() < 16 * 1024, "Intencja Elastic przekracza limit");
+    anyhow::ensure!(json.len() < 16 * 1024, "The Elastic intent exceeds its size limit");
     anyhow::ensure!(
         tx.execute(
             "UPDATE nas_elastic_operations SET request_json=?2
              WHERE array_id=?1 AND kind IN ('create','import')",
             params![array_id, json]
         )? == 1,
-        "Brak jednej operacji źródłowej macierzy"
+        "The array does not have exactly one source operation"
     );
     // The read-back is the proof the two writes agree: it is the very function
     // every later read of this array goes through.
     anyhow::ensure!(
         elastic_spec(&tx, owner, &array_id)? == after,
-        "Zapis dysku nie odtworzył intencji macierzy"
+        "The disk record does not reproduce the array's intent"
     );
     let at = now();
     // The attempts this add resumed stop holding the array only NOW, with its
@@ -4400,7 +4433,7 @@ pub fn finish_elastic_add_disk(
         "UPDATE nas_elastic_operations SET state='failed',error=?3,
             finished_at=COALESCE(finished_at,?4)
          WHERE array_id=?1 AND kind='add_disk' AND state='needs_attention' AND operation_id<>?2",
-        params![array_id, operation_id, format!("dokończone operacją {operation_id}"), at],
+        params![array_id, operation_id, "finished by a later resume of this add", at],
     )?;
     tx.execute(
         "UPDATE nas_elastic_operations SET state='succeeded',result_json=?2,error='',finished_at=?3
@@ -4650,7 +4683,17 @@ pub fn block_elastic_teardown(pool: &DbPool) -> Result<()> {
     let mut conn=write(pool)?;
     let tx=conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let reserved:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM nas_elastic_arrays)",[],|r|r.get(0))?;
-    anyhow::ensure!(!reserved,"Instancja ma trwałe rezerwacje Elastic; usunięcie utraciłoby nadzór i konfigurację macierzy");
+    // Coded, but NOT as `teardown_*`: the uninstall dialog reads a
+    // `refusal:teardown_*` code as "refused before the removal replicated"
+    // (`NOT_STARTED` in www/js/modules/addons/uninstall-dialog.js), and this
+    // refusal comes from the teardown hook, which runs after it did.
+    require(!reserved, || {
+        Refusal::conflict(
+            "elastic_uninstall_supervised",
+            "This instance holds Elastic Array reservations; removing it would lose the arrays' \
+             supervision and configuration",
+        )
+    })?;
     tx.execute("INSERT INTO nas_settings(key,value,updated_at) VALUES ('elastic_teardown_started','true',?1)
         ON CONFLICT(key) DO NOTHING",params![now()])?;
     tx.commit()?;
@@ -8797,6 +8840,43 @@ mod tests {
         assert!(array.snapraid_history[0].checked_blocks.is_none());
     }
 
+    /// Wave 15: what a run that recorded nothing, or whose record this core
+    /// could not confirm, puts on its job's error line is a coded refusal
+    /// (worded by the screen), never a Polish sentence.
+    #[test]
+    fn a_run_without_a_confirmed_result_is_closed_with_a_coded_error() {
+        use tentanas_helper::elastic::ElasticSnapraidKind as Kind;
+        let p = pool();
+        let spec = completed_array(&p, "coded-close");
+        // A Sync stopped before it recorded anything: interrupted, the array
+        // left as it was.
+        let (sync, intent, _) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &sync, Some(&intent)).unwrap();
+        finish_job(&p, &sync.job_id, "cancelled", None).unwrap();
+        let closed = job(&p, &sync.job_id).unwrap().unwrap();
+        assert_eq!(closed.status, "failed");
+        assert_eq!(
+            closed.error.as_deref(),
+            Some("refusal:elastic_run_no_result The SnapRAID operation recorded no result")
+        );
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(array.state, "active", "an interrupted Sync leaves the array as it was");
+        // A repair with no record at all is a result this core cannot
+        // confirm: coded, with why as the sentence, and the array needs
+        // attention.
+        let (fix, intent, _) = maintenance(&spec, Kind::Fix { disk: "d1".into() });
+        insert_job(&p, &fix, Some(&intent)).unwrap();
+        finish_job(&p, &fix.job_id, "cancelled", None).unwrap();
+        let closed = job(&p, &fix.job_id).unwrap().unwrap();
+        let error = closed.error.unwrap_or_default();
+        let (code, params, sentence) = super::super::refusal::parse(&error).expect("a coded error");
+        assert_eq!((code.as_str(), params.len()), ("elastic_result_unconfirmed", 0), "{error}");
+        assert_eq!(sentence, "The SnapRAID result was not confirmed: The SnapRAID operation recorded no result");
+        let array = elastic_array(&p, &spec.owner, &spec.name).unwrap().unwrap();
+        assert_eq!(array.state, "needs_attention");
+        assert_eq!(array.state_detail, error, "the array's detail is the same coded error, worded on the screen");
+    }
+
     #[test]
     fn failed_scrub_keeps_earlier_sync_receipt_and_blocks_only_the_mover() {
         use tentanas_helper::elastic::{
@@ -8936,7 +9016,13 @@ mod tests {
         )
         .unwrap();
         set_mover_settings(&p, &spec.array_id, 3600, 20, true).unwrap();
-        assert!(block_elastic_teardown(&p).is_err(), "an array row blocks the uninstall");
+        let blocked = block_elastic_teardown(&p).expect_err("an array row blocks the uninstall");
+        // Coded (wave 15), and NOT as `teardown_*`: the uninstall dialog reads
+        // that prefix as a refusal from before the removal replicated, and
+        // this one comes from the teardown hook, after it did.
+        let code = super::super::refusal::Refusal::find(&blocked).map(|r| r.code);
+        assert_eq!(code, Some("elastic_uninstall_supervised"));
+        assert!(!code.unwrap_or_default().starts_with("teardown_"), "{blocked}");
         assert_eq!(elastic_claims(&p).unwrap().len(), 4, "two disks per array");
 
         // An array of ANOTHER owner is not this owner's to release: without the
@@ -9644,6 +9730,38 @@ mod tests {
         insert_job(&p, &again, Some(&again_intent)).unwrap();
     }
 
+    /// Critic wave 15, MAJOR 1: a version refusal an OLDER core stored (its
+    /// Polish marker) on a `failed` Sync row still reads as "refused, nothing
+    /// ran" in the history. Without the legacy marker the row fell through to
+    /// "inconsistent history" and every read of the owner's arrays failed.
+    #[test]
+    fn a_version_refusal_stored_by_an_older_core_still_reads_as_refused() {
+        use tentanas_helper::elastic::ElasticSnapraidKind as Kind;
+        let p = pool();
+        let spec = completed_array(&p, "old-skew");
+        let (sync, intent, sync_id) = maintenance(&spec, Kind::Sync);
+        insert_job(&p, &sync, Some(&intent)).unwrap();
+        finish_job(&p, &sync.job_id, "failed", Some("refusal:helper_version_unknown?expected=0.13.0 x")).unwrap();
+        // The row as a pre-wave-15 core wrote it.
+        let old = "helper w innej wersji niż rdzeń: zainstalowany helper ma wersję 0.12.0, a ten rdzeń \
+                   wymaga 0.13.0. Operacja nie została uruchomiona";
+        let changed = p
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE nas_elastic_operations SET error=?2 WHERE operation_id=?1 AND state='failed' AND result_json IS NULL",
+                params![sync_id, old],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the stored row has the shape the critic measured");
+        let array = elastic_array(&p, &spec.owner, "old-skew")
+            .expect("the owner's arrays stay readable")
+            .expect("the array");
+        assert_eq!(array.snapraid_history[0].outcome, "refused");
+        assert_eq!(array.state, "active");
+        assert!(elastic_arrays(&p, &spec.owner).is_ok());
+    }
+
     /// A second self-test on one disk ABORTS the first, so `insert_job`
     /// refuses it — for the scheduler's short pass, for the manual start and
     /// for two rapid clicks on it alike, because this is the only place where
@@ -9670,10 +9788,14 @@ mod tests {
         // The manual path, or the short pass, arriving at a disk already under test.
         let refused = insert_job(&p, &mk("j2", "smart_test", "disk-a", "running"), None)
             .expect_err("a second test on disk-a is refused");
-        assert!(
-            refused.to_string().contains("autotest SMART"),
+        // Coded (wave 15): the dispatcher answers it as this refusal, and the
+        // screen words it; the sentence is English.
+        assert_eq!(
+            super::super::refusal::Refusal::find(&refused).map(|r| (r.code, r.status.clone())),
+            Some(("smart_self_test_running", tentaflow_protocol::ProtocolErrorCode::Conflict)),
             "{refused}"
         );
+        assert!(refused.to_string().starts_with("refusal:smart_self_test_running A SMART self-test"), "{refused}");
         let rows: i64 = p
             .read()
             .unwrap()

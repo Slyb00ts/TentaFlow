@@ -99,22 +99,27 @@ test('the plan is read first and its removal list names the signature and the la
   assert.deepEqual(screen.jobLogs.map((j) => j.jobId), ['j1'], 'the job log follows the answer');
 });
 
-test('a refused plan shows the node’s own sentence and can never arm the button', async () => {
+// Wave 15: the node's sentence is English, so every refusal code is worded
+// by the dialog, and the sentence — which names the pool — is its tooltip.
+test('a refused plan is worded from its code, keeps the node’s sentence as the tooltip, and can never arm the button', async () => {
   const screen = fakeScreen({
     tentaNasDiskWipePlanRequest: plan({
       role: 'pool_member',
       allowed: false,
       refusals: [{
         code: 'zfs_pool',
-        detail: 'sdc: dysk należy do puli ZFS tank — zniszcz pulę albo odłącz od niej ten dysk, a potem wyczyść go ponownie',
+        detail: 'sdc: the disk belongs to ZFS pool tank — destroy the pool or detach this disk from it, then clear it again',
       }],
     }),
   });
   const win = await openDiskWipeDialog(screen, DISK, () => {});
   await flush();
 
-  assert.match(win.textContent, /puli ZFS tank/, 'the refusal is the node’s sentence, verbatim');
-  assert.match(win.textContent, /zniszcz pulę/, 'and it names the remedy');
+  assert.match(win.textContent, /sdc należy do puli ZFS — zniszcz pulę/, 'the refusal is worded in the admin’s language');
+  assert.doesNotMatch(win.textContent, /destroy the pool/, 'the node’s English is not the text');
+  const box = win.querySelector('.wizard-warning.danger[title]');
+  assert.ok(box, 'the refusal carries a tooltip');
+  assert.match(box.getAttribute('title'), /ZFS pool tank/, 'and the tooltip names the pool');
   typeInto(win.querySelector('#retype-input'), 'sdc');
   assert.ok(!armed(win), 'a retyped name cannot override a refusal');
   confirmWindow(win);
@@ -209,6 +214,25 @@ test('an owner without a code from an older node reads as another installation',
   await flush();
   assert.match(win.textContent, /Właściciel zapisany w dzienniku: inna instalacja TentaNas\./);
   win.remove();
+});
+
+// A newer node's code this build has no words for is the node's sentence,
+// as sent; an older node's Polish sentence of a known code is worded like a
+// newer one's.
+test('an unknown refusal code reads as the node’s sentence, an older node’s known code is still worded', async () => {
+  const unknown = await openDiskWipeDialog(fakeScreen({
+    tentaNasDiskWipePlanRequest: plan({ allowed: false, refusals: [{ code: 'future_reason', detail: 'sdc: held by something new' }] }),
+  }), DISK, () => {});
+  await flush();
+  assert.match(unknown.textContent, /sdc: held by something new/);
+  assert.ok(!unknown.querySelector('.wizard-warning.danger[title]'), 'the sentence is the text, not a tooltip too');
+  unknown.remove();
+  const older = await openDiskWipeDialog(fakeScreen({
+    tentaNasDiskWipePlanRequest: plan({ allowed: false, refusals: [{ code: 'mounted', detail: 'sdc: dysk ma zamontowany system plików (/srv) — odmontuj go i wyczyść ponownie' }] }),
+  }), DISK, () => {});
+  await flush();
+  assert.match(older.textContent, /sdc ma zamontowany system plików — odmontuj go, a potem wyczyść ponownie\./);
+  older.remove();
 });
 
 test('a claim on a plan the node already refused is never offered for acknowledgement', async () => {

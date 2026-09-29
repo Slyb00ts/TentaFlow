@@ -6183,7 +6183,14 @@
       "retype": "Vuelve a escribir el nombre del dispositivo para confirmar:",
       "confirm": "Borrar {name}",
       "done": "Se aceptó el borrado del disco {name}. Comprueba el resultado de la tarea.",
-      "refusal_remote": "{name} es un disco remoto (iSCSI/NVMe-oF) que este nodo ve como cliente — sus datos pertenecen al target que lo exporta. Cierra la sesión en el target en lugar de borrar el disco."
+      "refusal_remote": "{name} es un disco remoto (iSCSI/NVMe-oF) que este nodo ve como cliente — sus datos pertenecen al target que lo exporta. Cierra la sesión en el target en lugar de borrar el disco.",
+      "refusal_system": "{name} es el disco del sistema de este nodo — ninguna operación lo libera. Mueva el sistema a otro soporte si este disco debe quedar libre.",
+      "refusal_zfs_pool": "{name} pertenece a un pool ZFS — destruya el pool o separe este disco de él y luego vuelva a borrarlo.",
+      "refusal_mdraid": "{name} es miembro de una matriz mdraid — detenga la matriz (mdadm --stop) y luego vuelva a borrar el disco.",
+      "refusal_elastic_member": "{name} pertenece a una Elastic Array — disuelva la matriz y luego borre sus discos.",
+      "refusal_mounted": "{name} tiene un sistema de archivos montado — desmóntelo y luego vuelva a borrarlo.",
+      "refusal_journal_serving": "{name} pertenece a una Elastic Array que todavía sirve su unión en este nodo — disuelva la matriz y luego borre sus discos.",
+      "refusal_journal_unknown": "No se pudo leer si la Elastic Array a la que pertenece {name} todavía se sirve — un estado desconocido no es un estado libre. Vuelva a leer el plan cuando el nodo responda."
     },
     "destroy_pool": {
       "title": "Destruir el pool {name}",
@@ -8128,7 +8135,23 @@
       "elastic_folders_unreadable": "No se puede leer la lista de carpetas de la matriz — la política de caché no se ha guardado",
       "elastic_folder_policy_limit": "Como máximo {limit} carpetas de esta matriz pueden tener su propia política de caché",
       "elastic_namespace_unconfirmed": "No se pudo confirmar que el espacio de montaje de este nombre esté libre — inténtelo de nuevo",
-      "target_rdma_no_device": "La interfaz {interface} no tiene dispositivo RDMA — el kernel rechaza una escucha RDMA en {address}. Elige TCP o una interfaz con tarjeta RDMA."
+      "target_rdma_no_device": "La interfaz {interface} no tiene dispositivo RDMA — el kernel rechaza una escucha RDMA en {address}. Elige TCP o una interfaz con tarjeta RDMA.",
+      "smart_self_test_running": "Ya hay una autoprueba SMART en curso en este disco — espere a que termine; una segunda la cancelaría",
+      "elastic_uninstall_supervised": "La desinstalación se detuvo en este nodo: sus Elastic Arrays están bajo la supervisión de TentaNas y eliminar la instancia los perdería",
+      "elastic_run_no_result": "La ejecución terminó sin resultado — se detuvo o se interrumpió, y la matriz quedó como estaba",
+      "elastic_result_unconfirmed": "No se pudo confirmar el resultado de la ejecución, así que la matriz requiere atención",
+      "elastic_restore_needs_attention": "La matriz se restauró, pero requiere intervención; se conservan las reservas de sus discos",
+      "elastic_snapraid_failed": "La ejecución de SnapRAID no tuvo éxito",
+      "elastic_mover_unfinished": "El mover no terminó: algo queda sin resolver para la próxima ejecución",
+      "privilege_channel_unavailable": "El canal de privilegios del sistema no está disponible ({why}) — abra TentaNas en este nodo y complete el paso de configuración del canal que aparece en lugar de las pestañas",
+      "helper_version_mismatch": "El helper instalado tiene la versión {installed} y este nodo necesita la {expected} — no se inició nada. Vuelva a conceder los privilegios del sistema (Entorno → canal de privilegios) para instalar el helper correspondiente",
+      "helper_version_unknown": "No se pudo leer la versión del helper instalado (este nodo necesita la {expected}) — no se inició nada. Vuelva a conceder los privilegios del sistema (Entorno → canal de privilegios)",
+      "disk_wipe_confirm_mismatch": "El nombre de dispositivo escrito no coincide con {disk}",
+      "disk_wipe_plan_changed": "El disco ya no es aquel para el que se leyó el plan — vuelva a leer el plan",
+      "disk_wipe_refused": "El nodo se niega a borrar este disco — vuelva a leer el plan para ver por qué",
+      "disk_wipe_no_journal": "Ningún diario de Elastic Array reserva ya este disco — vuelva a leer el plan",
+      "disk_wipe_journal_unacknowledged": "El diario de la Elastic Array disuelta {array} todavía reserva este disco — confirme la pérdida de esa matriz o recupérela con una importación de matrices",
+      "elastic_create_needs_attention": "La matriz se creó, pero requiere intervención; se conservan las reservas de sus discos"
     },
     "unreachable": {
       "title": "Nodo {node} inaccesible",
@@ -8161,6 +8184,14 @@
       "parity": "n.º {n} (paridad)",
       "cache": "de caché",
       "model": "{model}"
+    },
+    "refusal_channel": {
+      "password_expired": "la contraseña no está activada o ha caducado",
+      "not_configured": "el modo de privilegios no está configurado",
+      "sudo_rejected": "sudo rechazó la contraseña",
+      "not_passwordless": "el helper no funciona sin contraseña",
+      "not_root": "el helper no se ejecutó como root",
+      "other": "el motivo está en el texto del nodo"
     }
   },
   "agent_accounts": {

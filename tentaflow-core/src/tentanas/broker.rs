@@ -26,6 +26,23 @@ use zeroize::Zeroizing;
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
 use crate::profiling::elevation_runner::ElevationRunner;
+use super::refusal::Refusal;
+
+/// The closed key of an `Unarmed` reason, for the coded refusal the
+/// dispatcher answers with (`privilege_channel_unavailable?reason=<key>`):
+/// the screen words the key, and each one leads to a different fix. '' for a
+/// reason this list does not know yet; the screen then words the refusal
+/// without it.
+pub fn unarmed_reason_key(why: &str) -> &'static str {
+    match why {
+        "password not armed or expired" => "password_expired",
+        "privilege mode not configured" => "not_configured",
+        "sudo rejected the password" => "sudo_rejected",
+        "helper is not passwordless" => "not_passwordless",
+        "helper did not run as root" => "not_root",
+        _ => "",
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum BrokerError {
@@ -388,7 +405,19 @@ async fn sudo_argv(
 /// close the operation row as "refused before anything ran", so a refused
 /// cadence tick leaves the array exactly as it was instead of parking a fault
 /// on it.
-pub const HELPER_VERSION_MARKER: &str = "helper w innej wersji niż rdzeń";
+///
+/// Since wave 15 a version refusal is a coded refusal (`tentanas::refusal`):
+/// `helper_version_mismatch` or `helper_version_unknown`, so the marker is
+/// the prefix both codes share.
+pub const HELPER_VERSION_MARKER: &str = "refusal:helper_version_";
+
+/// The marker a version refusal carried before wave 15, in Polish. It is
+/// STORED data: `nothing_ran` also reads the error kept on a `failed`
+/// operation row (`db::elastic_runs`, the history of every array), and a row
+/// written by an older core during an upgrade window carries this text. It
+/// has to keep reading as "refused before anything ran", or that history row
+/// becomes unreadable and takes every read of the owner's arrays down with it.
+pub const LEGACY_HELPER_VERSION_MARKER: &str = "helper w innej wersji niż rdzeń";
 
 /// How long a version probe is trusted. The probe is one unprivileged
 /// `--version` exec; the scheduler ticks every minute and the automatic mover
@@ -492,16 +521,34 @@ fn version_gate(command: &HelperCommand, installed: Option<&str>) -> Result<(), 
     let expected = tentanas_helper::VERSION;
     match installed {
         Some(version) if version == expected => Ok(()),
-        Some(version) => Err(BrokerError::HelperVersion(format!(
-            "{HELPER_VERSION_MARKER}: zainstalowany helper ma wersję {version}, a ten rdzeń wymaga \
-             {expected}. Operacja nie została uruchomiona — powtórz nadanie uprawnień systemowych \
-             (TentaNas → Środowisko → kanał uprawnień), aby zainstalować pasującą wersję helpera."
-        ))),
-        None => Err(BrokerError::HelperVersion(format!(
-            "{HELPER_VERSION_MARKER}: nie udało się odczytać wersji zainstalowanego helpera (ten \
-             rdzeń wymaga {expected}). Operacja nie została uruchomiona — powtórz nadanie uprawnień \
-             systemowych (TentaNas → Środowisko → kanał uprawnień)."
-        ))),
+        // Coded (wave 15): the screen words the code in the reader's language
+        // and names both versions; the sentence is for an older screen and
+        // the log. A version is not an id.
+        Some(version) => Err(BrokerError::HelperVersion(
+            Refusal::not_available(
+                "helper_version_mismatch",
+                format!(
+                    "The installed helper is version {version} and this core needs {expected}. \
+                     Nothing was started — grant the system privileges again (TentaNas → \
+                     Environment → privilege channel) to install the matching helper."
+                ),
+            )
+            .param("installed", version)
+            .param("expected", expected)
+            .wire(),
+        )),
+        None => Err(BrokerError::HelperVersion(
+            Refusal::not_available(
+                "helper_version_unknown",
+                format!(
+                    "The installed helper's version could not be read (this core needs \
+                     {expected}). Nothing was started — grant the system privileges again \
+                     (TentaNas → Environment → privilege channel)."
+                ),
+            )
+            .param("expected", expected)
+            .wire(),
+        )),
     }
 }
 
@@ -621,6 +668,24 @@ pub async fn channel_available(db: &DbPool) -> bool {
 mod tests {
     use super::*;
 
+    /// Wave 15: every reason this file refuses the channel with has a key
+    /// the screen words, so no `privilege_channel_unavailable` reads "the
+    /// reason is in the node's text" for a reason this build raises itself.
+    #[test]
+    fn every_unarmed_reason_raised_here_has_a_key() {
+        let source = include_str!("broker.rs");
+        let production = &source[..source.find("#[cfg(test)]\nmod tests").expect("the test module")];
+        let mut reasons = 0;
+        for (at, _) in production.match_indices("Unarmed(\"") {
+            let rest = &production[at + "Unarmed(\"".len()..];
+            let why = &rest[..rest.find('"').expect("a closed literal")];
+            assert!(!unarmed_reason_key(why).is_empty(), "no key for {why:?}");
+            reasons += 1;
+        }
+        assert!(reasons >= 5, "the scan found the reasons ({reasons})");
+        assert_eq!(unarmed_reason_key("something new"), "");
+    }
+
     /// AN ELASTIC OPERATION NEVER REACHES A HELPER OF ANOTHER BUILD, and an
     /// unreadable version is refused exactly like a wrong one.
     ///
@@ -648,7 +713,7 @@ mod tests {
         };
         assert!(why.contains("0.12.0"), "{why}");
         assert!(why.contains(tentanas_helper::VERSION), "{why}");
-        assert!(why.contains("uprawnień"), "{why}");
+        assert!(why.starts_with("refusal:helper_version_mismatch?installed=0.12.0&expected="), "{why}");
         // And it carries the marker the store reads to close the row as
         // "nothing ran", so a refused cadence tick parks no fault.
         assert!(why.contains(HELPER_VERSION_MARKER), "{why}");
@@ -665,7 +730,7 @@ mod tests {
         // it blind is worst: the file is gone, it is not executable, it hangs.
         let unknown = version_gate(&elastic, None).expect_err("unknown is not fine");
         let BrokerError::HelperVersion(why) = &unknown else { panic!("{unknown:?}") };
-        assert!(why.contains("nie udało się odczytać"), "{why}");
+        assert!(why.starts_with("refusal:helper_version_unknown?expected="), "{why}");
         assert!(why.contains(HELPER_VERSION_MARKER), "{why}");
 
         // NOT an Elastic command: the share writers and the ZFS guards keep

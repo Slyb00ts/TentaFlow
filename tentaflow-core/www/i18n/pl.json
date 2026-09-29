@@ -8057,7 +8057,14 @@
       "retype": "Przepisz nazwę urządzenia, aby potwierdzić:",
       "confirm": "Wyczyść {name}",
       "done": "Przyjęto czyszczenie dysku {name}. Sprawdź wynik zadania.",
-      "refusal_remote": "{name} to dysk zdalny (iSCSI/NVMe-oF), który ten węzeł widzi jako klient — jego dane należą do targetu, który go udostępnia. Wyloguj się z targetu zamiast czyścić dysk."
+      "refusal_remote": "{name} to dysk zdalny (iSCSI/NVMe-oF), który ten węzeł widzi jako klient — jego dane należą do targetu, który go udostępnia. Wyloguj się z targetu zamiast czyścić dysk.",
+      "refusal_system": "{name} to dysk systemowy tego węzła — żadna operacja go nie zwalnia. Przenieś system na inny nośnik, jeśli ten dysk ma być wolny.",
+      "refusal_zfs_pool": "{name} należy do puli ZFS — zniszcz pulę albo odłącz od niej ten dysk, a potem wyczyść go ponownie.",
+      "refusal_mdraid": "{name} jest członkiem macierzy mdraid — rozłóż macierz (mdadm --stop), a potem wyczyść dysk ponownie.",
+      "refusal_elastic_member": "{name} należy do macierzy Elastic — rozwiąż macierz, a potem wyczyść jej dyski.",
+      "refusal_mounted": "{name} ma zamontowany system plików — odmontuj go, a potem wyczyść ponownie.",
+      "refusal_journal_serving": "{name} należy do macierzy Elastic, która nadal udostępnia unię na tym węźle — rozwiąż macierz, a potem wyczyść jej dyski.",
+      "refusal_journal_unknown": "Nie udało się odczytać, czy macierz Elastic, do której należy {name}, jest jeszcze udostępniana — nieznany stan nie jest stanem wolnym. Odczytaj plan ponownie, gdy węzeł odpowie."
     },
     "destroy_pool": {
       "title": "Zniszcz pulę {name}",
@@ -9395,7 +9402,23 @@
       "elastic_folders_unreadable": "Nie można odczytać listy folderów macierzy — polityka cache nie została zapisana",
       "elastic_folder_policy_limit": "Najwyżej {limit} folderów tej macierzy może mieć własną politykę cache",
       "elastic_namespace_unconfirmed": "Nie udało się potwierdzić, że przestrzeń montowania tej nazwy jest wolna — spróbuj ponownie",
-      "target_rdma_no_device": "Interfejs {interface} nie ma urządzenia RDMA — jądro odrzuca nasłuch RDMA na adresie {address}. Wybierz TCP albo interfejs z kartą RDMA."
+      "target_rdma_no_device": "Interfejs {interface} nie ma urządzenia RDMA — jądro odrzuca nasłuch RDMA na adresie {address}. Wybierz TCP albo interfejs z kartą RDMA.",
+      "smart_self_test_running": "Na tym dysku trwa już autotest SMART — poczekaj na jego koniec; drugi przerwałby pierwszy",
+      "elastic_uninstall_supervised": "Odinstalowanie zatrzymało się na tym węźle: jego macierze Elastic są pod nadzorem TentaNas, a usunięcie instancji by je utraciło",
+      "elastic_run_no_result": "Przebieg zakończył się bez wyniku — został zatrzymany albo przerwany, a macierz pozostała bez zmian",
+      "elastic_result_unconfirmed": "Nie udało się potwierdzić wyniku przebiegu, więc macierz wymaga uwagi",
+      "elastic_restore_needs_attention": "Macierz została przywrócona, ale wymaga interwencji; rezerwacje jej dysków są zachowane",
+      "elastic_snapraid_failed": "Przebieg SnapRAID nie zakończył się sukcesem",
+      "elastic_mover_unfinished": "Mover nie dokończył przenoszenia: coś pozostało nierozwiązane dla następnego przebiegu",
+      "privilege_channel_unavailable": "Kanał uprawnień systemowych nie jest dostępny ({why}) — otwórz TentaNas na tym węźle i dokończ krok konfiguracji kanału, który pojawi się zamiast zakładek",
+      "helper_version_mismatch": "Zainstalowany helper ma wersję {installed}, a ten węzeł wymaga {expected} — nic nie zostało uruchomione. Powtórz nadanie uprawnień systemowych (Środowisko → kanał uprawnień), aby zainstalować pasującą wersję helpera",
+      "helper_version_unknown": "Nie udało się odczytać wersji zainstalowanego helpera (ten węzeł wymaga {expected}) — nic nie zostało uruchomione. Powtórz nadanie uprawnień systemowych (Środowisko → kanał uprawnień)",
+      "disk_wipe_confirm_mismatch": "Przepisana nazwa urządzenia nie zgadza się z {disk}",
+      "disk_wipe_plan_changed": "To już nie jest dysk, dla którego odczytano plan — odczytaj plan ponownie",
+      "disk_wipe_refused": "Węzeł odmawia wyczyszczenia tego dysku — odczytaj plan ponownie, aby zobaczyć dlaczego",
+      "disk_wipe_no_journal": "Żaden dziennik macierzy Elastic nie rezerwuje już tego dysku — odczytaj plan ponownie",
+      "disk_wipe_journal_unacknowledged": "Dziennik rozwiązanej macierzy Elastic {array} nadal rezerwuje ten dysk — potwierdź utratę tej macierzy albo przywróć ją importem macierzy",
+      "elastic_create_needs_attention": "Macierz została utworzona, ale wymaga interwencji; rezerwacje jej dysków są zachowane"
     },
     "unreachable": {
       "title": "Węzeł {node} niedostępny",
@@ -9428,6 +9451,14 @@
       "parity": "parity nr {n}",
       "cache": "cache",
       "model": "{model}"
+    },
+    "refusal_channel": {
+      "password_expired": "hasło nie jest uzbrojone albo wygasło",
+      "not_configured": "tryb uprawnień nie jest skonfigurowany",
+      "sudo_rejected": "sudo odrzuciło hasło",
+      "not_passwordless": "helper nie działa bez hasła",
+      "not_root": "helper nie uruchomił się jako root",
+      "other": "przyczyna jest w tekście węzła"
     }
   },
   "agent_accounts": {

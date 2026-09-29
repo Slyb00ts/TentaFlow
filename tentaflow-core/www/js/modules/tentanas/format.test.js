@@ -475,17 +475,22 @@ test('the Elastic and approval alerts word their parameters, never the node text
 
 // ----- Refusals the node sends as codes ------------------------------------
 
-const { errMessage, errDetail, parseRefusal, wordIdTokens, T } = await import('./format.js');
+const { errMessage, errDetail, parseRefusal, wordIdTokens, nodeTextTitle, T } = await import('./format.js');
 const { scrubIds } = await import('./machine-id.js');
 
 // Every code the node refuses with: the `"refusal:<code>"` literals, and the
 // coded refusals with parameters (`Refusal::<kind>("<code>", …)`, wave 13).
 function nodeRefusalCodes() {
   const codes = new Set();
-  for (const file of ['tentanas/db.rs', 'tentanas/approvals.rs', 'tentanas/jobs.rs', 'tentanas/elastic.rs', 'dispatch/tentanas.rs']) {
+  for (const file of ['tentanas/db.rs', 'tentanas/approvals.rs', 'tentanas/jobs.rs', 'tentanas/elastic.rs', 'tentanas/disks.rs', 'tentanas/broker.rs', 'dispatch/tentanas.rs']) {
     const source = readFileSync(join(WWW_ROOT, '..', 'src', file), 'utf8');
-    for (const m of source.matchAll(/"refusal:([a-z0-9_]+)"/g)) codes.add(m[1]);
+    // A literal ending in `_` is a prefix shared by several codes
+    // (`broker::HELPER_VERSION_MARKER`), not a code.
+    for (const m of source.matchAll(/"refusal:([a-z0-9_]+)"/g)) if (!m[1].endsWith('_')) codes.add(m[1]);
     for (const m of source.matchAll(/Refusal::(?:not_available|bad_request|not_found|conflict)\(\s*"([a-z0-9_]+)"/g)) codes.add(m[1]);
+    // `refuse(` in disks.rs builds a wipe PLAN's refusal (its own codes,
+    // worded by the wipe dialog), not a wire refusal.
+    if (file === 'tentanas/disks.rs') continue;
     for (const m of source.matchAll(/\brefuse\(\s*"(elastic_[a-z0-9_]+)"/g)) codes.add(m[1]);
   }
   return codes;
@@ -499,6 +504,11 @@ function sampleParams(code) {
   for (const [, name] of words.matchAll(/\{([a-z0-9_]+)(?:\|[^}]*)?\}/g)) params[name] = '3';
   if ('disk' in params) params.disk = 'sdq';
   if ('owner' in params) Object.assign(params, { owner: 'pool', owner_name: 'tank' });
+  // `{why}` is worded from the closed `reason` key the node sends (wave 15).
+  if ('why' in params) {
+    delete params.why;
+    params.reason = 'sudo_rejected';
+  }
   return params;
 }
 
@@ -524,7 +534,7 @@ test('every refusal code the node sends is worded in every locale, an unknown on
         const text = errMessage(error);
         assert.doesNotMatch(text, /refusal:|tentanas\.|\{|own sentence/, `${code} is worded in ${lang}: ${text}`);
         for (const [name, value] of Object.entries(params)) {
-          if (name !== 'owner' && name !== 'owner_name') assert.ok(text.includes(value), `${code} in ${lang} carries {${name}}: ${text}`);
+          if (name !== 'owner' && name !== 'owner_name' && name !== 'reason') assert.ok(text.includes(value), `${code} in ${lang} carries {${name}}: ${text}`);
         }
         assert.equal(errDetail(error), 'The node\'s own sentence', `${code}: the sentence is the detail`);
         // A code that needs no parameter is also worded in the old form.
@@ -639,6 +649,54 @@ test('a screen from before wave 13 still shows the node sentence of a coded refu
   assert.match(shown, /Data disk no\. 2 is already in the array media$/);
   // And a parameter-less code it knew still reads as its words.
   assert.equal(preWave13ErrMessage(new Error('refusal:elastic_add_joined')), errMessage(new Error('refusal:elastic_add_joined')));
+});
+
+// Wave 15: the privilege channel, the helper version gate, the SMART
+// self-test and the wipe refusals are coded too.
+test('the wave-15 refusals are worded from their codes and parameters', async () => {
+  const channel = (reason) => errMessage(new Error(`protocol error NotAvailable: refusal:privilege_channel_unavailable${reason ? `?reason=${reason}` : ''} The system privilege channel is not available (x)`));
+  assert.equal(channel('sudo_rejected'), 'Kanał uprawnień systemowych nie jest dostępny (sudo odrzuciło hasło) — otwórz TentaNas na tym węźle i dokończ krok konfiguracji kanału, który pojawi się zamiast zakładek');
+  assert.match(channel('not_configured'), /\(tryb uprawnień nie jest skonfigurowany\)/);
+  // A reason this build does not know, or none, still reads as the words,
+  // pointing at the node's text.
+  assert.match(channel('a_future_reason'), /\(przyczyna jest w tekście węzła\)/);
+  assert.match(channel(''), /\(przyczyna jest w tekście węzła\)/);
+  assert.equal(errDetail(new Error('refusal:privilege_channel_unavailable?reason=sudo_rejected The channel is down')), 'The channel is down');
+  assert.equal(
+    errMessage(new Error('refusal:helper_version_mismatch?installed=0.12.0&expected=0.17.3 The installed helper is version 0.12.0')),
+    'Zainstalowany helper ma wersję 0.12.0, a ten węzeł wymaga 0.17.3 — nic nie zostało uruchomione. Powtórz nadanie uprawnień systemowych (Środowisko → kanał uprawnień), aby zainstalować pasującą wersję helpera',
+  );
+  assert.equal(errMessage(new Error('refusal:disk_wipe_confirm_mismatch?disk=sdc x')), 'Przepisana nazwa urządzenia nie zgadza się z sdc');
+  try {
+    await I18n.setLanguage('de');
+    assert.match(channel('not_root'), /\(der Helper lief nicht als root\)/);
+    assert.equal(errMessage(new Error('refusal:smart_self_test_running A SMART self-test is already running')),
+      'Auf diesem Datenträger läuft bereits ein SMART-Selbsttest — warten Sie, bis er endet; ein zweiter würde ihn abbrechen');
+  } finally {
+    await I18n.setLanguage('pl');
+  }
+  // An older node sends the Polish sentence, uncoded: it is shown as sent.
+  assert.equal(errMessage(new Error('Kanał uprawnień systemowych nie jest dostępny (sudo rejected the password)')),
+    'Kanał uprawnień systemowych nie jest dostępny (sudo rejected the password)');
+});
+
+// A node text that is a stored coded refusal (a failed run's error kept as
+// the array's state detail and its history row's detail) reads as words and
+// sentence, never as the wire; any other node text is scrubbed as before.
+test('nodeTextTitle words a stored coded refusal and scrubs the rest', () => {
+  assert.equal(
+    nodeTextTitle('refusal:elastic_result_unconfirmed The SnapRAID result was not confirmed: A sync without parity'),
+    'Nie udało się potwierdzić wyniku przebiegu, więc macierz wymaga uwagi — The SnapRAID result was not confirmed: A sync without parity',
+  );
+  assert.equal(nodeTextTitle('refusal:elastic_run_no_result'), 'Przebieg zakończył się bez wyniku — został zatrzymany albo przerwany, a macierz pozostała bez zmian');
+  // No words in this build: the sentence, ids scrubbed; no sentence either:
+  // the wire, scrubbed.
+  const id = 'wwn-0x5000c500a1b2c3d4';
+  const unknown = nodeTextTitle(`refusal:future_code Disk ${id} failed`);
+  assert.ok(unknown.startsWith('Disk ') && !unknown.includes(id), unknown);
+  assert.equal(nodeTextTitle('refusal:future_code'), 'refusal:future_code');
+  assert.equal(nodeTextTitle('  plain node text  '), 'plain node text');
+  assert.equal(nodeTextTitle(''), '');
 });
 
 test('errCode reads the wire enum from the client wrapping or from .code', () => {

@@ -6183,7 +6183,14 @@
       "retype": "Gerätenamen zur Bestätigung erneut eingeben:",
       "confirm": "{name} löschen",
       "done": "Das Löschen von Datenträger {name} wurde angenommen. Prüfen Sie das Auftragsergebnis.",
-      "refusal_remote": "{name} ist eine entfernte Platte (iSCSI/NVMe-oF), die dieser Knoten als Client sieht — ihre Daten gehören dem Target, das sie bereitstellt. Melde dich vom Target ab, statt die Platte zu löschen."
+      "refusal_remote": "{name} ist eine entfernte Platte (iSCSI/NVMe-oF), die dieser Knoten als Client sieht — ihre Daten gehören dem Target, das sie bereitstellt. Melden Sie sich vom Target ab, statt die Platte zu löschen.",
+      "refusal_system": "{name} ist der Systemdatenträger dieses Knotens — kein Vorgang gibt ihn frei. Verschieben Sie das System auf ein anderes Medium, wenn dieser Datenträger frei werden soll.",
+      "refusal_zfs_pool": "{name} gehört zu einem ZFS-Pool — zerstören Sie den Pool oder trennen Sie diesen Datenträger davon und löschen Sie ihn dann erneut.",
+      "refusal_mdraid": "{name} ist Mitglied eines mdraid-Arrays — stoppen Sie das Array (mdadm --stop) und löschen Sie den Datenträger dann erneut.",
+      "refusal_elastic_member": "{name} gehört zu einem Elastic Array — lösen Sie das Array auf und löschen Sie dann seine Datenträger.",
+      "refusal_mounted": "{name} hat ein eingehängtes Dateisystem — hängen Sie es aus und löschen Sie den Datenträger dann erneut.",
+      "refusal_journal_serving": "{name} gehört zu einem Elastic Array, das seine Union auf diesem Knoten noch bereitstellt — lösen Sie das Array auf und löschen Sie dann seine Datenträger.",
+      "refusal_journal_unknown": "Ob das Elastic Array, zu dem {name} gehört, noch bereitgestellt wird, konnte nicht gelesen werden — ein unbekannter Zustand ist kein freier. Lesen Sie den Plan erneut, wenn der Knoten antwortet."
     },
     "destroy_pool": {
       "title": "Pool {name} zerstören",
@@ -8128,7 +8135,23 @@
       "elastic_folders_unreadable": "Die Ordnerliste des Arrays kann nicht gelesen werden — die Cache-Richtlinie wurde nicht gespeichert",
       "elastic_folder_policy_limit": "Höchstens {limit} Ordner dieses Arrays können eine eigene Cache-Richtlinie haben",
       "elastic_namespace_unconfirmed": "Es konnte nicht bestätigt werden, dass der Einhängebereich dieses Namens frei ist — versuche es erneut",
-      "target_rdma_no_device": "Die Schnittstelle {interface} hat kein RDMA-Gerät — der Kernel lehnt einen RDMA-Listener auf {address} ab. Wählen Sie TCP oder eine Schnittstelle mit RDMA-Karte."
+      "target_rdma_no_device": "Die Schnittstelle {interface} hat kein RDMA-Gerät — der Kernel lehnt einen RDMA-Listener auf {address} ab. Wählen Sie TCP oder eine Schnittstelle mit RDMA-Karte.",
+      "smart_self_test_running": "Auf diesem Datenträger läuft bereits ein SMART-Selbsttest — warten Sie, bis er endet; ein zweiter würde ihn abbrechen",
+      "elastic_uninstall_supervised": "Die Deinstallation wurde auf diesem Knoten angehalten: Seine Elastic Arrays stehen unter der Aufsicht von TentaNas, und das Entfernen der Instanz würde sie verlieren",
+      "elastic_run_no_result": "Der Lauf endete ohne Ergebnis — er wurde angehalten oder unterbrochen, und das Array ist unverändert geblieben",
+      "elastic_result_unconfirmed": "Das Ergebnis des Laufs konnte nicht bestätigt werden, daher braucht das Array Aufmerksamkeit",
+      "elastic_restore_needs_attention": "Das Array wurde wiederhergestellt, braucht aber einen Eingriff; die Reservierungen seiner Datenträger bleiben erhalten",
+      "elastic_snapraid_failed": "Der SnapRAID-Lauf war nicht erfolgreich",
+      "elastic_mover_unfinished": "Der Mover ist nicht fertig geworden: Etwas bleibt für den nächsten Lauf ungelöst",
+      "privilege_channel_unavailable": "Der Rechtekanal des Systems ist nicht verfügbar ({why}) — öffnen Sie TentaNas auf diesem Knoten und schließen Sie den Einrichtungsschritt des Kanals ab, der anstelle der Registerkarten erscheint",
+      "helper_version_mismatch": "Der installierte Helper hat die Version {installed}, dieser Knoten benötigt {expected} — es wurde nichts gestartet. Erteilen Sie die Systemrechte erneut (Umgebung → Rechtekanal), um den passenden Helper zu installieren",
+      "helper_version_unknown": "Die Version des installierten Helpers konnte nicht gelesen werden (dieser Knoten benötigt {expected}) — es wurde nichts gestartet. Erteilen Sie die Systemrechte erneut (Umgebung → Rechtekanal)",
+      "disk_wipe_confirm_mismatch": "Der erneut eingegebene Gerätename stimmt nicht mit {disk} überein",
+      "disk_wipe_plan_changed": "Der Datenträger ist nicht mehr der, für den der Plan gelesen wurde — lesen Sie den Plan erneut",
+      "disk_wipe_refused": "Der Knoten verweigert das Löschen dieses Datenträgers — lesen Sie den Plan erneut, um den Grund zu sehen",
+      "disk_wipe_no_journal": "Kein Journal eines Elastic Arrays reserviert diesen Datenträger mehr — lesen Sie den Plan erneut",
+      "disk_wipe_journal_unacknowledged": "Das Journal des aufgelösten Elastic Arrays {array} reserviert diesen Datenträger noch — bestätigen Sie den Verlust dieses Arrays oder holen Sie es mit einem Array-Import zurück",
+      "elastic_create_needs_attention": "Das Array wurde erstellt, braucht aber einen Eingriff; die Reservierungen seiner Datenträger bleiben erhalten"
     },
     "unreachable": {
       "title": "Knoten {node} nicht erreichbar",
@@ -8161,6 +8184,14 @@
       "parity": "Nr. {n} (Parität)",
       "cache": "für den Cache",
       "model": "{model}"
+    },
+    "refusal_channel": {
+      "password_expired": "das Passwort ist nicht aktiviert oder abgelaufen",
+      "not_configured": "der Rechtemodus ist nicht konfiguriert",
+      "sudo_rejected": "sudo hat das Passwort abgelehnt",
+      "not_passwordless": "der Helper läuft nicht ohne Passwort",
+      "not_root": "der Helper lief nicht als root",
+      "other": "der Grund steht im Text des Knotens"
     }
   },
   "agent_accounts": {

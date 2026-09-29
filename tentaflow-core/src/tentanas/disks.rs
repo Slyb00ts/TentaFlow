@@ -28,6 +28,7 @@ use tentanas_helper::HelperCommand;
 
 use super::broker;
 use super::db::{self as store, DiskIdentity, SampleInsert};
+use super::refusal::{DiskWords, Refusal};
 use crate::db::DbPool;
 use crate::profiling::collectors::elevation::ElevationToken;
 
@@ -409,8 +410,8 @@ fn refuse_other_org(name: &str) -> NasDiskWipeRefusal {
     refuse(
         JOURNAL_OTHER_ORG,
         format!(
-            "{name}: dysk należy do macierzy Elastic innej organizacji na tym węźle — \
-             ta organizacja nie może go wyczyścić ani przejąć"
+            "{name}: the disk belongs to an Elastic Array of another organisation on this node — \
+             this organisation can neither clear nor adopt it"
         ),
     )
 }
@@ -425,24 +426,24 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
         "system" => refusals.push(refuse(
             "system",
             format!(
-                "{name}: to dysk systemowy tego noda ({}) — nie ma operacji, która go zwalnia; \
-                 przenieś system na inny nośnik, jeśli ten dysk ma być wolny",
+                "{name}: this is the node's system disk ({}) — no operation frees it; \
+                 move the system to another medium if this disk has to be free",
                 mounts()
             ),
         )),
         "pool_member" => refusals.push(refuse(
             "zfs_pool",
             format!(
-                "{name}: dysk należy do puli ZFS {} — zniszcz pulę albo odłącz od niej ten dysk, \
-                 a potem wyczyść go ponownie",
+                "{name}: the disk belongs to ZFS pool {} — destroy the pool or detach this disk \
+                 from it, then clear it again",
                 disk.member_of.as_deref().unwrap_or("?")
             ),
         )),
         "array_member" if disk.array_role.is_empty() => refusals.push(refuse(
             "mdraid",
             format!(
-                "{name}: dysk jest członkiem macierzy mdraid {} — rozłóż macierz \
-                 (mdadm --stop) i wyczyść dysk ponownie",
+                "{name}: the disk is a member of mdraid array {} — stop the array \
+                 (mdadm --stop) and clear the disk again",
                 disk.member_of.as_deref().unwrap_or("?")
             ),
         )),
@@ -453,8 +454,8 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
         "array_member" => refusals.push(refuse(
             "elastic_member",
             format!(
-                "{name}: dysk należy do macierzy Elastic {} jako {} — rozwiąż macierz, a potem \
-                 wyczyść jej dyski",
+                "{name}: the disk belongs to Elastic Array {} as {} — dissolve the array, then \
+                 clear its disks",
                 disk.member_of.as_deref().unwrap_or("?"),
                 disk.array_role
             ),
@@ -469,15 +470,15 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
         ROLE_REMOTE => refusals.push(refuse(
             ROLE_REMOTE,
             format!(
-                "{name}: to dysk zdalny (iSCSI/NVMe-oF), który ten node widzi jako klient — \
-                 jego dane należą do targetu, który go udostępnia; wyloguj się z targetu \
-                 zamiast czyścić dysk"
+                "{name}: this is a remote disk (iSCSI/NVMe-oF) this node sees as a client — \
+                 its data belongs to the target that exports it; log out of the target \
+                 instead of clearing the disk"
             ),
         )),
         "mounted" => refusals.push(refuse(
             "mounted",
             format!(
-                "{name}: dysk ma zamontowany system plików ({}) — odmontuj go i wyczyść ponownie",
+                "{name}: the disk has a mounted filesystem ({}) — unmount it and clear it again",
                 mounts()
             ),
         )),
@@ -491,7 +492,7 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
         refusals.push(refuse(
             "mounted",
             format!(
-                "{name}: dysk ma zamontowany system plików ({}) — odmontuj go i wyczyść ponownie",
+                "{name}: the disk has a mounted filesystem ({}) — unmount it and clear it again",
                 mounts()
             ),
         ));
@@ -513,8 +514,8 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
             refusals.push(refuse(
                 "journal_serving",
                 format!(
-                    "{name}: dysk należy do macierzy Elastic {}, która nadal udostępnia unię na \
-                     tym nodzie — rozwiąż macierz, a potem wyczyść jej dyski",
+                    "{name}: the disk belongs to Elastic Array {}, which still serves its union on \
+                     this node — dissolve the array, then clear its disks",
                     journal.claim.name
                 ),
             ));
@@ -524,9 +525,9 @@ pub fn plan_wipe(disk: &NasDisk, journal: Option<JournalClaim>) -> NasDiskWipePl
             refusals.push(refuse(
                 "journal_unknown",
                 format!(
-                    "{name}: nie udało się odczytać, czy macierz Elastic {} jest jeszcze \
-                     udostępniana — nieznany stan nie jest stanem wolnym; powtórz plan, gdy \
-                     node odpowie",
+                    "{name}: whether Elastic Array {} is still served could not be read — \
+                     an unknown state is not a free one; read the plan again when the node \
+                     answers",
                     journal.claim.name
                 ),
             ));
@@ -590,24 +591,30 @@ pub fn wipe_command(
     // request carried: a request naming a device that has since been renamed
     // fails here instead of reaching whatever answers to that name now.
     if confirm_device != plan.name {
-        return Err(WipeRefusal::BadRequest(format!(
-            "Przepisana nazwa urządzenia nie zgadza się z {}",
-            plan.name
-        )));
+        return Err(WipeRefusal::BadRequest(
+            Refusal::bad_request(
+                "disk_wipe_confirm_mismatch",
+                format!("The retyped device name does not match {}", plan.name),
+            )
+            .disk(DiskWords::Kernel(plan.name.clone()))
+            .wire(),
+        ));
     }
     if plan.disk_id != disk.disk_id || plan.path != disk.path {
         return Err(WipeRefusal::BadRequest(
-            "Plan dotyczy innego dysku niż ten, który node ma teraz w inwentarzu".to_string(),
+            Refusal::bad_request(
+                "disk_wipe_plan_changed",
+                "The plan is about another disk than the one the node has in its inventory now",
+            )
+            .wire(),
         ));
     }
     if !plan.refusals.is_empty() {
-        return Err(WipeRefusal::NotAvailable(
-            plan.refusals
-                .iter()
-                .map(|r| r.detail.as_str())
-                .collect::<Vec<_>>()
-                .join("; "),
-        ));
+        // The plan's own reasons are the dialog's; the request that ignored
+        // them is refused with a code, and the reasons go along as its
+        // sentence.
+        let reasons = plan.refusals.iter().map(|r| r.detail.as_str()).collect::<Vec<_>>().join("; ");
+        return Err(WipeRefusal::NotAvailable(Refusal::not_available("disk_wipe_refused", reasons).wire()));
     }
     // The SECOND acknowledgement, deliberately not a boolean: it names the
     // array, so a client that never showed the claim cannot satisfy it, and an
@@ -616,17 +623,27 @@ pub fn wipe_command(
         (None, "") => None,
         (None, _) => {
             return Err(WipeRefusal::BadRequest(
-                "Żaden dziennik macierzy Elastic nie rezerwuje tego dysku — odczytaj plan ponownie"
-                    .to_string(),
+                Refusal::bad_request(
+                    "disk_wipe_no_journal",
+                    "No Elastic Array journal reserves this disk — read the plan again",
+                )
+                .wire(),
             ))
         }
         (Some(claim), ack) if ack == claim.name => Some(claim.array_id.clone()),
         (Some(claim), _) => {
-            return Err(WipeRefusal::NotAvailable(format!(
-                "Dziennik rozwiązanej macierzy Elastic {} nadal rezerwuje ten dysk — potwierdź \
-                 utratę tej macierzy albo przywróć ją importem macierzy",
-                claim.name
-            )))
+            return Err(WipeRefusal::NotAvailable(
+                Refusal::not_available(
+                    "disk_wipe_journal_unacknowledged",
+                    format!(
+                        "The journal of dissolved Elastic Array {} still reserves this disk — confirm \
+                         the loss of this array or bring it back with an array import",
+                        claim.name
+                    ),
+                )
+                .param("array", &claim.name)
+                .wire(),
+            ))
         }
     };
     Ok(HelperCommand::DiskWipe {
@@ -672,7 +689,7 @@ pub async fn wipe_job(
     // 2026-09-26: job logs carry no ids).
     for signature in &result.removed {
         h.log(format!(
-            "usunięto sygnaturę {} na {}{}",
+            "removed signature {} at {}{}",
             signature.kind,
             signature.offset,
             signature
@@ -684,11 +701,11 @@ pub async fn wipe_job(
     }
     if let Some(array) = &result.journal_released {
         h.log(format!(
-            "zwolniono rezerwację dziennika macierzy Elastic {array}: macierzy nie da się już \
-             przywrócić importem"
+            "released the journal reservation of Elastic Array {array}: the array can no longer \
+             be brought back by an import"
         ));
     }
-    h.log(format!("urządzenie {} nie zgłasza już żadnych sygnatur", result.device));
+    h.log(format!("device {} reports no signatures any more", result.device));
     refresh_inventory(h.db()).await?;
     h.progress(100);
     Ok(())
@@ -3377,9 +3394,9 @@ mod tests {
         assert!(!plan.allowed);
         assert_eq!(plan.refusals.len(), 1, "{:?}", plan.refusals);
         assert_eq!(plan.refusals[0].code, "system");
-        assert!(plan.refusals[0].detail.contains("dysk systemowy"), "{:?}", plan.refusals[0]);
+        assert!(plan.refusals[0].detail.contains("system disk"), "{:?}", plan.refusals[0]);
         assert!(plan.refusals[0].detail.contains("/boot/efi"), "{:?}", plan.refusals[0]);
-        assert!(plan.refusals[0].detail.contains("przenieś system"), "{:?}", plan.refusals[0]);
+        assert!(plan.refusals[0].detail.contains("move the system"), "{:?}", plan.refusals[0]);
 
         let pool = NasDisk {
             role: "pool_member".to_string(),
@@ -3388,8 +3405,8 @@ mod tests {
         };
         let plan = plan_wipe(&pool, None);
         assert_eq!(plan.refusals[0].code, "zfs_pool");
-        assert!(plan.refusals[0].detail.contains("puli ZFS tank"));
-        assert!(plan.refusals[0].detail.contains("zniszcz pulę"));
+        assert!(plan.refusals[0].detail.contains("ZFS pool tank"));
+        assert!(plan.refusals[0].detail.contains("destroy the pool"));
 
         // An mdraid member and an Elastic Array member share `role`; what
         // separates them is `array_role`, which only an Elastic member has.
@@ -3400,7 +3417,7 @@ mod tests {
         };
         let plan = plan_wipe(&md, None);
         assert_eq!(plan.refusals[0].code, "mdraid");
-        assert!(plan.refusals[0].detail.contains("mdraid nas:0"));
+        assert!(plan.refusals[0].detail.contains("mdraid array nas:0"));
         assert!(plan.refusals[0].detail.contains("mdadm --stop"));
 
         let elastic = NasDisk {
@@ -3411,9 +3428,9 @@ mod tests {
         };
         let plan = plan_wipe(&elastic, None);
         assert_eq!(plan.refusals[0].code, "elastic_member");
-        assert!(plan.refusals[0].detail.contains("macierzy Elastic produkt"));
+        assert!(plan.refusals[0].detail.contains("Elastic Array produkt"));
         assert!(plan.refusals[0].detail.contains("parity"));
-        assert!(plan.refusals[0].detail.contains("rozwiąż macierz"));
+        assert!(plan.refusals[0].detail.contains("dissolve the array"));
 
         let mounted = NasDisk {
             role: "mounted".to_string(),
@@ -3423,7 +3440,7 @@ mod tests {
         let plan = plan_wipe(&mounted, None);
         assert_eq!(plan.refusals[0].code, "mounted");
         assert!(plan.refusals[0].detail.contains("/srv/stare"));
-        assert!(plan.refusals[0].detail.contains("odmontuj"));
+        assert!(plan.refusals[0].detail.contains("unmount it"));
 
         // A mount the ROLE did not already explain still refuses: the role is
         // decided by the first rule that matches, and a signature-classified
@@ -3469,7 +3486,7 @@ mod tests {
             assert!(!plan.allowed, "{serving:?}");
             assert_eq!(plan.refusals.len(), 1, "{:?}", plan.refusals);
             assert_eq!(plan.refusals[0].code, JOURNAL_OTHER_ORG);
-            assert!(plan.refusals[0].detail.contains("innej organizacji na tym węźle"), "{:?}", plan.refusals[0]);
+            assert!(plan.refusals[0].detail.contains("another organisation on this node"), "{:?}", plan.refusals[0]);
             assert!(plan.journal_claim.is_none(), "no claim to acknowledge, and none to read a name from");
             // What the plan says about the claim, as it would be serialised:
             // the array's name and id appear nowhere in it. (Only these two
@@ -3718,7 +3735,7 @@ mod tests {
         let plan = plan_wipe(&disk, Some(unknown));
         assert!(!plan.allowed);
         assert_eq!(plan.refusals[0].code, "journal_unknown");
-        assert!(plan.refusals[0].detail.contains("nieznany stan nie jest stanem wolnym"));
+        assert!(plan.refusals[0].detail.contains("an unknown state is not a free one"));
         assert!(plan.journal_claim.is_none());
     }
 
@@ -3818,6 +3835,23 @@ mod tests {
             wipe_command(&plan, &moved, "sdc", ""),
             Err(WipeRefusal::BadRequest(_))
         ));
+
+        // Wave 15: each refusal is coded, the screen words it, the English
+        // sentence is its detail, and no parameter carries an id.
+        let code_of = |refusal: WipeRefusal| {
+            let (WipeRefusal::BadRequest(wire) | WipeRefusal::NotAvailable(wire)) = refusal;
+            let (code, params, sentence) = crate::tentanas::refusal::parse(&wire).expect("a coded refusal");
+            assert!(!sentence.is_empty(), "{wire}");
+            assert!(params.iter().all(|(_, v)| !v.contains("wwn") && !v.contains("serial")), "{wire}");
+            (code, params)
+        };
+        assert_eq!(
+            code_of(wipe_command(&plan, &disk, "sdd", "").unwrap_err()),
+            ("disk_wipe_confirm_mismatch".to_string(), vec![("disk".to_string(), "sdc".to_string())])
+        );
+        assert_eq!(code_of(wipe_command(&refused, &disk, "sdc", "").unwrap_err()).0, "disk_wipe_refused");
+        assert_eq!(code_of(wipe_command(&plan, &disk, "sdc", "produkt").unwrap_err()).0, "disk_wipe_no_journal");
+        assert_eq!(code_of(wipe_command(&plan, &moved, "sdc", "").unwrap_err()).0, "disk_wipe_plan_changed");
     }
 
     /// The journal acknowledgement is a SECOND gate, and it names the array.
@@ -3832,6 +3866,8 @@ mod tests {
         // The retyped device name alone does NOT release the array.
         let refusal = wipe_command(&plan, &disk, "sdc", "").expect_err("brak potwierdzenia");
         assert!(matches!(&refusal, WipeRefusal::NotAvailable(d) if d.contains("produkt")));
+        let WipeRefusal::NotAvailable(wire) = &refusal else { unreachable!() };
+        assert!(wire.starts_with("refusal:disk_wipe_journal_unacknowledged?array=produkt "), "{wire}");
         // Neither does an acknowledgement naming a different array.
         assert!(matches!(
             wipe_command(&plan, &disk, "sdc", "foto"),
@@ -6357,7 +6393,7 @@ mod tests {
         assert!(!plan.allowed);
         assert_eq!(plan.refusals.len(), 1);
         assert_eq!(plan.refusals[0].code, ROLE_REMOTE);
-        assert!(plan.refusals[0].detail.contains("dysk zdalny"), "{}", plan.refusals[0].detail);
+        assert!(plan.refusals[0].detail.contains("remote disk"), "{}", plan.refusals[0].detail);
         assert!(plan_wipe(remote_named(&disks, "sda"), None).allowed, "a free local disk may be cleared");
     }
 }

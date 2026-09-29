@@ -901,8 +901,21 @@ export function wordReasons(reasons, words) {
 // The node's own sentence, for a tooltip only: it is one language, and it
 // may name what a screen must not show (a by-id path, a WWN, a node id), so
 // every such id is replaced by the neutral word first.
+//
+// A node text can itself be a coded refusal (wave 15): a failed run's error
+// is stored as the array's state detail and as its history row's detail. It
+// then reads as the refusal's words, followed by the node's sentence — never
+// as the raw `refusal:<code>?…` wire.
 export function nodeTextTitle(text) {
-  return scrubIds(String(text || '').trim(), T('alerts.id_hidden'));
+  const own = String(text || '').trim();
+  const refusal = parseRefusal(own);
+  if (refusal) {
+    const words = refusalWords(refusal);
+    const sentence = refusal.text ? scrubText(refusal.text) : '';
+    if (words) return sentence ? `${words} — ${sentence}` : words;
+    return sentence || scrubText(own);
+  }
+  return scrubIds(own, T('alerts.id_hidden'));
 }
 
 // A refusal the node sends as a CODE rather than a sentence (M1):
@@ -997,8 +1010,18 @@ export function diskOwnerWords(owner, name = '') {
 }
 
 // Parameters a refusal's words need in a form the wire does not carry.
+// Why the privilege channel is not available (`broker::unarmed_reason_key`):
+// a closed key, worded here; one this build does not know reads as "the
+// reason is in the node's text", and the sentence carries it.
+const CHANNEL_REASONS = new Set(['password_expired', 'not_configured', 'sudo_rejected', 'not_passwordless', 'not_root']);
+
+function channelReasonWords(reason) {
+  return T('refusal_channel.' + (CHANNEL_REASONS.has(reason) ? reason : 'other'));
+}
+
 const REFUSAL_PARAMS = new Map([
   ['elastic_disk_in_use', (p) => ({ owner: diskOwnerWords(p.owner, p.owner_name) })],
+  ['privilege_channel_unavailable', (p) => ({ why: channelReasonWords(p.reason) })],
   ['elastic_import_incomplete', (p) => ({ reused: p.reused || '—' })],
 ]);
 

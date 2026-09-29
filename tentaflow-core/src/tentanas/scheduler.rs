@@ -87,6 +87,12 @@ impl StoredRefusal {
     }
 }
 
+/// The prefix of the stored (and legacy wire) form of a skipped run. It is
+/// Polish because the rows and the older screens that read it are; it is
+/// data, and a screen of this build reads the structured fields instead. The
+/// wave-15 scan allows exactly this literal.
+const SKIPPED_PREFIX: &str = "pominięto";
+
 impl ScheduleOutcome {
     /// The outcome of one spawn attempt. A coded refusal is stored as its
     /// code and parameters, with its sentence as the detail.
@@ -135,7 +141,10 @@ impl ScheduleOutcome {
             let detail = detail.trim_start_matches(':').trim();
             return Some(Self::StartFailed { detail: detail.to_string(), refusal: None });
         }
-        if let Some(why) = stored.strip_prefix("pominięto") {
+        // `SKIPPED_PREFIX` is a stored token, not a message: rows written
+        // before the structured form carry it, and a screen that predates
+        // the structured fields still reads it (`legacy_sentence`).
+        if let Some(why) = stored.strip_prefix(SKIPPED_PREFIX) {
             let why = why.trim_start_matches(':').trim();
             return Some(match why.strip_prefix("reason:") {
                 Some(code) if !code.is_empty() && code.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_') => {
@@ -153,8 +162,8 @@ impl ScheduleOutcome {
         match self {
             Self::Started { job_id } => format!("started job {job_id}"),
             Self::StartFailed { detail, .. } => format!("failed to start: {detail}"),
-            Self::Skipped { reason, .. } if !reason.is_empty() => format!("pominięto: reason:{reason}"),
-            Self::Skipped { detail, .. } => format!("pominięto: {detail}"),
+            Self::Skipped { reason, .. } if !reason.is_empty() => format!("{SKIPPED_PREFIX}: reason:{reason}"),
+            Self::Skipped { detail, .. } => format!("{SKIPPED_PREFIX}: {detail}"),
         }
     }
 
@@ -754,10 +763,10 @@ async fn run_automatic_movers(
                 &array.name,
                 &store::AlertText::new(
                     "elastic_mover_settle_stopped",
-                    "Automatyczne dokończenie przenoszenia wstrzymane",
+                    "Automatic settling of the mover stopped",
                     format!(
-                        "{} kolejnych przebiegów przenoszenia zakończyło się niepowodzeniem, więc node nie uruchamia \
-                         następnych sam. Sprawdź przyczynę w historii przenoszenia i uruchom przenoszenie ręcznie.",
+                        "{} mover runs in a row failed, so the node does not start the next ones on its \
+                         own. Check the cause in the mover history and start the mover by hand.",
                         array.mover_failed_runs
                     ),
                 )
@@ -2211,7 +2220,7 @@ mod tests {
         let open = stuck_alerts(&p, "media");
         assert_eq!(open.len(), 1, "{open:?}");
         assert_eq!(open[0].severity, "warning");
-        assert!(open[0].detail.contains("otwarte"), "{}", open[0].detail);
+        assert!(open[0].detail.contains("open or tied"), "{}", open[0].detail);
         assert!(open[0].resolved_at.is_none());
         assert_eq!(open[0].code, "elastic_cache_stuck");
         assert_eq!(open[0].params.get("cause").map(String::as_str), Some("files_busy"));
@@ -2506,7 +2515,7 @@ mod tests {
         run_automatic_movers(&p, &[stopped], &MoverClock::new(), &Unmeasurable).await;
         assert_eq!(mover_jobs(&p, "media"), i64::from(crate::tentanas::elastic::SETTLE_ATTEMPTS), "nothing more started");
         assert!(
-            stuck_alerts(&p, "media").iter().any(|alert| alert.title.contains("wstrzymane")),
+            stuck_alerts(&p, "media").iter().any(|alert| alert.title.contains("stopped")),
             "the admin is told"
         );
         let settle = stuck_alerts(&p, "media")

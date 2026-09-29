@@ -10,8 +10,9 @@
 // WHAT THE DIALOG IS FOR, and it is not the button. The node decides; this
 // dialog exists to show the admin WHY before they decide, which means it
 // renders the plan the node produced rather than any judgement of its own:
-// what would be removed, and every refusal as the node's own sentence. The
-// two confirmations are the only state it owns — the retyped device name, and
+// what would be removed, and every refusal the node gave (worded by its
+// code, the node's own sentence as the tooltip). The two confirmations are
+// the only state it owns — the retyped device name, and
 // a SEPARATE acknowledgement when a dissolved array's journal still claims
 // the disk, because that second loss is the array's recoverability and the
 // device name says nothing about it.
@@ -26,7 +27,7 @@
 // the dialog, so the refusal is not read as a transient fault.
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
-import { T, sprite, fmtBytes, ADMIN_TIMEOUT_MS } from '/js/modules/tentanas/format.js';
+import { T, sprite, fmtBytes, ADMIN_TIMEOUT_MS, nodeTextTitle } from '/js/modules/tentanas/format.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
 import { journalOwnerPhrase, isOtherOrgOnNode } from '/js/modules/tentanas/journal-owner.js';
@@ -61,20 +62,39 @@ function lossListHtml(plan) {
 }
 
 // The refusals the dialog words itself, by code, in the admin's language.
-// Every other refusal is the node's own sentence (`detail`).
+// A code this build does not know is the node's own sentence (`detail`).
 // `journal_other_org` is one the admin must be able to read in full: the
 // disk is another organisation's on this node, and the node's detail names
 // no array on purpose — so the wording here must not either.
+// Since wave 15 every code the node sends is worded here: the node's sentence
+// is English, and it stays the tooltip, where it names the pool, the md
+// array, the Elastic Array or the mount the words leave out.
 const REFUSAL_KEYS = {
   journal_other_org: 'wipe_disk.refusal_journal_other_org',
   // A LUN this node reaches as a CLIENT (iSCSI/NVMe-oF, MAJOR 27 F4): its
   // data belongs to the target that exports it.
   remote: 'wipe_disk.refusal_remote',
+  system: 'wipe_disk.refusal_system',
+  zfs_pool: 'wipe_disk.refusal_zfs_pool',
+  mdraid: 'wipe_disk.refusal_mdraid',
+  elastic_member: 'wipe_disk.refusal_elastic_member',
+  mounted: 'wipe_disk.refusal_mounted',
+  journal_serving: 'wipe_disk.refusal_journal_serving',
+  journal_unknown: 'wipe_disk.refusal_journal_unknown',
 };
 
 function refusalText(refusal, plan) {
   const key = REFUSAL_KEYS[refusal?.code];
   return key ? T(key, { name: plan.name }) : (refusal?.detail || '');
+}
+
+// The node's sentence behind a worded refusal, for its tooltip — never for
+// `journal_other_org`, whose words say all the admin may read; '' when the
+// sentence is what the dialog already shows.
+function refusalTitle(refusal) {
+  const key = REFUSAL_KEYS[refusal?.code];
+  if (!key || refusal.code === 'journal_other_org') return '';
+  return nodeTextTitle(refusal.detail);
 }
 
 function journalHtml(claim) {
@@ -122,7 +142,10 @@ export async function openDiskWipeDialog(screen, disk, onDone) {
   const claim = plan.allowed && !isOtherOrgOnNode(plan.journalClaim) ? plan.journalClaim : null;
   const bodyHtml = `
     ${warningHtml('danger', T('wipe_disk.warning', { name: plan.name }))}
-    ${plan.refusals.map((r) => `<div class="wizard-warning danger">${sprite('alert')}<div><b>${escapeHtml(T('wipe_disk.refused'))}</b><br>${escapeHtml(refusalText(r, plan))}</div></div>`).join('')}
+    ${plan.refusals.map((r) => {
+    const title = refusalTitle(r);
+    return `<div class="wizard-warning danger"${title ? ` title="${escapeAttr(title)}"` : ''}>${sprite('alert')}<div><b>${escapeHtml(T('wipe_disk.refused'))}</b><br>${escapeHtml(refusalText(r, plan))}</div></div>`;
+  }).join('')}
     ${lossListHtml(plan)}
     ${claim ? journalHtml(claim) : ''}
     <div class="explain-box">${escapeHtml(T('wipe_disk.explain'))}</div>`;

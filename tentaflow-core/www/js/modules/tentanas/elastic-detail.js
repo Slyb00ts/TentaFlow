@@ -6,7 +6,7 @@
 
 import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
-import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, fmtAgo, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, errDetail, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, wordReasons, nodeTextTitle, jobKindLabel } from '/js/modules/tentanas/format.js';
+import { T, poolCrumbTail, sprite, fmtOptionalBytes, fmtBytes, fmtAgo, pct, fmtDate, fmtDuration, fmtSchedule, errMessage, errDetail, healthClass, KIND_BADGE, POLL_POOLS_MS, ADMIN_TIMEOUT_MS, wordReasons, nodeTextTitle, parseRefusal, jobKindLabel } from '/js/modules/tentanas/format.js';
 import { setAttr, setText, patchKeyedList, paintStatCards, SLOT, slotEl, setClass } from '/js/lib/dom-patch.js';
 import { openRetypeDialog } from '/js/lib/retype-dialog.js';
 import { followResponse, dangerRowHtml, warningHtml, NAS_DIALOG } from '/js/modules/tentanas/dialogs.js';
@@ -846,7 +846,10 @@ function paintRun(li, run) {
   setText(field(li, 'run-blocks'), `${run.checkedBlocks ?? '—'} / ${run.totalBlocks ?? '—'}`);
   setText(field(li, 'run-errors'), `${run.errorsFile ?? '—'} / ${run.errorsIo ?? '—'} / ${run.errorsData ?? '—'}`);
   setText(field(li, 'run-exit'), run.exitCode ?? '—');
-  const detail = run.outcome === 'refused' && RUN_REFUSALS[run.detail] ? T(`elastic.${RUN_REFUSALS[run.detail]}`) : run.detail;
+  // A failed run's detail can be its job's coded error (wave 15): it reads
+  // as the words and the node's sentence, never as the raw wire.
+  const detail = run.outcome === 'refused' && RUN_REFUSALS[run.detail] ? T(`elastic.${RUN_REFUSALS[run.detail]}`)
+    : parseRefusal(run.detail) ? nodeTextTitle(run.detail) : run.detail;
   const hint = slotEl(li.querySelector('[data-slot="run-detail"]'), Boolean(detail), 'detail', '<div class="hint"></div>');
   if (hint) setText(hint, detail);
 }

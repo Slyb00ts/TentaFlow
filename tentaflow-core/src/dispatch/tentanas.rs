@@ -47,9 +47,10 @@ fn internal(scope: &str, error: impl std::fmt::Display) -> ProtocolError {
 fn broker_error(scope: &str, error: BrokerError) -> ProtocolError {
     match error {
         // The operator can act on this one, so it has to say what to do. The
-        // raw reason stays in the sentence: "not configured" and "sudo
-        // rejected the password" lead to the same screen but not to the same
-        // fix, and only the node knows which of them happened.
+        // raw reason travels too: "not configured" and "sudo rejected the
+        // password" lead to the same screen but not to the same fix, and only
+        // the node knows which of them happened — as a closed key the screen
+        // words (`broker::unarmed_reason_key`), and in the English sentence.
         //
         // The remedy names no tab on purpose. A node that answers this cannot
         // run a privileged command, and the panel replaces ALL its tabs —
@@ -57,27 +58,23 @@ fn broker_error(scope: &str, error: BrokerError) -> ProtocolError {
         // Environment tab and start the wizard" pointed at a card that is not
         // on screen in exactly the state that produces this error.
         //
-        // Still a Polish sentence, not yet a coded refusal: the Elastic
-        // refusals of this file are coded since wave 13
-        // (`tentanas::refusal`), this one is shared by every privileged path
-        // and is tracked in the backlog. The two arms below read English
-        // because they forward `BrokerError`'s own `#[error]` text verbatim
-        // from broker.rs — those strings have other callers, so flipping
-        // them is its own change.
-        BrokerError::Unarmed(why) => ProtocolError::new(
-            ProtocolErrorCode::NotAvailable,
+        // Coded since wave 15 (`tentanas::refusal`), like the Elastic
+        // refusals; it is shared by every privileged path.
+        BrokerError::Unarmed(why) => Refusal::not_available(
+            "privilege_channel_unavailable",
             format!(
-                "Kanał uprawnień systemowych nie jest dostępny ({why}) — \
-                 otwórz TentaNas na tym nodzie i dokończ krok konfiguracji \
-                 kanału, który pojawi się zamiast zakładek."
+                "The system privilege channel is not available ({why}) — open TentaNas on this \
+                 node and finish the channel setup step that appears instead of the tabs."
             ),
-        ),
+        )
+        .param("reason", tentanas::broker::unarmed_reason_key(why))
+        .into(),
         BrokerError::ToolMissing(tool) => {
             ProtocolError::new(ProtocolErrorCode::NotAvailable, format!("{tool} is not installed"))
         }
-        // The version gate. Its text already names the versions and the remedy
-        // (it is written for the admin, in Polish, by `broker::version_gate`),
-        // so it is forwarded whole rather than turned into "tentanas … failed"
+        // The version gate. Its text is already a coded refusal naming the
+        // versions and the remedy (`broker::version_gate`), so it is
+        // forwarded whole rather than turned into "tentanas … failed"
         // by the fallthrough — this is the one refusal an admin fixes by
         // re-running provisioning, and they can only do that if they are told.
         BrokerError::HelperVersion(why) => {
@@ -816,10 +813,12 @@ async fn disk_smart_test(
     let device = tentanas::disks::device_path(disk_id)
         .ok_or_else(|| ProtocolError::not_found("disk not found"))?;
     let explicit = secret.map(token);
+    // A disk already under test is refused by the store, coded
+    // (`smart_self_test_running`), and answered as that refusal.
     let job = tentanas::jobs::spawn(&g.db, "smart_test", disk_id, &g.user_id, None, None, move |h| {
         tentanas::jobs::smart_self_test(h, device, kind, explicit)
     })
-    .map_err(|e| internal("job", e))?;
+    .map_err(|e| privileged_error("job", e))?;
     Ok(job_response(ctx, job))
 }
 
@@ -1038,7 +1037,7 @@ async fn disk_wipe(
     // merely by the dialog having no claim to acknowledge.
     let plan = wipe_plan_of(&g, &orgs_on_node(ctx)?, disk_id, explicit.as_deref()).await?;
     let disk = tentanas::disks::disk(disk_id)
-        .ok_or_else(|| ProtocolError::not_found("Dysk zniknął z inwentarza"))?;
+        .ok_or_else(disk_not_found)?;
     // Every gate between "an admin clicked" and "a device is opened" lives in
     // one pure function, over the plan this node just read for ITSELF: the
     // retyped device name, the plan's refusals and the separate journal
@@ -7338,6 +7337,176 @@ mod elastic_refusal_scan_tests {
         assert!(found.is_empty(), "raw Polish refusals on an Elastic request path: {found:#?}");
     }
 
+    /// The code of `source` (comments already dropped) with every
+    /// `#[cfg(test)]` item cut out: a module or a function to its matching
+    /// brace, a `const` or a `use` to its semicolon. Strings are skipped, so
+    /// a brace or a semicolon inside one does not end the item.
+    fn production(code: &str) -> String {
+        let mut out = String::with_capacity(code.len());
+        let mut rest = code;
+        while let Some(at) = rest.find("#[cfg(test)]") {
+            out.push_str(&rest[..at]);
+            let item = &rest[at + "#[cfg(test)]".len()..];
+            // An item (a function, a module, a const …) may hold a top-level
+            // comma in its signature (`Result<(), E>`), so only a field, a
+            // variant, an arm or a statement ends at one.
+            // A visibility (`pub `, `pub(crate) `) is looked past: a `pub`
+            // FIELD is not an item, a `pub fn` is.
+            let mut head = item.trim_start();
+            if let Some(rest) = head.strip_prefix("pub(") {
+                head = rest.split_once(')').map_or(rest, |(_, after)| after).trim_start();
+            } else if let Some(rest) = head.strip_prefix("pub ") {
+                head = rest.trim_start();
+            }
+            let is_item = [
+                "fn ", "async ", "unsafe ", "mod ", "impl ", "impl<", "struct ", "enum ", "trait ", "type ", "const ",
+                "static ", "use ", "#[", "macro_rules!",
+            ]
+            .iter()
+            .any(|keyword| head.starts_with(keyword));
+            let (mut depth, mut in_string, mut escaped, mut end) = (0usize, false, false, item.len());
+            for (i, ch) in item.char_indices() {
+                if in_string {
+                    match (escaped, ch) {
+                        (true, _) => escaped = false,
+                        (false, '\\') => escaped = true,
+                        (false, '"') => in_string = false,
+                        _ => {}
+                    }
+                    continue;
+                }
+                // Brackets of every kind nest; at the top level a `;` or a
+                // `,` ends the item (a statement, a struct field, an enum
+                // variant, a match arm), and a closing bracket that has no
+                // opener here ends it without being taken (the field's
+                // struct, the arm's match).
+                match ch {
+                    '"' => in_string = true,
+                    ';' if depth == 0 => {
+                        end = i + 1;
+                        break;
+                    }
+                    ',' if depth == 0 && !is_item => {
+                        end = i + 1;
+                        break;
+                    }
+                    '{' | '(' | '[' => depth += 1,
+                    '}' | ')' | ']' if depth == 0 => {
+                        end = i;
+                        break;
+                    }
+                    '}' | ')' | ']' => {
+                        depth -= 1;
+                        if depth == 0 && ch == '}' {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = &item[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Polish in a literal, more widely than `polish`: the diacritics, and
+    /// the words an integrity fault was written with before wave 15 — an
+    /// `ensure!` sentence often has no diacritic at all ("Sync bez parity",
+    /// "Obca operacja movera", "{} dni").
+    fn polish_literal(text: &str) -> bool {
+        const WORDS: [&str; 44] = [
+            "nie", "brak", "macierz", "macierzy", "dysk", "dysku", "dyskow", "zadanie", "zadania", "operacja",
+            "operacji", "operacje", "jest", "bez", "sie", "juz", "oraz", "lub", "dla", "przez", "albo", "gdy", "czy",
+            "jako", "tylko", "zostal", "zostala", "zostalo", "wynik", "wyniku", "intencja", "intencji", "niezgodna",
+            "niezgodny", "utracono", "obca", "sprzeczne", "zapis", "przekracza", "wymaga", "dni", "odmowa", "inny",
+            "movera",
+        ];
+        polish(text)
+            || text.split(|c: char| !c.is_alphanumeric()).any(|word| WORDS.contains(&word.to_lowercase().as_str()))
+    }
+
+    /// Wave 15: the integrity faults of the store and the Elastic layer
+    /// (helper-answer and stored-intent validation), the privilege-channel
+    /// and helper-version refusals, the wipe refusals and the rest of what
+    /// these modules put on a job's error line, a toast, an alert's node text
+    /// or a job log are coded or English. No Polish string literal is left in
+    /// the production code of any `tentanas/*.rs` module or of this
+    /// dispatcher, except the literals listed here, each of which is stored
+    /// data and not a message.
+    #[test]
+    fn no_polish_literal_remains_in_the_production_code() {
+        // EVERY production file of the TentaNas modules, read from disk so a
+        // file added later is guarded too (critic wave 15, MINOR 3), and this
+        // dispatcher.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tentanas");
+        let mut sources: Vec<(String, String)> = std::fs::read_dir(&root)
+            .expect("the tentanas sources")
+            .map(|entry| entry.expect("a directory entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .map(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                (name, std::fs::read_to_string(&path).expect("a readable source"))
+            })
+            .collect();
+        sources.sort();
+        assert!(sources.len() >= 25, "the scan found the modules ({})", sources.len());
+        sources.push(("dispatch/tentanas.rs".to_string(), DISPATCH.to_string()));
+        const ALLOWED: [(&str, &str); 3] = [
+            // The marker `fail_orphaned_jobs` wrote before wave 15; rows
+            // carrying it still have to read as interrupted.
+            ("db.rs", "Utracono nadzór core; wymagany odczyt journala roota"),
+            // The version-refusal marker an older core stored on a failed
+            // operation row; `nothing_ran` still has to recognise it.
+            ("broker.rs", "helper w innej wersji niż rdzeń"),
+            // The stored (and older-screen) prefix of a skipped scheduled run.
+            ("scheduler.rs", "pominięto"),
+        ];
+        let mut found = Vec::new();
+        let mut scanned = 0;
+        for (file, source) in &sources {
+            let file = file.as_str();
+            let mut code = production(&code_and_strings(source).0);
+            // The migrations are history: their SQL matches what older
+            // builds wrote, so it keeps the words those builds wrote.
+            if let Some(from) = code.find("const MIGRATIONS:") {
+                let to = from + code[from..].find("\n)];").expect("the end of the migrations");
+                code.replace_range(from..to, "");
+            }
+            let (_, strings) = code_and_strings(&code);
+            scanned += strings.len();
+            for literal in strings {
+                if polish_literal(&literal) && !ALLOWED.contains(&(file, literal.as_str())) {
+                    found.push(format!("{file}: {literal}"));
+                }
+            }
+        }
+        assert!(scanned > 3000, "the scan read the production literals ({scanned})");
+        assert!(found.is_empty(), "Polish literals in production code: {found:#?}");
+        // The detector sees what the old sentences were: no diacritic needed.
+        for old in ["Sync bez parity", "Obca operacja movera", "{} dni", "Inny checkpoint sync", "Zapis Elastic przekracza limit"] {
+            assert!(polish_literal(old), "{old}");
+        }
+        // And the cut keeps production code and drops test items only.
+        let cut = production("fn a() { \"x\" }\n#[cfg(test)]\nmod t { fn b() { \"}\" } }\n#[cfg(test)]\nconst C: u8 = 1;\nfn d() {}");
+        assert_eq!(cut, "fn a() { \"x\" }\n\n\nfn d() {}");
+        // A test-only field, variant or arm ends at its comma or at its
+        // enclosing bracket, and never swallows the code after it.
+        let fields = production("struct S { a: u8, #[cfg(test)] b: (u8, u8), c: u8 }\nmatch e { #[cfg(test)] E::R(k) => k.f(x), E::Q => 1 }\nstruct T { #[cfg(test)] z: u8 }");
+        assert_eq!(fields, "struct S { a: u8,  c: u8 }\nmatch e {  E::Q => 1 }\nstruct T { }");
+        let signature = production("#[cfg(test)]\nfn f() -> Result<(), E> { \"t\" }\nfn g() {}");
+        assert_eq!(signature, "\nfn g() {}");
+        // A test-only `pub` field ends at its comma; the production fields
+        // after it stay, and so does a field whose NAME starts like a keyword.
+        let public = production("struct P { #[cfg(test)] pub x: (u8, u8), pub y: u8, #[cfg(test)] pub(crate) z: u8, implicit: u8, publisher: u8 }");
+        assert_eq!(public, "struct P {  pub y: u8,  implicit: u8, publisher: u8 }");
+        let named = production("struct N { #[cfg(test)] implicit: u8, #[cfg(test)] publisher: u8, kept: u8 }");
+        assert_eq!(named, "struct N {   kept: u8 }");
+        let items = production("#[cfg(test)]\npub fn h() -> Result<(), E> { 1 }\n#[cfg(test)]\nimpl<T> X for T { fn a(&self, b: u8) {} }\nfn k() {}");
+        assert_eq!(items, "\n\nfn k() {}");
+    }
+
     /// Every code the Elastic layer and this dispatcher refuse with.
     fn refusal_codes() -> std::collections::BTreeSet<String> {
         let mut codes = std::collections::BTreeSet::new();
@@ -8397,7 +8566,8 @@ mod registration_tests {
         ] {
             assert_eq!(error.code, ProtocolErrorCode::NotAvailable, "{scope}: {}", error.message);
             assert!(
-                error.message.contains("TentaNas") && error.message.contains("konfiguracji kanału"),
+                error.message.starts_with("refusal:privilege_channel_unavailable?reason=")
+                    && error.message.contains("channel setup step"),
                 "{scope} musi nazwać lekarstwo: {}",
                 error.message
             );
@@ -10013,8 +10183,9 @@ mod registration_tests {
         ] {
             assert_eq!(error.code, ProtocolErrorCode::NotAvailable, "{scope}");
             assert!(
-                error.message.contains("TentaNas")
-                    && error.message.contains("konfiguracji kanału"),
+                error.message.starts_with("refusal:privilege_channel_unavailable?reason=not_configured ")
+                    && error.message.contains("TentaNas")
+                    && error.message.contains("channel setup step"),
                 "{scope} musi nazwać lekarstwo, nie samą porażkę: {}",
                 error.message
             );

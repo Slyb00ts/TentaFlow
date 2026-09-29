@@ -6183,7 +6183,14 @@
       "retype": "Ressaisissez le nom du périphérique pour confirmer :",
       "confirm": "Effacer {name}",
       "done": "L'effacement du disque {name} a été accepté. Consultez le résultat de la tâche.",
-      "refusal_remote": "{name} est un disque distant (iSCSI/NVMe-oF) que ce nœud voit en tant que client — ses données appartiennent à la cible qui l’exporte. Déconnectez-vous de la cible au lieu d’effacer le disque."
+      "refusal_remote": "{name} est un disque distant (iSCSI/NVMe-oF) que ce nœud voit en tant que client — ses données appartiennent à la cible qui l’exporte. Déconnectez-vous de la cible au lieu d’effacer le disque.",
+      "refusal_system": "{name} est le disque système de ce nœud — aucune opération ne le libère. Déplacez le système vers un autre support si ce disque doit être libre.",
+      "refusal_zfs_pool": "{name} appartient à un pool ZFS — détruisez le pool ou détachez-en ce disque, puis effacez-le de nouveau.",
+      "refusal_mdraid": "{name} est membre d’une grappe mdraid — arrêtez la grappe (mdadm --stop), puis effacez de nouveau le disque.",
+      "refusal_elastic_member": "{name} appartient à une Elastic Array — dissolvez la grappe, puis effacez ses disques.",
+      "refusal_mounted": "{name} a un système de fichiers monté — démontez-le, puis effacez-le de nouveau.",
+      "refusal_journal_serving": "{name} appartient à une Elastic Array qui sert encore son union sur ce nœud — dissolvez la grappe, puis effacez ses disques.",
+      "refusal_journal_unknown": "Impossible de lire si l’Elastic Array à laquelle appartient {name} est encore servie — un état inconnu n’est pas un état libre. Relisez le plan quand le nœud répond."
     },
     "destroy_pool": {
       "title": "Détruire le pool {name}",
@@ -8128,7 +8135,23 @@
       "elastic_folders_unreadable": "La liste des dossiers de la grappe ne peut pas être lue — la politique de cache n’a pas été enregistrée",
       "elastic_folder_policy_limit": "Au plus {limit} dossiers de cette grappe peuvent avoir leur propre politique de cache",
       "elastic_namespace_unconfirmed": "Il n’a pas pu être confirmé que l’espace de montage de ce nom est libre — réessayez",
-      "target_rdma_no_device": "L’interface {interface} n’a pas de périphérique RDMA — le noyau refuse une écoute RDMA sur {address}. Choisissez TCP ou une interface avec une carte RDMA."
+      "target_rdma_no_device": "L’interface {interface} n’a pas de périphérique RDMA — le noyau refuse une écoute RDMA sur {address}. Choisissez TCP ou une interface avec une carte RDMA.",
+      "smart_self_test_running": "Un autotest SMART est déjà en cours sur ce disque — attendez sa fin ; un second l’interromprait",
+      "elastic_uninstall_supervised": "La désinstallation s’est arrêtée sur ce nœud : ses Elastic Arrays sont sous la supervision de TentaNas, et supprimer l’instance les ferait perdre",
+      "elastic_run_no_result": "L’exécution s’est terminée sans résultat — elle a été arrêtée ou interrompue, et la grappe est restée telle quelle",
+      "elastic_result_unconfirmed": "Le résultat de l’exécution n’a pas pu être confirmé : la grappe demande votre attention",
+      "elastic_restore_needs_attention": "La grappe a été restaurée mais demande une intervention ; les réservations de ses disques sont conservées",
+      "elastic_snapraid_failed": "L’exécution de SnapRAID n’a pas réussi",
+      "elastic_mover_unfinished": "Le mover n’a pas terminé : quelque chose reste non résolu pour la prochaine exécution",
+      "privilege_channel_unavailable": "Le canal de privilèges système n’est pas disponible ({why}) — ouvrez TentaNas sur ce nœud et terminez l’étape de configuration du canal qui apparaît à la place des onglets",
+      "helper_version_mismatch": "Le helper installé est en version {installed} et ce nœud requiert la {expected} — rien n’a été lancé. Accordez de nouveau les privilèges système (Environnement → canal de privilèges) pour installer le helper correspondant",
+      "helper_version_unknown": "La version du helper installé n’a pas pu être lue (ce nœud requiert la {expected}) — rien n’a été lancé. Accordez de nouveau les privilèges système (Environnement → canal de privilèges)",
+      "disk_wipe_confirm_mismatch": "Le nom de périphérique saisi ne correspond pas à {disk}",
+      "disk_wipe_plan_changed": "Le disque n’est plus celui pour lequel le plan a été lu — relisez le plan",
+      "disk_wipe_refused": "Le nœud refuse d’effacer ce disque — relisez le plan pour voir pourquoi",
+      "disk_wipe_no_journal": "Aucun journal d’Elastic Array ne réserve plus ce disque — relisez le plan",
+      "disk_wipe_journal_unacknowledged": "Le journal de l’Elastic Array dissoute {array} réserve encore ce disque — confirmez la perte de cette grappe ou récupérez-la par un import de grappe",
+      "elastic_create_needs_attention": "La grappe a été créée mais demande une intervention ; les réservations de ses disques sont conservées"
     },
     "unreachable": {
       "title": "Nœud {node} injoignable",
@@ -8161,6 +8184,14 @@
       "parity": "n° {n} (parité)",
       "cache": "de cache",
       "model": "{model}"
+    },
+    "refusal_channel": {
+      "password_expired": "le mot de passe n’est pas armé ou a expiré",
+      "not_configured": "le mode de privilèges n’est pas configuré",
+      "sudo_rejected": "sudo a refusé le mot de passe",
+      "not_passwordless": "le helper ne fonctionne pas sans mot de passe",
+      "not_root": "le helper ne s’est pas exécuté en root",
+      "other": "la raison figure dans le texte du nœud"
     }
   },
   "agent_accounts": {

@@ -8006,7 +8006,14 @@
       "retype": "Retype the device name to confirm:",
       "confirm": "Clear {name}",
       "done": "Clearing disk {name} was accepted. Check the job result.",
-      "refusal_remote": "{name} is a remote disk (iSCSI/NVMe-oF) this node sees as a client — its data belongs to the target that exports it. Log out of the target instead of wiping the disk."
+      "refusal_remote": "{name} is a remote disk (iSCSI/NVMe-oF) this node sees as a client — its data belongs to the target that exports it. Log out of the target instead of wiping the disk.",
+      "refusal_system": "{name} is this node’s system disk — no operation frees it. Move the system to another medium if this disk has to be free.",
+      "refusal_zfs_pool": "{name} belongs to a ZFS pool — destroy the pool or detach this disk from it, then clear it again.",
+      "refusal_mdraid": "{name} is a member of an mdraid array — stop the array (mdadm --stop), then clear the disk again.",
+      "refusal_elastic_member": "{name} belongs to an Elastic Array — dissolve the array, then clear its disks.",
+      "refusal_mounted": "{name} has a mounted filesystem — unmount it, then clear it again.",
+      "refusal_journal_serving": "{name} belongs to an Elastic Array that still serves its union on this node — dissolve the array, then clear its disks.",
+      "refusal_journal_unknown": "Whether the Elastic Array that {name} belongs to is still served could not be read — an unknown state is not a free one. Read the plan again when the node answers."
     },
     "destroy_pool": {
       "title": "Destroy pool {name}",
@@ -9344,7 +9351,23 @@
       "elastic_folders_unreadable": "The array’s folder list cannot be read — the cache policy was not saved",
       "elastic_folder_policy_limit": "At most {limit} folders of this array can have their own cache policy",
       "elastic_namespace_unconfirmed": "The mount namespace of this name could not be confirmed free — try again",
-      "target_rdma_no_device": "Interface {interface} has no RDMA device — the kernel refuses an RDMA listener on {address}. Choose TCP or an interface with an RDMA card."
+      "target_rdma_no_device": "Interface {interface} has no RDMA device — the kernel refuses an RDMA listener on {address}. Choose TCP or an interface with an RDMA card.",
+      "smart_self_test_running": "A SMART self-test is already running on this disk — wait for it to end; a second one would abort it",
+      "elastic_uninstall_supervised": "The uninstall stopped on this node: its Elastic Arrays are under TentaNas supervision, and removing the instance would lose them",
+      "elastic_run_no_result": "The run ended without a result — it was stopped or interrupted, and the array is left as it was",
+      "elastic_result_unconfirmed": "The run’s result could not be confirmed, so the array needs attention",
+      "elastic_restore_needs_attention": "The array was restored but needs intervention; its disk reservations are kept",
+      "elastic_snapraid_failed": "The SnapRAID run did not succeed",
+      "elastic_mover_unfinished": "The mover did not finish: something is left unresolved for the next run",
+      "privilege_channel_unavailable": "The system permission channel is not available ({why}) — open TentaNas on this node and finish the channel setup step shown instead of the tabs",
+      "helper_version_mismatch": "The installed helper is version {installed} and this node needs {expected} — nothing was started. Grant the system permissions again (Environment → permission channel) to install the matching helper",
+      "helper_version_unknown": "The installed helper’s version could not be read (this node needs {expected}) — nothing was started. Grant the system permissions again (Environment → permission channel)",
+      "disk_wipe_confirm_mismatch": "The retyped device name does not match {disk}",
+      "disk_wipe_plan_changed": "The disk is no longer the one the plan was read for — read the plan again",
+      "disk_wipe_refused": "The node refuses to clear this disk — read the plan again to see why",
+      "disk_wipe_no_journal": "No Elastic Array journal reserves this disk any more — read the plan again",
+      "disk_wipe_journal_unacknowledged": "The journal of the dissolved Elastic Array {array} still reserves this disk — confirm the loss of this array, or bring it back with an array import",
+      "elastic_create_needs_attention": "The array was created but needs intervention; its disk reservations are kept"
     },
     "unreachable": {
       "title": "Node {node} unreachable",
@@ -9377,6 +9400,14 @@
       "parity": "no. {n} (parity)",
       "cache": "used as cache",
       "model": "{model}"
+    },
+    "refusal_channel": {
+      "password_expired": "the password is not armed or has expired",
+      "not_configured": "the permission mode is not configured",
+      "sudo_rejected": "sudo rejected the password",
+      "not_passwordless": "the helper is not passwordless",
+      "not_root": "the helper did not run as root",
+      "other": "the reason is in the node’s text"
     }
   },
   "agent_accounts": {
