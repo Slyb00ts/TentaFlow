@@ -1,0 +1,17 @@
+# =============================================================================
+# Plik: android-memory-diagnostic.yml
+# Opis: Sprawdza kompilację Androida z ograniczonym zużyciem pamięci na runnerze CI.
+# =============================================================================
+name: Diagnostyka pamięci kompilacji Androida
+on:
+  push:
+    branches:
+      - ci/arrow-configure-beta1
+    paths:
+      - .github/workflows/android-memory-diagnostic.yml
+      - .github/workflows/android.yml
+permissions:
+  contents: read
+jobs:
+  android:
+    uses: ./.github/workflows/android.yml

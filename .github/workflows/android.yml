@@ -84,6 +84,9 @@ jobs:
       - name: Rust core + native libraries
         env:
           ANDROID_ABIS: arm64-v8a
+          # Runner 16 GB wymaga ograniczenia równoległości i pamięci optymalizacji LLVM.
+          CARGO_BUILD_JOBS: "2"
+          CARGO_PROFILE_RELEASE_LTO: "off"
         run: |
           # The hosted image ships the NDK under $ANDROID_HOME/ndk/<version>,
           # which find_android_ndk already looks through — no third-party action
