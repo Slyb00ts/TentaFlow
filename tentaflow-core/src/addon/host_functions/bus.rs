@@ -362,7 +362,8 @@ fn map_bus_error(e: &BusServiceError) -> AbiError {
         // "operation blocked by policy", the same category this is.
         BusServiceError::FieldNotAllowed { .. }
         | BusServiceError::RequiredFieldMissing { .. }
-        | BusServiceError::FieldPolicyPayloadMalformed { .. } => AbiError::GateNotSatisfied,
+        | BusServiceError::FieldPolicyPayloadMalformed { .. }
+        | BusServiceError::KeyNeedsTopicWideRule { .. } => AbiError::GateNotSatisfied,
         // PLAN §7.2: the org's `bus.autocreate` ceiling refused the
         // auto-creation this call opted into — "blocked by policy", the same
         // category as the field-policy group above.

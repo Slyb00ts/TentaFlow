@@ -158,7 +158,9 @@ pub(crate) fn decode(row: DbBusFieldPolicy, topic: &str) -> Result<FieldPolicy, 
 ///      but deterministic, same tie-break shape as everywhere else in this
 ///      file that has no ordering signal from the domain itself;
 ///   3. the `subject_type='any'` topic-wide wildcard row (the only step for
-///      `PolicySubject::Any`).
+///      `PolicySubject::Any`). An API key that reaches no row here while the
+///      topic has rules of this direction for other subjects is refused
+///      (`BusServiceError::KeyNeedsTopicWideRule`), never let through.
 ///
 /// `Ok(None)` means "unrestricted" — no matching row at any level — which is
 /// also forced unconditionally for every OTHER `__`-prefixed reserved topic
@@ -228,6 +230,23 @@ pub fn resolve(
     }
     if let Some(row) = lookup("any", SUBJECT_ANY)? {
         return decode(row, topic).map(Some);
+    }
+    // A key meets no rule but the topic-wide one. Rules written only for
+    // chosen people, groups or addons say this topic's data is restricted;
+    // reading or writing past them because no rule names a key would be the
+    // one caller they were never meant to leave unrestricted — so the key is
+    // refused until the topic-wide rule exists (fail closed).
+    if let PolicySubject::Actor(ActorKind::ApiKey, _) = subject {
+        let restricted =
+            repository::bus_field_policy_list_for_topic(pool, instance_id, org_id, topic)?
+                .iter()
+                .any(|row| row.direction == direction.as_str());
+        if restricted {
+            return Err(BusServiceError::KeyNeedsTopicWideRule {
+                topic: topic.to_string(),
+                direction: direction.as_str(),
+            });
+        }
     }
     Ok(None)
 }

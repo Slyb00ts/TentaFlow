@@ -495,6 +495,10 @@ fn map_bus_error(e: BusServiceError) -> ProtocolError {
         BusServiceError::FieldPolicyPayloadMalformed { topic, format } => ProtocolError::bad_request(
             format!("bus.field_policy_payload_malformed: topic '{topic}' expected {format}"),
         ),
+        BusServiceError::KeyNeedsTopicWideRule { topic, direction } => ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!("bus.key_needs_topic_wide_rule: topic '{topic}' direction={direction}"),
+        ),
         // SUM/tentabus/PLAN-F3.md §4.7/§6 — schema registry errors.
         // `SchemaViolation`/`SchemaIncompatible`/`SchemaTypeUnsupported`/
         // `SchemaRefIdCollision` are all caller input problems (a bad
@@ -2956,19 +2960,70 @@ async fn acl_set_v1(
     // what makes that generation counter actually move for an ACL edit —
     // see `services::bus_authorizer::bump_acl_generation`'s doc.
     crate::services::bus_authorizer::bump_acl_generation();
+    audit_acl_set(
+        ctx,
+        &g.user_id,
+        &topic,
+        &subject_type,
+        &subject_id,
+        &action,
+        &access_level,
+    );
+    Ok(BusPayload::AclSetResponse)
+}
+
+/// The `bus.acl.set` audit row of one topic access change, whichever handler
+/// made it (`acl_set_v1`, or an API key's topic right set from the key's
+/// side, `require_key_topic_rights_admin`).
+pub(crate) fn audit_acl_set(
+    ctx: &HandlerContext,
+    user_id: &str,
+    topic: &str,
+    subject_type: &str,
+    subject_id: &str,
+    action: &str,
+    access_level: &str,
+) {
     let _ = repository::log_audit(
         &ctx.state.db,
-        Some(&g.user_id),
+        Some(user_id),
         None,
         "bus.acl.set",
-        Some(&topic),
+        Some(topic),
         Some(&format!(
             "subject_type={subject_type:?} subject_id={subject_id:?} action={action} access_level={access_level}"
         )),
         None,
         Some(&ctx.state.local_node_id),
     );
-    Ok(BusPayload::AclSetResponse)
+}
+
+/// Package K: an API key's right to a topic's messages is a topic access
+/// entry, however it is written. The API key handlers (`ApiKeyCreateRequest`
+/// scopes, `ApiKeyScopeSetRequest`/`ClearRequest`) are site-admin only, but
+/// that alone would let a site administrator open a topic of an organisation
+/// they do not administer; so they also pass the gate `AclSetRequest` does —
+/// `bus.admin` on the instance plus the organisation's admin role — for the
+/// organisation the entry names. Returns the caller's user id and the
+/// topic, for the `bus.acl.set` audit row.
+pub(crate) fn require_key_topic_rights_admin(
+    ctx: &HandlerContext,
+    resource_id: &str,
+) -> Result<(String, String), ProtocolError> {
+    let segments = crate::sync::resource_id::decode_segments(resource_id).unwrap_or_default();
+    let [instance_id, org_id, topic] = segments.as_slice() else {
+        return Err(ProtocolError::bad_request(
+            "topic resource_id must name exactly an instance, an organisation and a topic",
+        ));
+    };
+    let g = gate_admin(ctx, instance_id)?;
+    if g.org_id != *org_id {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "bus.org_mismatch: a topic right is granted from within its own organisation",
+        ));
+    }
+    Ok((g.user_id, topic.to_string()))
 }
 
 // =============================================================================

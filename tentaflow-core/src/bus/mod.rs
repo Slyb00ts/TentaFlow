@@ -94,6 +94,7 @@ pub mod dlq;
 pub mod field_policies;
 pub mod groups;
 pub mod instance;
+pub mod key_audit;
 pub mod lag_history;
 pub mod native;
 pub mod payload_format;
@@ -964,6 +965,16 @@ pub enum BusServiceError {
     /// implemented.
     #[error("topic '{topic}' has a field policy but the payload does not parse as {format}")]
     FieldPolicyPayloadMalformed { topic: String, format: &'static str },
+    /// Package K: a general API key meets only the topic-wide data-hiding
+    /// rule, and `topic` has rules for this direction but not that one —
+    /// letting the key through would read or write past rules written for
+    /// the people and addons it is not. Refused until an administrator
+    /// writes the topic-wide rule.
+    #[error("topic '{topic}' hides data by {direction} rules for chosen subjects only; an API key needs a rule for everyone")]
+    KeyNeedsTopicWideRule {
+        topic: String,
+        direction: &'static str,
+    },
     /// SUM/tentabus/PLAN-F3.md §4: a record failed schema validation and no
     /// per-record disposition (`warn` accept, `dlq` quarantine) applied —
     /// reserved for a `SchemaError` variant `publish`'s validation loop does
@@ -1048,6 +1059,24 @@ pub struct BusCallContext {
     pub actor_kind: ActorKind,
     pub correlation_id: Option<String>,
     pub origin: String,
+}
+
+/// `audit_log.user_id` prefix of a call made by an API key — the spelling
+/// every reader of those rows already understands (`dispatch/bus.rs`'s
+/// `SubjectLabels::actor`, the schema registry's `created_by`), so a key's
+/// uid is never mistaken for a user's id.
+pub const API_KEY_AUDIT_ACTOR_PREFIX: &str = "api_key:";
+
+impl BusCallContext {
+    /// Who an `audit_log` row written for this call names: the actor as is,
+    /// except an API key, written as `api_key:<uid>`.
+    pub fn audit_actor(&self) -> Option<String> {
+        let actor = self.actor.as_deref()?;
+        Some(match self.actor_kind {
+            ActorKind::ApiKey => format!("{API_KEY_AUDIT_ACTOR_PREFIX}{actor}"),
+            _ => actor.to_string(),
+        })
+    }
 }
 
 /// The `origin` value `addon::host_functions::bus::call_context` stamps on
@@ -1467,7 +1496,36 @@ fn check_leader_role(
 /// characters" guarantee a topic name gets, not a bespoke second regex.
 /// Re-wraps `InvalidTopicName` as `InvalidArgument` so the error message
 /// talks about a group, not a topic.
+///
+/// A general API key consumes under groups of its own
+/// (`API_KEY_GROUP_PREFIX`): `k:<key uid>` or `k:<key uid>.<name>`. The `:`
+/// lies outside the ordinary charset, so no ordinary group can take that
+/// shape; who may consume under it is the authorizer's decision
+/// (`services::bus_authorizer::api_key_owns_group`).
 fn validate_group_name(group: &str) -> Result<(), BusServiceError> {
+    let invalid = |reason: &str| {
+        BusServiceError::InvalidArgument(format!("invalid group name '{group}': {reason}"))
+    };
+    if let Some(rest) = group.strip_prefix(API_KEY_GROUP_PREFIX) {
+        let (uid, name) = match rest.split_once('.') {
+            Some((uid, name)) => (uid, Some(name)),
+            None => (rest, None),
+        };
+        let canonical_uuid =
+            uuid::Uuid::parse_str(uid).is_ok_and(|u| u.hyphenated().to_string() == uid);
+        if !canonical_uuid {
+            return Err(invalid(
+                "an API key group names the key by its lowercase uid",
+            ));
+        }
+        return match name {
+            None => Ok(()),
+            Some(name) => topics::validate_user_topic_name(name).map_err(|e| match e {
+                BusServiceError::InvalidTopicName { reason, .. } => invalid(reason),
+                other => other,
+            }),
+        };
+    }
     topics::validate_user_topic_name(group).map_err(|e| match e {
         BusServiceError::InvalidTopicName { name, reason } => {
             BusServiceError::InvalidArgument(format!("invalid group name '{name}': {reason}"))
@@ -1475,6 +1533,10 @@ fn validate_group_name(group: &str) -> Result<(), BusServiceError> {
         other => other,
     })
 }
+
+/// Prefix of the consumer groups a general API key consumes under
+/// (`validate_group_name`).
+pub const API_KEY_GROUP_PREFIX: &str = "k:";
 
 // ---- Publish/consume data types (PLAN §6.1) ----------------------------
 
@@ -3224,6 +3286,10 @@ impl BusService {
     /// in `audit_windowed`. Also callable directly (tests, an operator
     /// tool) to flush deterministically without waiting for the window.
     pub fn flush_audit_windows(&self) {
+        // The records REST's per-key windows are process-wide; this engine
+        // flushes the ones written to its database, which is what writes
+        // their tail on the shutdown path too (`shutdown` ends in this call).
+        key_audit::flush_for(&self.db);
         for (org_id, kind, count, resource, actor) in self.audit_windows.drain_suppressed() {
             let _ = crate::db::repository::log_audit(
                 &self.db,
@@ -3257,7 +3323,7 @@ impl BusService {
         write_windowed_audit(
             &self.db,
             &self.audit_windows,
-            ctx.actor.as_deref(),
+            ctx.audit_actor().as_deref(),
             &ctx.org_id,
             kind,
             resource,
@@ -4716,7 +4782,7 @@ impl BusService {
 
         let _ = crate::db::repository::log_audit(
             &self.db,
-            ctx.actor.as_deref(),
+            ctx.audit_actor().as_deref(),
             None,
             audit_action,
             Some(name),
@@ -4804,7 +4870,7 @@ impl BusService {
         };
         let _ = crate::db::repository::log_audit(
             &self.db,
-            ctx.actor.as_deref(),
+            ctx.audit_actor().as_deref(),
             None,
             "bus.topic.update",
             Some(name),
@@ -4977,7 +5043,7 @@ impl BusService {
         self.sub_org_stored_bytes(&ctx.org_id, released_bytes);
         let _ = crate::db::repository::log_audit(
             &self.db,
-            ctx.actor.as_deref(),
+            ctx.audit_actor().as_deref(),
             None,
             "bus.topic.delete",
             Some(name),
@@ -5082,7 +5148,7 @@ impl BusService {
         }
         let _ = crate::db::repository::log_audit(
             &self.db,
-            ctx.actor.as_deref(),
+            ctx.audit_actor().as_deref(),
             None,
             "bus.offset.reset",
             Some(topic),
@@ -5630,6 +5696,9 @@ impl BusService {
                 rec = rec.with_header("tf.org", ctx.org_id.clone());
                 if let Some(actor) = &ctx.actor {
                     rec = rec.with_header("tf.actor", actor.clone());
+                    // What `tf.actor` names — a key's uid and a user's id
+                    // are both bare strings.
+                    rec = rec.with_header("tf.actor_kind", ctx.actor_kind.as_str());
                 }
                 if let Some(cid) = &ctx.correlation_id {
                     rec = rec.with_header("tf.correlation_id", cid.clone());
@@ -6919,7 +6988,7 @@ impl BusService {
     fn audit_browse(&self, ctx: &BusCallContext, topic: &str, detail: &str) {
         let _ = crate::db::repository::log_audit(
             &self.db,
-            ctx.actor.as_deref(),
+            ctx.audit_actor().as_deref(),
             None,
             "bus.messages.browse",
             Some(topic),
@@ -7184,7 +7253,7 @@ impl BusService {
         )?;
         let _ = crate::db::repository::log_audit(
             &self.db,
-            ctx.actor.as_deref(),
+            ctx.audit_actor().as_deref(),
             None,
             "bus.dlq.sent",
             Some(topic),
@@ -7381,7 +7450,7 @@ impl BusService {
         self.mark_dlq_handled(ctx, dlq_topic, dlq_partition, dlq_offset)?;
         let _ = crate::db::repository::log_audit(
             &self.db,
-            ctx.actor.as_deref(),
+            ctx.audit_actor().as_deref(),
             None,
             "bus.dlq.retry",
             Some(source_topic),
@@ -7452,7 +7521,7 @@ impl BusService {
         self.mark_dlq_handled(ctx, dlq_topic, partition, offset)?;
         let _ = crate::db::repository::log_audit(
             &self.db,
-            ctx.actor.as_deref(),
+            ctx.audit_actor().as_deref(),
             None,
             "bus.dlq.discard",
             Some(dlq_topic),
@@ -7615,7 +7684,7 @@ impl BusService {
         self.group_state.invalidate(&ctx.org_id, group, topic);
         let _ = crate::db::repository::log_audit(
             &self.db,
-            ctx.actor.as_deref(),
+            ctx.audit_actor().as_deref(),
             None,
             "bus.group.pause",
             Some(topic),
@@ -8333,7 +8402,7 @@ impl ConsumerHandle {
                 write_windowed_audit(
                     &self.db,
                     &self.audit_windows,
-                    self.ctx.actor.as_deref(),
+                    self.ctx.audit_actor().as_deref(),
                     &self.org_id,
                     "bus.consume.denied",
                     Some(topic),
@@ -8533,7 +8602,7 @@ impl ConsumerHandle {
                         if !cp.gap_audited.swap(true, Ordering::AcqRel) {
                             let _ = crate::db::repository::log_audit(
                                 &self.db,
-                                self.ctx.actor.as_deref(),
+                                self.ctx.audit_actor().as_deref(),
                                 None,
                                 "bus.offset.gap",
                                 Some(&cp.topic),

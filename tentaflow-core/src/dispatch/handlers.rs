@@ -767,15 +767,21 @@ pub fn api_key_create(
     }
     let mut scopes: Vec<(String, String, String)> =
         Vec::with_capacity(payload.scope_resources.len());
+    let mut topic_audits: Vec<(String, String, &'static str)> = Vec::new();
     for r in &payload.scope_resources {
         let action =
             validate_scope_resource(db, &r.resource_type, &r.resource_id, r.action.as_deref())?;
-        // Checked again, with the write, in `create_api_key_with_scopes`; here
-        // it answers with a reason instead of a failed transaction.
-        if r.resource_type == "topic" && !topic_scope_target_exists(db, &r.resource_id)? {
-            return Err(ProtocolError::not_found(
-                "resource_id names no existing TentaBus topic",
-            ));
+        if r.resource_type == "topic" {
+            let (user_id, topic) =
+                crate::dispatch::bus::require_key_topic_rights_admin(ctx, &r.resource_id)?;
+            // Checked again, with the write, in `create_api_key_with_scopes`;
+            // here it answers with a reason instead of a failed transaction.
+            if !topic_scope_target_exists(db, &r.resource_id)? {
+                return Err(ProtocolError::not_found(
+                    "resource_id names no existing TentaBus topic",
+                ));
+            }
+            topic_audits.push((user_id, topic, action));
         }
         scopes.push((
             r.resource_type.clone(),
@@ -815,6 +821,14 @@ pub fn api_key_create(
         Some(&ctx.state.local_node_id),
     )
     .map_err(db_err)?;
+    if !topic_audits.is_empty() {
+        crate::services::bus_authorizer::bump_acl_generation();
+    }
+    for (user_id, topic, action) in topic_audits {
+        crate::dispatch::bus::audit_acl_set(
+            ctx, &user_id, &topic, "api_key", &uid, action, "allow",
+        );
+    }
 
     Ok(MessageBody::ApiKeyCreateResponseBody(
         ApiKeyCreateResponse {
@@ -944,6 +958,8 @@ pub fn api_key_scope_set(
         validate_scope_resource(&ctx.state.db, resource_type, resource_id, action.as_deref())?;
     require_general_key(ctx, key_uid)?;
     if resource_type == "topic" {
+        let (user_id, topic) =
+            crate::dispatch::bus::require_key_topic_rights_admin(ctx, resource_id)?;
         // Same guarded write as TentaBus's own topic entries.
         let written = repository::resource_permissions::set_topic_rule(
             &ctx.state.db,
@@ -959,6 +975,15 @@ pub fn api_key_scope_set(
                 "resource_id names no existing TentaBus topic",
             ));
         }
+        crate::dispatch::bus::audit_acl_set(
+            ctx,
+            &user_id,
+            &topic,
+            "api_key",
+            key_uid,
+            action,
+            access_level,
+        );
     } else {
         repository::resource_permissions::set_with_action(
             &ctx.state.db,
@@ -1021,6 +1046,14 @@ pub fn api_key_scope_clear(
     // revoked `write` never takes the key's separate `read` with it.
     let action = clear_scope_action(&ctx.state.db, resource_type, resource_id, action.as_deref())?;
     require_general_key(ctx, key_uid)?;
+    let topic_admin = if resource_type == "topic" {
+        Some(crate::dispatch::bus::require_key_topic_rights_admin(
+            ctx,
+            resource_id,
+        )?)
+    } else {
+        None
+    };
     match action {
         Some(action) => repository::resource_permissions::clear_with_action(
             &ctx.state.db,
@@ -1039,8 +1072,17 @@ pub fn api_key_scope_clear(
         ),
     }
     .map_err(db_err)?;
-    if resource_type == "topic" {
+    if let Some((user_id, topic)) = topic_admin {
         crate::services::bus_authorizer::bump_acl_generation();
+        crate::dispatch::bus::audit_acl_set(
+            ctx,
+            &user_id,
+            &topic,
+            "api_key",
+            key_uid,
+            action.unwrap_or("*"),
+            "clear",
+        );
     }
 
     // Audit mandatory (see api_key_scope_set): propagate the failure.

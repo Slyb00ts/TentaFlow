@@ -63,9 +63,13 @@
 //     key, a replicated row);
 //   * an allow counts only for the exact action (`resource_permissions::
 //     check_action`); a `'*'` row still denies;
-//   * a key consumes only under its own consumer groups — `<key uid>` or
-//     `<key uid>.<name>` (`api_key_owns_group`) — so it can never move the
-//     committed offsets of a group some other application consumes with.
+//   * a key consumes only under its own consumer groups — `k:<key uid>` or
+//     `k:<key uid>.<name>` (`api_key_owns_group`) — so it can never move the
+//     committed offsets of a group some other application consumes with; and
+//     no other caller (a user, an addon, another key) may consume under a
+//     `k:` group, so nobody moves a key's offsets either. The `:` is outside
+//     the ordinary group charset (`bus::validate_group_name`), so the two
+//     namespaces cannot meet.
 //
 // DLQ rule (PLAN §3.3 + this task's brief): `__dlq.<topic>` is never ACL'd
 // on its own — both consuming FROM `__dlq.<topic>` and the broker's own
@@ -100,7 +104,7 @@ use crate::auth::actor::ActorKind;
 use crate::bus::dlq::DLQ_TOPIC_PREFIX;
 use crate::bus::instance::BusInstanceId;
 use crate::bus::topics::RESERVED_PREFIX;
-use crate::bus::{BusAction, BusCallContext, BusServiceError};
+use crate::bus::{BusAction, BusCallContext, BusServiceError, API_KEY_GROUP_PREFIX};
 use crate::db::repository;
 use crate::db::DbPool;
 
@@ -229,15 +233,49 @@ fn topic_acl_allows(
 }
 
 /// Whether `group` is one of the consumer groups the API key `key_uid` may
-/// consume under: its uid itself, or its uid followed by `.` and a name.
-/// A key's uid is a lowercase UUID, which the group-name charset admits, so
-/// a key cannot choose a group that another key or a user already consumes
-/// with unless that group is named after this very key.
+/// consume under: `k:<uid>`, or `k:<uid>.` followed by a name
+/// (`bus::API_KEY_GROUP_PREFIX`).
 pub fn api_key_owns_group(key_uid: &str, group: &str) -> bool {
-    match group.strip_prefix(key_uid) {
+    match group
+        .strip_prefix(API_KEY_GROUP_PREFIX)
+        .and_then(|rest| rest.strip_prefix(key_uid))
+    {
         Some(rest) => rest.is_empty() || (rest.len() > 1 && rest.starts_with('.')),
         None => false,
     }
+}
+
+/// Whether the key holds `action` on `topic` of `org_id` in any instance —
+/// asked by the records REST's instance-less legacy path before it resolves
+/// an instance at all (`api/bus_rest.rs::precheck_api_key`). Each candidate
+/// row is re-checked through `api_key_topic_allows`, so a deny, a revoked key
+/// or a `'*'` row answers exactly as on the call itself.
+pub fn api_key_topic_granted_anywhere(
+    db: &DbPool,
+    org_id: &str,
+    topic: &str,
+    key_uid: &str,
+    action: BusAction,
+) -> bool {
+    let rows = match repository::resource_permissions::list_for_subject(db, "api_key", key_uid) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "bus ACL: listing an API key's grants failed, denying");
+            return false;
+        }
+    };
+    rows.iter()
+        .filter(|row| row.resource_type == "topic" && row.access_level == "allow")
+        .filter_map(|row| {
+            let segments = crate::sync::resource_id::decode_segments(&row.resource_id)?;
+            match segments.as_slice() {
+                [instance, row_org, row_topic] if *row_org == org_id && *row_topic == topic => {
+                    Some(instance.to_string())
+                }
+                _ => None,
+            }
+        })
+        .any(|instance| api_key_topic_allows(db, &instance, org_id, topic, key_uid, action))
 }
 
 /// The whole per-topic decision for a general API key (this file's `API KEY
@@ -371,15 +409,18 @@ impl crate::bus::BusAuthorizer for InstanceBusAuthorizer {
     ) -> Result<(), BusServiceError> {
         // The matrix/ACL model is topic-scoped, not group-scoped
         // (`BusAuthorizer::authorize_group`'s own doc explicitly allows this
-        // thin delegation for such an authorizer) — except for an API key,
-        // which consumes only under groups named after itself.
-        if ctx.actor_kind == ActorKind::ApiKey
-            && !ctx
-                .actor
-                .as_deref()
-                .is_some_and(|key_uid| api_key_owns_group(key_uid, group))
-        {
-            return Err(denied(action, topic));
+        // thin delegation for such an authorizer) — except for the API key
+        // namespace: a key consumes only under its own `k:` groups, and a
+        // `k:` group belongs to its key alone.
+        if ctx.actor_kind == ActorKind::ApiKey || group.starts_with(API_KEY_GROUP_PREFIX) {
+            let owner = ctx.actor_kind == ActorKind::ApiKey
+                && ctx
+                    .actor
+                    .as_deref()
+                    .is_some_and(|key_uid| api_key_owns_group(key_uid, group));
+            if !owner {
+                return Err(denied(action, topic));
+            }
         }
         self.authorize(ctx, action, topic)
     }
@@ -1081,32 +1122,45 @@ mod tests {
             .is_err());
     }
 
-    /// A key consumes only under groups named after itself, so it can never
-    /// move the offsets of a group another application consumes with.
+    /// A key consumes only under its own `k:` groups, and a `k:` group is its
+    /// key's alone: no user, addon or other key consumes (and so commits)
+    /// under it, so neither side can move the other's offsets.
     #[test]
-    fn api_key_consumes_only_under_its_own_groups() {
+    fn api_key_groups_and_ordinary_groups_never_meet() {
         let (_d, pool) = open_pool();
-        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker(&pool));
-        let key = api_key(&pool, "general");
-        key_rule(&pool, "org-1", &key, "read", "allow");
-        let c = key_ctx("org-1", &key);
-        let group = |g: &str| auth.authorize_group(&c, BusAction::Consume, "orders.created", g);
-        assert!(group(&key).is_ok());
-        assert!(group(&format!("{key}.lis")).is_ok());
-        assert!(group("billing").is_err());
-        assert!(group(&format!("{key}x")).is_err());
-        assert!(group(&format!("{key}.")).is_err());
-        // A user is not held to the key namespace.
         let checker = checker(&pool);
         grant(&pool, &checker, &instance_a(), "u-op", "bus.read");
-        let user_auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
-        assert!(user_auth
-            .authorize_group(
-                &ctx("org-1", "u-op"),
-                BusAction::Consume,
-                "orders.created",
-                "billing"
-            )
-            .is_ok());
+        grant(&pool, &checker, &instance_a(), "asystent", "bus.read");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let key = api_key(&pool, "general");
+        let other = api_key(&pool, "general");
+        key_rule(&pool, "org-1", &key, "read", "allow");
+        key_rule(&pool, "org-1", &other, "read", "allow");
+        let group = |c: &BusCallContext, g: &str| {
+            auth.authorize_group(c, BusAction::Consume, "orders.created", g)
+                .is_ok()
+        };
+        let k = key_ctx("org-1", &key);
+        assert!(group(&k, &format!("k:{key}")));
+        assert!(group(&k, &format!("k:{key}.lis")));
+        for foreign in [
+            "billing".to_string(),
+            key.clone(),
+            format!("{key}.lis"),
+            format!("k:{key}x"),
+            format!("k:{key}."),
+            format!("k:{other}"),
+        ] {
+            assert!(!group(&k, &foreign), "{foreign}");
+        }
+        let user = ctx("org-1", "u-op");
+        let addon = addon_ctx("org-1", "asystent");
+        assert!(group(&user, "billing"));
+        assert!(group(&addon, "billing"));
+        for taken in [format!("k:{key}"), format!("k:{key}.lis")] {
+            assert!(!group(&user, &taken), "{taken}");
+            assert!(!group(&addon, &taken), "{taken}");
+            assert!(!group(&key_ctx("org-1", &other), &taken), "{taken}");
+        }
     }
 }

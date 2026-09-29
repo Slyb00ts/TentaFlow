@@ -107,29 +107,51 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   są osobnymi prawami. Klucz nie potrzebuje wpisu w macierzy uprawnień i nigdy
   nie administruje topikiem: nie tworzy topików (także przez
   `create_if_missing`), nie zmienia ustawień ani dostępu, nie czyta
-  „Nieprzetworzonych wiadomości” ani topików wewnętrznych. Odbiera tylko pod
-  własnymi grupami odbiorców — `<id klucza>` albo `<id klucza>.<nazwa>` — więc
-  nie przesunie potwierdzeń cudzej grupy. Prawo jest sprawdzane przed
-  wyszukaniem instancji: klucz bez prawa dostaje 403 także dla instancji, która
-  nie istnieje. Klucz usunięty albo przypisany do osoby nie korzysta z wierszy
-  klucza; klucz przypisany do osoby działa jak dotąd — jako ta osoba.
+  „Nieprzetworzonych wiadomości” ani topików wewnętrznych. Klucz usunięty albo
+  przypisany do osoby nie korzysta z wierszy klucza; klucz przypisany do osoby
+  działa jak dotąd — jako ta osoba.
+- Grupy odbiorców klucza: klucz odbiera tylko pod `k:<id klucza>` albo
+  `k:<id klucza>.<nazwa>`, a pod grupą `k:…` nie odbiera nikt inny — ani osoba,
+  ani addon, ani inny klucz. Klucz nie przesunie więc potwierdzeń cudzej grupy,
+  a nikt nie przesunie potwierdzeń klucza. Zwykłe nazwy grup nie mogą zawierać
+  dwukropka, więc obie przestrzenie się nie spotykają.
+- Prawo klucza jest sprawdzane przed wyszukaniem instancji: klucz bez prawa
+  dostaje 403 także dla instancji, która nie istnieje, a na starej ścieżce bez
+  instancji (`/v1/bus/topics/{topik}/records`) — zanim ścieżka ujawni liczbę
+  albo identyfikatory instancji; dopiero klucz z prawem do tego topiku w tej
+  organizacji dostaje odpowiedź, jaką dostaje każdy wywołujący.
 - Prawa klucza do wiadomości nadaje administrator serwera
-  (`ApiKeyCreateRequest.scope_resources`, `ApiKeyScopeSetRequest`) albo
-  administrator topiku (`AclSetRequest` z `subject_type = 'api_key'`).
-  Zakres `topic` wymaga działania `read` albo `write` i poprawnego
-  identyfikatora (instancja, organizacja, istniejący topik); `admin` i `'*'`
-  są odrzucane, a `AclSetRequest` przyjmuje tylko istniejący klucz ogólny.
-  `ApiKeyScopeListResponse` zwraca prawa klucza z działaniem,
-  a `ApiKeyScopeClearRequest` z działaniem usuwa tylko to jedno prawo.
-  Wcześniej zapisany wiersz klucza z działaniem `'*'` niczego nie przyznaje
-  (nadal może tylko zabraniać) i można go usunąć.
-- Ukrywanie danych obejmuje klucze: klucz ogólny czyta według zasady dla
-  wszystkich (zasady nie da się przypisać kluczowi), nigdy według zasady osoby
-  o tym samym identyfikatorze.
-- Audyt: każde odrzucone żądanie REST rekordów klucza ogólnego zostawia wpis
-  `bus.rest.publish` albo `bus.rest.consume` z identyfikatorem i nazwą
-  klucza, kodem HTTP i powodem (bez treści wiadomości); udane żądania są
-  zapisywane raz na minutę na klucz i topik, z liczbą żądań.
+  (`ApiKeyCreateRequest.scope_resources`, `ApiKeyScopeSetRequest`,
+  `ApiKeyScopeClearRequest`), który musi też być administratorem tego topiku:
+  mieć `bus.admin` w instancji i rolę administratora organizacji, której prawo
+  dotyczy (tak jak przy `AclSetRequest`); każda zmiana zostawia wpis audytu
+  `bus.acl.set`. Administrator topiku nadaje je też przez `AclSetRequest`
+  z `subject_type = 'api_key'`. Zakres `topic` wymaga działania `read` albo
+  `write` i poprawnego identyfikatora (instancja, organizacja, istniejący
+  topik); `admin` i `'*'` są odrzucane, a `AclSetRequest` przyjmuje tylko
+  istniejący klucz ogólny. `ApiKeyScopeListResponse` zwraca prawa klucza
+  z działaniem, a `ApiKeyScopeClearRequest` z działaniem usuwa tylko to jedno
+  prawo. Wcześniej zapisany wiersz klucza z działaniem `'*'` niczego nie
+  przyznaje (nadal może tylko zabraniać) i można go usunąć.
+- Ukrywanie danych obejmuje klucze: klucz ogólny czyta i wysyła według zasady
+  dla wszystkich (zasady nie da się przypisać kluczowi), nigdy według zasady
+  osoby o tym samym identyfikatorze. Topik, który ma zasady ukrywania danych
+  tylko dla wybranych osób, grup albo addonów, a nie ma zasady dla wszystkich,
+  jest dla klucza zamknięty w danym kierunku (odczyt albo zapis):
+  `bus.key_needs_topic_wide_rule`, w REST 403 — dopóki administrator nie doda
+  zasady dla wszystkich.
+- Flow uruchomiony kluczem ogólnym publikuje z prawami zapisu tego klucza.
+  Flow uruchomiony kluczem przypisanym do osoby nadal nie publikuje do topiku
+  (działa jako klucz, a taki klucz nie ma własnych praw), choć REST rekordów
+  traktuje ten sam klucz jak jego osobę.
+- Audyt: żądania REST rekordów klucza ogólnego zostawiają wpisy
+  `bus.rest.publish` albo `bus.rest.consume` z identyfikatorem i nazwą klucza,
+  kodem HTTP i powodem (bez treści wiadomości). Pierwsze żądanie każdego wyniku
+  (sukces albo dany powód odmowy) jest zapisywane od razu, kolejne w ciągu
+  minuty są zliczane (liczba żądań i wiadomości) i zapisywane zbiorczo co
+  minutę oraz przy zatrzymaniu instancji. Wpisy audytu busa wskazują klucz
+  jako `api_key:<id>`, a nowy nagłówek wiadomości `tf.actor_kind` mówi, kim
+  jest nadawca z `tf.actor` (`user`, `api_key`, `addon`, `system`).
 - Aktualizacja: migracja bazy 177 przebudowuje `resource_permissions`
   (dopuszcza `subject_type = 'addon'`) bez zmiany istniejących wierszy.
   Nod w starszej wersji odrzuca zsynchronizowany wiersz addonu (operacja
