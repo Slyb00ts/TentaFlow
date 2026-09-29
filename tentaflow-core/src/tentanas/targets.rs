@@ -3437,11 +3437,7 @@ async fn run(
     if !out.success() {
         return Err(anyhow!(
             "{}",
-            out.stderr
-                .trim()
-                .lines()
-                .next()
-                .unwrap_or("the privileged step failed")
+            super::jobs::helper_error_line(&out.stderr, "the privileged step failed")
         ));
     }
     Ok(())
@@ -4193,12 +4189,7 @@ async fn read_nvmet_sessions(db: &DbPool) -> block::NvmetSessions {
     };
     if !out.success() {
         return block::NvmetSessions::unavailable(
-            out.stderr
-                .trim()
-                .lines()
-                .next()
-                .unwrap_or("the privileged read failed")
-                .to_string(),
+            super::jobs::helper_error_line(&out.stderr, "the privileged read failed"),
         );
     }
     serde_json::from_str(&out.stdout).unwrap_or_else(|e| {

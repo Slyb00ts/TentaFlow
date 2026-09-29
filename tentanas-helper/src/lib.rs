@@ -79,6 +79,7 @@ mod elastic_namespace;
 mod elastic_transfer;
 #[cfg(target_os = "linux")]
 mod folder_usage;
+pub mod refusal;
 
 /// Catalog version the wrapper reports with `--version`; core refuses to use
 /// a wrapper built from a different catalog. Bumps with the crate version.
@@ -1412,7 +1413,7 @@ pub fn validate_export_line(line: &str) -> Result<(), CatalogError> {
 pub fn audit_rules_file(exports: &[(String, String)]) -> String {
     let mut out = String::from(
         "# Managed by TentaFlow TentaNas — this whole file belongs to the app.\n\
-         # One watch per NFS export whose share turned \"Audytuj dostęp\" on.\n\
+         # One watch per NFS export whose share turned \"Audit access\" on.\n\
          # The events land in the HOST's audit log (ausearch -k tentanas), not\n\
          # in the app's access log: NFS has no per-export audit module.\n",
     );
@@ -2275,7 +2276,7 @@ impl HelperCommand {
                 elastic::validate_elastic_uuid(operation_id)?;
                 elastic::validate_elastic_uuid(&disk.expected_uuid)?;
                 if !matches!(disk.bytes, 1..=u64::MAX) {
-                    return Err(CatalogError::InvalidArgument("dodawany dysk bez rozmiaru".into()));
+                    return Err(CatalogError::InvalidArgument("the added disk has no size".into()));
                 }
                 owner.validate()
             }
@@ -2297,12 +2298,12 @@ impl HelperCommand {
                     || operation_id == sync_operation_id
                     || rebuild_operation_id == sync_operation_id
                 {
-                    return Err(CatalogError::InvalidArgument("powtórzone UUID wymiany dysku".into()));
+                    return Err(CatalogError::InvalidArgument("repeated disk replacement UUID".into()));
                 }
                 elastic::validate_data_branch_name(branch)?;
                 elastic::validate_elastic_uuid(&disk.expected_uuid)?;
                 if !matches!(disk.bytes, 1..=u64::MAX) {
-                    return Err(CatalogError::InvalidArgument("dysk zamienny bez rozmiaru".into()));
+                    return Err(CatalogError::InvalidArgument("the replacement disk has no size".into()));
                 }
                 owner.validate()
             }
@@ -2328,7 +2329,7 @@ impl HelperCommand {
                 elastic::validate_elastic_uuid(array_id)?;
                 elastic::validate_elastic_uuid(operation_id)?;
                 elastic::validate_elastic_uuid(resume_operation_id)?;
-                if operation_id == resume_operation_id { return Err(CatalogError::InvalidArgument("mover UUID i resume UUID muszą być różne".into())); }
+                if operation_id == resume_operation_id { return Err(CatalogError::InvalidArgument("the mover UUID and the resume UUID must differ".into())); }
                 rules.validate()?;
                 owner.validate()
             }
@@ -2363,7 +2364,7 @@ impl HelperCommand {
                 // re-identification. Refusing is the only honest answer.
                 if wwn.is_none() && serial.is_none() {
                     return Err(CatalogError::InvalidArgument(
-                        "czyszczenie wymaga WWN albo numeru seryjnego dysku".into(),
+                        "a clear needs the disk's WWN or serial number".into(),
                     ));
                 }
                 for value in [wwn, serial].into_iter().flatten() {
@@ -2371,7 +2372,7 @@ impl HelperCommand {
                 }
                 if *bytes == 0 {
                     return Err(CatalogError::InvalidArgument(
-                        "czyszczony dysk bez rozmiaru".into(),
+                        "the disk to clear has no size".into(),
                     ));
                 }
                 match release_journal {
@@ -3063,25 +3064,25 @@ impl HelperCommand {
     /// listing cannot silently fall behind the catalog.
     pub fn describe(&self) -> (&'static str, &'static str) {
         match self {
-            Self::ElasticCreate { .. } => ("builtin", "Tworzy Elastic Array z trwałym dziennikiem i kontrolą nośników."),
-            Self::ElasticRestore { .. } => ("builtin", "Odtwarza potwierdzone montowania Elastic bez formatowania."),
-            Self::ElasticEnterService { .. } => ("builtin", "Trwale zatrzymuje publikację Elastic przed przejściem unii w RO."),
-            Self::ElasticResume { .. } => ("builtin", "Wznawia autoryzowaną publikację Elastic po potwierdzeniu RW."),
-            Self::ElasticMover { .. } => ("builtin", "Przenosi pliki cache do data z trwałym dziennikiem i synchronizacją parity."),
-            Self::ElasticSync { .. } => ("builtin", "Synchronizuje parity własnej macierzy Elastic z trwałym wynikiem."),
-            Self::ElasticScrub { .. } => ("builtin", "Sprawdza pełną parity własnej macierzy Elastic bez naprawy."),
-            Self::ElasticFix { .. } => ("builtin", "Odbudowuje wskazany dysk danych własnej macierzy Elastic z parity."),
-            Self::ElasticAddDisk { .. } => ("builtin", "Dodaje dysk danych do działającej unii własnej macierzy Elastic."),
-            Self::ElasticAddDiskAbort { .. } => ("builtin", "Wycofuje niedokończone dodanie dysku danych, zanim dysk dołączył do udziału."),
-            Self::ElasticReplaceDisk { .. } => ("builtin", "Wymienia dysk danych własnej macierzy Elastic i odbudowuje go z parity."),
-            Self::ElasticDestroy { .. } => ("builtin", "Zatrzymuje udostępnianie własnej macierzy Elastic bez formatowania dysków."),
-            Self::ElasticInspect { .. } => ("builtin", "Odczytuje stan własnej macierzy Elastic."),
-            Self::ElasticCacheAge { .. } => ("builtin", "Odczytuje, ile plików na cache własnej macierzy Elastic czeka na przeniesienie, bez przenoszenia."),
-            Self::ElasticFolderUsage { .. } => ("builtin", "Odczytuje, ile miejsca zajmują foldery własnej macierzy Elastic, z limitem wpisów i czasu, bez zmian."),
-            Self::ElasticClaims { .. } => ("builtin", "Sprawdza anonimowe rezerwacje dysków i wskazanej nazwy."),
-            Self::ElasticJournals {} => ("builtin", "Wypisuje dzienniki macierzy Elastic obecne na tym nodzie."),
-            Self::ElasticAdopt { .. } => ("builtin", "Przepisuje właściciela dziennika macierzy Elastic na przejmującą instancję."),
-            Self::DiskWipe { .. } => ("builtin", "Usuwa sygnatury systemów plików i tablicy partycji z jednego dysku po wyłącznym otwarciu urządzenia."),
+            Self::ElasticCreate { .. } => ("builtin", "Create an Elastic Array with a durable journal and disk checks."),
+            Self::ElasticRestore { .. } => ("builtin", "Restore the confirmed Elastic mounts without formatting."),
+            Self::ElasticEnterService { .. } => ("builtin", "Durably stop the Elastic publication before the union goes read-only."),
+            Self::ElasticResume { .. } => ("builtin", "Resume the authorised Elastic publication once read-write is confirmed."),
+            Self::ElasticMover { .. } => ("builtin", "Move cache files to the data disks with a durable journal and a parity Sync."),
+            Self::ElasticSync { .. } => ("builtin", "Sync the parity of an owned Elastic Array with a durable result."),
+            Self::ElasticScrub { .. } => ("builtin", "Check the full parity of an owned Elastic Array without repairing."),
+            Self::ElasticFix { .. } => ("builtin", "Rebuild one data disk of an owned Elastic Array from parity."),
+            Self::ElasticAddDisk { .. } => ("builtin", "Add a data disk to the running union of an owned Elastic Array."),
+            Self::ElasticAddDiskAbort { .. } => ("builtin", "Undo an unfinished data disk addition before the disk joined the share."),
+            Self::ElasticReplaceDisk { .. } => ("builtin", "Replace a data disk of an owned Elastic Array and rebuild it from parity."),
+            Self::ElasticDestroy { .. } => ("builtin", "Stop serving an owned Elastic Array without formatting its disks."),
+            Self::ElasticInspect { .. } => ("builtin", "Read the state of an owned Elastic Array."),
+            Self::ElasticCacheAge { .. } => ("builtin", "Read how many files on the cache of an owned Elastic Array wait to be moved, without moving them."),
+            Self::ElasticFolderUsage { .. } => ("builtin", "Read how much space the folders of an owned Elastic Array take, bounded in entries and time, changing nothing."),
+            Self::ElasticClaims { .. } => ("builtin", "Check the anonymous reservations of disks and of a given name."),
+            Self::ElasticJournals {} => ("builtin", "List the Elastic Array journals present on this node."),
+            Self::ElasticAdopt { .. } => ("builtin", "Rewrite the owner of an Elastic Array journal to the adopting instance."),
+            Self::DiskWipe { .. } => ("builtin", "Remove the filesystem and partition table signatures of one disk after an exclusive open of the device."),
             Self::SmartctlInfo { .. } => (
                 "smartctl",
                 "Read one disk's SMART/NVMe health document (identity, attributes, self-test log).",

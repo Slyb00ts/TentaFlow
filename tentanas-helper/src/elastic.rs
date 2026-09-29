@@ -934,7 +934,7 @@ pub fn validate_elastic_uuid(value: &str) -> Result<(), CatalogError> {
         })
         || value == "00000000-0000-0000-0000-000000000000"
     {
-        return Err(invalid("nieprawidłowy UUID Elastic"));
+        return Err(invalid("invalid Elastic UUID"));
     }
     Ok(())
 }
@@ -951,14 +951,14 @@ pub fn validate_identity_text(value: &str) -> Result<(), CatalogError> {
     if identity_text(value) {
         Ok(())
     } else {
-        Err(invalid("nieprawidłowa tożsamość urządzenia"))
+        Err(invalid("invalid device identity"))
     }
 }
 
 impl ElasticOwner {
     pub fn validate(&self) -> Result<(), CatalogError> {
         if !identity_text(&self.org_id) || !identity_text(&self.addon_id) {
-            return Err(invalid("nieprawidłowy właściciel Elastic"));
+            return Err(invalid("invalid Elastic owner"));
         }
         Ok(())
     }
@@ -971,10 +971,10 @@ impl ElasticCreateSpec {
         self.owner.validate()?;
         validate_array_name(&self.name)?;
         if matches!(self.name.as_str(), "tentanas" | "tentanas-branches") {
-            return Err(invalid("nazwa zajmuje stałą przestrzeń mountów aplikacji"));
+            return Err(invalid("the name takes a fixed mount path of the app"));
         }
         if self.data.is_empty() || self.data.len() + usize::from(self.cache.is_some()) + self.parity.len() > 32 || self.parity.len() > 2 {
-            return Err(invalid("Elastic wymaga danych, najwyżej 2 parity i 32 urządzeń łącznie"));
+            return Err(invalid("Elastic needs data disks, at most 2 parity disks and 32 devices in all"));
         }
         let disks: Vec<_> = self.data.iter().chain(self.cache.iter()).chain(&self.parity).collect();
         for (i, disk) in disks.iter().enumerate() {
@@ -984,24 +984,24 @@ impl ElasticCreateSpec {
                 || disk.wwn.as_deref().is_some_and(|s| !identity_text(s))
                 || disk.serial.as_deref().is_some_and(|s| !identity_text(s))
             {
-                return Err(invalid("brak pełnej tożsamości nośnika Elastic"));
+                return Err(invalid("incomplete Elastic disk identity"));
             }
             for previous in &disks[..i] {
                 if disk.disk_id == previous.disk_id || disk.expected_uuid == previous.expected_uuid
                     || disk.wwn.as_ref().is_some_and(|v| previous.wwn.as_ref() == Some(v))
                     || disk.serial.as_ref().is_some_and(|v| previous.serial.as_ref() == Some(v))
                 {
-                    return Err(invalid("powtórzona tożsamość nośnika Elastic"));
+                    return Err(invalid("repeated Elastic disk identity"));
                 }
             }
         }
         let largest = self.data.iter().map(|disk| disk.bytes).max().unwrap_or(0);
         if self.parity.iter().any(|disk| disk.bytes < largest) {
-            return Err(invalid("parity mniejsze niż największy dysk danych"));
+            return Err(invalid("parity is smaller than the largest data disk"));
         }
         let encoded = serde_json::to_vec(self).map_err(|e| invalid(e.to_string()))?;
         if encoded.len() > 15 * 1024 {
-            return Err(invalid("zbyt duża specyfikacja Elastic"));
+            return Err(invalid("Elastic specification too large"));
         }
         Ok(())
     }
@@ -2889,14 +2889,14 @@ pub(crate) mod execution {
             type Value = Option<ElasticServiceState>;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("niepusty rekord service Elastic")
+                formatter.write_str("non-empty Elastic service record")
             }
 
             fn visit_none<E>(self) -> Result<Self::Value, E>
             where
                 E: serde::de::Error,
             {
-                Err(E::custom("service nie może być null"))
+                Err(E::custom("service cannot be null"))
             }
 
             fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
@@ -3076,7 +3076,7 @@ pub(crate) mod execution {
     /// A half-finished operation is a state a later Restore has to read.
     fn forgettable(journal: &Journal) -> Result<(), String> {
         if journal.private.as_ref().is_some_and(|private| private.anchor.is_some()) {
-            return Err("macierz nadal publikuje unię".into());
+            return Err("the array still publishes its union".into());
         }
         if journal.pending.is_some()
             || journal
@@ -3084,7 +3084,7 @@ pub(crate) mod execution {
                 .as_ref()
                 .is_some_and(|transfer| transfer.finished_at.is_none())
         {
-            return Err("dziennik ma otwartą operację macierzy".into());
+            return Err("the journal has an open array operation".into());
         }
         Ok(())
     }
@@ -3127,9 +3127,13 @@ pub(crate) mod execution {
         /// disk free against an incomplete list.
         fn complete(self) -> Result<Vec<Claim>, String> {
             if !self.unreadable.is_empty() {
-                return Err(format!(
-                    "nieczytelny dziennik macierzy; rezerwacji nie da się sprawdzić: {}",
-                    self.unreadable.join("; ")
+                return Err(crate::refusal::wire(
+                    "elastic_journal_unreadable",
+                    &[],
+                    format!(
+                        "an array journal cannot be read, so the reservations cannot be checked: {}",
+                        self.unreadable.join("; ")
+                    ),
                 ));
             }
             Ok(self.arrays)
@@ -3173,7 +3177,7 @@ pub(crate) mod execution {
         // bound was not written by this helper, and it would travel on into
         // the observation the core reads.
         if journal.detail.as_ref().is_some_and(|detail| detail.len() > TRANSFER_DETAIL_LIMIT) {
-            return Err("zbyt długi opis stanu macierzy".into());
+            return Err("array state description too long".into());
         }
         validate_attention(journal)?;
         match (journal.schema, &journal.private) {
@@ -3188,10 +3192,10 @@ pub(crate) mod execution {
             {
                 Ok(())
             }
-            (1, None) => Err("schema 1 nie obsługuje cache Elastic".into()),
+            (1, None) => Err("schema 1 does not support an Elastic cache".into()),
             (2, Some(private)) => {
                 if private.published && private.anchor.is_none() {
-                    return Err("publikacja bez kotwicy".into());
+                    return Err("publication without an anchor".into());
                 }
                 if let Some(anchor) = &private.anchor {
                     if anchor.boot_id != journal.boot_id
@@ -3212,13 +3216,13 @@ pub(crate) mod execution {
                             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
                         || anchor.exe_sha256.bytes().all(|c| c == b'0')
                     {
-                        return Err("nieprawidłowa tożsamość kotwicy".into());
+                        return Err("invalid anchor identity".into());
                     }
                 }
                 if let Some(service) = &private.service {
                     validate_elastic_uuid(&service.operation_id).map_err(|e| e.to_string())?;
                     if service.operation_id == journal.spec.operation_id {
-                        return Err("service używa identyfikatora Create".into());
+                        return Err("service uses the Create id".into());
                     }
                 }
                 if journal.stage == ElasticStage::Ready
@@ -3227,7 +3231,7 @@ pub(crate) mod execution {
                             service.mode == ElasticServiceMode::Hold || service.pending
                         }))
                 {
-                    return Err("Ready bez potwierdzenia publikacji".into());
+                    return Err("Ready without a confirmed publication".into());
                 }
                 if let Some(transfer) = &journal.transfer {
                     validate_elastic_uuid(&transfer.operation_id).map_err(|e| e.to_string())?;
@@ -3254,7 +3258,7 @@ pub(crate) mod execution {
                         || transfer.current_failed.as_ref().is_some_and(|reason| reason.len() > TRANSFER_DETAIL_LIMIT)
                         || (transfer.current_failed.is_some() && transfer.current.is_none())
                     {
-                        return Err("nieprawidłowy trwały dziennik transferu".into());
+                        return Err("invalid durable transfer journal".into());
                     }
                     if (transfer.phase == ElasticMoverPhase::Complete && transfer.current.is_some())
                         || (transfer.finished_at.is_some()
@@ -3266,7 +3270,7 @@ pub(crate) mod execution {
                         || (transfer.phase == ElasticMoverPhase::Complete
                             && (transfer.finished_at.is_none() || transfer_sync_owed(journal, transfer)))
                     {
-                        return Err("zakończony transfer bez spójnego stanu".into());
+                        return Err("finished transfer without a consistent state".into());
                     }
                 }
                 if journal
@@ -3275,7 +3279,7 @@ pub(crate) mod execution {
                     .is_some_and(|operation| validate_elastic_uuid(operation).is_err())
                     || (journal.stale_sync_operation.is_some() && journal.stale_parity_bytes.is_none())
                 {
-                    return Err("nieprawidłowy znacznik nieudanego Sync movera".into());
+                    return Err("invalid marker of a failed mover Sync".into());
                 }
                 // A digest is evicted only when the skip set is FULL, and
                 // nothing else ever removes a path, so a non-zero eviction
@@ -3285,12 +3289,12 @@ pub(crate) mod execution {
                 // `decode_journal`, which can only speak for journals this
                 // helper family wrote.
                 if journal.stuck_evicted > 0 && journal.stuck_paths.is_empty() {
-                    return Err("wyparte ścieżki bez listy pominiętych".into());
+                    return Err("evicted paths without a skip list".into());
                 }
                 if journal.stuck.len() > STUCK_LIMIT
                     || !journal.stuck.iter().all(|record| valid_stuck_record(&journal.spec, record))
                 {
-                    return Err("nieprawidłowa historia utkniętych rekordów".into());
+                    return Err("invalid stuck record history".into());
                 }
                 let digest = |value: &str| {
                     value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -3312,7 +3316,7 @@ pub(crate) mod execution {
                     || !journal.evicted_paths.iter().all(valid_path)
                     || journal.evicted_paths.len() as u64 > journal.stuck_evicted
                 {
-                    return Err("nieprawidłowy pierścień wypartych ścieżek".into());
+                    return Err("invalid ring of evicted paths".into());
                 }
                 if journal.stuck_paths.len() > STUCK_PATH_LIMIT
                     || !journal.stuck_paths.iter().enumerate().all(|(index, path)| {
@@ -3331,11 +3335,11 @@ pub(crate) mod execution {
                                 .any(|path| path.path_sha256 == record.path_sha256)
                         }))
                 {
-                    return Err("nieprawidłowa lista pominiętych ścieżek".into());
+                    return Err("invalid skip list".into());
                 }
                 Ok(())
             }
-            _ => Err("niezgodna schema i topologia journala".into()),
+            _ => Err("journal schema and topology disagree".into()),
         }
     }
 
@@ -3347,13 +3351,13 @@ pub(crate) mod execution {
             return Ok(());
         };
         if journal.stage == ElasticStage::Ready {
-            return Err("przyczyna uwagi na gotowej macierzy".into());
+            return Err("attention cause on a Ready array".into());
         }
         match attention {
             ElasticAttention::ParityRun { operation_id, kind } => {
                 validate_elastic_uuid(operation_id).map_err(|e| e.to_string())?;
                 if operation_id == &journal.spec.operation_id {
-                    return Err("przyczyna uwagi z identyfikatorem Create".into());
+                    return Err("attention cause carrying the Create id".into());
                 }
                 if let ElasticSnapraidKind::Fix { disk } = kind {
                     validate_data_branch_name(disk).map_err(|e| e.to_string())?;
@@ -3363,7 +3367,7 @@ pub(crate) mod execution {
                 if journal.spec.data.len() < 2
                     || journal.spec.data.last().is_none_or(|last| &last.disk_id != disk_id)
                 {
-                    return Err("przyczyna dodawania nie wskazuje ostatniego slotu danych".into());
+                    return Err("the add cause does not name the last data slot".into());
                 }
             }
             ElasticAttention::Other => (),
@@ -3436,7 +3440,7 @@ pub(crate) mod execution {
         if kind == ElasticSnapraidKind::Sync {
             mark_failed_sync(journal, &operation_id);
         }
-        let detail = journal.detail.clone().unwrap_or_else(|| "nieudana operacja SnapRAID".into());
+        let detail = journal.detail.clone().unwrap_or_else(|| "failed SnapRAID operation".into());
         enter_attention(journal, ElasticAttention::ParityRun { operation_id, kind }, &detail);
         true
     }
@@ -3478,7 +3482,7 @@ pub(crate) mod execution {
         if let Some(run) = &journal.last_run {
             validate_elastic_uuid(&run.operation_id).map_err(|e| e.to_string())?;
             if run.operation_id == journal.spec.operation_id || run.outcome == ElasticSnapraidOutcome::Refused {
-                return Err("obcy rekord operacji".into());
+                return Err("foreign operation record".into());
             }
             let pending = Some(Pending::Maintenance { operation_id: run.operation_id.clone(), kind: run.kind.clone() });
             // Only the mover's own coupled Sync that ended without success
@@ -3503,7 +3507,7 @@ pub(crate) mod execution {
             // intent: it is terminal with no pending, like a success.
             if run.outcome == ElasticSnapraidOutcome::NothingRepaired {
                 if run.finished_at.is_none() || journal.pending == pending {
-                    return Err("niespójny wynik operacji i pending".into());
+                    return Err("operation result and pending disagree".into());
                 }
                 return Ok(());
             }
@@ -3516,12 +3520,12 @@ pub(crate) mod execution {
                 // and is exactly what left parity marked out of date.
                 || (run.outcome == ElasticSnapraidOutcome::Partial
                     && (!stale_mover_sync || journal.pending == pending)) {
-                return Err("niespójny wynik operacji i pending".into());
+                return Err("operation result and pending disagree".into());
             }
         }
         if let Some(Pending::Maintenance { operation_id, kind }) = &journal.pending {
             if !journal.last_run.as_ref().is_some_and(|run| &run.operation_id == operation_id && &run.kind == kind) {
-                return Err("pending bez zgodnego rekordu operacji".into());
+                return Err("pending without a matching operation record".into());
             }
         }
         Ok(())
@@ -3530,7 +3534,7 @@ pub(crate) mod execution {
     fn decode_journal(bytes: &[u8]) -> Result<Journal, String> {
         let raw: serde_json::Value =
             serde_json::from_slice(bytes).map_err(|e| format!("journal: {e}"))?;
-        let object = raw.as_object().ok_or("journal nie jest obiektem")?;
+        let object = raw.as_object().ok_or("the journal is not an object")?;
         match object.get("schema").and_then(serde_json::Value::as_u64) {
             Some(1) if !object.contains_key("private") => (),
             Some(2)
@@ -3541,7 +3545,7 @@ pub(crate) mod execution {
                         private.contains_key("anchor") && private.contains_key("published")
                     }) =>
             {}
-            _ => return Err("niezgodna schema i obecność private".into()),
+            _ => return Err("schema and private section disagree".into()),
         }
         // A journal whose writer says it wrote every context-critical key must
         // still have all of them: for those journals an absent key is a field
@@ -3560,7 +3564,7 @@ pub(crate) mod execution {
             .into_iter()
             .find(|key| !object.contains_key(*key))
             {
-                return Err(format!("dziennik bez wymaganego pola '{missing}'"));
+                return Err(format!("journal without the required field '{missing}'"));
             }
         }
         let journal: Journal = serde_json::from_slice(bytes).map_err(|e| format!("journal: {e}"))?;
@@ -3579,14 +3583,14 @@ pub(crate) mod execution {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)
-            .map_err(|e| format!("odczyt {}: {e}", path.display()))?;
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         if !metadata.is_file()
             || metadata.uid() != uid
             || metadata.nlink() != 1
             || metadata.mode() & 0o777 != 0o600
         {
-            return Err(format!("obcy plik lub uprawnienia {}", path.display()));
+            return Err(format!("foreign file or permissions {}", path.display()));
         }
         Ok(file)
     }
@@ -3595,7 +3599,7 @@ pub(crate) mod execution {
         let mut current = PathBuf::from("/");
         for component in path.components().skip(1) {
             if !matches!(component, std::path::Component::Normal(_)) {
-                return Err("nieprawidłowa ścieżka katalogu".into());
+                return Err("invalid directory path".into());
             }
             current.push(component);
             match std::fs::symlink_metadata(&current) {
@@ -3604,8 +3608,8 @@ pub(crate) mod execution {
                     std::fs::DirBuilder::new()
                         .mode(0o700)
                         .create(&current)
-                        .map_err(|e| format!("katalog {}: {e}", current.display()))?;
-                    File::open(current.parent().ok_or("brak rodzica")?)
+                        .map_err(|e| format!("directory {}: {e}", current.display()))?;
+                    File::open(current.parent().ok_or("no parent")?)
                         .and_then(|f| f.sync_all())
                         .map_err(|e| e.to_string())?;
                 }
@@ -3620,7 +3624,7 @@ pub(crate) mod execution {
                     && current == path
                     && (metadata.uid() != uid || metadata.mode() & 0o777 != 0o700))
             {
-                return Err(format!("niebezpieczny katalog {}", current.display()));
+                return Err(format!("unsafe directory {}", current.display()));
             }
         }
         Ok(())
@@ -3641,7 +3645,7 @@ pub(crate) mod execution {
             || metadata.nlink() != 1
             || metadata.mode() & 0o777 != 0o600
         {
-            return Err("obcy plik blokady Elastic".into());
+            return Err("foreign Elastic lock file".into());
         }
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(format!("{ELASTIC_BUSY} {}", std::io::Error::last_os_error()));
@@ -3683,7 +3687,7 @@ pub(crate) mod execution {
                 .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
             if bytes.len() as u64 > JOURNAL_LIMIT {
-                return Err("journal zbyt duży".into());
+                return Err("journal too large".into());
             }
             let journal = decode_journal(&bytes)?;
             journal.spec.validate().map_err(|e| e.to_string())?;
@@ -3694,7 +3698,7 @@ pub(crate) mod execution {
                         || journal.formatted[..i].contains(role)
                 })
             {
-                return Err("niespójny journal Elastic".into());
+                return Err("inconsistent Elastic journal".into());
             }
             validate_operation_record(&journal)?;
             Ok(journal)
@@ -3719,7 +3723,7 @@ pub(crate) mod execution {
                 let id = path
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .ok_or("nazwa journala")?
+                    .ok_or("journal name")?
                     .to_string();
                 match self.load(&id) {
                     Ok(journal) => claims.arrays.push(Claim {
@@ -3747,17 +3751,17 @@ pub(crate) mod execution {
                 .read_to_end(&mut bytes)
                 .map_err(|e| e.to_string())?;
             if bytes.len() as u64 > JOURNAL_LIMIT {
-                return Err("journal zbyt duży".into());
+                return Err("journal too large".into());
             }
             let value: serde_json::Value =
                 serde_json::from_slice(&bytes).map_err(|e| format!("journal: {e}"))?;
             let spec: ElasticCreateSpec = serde_json::from_value(
-                value.get("spec").cloned().ok_or("journal bez specyfikacji")?,
+                value.get("spec").cloned().ok_or("journal without a specification")?,
             )
-            .map_err(|e| format!("specyfikacja: {e}"))?;
+            .map_err(|e| format!("specification: {e}"))?;
             spec.validate().map_err(|e| e.to_string())?;
             if spec.array_id != id {
-                return Err("specyfikacja innej macierzy".into());
+                return Err("specification of another array".into());
             }
             Ok(spec)
         }
@@ -3770,10 +3774,10 @@ pub(crate) mod execution {
             if target.try_exists().map_err(|e| e.to_string())? {
                 let old = self.load(&journal.spec.array_id)?;
                 if old.spec != journal.spec {
-                    return Err("zmiana trwałej specyfikacji Elastic".into());
+                    return Err("change of the durable Elastic specification".into());
                 }
                 if old.schema != journal.schema || old.private.is_some() != journal.private.is_some() {
-                    return Err("zmiana trwałej topologii Elastic".into());
+                    return Err("change of the durable Elastic topology".into());
                 }
                 if old
                     .private
@@ -3786,14 +3790,14 @@ pub(crate) mod execution {
                         .and_then(|private| private.service.as_ref())
                         .is_none()
                 {
-                    return Err("usunięcie stanu service Elastic".into());
+                    return Err("removal of the Elastic service state".into());
                 }
                 transfer_transition(&old, journal)?;
             }
             let bytes = serde_json::to_vec(journal).map_err(|e| e.to_string())?;
             // Never persist a state `load` would refuse to read back.
             if bytes.len() as u64 > JOURNAL_LIMIT {
-                return Err("journal przekroczyłby limit odczytu".into());
+                return Err("the journal would exceed its read limit".into());
             }
             atomic_write(&target, &bytes, self.uid)
         }
@@ -3851,7 +3855,7 @@ pub(crate) mod execution {
             // write validates its target: a foreign file, a symlink or a mode
             // we did not write is not a journal and is never deleted.
             private_file(&target, self.uid)?;
-            std::fs::remove_file(&target).map_err(|e| format!("usunięcie dziennika: {e}"))?;
+            std::fs::remove_file(&target).map_err(|e| format!("journal removal: {e}"))?;
             self.remove_walk_registration(array_id);
             File::open(&self.path)
                 .and_then(|f| f.sync_all())
@@ -3910,7 +3914,7 @@ pub(crate) mod execution {
             validate_operation_record(&journal)?;
             let bytes = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
             if bytes.len() as u64 > JOURNAL_LIMIT {
-                return Err("journal przekroczyłby limit odczytu".into());
+                return Err("the journal would exceed its read limit".into());
             }
             atomic_write(
                 &self.path.join(format!("{}.json", journal.spec.array_id)),
@@ -3957,7 +3961,7 @@ pub(crate) mod execution {
             }
             // A disk already present in ANY role is refused by `validate`
             // below as a repeated identity; this says so in the caller's terms
-            // first, because "powtórzona tożsamość nośnika" reads as a
+            // first, because "repeated Elastic disk identity" reads as a
             // corrupted journal rather than as "that disk is already yours".
             if journal
                 .spec
@@ -3967,7 +3971,7 @@ pub(crate) mod execution {
                 .chain(&journal.spec.parity)
                 .any(|member| member.disk_id == disk.disk_id)
             {
-                return Err("dysk jest już członkiem tej macierzy".into());
+                return Err("the disk is already a member of this array".into());
             }
             journal.spec.data.push(disk.clone());
             // THE SAME WRITE records the add as the array's cause (H9). A
@@ -3978,14 +3982,14 @@ pub(crate) mod execution {
             enter_attention(
                 &mut journal,
                 ElasticAttention::AddDisk { disk_id: disk.disk_id.clone(), joined: false },
-                "dodawanie dysku danych w toku",
+                "a data disk addition is in progress",
             );
             journal.spec.validate().map_err(|e| e.to_string())?;
             validate_topology(&journal)?;
             validate_operation_record(&journal)?;
             let bytes = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
             if bytes.len() as u64 > JOURNAL_LIMIT {
-                return Err("journal przekroczyłby limit odczytu".into());
+                return Err("the journal would exceed its read limit".into());
             }
             atomic_write(
                 &self.path.join(format!("{}.json", journal.spec.array_id)),
@@ -4011,16 +4015,16 @@ pub(crate) mod execution {
                 || !matches!(&journal.attention, Some(ElasticAttention::AddDisk { disk_id, .. }) if *disk_id == disk.disk_id)
                 || slot < 2
             {
-                return Err("wycofać można tylko niedokończone dodanie tego dysku".into());
+                return Err("only the unfinished addition of this disk can be undone".into());
             }
             if journal
                 .pending
                 .as_ref()
                 .is_some_and(|pending| !add_owned_pending(pending, slot))
             {
-                return Err("wycofanie dodawania wymaga braku obcej intencji".into());
+                return Err("undoing an addition needs no other intent".into());
             }
-            let role = ElasticRole::Data(u16::try_from(slot).map_err(|_| "numer slotu")?);
+            let role = ElasticRole::Data(u16::try_from(slot).map_err(|_| "slot number")?);
             journal.spec.data.pop();
             journal.formatted.retain(|formatted| *formatted != role);
             journal.pending = None;
@@ -4032,7 +4036,7 @@ pub(crate) mod execution {
                 enter_attention(
                     &mut journal,
                     ElasticAttention::Other,
-                    "dodawanie dysku wycofane; macierz czeka na przywrócenie",
+                    "disk addition undone; the array waits for a Restore",
                 );
             }
             journal.spec.validate().map_err(|e| e.to_string())?;
@@ -4040,7 +4044,7 @@ pub(crate) mod execution {
             validate_operation_record(&journal)?;
             let bytes = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
             if bytes.len() as u64 > JOURNAL_LIMIT {
-                return Err("journal przekroczyłby limit odczytu".into());
+                return Err("the journal would exceed its read limit".into());
             }
             atomic_write(
                 &self.path.join(format!("{}.json", journal.spec.array_id)),
@@ -4074,8 +4078,8 @@ pub(crate) mod execution {
             disk: &ElasticDiskSpec,
         ) -> Result<Journal, String> {
             let mut journal = self.load(array_id)?;
-            let role = ElasticRole::Data(u16::try_from(slot + 1).map_err(|_| "numer slotu")?);
-            let old = journal.spec.data.get(slot).ok_or("macierz nie ma tego slotu danych")?.clone();
+            let role = ElasticRole::Data(u16::try_from(slot + 1).map_err(|_| "slot number")?);
+            let old = journal.spec.data.get(slot).ok_or("the array has no such data slot")?.clone();
             if &old == disk {
                 // A repeat: the swap is already durable. The mkfs is gated by
                 // `formatted`, so the caller goes on from wherever it stopped.
@@ -4092,9 +4096,9 @@ pub(crate) mod execution {
                 .chain(&journal.spec.parity)
                 .any(|member| member.disk_id == disk.disk_id)
             {
-                return Err("dysk jest już członkiem tej macierzy".into());
+                return Err("the disk is already a member of this array".into());
             }
-            let slot_spec = journal.spec.data.get_mut(slot).ok_or("macierz nie ma tego slotu danych")?;
+            let slot_spec = journal.spec.data.get_mut(slot).ok_or("the array has no such data slot")?;
             slot_spec.disk_id = disk.disk_id.clone();
             slot_spec.wwn = disk.wwn.clone();
             slot_spec.serial = disk.serial.clone();
@@ -4106,7 +4110,7 @@ pub(crate) mod execution {
             validate_operation_record(&journal)?;
             let bytes = serde_json::to_vec(&journal).map_err(|e| e.to_string())?;
             if bytes.len() as u64 > JOURNAL_LIMIT {
-                return Err("journal przekroczyłby limit odczytu".into());
+                return Err("the journal would exceed its read limit".into());
             }
             atomic_write(
                 &self.path.join(format!("{}.json", journal.spec.array_id)),
@@ -4125,7 +4129,7 @@ pub(crate) mod execution {
             spec.validate().map_err(|e| e.to_string())?;
             let journals = self.claims()?.complete()?;
             if journals.iter().any(|j| j.spec.array_id == spec.array_id) {
-                return Err("macierz ma już journal; create nie jest ponawiane".into());
+                return Err("the array already has a journal; Create is not repeated".into());
             }
             claims_guard(&journals, spec)?;
             guard()?;
@@ -4187,13 +4191,13 @@ pub(crate) mod execution {
             || metadata.nlink() != 1
             || metadata.mode() & 0o777 != 0o600
         {
-            return Err(format!("pozostałość zapisu nie należy do wykonawcy: {}", path.display()));
+            return Err(format!("a write leftover does not belong to the executor: {}", path.display()));
         }
         std::fs::remove_file(path).map_err(|e| e.to_string())
     }
 
     fn atomic_write(target: &Path, bytes: &[u8], uid: u32) -> Result<(), String> {
-        let parent = target.parent().ok_or("brak katalogu zapisu")?;
+        let parent = target.parent().ok_or("no directory to write in")?;
         directory(parent, false, uid)?;
         match std::fs::symlink_metadata(target) {
             Ok(_) => {
@@ -4242,7 +4246,7 @@ pub(crate) mod execution {
             ElasticRole::Cache => spec.cache.as_ref(),
             ElasticRole::Parity(i) => spec.parity.get(usize::from(i).wrapping_sub(1)),
         }
-        .ok_or_else(|| "nieznana rola journala".into())
+        .ok_or_else(|| "unknown journal role".into())
     }
 
     fn boot_id() -> Result<String, String> {
@@ -4259,7 +4263,7 @@ pub(crate) mod execution {
             .map(Path::new)
             .find(|p| p.is_file())
             .map(Path::to_path_buf)
-            .ok_or_else(|| format!("brak narzędzia {}", candidates[0]))
+            .ok_or_else(|| format!("tool missing: {}", candidates[0]))
     }
 
     fn process_command(
@@ -4309,14 +4313,14 @@ pub(crate) mod execution {
                 let stdin = child.stdin.take();
                 scope.spawn(move || {
                     stdin
-                        .ok_or_else(|| "brak stdin dziecka".to_string())?
+                        .ok_or_else(|| "no child stdin".to_string())?
                         .write_all(payload)
                         .map_err(|e| format!("stdin: {e}"))
                 })
             });
             let output = child.wait_with_output().map_err(|e| e.to_string());
             if let Some(writer) = writer {
-                writer.join().map_err(|_| "błąd wątku stdin")??;
+                writer.join().map_err(|_| "stdin thread failed")??;
             }
             output
         })
@@ -4325,7 +4329,7 @@ pub(crate) mod execution {
     fn success(output: Output) -> Result<String, String> {
         if !output.status.success() {
             return Err(format!(
-                "narzędzie: {:?}: {}",
+                "tool {:?}: {}",
                 output.status.code(),
                 String::from_utf8_lossy(&output.stderr)
             ));
@@ -4369,32 +4373,32 @@ pub(crate) mod execution {
         let nodes = value
             .get("blockdevices")
             .and_then(|v| v.as_array())
-            .ok_or("brak inventory")?;
+            .ok_or("no inventory")?;
         let mut result = Vec::new();
         for node in nodes {
             if field(node, "type").as_deref() != Some("disk") {
                 continue;
             }
-            let path = field(node, "path").ok_or("brak device path")?;
+            let path = field(node, "path").ok_or("no device path")?;
             validate_branch_device(&path).map_err(|e| e.to_string())?;
             let kernel = Path::new(&path)
                 .file_name()
                 .and_then(|v| v.to_str())
-                .ok_or("brak nazwy urządzenia")?
+                .ok_or("no device name")?
                 .to_string();
             let bytes = node
                 .get("size")
                 .and_then(|v| v.as_u64())
-                .ok_or("brak wielkości urządzenia")?;
-            let major_minor = field(node, "maj:min").ok_or("brak maj:min")?;
+                .ok_or("no device size")?;
+            let major_minor = field(node, "maj:min").ok_or("no maj:min")?;
             let mounts = node
                 .get("mountpoints")
                 .and_then(|v| v.as_array())
-                .ok_or("brak listy mountpoints")?;
+                .ok_or("no mountpoints list")?;
             let ro = node
                 .get("ro")
                 .and_then(|v| v.as_bool())
-                .ok_or("brak flagi ro")?;
+                .ok_or("no ro flag")?;
             let occupied = ro
                 || mounts.iter().any(|v| !v.is_null())
                 || node
@@ -4436,14 +4440,22 @@ pub(crate) mod execution {
             })
             .collect();
         if matches.len() != 1 {
-            return Err("urządzenie nieobecne lub tożsamość niejednoznaczna".into());
+            return Err(crate::refusal::wire(
+                "elastic_disk_missing",
+                &[],
+                "a disk of the array is absent, or its identity matches more than one device",
+            ));
         }
         let d = matches[0];
         if d.bytes != bytes
             || wwn.is_some_and(|v| d.wwn.as_ref() != Some(v))
             || serial.is_some_and(|v| d.serial.as_ref() != Some(v))
         {
-            return Err("zmieniona tożsamość lub wielkość urządzenia".into());
+            return Err(crate::refusal::wire(
+                "elastic_disk_changed",
+                &[("disk", &d.kernel)],
+                "the device reports another identity or size than the journal records",
+            ));
         }
         Ok(d)
     }
@@ -4467,7 +4479,7 @@ pub(crate) mod execution {
             libc::minor(metadata.rdev() as libc::dev_t)
         );
         if !metadata.file_type().is_block_device() || actual != d.major_minor {
-            return Err("urządzenie zmieniło się podczas odczytu".into());
+            return Err("the device changed while it was read".into());
         }
         Ok(())
     }
@@ -4498,21 +4510,21 @@ pub(crate) mod execution {
             return Ok(BTreeMap::new());
         }
         if !output.stderr.is_empty() {
-            return Err("diagnostyka odczytu blkid".into());
+            return Err("blkid read diagnostics".into());
         }
         let text = success(output)?;
         let mut fields = BTreeMap::new();
         for line in text.lines() {
-            let (key, value) = line.split_once('=').ok_or("nieczytelny blkid")?;
+            let (key, value) = line.split_once('=').ok_or("unreadable blkid output")?;
             if key.is_empty()
                 || value.is_empty()
                 || fields.insert(key.into(), value.into()).is_some()
             {
-                return Err("niejednoznaczny blkid".into());
+                return Err("ambiguous blkid output".into());
             }
         }
         if fields.is_empty() {
-            return Err("pusty wynik udanego blkid".into());
+            return Err("empty output of a successful blkid".into());
         }
         Ok(fields)
     }
@@ -4524,19 +4536,19 @@ pub(crate) mod execution {
     /// blank".
     fn parse_wipefs_signatures(output: Output) -> Result<Vec<WipedSignature>, String> {
         if !output.stderr.is_empty() {
-            return Err("diagnostyka odczytu wipefs".into());
+            return Err("wipefs read diagnostics".into());
         }
         let value: serde_json::Value = serde_json::from_str(&success(output)?)
-            .map_err(|e| format!("nieczytelny wipefs: {e}"))?;
+            .map_err(|e| format!("unreadable wipefs output: {e}"))?;
         let rows = value
             .get("signatures")
             .and_then(|v| v.as_array())
-            .ok_or("wipefs bez listy sygnatur")?;
+            .ok_or("wipefs without a signature list")?;
         let mut out = Vec::new();
         for row in rows {
             let text = |key: &str| row.get(key).and_then(|v| v.as_str()).map(str::to_string);
             out.push(WipedSignature {
-                kind: text("type").ok_or("sygnatura wipefs bez typu")?,
+                kind: text("type").ok_or("wipefs signature without a type")?,
                 offset: text("offset").unwrap_or_default(),
                 label: text("label"),
                 uuid: text("uuid"),
@@ -4549,13 +4561,14 @@ pub(crate) mod execution {
         if parse_wipefs_signatures(output)?.is_empty() {
             Ok(())
         } else {
-            Err("wipefs nie potwierdził pustego nośnika".into())
+            Err("wipefs did not confirm a blank device".into())
         }
     }
 
     fn clean_device(device: &Device) -> Result<(), String> {
+        let busy = |why: &str| crate::refusal::wire("elastic_disk_busy", &[("disk", &device.kernel)], why);
         if device.occupied {
-            return Err("urządzenie ma partycje, mount lub jest tylko do odczytu".into());
+            return Err(busy("the device has partitions or a mount, or is read-only"));
         }
         if std::fs::read_dir(format!("/sys/class/block/{}/holders", device.kernel))
             .map_err(|e| e.to_string())?
@@ -4564,10 +4577,14 @@ pub(crate) mod execution {
             .map_err(|e| e.to_string())?
             .is_some()
         {
-            return Err("urządzenie ma aktywnych właścicieli".into());
+            return Err(busy("the device has active holders"));
         }
         if !probe_fs(device)?.is_empty() {
-            return Err("urządzenie zawiera podpis danych".into());
+            return Err(crate::refusal::wire(
+                "elastic_disk_has_signature",
+                &[("disk", &device.kernel)],
+                "the device carries a data signature",
+            ));
         }
         parse_blank_wipefs(run(
             &tool(&["/usr/sbin/wipefs", "/sbin/wipefs", "/usr/bin/wipefs"])?,
@@ -4577,7 +4594,7 @@ pub(crate) mod execution {
         )?)?;
         let swap = std::fs::read_to_string("/proc/swaps").map_err(|e| e.to_string())?;
         for line in swap.lines().skip(1) {
-            let source = line.split_whitespace().next().ok_or("nieczytelny swap")?;
+            let source = line.split_whitespace().next().ok_or("unreadable /proc/swaps")?;
             let metadata = std::fs::metadata(source).map_err(|e| e.to_string())?;
             if metadata.file_type().is_block_device()
                 && format!(
@@ -4586,7 +4603,7 @@ pub(crate) mod execution {
                     libc::minor(metadata.rdev() as libc::dev_t)
                 ) == device.major_minor
             {
-                return Err("urządzenie jest swapem".into());
+                return Err(busy("the device is in use as swap"));
             }
         }
         Ok(())
@@ -4612,11 +4629,11 @@ pub(crate) mod execution {
         let text = std::fs::read_to_string("/proc/self/mountinfo").map_err(|e| e.to_string())?;
         text.lines()
             .map(|line| {
-                let (left, right) = line.split_once(" - ").ok_or("nieczytelny mountinfo")?;
+                let (left, right) = line.split_once(" - ").ok_or("unreadable mountinfo")?;
                 let left: Vec<_> = left.split_whitespace().collect();
                 let right: Vec<_> = right.split_whitespace().collect();
                 if left.len() < 6 || right.len() < 3 {
-                    return Err("niepełny mountinfo".into());
+                    return Err("incomplete mountinfo".into());
                 }
                 let path = left[4]
                     .replace("\\040", " ")
@@ -4624,7 +4641,7 @@ pub(crate) mod execution {
                     .replace("\\012", "\n")
                     .replace("\\134", "\\");
                 Ok(MountRow {
-                    id: left[0].parse().map_err(|_| "nieprawidłowy mount id")?,
+                    id: left[0].parse().map_err(|_| "invalid mount id")?,
                     path,
                     major_minor: left[2].into(),
                     root: left[3]
@@ -4697,7 +4714,7 @@ pub(crate) mod execution {
                         .map_err(|e| e.to_string())?
                     || mounts.iter().any(|m| m.filesystem == "zfs")
                 {
-                    return Err("brak narzędzia i niepotwierdzony stan ZFS".into());
+                    return Err("no zfs tool and an unconfirmed ZFS state".into());
                 }
                 Ok(true)
             }
@@ -4706,7 +4723,11 @@ pub(crate) mod execution {
 
     fn vacant_namespace(spec: &ElasticCreateSpec, worker: Option<&Worker>) -> Result<(), String> {
         if !zfs_namespace_clear(&spec.name)? {
-            return Err("zajęta przestrzeń ZFS".into());
+            return Err(crate::refusal::wire(
+                "elastic_name_unavailable",
+                &[("array", &spec.name)],
+                "a ZFS pool or dataset already uses this name",
+            ));
         }
         for path in [
             union_path(&spec.name),
@@ -4717,7 +4738,13 @@ pub(crate) mod execution {
             match std::fs::symlink_metadata(&path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
                 Err(e) => return Err(e.to_string()),
-                Ok(_) => return Err("docelowa ścieżka już istnieje".into()),
+                Ok(_) => {
+                    return Err(crate::refusal::wire(
+                        "elastic_name_unavailable",
+                        &[("array", &spec.name)],
+                        format!("the path {path} already exists"),
+                    ))
+                }
             }
         }
         let mounts = mount_rows()?;
@@ -4728,7 +4755,11 @@ pub(crate) mod execution {
                     .iter()
                     .any(|p| overlaps(Path::new(p), Path::new(&m.path)))
         }) {
-            return Err("obcy mount zasłania przestrzeń macierzy".into());
+            return Err(crate::refusal::wire(
+                "elastic_name_unavailable",
+                &[("array", &spec.name)],
+                "a foreign mount covers the array's paths",
+            ));
         }
         Ok(())
     }
@@ -4783,7 +4814,11 @@ pub(crate) mod execution {
         if fields.get("UUID") != Some(&role_disk(spec, role)?.expected_uuid)
             || fields.get("TYPE").map(String::as_str) != Some(spec.filesystem.as_str())
         {
-            return Err("UUID lub typ FS niezgodny z journalem".into());
+            return Err(crate::refusal::wire(
+                "elastic_disk_foreign_filesystem",
+                &[("disk", &device.kernel)],
+                "the filesystem UUID or type does not match the journal",
+            ));
         }
         Ok(())
     }
@@ -4798,7 +4833,11 @@ pub(crate) mod execution {
         let found: Vec<_> = rows.iter().filter(|m| m.path == path).collect();
         if found.is_empty() {
             if rows.iter().any(|m| m.major_minor == device.major_minor) {
-                return Err("nośnik zamontowany poza oczekiwaną ścieżką".into());
+                return Err(crate::refusal::wire(
+                    "elastic_disk_mounted_elsewhere",
+                    &[("disk", &device.kernel)],
+                    format!("the device is mounted outside {path}"),
+                ));
             }
             return Ok(false);
         }
@@ -4806,7 +4845,7 @@ pub(crate) mod execution {
             || found[0].major_minor != device.major_minor
             || found[0].filesystem != spec.filesystem.as_str()
         {
-            return Err("obcy mount w ścieżce brancha".into());
+            return Err("a foreign mount on the branch path".into());
         }
         Ok(true)
     }
@@ -4821,7 +4860,7 @@ pub(crate) mod execution {
             return Ok(false);
         }
         if found.len() != 1 || found[0].filesystem != "fuse.mergerfs" {
-            return Err("obcy mount w ścieżce unii".into());
+            return Err("a foreign mount on the union path".into());
         }
         let values: BTreeMap<String, String> = [
             "branches",
@@ -4860,7 +4899,7 @@ pub(crate) mod execution {
         };
         if size < 0 {
             return Err(format!(
-                "odczyt branchy: {}",
+                "branch read: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -4921,7 +4960,7 @@ pub(crate) mod execution {
         } != 0
         {
             return Err(format!(
-                "dopisanie brancha do unii: {}",
+                "adding the branch to the union: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -4929,7 +4968,7 @@ pub(crate) mod execution {
         // write and did not grow would leave the new disk outside the array
         // while every later check said the add had succeeded.
         if !present(&read_union_branches(union)?) {
-            return Err("unia nie przyjęła nowego brancha".into());
+            return Err("the union did not take the new branch".into());
         }
         Ok(())
     }
@@ -4973,13 +5012,13 @@ pub(crate) mod execution {
             "M" => 1 << 20,
             "G" => 1 << 30,
             "T" => 1 << 40,
-            _ => return Err("nieobsługiwany runtime minfreespace".into()),
+            _ => return Err("unsupported runtime minfreespace".into()),
         };
         digits
             .parse::<u64>()
             .ok()
             .and_then(|n| n.checked_mul(multiplier))
-            .ok_or_else(|| "niepoprawny minfreespace".into())
+            .ok_or_else(|| "invalid minfreespace".into())
     }
 
     fn validate_union_options(
@@ -5003,7 +5042,7 @@ pub(crate) mod execution {
             ),
         ] {
             if values.get(key) != Some(&expected) {
-                return Err(format!("inna opcja unii: {key}"));
+                return Err(format!("another union option: {key}"));
             }
         }
         Ok(())
@@ -5028,7 +5067,7 @@ pub(crate) mod execution {
 
     fn observe(journal: &Journal, worker: Option<&Worker>) -> ElasticResult {
         let devices = if journal.private.is_some() && worker.is_none() {
-            Err("brak zweryfikowanej prywatnej przestrzeni montowań".into())
+            Err("no verified private mount namespace".into())
         } else {
             inventory()
         };
@@ -5327,11 +5366,11 @@ pub(crate) mod execution {
     }
 
     fn transfer_ref(journal: &Journal) -> Result<&TransferJournal, String> {
-        journal.transfer.as_ref().ok_or_else(|| "brak transferu".to_string())
+        journal.transfer.as_ref().ok_or_else(|| "no transfer".to_string())
     }
 
     fn transfer_mut(journal: &mut Journal) -> Result<&mut TransferJournal, String> {
-        journal.transfer.as_mut().ok_or_else(|| "brak transferu".to_string())
+        journal.transfer.as_mut().ok_or_else(|| "no transfer".to_string())
     }
 
     fn bounded_text(value: &str, limit: usize) -> String {
@@ -5475,7 +5514,7 @@ pub(crate) mod execution {
             return Ok(None);
         };
         if transfer.current.is_some() && transfer.current_failed.is_none() {
-            return Err("transfer ma plik w toku".into());
+            return Err("the transfer has a file in flight".into());
         }
         let stuck = stuck_entry(transfer);
         transfer.phase = ElasticMoverPhase::NeedsAttention;
@@ -5519,10 +5558,10 @@ pub(crate) mod execution {
             push_stuck_record(journal, record);
             if evicted.is_some() {
                 let total = journal.stuck_evicted;
-                let transfer = journal.transfer.as_mut().ok_or("brak transferu")?;
+                let transfer = journal.transfer.as_mut().ok_or("no transfer")?;
                 transfer.evicted = transfer.evicted.saturating_add(1);
                 let notice = format!(
-                    "lista pominiętych ścieżek pełna ({STUCK_PATH_LIMIT}): najstarsza ścieżka nie jest już pomijana (łącznie wypartych: {total})"
+                    "skip list full ({STUCK_PATH_LIMIT}): the oldest path is no longer skipped (evicted in all: {total})"
                 );
                 // Prefixed, never appended: the bound truncates at the tail, so
                 // an appended notice would be the first thing a long carried
@@ -5726,10 +5765,10 @@ pub(crate) mod execution {
     /// abandoned on the data branch.
     fn log_eviction(dropped: &StuckPath) {
         emit_notice(&format!(
-            "elastic mover: ścieżka wyparta z listy pominięć: sha256={} operacja={} kopia tymczasowa={}",
+            "elastic mover: path evicted from the skip list: sha256={} operation={} temporary copy={}",
             dropped.path_sha256,
             dropped.operation_id,
-            dropped.temporary.as_deref().unwrap_or("nieznana"),
+            dropped.temporary.as_deref().unwrap_or("unknown"),
         ));
     }
 
@@ -5840,31 +5879,31 @@ pub(crate) mod execution {
     fn transfer_transition(old: &Journal, new: &Journal) -> Result<(), String> {
         use ElasticMoverPhase as Phase;
         let refuse = |why: &str| -> Result<(), String> {
-            Err(format!("sprzeczne przejście transferu: {why}"))
+            Err(format!("contradictory transfer transition: {why}"))
         };
         match (&old.transfer, &new.transfer) {
             (None, None) => {}
-            (Some(_), None) => return refuse("usunięcie transferu"),
+            (Some(_), None) => return refuse("transfer removal"),
             (Some(previous), Some(next)) if previous.operation_id == next.operation_id => {
                 if previous.resume_operation_id != next.resume_operation_id
                     || previous.started_at != next.started_at
                     || previous.rules != next.rules
                     || previous.coupled_sync != next.coupled_sync
                 {
-                    return refuse("zmiana stałych operacji");
+                    return refuse("change of the operation constants");
                 }
                 if previous.finished_at.is_some() && previous != next {
-                    return refuse("zmiana zakończonego transferu");
+                    return refuse("change of a finished transfer");
                 }
                 if previous.target.is_some() && previous.target != next.target {
-                    return refuse("zmiana brancha docelowego");
+                    return refuse("change of the target branch");
                 }
                 if next.sequence < previous.sequence
                     || next.moved_files < previous.moved_files
                     || next.moved_bytes < previous.moved_bytes
                     || next.sync_attempt < previous.sync_attempt
                 {
-                    return refuse("cofnięty licznik");
+                    return refuse("counter went back");
                 }
                 let phase_allowed = previous.phase == next.phase
                     || matches!(
@@ -5875,7 +5914,7 @@ pub(crate) mod execution {
                             | (Phase::NeedsAttention, Phase::Moving)
                     );
                 if !phase_allowed {
-                    return refuse("niedozwolona zmiana fazy");
+                    return refuse("forbidden phase change");
                 }
                 match (&previous.current, &next.current) {
                     (None, None) => {}
@@ -5883,7 +5922,7 @@ pub(crate) mod execution {
                         if file.phase != TransferFilePhase::CopyIntent
                             || previous.sequence.checked_add(1) != Some(next.sequence)
                         {
-                            return refuse("plik w toku bez zapowiedzi");
+                            return refuse("in-flight file without an announcement");
                         }
                     }
                     (Some(before), Some(after)) => {
@@ -5909,7 +5948,7 @@ pub(crate) mod execution {
                                 && file_phase_rank(before.phase) <= file_phase_rank(TransferFilePhase::Done)
                                 && file_phase_rank(after.phase) > file_phase_rank(TransferFilePhase::Done))
                         {
-                            return refuse("cofnięty lub podmieniony plik w toku");
+                            return refuse("in-flight file went back or was replaced");
                         }
                     }
                     (Some(before), None) => {
@@ -5918,14 +5957,14 @@ pub(crate) mod execution {
                         let withdrawn = before.phase == TransferFilePhase::Restored
                             && next.moved_files == previous.moved_files;
                         if !completed && !withdrawn {
-                            return refuse("plik w toku zniknął bez potwierdzenia");
+                            return refuse("in-flight file vanished without a confirmation");
                         }
                     }
                 }
             }
             (previous, Some(next)) => {
                 if previous.as_ref().is_some_and(|previous| previous.finished_at.is_none()) {
-                    return refuse("zastąpienie niedokończonego transferu");
+                    return refuse("replacement of an unfinished transfer");
                 }
                 if next.phase != Phase::Announced
                     || next.finished_at.is_some()
@@ -5939,7 +5978,7 @@ pub(crate) mod execution {
                     || next.coupled_sync_result.is_some()
                     || next.sync_attempt != 0
                 {
-                    return refuse("nowy transfer zaczyna się od zapowiedzi");
+                    return refuse("a new transfer starts with an announcement");
                 }
             }
         }
@@ -5956,11 +5995,11 @@ pub(crate) mod execution {
             && new.stuck_paths.len() == STUCK_PATH_LIMIT
             && new.stuck_paths[..STUCK_PATH_LIMIT - 1] == old.stuck_paths[1..];
         if paths_changed && !paths_appended && !paths_evicted {
-            return refuse("zmiana listy pominiętych ścieżek");
+            return refuse("change of the skip list");
         }
         // Both counters move with the eviction, and only with it.
         if new.stuck_evicted != old.stuck_evicted.saturating_add(u64::from(paths_evicted)) {
-            return refuse("licznik wypartych ścieżek nie zgadza się z wyparciem");
+            return refuse("the evicted-path counter does not match the eviction");
         }
         let run_evicted = |journal: &Journal| journal.transfer.as_ref().map_or(0, |transfer| transfer.evicted);
         let same_operation = match (&old.transfer, &new.transfer) {
@@ -5970,7 +6009,7 @@ pub(crate) mod execution {
         if same_operation
             && run_evicted(new) != run_evicted(old).saturating_add(u64::from(paths_evicted))
         {
-            return refuse("licznik wyparć przebiegu nie zgadza się z wyparciem");
+            return refuse("the run's eviction counter does not match the eviction");
         }
         // The ring grows only with an eviction, and only by the identity that
         // actually left the skip set.
@@ -5985,7 +6024,7 @@ pub(crate) mod execution {
             }
         };
         if !ring_ok || (paths_evicted && new.evicted_paths.last() != old.stuck_paths.first()) {
-            return refuse("pierścień wypartych ścieżek nie zgadza się z wyparciem");
+            return refuse("the ring of evicted paths does not match the eviction");
         }
         let kept = old.stuck.len().min(STUCK_LIMIT.saturating_sub(1));
         let appended = new.stuck.len() == old.stuck.len() + 1 && new.stuck.starts_with(&old.stuck);
@@ -5993,7 +6032,7 @@ pub(crate) mod execution {
             && new.stuck.len() == STUCK_LIMIT
             && new.stuck[..kept] == old.stuck[old.stuck.len() - kept..];
         if new.stuck != old.stuck && !appended && !rolled {
-            return refuse("zmiana historii utkniętych rekordów");
+            return refuse("change of the stuck record history");
         }
         if let Some(added) = new.stuck.last().filter(|_| new.stuck != old.stuck) {
             let closes = matches!(
@@ -6006,7 +6045,7 @@ pub(crate) mod execution {
                         && added.operation_id == before.operation_id
             );
             if !closes {
-                return refuse("utknięty rekord poza zamknięciem jego operacji");
+                return refuse("stuck record outside the close of its operation");
             }
         }
         // The same holds for a skipped path: it appears — and evicts — only in
@@ -6022,11 +6061,11 @@ pub(crate) mod execution {
                         && added.operation_id == before.operation_id
             );
             if !closes {
-                return refuse("utknięty rekord poza zamknięciem jego operacji");
+                return refuse("stuck record outside the close of its operation");
             }
         }
         match (old.stale_parity_bytes, new.stale_parity_bytes) {
-            (Some(before), Some(after)) if after < before => refuse("zmniejszona nieaktualna parity"),
+            (Some(before), Some(after)) if after < before => refuse("stale parity figure went down"),
             // Only the write that records a successful Sync may clear the marker.
             (Some(_), None)
                 if new.last_run == old.last_run
@@ -6037,7 +6076,7 @@ pub(crate) mod execution {
                             && run.finished_at == new.sync_completed_at
                     }) =>
             {
-                refuse("parity uznana za aktualną bez udanego Sync")
+                refuse("parity marked current without a successful Sync")
             }
             _ => Ok(()),
         }
@@ -6074,12 +6113,12 @@ pub(crate) mod execution {
         let disk = transfer
             .target
             .as_deref()
-            .ok_or("transfer w toku bez utrwalonego brancha docelowego")?;
+            .ok_or("in-flight transfer without a durable target branch")?;
         data
             .iter()
             .find(|target| target.disk == disk)
             .map(|target| target.path.clone())
-            .ok_or_else(|| "utrwalony branch docelowy nie należy do macierzy".into())
+            .ok_or_else(|| "the durable target branch does not belong to the array".into())
     }
 
     fn now_ns() -> Result<i128, String> {
@@ -6094,7 +6133,7 @@ pub(crate) mod execution {
     fn mark_attention(root: &Root, array_id: &str, operation_id: &str, error: String) -> String {
         let mut stored = match root.load(array_id) {
             Ok(stored) => stored,
-            Err(load) => return format!("{error}; odczyt stanu: {load}"),
+            Err(load) => return format!("{error}; state read: {load}"),
         };
         let Some(transfer) = stored.transfer.as_mut().filter(|transfer| {
             transfer.operation_id == operation_id && transfer.finished_at.is_none()
@@ -6117,7 +6156,7 @@ pub(crate) mod execution {
                 }
                 match root.save(&stored) {
                     Ok(()) => format!("{error}; {save}"),
-                    Err(second) => format!("{error}; zapis stanu: {second}"),
+                    Err(second) => format!("{error}; state write: {second}"),
                 }
             }
         }
@@ -6143,6 +6182,11 @@ pub(crate) mod execution {
                     .is_some_and(|service| service.mode == ElasticServiceMode::Hold || service.pending)
         });
         if ready { ElasticStage::Ready } else { ElasticStage::NeedsAttention }
+    }
+
+    /// The detail of a Sync a gone process left Running, closed by `by`.
+    fn interrupted_sync_note(by: &str) -> String {
+        crate::refusal::wire("elastic_sync_interrupted", &[], format!("the Sync was interrupted and closed by {by}"))
     }
 
     /// Closes this operation's Sync that a gone process left Running: the
@@ -6181,12 +6225,12 @@ pub(crate) mod execution {
     fn close_attempt(root: &Root, array_id: &str, operation_id: &str, error: String) -> String {
         let mut stored = match root.load(array_id) {
             Ok(stored) => stored,
-            Err(load) => return format!("{error}; odczyt stanu: {load}"),
+            Err(load) => return format!("{error}; state read: {load}"),
         };
         match close_interrupted_sync(&mut stored, operation_id, &error) {
             Ok(true) => match root.save(&stored) {
                 Ok(()) => error,
-                Err(save) => format!("{error}; zapis stanu: {save}"),
+                Err(save) => format!("{error}; state write: {save}"),
             },
             Ok(false) => error,
             Err(close) => format!("{error}; {close}"),
@@ -6249,29 +6293,29 @@ pub(crate) mod execution {
         let (cleanup, unnamed) = match crate::elastic_transfer::remove_orphan_temporary(destination_root, file) {
             Ok(crate::elastic_transfer::OrphanCleanup::Removed { fsync }) => {
                 let mut said = format!(
-                    "usunięto porzuconą kopię tymczasową: {} operacja={}",
-                    file.temporary.as_deref().unwrap_or("nieznana"),
+                    "removed an abandoned temporary copy: {} operation={}",
+                    file.temporary.as_deref().unwrap_or("unknown"),
                     journal.transfer.as_ref().map_or("", |t| t.operation_id.as_str()),
                 );
                 // The file IS gone; only the durability of the directory entry
                 // is in doubt. Said as an extra clause, never as a retraction.
                 if let Some(error) = fsync {
-                    said.push_str(&format!("; wpis katalogu niepotwierdzony: {error}"));
+                    said.push_str(&format!("; directory entry unconfirmed: {error}"));
                 }
                 emit_notice(&format!("elastic mover: {said}"));
                 (Some(said), true)
             }
             Ok(crate::elastic_transfer::OrphanCleanup::Absent) => (None, false),
             Err(failure) => {
-                let said = format!("porzucona kopia tymczasowa nie została usunięta: {failure}");
+                let said = format!("an abandoned temporary copy was not removed: {failure}");
                 emit_notice(&format!("elastic mover: {said}"));
                 (Some(said), false)
             }
         };
         let reason = bounded_text(
             &match &cleanup {
-                Some(said) => format!("rekord nierozwiązany: {error}; {said}"),
-                None => format!("rekord nierozwiązany: {error}"),
+                Some(said) => format!("unresolved record: {error}; {said}"),
+                None => format!("unresolved record: {error}"),
             },
             TRANSFER_DETAIL_LIMIT,
         );
@@ -6293,7 +6337,7 @@ pub(crate) mod execution {
         }
         match root.save(journal) {
             Ok(()) => reason,
-            Err(save) => format!("{reason}; zapis stanu: {save}"),
+            Err(save) => format!("{reason}; state write: {save}"),
         }
     }
 
@@ -6302,14 +6346,14 @@ pub(crate) mod execution {
     /// next run would retry a record that cannot be written. The last durable
     /// state gets a SHORT, FIXED failure text instead, never the error itself
     /// (which may be what overflowed), and the next run can close it.
-    const SHORT_STUCK_REASON: &str = "rekord nierozwiązany: zapis dziennika odrzucony";
-    const SHORT_ATTENTION: &str = "operacja przerwana; szczegóły nie zmieściły się w dzienniku";
+    const SHORT_STUCK_REASON: &str = "unresolved record: the journal write was refused";
+    const SHORT_ATTENTION: &str = "operation stopped; its details did not fit in the journal";
 
     fn stick_short_record(root: &Root, journal: &mut Journal, error: String) -> String {
         let array_id = journal.spec.array_id.clone();
         let mut stored = match root.load(&array_id) {
             Ok(stored) => stored,
-            Err(load) => return format!("{error}; odczyt stanu: {load}"),
+            Err(load) => return format!("{error}; state read: {load}"),
         };
         let parity = !stored.spec.parity.is_empty();
         let Some(transfer) = stored.transfer.as_mut().filter(|transfer| {
@@ -6331,7 +6375,7 @@ pub(crate) mod execution {
                 *journal = stored;
                 format!("{error}; {SHORT_STUCK_REASON}")
             }
-            Err(save) => format!("{error}; zapis stanu: {save}"),
+            Err(save) => format!("{error}; state write: {save}"),
         }
     }
 
@@ -6394,7 +6438,7 @@ pub(crate) mod execution {
                         target,
                         array_lock,
                         &file,
-                        format!("{error}; wycofanie nieudane: {rollback}"),
+                        format!("{error}; withdrawal failed: {rollback}"),
                     )),
                 }
             }
@@ -6415,14 +6459,14 @@ pub(crate) mod execution {
         let (outcome, notices) = match end {
             TransferEnd::Moved { unreadable, mut notices } if file.phase == TransferFilePhase::Done => {
                 if let Some(error) = unreadable {
-                    notices.insert(0, format!("źródło usunięte po tożsamości po błędzie odczytu: {error}"));
+                    notices.insert(0, format!("source removed by identity after a read error: {error}"));
                 }
                 let size = file.source_identity.size;
                 let transfer = transfer_mut(journal)?;
                 transfer.moved_files = transfer
                     .moved_files
                     .checked_add(1)
-                    .ok_or("przepełnienie licznika plików")?;
+                    .ok_or("file counter overflow")?;
                 transfer.moved_bytes = transfer.moved_bytes.saturating_add(size);
                 // Parity no longer describes a data branch that just gained a file.
                 if !journal.spec.parity.is_empty() {
@@ -6438,7 +6482,7 @@ pub(crate) mod execution {
                 },
                 notices,
             ),
-            _ => return Err("transfer pliku bez potwierdzenia".into()),
+            _ => return Err("file transfer without a confirmation".into()),
         };
         let transfer = transfer_mut(journal)?;
         transfer.current = None;
@@ -6468,7 +6512,7 @@ pub(crate) mod execution {
                 ScanEntry::Refused { path, reason } => refused.push((path, reason)),
                 ScanEntry::File(file) if quarantined(&file.path) => refused.push((
                     file.path,
-                    "odsunięty oryginał nierozwiązanego przeniesienia; zostaje dla administratora".into(),
+                    "set-aside original of an unresolved move; left for the administrator".into(),
                 )),
                 ScanEntry::File(file)
                     if rules
@@ -6548,7 +6592,7 @@ pub(crate) mod execution {
         for other in env.data.iter().filter(|other| other.disk != target.disk) {
             match crate::elastic_transfer::entry_exists(&other.path, path) {
                 Ok(false) => {}
-                Ok(true) => return Some(format!("ścieżka istnieje już na branchu {}", other.disk)),
+                Ok(true) => return Some(format!("the path already exists on branch {}", other.disk)),
                 Err(error) => return Some(format!("branch {}: {error}", other.disk)),
             }
         }
@@ -6601,7 +6645,7 @@ pub(crate) mod execution {
                         .data
                         .iter()
                         .find(|target| target.disk == disk)
-                        .ok_or("utrwalony branch docelowy nie należy do macierzy")?;
+                        .ok_or("the durable target branch does not belong to the array")?;
                     (target, (env.space)(&target.path)?.1)
                 }
                 None => {
@@ -6616,7 +6660,7 @@ pub(crate) mod execution {
                             chosen = Some((target, free));
                         }
                     }
-                    chosen.ok_or("macierz bez brancha data")?
+                    chosen.ok_or("array without a data branch")?
                 }
             })
         };
@@ -6638,7 +6682,7 @@ pub(crate) mod execution {
             .as_ref()
             .and_then(|private| private.anchor.as_ref())
             .map(|anchor| anchor.pid)
-            .ok_or("skip_open_files wymaga kotwicy prywatnego mergerfs")?;
+            .ok_or("skip_open_files needs the anchor of the private mergerfs")?;
         open_files(daemon)
     }
 
@@ -6676,7 +6720,7 @@ pub(crate) mod execution {
                     transfer_mut(journal)?,
                     &file.path,
                     ElasticMoverIssueKind::Refused,
-                    &format!("rekord utknął w operacji {operation}; mover go nie rusza"),
+                    &format!("the record is stuck in operation {operation}; the mover leaves it alone"),
                     0,
                 );
                 continue;
@@ -6686,7 +6730,7 @@ pub(crate) mod execution {
                     transfer_mut(journal)?,
                     &file.path,
                     ElasticMoverIssueKind::Skipped,
-                    "plik otwarty przez inny proces",
+                    "file open in another process",
                     file.size,
                 );
                 continue;
@@ -6701,7 +6745,7 @@ pub(crate) mod execution {
                     transfer_mut(journal)?,
                     &file.path,
                     ElasticMoverIssueKind::Skipped,
-                    "brak miejsca na branchu docelowym ponad minfreespace",
+                    "no space on the target branch above minfreespace",
                     file.size,
                 );
                 continue;
@@ -6714,7 +6758,7 @@ pub(crate) mod execution {
                     transfer_mut(journal)?,
                     &file.path,
                     ElasticMoverIssueKind::Refused,
-                    "licznik operacji przekroczył długość nazwy tymczasowej",
+                    "the operation counter exceeds the temporary name length",
                     0,
                 );
                 continue;
@@ -6729,12 +6773,12 @@ pub(crate) mod execution {
             )
             .and_then(|record| {
                 if crate::elastic_transfer::worst_case_record_size(&record)? > TRANSFER_RECORD_LIMIT {
-                    return Err("rekord pliku przekroczyłby limit dziennika".into());
+                    return Err("the file record would exceed the journal limit".into());
                 }
                 // Everything this operation could still write for the file,
                 // including the entry its closing write appends, must fit.
                 if worst_case_journal_size(journal, &record)? > JOURNAL_LIMIT as usize {
-                    return Err("dziennik z tym plikiem przekroczyłby limit odczytu".into());
+                    return Err("the journal with this file would exceed its read limit".into());
                 }
                 Ok(record)
             });
@@ -6750,7 +6794,7 @@ pub(crate) mod execution {
             transfer.sequence = transfer
                 .sequence
                 .checked_add(1)
-                .ok_or("przepełnienie licznika transferu")?;
+                .ok_or("transfer counter overflow")?;
             // The target becomes the operation's target with its first file.
             transfer.target.get_or_insert_with(|| target.disk.clone());
             transfer.current = Some(record.clone());
@@ -6771,7 +6815,7 @@ pub(crate) mod execution {
                 transfer,
                 path,
                 ElasticMoverIssueKind::Refused,
-                &format!("wycofano kopię: {reason}"),
+                &format!("copy withdrawn: {reason}"),
                 0,
             ),
             FileOutcome::Skipped(reason) => note_issue(transfer, path, ElasticMoverIssueKind::Skipped, &reason, size),
@@ -6818,7 +6862,7 @@ pub(crate) mod execution {
                     transfer_mut(journal)?,
                     ".",
                     ElasticMoverIssueKind::Refused,
-                    &format!("przegląd cache przerwany: {error}"),
+                    &format!("cache walk stopped: {error}"),
                     0,
                 );
                 Some(error)
@@ -6831,13 +6875,13 @@ pub(crate) mod execution {
             root.save(journal)?;
             let synced = run_owed_sync(root, journal, request, host).and_then(|()| {
                 if transfer_sync_owed(journal, transfer_ref(journal)?) {
-                    return Err("sprzężony Sync nie potwierdził parity".to_string());
+                    return Err("the coupled Sync did not confirm parity".to_string());
                 }
                 Ok(())
             });
             if let Err(error) = synced {
                 return Err(match walk_error {
-                    Some(walk) => format!("{walk}; {error}"),
+                    Some(walk) => crate::refusal::reword(&error, |error| format!("{walk}; {error}")),
                     None => error,
                 });
             }
@@ -6852,14 +6896,19 @@ pub(crate) mod execution {
             .coupled_sync_result
             .as_ref()
             .filter(|run| run.outcome == ElasticSnapraidOutcome::Partial)
-            .map(|_| PARTIAL_SYNC_NOTE.to_string());
+            .map(|_| partial_sync_note());
         journal.detail = None;
         root.save(journal)
     }
 
     /// What a run whose coupled Sync met files changing under it says.
-    const PARTIAL_SYNC_NOTE: &str =
-        "pliki zmieniały się podczas Sync; parity obejmie je następny Sync";
+    fn partial_sync_note() -> String {
+        crate::refusal::wire(
+            "elastic_sync_files_changed",
+            &[],
+            "files changed during the Sync; the next Sync covers them in parity",
+        )
+    }
 
     /// Whether the journal holds a file record a run left in flight that no
     /// attempt has given up on: a record that must be finished or reversed
@@ -6879,7 +6928,7 @@ pub(crate) mod execution {
     /// would later reverse.
     fn serving_guard(journal: &Journal) -> Result<(), String> {
         if unsettled_record(journal) {
-            return Err("przenoszenie pliku przerwane i nierozstrzygnięte; unia nie zostanie udostępniona".into());
+            return Err("a file move stopped unresolved; the union will not be published".into());
         }
         Ok(())
     }
@@ -6901,19 +6950,19 @@ pub(crate) mod execution {
             return Ok(());
         }
         let transfer = transfer_ref(journal)?;
-        let file = transfer.current.clone().ok_or("brak rekordu w toku")?;
+        let file = transfer.current.clone().ok_or("no in-flight record")?;
         let target = persisted_target(data, transfer)?;
         let (path, size) = (file.source.clone(), file.source_identity.size);
         match finish_file(root, journal, cache, &target, array_lock, file, host) {
             Ok(outcome) => note_outcome(journal, &path, size, outcome),
             Err(_) if !unsettled_record(journal) => Ok(()),
-            Err(error) => Err(format!("rozstrzygnięcie przerwanego przenoszenia: {error}")),
+            Err(error) => Err(crate::refusal::reword(&error, |error| format!("settling a stopped move: {error}"))),
         }
     }
 
     /// The branch roots a record's files live under, as the mover sees them.
     fn record_branches(spec: &ElasticSpec, journal: &Journal) -> Result<(PathBuf, Vec<MoverTarget>), String> {
-        let cache = spec.cache.first().ok_or("macierz nie ma cache")?;
+        let cache = spec.cache.first().ok_or("the array has no cache")?;
         Ok((
             PathBuf::from(cache_branch_path(&spec.name, &cache.disk)),
             spec.data
@@ -6944,7 +6993,7 @@ pub(crate) mod execution {
         // Its Sync cannot still run: SnapRAID would hold the array lock this
         // run holds. It closes as an interrupted attempt with parity stale.
         let mut interrupted = journal.clone();
-        if close_interrupted_sync(&mut interrupted, &previous.operation_id, "Sync przerwany; zamknięty przez następne przenoszenie")? {
+        if close_interrupted_sync(&mut interrupted, &previous.operation_id, &interrupted_sync_note("the next mover run"))? {
             root.save(&interrupted)?;
             *journal = interrupted;
         }
@@ -6985,10 +7034,10 @@ pub(crate) mod execution {
             || request.resume_operation_id == journal.spec.operation_id
             || request.operation_id == request.resume_operation_id
         {
-            return Err("nieprawidłowy UUID movera".into());
+            return Err("invalid mover UUID".into());
         }
         if journal.spec.cache.is_none() {
-            return Err("macierz nie ma cache".into());
+            return Err("the array has no cache".into());
         }
         // I3 ON THE HELPER'S SIDE. A new mover run ends in a Sync nobody
         // acknowledged, so it does not start over a recorded Scrub or Fix
@@ -7000,15 +7049,17 @@ pub(crate) mod execution {
         if !journal.transfer.as_ref().is_some_and(|transfer| transfer.operation_id == request.operation_id) {
             match &journal.attention {
                 Some(ElasticAttention::ParityRun { kind, .. }) if *kind != ElasticSnapraidKind::Sync => {
-                    return Err(format!(
-                        "{}: mover kończy się Sync, a macierz ma nierozwiązany błąd scrub lub naprawy",
-                        ElasticRefusal::FaultUnacknowledged.as_str()
+                    return Err(crate::refusal::wire(
+                        "elastic_attention_parity_fault",
+                        &[("array", &journal.spec.name)],
+                        "the mover ends in a Sync, and the array has an unresolved scrub or repair fault",
                     ));
                 }
                 Some(ElasticAttention::AddDisk { .. }) => {
-                    return Err(format!(
-                        "{}: mover czeka na dokończenie albo wycofanie dodawania dysku",
-                        ElasticRefusal::AttentionAddDisk.as_str()
+                    return Err(crate::refusal::wire(
+                        "elastic_attention_add_disk",
+                        &[("array", &journal.spec.name)],
+                        "the mover waits until the disk addition is finished or undone",
                     ));
                 }
                 _ => (),
@@ -7024,10 +7075,14 @@ pub(crate) mod execution {
         if journal.transfer.as_ref().is_some_and(|transfer| {
             (transfer.operation_id == request.operation_id) != restarting
         }) {
-            return Err("operacja movera nie zgadza się z zapowiedzianym Resume".into());
+            return Err("the mover operation does not match its announced Resume".into());
         }
         if journal.boot_id != env.boot_id {
-            return Err("po zmianie boot macierz wymaga Restore przed przenoszeniem".into());
+            return Err(crate::refusal::wire(
+                "elastic_restore_after_boot",
+                &[("array", &journal.spec.name)],
+                "the node restarted since the array was mounted; a Restore comes before the mover",
+            ));
         }
         // The only intent a run may find is a Sync of the mover operation it
         // continues: its own on a restart, the unfinished one it closes first
@@ -7041,7 +7096,7 @@ pub(crate) mod execution {
                 kind: ElasticSnapraidKind::Sync,
             });
         if journal.pending.as_ref().is_some_and(|pending| Some(pending) != continued_sync.as_ref()) {
-            return Err("mover wymaga braku zwykłego pending".into());
+            return Err("the mover needs no other pending intent".into());
         }
         // An older helper's mover left the union read-only under a Hold only
         // its Resume releases. Nothing moves until that has happened.
@@ -7051,7 +7106,7 @@ pub(crate) mod execution {
             .and_then(|private| private.service.as_ref())
             .is_some_and(|service| service.mode == ElasticServiceMode::Hold || service.pending)
         {
-            return Err("macierz jest w service Hold; wymagany Resume przed przenoszeniem".into());
+            return Err("the array is in a service Hold; a Resume comes before the mover".into());
         }
         host.verify_branches(journal)?;
         let array_id = journal.spec.array_id.clone();
@@ -7061,7 +7116,7 @@ pub(crate) mod execution {
                 return Ok(());
             }
             if transfer.finished_at.is_some() {
-                return Err("operacja movera została już zamknięta".into());
+                return Err("the mover operation is already closed".into());
             }
         } else {
             if let Some(previous) = journal
@@ -7118,7 +7173,7 @@ pub(crate) mod execution {
 
     fn begin_coupled_sync(root: &Root, journal: &mut Journal, run_record: &ElasticSnapraidRun) -> Result<u64, String> {
         let mut prepared = journal.clone();
-        let transfer = prepared.transfer.as_ref().ok_or("brak transferu")?;
+        let transfer = prepared.transfer.as_ref().ok_or("no transfer")?;
         let owned = Pending::Maintenance {
             operation_id: run_record.operation_id.clone(),
             kind: ElasticSnapraidKind::Sync,
@@ -7130,13 +7185,13 @@ pub(crate) mod execution {
             // Never overwrite another operation's intent.
             || prepared.pending.as_ref().is_some_and(|pending| *pending != owned)
         {
-            return Err("coupled Sync wymaga własnego transferu po zakończeniu plików".into());
+            return Err("a coupled Sync needs its own transfer after the files finished".into());
         }
         let attempt = transfer.sync_attempt
-            .checked_add(1).ok_or("przepełnienie licznika prób sync")?;
-        prepared.transfer.as_mut().ok_or("brak transferu")?.phase = ElasticMoverPhase::Syncing;
-        prepared.transfer.as_mut().ok_or("brak transferu")?.coupled_sync_result = Some(run_record.clone());
-        prepared.transfer.as_mut().ok_or("brak transferu")?.sync_attempt = attempt;
+            .checked_add(1).ok_or("sync attempt counter overflow")?;
+        prepared.transfer.as_mut().ok_or("no transfer")?.phase = ElasticMoverPhase::Syncing;
+        prepared.transfer.as_mut().ok_or("no transfer")?.coupled_sync_result = Some(run_record.clone());
+        prepared.transfer.as_mut().ok_or("no transfer")?.sync_attempt = attempt;
         prepared.last_run = Some(run_record.clone());
         prepared.pending = Some(owned);
         prepared.stage = ElasticStage::SyncPending;
@@ -7200,7 +7255,7 @@ pub(crate) mod execution {
             true,
         ) {
             Ok(run) if matches!(run.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial) => Ok(()),
-            Ok(run) => Err(run.detail.unwrap_or_else(|| "proces SnapRAID nie zakończył się sukcesem".into())),
+            Ok(run) => Err(run.detail.unwrap_or_else(|| "the SnapRAID process did not succeed".into())),
             Err(error) => {
                 // An attempt recorded as Running must not outlive this call.
                 let array_id = journal.spec.array_id.clone();
@@ -7229,7 +7284,7 @@ pub(crate) mod execution {
                 let device = resolve(role_disk(&journal.spec, role)?, &devices)?;
                 filesystem_matches(&journal.spec, role, device)?;
                 if !branch_mounted(&journal.spec, role, device)? {
-                    return Err("mover wymaga zamontowanych branchy macierzy".into());
+                    return Err("the mover needs the array's branches mounted".into());
                 }
             }
             Ok(())
@@ -7253,7 +7308,7 @@ pub(crate) mod execution {
     fn probe_cache_age(journal: &Journal, rules: &MoverRules) -> Result<ElasticCacheAge, String> {
         rules.validate().map_err(|error| error.to_string())?;
         if journal.spec.cache.is_none() {
-            return Err("macierz nie ma cache".into());
+            return Err("the array has no cache".into());
         }
         let cache = PathBuf::from(mount_path(&journal.spec, ElasticRole::Cache));
         let entries = crate::elastic_transfer::scan_cache(&cache, walk_prunes(rules))?;
@@ -7282,7 +7337,7 @@ pub(crate) mod execution {
             .collect();
         let mounted = |branches: &[PathBuf]| -> Result<bool, String> {
             for branch in branches {
-                let parent = branch.parent().ok_or("branch bez katalogu nadrzędnego")?;
+                let parent = branch.parent().ok_or("branch without a parent directory")?;
                 match (crate::folder_usage::device_of(branch), crate::folder_usage::device_of(parent)) {
                     (Ok(own), Ok(above)) if own != above => {}
                     _ => return Ok(false),
@@ -7312,7 +7367,7 @@ pub(crate) mod execution {
 
     #[cfg(not(target_os = "linux"))]
     fn probe_folder_usage(_: &ElasticCreateSpec, _: &[String]) -> Result<ElasticFolderUsage, String> {
-        Err("pomiar folderów wymaga Linuxa".into())
+        Err("folder usage needs Linux".into())
     }
 
     /// Each folder summed over `branches`, sharing one budget: a folder with
@@ -7370,13 +7425,17 @@ pub(crate) mod execution {
     /// that command holds.
     fn folder_usage_unlocked(root: Root, journal: Journal, folders: &[String]) -> Result<serde_json::Value, String> {
         if journal.boot_id != boot_id()? {
-            return Err("pomiar folderów wymaga macierzy przywróconej w tym uruchomieniu".into());
+            return Err(crate::refusal::wire(
+                "elastic_restore_after_boot",
+                &[("array", &journal.spec.name)],
+                "the node restarted since the array was mounted; folder usage is measured after a Restore",
+            ));
         }
         let anchor = journal
             .private
             .as_ref()
             .and_then(|private| private.anchor.clone())
-            .ok_or("brak kotwicy macierzy; pomiar folderów niemożliwy")?;
+            .ok_or("no array anchor; folder usage cannot be measured")?;
         let spec = journal.spec.clone();
         let walk = walk_lock(&root.path, &spec.array_id, root.uid)?;
         let walk_fd = walk.as_raw_fd();
@@ -7398,7 +7457,7 @@ pub(crate) mod execution {
                 forget_walker(walk_fd);
                 measured
             },
-            |_| Err("pomiar folderów nie publikuje unii".into()),
+            |_| Err("folder usage does not publish the union".into()),
         )?;
         drop(walk);
         result.value.public_result(false)
@@ -7419,7 +7478,7 @@ pub(crate) mod execution {
         let pid = std::process::id().to_string();
         let written = unsafe { libc::pwrite(fd, pid.as_ptr().cast(), pid.len(), 0) };
         if written != pid.len() as isize {
-            return Err(format!("rejestracja pomiaru: {}", std::io::Error::last_os_error()));
+            return Err(format!("walk registration: {}", std::io::Error::last_os_error()));
         }
         Ok(())
     }
@@ -7455,11 +7514,11 @@ pub(crate) mod execution {
         {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(format!("rejestracja pomiaru: {e}")),
+            Err(e) => return Err(format!("walk registration: {e}")),
         };
         let metadata = file.metadata().map_err(|e| e.to_string())?;
         if !metadata.is_file() || metadata.uid() != uid || metadata.nlink() != 1 || metadata.mode() & 0o777 != 0o600 {
-            return Err("obcy plik rejestracji pomiaru".into());
+            return Err("foreign walk registration file".into());
         }
         let deadline = std::time::Instant::now() + wait;
         let mut killed = None;
@@ -7475,7 +7534,7 @@ pub(crate) mod execution {
                 }
             }
             if std::time::Instant::now() >= deadline {
-                return Err(format!("{ELASTIC_BUSY} pomiar folderów macierzy nie zakończył się"));
+                return Err(format!("{ELASTIC_BUSY} the array's folder usage walk did not end"));
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -7524,7 +7583,7 @@ pub(crate) mod execution {
         let spec = layout(&journal.spec, &inventory()?)?;
         let (cache, data) = record_branches(&spec, journal)?;
         let space = |path: &Path| -> Result<(u64, u64), String> {
-            let (size, _, free) = capacity(path.to_str().ok_or("ścieżka brancha nie jest UTF-8")?)?;
+            let (size, _, free) = capacity(path.to_str().ok_or("the branch path is not UTF-8")?)?;
             Ok((size, free))
         };
         let env = MoverEnv {
@@ -7539,7 +7598,7 @@ pub(crate) mod execution {
         let mut host = LiveSteps { worker: Some(worker) };
         run_mover(root, journal, request, &env, &mut host)?;
         let state = observe(journal, host.worker.as_deref());
-        let run = state.last_mover.clone().ok_or("brak wyniku movera")?;
+        let run = state.last_mover.clone().ok_or("no mover result")?;
         Ok(ElasticMoverResult { state, run })
     }
 
@@ -7550,7 +7609,7 @@ pub(crate) mod execution {
             .as_secs() as libc::time_t;
         let mut time = std::mem::MaybeUninit::<libc::tm>::uninit();
         if unsafe { libc::gmtime_r(&seconds, time.as_mut_ptr()) }.is_null() {
-            return Err("brak czasu UTC".into());
+            return Err("no UTC time".into());
         }
         let time = unsafe { time.assume_init() };
         Ok(format!(
@@ -7621,7 +7680,7 @@ pub(crate) mod execution {
             .iter()
             .find(|d| d.device == device)
             .map(|d| ElasticRole::Parity(d.index))
-            .ok_or_else(|| "urządzenie planu poza specyfikacją".into())
+            .ok_or_else(|| "a plan device outside the specification".into())
     }
 
     /// What one `execute_steps` call may do beyond mounting.
@@ -7800,7 +7859,7 @@ pub(crate) mod execution {
             program: &Path,
             args: &[String],
         ) -> Result<(Option<i32>, Result<SnapraidLog, String>), String> {
-            capture_snapraid(root, array_lock, directory, label, program.to_str().ok_or("ścieżka programu")?, args)
+            capture_snapraid(root, array_lock, directory, label, program.to_str().ok_or("program path")?, args)
         }
 
         fn write_file(&mut self, path: &str, content: &str, uid: u32) -> Result<(), String> {
@@ -7842,7 +7901,7 @@ pub(crate) mod execution {
             // mount in any namespace (the exclusive open), and `wipefs`
             // WITHOUT `--force`, which would skip its own exclusive open.
             if !device_holders(device)?.is_empty() {
-                return Err(format!("{}: urządzenie ma aktywnych właścicieli", device.path));
+                return Err(format!("{}: the device has active holders", device.path));
             }
             drop(open_exclusive(&device.path)?);
             let wipefs = tool(&["/usr/sbin/wipefs", "/sbin/wipefs", "/usr/bin/wipefs"])?;
@@ -7850,7 +7909,7 @@ pub(crate) mod execution {
             let remaining = wipefs_probe(&device.path)?;
             if !remaining.is_empty() {
                 return Err(format!(
-                    "{}: po czyszczeniu urządzenie nadal zgłasza sygnatury ({})",
+                    "{}: after the clear the device still reports signatures ({})",
                     device.path,
                     remaining.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>().join(", ")
                 ));
@@ -7869,14 +7928,14 @@ pub(crate) mod execution {
         fn start_mergerfs(&mut self, program: &Path, args: &[String], log: &File) -> Result<Anchor, String> {
             self.worker
                 .as_deref_mut()
-                .ok_or("brak prywatnego wykonawcy")?
+                .ok_or("no private executor")?
                 .start_mergerfs(program, args, log)
         }
 
         fn publish(&mut self, anchor: &Anchor) -> Result<(), String> {
             self.worker
                 .as_deref_mut()
-                .ok_or("brak prywatnego wykonawcy")?
+                .ok_or("no private executor")?
                 .publish(anchor)
                 .map(|_| ())
         }
@@ -7928,11 +7987,11 @@ pub(crate) mod execution {
                     // check below is what actually enforces — every older
                     // slot is already in it.
                     if !matches!(mode, StepMode::Create | StepMode::AddDisk | StepMode::Replace) {
-                        return Err("tylko create, dodanie dysku i wymiana formatują".into());
+                        return Err("only Create, a disk addition and a replacement format".into());
                     }
                     let role = plan_role(plan, &device)?;
                     if journal.formatted.contains(&role) || journal.pending.is_some() {
-                        return Err("formatowanie już rozpoczęte".into());
+                        return Err("formatting already started".into());
                     }
                     let disk = role_disk(&journal.spec, role)?.clone();
                     let current = system.device(&disk)?;
@@ -7947,9 +8006,14 @@ pub(crate) mod execution {
                         // always clean, so the undo's rule covers every state
                         // it leaves.
                         if mode == StepMode::AddDisk {
-                            format!(
-                                "{error} — dysk nosi już podpis, być może niedokończonego formatowania tego \
-                                 dodawania; wycofaj dodawanie, a potem dodaj dysk ponownie"
+                            crate::refusal::wire(
+                                "elastic_add_disk_signed",
+                                &[("disk", &current.kernel)],
+                                format!(
+                                    "{}; the disk may carry the signature of an unfinished format of this \
+                                     addition; undo the addition, then add the disk again",
+                                    crate::refusal::sentence(&error)
+                                ),
                             )
                         } else {
                             error
@@ -7996,7 +8060,7 @@ pub(crate) mod execution {
                 } => {
                     let role = plan_role(plan, &source)?;
                     if mountpoint != mount_path(&journal.spec, role) {
-                        return Err("mountpoint niezgodny z rolą".into());
+                        return Err("mountpoint does not match the role".into());
                     }
                     let device = system.device(role_disk(&journal.spec, role)?)?;
                     system.filesystem_matches(&journal.spec, role, &device)?;
@@ -8004,7 +8068,7 @@ pub(crate) mod execution {
                         continue;
                     }
                     if !system.directory_empty(&mountpoint)? {
-                        return Err("katalog brancha nie jest pusty".into());
+                        return Err("the branch directory is not empty".into());
                     }
                     pending_operation(
                         journal,
@@ -8014,7 +8078,7 @@ pub(crate) mod execution {
                         || system.mount(&filesystem, &options, &device, &mountpoint, &locks),
                     )?;
                     if !system.branch_mounted(&journal.spec, role, &device)? {
-                        return Err("brak mount po wykonaniu".into());
+                        return Err("no mount after the step".into());
                     }
                     journal.pending = None;
                     root.save(journal)?;
@@ -8042,14 +8106,14 @@ pub(crate) mod execution {
                         let device = system.device(role_disk(&journal.spec, role)?)?;
                         system.filesystem_matches(&journal.spec, role, &device)?;
                         if !system.branch_mounted(&journal.spec, role, &device)? {
-                            return Err("brak potwierdzonego brancha".into());
+                            return Err("no confirmed branch".into());
                         }
                     }
                     if system.union_mounted(plan)? {
                         continue;
                     }
                     if !system.directory_empty(&mountpoint)? {
-                        return Err("katalog unii nie jest pusty".into());
+                        return Err("the union directory is not empty".into());
                     }
                     let args = vec!["-o".into(), options.join(","), branches.join(":"), mountpoint];
                     if system.has_worker() {
@@ -8068,12 +8132,12 @@ pub(crate) mod execution {
                             .open(log_path).map_err(|e| e.to_string())?;
                         File::open(&root.path).and_then(|file| file.sync_all()).map_err(|e| e.to_string())?;
                         let anchor = system.start_mergerfs(Path::new(&program), &args, &log)?;
-                        let private = journal.private.as_mut().ok_or("worker bez private journala")?;
+                        let private = journal.private.as_mut().ok_or("worker without a private journal")?;
                         private.anchor = Some(anchor);
                         private.published = false;
                         root.save(journal)?;
                         if !system.union_mounted(plan)? {
-                            return Err("brak potwierdzonej prywatnej unii".into());
+                            return Err("no confirmed private union".into());
                         }
                         publish_private(root, journal, |anchor| system.publish(anchor))?;
                         continue;
@@ -8087,7 +8151,7 @@ pub(crate) mod execution {
                         || system.run_tool(Path::new(&program), &args, &[]),
                     )?;
                     if !system.union_mounted(plan)? {
-                        return Err("brak potwierdzonej unii".into());
+                        return Err("no confirmed union".into());
                     }
                     journal.pending = None;
                     root.save(journal)?;
@@ -8096,7 +8160,7 @@ pub(crate) mod execution {
                     if !matches!(mode, StepMode::Create | StepMode::AddDisk)
                         || journal.spec.parity.is_empty()
                     {
-                        return Err("nieoczekiwany sync".into());
+                        return Err("unexpected sync".into());
                     }
                     if mode == StepMode::AddDisk {
                         add_sync(root, array_lock, journal, plan, &program, &args, system)?;
@@ -8115,10 +8179,10 @@ pub(crate) mod execution {
                 }
                 ElasticStep::AddBranch { union, branch } => {
                     if mode != StepMode::AddDisk {
-                        return Err("tylko dodanie dysku rozszerza żywą unię".into());
+                        return Err("only a disk addition extends a live union".into());
                     }
                     if union != plan.union_path() {
-                        return Err("obca unia w kroku AddBranch".into());
+                        return Err("foreign union in the AddBranch step".into());
                     }
                     // The union stays UP, so there is no mount intent to
                     // record and nothing to resume: the xattr write either
@@ -8138,7 +8202,7 @@ pub(crate) mod execution {
                     }
                     system.add_branch(&union, &branch)?;
                 }
-                _ => return Err("niedozwolony krok wykonawcy".into()),
+                _ => return Err("forbidden executor step".into()),
             }
         }
         Ok(())
@@ -8190,7 +8254,7 @@ pub(crate) mod execution {
     ) -> Result<(), String> {
         let runs = root.path.join(format!("{}.runs", journal.spec.array_id));
         directory(&runs, true, root.uid)?;
-        let disk = journal.spec.data.last().ok_or("brak dodawanego dysku")?;
+        let disk = journal.spec.data.last().ok_or("no disk being added")?;
         let directory_path = runs.join(format!("add-{}", disk.expected_uuid));
         directory(&directory_path, true, root.uid)?;
         // Every attempt keeps its own log: a resume after a failed Sync
@@ -8235,7 +8299,7 @@ pub(crate) mod execution {
                     (Ok(SnapraidVerdict::Complete), Some(0)) => Ok(SnapraidVerdict::Complete),
                     (Ok(SnapraidVerdict::FilesChanged), Some(1)) => Ok(SnapraidVerdict::FilesChanged),
                     (Err(error), _) => Err(error),
-                    _ => Err("proces SnapRAID nie zakończył się sukcesem".to_string()),
+                    _ => Err("the SnapRAID process did not succeed".to_string()),
                 }
             });
         journal.pending = None;
@@ -8253,10 +8317,13 @@ pub(crate) mod execution {
                 root.save(journal)
             }
             other => {
-                let error = other.err().unwrap_or_else(|| "niespodziewany werdykt".into());
+                let error = other.err().unwrap_or_else(|| "unexpected verdict".into());
                 journal.stale_parity_bytes.get_or_insert(0);
                 root.save(journal)?;
-                Err(bounded_text(&format!("sync po dodaniu dysku: {error}"), TRANSFER_DETAIL_LIMIT))
+                Err(bounded_text(
+                    &crate::refusal::reword(&error, |error| format!("sync after the disk addition: {error}")),
+                    TRANSFER_DETAIL_LIMIT,
+                ))
             }
         }
     }
@@ -8264,13 +8331,13 @@ pub(crate) mod execution {
     fn private_directory(base: &Path, path: &Path, uid: u32) -> Result<(), String> {
         let relative = path
             .strip_prefix(base)
-            .map_err(|_| "katalog poza prywatnym overlay")?;
+            .map_err(|_| "directory outside the private overlay")?;
         directory(base, false, uid)?;
         let overlay_device = std::fs::metadata(base).map_err(|e| e.to_string())?.dev();
         let mut current = base.to_path_buf();
         for component in relative.components() {
             if !matches!(component, std::path::Component::Normal(_)) {
-                return Err("nieprawidłowy katalog prywatnego brancha".into());
+                return Err("invalid private branch directory".into());
             }
             current.push(component);
             let created = match std::fs::DirBuilder::new().mode(0o711).create(&current) {
@@ -8285,18 +8352,18 @@ pub(crate) mod execution {
                 .map_err(|e| e.to_string())?;
             let metadata = directory.metadata().map_err(|e| e.to_string())?;
             if metadata.uid() != uid || metadata.mode() & 0o022 != 0 {
-                return Err("obcy katalog prywatnego brancha".into());
+                return Err("foreign private branch directory".into());
             }
             if created {
                 if unsafe { libc::fchmod(directory.as_raw_fd(), 0o711) } != 0 {
                     return Err(std::io::Error::last_os_error().to_string());
                 }
                 directory.sync_all().map_err(|e| e.to_string())?;
-                File::open(current.parent().ok_or("brak rodzica brancha")?)
+                File::open(current.parent().ok_or("no branch parent")?)
                     .and_then(|file| file.sync_all())
                     .map_err(|e| e.to_string())?;
             } else if metadata.dev() == overlay_device && metadata.mode() & 0o111 != 0o111 {
-                return Err("nietrawersowalny katalog w prywatnym overlay".into());
+                return Err("untraversable directory in the private overlay".into());
             }
         }
         Ok(())
@@ -8314,15 +8381,15 @@ pub(crate) mod execution {
                 let mut evicted = None;
                 if let Some(service) = completed.private.as_ref().and_then(|private| private.service.as_ref()) {
                     if service.mode != ElasticServiceMode::Online {
-                        return Err("service Hold nie może zakończyć się jako Ready".into());
+                        return Err("a service Hold cannot end as Ready".into());
                     }
-                    let worker = worker.ok_or("service Online wymaga workera")?;
+                    let worker = worker.ok_or("service Online needs a worker")?;
                     if worker.public_mount().is_none() || worker.union_readonly()? {
-                        return Err("service Online bez potwierdzonej publikacji RW".into());
+                        return Err("service Online without a confirmed RW publication".into());
                     }
                     let service_operation_id = service.operation_id.clone();
-                    completed.private.as_mut().ok_or("brak prywatnej topologii")?.service.as_mut()
-                        .ok_or("brak stanu service")?.pending = false;
+                    completed.private.as_mut().ok_or("no private topology")?.service.as_mut()
+                        .ok_or("no service state")?.pending = false;
                     // The run the released Hold belonged to is closed, unless a
                     // file of it is still in flight: the next run finishes or
                     // reverses that record and closes the run itself.
@@ -8370,8 +8437,8 @@ pub(crate) mod execution {
         publish: impl FnOnce(&Anchor) -> Result<(), String>,
     ) -> Result<(), String> {
         serving_guard(journal)?;
-        let private = journal.private.as_mut().ok_or("brak private journala")?;
-        let anchor = private.anchor.clone().ok_or("brak trwałej kotwicy")?;
+        let private = journal.private.as_mut().ok_or("no private journal")?;
+        let anchor = private.anchor.clone().ok_or("no durable anchor")?;
         private.published = false;
         journal.pending = Some(Pending::Union);
         journal.stage = ElasticStage::Mounting;
@@ -8381,7 +8448,7 @@ pub(crate) mod execution {
         completed
             .private
             .as_mut()
-            .ok_or("brak private journala")?
+            .ok_or("no private journal")?
             .published = true;
         completed.pending = None;
         root.save(&completed)?;
@@ -8489,9 +8556,9 @@ pub(crate) mod execution {
                 return Ok(());
             }
             if count > 1024 * 1024 {
-                return Err("zbyt długa linia logu".into());
+                return Err("log line too long".into());
             }
-            let text = std::str::from_utf8(&bytes).map_err(|_| "log nie jest UTF-8")?;
+            let text = std::str::from_utf8(&bytes).map_err(|_| "the log is not UTF-8")?;
             for line in text.trim_end_matches('\n').split('\r') {
                 if !line.is_empty() {
                     consume(line)?;
@@ -8523,8 +8590,8 @@ pub(crate) mod execution {
                 [value] => value
                     .parse()
                     .map(Some)
-                    .map_err(|_| format!("nieprawidłowy licznik {key}")),
-                _ => Err(format!("powtórzony licznik {key}")),
+                    .map_err(|_| format!("invalid counter {key}")),
+                _ => Err(format!("repeated counter {key}")),
             }
         }
 
@@ -8536,7 +8603,7 @@ pub(crate) mod execution {
                 }
                 if let Some((_, value)) = line.strip_prefix("argv:").and_then(|rest| rest.split_once(':')) {
                     if result.argv.len() >= 64 {
-                        return Err("zbyt wiele argumentów w logu".into());
+                        return Err("too many arguments in the log".into());
                     }
                     result.argv.push(value.to_string());
                 }
@@ -8571,7 +8638,7 @@ pub(crate) mod execution {
                 {
                     let values = result.fields.entry(key).or_default();
                     if values.len() >= 3 {
-                        return Err("zduplikowane pole logu".into());
+                        return Err("duplicated log field".into());
                     }
                     values.push(value.to_string());
                 }
@@ -8610,13 +8677,13 @@ pub(crate) mod execution {
                     result.clean += 1;
                 }
                 if let Some((percent, rest)) = line.split_once("% completed, ") {
-                    let (mb, _) = rest.split_once(" MB accessed").ok_or("niepełny postęp")?;
+                    let (mb, _) = rest.split_once(" MB accessed").ok_or("incomplete progress")?;
                     if result.progress.len() >= 2 {
-                        return Err("powtórzony postęp końcowy".into());
+                        return Err("repeated final progress".into());
                     }
                     result.progress.push((
-                        percent.parse().map_err(|_| "nieprawidłowy postęp")?,
-                        mb.parse().map_err(|_| "nieprawidłowy odczyt MB")?,
+                        percent.parse().map_err(|_| "invalid progress")?,
+                        mb.parse().map_err(|_| "invalid MB reading")?,
                     ));
                 }
                 Ok(())
@@ -8642,7 +8709,7 @@ pub(crate) mod execution {
                 ) && !(command == "fix"
                     && matches!(key.as_str(), "summary:error" | "summary:error_recovered" | "summary:error_unrecoverable"))
                 {
-                    return Err("nieznane podsumowanie narzędzia".into());
+                    return Err("unknown tool summary".into());
                 }
             }
             for (key, expected) in [
@@ -8655,7 +8722,7 @@ pub(crate) mod execution {
                 ("mode", format!("par{}", spec.parity.len())),
             ] {
                 if self.field(key) != [expected] {
-                    return Err(format!("obcy lub niepełny log: {key}"));
+                    return Err(format!("foreign or incomplete log: {key}"));
                 }
             }
             Ok(())
@@ -8668,7 +8735,7 @@ pub(crate) mod execution {
             ] {
                 let value = self
                     .number(&format!("summary:{key}"))?
-                    .ok_or("niepełne podsumowanie scan")?;
+                    .ok_or("incomplete scan summary")?;
                 if key != "equal" && value != 0 {
                     changed = true;
                 }
@@ -8707,13 +8774,17 @@ pub(crate) mod execution {
             // still fails whatever it printed.
             if let Some(fault) = &self.fault {
                 return Err(bounded_text(
-                    &format!("diagnostyka błędu w logu: {fault}"),
+                    &format!("fault diagnostics in the log: {fault}"),
                     TRANSFER_DETAIL_LIMIT,
                 ));
             }
             let errors = [run.errors_file, run.errors_io, run.errors_data];
             if errors.iter().flatten().any(|v| *v != 0) {
-                return Err("narzędzie zgłosiło błędy".into());
+                return Err(crate::refusal::wire(
+                    "elastic_snapraid_reported_errors",
+                    &[],
+                    "the tool reported errors; the run's error counters say which",
+                ));
             }
             if run.kind == ElasticSnapraidKind::Sync {
                 let scan = if self.scan()? { "diff" } else { "equal" };
@@ -8728,7 +8799,7 @@ pub(crate) mod execution {
                     return Ok(SnapraidVerdict::Complete);
                 }
                 if self.field("summary:exit") != [scan, "ok"] {
-                    return Err("niepełne zakończenie sync".into());
+                    return Err("incomplete sync end".into());
                 }
                 let idle = self.nothing == 1
                     && self.nothing_status == 1
@@ -8739,12 +8810,12 @@ pub(crate) mod execution {
                     && matches!(self.progress.as_slice(), [(100, _)])
                     && self.clean == 1;
                 if !idle && !worked {
-                    return Err("niepełna praca sync".into());
+                    return Err("incomplete sync work".into());
                 }
             } else {
                 let checked = self
                     .number("info_count")?
-                    .ok_or("brak liczby bloków scrub")?;
+                    .ok_or("no scrub block count")?;
                 if checked == 0
                     || run.total_blocks.is_none_or(|total| checked > total)
                     || !matches!(self.progress.as_slice(), [(100, _)])
@@ -8752,12 +8823,12 @@ pub(crate) mod execution {
                     || self.nothing != 0
                     || self.field("summary:exit") != ["ok"]
                 {
-                    return Err("niepełny pełny scrub".into());
+                    return Err("incomplete full scrub".into());
                 }
                 run.checked_blocks = Some(checked);
             }
             if errors != [Some(0); 3] {
-                return Err("brak liczników błędów".into());
+                return Err("no error counters".into());
             }
             run.accessed_mb = self.progress.first().map(|(_, mb)| *mb);
             Ok(SnapraidVerdict::Complete)
@@ -8780,29 +8851,33 @@ pub(crate) mod execution {
             let invoked: Vec<&str> = self.argv.iter().skip(1).map(String::as_str).collect();
             let args = match invoked.as_slice() {
                 ["-l", _, args @ ..] => args,
-                _ => return Err("log naprawy bez wywołania".into()),
+                _ => return Err("repair log without its invocation".into()),
             };
             let scope = if args == ["-c", config.as_str(), "-e", "fix"] {
                 FixScope::MarkedBlocks
             } else if args == ["-c", config.as_str(), "-d", disk, "fix"] {
                 FixScope::ReplacedDisk
             } else {
-                return Err("naprawa uruchomiona bez bezpiecznego filtra".into());
+                return Err("repair started without a safe filter".into());
             };
             let count = |key: &str| -> Result<u64, String> {
-                self.number(key)?.ok_or_else(|| format!("niepełne podsumowanie fix: {key}"))
+                self.number(key)?.ok_or_else(|| format!("incomplete fix summary: {key}"))
             };
             let (errors, recovered, unrecoverable) =
                 (count("summary:error")?, count("summary:error_recovered")?, count("summary:error_unrecoverable")?);
             if unrecoverable != 0 {
-                return Err(format!("naprawa: {unrecoverable} błędów nie do odzyskania z parity"));
+                return Err(crate::refusal::wire(
+                    "elastic_fix_unrecoverable",
+                    &[("count", &unrecoverable.to_string())],
+                    format!("repair: {unrecoverable} errors cannot be recovered from parity"),
+                ));
             }
             if recovered > errors {
-                return Err("niespójne liczniki naprawy".into());
+                return Err("inconsistent repair counters".into());
             }
             let exit: Vec<&str> = self.field("summary:exit").iter().map(String::as_str).collect();
             if !matches!(self.progress.as_slice(), [] | [(100, _)]) {
-                return Err("niepełna praca fix".into());
+                return Err("incomplete fix work".into());
             }
             run.accessed_mb = self.progress.first().map(|(_, mb)| *mb);
             // A REPAIR THAT WROTE NOTHING IS NOT A SUCCESS. snapraid says
@@ -8811,34 +8886,47 @@ pub(crate) mod execution {
             // since the Sync — so only the counters tell the two apart.
             let verdict = match (exit.as_slice(), scope) {
                 (["ok"], _) if errors == 0 => {
-                    run.detail = Some(
-                        "nic nie naprawiono: parity nie ma zaznaczonych błędów — uruchom scrub, który je zaznaczy, \
-                         albo wymień dysk"
-                            .into(),
-                    );
+                    run.detail = Some(crate::refusal::wire(
+                        "elastic_fix_nothing_marked",
+                        &[],
+                        "nothing was repaired: parity has no marked errors; run a scrub, which marks them, \
+                         or replace the disk",
+                    ));
                     SnapraidVerdict::NothingWritten
                 }
                 (["recovered"], _) if recovered == 0 => {
-                    run.detail = Some(format!(
-                        "nic nie naprawiono: wszystkie {errors} zaznaczonych bloków należą do plików zmienionych \
-                         od ostatniego Sync, a tych naprawa nie dotyka"
+                    run.detail = Some(crate::refusal::wire(
+                        "elastic_fix_nothing_unchanged",
+                        &[("errors", &errors.to_string())],
+                        format!(
+                            "nothing was repaired: all {errors} marked blocks belong to files changed since \
+                             the last Sync, which a repair does not touch"
+                        ),
                     ));
                     SnapraidVerdict::NothingWritten
                 }
                 (["recovered"], _) if recovered == errors => {
-                    run.detail = Some(format!("naprawiono {recovered} bloków"));
+                    run.detail = Some(crate::refusal::wire(
+                        "elastic_fix_recovered",
+                        &[("recovered", &recovered.to_string())],
+                        format!("{recovered} blocks repaired"),
+                    ));
                     SnapraidVerdict::Complete
                 }
                 // `-e` repairs only files unchanged since the last Sync; the
                 // rest of what the Scrub marked belongs to files users have
                 // rewritten since, which the next Sync covers.
                 (["recovered"], FixScope::MarkedBlocks) => {
-                    run.detail = Some(format!(
-                        "naprawiono {recovered} z {errors} bloków; pozostałe należą do plików zmienionych od ostatniego Sync"
+                    run.detail = Some(crate::refusal::wire(
+                        "elastic_fix_partly_recovered",
+                        &[("recovered", &recovered.to_string()), ("errors", &errors.to_string())],
+                        format!(
+                            "{recovered} of {errors} blocks repaired; the rest belong to files changed since the last Sync"
+                        ),
                     ));
                     SnapraidVerdict::Complete
                 }
-                _ => return Err("niepełne zakończenie fix".into()),
+                _ => return Err("incomplete fix end".into()),
             };
             Ok(verdict)
         }
@@ -8859,7 +8947,7 @@ pub(crate) mod execution {
             {
                 return Err(bounded_text(
                     &format!(
-                        "niepełne zakończenie sync ze zmienionymi plikami: {}",
+                        "incomplete end of a sync with changed files: {}",
                         self.fault.as_deref().unwrap_or("")
                     ),
                     TRANSFER_DETAIL_LIMIT,
@@ -8875,10 +8963,10 @@ pub(crate) mod execution {
             return Err("no_parity".into());
         }
         if journal.formatted.len() != roles(&journal.spec).len() {
-            return Err("nieukończone formatowanie".into());
+            return Err("unfinished formatting".into());
         }
         if journal.sync_completed_at.is_none() {
-            return Err("niepotwierdzony pierwszy sync".into());
+            return Err("unconfirmed first sync".into());
         }
         let devices = inventory()?;
         let spec = layout(&journal.spec, &devices)?;
@@ -8886,11 +8974,11 @@ pub(crate) mod execution {
             let device = resolve(role_disk(&journal.spec, role)?, &devices)?;
             filesystem_matches(&journal.spec, role, device)?;
             if !branch_mounted(&journal.spec, role, device)? {
-                return Err("niezamontowany branch".into());
+                return Err("unmounted branch".into());
             }
         }
         if !union_mounted(&spec)? {
-            return Err("niezamontowana unia".into());
+            return Err("unmounted union".into());
         }
         let mut config = String::new();
         private_file(Path::new(&spec.config_path()), root.uid)?
@@ -8898,7 +8986,7 @@ pub(crate) mod execution {
             .read_to_string(&mut config)
             .map_err(|e| e.to_string())?;
         if config != snapraid_config(&spec).map_err(|e| e.to_string())? {
-            return Err("config niezgodny z UUID i journalem".into());
+            return Err("config does not match the UUIDs and the journal".into());
         }
         let mut empty = true;
         for (directive, path) in snapraid_directives(&spec).map_err(|e| e.to_string())? {
@@ -8907,7 +8995,7 @@ pub(crate) mod execution {
             }
             let path = Path::new(&path);
             directory(
-                path.parent().ok_or("brak katalogu metadanych")?,
+                path.parent().ok_or("no metadata directory")?,
                 false,
                 root.uid,
             )?;
@@ -8924,7 +9012,7 @@ pub(crate) mod execution {
                     .map_err(|e| e.to_string())?
                     .dev()
             {
-                return Err("metadane na obcym filesystemie".into());
+                return Err("metadata on a foreign filesystem".into());
             }
             if directive != "content" && metadata.len() != 0 {
                 empty = false;
@@ -8935,7 +9023,7 @@ pub(crate) mod execution {
 
     /// How the run's detail introduces text the tool wrote to stderr, so an
     /// operator reading a run can tell the tool's own words from ours.
-    const SNAPRAID_WARNING_PREFIX: &str = "ostrzeżenie snapraid: ";
+    const SNAPRAID_WARNING_PREFIX: &str = "snapraid warning: ";
     /// What is read back from a captured stderr. The text is bounded again to
     /// `TRANSFER_DETAIL_LIMIT` afterwards; this only stops a runaway tool from
     /// making the read itself unbounded.
@@ -9104,7 +9192,7 @@ pub(crate) mod execution {
             }
         };
         if journal.private.is_some() && !worker.is_some_and(|worker| worker.public_mount().is_some()) {
-            return Err("brak potwierdzonej publikacji prywatnej macierzy".into());
+            return Err("no confirmed publication of the private array".into());
         }
         // H6: a failed run an older helper left pinned is settled into its
         // cause first, under the lock this process now holds, so the gate
@@ -9130,7 +9218,7 @@ pub(crate) mod execution {
                 .as_ref()
                 .is_some_and(|run| run.operation_id == operation_id)
         {
-            return Err("ponowne użycie ID create".into());
+            return Err("reuse of the Create id".into());
         }
         let mut run = ElasticSnapraidRun {
             operation_id: operation_id.into(),
@@ -9172,8 +9260,8 @@ pub(crate) mod execution {
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
-            .map_err(|e| format!("operacja już użyta lub katalog niedostępny: {e}"))?;
-        File::open(path.parent().ok_or("brak katalogu operacji")?)
+            .map_err(|e| format!("operation already used or directory unavailable: {e}"))?;
+        File::open(path.parent().ok_or("no operation directory")?)
             .and_then(|f| f.sync_all())
             .map_err(|e| e.to_string())?;
         let tools = Tools::resolve(&spec).map_err(|e| e.to_string())?;
@@ -9197,13 +9285,13 @@ pub(crate) mod execution {
             // the scrub that follows prints the same advisory itself, where
             // the run does record it.
             if diff.fault.is_some() {
-                return Err("błąd odczytowego pre-diff".into());
+                return Err("read-only pre-diff failed".into());
             }
             let changed = diff.scan()?;
             if code != Some(if changed { 2 } else { 0 })
                 || diff.field("summary:exit") != [if changed { "diff" } else { "equal" }]
             {
-                return Err("niepełny wynik pre-diff".into());
+                return Err("incomplete pre-diff result".into());
             }
             if changed || empty {
                 run.outcome = ElasticSnapraidOutcome::Refused;
@@ -9242,7 +9330,7 @@ pub(crate) mod execution {
         // so reaching here with a foreign one means something bypassed it.
         let steps = plan_snapraid(&spec, &action, &tools).map_err(|e| e.to_string())?;
         let [ElasticStep::Run { program, args }] = steps.as_slice() else {
-            return Err("nieprawidłowy plan ręcznej operacji".into());
+            return Err("invalid manual operation plan".into());
         };
         let guard_journal = journal.clone();
         let run = perform_maintenance(
@@ -9276,7 +9364,7 @@ pub(crate) mod execution {
         let stage_before = journal.stage;
         let detail_before = journal.detail.clone();
         if coupled {
-            let transfer = journal.transfer.as_ref().ok_or("mover Sync wymaga trwałego transferu")?;
+            let transfer = journal.transfer.as_ref().ok_or("a mover Sync needs a durable transfer")?;
             let owned = Pending::Maintenance {
                 operation_id: run.operation_id.clone(),
                 kind: ElasticSnapraidKind::Sync,
@@ -9287,7 +9375,7 @@ pub(crate) mod execution {
                 || journal.pending.as_ref().is_some_and(|pending| *pending != owned)
                 || transfer.current.is_some()
             {
-                return Err("mover Sync wymaga zgodnego transferu".into());
+                return Err("a mover Sync needs a matching transfer".into());
             }
         }
         journal.last_run = Some(run.clone());
@@ -9306,7 +9394,7 @@ pub(crate) mod execution {
             },
         );
         let outcome = outcome.and_then(|()| {
-            let (code, parsed) = captured.as_ref().ok_or("brak wyniku procesu")?;
+            let (code, parsed) = captured.as_ref().ok_or("no process result")?;
             run.exit_code = *code;
             let log = parsed.as_ref().map_err(Clone::clone)?;
             let checked = post_guard();
@@ -9320,7 +9408,7 @@ pub(crate) mod execution {
                 (Ok(SnapraidVerdict::Complete), Some(0)) => Ok(SnapraidVerdict::Complete),
                 (Ok(SnapraidVerdict::NothingWritten), Some(0)) => Ok(SnapraidVerdict::NothingWritten),
                 (Err(error), Some(0)) => Err(error),
-                _ => Err("proces SnapRAID nie zakończył się sukcesem".to_string()),
+                _ => Err("the SnapRAID process did not succeed".to_string()),
             }
         });
         // What the tool said on stderr or under `msg:fatal:`, whatever the
@@ -9370,7 +9458,7 @@ pub(crate) mod execution {
             // where the last complete Sync put it. Nothing needs an admin.
             Ok(SnapraidVerdict::FilesChanged) => {
                 run.outcome = ElasticSnapraidOutcome::Partial;
-                run.detail = with_warning(Some(PARTIAL_SYNC_NOTE.to_string()));
+                run.detail = with_warning(Some(partial_sync_note()));
                 journal.stale_parity_bytes.get_or_insert(0);
                 journal.stale_sync_operation = Some(run.operation_id.clone());
                 journal.pending = None;
@@ -9447,7 +9535,7 @@ pub(crate) mod execution {
 
     fn create(root: &Root, spec: &ElasticCreateSpec, mut worker: Option<&mut Worker>) -> Result<ElasticResult, String> {
         if worker.is_none() {
-            return Err("nowy Create wymaga prywatnego wykonawcy".into());
+            return Err("a new Create needs the private executor".into());
         }
         let array_lock = root.array_lock(&spec.array_id)?;
         let devices = inventory()?;
@@ -9478,7 +9566,7 @@ pub(crate) mod execution {
             .is_some_and(|service| service.mode == ElasticServiceMode::Hold)
             && legacy_mover_hold(journal).is_none()
         {
-            return Err("Restore nie konsumuje trwałego service Hold".into());
+            return Err("Restore does not consume a durable service Hold".into());
         }
         // An unfinished mover run does not keep the union down: Restore settles
         // the record it left in flight on the mounted branches before it
@@ -9497,7 +9585,7 @@ pub(crate) mod execution {
             && !add_sync)
             || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
         {
-            return Err("sync niepotwierdzony; restore nie wykonuje sync".into());
+            return Err("sync unconfirmed; Restore does not run a sync".into());
         }
         Ok(())
     }
@@ -9521,13 +9609,13 @@ pub(crate) mod execution {
         };
         let mut settled = journal.clone();
         let closed = match kind {
-            ElasticSnapraidKind::Sync => close_interrupted_sync(&mut settled, &operation_id, "Sync przerwany; zamknięty przez Restore")?,
+            ElasticSnapraidKind::Sync => close_interrupted_sync(&mut settled, &operation_id, &interrupted_sync_note("the Restore"))?,
             ElasticSnapraidKind::Scrub | ElasticSnapraidKind::Fix { .. } => {
                 close_interrupted_maintenance(&mut settled, &operation_id, &kind)?
             }
         };
         if !closed {
-            return Err("intencja SnapRAID bez zapisu próby".into());
+            return Err("SnapRAID intent without a recorded attempt".into());
         }
         root.save(&settled)?;
         *journal = settled;
@@ -9544,13 +9632,18 @@ pub(crate) mod execution {
         };
         run.outcome = ElasticSnapraidOutcome::NeedsAttention;
         run.finished_at = Some(timestamp()?);
-        run.detail = Some(
-            match kind {
-                ElasticSnapraidKind::Fix { .. } => "Fix przerwany; zamknięty przez Restore — naprawę można zlecić ponownie",
-                _ => "Scrub przerwany; zamknięty przez Restore",
-            }
-            .into(),
-        );
+        run.detail = Some(match kind {
+            ElasticSnapraidKind::Fix { .. } => crate::refusal::wire(
+                "elastic_fix_interrupted",
+                &[],
+                "the repair was interrupted and closed by the Restore; it can be started again",
+            ),
+            _ => crate::refusal::wire(
+                "elastic_scrub_interrupted",
+                &[],
+                "the scrub was interrupted and closed by the Restore",
+            ),
+        });
         journal.pending = None;
         journal.interrupted_operation = Some(operation_id.to_string());
         journal.stage = settled_stage(journal);
@@ -9558,10 +9651,10 @@ pub(crate) mod execution {
     }
 
     fn service_guard(journal: &Journal, operation_id: &str) -> Result<(), String> {
-        let private = journal.private.as_ref().ok_or("service wymaga prywatnej topologii")?;
+        let private = journal.private.as_ref().ok_or("service needs a private topology")?;
         validate_elastic_uuid(operation_id).map_err(|e| e.to_string())?;
         if operation_id == journal.spec.operation_id {
-            return Err("operacja service nie może zastępować Create".into());
+            return Err("a service operation cannot replace Create".into());
         }
         // An unfinished mover run blocks a service operation until the next run
         // closes it, and a Hold an older helper's run left belongs to that run
@@ -9576,18 +9669,18 @@ pub(crate) mod execution {
             transfer.operation_id != operation_id
                 && (transfer.finished_at.is_none() || hold_owner == Some(transfer.operation_id.as_str()))
         }) {
-            return Err("transfer movera zajmuje service Hold".into());
+            return Err("a mover transfer holds the service Hold".into());
         }
         if journal.private.as_ref().and_then(|private| private.service.as_ref())
             .is_some_and(|service| service.operation_id == operation_id)
         {
-            return Err("operacja service została już użyta".into());
+            return Err("the service operation was already used".into());
         }
         if journal.pending.is_some()
             || journal.formatted.len() != roles(&journal.spec).len()
             || (!journal.spec.parity.is_empty() && journal.sync_completed_at.is_none())
         {
-            return Err("service wymaga ukończonego Create i sync bez pending".into());
+            return Err("service needs a finished Create and a sync with nothing pending".into());
         }
         match private.service.as_ref() {
             None if journal.stage == ElasticStage::Ready => Ok(()),
@@ -9595,7 +9688,7 @@ pub(crate) mod execution {
                 && matches!(journal.stage, ElasticStage::NeedsAttention | ElasticStage::Mounting) => Ok(()),
             Some(service) if service.mode == ElasticServiceMode::Online
                 && !service.pending && journal.stage == ElasticStage::Ready => Ok(()),
-            _ => Err("nieprawidłowy trwały stan service".into()),
+            _ => Err("invalid durable service state".into()),
         }
     }
 
@@ -9607,7 +9700,7 @@ pub(crate) mod execution {
         set_readonly: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
         service_guard(&journal, operation_id)?;
-        journal.private.as_mut().ok_or("brak prywatnej topologii")?.service = Some(ElasticServiceState {
+        journal.private.as_mut().ok_or("no private topology")?.service = Some(ElasticServiceState {
             mode: ElasticServiceMode::Hold,
             operation_id: operation_id.to_string(),
             pending: true,
@@ -9615,15 +9708,19 @@ pub(crate) mod execution {
         journal.stage = ElasticStage::Mounting;
         root.save(&journal)?;
         if let Err(error) = set_readonly() {
-            enter_attention(&mut journal, ElasticAttention::Other, &format!("service: {error}"));
+            enter_attention(
+                &mut journal,
+                ElasticAttention::Other,
+                &crate::refusal::reword(&error, |error| format!("service: {error}")),
+            );
             root.save(&journal)?;
             return Err(error);
         }
         let mut completed = journal;
         completed.pending = None;
-        enter_attention(&mut completed, ElasticAttention::Other, "service Hold: unia potwierdzona jako globalnie RO");
-        completed.private.as_mut().ok_or("brak prywatnej topologii")?.service.as_mut()
-            .ok_or("brak stanu service")?.pending = false;
+        enter_attention(&mut completed, ElasticAttention::Other, "service Hold: union confirmed globally read-only");
+        completed.private.as_mut().ok_or("no private topology")?.service.as_mut()
+            .ok_or("no service state")?.pending = false;
         root.save(&completed)?;
         Ok(())
     }
@@ -9641,9 +9738,9 @@ pub(crate) mod execution {
         if let Some(transfer) = journal.transfer.as_ref().filter(|transfer| {
             transfer.finished_at.is_none() && transfer.resume_operation_id == operation_id
         }) {
-            close_interrupted_sync(&mut online, &transfer.operation_id, "Sync przerwany przed Resume")?;
+            close_interrupted_sync(&mut online, &transfer.operation_id, &interrupted_sync_note("the Resume"))?;
         }
-        let private = online.private.as_ref().ok_or("Resume wymaga prywatnej topologii")?;
+        let private = online.private.as_ref().ok_or("Resume needs a private topology")?;
         if operation_id == online.spec.operation_id
             || private.service.as_ref().is_some_and(|service| service.operation_id == operation_id)
             || online
@@ -9656,9 +9753,9 @@ pub(crate) mod execution {
             || !private.service.as_ref().is_some_and(|service| service.mode == ElasticServiceMode::Hold)
             || !matches!(online.stage, ElasticStage::NeedsAttention | ElasticStage::Mounting)
         {
-            return Err("Resume wymaga trwałego service Hold bez zwykłego pending".into());
+            return Err("Resume needs a durable service Hold with no other pending intent".into());
         }
-        online.private.as_mut().ok_or("brak prywatnej topologii")?.service = Some(ElasticServiceState {
+        online.private.as_mut().ok_or("no private topology")?.service = Some(ElasticServiceState {
             mode: ElasticServiceMode::Online,
             operation_id: operation_id.to_string(),
             pending: true,
@@ -9678,11 +9775,15 @@ pub(crate) mod execution {
             && current_boot == journal.boot_id
             && !union_mounted()?
         {
-            return Err("niepewne zakończenie mount w tym samym boot; wymagany restart".into());
+            return Err(crate::refusal::wire(
+                "elastic_restart_required",
+                &[("array", &journal.spec.name)],
+                "a mount of this boot has an unconfirmed end; the node has to restart",
+            ));
         }
         let serving = serving_spec(journal);
         if !roles(&serving).iter().all(|role| journal.formatted.contains(role)) {
-            return Err("nieukończone formatowanie; restore nie formatuje".into());
+            return Err("unfinished formatting; Restore does not format".into());
         }
         Ok(())
     }
@@ -9727,7 +9828,7 @@ pub(crate) mod execution {
             return Ok(false);
         };
         if unfinished_add(journal).is_none() || !add_owned_pending(&pending, journal.spec.data.len()) {
-            return Err("intencja innej operacji niż niedokończone dodanie dysku".into());
+            return Err("an intent of an operation other than the unfinished disk addition".into());
         }
         if pending == Pending::Sync {
             journal.stale_parity_bytes.get_or_insert(0);
@@ -9809,7 +9910,7 @@ pub(crate) mod execution {
                     .map(|spec| snapraid_config(spec).map_err(|e| e.to_string()))
                     .collect::<Result<Vec<_>, _>>()?;
                 if !expected.contains(&content) {
-                    return Err("konfiguracja niezgodna z journalem".into());
+                    return Err("configuration does not match the journal".into());
                 }
             }
             if journal.boot_id != current_boot {
@@ -9848,7 +9949,7 @@ pub(crate) mod execution {
                 },
             )?;
             if let Some(worker) = worker.as_deref_mut() {
-                let private = journal.private.as_ref().ok_or("worker bez private journala")?;
+                let private = journal.private.as_ref().ok_or("worker without a private journal")?;
                 if !private.published || worker.public_mount().is_none() {
                     publish_private(root, &mut journal, |anchor| worker.publish(anchor).map(|_| ()))?;
                 }
@@ -9856,14 +9957,14 @@ pub(crate) mod execution {
             if journal.private.as_ref().and_then(|private| private.service.as_ref())
                 .is_some_and(|service| service.mode == ElasticServiceMode::Online)
             {
-                let worker = worker.as_deref_mut().ok_or("Resume wymaga workera")?;
+                let worker = worker.as_deref_mut().ok_or("Resume needs a worker")?;
                 if worker.public_mount().is_none() {
-                    return Err("Resume nie potwierdził publikacji RW".into());
+                    return Err("Resume did not confirm the RW publication".into());
                 }
                 serving_guard(&journal)?;
                 worker.set_union_readonly(false)?;
                 if worker.union_readonly()? {
-                    return Err("Resume nie potwierdził publikacji RW".into());
+                    return Err("Resume did not confirm the RW publication".into());
                 }
             }
             Ok(())
@@ -9908,7 +10009,7 @@ pub(crate) mod execution {
             AddVerdict::Refused(
                 journal,
                 ElasticRefusal::PreconditionFailed,
-                "brak potwierdzonej publikacji prywatnej macierzy".into(),
+                "no confirmed publication of the private array".into(),
             )
         } else {
             add_disk_steps(
@@ -9965,13 +10066,13 @@ pub(crate) mod execution {
             Err(refusal) => {
                 let why = match refusal {
                     ElasticRefusal::AttentionAddDisk => {
-                        "macierz ma niedokończone dodanie innego dysku; dokończ je albo wycofaj"
+                        "the array has an unfinished addition of another disk; finish it or undo it"
                     }
                     ElasticRefusal::AttentionParityFault => {
-                        "macierz ma nierozwiązany błąd parity; najpierw naprawa, scrub albo sync"
+                        "the array has an unresolved parity fault; repair, scrub or Sync first"
                     }
-                    ElasticRefusal::AttentionOther => "macierz wymaga uwagi; najpierw ją przywróć",
-                    _ => "dodanie dysku wymaga gotowej macierzy bez trwającej operacji",
+                    ElasticRefusal::AttentionOther => "the array needs attention; restore it first",
+                    _ => "a disk addition needs a Ready array with no operation running",
                 };
                 return refuse(journal, refusal, why);
             }
@@ -9992,10 +10093,10 @@ pub(crate) mod execution {
             }
             ElasticAddAdmission::Fresh => {
                 if journal.formatted.len() != roles(&journal.spec).len() {
-                    return refuse(journal, ElasticRefusal::PreconditionFailed, "nieukończone formatowanie macierzy");
+                    return refuse(journal, ElasticRefusal::PreconditionFailed, "unfinished formatting of the array");
                 }
                 if !journal.spec.parity.is_empty() && journal.sync_completed_at.is_none() {
-                    return refuse(journal, ElasticRefusal::PreconditionFailed, "niepotwierdzony pierwszy sync");
+                    return refuse(journal, ElasticRefusal::PreconditionFailed, "unconfirmed first sync");
                 }
                 match journal.spec.data.iter().position(|old| old.disk_id == disk.disk_id) {
                     // A repeat of an add this node already finished and the
@@ -10009,14 +10110,14 @@ pub(crate) mod execution {
                             return refuse(
                                 journal,
                                 ElasticRefusal::DiskClaimed,
-                                "dysk jest już innym członkiem tej macierzy",
+                                "the disk is already another member of this array",
                             );
                         }
                         // It has served the union already: forward only.
                         enter_attention(
                             &mut journal,
                             ElasticAttention::AddDisk { disk_id: disk.disk_id.clone(), joined: true },
-                            "dodawanie dysku danych w toku",
+                            "a data disk addition is in progress",
                         );
                         root.save(&journal)?;
                     }
@@ -10028,7 +10129,7 @@ pub(crate) mod execution {
                             .chain(&journal.spec.parity)
                             .any(|old| old.disk_id == disk.disk_id)
                         {
-                            return refuse(journal, ElasticRefusal::DiskClaimed, "dysk pełni w tej macierzy inną rolę");
+                            return refuse(journal, ElasticRefusal::DiskClaimed, "the disk has another role in this array");
                         }
                         let others: Vec<Claim> = match root.claims().and_then(Claims::complete) {
                             Ok(claims) => claims
@@ -10086,7 +10187,7 @@ pub(crate) mod execution {
         system: &mut dyn StepSystem,
     ) -> Result<(), String> {
         let slot = journal.spec.data.len();
-        let role = ElasticRole::Data(u16::try_from(slot).map_err(|_| "numer slotu")?);
+        let role = ElasticRole::Data(u16::try_from(slot).map_err(|_| "slot number")?);
         let spec_after = layout_with(&journal.spec, |disk| system.device(disk).map(|device| device.path))?;
         let mut spec_before = spec_after.clone();
         spec_before.data.pop();
@@ -10097,7 +10198,7 @@ pub(crate) mod execution {
             let device = system.device(role_disk(&journal.spec, other)?)?;
             system.filesystem_matches(&journal.spec, other, &device)?;
             if !system.branch_mounted(&journal.spec, other, &device)? {
-                return Err("niezamontowany branch macierzy".into());
+                return Err("unmounted array branch".into());
             }
         }
         // `union_mounted` is strict by design — any difference from the spec
@@ -10106,9 +10207,9 @@ pub(crate) mod execution {
         // expects is reported.
         let in_union = system.union_mounted(&spec_after).unwrap_or(false);
         if !in_union && !system.union_mounted(&spec_before)? {
-            return Err("dodanie dysku wymaga działającej unii macierzy".into());
+            return Err("a disk addition needs a running array union".into());
         }
-        let added = spec_after.data.last().ok_or("brak dodanego brancha")?.clone();
+        let added = spec_after.data.last().ok_or("no added branch")?.clone();
         let device = system.device(role_disk(&journal.spec, role)?)?;
         let done = AddedDiskState {
             formatted: journal.formatted.contains(&role),
@@ -10128,7 +10229,7 @@ pub(crate) mod execution {
         // now report exactly the branch list the journal describes, new disk
         // included.
         if !system.union_mounted(&spec_after)? {
-            return Err("unia nie potwierdziła nowego brancha".into());
+            return Err("the union did not confirm the new branch".into());
         }
         Ok(())
     }
@@ -10149,7 +10250,7 @@ pub(crate) mod execution {
             // The kind only: a filesystem UUID is an identifier, and this text
             // travels to the core as an answer's detail.
             return Err(format!(
-                "dysk nosi podpis {}, którego to dodawanie nie zapisało; wycofanie nie czyści cudzych danych",
+                "the disk carries a {} signature this addition did not write; an undo does not clear foreign data",
                 foreign.kind,
             ));
         }
@@ -10188,7 +10289,7 @@ pub(crate) mod execution {
             _ => {
                 return Err(UndoStop::Refused(
                     ElasticRefusal::PreconditionFailed,
-                    "macierz nie ma niedokończonego dodania tego dysku".into(),
+                    "the array has no unfinished addition of this disk".into(),
                 ))
             }
         };
@@ -10200,11 +10301,11 @@ pub(crate) mod execution {
         {
             return Err(UndoStop::Refused(
                 ElasticRefusal::OperationPending,
-                "trwa inna operacja macierzy".into(),
+                "another array operation is running".into(),
             ));
         }
         let slot = journal.spec.data.len();
-        let role = ElasticRole::Data(u16::try_from(slot).map_err(|_| "numer slotu".to_string())?);
+        let role = ElasticRole::Data(u16::try_from(slot).map_err(|_| "slot number".to_string())?);
         let union = union_path(&journal.spec.name);
         let branch = mount_path(&journal.spec, role);
         let in_union = system.union_branches(&union).ok().map(|branches| {
@@ -10217,7 +10318,7 @@ pub(crate) mod execution {
         if let Err(refusal) = add_undo_admission(joined, in_union) {
             return Err(UndoStop::Refused(
                 refusal,
-                "dysk mógł już dołączyć do udziału; dodawanie można tylko dokończyć".into(),
+                "the disk may already have joined the share; the addition can only be finished".into(),
             ));
         }
         // Still before the first effect: a disk that is not here is a
@@ -10236,14 +10337,14 @@ pub(crate) mod execution {
         {
             return Err(UndoStop::Refused(
                 ElasticRefusal::AddJoined,
-                "nowy branch zawiera pliki; dodawanie można tylko dokończyć".into(),
+                "the new branch holds files; the addition can only be finished".into(),
             ));
         }
         // First effect.
         if mounted {
             system.unmount(&branch)?;
             if system.branch_mounted(&journal.spec, role, &device)? {
-                return Err(UndoStop::Failed("nowy branch nadal jest zamontowany".into()));
+                return Err(UndoStop::Failed("the new branch is still mounted".into()));
             }
         }
         if !journal.spec.parity.is_empty() {
@@ -10292,7 +10393,11 @@ pub(crate) mod execution {
             }
             Err(UndoStop::Failed(error)) => {
                 let mut failed = root.load(&journal.spec.array_id)?;
-                enter_attention(&mut failed, ElasticAttention::Other, &format!("wycofanie dodawania: {error}"));
+                enter_attention(
+                    &mut failed,
+                    ElasticAttention::Other,
+                    &crate::refusal::reword(&error, |error| format!("undoing the addition: {error}")),
+                );
                 root.save(&failed)?;
                 Ok(observe(&failed, worker.as_deref()))
             }
@@ -10400,16 +10505,16 @@ pub(crate) mod execution {
             || distinct[1] == distinct[2]
             || distinct[0] == distinct[2]
         {
-            return Err("nieprawidłowe UUID wymiany dysku".into());
+            return Err("invalid disk replacement UUID".into());
         }
         let array_id = journal.spec.array_id.clone();
         let slot = replaceable_slot(&journal, request)?;
-        let role = ElasticRole::Data(u16::try_from(slot + 1).map_err(|_| "numer slotu")?);
+        let role = ElasticRole::Data(u16::try_from(slot + 1).map_err(|_| "slot number")?);
         if journal.spec.data[slot].disk_id != request.disk.disk_id
             && old_disk_is_healthy(&journal, slot, &inventory()?)
         {
             return Err(format!(
-                "dysk {} jest obecny i nadal ma system plików tej macierzy; użyj naprawy, nie wymiany",
+                "disk {} is present and still carries this array's filesystem; use a repair, not a replacement",
                 request.branch
             ));
         }
@@ -10417,7 +10522,7 @@ pub(crate) mod execution {
         let journal = root.replace_data_disk(&array_id, slot, request.disk)?;
         let devices = inventory()?;
         let spec = layout(&journal.spec, &devices)?;
-        let replaced = spec.data.get(slot).ok_or("brak brancha wymienianego dysku")?.clone();
+        let replaced = spec.data.get(slot).ok_or("no branch of the replaced disk")?.clone();
         let tools = Tools::resolve(&spec).map_err(|e| e.to_string())?;
         // 3. The format, which `formatted` gates, so a repeat does not redo it.
         let mut formatting = journal.clone();
@@ -10435,12 +10540,12 @@ pub(crate) mod execution {
         if restored.stage != ElasticStage::Ready {
             return Err(restored
                 .detail
-                .unwrap_or_else(|| "wymiana dysku: macierz nie wróciła do stanu Ready".into()));
+                .unwrap_or_else(|| "disk replacement: the array did not return to Ready".into()));
         }
         // 5. The rebuild, on a branch proved empty first.
         let branch = mount_path(&journal.spec, role);
-        if !fresh_branch(Path::new(&branch)).map_err(|error| format!("odczyt nowego brancha: {error}"))? {
-            return Err("nowy branch nie jest pusty; odbudowa nie nadpisuje danych".into());
+        if !fresh_branch(Path::new(&branch)).map_err(|error| format!("reading the new branch: {error}"))? {
+            return Err("the new branch is not empty; a rebuild does not overwrite data".into());
         }
         let rebuild = maintenance_with_scope(
             root,
@@ -10456,7 +10561,7 @@ pub(crate) mod execution {
             return Err(rebuild
                 .run
                 .detail
-                .unwrap_or_else(|| "odbudowa dysku z parity nie zakończyła się sukcesem".into()));
+                .unwrap_or_else(|| "the rebuild of the disk from parity did not succeed".into()));
         }
         // 6. The Sync: the restored files are the same bytes with new inodes,
         // and the content file has to say so.
@@ -10474,7 +10579,7 @@ pub(crate) mod execution {
             return Err(synced
                 .run
                 .detail
-                .unwrap_or_else(|| "sync po odbudowie nie zakończył się sukcesem".into()));
+                .unwrap_or_else(|| "the sync after the rebuild did not succeed".into()));
         }
         Ok(ElasticReplaceResult {
             state: synced.state,
@@ -10505,19 +10610,19 @@ pub(crate) mod execution {
     /// them answered from the journal and the request, so nothing here depends
     /// on what the node's inventory happens to say.
     fn replaceable_slot(journal: &Journal, request: &ReplaceRequest<'_>) -> Result<usize, String> {
-        let private = journal.private.as_ref().ok_or("wymiana dysku wymaga prywatnej topologii")?;
+        let private = journal.private.as_ref().ok_or("disk replacement needs a private topology")?;
         // The union must not be serving in this boot (see the note above).
         if private.anchor.is_some() {
-            return Err("macierz publikuje unię w tym uruchomieniu; zrestartuj node przed wymianą dysku".into());
+            return Err("the array publishes its union in this boot; restart the node before replacing a disk".into());
         }
         if journal.spec.parity.is_empty() {
-            return Err("macierz bez parity nie ma z czego odbudować dysku".into());
+            return Err("an array without parity has nothing to rebuild a disk from".into());
         }
         if journal.sync_completed_at.is_none() {
-            return Err("macierz bez potwierdzonego sync nie ma z czego odbudować dysku".into());
+            return Err("an array without a confirmed sync has nothing to rebuild a disk from".into());
         }
         if matches!(journal.pending, Some(Pending::Sync | Pending::Maintenance { .. })) {
-            return Err("przerwana operacja SnapRAID; wymiana dysku wymaga jej zamknięcia".into());
+            return Err("an interrupted SnapRAID operation; a disk replacement needs it closed".into());
         }
         // A rebuild writes the disk back to its state at the LAST SYNC. With
         // parity out of date the blocks changed elsewhere since cannot be
@@ -10528,8 +10633,8 @@ pub(crate) mod execution {
         // because a Sync needs every disk and a dead disk is why we are here.
         if journal.stale_parity_bytes.is_some() && !request.accept_stale_parity {
             return Err(
-                "parity nie jest aktualna: odbudowa odtworzy dysk do stanu z ostatniego Sync, a bloki zmienione \
-                 na innych dyskach od tego czasu będą nieodtwarzalne — wymaga jawnej zgody"
+                "parity is not current: a rebuild restores the disk to the state of the last Sync, and blocks \
+                 changed on other disks since then cannot be recovered; this needs an explicit consent"
                     .into(),
             );
         }
@@ -10539,13 +10644,13 @@ pub(crate) mod execution {
             .iter()
             .enumerate()
             .position(|(index, _)| data_branch_name(index + 1) == request.branch)
-            .ok_or("macierz nie ma tego dysku danych")?;
+            .ok_or("the array has no such data disk")?;
         let old = &journal.spec.data[slot];
         if old.disk_id == request.disk.disk_id {
             // A repeat of this very replacement: the recorded identity must be
             // the SAME disk down to the filesystem UUID the mkfs was given.
             if old != request.disk {
-                return Err("slot ma już inną tożsamość tego dysku".into());
+                return Err("the slot already has another identity of this disk".into());
             }
             return Ok(slot);
         }
@@ -10560,17 +10665,17 @@ pub(crate) mod execution {
             .chain(&journal.spec.parity)
             .any(|member| member.disk_id == request.disk.disk_id)
         {
-            return Err("dysk pełni w tej macierzy inną rolę".into());
+            return Err("the disk has another role in this array".into());
         }
         if request.disk.bytes < old.bytes {
             return Err(format!(
-                "nowy dysk ma {} bajtów, a slot potrzebuje co najmniej {}",
+                "the new disk has {} bytes and the slot needs at least {}",
                 request.disk.bytes, old.bytes
             ));
         }
         if let Some(parity) = journal.spec.parity.iter().map(|parity| parity.bytes).min() {
             if request.disk.bytes > parity {
-                return Err("nowy dysk jest większy niż parity macierzy; parity nie pokryłaby go w całości".into());
+                return Err("the new disk is larger than the array's parity; parity would not cover all of it".into());
             }
         }
         Ok(slot)
@@ -10611,7 +10716,7 @@ pub(crate) mod execution {
     ) -> Result<ElasticDissolveResult, String> {
         validate_elastic_uuid(operation_id).map_err(|e| e.to_string())?;
         if operation_id == journal.spec.operation_id {
-            return Err("ponowne użycie ID create".into());
+            return Err("reuse of the Create id".into());
         }
         let _array_lock = root.array_lock(&journal.spec.array_id)?;
         if journal.pending.is_some()
@@ -10620,7 +10725,11 @@ pub(crate) mod execution {
                 .as_ref()
                 .is_some_and(|transfer| transfer.finished_at.is_none())
         {
-            return Err("rozwiązanie wymaga zamkniętych operacji macierzy".into());
+            return Err(crate::refusal::wire(
+                "elastic_operation_pending",
+                &[("array", &journal.spec.name)],
+                "a dissolve needs every operation of the array closed",
+            ));
         }
         let mut steps = plan_dissolve(&journal.spec).map_err(|e| e.to_string())?;
         let union = union_path(&journal.spec.name);
@@ -10660,7 +10769,7 @@ pub(crate) mod execution {
                         released.push(mountpoint.clone());
                     }
                 }
-                _ => return Err("nieoczekiwany krok rozwiązania".into()),
+                _ => return Err("unexpected dissolve step".into()),
             }
         }
         if let Some(anchor) = &anchor {
@@ -10670,7 +10779,7 @@ pub(crate) mod execution {
                     .into_iter()
                     .map(|role| mount_path(&journal.spec, role)),
             );
-            let private = journal.private.as_mut().ok_or("brak prywatnej topologii")?;
+            let private = journal.private.as_mut().ok_or("no private topology")?;
             private.anchor = None;
             private.published = false;
         }
@@ -10680,8 +10789,8 @@ pub(crate) mod execution {
         enter_attention(
             &mut journal,
             ElasticAttention::Other,
-            "macierz rozwiązana: dyski zachowały systemy plików i dane, \
-             import macierzy przywraca ją w całości",
+            "array dissolved: the disks kept their filesystems and data, \
+             and an array import brings it back whole",
         );
         root.save(&journal)?;
         Ok(ElasticDissolveResult {
@@ -10746,9 +10855,9 @@ pub(crate) mod execution {
         let private = stored
             .private
             .as_ref()
-            .ok_or("publiczny journal przy publikacji prywatnej")?;
+            .ok_or("public journal at a private publication")?;
         if private.service.as_ref().is_some_and(|service| service.mode == ElasticServiceMode::Hold) {
-            return Err("publikacja zablokowana przez service Hold".into());
+            return Err("publication blocked by a service Hold".into());
         }
         if stored.spec != *spec
             || stored.pending != Some(Pending::Union)
@@ -10756,7 +10865,7 @@ pub(crate) mod execution {
             || private.anchor.as_ref() != Some(anchor)
             || stored.boot_id != boot_id()?
         {
-            return Err("brak dokładnego trwałego zamiaru publikacji".into());
+            return Err("no exact durable publication intent".into());
         }
         Ok(())
     }
@@ -10767,7 +10876,7 @@ pub(crate) mod execution {
             .iter()
             .any(|journal| journal.spec.array_id == spec.array_id)
         {
-            return Err("macierz ma już journal; create nie jest ponawiane".into());
+            return Err("the array already has a journal; Create is not repeated".into());
         }
         claims_guard(&journals, spec)?;
         vacant_namespace(spec, None)?;
@@ -10811,7 +10920,7 @@ pub(crate) mod execution {
             return PrivateResponse::State(Box::new(observe(&journal, None))).public_result(false);
         }
         if service_command && fresh && !matches!(command, crate::HelperCommand::ElasticResume { .. }) {
-            return Err("service wymaga istniejącej kotwicy".into());
+            return Err("service needs an existing anchor".into());
         }
         if matches!(
             command,
@@ -10823,7 +10932,7 @@ pub(crate) mod execution {
         ) {
             if let Some(service) = journal.private.as_ref().and_then(|private| private.service.as_ref()) {
                 if service.mode == ElasticServiceMode::Hold || service.pending {
-                    return Err("SnapRAID niedostępny podczas service Hold/pending".into());
+                    return Err("SnapRAID is unavailable during a service Hold or pending service".into());
                 }
             }
         }
@@ -10832,10 +10941,18 @@ pub(crate) mod execution {
         }
         if fresh {
             if !runs_after_a_boot(command) {
-                return Err("prywatna macierz wymaga Restore po zmianie boot".into());
+                return Err(crate::refusal::wire(
+                    "elastic_restore_after_boot",
+                    &[("array", &spec.name)],
+                    "the node restarted since the array was mounted; a Restore comes first",
+                ));
             }
             if add_disk_command {
-                return Err("dodanie dysku wymaga macierzy przywróconej w tym uruchomieniu".into());
+                return Err(crate::refusal::wire(
+                    "elastic_restore_after_boot",
+                    &[("array", &spec.name)],
+                    "the node restarted since the array was mounted; a Restore comes before a disk addition",
+                ));
             }
             let devices = inventory()?;
             let serving = serving_spec(&journal);
@@ -10844,7 +10961,7 @@ pub(crate) mod execution {
                 filesystem_matches(&serving, role, resolve(role_disk(&serving, role)?, &devices)?)?;
             }
             restore_mount_guard(&journal, &current_boot, || {
-                Err("sonda unii przed prywatnym Restore".into())
+                Err("union probe before a private Restore".into())
             })?;
             let tools = Tools::resolve(&layout).map_err(|e| e.to_string())?;
             let paths = private_paths(&spec);
@@ -10854,7 +10971,7 @@ pub(crate) mod execution {
         let anchor = journal
             .private
             .as_ref()
-            .ok_or("brak prywatnej topologii")?
+            .ok_or("no private topology")?
             .anchor
             .clone();
         // A Restore after a boot that stopped before its new anchor waits for
@@ -10872,7 +10989,13 @@ pub(crate) mod execution {
             Entry::Existing(
                 anchor
                     .as_ref()
-                    .ok_or("brak kotwicy w tym samym boot; wymagany restart")?,
+                    .ok_or_else(|| {
+                        crate::refusal::wire(
+                            "elastic_restart_required",
+                            &[("array", &spec.name)],
+                            "no namespace anchor in this boot; the node has to restart",
+                        )
+                    })?,
             )
         };
         let array_lock = root.array_lock(&spec.array_id)?;
@@ -10924,7 +11047,7 @@ pub(crate) mod execution {
                             if released.stage != ElasticStage::Ready {
                                 return Err(released
                                     .detail
-                                    .unwrap_or_else(|| "zwolnienie starego service Hold nie przywróciło macierzy".into()));
+                                    .unwrap_or_else(|| "releasing the old service Hold did not bring the array back".into()));
                             }
                             journal = root.load(&spec.array_id)?;
                         }
@@ -11010,7 +11133,7 @@ pub(crate) mod execution {
                     add_disk_abort(root, journal, disk, Some(worker), Some(&array_lock))
                         .map(|state| PrivateResponse::State(Box::new(state)))
                 }
-                _ => Err("nieprawidłowa operacja prywatnej macierzy".into()),
+                _ => Err("invalid private array operation".into()),
             },
             |anchor| authorize_publication(root, &spec, anchor),
         )?;
@@ -11019,7 +11142,7 @@ pub(crate) mod execution {
 
     pub(crate) fn execute(command: &crate::HelperCommand) -> Result<String, String> {
         if unsafe { libc::geteuid() } != 0 {
-            return Err("wykonawca Elastic wymaga root".into());
+            return Err("the Elastic executor needs root".into());
         }
         let root = Root::open(Path::new(ROOT), 0)?;
         // Everything that may unmount, replace, add, remove or dissolve a
@@ -11047,9 +11170,9 @@ pub(crate) mod execution {
             }
             crate::HelperCommand::ElasticFolderUsage { array_id, owner, folders } => {
                 let journal = root.load(array_id)?;
-                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                if &journal.spec.owner != owner { return Err("the array is not available to this owner".into()); }
                 if journal.private.is_none() {
-                    return Err("pomiar folderów wymaga prywatnej topologii".into());
+                    return Err("folder usage needs a private topology".into());
                 }
                 return serde_json::to_string(&folder_usage_unlocked(root, journal, folders)?).map_err(|e| e.to_string());
             }
@@ -11059,9 +11182,9 @@ pub(crate) mod execution {
             | crate::HelperCommand::ElasticReplaceDisk { array_id, owner, .. }
             | crate::HelperCommand::ElasticCacheAge { array_id, owner, .. } => {
                 let journal = root.load(array_id)?;
-                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                if &journal.spec.owner != owner { return Err("the array is not available to this owner".into()); }
                 if journal.private.is_none() {
-                    return Err("service wymaga prywatnej topologii".into());
+                    return Err("service needs a private topology".into());
                 }
                 serde_json::to_value(private_operation(&root, journal, command)?)
             }
@@ -11069,7 +11192,7 @@ pub(crate) mod execution {
             | crate::HelperCommand::ElasticScrub { array_id, owner, operation_id }
             | crate::HelperCommand::ElasticFix { array_id, owner, operation_id, .. } => {
                 let journal = root.load(array_id)?;
-                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                if &journal.spec.owner != owner { return Err("the array is not available to this owner".into()); }
                 if journal.private.is_some() {
                     return serde_json::to_string(&private_operation(&root, journal, command)?).map_err(|e| e.to_string());
                 }
@@ -11079,7 +11202,7 @@ pub(crate) mod execution {
                     crate::HelperCommand::ElasticFix { disk, .. } => {
                         ElasticSnapraidKind::Fix { disk: disk.clone() }
                     }
-                    _ => return Err("nie jest operacją SnapRAID".into()),
+                    _ => return Err("not a SnapRAID operation".into()),
                 };
                 let acknowledged_fault = match command {
                     crate::HelperCommand::ElasticSync { acknowledge_parity_fault, .. } => acknowledge_parity_fault.as_deref(),
@@ -11089,7 +11212,7 @@ pub(crate) mod execution {
             }
             crate::HelperCommand::ElasticAddDisk { array_id, owner, disk, .. } => {
                 let journal = root.load(array_id)?;
-                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                if &journal.spec.owner != owner { return Err("the array is not available to this owner".into()); }
                 if journal.private.is_some() {
                     return serde_json::to_string(&private_operation(&root, journal, command)?).map_err(|e| e.to_string());
                 }
@@ -11103,7 +11226,7 @@ pub(crate) mod execution {
             // any Restore could bring the array back.
             crate::HelperCommand::ElasticAddDiskAbort { array_id, owner, disk, .. } => {
                 let journal = root.load(array_id)?;
-                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                if &journal.spec.owner != owner { return Err("the array is not available to this owner".into()); }
                 let in_namespace = journal.private.as_ref().is_some_and(|private| private.anchor.is_some())
                     && journal.boot_id == boot_id()?;
                 if in_namespace {
@@ -11117,14 +11240,14 @@ pub(crate) mod execution {
             // very namespace whose last member it is about to kill.
             crate::HelperCommand::ElasticDestroy { array_id, owner, operation_id } => {
                 let journal = root.load(array_id)?;
-                if &journal.spec.owner != owner { return Err("macierz niedostępna dla właściciela".into()); }
+                if &journal.spec.owner != owner { return Err("the array is not available to this owner".into()); }
                 serde_json::to_value(destroy(&root, journal, operation_id)?)
             }
             crate::HelperCommand::ElasticInspect { array_id, owner }
             | crate::HelperCommand::ElasticRestore { array_id, owner } => {
                 let journal = root.load(array_id)?;
                 if &journal.spec.owner != owner {
-                    return Err("macierz niedostępna dla właściciela".into());
+                    return Err("the array is not available to this owner".into());
                 }
                 if journal.private.is_some() {
                     return serde_json::to_string(&private_operation(&root, journal, command)?).map_err(|e| e.to_string());
@@ -11192,7 +11315,7 @@ pub(crate) mod execution {
                     disks,
                 })
             }
-            _ => return Err("nie jest poleceniem Elastic".into()),
+            _ => return Err("not an Elastic command".into()),
         }
         .map_err(|e| e.to_string())?;
         serde_json::to_string(&value).map_err(|e| e.to_string())
@@ -11201,7 +11324,11 @@ pub(crate) mod execution {
     fn claims_guard(journals: &[Claim], spec: &ElasticCreateSpec) -> Result<(), String> {
         for journal in journals {
             if journal.spec.name == spec.name {
-                return Err("nazwa zarezerwowana".into());
+                return Err(crate::refusal::wire(
+                    "elastic_name_unavailable",
+                    &[("array", &spec.name)],
+                    "another array journal on this node reserves this name",
+                ));
             }
             for disk in spec.data.iter().chain(spec.cache.iter()).chain(&spec.parity) {
                 if journal
@@ -11223,7 +11350,11 @@ pub(crate) mod execution {
                                 .is_some_and(|v| old.serial.as_ref() == Some(v))
                     })
                 {
-                    return Err("nośnik zarezerwowany".into());
+                    return Err(crate::refusal::wire(
+                        "elastic_disk_claimed",
+                        &[],
+                        "another array journal on this node reserves a picked disk",
+                    ));
                 }
             }
         }
@@ -11231,9 +11362,13 @@ pub(crate) mod execution {
     }
 
     fn zfs_name_guard(journals: &[Claim], name: &str) -> Result<(), String> {
-        let pool = name.split('/').next().ok_or("brak nazwy puli")?;
+        let pool = name.split('/').next().ok_or("no pool name")?;
         if journals.iter().any(|j| j.spec.name == pool) {
-            return Err("nazwa zarezerwowana przez Elastic".into());
+            return Err(crate::refusal::wire(
+                "zfs_name_reserved",
+                &[("pool", pool)],
+                "an Elastic Array on this node reserves this name",
+            ));
         }
         Ok(())
     }
@@ -11248,14 +11383,18 @@ pub(crate) mod execution {
                 .components()
                 .any(|c| matches!(c, std::path::Component::ParentDir))
         {
-            return Err("niejednoznaczny mountpoint ZFS".into());
+            return Err("ambiguous ZFS mountpoint".into());
         }
         if journals.iter().any(|j| {
             [union_path(&j.spec.name), branch_root(&j.spec.name)]
                 .iter()
                 .any(|reserved| overlaps(path, Path::new(reserved)))
         }) {
-            return Err("mountpoint przecina rezerwację Elastic".into());
+            return Err(crate::refusal::wire(
+                "zfs_mountpoint_reserved",
+                &[],
+                format!("the mountpoint {} overlaps the paths an Elastic Array reserves", path.display()),
+            ));
         }
         Ok(())
     }
@@ -11263,7 +11402,7 @@ pub(crate) mod execution {
     fn physical_device(path: &str, devices: &[Device]) -> Result<Device, String> {
         let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
         if !metadata.file_type().is_block_device() {
-            return Err("ZFS: źródło nie jest block device".into());
+            return Err("ZFS: the source is not a block device".into());
         }
         let major_minor = format!(
             "{}:{}",
@@ -11277,22 +11416,22 @@ pub(crate) mod execution {
             .try_exists()
             .map_err(|e| e.to_string())?
         {
-            sys = sys.parent().ok_or("brak rodzica partycji")?.to_path_buf();
+            sys = sys.parent().ok_or("no partition parent")?.to_path_buf();
         }
         let kernel = sys
             .file_name()
             .and_then(|v| v.to_str())
-            .ok_or("brak kernel name")?;
+            .ok_or("no kernel name")?;
         let found: Vec<_> = devices.iter().filter(|d| d.kernel == kernel).collect();
         if found.len() != 1 {
-            return Err("nieznana tożsamość fizyczna nośnika ZFS".into());
+            return Err("unknown physical identity of the ZFS device".into());
         }
         Ok(found[0].clone())
     }
 
     fn zfs_disk_guard(journals: &[Claim], device: &Device) -> Result<(), String> {
         if device.wwn.is_none() && device.serial.is_none() && !journals.is_empty() {
-            return Err("brak tożsamości do porównania rezerwacji ZFS".into());
+            return Err("no identity to compare against the ZFS reservations".into());
         }
         if journals
             .iter()
@@ -11307,7 +11446,11 @@ pub(crate) mod execution {
                         .is_some_and(|v| device.serial.as_ref() == Some(v))
             })
         {
-            return Err("nośnik zarezerwowany przez Elastic".into());
+            return Err(crate::refusal::wire(
+                "zfs_disk_reserved",
+                &[("disk", &device.kernel)],
+                "an Elastic Array on this node reserves this disk",
+            ));
         }
         Ok(())
     }
@@ -11337,7 +11480,7 @@ pub(crate) mod execution {
             .map(|line| {
                 let fields: Vec<_> = line.split('\t').collect();
                 if fields.len() != 3 || !["on", "off", "noauto"].contains(&fields[2]) {
-                    return Err("nieczytelne właściwości ZFS".into());
+                    return Err("unreadable ZFS properties".into());
                 }
                 crate::validate_dataset_name(fields[0]).map_err(|e| e.to_string())?;
                 Ok(ZfsDataset {
@@ -11354,11 +11497,11 @@ pub(crate) mod execution {
     }
 
     fn child_mountpoint(name: &str, datasets: &[ZfsDataset]) -> Result<String, String> {
-        let (parent, child) = name.rsplit_once('/').ok_or("brak rodzica datasetu")?;
+        let (parent, child) = name.rsplit_once('/').ok_or("no dataset parent")?;
         let parent = datasets
             .iter()
             .find(|d| d.name == parent)
-            .ok_or("brak właściwości rodzica")?;
+            .ok_or("no parent properties")?;
         if parent.mountpoint == "none" || parent.mountpoint == "legacy" {
             return Ok(parent.mountpoint.clone());
         }
@@ -11410,7 +11553,7 @@ pub(crate) mod execution {
                 let row = datasets
                     .iter()
                     .find(|d| &d.name == dataset)
-                    .ok_or("brak datasetu")?;
+                    .ok_or("no dataset")?;
                 zfs_path_guard(journals, &row.mountpoint)
             }
             ZfsSet { name, property, .. } | ZfsInherit { name, property } => {
@@ -11419,7 +11562,7 @@ pub(crate) mod execution {
                 let root = datasets
                     .iter()
                     .find(|d| &d.name == name)
-                    .ok_or("brak datasetu")?;
+                    .ok_or("no dataset")?;
                 let replacement = if property == "mountpoint" {
                     Some(match command {
                         ZfsSet { value, .. } => value.clone(),
@@ -11444,7 +11587,7 @@ pub(crate) mod execution {
                 }
                 Ok(())
             }
-            _ => Err("nieobsługiwany guard przestrzeni ZFS".into()),
+            _ => Err("unsupported ZFS namespace guard".into()),
         }
     }
 
@@ -11466,7 +11609,7 @@ pub(crate) mod execution {
                 .filter(|d| dataset_under(&d.name, name))
                 .collect();
             if rows.is_empty() {
-                return Err("brak właściwości zaimportowanej puli".into());
+                return Err("no properties of the imported pool".into());
             }
             for row in &rows {
                 zfs_path_guard(journals, &row.mountpoint)?;
@@ -11477,10 +11620,10 @@ pub(crate) mod execution {
             {
                 mount(&row.name)?;
             }
-            Ok("Pula zaimportowana; mountpointy sprawdzone".into())
+            Ok("Pool imported; mountpoints checked".into())
         })();
         outcome.map_err(|e| {
-            format!("Pula pozostaje zaimportowana po import -N; montowanie nieukończone: {e}")
+            crate::refusal::reword(&e, |e| format!("The pool stays imported after import -N; mounting did not finish: {e}"))
         })
     }
 
@@ -11515,7 +11658,7 @@ pub(crate) mod execution {
                     if fields.len() < 2
                         || !["ONLINE", "DEGRADED", "AVAIL", "INUSE"].contains(&fields[1])
                     {
-                        return Err("nieznana lub niedostępna pozycja import scan".into());
+                        return Err("unknown or unavailable import scan entry".into());
                     }
                     crate::validate_vdev_name(name).map_err(|e| e.to_string())?;
                     row.leaves.push(if name.starts_with('/') {
@@ -11528,7 +11671,7 @@ pub(crate) mod execution {
         }
         let mut matches: Vec<_> = rows.into_iter().filter(|r| r.guid == guid).collect();
         if matches.len() != 1 || matches[0].leaves.is_empty() {
-            return Err("niejednoznaczny import scan".into());
+            return Err("ambiguous import scan".into());
         }
         Ok(matches.remove(0))
     }
@@ -11612,74 +11755,95 @@ pub(crate) mod execution {
     /// combination of the other facts can reach `Erase` while `exclusive` is
     /// an error, which is the invariant the tests pin.
     pub(crate) fn wipe_verdict(facts: &WipeFacts) -> WipeVerdict {
+        use crate::refusal::wire;
         use WipeVerdict::*;
+        // The kernel name is the parameter (never an id); the sentence names
+        // the device as the request did.
+        let disk = kernel_name_of(&facts.device);
         if !facts.holders.is_empty() {
-            return Refuse(format!(
-                "{}: urządzenie ma aktywnych właścicieli ({}) — rozłóż tablicę md albo \
-                 device-mapper, która je trzyma, i powtórz",
-                facts.device,
-                facts.holders.join(", ")
+            return Refuse(wire(
+                "disk_wipe_holders",
+                &[("disk", disk)],
+                format!(
+                    "{}: the device has active holders ({}); stop the md array or device-mapper \
+                     device that holds it and try again",
+                    facts.device,
+                    facts.holders.join(", ")
+                ),
             ));
         }
         if !facts.host_mounts.is_empty() {
-            return Refuse(format!(
-                "{}: urządzenie jest zamontowane ({}) — odmontuj je i powtórz",
-                facts.device,
-                facts.host_mounts.join(", ")
+            return Refuse(wire(
+                "disk_wipe_mounted",
+                &[("disk", disk)],
+                format!(
+                    "{}: the device is mounted ({}); unmount it and try again",
+                    facts.device,
+                    facts.host_mounts.join(", ")
+                ),
             ));
         }
         if facts.swap {
-            return Refuse(format!(
-                "{}: urządzenie jest swapem — wyłącz swap (swapoff) i powtórz",
-                facts.device
+            return Refuse(wire(
+                "disk_wipe_swap",
+                &[("disk", disk)],
+                format!("{}: the device is in use as swap; turn it off (swapoff) and try again", facts.device),
             ));
         }
         for signature in &facts.signatures {
+            let label = signature.label.as_deref().unwrap_or_default();
+            let named = if label.is_empty() { String::new() } else { format!(" {label}") };
             if signature.kind == "zfs_member" {
-                return Refuse(format!(
-                    "{}: urządzenie nosi sygnaturę członka puli ZFS{} — usuń albo wyeksportuj \
-                     pulę i powtórz",
-                    facts.device,
-                    signature
-                        .label
-                        .as_deref()
-                        .map(|label| format!(" {label}"))
-                        .unwrap_or_default()
+                return Refuse(wire(
+                    "disk_wipe_zfs_member",
+                    &[("disk", disk), ("pool", label)],
+                    format!(
+                        "{}: the device carries the signature of a member of ZFS pool{named}; \
+                         destroy or export the pool and try again",
+                        facts.device
+                    ),
                 ));
             }
             if signature.kind == "linux_raid_member" {
-                return Refuse(format!(
-                    "{}: urządzenie nosi sygnaturę członka macierzy mdraid{} — rozłóż macierz \
-                     (mdadm --stop) i powtórz",
-                    facts.device,
-                    signature
-                        .label
-                        .as_deref()
-                        .map(|label| format!(" {label}"))
-                        .unwrap_or_default()
+                return Refuse(wire(
+                    "disk_wipe_md_member",
+                    &[("disk", disk), ("name", label)],
+                    format!(
+                        "{}: the device carries the signature of a member of md array{named}; \
+                         stop the array (mdadm --stop) and try again",
+                        facts.device
+                    ),
                 ));
             }
         }
         let release = match &facts.claim {
             None => None,
             Some(claim) if claim.serving != Some(false) => {
-                return Refuse(format!(
-                    "{}: dysk należy do macierzy Elastic {}, która {} — rozwiąż macierz i \
-                     powtórz",
-                    facts.device,
-                    claim.name,
-                    if claim.serving == Some(true) {
-                        "nadal udostępnia unię"
-                    } else {
-                        "ma nieodczytany stan montowań"
-                    }
+                return Refuse(wire(
+                    "disk_wipe_elastic_serving",
+                    &[("disk", disk), ("array", &claim.name)],
+                    format!(
+                        "{}: the disk belongs to Elastic Array {}, which {}; dissolve the array and \
+                         try again",
+                        facts.device,
+                        claim.name,
+                        if claim.serving == Some(true) {
+                            "still serves its union"
+                        } else {
+                            "has a mount state that cannot be read"
+                        }
+                    ),
                 ));
             }
             Some(claim) if facts.acknowledged.as_deref() != Some(claim.name.as_str()) => {
-                return Refuse(format!(
-                    "{}: dziennik rozwiązanej macierzy Elastic {} nadal rezerwuje ten dysk — \
-                     potwierdź utratę tej macierzy albo przywróć ją importem macierzy",
-                    facts.device, claim.name
+                return Refuse(wire(
+                    "disk_wipe_journal_unacknowledged",
+                    &[("array", &claim.name)],
+                    format!(
+                        "{}: the journal of the dissolved Elastic Array {} still reserves this disk; \
+                         confirm the loss of that array, or bring it back with an array import",
+                        facts.device, claim.name
+                    ),
                 ));
             }
             Some(claim) => Some(claim.array_id.clone()),
@@ -11691,35 +11855,52 @@ pub(crate) mod execution {
         Erase { release }
     }
 
-    /// The exclusive open's outcome, as a sentence naming cause and remedy.
+    /// A device's kernel name (`sdc` of `/dev/sdc`): what a refusal names a
+    /// disk by.
+    fn kernel_name_of(device: &str) -> &str {
+        device.rsplit('/').next().unwrap_or(device)
+    }
+
+    /// The exclusive open's outcome, as a refusal naming cause and remedy.
     ///
     /// Pure over the errno so the kernel's veto is testable: EBUSY is the one
     /// branch that matters and the one a unit test cannot provoke without a
     /// real mounted block device.
     pub(crate) fn exclusive_open_refusal(device: &str, errno: Option<i32>) -> Result<(), String> {
-        let reason = match errno {
+        use crate::refusal::wire;
+        let disk = kernel_name_of(device);
+        Err(match errno {
             None => return Ok(()),
             // THE VETO. The kernel holds this against a filesystem mounted in
             // ANY mount namespace, which is the only way an Elastic Array
             // branch is ever seen from outside the union process.
-            Some(libc::EBUSY) => "urządzenie jest zajęte — jądro odmówiło wyłącznego otwarcia, \
-                 więc nosi zamontowany system plików (także w prywatnej przestrzeni montowań \
-                 macierzy Elastic) albo aktywnego właściciela; odmontuj go i powtórz"
-                .to_string(),
-            Some(libc::EROFS) | Some(libc::EACCES) | Some(libc::EPERM) => {
-                "urządzenie nie daje się otworzyć do zapisu — sprawdź, czy nie jest tylko do \
-                 odczytu (blockdev --setrw) i czy kanał uprawnień działa"
-                    .to_string()
-            }
-            Some(libc::ENOENT) | Some(libc::ENXIO) | Some(libc::ENODEV) => {
-                "urządzenia nie ma — odśwież listę dysków i powtórz".to_string()
-            }
+            Some(libc::EBUSY) => wire(
+                "disk_wipe_busy",
+                &[("disk", disk)],
+                format!(
+                    "{device}: the device is busy: the kernel refused the exclusive open, so it \
+                     carries a mounted filesystem (possibly in the private mount namespace of an \
+                     Elastic Array) or an active holder; unmount it and try again"
+                ),
+            ),
+            Some(libc::EROFS) | Some(libc::EACCES) | Some(libc::EPERM) => wire(
+                "disk_wipe_readonly",
+                &[("disk", disk)],
+                format!(
+                    "{device}: the device cannot be opened for writing; check that it is not \
+                     read-only (blockdev --setrw) and that the permission channel works"
+                ),
+            ),
+            Some(libc::ENOENT) | Some(libc::ENXIO) | Some(libc::ENODEV) => wire(
+                "disk_not_found",
+                &[("disk", disk)],
+                format!("{device}: the device is gone; refresh the disk list and try again"),
+            ),
             Some(other) => format!(
-                "wyłączne otwarcie urządzenia nie udało się: {}",
+                "{device}: the exclusive open of the device failed: {}",
                 std::io::Error::from_raw_os_error(other)
             ),
-        };
-        Err(format!("{device}: {reason}"))
+        })
     }
 
     /// Opens the block device the way the erase needs it — for writing, and
@@ -11779,7 +11960,7 @@ pub(crate) mod execution {
     fn swap_holds(numbers: &[String]) -> Result<bool, String> {
         let text = std::fs::read_to_string("/proc/swaps").map_err(|e| e.to_string())?;
         for line in text.lines().skip(1) {
-            let source = line.split_whitespace().next().ok_or("nieczytelny swap")?;
+            let source = line.split_whitespace().next().ok_or("unreadable /proc/swaps")?;
             let Ok(metadata) = std::fs::metadata(source) else {
                 // A swap FILE, not a device: it has no bearing on this disk's
                 // exclusivity and must not fail the read of the ones that do.
@@ -11816,24 +11997,42 @@ pub(crate) mod execution {
     /// built around. A refusal from it is honoured, never worked around.
     pub(crate) fn guarded_wipe(command: &crate::HelperCommand) -> Result<String, String> {
         if unsafe { libc::geteuid() } != 0 {
-            return Err("czyszczenie dysku wymaga root".into());
+            return Err("clearing a disk needs root".into());
         }
         let crate::HelperCommand::DiskWipe { device, wwn, serial, bytes, release_journal } = command
         else {
-            return Err("nie jest poleceniem czyszczenia dysku".into());
+            return Err("not a disk clear command".into());
         };
         command.plan().map_err(|e| e.to_string())?;
         let root = Root::open(Path::new(ROOT), 0)?;
         let devices = inventory()?;
-        let resolved = device_by_identity(&devices, wwn.as_ref(), serial.as_ref(), *bytes)?;
+        let disk = kernel_name_of(device);
+        let resolved = device_by_identity(&devices, wwn.as_ref(), serial.as_ref(), *bytes).map_err(|error| {
+            // The array's words for "the disk is not here" and "it changed"
+            // are the wipe's own here: this disk is no array's member.
+            if error.starts_with("refusal:elastic_disk_missing") {
+                crate::refusal::wire(
+                    "disk_not_found",
+                    &[("disk", disk)],
+                    format!("{device}: no single device has this identity any more; refresh the disk list and try again"),
+                )
+            } else {
+                crate::refusal::wire(
+                    "disk_wipe_plan_changed",
+                    &[("disk", disk)],
+                    format!("{device}: the device reports another identity or size than the plan was read for"),
+                )
+            }
+        })?;
         // The name the caller asked for must still BE this disk. It is checked
         // rather than silently corrected: an admin who confirmed "sdc" and a
         // node that would then clear "sdf" is the accident this whole
         // operation is shaped around.
         if resolved.path != *device {
-            return Err(format!(
-                "{device}: tożsamość wskazuje teraz na {} — odśwież listę dysków i powtórz",
-                resolved.path
+            return Err(crate::refusal::wire(
+                "disk_wipe_plan_changed",
+                &[("disk", disk)],
+                format!("{device}: the identity now points at {}; refresh the disk list and try again", resolved.path),
             ));
         }
         confirm_device(resolved)?;
@@ -11892,9 +12091,13 @@ pub(crate) mod execution {
         // caller and this node disagree about what the disk belongs to, and
         // the disagreement is exactly what must not be resolved by acting.
         if release_journal.is_some() && acknowledged.is_none() {
-            return Err(format!(
-                "{device}: potwierdzenie dotyczy innej macierzy niż ta, która rezerwuje ten \
-                 dysk — odczytaj plan ponownie"
+            return Err(crate::refusal::wire(
+                "disk_wipe_plan_changed",
+                &[("disk", disk)],
+                format!(
+                    "{device}: the confirmation names another array than the one that reserves \
+                     this disk; read the plan again"
+                ),
             ));
         }
         let mut facts = WipeFacts { acknowledged, ..facts };
@@ -11911,7 +12114,11 @@ pub(crate) mod execution {
         let gate = gate?;
         if let Some(array_id) = &release {
             root.releasable(array_id).map_err(|error| {
-                format!("{device}: dziennika macierzy nie można zwolnić ({error}); dysk nie został wyczyszczony")
+                crate::refusal::wire(
+                    "disk_wipe_release_failed",
+                    &[("disk", disk), ("array", facts.acknowledged.as_deref().unwrap_or_default())],
+                    format!("{device}: the array journal cannot be released ({error}); the disk was not cleared"),
+                )
             })?;
         }
         // The steps are the privileged operations AS THEY RAN, in order, for
@@ -11940,10 +12147,14 @@ pub(crate) mod execution {
         steps.push(format!("wipefs --no-act --json {}", resolved.path));
         let remaining = wipefs_probe(&resolved.path)?;
         if !remaining.is_empty() {
-            return Err(format!(
-                "{}: po czyszczeniu urządzenie nadal zgłasza sygnatury ({}) — powtórz operację",
-                resolved.path,
-                remaining.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>().join(", ")
+            return Err(crate::refusal::wire(
+                "disk_wipe_signatures_remain",
+                &[("disk", disk)],
+                format!(
+                    "{}: after the clear the device still reports signatures ({}); run it again",
+                    resolved.path,
+                    remaining.iter().map(|s| s.kind.as_str()).collect::<Vec<_>>().join(", ")
+                ),
             ));
         }
         let mut journal_released = None;
@@ -11953,11 +12164,16 @@ pub(crate) mod execution {
             // NOT "nothing happened". Say both halves: the operation did not
             // complete, and what it did do is irreversible.
             root.release(array_id).map_err(|e| {
-                format!(
-                    "{}: urządzenie zostało wyczyszczone, ale dziennik macierzy '{}' nie został \
-                     zwolniony ({e}) — dysk jest już pusty, a rezerwacja pozostaje; powtórz \
-                     zwolnienie",
-                    resolved.path, name
+                crate::refusal::wire(
+                    "disk_wipe_journal_kept",
+                    // Never the id the name falls back to.
+                    &[("disk", disk), ("array", facts.acknowledged.as_deref().unwrap_or_default())],
+                    format!(
+                        "{}: the device was cleared, but the journal of array '{}' was not \
+                         released ({e}); the disk is blank and the reservation remains; release it \
+                         again",
+                        resolved.path, name
+                    ),
                 )
             })?;
             steps.push(format!("rm {ROOT}/{array_id}.json"));
@@ -11977,7 +12193,7 @@ pub(crate) mod execution {
         payload: &[u8],
     ) -> Result<String, String> {
         if unsafe { libc::geteuid() } != 0 {
-            return Err("guard ZFS wymaga root".into());
+            return Err("the ZFS guard needs root".into());
         }
         let root = Root::open(Path::new(ROOT), 0)?;
         let journals = root.claims()?.complete()?;
@@ -12017,7 +12233,7 @@ pub(crate) mod execution {
                     &[],
                 )?)?;
                 if actual_guid.trim() != guid {
-                    return Err("inna tożsamość zaimportowanej puli".into());
+                    return Err("another identity of the imported pool".into());
                 }
                 let datasets = zfs_datasets(&zfs)?;
                 mount_imported(name, &journals, &datasets, |dataset| {
@@ -12025,7 +12241,7 @@ pub(crate) mod execution {
                 })
             })();
             return outcome.map_err(|e| {
-                format!("Pula pozostaje zaimportowana po import -N; montowanie nieukończone: {e}")
+                crate::refusal::reword(&e, |e| format!("The pool stays imported after import -N; mounting did not finish: {e}"))
             });
         }
         zfs_namespace_command(command, &journals, &zfs)?;
@@ -12406,16 +12622,19 @@ pub(crate) mod execution {
         fn every_wipe_refusal_fires_for_its_own_cause_and_names_a_remedy() {
             let holders = WipeFacts { holders: vec!["md0".into()], ..wipe_facts() };
             let reason = refusal(&holders);
-            assert!(reason.contains("właścicieli") && reason.contains("md0"), "{reason}");
-            assert!(reason.contains("powtórz"), "brak zaradzenia: {reason}");
+            assert!(reason.starts_with("refusal:disk_wipe_holders?disk=sdc "), "{reason}");
+            assert!(reason.contains("holders") && reason.contains("md0"), "{reason}");
+            assert!(reason.contains("try again"), "no remedy: {reason}");
 
             let mounted = WipeFacts { host_mounts: vec!["/mnt/stare".into()], ..wipe_facts() };
             let reason = refusal(&mounted);
-            assert!(reason.contains("zamontowane") && reason.contains("/mnt/stare"), "{reason}");
-            assert!(reason.contains("Odmontuj") || reason.contains("odmontuj"), "{reason}");
+            assert!(reason.starts_with("refusal:disk_wipe_mounted?disk=sdc "), "{reason}");
+            assert!(reason.contains("mounted") && reason.contains("/mnt/stare"), "{reason}");
+            assert!(reason.contains("unmount"), "{reason}");
 
             let swap = WipeFacts { swap: true, ..wipe_facts() };
             let reason = refusal(&swap);
+            assert!(reason.starts_with("refusal:disk_wipe_swap?disk=sdc "), "{reason}");
             assert!(reason.contains("swap") && reason.contains("swapoff"), "{reason}");
 
             let zfs = WipeFacts {
@@ -12428,8 +12647,9 @@ pub(crate) mod execution {
                 ..wipe_facts()
             };
             let reason = refusal(&zfs);
-            assert!(reason.contains("puli ZFS") && reason.contains("tank"), "{reason}");
-            assert!(reason.contains("wyeksportuj"), "{reason}");
+            assert!(reason.starts_with("refusal:disk_wipe_zfs_member?disk=sdc&pool=tank "), "{reason}");
+            assert!(reason.contains("ZFS pool tank"), "{reason}");
+            assert!(reason.contains("export"), "{reason}");
 
             let md = WipeFacts {
                 signatures: vec![WipedSignature {
@@ -12441,7 +12661,8 @@ pub(crate) mod execution {
                 ..wipe_facts()
             };
             let reason = refusal(&md);
-            assert!(reason.contains("mdraid") && reason.contains("nas:0"), "{reason}");
+            assert!(reason.starts_with("refusal:disk_wipe_md_member?disk=sdc&name=nas%3A0 "), "{reason}");
+            assert!(reason.contains("md array nas:0"), "{reason}");
             assert!(reason.contains("mdadm --stop"), "{reason}");
 
             // A signature list is scanned WHOLE: a partition table in front of
@@ -12453,7 +12674,7 @@ pub(crate) mod execution {
                 ],
                 ..wipe_facts()
             };
-            assert!(refusal(&behind).contains("puli ZFS"), "sygnatura za tablicą partycji");
+            assert!(refusal(&behind).starts_with("refusal:disk_wipe_zfs_member?disk=sdc "), "a signature behind a partition table");
         }
 
         /// The journal case, in all four of its states. The acknowledgement is
@@ -12473,8 +12694,8 @@ pub(crate) mod execution {
                 ..wipe_facts()
             };
             let reason = refusal(&serving);
-            assert!(reason.contains("nadal udostępnia unię"), "{reason}");
-            assert!(reason.contains("media"), "odmowa nazywa macierz: {reason}");
+            assert!(reason.starts_with("refusal:disk_wipe_elastic_serving?disk=sdc&array=media "), "{reason}");
+            assert!(reason.contains("still serves its union"), "{reason}");
 
             // The mount table could not be read. Unknown is NOT free: this is
             // the exact shape of the incident this operation was written after.
@@ -12483,12 +12704,13 @@ pub(crate) mod execution {
                 acknowledged: Some("media".into()),
                 ..wipe_facts()
             };
-            assert!(refusal(&unknown).contains("nieodczytany stan montowań"));
+            assert!(refusal(&unknown).contains("mount state that cannot be read"));
 
             let unacknowledged = WipeFacts { claim: Some(claim()), ..wipe_facts() };
             let reason = refusal(&unacknowledged);
-            assert!(reason.contains("rozwiązanej macierzy Elastic media"), "{reason}");
-            assert!(reason.contains("importem macierzy"), "odmowa oferuje odzysk: {reason}");
+            assert!(reason.starts_with("refusal:disk_wipe_journal_unacknowledged?array=media "), "{reason}");
+            assert!(reason.contains("dissolved Elastic Array media"), "{reason}");
+            assert!(reason.contains("array import"), "the refusal offers the recovery: {reason}");
 
             // An acknowledgement for a DIFFERENT array does not release this one.
             let wrong = WipeFacts {
@@ -12496,7 +12718,7 @@ pub(crate) mod execution {
                 acknowledged: Some("foto".into()),
                 ..wipe_facts()
             };
-            assert!(refusal(&wrong).contains("rozwiązanej macierzy Elastic media"));
+            assert!(refusal(&wrong).contains("dissolved Elastic Array media"));
 
             let ready = WipeFacts {
                 claim: Some(claim()),
@@ -12555,25 +12777,29 @@ pub(crate) mod execution {
         #[test]
         fn the_exclusive_open_errnos_each_name_their_own_cause() {
             assert!(exclusive_open_refusal("/dev/sdc", None).is_ok(), "udane otwarcie przechodzi");
-            for (errno, needle) in [
-                (libc::EBUSY, "zajęte"),
-                (libc::EROFS, "tylko do odczytu"),
-                (libc::EACCES, "do zapisu"),
-                (libc::EPERM, "do zapisu"),
-                (libc::ENOENT, "nie ma"),
-                (libc::ENXIO, "nie ma"),
-                (libc::ENODEV, "nie ma"),
-                (libc::EIO, "wyłączne otwarcie"),
+            for (errno, code, needle) in [
+                (libc::EBUSY, Some("disk_wipe_busy"), "busy"),
+                (libc::EROFS, Some("disk_wipe_readonly"), "read-only"),
+                (libc::EACCES, Some("disk_wipe_readonly"), "for writing"),
+                (libc::EPERM, Some("disk_wipe_readonly"), "for writing"),
+                (libc::ENOENT, Some("disk_not_found"), "is gone"),
+                (libc::ENXIO, Some("disk_not_found"), "is gone"),
+                (libc::ENODEV, Some("disk_not_found"), "is gone"),
+                (libc::EIO, None, "exclusive open"),
             ] {
                 let reason = exclusive_open_refusal("/dev/sdc", Some(errno))
-                    .expect_err("każdy błąd otwarcia jest odmową");
-                assert!(reason.starts_with("/dev/sdc: "), "odmowa nazywa urządzenie: {reason}");
+                    .expect_err("every open error is a refusal");
+                match code {
+                    Some(code) => assert!(reason.starts_with(&format!("refusal:{code}?disk=sdc ")), "errno {errno}: {reason}"),
+                    None => assert!(!crate::refusal::is_wire(&reason), "errno {errno}: {reason}"),
+                }
+                assert!(crate::refusal::sentence(&reason).starts_with("/dev/sdc: "), "the refusal names the device: {reason}");
                 assert!(reason.contains(needle), "errno {errno}: {reason}");
             }
             // EBUSY is the one that has to say WHY user space could not see
             // the mount, or the admin reads it as a transient fault to retry.
             let busy = exclusive_open_refusal("/dev/sdc", Some(libc::EBUSY)).expect_err("EBUSY");
-            assert!(busy.contains("prywatnej przestrzeni montowań"), "{busy}");
+            assert!(busy.contains("private mount namespace"), "{busy}");
         }
 
         /// The gate really opens the device: exercised against real paths, so
@@ -12590,7 +12816,7 @@ pub(crate) mod execution {
             let missing = dir.0.join("nie-ma");
             let reason = open_exclusive(missing.to_str().expect("ścieżka"))
                 .expect_err("brak urządzenia jest odmową");
-            assert!(reason.contains("nie ma"), "{reason}");
+            assert!(reason.starts_with("refusal:disk_not_found?disk=nie-ma ") && reason.contains("is gone"), "{reason}");
 
             let reason = open_exclusive(dir.0.to_str().expect("ścieżka"))
                 .expect_err("katalog nie jest urządzeniem");
@@ -13420,12 +13646,12 @@ summary:exit:unrecoverable
             let done = "100% completed, 1 MB accessed in 0:00\n\n       1 errors\n       1 recovered errors\n       0 unrecoverable errors\nEverything OK\n";
             assert_eq!(
                 judge(&marked, FIX_MARKED_BLOCKS_BODY, done),
-                Ok((SnapraidVerdict::Complete, "naprawiono 1 bloków".into(), Some(1)))
+                Ok((SnapraidVerdict::Complete, "refusal:elastic_fix_recovered?recovered=1 1 blocks repaired".into(), Some(1)))
             );
             // The rebuild of a replaced disk, as measured on rig11.
             assert_eq!(
                 judge(&rebuilt, REBUILD_REPLACED_DISK_BODY, done),
-                Ok((SnapraidVerdict::Complete, "naprawiono 313 bloków".into(), Some(1)))
+                Ok((SnapraidVerdict::Complete, "refusal:elastic_fix_recovered?recovered=313 313 blocks repaired".into(), Some(1)))
             );
             // NOTHING REPAIRED is not a success, whichever way snapraid says
             // it: no marked blocks at all, or marked blocks that all belong to
@@ -13433,14 +13659,16 @@ summary:exit:unrecoverable
             let nothing = judge(&marked, FIX_NOTHING_MARKED_BODY, "Nothing to check.\nEverything OK\n")
                 .expect("a repair with nothing to do is not a failure either");
             assert_eq!(nothing.0, SnapraidVerdict::NothingWritten);
-            assert!(nothing.1.contains("uruchom scrub"), "{nothing:?}");
+            assert!(nothing.1.starts_with("refusal:elastic_fix_nothing_marked ") && nothing.1.contains("run a scrub"), "{nothing:?}");
             let skipped = judge(&marked, FIX_CHANGED_SINCE_SYNC_BODY, done).expect("a rewritten file is skipped, not a failure");
             assert_eq!(skipped.0, SnapraidVerdict::NothingWritten);
-            assert!(skipped.1.contains("391") && skipped.1.contains("zmienionych"), "{skipped:?}");
+            assert!(skipped.1.starts_with("refusal:elastic_fix_nothing_unchanged?errors=391 "), "{skipped:?}");
+            assert!(skipped.1.contains("changed since"), "{skipped:?}");
             // Parity that no longer describes the other disks: the rebuild
             // reports unrecoverable blocks and the run fails.
             let stale = judge(&rebuilt, REBUILD_STALE_PARITY_BODY, done).expect_err("unrecoverable blocks fail the run");
-            assert!(stale.contains("nie do odzyskania"), "{stale}");
+            assert!(stale.starts_with("refusal:elastic_fix_unrecoverable?count="), "{stale}");
+            assert!(stale.contains("cannot be recovered"), "{stale}");
             // THE UNFILTERED FORMS reverts users' files: their logs fail the
             // run whatever they recovered, and so does the old `-m` rebuild
             // this flow no longer runs.
@@ -13641,7 +13869,7 @@ summary:exit:unrecoverable
             )
             .expect("wynik");
             assert_eq!(run.outcome, ElasticSnapraidOutcome::Partial);
-            assert!(run.detail.as_deref().is_some_and(|detail| detail.starts_with(PARTIAL_SYNC_NOTE)), "{:?}", run.detail);
+            assert!(run.detail.as_deref().is_some_and(|detail| detail.starts_with(&partial_sync_note())), "{:?}", run.detail);
             let stored = root.load(&journal.spec.array_id).expect("load");
             assert_eq!(stored.stage, ElasticStage::Ready);
             assert!(stored.pending.is_none());
@@ -13976,7 +14204,7 @@ Nothing to do
                     let restored = restore(&root, persisted, None, None).expect("an observation");
                     assert_eq!(restored.stage, ElasticStage::NeedsAttention);
                     assert!(
-                        !restored.detail.as_deref().unwrap_or("").contains("intencja SnapRAID"),
+                        !restored.detail.as_deref().unwrap_or("").contains("SnapRAID intent without a recorded attempt"),
                         "{:?}",
                         restored.detail
                     );
@@ -14344,7 +14572,11 @@ Nothing to do
             .expect("a repair with nothing to do is a recorded run, not an error");
             assert_eq!(run.outcome, ElasticSnapraidOutcome::NothingRepaired);
             assert_eq!(run.exit_code, Some(0));
-            assert!(run.detail.as_deref().is_some_and(|detail| detail.contains("uruchom scrub")), "{run:?}");
+            assert!(
+                run.detail.as_deref().is_some_and(|detail| detail.starts_with("refusal:elastic_fix_nothing_marked ")
+                    && detail.contains("run a scrub")),
+                "{run:?}"
+            );
             drop(root);
             let stored = Root::open(&dir.0, uid).expect("reopen").load(&spec().array_id).expect("stan");
             assert_eq!(stored.stage, ElasticStage::NeedsAttention, "the fault still holds the array");
@@ -14405,7 +14637,7 @@ Nothing to do
                 Some("2026-09-08T10:00:00Z")
             );
             let detail = run.detail.as_deref().expect("powód niepowodzenia");
-            assert!(detail.contains("nie zakończył się sukcesem"), "{detail}");
+            assert!(detail.contains("did not succeed"), "{detail}");
             assert!(detail.contains("two parity levels."), "{detail}");
         }
 
@@ -14427,7 +14659,7 @@ Nothing to do
                 Some("2026-09-08T10:00:00Z")
             );
             let detail = run.detail.as_deref().expect("powód niepowodzenia");
-            assert!(detail.contains("niepełna praca sync"), "{detail}");
+            assert!(detail.contains("incomplete sync work"), "{detail}");
         }
 
         /// stdout of a sync that did the work: one final progress line and the
@@ -14515,7 +14747,7 @@ Nothing to do
                 Some("2026-09-08T10:00:00Z")
             );
             let detail = run.detail.as_deref().expect("powód niepowodzenia");
-            assert!(detail.contains("nie zakończył się sukcesem"), "{detail}");
+            assert!(detail.contains("did not succeed"), "{detail}");
             assert!(detail.contains("two parity levels."), "{detail}");
         }
 
@@ -14535,7 +14767,7 @@ Nothing to do
             assert_eq!(stored.stage, ElasticStage::NeedsAttention);
             assert_eq!(stored.stale_parity_bytes, Some(805_306_368));
             let detail = run.detail.as_deref().expect("powód niepowodzenia");
-            assert!(detail.contains("niepełne zakończenie sync"), "{detail}");
+            assert!(detail.contains("incomplete sync end"), "{detail}");
             assert!(detail.contains("two parity levels."), "{detail}");
         }
 
@@ -14559,7 +14791,7 @@ Nothing to do
                 Some("2026-09-08T10:00:00Z")
             );
             let detail = run.detail.as_deref().expect("powód niepowodzenia");
-            assert!(detail.contains("diagnostyka błędu w logu"), "{detail}");
+            assert!(detail.contains("fault diagnostics in the log"), "{detail}");
             assert!(detail.contains("unexpected end of content file"), "{detail}");
         }
 
@@ -14963,7 +15195,10 @@ Nothing to do
             taking_disk.array_id = "47474747-4747-4747-8747-474747474747".into();
             taking_disk.name = "nowa".into();
             taking_disk.data = other_spec().data;
-            assert_eq!(claims_guard(&claims, &taking_disk).expect_err("dysk"), "nośnik zarezerwowany");
+            assert!(
+                claims_guard(&claims, &taking_disk).expect_err("dysk").starts_with("refusal:elastic_disk_claimed "),
+                "a reserved disk is refused coded"
+            );
             assert!(zfs_name_guard(&claims, "archiwum/dane").is_err());
             // A file nothing can be read from: listed nowhere, and every guard
             // refuses while it exists instead of proving a disk free without it.
@@ -15283,7 +15518,7 @@ Nothing to do
             let mut serving = journal.clone();
             serving.private = Some(PrivateTopology { anchor: Some(anchor_fixture()), published: true, service: None });
             let error = replaceable_slot(&serving, &replace_request("d1", &fresh, false)).expect_err("serving");
-            assert!(error.contains("zrestartuj node"), "{error}");
+            assert!(error.contains("restart the node"), "{error}");
 
             // No parity, or no confirmed first sync: nothing to rebuild from.
             let mut bare = journal.clone();
@@ -15307,7 +15542,7 @@ Nothing to do
             let mut stale = journal.clone();
             stale.stale_parity_bytes = Some(4096);
             let error = replaceable_slot(&stale, &replace_request("d1", &fresh, false)).expect_err("stale parity");
-            assert!(error.contains("nieodtwarzalne") && error.contains("jawnej zgody"), "{error}");
+            assert!(error.contains("cannot be recovered") && error.contains("explicit consent"), "{error}");
             replaceable_slot(&stale, &replace_request("d1", &fresh, true)).expect("with the acknowledgement");
 
             // A slot the array does not have, and a replacement that is
@@ -15315,17 +15550,17 @@ Nothing to do
             assert!(replaceable_slot(&journal, &replace_request("d9", &fresh, false)).is_err());
             let member = journal.spec.data[1].clone();
             let error = replaceable_slot(&journal, &replace_request("d1", &member, false)).expect_err("member");
-            assert!(error.contains("inną rolę"), "{error}");
+            assert!(error.contains("another role"), "{error}");
 
             // Sizes: at least what the slot held, and no larger than parity.
             let mut small = fresh.clone();
             small.bytes = journal.spec.data[0].bytes - 1;
             let error = replaceable_slot(&journal, &replace_request("d1", &small, false)).expect_err("too small");
-            assert!(error.contains("co najmniej"), "{error}");
+            assert!(error.contains("at least"), "{error}");
             let mut huge = fresh.clone();
             huge.bytes = journal.spec.parity[0].bytes + 1;
             let error = replaceable_slot(&journal, &replace_request("d1", &huge, false)).expect_err("too large");
-            assert!(error.contains("większy niż parity"), "{error}");
+            assert!(error.contains("larger than the array's parity"), "{error}");
 
             // A REPEAT of the same replacement is admitted, and only for the
             // identity the journal already recorded.
@@ -15334,7 +15569,7 @@ Nothing to do
             let mut reused_id = fresh.clone();
             reused_id.expected_uuid = "abababab-abab-4bab-8bab-abababababab".into();
             let error = replaceable_slot(&swapped, &replace_request("d1", &reused_id, false)).expect_err("another identity");
-            assert!(error.contains("inną tożsamość"), "{error}");
+            assert!(error.contains("another identity"), "{error}");
             // Nothing above wrote anything beyond the swap under test.
             assert_eq!(root.load(&journal.spec.array_id).expect("load").spec, swapped.spec);
         }
@@ -15406,7 +15641,7 @@ Nothing to do
             assert_eq!(
                 root.grow_data(&spec().array_id, &spec().data[0])
                     .expect_err("already a member"),
-                "dysk jest już członkiem tej macierzy"
+                "the disk is already a member of this array"
             );
 
             // And every rule `save` enforces still applies to the array the
@@ -15471,7 +15706,7 @@ Nothing to do
                     serde_json::Value::Null,
                     added.clone(),
                     ElasticRefusal::OperationPending,
-                    "dodanie dysku wymaga gotowej macierzy bez trwającej operacji",
+                    "a disk addition needs a Ready array with no operation running",
                 ),
                 (
                     "ready",
@@ -15479,7 +15714,7 @@ Nothing to do
                     serde_json::Value::Null,
                     added.clone(),
                     ElasticRefusal::PreconditionFailed,
-                    "nieukończone formatowanie macierzy",
+                    "unfinished formatting of the array",
                 ),
                 (
                     "ready",
@@ -15487,7 +15722,7 @@ Nothing to do
                     serde_json::Value::Null,
                     added.clone(),
                     ElasticRefusal::PreconditionFailed,
-                    "niepotwierdzony pierwszy sync",
+                    "unconfirmed first sync",
                 ),
                 (
                     "ready",
@@ -15495,7 +15730,7 @@ Nothing to do
                     synced(),
                     with_parity().parity[0].clone(),
                     ElasticRefusal::DiskClaimed,
-                    "dysk pełni w tej macierzy inną rolę",
+                    "the disk has another role in this array",
                 ),
                 (
                     "ready",
@@ -15503,7 +15738,7 @@ Nothing to do
                     synced(),
                     ElasticDiskSpec { expected_uuid: "12121212-1212-4212-8212-121212121212".into(), ..spec().data[0].clone() },
                     ElasticRefusal::DiskClaimed,
-                    "dysk jest już innym członkiem tej macierzy",
+                    "the disk is already another member of this array",
                 ),
                 (
                     "needs_attention",
@@ -15511,7 +15746,7 @@ Nothing to do
                     synced(),
                     added.clone(),
                     ElasticRefusal::AttentionOther,
-                    "najpierw ją przywróć",
+                    "restore it first",
                 ),
             ];
             for (stage, formatted, sync, disk, refusal, expected) in cases {
@@ -15690,7 +15925,7 @@ Nothing to do
                 ("E8 the final union check failed", Box::new(|journal, steps| {
                     journal.formatted.push(ElasticRole::Data(2));
                     journal.attention = Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: true });
-                    journal.detail = Some("unia nie potwierdziła nowego brancha".into());
+                    journal.detail = Some("the union did not confirm the new branch".into());
                     steps.mounted.insert(data_branch_path("media", "d2"));
                     steps.union_data = Some(2);
                 }), vec![config.clone(), "snapraid sync-1".into()]),
@@ -15738,7 +15973,7 @@ Nothing to do
                 let (refusal, why) = request_add(&root, root.load(&spec().array_id).expect("load"), &mut steps)
                     .expect_err("not the add's intent");
                 assert_eq!(refusal, ElasticRefusal::OperationPending, "{foreign:?}");
-                assert!(why.contains("intencja innej operacji"), "{why}");
+                assert!(why.contains("an intent of an operation other than"), "{why}");
                 assert_eq!(std::fs::read(&path).expect("bytes"), before, "{foreign:?}");
                 assert!(steps.log.is_empty(), "{foreign:?}: nothing ran");
             }
@@ -15803,7 +16038,12 @@ Nothing to do
             );
             let observed = request_add(&root, journal, &mut steps).expect("no refusal");
             assert_eq!(observed.stage, ElasticStage::NeedsAttention);
-            assert!(observed.detail.as_deref().is_some_and(|detail| detail.contains("sync po dodaniu dysku")), "{:?}", observed.detail);
+            assert!(
+                observed.detail.as_deref().is_some_and(|detail| detail.starts_with("refusal:elastic_snapraid_reported_errors ")
+                    && detail.contains("Sync after the disk addition")),
+                "{:?}",
+                observed.detail
+            );
             let stored = root.load(&spec().array_id).expect("load");
             assert!(stored.pending.is_none(), "the verdict is known: no intent");
             assert_eq!(stored.attention, Some(ElasticAttention::AddDisk { disk_id: "serial:new".into(), joined: true }));
@@ -15858,7 +16098,12 @@ Nothing to do
             root.save(&stopped).expect("interrupted mkfs");
             let observed = request_add(&root, root.load(&spec().array_id).expect("load"), &mut steps).expect("an answer");
             assert_eq!(observed.stage, ElasticStage::NeedsAttention);
-            assert!(observed.detail.as_deref().is_some_and(|detail| detail.contains("wycofaj dodawanie")), "{:?}", observed.detail);
+            assert!(
+                observed.detail.as_deref().is_some_and(|detail| detail.starts_with("refusal:elastic_add_disk_signed?disk=")
+                    && detail.contains("undo the addition")),
+                "{:?}",
+                observed.detail
+            );
             assert!(!steps.log.iter().any(|line| line.starts_with("mkfs")), "{:?}", steps.log);
             let stored = root.load(&spec().array_id).expect("load");
             assert!(stored.pending.is_none(), "the resume settled the intent it found");
@@ -16078,9 +16323,9 @@ Nothing to do
             let _isolation = FORK_REOPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let rules = move_everything_aged();
             for (data_disks, attention, refused) in [
-                (1, parity_fault(ElasticSnapraidKind::Scrub), Some("fault_unacknowledged")),
-                (1, parity_fault(ElasticSnapraidKind::Fix { disk: "d1".into() }), Some("fault_unacknowledged")),
-                (2, ElasticAttention::AddDisk { disk_id: "serial:data2".into(), joined: true }, Some("attention_add_disk")),
+                (1, parity_fault(ElasticSnapraidKind::Scrub), Some("refusal:elastic_attention_parity_fault?array=media ")),
+                (1, parity_fault(ElasticSnapraidKind::Fix { disk: "d1".into() }), Some("refusal:elastic_attention_parity_fault?array=media ")),
+                (2, ElasticAttention::AddDisk { disk_id: "serial:data2".into(), joined: true }, Some("refusal:elastic_attention_add_disk?array=media ")),
                 (1, parity_fault(ElasticSnapraidKind::Sync), None),
             ] {
                 let (bench, root, mut journal) = mover_bench(data_disks);
@@ -16122,14 +16367,14 @@ Nothing to do
                 (
                     Box::new(|journal: &mut Journal| journal.pending = Some(Pending::Sync)),
                     operation,
-                    "rozwiązanie wymaga zamkniętych operacji macierzy",
+                    "refusal:elastic_operation_pending?array=media A dissolve needs every operation of the array closed",
                 ),
                 (
                     Box::new(|_: &mut Journal| ()),
                     create_operation.as_str(),
-                    "ponowne użycie ID create",
+                    "reuse of the Create id",
                 ),
-                (Box::new(|_: &mut Journal| ()), "not-a-uuid", "nieprawidłowy UUID Elastic"),
+                (Box::new(|_: &mut Journal| ()), "not-a-uuid", "invalid Elastic UUID"),
             ];
             for (mutate, operation_id, expected) in cases {
                 let dir = Temp::new();
@@ -16224,7 +16469,7 @@ Nothing to do
             });
             assert_eq!(
                 root.save(&journal).expect_err("bez adopcji"),
-                "zmiana trwałej topologii Elastic"
+                "change of the durable Elastic topology"
             );
             assert_eq!(std::fs::read(&path).expect("po odmowie"), before);
             assert!(root
@@ -16431,13 +16676,13 @@ Nothing to do
             root.save(&journal).expect("niepewny sync");
             assert_eq!(
                 private_operation(&root, journal.clone(), &command).expect_err("H1 przed namespace"),
-                "sync niepotwierdzony; restore nie wykonuje sync"
+                "sync unconfirmed; Restore does not run a sync"
             );
             journal.pending = None;
             root.save(&journal).expect("brak kotwicy");
             assert_eq!(
                 private_operation(&root, journal, &command).expect_err("bez fork fallback"),
-                "brak kotwicy w tym samym boot; wymagany restart"
+                "refusal:elastic_restart_required?array=media No namespace anchor in this boot; the node has to restart"
             );
         }
 
@@ -16472,7 +16717,7 @@ Nothing to do
                     if same_boot && !mounted {
                         assert_eq!(
                             result.expect_err("niepewny mount w tym samym boot"),
-                            "niepewne zakończenie mount w tym samym boot; wymagany restart"
+                            "refusal:elastic_restart_required?array=media A mount of this boot has an unconfirmed end; the node has to restart"
                         );
                     } else {
                         result.expect("dopuszczenie dalszej walidacji restore");
@@ -16550,7 +16795,7 @@ Nothing to do
                 } else {
                     assert_eq!(
                         result.expect_err("odmowa przed sondą mount"),
-                        "sync niepotwierdzony; restore nie wykonuje sync",
+                        "sync unconfirmed; Restore does not run a sync",
                         "{case}"
                     );
                     assert_eq!(calls.get(), 0, "{case}");
@@ -16604,7 +16849,7 @@ Nothing to do
                     } else {
                         assert_eq!(
                             after_reboot.expect_err("niepełne formatowanie po zmianie boot"),
-                            "nieukończone formatowanie; restore nie formatuje"
+                            "unfinished formatting; Restore does not format"
                         );
                     }
                 } else {
@@ -16614,7 +16859,7 @@ Nothing to do
                     } else {
                         assert_eq!(
                             result.expect_err("niepełne formatowanie"),
-                            "nieukończone formatowanie; restore nie formatuje"
+                            "unfinished formatting; Restore does not format"
                         );
                     }
                 }
@@ -16679,7 +16924,7 @@ Nothing to do
                 &mut LiveSteps { worker: None },
             )
             .expect_err("restore odmawia mkfs");
-            assert_eq!(error, "tylko create, dodanie dysku i wymiana formatują");
+            assert_eq!(error, "only Create, a disk addition and a replacement format");
             assert_eq!(
                 std::fs::read(dir.0.join(format!("{}.json", journal.spec.array_id)))
                     .expect("after"),
@@ -16930,7 +17175,7 @@ Nothing to do
                         let restored = restore(&root, root.load(&spec().array_id).expect("load"), None, None)
                             .expect("an observation");
                         assert!(
-                            !restored.detail.as_deref().unwrap_or("").contains("intencja SnapRAID bez zapisu próby"),
+                            !restored.detail.as_deref().unwrap_or("").contains("SnapRAID intent without a recorded attempt"),
                             "{kind:?}: {:?}",
                             restored.detail
                         );
@@ -17050,7 +17295,7 @@ Nothing to do
             for mode in [StepMode::Create, StepMode::Restore] {
                 assert_eq!(
                     run(branch.clone(), mode).expect_err("only an add grows a live union"),
-                    "tylko dodanie dysku rozszerza żywą unię",
+                    "only a disk addition extends a live union",
                     "{mode:?}"
                 );
             }
@@ -17074,7 +17319,7 @@ Nothing to do
                     StepMode::AddDisk
                 )
                 .expect_err("foreign union"),
-                "obca unia w kroku AddBranch"
+                "foreign union in the AddBranch step"
             );
             // An unmount never runs through this executor at all — the dissolve
             // walks its own plan, in the namespace that can see the mounts.
@@ -17087,7 +17332,7 @@ Nothing to do
                         mode
                     )
                     .expect_err("no mode unmounts here"),
-                    "niedozwolony krok wykonawcy",
+                    "forbidden executor step",
                     "{mode:?}"
                 );
             }
@@ -17289,7 +17534,7 @@ Nothing to do
                 Ok(())
             })
             .expect_err("konflikt przed mount");
-            assert!(error.contains("pozostaje zaimportowana po import -N"));
+            assert!(error.contains("stays imported after import -N"), "{error}");
             assert!(calls.is_empty());
             datasets[1].mountpoint = "/mnt/tank/data".into();
             mount_imported("tank", &journals, &datasets, |name| {
@@ -17490,7 +17735,7 @@ Nothing to do
                 operation_id: "55555555-5555-4555-8555-555555555555".into(),
                 pending: false,
             });
-            assert_eq!(restore_checkpoint_guard(&held).expect_err("hold"), "Restore nie konsumuje trwałego service Hold");
+            assert_eq!(restore_checkpoint_guard(&held).expect_err("hold"), "Restore does not consume a durable service Hold");
         }
 
         #[test]
@@ -18153,7 +18398,7 @@ Nothing to do
                         continue;
                     }
                     if !self.steps.mounted.contains(&mount_path(&journal.spec, role)) {
-                        return Err("mover wymaga zamontowanych branchy macierzy".into());
+                        return Err("the mover needs the array's branches mounted".into());
                     }
                 }
                 Ok(())
@@ -18625,7 +18870,7 @@ Nothing to do
             let stored = root.load(&bench.spec.array_id).expect("stan");
             let transfer = stored.transfer.clone().expect("transfer");
             assert_eq!(transfer.phase, ElasticMoverPhase::Complete);
-            assert_eq!(transfer.detail.as_deref(), Some(PARTIAL_SYNC_NOTE));
+            assert_eq!(transfer.detail.as_deref(), Some(partial_sync_note().as_str()));
             let sync = transfer.coupled_sync_result.clone().expect("sync");
             assert_eq!((sync.outcome, sync.exit_code), (ElasticSnapraidOutcome::Partial, Some(1)));
             assert!(coupled_sync_settled(&sync, MOVER_OPERATION));
@@ -18776,7 +19021,7 @@ Nothing to do
                         assert_eq!(data.len(), 2, "katalog bez dostępu zostaje na cache");
                         assert!(transfer.issues.iter().any(|issue| issue.path == "locked"
                             && issue.kind == ElasticMoverIssueKind::Refused
-                            && issue.reason.starts_with("katalog niedostępny")), "{:?}", transfer.issues);
+                            && issue.reason.starts_with("directory unavailable")), "{:?}", transfer.issues);
                     } else {
                         // Root reads the directory, so its file moves like any other.
                         assert_eq!(data, ["a.bin", "b.bin", "locked/c.bin"]);
@@ -18787,7 +19032,7 @@ Nothing to do
                 assert_eq!(data.len(), 2, "{case}");
                 assert!(!mover_run(&transfer, &[], 0, 0).counts_known, "{case}");
                 let issue = transfer.issues.iter().find(|issue| issue.path == ".").expect("zgłoszenie przeglądu");
-                assert!(issue.reason.starts_with("przegląd cache przerwany"), "{}", issue.reason);
+                assert!(issue.reason.starts_with("cache walk stopped"), "{}", issue.reason);
                 if case == "walk_and_sync" {
                     // Both failures are reported, and the Sync that did not
                     // confirm parity is named as the one that left it stale.
@@ -18937,7 +19182,7 @@ Nothing to do
             assert_eq!(tree(&bench.data[0]), vec!["next.bin"], "otwarty plik nie rezerwuje miejsca");
             let transfer = journal.transfer.clone().expect("transfer");
             assert_eq!(transfer.issues.len(), 1);
-            assert_eq!(transfer.issues[0].reason, "plik otwarty przez inny proces");
+            assert_eq!(transfer.issues[0].reason, "file open in another process");
             drop(array_lock);
             drop(root);
             // Nothing that moves: no target is chosen for the operation.
@@ -19004,7 +19249,7 @@ Nothing to do
                 vec![ElasticMoverIssue {
                     path: "huge.bin".into(),
                     kind: ElasticMoverIssueKind::Refused,
-                    reason: "rekord pliku przekroczyłby limit dziennika".into(),
+                    reason: "the file record would exceed the journal limit".into(),
                 }]
             );
             // Four hundred moved files never make the durable state larger than one record.
@@ -19424,7 +19669,7 @@ Nothing to do
             assert_eq!(transfer.refused_files, 1);
             assert_eq!(transfer.issues[0].path, "nested/x.bin");
             assert!(
-                transfer.issues[0].reason.starts_with("katalog docelowy nested"),
+                transfer.issues[0].reason.starts_with("target directory nested"),
                 "{}",
                 transfer.issues[0].reason
             );
@@ -19468,7 +19713,7 @@ Nothing to do
             );
             assert!(transfer.current.is_none());
             assert_eq!(transfer.issues[0].path, "nested/a.bin");
-            assert!(transfer.issues[0].reason.starts_with("wycofano kopię"), "{}", transfer.issues[0].reason);
+            assert!(transfer.issues[0].reason.starts_with("copy withdrawn"), "{}", transfer.issues[0].reason);
         }
 
         #[test]
@@ -19512,7 +19757,7 @@ Nothing to do
             assert_eq!((transfer.phase, transfer.moved_files), (ElasticMoverPhase::Complete, 2));
             let issue = transfer.issues.iter().find(|issue| issue.path == "b/b.bin").expect("zgłoszenie");
             assert_eq!(issue.kind, ElasticMoverIssueKind::Attention);
-            assert!(issue.reason.starts_with("źródło usunięte po tożsamości"), "{}", issue.reason);
+            assert!(issue.reason.starts_with("source removed by identity"), "{}", issue.reason);
         }
 
         #[test]
@@ -19545,7 +19790,7 @@ Nothing to do
             );
             crate::elastic_transfer::fail_content_reads(None);
             let error = result.expect_err("nierozwiązany rekord");
-            assert!(error.starts_with("rekord nierozwiązany"), "{error}");
+            assert!(error.starts_with("unresolved record"), "{error}");
             // Nothing is deleted: both copies stay for the admin.
             assert_eq!(std::fs::read(bench.cache.join("a.bin")).expect("źródło"), b"first");
             assert_eq!(std::fs::read(bench.data[0].join("a.bin")).expect("cel"), b"FIRST");
@@ -19557,10 +19802,10 @@ Nothing to do
             // Stuck on the reversal: the copy under the path is not the one
             // the record pinned, so it is not the record's to remove.
             assert_eq!(transfer.current.as_ref().expect("rekord").phase, TransferFilePhase::RestoreIntent);
-            assert!(transfer.current_failed.as_deref().is_some_and(|reason| reason.starts_with("rekord nierozwiązany")));
+            assert!(transfer.current_failed.as_deref().is_some_and(|reason| reason.starts_with("unresolved record")));
             assert!(stored.stale_parity_bytes.is_some());
             assert!(transfer.issues.iter().any(|issue| issue.kind == ElasticMoverIssueKind::Attention));
-            assert!(mover_run(&transfer, &[], 0, 0).detail.is_some_and(|detail| detail.contains("rekord nierozwiązany")));
+            assert!(mover_run(&transfer, &[], 0, 0).detail.is_some_and(|detail| detail.contains("unresolved record")));
             assert!(stored.private.as_ref().unwrap().service.is_none(), "a stuck record holds nothing");
             // The next run closes it into the history and leaves both copies alone.
             let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
@@ -19574,7 +19819,7 @@ Nothing to do
             let history = root.load(&bench.spec.array_id).expect("historia");
             assert_eq!(history.stuck.len(), 1);
             assert_eq!(history.stuck[0].operation_id, MOVER_OPERATION);
-            assert!(history.stuck[0].reason.starts_with("rekord nierozwiązany"), "{}", history.stuck[0].reason);
+            assert!(history.stuck[0].reason.starts_with("unresolved record"), "{}", history.stuck[0].reason);
             assert_eq!(std::fs::read(bench.cache.join("a.bin")).expect("źródło"), b"first");
             assert_eq!(std::fs::read(bench.data[0].join("a.bin")).expect("cel"), b"FIRST");
         }
@@ -19627,7 +19872,7 @@ Nothing to do
             let rules = move_everything_aged();
             let array_lock = root.array_lock(&bench.spec.array_id).expect("lock");
             let error = stick_with_orphan(&bench, &root, &mut journal, &rules, &array_lock, |_| {});
-            assert!(error.contains("usunięto porzuconą kopię tymczasową"), "{error}");
+            assert!(error.contains("removed an abandoned temporary copy"), "{error}");
             assert!(
                 tree(&bench.data[0]).is_empty(),
                 "sierota zniknęła z gałęzi: {:?}",
@@ -19643,7 +19888,7 @@ Nothing to do
                 EVICTION_LOG.with(|log| log
                     .borrow()
                     .as_ref()
-                    .is_some_and(|lines| lines.iter().any(|line| line.contains("usunięto porzuconą kopię")))),
+                    .is_some_and(|lines| lines.iter().any(|line| line.contains("removed an abandoned temporary copy")))),
                 "log systemowy musi nazwać usuniętą kopię"
             );
         }
@@ -19662,12 +19907,12 @@ Nothing to do
                 crate::elastic_transfer::fail_directory_fsync(true);
             });
             crate::elastic_transfer::fail_directory_fsync(false);
-            assert!(error.contains("usunięto porzuconą kopię tymczasową"), "{error}");
+            assert!(error.contains("removed an abandoned temporary copy"), "{error}");
             assert!(
-                !error.contains("nie została usunięta"),
+                !error.contains("was not removed"),
                 "usunięty plik nie może być zgłoszony jako nieusunięty: {error}"
             );
-            assert!(error.contains("wpis katalogu niepotwierdzony"), "{error}");
+            assert!(error.contains("directory entry unconfirmed"), "{error}");
             assert!(
                 tree(&bench.data[0]).is_empty(),
                 "plik naprawdę zniknął: {:?}",
@@ -19699,7 +19944,7 @@ Nothing to do
                 // cannot be what refuses it: the inode pin has to.
                 std::fs::write(branch.join(temporary), b"OBCY!").expect("obcy plik");
             });
-            assert!(error.contains("nie została usunięta"), "{error}");
+            assert!(error.contains("was not removed"), "{error}");
             assert_eq!(
                 std::fs::read(bench.data[0].join(&name)).expect("obcy plik"),
                 b"OBCY!",
@@ -19725,8 +19970,8 @@ Nothing to do
                 // The crash window: the unlink landed, the record did not.
                 std::fs::remove_file(branch.join(temporary)).expect("ktoś już posprzątał");
             });
-            assert!(!error.contains("nie została usunięta"), "{error}");
-            assert!(error.starts_with("rekord nierozwiązany"), "{error}");
+            assert!(!error.contains("was not removed"), "{error}");
+            assert!(error.starts_with("unresolved record"), "{error}");
             let shown = stuck_records(&root.load(&bench.spec.array_id).expect("stan"));
             // The record keeps its name: this run deleted nothing, and a name
             // is also how a reader recognises a copy that was renamed into
@@ -19802,7 +20047,7 @@ Nothing to do
             )
             .expect_err("nieudane wycofanie");
             std::fs::set_permissions(&bench.data[0], std::fs::Permissions::from_mode(0o755)).expect("mode");
-            assert!(error.contains("wycofanie nieudane"), "{error}");
+            assert!(error.contains("withdrawal failed"), "{error}");
             assert_eq!(std::fs::read(bench.cache.join("a.bin")).expect("źródło"), b"first");
             assert_eq!(tree(&bench.data[0]).len(), 1, "kopia tymczasowa zostaje");
             let stored = root.load(&bench.spec.array_id).expect("load");
@@ -19857,7 +20102,7 @@ Nothing to do
                 &mut unmounted,
             )
             .expect_err("niezamontowany cache");
-            assert!(error.contains("zamontowanych branchy"), "{error}");
+            assert!(error.contains("branches mounted"), "{error}");
             // A Hold an older helper's mover left is released only by its Resume.
             let mut held = journal.clone();
             held.transfer.as_mut().unwrap().current = None;
@@ -19890,7 +20135,7 @@ Nothing to do
                 &mut TestHost::new(&bench, &snapraid),
             )
             .expect_err("nowy boot");
-            assert!(error.contains("wymaga Restore"), "{error}");
+            assert!(error.starts_with("refusal:elastic_restore_after_boot?array=media "), "{error}");
             assert_eq!(bench.journal_bytes(), before);
             assert_eq!(tree(&bench.data[0]), vec!["a.bin"]);
             assert_eq!(tree(&bench.cache), vec!["b.bin"]);
@@ -19987,7 +20232,7 @@ Nothing to do
             assert_eq!(tree(&bench.cache), vec!["a.bin"]);
             let transfer = journal.transfer.clone().expect("transfer");
             assert_eq!(transfer.issues[0].path, "a.bin");
-            assert_eq!(transfer.issues[0].reason, "ścieżka istnieje już na branchu d2");
+            assert_eq!(transfer.issues[0].reason, "the path already exists on branch d2");
         }
 
         #[test]
@@ -20052,13 +20297,13 @@ Nothing to do
             variants.push(("porzucony plik po zmianie nazwy", variant));
             let mut variant = stored.clone();
             variant.transfer.as_mut().unwrap().target = Some("d2".into());
-            variants.push(("zmiana brancha docelowego", variant));
+            variants.push(("change of the target branch", variant));
             let mut variant = stored.clone();
             variant.transfer.as_mut().unwrap().moved_files = 0;
-            variants.push(("cofnięty licznik", variant));
+            variants.push(("counter went back", variant));
             let mut variant = stored.clone();
             variant.transfer = None;
-            variants.push(("usunięcie transferu", variant));
+            variants.push(("transfer removal", variant));
             let mut variant = stored.clone();
             variant.transfer.as_mut().unwrap().phase = ElasticMoverPhase::Announced;
             variants.push(("powrót do zapowiedzi", variant));
@@ -20133,7 +20378,7 @@ Nothing to do
             let transfer = journal.transfer.clone().expect("transfer");
             assert_eq!((transfer.moved_files, transfer.refused_files, transfer.sequence), (1, 1, 1));
             assert_eq!(transfer.issues[0].path, "over.bin");
-            assert_eq!(transfer.issues[0].reason, "rekord pliku przekroczyłby limit dziennika");
+            assert_eq!(transfer.issues[0].reason, "the file record would exceed the journal limit");
         }
 
         #[test]
@@ -20179,10 +20424,10 @@ Nothing to do
                 .filter(|issue| issue.kind == ElasticMoverIssueKind::Refused)
                 .map(|issue| (issue.path.as_str(), issue.reason.as_str()))
                 .collect();
-            assert!(refused.iter().any(|(path, reason)| *path == "unlistable" && reason.starts_with("listowanie katalogu")), "{refused:?}");
+            assert!(refused.iter().any(|(path, reason)| *path == "unlistable" && reason.starts_with("directory listing")), "{refused:?}");
             assert!(refused.iter().any(|(path, reason)| *path == "d.bin" && reason.starts_with("stat:")), "{refused:?}");
             if as_user {
-                assert!(refused.iter().any(|(path, reason)| *path == "locked" && reason.starts_with("katalog niedostępny")), "{refused:?}");
+                assert!(refused.iter().any(|(path, reason)| *path == "locked" && reason.starts_with("directory unavailable")), "{refused:?}");
             }
             assert_eq!(transfer.refused_files, if as_user { 3 } else { 2 });
             assert!(coupled_sync_success(transfer.coupled_sync_result.as_ref().expect("sync"), MOVER_OPERATION));
@@ -20259,18 +20504,18 @@ Nothing to do
             // A Sync still running without the pending that owns it.
             let mut running = journal.clone();
             running.last_run = Some(sync(ElasticSnapraidOutcome::Running, false));
-            assert_eq!(root.save(&running).expect_err("Running bez pending"), "niespójny wynik operacji i pending");
+            assert_eq!(root.save(&running).expect_err("Running bez pending"), "operation result and pending disagree");
             // A failed Sync next to stale parity it did not leave behind.
             let mut foreign = journal.clone();
             foreign.stale_parity_bytes = Some(5);
             foreign.last_run = Some(sync(ElasticSnapraidOutcome::Failed, true));
-            assert_eq!(root.save(&foreign).expect_err("obca nieaktualna parity"), "niespójny wynik operacji i pending");
+            assert_eq!(root.save(&foreign).expect_err("obca nieaktualna parity"), "operation result and pending disagree");
             foreign.stale_sync_operation = Some(NEXT_OPERATION.into());
-            assert_eq!(root.save(&foreign).expect_err("inna operacja"), "niespójny wynik operacji i pending");
+            assert_eq!(root.save(&foreign).expect_err("inna operacja"), "operation result and pending disagree");
             assert_eq!(bench.journal_bytes(), before);
             // The same crafted state is unreadable, whoever wrote it.
             atomic_write(&bench.journal_path(), &serde_json::to_vec(&running).expect("json"), root.uid).expect("zapis");
-            assert_eq!(root.load(&bench.spec.array_id).err().as_deref(), Some("niespójny wynik operacji i pending"));
+            assert_eq!(root.load(&bench.spec.array_id).err().as_deref(), Some("operation result and pending disagree"));
             atomic_write(&bench.journal_path(), &before, root.uid).expect("przywrócenie");
             // The mover's own failed Sync is the one record that stands without its pending.
             foreign.stale_sync_operation = Some(MOVER_OPERATION.into());
@@ -20347,7 +20592,7 @@ Nothing to do
                 &mut TestHost::new(&bench, &snapraid),
             );
             crate::elastic_transfer::fail_content_reads(None);
-            assert!(result.expect_err("nierozwiązany rekord").starts_with("rekord nierozwiązany"));
+            assert!(result.expect_err("nierozwiązany rekord").starts_with("unresolved record"));
             // Visible while its operation is still the array's open run.
             let state = observe(&journal, None);
             assert_eq!(state.stuck_records.len(), 1);
@@ -20387,12 +20632,12 @@ Nothing to do
                 .is_some_and(|name| name.starts_with(&format!(".tentanas-transfer-{MOVER_OPERATION}-"))));
             assert!(record.source.sha256.is_some());
             assert!(record.temporary_copy.as_ref().is_some_and(|pin| pin.sha256.is_some()));
-            assert!(record.reason.starts_with("rekord nierozwiązany"), "{}", record.reason);
+            assert!(record.reason.starts_with("unresolved record"), "{}", record.reason);
             let transfer = stored.transfer.clone().expect("transfer");
             assert_eq!((transfer.operation_id.as_str(), transfer.phase), (NEXT_OPERATION, ElasticMoverPhase::Complete));
             let issue = transfer.issues.iter().find(|issue| issue.path == "a.bin").expect("pominięta ścieżka");
             assert_eq!(issue.kind, ElasticMoverIssueKind::Refused);
-            assert_eq!(issue.reason, format!("rekord utknął w operacji {MOVER_OPERATION}; mover go nie rusza"));
+            assert_eq!(issue.reason, format!("the record is stuck in operation {MOVER_OPERATION}; the mover leaves it alone"));
             // The new operation's result shows the history, carrying the flag
             // the view derives rather than whatever the journal stored.
             let state = observe(&stored, None);
@@ -20483,7 +20728,7 @@ Nothing to do
                 assert_eq!(issue.kind, ElasticMoverIssueKind::Refused);
                 assert_eq!(
                     issue.reason,
-                    format!("rekord utknął w operacji {}; mover go nie rusza", summarised_operation(index))
+                    format!("the record is stuck in operation {}; the mover leaves it alone", summarised_operation(index))
                 );
             }
             // The result says how many stuck paths it does not show in full.
@@ -20497,14 +20742,14 @@ Nothing to do
             dropped.stuck_paths.pop();
             assert_eq!(
                 root.save(&dropped).expect_err("usunięcie pominiętej ścieżki"),
-                "sprzeczne przejście transferu: zmiana listy pominiętych ścieżek"
+                "contradictory transfer transition: change of the skip list"
             );
             // A path a shown record stands on is refused even earlier.
             let mut orphaned = stored.clone();
             orphaned.stuck_paths.remove(0);
             assert_eq!(
                 root.save(&orphaned).expect_err("rekord bez swojej ścieżki"),
-                "nieprawidłowa lista pominiętych ścieżek"
+                "invalid skip list"
             );
             // Over its bound the skip set is not a readable journal.
             let mut over = stored.clone();
@@ -20518,7 +20763,7 @@ Nothing to do
                 .collect();
             assert_eq!(
                 validate_topology(&over).expect_err("ponad limit"),
-                "nieprawidłowa lista pominiętych ścieżek"
+                "invalid skip list"
             );
         }
 
@@ -20940,7 +21185,7 @@ Nothing to do
                 .iter()
                 .find(|issue| issue.path == "huge.bin")
                 .unwrap_or_else(|| panic!("{:?}", transfer.issues));
-            assert_eq!(issue.reason, "dziennik z tym plikiem przekroczyłby limit odczytu");
+            assert_eq!(issue.reason, "the journal with this file would exceed its read limit");
         }
 
         #[test]
@@ -20968,10 +21213,10 @@ Nothing to do
             refused.detail = Some("x".repeat(TRANSFER_DETAIL_LIMIT));
             assert_eq!(
                 root.save(&refused).expect_err("zbyt duży journal"),
-                "journal przekroczyłby limit odczytu"
+                "the journal would exceed its read limit"
             );
             let mut after = refused.clone();
-            let error = stick_short_record(&root, &mut after, "journal przekroczyłby limit odczytu".into());
+            let error = stick_short_record(&root, &mut after, "the journal would exceed its read limit".into());
             assert!(error.ends_with(SHORT_STUCK_REASON), "{error}");
             let released = root.load(&journal.spec.array_id).expect("stan po awaryjnym zapisie");
             let transfer = released.transfer.clone().expect("transfer");
@@ -21037,7 +21282,7 @@ Nothing to do
             });
             assert_eq!(
                 validate_topology(&oversized).expect_err("kotwica po zakodowaniu"),
-                "nieprawidłowa tożsamość kotwicy"
+                "invalid anchor identity"
             );
             assert!(root.save(&oversized).is_err());
             // The same length of plain bytes is what the bound allows.
@@ -21107,8 +21352,8 @@ Nothing to do
             );
             // The eviction is reported where nothing can drop it.
             let detail = journal.transfer.as_ref().expect("transfer").detail.clone().expect("szczegóły");
-            assert!(detail.contains("lista pominiętych ścieżek pełna"), "{detail}");
-            assert!(detail.contains("łącznie wypartych: 1"), "{detail}");
+            assert!(detail.contains("skip list full"), "{detail}");
+            assert!(detail.contains("evicted in all: 1"), "{detail}");
             // The identity of what stopped being skipped survives on both
             // routes: the journal's ring and the system log.
             let kept = journal.evicted_paths.last().expect("pierścień");
@@ -21191,7 +21436,7 @@ Nothing to do
             close_transfer(&mut journal).expect("zamknięcie transferu");
             let detail = journal.transfer.expect("transfer").detail.expect("szczegóły");
             assert!(detail.len() <= TRANSFER_DETAIL_LIMIT, "{}", detail.len());
-            assert!(detail.starts_with("lista pominiętych ścieżek pełna"), "{detail}");
+            assert!(detail.starts_with("skip list full"), "{detail}");
         }
 
         #[test]
@@ -21256,7 +21501,7 @@ Nothing to do
             assert_eq!(after_run.stuck_paths.len(), 1, "ścieżka trafia na listę pominięć");
             let transfer = after_run.transfer.expect("transfer");
             let issue = transfer.issues.iter().find(|issue| issue.path == "a.bin").expect("pominięta ścieżka");
-            assert_eq!(issue.reason, format!("rekord utknął w operacji {MOVER_OPERATION}; mover go nie rusza"));
+            assert_eq!(issue.reason, format!("the record is stuck in operation {MOVER_OPERATION}; the mover leaves it alone"));
         }
 
         #[test]
@@ -21271,7 +21516,7 @@ Nothing to do
             dropped.stuck_paths.remove(0);
             assert_eq!(
                 root.save(&dropped).expect_err("samo usunięcie"),
-                "sprzeczne przejście transferu: zmiana listy pominiętych ścieżek"
+                "contradictory transfer transition: change of the skip list"
             );
             // A removal paired with an insert is legal only as the eviction of
             // a write that closes the operation that left the record.
@@ -21285,7 +21530,7 @@ Nothing to do
             rotated.stuck_evicted = 1;
             assert_eq!(
                 root.save(&rotated).expect_err("wyparcie bez pierścienia"),
-                "sprzeczne przejście transferu: pierścień wypartych ścieżek nie zgadza się z wyparciem"
+                "contradictory transfer transition: the ring of evicted paths does not match the eviction"
             );
             // The ring must take the identity that actually left the set.
             let mut wrong_identity = rotated.clone();
@@ -21296,7 +21541,7 @@ Nothing to do
             });
             assert_eq!(
                 root.save(&wrong_identity).expect_err("obca tożsamość w pierścieniu"),
-                "sprzeczne przejście transferu: pierścień wypartych ścieżek nie zgadza się z wyparciem"
+                "contradictory transfer transition: the ring of evicted paths does not match the eviction"
             );
             // And even with the ring right, only the write that closes the
             // operation may evict at all.
@@ -21304,14 +21549,14 @@ Nothing to do
             complete.evicted_paths.push(evicted);
             assert_eq!(
                 root.save(&complete).expect_err("wyparcie bez zamknięcia"),
-                "sprzeczne przejście transferu: utknięty rekord poza zamknięciem jego operacji"
+                "contradictory transfer transition: stuck record outside the close of its operation"
             );
             // The counter moves with the eviction and only with it.
             let mut counted = journal.clone();
             counted.stuck_evicted = 1;
             assert_eq!(
                 root.save(&counted).expect_err("licznik bez wyparcia"),
-                "sprzeczne przejście transferu: licznik wypartych ścieżek nie zgadza się z wyparciem"
+                "contradictory transfer transition: the evicted-path counter does not match the eviction"
             );
             assert_eq!(
                 root.load(&journal.spec.array_id).expect("stan").stuck_paths.len(),
@@ -21380,7 +21625,7 @@ Nothing to do
             )
             .err()
             .expect("zapis odrzucony");
-            assert!(error.contains("limit odczytu"), "{error}");
+            assert!(error.contains("read limit"), "{error}");
             let released = root.load(&journal.spec.array_id).expect("stan po awaryjnym zapisie");
             let transfer = released.transfer.clone().expect("transfer");
             assert_eq!(transfer.current_failed.as_deref(), Some(SHORT_STUCK_REASON));
@@ -21590,7 +21835,7 @@ Nothing to do
             journal.stuck_paths = vec![entry];
             assert_eq!(
                 validate_topology(&journal).expect_err("ponad limit cyfr"),
-                "nieprawidłowa lista pominiętych ścieżek"
+                "invalid skip list"
             );
         }
 
@@ -21605,7 +21850,7 @@ Nothing to do
             oversized.detail = Some("x".repeat(JOURNAL_LIMIT as usize));
             assert_eq!(
                 root.save(&oversized).expect_err("zbyt długi opis"),
-                "zbyt długi opis stanu macierzy"
+                "array state description too long"
             );
             // And a journal whose every field is within its own bound, but
             // which together no longer fits.
@@ -21615,7 +21860,7 @@ Nothing to do
             heavy.detail = Some("x".repeat(TRANSFER_DETAIL_LIMIT));
             assert_eq!(
                 root.save(&heavy).expect_err("zbyt duży journal"),
-                "journal przekroczyłby limit odczytu"
+                "the journal would exceed its read limit"
             );
             let mut foreign_target = journal.clone();
             foreign_target.transfer = Some(TransferJournal {
@@ -21880,7 +22125,7 @@ Nothing to do
             assert_ne!(journal.boot_id, boot_id().expect("boot"), "the journal is from an earlier boot");
             let before = std::fs::read(root.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes");
             let (array_id, owner) = (journal.spec.array_id.clone(), journal.spec.owner.clone());
-            let refused = "prywatna macierz wymaga Restore po zmianie boot";
+            let refused = "refusal:elastic_restore_after_boot?array=media The node restarted since the array was mounted; a Restore comes first";
             for command in [
                 crate::HelperCommand::ElasticInspect { array_id: array_id.clone(), owner: owner.clone() },
                 crate::HelperCommand::ElasticCacheAge { array_id: array_id.clone(), owner: owner.clone(), rules: MoverRules::default() },
@@ -22284,7 +22529,7 @@ Nothing to do
                         owner: stored.spec.owner.clone(),
                     };
                     let error = private_operation(&reopened, stored.clone(), &command).expect_err("hold restore");
-                    assert!(error.contains("Restore nie konsumuje trwałego service Hold"));
+                    assert!(error.contains("Restore does not consume a durable service Hold"));
                     assert_eq!(std::fs::read(reopened.path.join(format!("{}.json", journal.spec.array_id))).expect("bytes"), before);
                 }
             }

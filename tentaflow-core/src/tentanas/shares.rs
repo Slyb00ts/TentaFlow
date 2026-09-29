@@ -1092,11 +1092,7 @@ async fn run(
     if !out.success() {
         return Err(anyhow!(
             "{}",
-            out.stderr
-                .trim()
-                .lines()
-                .next()
-                .unwrap_or("the privileged step failed")
+            super::jobs::helper_error_line(&out.stderr, "the privileged step failed")
         ));
     }
     Ok(())

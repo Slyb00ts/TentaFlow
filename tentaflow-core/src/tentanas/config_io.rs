@@ -1076,7 +1076,7 @@ pub async fn apply_with(
         };
         match super::jobs::run_step(handle, &command, explicit, STEP_TIMEOUT).await {
             Ok(_) => handle.log(format!("pool {}: imported", pool.name)),
-            Err(e) => handle.log(format!("pool {}: import failed: {e}", pool.name)),
+            Err(e) => handle.log(format!("pool {}: import failed: {}", pool.name, super::jobs::log_text(&e))),
         }
         step(handle, &mut done);
     }
@@ -1111,7 +1111,7 @@ pub async fn apply_with(
         };
         match super::jobs::run_step(handle, &command, explicit, STEP_TIMEOUT).await {
             Ok(_) => handle.log(format!("dataset {}: created", dataset.name)),
-            Err(e) => handle.log(format!("dataset {}: create failed: {e}", dataset.name)),
+            Err(e) => handle.log(format!("dataset {}: create failed: {}", dataset.name, super::jobs::log_text(&e))),
         }
         step(handle, &mut done);
     }

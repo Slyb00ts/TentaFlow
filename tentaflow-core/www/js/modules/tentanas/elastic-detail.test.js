@@ -545,6 +545,21 @@ test('a failed run whose detail is a coded error reads as its words in the histo
   screen.dispose();
 });
 
+// Wave 16: the helper (0.17.4) codes a repair's outcome; the history row
+// words it in the reader's language. An older helper's Polish detail is
+// shown as it came.
+test('a repair outcome the helper coded reads as its words in the history', async () => {
+  const detail = 'refusal:elastic_fix_nothing_marked Nothing was repaired: parity has no marked errors; run a scrub';
+  const { screen, body } = await mount(array({ state: 'needs_attention', snapraid: { history: [{ kind: 'fix', outcome: 'nothing_repaired', detail }] } }));
+  const text = body.querySelector('.nas-snapraid-history').textContent;
+  assert.doesNotMatch(text, /refusal:/);
+  assert.match(text, /Nic nie naprawiono: parity nie ma zaznaczonych błędów/);
+  screen.dispose();
+  const older = await mount(array({ state: 'needs_attention', snapraid: { history: [{ kind: 'fix', outcome: 'ok', detail: 'naprawiono 313 bloków' }] } }));
+  assert.match(older.body.querySelector('.nas-snapraid-history').textContent, /naprawiono 313 bloków/);
+  older.screen.dispose();
+});
+
 const cacheDisk = { ...disk, diskId: 'serial-3', name: 'c1', kind: 'nvme', mountpoint: '/mnt/tentanas-branches/media/cache/c1' };
 const moverArray = (overrides = {}, mover = {}) => array({
   cacheDisks: [cacheDisk],

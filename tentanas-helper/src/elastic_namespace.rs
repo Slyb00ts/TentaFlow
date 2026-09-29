@@ -86,7 +86,7 @@ mod linux {
     }
 
     fn cpath(path: &Path) -> Result<CString, String> {
-        CString::new(path.as_os_str().as_bytes()).map_err(|_| "NUL w ścieżce".into())
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| "NUL in a path".into())
     }
 
     fn boot_id() -> Result<String, String> {
@@ -98,13 +98,13 @@ mod linux {
     fn start_ticks(pid: u32) -> Result<u64, String> {
         let raw =
             std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;
-        let fields = raw.rsplit_once(") ").ok_or("nieczytelny stat procesu")?.1;
+        let fields = raw.rsplit_once(") ").ok_or("unreadable process stat")?.1;
         fields
             .split_whitespace()
             .nth(19)
-            .ok_or("brak starttime")?
+            .ok_or("no starttime")?
             .parse()
-            .map_err(|_| "nieczytelny starttime".into())
+            .map_err(|_| "unreadable starttime".into())
     }
 
     fn executable(file: &mut File) -> Result<(u64, u64, String), String> {
@@ -114,7 +114,7 @@ mod linux {
                 && before.uid() == 0
                 && before.mode() & 0o022 == 0
                 && before.len() <= 128 * 1024 * 1024,
-            "niebezpieczny plik mergerfs",
+            "unsafe mergerfs file",
         )?;
         let mut hash = Sha256::new();
         let mut buffer = [0u8; 65536];
@@ -125,7 +125,7 @@ mod linux {
                 break;
             }
             total += count;
-            require(total <= 128 * 1024 * 1024, "rosnący plik mergerfs")?;
+            require(total <= 128 * 1024 * 1024, "growing mergerfs file")?;
             hash.update(&buffer[..count]);
         }
         let after = file.metadata().map_err(|e| e.to_string())?;
@@ -137,7 +137,7 @@ mod linux {
                 && before.mtime() == after.mtime()
                 && before.ctime() == after.ctime()
                 && before.ctime_nsec() == after.ctime_nsec(),
-            "zmieniony plik mergerfs",
+            "changed mergerfs file",
         )?;
         Ok((
             before.dev(),
@@ -158,23 +158,23 @@ mod linux {
                 && anchor.exe_sha256.len() == 64
                 && anchor.exe_sha256.bytes().all(|b| b.is_ascii_hexdigit())
                 && !anchor.union_source.is_empty(),
-            "niepełna kotwica",
+            "incomplete anchor",
         )?;
         require(
             boot_id()? == anchor.boot_id && start_ticks(anchor.pid)? == anchor.start_ticks,
-            "obcy boot/PID kotwicy",
+            "foreign anchor boot/PID",
         )?;
         let file = File::open(format!("/proc/{}/ns/mnt", anchor.pid)).map_err(|e| e.to_string())?;
         require(
             file.metadata().map_err(|e| e.to_string())?.ino() == anchor.mount_ns_inode,
-            "obca namespace kotwicy",
+            "foreign anchor namespace",
         )?;
         require(
             std::fs::metadata("/proc/self/ns/mnt")
                 .map_err(|e| e.to_string())?
                 .ino()
                 != anchor.mount_ns_inode,
-            "kotwica w hostowej namespace",
+            "anchor in the host namespace",
         )?;
         let mut exe = File::open(format!("/proc/{}/exe", anchor.pid)).map_err(|e| e.to_string())?;
         let measured = executable(&mut exe)?;
@@ -185,7 +185,7 @@ mod linux {
                     anchor.exe_inode,
                     anchor.exe_sha256.clone(),
                 ),
-            "obce exe kotwicy",
+            "foreign anchor exe",
         )?;
         require(
             start_ticks(anchor.pid)? == anchor.start_ticks
@@ -193,7 +193,7 @@ mod linux {
                     .map_err(|e| e.to_string())?
                     .ino()
                     == anchor.mount_ns_inode,
-            "podmieniona kotwica podczas odczytu",
+            "anchor replaced while read",
         )?;
         Ok(file.into())
     }
@@ -218,7 +218,7 @@ mod linux {
         if found.is_empty() {
             if let Err(error) = std::fs::symlink_metadata(path) {
                 if error.kind() == std::io::ErrorKind::NotFound {
-                    secure_directory(path.parent().ok_or("brak parenta unii")?, false)?;
+                    secure_directory(path.parent().ok_or("no union parent")?, false)?;
                     return Ok(None);
                 }
                 return Err(error.to_string());
@@ -229,11 +229,11 @@ mod linux {
                     .map_err(|e| e.to_string())?
                     .next()
                     .is_none(),
-                "niepusty publiczny mountpoint",
+                "non-empty public mountpoint",
             )?;
             return Ok(None);
         }
-        let anchor = anchor.ok_or("nieoczekiwany publiczny mount")?;
+        let anchor = anchor.ok_or("unexpected public mount")?;
         require(
             found.len() == 1
                 && found[0].filesystem == "fuse.mergerfs"
@@ -242,7 +242,7 @@ mod linux {
                 && found[0].id > 0
                 && !found[0].mount_options.is_empty()
                 && !found[0].super_options.is_empty(),
-            "obcy publiczny mount",
+            "foreign public mount",
         )?;
         let fd = OpenOptions::new()
             .read(true)
@@ -251,7 +251,7 @@ mod linux {
             .map_err(|e| e.to_string())?;
         require(
             filesystem(fd.as_raw_fd())? == (FUSE_MAGIC, anchor.union_device),
-            "obcy publiczny FUSE",
+            "foreign public FUSE",
         )?;
         let number = format!(
             "{}:{}",
@@ -260,7 +260,7 @@ mod linux {
         );
         require(
             found[0].major_minor == number,
-            "obcy numer publicznego urządzenia",
+            "foreign public device number",
         )?;
         Ok(Some(PublicMount {
             device: anchor.union_device,
@@ -269,12 +269,12 @@ mod linux {
     }
 
     fn secure_directory(path: &Path, private: bool) -> Result<(), String> {
-        require(path.is_absolute(), "względna ścieżka namespace")?;
+        require(path.is_absolute(), "relative namespace path")?;
         let mut current = PathBuf::from("/");
         for part in path.components().skip(1) {
             require(
                 matches!(part, Component::Normal(_)),
-                "niekanoniczna ścieżka namespace",
+                "non-canonical namespace path",
             )?;
             current.push(part);
             let metadata = std::fs::symlink_metadata(&current).map_err(|e| e.to_string())?;
@@ -283,12 +283,12 @@ mod linux {
                     && !metadata.file_type().is_symlink()
                     && metadata.uid() == 0
                     && metadata.mode() & 0o022 == 0,
-                "niebezpieczny katalog namespace",
+                "unsafe namespace directory",
             )?;
             if current == path && private {
                 require(
                     metadata.mode() & 0o777 == 0o700,
-                    "mountpoint nie jest root0700",
+                    "the mountpoint is not root 0700",
                 )?;
             }
         }
@@ -296,11 +296,11 @@ mod linux {
     }
 
     fn single_thread() -> Result<(), String> {
-        require(unsafe { libc::geteuid() } == 0, "namespace wymaga root")?;
+        require(unsafe { libc::geteuid() } == 0, "the namespace needs root")?;
         let count = std::fs::read_dir("/proc/self/task")
             .map_err(|e| e.to_string())?
             .count();
-        require(count == 1, "fork namespace wymaga jednowątkowego helpera")
+        require(count == 1, "a namespace fork needs a single-threaded helper")
     }
 
     fn socket_pair() -> Result<(OwnedFd, OwnedFd), String> {
@@ -337,7 +337,7 @@ mod linux {
                 )
             } != 0
             {
-                return Err(last_error("timeout wysyłki namespace"));
+                return Err(last_error("namespace send timed out"));
             }
         }
         Ok(pair)
@@ -364,7 +364,7 @@ mod linux {
 
     fn send_frame<T: Serialize>(socket: RawFd, value: &T, fd: Option<RawFd>) -> Result<(), String> {
         let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
-        require(bytes.len() <= FRAME_LIMIT, "za duży komunikat namespace")?;
+        require(bytes.len() <= FRAME_LIMIT, "namespace message too large")?;
         let mut iov = libc::iovec {
             iov_base: bytes.as_ptr().cast_mut().cast(),
             iov_len: bytes.len(),
@@ -434,7 +434,7 @@ mod linux {
         }
         require(
             count > 0 && valid && message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) == 0,
-            "niepełny lub obcy komunikat namespace",
+            "incomplete or foreign namespace message",
         )?;
         bytes.truncate(count as usize);
         let value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
@@ -455,7 +455,7 @@ mod linux {
             )
         } != 0
         {
-            return Err(last_error("prywatna propagacja"));
+            return Err(last_error("private propagation"));
         }
         let path = cpath(branch_root)?;
         if unsafe {
@@ -468,7 +468,7 @@ mod linux {
             )
         } != 0
         {
-            return Err(last_error("prywatny korzeń branchy"));
+            return Err(last_error("private branch root"));
         }
         Ok(())
     }
@@ -489,7 +489,7 @@ mod linux {
         let owned = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
         require(
             filesystem(owned.as_raw_fd())?.0 == FUSE_MAGIC,
-            "klon nie jest FUSE",
+            "the clone is not FUSE",
         )?;
         Ok(owned)
     }
@@ -574,16 +574,16 @@ mod linux {
                 && matching[0].filesystem == "fuse.mergerfs"
                 && matching[0].root == "/"
                 && matching[0].source == anchor.union_source,
-            "obca wewnętrzna unia kotwicy",
+            "foreign inner union of the anchor",
         )?;
         let row = matching[0];
         let readonly = readonly_option(
             &row.super_options,
-            "nieznany lub sprzeczny stan superblocka unii",
+            "unknown or contradictory union superblock state",
         )?;
         let local_readonly = readonly_option(
             &row.mount_options,
-            "nieznany stan lokalnego mounta unii",
+            "unknown state of the union's local mount",
         )?;
         let file = OpenOptions::new()
             .read(true)
@@ -592,7 +592,7 @@ mod linux {
             .map_err(|e| e.to_string())?;
         require(
             filesystem(file.as_raw_fd())? == (FUSE_MAGIC, anchor.union_device),
-            "obce urządzenie wewnętrznej unii",
+            "foreign device of the inner union",
         )?;
         let number = format!(
             "{}:{}",
@@ -601,7 +601,7 @@ mod linux {
         );
         require(
             row.id > 0 && row.major_minor == number,
-            "obca tożsamość wewnętrznej unii",
+            "foreign identity of the inner union",
         )?;
         Ok(InternalMountState {
             flags: remount_flags(&row.mount_options, &row.super_options),
@@ -654,7 +654,7 @@ mod linux {
         ) -> Result<Anchor, String> {
             require(
                 self.anchor.is_none() && self.daemon.is_none(),
-                "kotwica już istnieje",
+                "the anchor already exists",
             )?;
             let mut program_file = OpenOptions::new()
                 .read(true)
@@ -669,10 +669,10 @@ mod linux {
             );
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
-                let daemon = self.daemon.as_mut().ok_or("brak procesu mergerfs")?;
+                let daemon = self.daemon.as_mut().ok_or("no mergerfs process")?;
                 require(
                     daemon.try_wait().map_err(|e| e.to_string())?.is_none(),
-                    "mergerfs zakończył start",
+                    "mergerfs ended its start",
                 )?;
                 let rows = mount_rows()?;
                 let found: Vec<_> = rows
@@ -685,7 +685,7 @@ mod linux {
                             && found[0].filesystem == "fuse.mergerfs"
                             && found[0].root == "/"
                             && !found[0].source.is_empty(),
-                        "obcy mount przy starcie mergerfs",
+                        "foreign mount at the mergerfs start",
                     )?;
                     let pid = daemon.id();
                     let ticks = start_ticks(pid)?;
@@ -693,7 +693,7 @@ mod linux {
                         File::open(format!("/proc/{pid}/exe")).map_err(|e| e.to_string())?;
                     require(
                         executable(&mut exe)? == expected_exe,
-                        "niezgodny uruchomiony mergerfs",
+                        "the running mergerfs does not match",
                     )?;
                     let ns = std::fs::metadata(format!("/proc/{pid}/ns/mnt"))
                         .map_err(|e| e.to_string())?
@@ -703,7 +703,7 @@ mod linux {
                             .map_err(|e| e.to_string())?
                             .ino()
                             && start_ticks(pid)? == ticks,
-                        "podmieniony proces mergerfs",
+                        "mergerfs process replaced",
                     )?;
                     let union = OpenOptions::new()
                         .read(true)
@@ -711,7 +711,7 @@ mod linux {
                         .open(&self.paths.union_path)
                         .map_err(|e| e.to_string())?;
                     let (kind, device) = filesystem(union.as_raw_fd())?;
-                    require(kind == FUSE_MAGIC, "unia nie jest FUSE")?;
+                    require(kind == FUSE_MAGIC, "the union is not FUSE")?;
                     let anchor = Anchor {
                         boot_id: boot_id()?,
                         pid,
@@ -730,7 +730,7 @@ mod linux {
                     self.anchor = Some(anchor.clone());
                     return Ok(anchor);
                 }
-                require(Instant::now() < deadline, "timeout startu mergerfs")?;
+                require(Instant::now() < deadline, "mergerfs start timed out")?;
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -738,7 +738,7 @@ mod linux {
         pub(crate) fn publish(&mut self, anchor: &Anchor) -> Result<PublicMount, String> {
             require(
                 self.anchor.as_ref() == Some(anchor),
-                "publikacja obcej kotwicy",
+                "publication of a foreign anchor",
             )?;
             internal_mount(&self.paths.union_path, anchor)?;
             let fd = clone_mount(&self.paths.union_path)?;
@@ -749,27 +749,27 @@ mod linux {
             )?;
             require(
                 wait_readable(self.socket, HANDSHAKE)?,
-                "timeout ACK publikacji",
+                "publication ACK timed out",
             )?;
             let (response, descriptors): (Result<PublicMount, String>, _) =
                 receive_frame(self.socket)?;
-            require(descriptors.is_empty(), "deskryptor w ACK publikacji")?;
+            require(descriptors.is_empty(), "a descriptor in the publication ACK")?;
             let public = response?;
             require(
                 public.device == anchor.union_device && public.mount_id > 0,
-                "obcy ACK publikacji",
+                "foreign publication ACK",
             )?;
             self.public = Some(public.clone());
             Ok(public)
         }
 
         pub(crate) fn union_readonly(&self) -> Result<bool, String> {
-            let anchor = self.anchor.as_ref().ok_or("brak kotwicy unii")?;
+            let anchor = self.anchor.as_ref().ok_or("no union anchor")?;
             Ok(internal_mount_state(&self.paths.union_path, anchor)?.readonly)
         }
 
         pub(crate) fn set_union_readonly(&mut self, readonly: bool) -> Result<(), String> {
-            let anchor = self.anchor.as_ref().ok_or("brak kotwicy unii")?;
+            let anchor = self.anchor.as_ref().ok_or("no union anchor")?;
             let state = internal_mount_state(&self.paths.union_path, anchor)?;
             if state.readonly == readonly && state.mount_readonly == readonly {
                 return Ok(());
@@ -789,7 +789,7 @@ mod linux {
                 )
             } != 0
             {
-                return Err(last_error("remount globalnego FUSE"));
+                return Err(last_error("remount of the global FUSE"));
             }
             let after = internal_mount_state(&self.paths.union_path, anchor)?;
             require(
@@ -797,7 +797,7 @@ mod linux {
                     && after.mount_readonly == readonly
                     && after.mount_id == state.mount_id
                     && after.flags == state.flags,
-                "remount nie zmienił stanu superblocka unii",
+                "the remount did not change the union superblock state",
             )
         }
     }
@@ -880,15 +880,15 @@ mod linux {
                 child_descriptors(&keep)?;
                 if let Some(fd) = namespace.as_ref() {
                     if unsafe { libc::setns(fd.as_raw_fd(), libc::CLONE_NEWNS) } != 0 {
-                        return Err(last_error("setns kotwicy"));
+                        return Err(last_error("anchor setns"));
                     }
-                    let anchor = initial.as_ref().ok_or("brak kotwicy setns")?;
+                    let anchor = initial.as_ref().ok_or("no setns anchor")?;
                     require(
                         std::fs::metadata("/proc/self/ns/mnt")
                             .map_err(|e| e.to_string())?
                             .ino()
                             == anchor.mount_ns_inode,
-                        "setns innej kotwicy",
+                        "setns of another anchor",
                     )?;
                     internal_mount(&paths.union_path, anchor)?;
                 } else {
@@ -916,31 +916,31 @@ mod linux {
                 if !wait_readable(parent.as_raw_fd(), Duration::from_secs(1))? {
                     if wait_child(pid, Duration::ZERO)?.is_some() {
                         reaped = true;
-                        return Err("worker zakończył się bez wyniku".into());
+                        return Err("the worker ended without a result".into());
                     }
                     continue;
                 }
                 let (message, descriptors): (Message<T>, _) = receive_frame(parent.as_raw_fd())?;
                 match message {
                     Message::Complete(value) => {
-                        require(descriptors.is_empty(), "deskryptor w wyniku workera")?;
+                        require(descriptors.is_empty(), "a descriptor in the worker result")?;
                         let status = wait_child(pid, Duration::from_secs(2))?
-                            .ok_or("worker nie zakończył się po wyniku")?;
+                            .ok_or("the worker did not end after its result")?;
                         reaped = true;
                         require(
                             libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-                            "błędne wyjście workera",
+                            "bad worker output",
                         )?;
                         return Ok((value?, anchor));
                     }
                     Message::Publish(candidate) => {
                         let published: Result<PublicMount, String> = (|| {
-                            require(descriptors.len() == 1, "publikacja wymaga jednego FD")?;
+                            require(descriptors.len() == 1, "publication needs one FD")?;
                             let _namespace = validate_anchor(&candidate)?;
                             require(
                                 filesystem(descriptors[0].as_raw_fd())?
                                     == (FUSE_MAGIC, candidate.union_device),
-                                "obcy deskryptor publikacji",
+                                "foreign publication descriptor",
                             )?;
                             authorize(&candidate)?;
                             if public_mount(&paths.union_path, Some(&candidate))?.is_none() {
@@ -948,11 +948,11 @@ mod linux {
                                 attach_mount(descriptors[0].as_raw_fd(), &paths.union_path)?;
                             }
                             let public = public_mount(&paths.union_path, Some(&candidate))?
-                                .ok_or("brak opublikowanej unii")?;
+                                .ok_or("no published union")?;
                             require(
                                 public_mount(&paths.union_path, Some(&candidate))?.as_ref()
                                     == Some(&public),
-                                "zmiana publikacji przed ACK",
+                                "publication changed before the ACK",
                             )?;
                             Ok(public)
                         })();
@@ -986,7 +986,7 @@ mod linux {
         let after = public_mount(&paths.union_path, anchor.as_ref())?;
         require(
             before.is_none() || before == after,
-            "zmieniona istniejąca publikacja podczas operacji",
+            "the existing publication changed during the operation",
         )?;
         Ok(RunResult {
             value,
@@ -1004,7 +1004,7 @@ mod linux {
         match std::fs::metadata(format!("/proc/{pid}")) {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(format!("nieczytelny /proc/{pid}: {error}")),
+            Err(error) => Err(format!("unreadable /proc/{pid}: {error}")),
         }
     }
 
@@ -1020,7 +1020,7 @@ mod linux {
         match std::fs::metadata(format!("/proc/{pid}/ns/mnt")) {
             Ok(metadata) => Ok(Some(metadata.ino())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(format!("nieczytelna namespace /proc/{pid}: {error}")),
+            Err(error) => Err(format!("unreadable namespace /proc/{pid}: {error}")),
         }
     }
 
@@ -1150,7 +1150,7 @@ mod linux {
                     }
                     if Instant::now() >= deadline {
                         if killed {
-                            return Err("proces unii nie zakończył się".into());
+                            return Err("the union process did not end".into());
                         }
                         // SIGTERM leaves a FUSE daemon waiting on in-flight
                         // requests; the second signal does not.
@@ -1168,7 +1168,7 @@ mod linux {
             // mounts, alive.
             if namespace_alive(anchor.mount_ns_inode)? {
                 return Err(
-                    "prywatna namespace unii nadal ma proces; branche nie zostały zwolnione".into(),
+                    "the union's private namespace still has a process; the branches were not released".into(),
                 );
             }
         }
@@ -1227,7 +1227,7 @@ mod linux {
                 }
                 result
             },
-            |_| Err("preflight nie publikuje na hoście".into()),
+            |_| Err("preflight does not publish on the host".into()),
         )
         .map(|_| ())
     }
@@ -1256,8 +1256,8 @@ mod linux {
                 Err("nieczytelny /proc/42".into())
             );
             assert_eq!(
-                daemon_live(Ok(true), || Err("nieczytelny starttime".into()), 7),
-                Err("nieczytelny starttime".into())
+                daemon_live(Ok(true), || Err("unreadable starttime".into()), 7),
+                Err("unreadable starttime".into())
             );
         }
 
@@ -1440,7 +1440,7 @@ mod linux {
             };
             assert!(validate_anchor(&anchor)
                 .unwrap_err()
-                .contains("hostowej namespace"));
+                .contains("host namespace"));
             let mut value = serde_json::to_value(&anchor).unwrap();
             value["extra"] = serde_json::json!(true);
             assert!(serde_json::from_value::<Anchor>(value).is_err());
@@ -1534,27 +1534,27 @@ impl Worker<'_> {
         _: &[String],
         _: &std::fs::File,
     ) -> Result<Anchor, String> {
-        Err("prywatna namespace wymaga Linux".into())
+        Err("a private namespace needs Linux".into())
     }
     pub(crate) fn publish(&mut self, _: &Anchor) -> Result<PublicMount, String> {
-        Err("prywatna namespace wymaga Linux".into())
+        Err("a private namespace needs Linux".into())
     }
     pub(crate) fn union_readonly(&self) -> Result<bool, String> {
-        Err("prywatna namespace wymaga Linux".into())
+        Err("a private namespace needs Linux".into())
     }
     pub(crate) fn set_union_readonly(&mut self, _: bool) -> Result<(), String> {
-        Err("prywatna namespace wymaga Linux".into())
+        Err("a private namespace needs Linux".into())
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn preflight(_: &Paths, _: &std::path::Path) -> Result<(), String> {
-    Err("prywatna namespace wymaga Linux".into())
+    Err("a private namespace needs Linux".into())
 }
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn stop(_: &Anchor) -> Result<(), String> {
-    Err("prywatna namespace wymaga Linux".into())
+    Err("a private namespace needs Linux".into())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1565,5 +1565,5 @@ pub(crate) fn run<T: Serialize + DeserializeOwned>(
     _: impl FnOnce(&mut Worker<'_>) -> Result<T, String>,
     _: impl FnMut(&Anchor) -> Result<(), String>,
 ) -> Result<RunResult<T>, String> {
-    Err("prywatna namespace wymaga Linux".into())
+    Err("a private namespace needs Linux".into())
 }

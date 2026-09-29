@@ -40,6 +40,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   od nowa dla sesji aktywnych w chwili aktualizacji (klucz sesji zawiera teraz
   wcielenie grupy portali, aby zatrzymanie i wznowienie targetu nie przedłużało
   starej sesji).
+- Komunikaty `tentanas-helper` są po angielsku, a te, na które administrator
+  może zareagować, helper wysyła jako kody odmowy (`refusal:<kod>?…`, jak rdzeń
+  od fali 13): czyszczenie dysku (zamontowany, swap, członek puli ZFS lub
+  macierzy md, zajęty, tylko do odczytu, sygnatury po czyszczeniu, dziennik
+  macierzy), rezerwacje Elastic przy operacjach ZFS (nazwa, punkt montowania,
+  dysk), brak lub zmiana dysku macierzy, dysk zajęty lub z sygnaturą przy
+  tworzeniu i dodawaniu, restart węzła przed operacją (najpierw
+  „Odtwórz montowania”) oraz wyniki napraw i przerwane przebiegi SnapRAID
+  w historii macierzy. Ekran tłumaczy te kody w pięciu językach; zdanie helpera
+  trafia do podpowiedzi i do dziennika zadania. Rdzeń przekazuje kod helpera
+  bez zmian jako błąd zadania i jako odpowiedź operacji wykonywanych od razu
+  (np. tworzenie datasetu lub zvola), bez przedrostka `tentanas-helper:`.
+  Wiersze zapisane przez starszego helpera
+  (po polsku) wyświetlają się tak jak dotąd.
+- `tentanas-helper` ma wersję `0.17.4` (bramka wersji wymaga dokładnie tej
+  wersji) — po aktualizacji ponów nadanie uprawnień systemowych. Nagłówek
+  pliku reguł audytu NFS zmienia się na angielski przy następnym zapisie.
 
 ## [0.4.0-beta.1] — 2026-09-29
 

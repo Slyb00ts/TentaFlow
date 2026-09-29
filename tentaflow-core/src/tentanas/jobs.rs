@@ -221,14 +221,9 @@ pub async fn run_step(
     let (out, channel) = super::broker::run_privileged(h.db(), command, explicit, timeout).await?;
     h.log(format!("channel: {}", channel.as_str()));
     h.log(&out.stdout);
-    h.log(&out.stderr);
+    h.log(helper_log_text(&out.stderr));
     if !out.success() {
-        return Err(anyhow!(
-            "{} exited with {}: {}",
-            command_label(command),
-            out.code,
-            out.stderr.trim().lines().next().unwrap_or("no output")
-        ));
+        return Err(step_failure(command, &out));
     }
     Ok(out)
 }
@@ -249,16 +244,72 @@ pub async fn run_step_with_key(
         super::broker::run_privileged_with_key(h.db(), command, key, explicit, timeout).await?;
     h.log(format!("channel: {}", channel.as_str()));
     h.log(&out.stdout);
-    h.log(&out.stderr);
+    h.log(helper_log_text(&out.stderr));
     if !out.success() {
-        return Err(anyhow!(
-            "{} exited with {}: {}",
-            command_label(command),
-            out.code,
-            out.stderr.trim().lines().next().unwrap_or("no output")
-        ));
+        return Err(step_failure(command, &out));
     }
     Ok(out)
+}
+
+/// The helper's refusal on its first stderr line, when it wrote one
+/// (helper 0.17.4): `tentanas-helper: <label>: refusal:<code>…`. The wire is
+/// the job's whole error, so the screen words its code (`format.js`
+/// `errMessage`); anything else — an older helper's sentence, a tool's own
+/// stderr — keeps the historic `<tool> exited with <code>: <line>` form.
+pub(crate) fn helper_refusal(stderr: &str) -> Option<&str> {
+    let line = stderr.trim().lines().next()?.trim();
+    let text = line
+        .strip_prefix("tentanas-helper: ")
+        .and_then(|rest| rest.split_once(": "))
+        .map_or(line, |(_, text)| text);
+    tentanas_helper::refusal::is_wire(text).then_some(text)
+}
+
+/// The line a privileged command that failed outside a job answers with
+/// (a toast, a dialog): the helper's refusal wire alone when its first stderr
+/// line carries one, so the screen words the code; otherwise that first line
+/// as it came, or `fallback` when there is none.
+pub fn helper_error_line(stderr: &str, fallback: &str) -> String {
+    match helper_refusal(stderr) {
+        Some(wire) => wire.to_string(),
+        None => stderr.trim().lines().next().unwrap_or(fallback).to_string(),
+    }
+}
+
+fn step_failure(command: &HelperCommand, out: &super::broker::CommandOutput) -> anyhow::Error {
+    if let Some(refusal) = helper_refusal(&out.stderr) {
+        return anyhow!("{refusal}");
+    }
+    anyhow!(
+        "{} exited with {}: {}",
+        command_label(command),
+        out.code,
+        out.stderr.trim().lines().next().unwrap_or("no output")
+    )
+}
+
+/// An error as a job log line reads it: a helper refusal (the wire a failed
+/// step returns) as its English sentence, since a log line is not worded.
+pub fn log_text(error: &anyhow::Error) -> String {
+    let text = error.to_string();
+    if tentanas_helper::refusal::is_wire(&text) {
+        tentanas_helper::refusal::sentence(&text).to_string()
+    } else {
+        text
+    }
+}
+
+/// The helper's stderr as the job log keeps it: a refusal line reads as its
+/// English sentence (the code is the job's error line, not a log line).
+fn helper_log_text(stderr: &str) -> String {
+    stderr
+        .lines()
+        .map(|line| match helper_refusal(line) {
+            Some(wire) => line.replacen(wire, tentanas_helper::refusal::sentence(wire), 1),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn command_label(command: &HelperCommand) -> &'static str {
@@ -563,6 +614,60 @@ pub fn cancel(job_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wave 16: a helper refusal is the job's whole error, so the screen
+    /// words its code; an older helper's sentence and a tool's own stderr keep
+    /// the historic form, and the job log reads the refusal's sentence.
+    #[test]
+    fn a_helper_refusal_is_the_job_error_and_the_log_reads_its_sentence() {
+        let command = HelperCommand::DiskWipe {
+            device: "/dev/sdc".into(),
+            wwn: None,
+            serial: Some("S1".into()),
+            bytes: 1,
+            release_journal: None,
+        };
+        let refused = super::super::broker::CommandOutput {
+            code: 69,
+            stdout: String::new(),
+            stderr: "tentanas-helper: disk_wipe: refusal:disk_wipe_mounted?disk=sdc /dev/sdc: the device is mounted (/mnt/x); unmount it and try again\n".into(),
+        };
+        assert_eq!(
+            step_failure(&command, &refused).to_string(),
+            "refusal:disk_wipe_mounted?disk=sdc /dev/sdc: the device is mounted (/mnt/x); unmount it and try again"
+        );
+        assert_eq!(
+            helper_log_text(&refused.stderr),
+            "tentanas-helper: disk_wipe: /dev/sdc: the device is mounted (/mnt/x); unmount it and try again"
+        );
+        // An older helper's Polish sentence is shown as it came.
+        let older = super::super::broker::CommandOutput {
+            code: 69,
+            stdout: String::new(),
+            stderr: "tentanas-helper: disk_wipe: /dev/sdc: urządzenie jest zamontowane (/mnt/x)".into(),
+        };
+        let error = step_failure(&command, &older).to_string();
+        assert!(error.ends_with("exited with 69: tentanas-helper: disk_wipe: /dev/sdc: urządzenie jest zamontowane (/mnt/x)"), "{error}");
+        assert_eq!(helper_log_text(&older.stderr), older.stderr);
+        // Only the FIRST line decides, and only a wire at the start of the
+        // helper's text: a sentence that mentions one is not one.
+        let quoting = super::super::broker::CommandOutput {
+            code: 1,
+            stdout: String::new(),
+            stderr: "zpool: cannot open 'refusal:x'\ntentanas-helper: x: refusal:disk_wipe_busy".into(),
+        };
+        assert!(step_failure(&command, &quoting).to_string().contains("exited with 1: zpool"));
+        assert_eq!(
+            log_text(&step_failure(&command, &refused)),
+            "/dev/sdc: the device is mounted (/mnt/x); unmount it and try again"
+        );
+        assert_eq!(
+            helper_error_line(&refused.stderr, "x"),
+            "refusal:disk_wipe_mounted?disk=sdc /dev/sdc: the device is mounted (/mnt/x); unmount it and try again"
+        );
+        assert_eq!(helper_error_line(&older.stderr, "x"), older.stderr);
+        assert_eq!(helper_error_line("", "fallback"), "fallback");
+    }
 
     fn database() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().unwrap();

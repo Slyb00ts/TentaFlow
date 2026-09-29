@@ -208,7 +208,7 @@ fn allocated(stat: &libc::stat) -> u64 {
 /// must not be read as "the folder is empty on this disk".
 pub(crate) fn device_of(path: &Path) -> Result<u64, String> {
     let path = CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()))
-        .map_err(|_| "ścieżka zawiera NUL".to_string())?;
+        .map_err(|_| "the path contains NUL".to_string())?;
     let mut stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::lstat(path.as_ptr(), &mut stat) } != 0 {
         return Err(last_error().to_string());

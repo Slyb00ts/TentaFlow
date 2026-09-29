@@ -674,13 +674,7 @@ pub async fn reconcile(main_db: &DbPool, addon_id: &str, db: &DbPool, only: Opti
             }
             Ok((out, _)) => {
                 status.state = "error".to_string();
-                status.detail = out
-                    .stderr
-                    .trim()
-                    .lines()
-                    .next()
-                    .unwrap_or("mount failed")
-                    .to_string();
+                status.detail = super::jobs::helper_error_line(&out.stderr, "mount failed");
             }
             Err(e) => {
                 status.state = "error".to_string();

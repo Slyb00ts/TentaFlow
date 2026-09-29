@@ -549,8 +549,10 @@ const CACHE_STUCK_CAUSES = new Set(['unresolved_operation', 'files_busy', 'sched
 function unconfirmed(code) {
   return (p) => {
     const t = textParams(p, ['array', 'error']);
+    // The error may be a coded refusal (a helper of 0.17.4 codes what an
+    // admin acts on): its words, then its sentence — never the raw wire.
     return t
-      ? { title: T(`alerts.code.${code}.title`, { array: t.array }), detail: T(`alerts.code.${code}.detail`), raw: t.error }
+      ? { title: T(`alerts.code.${code}.title`, { array: t.array }), detail: T(`alerts.code.${code}.detail`), raw: nodeTextTitle(t.error) }
       : null;
   };
 }
@@ -675,12 +677,14 @@ const ALERT_WORDS = new Map([
     const t = textParams(p, ['array']);
     if (!t) return null;
     // The helper's own text, when it gave one, is its words, not ours: the
-    // tooltip, with the sentence saying it is there.
+    // tooltip, with the sentence saying it is there. A helper of 0.17.4
+    // codes what an admin acts on; that reads as its words and sentence,
+    // an older helper's text as it came.
     const helper = textParam(p, 'helper_detail');
     return {
       title: T('alerts.code.elastic_needs_attention.title', t),
       detail: T(helper ? 'alerts.code.elastic_needs_attention.detail_helper' : 'alerts.code.elastic_needs_attention.detail'),
-      raw: helper,
+      raw: helper ? nodeTextTitle(helper) : helper,
     };
   }],
   ['elastic_result_unconfirmed', unconfirmed('elastic_result_unconfirmed')],

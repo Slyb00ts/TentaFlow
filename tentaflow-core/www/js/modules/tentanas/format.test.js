@@ -493,7 +493,16 @@ function nodeRefusalCodes() {
     if (file === 'tentanas/disks.rs') continue;
     for (const m of source.matchAll(/\brefuse\(\s*"(elastic_[a-z0-9_]+)"/g)) codes.add(m[1]);
   }
+  for (const code of helperRefusalCodes()) codes.add(code);
   return codes;
+}
+
+// Wave 16: the helper refuses in codes of its own (`tentanas-helper`
+// `refusal::CODES`), which the node forwards as a job's error unchanged.
+function helperRefusalCodes() {
+  const source = readFileSync(join(WWW_ROOT, '..', '..', 'tentanas-helper', 'src', 'refusal.rs'), 'utf8');
+  const list = source.split('pub const CODES: &[&str] = &[')[1].split('];')[0];
+  return [...list.matchAll(/"([a-z0-9_]+)"/g)].map((m) => m[1]);
 }
 
 // A value for every placeholder the Polish words of a code need — the way
@@ -523,6 +532,9 @@ test('every refusal code the node sends is worded in every locale, an unknown on
     assert.ok(codes.has(coded), `the coded refusals with parameters are scanned too: ${coded}`);
   }
   assert.ok(codes.size >= 60, [...codes].join(', '));
+  for (const helper of ['disk_wipe_busy', 'elastic_fix_nothing_marked', 'zfs_name_reserved', 'elastic_restore_after_boot']) {
+    assert.ok(codes.has(helper), `the helper's own codes are scanned too: ${helper}`);
+  }
   try {
     for (const lang of ['pl', 'en', 'de', 'es', 'fr']) {
       await I18n.setLanguage(lang);
@@ -802,4 +814,31 @@ test('a lost iSER listener alert nests no parentheses, in every language (critic
   } finally {
     await I18n.setLanguage('pl');
   }
+});
+
+// Wave 16: the helper (0.17.4) codes what an admin acts on. Its refusal is a
+// job's whole error, a SnapRAID run's detail or an alert's helper note, and
+// each reads as the words, its English sentence only as the detail or the
+// tooltip. An older helper's Polish sentence has no code and reads as sent.
+test('a helper refusal reads as its words; an older helper\'s sentence as it came', () => {
+  const wipe = 'refusal:disk_wipe_mounted?disk=sdc /dev/sdc: the device is mounted (/mnt/x); unmount it and try again';
+  assert.equal(errMessage(new Error(wipe)), 'Dysk sdc jest zamontowany — odmontuj go i wyczyść ponownie');
+  assert.equal(errDetail(new Error(wipe)), '/dev/sdc: the device is mounted (/mnt/x); unmount it and try again');
+  const older = 'disk_wipe exited with 69: tentanas-helper: disk_wipe: /dev/sdc: urządzenie jest zamontowane (/mnt/x) — odmontuj je i powtórz';
+  assert.equal(errMessage(new Error(older)), older);
+  assert.equal(errDetail(new Error(older)), '');
+
+  const fix = 'refusal:elastic_fix_recovered?recovered=313 313 blocks repaired';
+  assert.equal(nodeTextTitle(fix), 'Naprawiono 313 bloków — 313 blocks repaired');
+  const nothing = 'refusal:elastic_fix_nothing_marked Nothing was repaired: parity has no marked errors';
+  assert.match(nodeTextTitle(nothing), /^Nic nie naprawiono: parity nie ma zaznaczonych błędów — uruchom scrub/);
+
+  const coded = alertText(A('elastic_needs_attention', { array: 'media', helper_detail: 'refusal:elastic_disk_foreign_filesystem?disk=sdq The filesystem UUID or type does not match the journal' }));
+  assert.doesNotMatch(coded.tooltip, /refusal:/, coded.tooltip);
+  assert.match(coded.tooltip, /Dysk sdq nie ma już systemu plików tej macierzy/, coded.tooltip);
+  const olderNote = alertText(A('elastic_needs_attention', { array: 'media', helper_detail: 'UUID lub typ FS niezgodny z journalem' }));
+  assert.match(olderNote.tooltip, /UUID lub typ FS niezgodny z journalem/, olderNote.tooltip);
+  const unconfirmed = alertText(A('elastic_result_unconfirmed', { array: 'media', error: 'refusal:elastic_disk_missing A disk of the array is absent; a lost answer does not prove that I/O stopped' }));
+  assert.doesNotMatch(unconfirmed.tooltip, /refusal:/, unconfirmed.tooltip);
+  assert.match(unconfirmed.tooltip, /Dysku macierzy nie ma na tym węźle/, unconfirmed.tooltip);
 });

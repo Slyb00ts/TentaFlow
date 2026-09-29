@@ -171,7 +171,7 @@ pub(crate) fn quarantine_name(temporary: &str) -> Result<String, String> {
         .strip_prefix(TEMPORARY_PREFIX)
         .filter(|rest| !rest.is_empty() && !rest.contains('/'))
         .map(|rest| format!("{QUARANTINE_PREFIX}{rest}"))
-        .ok_or_else(|| "nazwa tymczasowa bez prefiksu transferu".to_string())
+        .ok_or_else(|| "temporary name without the transfer prefix".to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -194,7 +194,7 @@ mod hex_value {
         if text.len() % 2 != 0
             || !text.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err(serde::de::Error::custom("wartość atrybutu nie jest zapisem hex"));
+            return Err(serde::de::Error::custom("the attribute value is not hex"));
         }
         (0..text.len())
             .step_by(2)
@@ -374,7 +374,7 @@ pub(crate) fn scan_cache(
             ) {
                 Ok(directory) => directory,
                 Err(error) => {
-                    entries.push(refused(shown, &format!("katalog niedostępny: {error}")));
+                    entries.push(refused(shown, &format!("directory unavailable: {error}")));
                     continue;
                 }
             }
@@ -389,7 +389,7 @@ pub(crate) fn scan_cache(
         let names = match read_directory(directory.as_raw_fd()) {
             Ok(names) => names,
             Err(error) => {
-                entries.push(refused(shown, &format!("listowanie katalogu: {error}")));
+                entries.push(refused(shown, &format!("directory listing: {error}")));
                 continue;
             }
         };
@@ -399,7 +399,7 @@ pub(crate) fn scan_cache(
                 Err(error) => {
                     entries.push(refused(
                         join(&String::from_utf8_lossy(error.as_bytes())),
-                        "nazwa nie jest UTF-8",
+                        "the name is not UTF-8",
                     ));
                     continue;
                 }
@@ -417,22 +417,22 @@ pub(crate) fn scan_cache(
             };
             let kind = stat.st_mode as u32 & libc::S_IFMT as u32;
             if stat.st_dev != root_device {
-                entries.push(refused(relative, "wpis na innym systemie plików"));
+                entries.push(refused(relative, "entry on another filesystem"));
             } else if kind == libc::S_IFDIR as u32 {
                 pending.push(relative);
             } else if kind == libc::S_IFLNK as u32 {
-                entries.push(refused(relative, "mover odmawia symlinku"));
+                entries.push(refused(relative, "the mover refuses a symlink"));
             } else if kind != libc::S_IFREG as u32 {
-                entries.push(refused(relative, "mover odmawia pliku specjalnego"));
+                entries.push(refused(relative, "the mover refuses a special file"));
             } else if stat.st_nlink != 1 {
-                entries.push(refused(relative, "mover odmawia hardlinku"));
+                entries.push(refused(relative, "the mover refuses a hardlink"));
             } else {
-                let size = u64::try_from(stat.st_size).map_err(|_| "ujemny rozmiar pliku")?;
+                let size = u64::try_from(stat.st_size).map_err(|_| "negative file size")?;
                 let allocated = u64::try_from(stat.st_blocks)
-                    .map_err(|_| "ujemna liczba bloków pliku")?
+                    .map_err(|_| "negative file block count")?
                     .saturating_mul(512);
                 if allocated < size {
-                    entries.push(refused(relative, "mover odmawia pliku sparse"));
+                    entries.push(refused(relative, "the mover refuses a sparse file"));
                 } else {
                     entries.push(ScanEntry::File(ScanFile {
                         path: relative,
@@ -453,7 +453,7 @@ pub(crate) fn scan_cache(
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn scan_cache(_: &Path, _: impl Fn(&str) -> bool) -> Result<Vec<ScanEntry>, String> {
-    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
+    Err("an FD-relative transfer is supported on Linux only".into())
 }
 
 fn valid_relative(path: &str) -> Result<(), String> {
@@ -462,7 +462,7 @@ fn valid_relative(path: &str) -> Result<(), String> {
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
     {
-        return Err("ścieżka transferu musi być względna i bez składników specjalnych".into());
+        return Err("a transfer path must be relative and without special components".into());
     }
     Ok(())
 }
@@ -537,7 +537,7 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 #[cfg(target_os = "linux")]
 fn open_root_directory(path: &Path) -> Result<OwnedFd, String> {
     let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| "ścieżka katalogu zawiera NUL".to_string())?;
+        .map_err(|_| "the directory path contains NUL".to_string())?;
     let how = OpenHow {
         flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
         mode: 0,
@@ -650,7 +650,7 @@ fn open_relative_io(
 ) -> Result<OwnedFd, std::io::Error> {
     valid_relative(path).map_err(std::io::Error::other)?;
     let path = CString::new(path).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "ścieżka zawiera NUL")
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "the path contains NUL")
     })?;
     let how = OpenHow {
         flags: flags as u64,
@@ -690,14 +690,14 @@ fn stat_fd(fd: i32) -> Result<libc::stat, String> {
 #[cfg(target_os = "linux")]
 fn stat_at_io(dirfd: i32, name: &str) -> Result<libc::stat, std::io::Error> {
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-        return Err(std::io::Error::other("nieprawidłowa nazwa wpisu"));
+        return Err(std::io::Error::other("invalid entry name"));
     }
     #[cfg(test)]
     if UNSTATABLE.with(|cell| cell.borrow().as_deref() == Some(name)) {
         return Err(std::io::Error::from_raw_os_error(libc::EIO));
     }
     let name = CString::new(name).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "nazwa zawiera NUL")
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "the name contains NUL")
     })?;
     let mut stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
@@ -736,7 +736,7 @@ impl MeasureError {
     fn into_message(self) -> String {
         match self {
             Self::MediaRead(message) | Self::Other(message) => message,
-            Self::LeaseBroken => "plik otwarty przez inny proces podczas pomiaru".into(),
+            Self::LeaseBroken => "file open in another process while measured".into(),
         }
     }
 }
@@ -843,16 +843,16 @@ fn measure_fd(fd: &OwnedFd, leases: &[&OwnedFd]) -> Result<TransferIdentity, Mea
     let stat = stat_fd(fd.as_raw_fd())?;
     let mode = stat.st_mode as u32;
     if stat.st_nlink != 1 || (mode & libc::S_IFMT as u32) != libc::S_IFREG as u32 {
-        return Err("mover odmawia symlinku, hardlinku lub pliku specjalnego".into());
+        return Err("the mover refuses a symlink, a hardlink or a special file".into());
     }
-    let blocks = u64::try_from(stat.st_blocks).map_err(|_| "ujemna liczba bloków pliku")?;
-    let file_size = u64::try_from(stat.st_size).map_err(|_| "ujemny rozmiar pliku")?;
+    let blocks = u64::try_from(stat.st_blocks).map_err(|_| "negative file block count")?;
+    let file_size = u64::try_from(stat.st_size).map_err(|_| "negative file size")?;
     if blocks
         .checked_mul(512)
-        .ok_or("rozmiar bloków przekracza limit")?
+        .ok_or("block size exceeds the limit")?
         < file_size
     {
-        return Err("mover odmawia pliku sparse".into());
+        return Err("the mover refuses a sparse file".into());
     }
     #[cfg(test)]
     if UNREADABLE.with(|cell| cell.get()) == Some((stat.st_dev as u64, stat.st_ino as u64)) {
@@ -879,7 +879,7 @@ fn measure_fd(fd: &OwnedFd, leases: &[&OwnedFd]) -> Result<TransferIdentity, Mea
         }
         size = size
             .checked_add(count as u64)
-            .ok_or("rozmiar pliku przekracza limit")?;
+            .ok_or("file size exceeds the limit")?;
         hash.update(&buffer[..count]);
         #[cfg(test)]
         {
@@ -903,7 +903,7 @@ fn measure_fd(fd: &OwnedFd, leases: &[&OwnedFd]) -> Result<TransferIdentity, Mea
         || after.st_mtime != stat.st_mtime
         || after.st_mtime_nsec != stat.st_mtime_nsec
     {
-        return Err("plik zmienił się podczas pomiaru".into());
+        return Err("the file changed while measured".into());
     }
     let (acl, xattr) = attributes_fd(fd.as_raw_fd())?;
     Ok(TransferIdentity {
@@ -982,7 +982,7 @@ fn attributes_fd(fd: i32) -> Result<(Vec<TransferAttribute>, Vec<TransferAttribu
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
     {
-        let name = CString::new(name).map_err(|_| "xattr zawiera NUL".to_string())?;
+        let name = CString::new(name).map_err(|_| "the xattr contains NUL".to_string())?;
         let value_size = unsafe { libc::fgetxattr(fd, name.as_ptr(), std::ptr::null_mut(), 0) };
         if value_size < 0 {
             return Err(std::io::Error::last_os_error().to_string());
@@ -994,7 +994,7 @@ fn attributes_fd(fd: i32) -> Result<(Vec<TransferAttribute>, Vec<TransferAttribu
             return Err(std::io::Error::last_os_error().to_string());
         }
         if read_value as usize != value.len() {
-            return Err("atrybut pliku zmienił rozmiar podczas odczytu".into());
+            return Err("a file attribute changed size while read".into());
         }
         let attribute = TransferAttribute {
             name: name.to_string_lossy().into_owned(),
@@ -1020,7 +1020,7 @@ fn restore_attributes<'a>(
 ) -> Result<(), String> {
     for attribute in attributes {
         let name =
-            CString::new(attribute.name.as_str()).map_err(|_| "xattr zawiera NUL".to_string())?;
+            CString::new(attribute.name.as_str()).map_err(|_| "the xattr contains NUL".to_string())?;
         let result = unsafe {
             libc::fsetxattr(
                 fd,
@@ -1089,8 +1089,8 @@ fn rename_without_replace(rootfd: i32, source: &str, target: &str) -> Result<(),
 #[cfg(target_os = "linux")]
 fn flush_range(fd: i32, offset: u64, count: usize) -> Result<(), String> {
     let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE | libc::SYNC_FILE_RANGE_WRITE | libc::SYNC_FILE_RANGE_WAIT_AFTER;
-    let offset = i64::try_from(offset).map_err(|_| "przesunięcie poza zakresem")?;
-    let count = i64::try_from(count).map_err(|_| "rozmiar poza zakresem")?;
+    let offset = i64::try_from(offset).map_err(|_| "offset out of range")?;
+    let count = i64::try_from(count).map_err(|_| "size out of range")?;
     if unsafe { libc::sync_file_range(fd, offset, count, flags) } != 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
@@ -1108,13 +1108,13 @@ fn rename_at_noreplace(
 ) -> Result<(), std::io::Error> {
     for name in [source, target] {
         if name.is_empty() || name.contains('/') || name == "." || name == ".." {
-            return Err(std::io::Error::other("nieprawidłowa nazwa wpisu"));
+            return Err(std::io::Error::other("invalid entry name"));
         }
     }
     let source = CString::new(source)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "źródło zawiera NUL"))?;
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "the source contains NUL"))?;
     let target = CString::new(target)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "cel zawiera NUL"))?;
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "the target contains NUL"))?;
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
@@ -1222,7 +1222,7 @@ fn strip_foreign_acls(fd: i32, source_acl: &[TransferAttribute]) -> Result<(), S
         if source_acl.iter().any(|attribute| attribute.name == name) {
             continue;
         }
-        let c_name = CString::new(name).map_err(|_| "xattr zawiera NUL".to_string())?;
+        let c_name = CString::new(name).map_err(|_| "the xattr contains NUL".to_string())?;
         if unsafe { libc::fremovexattr(fd, c_name.as_ptr()) } != 0 {
             let error = std::io::Error::last_os_error();
             if !matches!(error.raw_os_error(), Some(libc::ENODATA) | Some(libc::ENOTSUP)) {
@@ -1255,7 +1255,7 @@ fn finalize_directory(
     fsync_fd(fd.as_raw_fd())?;
     fsync_fd(parent)?;
     if directory_identity_fd(fd)? != *identity {
-        return Err("utworzony katalog ma inne metadane niż źródło".into());
+        return Err("the created directory has other metadata than the source".into());
     }
     Ok(())
 }
@@ -1273,7 +1273,7 @@ pub(crate) fn plan_file(
     valid_relative(path)?;
     valid_relative(temporary)?;
     if temporary.contains('/') {
-        return Err("nazwa tymczasowa musi leżeć w korzeniu brancha".into());
+        return Err("the temporary name must be in the branch root".into());
     }
     let source_root = open_root_directory(source_root)?;
     let destination_root = open_root_directory(destination_root)?;
@@ -1285,7 +1285,7 @@ pub(crate) fn plan_file(
     )?;
     let source_identity = identity_fd(&source)?;
     if (source_identity.device, source_identity.inode) != scanned {
-        return Err("plik zmienił się od skanu".into());
+        return Err("the file changed since the scan".into());
     }
     let mut complete = true;
     for prefix in parent_prefixes(parent_path(path)?) {
@@ -1303,27 +1303,27 @@ pub(crate) fn plan_file(
         ) {
             Ok(existing) => {
                 if !same_directory_access(&directory_identity_fd(&existing)?, &expected) {
-                    return Err(format!("katalog docelowy {prefix} ma obce metadane"));
+                    return Err(format!("target directory {prefix} has foreign metadata"));
                 }
             }
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
                 complete = false;
                 break;
             }
-            Err(error) => return Err(format!("katalog docelowy {prefix}: {error}")),
+            Err(error) => return Err(format!("target directory {prefix}: {error}")),
         }
     }
     if complete {
         let (parent, name) = directory_parent(destination_root.as_raw_fd(), path)?;
         if exists_at(parent.as_raw_fd(), &name)? {
-            return Err("cel już istnieje".into());
+            return Err("the target already exists".into());
         }
     }
     if exists_at(destination_root.as_raw_fd(), temporary)? {
-        return Err("nazwa tymczasowa jest zajęta".into());
+        return Err("the temporary name is taken".into());
     }
     if exists_at(source_root.as_raw_fd(), &quarantine_name(temporary)?)? {
-        return Err("nazwa odsunięcia oryginału jest zajęta".into());
+        return Err("the set-aside name of the original is taken".into());
     }
     Ok(TransferFile {
         source: path.into(),
@@ -1349,7 +1349,7 @@ pub(crate) fn plan_file(
     _: (u64, u64),
     _: &str,
 ) -> Result<TransferFile, String> {
-    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
+    Err("an FD-relative transfer is supported on Linux only".into())
 }
 
 /// Creates the destination's missing parent directories FD-relative, with the
@@ -1375,7 +1375,7 @@ where
         .as_deref()
         .is_some_and(|intent| !prefixes.contains(&intent))
     {
-        return Err("zamiar katalogu spoza ścieżki celu".into());
+        return Err("directory intent outside the target path".into());
     }
     for prefix in prefixes {
         let expected = directory_identity_fd(&open_relative(
@@ -1396,7 +1396,7 @@ where
                 let actual = directory_identity_fd(&existing)?;
                 if !same_directory_access(&actual, &expected) {
                     if !intended || !created_privately(&existing, &actual)? {
-                        return Err(format!("katalog docelowy {prefix} ma obce metadane"));
+                        return Err(format!("target directory {prefix} has foreign metadata"));
                     }
                     finalize_directory(&existing, parent.as_raw_fd(), &expected)?;
                 }
@@ -1409,7 +1409,7 @@ where
                 file.directory_intent = Some(prefix.to_string());
                 persist(file)?;
                 let c_name = CString::new(name.as_str())
-                    .map_err(|_| "nazwa katalogu zawiera NUL".to_string())?;
+                    .map_err(|_| "the directory name contains NUL".to_string())?;
                 if unsafe { libc::mkdirat(parent.as_raw_fd(), c_name.as_ptr(), 0o700) } != 0 {
                     return Err(std::io::Error::last_os_error().to_string());
                 }
@@ -1420,13 +1420,13 @@ where
                     0,
                 )?;
                 if !created_privately(&created, &directory_identity_fd(&created)?)? {
-                    return Err("utworzony katalog ma nieoczekiwane metadane".into());
+                    return Err("the created directory has unexpected metadata".into());
                 }
                 finalize_directory(&created, parent.as_raw_fd(), &expected)?;
                 file.directory_intent = None;
                 persist(file)?;
             }
-            Err(error) => return Err(format!("katalog docelowy {prefix}: {error}")),
+            Err(error) => return Err(format!("target directory {prefix}: {error}")),
         }
     }
     Ok(())
@@ -1437,7 +1437,7 @@ pub(crate) fn prepare_parents<F>(_: &Path, _: &Path, _: &mut TransferFile, _: F)
 where
     F: FnMut(&TransferFile) -> Result<(), String>,
 {
-    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
+    Err("an FD-relative transfer is supported on Linux only".into())
 }
 
 /// `(device, inode)` of every file another process holds open, read from
@@ -1471,7 +1471,7 @@ pub(crate) fn open_file_identities(daemon: u32) -> Result<BTreeSet<(u64, u64)>, 
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn open_file_identities(_: u32) -> Result<BTreeSet<(u64, u64)>, String> {
-    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
+    Err("an FD-relative transfer is supported on Linux only".into())
 }
 
 /// Open descriptors of the given processes. Another process or descriptor
@@ -1483,7 +1483,7 @@ pub(crate) fn open_file_identities_of(
     required: u32,
 ) -> Result<BTreeSet<(u64, u64)>, String> {
     if !pids.contains(&required) {
-        return Err(format!("proces mergerfs {required} jest niewidoczny w /proc"));
+        return Err(format!("mergerfs process {required} is not visible in /proc"));
     }
     let gone = |error: &std::io::Error| {
         matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH))
@@ -1541,7 +1541,7 @@ pub(crate) fn entry_exists(root: &Path, path: &str) -> Result<bool, String> {
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn entry_exists(_: &Path, _: &str) -> Result<bool, String> {
-    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
+    Err("an FD-relative transfer is supported on Linux only".into())
 }
 
 /// A temporary this record created and never pinned: the helper's own, still
@@ -1593,7 +1593,7 @@ pub(crate) fn remove_orphan_temporary(
     let temporary = file
         .temporary
         .as_deref()
-        .ok_or("brak trwałej ścieżki tymczasowej")?;
+        .ok_or("no durable temporary path")?;
     // One component, validated when the record was planned, so `unlinkat`
     // relative to the branch FD cannot reach outside it. `stat_at_io` refuses
     // a name with a separator or a special component and never follows a
@@ -1607,21 +1607,21 @@ pub(crate) fn remove_orphan_temporary(
         Err(error) => return Err(error.to_string()),
     };
     if (stat.st_mode as u32 & libc::S_IFMT as u32) != libc::S_IFREG as u32 || stat.st_nlink != 1 {
-        return Err("pod nazwą tymczasową nie leży zwykły plik tej operacji".into());
+        return Err("the temporary name does not hold a regular file of this operation".into());
     }
     let ours = match file.temporary_pin {
         Some(pin) => (stat.st_dev as u64, stat.st_ino as u64) == pin,
         None => fresh_temporary(&stat),
     };
     if !ours {
-        return Err("pod nazwą tymczasową leży obcy plik".into());
+        return Err("the temporary name holds a foreign file".into());
     }
     if let Some(pinned) = file.temporary_identity.as_ref() {
         if pinned.size != stat.st_size as u64 {
-            return Err("kopia tymczasowa ma inny rozmiar niż przypięty".into());
+            return Err("the temporary copy has another size than the pinned one".into());
         }
     }
-    let name = CString::new(temporary).map_err(|_| "nazwa zawiera NUL".to_string())?;
+    let name = CString::new(temporary).map_err(|_| "the name contains NUL".to_string())?;
     if unsafe { libc::unlinkat(destination_root.as_raw_fd(), name.as_ptr(), 0) } != 0 {
         let error = std::io::Error::last_os_error();
         // Lost a race with another cleanup: the orphan is gone either way.
@@ -1657,7 +1657,7 @@ fn fsync_after_unlink(fd: i32) -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn remove_orphan_temporary(_: &Path, _: &TransferFile) -> Result<OrphanCleanup, String> {
-    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
+    Err("an FD-relative transfer is supported on Linux only".into())
 }
 
 /// Why a step of the state machine stopped: a decision to reverse the move,
@@ -1771,7 +1771,7 @@ fn lease_intact(fd: &OwnedFd) -> Result<bool, String> {
 fn temporary_of(file: &TransferFile) -> Result<&str, String> {
     file.temporary
         .as_deref()
-        .ok_or_else(|| "brak trwałej ścieżki tymczasowej".to_string())
+        .ok_or_else(|| "no durable temporary path".to_string())
 }
 
 /// Whether `name` in `dirfd` is the pinned regular inode; a missing name is
@@ -1828,7 +1828,7 @@ fn locate_original(session: &Session, file: &TransferFile) -> Result<Option<Plac
         (true, false) => Ok(Some(Place::Path)),
         (false, true) => Ok(Some(Place::Quarantine)),
         (false, false) => Ok(None),
-        (true, true) => Err("oryginał jest pod ścieżką i pod nazwą odsunięcia".into()),
+        (true, true) => Err("the original is both under the path and under the set-aside name".into()),
     }
 }
 
@@ -1848,7 +1848,7 @@ fn locate_copy(session: &Session, file: &TransferFile) -> Result<Option<CopyPlac
         (true, false) => Ok(Some(CopyPlace::Temporary)),
         (false, true) => Ok(Some(CopyPlace::Path)),
         (false, false) => Ok(None),
-        (true, true) => Err("kopia jest pod nazwą tymczasową i pod ścieżką".into()),
+        (true, true) => Err("the copy is both under the temporary name and under the path".into()),
     }
 }
 
@@ -1862,7 +1862,7 @@ fn hold_original(session: &mut Session, file: &TransferFile, place: Place) -> Re
     let fd = match place {
         Place::Path => {
             let (parent, name) = existing_parent(session.source_root.as_raw_fd(), &file.source)?
-                .ok_or("katalog oryginału zniknął")?;
+                .ok_or("the original's directory vanished")?;
             open_relative(parent.as_raw_fd(), &name, flags, 0)?
         }
         Place::Quarantine => open_relative(
@@ -1874,10 +1874,10 @@ fn hold_original(session: &mut Session, file: &TransferFile, place: Place) -> Re
     };
     let stat = stat_fd(fd.as_raw_fd())?;
     if (stat.st_dev as u64, stat.st_ino as u64) != original_pin(file) {
-        return Err(Stop::Withdraw("plik zmienił się od skanu".into()));
+        return Err(Stop::Withdraw("the file changed since the scan".into()));
     }
     if !take_lease(&fd)? {
-        return Err(Stop::Withdraw("plik otwarty przez inny proces".into()));
+        return Err(Stop::Withdraw("file open in another process".into()));
     }
     session.original = Some(Leased { fd, measured: false });
     Ok(())
@@ -1886,7 +1886,7 @@ fn hold_original(session: &mut Session, file: &TransferFile, place: Place) -> Re
 /// Opens the copy where it is and leases it, once per session.
 #[cfg(target_os = "linux")]
 fn hold_copy(session: &mut Session, file: &TransferFile) -> Result<CopyPlace, Stop> {
-    let place = locate_copy(session, file)?.ok_or("kopia zniknęła z dysku danych")?;
+    let place = locate_copy(session, file)?.ok_or("the copy vanished from the data disk")?;
     if session.copy.is_some() {
         return Ok(place);
     }
@@ -1896,16 +1896,16 @@ fn hold_copy(session: &mut Session, file: &TransferFile) -> Result<CopyPlace, St
         CopyPlace::Temporary => open_relative(destination_root, temporary_of(file)?, flags, 0)?,
         CopyPlace::Path => {
             let (parent, name) = existing_parent(destination_root, &file.destination)?
-                .ok_or("katalog kopii zniknął")?;
+                .ok_or("the copy's directory vanished")?;
             open_relative(parent.as_raw_fd(), &name, flags, 0)?
         }
     };
     let stat = stat_fd(fd.as_raw_fd())?;
     if Some((stat.st_dev as u64, stat.st_ino as u64)) != file.temporary_pin {
-        return Err(Stop::Fail("kopia zmieniła przypięty inode".into()));
+        return Err(Stop::Fail("the copy changed its pinned inode".into()));
     }
     if !take_lease(&fd)? {
-        return Err(Stop::Withdraw("kopia na dysku danych otwarta przez inny proces".into()));
+        return Err(Stop::Withdraw("the copy on the data disk is open in another process".into()));
     }
     session.copy = Some(Leased { fd, measured: false });
     Ok(place)
@@ -1944,22 +1944,22 @@ fn copy_metadata_matches(fd: &OwnedFd, pin: &TransferPin, identity: &TransferIde
 #[cfg(target_os = "linux")]
 fn check_original(session: &mut Session, file: &TransferFile, unreadable_allowed: bool) -> Result<(), Stop> {
     let Session { original, copy, .. } = session;
-    let held = original.as_mut().ok_or("brak trzymanego oryginału")?;
+    let held = original.as_mut().ok_or("no held original")?;
     if !lease_intact(&held.fd)? {
-        return Err(Stop::Withdraw("plik otwarty przez inny proces".into()));
+        return Err(Stop::Withdraw("file open in another process".into()));
     }
     if held.measured {
         if !original_metadata_matches(&held.fd, &file.source_identity)? {
-            return Err(Stop::Withdraw("metadane pliku zmieniły się podczas przenoszenia".into()));
+            return Err(Stop::Withdraw("the file metadata changed during the move".into()));
         }
         return Ok(());
     }
     let leases: Vec<&OwnedFd> = std::iter::once(&held.fd).chain(copy.as_ref().map(|copy| &copy.fd)).collect();
     let unreadable = match measure_fd(&held.fd, &leases) {
         Ok(identity) if identity == file.source_identity => None,
-        Ok(_) => return Err(Stop::Withdraw("plik zmienił się podczas przenoszenia".into())),
+        Ok(_) => return Err(Stop::Withdraw("the file changed during the move".into())),
         Err(MeasureError::LeaseBroken) => {
-            return Err(Stop::Withdraw("plik lub jego kopia otwarte przez inny proces".into()));
+            return Err(Stop::Withdraw("the file or its copy is open in another process".into()));
         }
         Err(MeasureError::MediaRead(error))
             if unreadable_allowed && same_stat(&stat_fd(held.fd.as_raw_fd())?, &file.source_identity) =>
@@ -1969,7 +1969,7 @@ fn check_original(session: &mut Session, file: &TransferFile, unreadable_allowed
         Err(error) => return Err(Stop::Fail(error.into_message())),
     };
     if !lease_intact(&held.fd)? {
-        return Err(Stop::Withdraw("plik otwarty przez inny proces".into()));
+        return Err(Stop::Withdraw("file open in another process".into()));
     }
     held.measured = true;
     if unreadable.is_some() {
@@ -1986,16 +1986,16 @@ fn check_copy(session: &mut Session, file: &TransferFile) -> Result<(), Stop> {
     let pin = file
         .temporary_identity
         .clone()
-        .ok_or("brak tożsamości kopii")?;
+        .ok_or("no copy identity")?;
     let reread = session.unreadable.is_some();
     let Session { original, copy, .. } = session;
-    let held = copy.as_mut().ok_or("brak trzymanej kopii")?;
+    let held = copy.as_mut().ok_or("no held copy")?;
     if !lease_intact(&held.fd)? {
-        return Err(Stop::Withdraw("kopia na dysku danych otwarta przez inny proces".into()));
+        return Err(Stop::Withdraw("the copy on the data disk is open in another process".into()));
     }
     if held.measured && !reread {
         if !copy_metadata_matches(&held.fd, &pin, &file.source_identity)? {
-            return Err(Stop::Fail("kopia ma inne metadane niż źródło".into()));
+            return Err(Stop::Fail("the copy has other metadata than the source".into()));
         }
         return Ok(());
     }
@@ -2006,15 +2006,15 @@ fn check_copy(session: &mut Session, file: &TransferFile) -> Result<(), Stop> {
     let actual = match measure_fd(&held.fd, &leases) {
         Ok(actual) => actual,
         Err(MeasureError::LeaseBroken) => {
-            return Err(Stop::Withdraw("plik lub jego kopia otwarte przez inny proces".into()));
+            return Err(Stop::Withdraw("the file or its copy is open in another process".into()));
         }
         Err(error) => return Err(Stop::Fail(error.into_message())),
     };
     if pin_of(&actual) != pin || !same_content_metadata(&actual, &file.source_identity) {
-        return Err(Stop::Fail("kopia nie odpowiada przypiętej tożsamości i metadanym źródła".into()));
+        return Err(Stop::Fail("the copy does not match the pinned identity and the source metadata".into()));
     }
     if !lease_intact(&held.fd)? {
-        return Err(Stop::Withdraw("kopia na dysku danych otwarta przez inny proces".into()));
+        return Err(Stop::Withdraw("the copy on the data disk is open in another process".into()));
     }
     held.measured = true;
     Ok(())
@@ -2037,7 +2037,7 @@ where
     let temporary = temporary_of(file)?.to_string();
     persist(file)?;
     if locate_original(session, file)? != Some(Place::Path) {
-        return Err(Stop::Withdraw("plik zmienił się od skanu".into()));
+        return Err(Stop::Withdraw("the file changed since the scan".into()));
     }
     hold_original(session, file, Place::Path)?;
     check_original(session, file, false)?;
@@ -2054,7 +2054,7 @@ where
             // before its pin was written: adopt it, but only in that fresh
             // state.
             if file.temporary_pin.is_none() && !fresh_temporary(&stat_fd(target.as_raw_fd())?) {
-                return Err(Stop::Fail("plik tymczasowy bez pina nie jest świeżą kopią tej operacji".into()));
+                return Err(Stop::Fail("an unpinned temporary file is not a fresh copy of this operation".into()));
             }
             target
         }
@@ -2063,7 +2063,7 @@ where
         // somebody else. Recreating it could only fail its pin: the record is
         // withdrawn instead, and a later run copies the file afresh.
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) && file.temporary_pin.is_some() => {
-            return Err(Stop::Withdraw("kopia tymczasowa zniknęła przed potwierdzeniem".into()));
+            return Err(Stop::Withdraw("the temporary copy vanished before its confirmation".into()));
         }
         Err(error) if error.raw_os_error() == Some(libc::ENOENT) => open_relative(
             destination_fd,
@@ -2077,12 +2077,12 @@ where
     if temporary_stat.st_nlink != 1
         || (temporary_stat.st_mode as u32 & libc::S_IFMT as u32) != libc::S_IFREG as u32
     {
-        return Err(Stop::Fail("mover odmawia tymczasowego hardlinku lub pliku specjalnego".into()));
+        return Err(Stop::Fail("the mover refuses a temporary hardlink or special file".into()));
     }
     let temporary_pin = (temporary_stat.st_dev as u64, temporary_stat.st_ino as u64);
     match file.temporary_pin {
         Some(pin) if pin != temporary_pin => {
-            return Err(Stop::Fail("plik tymczasowy zmienił przypięty inode".into()));
+            return Err(Stop::Fail("the temporary file changed its pinned inode".into()));
         }
         Some(_) => {}
         None => {
@@ -2091,13 +2091,13 @@ where
         }
     }
     if !take_lease(&target)? {
-        return Err(Stop::Withdraw("kopia tymczasowa otwarta przez inny proces".into()));
+        return Err(Stop::Withdraw("the temporary copy is open in another process".into()));
     }
     if unsafe { libc::ftruncate(target.as_raw_fd(), 0) } != 0 {
         return Err(Stop::Fail(std::io::Error::last_os_error().to_string()));
     }
     {
-        let original = session.original.as_ref().ok_or("brak trzymanego oryginału")?;
+        let original = session.original.as_ref().ok_or("no held original")?;
         let input = File::from(original.fd.try_clone().map_err(|e| e.to_string())?);
         let output = File::from(target.try_clone().map_err(|e| e.to_string())?);
         let mut buffer = vec![0u8; COPY_CHUNK];
@@ -2111,13 +2111,13 @@ where
                 .write_all_at(&buffer[..count], offset)
                 .map_err(|e| e.to_string())?;
             flush_range(output.as_raw_fd(), offset, count)?;
-            offset = offset.checked_add(count as u64).ok_or("rozmiar pliku przekracza limit")?;
+            offset = offset.checked_add(count as u64).ok_or("file size exceeds the limit")?;
             lease_moment(LeaseMoment::CopyChunk, &original.fd);
             if !lease_intact(&original.fd)? {
-                return Err(Stop::Withdraw("plik otwarty przez inny proces podczas kopiowania".into()));
+                return Err(Stop::Withdraw("file open in another process during the copy".into()));
             }
             if !lease_intact(&target)? {
-                return Err(Stop::Withdraw("kopia tymczasowa otwarta przez inny proces".into()));
+                return Err(Stop::Withdraw("the temporary copy is open in another process".into()));
             }
         }
     }
@@ -2146,22 +2146,22 @@ where
     fsync_fd(target.as_raw_fd())?;
     // Compared before CopyConfirmed: a copy the branch altered (an inherited
     // ACL, a label) is withdrawn instead of being published.
-    let original_fd = &session.original.as_ref().ok_or("brak trzymanego oryginału")?.fd;
+    let original_fd = &session.original.as_ref().ok_or("no held original")?.fd;
     if !lease_intact(original_fd)? {
-        return Err(Stop::Withdraw("plik otwarty przez inny proces podczas kopiowania".into()));
+        return Err(Stop::Withdraw("file open in another process during the copy".into()));
     }
     let actual = match measure_fd(&target, &[&target, original_fd]) {
         Ok(actual) => actual,
         Err(MeasureError::LeaseBroken) => {
-            return Err(Stop::Withdraw("plik lub kopia tymczasowa otwarte przez inny proces".into()));
+            return Err(Stop::Withdraw("the file or the temporary copy is open in another process".into()));
         }
         Err(error) => return Err(Stop::Fail(error.into_message())),
     };
     if !same_content_metadata(&actual, &file.source_identity) {
-        return Err(Stop::Fail("kopia tymczasowa ma inną treść lub metadane niż źródło".into()));
+        return Err(Stop::Fail("the temporary copy has other content or metadata than the source".into()));
     }
     if !lease_intact(&target)? {
-        return Err(Stop::Withdraw("kopia tymczasowa otwarta przez inny proces".into()));
+        return Err(Stop::Withdraw("the temporary copy is open in another process".into()));
     }
     check_original(session, file, false)?;
     file.temporary_identity = Some(pin_of(&actual));
@@ -2184,7 +2184,7 @@ where
     // A copy is never put under the path of an original that is gone or was
     // replaced: that file is somebody else's now.
     if locate_original(session, file)? != Some(Place::Path) {
-        return Err(Stop::Withdraw("plik zmienił się od skanu".into()));
+        return Err(Stop::Withdraw("the file changed since the scan".into()));
     }
     let place = hold_copy(session, file)?;
     check_copy(session, file)?;
@@ -2192,7 +2192,7 @@ where
     if place == CopyPlace::Temporary {
         rename_without_replace(destination_fd, temporary_of(file)?, &file.destination)?;
     }
-    let (parent, _) = existing_parent(destination_fd, &file.destination)?.ok_or("katalog kopii zniknął")?;
+    let (parent, _) = existing_parent(destination_fd, &file.destination)?.ok_or("the copy's directory vanished")?;
     fsync_fd(parent.as_raw_fd())?;
     fsync_fd(destination_fd)?;
     file.destination_identity = file.temporary_identity.clone();
@@ -2209,27 +2209,27 @@ fn move_aside(session: &mut Session, file: &TransferFile) -> Result<(), Stop> {
     hold_original(session, file, Place::Path)?;
     check_original(session, file, true)?;
     if hold_copy(session, file)? != CopyPlace::Path {
-        return Err(Stop::Fail("kopia nie stoi pod ścieżką pliku".into()));
+        return Err(Stop::Fail("the copy is not under the file's path".into()));
     }
     check_copy(session, file)?;
-    let original = session.original.as_ref().ok_or("brak trzymanego oryginału")?;
+    let original = session.original.as_ref().ok_or("no held original")?;
     if !lease_intact(&original.fd)? {
-        return Err(Stop::Withdraw("plik otwarty przez inny proces".into()));
+        return Err(Stop::Withdraw("file open in another process".into()));
     }
-    let copy = session.copy.as_ref().ok_or("brak trzymanej kopii")?;
+    let copy = session.copy.as_ref().ok_or("no held copy")?;
     if !lease_intact(&copy.fd)? {
-        return Err(Stop::Withdraw("kopia na dysku danych otwarta przez inny proces".into()));
+        return Err(Stop::Withdraw("the copy on the data disk is open in another process".into()));
     }
     let source_root = session.source_root.as_raw_fd();
     let quarantine = quarantine_name(temporary_of(file)?)?;
-    let (parent, name) = existing_parent(source_root, &file.source)?.ok_or("katalog oryginału zniknął")?;
+    let (parent, name) = existing_parent(source_root, &file.source)?.ok_or("the original's directory vanished")?;
     rename_at_noreplace(parent.as_raw_fd(), &name, source_root, &quarantine).map_err(|error| error.to_string())?;
     // The name was resolved again by the rename: what moved must be the leased
     // inode, or a file swapped in under the path goes straight back.
     if !pinned_at(source_root, &quarantine, original_pin(file))? {
         return Err(Stop::Fail(match rename_at_noreplace(source_root, &quarantine, parent.as_raw_fd(), &name) {
-            Ok(()) => "pod ścieżką pliku leżał inny plik niż przypięty oryginał; przywrócono go".to_string(),
-            Err(error) => format!("pod ścieżką pliku leżał inny plik niż przypięty oryginał; nie przywrócono go: {error}"),
+            Ok(()) => "the file's path held another file than the pinned original; it was put back".to_string(),
+            Err(error) => format!("the file's path held another file than the pinned original; it was not put back: {error}"),
         }));
     }
     fsync_fd(parent.as_raw_fd())?;
@@ -2252,7 +2252,7 @@ where
         // original again before anything is removed.
         Some(Place::Quarantine) => {}
         Some(Place::Path) => move_aside(session, file)?,
-        None => return Err(Stop::Fail("oryginał zniknął spod swojej ścieżki".into())),
+        None => return Err(Stop::Fail("the original vanished from its path".into())),
     }
     if let Some(error) = session.unreadable.as_deref() {
         file.unread_source = Some(bounded_error(error));
@@ -2274,7 +2274,7 @@ where
         // the persisted intent.
         Some(Place::Path) if file.phase == TransferFilePhase::QuarantineConfirmed => move_aside(session, file)?,
         Some(Place::Path) => {
-            return Err(Stop::Fail("oryginał wrócił pod swoją ścieżkę po zamiarze usunięcia".into()));
+            return Err(Stop::Fail("the original came back to its path after the removal intent".into()));
         }
         Some(Place::Quarantine) => {}
         None if file.phase == TransferFilePhase::UnlinkIntent => {
@@ -2288,14 +2288,14 @@ where
         // admin hears whose delete it was.
         None if locate_copy(session, file)? == Some(CopyPlace::Path) => {
             session.notices.push(format!(
-                "odsunięty oryginał {} usunięto spoza movera; plik pozostaje jako kopia na dysku danych",
+                "the set-aside original {} was removed outside the mover; the file remains as the copy on the data disk",
                 quarantine_name(temporary_of(file)?)?
             ));
             file.phase = TransferFilePhase::UnlinkConfirmed;
             persist(file)?;
             return finish_release(session, file, persist);
         }
-        None => return Err(Stop::Fail("odsunięty oryginał i kopia zniknęły".into())),
+        None => return Err(Stop::Fail("the set-aside original and the copy vanished".into())),
     }
     hold_original(session, file, Place::Quarantine)?;
     if let Some(original) = session.original.as_ref() {
@@ -2306,7 +2306,7 @@ where
     // the copy is the live file and may legitimately change.
     check_original(session, file, file.unread_source.is_some())?;
     if session.unreadable.is_some() && file.unread_source.is_none() {
-        return Err(Stop::Fail("nieczytelny oryginał bez potwierdzonej kopii".into()));
+        return Err(Stop::Fail("unreadable original without a confirmed copy".into()));
     }
     if file.phase == TransferFilePhase::QuarantineConfirmed {
         file.phase = TransferFilePhase::UnlinkIntent;
@@ -2314,26 +2314,26 @@ where
     }
     let source_root = session.source_root.as_raw_fd();
     let quarantine = quarantine_name(temporary_of(file)?)?;
-    let opened = || Stop::Withdraw("oryginał otwarto po jego odsunięciu".into());
+    let opened = || Stop::Withdraw("the original was opened after it was set aside".into());
     // Checked once while the copy is still leased, so a withdrawal decided
     // here finds the copy provably untouched, and once more after its lease
     // is dropped — the copy owns the path, and its clients must not wait for
     // the unlink.
-    if !lease_intact(&session.original.as_ref().ok_or("brak trzymanego oryginału")?.fd)? {
+    if !lease_intact(&session.original.as_ref().ok_or("no held original")?.fd)? {
         return Err(opened());
     }
     session.copy = None;
-    let original = session.original.as_ref().ok_or("brak trzymanego oryginału")?;
+    let original = session.original.as_ref().ok_or("no held original")?;
     if !lease_intact(&original.fd)? {
         return Err(opened());
     }
-    let name = CString::new(quarantine.as_str()).map_err(|_| "nazwa zawiera NUL".to_string())?;
+    let name = CString::new(quarantine.as_str()).map_err(|_| "the name contains NUL".to_string())?;
     if unsafe { libc::unlinkat(source_root, name.as_ptr(), 0) } != 0 {
         return Err(Stop::Fail(std::io::Error::last_os_error().to_string()));
     }
     if !lease_intact(&original.fd)? {
         session.notices.push(
-            "oryginał otwarto w chwili jego usuwania z cache; zapis przez ten deskryptor mógł zostać utracony".into(),
+            "the original was opened while it was removed from the cache; a write through that descriptor may have been lost".into(),
         );
     }
     session.original = None;
@@ -2341,7 +2341,7 @@ where
     // afterwards leaves only the durability of that in doubt, and reporting the
     // move as failed would send the record into a reversal that cannot happen.
     if let Err(error) = fsync_after_unlink(source_root) {
-        session.notices.push(format!("usunięcie oryginału niepotwierdzone na dysku: {error}"));
+        session.notices.push(format!("removal of the original not confirmed on disk: {error}"));
     }
     file.phase = TransferFilePhase::UnlinkConfirmed;
     persist(file)?;
@@ -2361,7 +2361,7 @@ where
         &quarantine_name(temporary_of(file)?)?,
         original_pin(file),
     )? {
-        return Err(Stop::Fail("odsunięty oryginał nadal istnieje po usunięciu".into()));
+        return Err(Stop::Fail("the set-aside original still exists after its removal".into()));
     }
     if file.phase == TransferFilePhase::UnlinkConfirmed {
         file.phase = TransferFilePhase::Done;
@@ -2377,15 +2377,15 @@ where
 /// metadata must be untouched as well.
 #[cfg(target_os = "linux")]
 fn copy_removable(session: &mut Session, file: &TransferFile, owned_path: bool) -> Result<(), String> {
-    let changed = || "kopia na dysku danych zmieniła się".to_string();
+    let changed = || "the copy on the data disk changed".to_string();
     match hold_copy(session, file) {
         Ok(_) => {}
         Err(Stop::Withdraw(reason) | Stop::Fail(reason)) => return Err(reason),
     }
-    let pin = file.temporary_identity.clone().ok_or("brak tożsamości kopii")?;
-    let held = session.copy.as_ref().ok_or("brak trzymanej kopii")?;
+    let pin = file.temporary_identity.clone().ok_or("no copy identity")?;
+    let held = session.copy.as_ref().ok_or("no held copy")?;
     if !lease_intact(&held.fd)? {
-        return Err("kopia na dysku danych otwarta przez inny proces".into());
+        return Err("the copy on the data disk is open in another process".into());
     }
     if !held.measured {
         // The original's lease, while the session holds it, is polled too: an
@@ -2400,7 +2400,7 @@ fn copy_removable(session: &mut Session, file: &TransferFile, owned_path: bool) 
                 Err(MeasureError::LeaseBroken) if lease_intact(&held.fd)? && session.original.is_some() => {
                     session.original = None;
                 }
-                Err(MeasureError::LeaseBroken) => return Err("kopia na dysku danych otwarta przez inny proces".into()),
+                Err(MeasureError::LeaseBroken) => return Err("the copy on the data disk is open in another process".into()),
                 Err(_) => return Err(changed()),
             }
         };
@@ -2408,11 +2408,11 @@ fn copy_removable(session: &mut Session, file: &TransferFile, owned_path: bool) 
             return Err(changed());
         }
         if !lease_intact(&held.fd)? {
-            return Err("kopia na dysku danych otwarta przez inny proces".into());
+            return Err("the copy on the data disk is open in another process".into());
         }
-        session.copy.as_mut().ok_or("brak trzymanej kopii")?.measured = true;
+        session.copy.as_mut().ok_or("no held copy")?.measured = true;
     }
-    let held = session.copy.as_ref().ok_or("brak trzymanej kopii")?;
+    let held = session.copy.as_ref().ok_or("no held copy")?;
     if owned_path && !copy_metadata_matches(&held.fd, &pin, &file.source_identity)? {
         return Err(changed());
     }
@@ -2432,7 +2432,7 @@ where
     match file.phase {
         TransferFilePhase::Restored => return Ok(Withdrawal::Restored),
         TransferFilePhase::UnlinkConfirmed | TransferFilePhase::Done => {
-            return Err("rekordu po usunięciu oryginału nie można wycofać".into());
+            return Err("a record past the removal of its original cannot be withdrawn".into());
         }
         TransferFilePhase::RestoreIntent => {}
         _ => {
@@ -2457,17 +2457,17 @@ where
             // save, or bring a deleted file back. Both stay as they are.
             if copy != Some(CopyPlace::Path) {
                 return Err(format!(
-                    "konflikt: plik pod ścieżką zastąpiono, przeniesiono lub usunięto po odsunięciu oryginału; \
-                     oryginał zostaje jako {quarantine}"
+                    "conflict: the file under the path was replaced, moved or removed after the original was set aside; \
+                     the original stays as {quarantine}"
                 ));
             }
             copy_removable(session, file, true)
-                .map_err(|reason| format!("konflikt: {reason}; oryginał zostaje jako {quarantine}"))?;
+                .map_err(|reason| format!("conflict: {reason}; the original stays as {quarantine}"))?;
             let (parent, name) = existing_parent(source_root, &file.source)?.ok_or_else(|| {
-                format!("konflikt: katalog pliku zniknął z cache; oryginał zostaje jako {quarantine}")
+                format!("conflict: the file's directory vanished from the cache; the original stays as {quarantine}")
             })?;
             rename_at_noreplace(source_root, &quarantine, parent.as_raw_fd(), &name).map_err(|error| {
-                format!("konflikt: ścieżka pliku jest zajęta na cache ({error}); oryginał zostaje jako {quarantine}")
+                format!("conflict: the file's path is taken on the cache ({error}); the original stays as {quarantine}")
             })?;
             if let Some(held) = session.copy.as_ref() {
                 lease_moment(LeaseMoment::AfterRenameBack, &held.fd);
@@ -2483,11 +2483,11 @@ where
                     Ok(()) => {
                         let _ = fsync_fd(parent.as_raw_fd());
                         let _ = fsync_fd(source_root);
-                        format!("konflikt: {reason} w trakcie wycofania; oryginał zostaje jako {quarantine}")
+                        format!("conflict: {reason} during the withdrawal; the original stays as {quarantine}")
                     }
                     Err(error) => format!(
-                        "konflikt: {reason} w trakcie wycofania, a ścieżki nie oddano kopii ({error}); \
-                         oryginał jest pod ścieżką, kopia zostaje na dysku danych"
+                        "conflict: {reason} during the withdrawal, and the path was not given back to the copy ({error}); \
+                         the original is under the path, the copy stays on the data disk"
                     ),
                 });
             }
@@ -2502,7 +2502,7 @@ where
         None if copy == Some(CopyPlace::Path) => {
             session.original = None;
             session.notices.push(format!(
-                "odsunięty oryginał {quarantine} usunięto spoza movera; plik pozostaje jako kopia na dysku danych"
+                "the set-aside original {quarantine} was removed outside the mover; the file remains as the copy on the data disk"
             ));
             file.phase = TransferFilePhase::Done;
             persist(file)?;
@@ -2524,11 +2524,11 @@ where
             if deleted != Some(true) {
                 let pin = file.temporary_pin.unwrap_or_default();
                 return Err(format!(
-                    "plik przeniesiono lub usunięto podczas przenoszenia; kopia na dysku danych (urządzenie {}, i-węzeł {}) mogła zostać pod nową ścieżką",
+                    "the file was moved or removed during the move; the copy on the data disk (device {}, inode {}) may have stayed under a new path",
                     pin.0, pin.1
                 ));
             }
-            session.notices.push("plik usunięto podczas przenoszenia; nic nie zostało do wycofania".into());
+            session.notices.push("the file was removed during the move; nothing is left to withdraw".into());
         }
         None => {}
     }
@@ -2539,8 +2539,8 @@ where
         if !removable_after_rename_back {
             copy_removable(session, file, false)?;
         }
-        let (parent, name) = existing_parent(destination_root, &file.destination)?.ok_or("katalog kopii zniknął")?;
-        let c_name = CString::new(name.as_str()).map_err(|_| "nazwa zawiera NUL".to_string())?;
+        let (parent, name) = existing_parent(destination_root, &file.destination)?.ok_or("the copy's directory vanished")?;
+        let c_name = CString::new(name.as_str()).map_err(|_| "the name contains NUL".to_string())?;
         if unsafe { libc::unlinkat(parent.as_raw_fd(), c_name.as_ptr(), 0) } != 0 {
             return Err(std::io::Error::last_os_error().to_string());
         }
@@ -2548,13 +2548,13 @@ where
         // that resolved the path to the copy before the rename back and reached
         // the copy's lease between the last check and this unlink holds an
         // unlinked inode now. It is seen and said; it cannot be undone.
-        if !lease_intact(&session.copy.as_ref().ok_or("brak trzymanej kopii")?.fd)? {
+        if !lease_intact(&session.copy.as_ref().ok_or("no held copy")?.fd)? {
             session.notices.push(
-                "kopię otwarto w chwili jej usuwania z dysku danych; zapis przez ten deskryptor mógł zostać utracony".into(),
+                "the copy was opened while it was removed from the data disk; a write through that descriptor may have been lost".into(),
             );
         }
         if let Err(error) = fsync_fd(parent.as_raw_fd()) {
-            session.notices.push(format!("usunięcie kopii niepotwierdzone na dysku: {error}"));
+            session.notices.push(format!("removal of the copy not confirmed on disk: {error}"));
         }
     }
     session.copy = None;
@@ -2566,9 +2566,9 @@ where
                 None => fresh_temporary(&stat),
             };
             if !ours {
-                return Err("pod nazwą tymczasową leży obcy plik".into());
+                return Err("the temporary name holds a foreign file".into());
             }
-            let c_name = CString::new(temporary.as_str()).map_err(|_| "nazwa zawiera NUL".to_string())?;
+            let c_name = CString::new(temporary.as_str()).map_err(|_| "the name contains NUL".to_string())?;
             if unsafe { libc::unlinkat(destination_root, c_name.as_ptr(), 0) } != 0 {
                 return Err(std::io::Error::last_os_error().to_string());
             }
@@ -2587,7 +2587,7 @@ where
             Ok(directory) => {
                 if created_privately(&directory, &directory_identity_fd(&directory)?)? {
                     let c_name = CString::new(name.as_str())
-                        .map_err(|_| "nazwa katalogu zawiera NUL".to_string())?;
+                        .map_err(|_| "the directory name contains NUL".to_string())?;
                     if unsafe { libc::unlinkat(parent.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
                         return Err(std::io::Error::last_os_error().to_string());
                     }
@@ -2658,10 +2658,10 @@ where
             }
             TransferFilePhase::RestoreIntent => {
                 let withdrawal = withdraw(session, file, persist)?;
-                return Ok(ended(session, file, withdrawal, "wycofanie dokończone po przerwaniu".into()));
+                return Ok(ended(session, file, withdrawal, "withdrawal finished after an interruption".into()));
             }
             TransferFilePhase::Restored => {
-                return Ok(ended(session, file, Withdrawal::Restored, "przeniesienie wycofane przed przerwaniem".into()));
+                return Ok(ended(session, file, Withdrawal::Restored, "move withdrawn before the interruption".into()));
             }
         }
     }
@@ -2688,7 +2688,7 @@ where
         Err(Stop::Fail(error)) => Err(error),
         Err(Stop::Withdraw(reason)) => {
             let withdrawal = withdraw(&mut session, file, &mut persist)
-                .map_err(|error| format!("{reason}; wycofanie nieudane: {error}"))?;
+                .map_err(|error| format!("{reason}; withdrawal failed: {error}"))?;
             Ok(ended(&mut session, file, withdrawal, reason))
         }
     }
@@ -2699,7 +2699,7 @@ pub(crate) fn transfer_file<F>(_: &Path, _: &Path, _: &mut TransferFile, _: F) -
 where
     F: FnMut(&TransferFile) -> Result<(), String>,
 {
-    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
+    Err("an FD-relative transfer is supported on Linux only".into())
 }
 
 /// Reverses a record after a failure, from a fresh session: every file is
@@ -2723,7 +2723,7 @@ pub(crate) fn withdraw_record<F>(_: &Path, _: &Path, _: &mut TransferFile, _: F)
 where
     F: FnMut(&TransferFile) -> Result<(), String>,
 {
-    Err("transfer FD-relative jest obsługiwany wyłącznie na Linuxie".into())
+    Err("an FD-relative transfer is supported on Linux only".into())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -2847,7 +2847,7 @@ mod tests {
             ".tentanas-transfer-test-0",
         )
         .expect_err("istniejący cel");
-        assert_eq!(error, "cel już istnieje");
+        assert_eq!(error, "the target already exists");
         assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 1);
         fs::remove_dir_all(source_root).unwrap();
         fs::remove_dir_all(destination_root).unwrap();
@@ -3043,8 +3043,8 @@ mod tests {
         assert_eq!(
             refused,
             vec![
-                ("leaf.bin", "mover odmawia symlinku"),
-                ("nested", "mover odmawia symlinku")
+                ("leaf.bin", "the mover refuses a symlink"),
+                ("nested", "the mover refuses a symlink")
             ]
         );
         let files: Vec<&str> = entries
@@ -3090,11 +3090,11 @@ mod tests {
         assert_eq!(
             refused,
             vec![
-                ("alias.bin".into(), "mover odmawia hardlinku".into()),
-                ("bad\u{fffd}.bin".into(), "nazwa nie jest UTF-8".into()),
-                ("payload.bin".into(), "mover odmawia hardlinku".into()),
-                ("payload.pipe".into(), "mover odmawia pliku specjalnego".into()),
-                ("sparse.bin".into(), "mover odmawia pliku sparse".into()),
+                ("alias.bin".into(), "the mover refuses a hardlink".into()),
+                ("bad\u{fffd}.bin".into(), "the name is not UTF-8".into()),
+                ("payload.bin".into(), "the mover refuses a hardlink".into()),
+                ("payload.pipe".into(), "the mover refuses a special file".into()),
+                ("sparse.bin".into(), "the mover refuses a sparse file".into()),
             ]
         );
         let ok = scanned(&root, "ok.bin");
@@ -3315,7 +3315,7 @@ mod tests {
             ".tentanas-transfer-test-1",
         )
         .expect_err("symlinkowany rodzic celu");
-        assert!(error.starts_with("katalog docelowy nested"), "{error}");
+        assert!(error.starts_with("target directory nested"), "{error}");
         assert!(prepare_parents(&source_root, &destination_root, &mut file, |_| Ok(())).is_err());
         assert!(transfer_file(&source_root, &destination_root, &mut file, |_| Ok(())).is_err());
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
@@ -3646,8 +3646,8 @@ mod tests {
             })
             .collect();
         assert_eq!(refused.len(), 3, "{refused:?}");
-        assert!(refused.iter().any(|(path, reason)| *path == "locked" && reason.starts_with("katalog niedostępny")));
-        assert!(refused.iter().any(|(path, reason)| *path == "unlistable" && reason.starts_with("listowanie katalogu")));
+        assert!(refused.iter().any(|(path, reason)| *path == "locked" && reason.starts_with("directory unavailable")));
+        assert!(refused.iter().any(|(path, reason)| *path == "unlistable" && reason.starts_with("directory listing")));
         assert!(refused.iter().any(|(path, reason)| *path == "d.bin" && reason.starts_with("stat:")));
         fs::remove_dir_all(root).unwrap();
     }
@@ -3838,7 +3838,7 @@ mod tests {
         let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
         reader.kill().unwrap();
         reader.wait().unwrap();
-        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "plik otwarty przez inny proces".into(), notices: Vec::new() }));
+        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "file open in another process".into(), notices: Vec::new() }));
         assert_eq!(file.phase, TransferFilePhase::Restored);
         assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), b"payload");
         assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0, "nothing written to the data branch");
@@ -3868,7 +3868,7 @@ mod tests {
         on_lease_moment(None);
         let status = child.borrow_mut().take().expect("pisarz uruchomiony").wait().unwrap();
         assert!(status.success());
-        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "plik otwarty przez inny proces podczas kopiowania".into(), notices: Vec::new() }));
+        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "file open in another process during the copy".into(), notices: Vec::new() }));
         let mut expected = payload.clone();
         expected.extend_from_slice(b"MORE");
         assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), expected, "the write landed in the original");
@@ -3901,7 +3901,7 @@ mod tests {
         on_lease_moment(None);
         let status = child.borrow_mut().take().expect("pisarz uruchomiony").wait().unwrap();
         assert!(status.success());
-        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "plik otwarty przez inny proces".into(), notices: Vec::new() }));
+        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "file open in another process".into(), notices: Vec::new() }));
         assert_eq!(file.phase, TransferFilePhase::Restored);
         assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), b"payloadNEW");
         assert!(!destination_root.join("payload.bin").exists(), "no copy left on the data branch");
@@ -3927,7 +3927,7 @@ mod tests {
         })));
         let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
         on_lease_moment(None);
-        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "metadane pliku zmieniły się podczas przenoszenia".into(), notices: Vec::new() }));
+        assert_eq!(end, Ok(TransferEnd::Withdrawn { reason: "the file metadata changed during the move".into(), notices: Vec::new() }));
         assert_eq!(mode(&source_root.join("payload.bin")), 0o600, "the change is kept");
         assert!(!destination_root.join("payload.bin").exists());
         fs::remove_dir_all(source_root).unwrap();
@@ -3994,7 +3994,7 @@ mod tests {
         let error = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(())).expect_err("konflikt");
         on_lease_moment(None);
         assert!(child.borrow_mut().take().expect("pisarz").wait().unwrap().success());
-        assert!(error.contains("konflikt") && error.contains(&quarantine_file), "{error}");
+        assert!(error.contains("conflict") && error.contains(&quarantine_file), "{error}");
         assert_eq!(file.phase, TransferFilePhase::RestoreIntent);
         assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payload");
         assert_eq!(fs::read(&quarantine).unwrap(), b"payloadNEW", "the opener's write is kept");
@@ -4041,7 +4041,7 @@ mod tests {
         for child in children.borrow_mut().iter_mut() {
             assert!(child.wait().unwrap().success());
         }
-        assert!(error.contains("otwarta przez inny proces w trakcie wycofania"), "{error}");
+        assert!(error.contains("open in another process during the withdrawal"), "{error}");
         assert!(!source_root.join("payload.bin").exists(), "the path resolves to the copy again");
         assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"payloadB", "B's save is visible");
         assert_eq!(fs::read(&quarantine).unwrap(), b"payloadA", "A's save is kept");
@@ -4136,7 +4136,7 @@ mod tests {
             }
             match &end {
                 Ok(TransferEnd::Moved { unreadable: None, notices }) => {
-                    assert!(notices.iter().any(|notice| notice.contains("usunięto spoza movera")), "{notices:?}");
+                    assert!(notices.iter().any(|notice| notice.contains("was removed outside the mover")), "{notices:?}");
                 }
                 other => panic!("opened_first={opened_first}: {other:?}"),
             }
@@ -4176,7 +4176,7 @@ mod tests {
                 }
                 let error = withdraw_record(&source_root, &destination_root, &mut file, |_| Ok(()))
                     .expect_err("the record sticks");
-                assert!(error.contains("zastąpiono, przeniesiono lub usunięto"), "{replaced} {stop:?}: {error}");
+                assert!(error.contains("was replaced, moved or removed"), "{replaced} {stop:?}: {error}");
                 assert!(!source_root.join("payload.bin").exists(), "{replaced} {stop:?}: the original stays aside");
                 assert_eq!(fs::read(&quarantine).unwrap(), b"payload", "{replaced} {stop:?}");
                 if replaced {
@@ -4204,7 +4204,7 @@ mod tests {
         let end = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(()));
         match &end {
             Ok(TransferEnd::Moved { unreadable: None, notices }) => {
-                assert!(notices.iter().any(|notice| notice.contains("usunięto spoza movera")), "{notices:?}");
+                assert!(notices.iter().any(|notice| notice.contains("was removed outside the mover")), "{notices:?}");
             }
             other => panic!("{other:?}"),
         }
@@ -4237,7 +4237,7 @@ mod tests {
         assert!(durable.temporary_pin.is_some());
         fs::remove_file(destination_root.join(durable.temporary.as_deref().unwrap())).unwrap();
         let end = transfer_file(&source_root, &destination_root, &mut durable, |_| Ok(()));
-        assert!(matches!(end, Ok(TransferEnd::Withdrawn { ref reason, .. }) if reason.contains("zniknęła")), "{end:?}");
+        assert!(matches!(end, Ok(TransferEnd::Withdrawn { ref reason, .. }) if reason.contains("vanished")), "{end:?}");
         assert_eq!(durable.phase, TransferFilePhase::Restored);
         assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0);
         assert_eq!(fs::read(source_root.join("payload.bin")).unwrap(), b"payload");
@@ -4264,7 +4264,7 @@ mod tests {
         fail_directory_fsync(false);
         match &end {
             Ok(TransferEnd::Moved { notices, .. }) => {
-                assert!(notices.iter().any(|notice| notice.contains("niepotwierdzone na dysku")), "{notices:?}");
+                assert!(notices.iter().any(|notice| notice.contains("not confirmed on disk")), "{notices:?}");
             }
             other => panic!("{other:?}"),
         }
@@ -4288,9 +4288,9 @@ mod tests {
             fs::rename(root.join("payload.bin"), root.join("renamed.bin")).unwrap();
         }
         let error = transfer_file(&source_root, &destination_root, &mut file, |_| Ok(())).expect_err("zniknął");
-        assert!(error.contains("zniknął"), "{error}");
+        assert!(error.contains("vanished"), "{error}");
         let refusal = withdraw_record(&source_root, &destination_root, &mut file, |_| Ok(())).expect_err("named");
-        assert!(refusal.contains("mogła zostać pod nową ścieżką"), "{refusal}");
+        assert!(refusal.contains("may have stayed under a new path"), "{refusal}");
         assert_eq!(fs::read(destination_root.join("renamed.bin")).unwrap(), b"payload", "nothing removed");
         assert_eq!(fs::read(source_root.join("renamed.bin")).unwrap(), b"payload");
         fs::remove_dir_all(source_root).unwrap();
@@ -4378,7 +4378,7 @@ mod tests {
                     let on_data = destination_root.join("payload.bin").exists();
                     if reverse && stop == TransferFilePhase::RestoreIntent && !before_write {
                         let error = resumed.expect_err(&case);
-                        assert!(error.contains("konflikt"), "{case}: {error}");
+                        assert!(error.contains("conflict"), "{case}: {error}");
                         assert!(!on_cache && on_data, "{case}");
                         assert_eq!(fs::read(destination_root.join("payload.bin")).unwrap(), b"boundary payloadNEWER", "{case}");
                         assert_eq!(fs::read(source_root.join(&quarantine)).unwrap(), b"boundary payload", "{case}: the original is kept");

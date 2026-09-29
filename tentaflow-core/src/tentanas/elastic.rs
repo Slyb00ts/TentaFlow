@@ -3999,7 +3999,7 @@ pub fn claimed_disk_ids(disks: &[NasDisk], claims: &[tentanas_helper::elastic::E
 //
 // AND THE OWNER LIVES IN TWO PLACES. The database row is one; the journal is
 // the other, and every privileged command refuses an array whose journal owner
-// is not the caller's ("macierz niedostępna dla właściciela"). An adoption
+// is not the caller's ("the array is not available to this owner"). An adoption
 // that wrote only the database would produce an array that lists, and then
 // fails every Inspect, Restore, Sync and mover on it. So `import_apply`
 // re-owns the journal through the helper FIRST and writes the row second.
@@ -4326,7 +4326,16 @@ pub fn confirm_mismatch() -> Refusal {
 /// The helper's refusal line, bounded. The broker already caps stderr, and a
 /// refusal is one sentence; this keeps a runaway one out of a dialog.
 fn helper_detail(stderr: &str) -> String {
-    let text: String = stderr.trim().lines().next().unwrap_or_default().chars().take(200).collect();
+    let line = stderr.trim().lines().next().unwrap_or_default();
+    // A coded refusal (helper 0.17.4) becomes a sentence of the core's own
+    // refusal: its English sentence, never a second wire inside the first.
+    let line = match line.strip_prefix("tentanas-helper: ").and_then(|rest| rest.split_once(": ")) {
+        Some((label, text)) if tentanas_helper::refusal::is_wire(text) => {
+            format!("tentanas-helper: {label}: {}", tentanas_helper::refusal::sentence(text))
+        }
+        _ => line.to_string(),
+    };
+    let text: String = line.chars().take(200).collect();
     if text.is_empty() { "the helper gave no reason".to_string() } else { text }
 }
 
@@ -4492,7 +4501,15 @@ async fn execute_job(h: &jobs::JobHandle, spec: ElasticCreateSpec, operation_id:
         Ok(result) => {
             store::finish_elastic_operation(h.db(), &spec.owner, &operation_id, Ok(&result))?;
             if result.stage != ElasticStage::Ready {
-                let detail = result.detail.as_deref().unwrap_or("The array needs intervention; its reservations are kept");
+                // A coded helper note (0.17.4) is carried whole as the alert's
+                // `helper_detail`, which the screen words; the English
+                // sentences here take only its sentence.
+                let detail = result
+                    .detail
+                    .as_deref()
+                    .map(tentanas_helper::refusal::sentence)
+                    .filter(|sentence| !sentence.is_empty())
+                    .unwrap_or("The array needs intervention; its reservations are kept");
                 // The helper's own text, when it gave one, is shown as-is;
                 // without it the screen words the default itself.
                 let text = store::AlertText::new("elastic_needs_attention", "The array needs intervention", detail)
@@ -4839,16 +4856,20 @@ async fn execute_snapraid_job(
         }
     }
     // The job's error line is worded by the screen from the code; the
-    // helper's own sentence, when it gave one, is its tooltip.
-    require(
-        matches!(result.run.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial),
-        || {
-            Refusal::not_available(
-                "elastic_snapraid_failed",
-                result.run.detail.as_deref().unwrap_or("The SnapRAID run did not succeed"),
-            )
-        },
-    )?;
+    // helper's own sentence, when it gave one, is its tooltip. A helper that
+    // coded the outcome itself (0.17.4: "nothing was repaired", errors it
+    // cannot recover) is more precise than the generic code, so its refusal
+    // is the error as it came.
+    let succeeded = matches!(result.run.outcome, ElasticSnapraidOutcome::Succeeded | ElasticSnapraidOutcome::Partial);
+    if let Some(coded) = result.run.detail.as_deref().filter(|detail| !succeeded && tentanas_helper::refusal::is_wire(detail)) {
+        return Err(anyhow!("{coded}"));
+    }
+    require(succeeded, || {
+        Refusal::not_available(
+            "elastic_snapraid_failed",
+            result.run.detail.as_deref().unwrap_or("The SnapRAID run did not succeed"),
+        )
+    })?;
     Ok(())
 }
 
@@ -4937,11 +4958,17 @@ async fn execute_mover_job(
     if let Err(error) = record_conflict_alert(h.db(), &spec.name, &result.state.conflicts) {
         tracing::warn!("tentanas mover: conflict alert of {} not recorded: {error}", spec.name);
     }
-    // Worded by the screen from the code, the helper's sentence as its tooltip.
+    // Worded by the screen from the code, the helper's sentence as its
+    // tooltip (a coded one reads as its sentence: one code per line).
     require(result.run.phase == ElasticMoverPhase::Complete, || {
         Refusal::not_available(
             "elastic_mover_unfinished",
-            result.run.detail.as_deref().unwrap_or("The mover did not finish moving the files"),
+            result
+                .run
+                .detail
+                .as_deref()
+                .map(tentanas_helper::refusal::sentence)
+                .unwrap_or("The mover did not finish moving the files"),
         )
     })?;
     Ok(())
@@ -5872,7 +5899,12 @@ fn observed_protocol(array: &ElasticArrayRow, disks: &BTreeMap<String,NasDisk>,
                     Some(detail) => CodedText::new(
                         "restart_required",
                         &[],
-                        format!("the node has to be restarted: {}", detail.text),
+                        // A coded helper note (0.17.4) gives its sentence:
+                        // a wire in the middle of the line is read by nothing.
+                        format!(
+                            "the node has to be restarted: {}",
+                            tentanas_helper::refusal::sentence(&detail.text)
+                        ),
                     ),
                     None => CodedText::new("restart_required", &[], "the node has to be restarted"),
                 });
@@ -7106,11 +7138,17 @@ pub(crate) mod tests {
         // still prefixed exactly once.
         let mut mentions = result;
         mentions.detail = Some("restart demona mergerfs nie powiódł się".into());
-        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(mentions), &[]);
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(mentions.clone()), &[]);
         assert_eq!(
             wire.state_detail,
             "the node has to be restarted: restart demona mergerfs nie powiódł się"
         );
+        // Critic wave 16, MINOR 2: a coded cause (helper 0.17.4) gives its
+        // sentence; the wire never lands in the middle of the line.
+        let mut coded = mentions;
+        coded.detail = Some("refusal:elastic_disk_missing A disk of the array is absent".into());
+        let wire = observed_protocol(&row, &BTreeMap::new(), Ok(coded), &[]);
+        assert_eq!(wire.state_detail, "the node has to be restarted: A disk of the array is absent");
     }
 
     /// A3 of the second review: a file a stuck record left in two versions
@@ -8983,12 +9021,17 @@ pub(crate) mod tests {
         validate_mover_result(&spec, &operation_id, &clean).expect("released and serving");
     }
 
+    /// A run detail the helper coded itself (helper 0.17.4).
+    const CODED_RUN_DETAIL: &str =
+        "refusal:elastic_snapraid_reported_errors The tool reported errors; the run's error counters say which";
+
     #[tokio::test]
     async fn snapraid_real_job_keeps_terminal_history_atomic_and_is_not_cancellable() {
         for case in [
             "success",
             "refused",
             "failed",
+            "coded",
             "malformed",
             "transport",
             "panic",
@@ -9046,11 +9089,15 @@ pub(crate) mod tests {
                     }
                     let outcome = match case {
                         "refused" => ElasticSnapraidOutcome::Refused,
-                        "failed" => ElasticSnapraidOutcome::Failed,
+                        "failed" | "coded" => ElasticSnapraidOutcome::Failed,
                         _ => ElasticSnapraidOutcome::Succeeded,
                     };
-                    let result =
+                    let mut result =
                         snapraid_result(&work_spec, &work_id, ElasticSnapraidKind::Sync, outcome);
+                    if case == "coded" {
+                        result.run.detail = Some(CODED_RUN_DETAIL.into());
+                        result.state.last_run = Some(result.run.clone());
+                    }
                     execute_snapraid_job(
                         &h,
                         &work_spec,
@@ -9113,13 +9160,19 @@ pub(crate) mod tests {
                 // Only a run the helper JUDGED and reported as failed takes the
                 // array with it. A run with no result at all is interrupted and
                 // leaves the array exactly as it was (W-D of the third review).
-                if case == "failed" { "needs_attention" } else { "active" },
+                if matches!(case, "failed" | "coded") { "needs_attention" } else { "active" },
                 "{case}"
             );
             // Wave 15: a run the helper judged failed is a coded job error.
             if case == "failed" {
                 let error = terminal.error.clone().unwrap_or_default();
                 assert!(error.starts_with("refusal:elastic_snapraid_failed"), "{error}");
+            }
+            // Wave 16: the helper's own code is more precise than the generic
+            // one, and it is the job's error as it came — one wire, never a
+            // wire inside another's sentence.
+            if case == "coded" {
+                assert_eq!(terminal.error.as_deref(), Some(CODED_RUN_DETAIL), "{case}");
             }
             let run = &array.snapraid_history[0];
             assert_eq!(run.job_id.as_deref(), Some(job.job_id.as_str()));
@@ -9129,7 +9182,7 @@ pub(crate) mod tests {
                 match case {
                     "success" => "ok",
                     "refused" => "refused",
-                    "failed" => "failed",
+                    "failed" | "coded" => "failed",
                     "persist" => "running",
                     // No confirmed result: interrupted, not a parity fault.
                     _ => store::INTERRUPTED_OUTCOME,

@@ -911,7 +911,7 @@ async fn disk_locate(ctx: &HandlerContext, disk_id: &str, enable: bool) -> Resul
         Ok((out, _)) => Ok(tn(P::DiskLocateResponse {
             method: "ledctl".to_string(),
             active: false,
-            detail: out.stderr.trim().lines().next().unwrap_or("ledctl failed").to_string(),
+            detail: tentanas::jobs::helper_error_line(&out.stderr, "ledctl failed"),
         })),
         // No enclosure LED path: the UI shows serial/WWN large instead.
         Err(BrokerError::ToolMissing(_)) => Ok(tn(P::DiskLocateResponse {
@@ -1359,12 +1359,7 @@ async fn run_now(
         Ok(())
     } else {
         Err(ProtocolError::bad_request(
-            out.stderr
-                .trim()
-                .lines()
-                .next()
-                .unwrap_or("the command failed")
-                .to_string(),
+            tentanas::jobs::helper_error_line(&out.stderr, "the command failed"),
         ))
     }
 }
@@ -1982,7 +1977,7 @@ async fn dataset_create(
         .map_err(|e| broker_error("dataset create", e))?;
         if !out.success() {
             return Err(ProtocolError::bad_request(
-                out.stderr.trim().lines().next().unwrap_or("zfs create failed").to_string(),
+                tentanas::jobs::helper_error_line(&out.stderr, "zfs create failed"),
             ));
         }
         // Only a dataset that exists gets a key: a stored key for a dataset
@@ -2086,7 +2081,7 @@ async fn dataset_key(
             .map_err(|e| broker_error("load-key", e))?;
             if !out.success() {
                 return Err(ProtocolError::bad_request(
-                    out.stderr.trim().lines().next().unwrap_or("zfs load-key failed").to_string(),
+                    tentanas::jobs::helper_error_line(&out.stderr, "zfs load-key failed"),
                 ));
             }
         }
@@ -2955,12 +2950,7 @@ async fn share_user_set(
             .map_err(|e| broker_error("share user", e))?;
             if !out.success() {
                 return Err(ProtocolError::bad_request(
-                    out.stderr
-                        .trim()
-                        .lines()
-                        .next()
-                        .unwrap_or(fallback)
-                        .to_string(),
+                    tentanas::jobs::helper_error_line(&out.stderr, fallback),
                 ));
             }
         }
@@ -3007,12 +2997,7 @@ async fn share_user_delete(
         .map_err(|e| broker_error("share user", e))?;
         if !out.success() {
             return Err(ProtocolError::bad_request(
-                out.stderr
-                    .trim()
-                    .lines()
-                    .next()
-                    .unwrap_or("the ksmbd account could not be removed")
-                    .to_string(),
+                tentanas::jobs::helper_error_line(&out.stderr, "the ksmbd account could not be removed"),
             ));
         }
     }
@@ -3026,12 +3011,7 @@ async fn share_user_delete(
     .map_err(|e| broker_error("share user", e))?;
     if !out.success() {
         return Err(ProtocolError::bad_request(
-            out.stderr
-                .trim()
-                .lines()
-                .next()
-                .unwrap_or("the account could not be removed")
-                .to_string(),
+            tentanas::jobs::helper_error_line(&out.stderr, "the account could not be removed"),
         ));
     }
     store::delete_share_user(&g.db, &g.org_id, name).map_err(|e| internal("share users", e))?;
@@ -3631,12 +3611,7 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         .map_err(|e| broker_error("zvol", e))?;
         if !out.success() {
             return Err(ProtocolError::bad_request(
-                out.stderr
-                    .trim()
-                    .lines()
-                    .next()
-                    .unwrap_or("the volume could not be created")
-                    .to_string(),
+                tentanas::jobs::helper_error_line(&out.stderr, "the volume could not be created"),
             ));
         }
     }
@@ -4152,10 +4127,13 @@ async fn arc_limit_set(
     .map_err(|e| broker_error("arc limit", e))?;
     drop(explicit);
     if !out.success() {
-        return Err(ProtocolError::internal(format!(
-            "setting the ARC limit failed: {}",
-            out.stderr.trim().lines().next().unwrap_or("no output")
-        )));
+        return Err(match tentanas::jobs::helper_refusal(&out.stderr) {
+            Some(wire) => ProtocolError::internal(wire.to_string()),
+            None => ProtocolError::internal(format!(
+                "setting the ARC limit failed: {}",
+                out.stderr.trim().lines().next().unwrap_or("no output")
+            )),
+        });
     }
     // Read back rather than echo the request: the module clamps what it
     // accepts, and the card must show what is actually in force.
@@ -5597,7 +5575,7 @@ async fn elastic_add_disk_abort(
 /// * the journal swap is durable while the core DB is written only on full
 ///   success, so any failure in between desynchronises them and every later
 ///   Restore and Inspect of that array fails validation (finding 4/W1);
-/// * a repeat hard-errors on the `Mkfs` step (`formatowanie już rozpoczęte`)
+/// * a repeat hard-errors on the `Mkfs` step (`formatting already started`)
 ///   instead of skipping it the way `plan_add_data_disk` does, so an
 ///   interrupted replacement cannot be finished (finding 7/W2);
 /// * `accept_stale_parity` admits a rebuild whose own verdict then rejects the
@@ -7616,6 +7594,32 @@ mod elastic_refusal_scan_tests {
             }
         }
         assert!(missing.is_empty(), "refusal codes without words: {missing:#?}");
+    }
+
+    /// Wave 16: the helper refuses in codes of its own (`tentanas_helper::
+    /// refusal::CODES`), which the core forwards unchanged as a job's error
+    /// and as a SnapRAID run's detail. Each has words in all five locales, and
+    /// the words need no parameter the helper's code may leave out.
+    #[test]
+    fn every_helper_refusal_code_has_words_in_all_five_locales() {
+        let codes = tentanas_helper::refusal::CODES;
+        assert!(codes.len() >= 30, "the helper's codes ({})", codes.len());
+        let mut missing = Vec::new();
+        for (locale, text) in LOCALES {
+            let bundle: serde_json::Value = serde_json::from_str(text).expect("a locale bundle");
+            for code in codes {
+                let words = bundle["tentanas"]["refusal"][*code].as_str().unwrap_or_default();
+                if words.trim().is_empty() {
+                    missing.push(format!("{locale}: {code}"));
+                }
+                // A wipe of a disk with an unlabelled ZFS or md signature
+                // sends no `pool` / `name`: its words must not need them.
+                if code.starts_with("disk_wipe_") && (words.contains("{pool") || words.contains("{name")) {
+                    missing.push(format!("{locale}: {code} needs an optional parameter"));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "helper refusal codes without usable words: {missing:#?}");
     }
 }
 
@@ -11402,5 +11406,46 @@ mod registration_tests {
         let g = gate(&fixture.ctx, PERM_READ).unwrap();
         assert_eq!(store::approval(&g.db, &approval.request_id).unwrap().unwrap().approval.status, "pending");
         assert!(store::list_jobs(&g.db, 10).unwrap().is_empty(), "nothing ran");
+    }
+}
+
+#[cfg(test)]
+mod helper_refusal_forwarding_tests {
+    use super::*;
+
+    fn gate() -> Gate {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tentanas::db::migrate(&conn).unwrap();
+        Gate {
+            addon_id: "nas".into(),
+            org_id: "org".into(),
+            user_id: "admin".into(),
+            db: std::sync::Arc::new(crate::db::Db::from_connection(conn)),
+        }
+    }
+
+    /// Critic wave 16, MAJOR 1: a guarded ZFS command run outside a job
+    /// answers with the helper's refusal ALONE, so the screen words its code;
+    /// the `tentanas-helper: <label>: ` prefix never reaches the toast. A line
+    /// without a refusal (an older helper, the tool's own stderr) is kept.
+    #[tokio::test]
+    async fn a_direct_zfs_command_answers_with_the_helper_s_refusal_alone() {
+        let g = gate();
+        let channel = tentanas::broker::test_channel::install(&g.db);
+        // The recorded answer is the guarded ZFS refusal; the command is a
+        // builtin whose plan needs no tool on the test machine (a `zfs`
+        // command is refused as "zfs is not installed" before the channel).
+        let command = HelperCommand::AuditRulesClear {};
+        channel.fail(
+            "audit_rules_clear",
+            "tentanas-helper: zfs_storage_guard: refusal:zfs_mountpoint_reserved The mountpoint /mnt/media/x overlaps the paths an Elastic Array reserves\n",
+        );
+        let refused = run_now(&g, "dataset create", &command, None).await.expect_err("refused");
+        assert!(refused.message.starts_with("refusal:zfs_mountpoint_reserved The mountpoint"), "{}", refused.message);
+        assert!(!refused.message.contains("tentanas-helper"), "{}", refused.message);
+
+        channel.fail("audit_rules_clear", "tentanas-helper: zfs_storage_guard: nośnik zarezerwowany przez Elastic");
+        let older = run_now(&g, "dataset create", &command, None).await.expect_err("refused");
+        assert_eq!(older.message, "tentanas-helper: zfs_storage_guard: nośnik zarezerwowany przez Elastic");
     }
 }

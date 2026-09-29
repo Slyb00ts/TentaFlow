@@ -89,7 +89,7 @@ fn main() -> ExitCode {
         return ExitCode::from(65);
     }
     if input.len() as u64 > MAX_COMMAND_BYTES {
-        eprintln!("tentanas-helper: polecenie przekracza limit rozmiaru");
+        eprintln!("tentanas-helper: the command exceeds the size limit");
         return ExitCode::from(65);
     }
     let split = input.iter().position(|b| *b == b'\n').unwrap_or(input.len());
