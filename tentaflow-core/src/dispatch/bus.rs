@@ -2852,7 +2852,14 @@ async fn acl_set_v1(
             "bus.invalid_argument: subject_type must be 'user', 'group', 'api_key' or 'addon'",
         ));
     }
-    require_valid_subject_id(&subject_id)?;
+    // Removing a row accepts any stored id — one replicated from a peer or
+    // written before ids were checked must always be removable; only a
+    // write is held to the id charset.
+    if access_level == "clear" {
+        require_non_empty_subject_id(&subject_id)?;
+    } else {
+        require_valid_subject_id(&subject_id)?;
+    }
     // A `'user'` row naming an addon admits nothing and only denies through
     // the fail-closed fallback — never what an administrator granting access
     // meant. Clearing one stays possible: that is how a pre-177 stand-in row
@@ -2931,7 +2938,7 @@ async fn acl_set_v1(
         "bus.acl.set",
         Some(&topic),
         Some(&format!(
-            "subject_type={subject_type} subject_id={subject_id} action={action} access_level={access_level}"
+            "subject_type={subject_type:?} subject_id={subject_id:?} action={action} access_level={access_level}"
         )),
         None,
         Some(&ctx.state.local_node_id),
@@ -3057,7 +3064,8 @@ async fn field_policy_delete_v1(
     direction: String,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
-    require_valid_subject_id(&subject_id)?;
+    // Like an ACL clear: any stored id must stay removable.
+    require_non_empty_subject_id(&subject_id)?;
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
         ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
     })?;
@@ -3087,7 +3095,7 @@ async fn field_policy_delete_v1(
         "bus.field_policy.delete",
         Some(&topic),
         Some(&format!(
-            "subject_type={subject_type} subject_id={subject_id} direction={direction}"
+            "subject_type={subject_type:?} subject_id={subject_id:?} direction={direction}"
         )),
         None,
         Some(&ctx.state.local_node_id),
@@ -3266,7 +3274,10 @@ async fn field_policy_preview_v1(
         ctx.org_context.as_ref().map(|o| o.user_id.as_str()),
         None,
         "bus.field_policy.preview",
-        Some(&topic),
+        Some(&shown(
+            &topic,
+            topics::validate_user_topic_name(&topic).is_ok(),
+        )),
         Some(&format!(
             "outcome={outcome} subject_type={:?} subject_id={:?} partition={partition} offset={offset}",
             shown(&subject_type, matches!(subject_type.as_str(), "user" | "group" | "addon" | "any")),
@@ -3306,6 +3317,16 @@ fn valid_subject_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '@' | '*'))
+}
+
+fn require_non_empty_subject_id(id: &str) -> Result<(), ProtocolError> {
+    if id.is_empty() {
+        Err(ProtocolError::bad_request(
+            "bus.invalid_argument: subject_id must not be empty",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn require_valid_subject_id(id: &str) -> Result<(), ProtocolError> {
@@ -10076,6 +10097,48 @@ mod tests {
         )
         .await
         .expect("clearing a stand-in row stays possible");
+        // A stored id outside the write charset (replicated, or written
+        // before ids were checked) can still be cleared.
+        repository::resource_permissions::set_topic_rule(
+            &db,
+            &crate::services::bus_authorizer::topic_acl_resource_id(
+                inst.as_str(),
+                &ctx.org_context.as_ref().unwrap().org_id,
+                &topic,
+            ),
+            "user",
+            "legacy id",
+            "read",
+            "deny",
+        )
+        .unwrap();
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            "legacy id".to_string(),
+            "clear".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("any stored id can be cleared");
+        let err = acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            String::new(),
+            "clear".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect_err("an empty id");
+        assert!(
+            err.message.starts_with("bus.invalid_argument"),
+            "{}",
+            err.message
+        );
         let err = acl_set_v1(
             &ctx,
             inst.as_str(),
@@ -10443,5 +10506,91 @@ mod tests {
             .iter()
             .any(|d| d.contains("subject_id=\"<invalid>\" partition=0 offset=0")));
         assert!(details.iter().all(|d| !d.contains("partition=9")));
+
+        // A topic name that fails validation never reaches the resource
+        // column: the refusal is recorded under "<invalid>".
+        let forged = format!("x resource={}", f.topic);
+        let err = field_policy_preview_v1(
+            &f.ctx,
+            inst.as_str(),
+            forged.clone(),
+            0,
+            0,
+            "any".to_string(),
+            "*".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+        let rows = repository::list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("bus.field_policy.preview".to_string()),
+                ..Default::default()
+            },
+            0,
+            1000,
+        )
+        .expect("audit");
+        assert!(rows
+            .iter()
+            .all(|r| r.resource.as_deref() != Some(forged.as_str())));
+        assert!(rows
+            .iter()
+            .any(|r| r.resource.as_deref() == Some("<invalid>")));
+    }
+
+    /// A data-hiding rule stored under an id outside the write charset
+    /// (replicated from a peer, or written before ids were checked) can
+    /// still be deleted; an empty id cannot.
+    #[tokio::test]
+    async fn field_policy_delete_accepts_any_stored_subject_id() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        let inst = fixture_instance_id();
+        let org_id = f.ctx.org_context.as_ref().unwrap().org_id.clone();
+        field_policies::set_policy(
+            &db,
+            inst.as_str(),
+            &org_id,
+            &f.topic,
+            "user",
+            "legacy id",
+            field_policies::Direction::Read,
+            &["id".to_string()].into_iter().collect(),
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("stored rule");
+        field_policy_delete_v1(
+            &f.ctx,
+            inst.as_str(),
+            f.topic.clone(),
+            "user".to_string(),
+            "legacy id".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("any stored id can be deleted");
+        assert!(
+            field_policies::list_policies(&db, inst.as_str(), &org_id, &f.topic)
+                .unwrap()
+                .iter()
+                .all(|p| p.subject_id != "legacy id")
+        );
+        let err = field_policy_delete_v1(
+            &f.ctx,
+            inst.as_str(),
+            f.topic.clone(),
+            "user".to_string(),
+            String::new(),
+            "read".to_string(),
+        )
+        .await
+        .expect_err("an empty id");
+        assert!(
+            err.message.starts_with("bus.invalid_argument"),
+            "{}",
+            err.message
+        );
     }
 }
