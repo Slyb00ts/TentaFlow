@@ -2431,6 +2431,10 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Bp::LagHistoryResponse { .. } => "BusLagHistoryResponse",
                 Bp::OffsetForTimestampRequest { .. } => "BusOffsetForTimestampRequest",
                 Bp::OffsetForTimestampResponse { .. } => "BusOffsetForTimestampResponse",
+                Bp::SubjectDirectoryRequest { .. } => "BusSubjectDirectoryRequest",
+                Bp::SubjectDirectoryResponse { .. } => "BusSubjectDirectoryResponse",
+                Bp::FieldPolicyPreviewRequest { .. } => "BusFieldPolicyPreviewRequest",
+                Bp::FieldPolicyPreviewResponse { .. } => "BusFieldPolicyPreviewResponse",
             }
         }
         MessageBody::TentaNasBody(p) => {

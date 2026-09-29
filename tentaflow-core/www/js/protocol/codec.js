@@ -3366,6 +3366,44 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /**
+   * BusPayload::SubjectDirectoryRequest (admin tier) — users, groups or addons of the
+   * caller's organization to name in a topic's access list or data-hiding rules.
+   * payload: { instanceId, kind: 'user'|'group'|'addon', query? }. Answers
+   * BusSubjectDirectoryResponse { entries: [{ subjectType, subjectId, label, memberCount }],
+   * truncated } — at most 50 entries, ordered by label.
+   */
+  busSubjectDirectoryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusSubjectDirectoryRequest(
+      encode._busInstanceId(payload),
+      String(payload.kind ?? 'user'),
+      String(payload.query ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * BusPayload::FieldPolicyPreviewRequest (admin tier + admin on the topic) — the record at
+   * (topic, partition, offset) as the subject would read it, never more than the caller
+   * may read. payload: { instanceId, topic, partition, offset, subjectType:
+   * 'user'|'group'|'addon'|'any', subjectId ('*' for 'any') }. Answers
+   * BusFieldPolicyPreviewResponse { record, applied: [{ field, action: 'show'|'hide' }],
+   * limitedByCaller }.
+   */
+  busFieldPolicyPreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeBusFieldPolicyPreviewRequest(
+      encode._busInstanceId(payload),
+      String(payload.topic ?? ''),
+      Number(payload.partition ?? 0),
+      BigInt(payload.offset ?? 0),
+      String(payload.subjectType ?? payload.subject_type ?? 'any'),
+      String(payload.subjectId ?? payload.subject_id ?? '*'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   // ----- Schema registry (SUM/tentabus/PLAN-F3.md §6; JS-codec) -----
 
   /** BusPayload::SchemaSubjectListRequest — every schema subject registered in the caller's org. payload: { instanceId }. */

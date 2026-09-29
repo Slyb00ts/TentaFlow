@@ -2486,6 +2486,46 @@ pub fn encode_bus_field_policy_set_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// Users, groups or addons of the caller's organization an administrator
+/// can name in a topic's access list or data-hiding rules. `kind` is
+/// 'user' | 'group' | 'addon'; `query` narrows by label (empty = all).
+#[wasm_bindgen(js_name = encodeBusSubjectDirectoryRequest)]
+pub fn encode_bus_subject_directory_request(
+    instance_id: String,
+    kind: String,
+    query: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::SubjectDirectoryRequest { kind, query },
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// The record at `(topic, partition, offset)` as the subject would read it.
+/// `subject_type` is 'user' | 'group' | 'addon' | 'any' (`subject_id` "*").
+#[wasm_bindgen(js_name = encodeBusFieldPolicyPreviewRequest)]
+pub fn encode_bus_field_policy_preview_request(
+    instance_id: String,
+    topic: String,
+    partition: u32,
+    offset: u64,
+    subject_type: String,
+    subject_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::BusBody(tentaflow_protocol::BusEnvelope {
+        instance_id,
+        payload: tentaflow_protocol::BusPayload::FieldPolicyPreviewRequest {
+            topic,
+            partition,
+            offset,
+            subject_type,
+            subject_id,
+        },
+    }))
+    .map_err(|e| JsError::new(&e))
+}
+
 /// `direction` is 'write' | 'read'.
 #[wasm_bindgen(js_name = encodeBusFieldPolicyDeleteRequest)]
 pub fn encode_bus_field_policy_delete_request(
@@ -12541,6 +12581,58 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
         BP::OffsetForTimestampResponse { offset } => {
             set(obj, "variant", "BusOffsetForTimestampResponse".into());
             set(obj, "offset", (offset as f64).into());
+        }
+        BP::SubjectDirectoryRequest { .. } => {
+            set(obj, "variant", "BusSubjectDirectoryRequest".into())
+        }
+        BP::SubjectDirectoryResponse { entries, truncated } => {
+            set(obj, "variant", "BusSubjectDirectoryResponse".into());
+            let arr = js_sys::Array::new();
+            for e in &entries {
+                let o = js_sys::Object::new();
+                set_bus(
+                    &o,
+                    "subjectType",
+                    "subject_type",
+                    e.subject_type.clone().into(),
+                );
+                set_bus(&o, "subjectId", "subject_id", e.subject_id.clone().into());
+                set(&o, "label", e.label.clone().into());
+                set_bus(
+                    &o,
+                    "memberCount",
+                    "member_count",
+                    opt_f64_to_js(e.member_count.map(f64::from)),
+                );
+                arr.push(&o);
+            }
+            set(obj, "entries", arr.into());
+            set(obj, "truncated", truncated.into());
+        }
+        BP::FieldPolicyPreviewRequest { .. } => {
+            set(obj, "variant", "BusFieldPolicyPreviewRequest".into())
+        }
+        BP::FieldPolicyPreviewResponse {
+            record,
+            applied,
+            limited_by_caller,
+        } => {
+            set(obj, "variant", "BusFieldPolicyPreviewResponse".into());
+            set(obj, "record", bus_message_preview_to_js(&record));
+            let arr = js_sys::Array::new();
+            for a in &applied {
+                let o = js_sys::Object::new();
+                set(&o, "field", a.field.clone().into());
+                set(&o, "action", a.action.clone().into());
+                arr.push(&o);
+            }
+            set(obj, "applied", arr.into());
+            set_bus(
+                obj,
+                "limitedByCaller",
+                "limited_by_caller",
+                limited_by_caller.into(),
+            );
         }
     }
 }

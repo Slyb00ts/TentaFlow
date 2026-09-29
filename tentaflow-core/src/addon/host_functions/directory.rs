@@ -276,39 +276,19 @@ fn list_org_users(db: &DbPool, org_id: &str) -> Result<DirectoryUsersOutput, Abi
     Ok(DirectoryUsersOutput { users })
 }
 
-/// Groups visible to `org_id`, with a member count restricted to its active
-/// users. `user_groups` has no org column — groups are platform-global — so
-/// org scoping is membership-based: a group is returned ONLY when at least
-/// one active member of the caller's org belongs to it (otherwise a tenant
-/// would see other tenants' group names/descriptions with a zero count).
+/// Groups visible to `org_id` (`repository::list_org_groups` — scoped by
+/// the org's active members, the only org link a platform-global group has).
 fn list_org_groups(db: &DbPool, org_id: &str) -> Result<DirectoryGroupsOutput, AbiError> {
-    let conn = db.read().map_err(|_| AbiError::Operation)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, description, org_members FROM ( \
-                 SELECT g.id AS id, g.name AS name, \
-                        IFNULL(g.description, '') AS description, \
-                        (SELECT COUNT(*) FROM group_members gm \
-                         JOIN user_accounts u ON u.id = gm.user_id AND u.is_active = 1 \
-                         JOIN org_memberships m ON m.user_id = u.id AND m.org_id = ?1 \
-                         WHERE gm.group_id = g.id) AS org_members \
-                 FROM user_groups g) \
-             WHERE org_members > 0 ORDER BY name",
-        )
-        .map_err(|_| AbiError::Operation)?;
-    let rows = stmt
-        .query_map(rusqlite::params![org_id], |row| {
-            Ok(DirectoryGroupOut {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                member_count: row.get::<_, i64>(3)?.max(0) as u64,
-            })
+    let groups = crate::db::repository::list_org_groups(db, org_id)
+        .map_err(|_| AbiError::Operation)?
+        .into_iter()
+        .map(|g| DirectoryGroupOut {
+            id: g.id,
+            name: g.name,
+            description: g.description,
+            member_count: g.member_count.max(0) as u64,
         })
-        .map_err(|_| AbiError::Operation)?;
-    let groups = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| AbiError::Operation)?;
+        .collect();
     Ok(DirectoryGroupsOutput { groups })
 }
 

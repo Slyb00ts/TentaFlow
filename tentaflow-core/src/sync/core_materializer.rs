@@ -735,6 +735,14 @@ fn apply_resource_permission(
             operation.body.resource_id, expected_id
         )));
     }
+    // Same rule as the local write path (`set_with_action_tx`): only a topic
+    // is ever asked about an addon actor, so an addon row anywhere else would
+    // be stored and never enforced.
+    if subject_type == "addon" && resource_type != "topic" {
+        return Err(SyncLedgerError::Runtime(format!(
+            "resource_permission: subject_type 'addon' is only valid on a topic, got '{resource_type}'"
+        )));
+    }
     // A topic's access entry names its topic through the ACL's composite
     // `(instance_id, org_id, topic)` id (`bus_authorizer::topic_acl_resource_id`).
     if resource_type == "topic" && operation.body.action != ActionType::Delete {
@@ -8294,6 +8302,77 @@ mod tests {
             assert_eq!(row, Some(second.generation));
             assert_eq!(topic_rules(&db), (Vec::<String>::new(), Vec::<String>::new()));
         }
+    }
+
+    /// Migration 177: a replicated `'addon'` entry of a topic's access list
+    /// lands as an addon row — distinct from a `'user'` row with the same id,
+    /// which lands beside it — while an addon entry on any other resource is
+    /// refused (nothing would ever consult it).
+    #[test]
+    fn a_replicated_addon_topic_entry_lands_as_its_own_subject() {
+        let db = bus_db();
+        let create = at(bus_topic_op(&incarnation(1_000), ActionType::Insert), 1_000);
+        let addon = at(topic_acl_op("addon", "asystent-lekarza", "read"), 1_500);
+        let user = at(topic_acl_op("user", "asystent-lekarza", "read"), 1_600);
+        apply_like_the_inbox(&db, &[create, addon, user]);
+        let acl = crate::services::bus_authorizer::topic_acl_resource_id(
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+        );
+        let mut subjects: Vec<(String, String)> =
+            repository::resource_permissions::list_for_resource(&db, "topic", &acl)
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.subject_type, r.subject_id))
+                .collect();
+        subjects.sort();
+        assert_eq!(
+            subjects,
+            vec![
+                ("addon".to_string(), "asystent-lekarza".to_string()),
+                ("user".to_string(), "asystent-lekarza".to_string()),
+            ]
+        );
+
+        let descriptor = crate::sync::core_registry::descriptor_for_kind(
+            CoreSyncResourceKind::ResourcePermission,
+        );
+        let mut fields = BTreeMap::new();
+        for (k, v) in [
+            ("resource_type", "model"),
+            ("resource_id", "gpt"),
+            ("subject_type", "addon"),
+            ("subject_id", "asystent-lekarza"),
+            ("action", "*"),
+            ("access_level", "deny"),
+        ] {
+            fields.insert(k.to_string(), FieldValue::String(v.to_string()));
+        }
+        let id = crate::sync::resource_id::composite_resource_id(&[
+            "model",
+            "gpt",
+            "addon",
+            "asystent-lekarza",
+        ]);
+        let model_entry = bus_operation(
+            "org-1",
+            descriptor.resource_type,
+            &id,
+            descriptor.table_name,
+            &id,
+            ActionType::Update,
+            fields,
+        );
+        assert!(matches!(
+            apply_core_operation(&db, &model_entry),
+            Err(SyncLedgerError::Runtime(_))
+        ));
+        assert!(
+            repository::resource_permissions::list_for_resource(&db, "model", "gpt")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn dlq_row(wall_ms: i64) -> repository::DbBusTopic {

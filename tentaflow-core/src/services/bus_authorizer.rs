@@ -36,6 +36,12 @@
 // user_deny > user_allow > group_deny > group_allow > default_allow, each
 // level summing rows for the exact action plus `'*'` rows.
 //
+// ADDON SUBJECTS (migration 177, owner decision P6): a call that crossed the
+// addon wasm boundary (`ctx.origin == bus::ADDON_ORIGIN`) is looked up as
+// `subject_type = 'addon'` — its own rows only, no group step — and every
+// other call as a user. An addon never inherits a user row carrying its id,
+// and a user never inherits an addon's row.
+//
 // DLQ rule (PLAN §3.3 + this task's brief): `__dlq.<topic>` is never ACL'd
 // on its own — both consuming FROM `__dlq.<topic>` and the broker's own
 // internal republish INTO it (`bus::note_delivery_failure`) are gated on
@@ -66,6 +72,7 @@ use std::sync::Arc;
 
 use crate::addon::permissions::PermissionChecker;
 use crate::bus::dlq::DLQ_TOPIC_PREFIX;
+use crate::bus::field_policies::ActorKind;
 use crate::bus::instance::BusInstanceId;
 use crate::bus::topics::RESERVED_PREFIX;
 use crate::bus::{BusAction, BusCallContext, BusServiceError};
@@ -158,12 +165,18 @@ pub fn topic_acl_resource_id(instance_id: &str, org_id: &str, topic: &str) -> St
 /// the migration, still meaning "every action"), and group rows are resolved
 /// through `actor`'s `group_members` rows — the gap this file's doc used to
 /// name is closed.
+///
+/// `actor_kind` (migration 177, owner decision P6): an addon is its own kind
+/// of subject. Its calls are matched against `subject_type = 'addon'` rows
+/// only, so a user whose id happens to equal an addon's never inherits the
+/// addon's rows, and the addon never inherits theirs.
 fn topic_acl_allows(
     db: &DbPool,
     instance_id: &str,
     org_id: &str,
     topic: &str,
     actor: &str,
+    actor_kind: ActorKind,
     action: &str,
 ) -> bool {
     let resource_id = topic_acl_resource_id(instance_id, org_id, topic);
@@ -172,6 +185,7 @@ fn topic_acl_allows(
         "topic",
         &resource_id,
         action,
+        actor_kind,
         actor,
         true, // default_allow: unchanged from the pre-168 "allow unless denied" shape.
     ) {
@@ -239,6 +253,7 @@ impl crate::bus::BusAuthorizer for InstanceBusAuthorizer {
             &ctx.org_id,
             acl_topic,
             actor,
+            ActorKind::from_origin(&ctx.origin),
             acl_action(base_action),
         ) {
             return Err(denied(action, topic));
@@ -678,6 +693,97 @@ mod tests {
             .is_err());
         assert!(auth
             .authorize(&c, BusAction::Admin, "orders.created")
+            .is_err());
+    }
+
+    fn addon_ctx(org_id: &str, addon_id: &str) -> BusCallContext {
+        BusCallContext {
+            origin: crate::bus::ADDON_ORIGIN.to_string(),
+            ..ctx(org_id, addon_id)
+        }
+    }
+
+    fn topic_rule(pool: &DbPool, subject_type: &str, subject_id: &str, level: &str) {
+        let resource_id = topic_acl_resource_id(instance_a().as_str(), "org-1", "orders.created");
+        repository::resource_permissions::set_with_action(
+            pool,
+            "topic",
+            &resource_id,
+            subject_type,
+            subject_id,
+            "read",
+            level,
+        )
+        .unwrap();
+    }
+
+    /// Owner decision P6 (migration 177): an addon is its own kind of subject.
+    /// Its `'addon'` deny stops the addon, and a user holding the SAME id —
+    /// with the same matrix grants — is not touched by it.
+    #[test]
+    fn addon_deny_row_stops_the_addon_but_not_a_user_with_the_same_id() {
+        let (_d, pool) = open_pool();
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "asystent", "bus.read");
+        topic_rule(&pool, "addon", "asystent", "deny");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        assert!(auth
+            .authorize(
+                &addon_ctx("org-1", "asystent"),
+                BusAction::Consume,
+                "orders.created"
+            )
+            .is_err());
+        assert!(auth
+            .authorize(
+                &ctx("org-1", "asystent"),
+                BusAction::Consume,
+                "orders.created"
+            )
+            .is_ok());
+    }
+
+    /// The other direction: a `'user'` row carrying an addon's id — the
+    /// stand-in the pre-177 authorizer honoured — no longer reaches the addon,
+    /// and a user's group rows are never consulted for an addon.
+    #[test]
+    fn user_and_group_rows_never_apply_to_an_addon() {
+        let (_d, pool) = open_pool();
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "asystent", "bus.read");
+        topic_rule(&pool, "user", "asystent", "deny");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        assert!(auth
+            .authorize(
+                &addon_ctx("org-1", "asystent"),
+                BusAction::Consume,
+                "orders.created"
+            )
+            .is_ok());
+        assert!(auth
+            .authorize(
+                &ctx("org-1", "asystent"),
+                BusAction::Consume,
+                "orders.created"
+            )
+            .is_err());
+    }
+
+    /// An addon allow row still answers for the addon, and an allow for one
+    /// action does not open another (the matrix still gates the action).
+    #[test]
+    fn addon_allow_row_admits_the_addon() {
+        let (_d, pool) = open_pool();
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "asystent", "bus.read");
+        topic_rule(&pool, "addon", "asystent", "allow");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = addon_ctx("org-1", "asystent");
+        assert!(auth
+            .authorize(&c, BusAction::Consume, "orders.created")
+            .is_ok());
+        assert!(auth
+            .authorize(&c, BusAction::Produce, "orders.created")
             .is_err());
     }
 }

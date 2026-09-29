@@ -62,12 +62,13 @@ use bytes::Bytes;
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     BusAclEntryWire, BusBrowsePartitionInfoWire, BusCapabilitiesWire, BusDlqListResultWire,
-    BusDlqRecordWire, BusDlqSampleWire, BusFailoverEventWire, BusFieldPolicyWire,
-    BusGroupDetailWire, BusGroupLagSeriesWire, BusGroupLagSummaryWire, BusGroupPartitionDetailWire,
-    BusGroupStatsWire, BusGroupSummaryWire, BusHeaderWire, BusLagSampleWire, BusMessagePreviewWire,
-    BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire, BusPartitionOffsetWire,
-    BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire,
-    BusSchemaSubjectWire, BusSchemaVersionWire, BusStatsSnapshotWire, BusTopicAccessWire,
+    BusDlqRecordWire, BusDlqSampleWire, BusFailoverEventWire, BusFieldActionWire,
+    BusFieldPolicyWire, BusGroupDetailWire, BusGroupLagSeriesWire, BusGroupLagSummaryWire,
+    BusGroupPartitionDetailWire, BusGroupStatsWire, BusGroupSummaryWire, BusHeaderWire,
+    BusLagSampleWire, BusMessagePreviewWire, BusMessagesBrowseResultWire, BusOffsetResetMode,
+    BusPartitionInfoWire, BusPartitionOffsetWire, BusPartitionReplicaWire, BusPayload,
+    BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire, BusSchemaSubjectWire,
+    BusSchemaVersionWire, BusStatsSnapshotWire, BusSubjectWire, BusTopicAccessWire,
     BusTopicConfigWire, BusTopicDlqSeriesWire, BusTopicOptionsWire, BusTopicStatsWire,
     BusTopicSummaryWire, MessageBody, ProtocolError, ProtocolErrorCode,
 };
@@ -679,7 +680,7 @@ async fn topic_to_wire(
     let db = ctx.state.db.clone();
     run_blocking(move || {
         let actors: Vec<String> = cfg.created_by.iter().cloned().collect();
-        let labels = SubjectLabels::resolve(&db, &[], &actors)?;
+        let labels = SubjectLabels::resolve(&db, &cfg.org_id, &[], &actors)?;
         Ok(topic_config_to_wire(&cfg, &labels))
     })
     .await
@@ -743,8 +744,12 @@ fn topic_config_to_summary_wire(cfg: &topics::TopicConfig) -> BusTopicSummaryWir
 #[derive(Default)]
 struct SubjectLabels {
     users: std::collections::HashMap<String, repository::UserNameRow>,
+    /// `group_id -> (name, members inside the caller's organization)` — the
+    /// same count the subject directory shows, so a picker and the access
+    /// table never disagree about one group.
     groups: std::collections::HashMap<String, (String, i64)>,
     api_keys: std::collections::HashMap<String, String>,
+    addons: std::collections::HashMap<String, String>,
 }
 
 /// `created_by` prefix of a REST registration (`api/bus_schema_rest.rs`).
@@ -752,19 +757,23 @@ const API_KEY_ACTOR_PREFIX: &str = "api_key:";
 
 impl SubjectLabels {
     /// `subjects` are `(subject_type, subject_id)`; `actors` are
-    /// `created_by`/audit actors (a user id, or `api_key:<uid>`).
+    /// `created_by`/audit actors (a user id, or `api_key:<uid>`). `org_id`
+    /// scopes the member count of a group subject.
     fn resolve(
         db: &crate::db::DbPool,
+        org_id: &str,
         subjects: &[(String, String)],
         actors: &[String],
     ) -> Result<Self, ProtocolError> {
         let mut user_ids = Vec::new();
         let mut group_ids = Vec::new();
+        let mut addon_ids = Vec::new();
         let mut want_api_keys = false;
         for (kind, id) in subjects {
             match kind.as_str() {
                 "user" => user_ids.push(id.clone()),
                 "group" => group_ids.push(id.clone()),
+                "addon" => addon_ids.push(id.clone()),
                 "api_key" => want_api_keys = true,
                 _ => {}
             }
@@ -782,8 +791,24 @@ impl SubjectLabels {
                 .map_err(|e| db_err("lookup_user_names", e))?;
         }
         if !group_ids.is_empty() {
+            let org_members: std::collections::HashMap<String, i64> =
+                repository::list_org_groups(db, org_id)
+                    .map_err(|e| db_err("list_org_groups", e))?
+                    .into_iter()
+                    .map(|g| (g.id, g.member_count))
+                    .collect();
             labels.groups = repository::lookup_group_info(db, &group_ids)
-                .map_err(|e| db_err("lookup_group_info", e))?;
+                .map_err(|e| db_err("lookup_group_info", e))?
+                .into_iter()
+                .map(|(id, (name, _))| {
+                    let members = org_members.get(&id).copied().unwrap_or(0);
+                    (id, (name, members))
+                })
+                .collect();
+        }
+        if !addon_ids.is_empty() {
+            labels.addons = repository::lookup_addon_names(db, &addon_ids)
+                .map_err(|e| db_err("lookup_addon_names", e))?;
         }
         if want_api_keys {
             labels.api_keys = repository::list_api_keys(db)
@@ -819,6 +844,7 @@ impl SubjectLabels {
                 None => (None, None),
             },
             "api_key" => (self.api_keys.get(subject_id).cloned(), None),
+            "addon" => (self.addons.get(subject_id).cloned(), None),
             _ => (None, None),
         }
     }
@@ -1610,6 +1636,27 @@ pub async fn bus_dispatch(
             partition,
             ts_ms,
         } => offset_for_timestamp_v1(ctx, instance_id, topic.clone(), *partition, *ts_ms).await?,
+        BusPayload::SubjectDirectoryRequest { kind, query } => {
+            subject_directory_v1(ctx, instance_id, kind.clone(), query.clone()).await?
+        }
+        BusPayload::FieldPolicyPreviewRequest {
+            topic,
+            partition,
+            offset,
+            subject_type,
+            subject_id,
+        } => {
+            field_policy_preview_v1(
+                ctx,
+                instance_id,
+                topic.clone(),
+                *partition,
+                *offset,
+                subject_type.clone(),
+                subject_id.clone(),
+            )
+            .await?
+        }
 
         BusPayload::TopicListResponse { .. }
         | BusPayload::TopicCreateResponse { .. }
@@ -1646,7 +1693,9 @@ pub async fn bus_dispatch(
         | BusPayload::SchemaCompatibilitySetResponse
         | BusPayload::SchemaDeleteResponse { .. }
         | BusPayload::LagHistoryResponse { .. }
-        | BusPayload::OffsetForTimestampResponse { .. } => {
+        | BusPayload::OffsetForTimestampResponse { .. }
+        | BusPayload::SubjectDirectoryResponse { .. }
+        | BusPayload::FieldPolicyPreviewResponse { .. } => {
             return Err(ProtocolError::bad_request(
                 "variant is not routed through bus_dispatch (UserSession tier)",
             ))
@@ -1757,6 +1806,14 @@ register_bus_variant!(
 register_bus_variant!(
     "BusOffsetForTimestampRequest",
     "tentaflow_ws_handler_bus_offset_for_timestamp"
+);
+register_bus_variant!(
+    "BusSubjectDirectoryRequest",
+    "tentaflow_ws_handler_bus_subject_directory"
+);
+register_bus_variant!(
+    "BusFieldPolicyPreviewRequest",
+    "tentaflow_ws_handler_bus_field_policy_preview"
 );
 
 // plan-app-platform §4.2/§7 W7: the 11 variants formerly routed through
@@ -2051,6 +2108,7 @@ async fn topic_admin_labels(
         &g.org_id,
         topic,
     );
+    let org_id = g.org_id.clone();
     run_blocking(move || {
         let admins: Vec<(String, String)> =
             repository::resource_permissions::list_for_resource(&db, "topic", &resource_id)
@@ -2059,7 +2117,7 @@ async fn topic_admin_labels(
                 .filter(|r| r.access_level == "allow" && matches!(r.action.as_str(), "admin" | "*"))
                 .map(|r| (r.subject_type, r.subject_id))
                 .collect();
-        let labels = SubjectLabels::resolve(&db, &admins, &[])?;
+        let labels = SubjectLabels::resolve(&db, &org_id, &admins, &[])?;
         let mut names: Vec<String> = admins
             .iter()
             .filter_map(|(kind, id)| labels.subject(kind, id).0)
@@ -2734,7 +2792,7 @@ async fn acl_list_v1(
             .iter()
             .map(|r| (r.subject_type.clone(), r.subject_id.clone()))
             .collect();
-        let labels = SubjectLabels::resolve(&db, &subjects, &[])?;
+        let labels = SubjectLabels::resolve(&db, &org_id, &subjects, &[])?;
         Ok(rows
             .into_iter()
             .map(|r| {
@@ -2780,6 +2838,21 @@ async fn acl_set_v1(
     if !matches!(action.as_str(), "read" | "write" | "admin" | "*") {
         return Err(ProtocolError::bad_request(
             "bus.invalid_argument: action must be 'read', 'write', 'admin' or '*'",
+        ));
+    }
+    // An addon is its own kind of subject (migration 177), never a user row
+    // carrying the addon's id — see `bus_authorizer::topic_acl_allows`.
+    if !matches!(
+        subject_type.as_str(),
+        "user" | "group" | "api_key" | "addon"
+    ) {
+        return Err(ProtocolError::bad_request(
+            "bus.invalid_argument: subject_type must be 'user', 'group', 'api_key' or 'addon'",
+        ));
+    }
+    if subject_id.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "bus.invalid_argument: subject_id must not be empty",
         ));
     }
     let db = ctx.state.db.clone();
@@ -2875,7 +2948,7 @@ async fn field_policy_list_v1(
             .iter()
             .map(|r| (r.subject_type.clone(), r.subject_id.clone()))
             .collect();
-        let labels = SubjectLabels::resolve(&db, &subjects, &[])?;
+        let labels = SubjectLabels::resolve(&db, &org_id, &subjects, &[])?;
         rows.into_iter()
             .map(|row| {
                 let subject_type = row.subject_type.clone();
@@ -3005,6 +3078,255 @@ async fn field_policy_delete_v1(
 }
 
 // =============================================================================
+// Subject directory and the "how does … see it" preview (B3,
+// PLAN-UI-20260923). Both are admin tier: they exist for the windows that
+// grant access and write data-hiding rules, which only an administrator has.
+// =============================================================================
+
+/// Entries one `SubjectDirectoryResponse` carries at most — a picker shows a
+/// short list and the administrator narrows it by typing.
+const SUBJECT_DIRECTORY_MAX_ENTRIES: usize = 50;
+/// Longest accepted `SubjectDirectoryRequest.query`, in characters.
+const SUBJECT_DIRECTORY_QUERY_MAX_CHARS: usize = 200;
+
+/// Users, groups or addons an administrator can name in this instance's
+/// topic access list or data-hiding rules, from the caller's organization:
+///
+/// - `user` — active members of the organization (`org_memberships`),
+///   labelled `display_name`, else `username`; never the e-mail address,
+///   like every other subject label (`SubjectLabels::user`);
+/// - `group` — groups with at least one active member in the organization,
+///   with that member count (`repository::list_org_groups`, the rule the
+///   addon directory host functions already apply — groups are
+///   platform-global and only membership ties one to an organization);
+/// - `addon` — enabled, non-native addons that declare a bus host permission
+///   (`bus.publish`/`bus.subscribe`) AND to which this instance's permission
+///   matrix grants `bus.read` or `bus.write` — exactly the addons whose calls
+///   pass the first layer of `InstanceBusAuthorizer::authorize`, so a topic
+///   rule written for one of them is a rule that can actually apply. Addons
+///   are installed per node, not per organization.
+///
+/// `query` keeps the entries whose label contains it, case-insensitively.
+async fn subject_directory_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    kind: String,
+    query: String,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    if !matches!(kind.as_str(), "user" | "group" | "addon") {
+        return Err(ProtocolError::bad_request(
+            "bus.invalid_argument: kind must be 'user', 'group' or 'addon'",
+        ));
+    }
+    if query.chars().count() > SUBJECT_DIRECTORY_QUERY_MAX_CHARS {
+        return Err(ProtocolError::bad_request(format!(
+            "bus.invalid_argument: query is longer than {SUBJECT_DIRECTORY_QUERY_MAX_CHARS} characters"
+        )));
+    }
+    let checker = ctx.state.permission_checker.clone().ok_or_else(|| {
+        tracing::error!("bus subject directory: permission checker not wired");
+        ProtocolError::internal("permission checker unavailable")
+    })?;
+    let db = ctx.state.db.clone();
+    let org_id = g.org_id.clone();
+    let instance = g.instance.as_str().to_string();
+    let needle = query.trim().to_lowercase();
+    let (entries, truncated) = run_blocking(move || {
+        let mut entries: Vec<BusSubjectWire> = match kind.as_str() {
+            "user" => repository::list_org_user_names(&db, &org_id)
+                .map_err(|e| db_err("list_org_user_names", e))?
+                .into_iter()
+                .filter_map(|(id, display_name, username)| {
+                    let label = [display_name, username]
+                        .into_iter()
+                        .find(|v| !v.is_empty())?;
+                    Some(BusSubjectWire {
+                        subject_type: "user".to_string(),
+                        subject_id: id,
+                        label,
+                        member_count: None,
+                    })
+                })
+                .collect(),
+            "group" => repository::list_org_groups(&db, &org_id)
+                .map_err(|e| db_err("list_org_groups", e))?
+                .into_iter()
+                .map(|group| BusSubjectWire {
+                    subject_type: "group".to_string(),
+                    subject_id: group.id,
+                    label: group.name,
+                    member_count: Some(u32::try_from(group.member_count).unwrap_or(0)),
+                })
+                .collect(),
+            _ => repository::list_bus_addon_candidates(&db)
+                .map_err(|e| db_err("list_bus_addon_candidates", e))?
+                .into_iter()
+                .filter(|(addon_id, _)| {
+                    [PERM_READ, PERM_WRITE]
+                        .into_iter()
+                        .any(|perm| checker.check(&instance, addon_id, perm, None).is_granted())
+                })
+                .map(|(addon_id, label)| BusSubjectWire {
+                    subject_type: "addon".to_string(),
+                    subject_id: addon_id,
+                    label,
+                    member_count: None,
+                })
+                .collect(),
+        };
+        if !needle.is_empty() {
+            entries.retain(|e| e.label.to_lowercase().contains(&needle));
+        }
+        entries.sort_by_cached_key(|e| (e.label.to_lowercase(), e.subject_id.clone()));
+        let truncated = entries.len() > SUBJECT_DIRECTORY_MAX_ENTRIES;
+        entries.truncate(SUBJECT_DIRECTORY_MAX_ENTRIES);
+        Ok((entries, truncated))
+    })
+    .await?;
+    Ok(BusPayload::SubjectDirectoryResponse { entries, truncated })
+}
+
+/// One record of `topic` as the named subject would read it. The record is
+/// read with the CALLER's rights (`BusService::peek`: Consume on the topic,
+/// the caller's own read rule already applied, the `bus.messages.browse`
+/// audit row), and the subject's effective read rule is applied on top, so
+/// the answer is the subject's view narrowed to what the caller may see —
+/// never more. The rule is resolved exactly as a real read by that subject
+/// would resolve it (`field_policies::resolve`): a user's own rule, else one
+/// of its groups', else the topic-wide one; a group's or an addon's own rule,
+/// else the topic-wide one; `any` is the topic-wide rule alone.
+///
+/// Needs the admin tier and admin rights on the topic: the preview reveals
+/// what a rule shows, and only someone who may change the rule needs that. A
+/// `user` subject must be an active member of the caller's organization —
+/// its group memberships decide the answer, and those of someone outside the
+/// organization are not the caller's to probe. Audited as
+/// `bus.field_policy.preview` with the subject and position only, never the
+/// payload.
+#[allow(clippy::too_many_arguments)]
+async fn field_policy_preview_v1(
+    ctx: &HandlerContext,
+    instance_id: &str,
+    topic: String,
+    partition: u32,
+    offset: u64,
+    subject_type: String,
+    subject_id: String,
+) -> Result<BusPayload, ProtocolError> {
+    let g = gate_admin(ctx, instance_id)?;
+    topics::validate_user_topic_name(&topic).map_err(map_bus_error)?;
+    if field_policies::PolicySubject::parse(&subject_type, &subject_id).is_none() {
+        return Err(ProtocolError::bad_request(format!(
+            "bus.invalid_argument: subject_type must be 'user', 'group', 'addon' or 'any' \
+             (with subject_id '{}')",
+            field_policies::SUBJECT_ANY
+        )));
+    }
+    let bctx = bus_ctx(ctx, &g);
+    let svc = g.svc.clone();
+    let db = ctx.state.db.clone();
+    let org_id = g.org_id.clone();
+    let caller = g.user_id.clone();
+    let instance = g.instance.as_str().to_string();
+    let (topic2, subject_type2, subject_id2) =
+        (topic.clone(), subject_type.clone(), subject_id.clone());
+    let (record, applied, limited_by_caller) = run_blocking(move || {
+        let topic = topic2;
+        if !svc.topic_access(&bctx, &topic).2 {
+            return Err(map_bus_error(BusServiceError::PermissionDenied {
+                action: bus::BusAction::Admin.as_str(),
+                topic,
+            }));
+        }
+        let subject = field_policies::PolicySubject::parse(&subject_type2, &subject_id2)
+            .expect("validated before the blocking task");
+        if let field_policies::PolicySubject::User(user_id) = subject {
+            let member = repository::is_active_org_member(&db, &org_id, user_id)
+                .map_err(|e| db_err("is_active_org_member", e))?;
+            if !member {
+                return Err(ProtocolError::not_found(
+                    "bus.subject_not_found: no such user in this organization",
+                ));
+            }
+        }
+        let cfg = topics::get_topic(&db, &instance, &org_id, &topic)
+            .map_err(map_bus_error)?
+            .ok_or_else(|| ProtocolError::not_found(format!("bus.topic_not_found: '{topic}'")))?;
+        validate_partition_filter(Some(partition), cfg.partitions, &topic)?;
+        let mut rec = svc
+            .peek(&bctx, &topic, partition, offset, 1, bus::PEEK_MAX_BYTES)
+            .map_err(map_bus_error)?
+            .records
+            .into_iter()
+            .next()
+            .filter(|r| r.offset == offset)
+            .ok_or_else(|| {
+                ProtocolError::not_found(format!(
+                    "bus.record_not_found: partition {partition} has no record at offset {offset}"
+                ))
+            })?;
+        let read = field_policies::Direction::Read;
+        let subject_rule = field_policies::resolve(&db, &instance, &org_id, &topic, subject, read)
+            .map_err(map_bus_error)?;
+        let caller_rule = field_policies::resolve(
+            &db,
+            &instance,
+            &org_id,
+            &topic,
+            field_policies::PolicySubject::User(&caller),
+            read,
+        )
+        .map_err(map_bus_error)?;
+        let format = bus::payload_format::PayloadFormat::from_content_type(&cfg.content_type);
+        // Fields of the record as the caller already sees it: a field the
+        // caller's own rule hides is not named here either.
+        let applied = format
+            .codec()
+            .list_fields(&rec.payload)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|field| {
+                let shown = subject_rule
+                    .as_ref()
+                    .is_none_or(|rule| rule.fields.contains(&field));
+                BusFieldActionWire {
+                    field,
+                    action: if shown { "show" } else { "hide" }.to_string(),
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some(rule) = &subject_rule {
+            rec.payload = field_policies::project_read(rule, format, &rec.payload);
+        }
+        let limited_by_caller = match (&caller_rule, &subject_rule) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(caller), Some(subject)) => !subject.fields.is_subset(&caller.fields),
+        };
+        Ok((record_to_preview(&rec), applied, limited_by_caller))
+    })
+    .await?;
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        Some(&g.user_id),
+        None,
+        "bus.field_policy.preview",
+        Some(&topic),
+        Some(&format!(
+            "subject_type={subject_type} subject_id={subject_id} partition={partition} offset={offset}"
+        )),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+    Ok(BusPayload::FieldPolicyPreviewResponse {
+        record,
+        applied,
+        limited_by_caller,
+    })
+}
+
+// =============================================================================
 // Schema registry (SUM/tentabus/PLAN-F3.md §6). §4.3: List/Get/DerivedGet
 // are `gate_read` (reading a schema is not itself privileged — a bound
 // schema affects writers, not readers); Register/CompatibilitySet/Delete
@@ -3063,7 +3385,7 @@ async fn schema_subject_list_v1(
             .iter()
             .filter_map(|s| s.created_by.clone())
             .collect();
-        let labels = SubjectLabels::resolve(&db, &[], &actors)?;
+        let labels = SubjectLabels::resolve(&db, &org_id, &[], &actors)?;
         Ok(subjects
             .into_iter()
             .map(|info| {
@@ -3092,7 +3414,7 @@ async fn schema_version_list_v1(
             .iter()
             .filter_map(|v| v.created_by.clone())
             .collect();
-        let labels = SubjectLabels::resolve(&db, &[], &actors)?;
+        let labels = SubjectLabels::resolve(&db, &org_id, &[], &actors)?;
         Ok(versions
             .into_iter()
             .map(|v| schema_version_to_wire(v, &labels))
@@ -3118,6 +3440,7 @@ async fn schema_get_v1(
                 .map_err(map_bus_error)?;
         let labels = SubjectLabels::resolve(
             &db,
+            &org_id,
             &[],
             &info.created_by.iter().cloned().collect::<Vec<_>>(),
         )?;
@@ -3811,7 +4134,7 @@ fn failover_events_from_audit(
     // (the precision `audit_log.timestamp` has).
     rows.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.id.cmp(&a.id)));
     let actors: Vec<String> = rows.iter().filter_map(|r| r.user_id.clone()).collect();
-    let labels = SubjectLabels::resolve(db, &[], &actors)?;
+    let labels = SubjectLabels::resolve(db, org_id, &[], &actors)?;
 
     let mut out = Vec::new();
     for row in rows {
@@ -7257,6 +7580,42 @@ mod tests {
             .unwrap();
     }
 
+    /// Makes `user_id` a member of `org_id` (creating the organization row
+    /// on first use) — what ties a user, and through users a group, to the
+    /// organization a bus directory answers for.
+    fn seed_org_member(db: &DbPool, org_id: &str, user_id: &str) {
+        let conn = db.write().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO organizations (org_id, name, slug, status, created_at) \
+             VALUES (?1, ?1, ?1, 'active', '2026-09-29T00:00:00Z')",
+            rusqlite::params![org_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
+             VALUES (?1, ?2, 'role-supervisor', '2026-09-29T00:00:00Z', 'test')",
+            rusqlite::params![org_id, user_id],
+        )
+        .unwrap();
+    }
+
+    /// An installed wasm addon that declares the bus host permissions, with
+    /// no grant on any instance yet.
+    fn seed_bus_addon(db: &DbPool, addon_id: &str, display_name: &str) {
+        let conn = db.write().unwrap();
+        conn.execute(
+            "INSERT INTO addons (addon_id, name, version, display_name) \
+             VALUES (?1, ?1, '1.0.0', ?2)",
+            rusqlite::params![addon_id, display_name],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO addon_permission_catalog (addon_id, permission_id) VALUES (?1, 'bus.subscribe')",
+            rusqlite::params![addon_id],
+        )
+        .unwrap();
+    }
+
     /// Regression for PLAN-UI §0.1: the lag reads behind `StatsSnapshot`,
     /// `GroupDetail`, `TopicDetail` and `GroupList` used to open a consumer
     /// with `CommitMode::Explicit` under the REAL group id, so every
@@ -7514,7 +7873,7 @@ mod tests {
     #[tokio::test]
     async fn acl_and_field_policy_rows_carry_subject_labels() {
         let (_guard, db) = bus_fixture();
-        let (ctx, _org_id, _) = admin_session(&db);
+        let (ctx, org_id, _) = admin_session(&db);
         let inst = fixture_instance_id();
         let topic = format!("pacjenci.{}", uuid::Uuid::new_v4().simple());
         topic_create_v1(
@@ -7527,15 +7886,25 @@ mod tests {
         .expect("topic create");
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let (user_id, group_id) = (format!("u-{suffix}"), format!("g-{suffix}"));
+        let (outsider_id, addon_id) = (format!("o-{suffix}"), format!("addon-{suffix}"));
         seed_user(&db, &user_id, "Tomasz Nowak");
+        seed_user(&db, &outsider_id, "Spoza organizacji");
+        seed_org_member(&db, &org_id, &user_id);
+        seed_org_member(&db, &format!("{org_id}-other"), &outsider_id);
+        seed_bus_addon(&db, &addon_id, "Asystent lekarza");
         db.write()
             .unwrap()
             .execute_batch(&format!(
                 "INSERT INTO user_groups (id, name) VALUES ('{group_id}', 'Lekarze {suffix}'); \
-                 INSERT INTO group_members (group_id, user_id) VALUES ('{group_id}', '{user_id}');"
+                 INSERT INTO group_members (group_id, user_id) VALUES ('{group_id}', '{user_id}'); \
+                 INSERT INTO group_members (group_id, user_id) VALUES ('{group_id}', '{outsider_id}');"
             ))
             .unwrap();
-        for (kind, id) in [("user", &user_id), ("group", &group_id)] {
+        for (kind, id) in [
+            ("user", &user_id),
+            ("group", &group_id),
+            ("addon", &addon_id),
+        ] {
             acl_set_v1(
                 &ctx,
                 inst.as_str(),
@@ -7571,7 +7940,13 @@ mod tests {
                 assert_eq!(user.member_count, None);
                 let group = entries.iter().find(|e| e.subject_id == group_id).unwrap();
                 assert_eq!(group.subject_label, Some(format!("Lekarze {suffix}")));
+                // Two members, one of them in another organization: the
+                // count is the caller's organization's, like the directory.
                 assert_eq!(group.member_count, Some(1));
+                let addon = entries.iter().find(|e| e.subject_id == addon_id).unwrap();
+                assert_eq!(addon.subject_type, "addon");
+                assert_eq!(addon.subject_label.as_deref(), Some("Asystent lekarza"));
+                assert_eq!(addon.member_count, None);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -9296,5 +9671,577 @@ mod tests {
             .find(|r| r.resource.as_deref() == Some(subject.as_str()))
             .expect("a bus.schema.deprecate row for the subject");
         assert_eq!(row.details.as_deref(), Some("deprecated=true version=1"));
+    }
+
+    fn directory_entries(payload: BusPayload) -> (Vec<BusSubjectWire>, bool) {
+        match payload {
+            BusPayload::SubjectDirectoryResponse { entries, truncated } => (entries, truncated),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// B3: the user and group directory answers for the caller's
+    /// organization only — an active member of another organization, an
+    /// inactive member and a group with no member here are absent, a group's
+    /// count is its members here — labels never carry an e-mail address, and
+    /// the query matches a label case-insensitively (Polish letters too).
+    #[tokio::test]
+    async fn subject_directory_lists_only_the_callers_organization() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let other_org = format!("{org_id}-other");
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let (anna, lukasz, inactive, stranger) = (
+            format!("anna-{tag}"),
+            format!("lukasz-{tag}"),
+            format!("inactive-{tag}"),
+            format!("stranger-{tag}"),
+        );
+        seed_user(&db, &anna, "");
+        seed_user(&db, &lukasz, &format!("Łukasz Nowak {tag}"));
+        seed_user(&db, &inactive, &format!("Nieaktywny {tag}"));
+        seed_user(&db, &stranger, &format!("Obcy {tag}"));
+        db.write()
+            .unwrap()
+            .execute_batch(&format!(
+                "UPDATE user_accounts SET email = 'anna@szpital.pl' WHERE id = '{anna}'; \
+                 UPDATE user_accounts SET is_active = 0 WHERE id = '{inactive}'; \
+                 INSERT INTO user_groups (id, name) VALUES ('ga-{tag}', 'Lekarze {tag}'); \
+                 INSERT INTO user_groups (id, name) VALUES ('gb-{tag}', 'Obca grupa {tag}'); \
+                 INSERT INTO group_members VALUES ('ga-{tag}', '{lukasz}'); \
+                 INSERT INTO group_members VALUES ('ga-{tag}', '{stranger}'); \
+                 INSERT INTO group_members VALUES ('gb-{tag}', '{stranger}');"
+            ))
+            .unwrap();
+        for user in [&anna, &lukasz, &inactive] {
+            seed_org_member(&db, &org_id, user);
+        }
+        seed_org_member(&db, &other_org, &stranger);
+
+        let (users, truncated) = directory_entries(
+            subject_directory_v1(&ctx, inst.as_str(), "user".to_string(), String::new())
+                .await
+                .expect("user directory"),
+        );
+        assert!(!truncated);
+        let mut ids: Vec<&str> = users.iter().map(|e| e.subject_id.as_str()).collect();
+        ids.sort();
+        let mut expected = vec![anna.as_str(), lukasz.as_str()];
+        expected.sort();
+        // The admin session's own user has no account row here, so the
+        // organization holds exactly the two active members seeded above.
+        assert_eq!(ids, expected);
+        let anna_row = users.iter().find(|e| e.subject_id == anna).unwrap();
+        assert_eq!(anna_row.label, format!("login-{anna}"));
+        assert!(users.iter().all(|e| !e.label.contains('@')));
+        assert!(users
+            .iter()
+            .all(|e| e.subject_type == "user" && e.member_count.is_none()));
+
+        let (found, _) = directory_entries(
+            subject_directory_v1(
+                &ctx,
+                inst.as_str(),
+                "user".to_string(),
+                "  łUKASZ ".to_string(),
+            )
+            .await
+            .expect("query"),
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].subject_id, lukasz);
+
+        let (groups, _) = directory_entries(
+            subject_directory_v1(&ctx, inst.as_str(), "group".to_string(), tag.clone())
+                .await
+                .expect("group directory"),
+        );
+        assert_eq!(groups.len(), 1, "a group with no member here is not listed");
+        assert_eq!(groups[0].subject_id, format!("ga-{tag}"));
+        assert_eq!(groups[0].member_count, Some(1));
+        assert_eq!(groups[0].subject_type, "group");
+    }
+
+    /// The directory is bounded, ordered by label, and says when more
+    /// matched than it returned.
+    #[tokio::test]
+    async fn subject_directory_is_bounded_and_ordered() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, org_id, _) = admin_session(&db);
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        for i in 0..(SUBJECT_DIRECTORY_MAX_ENTRIES + 3) {
+            let id = format!("p{i:03}-{tag}");
+            seed_user(&db, &id, &format!("Osoba {i:03} {tag}"));
+            seed_org_member(&db, &org_id, &id);
+        }
+        let (entries, truncated) = directory_entries(
+            subject_directory_v1(
+                &ctx,
+                fixture_instance_id().as_str(),
+                "user".to_string(),
+                tag.clone(),
+            )
+            .await
+            .expect("directory"),
+        );
+        assert!(truncated);
+        assert_eq!(entries.len(), SUBJECT_DIRECTORY_MAX_ENTRIES);
+        assert_eq!(entries[0].label, format!("Osoba 000 {tag}"));
+        assert!(entries.windows(2).all(|w| w[0].label < w[1].label));
+    }
+
+    /// Addons: only enabled wasm addons that declare a bus host permission
+    /// AND hold `bus.read`/`bus.write` in THIS instance's matrix — the ones a
+    /// topic rule can actually apply to.
+    #[tokio::test]
+    async fn subject_directory_lists_addons_granted_on_this_instance() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let granted = format!("granted-{tag}");
+        let ungranted = format!("ungranted-{tag}");
+        let undeclared = format!("undeclared-{tag}");
+        let disabled = format!("disabled-{tag}");
+        let other_instance = format!("other-instance-{tag}");
+        for (id, label) in [
+            (&granted, format!("Asystent lekarza {tag}")),
+            (&ungranted, format!("Bez prawa {tag}")),
+            (&disabled, format!("Wyłączony {tag}")),
+            (&other_instance, format!("Inna instancja {tag}")),
+        ] {
+            seed_bus_addon(&db, id, &label);
+        }
+        db.write()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO addons (addon_id, name, version, display_name) \
+                     VALUES ('{undeclared}', '{undeclared}', '1.0.0', 'Bez busa {tag}'); \
+                 UPDATE addons SET is_enabled = 0 WHERE addon_id = '{disabled}';"
+            ))
+            .unwrap();
+        for (addon, instance, perm) in [
+            (&granted, inst.as_str(), "bus.read"),
+            (&undeclared, inst.as_str(), "bus.write"),
+            (&disabled, inst.as_str(), "bus.read"),
+            (&other_instance, "tentabus-0000ffff", "bus.read"),
+        ] {
+            repository::upsert_permission(&db, instance, "user", addon, perm, "allow", None)
+                .unwrap();
+        }
+        let checker = shared_checker(&db);
+        checker.refresh_addon(inst.as_str());
+        checker.refresh_addon("tentabus-0000ffff");
+
+        let (entries, _) = directory_entries(
+            subject_directory_v1(&ctx, inst.as_str(), "addon".to_string(), tag.clone())
+                .await
+                .expect("addon directory"),
+        );
+        assert_eq!(
+            entries,
+            vec![BusSubjectWire {
+                subject_type: "addon".to_string(),
+                subject_id: granted,
+                label: format!("Asystent lekarza {tag}"),
+                member_count: None,
+            }]
+        );
+    }
+
+    /// The directory is admin tier: the org Admin role is required on top of
+    /// `bus.admin`, and an unknown kind or an oversized query is refused.
+    #[tokio::test]
+    async fn subject_directory_requires_the_admin_tier() {
+        let (_guard, db) = bus_fixture();
+        let inst = fixture_instance_id();
+        let user_id = format!("u-dir-{}", uuid::Uuid::new_v4());
+        let org_id = seed_membership(&db, &user_id, "org_admin");
+        let ctx = handler_ctx(db.clone(), org_context(&org_id, &user_id, &[]));
+        let err = subject_directory_v1(&ctx, inst.as_str(), "user".to_string(), String::new())
+            .await
+            .expect_err("no org Admin role");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+
+        let reader = format!("u-dir-r-{}", uuid::Uuid::new_v4());
+        let org_id = seed_bus_permissions(&db, &reader, &["bus.read"]);
+        let ctx = handler_ctx(db.clone(), org_context(&org_id, &reader, &["org.admin"]));
+        let err = subject_directory_v1(&ctx, inst.as_str(), "user".to_string(), String::new())
+            .await
+            .expect_err("no bus.admin");
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+
+        let (ctx, _, _) = admin_session(&db);
+        let err = subject_directory_v1(&ctx, inst.as_str(), "api_key".to_string(), String::new())
+            .await
+            .expect_err("unknown kind");
+        assert!(
+            err.message.starts_with("bus.invalid_argument"),
+            "{}",
+            err.message
+        );
+        let err = subject_directory_v1(
+            &ctx,
+            inst.as_str(),
+            "user".to_string(),
+            "x".repeat(SUBJECT_DIRECTORY_QUERY_MAX_CHARS + 1),
+        )
+        .await
+        .expect_err("oversized query");
+        assert!(
+            err.message.starts_with("bus.invalid_argument"),
+            "{}",
+            err.message
+        );
+    }
+
+    /// `AclSet` takes an addon subject (and still refuses an unknown type).
+    #[tokio::test]
+    async fn acl_set_accepts_an_addon_subject() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("zlecenia.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "addon".to_string(),
+            "asystent".to_string(),
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("an addon subject");
+        let err = acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "robot".to_string(),
+            "r2".to_string(),
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect_err("an unknown subject type");
+        assert!(
+            err.message.starts_with("bus.invalid_argument"),
+            "{}",
+            err.message
+        );
+        match acl_list_v1(&ctx, inst.as_str(), topic).await.unwrap() {
+            BusPayload::AclListResponse { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].subject_type, "addon");
+                assert_eq!(entries[0].subject_id, "asystent");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    struct PreviewFixture {
+        ctx: HandlerContext,
+        org_id: String,
+        topic: String,
+        member: String,
+        own_rule: String,
+        group: String,
+    }
+
+    /// A JSON topic holding one record `{id, name, pesel}` and read rules for
+    /// everyone (`id`), a group (`id`, `name`), a user of that group without a
+    /// rule of its own, a user with its own rule (all three fields) and an
+    /// addon (`id`, `pesel`).
+    async fn preview_fixture(db: &DbPool) -> PreviewFixture {
+        let (ctx, org_id, _) = admin_session(db);
+        let inst = fixture_instance_id();
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let topic = format!("wyniki.{tag}");
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                content_type: Some("application/json".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        publish_records(
+            &ctx,
+            &topic,
+            vec![(
+                r#"{"id":"b-1","name":"Anna Kowalska","pesel":"90010112345"}"#.to_string(),
+                1_000,
+            )],
+        )
+        .await;
+        let (member, own_rule, group) =
+            (format!("m-{tag}"), format!("o-{tag}"), format!("g-{tag}"));
+        seed_user(db, &member, "Członek grupy");
+        seed_user(db, &own_rule, "Własna zasada");
+        seed_org_member(db, &org_id, &member);
+        seed_org_member(db, &org_id, &own_rule);
+        db.write()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO user_groups (id, name) VALUES ('{group}', 'Pielęgniarki {tag}'); \
+                 INSERT INTO group_members VALUES ('{group}', '{member}'); \
+                 INSERT INTO group_members VALUES ('{group}', '{own_rule}');"
+            ))
+            .unwrap();
+        // The caller reads through the topic-wide rule too unless it has its
+        // own: a preview never shows it more than that, so the fixture's
+        // administrator gets a rule showing every field.
+        let caller = ctx.org_context.as_ref().unwrap().user_id.clone();
+        for (subject_type, subject_id, fields) in [
+            ("user", caller, vec!["id", "name", "pesel"]),
+            ("any", "*".to_string(), vec!["id"]),
+            ("group", group.clone(), vec!["id", "name"]),
+            ("user", own_rule.clone(), vec!["id", "name", "pesel"]),
+            ("addon", "asystent".to_string(), vec!["id", "pesel"]),
+        ] {
+            field_policy_set_v1(
+                &ctx,
+                inst.as_str(),
+                topic.clone(),
+                subject_type.to_string(),
+                subject_id,
+                "read".to_string(),
+                fields.into_iter().map(str::to_string).collect(),
+                vec![],
+            )
+            .await
+            .expect("field policy set");
+        }
+        PreviewFixture {
+            ctx,
+            org_id,
+            topic,
+            member,
+            own_rule,
+            group,
+        }
+    }
+
+    async fn preview(
+        f: &PreviewFixture,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> Result<(serde_json::Value, Vec<(String, String)>, bool), ProtocolError> {
+        match field_policy_preview_v1(
+            &f.ctx,
+            fixture_instance_id().as_str(),
+            f.topic.clone(),
+            0,
+            0,
+            subject_type.to_string(),
+            subject_id.to_string(),
+        )
+        .await?
+        {
+            BusPayload::FieldPolicyPreviewResponse {
+                record,
+                applied,
+                limited_by_caller,
+            } => {
+                assert_eq!((record.partition, record.offset), (0, 0));
+                Ok((
+                    serde_json::from_slice(&record.payload_preview).expect("json payload"),
+                    applied.into_iter().map(|a| (a.field, a.action)).collect(),
+                    limited_by_caller,
+                ))
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    fn actions(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(f, a)| (f.to_string(), a.to_string()))
+            .collect()
+    }
+
+    /// B3 "how does … see it": each subject gets the rule a real read by it
+    /// would resolve — its own, else (for a user) its group's, else the
+    /// topic-wide one — and `applied` names what that rule does per field.
+    #[tokio::test]
+    async fn field_policy_preview_applies_the_subjects_effective_rule() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+
+        let (payload, applied, limited) = preview(&f, "any", "*").await.unwrap();
+        assert_eq!(payload, serde_json::json!({"id": "b-1"}));
+        assert_eq!(
+            applied,
+            actions(&[("id", "show"), ("name", "hide"), ("pesel", "hide")])
+        );
+        assert!(!limited);
+
+        let group_view = preview(&f, "group", &f.group).await.unwrap();
+        assert_eq!(
+            group_view.0,
+            serde_json::json!({"id": "b-1", "name": "Anna Kowalska"})
+        );
+        assert_eq!(
+            group_view.1,
+            actions(&[("id", "show"), ("name", "show"), ("pesel", "hide")])
+        );
+        // A member without a rule of its own reads through its group — the
+        // group wins over the topic-wide rule.
+        assert_eq!(preview(&f, "user", &f.member).await.unwrap(), group_view);
+
+        // A user's own rule wins over its group's.
+        let (payload, applied, _) = preview(&f, "user", &f.own_rule).await.unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"id": "b-1", "name": "Anna Kowalska", "pesel": "90010112345"})
+        );
+        assert!(applied.iter().all(|(_, a)| a == "show"));
+
+        let (payload, _, _) = preview(&f, "addon", "asystent").await.unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"id": "b-1", "pesel": "90010112345"})
+        );
+        // An addon without a rule reads the topic-wide one.
+        let (payload, _, _) = preview(&f, "addon", "inny").await.unwrap();
+        assert_eq!(payload, serde_json::json!({"id": "b-1"}));
+
+        let rows = repository::list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("bus.field_policy.preview".to_string()),
+                ..Default::default()
+            },
+            0,
+            500,
+        )
+        .expect("audit");
+        let ours: Vec<_> = rows
+            .iter()
+            .filter(|r| r.resource.as_deref() == Some(f.topic.as_str()))
+            .collect();
+        assert_eq!(ours.len(), 6);
+        assert!(ours.iter().all(|r| {
+            let details = r.details.as_deref().unwrap_or_default();
+            details.contains("partition=0 offset=0")
+                && !details.contains("Anna")
+                && !details.contains("90010112345")
+        }));
+    }
+
+    /// The preview never shows the caller more than the caller may read: with
+    /// a rule of its own that hides `pesel`, the caller's preview of a subject
+    /// who sees `pesel` carries neither the value nor the field name, and says
+    /// the view is narrowed.
+    #[tokio::test]
+    async fn field_policy_preview_never_exceeds_the_callers_own_view() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        let caller = f.ctx.org_context.as_ref().unwrap().user_id.clone();
+        field_policy_set_v1(
+            &f.ctx,
+            fixture_instance_id().as_str(),
+            f.topic.clone(),
+            "user".to_string(),
+            caller,
+            "read".to_string(),
+            vec!["id".to_string(), "name".to_string()],
+            vec![],
+        )
+        .await
+        .expect("caller's own rule");
+
+        let (payload, applied, limited) = preview(&f, "user", &f.own_rule).await.unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({"id": "b-1", "name": "Anna Kowalska"})
+        );
+        assert_eq!(applied, actions(&[("id", "show"), ("name", "show")]));
+        assert!(limited);
+        let (_, _, limited) = preview(&f, "any", "*").await.unwrap();
+        assert!(
+            !limited,
+            "the topic-wide rule shows nothing the caller cannot read"
+        );
+    }
+
+    /// Refusals: no org Admin role, no admin right on the topic itself, a
+    /// user outside the caller's organization, an unknown subject type, a
+    /// missing record.
+    #[tokio::test]
+    async fn field_policy_preview_refusals() {
+        let (_guard, db) = bus_fixture();
+        let f = preview_fixture(&db).await;
+        let inst = fixture_instance_id();
+
+        let stranger = format!("stranger-{}", uuid::Uuid::new_v4().simple());
+        seed_user(&db, &stranger, "Obcy");
+        seed_org_member(&db, &format!("{}-other", f.org_id), &stranger);
+        let err = preview(&f, "user", &stranger).await.unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::NotFound);
+        let err = preview(&f, "api_key", "k").await.unwrap_err();
+        assert!(
+            err.message.starts_with("bus.invalid_argument"),
+            "{}",
+            err.message
+        );
+        let err = field_policy_preview_v1(
+            &f.ctx,
+            inst.as_str(),
+            f.topic.clone(),
+            0,
+            7,
+            "any".to_string(),
+            "*".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::NotFound);
+
+        let org = f.ctx.org_context.as_ref().unwrap();
+        let no_org_admin = handler_ctx(db.clone(), org_context(&org.org_id, &org.user_id, &[]));
+        let err = field_policy_preview_v1(
+            &no_org_admin,
+            inst.as_str(),
+            f.topic.clone(),
+            0,
+            0,
+            "any".to_string(),
+            "*".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
+
+        acl_set_v1(
+            &f.ctx,
+            inst.as_str(),
+            f.topic.clone(),
+            "user".to_string(),
+            org.user_id.clone(),
+            "deny".to_string(),
+            "admin".to_string(),
+        )
+        .await
+        .expect("deny topic admin to the caller");
+        let err = preview(&f, "any", "*").await.unwrap_err();
+        assert!(
+            err.message.starts_with("bus.permission_denied"),
+            "{}",
+            err.message
+        );
     }
 }

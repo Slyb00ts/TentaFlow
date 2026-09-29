@@ -497,7 +497,8 @@ fn default_acl_action() -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BusAclEntryWire {
-    /// 'user' | 'group' | 'api_key'.
+    /// 'user' | 'group' | 'api_key' | 'addon' (migration 177 — an addon is
+    /// its own kind of subject, never a user with the same id).
     pub subject_type: String,
     pub subject_id: String,
     /// 'allow' | 'deny'.
@@ -525,7 +526,7 @@ pub struct BusAclEntryWire {
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct BusFieldPolicyWire {
-    /// 'user' | 'any'.
+    /// 'user' | 'group' | 'addon' | 'any'.
     pub subject_type: String,
     /// The wildcard sentinel is `"*"` when `subject_type == "any"`.
     pub subject_id: String,
@@ -541,6 +542,30 @@ pub struct BusFieldPolicyWire {
     /// See `BusAclEntryWire::member_count`'s doc.
     #[serde(default)]
     pub member_count: Option<u32>,
+}
+
+/// One pickable subject of the topic access / data-hiding windows
+/// (`SubjectDirectoryResponse`). `label` is a display name, never an e-mail
+/// address: the same rule as `BusAclEntryWire::subject_label`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusSubjectWire {
+    /// 'user' | 'group' | 'addon'.
+    pub subject_type: String,
+    pub subject_id: String,
+    pub label: String,
+    /// Members of a `group` inside the caller's organization; `None` for
+    /// every other type.
+    #[serde(default)]
+    pub member_count: Option<u32>,
+}
+
+/// What one subject's read rule does to one field of a previewed record
+/// (`FieldPolicyPreviewResponse::applied`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct BusFieldActionWire {
+    pub field: String,
+    /// 'show' | 'hide'.
+    pub action: String,
 }
 
 // =============================================================================
@@ -1353,6 +1378,49 @@ pub enum BusPayload {
     },
     OffsetForTimestampResponse {
         offset: u64,
+    },
+
+    // ===== B3 (PLAN-UI-20260923) — subject picker and "how does … see it".
+    // Both are admin tier (`bus.admin` + org Admin). =====
+    /// Users, groups or addons an administrator can name in a topic's access
+    /// list or data-hiding rules, from the caller's organization only.
+    /// `kind` is 'user' | 'group' | 'addon'; `query` narrows by a
+    /// case-insensitive substring of the label (empty = everything). At most
+    /// 50 entries, ordered by label; `truncated` says more matched.
+    SubjectDirectoryRequest {
+        kind: String,
+        #[serde(default)]
+        query: String,
+    },
+    SubjectDirectoryResponse {
+        entries: Vec<BusSubjectWire>,
+        #[serde(default)]
+        truncated: bool,
+    },
+    /// The record at `(topic, partition, offset)` as the subject would read
+    /// it: that subject's effective read rule (a user's own rule, else one of
+    /// its groups', else the topic-wide one; a group's rule, else the
+    /// topic-wide one; an addon's rule, else the topic-wide one) applied ON
+    /// TOP of the caller's own, so the answer never shows a field the caller
+    /// could not read. Needs admin rights on the topic as well.
+    FieldPolicyPreviewRequest {
+        topic: String,
+        partition: u32,
+        offset: u64,
+        /// 'user' | 'group' | 'addon' | 'any' (`subject_id` = "*").
+        subject_type: String,
+        subject_id: String,
+    },
+    FieldPolicyPreviewResponse {
+        record: BusMessagePreviewWire,
+        /// One entry per field of the record the caller can read, ordered
+        /// by field name.
+        applied: Vec<BusFieldActionWire>,
+        /// `true` when the caller's own read rule hides fields the subject's
+        /// rule would show, so the preview is narrower than the subject's
+        /// real view.
+        #[serde(default)]
+        limited_by_caller: bool,
     },
 }
 
@@ -2768,6 +2836,103 @@ mod tests {
     }
 
     #[test]
+    fn subject_directory_and_field_policy_preview_round_trip() {
+        round_trip(BusPayload::SubjectDirectoryRequest {
+            kind: "group".to_string(),
+            query: "Łekarze".to_string(),
+        });
+        round_trip(BusPayload::SubjectDirectoryResponse {
+            entries: vec![
+                BusSubjectWire {
+                    subject_type: "group".to_string(),
+                    subject_id: "g-1".to_string(),
+                    label: "Lekarze".to_string(),
+                    member_count: Some(12),
+                },
+                BusSubjectWire {
+                    subject_type: "addon".to_string(),
+                    subject_id: "asystent-lekarza".to_string(),
+                    label: "Asystent lekarza".to_string(),
+                    member_count: None,
+                },
+            ],
+            truncated: true,
+        });
+        round_trip(BusPayload::FieldPolicyPreviewRequest {
+            topic: "wyniki-badan".to_string(),
+            partition: 1,
+            offset: 42,
+            subject_type: "any".to_string(),
+            subject_id: "*".to_string(),
+        });
+        round_trip(BusPayload::FieldPolicyPreviewResponse {
+            record: BusMessagePreviewWire {
+                partition: 1,
+                offset: 42,
+                timestamp_ms: 1_756_000_000_000,
+                key: b"k".to_vec(),
+                headers: vec![],
+                payload_preview: br#"{"id":1}"#.to_vec(),
+                is_blob_ref: false,
+                truncated: false,
+            },
+            applied: vec![
+                BusFieldActionWire {
+                    field: "id".to_string(),
+                    action: "show".to_string(),
+                },
+                BusFieldActionWire {
+                    field: "pesel".to_string(),
+                    action: "hide".to_string(),
+                },
+            ],
+            limited_by_caller: true,
+        });
+    }
+
+    #[test]
+    fn subject_directory_optional_fields_default_when_absent() {
+        #[derive(SerdeSerialize)]
+        struct MinimalSubject {
+            subject_type: String,
+            subject_id: String,
+            label: String,
+        }
+        #[derive(SerdeSerialize)]
+        enum MinimalBusPayload {
+            SubjectDirectoryRequest { kind: String },
+            SubjectDirectoryResponse { entries: Vec<MinimalSubject> },
+        }
+        let bytes = crate::cbor::encode(&MinimalBusPayload::SubjectDirectoryRequest {
+            kind: "user".to_string(),
+        })
+        .expect("encode");
+        assert_eq!(
+            crate::cbor::decode::<BusPayload>(&bytes).expect("decode"),
+            BusPayload::SubjectDirectoryRequest {
+                kind: "user".to_string(),
+                query: String::new(),
+            }
+        );
+        let bytes = crate::cbor::encode(&MinimalBusPayload::SubjectDirectoryResponse {
+            entries: vec![MinimalSubject {
+                subject_type: "user".to_string(),
+                subject_id: "u-1".to_string(),
+                label: "Anna Kowalska".to_string(),
+            }],
+        })
+        .expect("encode");
+        match crate::cbor::decode::<BusPayload>(&bytes).expect("decode") {
+            BusPayload::SubjectDirectoryResponse { entries, truncated } => {
+                assert!(!truncated);
+                assert_eq!(entries[0].member_count, None);
+                assert_eq!(entries[0].label, "Anna Kowalska");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn topic_stats_without_dlq_recency_fields_decodes() {
         #[derive(SerdeSerialize)]
         struct LegacyTopicStats {
@@ -3162,6 +3327,10 @@ mod tests {
             "LagHistoryResponse",
             "OffsetForTimestampRequest",
             "OffsetForTimestampResponse",
+            "SubjectDirectoryRequest",
+            "SubjectDirectoryResponse",
+            "FieldPolicyPreviewRequest",
+            "FieldPolicyPreviewResponse",
         ];
         assert_eq!(
             live, pinned,

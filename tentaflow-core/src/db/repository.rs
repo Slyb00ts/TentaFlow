@@ -12833,6 +12833,138 @@ pub fn lookup_group_info(pool: &DbPool, ids: &[String]) -> Result<HashMap<String
     Ok(out)
 }
 
+/// One group as an organization sees it (`list_org_groups`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgGroupRow {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// Active members of the organization in this group.
+    pub member_count: i64,
+}
+
+/// Groups visible to `org_id`, ordered by name. `user_groups` has no org
+/// column — groups are platform-global — so org scoping is membership-based:
+/// a group is returned ONLY when at least one active member of the org
+/// belongs to it (otherwise a tenant would see other tenants' group names
+/// with a zero count), and `member_count` counts only those members.
+pub fn list_org_groups(pool: &DbPool, org_id: &str) -> Result<Vec<OrgGroupRow>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, name, description, org_members FROM ( \
+             SELECT g.id AS id, g.name AS name, \
+                    IFNULL(g.description, '') AS description, \
+                    (SELECT COUNT(*) FROM group_members gm \
+                     JOIN user_accounts u ON u.id = gm.user_id AND u.is_active = 1 \
+                     JOIN org_memberships m ON m.user_id = u.id AND m.org_id = ?1 \
+                     WHERE gm.group_id = g.id) AS org_members \
+             FROM user_groups g) \
+         WHERE org_members > 0 ORDER BY name",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id], |row| {
+            Ok(OrgGroupRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                member_count: row.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Active members of `org_id` as `(id, display_name, username)`, ordered by
+/// username. No credential or contact column is read.
+pub fn list_org_user_names(pool: &DbPool, org_id: &str) -> Result<Vec<(String, String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT u.id, u.display_name, u.username FROM user_accounts u \
+         JOIN org_memberships m ON m.user_id = u.id \
+         WHERE m.org_id = ?1 AND u.is_active = 1 \
+         ORDER BY u.username",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Whether `user_id` is an active member of `org_id`.
+pub fn is_active_org_member(pool: &DbPool, org_id: &str, user_id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM user_accounts u \
+         JOIN org_memberships m ON m.user_id = u.id \
+         WHERE m.org_id = ?1 AND u.id = ?2 AND u.is_active = 1)",
+        rusqlite::params![org_id, user_id],
+        |row| row.get(0),
+    )?)
+}
+
+/// Enabled, non-native addons that declare a TentaBus host permission
+/// (`bus.publish` or `bus.subscribe`) — the only addons that can ever act on
+/// a topic — as `(addon_id, label)`, the label being `display_name`, else
+/// `name`, else the id.
+pub fn list_bus_addon_candidates(pool: &DbPool) -> Result<Vec<(String, String)>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT a.addon_id, a.display_name, a.name FROM addons a \
+         WHERE a.is_enabled = 1 AND a.runtime <> 'native' \
+           AND EXISTS (SELECT 1 FROM addon_permission_catalog c \
+                       WHERE c.addon_id = a.addon_id \
+                         AND c.permission_id IN ('bus.publish', 'bus.subscribe')) \
+         ORDER BY a.addon_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let display_name: String = row.get(1)?;
+            let name: String = row.get(2)?;
+            Ok((id, [display_name, name]))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, names)| {
+            let label = names
+                .into_iter()
+                .find(|n| !n.is_empty())
+                .unwrap_or_else(|| id.clone());
+            (id, label)
+        })
+        .collect())
+}
+
+/// Batched `addon_id -> label` (`display_name`, else `name`); unknown ids
+/// are absent.
+pub fn lookup_addon_names(pool: &DbPool, ids: &[String]) -> Result<HashMap<String, String>> {
+    let conn = acquire(pool)?;
+    let mut out = HashMap::with_capacity(ids.len());
+    lookup_in_chunks(
+        &conn,
+        ids,
+        |ph| format!("SELECT addon_id, display_name, name FROM addons WHERE addon_id IN ({ph})"),
+        |row| {
+            let id: String = row.get(0)?;
+            let display_name: String = row.get(1)?;
+            let name: String = row.get(2)?;
+            let label = if display_name.is_empty() {
+                name
+            } else {
+                display_name
+            };
+            if !label.is_empty() {
+                out.insert(id, label);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
 /// Batched `node_id -> (display_name, last_seen_at)`. The name comes from
 /// `sync_nodes` (may be empty — caller falls back); liveness is the LATER of
 /// `sync_nodes.last_seen_at` and `peer_persisted.last_seen_ms` (the mesh
@@ -21943,7 +22075,8 @@ pub mod resource_permissions {
         pub id: i64,
         pub resource_type: String,
         pub resource_id: String,
-        pub subject_type: String, // "user" | "group" | "api_key"
+        /// "user" | "group" | "api_key" | "addon" (`topic` rows only).
+        pub subject_type: String,
         pub subject_id: String,
         pub access_level: String, // "allow" | "deny"
         /// "read" | "write" | "admin" | "*" (migration 168). `'*'` matches
@@ -22077,8 +22210,14 @@ pub mod resource_permissions {
         if !matches!(access_level, "allow" | "deny") {
             anyhow::bail!("access_level must be 'allow' or 'deny'");
         }
-        if !matches!(subject_type, "user" | "group" | "api_key") {
-            anyhow::bail!("subject_type must be 'user', 'group' or 'api_key'");
+        if !matches!(subject_type, "user" | "group" | "api_key" | "addon") {
+            anyhow::bail!("subject_type must be 'user', 'group', 'api_key' or 'addon'");
+        }
+        // Only a TentaBus topic asks about an addon actor
+        // (`bus_authorizer::topic_acl_allows`); on any other resource an addon
+        // row would be stored and never consulted.
+        if subject_type == "addon" && resource_type != "topic" {
+            anyhow::bail!("subject_type 'addon' is only valid on a topic");
         }
         if !matches!(action, "read" | "write" | "admin" | "*") {
             anyhow::bail!("action must be 'read', 'write', 'admin' or '*'");
@@ -22555,7 +22694,15 @@ pub mod resource_permissions {
                 if role == "admin" {
                     return Ok(true);
                 }
-                check_action(pool, resource_type, resource_id, action, user_id, false)
+                check_action(
+                    pool,
+                    resource_type,
+                    resource_id,
+                    action,
+                    crate::bus::field_policies::ActorKind::User,
+                    user_id,
+                    false,
+                )
             }
             Principal::Group { group_id } => {
                 check_single_subject(pool, resource_type, resource_id, action, "group", group_id)
@@ -22602,45 +22749,62 @@ pub mod resource_permissions {
     }
 
     /// Action-aware variant of `check_inner`'s priority chain (migration 168):
-    /// `user_deny > user_allow > group_deny > group_allow > default_allow`,
-    /// where every level now sums the rows that match `action` EXACTLY plus
-    /// the rows recorded as `'*'` (matches every action — what every
-    /// pre-168 row means, per the migration's own mapping note). No
-    /// admin-role bypass: unlike `check_inner`'s Tier-1 shape, the bus topic
-    /// ACL sits BEHIND the addon permission matrix's own `bus.admin` check,
-    /// so folding a second, org-role-based bypass in here would let an org
-    /// admin who was never granted `bus.admin` on this instance skip that
-    /// layer entirely. The /v1 `User` branch of `check_subject_default_deny`
-    /// applies its own site-admin bypass before calling this.
+    /// `own_deny > own_allow > group_deny > group_allow > default_allow`,
+    /// where every level sums the rows that match `action` EXACTLY plus the
+    /// rows recorded as `'*'` (matches every action — what every pre-168 row
+    /// means, per the migration's own mapping note).
+    ///
+    /// `subject_kind` says what `subject_id` names (migration 177): a `User`
+    /// is matched against `subject_type = 'user'` rows and then through its
+    /// `group_members` rows; an `Addon` only against `subject_type = 'addon'`
+    /// rows — groups hold users, and a user row with an addon's id is not the
+    /// addon. No admin-role bypass: unlike `check_inner`'s Tier-1 shape, the
+    /// bus topic ACL sits BEHIND the addon permission matrix's own
+    /// `bus.admin` check, so folding a second, org-role-based bypass in here
+    /// would let an org admin who was never granted `bus.admin` on this
+    /// instance skip that layer entirely. The /v1 `User` branch of
+    /// `check_subject_default_deny` applies its own site-admin bypass before
+    /// calling this.
     pub fn check_action(
         pool: &DbPool,
         resource_type: &str,
         resource_id: &str,
         action: &str,
-        user_id: &str,
+        subject_kind: crate::bus::field_policies::ActorKind,
+        subject_id: &str,
         default_allow: bool,
     ) -> Result<bool> {
+        use crate::bus::field_policies::ActorKind;
         let conn = pool
             .read()
             .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
 
-        let mut user_stmt = conn.prepare_cached(
+        let mut own_stmt = conn.prepare_cached(
             "SELECT access_level FROM resource_permissions
              WHERE resource_type = ?1 AND resource_id = ?2
-               AND subject_type = 'user' AND subject_id = ?3
-               AND (action = ?4 OR action = '*')",
+               AND subject_type = ?3 AND subject_id = ?4
+               AND (action = ?5 OR action = '*')",
         )?;
-        let user_levels: Vec<String> = user_stmt
+        let own_levels: Vec<String> = own_stmt
             .query_map(
-                rusqlite::params![resource_type, resource_id, user_id, action],
+                rusqlite::params![
+                    resource_type,
+                    resource_id,
+                    subject_kind.subject_type_str(),
+                    subject_id,
+                    action
+                ],
                 |row| row.get::<_, String>(0),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if user_levels.iter().any(|l| l == "deny") {
+        if own_levels.iter().any(|l| l == "deny") {
             return Ok(false);
         }
-        if user_levels.iter().any(|l| l == "allow") {
+        if own_levels.iter().any(|l| l == "allow") {
             return Ok(true);
+        }
+        if subject_kind == ActorKind::Addon {
+            return Ok(default_allow);
         }
 
         let mut group_stmt = conn.prepare_cached(
@@ -22652,7 +22816,7 @@ pub mod resource_permissions {
         )?;
         let group_levels: Vec<String> = group_stmt
             .query_map(
-                rusqlite::params![resource_type, resource_id, user_id, action],
+                rusqlite::params![resource_type, resource_id, subject_id, action],
                 |row| row.get::<_, String>(0),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -28012,6 +28176,62 @@ mod api_key_access_v2_tests {
         let rows = resource_permissions::list_for_subject(&db, "api_key", "key-uid-1").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].access_level, "allow");
+    }
+
+    /// Migration 177: an addon subject is accepted on a topic only — the one
+    /// resource whose check (`check_action` with `ActorKind::Addon`) ever
+    /// asks about an addon.
+    #[test]
+    fn resource_permissions_accept_an_addon_subject_on_a_topic_only() {
+        let db = fresh_db();
+        resource_permissions::set_with_action(&db, "topic", "t1", "addon", "a1", "read", "deny")
+            .expect("an addon subject on a topic");
+        assert!(
+            resource_permissions::set(&db, "model", "gpt-4o", "addon", "a1", "deny").is_err(),
+            "an addon subject on a model would never be consulted"
+        );
+        let rows = resource_permissions::list_for_subject(&db, "addon", "a1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].resource_type, "topic");
+    }
+
+    /// `check_action` keeps the two subject kinds apart: the addon's own
+    /// rows decide for the addon (no group step), the user's own and group
+    /// rows for the user, whatever the ids.
+    #[test]
+    fn check_action_matches_rows_of_the_subjects_own_kind() {
+        use crate::bus::field_policies::ActorKind;
+        let db = fresh_db();
+        seed_user(&db, "shared-id", "user");
+        seed_group_member(&db, "g-readers", "shared-id");
+        resource_permissions::set_with_action(
+            &db,
+            "topic",
+            "t1",
+            "addon",
+            "shared-id",
+            "read",
+            "deny",
+        )
+        .unwrap();
+        resource_permissions::set_with_action(
+            &db,
+            "topic",
+            "t1",
+            "group",
+            "g-readers",
+            "write",
+            "deny",
+        )
+        .unwrap();
+        let check = |kind, action| {
+            resource_permissions::check_action(&db, "topic", "t1", action, kind, "shared-id", true)
+                .unwrap()
+        };
+        assert!(!check(ActorKind::Addon, "read"));
+        assert!(check(ActorKind::User, "read"));
+        assert!(!check(ActorKind::User, "write"));
+        assert!(check(ActorKind::Addon, "write"));
     }
 
     fn seed_user(db: &DbPool, id: &str, role: &str) {

@@ -1045,11 +1045,12 @@ pub struct BusCallContext {
 
 /// The `origin` value `addon::host_functions::bus::call_context` stamps on
 /// every `BusCallContext` it builds — the SOLE entry point through which an
-/// addon's wasm code reaches `BusService`. `field_policies::resolve`'s
-/// `ActorKind::from_origin` is the only reader: it is how a field policy
-/// (`FP-subject-type`, SUM/tentabus/DECYZJE-2026-09-22.md) tells an addon
-/// actor apart from a human/service user actor, since `BusCallContext.actor`
-/// itself carries no type tag either way.
+/// addon's wasm code reaches `BusService`. `ActorKind::from_origin` is the
+/// only reader: it is how a field policy (`FP-subject-type`,
+/// SUM/tentabus/DECYZJE-2026-09-22.md) and the topic ACL
+/// (`services::bus_authorizer`, migration 177) tell an addon actor apart from
+/// a human/service user actor, since `BusCallContext.actor` itself carries no
+/// type tag either way.
 pub const ADDON_ORIGIN: &str = "addon";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5149,8 +5150,10 @@ impl BusService {
             &self.instance_id,
             &ctx.org_id,
             topic,
-            ctx.actor.as_deref().unwrap_or(""),
-            field_policies::ActorKind::from_origin(&ctx.origin),
+            field_policies::PolicySubject::actor(
+                ctx.actor.as_deref().unwrap_or(""),
+                field_policies::ActorKind::from_origin(&ctx.origin),
+            ),
             field_policies::Direction::Write,
         )? {
             let format = payload_format::PayloadFormat::from_content_type(&cfg.content_type);
@@ -6938,8 +6941,10 @@ impl BusService {
             &self.instance_id,
             &ctx.org_id,
             topic,
-            ctx.actor.as_deref().unwrap_or(""),
-            field_policies::ActorKind::from_origin(&ctx.origin),
+            field_policies::PolicySubject::actor(
+                ctx.actor.as_deref().unwrap_or(""),
+                field_policies::ActorKind::from_origin(&ctx.origin),
+            ),
             field_policies::Direction::Read,
         )?
         else {
@@ -8601,8 +8606,10 @@ impl ConsumerHandle {
                                 &self.instance_id,
                                 &self.org_id,
                                 &rec.topic,
-                                self.ctx.actor.as_deref().unwrap_or(""),
-                                field_policies::ActorKind::from_origin(&self.ctx.origin),
+                                field_policies::PolicySubject::actor(
+                                    self.ctx.actor.as_deref().unwrap_or(""),
+                                    field_policies::ActorKind::from_origin(&self.ctx.origin),
+                                ),
                                 field_policies::Direction::Read,
                             )?;
                             let resolved = match resolved {
@@ -14919,8 +14926,7 @@ mod tests {
             svc.instance_id(),
             "org-a",
             "orders.created",
-            "anyone",
-            field_policies::ActorKind::User,
+            field_policies::PolicySubject::actor("anyone", field_policies::ActorKind::User),
             field_policies::Direction::Read,
         )
         .unwrap()
@@ -14939,8 +14945,7 @@ mod tests {
                 svc.instance_id(),
                 "org-b",
                 "orders.created",
-                "anyone",
-                field_policies::ActorKind::User,
+                field_policies::PolicySubject::actor("anyone", field_policies::ActorKind::User),
                 field_policies::Direction::Read,
             )
             .unwrap()

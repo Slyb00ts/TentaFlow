@@ -78,10 +78,45 @@ impl ActorKind {
         }
     }
 
-    fn subject_type_str(self) -> &'static str {
+    /// The `subject_type` spelling rows about this kind of actor carry —
+    /// in `bus_field_policies` and in a topic's `resource_permissions`.
+    pub fn subject_type_str(self) -> &'static str {
         match self {
             ActorKind::User => "user",
             ActorKind::Addon => "addon",
+        }
+    }
+}
+
+/// Whose rule `resolve` looks up. An actor (`User`/`Addon`) is what a
+/// publish/fetch/peek resolves for; `Group` and `Any` exist for the
+/// administrator's "how does … see it" preview, which asks about a group or
+/// the topic-wide rule directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicySubject<'a> {
+    User(&'a str),
+    Addon(&'a str),
+    Group(&'a str),
+    Any,
+}
+
+impl<'a> PolicySubject<'a> {
+    pub fn actor(actor: &'a str, kind: ActorKind) -> Self {
+        match kind {
+            ActorKind::User => PolicySubject::User(actor),
+            ActorKind::Addon => PolicySubject::Addon(actor),
+        }
+    }
+
+    /// Parses a wire `(subject_type, subject_id)` pair; `None` for an
+    /// unknown type or an `any` subject whose id is not `SUBJECT_ANY`.
+    pub fn parse(subject_type: &str, subject_id: &'a str) -> Option<Self> {
+        match subject_type {
+            "user" => Some(PolicySubject::User(subject_id)),
+            "addon" => Some(PolicySubject::Addon(subject_id)),
+            "group" => Some(PolicySubject::Group(subject_id)),
+            "any" if subject_id == SUBJECT_ANY => Some(PolicySubject::Any),
+            _ => None,
         }
     }
 }
@@ -139,25 +174,26 @@ pub(crate) fn decode(row: DbBusFieldPolicy, topic: &str) -> Result<FieldPolicy, 
     })
 }
 
-/// Resolves the effective policy for `(org_id, topic, direction)` against
-/// `actor`, a raw actor string whose KIND (`FP-subject-type`,
-/// SUM/tentabus/DECYZJE-2026-09-22.md) the caller supplies as `actor_kind` —
-/// `BusCallContext.actor` itself carries no type tag, so the caller resolves
-/// it from context it already has (`ActorKind::from_origin`).
+/// Resolves the effective policy for `(org_id, topic, direction)` for
+/// `subject`. For an actor the caller decides its KIND (`FP-subject-type`,
+/// SUM/tentabus/DECYZJE-2026-09-22.md) from context it already has
+/// (`PolicySubject::actor` + `ActorKind::from_origin`) —
+/// `BusCallContext.actor` itself carries no type tag.
 ///
 /// Precedence, most to least specific:
-///   1. an exact `subject_type` row matching `actor_kind` (`'user'` or
-///      `'addon'`) for `actor` itself;
-///   2. for a `User` actor only, a `subject_type='group'` row for one of the
-///      groups `actor` belongs to (`repository::get_user_groups` — the
+///   1. the subject's own row (`'user'`, `'addon'` or `'group'`);
+///   2. for a `User` only, a `subject_type='group'` row for one of the
+///      groups the user belongs to (`repository::get_user_groups` — the
 ///      platform's one source of group membership; groups are not a
 ///      meaningful concept for an addon actor, so this step is skipped for
-///      `Addon`). Group rows are checked in the same `(group.id)` ascending
-///      order `get_user_groups` already returns; the first match wins if a
-///      user belongs to more than one group with a row on this topic —
-///      arbitrary but deterministic, same tie-break shape as everywhere else
-///      in this file that has no ordering signal from the domain itself;
-///   3. the `subject_type='any'` topic-wide wildcard row.
+///      `Addon`, and a `Group` subject has already been matched in step 1).
+///      Group rows are checked in the same `(group.id)` ascending order
+///      `get_user_groups` already returns; the first match wins if a user
+///      belongs to more than one group with a row on this topic — arbitrary
+///      but deterministic, same tie-break shape as everywhere else in this
+///      file that has no ordering signal from the domain itself;
+///   3. the `subject_type='any'` topic-wide wildcard row (the only step for
+///      `PolicySubject::Any`).
 ///
 /// `Ok(None)` means "unrestricted" — no matching row at any level — which is
 /// also forced unconditionally for every OTHER `__`-prefixed reserved topic
@@ -177,23 +213,14 @@ pub fn resolve(
     instance_id: &str,
     org_id: &str,
     topic: &str,
-    actor: &str,
-    actor_kind: ActorKind,
+    subject: PolicySubject<'_>,
     direction: Direction,
 ) -> Result<Option<FieldPolicy>, BusServiceError> {
     if let Some(source_topic) = topic.strip_prefix(dlq::DLQ_TOPIC_PREFIX) {
         // A DLQ topic is only ever named after a non-reserved source topic
         // (`dlq::dlq_topic_name`), so `source_topic` never itself starts
         // with `RESERVED_PREFIX` — no risk of looping back into this branch.
-        return resolve(
-            pool,
-            instance_id,
-            org_id,
-            source_topic,
-            actor,
-            actor_kind,
-            direction,
-        );
+        return resolve(pool, instance_id, org_id, source_topic, subject, direction);
     }
     // Every OTHER reserved topic is broker-owned and carries no subject of
     // its own, so no policy applies to it. `set_policy` refuses to store one
@@ -204,43 +231,38 @@ pub fn resolve(
     if topic.starts_with(topics::RESERVED_PREFIX) {
         return Ok(None);
     }
-    if let Some(row) = repository::bus_field_policy_get(
-        pool,
-        instance_id,
-        org_id,
-        topic,
-        actor_kind.subject_type_str(),
-        actor,
-        direction.as_str(),
-    )? {
-        return decode(row, topic).map(Some);
+    let lookup = |subject_type: &str, subject_id: &str| {
+        repository::bus_field_policy_get(
+            pool,
+            instance_id,
+            org_id,
+            topic,
+            subject_type,
+            subject_id,
+            direction.as_str(),
+        )
+    };
+    let own = match subject {
+        PolicySubject::User(id) => Some(("user", id)),
+        PolicySubject::Addon(id) => Some(("addon", id)),
+        PolicySubject::Group(id) => Some(("group", id)),
+        PolicySubject::Any => None,
+    };
+    if let Some((subject_type, subject_id)) = own {
+        if let Some(row) = lookup(subject_type, subject_id)? {
+            return decode(row, topic).map(Some);
+        }
     }
-    if actor_kind == ActorKind::User {
-        let groups = repository::get_user_groups(pool, actor)
+    if let PolicySubject::User(user_id) = subject {
+        let groups = repository::get_user_groups(pool, user_id)
             .map_err(|e| BusServiceError::Db(e.to_string()))?;
         for group in groups {
-            if let Some(row) = repository::bus_field_policy_get(
-                pool,
-                instance_id,
-                org_id,
-                topic,
-                "group",
-                &group.id,
-                direction.as_str(),
-            )? {
+            if let Some(row) = lookup("group", &group.id)? {
                 return decode(row, topic).map(Some);
             }
         }
     }
-    if let Some(row) = repository::bus_field_policy_get(
-        pool,
-        instance_id,
-        org_id,
-        topic,
-        "any",
-        SUBJECT_ANY,
-        direction.as_str(),
-    )? {
+    if let Some(row) = lookup("any", SUBJECT_ANY)? {
         return decode(row, topic).map(Some);
     }
     Ok(None)
@@ -702,8 +724,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             &dlq_topic,
-            "some-actor",
-            ActorKind::User,
+            PolicySubject::actor("some-actor", ActorKind::User),
             Direction::Read,
         )
         .expect("resolve on the DLQ topic")
@@ -715,8 +736,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             source,
-            "some-actor",
-            ActorKind::User,
+            PolicySubject::actor("some-actor", ActorKind::User),
             Direction::Read,
         )
         .expect("resolve on the source topic")
@@ -758,8 +778,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             &dlq_topic,
-            "some-actor",
-            ActorKind::User,
+            PolicySubject::actor("some-actor", ActorKind::User),
             Direction::Read,
         )
         .expect("resolve on the DLQ topic");
@@ -776,8 +795,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             "__bus.metrics",
-            "some-actor",
-            ActorKind::User,
+            PolicySubject::actor("some-actor", ActorKind::User),
             Direction::Read,
         )
         .expect("resolve on a broker-internal topic");
@@ -820,8 +838,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             topic,
-            "meeting-recorder",
-            ActorKind::Addon,
+            PolicySubject::actor("meeting-recorder", ActorKind::Addon),
             Direction::Read,
         )
         .expect("resolve as the addon actor")
@@ -833,8 +850,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             topic,
-            "meeting-recorder",
-            ActorKind::User,
+            PolicySubject::actor("meeting-recorder", ActorKind::User),
             Direction::Read,
         )
         .expect("resolve as a user actor sharing the same raw id string");
@@ -901,8 +917,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             topic,
-            &member_id,
-            ActorKind::User,
+            PolicySubject::actor(&member_id, ActorKind::User),
             Direction::Read,
         )
         .expect("resolve for the group member")
@@ -914,8 +929,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             topic,
-            &outsider_id,
-            ActorKind::User,
+            PolicySubject::actor(&outsider_id, ActorKind::User),
             Direction::Read,
         )
         .expect("resolve for a non-member");
@@ -984,8 +998,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             topic,
-            &member_id,
-            ActorKind::User,
+            PolicySubject::actor(&member_id, ActorKind::User),
             Direction::Read,
         )
         .expect("resolve for the user")
@@ -1025,5 +1038,96 @@ mod tests {
         )
         .expect_err("an unknown subject_type must be rejected");
         assert!(matches!(err, BusServiceError::InvalidArgument(_)));
+    }
+
+    /// The subjects the administrator's preview asks about directly: a
+    /// group resolves its own row, else the topic-wide one — never a row of
+    /// one of its members — and `Any` is the topic-wide row alone, even when
+    /// the group has its own.
+    #[test]
+    fn resolve_for_a_group_or_any_subject_skips_member_rows() {
+        let db = test_db();
+        let topic = "orders.created";
+        topics::create_topic(
+            &db,
+            TEST_INSTANCE,
+            TEST_ORG,
+            topic,
+            topics::TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .expect("create topic");
+        let member_id =
+            repository::create_user_account(&db, "g-member", "hash", "Member", "m@example.com")
+                .expect("member");
+        let group_id = repository::create_group(&db, "nurses", "").expect("group");
+        let empty_group_id = repository::create_group(&db, "no-rule", "").expect("group");
+        repository::add_user_to_group(&db, &group_id, &member_id).expect("add member");
+        for (subject_type, subject_id, fields) in [
+            ("any", SUBJECT_ANY, vec!["id"]),
+            ("group", group_id.as_str(), vec!["id", "name"]),
+            ("user", member_id.as_str(), vec!["id", "name", "pesel"]),
+        ] {
+            set_policy(
+                &db,
+                TEST_INSTANCE,
+                TEST_ORG,
+                topic,
+                subject_type,
+                subject_id,
+                Direction::Read,
+                &field_set(&fields),
+                &BTreeSet::new(),
+            )
+            .expect("set policy");
+        }
+        let fields_of = |subject: PolicySubject<'_>| {
+            resolve(
+                &db,
+                TEST_INSTANCE,
+                TEST_ORG,
+                topic,
+                subject,
+                Direction::Read,
+            )
+            .expect("resolve")
+            .map(|p| p.fields)
+        };
+        assert_eq!(
+            fields_of(PolicySubject::Group(&group_id)),
+            Some(field_set(&["id", "name"]))
+        );
+        assert_eq!(
+            fields_of(PolicySubject::Group(&empty_group_id)),
+            Some(field_set(&["id"]))
+        );
+        assert_eq!(fields_of(PolicySubject::Any), Some(field_set(&["id"])));
+        assert_eq!(
+            fields_of(PolicySubject::User(&member_id)),
+            Some(field_set(&["id", "name", "pesel"]))
+        );
+    }
+
+    #[test]
+    fn policy_subject_parse_accepts_the_four_kinds_only() {
+        assert_eq!(
+            PolicySubject::parse("user", "u-1"),
+            Some(PolicySubject::User("u-1"))
+        );
+        assert_eq!(
+            PolicySubject::parse("addon", "a"),
+            Some(PolicySubject::Addon("a"))
+        );
+        assert_eq!(
+            PolicySubject::parse("group", "g"),
+            Some(PolicySubject::Group("g"))
+        );
+        assert_eq!(
+            PolicySubject::parse("any", SUBJECT_ANY),
+            Some(PolicySubject::Any)
+        );
+        assert_eq!(PolicySubject::parse("any", "u-1"), None);
+        assert_eq!(PolicySubject::parse("api_key", "k"), None);
     }
 }

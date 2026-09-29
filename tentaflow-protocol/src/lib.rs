@@ -55,12 +55,13 @@ pub use benchmark::{
 };
 pub use bus::{
     BusAclEntryWire, BusBrowsePartitionInfoWire, BusCapabilitiesWire, BusDlqListResultWire,
-    BusDlqRecordWire, BusDlqSampleWire, BusEnvelope, BusFailoverEventWire, BusFieldPolicyWire,
-    BusGroupDetailWire, BusGroupLagSeriesWire, BusGroupLagSummaryWire, BusGroupPartitionDetailWire,
-    BusGroupStatsWire, BusGroupSummaryWire, BusHeaderWire, BusLagSampleWire, BusMessagePreviewWire,
-    BusMessagesBrowseResultWire, BusOffsetResetMode, BusPartitionInfoWire, BusPartitionOffsetWire,
-    BusPartitionReplicaWire, BusPayload, BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire,
-    BusSchemaSubjectWire, BusSchemaVersionWire, BusStatsSnapshotWire, BusTopicAccessWire,
+    BusDlqRecordWire, BusDlqSampleWire, BusEnvelope, BusFailoverEventWire, BusFieldActionWire,
+    BusFieldPolicyWire, BusGroupDetailWire, BusGroupLagSeriesWire, BusGroupLagSummaryWire,
+    BusGroupPartitionDetailWire, BusGroupStatsWire, BusGroupSummaryWire, BusHeaderWire,
+    BusLagSampleWire, BusMessagePreviewWire, BusMessagesBrowseResultWire, BusOffsetResetMode,
+    BusPartitionInfoWire, BusPartitionOffsetWire, BusPartitionReplicaWire, BusPayload,
+    BusQuotaWire, BusReplicaLagWire, BusReplicaNodeWire, BusSchemaSubjectWire,
+    BusSchemaVersionWire, BusStatsSnapshotWire, BusSubjectWire, BusTopicAccessWire,
     BusTopicConfigWire, BusTopicDlqSeriesWire, BusTopicOptionsWire, BusTopicStatsWire,
     BusTopicSummaryWire,
 };

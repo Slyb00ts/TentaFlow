@@ -58,6 +58,43 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   wersji) — po aktualizacji ponów nadanie uprawnień systemowych. Nagłówek
   pliku reguł audytu NFS zmienia się na angielski przy następnym zapisie.
 
+### TentaBus
+
+- Katalog podmiotów dla okien „Nadaj dostęp” i „Ukrywanie danych”:
+  `SubjectDirectoryRequest { kind, query }` zwraca do 50 osób, grup albo
+  addonów (`BusSubjectWire`: rodzaj, identyfikator, nazwa, liczba członków
+  grupy) wyłącznie z organizacji wywołującego, posortowanych po nazwie
+  i zawężonych frazą (bez rozróżniania wielkości liter). Osoby to aktywni
+  członkowie organizacji, podpisani nazwą wyświetlaną albo loginem, nigdy
+  adresem e-mail; grupy to te, które mają w organizacji co najmniej jednego
+  aktywnego członka, a liczba członków liczy tylko ich; addony to włączone
+  addony deklarujące `bus.publish`/`bus.subscribe`, którym macierz uprawnień
+  tej instancji daje `bus.read` lub `bus.write`. Wymaga uprawnienia
+  `bus.admin` i roli administratora organizacji.
+- Podgląd „jak widzi…”: `FieldPolicyPreviewRequest { topic, partition,
+  offset, subject_type, subject_id }` pokazuje wiadomość tak, jak odczytałby
+  ją wskazany podmiot (osoba: własna zasada, potem zasada jej grupy, potem
+  zasada dla wszystkich; grupa i addon: własna zasada, potem zasada dla
+  wszystkich), razem z listą pól „pokaż/ukryj”. Podgląd nigdy nie pokazuje
+  więcej, niż może odczytać sam administrator; `limited_by_caller` mówi, że
+  jego własna zasada zawęziła widok. Wymaga roli administratora i prawa
+  administrowania topikiem; wpis audytu `bus.field_policy.preview` nie
+  zawiera treści wiadomości.
+- Addon jest osobnym rodzajem podmiotu w dostępie do topiku
+  (`subject_type = 'addon'` w `AclSetRequest`/`AclListResponse`). Wywołania
+  addonu są sprawdzane wyłącznie wierszami addonu — użytkownik o tym samym
+  identyfikatorze nie dziedziczy jego wiersza i odwrotnie. Liczba członków
+  grupy w liście dostępu i zasadach ukrywania danych liczy teraz tylko
+  członków organizacji, tak jak katalog, a wiersz addonu ma jego nazwę.
+- Aktualizacja: migracja bazy 177 przebudowuje `resource_permissions`
+  (dopuszcza `subject_type = 'addon'`) i zamienia wiersze topików zapisane
+  dotąd jako użytkownik z identyfikatorem zainstalowanego addonu (i bez
+  konta o tym identyfikatorze) na wiersze addonu. Zamiana działa na każdym
+  nodzie osobno; na nodzie bez tego addonu stary wiersz zostaje i nie działa
+  na nikogo. Nod w starszej wersji odrzuca zsynchronizowany wiersz addonu
+  (operacja trafia do konfliktów synchronizacji) i dalej traktuje addony jak
+  użytkowników — nody trzeba zaktualizować razem.
+
 ## [0.4.0-beta.1] — 2026-09-29
 
 Zmiany od tagu `v0.4.0-beta`. Pełny opis zmian od `v0.3.0-beta` znajduje się
