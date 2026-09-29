@@ -21,7 +21,13 @@
 //              Nieprzetworzone wiadomości (the tiles and the merged list of the
 //              instance, a topic's section, Pokaż with the data-hiding rules
 //              applied, Ponów / Odrzuć / Ponów wszystkie with every counter
-//              following, the phone layout and a reader without rights); and,
+//              following, the phone layout and a reader without rights); then
+//              U5: Wzory wiadomości (the list, a pattern's page with the text
+//              of a version, "Pobierz" and "Kopiuj", adding a pattern, a new
+//              version refused in plain words and added after the
+//              compatibility changed, withdrawing a version and the pattern,
+//              deleting from the page and from the list, a used pattern the
+//              server will not delete, the phone layout and a reader); and,
 //              last because it stops the node, the list kept under the
 //              connection notice (T12). Stateful: run the whole project, never `-g`.
 //              The runtime lives under the repo's `.runtime/` — on macOS a
@@ -340,13 +346,10 @@ test('T01 at 390x844: one column, no horizontal scroll, the same content', async
   await assertNoOverflow(page);
   await page.screenshot({ path: path.join(SHOTS, 't01-przeglad-telefon.png'), fullPage: true });
 
-  // Wzory wiadomości on the phone: the table turns into cards, nothing cut
-  // off, and a row that opens nothing does not look like it would.
+  // Wzory wiadomości on the phone: the table turns into cards, nothing cut off.
   await tab(page, 'schemas').click();
   const table = page.locator('#tb-panel > [data-tb-view-slot="schemas"] [data-role="table"]');
   await expect(table.locator('tbody tr')).toHaveCount(2, { timeout: 15000 });
-  const cursors = await table.locator('tbody tr').evaluateAll((rows) => [...new Set(rows.map((r) => getComputedStyle(r).cursor))]);
-  expect(cursors).not.toContain('pointer');
   await assertNoOverflow(page);
   const clipped = await table.evaluate((host) => [...host.shadowRoot.querySelectorAll('td')].filter((td) => td.getBoundingClientRect().width > 0 && td.scrollWidth > td.clientWidth + 1).length);
   expect(clipped).toBe(0);
@@ -2058,6 +2061,316 @@ test('U4 Ponów wszystkie: from a tile and from a section, what stays is counted
   await tab(page, 'overview').click();
   await expect(overview(page).locator('tf-stat-card[data-kpi="dlq"]')).toHaveAttribute('value', '0', { timeout: 15000 });
   expect(errors, errors.join('\n')).toEqual([]);
+});
+
+// ----------------------------------------------------------------------------
+// U5 — Wzory wiadomości (T08): the list, a pattern's page, and the windows
+// (add, new version accepted and refused, compatibility, withdraw a version
+// and the pattern, delete), each ending on the new state on screen and on
+// the server.
+// ----------------------------------------------------------------------------
+
+const schemasSlot = (page) => page.locator('#tb-panel > [data-tb-view-slot="schemas"]');
+const schemaSlot = (page) => page.locator('#tb-panel > [data-tb-view-slot="schema"]');
+const schemaWindow = (page) => page.locator('tf-window.tb-schema-window');
+const deleteWindow = (page) => page.locator('tf-window.tb-delete-window');
+const schemaTable = (page) => schemasSlot(page).locator('[data-role="table"]');
+const schemaRow = (page, name) => schemaTable(page).locator('tbody tr').filter({ has: page.locator('.tf-table__cell-title', { hasText: new RegExp(`^${name}$`) }) });
+const versionRow = (page, n) => schemaSlot(page).locator('[data-role="versions"] tbody tr').filter({ has: page.locator('.tf-table__cell-title', { hasText: new RegExp(`^Wersja ${n}$`) }) });
+const editorText = (page) => schemaSlot(page).locator('tf-code-editor').evaluate((el) => el.value);
+
+const REFERRAL_V1 = JSON.stringify({ type: 'object', required: ['pacjent', 'badanie'], properties: { pacjent: { type: 'string' }, badanie: { type: 'string' } } }, null, 2);
+const REFERRAL_V2 = JSON.stringify({ type: 'object', required: ['pacjent', 'badanie', 'pilne'], properties: { pacjent: { type: 'string' }, badanie: { type: 'string' }, pilne: { type: 'boolean' } } }, null, 2);
+
+async function openSchemas(page) {
+  await openInstance(page, 'Produkcja');
+  await tab(page, 'schemas').click();
+  await expect(schemaTable(page).locator('tbody tr').first()).toBeVisible({ timeout: 20000 });
+}
+
+async function openSchemaPage(page, name) {
+  const instance = await openInstance(page, 'Produkcja');
+  await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instance}&tab=schemas&subject=${name}`);
+  await expect(schemaSlot(page).locator('.tb-title')).toHaveText(name, { timeout: 20000 });
+  return instance;
+}
+
+test('U5 Wzory at 1440: the list, a pattern\'s page with its text, versions and compatibility', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openSchemas(page);
+  const instance = hashParams(page).instance;
+  await expect(schemaTable(page).locator('tbody tr')).toHaveCount(2);
+  await expect(schemasSlot(page).locator('[data-role="filter"] .tf-seg-opt')).toHaveText(['Wszystkie 2', 'W użyciu 1', 'Wycofane 1']);
+  const used = (await busCall(page, 'busSchemaSubjectListRequest', { instanceId: instance })).subjects.find((s) => s.subject === 'wizyta').usedByTopics.sort();
+  expect(used).toContain('wizyty');
+  const blocked = schemaRow(page, 'wizyta').locator('tf-button[data-act="delete"]');
+  await expect(blocked).toHaveAttribute('disabled', '');
+  await expect(blocked).toHaveAttribute('title', new RegExp(`^Nie można usunąć: używa(ją)? go topik(i)? ${used[0]}`));
+  await expect(schemaRow(page, 'wizyta-2025').locator('tf-button[data-act="delete"]')).not.toHaveAttribute('disabled', '');
+  await assertNoOverflow(page);
+  await page.screenshot({ path: path.join(SHOTS, 't08-wzory.png'), fullPage: true });
+
+  await schemaRow(page, 'wizyta').locator('td').first().click();
+  const p = schemaSlot(page);
+  await expect(p.locator('.tb-title')).toHaveText('wizyta', { timeout: 15000 });
+  expect(hashParams(page)).toMatchObject({ tab: 'schemas', subject: 'wizyta' });
+  await expect(page.locator('#tb-crumbs')).toContainText('wizyta');
+  await expect(p.locator('[data-role="chips"] tf-chip')).toHaveCount(3);
+  await expect(p.locator('[data-role="chips"] tf-chip').nth(0)).toHaveAttribute('label', 'JSON Schema');
+  await expect(p.locator('[data-role="chips"] tf-chip').nth(1)).toHaveAttribute('label', 'wersja 3');
+  await expect(p.locator('[data-role="chips"] tf-chip').nth(2)).toHaveAttribute('label', 'w użyciu');
+  await expect(p.locator('[data-role="desc"]')).toContainText('używa');
+  await expect(p.locator('[data-role="badges"] tf-chip')).toHaveAttribute('label', 'zgodność: nowe programy przeczytają stare wiadomości');
+  await expect(p.locator('[data-role="text-title"]')).toHaveText('Wersja 3 — tekst wzoru');
+  await expect(p.locator('[data-role="about"]')).toHaveText('Wizyta musi mieć pacjenta i termin.');
+  await expect.poll(() => editorText(page), { timeout: 15000 }).toContain('"gabinet"');
+  await expect(p.locator('[data-role="versions"] tbody tr')).toHaveCount(3);
+  await expect(versionRow(page, 3)).toContainText('aktualna');
+  await expect(versionRow(page, 2)).toContainText('starsza');
+  await expect(versionRow(page, 1)).toContainText('wycofana');
+  await expect(versionRow(page, 1).locator('tf-button[data-act="withdraw-version"]')).toHaveCount(0);
+  await expect(p.locator('[data-role="delete"]')).toHaveAttribute('disabled', '');
+  await expect(p.locator('[data-role="delete-note"]')).toContainText(used[0]);
+  await assertNoOverflow(page);
+  await assertNoBannedWords(page);
+  await page.screenshot({ path: path.join(SHOTS, 't08-wzor-wizyta.png'), fullPage: true });
+
+  // An older version's text, then "Pobierz" and "Kopiuj" of what is shown.
+  await versionRow(page, 2).locator('tf-button[data-act="show-version"]').click();
+  await expect(p.locator('[data-role="text-title"]')).toHaveText('Wersja 2 — tekst wzoru');
+  await expect(p.locator('[data-role="text-note"]')).toHaveText('Topiki sprawdzają wiadomości według wersji 3, nie tej.');
+  await expect.poll(() => editorText(page)).not.toContain('"gabinet"');
+  const [download] = await Promise.all([page.waitForEvent('download'), p.locator('[data-role="download"]').click()]);
+  expect(download.suggestedFilename()).toBe('wizyta-v2.json');
+  const saved = fs.readFileSync(await download.path(), 'utf8');
+  expect(JSON.parse(saved).properties.lekarz).toBeTruthy();
+  expect(saved).not.toContain('gabinet');
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: `https://127.0.0.1:${PORT}` });
+  await p.locator('[data-role="copy"]').click();
+  await expect(page.locator('.toast', { hasText: 'Skopiowano tekst wersji 2' })).toBeVisible();
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(saved);
+
+  // A reload opens the same pattern.
+  await page.reload();
+  await expect(schemaSlot(page).locator('.tb-title')).toHaveText('wizyta', { timeout: 20000 });
+  await expect(tab(page, 'schemas')).toHaveAttribute('aria-selected', 'true');
+  await schemaSlot(page).locator('[data-go="back"]').first().click();
+  await expect(schemaTable(page).locator('tbody tr')).toHaveCount(2);
+  expect(hashParams(page).subject).toBeUndefined();
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U5 Dodaj wzór, then a new version refused in plain words, the compatibility changed, the version added', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  await openSchemas(page);
+  const instance = hashParams(page).instance;
+  await schemasSlot(page).locator('[data-go="add"]').first().click();
+  const win = schemaWindow(page);
+  await expect(win.locator('[slot="body"]')).toBeVisible();
+  await expect(win.locator('tf-choice-card')).toHaveAttribute('heading', 'JSON Schema');
+  const save = win.locator('[data-act="save"]');
+  await win.locator('[data-role="name"] input').fill('wizyta');
+  await expect(win.locator('[data-role="name"]')).toHaveAttribute('error', /już jest/);
+  await win.locator('[data-role="name"] input').fill('skierowanie');
+  await win.locator('[data-role="text"] textarea').fill('{"type": ');
+  await expect(win.locator('[data-role="text"]')).toHaveAttribute('error', /To nie jest poprawny JSON/);
+  await expect(save).toHaveAttribute('disabled', '');
+  await win.locator('[data-role="text"] textarea').fill(REFERRAL_V1);
+  await expect(win.locator('[data-role="impact"]')).toHaveText('Co się stanie po dodaniu: powstanie wzór skierowanie (JSON Schema), wersja 1. Żaden topik go jeszcze nie używa — wybierzesz go w ustawieniach topiku.');
+  await page.screenshot({ path: path.join(SHOTS, 't08-dodaj.png') });
+  await save.click();
+  await expect(win).toHaveCount(0);
+  await expect(schemasSlot(page).locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Dodano wzór skierowanie');
+  await expect(schemaTable(page).locator('tbody tr')).toHaveCount(3, { timeout: 15000 });
+  await expect(page.locator('#tb-tabs tf-tab#schemas')).toHaveAttribute('count', '3');
+  await expect(schemaRow(page, 'skierowanie')).toContainText('nieużywany');
+  await page.screenshot({ path: path.join(SHOTS, 't08-dodano.png'), fullPage: true });
+
+  await schemaRow(page, 'skierowanie').locator('td').first().click();
+  const p = schemaSlot(page);
+  await expect(p.locator('.tb-title')).toHaveText('skierowanie', { timeout: 15000 });
+  await expect(p.locator('[data-role="delete"]')).not.toHaveAttribute('disabled', '');
+
+  // A new required field breaks "nowe programy przeczytają stare wiadomości".
+  await p.locator('[data-role="new-version"]').click();
+  await expect(win.locator('[data-role="text"] textarea')).toHaveValue(REFERRAL_V1);
+  await win.locator('[data-role="text"] textarea').fill(REFERRAL_V2);
+  await expect(win.locator('[data-role="diff"]')).toHaveText('Różnica względem wersji 1: nowe, wymagane pole „pilne”.');
+  await win.locator('[data-act="save"]').click();
+  const refusal = win.locator('[data-role="error"]');
+  await expect(refusal).toBeVisible({ timeout: 15000 });
+  await expect(refusal).toHaveText('Nie dodano wersji 2. Ten wzór ma zgodność „nowe programy przeczytają stare wiadomości”, a nowa wersja wymaga pola „pilne”, którego stare wiadomości mogą nie mieć. Usuń „pilne” z pól wymaganych albo zmień zgodność wzoru.');
+  await expect(win).toHaveCount(1);
+  await page.screenshot({ path: path.join(SHOTS, 't08-wzor-nowa-wersja-odmowa.png') });
+  await win.locator('[data-act="cancel"]').click();
+  await expect(win).toHaveCount(0);
+  expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: 'skierowanie' })).versions).toHaveLength(1);
+
+  await p.locator('[data-role="compat"]').click();
+  await win.locator('tf-radio[value="none"]').click();
+  await expect(win.locator('[data-role="impact"]')).toContainText('każda kolejna wersja wzoru skierowanie będzie sprawdzana warunkiem „bez sprawdzania”');
+  await win.locator('[data-act="save"]').click();
+  await expect(win).toHaveCount(0);
+  await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Zapisano zgodność');
+  await expect(p.locator('[data-role="badges"] tf-chip')).toHaveAttribute('label', 'zgodność: bez sprawdzania', { timeout: 15000 });
+
+  // "Nowa wersja" comes back with the refused text.
+  await p.locator('[data-role="new-version"]').click();
+  await expect(win.locator('.tb-explain-box')).toContainText('z poprzedniej próby');
+  await expect(win.locator('[data-role="text"] textarea')).toHaveValue(REFERRAL_V2);
+  await win.locator('[data-act="save"]').click();
+  await expect(win).toHaveCount(0, { timeout: 15000 });
+  await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Dodano wersję 2');
+  await expect(p.locator('[data-role="chips"] tf-chip').nth(1)).toHaveAttribute('label', 'wersja 2', { timeout: 15000 });
+  await expect(p.locator('[data-role="versions"] tbody tr')).toHaveCount(2);
+  await expect(versionRow(page, 2)).toContainText('aktualna');
+  await expect.poll(() => editorText(page)).toContain('"pilne"');
+  expect((await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: 'skierowanie' })).versions.map((v) => v.version)).toEqual([1, 2]);
+  expect(errors.filter((e) => !/schema_incompatible|BadRequest/.test(e)), errors.join('\n')).toEqual([]);
+});
+
+test('U5 withdraw a version, withdraw the pattern, delete it; a pattern a topic uses cannot be deleted', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instance = await openSchemaPage(page, 'skierowanie');
+  const p = schemaSlot(page);
+  const confirm = page.locator('tf-window.tb-schema-window');
+
+  await versionRow(page, 2).locator('tf-button[data-act="withdraw-version"]').click();
+  await expect(confirm.locator('[data-role="impact"]')).toHaveText('Co się stanie po wycofaniu: najnowszą niewycofaną wersją stanie się wersja 1.');
+  await expect(confirm.locator('.tb-foot-note')).toContainText('dzienniku audytu');
+  await page.screenshot({ path: path.join(SHOTS, 't08-wzor-wycofaj-wersje.png') });
+  await confirm.locator('[data-act="go"]').click();
+  await expect(confirm).toHaveCount(0);
+  await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Wycofano wersję 2');
+  await expect(versionRow(page, 2)).toContainText('wycofana', { timeout: 15000 });
+  await expect(versionRow(page, 1)).toContainText('aktualna');
+  const afterVersion = (await busCall(page, 'busSchemaVersionListRequest', { instanceId: instance, subject: 'skierowanie' })).versions;
+  expect(afterVersion.find((v) => v.version === 2).deprecatedAtMs).toBeTruthy();
+  expect(afterVersion.find((v) => v.version === 1).deprecatedAtMs ?? null).toBeNull();
+
+  await p.locator('[data-role="withdraw"]').click();
+  await expect(confirm.locator('.tb-explain-box')).toContainText('Wzór skierowanie i 1 jego niewycofana wersja zostaną oznaczone jako wycofane.');
+  await confirm.locator('[data-act="go"]').click();
+  await expect(confirm).toHaveCount(0);
+  await expect(p.locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Wycofano wzór skierowanie');
+  await expect(p.locator('[data-role="warning"] tf-alert')).toHaveAttribute('title', 'Wzór wycofany', { timeout: 15000 });
+  await expect(p.locator('[data-role="new-version"]')).toHaveAttribute('disabled', '');
+  await expect(p.locator('[data-role="withdraw"]')).toHaveAttribute('disabled', '');
+  await expect(p.locator('[data-role="compat"]')).toHaveCount(0);
+  await expect(versionRow(page, 1)).toContainText('wycofana');
+  await page.screenshot({ path: path.join(SHOTS, 't08-wzor-wycofano.png'), fullPage: true });
+  const subjects = (await busCall(page, 'busSchemaSubjectListRequest', { instanceId: instance })).subjects;
+  expect(subjects.find((s) => s.subject === 'skierowanie').deprecatedAtMs).toBeTruthy();
+
+  await p.locator('[data-role="delete"]').click();
+  const del = deleteWindow(page);
+  await expect(del.locator('.tb-danger-box')).toContainText('Wzór skierowanie (JSON Schema) i 2 jego wersje znikną.');
+  await expect(del.locator('[data-action="confirm"]')).toHaveAttribute('disabled', '');
+  await del.locator('#retype-input input').fill('skierowanie');
+  await del.locator('[data-action="confirm"]').click();
+  await expect(del).toHaveCount(0, { timeout: 15000 });
+  await expect(schemasSlot(page).locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Usunięto wzór skierowanie');
+  await expect(schemaTable(page).locator('tbody tr')).toHaveCount(2, { timeout: 15000 });
+  await expect(schemaRow(page, 'skierowanie')).toHaveCount(0);
+  expect(hashParams(page).subject).toBeUndefined();
+
+  // The withdrawn, unused pattern goes from its row.
+  await schemasSlot(page).locator('[data-role="filter"] .tf-seg-opt', { hasText: 'Wycofane' }).click();
+  await expect(schemaTable(page).locator('tbody tr')).toHaveCount(1);
+  await schemaRow(page, 'wizyta-2025').locator('tf-button[data-act="delete"]').click();
+  await expect(del.locator('.tb-danger-box')).toContainText('Wzór wizyta-2025 (JSON Schema) i 1 jego wersja znikną.');
+  await del.locator('#retype-input input').fill('wizyta-2025');
+  await del.locator('[data-action="confirm"]').click();
+  await expect(del).toHaveCount(0, { timeout: 15000 });
+  await expect(schemasSlot(page).locator('[data-role="notice"] tf-alert')).toHaveAttribute('title', 'Usunięto wzór wizyta-2025');
+  await expect(schemasSlot(page).locator('[data-role="filter"] .tf-seg-opt')).toHaveText(['Wszystkie 1', 'W użyciu 1', 'Wycofane 0'], { timeout: 15000 });
+
+  // A pattern a topic uses: no delete on screen, and the server refuses it too.
+  await schemasSlot(page).locator('[data-role="filter"] .tf-seg-opt', { hasText: 'Wszystkie' }).click();
+  await expect(schemaRow(page, 'wizyta').locator('tf-button[data-act="delete"]')).toHaveAttribute('disabled', '');
+  const refused = await page.evaluate(async (iid) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    try {
+      await ApiBinary.action('busSchemaDeleteRequest', { instanceId: iid, subject: 'wizyta', deprecateOnly: false });
+      return null;
+    } catch (err) {
+      return String(err?.message || err);
+    }
+  }, instance);
+  expect(refused).toMatch(/is bound by topics: .*wizyty/);
+  expect((await busCall(page, 'busSchemaSubjectListRequest', { instanceId: instance })).subjects.map((s) => s.subject)).toEqual(['wizyta']);
+  expect(errors.filter((e) => !/bound by topics|BadRequest/.test(e)), errors.join('\n')).toEqual([]);
+});
+
+test('U5 at 390x844: the list as cards, the pattern\'s page in one column, a window fills the phone', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(PHONE);
+  await login(page);
+  await openSchemas(page);
+  await assertNoOverflow(page);
+  await page.screenshot({ path: path.join(SHOTS, 't08-wzory-u5-telefon.png'), fullPage: true });
+  await schemasSlot(page).locator('[data-go="add"]').first().click();
+  await expect(schemaWindow(page).locator('[slot="body"]')).toBeVisible();
+  await windowFits(page, 'tf-window.tb-schema-window', PHONE.width);
+  await page.screenshot({ path: path.join(SHOTS, 't08-dodaj-telefon.png') });
+  await schemaWindow(page).locator('[data-act="cancel"]').click();
+  await expect(schemaWindow(page)).toHaveCount(0);
+  await schemaRow(page, 'wizyta').locator('td').first().click();
+  const p = schemaSlot(page);
+  await expect(p.locator('.tb-title')).toHaveText('wizyta', { timeout: 15000 });
+  await expect.poll(() => editorText(page), { timeout: 15000 }).toContain('"gabinet"');
+  const cols = await p.locator('.tb-schema-grid').evaluate((el) => getComputedStyle(el).gridTemplateColumns.split(' ').length);
+  expect(cols).toBe(1);
+  await assertNoOverflow(page);
+  await page.screenshot({ path: path.join(SHOTS, 't08-wzor-wizyta-telefon.png'), fullPage: true });
+  await p.locator('[data-role="compat"]').click();
+  await expect(schemaWindow(page).locator('[slot="body"]')).toBeVisible();
+  await windowFits(page, 'tf-window.tb-schema-window', PHONE.width);
+  await schemaWindow(page).locator('[data-act="cancel"]').click();
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U5 without administration: the patterns to read, no change buttons, who changes them', async ({ page, browser }) => {
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: DESKTOP });
+  const rp = await context.newPage();
+  const readerErrors = trackErrors(rp);
+  try {
+    await rp.addInitScript(() => {
+      localStorage.setItem('tentaflow_lang', 'pl');
+      document.addEventListener('DOMContentLoaded', () => {
+        const st = document.createElement('style');
+        st.textContent = '.update-overlay{display:none!important}';
+        document.head.appendChild(st);
+      });
+    });
+    await loginAsAdmin(rp, { port: PORT, username: 'tomasz', password: 'Tomasz-czyta-1' });
+    await rp.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=schemas`);
+    await expect(schemaTable(rp).locator('tbody tr')).toHaveCount(1, { timeout: 20000 });
+    await expect(schemasSlot(rp).locator('[data-go="add"]')).toHaveCount(0);
+    await expect(schemasSlot(rp).locator('.tb-admin-note')).toContainText('administrator instancji');
+    await expect(schemaRow(rp, 'wizyta').locator('tf-button[data-act="delete"]')).toHaveCount(0);
+    await schemaRow(rp, 'wizyta').locator('td').first().click();
+    const p = schemaSlot(rp);
+    await expect(p.locator('.tb-title')).toHaveText('wizyta', { timeout: 15000 });
+    await expect(p.locator('[data-role="actions"] tf-button')).toHaveCount(0);
+    await expect(p.locator('[data-role="actions"]')).toContainText('Wzory dodaje, zmienia, wycofuje i usuwa administrator instancji.');
+    await expect(p.locator('[data-role="compat"]')).toHaveCount(0);
+    await expect(p.locator('[data-role="versions"] tf-button[data-act="withdraw-version"]')).toHaveCount(0);
+    await expect.poll(() => p.locator('tf-code-editor').evaluate((el) => el.value), { timeout: 15000 }).toContain('"gabinet"');
+    await rp.screenshot({ path: path.join(SHOTS, 't08-wzor-bez-uprawnien.png'), fullPage: true });
+    expect(readerErrors.filter((e) => !/PolicyDenied|permission_denied|protocol error/i.test(e)), readerErrors.join('\n')).toEqual([]);
+  } finally {
+    await context.close();
+  }
 });
 
 test('T12: when the node stops, the list keeps its last data under the connection notice', async ({ page }) => {

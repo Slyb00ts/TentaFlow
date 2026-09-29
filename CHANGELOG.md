@@ -64,6 +64,23 @@ wszystkich platform. Wynik kompilacji należy sprawdzić w GitHub Actions.
   więc do czasu aktualizacji wszystkich nodów instancji walidacja może się
   między nimi różnić. Opis spoza limitów tej wersji (np. dłuższy niż
   500 znaków) jest przy synchronizacji skracany.
+- Wzory wiadomości w panelu: wiersz listy otwiera stronę wzoru, a
+  administrator instancji dodaje wzór („Dodaj wzór”: nazwa, zgodność, format
+  z tych, które serwer sprawdza, tekst wpisany albo wczytany z pliku) i usuwa
+  wzór, którego nie używa żaden topik — dla używanego kosz jest wyłączony
+  i podaje topiki. Strona wzoru pokazuje format, wersję, stan, kto i kiedy
+  go dodał, topiki i zgodność, tekst wybranej wersji tylko do odczytu
+  z „Kopiuj” i „Pobierz” oraz opis zapisany w samym wzorze (`description`
+  JSON Schema, `doc` Avro), wersje z „Wycofaj” przy każdej aktywnej i kartę
+  zgodności z „Zmień”. Okna „Nowa wersja”, „Zmień zgodność”, „Wycofaj wzór”,
+  „Wycofaj wersję” i „Usuń…” mówią przed potwierdzeniem, według której
+  wersji topiki będą sprawdzać wiadomości. Odmowę nowej wersji przez
+  zgodność panel opisuje zwykłymi słowami (np. „nowa wersja wymaga pola
+  „pilne”, którego stare wiadomości mogą nie mieć”), a nieznany powód
+  pokazuje z tekstem serwera w zwijanym bloku; tekst odrzuconej wersji
+  wraca przy następnej próbie. Wycofany wzór ma ostrzeżenie „Wzór wycofany”
+  i nie przyjmuje nowych wersji. Adres strony wzoru:
+  `#/tentabus?instance=…&tab=schemas&subject=…`.
 
 - Nieprzetworzone wiadomości: usunięto ograniczenia opisane w wydaniu 0.4.0-beta.
   „Wczytaj więcej” nie powtarza wierszy przy wielu partycjach. Ponowienie

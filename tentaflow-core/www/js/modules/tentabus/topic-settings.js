@@ -28,8 +28,7 @@ import { I18n } from '/js/i18n.js';
 import { T, fmtCount, fmtBytes, fmtRetention, fmtDuration, contentTypeLabel } from '/js/modules/tentabus/format.js';
 import { compatibleSchemas, compatibleFormatsLabel, descriptionFits, DESCRIPTION_MAX } from '/js/modules/tentabus/topic-creator.js';
 import { schemaFormatLabel } from '/js/modules/tentabus/schemas.js';
-import { patchHtml } from '/js/lib/dom-patch.js';
-import '/js/components/tf-window.js';
+import { openChangeWindow } from '/js/modules/tentabus/windows.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
@@ -343,80 +342,6 @@ export function settingsHtml(view) {
 // ---------------------------------------------------------------------------
 // The windows
 // ---------------------------------------------------------------------------
-
-/**
- * One "Zmień …" window. `fields()` = the body's controls (markup), `wire(win,
- * sync)` attaches their handlers and calls `sync()` on every change,
- * `draft()` = the values the controls hold now (or `null` when one is not
- * valid), `impact(draft)` = the "Co się stanie" sentences, `save(draft)`
- * sends it (may throw: the window stays with `describeError(err)`),
- * `onSaved(draft)` runs after the window closed.
- */
-function openChangeWindow({ title, icon, width = 620, fields, wire, draft, current, impact, save, describeError, onSaved }) {
-  const win = document.createElement('tf-window');
-  win.className = 'tb-window tb-change-window';
-  win.setAttribute('title', title);
-  win.setAttribute('icon', icon);
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('modal', '');
-  win.setAttribute('draggable', '');
-  win.setAttribute('width', String(width));
-  win.setAttribute('min-width', '360');
-  win.setAttribute('initial-x', 'center');
-  win.setAttribute('initial-y', 'center');
-  win.innerHTML = `
-    <div slot="body" class="stack">
-      ${fields()}
-      <div class="tb-will-happen" data-role="impact" aria-live="polite"></div>
-      <div class="tb-window-error" role="alert" data-role="error" hidden>${sprite('alert')}<span></span></div>
-    </div>
-    <div slot="footer">
-      <tf-button variant="ghost" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-      <tf-button variant="primary" icon="check" data-act="save" disabled>${escapeHtml(T('settings.save'))}</tf-button>
-    </div>`;
-  document.body.appendChild(win);
-  let busy = false;
-  const saveBtn = win.querySelector('[data-act="save"]');
-  const cancelBtn = win.querySelector('[data-act="cancel"]');
-  const changed = (d) => d != null && Object.keys(d).some((k) => d[k] !== current[k]);
-  const sync = () => {
-    const d = draft(win);
-    const lines = d == null ? [] : impact(d);
-    patchHtml(win.querySelector('[data-role="impact"]'), d == null
-      ? `${sprite('info')}<div>${escapeHtml(T('settings.fix_fields'))}</div>`
-      : changed(d)
-        ? `${sprite('info')}<div><b>${escapeHtml(T('settings.will_happen'))}</b> ${lines.map(escapeHtml).join(' ')}</div>`
-        : `${sprite('info')}<div>${escapeHtml(T('settings.nothing_changed'))}</div>`);
-    saveBtn.toggleAttribute('disabled', busy || !changed(d));
-    cancelBtn.toggleAttribute('disabled', busy);
-  };
-  wire(win, sync);
-  sync();
-  win.addEventListener('close-request', (e) => { if (busy) e.preventDefault(); });
-  win.addEventListener('click', async (e) => {
-    const btn = e.target.closest('[data-act]');
-    if (!btn || btn.hasAttribute('disabled')) return;
-    if (btn.dataset.act === 'cancel') { win.close(true); return; }
-    const d = draft(win);
-    if (!changed(d)) return;
-    busy = true;
-    sync();
-    const errEl = win.querySelector('[data-role="error"]');
-    errEl.hidden = true;
-    try {
-      await save(d);
-    } catch (err) {
-      busy = false;
-      sync();
-      errEl.querySelector('span').textContent = describeError(err);
-      errEl.hidden = false;
-      return;
-    }
-    win.close(true);
-    onSaved(d);
-  });
-  return win;
-}
 
 const selectMarkup = (id, label, hint) => `<tf-select id="${id}" label="${escapeAttr(label)}" hint="${escapeAttr(hint)}"></tf-select>`;
 

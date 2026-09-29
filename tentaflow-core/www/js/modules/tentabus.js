@@ -4,11 +4,12 @@
 // the TentaBus header card with the instance picker, the six underlined main
 // tabs (Przegląd / Topiki / Odbiorcy / Nieprzetworzone / Wzory wiadomości /
 // Kopie i nody) with their counters, the address (`#/tentabus?instance=…&tab=
-// …&topic=…&section=…&group=…&gtopic=…`, see modules/tentabus/routes.js) and
-// the polling every tab reads. Przegląd, Topiki with a topic's page (Stan,
-// Ustawienia, Nieprzetworzone, Partycje i kopie), Odbiorcy with a consumer's
-// page (Stan, Miejsce czytania, Ustawienia), Nieprzetworzone wiadomości,
-// Wzory wiadomości and Kopie i nody live in modules/tentabus/*.
+// …&topic=…&section=…&group=…&gtopic=…&subject=…`, see modules/tentabus/
+// routes.js) and the polling every tab reads. Przegląd, Topiki with a topic's
+// page (Stan, Ustawienia, Nieprzetworzone, Partycje i kopie), Odbiorcy with a
+// consumer's page (Stan, Miejsce czytania, Ustawienia), Nieprzetworzone
+// wiadomości, Wzory wiadomości with a pattern's page and Kopie i nody live in
+// modules/tentabus/*.
 //
 // Every request names its instance (`BusEnvelope.instance_id`): `mount`
 // resolves `state.instanceId` from `?instance=` (or the same-screen instance
@@ -28,7 +29,9 @@ import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTI
 import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
-import { drawSchemas } from '/js/modules/tentabus/schemas.js';
+import { drawSchemas, schemaFormatLabel, schemaKind, listText, compatLabel } from '/js/modules/tentabus/schemas.js';
+import { drawSchemaDetail, shareShownText } from '/js/modules/tentabus/schema-detail.js';
+import { openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
 import { drawTopics } from '/js/modules/tentabus/topics.js';
 import { openTopicCreator } from '/js/modules/tentabus/topic-creator.js';
 import { openTopicDelete } from '/js/modules/tentabus/topic-delete.js';
@@ -63,11 +66,12 @@ const REPLICA_POLL_MS = 10_000;
 const TABS = MAIN_TABS;
 const TAB_ICONS = { overview: 'gauge', topics: 'share', groups: 'users', dlq: 'inbox', schemas: 'file-code', replication: 'branch' };
 // The mutually-exclusive views `#tb-panel` can show (six tabs, a topic's
-// page, a consumer's page) — each gets its OWN persistent container (`ensureViewContainer`)
+// page, a consumer's page, a message pattern's page) — each gets its OWN
+// persistent container (`ensureViewContainer`)
 // so switching between them shows/hides existing DOM instead of tearing it
 // down and rebuilding it, keeping scroll position, in-progress search text,
 // table sort and focus intact across a tab switch.
-const VIEW_SLOTS = ['overview', 'topics', 'groups', 'dlq', 'schemas', 'detail', 'consumer', 'replication'];
+const VIEW_SLOTS = ['overview', 'topics', 'groups', 'dlq', 'schemas', 'detail', 'consumer', 'schema', 'replication'];
 // "Ponów wszystkie" republishes up to 500 messages one by one on the server.
 const RETRY_ALL_TIMEOUT_MS = 120_000;
 // =============================================================================
@@ -243,7 +247,7 @@ const state = {
   instanceLabel: '',
   capabilities: NO_CAPABILITIES,
   tab: DEFAULT_TAB,
-  view: null, // null | { kind: 'topic-detail', name, section } | { kind: 'consumer-detail', group, topic, section }
+  view: null, // null | { kind: 'topic-detail', name, section } | { kind: 'consumer-detail', group, topic, section } | { kind: 'schema-detail', subject }
 
   topics: [],
   topicsLoaded: false,
@@ -284,6 +288,14 @@ const state = {
   // Nieprzetworzone wiadomości — see `freshUnprocessed`.
   unprocessed: freshUnprocessed(),
 
+  // "Dodano wzór …" / "Usunięto wzór …" above the pattern list, until the tab is left.
+  schemasNotice: null,
+  // The open pattern's page — see `freshSchemaPage`.
+  schema: freshSchemaPage(),
+  // A new version the server refused, per pattern, so "Nowa wersja" reopens
+  // with it instead of the newest version's text.
+  schemaDrafts: new Map(),
+
   // What the frame (header card, tab counters) and Przegląd read beside the
   // stats snapshot — see `freshShellState`.
   shell: freshShellState(),
@@ -296,6 +308,14 @@ const state = {
 // list shows, and the note over the tab.
 function freshUnprocessed() {
   return { byTopic: new Map(), access: new Map(), asked: new Map(), shown: LIST_STEP, sectionShown: LIST_STEP, notice: null };
+}
+
+// The open pattern's versions (`null` until they answer) and the failed
+// load, the version whose text the page shows (`{ version, text, error }`;
+// `version` null = the one topics check with), the version the reader asked
+// for, and the note over the page.
+function freshSchemaPage() {
+  return { versions: null, error: null, shown: null, selected: null, notice: null };
 }
 
 // `null` = that source has not answered yet (the figure is left out), never
@@ -470,6 +490,7 @@ const TentaBusScreen = {
     renderPanel();
     if (route.topic) openTopicDetail(route.topic, route.section);
     else if (route.group && route.groupTopic) openConsumer(route.group, route.groupTopic, route.section);
+    else if (route.subject) openSchema(route.subject);
     loadShellMeta();
     startStatsPolling();
     // Task 3: groups load together with topics so every counter reads the
@@ -500,6 +521,9 @@ const TentaBusScreen = {
     state.groups = null;
     state.groupsError = null;
     closeConsumer();
+    state.schemasNotice = null;
+    state.schema = freshSchemaPage();
+    state.schemaDrafts = new Map();
     state.unprocessed = freshUnprocessed();
     unprocessedTurns.clear();
     unprocessedLoads.clear();
@@ -578,6 +602,9 @@ function paintCrumbs() {
     } else if (state.view?.kind === 'consumer-detail') {
       items.push({ label: tabLabel, act: 'groups', href: href({ tab: 'groups' }) });
       items.push({ label: state.view.group });
+    } else if (state.view?.kind === 'schema-detail') {
+      items.push({ label: tabLabel, act: 'schemas', href: href({ tab: 'schemas' }) });
+      items.push({ label: state.view.subject });
     } else {
       items.push({ label: tabLabel });
     }
@@ -617,6 +644,7 @@ function syncLocation() {
     section,
     group: consumer?.group || null,
     groupTopic: consumer?.topic || null,
+    subject: state.view?.kind === 'schema-detail' ? state.view.subject : null,
   }));
 }
 
@@ -715,7 +743,7 @@ async function loadSubjects() {
     state.shell.subjectsError = err;
   }
   paintShell();
-  if (state.tab === 'schemas' && !state.view) renderPanel();
+  if ((state.tab === 'schemas' && !state.view) || state.view?.kind === 'schema-detail') renderPanel();
 }
 
 // "Odśwież": asks every source again and repaints the open tab.
@@ -732,7 +760,7 @@ async function refreshAll() {
     state.consumerMoved = new Set();
     consumerDlqDue = true;
     loadConsumer(consumerKey(state.view.group, state.view.topic));
-  }
+  } else if (state.view?.kind === 'schema-detail') loadSchemaPage(state.view.subject);
   // Every unprocessed list is asked again, the open one first.
   state.unprocessed.asked = new Map();
   ensureUnprocessed();
@@ -770,25 +798,12 @@ const tabContext = {
   },
 };
 
-const schemasContext = {
-  view() {
-    const sh = state.shell;
-    return {
-      subjects: sh.subjects,
-      error: sh.subjectsError,
-      errorKind: sh.subjectsError ? loadErrorKind(sh.subjectsError) : null,
-      instanceLabel: state.instanceLabel,
-    };
-  },
-  go(action) {
-    if (action.kind === 'retry') { state.shell.subjectsError = null; renderPanel(); loadSubjects(); }
-  },
-};
-
 function setTab(id) {
   if (state.view?.kind === 'topic-detail') closeTopicDetail();
   else if (state.view?.kind === 'consumer-detail') closeConsumer();
+  else if (state.view?.kind === 'schema-detail') closeSchema();
   if (id !== 'topics') state.topicsNotice = null;
+  if (id !== 'schemas') state.schemasNotice = null;
   if (id !== 'replication') { state.replicationNotice = null; state.justMoved = new Set(); }
   if (id !== 'dlq') { state.unprocessed.notice = null; state.unprocessed.shown = LIST_STEP; }
   state.tab = id;
@@ -820,6 +835,7 @@ function renderPanel() {
   let activeKey = state.tab;
   if (state.view?.kind === 'topic-detail') activeKey = 'detail';
   else if (state.view?.kind === 'consumer-detail') activeKey = 'consumer';
+  else if (state.view?.kind === 'schema-detail') activeKey = 'schema';
   let activeEl = null;
   for (const key of VIEW_SLOTS) {
     const el = ensureViewContainer(panel, key);
@@ -830,6 +846,7 @@ function renderPanel() {
   if (!activeEl) return;
   if (activeKey === 'overview') { drawOverview(activeEl, tabContext); return; }
   if (activeKey === 'schemas') { drawSchemas(activeEl, schemasContext); return; }
+  if (activeKey === 'schema') { drawSchemaDetail(activeEl, schemaContext); return; }
   if (activeKey === 'detail') { drawTopicDetail(activeEl, detailContext); return; }
   if (activeKey === 'topics') { drawTopics(activeEl, topicsContext); return; }
   if (activeKey === 'groups') { drawConsumers(activeEl, consumersContext); return; }
@@ -1125,6 +1142,7 @@ function openTopicDeleteWindow(name) {
 // =============================================================================
 
 function openTopicDetail(name, section = DEFAULT_SECTION) {
+  if (state.view?.kind === 'schema-detail') closeSchema();
   if (state.view?.name !== name) {
     state.detail = null;
     state.detailError = null;
@@ -1343,6 +1361,7 @@ const consumersContext = {
 function openConsumer(group, topic, section = CONSUMER_SECTIONS[0]) {
   const same = state.view?.kind === 'consumer-detail' && state.view.group === group && state.view.topic === topic;
   if (state.view?.kind === 'topic-detail') closeTopicDetail();
+  else if (state.view?.kind === 'schema-detail') closeSchema();
   if (!same) {
     closeConsumer();
     consumerDlqDue = true;
@@ -1802,6 +1821,299 @@ function openUnprocessedRetryAll(topic, from) {
     describeError: describeBusError,
     onDone: (resp) => {
       afterUnprocessedChange(topic, from, retryAllDoneNotice({ topic, resp, consumers }));
+    },
+  });
+}
+
+// =============================================================================
+// Wzory wiadomości (T08): the list lives in modules/tentabus/schemas.js, a
+// pattern's page in schema-detail.js and the windows in schema-windows.js;
+// the shell loads the data and says where each move leads. Every change is
+// the instance administrator's (`gate_admin` on the server, `canAdmin()`
+// here).
+// =============================================================================
+
+const schemasContext = {
+  view() {
+    const sh = state.shell;
+    return {
+      subjects: sh.subjects,
+      error: sh.subjectsError,
+      errorKind: sh.subjectsError ? loadErrorKind(sh.subjectsError) : null,
+      instanceLabel: state.instanceLabel,
+      canAdmin: canAdmin(),
+      notice: state.schemasNotice,
+    };
+  },
+  go(action) {
+    if (action.kind === 'open') openSchema(action.subject);
+    else if (action.kind === 'add') openSchemaAddWindow();
+    else if (action.kind === 'delete') openSchemaDeleteWindow(action.subject);
+    else if (action.kind === 'retry') { state.shell.subjectsError = null; renderPanel(); loadSubjects(); }
+  },
+};
+
+function subjectByName(name) {
+  return (state.shell.subjects || []).find((s) => s.subject === name) || null;
+}
+
+function openSchema(name) {
+  if (state.view?.kind === 'topic-detail') closeTopicDetail();
+  else if (state.view?.kind === 'consumer-detail') closeConsumer();
+  if (state.view?.kind !== 'schema-detail' || state.view.subject !== name) state.schema = freshSchemaPage();
+  state.schemasNotice = null;
+  state.tab = 'schemas';
+  state.view = { kind: 'schema-detail', subject: name };
+  renderPanel();
+  loadSchemaPage(name);
+}
+
+function closeSchema() {
+  if (state.view?.kind === 'schema-detail') state.view = null;
+  state.schema = freshSchemaPage();
+}
+
+const openSchemaName = () => (state.view?.kind === 'schema-detail' ? state.view.subject : null);
+
+// The versions and the text of the version the page shows, in one answer. A
+// failed reload keeps the page it already shows; the text of one version
+// failing leaves the rest of the page standing.
+const loadSchemaPage = topicDetailLoader({
+  fetch: async (instanceId, name) => {
+    const iid = requireInstanceId(instanceId);
+    const selected = state.schema.selected;
+    const [list, got] = await Promise.all([
+      ApiBinary.one('busSchemaVersionListRequest', { instanceId: iid, subject: name }),
+      ApiBinary.one('busSchemaGetRequest', { instanceId: iid, subject: name, version: selected ?? undefined })
+        .then((r) => ({ version: r?.schema?.version ?? selected, text: r?.schemaText ?? '', error: null }), (error) => ({ version: selected, text: null, error })),
+    ]);
+    return { versions: list?.versions || [], shown: got };
+  },
+  context: () => ({ instanceId: state.instanceId, name: openSchemaName() }),
+  apply({ detail, error }) {
+    if (!error) {
+      state.schema.versions = detail.versions;
+      state.schema.shown = detail.shown;
+      state.schema.error = null;
+    } else if (!state.schema.versions) {
+      state.schema.error = error;
+    }
+    renderPanel();
+  },
+});
+
+/** Puts `version`'s text on the page (`null` = the one topics check with). */
+async function showSchemaVersion(version) {
+  const name = openSchemaName();
+  if (!name) return;
+  const instanceId = state.instanceId;
+  state.schema.selected = version;
+  state.schema.shown = { version, text: null, error: null };
+  renderPanel();
+  let shown;
+  try {
+    const r = await ApiBinary.one('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: name, version: version ?? undefined });
+    shown = { version: r?.schema?.version ?? version, text: r?.schemaText ?? '', error: null };
+  } catch (error) {
+    shown = { version, text: null, error };
+  }
+  if (state.instanceId !== instanceId || openSchemaName() !== name || state.schema.selected !== version) return;
+  state.schema.shown = shown;
+  renderPanel();
+}
+
+const schemaContext = {
+  view() {
+    const sh = state.shell;
+    const name = state.view.subject;
+    const error = state.schema.error || (sh.subjects == null ? sh.subjectsError : null);
+    return {
+      name,
+      info: subjectByName(name),
+      subjectsLoaded: sh.subjects != null,
+      versions: state.schema.versions,
+      shown: state.schema.shown,
+      error,
+      errorKind: error ? loadErrorKind(error) : null,
+      canAdmin: canAdmin(),
+      notice: state.schema.notice,
+      instanceLabel: state.instanceLabel,
+    };
+  },
+  go(action) {
+    const name = openSchemaName();
+    if (!name) return;
+    if (action.kind === 'back') setTab('schemas');
+    else if (action.kind === 'new-version') openNewVersionWindow(name);
+    else if (action.kind === 'withdraw') openSchemaWithdrawWindow(name);
+    else if (action.kind === 'withdraw-version') openVersionWithdrawWindow(name, action.version);
+    else if (action.kind === 'delete') openSchemaDeleteWindow(name);
+    else if (action.kind === 'compat') openSchemaCompatWindow(name);
+    else if (action.kind === 'show-version') showSchemaVersion(action.version);
+    else if (action.kind === 'retry-text') showSchemaVersion(state.schema.selected);
+    else if (action.kind === 'copy' || action.kind === 'download') shareShownText(action.kind, schemaContext.view());
+    else if (action.kind === 'retry') {
+      state.schema.error = null;
+      state.shell.subjectsError = null;
+      renderPanel();
+      loadSubjects();
+      loadSchemaPage(name);
+    }
+  },
+};
+
+// After a change made on a pattern's page: the note over the page when the
+// reader is still there (else a toast), and the list and the page asked again.
+async function afterSchemaChange(name, notice) {
+  const instanceId = state.instanceId;
+  if (openSchemaName() === name) {
+    state.schema.notice = notice;
+    state.schema.selected = null;
+  } else {
+    toast(notice.title, notice.tone === 'success' ? 'success' : 'info');
+  }
+  renderPanel();
+  await loadSubjects();
+  if (state.instanceId === instanceId && openSchemaName() === name) await loadSchemaPage(name);
+}
+
+// "Topik wizyty …" or the sentence for a pattern no topic uses.
+function usedByText(info, key) {
+  const topics = [...(info?.usedByTopics || [])].sort();
+  return topics.length ? T(`${key}_used`, { topics: listText(topics), n: topics.length }) : T(`${key}_unused`);
+}
+
+function openSchemaAddWindow() {
+  if (!canAdmin()) return;
+  const instanceId = state.instanceId;
+  openSchemaAdd({
+    instanceId: requireInstanceId(instanceId),
+    schemaTypes: state.capabilities?.schemaTypes || [],
+    existingNames: (state.shell.subjects || []).map((s) => s.subject),
+    register: (request) => ApiBinary.action('busSchemaRegisterRequest', request),
+    describeError: describeBusError,
+    onAdded: async ({ subject, schemaType }) => {
+      if (state.instanceId !== instanceId) return;
+      const notice = {
+        tone: 'success',
+        title: T('schemas.added_title', { name: subject }),
+        text: T('schemas.added_text', { format: schemaFormatLabel(schemaType), where: T(`schemas.kind_for.${schemaKind(schemaType) || 'binary'}`) }),
+      };
+      if (!state.view && state.tab === 'schemas') state.schemasNotice = notice;
+      else toast(notice.title, 'success');
+      await loadSubjects();
+    },
+  });
+}
+
+async function openNewVersionWindow(name) {
+  const info = subjectByName(name);
+  if (!canAdmin() || !info || info.deprecatedAtMs != null) return;
+  const instanceId = state.instanceId;
+  let latestText = state.schema.shown?.version === info.latestVersion ? state.schema.shown.text : null;
+  if (latestText == null && info.latestVersion != null) {
+    try {
+      latestText = (await ApiBinary.one('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: name, version: info.latestVersion }))?.schemaText ?? null;
+    } catch {
+      latestText = null;
+    }
+    if (state.instanceId !== instanceId || openSchemaName() !== name) return;
+  }
+  openSchemaVersion({
+    instanceId: requireInstanceId(instanceId),
+    subject: info,
+    latestText,
+    draftText: state.schemaDrafts.get(name) ?? null,
+    register: (request) => ApiBinary.action('busSchemaRegisterRequest', request),
+    describeError: describeBusError,
+    onDraft: (text) => {
+      if (text == null) state.schemaDrafts.delete(name);
+      else state.schemaDrafts.set(name, text);
+    },
+    onAdded: ({ version, deduplicated }) => {
+      state.schemaDrafts.delete(name);
+      if (state.instanceId !== instanceId) return;
+      afterSchemaChange(name, deduplicated
+        ? { tone: 'info', title: T('schemas.version.same_title'), text: T('schemas.version.same_text', { version: fmtCount(version) }) }
+        : { tone: 'success', title: T('schemas.version.added_title', { version: fmtCount(version) }), text: usedByText(info, 'schemas.version.added_text') });
+    },
+  });
+}
+
+function openSchemaCompatWindow(name) {
+  const info = subjectByName(name);
+  if (!canAdmin() || !info || info.deprecatedAtMs != null) return;
+  const instanceId = state.instanceId;
+  openSchemaCompat({
+    instanceId: requireInstanceId(instanceId),
+    subject: info,
+    setCompatibility: (request) => ApiBinary.action('busSchemaCompatibilitySetRequest', request),
+    describeError: describeBusError,
+    onSaved: (compatibility) => {
+      if (state.instanceId !== instanceId) return;
+      afterSchemaChange(name, { tone: 'success', title: T('schemas.compat_window.saved_title'), text: T('schemas.compat_window.saved_text', { compat: compatLabel(compatibility) }) });
+    },
+  });
+}
+
+function openSchemaWithdrawWindow(name) {
+  const info = subjectByName(name);
+  if (!canAdmin() || !info || info.deprecatedAtMs != null || !state.schema.versions) return;
+  const instanceId = state.instanceId;
+  openSchemaDeprecate({
+    instanceId: requireInstanceId(instanceId),
+    subject: info,
+    versions: state.schema.versions,
+    remove: (request) => ApiBinary.action('busSchemaDeleteRequest', request),
+    describeError: describeBusError,
+    onDone: () => {
+      state.schemaDrafts.delete(name);
+      if (state.instanceId !== instanceId) return;
+      afterSchemaChange(name, { tone: 'success', title: T('schemas.withdraw.done_title', { name }), text: usedByText(info, 'schemas.withdraw.done_text') });
+    },
+  });
+}
+
+function openVersionWithdrawWindow(name, version) {
+  const info = subjectByName(name);
+  const versions = state.schema.versions;
+  const row = (versions || []).find((v) => v.version === Number(version));
+  if (!canAdmin() || !info || info.deprecatedAtMs != null || !row || row.deprecatedAtMs != null) return;
+  const instanceId = state.instanceId;
+  openVersionDeprecate({
+    instanceId: requireInstanceId(instanceId),
+    subject: info,
+    version: row.version,
+    versions,
+    remove: (request) => ApiBinary.action('busSchemaDeleteRequest', request),
+    describeError: describeBusError,
+    onDone: () => {
+      if (state.instanceId !== instanceId) return;
+      afterSchemaChange(name, { tone: 'success', title: T('schemas.withdraw_version.done_title', { version: fmtCount(row.version) }), text: T('schemas.withdraw_version.done_text') });
+    },
+  });
+}
+
+// "Usuń…" from the list row or the pattern's page: the result lands over the
+// list either way (the page is gone with the pattern).
+function openSchemaDeleteWindow(name) {
+  const info = subjectByName(name);
+  if (!canAdmin() || !info || (info.usedByTopics || []).length) return;
+  const instanceId = state.instanceId;
+  openSchemaDelete({
+    instanceId: requireInstanceId(instanceId),
+    subject: info,
+    remove: (request) => ApiBinary.action('busSchemaDeleteRequest', request),
+    describeError: describeBusError,
+    onDeleted: async () => {
+      state.schemaDrafts.delete(name);
+      if (state.instanceId !== instanceId) return;
+      const notice = { tone: 'success', title: T('schemas.delete.done_title', { name }), text: '' };
+      if (openSchemaName() === name) setTab('schemas');
+      if (!state.view && state.tab === 'schemas') state.schemasNotice = notice;
+      else toast(notice.title, 'success');
+      renderPanel();
+      await loadSubjects();
     },
   });
 }

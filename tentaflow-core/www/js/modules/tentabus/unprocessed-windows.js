@@ -15,31 +15,15 @@
 //   - every one of them is written to the audit log.
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
-import { I18n } from '/js/i18n.js';
 import { T, fmtCount, fmtBytes, fmtWhen } from '/js/modules/tentabus/format.js';
 import { bytesToPreviewText, parseBlobRefJson } from '/js/modules/tentabus/payload.js';
 import { reasonLabel, sourceText, attemptsText, receiversText, RETRY_ALL_MAX } from '/js/modules/tentabus/unprocessed.js';
-import '/js/components/tf-window.js';
+import { windowEl, openConfirmWindow } from '/js/modules/tentabus/windows.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 
 const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}"/></svg>`;
 const PAYLOAD_PREVIEW_BYTES = 4096;
-
-function windowEl({ title, icon, width, cls }) {
-  const win = document.createElement('tf-window');
-  win.className = `tb-window ${cls}`;
-  win.setAttribute('title', title);
-  win.setAttribute('icon', icon);
-  win.setAttribute('buttons', 'close');
-  win.setAttribute('modal', '');
-  win.setAttribute('draggable', '');
-  win.setAttribute('width', String(width));
-  win.setAttribute('min-width', '360');
-  win.setAttribute('initial-x', 'center');
-  win.setAttribute('initial-y', 'center');
-  return win;
-}
 
 const kv = (pairs) => `<div class="tb-kv-grid">${pairs.map(([k, v]) => `<div class="k">${escapeHtml(k)}</div><div class="v">${v}</div>`).join('')}</div>`;
 
@@ -140,58 +124,9 @@ export function retryAllImpact({ topic, consumers, plan, maxAttempts }) {
   return lines;
 }
 
-// One confirm window: facts or a lead, "Co się stanie", an error line, and
-// the action. `run()` sends it (may throw: the window stays with the error).
-function confirmWindow({ title, icon, lead, impactTitle, impact, info, audit, button, danger, run, describeError, onDone }) {
-  const win = windowEl({ title, icon, width: 600, cls: 'tb-unp-confirm' });
-  win.innerHTML = `
-    <div slot="body" class="stack">
-      ${lead}
-      <div class="tb-will-happen" data-role="impact">${sprite('info')}<div><b>${escapeHtml(impactTitle)}</b> ${impact.map(escapeHtml).join(' ')}</div></div>
-      ${info ? `<div class="tb-will-happen">${sprite('info')}<div>${escapeHtml(info)}</div></div>` : ''}
-      <div class="tb-window-error" role="alert" data-role="error" hidden>${sprite('alert')}<span></span></div>
-    </div>
-    <div slot="footer">
-      <span class="tb-foot-note">${sprite('file-text')}${escapeHtml(audit)}</span>
-      <tf-button variant="ghost" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
-      <tf-button variant="${danger ? 'danger' : 'primary'}" icon="${danger ? 'close' : 'refresh'}" data-act="go">${escapeHtml(button)}</tf-button>
-    </div>`;
-  document.body.appendChild(win);
-  const goBtn = win.querySelector('[data-act="go"]');
-  const cancelBtn = win.querySelector('[data-act="cancel"]');
-  let busy = false;
-  const sync = () => {
-    goBtn.toggleAttribute('disabled', busy);
-    cancelBtn.toggleAttribute('disabled', busy);
-  };
-  win.addEventListener('close-request', (e) => { if (busy) e.preventDefault(); });
-  win.addEventListener('click', async (e) => {
-    const btn = e.target.closest('[data-act]');
-    if (!btn || btn.hasAttribute('disabled')) return;
-    if (btn.dataset.act === 'cancel') { win.close(true); return; }
-    busy = true;
-    sync();
-    const errEl = win.querySelector('[data-role="error"]');
-    errEl.hidden = true;
-    let result;
-    try {
-      result = await run();
-    } catch (err) {
-      busy = false;
-      sync();
-      errEl.querySelector('span').textContent = describeError(err);
-      errEl.hidden = false;
-      return;
-    }
-    win.close(true);
-    onDone?.(result);
-  });
-  return win;
-}
-
 /** "Ponów" of one message. `retry()` answers the server's `accepted`. */
 export function openRetryOne({ rec, topic, consumers, maxAttempts, retry, describeError, onDone, nowMs = Date.now() }) {
-  return confirmWindow({
+  return openConfirmWindow({
     title: T('unprocessed.retry.title'),
     icon: 'refresh',
     lead: kv([
@@ -220,7 +155,7 @@ export function openDiscardOne({ rec, topic, discard, describeError, onDone }) {
       [T('unprocessed.view.k_reason'), reasonHtml(rec)],
     ]),
   ].join('');
-  return confirmWindow({
+  return openConfirmWindow({
     title: T('unprocessed.discard.title'),
     icon: 'close',
     lead,
@@ -245,7 +180,7 @@ export function openRetryAll({ topic, plan, consumers, maxAttempts, retryAll, de
     `<div class="tb-explain-box">${T(leadKey, { topic: `<b class="mono">${escapeHtml(topic)}</b>`, count: `<b>${escapeHtml(fmtCount(plan.retryable))}</b>`, n: plan.retryable })}</div>`,
     plan.atWrite > 0 ? `<div class="tb-explain-box">${escapeHtml(T('unprocessed.retry_all.at_write', { count: fmtCount(plan.atWrite), n: plan.atWrite }))}</div>` : '',
   ].join('');
-  return confirmWindow({
+  return openConfirmWindow({
     title: T('unprocessed.retry_all.title'),
     icon: 'refresh',
     lead,

@@ -1,8 +1,9 @@
 /* =============================================================================
    File: tentabus.css — the TentaBus screen: the shell and Przegląd (U0),
    Topiki with the creator, delete and preview windows (U1), a topic's page
-   and Kopie i nody (U2), Odbiorcy with a consumer's page (U3) and
-   Nieprzetworzone wiadomości (U4). Only --tf-* tokens (scripts/ci-gates.sh Gate 5a);
+   and Kopie i nody (U2), Odbiorcy with a consumer's page (U3),
+   Nieprzetworzone wiadomości (U4) and Wzory wiadomości with a pattern's
+   page and windows (U5). Only --tf-* tokens (scripts/ci-gates.sh Gate 5a);
    classes tb-*. Animations use transform/opacity only; prefers-reduced-motion
    is neutralized globally by controls.css.
    ============================================================================= */
@@ -422,4 +423,40 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
   .tb-root .tb-unp-tile { flex-wrap: wrap; }
   .tb-root .tb-unp-tile .job-main { flex: 1 1 calc(100% - 44px); }
   .tb-root .tb-unp-tile > tf-button { margin-left: 44px; }
+}
+
+/* =============================================================================
+   U5 Wzory wiadomości (T08): a pattern's page — the title with its chips and
+   actions, the text of a version beside the versions and the compatibility —
+   and the pattern windows (add, new version, compatibility).
+   ============================================================================= */
+.tb-title-line { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 10px; }
+.tb-title-badges { margin-top: 8px; }
+.tb-title-buttons { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.tb-title-note .icon { width: 12px; height: 12px; vertical-align: -1px; }
+.tb-schema-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.tb-schema-side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.tb-schema-text tf-code-editor { display: block; height: 380px; }
+.tb-schema-text .tb-state { justify-content: flex-start; padding: 16px 0; }
+.tb-schema-text .tb-state .icon { color: var(--tf-danger); }
+.tb-schema-text [data-role="text-note"] { margin: -4px 0 8px; }
+.tb-schema-window .stack { display: flex; flex-direction: column; gap: 14px; }
+.tb-schema-window .tb-window-error { margin-top: 0; }
+.tb-window .tb-mono-input textarea { font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px; }
+.tb-window .tb-vr-hint { font-size: 11.5px; color: var(--tf-text-3); line-height: 1.5; }
+.tb-window .tb-rc-name { font-size: 13px; font-weight: 600; color: var(--tf-text); }
+.tb-window .tb-rc-sub { font-size: 12px; color: var(--tf-text-3); margin-top: 2px; }
+.tb-window .tb-tech { margin-top: 8px; font-size: 12px; color: var(--tf-text-2); }
+.tb-window .tb-tech summary { cursor: pointer; }
+.tb-window .tb-tech pre {
+  margin: 6px 0 0; padding: 8px 10px; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm);
+  background: var(--tf-bg-2); font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 11.5px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+@media (max-width: 960px) {
+  .tb-schema-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 767px) {
+  .tb-title-buttons { justify-content: flex-start; }
+  .tb-schema-text tf-code-editor { height: 300px; }
 }

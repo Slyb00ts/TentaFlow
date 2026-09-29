@@ -862,11 +862,12 @@ const VISITS_UNPROCESSED: usize = 2;
 /// Minutes of rising lag history written for the lagging consumer.
 const RISING_MINUTES: i64 = 25;
 
-/// Three backward-compatible versions: each adds an optional field.
+/// Three backward-compatible versions: each adds an optional field; the
+/// newest carries the description the pattern's page shows.
 const VISIT_SCHEMA_VERSIONS: [&str; 3] = [
     r#"{"type":"object","required":["pacjent","termin"],"properties":{"pacjent":{"type":"string"},"termin":{"type":"string"}}}"#,
     r#"{"type":"object","required":["pacjent","termin"],"properties":{"pacjent":{"type":"string"},"termin":{"type":"string"},"lekarz":{"type":"string"}}}"#,
-    r#"{"type":"object","required":["pacjent","termin"],"properties":{"pacjent":{"type":"string"},"termin":{"type":"string"},"lekarz":{"type":"string"},"gabinet":{"type":"string"}}}"#,
+    r#"{"description":"Wizyta musi mieć pacjenta i termin.","type":"object","required":["pacjent","termin"],"properties":{"pacjent":{"type":"string"},"termin":{"type":"string"},"lekarz":{"type":"string"},"gabinet":{"type":"string"}}}"#,
 ];
 
 fn hl7_result(seq: usize) -> Bytes {
@@ -987,9 +988,6 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
     if existing.is_some() {
         println!("seed[clinic]: pattern '{VISIT_SCHEMA}' already exists — skipping");
     } else {
-        // Withdrawing ONE version (not the whole pattern) needs registry
-        // support that is not there yet (`registry::delete` refuses
-        // `deprecate_only` with a version), so all three stay current.
         for text in VISIT_SCHEMA_VERSIONS {
             schema_registry::register(
                 db,
@@ -1003,6 +1001,9 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
             )
             .expect("register a version of pattern wizyta");
         }
+        // The oldest version is withdrawn; the newest still checks `wizyty`.
+        schema_registry::delete(db, &instance, &ctx.org_id, VISIT_SCHEMA, Some(1), true)
+            .expect("withdraw version 1 of pattern wizyta");
         schema_registry::register(
             db,
             &instance,

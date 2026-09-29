@@ -20,6 +20,20 @@ if (typeof globalThis.ResizeObserver !== 'function') {
 if (typeof globalThis.MutationObserver !== 'function' && window.MutationObserver) {
   globalThis.MutationObserver = window.MutationObserver;
 }
+// happy-dom has no canvas backend, and tf-code-editor (a pattern's page)
+// measures its character width before drawing anything: every drawing call
+// is a no-op answering the stub itself.
+const CANVAS_CONTEXT = new Proxy({ canvas: { width: 0, height: 0 } }, {
+  get(target, property) {
+    if (property === 'measureText') return (text) => ({ width: String(text).length * 7 });
+    if (property in target) return target[property];
+    return () => CANVAS_CONTEXT;
+  },
+  set(target, property, value) { target[property] = value; return true; },
+});
+if (window.HTMLCanvasElement) {
+  window.HTMLCanvasElement.prototype.getContext = () => CANVAS_CONTEXT;
+}
 globalThis.fetch = (url) => {
   const m = /^\/i18n\/(\w+)\.json$/.exec(String(url));
   if (m) {

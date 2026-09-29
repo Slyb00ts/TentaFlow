@@ -14,7 +14,7 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, fmtCount, fmtRetention, contentKind, contentTypeLabel } from '/js/modules/tentabus/format.js';
-import { schemaFormatLabel } from '/js/modules/tentabus/schemas.js';
+import { schemaFormatLabel, SCHEMA_TYPES_BY_KIND } from '/js/modules/tentabus/schemas.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
@@ -42,16 +42,6 @@ const GIB = 1024 ** 3;
 export const PARTITION_LIMITS_GB = [0, 8, 16];
 
 const CONTENT_ICONS = { json: 'file-code', xml: 'file-text', hl7v2: 'activity', binary: 'layers' };
-
-// Which pattern formats describe which content: a JSON Schema checks JSON,
-// an XSD checks XML, an HL7 v2 profile checks HL7 v2, and Avro / Protobuf /
-// Thrift describe binary payloads.
-const SCHEMA_TYPES_BY_KIND = {
-  json: ['json_schema'],
-  xml: ['xsd'],
-  hl7v2: ['hl7v2_profile'],
-  binary: ['avro', 'protobuf', 'thrift'],
-};
 
 /**
  * Why a name cannot be used, or `null` when it can: `empty`, `reserved`
