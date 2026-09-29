@@ -301,11 +301,9 @@ pub fn build_publish_violation_record(
         "dlq.rejected_at_ms".to_string(),
         Bytes::from(super::now_ms().to_string()),
     ));
-    if let Some(actor) = producer_ctx.actor.as_deref() {
-        headers.push((
-            "dlq.producer_actor".to_string(),
-            Bytes::from(actor.to_string()),
-        ));
+    // Named like an audit row names it: a key as `api_key:<uid>`.
+    if let Some(actor) = producer_ctx.audit_actor() {
+        headers.push(("dlq.producer_actor".to_string(), Bytes::from(actor)));
     }
     if let Some(correlation_id) = producer_ctx.correlation_id.as_deref() {
         headers.push((
@@ -1146,6 +1144,30 @@ mod tests {
         assert_eq!(
             find("dlq.correlation_id").unwrap(),
             Bytes::from_static(b"corr-9")
+        );
+
+        // A key is named as the audit names it, never as a bare uid that
+        // reads like a user's id.
+        let key_ctx = BusCallContext {
+            actor_kind: crate::auth::actor::ActorKind::ApiKey,
+            ..test_producer_ctx(Some("0d4f1c2a-0000-4000-8000-000000000001"), None)
+        };
+        let rec = build_publish_violation_record(
+            "orders.created",
+            "schema_violation",
+            "field 'x' is required",
+            &key_ctx,
+            &original,
+        );
+        let actor = rec
+            .headers
+            .iter()
+            .find(|(k, _)| k == "dlq.producer_actor")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(
+            actor,
+            Bytes::from_static(b"api_key:0d4f1c2a-0000-4000-8000-000000000001")
         );
     }
 

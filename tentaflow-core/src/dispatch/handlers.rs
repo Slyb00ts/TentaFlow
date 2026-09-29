@@ -1047,9 +1047,11 @@ pub fn api_key_scope_clear(
     let action = clear_scope_action(&ctx.state.db, resource_type, resource_id, action.as_deref())?;
     require_general_key(ctx, key_uid)?;
     let topic_admin = if resource_type == "topic" {
-        Some(crate::dispatch::bus::require_key_topic_rights_admin(
+        let site_admin = require_user_id(ctx).map(|b| user_id_to_uuid(&b))?;
+        Some(crate::dispatch::bus::require_key_topic_rights_clear(
             ctx,
             resource_id,
+            &site_admin,
         )?)
     } else {
         None

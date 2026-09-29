@@ -3026,6 +3026,60 @@ pub(crate) fn require_key_topic_rights_admin(
     Ok((g.user_id, topic.to_string()))
 }
 
+/// The revocation side of `require_key_topic_rights_admin`: taking a right
+/// away must always be possible, so nothing that only matters for USING a
+/// topic is asked — not whether the instance is enabled, nor whether its
+/// engine runs on this node. While the instance is installed and the
+/// organisation exists, the caller still needs `bus.admin` on the instance
+/// and the admin role of that organisation; once either is gone there is no
+/// topic administrator left to ask, and the site administrator the key
+/// handlers already require may clear the leftover right alone. The id is
+/// checked for shape only — clearing never writes, so a name a later rule
+/// made invalid stays removable. Returns the caller's user id and the topic.
+pub(crate) fn require_key_topic_rights_clear(
+    ctx: &HandlerContext,
+    resource_id: &str,
+    site_admin_user_id: &str,
+) -> Result<(String, String), ProtocolError> {
+    let segments = crate::sync::resource_id::decode_segments(resource_id).unwrap_or_default();
+    let [instance_id, org_id, topic] = segments.as_slice() else {
+        return Err(ProtocolError::bad_request(
+            "topic resource_id must name exactly an instance, an organisation and a topic",
+        ));
+    };
+    let db = &ctx.state.db;
+    let instance = repository::get_instance_of_package(db, BusInstanceId::PACKAGE_ID, instance_id)
+        .map_err(|e| db_err("get_instance_of_package", e))?;
+    let org_alive = crate::services::org::get_organization(db, org_id)
+        .map_err(|e| db_err("get_organization", e.into()))?
+        .is_some_and(|org| org.status != "deleted");
+    let Some((resolved_instance, _enabled)) = instance.filter(|_| org_alive) else {
+        return Ok((site_admin_user_id.to_string(), topic.to_string()));
+    };
+    let org = require_org(ctx)?;
+    if org.org_id != *org_id || !org.has("org.admin") {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "bus.org_mismatch: a topic right is revoked by an admin of its own organisation",
+        ));
+    }
+    let checker = ctx
+        .state
+        .permission_checker
+        .as_ref()
+        .ok_or_else(|| ProtocolError::internal("permission checker unavailable"))?;
+    if !checker
+        .check(&resolved_instance, &org.user_id, PERM_ADMIN, None)
+        .is_granted()
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            format!("{PERM_ADMIN} permission required"),
+        ));
+    }
+    Ok((org.user_id.clone(), topic.to_string()))
+}
+
 // =============================================================================
 // Field policies (SUM/tentabus/POLITYKI-POL.md, F0 follow-up
 // SUM/tentabus/POLITYKI-POL-FORMATY.md — per-field access control, distinct

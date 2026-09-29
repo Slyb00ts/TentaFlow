@@ -5972,10 +5972,14 @@ impl BusService {
     /// partition of `topic`, read WITHOUT opening a consumer session: no
     /// `bus_groups` upsert, so the `commit_mode` the group's own program
     /// chose (and `updated_at_ms`) are never touched by a dashboard poll.
-    /// Same checks `open_consumer` runs before its side effects — group-
-    /// scoped Consume authorization (denial audited, windowed), Z12
-    /// environment fencing, and leadership of every partition (offsets are
-    /// committed on the leader, so a follower's copy would be stale).
+    /// Same checks `open_consumer` runs before its side effects — Consume
+    /// authorization (denial audited, windowed), Z12 environment fencing,
+    /// and leadership of every partition (offsets are committed on the
+    /// leader, so a follower's copy would be stale) — except that the right
+    /// asked for is Consume on the TOPIC, not on the group: reading a lag
+    /// neither consumes nor commits, so the group-scoped rules (an API key's
+    /// `k:` groups belong to that key alone) have nothing to protect here,
+    /// and an administrator reading a key's group must not be refused.
     pub fn group_lag(
         &self,
         ctx: &BusCallContext,
@@ -5986,7 +5990,7 @@ impl BusService {
         topics::validate_org_id(&ctx.org_id)?;
         validate_group_name(group)?;
         self.authorizer
-            .authorize_group(ctx, BusAction::Consume, topic, group)
+            .authorize(ctx, BusAction::Consume, topic)
             .map_err(|_| {
                 self.audit_windowed(
                     ctx,

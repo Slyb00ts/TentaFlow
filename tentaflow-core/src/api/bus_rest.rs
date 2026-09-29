@@ -1720,6 +1720,16 @@ mod tests {
             svc,
             checker,
         };
+        fx.state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "INSERT OR IGNORE INTO organizations (org_id, name, slug, status, created_at) \
+                 VALUES (?1, ?1, ?1, 'active', '2026-09-29T00:00:00Z')",
+                rusqlite::params![ORG],
+            )
+            .unwrap();
         fx.grant("u-admin", "bus.admin");
         fx.grant("u-admin", "bus.write");
         fx.svc
@@ -1942,6 +1952,10 @@ mod tests {
         );
         assert_eq!(unknown.status, StatusCode::FORBIDDEN);
 
+        // Both refusals share one bucket (same key, action and reason): the
+        // first is written at once, the second with the flush.
+        assert_eq!(fx.audit_rows("bus.rest.publish").len(), 1);
+        crate::bus::key_audit::flush_for(&fx.db());
         let rows = fx.audit_rows("bus.rest.publish");
         assert_eq!(rows.len(), 2);
         for row in &rows {
@@ -2230,8 +2244,15 @@ mod tests {
     fn refused_key_requests_are_counted_and_flushed() {
         let fx = key_fixture("cccc3011");
         let key = fx.key(&[]);
-        for _ in 0..3 {
-            let reply = fx.publish_as(key_principal(&key), &org_query(), &ndjson(r#"{"id":1}"#));
+        for topic in [TOPIC, "invoices", "lab.results"] {
+            let reply = fx.send_to(
+                fx.instance.as_str(),
+                topic,
+                "POST",
+                key_principal(&key),
+                &org_query(),
+                &ndjson(r#"{"id":1}"#),
+            );
             assert_eq!(reply.status, StatusCode::FORBIDDEN);
         }
         assert_eq!(audited(&fx, "bus.rest.publish", &key), (1, 1, 0));
@@ -2677,5 +2698,81 @@ mod tests {
             .all(|d| d.contains(&uid) && d.contains("api_key")));
         assert!(acl_rows.iter().any(|d| d.contains("access_level=allow")));
         assert!(acl_rows.iter().any(|d| d.contains("access_level=clear")));
+    }
+
+    /// Package K, review 2: revoking must always work. A right on an
+    /// instance that was disabled since is cleared by the topic's admin (no
+    /// running engine is asked for), and one on an instance that is gone by
+    /// the site administrator alone.
+    #[test]
+    fn a_key_topic_right_is_revocable_on_a_disabled_or_removed_instance() {
+        let fx = key_fixture("cccc3104");
+        let id = topic_acl_resource_id(fx.instance.as_str(), ORG, TOPIC);
+        let admin = topic_admin_ctx(&fx);
+        let uid = create_general_key(
+            &admin,
+            vec![
+                topic_scope(&id, Some("read")),
+                topic_scope(&id, Some("write")),
+            ],
+        )
+        .unwrap();
+        let clear = |ctx: &crate::dispatch::HandlerContext, action: &str| {
+            dispatch_blocking(
+                &MessageBody::ApiKeyScopeClearRequest {
+                    key_uid: uid.clone(),
+                    resource_type: "topic".to_string(),
+                    resource_id: id.clone(),
+                    action: Some(action.to_string()),
+                },
+                ctx,
+            )
+        };
+
+        crate::db::repository::set_addon_enabled(&fx.state.db, fx.instance.as_str(), false)
+            .expect("disable instance");
+        clear(&admin, "read").expect("the topic's admin revokes on a disabled instance");
+        assert_eq!(
+            scope_list(&admin, &uid),
+            vec![("topic".to_string(), "write".to_string())]
+        );
+
+        // While the instance is installed, a site admin alone still may not.
+        let site_admin_only = admin_ctx(fx.state.clone());
+        assert_code(
+            clear(&site_admin_only, "write"),
+            ProtocolErrorCode::AuthRequired,
+        );
+
+        fx.state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "DELETE FROM addons WHERE addon_id = ?1",
+                rusqlite::params![fx.instance.as_str()],
+            )
+            .expect("remove instance");
+        clear(&site_admin_only, "write")
+            .expect("the site admin revokes a removed instance's right");
+        assert!(scope_list(&site_admin_only, &uid).is_empty());
+    }
+
+    /// Package K, review 2: reading a consumer group's lag is not consuming
+    /// — an administrator reads a key's `k:` group without being refused
+    /// and without a denial written for every poll.
+    #[test]
+    fn an_admin_reads_a_key_groups_lag() {
+        let fx = key_fixture("cccc3105");
+        let reader = fx.key(&["read"]);
+        let read = fx.consume_as(key_principal(&reader), &own_group_query(&reader));
+        assert_eq!(read.status, StatusCode::OK, "{}", read.json);
+        fx.grant("u-admin", "bus.read");
+        let lag = fx
+            .svc
+            .group_lag(&fx.user_ctx("u-admin"), &format!("k:{reader}"), TOPIC)
+            .expect("the admin reads the key group's lag");
+        assert_eq!(lag.len(), 1);
+        assert!(fx.audit_rows("bus.consume.denied").is_empty());
     }
 }

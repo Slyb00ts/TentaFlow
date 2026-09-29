@@ -132,7 +132,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   istniejący klucz ogólny. `ApiKeyScopeListResponse` zwraca prawa klucza
   z działaniem, a `ApiKeyScopeClearRequest` z działaniem usuwa tylko to jedno
   prawo. Wcześniej zapisany wiersz klucza z działaniem `'*'` niczego nie
-  przyznaje (nadal może tylko zabraniać) i można go usunąć.
+  przyznaje (nadal może tylko zabraniać) i można go usunąć. Odebranie prawa
+  działa zawsze: nie wymaga włączonej ani uruchomionej instancji, a gdy
+  instancji albo organizacji już nie ma, wystarczy administrator serwera.
 - Ukrywanie danych obejmuje klucze: klucz ogólny czyta i wysyła według zasady
   dla wszystkich (zasady nie da się przypisać kluczowi), nigdy według zasady
   osoby o tym samym identyfikatorze. Topik, który ma zasady ukrywania danych
@@ -147,11 +149,19 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 - Audyt: żądania REST rekordów klucza ogólnego zostawiają wpisy
   `bus.rest.publish` albo `bus.rest.consume` z identyfikatorem i nazwą klucza,
   kodem HTTP i powodem (bez treści wiadomości). Pierwsze żądanie każdego wyniku
-  (sukces albo dany powód odmowy) jest zapisywane od razu, kolejne w ciągu
-  minuty są zliczane (liczba żądań i wiadomości) i zapisywane zbiorczo co
-  minutę oraz przy zatrzymaniu instancji. Wpisy audytu busa wskazują klucz
-  jako `api_key:<id>`, a nowy nagłówek wiadomości `tf.actor_kind` mówi, kim
-  jest nadawca z `tf.actor` (`user`, `api_key`, `addon`, `system`).
+  jest zapisywane od razu, kolejne w ciągu minuty są zliczane (liczba żądań
+  i wiadomości) i zapisywane zbiorczo co minutę oraz przy zatrzymaniu
+  instancji. Sukcesy liczą się osobno dla każdego topiku, odmowy — dla klucza
+  i powodu, z liczbą różnych topików i jednym przykładem, więc klucz pytający
+  o coraz to nowe topiki nie mnoży wpisów. Liczba liczników na klucz i łącznie
+  jest ograniczona; nadmiar trafia do jednego licznika `bus.rest.overflow`.
+  Wpisy audytu busa i nagłówek `dlq.producer_actor` kopii
+  w „Nieprzetworzonych wiadomościach” wskazują klucz jako `api_key:<id>`,
+  a nowy nagłówek wiadomości `tf.actor_kind` mówi, kim jest nadawca
+  z `tf.actor` (`user`, `api_key`, `addon`, `system`).
+- Zaległość grupy odbiorców odczytuje każdy, kto może czytać topik — także
+  grupy klucza `k:…`, bez wpisu odmowy przy każdym odświeżeniu; odbierać
+  i potwierdzać pod grupą klucza nadal może tylko ten klucz.
 - Aktualizacja: migracja bazy 177 przebudowuje `resource_permissions`
   (dopuszcza `subject_type = 'addon'`) bez zmiany istniejących wierszy.
   Nod w starszej wersji odrzuca zsynchronizowany wiersz addonu (operacja
