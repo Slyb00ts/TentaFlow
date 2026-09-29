@@ -46,14 +46,14 @@ export function windowEl({ title, icon, width, cls }) {
  * result)` runs after the window closed. `saveLabel`/`saveIcon` name the
  * action and `willHappen` the impact line; `current` is what is there now —
  * the save unlocks only once the draft differs from it. "Popraw zaznaczone
- * pole" is said only once a field is actually marked. With `guardDiscard`
- * the close button and Escape ask once before dropping a changed draft
- * ("Anuluj" is the explicit way out and never asks).
+ * pole" is said only once a field is actually marked. The close button and
+ * Escape ask once before dropping a changed draft ("Anuluj" is the explicit
+ * way out and never asks).
  */
 export function openChangeWindow({
   title, icon, width = 620, cls = 'tb-change-window', fields, wire, draft, current, impact,
   save, describeError, errorHtml = null, onSaved,
-  saveLabel = T('settings.save'), saveIcon = 'check', willHappen = T('settings.will_happen'), guardDiscard = false,
+  saveLabel = T('settings.save'), saveIcon = 'check', willHappen = T('settings.will_happen'),
 }) {
   const win = windowEl({ title, icon, width, cls });
   win.innerHTML = `
@@ -96,9 +96,19 @@ export function openChangeWindow({
   };
   wire(win, sync);
   sync();
+  // A half-typed draft is still work to lose even while it is not valid yet
+  // (the draft is then `null`); an untouched window is not.
+  let touched = false;
+  const body = win.querySelector('[slot="body"]');
+  body.addEventListener('input', () => { touched = true; }, true);
+  body.addEventListener('change', () => { touched = true; }, true);
+  const dirty = () => {
+    const d = draft(win);
+    return touched && (d == null || changed(d));
+  };
   win.addEventListener('close-request', (e) => {
     if (busy) { e.preventDefault(); return; }
-    if (!guardDiscard || !discardEl.hidden || !changed(draft(win))) return;
+    if (!discardEl.hidden || !dirty()) return;
     e.preventDefault();
     discardEl.hidden = false;
   });

@@ -66,8 +66,13 @@ test('the line under the name: when, by whom, and who checks with it', () => {
   assert.equal(headerLine(wizyta), 'dodany 20.09.2026 · Anna Kowalska · używa go topik wizyty');
   assert.equal(headerLine({ ...wizyta, createdByLabel: null, usedByTopics: [] }), 'dodany 20.09.2026 · żaden topik go nie używa');
   assert.equal(headerLine({ ...wizyta, usedByTopics: ['wizyty', 'kolejka'] }), 'dodany 20.09.2026 · Anna Kowalska · używają go topiki kolejka i wizyty');
-  assert.match(withdrawnText({ ...wizyta, deprecatedAtMs: 1 }, 3), /Topik wizyty nadal sprawdza wiadomości według ostatniej wersji \(3\)/);
-  assert.match(withdrawnText({ ...wizyta, usedByTopics: [], deprecatedAtMs: 1 }, 3), /możesz go usunąć/);
+  assert.match(withdrawnText({ ...wizyta, deprecatedAtMs: 1 }, 3, true), /Topik wizyty nadal sprawdza wiadomości według ostatniej wersji \(3\), dopóki nie wybierzesz innego wzoru w jego ustawieniach/);
+  assert.match(withdrawnText({ ...wizyta, usedByTopics: [], deprecatedAtMs: 1 }, 3, true), /możesz go usunąć/);
+  // A reader is not asked to do what only an administrator can.
+  const reader = withdrawnText({ ...wizyta, deprecatedAtMs: 1 }, 3, false);
+  assert.match(reader, /według ostatniej wersji \(3\), dopóki administrator nie wybierze w nim innego wzoru\.$/);
+  assert.doesNotMatch(reader, /wybierzesz/);
+  assert.doesNotMatch(withdrawnText({ ...wizyta, usedByTopics: [], deprecatedAtMs: 1 }, 3, false), /możesz go usunąć/);
 });
 
 test('versions newest first: "Wycofaj" only on an active version for an administrator, "Pokaż" on the others', () => {
@@ -228,4 +233,11 @@ test('"Kopiuj" writes the shown text to the clipboard; "Pobierz" saves it under 
     window.HTMLAnchorElement.prototype.click = originalClick;
   }
   await tick();
+});
+
+test('a reader\'s page of a withdrawn pattern gets the reader\'s warning', () => {
+  const { body } = mount({ canAdmin: false, info: { ...wizyta, deprecatedAtMs: ADDED } });
+  const message = body.querySelector('[data-role="warning"] tf-alert').getAttribute('message');
+  assert.match(message, /dopóki administrator nie wybierze w nim innego wzoru/);
+  assert.doesNotMatch(message, /wybierzesz/);
 });

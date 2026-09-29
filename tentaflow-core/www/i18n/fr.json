@@ -10009,7 +10009,9 @@
         "missing_title": "Le modèle {name} n’existe plus",
         "missing_text": "Il a peut-être été supprimé. Revenez à la liste des modèles.",
         "error_title": "Impossible de charger le modèle",
-        "show": "Afficher"
+        "show": "Afficher",
+        "withdrawn_used_reader": "On ne peut plus ajouter de versions ni le choisir pour un nouveau topic. {n|Le topic|Les topics} {topics} {n|continue|continuent} à vérifier les messages selon la dernière version ({version}) jusqu’à ce qu’un administrateur y choisisse un autre modèle.",
+        "withdrawn_unused_reader": "On ne peut plus ajouter de versions ni le choisir pour un topic. Aucun topic ne l’utilise."
       },
       "added_existing_title": "Le modèle {name} existait déjà",
       "added_existing_version": "Quelqu’un l’a ajouté entre-temps, le texte y est donc entré en version {version}.",

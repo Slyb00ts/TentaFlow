@@ -10009,7 +10009,9 @@
         "missing_title": "El patrón {name} ya no existe",
         "missing_text": "Puede que se haya eliminado. Vuelve a la lista de patrones.",
         "error_title": "No se pudo cargar el patrón",
-        "show": "Mostrar"
+        "show": "Mostrar",
+        "withdrawn_used_reader": "No se pueden añadir versiones nuevas ni elegirlo para un topic nuevo. {n|El topic|Los topics} {topics} {n|sigue|siguen} comprobando los mensajes con la última versión ({version}) hasta que un administrador elija allí otro patrón.",
+        "withdrawn_unused_reader": "No se pueden añadir versiones nuevas ni elegirlo para un topic. Ningún topic lo usa."
       },
       "added_existing_title": "El patrón {name} ya existía",
       "added_existing_version": "Alguien lo añadió mientras tanto, así que el texto entró como versión {version}.",

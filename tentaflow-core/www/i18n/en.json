@@ -11244,7 +11244,9 @@
         "missing_title": "Pattern {name} no longer exists",
         "missing_text": "It may have been deleted. Go back to the pattern list.",
         "error_title": "Could not load the pattern",
-        "show": "Show"
+        "show": "Show",
+        "withdrawn_used_reader": "No new versions can be added and it cannot be chosen for a new topic. {n|Topic|Topics} {topics} {n|keeps|keep} checking messages against the last version ({version}) until an administrator chooses another pattern there.",
+        "withdrawn_unused_reader": "No new versions can be added and it cannot be chosen for a topic. No topic uses it."
       },
       "added_existing_title": "Pattern {name} already existed",
       "added_existing_version": "Someone added it meanwhile, so the text went into it as version {version}.",

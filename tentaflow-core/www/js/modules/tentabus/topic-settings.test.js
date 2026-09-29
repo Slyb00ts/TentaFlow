@@ -324,3 +324,28 @@ test('pattern window: only patterns for the topic\'s content, "bez wzoru" clears
   assert.deepEqual(sent[0].options, { schemaId: '' });
   assert.match(saved[0].text, /nie ma wzoru/);
 });
+
+test('Escape and the close button ask once before dropping a changed setting; "Anuluj" drops it without asking', async () => {
+  const later = () => new Promise((r) => setTimeout(r, 300));
+  const untouched = openWindow('retention').win;
+  untouched.close();
+  await later();
+  assert.equal(untouched.isConnected, false, 'nothing changed, nothing to ask');
+
+  const { win } = openWindow('retention');
+  pick(win.querySelector('#tb-set-retention'), String(7 * 86_400_000));
+  win.close();
+  await later();
+  assert.equal(win.isConnected, true, 'the first close only asks');
+  assert.equal(win.querySelector('[data-role="discard"]').hidden, false);
+  assert.match(win.querySelector('[data-role="discard"]').textContent, /Zamknij okno jeszcze raz/);
+  win.close();
+  await later();
+  assert.equal(win.isConnected, false);
+
+  const cancelled = openWindow('retention').win;
+  pick(cancelled.querySelector('#tb-set-retention'), String(7 * 86_400_000));
+  cancelled.querySelector('[data-act="cancel"]').click();
+  await later();
+  assert.equal(cancelled.isConnected, false);
+});

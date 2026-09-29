@@ -103,11 +103,14 @@ export function headerLine(info) {
   return parts.join(' · ');
 }
 
-/** "Wzór wycofany": what still happens with a withdrawn pattern. */
-export function withdrawnText(info, effective) {
+/**
+ * "Wzór wycofany": what still happens with a withdrawn pattern. A reader is
+ * told who can change it, not asked to do what only an administrator can.
+ */
+export function withdrawnText(info, effective, canAdmin) {
   const topics = [...(info.usedByTopics || [])].sort();
-  if (!topics.length) return T('schemas.detail.withdrawn_unused');
-  return T('schemas.detail.withdrawn_used', { topics: listText(topics), n: topics.length, version: fmtCount(effective) });
+  if (!topics.length) return T(canAdmin ? 'schemas.detail.withdrawn_unused' : 'schemas.detail.withdrawn_unused_reader');
+  return T(canAdmin ? 'schemas.detail.withdrawn_used' : 'schemas.detail.withdrawn_used_reader', { topics: listText(topics), n: topics.length, version: fmtCount(effective) });
 }
 
 /** Why a new version cannot be added, or `null` when it can. */
@@ -312,7 +315,7 @@ function paintPage(body, view) {
     : '');
   // The note of the withdrawal itself already says all the warning would.
   patchHtml(body.querySelector('[data-role="warning"]'), subjectDeprecated && !notice?.withdrawn
-    ? `<tf-alert tone="warning" title="${escapeAttr(T('schemas.detail.withdrawn_title'))}" message="${escapeAttr(withdrawnText(info, effective))}"></tf-alert>`
+    ? `<tf-alert tone="warning" title="${escapeAttr(T('schemas.detail.withdrawn_title'))}" message="${escapeAttr(withdrawnText(info, effective, canAdmin))}"></tf-alert>`
     : '');
 
   paintText(body, view, effective);

@@ -186,7 +186,10 @@ test('"Dodaj wzór": formats from the server, a taken name and a broken text kee
   assert.equal(win.getAttribute('modal'), '');
   assert.deepEqual([...win.querySelectorAll('tf-choice-card')].map((c) => c.getAttribute('heading')), ['JSON Schema', 'Avro', 'Protobuf', 'Thrift']);
   assert.equal(win.querySelector('[data-role="format"]').getAttribute('value'), 'json_schema');
-  assert.equal(win.querySelector('[data-role="compat"]').value, 'backward');
+  const compat = win.querySelector('[data-role="compat"]');
+  assert.equal(compat.value, 'backward');
+  assert.equal(compat.closest('.form-grid-2'), null, 'the long option names get the whole row');
+  assert.equal(compat.getAttribute('hint'), 'Nowa wersja nie może wymagać niczego, czego stare wiadomości nie mają. Sprawdzane, gdy ktoś doda kolejną wersję.');
   const save = win.querySelector('[data-act="save"]');
   assert.equal(norm(save.textContent), 'Dodaj wzór');
   assert.equal(win.querySelector('[data-role="impact"]').hidden, true, 'nothing is marked yet, so nothing to fix is said');
@@ -203,6 +206,7 @@ test('"Dodaj wzór": formats from the server, a taken name and a broken text kee
   type(name, 'skierowanie');
   type(win.querySelector('[data-role="text"]'), V1);
   pick(win.querySelector('[data-role="compat"]'), 'full');
+  assert.equal(win.querySelector('[data-role="compat"]').getAttribute('hint'), 'Oba warunki naraz. Sprawdzane, gdy ktoś doda kolejną wersję.');
   assert.equal(save.hasAttribute('disabled'), false);
   assert.equal(norm(win.querySelector('[data-role="impact"]').textContent), 'Co się stanie po dodaniu: powstanie wzór skierowanie (JSON Schema), wersja 1. Żaden topik go jeszcze nie używa — wybierzesz go w ustawieniach topiku.');
   save.click();

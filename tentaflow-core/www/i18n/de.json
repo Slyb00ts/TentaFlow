@@ -10009,7 +10009,9 @@
         "missing_title": "Muster {name} gibt es nicht mehr",
         "missing_text": "Es wurde möglicherweise gelöscht. Kehren Sie zur Musterliste zurück.",
         "error_title": "Muster konnte nicht geladen werden",
-        "show": "Anzeigen"
+        "show": "Anzeigen",
+        "withdrawn_used_reader": "Neue Versionen lassen sich nicht hinzufügen und es lässt sich nicht für ein neues Topic wählen. {n|Topic|Topics} {topics} {n|prüft|prüfen} Nachrichten weiter nach der letzten Version ({version}), bis ein Administrator dort ein anderes Muster wählt.",
+        "withdrawn_unused_reader": "Neue Versionen lassen sich nicht hinzufügen und es lässt sich nicht für ein Topic wählen. Kein Topic verwendet es."
       },
       "added_existing_title": "Muster {name} gab es bereits",
       "added_existing_version": "Jemand hat es inzwischen hinzugefügt, daher ging der Text als Version {version} hinein.",

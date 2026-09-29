@@ -11244,7 +11244,9 @@
         "missing_title": "Wzoru {name} już nie ma",
         "missing_text": "Mógł zostać usunięty. Wróć do listy wzorów.",
         "error_title": "Nie udało się wczytać wzoru",
-        "show": "Pokaż"
+        "show": "Pokaż",
+        "withdrawn_used_reader": "Nowych wersji nie da się dodać i nie można go wybrać dla nowego topiku. {n|Topik|Topiki|Topiki} {topics} nadal {n|sprawdza|sprawdzają|sprawdzają} wiadomości według ostatniej wersji ({version}), dopóki administrator nie wybierze w {n|nim|nich|nich} innego wzoru.",
+        "withdrawn_unused_reader": "Nowych wersji nie da się dodać i nie można go wybrać dla topiku. Żaden topik go nie używa."
       },
       "added_existing_title": "Wzór {name} już istniał",
       "added_existing_version": "Ktoś dodał go w międzyczasie, więc tekst trafił do niego jako wersja {version}.",

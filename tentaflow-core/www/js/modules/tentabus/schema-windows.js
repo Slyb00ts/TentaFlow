@@ -359,6 +359,10 @@ function wireTextField(win, sync, formatOf) {
   return check;
 }
 
+// The option names are sentences themselves, so the list gets the whole row
+// and its hint says what the chosen one checks.
+const compatHint = (c) => `${T(`schemas.compat_desc.${c}`)} ${T('schemas.add.compat_hint')}`;
+
 // A text field marked with an error (a file too big to load) holds nothing sendable.
 const textMarked = (win) => win.querySelector('[data-role="text"]').hasAttribute('error');
 
@@ -381,14 +385,11 @@ export function openSchemaAdd(ctx) {
     cls: 'tb-schema-window',
     current: { subject: '', compatibility: DEFAULT_COMPATIBILITY, schemaType: initialType, schemaText: '' },
     saveLabel: T('schemas.add.button'),
-    guardDiscard: true,
     saveIcon: 'plus',
     willHappen: T('schemas.will_happen_add'),
     fields: () => `
-      <div class="form-grid-2">
-        <tf-input data-role="name" class="tb-mono-input" autocomplete="off" spellcheck="false" label="${escapeAttr(T('schemas.add.name_label'))}" hint="${escapeAttr(T('schemas.add.name_hint'))}"></tf-input>
-        <tf-select data-role="compat" label="${escapeAttr(T('schemas.col_compat'))}" hint="${escapeAttr(T('schemas.add.compat_hint'))}"></tf-select>
-      </div>
+      <tf-input data-role="name" class="tb-mono-input" autocomplete="off" spellcheck="false" label="${escapeAttr(T('schemas.add.name_label'))}" hint="${escapeAttr(T('schemas.add.name_hint'))}"></tf-input>
+      <tf-select data-role="compat" label="${escapeAttr(T('schemas.col_compat'))}" hint="${escapeAttr(compatHint(DEFAULT_COMPATIBILITY))}"></tf-select>
       <div class="field">
         <label>${escapeHtml(T('schemas.col_format'))}</label>
         ${types.length
@@ -406,7 +407,7 @@ export function openSchemaAdd(ctx) {
       });
       const compat = win.querySelector('[data-role="compat"]');
       compat.setOptions(COMPATIBILITIES.map((c) => ({ value: c, label: T(`schemas.compat_title.${c}`) })), DEFAULT_COMPATIBILITY);
-      compat.addEventListener('change', sync);
+      compat.addEventListener('change', () => { compat.setAttribute('hint', compatHint(compat.value)); sync(); });
       const format = win.querySelector('[data-role="format"]');
       check = wireTextField(win, sync, () => format?.value || '');
       format?.addEventListener('change', () => { check(); sync(); });
@@ -453,7 +454,6 @@ export function openSchemaVersion(ctx) {
     cls: 'tb-schema-window',
     current: { schemaText: ctx.latestText ?? '' },
     saveLabel: T('schemas.version.button'),
-    guardDiscard: true,
     saveIcon: 'plus',
     willHappen: T('schemas.will_happen_add'),
     fields: () => `
