@@ -9747,7 +9747,11 @@
       "dlq_record_handled": "Diese Nachricht wurde bereits wiederholt oder verworfen — aktualisieren Sie die Liste.",
       "dlq_retry_deduplicated": "Das Topic stellt eine Nachricht einmal pro Zeitfenster zu, und diese wurde darin bereits zugestellt — sie kann nach Ablauf des Fensters erneut gesendet werden. Die Nachricht bleibt in der Liste.",
       "dlq_retry_source_not_leader": "Dieser Node führt die Partition des Topics nicht, in die die Nachricht zurückgeht — wiederhole sie auf dem Node, der sie führt.",
-      "dlq_retry_requarantine_failed": "Das Muster des Topics hat die Nachricht erneut abgelehnt, und ihre neue Kopie konnte nicht unter den unverarbeiteten gespeichert werden — die Nachricht bleibt in der Liste."
+      "dlq_retry_requarantine_failed": "Das Muster des Topics hat die Nachricht erneut abgelehnt, und ihre neue Kopie konnte nicht unter den unverarbeiteten gespeichert werden — die Nachricht bleibt in der Liste.",
+      "key_needs_topic_wide_rule": "Ein Schlüssel kann die Nachrichten dieses Topics erst lesen oder senden, wenn das Topic eine Datenausblendungsregel für alle hat — Regeln nur für ausgewählte Personen gelten nicht für Schlüssel.",
+      "subject_is_addon": "Diese Kennung gehört zu einem Addon, nicht zu einem Benutzer. Entfernen Sie diesen Eintrag und gewähren Sie dem Addon Zugriff (Für wen: Addon).",
+      "subject_not_found": "Dieser Schlüssel wurde nicht gefunden — er wurde vielleicht widerrufen. Laden Sie die Seite neu.",
+      "org_mismatch": "Ein Recht an einem Topic kann nur aus seiner eigenen Organisation gewährt werden."
     },
     "shell": {
       "instance": "Instanz",
@@ -10264,6 +10268,7 @@
       "section": {
         "state": "Status",
         "settings": "Einstellungen",
+        "access": "Zugriff",
         "partitions": "Partitionen und Kopien",
         "dlq": "Unverarbeitet"
       },
@@ -10813,6 +10818,190 @@
         "button": "Nachricht verwerfen",
         "done_title": "Nachricht verworfen",
         "done_text": "{what} ist aus den unverarbeiteten Nachrichten verschwunden."
+      }
+    },
+    "access": {
+      "subjects_title": "Personen, Gruppen und Addons",
+      "explain": "Lesen — Nachrichten abrufen. Schreiben — Nachrichten senden. Administration — Einstellungen, Zugriff und Datenausblendung dieses Topics ändern.",
+      "col_who": "Wer",
+      "right_title": {
+        "read": "Lesen",
+        "write": "Schreiben",
+        "admin": "Administration"
+      },
+      "right_hint": {
+        "read": "Nachrichten abrufen",
+        "write": "Nachrichten senden",
+        "admin": "Einstellungen, Zugriff und Datenausblendung"
+      },
+      "right": {
+        "read": "Lesen",
+        "write": "Schreiben",
+        "admin": "Administration"
+      },
+      "about": {
+        "read": "das Lesen",
+        "write": "das Schreiben",
+        "admin": "die Administration"
+      },
+      "can": {
+        "read": "Nachrichten lesen",
+        "write": "Nachrichten senden",
+        "admin": "Einstellungen, Zugriff und Datenausblendung ändern"
+      },
+      "allowed": "erlaubt",
+      "denied": "verboten",
+      "not_set": "nicht festgelegt",
+      "not_set_title": "Hier nicht festgelegt — die Rolle in der Organisation entscheidet.",
+      "legend": "— hier nicht festgelegt: die Rolle in der Organisation entscheidet. „Verboten“ gewinnt gegen „erlaubt“ aus einer Gruppe.",
+      "kind": {
+        "user": "Benutzer",
+        "group": "Gruppe",
+        "addon": "Addon"
+      },
+      "group_sub": "{kind} · {count} {n|Person|Personen}",
+      "unknown_subject": "Unbekannter Eintrag",
+      "unknown_sub": "{kind} · Kennung {id}",
+      "empty_title": "Hier hat noch niemand einen Eintrag",
+      "empty_text": "Über den Zugriff auf dieses Topic entscheidet die Rolle in der Organisation. Gewähren Sie Zugriff, um ausgewählten Personen, Gruppen oder Addons etwas zu erlauben oder zu verbieten.",
+      "rights_label": "Rechte im Topic {topic}",
+      "level": {
+        "allow": "Erlauben",
+        "deny": "Verbieten",
+        "unset": "Nicht festlegen"
+      },
+      "grant": {
+        "button": "Zugriff gewähren",
+        "window_title": "Zugriff gewähren — {topic}",
+        "who": "Für wen",
+        "search": "Nach Namen suchen",
+        "pick": {
+          "user": "Welcher Benutzer",
+          "group": "Welche Gruppe",
+          "addon": "Welches Addon"
+        },
+        "pick_hint": {
+          "user": "Die Liste zeigt Benutzer, die noch keinen Eintrag haben.",
+          "group": "Die Liste zeigt Gruppen, die noch keinen Eintrag haben.",
+          "addon": "Die Liste zeigt Addons mit Zugriff auf diese Instanz, die noch keinen Eintrag haben."
+        },
+        "none": {
+          "user": "Jeder Benutzer der Organisation hat bereits einen Eintrag in diesem Topic.",
+          "group": "Jede Gruppe der Organisation hat bereits einen Eintrag in diesem Topic (oder die Organisation hat keine Gruppen).",
+          "addon": "Es gibt kein Addon mit Zugriff auf diese Instanz ohne Eintrag in diesem Topic."
+        },
+        "none_found": "Nichts passt zum eingegebenen Namen, oder der Treffer hat bereits einen Eintrag.",
+        "truncated": "Die ersten 50 werden angezeigt — geben Sie einen Teil des Namens ein, um die Liste einzugrenzen.",
+        "group_option": "{name} ({count} {n|Person|Personen})",
+        "pick_first": "Wählen Sie, wer Zugriff erhält.",
+        "pick_right": "Legen Sie mindestens ein Recht fest: erlauben oder verbieten.",
+        "impact_group": "{count} {n|Person der Gruppe|Personen der Gruppe} {name} {n|kann|können} im Topic {topic} {doing}.",
+        "impact_group_plain": "Die Gruppe „{name}“ erhält im Topic {topic}: {rights}.",
+        "impact_user": "Der Benutzer „{name}“ erhält im Topic {topic}: {rights}.",
+        "impact_addon": "Das Addon „{name}“ erhält im Topic {topic}: {rights}.",
+        "impact_deny": "Verboten für „{name}“: {rights} — gewinnt gegen die Rolle in der Organisation und gegen eine Erlaubnis aus einer Gruppe.",
+        "impact_unset": "Über {rights} entscheidet die Rolle in der Organisation.",
+        "saved_title": "Zugriff gewährt"
+      },
+      "change": {
+        "button": "Ändern",
+        "window_title": "Zugriff ändern — {name}",
+        "impact_line": "{right} für „{name}“ ändert sich von „{from}“ zu „{to}“.",
+        "impact_role": {
+          "read": "Darüber entscheidet die Rolle in der Organisation.",
+          "write": "Darüber entscheidet die Rolle in der Organisation.",
+          "admin": "Darüber entscheidet die Rolle in der Organisation."
+        },
+        "impact_rest": "Die übrigen Rechte bleiben unverändert.",
+        "saved_title": "Gespeichert"
+      },
+      "remove": {
+        "button": "Entfernen",
+        "window_title": "Zugriff entfernen — {name}",
+        "lead": "{name} verliert den Eintrag in diesem Topic: {parts}.",
+        "part": "{right} ({level})",
+        "lifts_deny": "Das Entfernen von „verboten“ kann diese Rechte geben, wenn die Rolle in der Organisation sie erlaubt.",
+        "impact_title": "Was nach dem Entfernen passiert:",
+        "impact": "über den Zugriff auf das Topic {topic} entscheidet die Rolle in der Organisation.",
+        "confirm": "Eintrag entfernen",
+        "saved_title": "Eintrag entfernt",
+        "saved_text": "{name} hat keinen Eintrag mehr in diesem Topic; über den Zugriff entscheidet die Rolle in der Organisation."
+      },
+      "keys": {
+        "title": "Externe Systeme (API-Schlüssel)",
+        "sub": "Der Schlüssel gilt in der Instanz {instance} und der Organisation {org}. Rechte an Nachrichtenmustern gelten für die ganze Instanz, nicht nur für dieses Topic.",
+        "sub_reader": "Der Schlüssel gilt in der Instanz {instance} und der Organisation {org}. Hier sind die Rechte der Schlüssel an den Nachrichten dieses Topics zu sehen; Rechte an Mustern und die letzte Nutzung sieht der Serveradministrator.",
+        "site_admin_only": "Schlüssel gibt der Serveradministrator aus.",
+        "col_system": "System",
+        "col_rights": "Rechte",
+        "col_used": "Zuletzt genutzt",
+        "kind": "API-Schlüssel",
+        "unknown_key": "Unbekannter Schlüssel",
+        "unknown_sub": "API-Schlüssel · Kennung {id}",
+        "empty": "Noch kein externes System hat einen Schlüssel mit Rechten an diesem Topic.",
+        "never": "noch nicht",
+        "just_now": "gerade eben",
+        "org_unknown": "ohne Namen",
+        "right": {
+          "readMessages": "Liest Nachrichten",
+          "writeMessages": "Sendet Nachrichten",
+          "readSchemas": "Liest Muster",
+          "writeSchemas": "Fügt Muster hinzu"
+        },
+        "right_hint": {
+          "readMessages": "Ruft Nachrichten aus dem Topic {topic} ab.",
+          "writeMessages": "Schreibt neue Nachrichten in das Topic {topic}.",
+          "readSchemas": "Ruft Muster und ihre Versionen ab (ganze Instanz).",
+          "writeSchemas": "Fügt Muster und Versionen hinzu, zieht Versionen zurück, ändert die Kompatibilität. Umfasst kein Lesen."
+        },
+        "issue": {
+          "button": "Schlüssel ausgeben",
+          "window_title": "Schlüssel für ein externes System ausgeben",
+          "name_label": "Name des Systems",
+          "name_hint": "Name in der Schlüsselliste und im Audit-Protokoll.",
+          "name_first": "Geben Sie den Namen des Systems ein.",
+          "name_too_long": "Der Name darf höchstens {max} Zeichen haben.",
+          "right_first": "Wählen Sie mindestens ein Recht.",
+          "impact": "{name} erhält einen Schlüssel mit den Rechten: {rights} (Topic {topic}). Den Schlüssel sehen Sie nur einmal.",
+          "saved_title": "Schlüssel ausgegeben",
+          "saved_text": "{name}: {rights}."
+        },
+        "issued": {
+          "window_title": "Schlüssel für das System „{name}“",
+          "once": "Kopieren Sie den Schlüssel jetzt. Später lässt er sich nicht mehr anzeigen — dann muss ein neuer ausgegeben werden.",
+          "k_key": "Schlüssel",
+          "k_system": "System",
+          "k_instance": "Instanz",
+          "k_rights": "Rechte",
+          "k_address": "Adresse für das System",
+          "topic": "Topic {topic}",
+          "how": "Das System sendet den Schlüssel im Header „Authorization: Bearer …“. Nachrichten sendet es per POST an diese Adresse und liest sie per GET mit dem zusätzlichen Parameter group={group} (oder {group}.name, wenn mehrere unabhängige Programme lesen).",
+          "copy_key": "Schlüssel kopieren",
+          "copy_url": "Adresse für das System kopieren",
+          "done": "Fertig",
+          "copied_key": "Schlüssel kopiert.",
+          "copied_url": "Adresse kopiert.",
+          "copy_failed": "Der Browser hat das Kopieren nicht erlaubt — markieren Sie den Text und kopieren Sie ihn von Hand."
+        },
+        "rights": {
+          "window_title": "Rechte des Schlüssels — {name}",
+          "impact_added": "{name} erhält die Rechte: {rights}.",
+          "impact_removed": "{name} verliert die Rechte: {rights}.",
+          "impact_none": "Der Schlüssel hat dann keine Rechte an diesem Topic oder an den Mustern dieser Instanz und verschwindet aus dieser Liste, besteht aber weiter.",
+          "impact_rest": "Die übrigen Rechte bleiben unverändert; der Schlüssel selbst ändert sich nicht.",
+          "saved_title": "Rechte des Schlüssels gespeichert"
+        },
+        "revoke": {
+          "button": "Widerrufen",
+          "window_title": "Schlüssel widerrufen — {name}",
+          "lead": "Das lässt sich nicht rückgängig machen — es müsste ein neuer Schlüssel ausgegeben werden.",
+          "impact_title": "Was nach dem Widerrufen passiert:",
+          "impact": "Der Schlüssel funktioniert sofort nicht mehr. {name} verliert die Rechte: {rights}.",
+          "impact_other": "Auch {count} {n|weiteres Recht|weitere Rechte} dieses Schlüssels außerhalb dieses Topics {n|funktioniert|funktionieren} nicht mehr.",
+          "audit": "Das Widerrufen wird im Audit-Protokoll vermerkt.",
+          "saved_title": "Schlüssel widerrufen",
+          "saved_text": "{name} kann sich nicht mehr mit TentaBus verbinden."
+        }
       }
     }
   },

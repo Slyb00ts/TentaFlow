@@ -4212,8 +4212,15 @@ async fn capabilities_v1(
     let is_org_admin = ctx.org_context.as_ref().is_some_and(|o| o.has("org.admin"));
     let svc = g.svc.clone();
     let org_id = g.org_id.clone();
-    let (default_replication_factor, node_count) =
-        run_blocking(move || Ok(svc.default_replication(&org_id))).await?;
+    let db = ctx.state.db.clone();
+    let (default_replication_factor, node_count, org_name) = run_blocking(move || {
+        let (rf, nodes) = svc.default_replication(&org_id);
+        let org_name = crate::services::org::get_organization(&db, &org_id)
+            .map_err(|e| db_err("org::get_organization", e.into()))?
+            .map(|o| o.name);
+        Ok((rf, nodes, org_name))
+    })
+    .await?;
     let capabilities = BusCapabilitiesWire {
         can_read: true,
         can_write: can(PERM_WRITE),
@@ -4233,6 +4240,8 @@ async fn capabilities_v1(
             .map(|t| t.as_str().to_string())
             .collect(),
         field_actions: vec![FIELD_ACTION_HIDE.to_string()],
+        org_id: g.org_id.clone(),
+        org_name,
     };
     Ok(BusPayload::CapabilitiesResponse { capabilities })
 }
@@ -5938,6 +5947,44 @@ mod tests {
                 // other (see `capabilities_is_site_admin_false_for_a_non_
                 // admin_role_session` for the opposite case).
                 assert!(capabilities.is_site_admin);
+                // An organisation this node has no row for keeps its id and
+                // has no name to show.
+                assert_eq!(capabilities.org_id, org_id);
+                assert_eq!(capabilities.org_name, None);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// The access section builds a topic right's id and the REST address a
+    /// key is given from the caller's organisation; it names it too.
+    #[tokio::test]
+    async fn capabilities_name_the_callers_organisation() {
+        let (_guard, db) = bus_fixture();
+        let user_id = format!("u-caps-org-{}", uuid::Uuid::new_v4());
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let org = crate::services::org::create_organization(
+            &db,
+            &format!("Przychodnia Zdrowie {tag}"),
+            &format!("przychodnia-{tag}"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("organisation");
+        seed_bus_permissions(&db, &user_id, &["bus.read"]);
+        let ctx = handler_ctx(db, org_context(&org.org_id, &user_id, &[]));
+        match capabilities_v1(&ctx, fixture_instance_id().as_str())
+            .await
+            .expect("capabilities")
+        {
+            BusPayload::CapabilitiesResponse { capabilities } => {
+                assert_eq!(capabilities.org_id, org.org_id);
+                assert_eq!(
+                    capabilities.org_name.as_deref(),
+                    Some(format!("Przychodnia Zdrowie {tag}").as_str())
+                );
             }
             other => panic!("unexpected response: {other:?}"),
         }

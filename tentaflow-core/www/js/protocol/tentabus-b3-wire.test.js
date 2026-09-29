@@ -7,7 +7,11 @@
 //       - `SubjectDirectoryResponse` / `FieldPolicyPreviewResponse` decode to
 //         the objects the access and data-hiding windows read, including an
 //         answer without the `#[serde(default)]` fields;
-//       - an addon row of `AclListResponse` keeps its own subject type.
+//       - an addon row of `AclListResponse` keeps its own subject type;
+//       - U6 Dostęp: `AclSetRequest` carries one right of one subject, and
+//         `CapabilitiesResponse` hands over the caller's organisation (the
+//         middle part of a topic right's id and the REST address's `org_id`),
+//         empty on an answer that predates it.
 // =============================================================================
 
 import { test } from 'node:test';
@@ -223,4 +227,19 @@ test('an addon row of the access list keeps its own subject type and label', { s
   assert.equal(body.entries[0].subjectType, 'addon');
   assert.equal(body.entries[0].subjectLabel, 'Asystent lekarza');
   assert.equal(body.entries[0].memberCount, null);
+});
+
+test('an access entry request names one right of one subject', { skip }, () => {
+  const sent = sentEnvelope('busAclSetRequest', { instanceId: INSTANCE, topic: 'wyniki', subjectType: 'addon', subjectId: 'asystent', accessLevel: 'deny', action: 'write' });
+  assert.deepEqual(sent.payload, { AclSetRequest: { topic: 'wyniki', subject_type: 'addon', subject_id: 'asystent', access_level: 'deny', action: 'write' } });
+});
+
+test('the capabilities answer carries the caller\'s organisation, empty when an older server sends none', { skip }, () => {
+  const base = { can_read: true, can_write: true, can_admin: true, is_site_admin: true, default_replication_factor: 1, node_count: 1, content_types: [], schema_types: [], field_actions: [] };
+  const body = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { CapabilitiesResponse: { capabilities: { ...base, org_id: 'org-default', org_name: 'Przychodnia Zdrowie' } } } } });
+  assert.equal(body.capabilities.orgId, 'org-default');
+  assert.equal(body.capabilities.orgName, 'Przychodnia Zdrowie');
+  const older = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { CapabilitiesResponse: { capabilities: base } } } });
+  assert.equal(older.capabilities.orgId, '');
+  assert.equal(older.capabilities.orgName, null);
 });

@@ -12298,6 +12298,16 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 "field_actions",
                 string_vec_to_js(capabilities.field_actions).into(),
             );
+            set_bus(&o, "orgId", "org_id", capabilities.org_id.into());
+            set_bus(
+                &o,
+                "orgName",
+                "org_name",
+                capabilities
+                    .org_name
+                    .map(JsValue::from)
+                    .unwrap_or(JsValue::NULL),
+            );
             set(obj, "capabilities", o.into());
         }
         BP::ReplicaListRequest { .. } => set(obj, "variant", "BusReplicaListRequest".into()),

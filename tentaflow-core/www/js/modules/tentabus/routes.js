@@ -8,7 +8,7 @@
 export const MAIN_TABS = ['overview', 'topics', 'groups', 'dlq', 'schemas', 'replication'];
 export const DEFAULT_TAB = 'overview';
 /** The sections of a topic's page, in the order of its menu. */
-export const TOPIC_SECTIONS = ['state', 'settings', 'dlq', 'partitions'];
+export const TOPIC_SECTIONS = ['state', 'settings', 'access', 'dlq', 'partitions'];
 export const DEFAULT_SECTION = 'state';
 /** The sections of a consumer's page, in the order of its menu; it opens on the first. */
 export const CONSUMER_SECTIONS = ['state', 'position', 'settings'];

@@ -53,7 +53,7 @@ test('build: short addresses, and every view survives a round trip', () => {
 });
 
 test('a topic opens on its first section; the section stays out of the address until it is another', () => {
-  assert.deepEqual(TOPIC_SECTIONS, ['state', 'settings', 'dlq', 'partitions']);
+  assert.deepEqual(TOPIC_SECTIONS, ['state', 'settings', 'access', 'dlq', 'partitions']);
   assert.equal(DEFAULT_SECTION, 'state');
   assert.equal(parseRoute({ topic: 'faktury', section: 'nonsense' }).section, 'state');
   assert.equal(parseRoute({ tab: 'overview', section: 'settings' }).section, null, 'a section without a topic means nothing');

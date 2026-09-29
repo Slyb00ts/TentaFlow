@@ -5,15 +5,16 @@
 // carries and checks), "Podgląd
 // wiadomości" on the right, then a vertical section menu (tf-tabs
 // orientation="vertical"; a "Sekcja: …" list on a phone) beside exactly one
-// section: Stan, Ustawienia, Nieprzetworzone, Partycje i kopie. Sections are
-// read views; every change goes through a window (topic-settings.js,
-// unprocessed-windows.js, partitions.js) and comes back as a note over the
-// section it changed.
+// section: Stan, Ustawienia, Dostęp, Nieprzetworzone, Partycje i kopie.
+// Sections are read views; every change goes through a window
+// (topic-settings.js, topic-access.js, unprocessed-windows.js, partitions.js)
+// and comes back as a note over the section it changed.
 //
 // Rights come from `TopicDetailResponse.access`: without administration the
 // page shows no change buttons and says who can change the topic
-// (`adminLabels`); without read access the sections that show messages and
-// their numbers are unavailable with the reason, and so is the preview.
+// (`adminLabels`), and Dostęp is not in the menu at all; without read access
+// the sections that show messages and their numbers are unavailable with the
+// reason, and so is the preview.
 //
 // Drawn once per topic and state, then painted in place on every poll. The
 // shell passes the moves in as `ctx.go`.
@@ -28,6 +29,7 @@ import { paintStateSection } from '/js/modules/tentabus/topic-state.js';
 import { settingsHtml, whoCanChange } from '/js/modules/tentabus/topic-settings.js';
 import { partitionRows, transferBlocker, copyChipHtml, rangeText, unavailableText } from '/js/modules/tentabus/partitions.js';
 import { paintUnprocessedSection } from '/js/modules/tentabus/unprocessed.js';
+import { paintAccessSection, accessCount } from '/js/modules/tentabus/topic-access.js';
 import '/js/components/tf-tabs.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-button.js';
@@ -38,9 +40,11 @@ import '/js/components/tf-spinner.js';
 
 const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}"/></svg>`;
 
-const SECTION_ICONS = { state: 'gauge', settings: 'settings', dlq: 'inbox', partitions: 'layers' };
+const SECTION_ICONS = { state: 'gauge', settings: 'settings', access: 'lock', dlq: 'inbox', partitions: 'layers' };
 /** Sections that show messages or their numbers: closed to a reader without read access. */
 const READ_SECTIONS = new Set(['state', 'dlq', 'partitions']);
+/** Sections only the topic's administrators see: absent from the menu for everyone else. */
+const ADMIN_SECTIONS = new Set(['access']);
 
 /**
  * Loads a topic's page data so that only the newest answer lands: a poll
@@ -78,7 +82,13 @@ export function titleLine(topic) {
 
 /** Whether a section can be opened with these rights. */
 export function sectionOpen(section, access) {
+  if (ADMIN_SECTIONS.has(section)) return Boolean(access?.canAdmin);
   return !READ_SECTIONS.has(section) || Boolean(access?.canRead);
+}
+
+/** Whether a section is in the menu at all (a closed read section stays, with its reason). */
+export function sectionListed(section, access) {
+  return !ADMIN_SECTIONS.has(section) || Boolean(access?.canAdmin);
 }
 
 /**
@@ -134,12 +144,13 @@ function missingHtml(name) {
  * Draws or repaints the page from `ctx.view()` = `{ name, detail, error,
  * errorKind, section, stats, subjects, capabilities, nodes, replicaTopics,
  * replicaLags, lagSeries, notice, justMoved, unprocessed, unprocessedShown,
- * instanceLabel, nowMs }`.
+ * accessData, instanceId, instanceLabel, nowMs }`.
  * `ctx.go(action)`: `{ kind: 'back' | 'preview' | 'delete' | 'retry' }`,
  * `{ kind: 'section', section }`, `{ kind: 'change', card }`,
  * `{ kind: 'group', group }`, `{ kind: 'dlq' }`, `{ kind: 'transfer', partition }`,
- * and the unprocessed section's `{ kind: 'unp-view' | 'unp-retry' |
- * 'unp-discard', key }`, `{ kind: 'unp-retry-all' | 'unp-more' | 'unp-reload' }`.
+ * the unprocessed section's `{ kind: 'unp-view' | 'unp-retry' |
+ * 'unp-discard', key }`, `{ kind: 'unp-retry-all' | 'unp-more' | 'unp-reload' }`
+ * and the access section's (see `paintAccessSection`).
  */
 export function drawTopicDetail(body, ctx) {
   const view = ctx.view();
@@ -202,10 +213,16 @@ function paintPage(body, view, ctx) {
 
   const menu = body.querySelector('[data-role="menu"]');
   const unprocessed = Number((view.stats?.topics || []).find((t) => t.topic === topic.name)?.dlqDepth) || 0;
-  const counts = { partitions: fmtCount(topic.partitions), dlq: access.canRead && unprocessed > 0 ? fmtCount(unprocessed) : null };
+  const entries = access.canAdmin ? accessCount(view.accessData, { instanceId: view.instanceId, orgId: view.capabilities?.orgId || '' }) : null;
+  const counts = {
+    partitions: fmtCount(topic.partitions),
+    dlq: access.canRead && unprocessed > 0 ? fmtCount(unprocessed) : null,
+    access: entries != null && entries > 0 ? fmtCount(entries) : null,
+  };
   for (const s of TOPIC_SECTIONS) {
     const tab = menu.querySelector(`tf-tab#${s}`);
-    setAttr(tab, 'disabled', !sectionOpen(s, access));
+    tab.hidden = !sectionListed(s, access);
+    setAttr(tab, 'disabled', sectionListed(s, access) && !sectionOpen(s, access));
     setAttr(tab, 'count', counts[s] ?? null);
   }
   if (menu.getAttribute('value') !== section) menu.value = section;
@@ -235,6 +252,7 @@ function paintPage(body, view, ctx) {
   };
   if (section === 'state') paintStateSection(host, sectionView);
   else if (section === 'settings') patchHtml(host, settingsHtml(sectionView));
+  else if (section === 'access') paintAccessSection(host, sectionView, ctx);
   else if (section === 'dlq') paintUnprocessedSection(host, sectionView, ctx);
   else paintPartitionsSection(host, sectionView, ctx);
 }

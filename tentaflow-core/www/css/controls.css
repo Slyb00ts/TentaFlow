@@ -3497,6 +3497,23 @@ tf-checkbox {
   opacity: 0.4;
   cursor: not-allowed;
 }
+.tf-checkbox-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.tf-checkbox-label.has-desc {
+  align-items: flex-start;
+}
+.tf-checkbox-label.has-desc .tf-checkbox-text {
+  font-weight: 600;
+}
+.tf-checkbox-desc {
+  font-size: 12px;
+  color: var(--tf-text-3);
+  overflow-wrap: anywhere;
+}
 .tf-checkbox-input {
   display: inline-flex;
   align-items: center;
@@ -10462,6 +10479,7 @@ tf-tabs[orientation="vertical"] .tf-tabs-chev { display: none; }
   border-radius: var(--tf-radius);
 }
 .tf-tabs--vertical > tf-tab { display: block; }
+.tf-tabs--vertical > tf-tab[hidden] { display: none; }
 .tf-tabs--vertical > tf-tab + tf-tab { border-top: 1px solid var(--tf-border); }
 .tf-tabs--vertical .tf-tab {
   display: flex;

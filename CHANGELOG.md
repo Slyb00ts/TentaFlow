@@ -167,6 +167,29 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   Nod w starszej wersji odrzuca zsynchronizowany wiersz addonu (operacja
   trafia do konfliktów synchronizacji) i dalej traktuje addony jak
   użytkowników — nody trzeba zaktualizować razem.
+- Strona topiku ma sekcję „Dostęp” (widoczną tylko dla administratora
+  topiku; pozostali nie widzą jej w menu). Tabela „Osoby, grupy i addony”
+  pokazuje dla każdego wpisu nazwę, rodzaj i liczebność grupy oraz Czytanie /
+  Zapis / Administracja jako „pozwolono”, „zabroniono” albo „—” (decyduje rola
+  w organizacji). „Nadaj dostęp” wybiera użytkownika, grupę albo addon
+  z katalogu (tylko tych bez wpisu), „Zmień” i „Usuń” działają w wierszu;
+  każde okno mówi przed zapisem, co się stanie, a usunięcie „zabroniono”
+  ostrzega, że rola w organizacji może dać te prawa. Stary wpis na wszystkie
+  prawa naraz jest przy zmianie rozpisywany na trzy osobne. Wpis
+  użytkownika o identyfikatorze addonu jest pokazany jako nieznany podmiot
+  z identyfikatorem i można go usunąć.
+- Karta „Systemy zewnętrzne (klucze API)” w tej sekcji pokazuje klucze
+  z prawami do wiadomości topiku lub do wzorów wiadomości instancji.
+  Administrator serwera widzi też ostatnie użycie i może wydać klucz (nazwa
+  i prawa: czyta/wysyła wiadomości, czyta/dodaje wzory — klucz pokazany raz,
+  z adresem dla systemu i nazwą grupy odbiorców `k:<id klucza>`), zmienić
+  jego prawa i go unieważnić. Pozostali administratorzy topiku widzą prawa
+  kluczy do wiadomości tylko do odczytu, z informacją, że klucze wydaje
+  administrator serwera. Nowe tłumaczenia błędów: klucz bez zasady ukrywania
+  danych dla wszystkich (`bus.key_needs_topic_wide_rule`), wpis użytkownika
+  o identyfikatorze addonu, nieznany klucz, prawo spoza własnej organizacji.
+  Protokół: `BusCapabilitiesWire.{org_id, org_name}` (organizacja wywołującego;
+  pusta u starszego serwera).
 
 ## [0.4.0-beta.1] — 2026-09-29
 

@@ -3201,7 +3201,7 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** BusPayload::AclListRequest (M03 ACL tab). payload: { instanceId, topic }. */
+  /** BusPayload::AclListRequest (a topic's Dostęp section). payload: { instanceId, topic }. */
   busAclListRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeBusAclListRequest(encode._busInstanceId(payload), String(payload.topic ?? ''));
@@ -3209,9 +3209,9 @@ export const encode = {
   },
 
   /**
-   * BusPayload::AclSetRequest. payload: { topic, subjectType, subjectId, accessLevel: 'allow'|'deny'|'clear' }.
-   * NOTE: `resource_permissions` has no produce/consume/admin action column (see
-   * `services/bus_authorizer.rs`'s doc) — `accessLevel` gates the whole topic, not one action.
+   * BusPayload::AclSetRequest. payload: { topic, subjectType: 'user'|'group'|'addon'|'api_key',
+   * subjectId, accessLevel: 'allow'|'deny'|'clear', action: 'read'|'write'|'admin'|'*' }.
+   * One row per subject AND action (migration 168): 'clear' removes only that action's row.
    */
   busAclSetRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

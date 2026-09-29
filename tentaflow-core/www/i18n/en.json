@@ -10982,7 +10982,11 @@
       "dlq_record_handled": "This message was already retried or discarded — refresh the list.",
       "dlq_retry_deduplicated": "The topic delivers a message once per window and this one was already delivered in it — it can be retried once the window has passed. The message stays on the list.",
       "dlq_retry_source_not_leader": "This node does not lead the topic partition the message goes back to — retry it on the node that leads it.",
-      "dlq_retry_requarantine_failed": "The topic's pattern rejected the message again and its new copy could not be saved among the unprocessed ones — the message stays on the list."
+      "dlq_retry_requarantine_failed": "The topic's pattern rejected the message again and its new copy could not be saved among the unprocessed ones — the message stays on the list.",
+      "key_needs_topic_wide_rule": "A key cannot read or send this topic's messages until the topic has a data-hiding rule for everyone — rules set only for chosen people do not cover keys.",
+      "subject_is_addon": "This id belongs to an addon, not a user. Remove this entry and grant access to the addon (To whom: Addon).",
+      "subject_not_found": "This key was not found — it may have been revoked. Refresh the page.",
+      "org_mismatch": "A right to a topic can only be granted from the topic's own organisation."
     },
     "shell": {
       "instance": "Instance",
@@ -11499,6 +11503,7 @@
       "section": {
         "state": "Status",
         "settings": "Settings",
+        "access": "Access",
         "partitions": "Partitions and copies",
         "dlq": "Unprocessed"
       },
@@ -12048,6 +12053,190 @@
         "button": "Discard message",
         "done_title": "Message discarded",
         "done_text": "{what} left the unprocessed messages."
+      }
+    },
+    "access": {
+      "subjects_title": "People, groups and addons",
+      "explain": "Reading — fetching messages. Writing — sending messages. Administration — changing the settings, access and data hiding of this topic.",
+      "col_who": "Who",
+      "right_title": {
+        "read": "Reading",
+        "write": "Writing",
+        "admin": "Administration"
+      },
+      "right_hint": {
+        "read": "fetching messages",
+        "write": "sending messages",
+        "admin": "settings, access and data hiding"
+      },
+      "right": {
+        "read": "reading",
+        "write": "writing",
+        "admin": "administration"
+      },
+      "about": {
+        "read": "reading",
+        "write": "writing",
+        "admin": "administration"
+      },
+      "can": {
+        "read": "read messages",
+        "write": "send messages",
+        "admin": "change the settings, access and data hiding"
+      },
+      "allowed": "allowed",
+      "denied": "denied",
+      "not_set": "not set",
+      "not_set_title": "Not set here — the role in the organisation decides.",
+      "legend": "— not set here: the role in the organisation decides. “Denied” wins over “allowed” from a group.",
+      "kind": {
+        "user": "User",
+        "group": "Group",
+        "addon": "Addon"
+      },
+      "group_sub": "{kind} · {count} {n|person|people}",
+      "unknown_subject": "Unknown subject",
+      "unknown_sub": "{kind} · id {id}",
+      "empty_title": "Nobody has an entry here yet",
+      "empty_text": "Access to this topic is decided by the role in the organisation. Grant access to allow or deny chosen people, groups or addons.",
+      "rights_label": "Rights in topic {topic}",
+      "level": {
+        "allow": "Allow",
+        "deny": "Deny",
+        "unset": "Do not set"
+      },
+      "grant": {
+        "button": "Grant access",
+        "window_title": "Grant access — {topic}",
+        "who": "To whom",
+        "search": "Search by name",
+        "pick": {
+          "user": "Which user",
+          "group": "Which group",
+          "addon": "Which addon"
+        },
+        "pick_hint": {
+          "user": "The list shows users who do not have an entry yet.",
+          "group": "The list shows groups that do not have an entry yet.",
+          "addon": "The list shows addons with access to this instance that do not have an entry yet."
+        },
+        "none": {
+          "user": "Every user of the organisation already has an entry in this topic.",
+          "group": "Every group of the organisation already has an entry in this topic (or the organisation has no groups).",
+          "addon": "There is no addon with access to this instance without an entry in this topic."
+        },
+        "none_found": "Nothing matches the name typed, or the match already has an entry.",
+        "truncated": "The first 50 are shown — type part of the name to narrow the list.",
+        "group_option": "{name} ({count} {n|person|people})",
+        "pick_first": "Choose who gets access.",
+        "pick_right": "Set at least one right: allow or deny.",
+        "impact_group": "{count} {n|person in the group|people in the group} {name} will be able to {doing} in topic {topic}.",
+        "impact_group_plain": "The group “{name}” gets in topic {topic}: {rights}.",
+        "impact_user": "The user “{name}” gets in topic {topic}: {rights}.",
+        "impact_addon": "The addon “{name}” gets in topic {topic}: {rights}.",
+        "impact_deny": "Denied for “{name}”: {rights} — this wins over the role in the organisation and over an allow from a group.",
+        "impact_unset": "The role in the organisation decides about {rights}.",
+        "saved_title": "Access granted"
+      },
+      "change": {
+        "button": "Change",
+        "window_title": "Change access — {name}",
+        "impact_line": "{right} for “{name}” changes from “{from}” to “{to}”.",
+        "impact_role": {
+          "read": "The role in the organisation decides about it.",
+          "write": "The role in the organisation decides about it.",
+          "admin": "The role in the organisation decides about it."
+        },
+        "impact_rest": "The other rights stay as they are.",
+        "saved_title": "Saved"
+      },
+      "remove": {
+        "button": "Remove",
+        "window_title": "Remove access — {name}",
+        "lead": "{name} loses the entry in this topic: {parts}.",
+        "part": "{right} ({level})",
+        "lifts_deny": "Removing “denied” may give these rights if the role in the organisation allows them.",
+        "impact_title": "What happens after removing:",
+        "impact": "the role in the organisation decides about access to topic {topic}.",
+        "confirm": "Remove entry",
+        "saved_title": "Entry removed",
+        "saved_text": "{name} no longer has an entry in this topic; the role in the organisation decides about access."
+      },
+      "keys": {
+        "title": "External systems (API keys)",
+        "sub": "The key works in instance {instance} and organisation {org}. Rights to message patterns cover the whole instance, not only this topic.",
+        "sub_reader": "The key works in instance {instance} and organisation {org}. Shown here are the keys' rights to this topic's messages; rights to patterns and a key's last use are seen by the server administrator.",
+        "site_admin_only": "Keys are issued by the server administrator.",
+        "col_system": "System",
+        "col_rights": "Rights",
+        "col_used": "Last used",
+        "kind": "API key",
+        "unknown_key": "Unknown key",
+        "unknown_sub": "API key · id {id}",
+        "empty": "No external system has a key with rights to this topic yet.",
+        "never": "not yet",
+        "just_now": "just now",
+        "org_unknown": "without a name",
+        "right": {
+          "readMessages": "Reads messages",
+          "writeMessages": "Sends messages",
+          "readSchemas": "Reads patterns",
+          "writeSchemas": "Adds patterns"
+        },
+        "right_hint": {
+          "readMessages": "Fetches messages from topic {topic}.",
+          "writeMessages": "Writes new messages to topic {topic}.",
+          "readSchemas": "Fetches patterns and their versions (the whole instance).",
+          "writeSchemas": "Adds patterns and versions, withdraws versions, changes compatibility. Does not include reading."
+        },
+        "issue": {
+          "button": "Issue key",
+          "window_title": "Issue a key for an external system",
+          "name_label": "System name",
+          "name_hint": "The name shown on the key list and in the audit log.",
+          "name_first": "Type the system's name.",
+          "name_too_long": "The name can have at most {max} characters.",
+          "right_first": "Tick at least one right.",
+          "impact": "{name} gets a key with the rights: {rights} (topic {topic}). You will see the key only once.",
+          "saved_title": "Key issued",
+          "saved_text": "{name}: {rights}."
+        },
+        "issued": {
+          "window_title": "Key for the system “{name}”",
+          "once": "Copy the key now. It cannot be shown later — a new one would have to be issued.",
+          "k_key": "Key",
+          "k_system": "System",
+          "k_instance": "Instance",
+          "k_rights": "Rights",
+          "k_address": "Address for the system",
+          "topic": "topic {topic}",
+          "how": "The system sends the key in the “Authorization: Bearer …” header. It sends messages with POST to this address and reads them with GET, adding the parameter group={group} (or {group}.name when several independent programs read).",
+          "copy_key": "Copy key",
+          "copy_url": "Copy address for the system",
+          "done": "Done",
+          "copied_key": "Key copied.",
+          "copied_url": "Address copied.",
+          "copy_failed": "The browser did not allow copying — select the text and copy it by hand."
+        },
+        "rights": {
+          "window_title": "Key rights — {name}",
+          "impact_added": "{name} gets the rights: {rights}.",
+          "impact_removed": "{name} loses the rights: {rights}.",
+          "impact_none": "The key will have no rights to this topic or to this instance's patterns and will disappear from this list, but it will still exist.",
+          "impact_rest": "The other rights stay as they are; the key itself does not change.",
+          "saved_title": "Key rights saved"
+        },
+        "revoke": {
+          "button": "Revoke",
+          "window_title": "Revoke key — {name}",
+          "lead": "This cannot be undone — a new key would have to be issued.",
+          "impact_title": "What happens after revoking:",
+          "impact": "The key stops working at once. {name} loses the rights: {rights}.",
+          "impact_other": "{count} other {n|right|rights} of this key outside this topic also {n|stops|stop} working.",
+          "audit": "The revocation is written to the audit log.",
+          "saved_title": "Key revoked",
+          "saved_text": "{name} can no longer connect to TentaBus."
+        }
       }
     }
   },

@@ -10982,7 +10982,11 @@
       "dlq_record_handled": "Tę wiadomość już ponowiono albo odrzucono — odśwież listę.",
       "dlq_retry_deduplicated": "Topik ma regułę jednorazowego dostarczenia i tę wiadomość już raz dostarczono w jej oknie — ponowienie jest możliwe po upływie tego okna. Wiadomość zostaje na liście.",
       "dlq_retry_source_not_leader": "Ten node nie prowadzi partycji topiku, do której wiadomość ma wrócić — ponów ją na nodzie, który ją prowadzi.",
-      "dlq_retry_requarantine_failed": "Wzór topiku znów odrzucił wiadomość, a jej nowej kopii nie udało się zapisać wśród nieprzetworzonych — wiadomość zostaje na liście."
+      "dlq_retry_requarantine_failed": "Wzór topiku znów odrzucił wiadomość, a jej nowej kopii nie udało się zapisać wśród nieprzetworzonych — wiadomość zostaje na liście.",
+      "key_needs_topic_wide_rule": "Klucz nie może czytać ani wysyłać wiadomości tego topiku, dopóki topik nie ma zasady ukrywania danych dla wszystkich — zasady ustawione tylko dla wybranych osób nie obejmują kluczy.",
+      "subject_is_addon": "Ten identyfikator należy do addonu, nie do użytkownika. Usuń ten wpis i nadaj dostęp addonowi (Komu: Addon).",
+      "subject_not_found": "Nie znaleziono tego klucza — mógł zostać unieważniony. Odśwież stronę.",
+      "org_mismatch": "Prawo do topiku można nadać tylko z jego własnej organizacji."
     },
     "shell": {
       "instance": "Instancja",
@@ -11499,6 +11503,7 @@
       "section": {
         "state": "Stan",
         "settings": "Ustawienia",
+        "access": "Dostęp",
         "partitions": "Partycje i kopie",
         "dlq": "Nieprzetworzone"
       },
@@ -12048,6 +12053,190 @@
         "button": "Odrzuć wiadomość",
         "done_title": "Odrzucono wiadomość",
         "done_text": "{what} zniknęła z nieprzetworzonych."
+      }
+    },
+    "access": {
+      "subjects_title": "Osoby, grupy i addony",
+      "explain": "Czytanie — pobieranie wiadomości. Zapis — wysyłanie wiadomości. Administracja — zmiana ustawień, dostępu i ukrywania danych tego topiku.",
+      "col_who": "Kto",
+      "right_title": {
+        "read": "Czytanie",
+        "write": "Zapis",
+        "admin": "Administracja"
+      },
+      "right_hint": {
+        "read": "pobieranie wiadomości",
+        "write": "wysyłanie wiadomości",
+        "admin": "ustawienia, dostęp i ukrywanie danych"
+      },
+      "right": {
+        "read": "czytanie",
+        "write": "zapis",
+        "admin": "administracja"
+      },
+      "about": {
+        "read": "czytaniu",
+        "write": "zapisie",
+        "admin": "administracji"
+      },
+      "can": {
+        "read": "czytać wiadomości",
+        "write": "wysyłać wiadomości",
+        "admin": "zmieniać ustawienia, dostęp i ukrywanie danych"
+      },
+      "allowed": "pozwolono",
+      "denied": "zabroniono",
+      "not_set": "nie ustawiono",
+      "not_set_title": "Nie ustawiono tutaj — decyduje rola w organizacji.",
+      "legend": "— nie ustawiono tutaj: decyduje rola w organizacji. „Zabroniono” wygrywa z „pozwolono” z grupy.",
+      "kind": {
+        "user": "Użytkownik",
+        "group": "Grupa",
+        "addon": "Addon"
+      },
+      "group_sub": "{kind} · {count} {n|osoba|osoby|osób}",
+      "unknown_subject": "Nieznany podmiot",
+      "unknown_sub": "{kind} · identyfikator {id}",
+      "empty_title": "Nikt nie ma tu jeszcze wpisu",
+      "empty_text": "O dostępie do tego topiku decyduje rola w organizacji. Nadaj dostęp, aby pozwolić albo zabronić wybranym osobom, grupom lub addonom.",
+      "rights_label": "Prawa w topiku {topic}",
+      "level": {
+        "allow": "Pozwól",
+        "deny": "Zabroń",
+        "unset": "Nie ustawiaj"
+      },
+      "grant": {
+        "button": "Nadaj dostęp",
+        "window_title": "Nadaj dostęp — {topic}",
+        "who": "Komu",
+        "search": "Szukaj po nazwie",
+        "pick": {
+          "user": "Który użytkownik",
+          "group": "Która grupa",
+          "addon": "Który addon"
+        },
+        "pick_hint": {
+          "user": "Na liście są użytkownicy, którzy nie mają jeszcze wpisu.",
+          "group": "Na liście są grupy, które nie mają jeszcze wpisu.",
+          "addon": "Na liście są addony z dostępem do tej instancji, które nie mają jeszcze wpisu."
+        },
+        "none": {
+          "user": "Każdy użytkownik organizacji ma już wpis w tym topiku.",
+          "group": "Każda grupa organizacji ma już wpis w tym topiku (albo organizacja nie ma grup).",
+          "addon": "Nie ma addonu z dostępem do tej instancji bez wpisu w tym topiku."
+        },
+        "none_found": "Nic nie pasuje do wpisanej nazwy albo pasujący ma już wpis.",
+        "truncated": "Pokazano pierwsze 50 — wpisz część nazwy, aby zawęzić listę.",
+        "group_option": "{name} ({count} {n|osoba|osoby|osób})",
+        "pick_first": "Wybierz, komu nadać dostęp.",
+        "pick_right": "Ustaw co najmniej jedno prawo: pozwól albo zabroń.",
+        "impact_group": "{count} {n|osoba z grupy|osoby z grupy|osób z grupy} {name} {n|będzie mogła|będą mogły|będzie mogło} {doing} w topiku {topic}.",
+        "impact_group_plain": "Grupa „{name}” dostanie w topiku {topic}: {rights}.",
+        "impact_user": "Użytkownik „{name}” dostanie w topiku {topic}: {rights}.",
+        "impact_addon": "Addon „{name}” dostanie w topiku {topic}: {rights}.",
+        "impact_deny": "Zakaz dla „{name}”: {rights} — wygrywa z rolą w organizacji i z pozwoleniem z grupy.",
+        "impact_unset": "O {rights} zdecyduje rola w organizacji.",
+        "saved_title": "Nadano dostęp"
+      },
+      "change": {
+        "button": "Zmień",
+        "window_title": "Zmień dostęp — {name}",
+        "impact_line": "{right} dla „{name}” zmieni się z „{from}” na „{to}”.",
+        "impact_role": {
+          "read": "Zdecyduje o nim rola w organizacji.",
+          "write": "Zdecyduje o nim rola w organizacji.",
+          "admin": "Zdecyduje o niej rola w organizacji."
+        },
+        "impact_rest": "Pozostałe prawa bez zmian.",
+        "saved_title": "Zapisano"
+      },
+      "remove": {
+        "button": "Usuń",
+        "window_title": "Usuń dostęp — {name}",
+        "lead": "{name} straci wpis w tym topiku: {parts}.",
+        "part": "{right} ({level})",
+        "lifts_deny": "Usunięcie „zabroniono” może dać te prawa, jeśli pozwala na nie rola w organizacji.",
+        "impact_title": "Co się stanie po usunięciu:",
+        "impact": "o dostępie do topiku {topic} zdecyduje rola w organizacji.",
+        "confirm": "Usuń wpis",
+        "saved_title": "Usunięto wpis",
+        "saved_text": "{name} nie ma już wpisu w tym topiku; o dostępie decyduje rola w organizacji."
+      },
+      "keys": {
+        "title": "Systemy zewnętrzne (klucze API)",
+        "sub": "Klucz działa w instancji {instance} i organizacji {org}. Prawa do wzorów wiadomości dotyczą całej instancji, nie tylko tego topiku.",
+        "sub_reader": "Klucz działa w instancji {instance} i organizacji {org}. Tu widać prawa kluczy do wiadomości tego topiku; prawa do wzorów i ostatnie użycie klucza widzi administrator serwera.",
+        "site_admin_only": "Klucze wydaje administrator serwera.",
+        "col_system": "System",
+        "col_rights": "Prawa",
+        "col_used": "Ostatnio użyty",
+        "kind": "Klucz API",
+        "unknown_key": "Nieznany klucz",
+        "unknown_sub": "Klucz API · identyfikator {id}",
+        "empty": "Żaden system zewnętrzny nie ma jeszcze klucza z prawami do tego topiku.",
+        "never": "jeszcze nie",
+        "just_now": "przed chwilą",
+        "org_unknown": "bez nazwy",
+        "right": {
+          "readMessages": "Czyta wiadomości",
+          "writeMessages": "Wysyła wiadomości",
+          "readSchemas": "Czyta wzory",
+          "writeSchemas": "Dodaje wzory"
+        },
+        "right_hint": {
+          "readMessages": "Pobiera wiadomości z topiku {topic}.",
+          "writeMessages": "Zapisuje nowe wiadomości do topiku {topic}.",
+          "readSchemas": "Pobiera wzory i ich wersje (cała instancja).",
+          "writeSchemas": "Dodaje wzory i wersje, wycofuje wersje, zmienia zgodność. Nie obejmuje czytania."
+        },
+        "issue": {
+          "button": "Wydaj klucz",
+          "window_title": "Wydaj klucz dla systemu zewnętrznego",
+          "name_label": "Nazwa systemu",
+          "name_hint": "Nazwa widoczna na liście kluczy i w dzienniku audytu.",
+          "name_first": "Wpisz nazwę systemu.",
+          "name_too_long": "Nazwa może mieć najwyżej {max} znaków.",
+          "right_first": "Zaznacz co najmniej jedno prawo.",
+          "impact": "{name} dostanie klucz z prawami: {rights} (topik {topic}). Klucz zobaczysz tylko raz.",
+          "saved_title": "Wydano klucz",
+          "saved_text": "{name}: {rights}."
+        },
+        "issued": {
+          "window_title": "Klucz dla systemu „{name}”",
+          "once": "Skopiuj klucz teraz. Później nie będzie można go zobaczyć — trzeba będzie wydać nowy.",
+          "k_key": "Klucz",
+          "k_system": "System",
+          "k_instance": "Instancja",
+          "k_rights": "Prawa",
+          "k_address": "Adres dla systemu",
+          "topic": "topik {topic}",
+          "how": "System wysyła klucz w nagłówku „Authorization: Bearer …”. Wiadomości wysyła metodą POST na ten adres, a czyta metodą GET z dodanym parametrem group={group} (albo {group}.nazwa, gdy czyta kilka niezależnych programów).",
+          "copy_key": "Kopiuj klucz",
+          "copy_url": "Kopiuj adres dla systemu",
+          "done": "Gotowe",
+          "copied_key": "Skopiowano klucz.",
+          "copied_url": "Skopiowano adres.",
+          "copy_failed": "Przeglądarka nie pozwoliła skopiować — zaznacz tekst i skopiuj go ręcznie."
+        },
+        "rights": {
+          "window_title": "Prawa klucza — {name}",
+          "impact_added": "{name} dostanie prawa: {rights}.",
+          "impact_removed": "{name} straci prawa: {rights}.",
+          "impact_none": "Klucz nie będzie miał praw do tego topiku ani do wzorów tej instancji i zniknie z tej listy, ale nadal będzie istniał.",
+          "impact_rest": "Pozostałe prawa bez zmian; klucz się nie zmienia.",
+          "saved_title": "Zapisano prawa klucza"
+        },
+        "revoke": {
+          "button": "Unieważnij",
+          "window_title": "Unieważnij klucz — {name}",
+          "lead": "Tego nie da się cofnąć — trzeba będzie wydać nowy klucz.",
+          "impact_title": "Co się stanie po unieważnieniu:",
+          "impact": "Klucz przestanie działać od razu. {name} straci prawa: {rights}.",
+          "impact_other": "{n|Przestanie|Przestaną|Przestanie} działać także {count} {n|inne prawo|inne prawa|innych praw} tego klucza poza tym topikiem.",
+          "audit": "Unieważnienie zapisze się w dzienniku audytu.",
+          "saved_title": "Unieważniono klucz",
+          "saved_text": "{name} nie może już łączyć się z TentaBus."
+        }
       }
     }
   },

@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   busSchemaScopeId,
+  topicScopeId,
   parseBusSchemaScopeId,
   scopeKey,
   busSchemaScopeNames,
@@ -38,6 +39,12 @@ test('scope id matches the Rust composite encoding', () => {
 test('lengths are UTF-8 bytes, not UTF-16 code units', () => {
   // "ż" is one code unit in JS but two bytes in UTF-8, as Rust counts it.
   assert.equal(busSchemaScopeId('tentabus-aaaaaaaa', 'żółw'), `17${US}tentabus-aaaaaaaa7${US}żółw`);
+});
+
+test('a topic right is the three-part id `bus_authorizer::topic_acl_resource_id` builds', () => {
+  // "ń" is two UTF-8 bytes: "wyniki-badań" counts 13.
+  assert.equal(topicScopeId('tentabus-aaaaaaaa', 'org-1', 'wyniki-badań'), `17${US}tentabus-aaaaaaaa5${US}org-113${US}wyniki-badań`);
+  assert.equal(parseBusSchemaScopeId(topicScopeId('tentabus-aaaaaaaa', 'org-1', 'x')), null, 'never read as a pattern right');
 });
 
 test('parse is the exact inverse and refuses anything else', () => {

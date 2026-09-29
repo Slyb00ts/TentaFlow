@@ -800,6 +800,15 @@ pub struct BusCapabilitiesWire {
     /// 'mask'/'hash' once implemented).
     #[serde(default)]
     pub field_actions: Vec<String>,
+    /// The caller's organisation every call of this session runs in — the
+    /// middle part of a topic right's id and the `?org_id=` of the REST
+    /// address a system is given with its key. Empty on a peer built before
+    /// this field existed.
+    #[serde(default)]
+    pub org_id: String,
+    /// That organisation's display name; `None` when unknown to this node.
+    #[serde(default)]
+    pub org_name: Option<String>,
 }
 
 /// The calling session's effective rights on ONE topic
@@ -2248,6 +2257,8 @@ mod tests {
                 ],
                 schema_types: vec!["json_schema".to_string()],
                 field_actions: vec!["hide".to_string()],
+                org_id: "org-default".to_string(),
+                org_name: Some("Przychodnia Zdrowie".to_string()),
             },
         });
     }
@@ -2994,6 +3005,8 @@ mod tests {
                     content_types: vec![],
                     schema_types: vec![],
                     field_actions: vec![],
+                    org_id: String::new(),
+                    org_name: None,
                 },
             }
         );

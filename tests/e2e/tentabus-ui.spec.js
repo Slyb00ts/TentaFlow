@@ -27,9 +27,14 @@
 //              version refused in plain words and added after the
 //              compatibility changed, withdrawing a version and the pattern,
 //              deleting from the page and from the list, a used pattern the
-//              server will not delete, the phone layout and a reader); and,
-//              last because it stops the node, the list kept under the
-//              connection notice (T12). Stateful: run the whole project, never `-g`.
+//              server will not delete, the phone layout and a reader); then
+//              U6: a topic's Dostęp (a group given reading, a person a write
+//              ban, a change, the ban removed with its warning, an addon;
+//              a key issued with reading and shown once, checked over the
+//              records REST — it reads and cannot write — its rights changed
+//              and the key revoked; the phone layout; no section without
+//              administration); and, last because it stops the node, the
+//              list kept under the connection notice (T12). Stateful: run the whole project, never `-g`.
 //              The runtime lives under the repo's `.runtime/` — on macOS a
 //              rig under /tmp (a symlink to /private/tmp) is not reliable.
 // =============================================================================
@@ -920,7 +925,7 @@ test('U2 topic page at 1440: the menu, Stan with this topic\'s figures, alerts a
   await expect(page.locator('#tb-crumbs .tf-breadcrumb-item')).toHaveText(['TentaBus', 'Produkcja', 'Topiki', 'wyniki-badan']);
   const menu = d.locator('[data-role="menu"]');
   await expect(menu).toHaveAttribute('orientation', 'vertical');
-  await expect(menu.locator('tf-tab')).toHaveText([/Stan/, /Ustawienia/, /Nieprzetworzone\s*14/, /Partycje i kopie\s*3/]);
+  await expect(menu.locator('tf-tab')).toHaveText([/Stan/, /Ustawienia/, /Dostęp/, /Nieprzetworzone\s*14/, /Partycje i kopie\s*3/]);
   await expect(d.locator('[data-role="pick"]')).toBeHidden();
 
   const s = section(page, 'state');
@@ -2398,6 +2403,295 @@ test('U5 without administration: the patterns to read, no change buttons, who ch
     await expect(p.locator('[data-role="versions"] tf-button[data-act="withdraw-version"]')).toHaveCount(0);
     await expect.poll(() => p.locator('tf-code-editor').evaluate((el) => el.value), { timeout: 15000 }).toContain('"gabinet"');
     await rp.screenshot({ path: path.join(SHOTS, 't08-wzor-bez-uprawnien.png'), fullPage: true });
+    expect(readerErrors.filter((e) => !/PolicyDenied|permission_denied|protocol error/i.test(e)), readerErrors.join('\n')).toEqual([]);
+  } finally {
+    await context.close();
+  }
+});
+
+// ----------------------------------------------------------------------------
+// U6 — a topic's Dostęp (T09): the entries of people, groups and addons, and
+// the keys of outside systems. What the screen writes is checked against the
+// server's own list of entries and, for a key, against the records REST the
+// key is for.
+// ----------------------------------------------------------------------------
+
+const accessSection = (page) => section(page, 'access');
+const accessWindow = (page) => page.locator('tf-window.tb-access-window');
+const subjectRow = (page, name) => accessSection(page).locator('[data-role="subjects"] tbody tr', { hasText: name });
+
+function sqliteWrite(sql) {
+  execFileSync('/usr/bin/sqlite3', ['-cmd', '.timeout 5000', DB, sql], { encoding: 'utf8' });
+}
+
+function iamCall(page, kind, payload) {
+  return page.evaluate(async ([k, p]) => {
+    const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+    return k === 'iamListUsersRequest' ? ApiBinary.one(k, p) : ApiBinary.action(k, p);
+  }, [kind, payload]);
+}
+
+async function ensureUser(page, username, password, displayName) {
+  const users = (await iamCall(page, 'iamListUsersRequest', {}))?.users || [];
+  const found = users.find((u) => u.username === username);
+  if (found) return found.userId ?? found.user_id ?? found.id;
+  const created = await iamCall(page, 'iamCreateUserRequest', { username, password, displayName, email: '', role: 'user', groupIds: [] });
+  return created?.userId ?? created?.user_id;
+}
+
+async function serverEntries(page, instanceId, topic = 'wyniki-badan') {
+  const res = await busCall(page, 'busAclListRequest', { instanceId, topic });
+  return (res?.entries || []).map((e) => `${e.subjectType}:${e.subjectId}:${e.action}:${e.accessLevel}`).sort();
+}
+
+// A window's entry and exit are animated: the evidence is taken once they
+// end (a status dot pulses forever and is not waited for).
+async function settled(page) {
+  await page.waitForFunction(() => document.getAnimations({ subtree: true })
+    .every((a) => a.playState !== 'running' || a.effect?.getTiming().iterations === Infinity));
+}
+
+async function pickSegment(win, selector, label) {
+  await win.locator(`${selector} .tf-seg-opt`, { hasText: label }).click();
+}
+
+test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, the ban removed with its warning, an addon', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  const tomaszId = await ensureUser(page, 'tomasz', 'Tomasz-czyta-1', 'Tomasz Nowak');
+  const piotrId = await ensureUser(page, 'piotr', 'Piotr-zakaz-1', 'Piotr Zieliński');
+  const groupId = (await iamCall(page, 'iamCreateGroupRequest', { name: 'Rejestracja', description: '' }))?.groupId;
+  expect(groupId).toBeTruthy();
+  await iamCall(page, 'iamSetUserGroupsRequest', { userId: tomaszId, groupIds: [groupId] });
+  // An addon that declares the bus and holds bus.read in this instance: the
+  // directory offers exactly those.
+  sqliteWrite("INSERT OR IGNORE INTO addons (addon_id, name, version, display_name) VALUES ('e2e-asystent', 'e2e-asystent', '1.0.0', 'Asystent lekarza');"
+    + " INSERT OR IGNORE INTO addon_permission_catalog (addon_id, permission_id) VALUES ('e2e-asystent', 'bus.subscribe');");
+  await iamCall(page, 'addonPermissionSetRequest', { addonId: instanceId, subjectType: 'user', subjectId: 'e2e-asystent', permissionId: 'bus.read', grantMode: 'allow' });
+  const before = await serverEntries(page, instanceId);
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=access`);
+    const d = detailSlot(page);
+    await expect(d.locator('.tb-title')).toHaveText('wyniki-badan', { timeout: 20000 });
+    await expect(d.locator('[data-role="menu"]')).toHaveAttribute('value', 'access');
+    const s = accessSection(page);
+    await expect(s.locator('.section-card').first()).toContainText('Osoby, grupy i addony');
+    await expect(s.locator('[data-role="subjects-count"] tf-chip')).toBeVisible({ timeout: 15000 });
+
+    // Nadaj: the group Rejestracja reads.
+    await s.locator('tf-button[data-go="access-grant"]').click();
+    const win = accessWindow(page);
+    await expect(win).toHaveCount(1);
+    await expect(win.locator('[data-role="subject"] select option', { hasText: 'Rejestracja (1 osoba)' })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: 'Rejestracja (1 osoba)' });
+    await expect(win.locator('[data-role="impact"]')).toContainText('1 osoba z grupy Rejestracja będzie mogła czytać wiadomości w topiku wyniki-badan. O zapisie i administracji zdecyduje rola w organizacji.');
+    await windowFits(page, 'tf-window.tb-access-window', DESKTOP.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-nadaj.png') });
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Nadano dostęp');
+    await expect(subjectRow(page, 'Rejestracja')).toContainText('Grupa · 1 osoba');
+    await expect(subjectRow(page, 'Rejestracja')).toContainText('pozwolono');
+    expect(await serverEntries(page, instanceId)).toContain(`group:${groupId}:read:allow`);
+
+    // Nadaj: Piotr may not write; reading is left to his role.
+    await s.locator('tf-button[data-go="access-grant"]').click();
+    await pickSegment(win, '[data-role="kind"]', 'Użytkownik');
+    await expect(win.locator('[data-role="subject"]')).toHaveAttribute('label', 'Który użytkownik');
+    await expect(win.locator('[data-role="subject"] select option', { hasText: 'Piotr Zieliński' })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: 'Piotr Zieliński' });
+    await pickSegment(win, 'tf-segmented[data-right="read"]', 'Nie ustawiaj');
+    await pickSegment(win, 'tf-segmented[data-right="write"]', 'Zabroń');
+    await expect(win.locator('[data-role="impact"]')).toContainText('Zakaz dla „Piotr Zieliński”: zapis — wygrywa z rolą w organizacji i z pozwoleniem z grupy.');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(subjectRow(page, 'Piotr Zieliński')).toContainText('zabroniono');
+    let server = await serverEntries(page, instanceId);
+    expect(server).toContain(`user:${piotrId}:write:deny`);
+    expect(server.filter((e) => e.startsWith(`user:${piotrId}:`))).toHaveLength(1);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep.png'), fullPage: true });
+
+    // Zmień: Rejestracja may also write — one change, said before saving.
+    await subjectRow(page, 'Rejestracja').locator('tf-button[data-act="change"]').click();
+    await expect(win.locator('.tb-explain-box')).toContainText('Rejestracja');
+    await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+    await pickSegment(win, 'tf-segmented[data-right="write"]', 'Pozwól');
+    await expect(win.locator('[data-role="impact"]')).toContainText('Zapis dla „Rejestracja” zmieni się z „nie ustawiono” na „pozwolono”. Pozostałe prawa bez zmian.');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Zapisano');
+    expect(await serverEntries(page, instanceId)).toContain(`group:${groupId}:write:allow`);
+
+    // Usuń the ban: the window warns that it may give the right back.
+    await subjectRow(page, 'Piotr Zieliński').locator('tf-button[data-act="remove"]').click();
+    await expect(win.locator('[data-role="lifts-deny"]')).toHaveText(/Usunięcie „zabroniono” może dać te prawa, jeśli pozwala na nie rola w organizacji\./);
+    await expect(win).toContainText('Piotr Zieliński straci wpis w tym topiku: zapis (zabroniono).');
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-usun.png') });
+    await win.locator('[data-act="go"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(subjectRow(page, 'Piotr Zieliński')).toHaveCount(0);
+    await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Usunięto wpis');
+    server = await serverEntries(page, instanceId);
+    expect(server.filter((e) => e.startsWith(`user:${piotrId}:`))).toEqual([]);
+
+    // Nadaj to an addon: its own kind of entry, never a user with its id.
+    await s.locator('tf-button[data-go="access-grant"]').click();
+    await pickSegment(win, '[data-role="kind"]', 'Addon');
+    await expect(win.locator('[data-role="subject"] select option', { hasText: 'Asystent lekarza' })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: 'Asystent lekarza' });
+    await expect(win.locator('[data-role="impact"]')).toContainText('Addon „Asystent lekarza” dostanie w topiku wyniki-badan: czytanie.');
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(subjectRow(page, 'Asystent lekarza')).toContainText('Addon');
+    expect(await serverEntries(page, instanceId)).toContain('addon:e2e-asystent:read:allow');
+
+    const rows = await s.locator('[data-role="subjects"] tbody tr').count();
+    await expect(d.locator('[data-role="menu"] tf-tab#access')).toHaveAttribute('count', String(rows));
+    await assertNoBannedWords(page);
+    await assertNoOverflow(page);
+  } finally {
+    for (const [subjectType, subjectId] of [['group', groupId], ['addon', 'e2e-asystent'], ['user', piotrId]]) {
+      for (const action of ['read', 'write', 'admin']) {
+        await busCall(page, 'busAclSetRequest', { instanceId, topic: 'wyniki-badan', subjectType, subjectId, accessLevel: 'clear', action });
+      }
+    }
+  }
+  expect(await serverEntries(page, instanceId)).toEqual(before);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U6 keys: issued with reading, shown once; the key reads over REST and cannot write; its rights change; revoked, it is refused', async ({ page, request }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=access`);
+  const s = accessSection(page);
+  await expect(s.locator('[data-role="keys-sub"]')).toContainText('Klucz działa w instancji Produkcja', { timeout: 20000 });
+  await s.locator('tf-button[data-go="key-issue"]').click();
+  const win = accessWindow(page);
+  await expect(win.locator('[data-role="impact"]')).toContainText('Wpisz nazwę systemu.');
+  await win.locator('[data-role="name"] input').fill('Portal wyników pacjenta');
+  await expect(win.locator('[data-role="impact"]')).toContainText('Zaznacz co najmniej jedno prawo.');
+  await win.locator('tf-checkbox[data-key-right="readMessages"] .tf-checkbox-label').click();
+  await expect(win.locator('[data-role="impact"]')).toContainText('Portal wyników pacjenta dostanie klucz z prawami: czyta wiadomości (topik wyniki-badan). Klucz zobaczysz tylko raz.');
+  await settled(page);
+  await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-wydaj-klucz.png') });
+  await win.locator('[data-act="save"]').click();
+
+  const issued = page.locator('tf-window.tb-key-issued');
+  await expect(issued).toHaveCount(1);
+  const token = (await issued.locator('[data-role="token"]').textContent()).trim();
+  expect(token).toMatch(/^sk-[0-9a-f]{64}$/);
+  const url = (await issued.locator('[data-role="url"]').textContent()).trim();
+  expect(url).toBe(`https://127.0.0.1:${PORT}/v1/bus/instances/${instanceId}/topics/wyniki-badan/records?org_id=org-default`);
+  const group = /group=(k:[0-9A-Za-z-]+)/.exec(await issued.textContent())?.[1];
+  expect(group).toBeTruthy();
+  await expect(issued).toContainText('Produkcja ·');
+  await expect(issued).toContainText('czyta wiadomości · topik wyniki-badan');
+  await settled(page);
+  await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-klucz-wydany.png') });
+  await issued.locator('[data-act="done"]').click();
+  await expect(issued).toHaveCount(0);
+  await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Wydano klucz');
+  const keyRow = s.locator('[data-role="keys"] tbody tr', { hasText: 'Portal wyników pacjenta' });
+  await expect(keyRow).toContainText('Czyta wiadomości');
+  await expect(keyRow).toContainText('jeszcze nie');
+  await expect(keyRow).not.toContainText('Wysyła wiadomości');
+
+  // The key reads the topic under its own group, and nothing more.
+  const auth = { Authorization: `Bearer ${token}` };
+  const read = await request.get(`${url}&group=${encodeURIComponent(group)}&max_records=5&wait_ms=0`, { headers: auth });
+  expect(read.status(), await read.text()).toBe(200);
+  expect((await read.json()).records.length).toBeGreaterThan(0);
+  const line = JSON.stringify({ payload_b64: Buffer.from('MSH|^~\\&|LAB|X|||20260929||ORU^R01|1|P|2.5').toString('base64') });
+  const write = await request.post(url, { headers: { ...auth, 'Content-Type': 'application/x-ndjson' }, data: `${line}\n` });
+  expect(write.status(), await write.text()).toBe(403);
+
+  // Prawa klucza: add sending; the key stays the same.
+  await keyRow.locator('tf-button[data-act="key-rights"]').click();
+  await win.locator('tf-checkbox[data-key-right="writeMessages"] .tf-checkbox-label').click();
+  await expect(win.locator('[data-role="impact"]')).toContainText('Portal wyników pacjenta dostanie prawa: wysyła wiadomości. Pozostałe prawa bez zmian; klucz się nie zmienia.');
+  await win.locator('[data-act="save"]').click();
+  await expect(win).toHaveCount(0);
+  await expect(keyRow).toContainText('Wysyła wiadomości');
+  const keyEntries = (await busCall(page, 'busAclListRequest', { instanceId, topic: 'wyniki-badan' })).entries
+    .filter((e) => e.subjectType === 'api_key' && e.subjectLabel === 'Portal wyników pacjenta')
+    .map((e) => `${e.action}:${e.accessLevel}`).sort();
+  expect(keyEntries).toEqual(['read:allow', 'write:allow']);
+
+  // Unieważnij: at once, for good.
+  await keyRow.locator('tf-button[data-act="key-revoke"]').click();
+  await expect(win.locator('[data-role="impact"]')).toContainText('Klucz przestanie działać od razu. Portal wyników pacjenta straci prawa: czyta wiadomości i wysyła wiadomości.');
+  await win.locator('[data-act="go"]').click();
+  await expect(win).toHaveCount(0);
+  await expect(keyRow).toHaveCount(0);
+  await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Unieważniono klucz');
+  const refused = await request.get(`${url}&group=${encodeURIComponent(group)}&max_records=5&wait_ms=0`, { headers: auth });
+  expect(refused.status()).toBe(401);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U6 at 390x844: Dostęp from the section list, the rows as cards, a window fills the phone', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(PHONE);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  await busCall(page, 'busAclSetRequest', { instanceId, topic: 'wyniki-badan', subjectType: 'user', subjectId: 'e2e-telefon', accessLevel: 'deny', action: 'read' });
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan`);
+    const d = detailSlot(page);
+    await expect(d.locator('.tb-title')).toHaveText('wyniki-badan', { timeout: 20000 });
+    await d.locator('[data-role="pick"] select').selectOption('access');
+    await expect.poll(() => hashParams(page).section).toBe('access');
+    const s = accessSection(page);
+    await expect(s.locator('[data-role="subjects"] tbody tr').first()).toBeVisible({ timeout: 15000 });
+    await assertNoOverflow(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-390.png'), fullPage: true });
+    await s.locator('tf-button[data-go="access-grant"]').click();
+    await expect(accessWindow(page).locator('[data-role="subject"] select option').first()).toBeAttached({ timeout: 15000 });
+    await windowFits(page, 'tf-window.tb-access-window', PHONE.width);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-nadaj-390.png') });
+    await accessWindow(page).locator('[data-act="cancel"]').click();
+    await expect(accessWindow(page)).toHaveCount(0);
+  } finally {
+    await busCall(page, 'busAclSetRequest', { instanceId, topic: 'wyniki-badan', subjectType: 'user', subjectId: 'e2e-telefon', accessLevel: 'clear', action: 'read' });
+  }
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U6 without administration: no Dostęp in the menu or the section list, and an address naming it opens Stan', async ({ page, browser }) => {
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openInstance(page, 'Produkcja');
+  await ensureUser(page, 'tomasz', 'Tomasz-czyta-1', 'Tomasz Nowak');
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, locale: 'pl-PL', viewport: DESKTOP });
+  const rp = await context.newPage();
+  const readerErrors = trackErrors(rp);
+  try {
+    await rp.addInitScript(() => {
+      localStorage.setItem('tentaflow_lang', 'pl');
+      document.addEventListener('DOMContentLoaded', () => {
+        const st = document.createElement('style');
+        st.textContent = '.update-overlay{display:none!important}';
+        document.head.appendChild(st);
+      });
+    });
+    await loginAsAdmin(rp, { port: PORT, username: 'tomasz', password: 'Tomasz-czyta-1' });
+    await rp.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=access`);
+    const d = rp.locator('#tb-panel > [data-tb-view-slot="detail"]');
+    await expect(d.locator('.tb-title')).toHaveText('wyniki-badan', { timeout: 20000 });
+    await expect(d.locator('[data-role="menu"]')).toHaveAttribute('value', 'state');
+    await expect(d.locator('[data-role="menu"] tf-tab#access')).toBeHidden();
+    await expect(d.locator('[data-role="menu"] tf-tab#settings')).toBeVisible();
+    await expect(d.locator('[data-section="access"]')).toBeHidden();
+    const options = await d.locator('[data-role="pick"] select option').allTextContents();
+    expect(options).not.toContain('Dostęp');
     expect(readerErrors.filter((e) => !/PolicyDenied|permission_denied|protocol error/i.test(e)), readerErrors.join('\n')).toEqual([]);
   } finally {
     await context.close();

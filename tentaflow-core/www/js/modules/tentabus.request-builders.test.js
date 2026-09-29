@@ -256,6 +256,7 @@ const ERROR_CODES = [
   'dlq_of_dlq_not_allowed', 'dlq_record_handled', 'dlq_retry_deduplicated',
   'dlq_retry_source_not_leader', 'dlq_retry_requarantine_failed', 'partition_poisoned', 'partial_publish',
   'blocking_task_failed', 'max_groups_exceeded',
+  'key_needs_topic_wide_rule', 'subject_is_addon', 'subject_not_found', 'org_mismatch',
 ];
 
 for (const [locName, dict] of [['pl', pl], ['en', en], ['de', de], ['es', es], ['fr', fr]]) {

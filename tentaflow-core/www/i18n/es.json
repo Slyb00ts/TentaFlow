@@ -9747,7 +9747,11 @@
       "dlq_record_handled": "Este mensaje ya se reintentó o descartó — actualice la lista.",
       "dlq_retry_deduplicated": "El topic entrega un mensaje una vez por ventana y este ya se entregó en ella: podrá reintentarse cuando pase la ventana. El mensaje sigue en la lista.",
       "dlq_retry_source_not_leader": "Este node no dirige la partición del topic a la que vuelve el mensaje: reinténtalo en el node que la dirige.",
-      "dlq_retry_requarantine_failed": "El patrón del topic volvió a rechazar el mensaje y su nueva copia no pudo guardarse entre los no procesados: el mensaje sigue en la lista."
+      "dlq_retry_requarantine_failed": "El patrón del topic volvió a rechazar el mensaje y su nueva copia no pudo guardarse entre los no procesados: el mensaje sigue en la lista.",
+      "key_needs_topic_wide_rule": "Una clave no puede leer ni enviar los mensajes de este topic hasta que el topic tenga una regla de ocultación de datos para todos — las reglas solo para personas concretas no cubren las claves.",
+      "subject_is_addon": "Este identificador pertenece a un addon, no a un usuario. Quita esta entrada y concede acceso al addon (A quién: Addon).",
+      "subject_not_found": "No se encontró esta clave — puede que se haya revocado. Actualiza la página.",
+      "org_mismatch": "Un derecho sobre un topic solo se puede conceder desde su propia organización."
     },
     "shell": {
       "instance": "Instancia",
@@ -10264,6 +10268,7 @@
       "section": {
         "state": "Estado",
         "settings": "Ajustes",
+        "access": "Acceso",
         "partitions": "Particiones y copias",
         "dlq": "Sin procesar"
       },
@@ -10813,6 +10818,190 @@
         "button": "Descartar mensaje",
         "done_title": "Mensaje descartado",
         "done_text": "{what} salió de los mensajes sin procesar."
+      }
+    },
+    "access": {
+      "subjects_title": "Personas, grupos y addons",
+      "explain": "Lectura — obtener mensajes. Escritura — enviar mensajes. Administración — cambiar los ajustes, el acceso y la ocultación de datos de este topic.",
+      "col_who": "Quién",
+      "right_title": {
+        "read": "Lectura",
+        "write": "Escritura",
+        "admin": "Administración"
+      },
+      "right_hint": {
+        "read": "obtener mensajes",
+        "write": "enviar mensajes",
+        "admin": "ajustes, acceso y ocultación de datos"
+      },
+      "right": {
+        "read": "lectura",
+        "write": "escritura",
+        "admin": "administración"
+      },
+      "about": {
+        "read": "la lectura",
+        "write": "la escritura",
+        "admin": "la administración"
+      },
+      "can": {
+        "read": "leer mensajes",
+        "write": "enviar mensajes",
+        "admin": "cambiar los ajustes, el acceso y la ocultación de datos"
+      },
+      "allowed": "permitido",
+      "denied": "prohibido",
+      "not_set": "sin definir",
+      "not_set_title": "Sin definir aquí — decide el rol en la organización.",
+      "legend": "— sin definir aquí: decide el rol en la organización. «Prohibido» gana a «permitido» de un grupo.",
+      "kind": {
+        "user": "Usuario",
+        "group": "Grupo",
+        "addon": "Addon"
+      },
+      "group_sub": "{kind} · {count} {n|persona|personas}",
+      "unknown_subject": "Sujeto desconocido",
+      "unknown_sub": "{kind} · identificador {id}",
+      "empty_title": "Aquí nadie tiene todavía una entrada",
+      "empty_text": "El acceso a este topic lo decide el rol en la organización. Concede acceso para permitir o prohibir a personas, grupos o addons concretos.",
+      "rights_label": "Derechos en el topic {topic}",
+      "level": {
+        "allow": "Permitir",
+        "deny": "Prohibir",
+        "unset": "No definir"
+      },
+      "grant": {
+        "button": "Conceder acceso",
+        "window_title": "Conceder acceso — {topic}",
+        "who": "A quién",
+        "search": "Buscar por nombre",
+        "pick": {
+          "user": "Qué usuario",
+          "group": "Qué grupo",
+          "addon": "Qué addon"
+        },
+        "pick_hint": {
+          "user": "La lista muestra los usuarios que aún no tienen entrada.",
+          "group": "La lista muestra los grupos que aún no tienen entrada.",
+          "addon": "La lista muestra los addons con acceso a esta instancia que aún no tienen entrada."
+        },
+        "none": {
+          "user": "Todos los usuarios de la organización ya tienen una entrada en este topic.",
+          "group": "Todos los grupos de la organización ya tienen una entrada en este topic (o la organización no tiene grupos).",
+          "addon": "No hay ningún addon con acceso a esta instancia sin entrada en este topic."
+        },
+        "none_found": "Nada coincide con el nombre escrito, o la coincidencia ya tiene entrada.",
+        "truncated": "Se muestran los 50 primeros — escribe parte del nombre para acotar la lista.",
+        "group_option": "{name} ({count} {n|persona|personas})",
+        "pick_first": "Elige a quién conceder acceso.",
+        "pick_right": "Define al menos un derecho: permitir o prohibir.",
+        "impact_group": "{count} {n|persona del grupo|personas del grupo} {name} {n|podrá|podrán} {doing} en el topic {topic}.",
+        "impact_group_plain": "El grupo «{name}» obtendrá en el topic {topic}: {rights}.",
+        "impact_user": "El usuario «{name}» obtendrá en el topic {topic}: {rights}.",
+        "impact_addon": "El addon «{name}» obtendrá en el topic {topic}: {rights}.",
+        "impact_deny": "Prohibido para «{name}»: {rights} — gana al rol en la organización y al permiso de un grupo.",
+        "impact_unset": "Sobre {rights} decidirá el rol en la organización.",
+        "saved_title": "Acceso concedido"
+      },
+      "change": {
+        "button": "Cambiar",
+        "window_title": "Cambiar acceso — {name}",
+        "impact_line": "{right} para «{name}» pasará de «{from}» a «{to}».",
+        "impact_role": {
+          "read": "Decidirá el rol en la organización.",
+          "write": "Decidirá el rol en la organización.",
+          "admin": "Decidirá el rol en la organización."
+        },
+        "impact_rest": "Los demás derechos no cambian.",
+        "saved_title": "Guardado"
+      },
+      "remove": {
+        "button": "Quitar",
+        "window_title": "Quitar acceso — {name}",
+        "lead": "{name} perderá la entrada en este topic: {parts}.",
+        "part": "{right} ({level})",
+        "lifts_deny": "Quitar «prohibido» puede dar estos derechos si el rol en la organización los permite.",
+        "impact_title": "Qué pasará al quitar:",
+        "impact": "el acceso al topic {topic} lo decidirá el rol en la organización.",
+        "confirm": "Quitar entrada",
+        "saved_title": "Entrada quitada",
+        "saved_text": "{name} ya no tiene entrada en este topic; el acceso lo decide el rol en la organización."
+      },
+      "keys": {
+        "title": "Sistemas externos (claves API)",
+        "sub": "La clave funciona en la instancia {instance} y la organización {org}. Los derechos sobre los patrones de mensajes abarcan toda la instancia, no solo este topic.",
+        "sub_reader": "La clave funciona en la instancia {instance} y la organización {org}. Aquí se ven los derechos de las claves sobre los mensajes de este topic; los derechos sobre patrones y el último uso los ve el administrador del servidor.",
+        "site_admin_only": "Las claves las emite el administrador del servidor.",
+        "col_system": "Sistema",
+        "col_rights": "Derechos",
+        "col_used": "Último uso",
+        "kind": "Clave API",
+        "unknown_key": "Clave desconocida",
+        "unknown_sub": "Clave API · identificador {id}",
+        "empty": "Ningún sistema externo tiene todavía una clave con derechos sobre este topic.",
+        "never": "todavía no",
+        "just_now": "hace un momento",
+        "org_unknown": "sin nombre",
+        "right": {
+          "readMessages": "Lee mensajes",
+          "writeMessages": "Envía mensajes",
+          "readSchemas": "Lee patrones",
+          "writeSchemas": "Añade patrones"
+        },
+        "right_hint": {
+          "readMessages": "Obtiene mensajes del topic {topic}.",
+          "writeMessages": "Escribe mensajes nuevos en el topic {topic}.",
+          "readSchemas": "Obtiene patrones y sus versiones (toda la instancia).",
+          "writeSchemas": "Añade patrones y versiones, retira versiones, cambia la compatibilidad. No incluye la lectura."
+        },
+        "issue": {
+          "button": "Emitir clave",
+          "window_title": "Emitir una clave para un sistema externo",
+          "name_label": "Nombre del sistema",
+          "name_hint": "Nombre visible en la lista de claves y en el registro de auditoría.",
+          "name_first": "Escribe el nombre del sistema.",
+          "name_too_long": "El nombre puede tener como máximo {max} caracteres.",
+          "right_first": "Marca al menos un derecho.",
+          "impact": "{name} recibirá una clave con los derechos: {rights} (topic {topic}). La clave solo la verás una vez.",
+          "saved_title": "Clave emitida",
+          "saved_text": "{name}: {rights}."
+        },
+        "issued": {
+          "window_title": "Clave para el sistema «{name}»",
+          "once": "Copia la clave ahora. Después no se podrá ver — habría que emitir una nueva.",
+          "k_key": "Clave",
+          "k_system": "Sistema",
+          "k_instance": "Instancia",
+          "k_rights": "Derechos",
+          "k_address": "Dirección para el sistema",
+          "topic": "topic {topic}",
+          "how": "El sistema envía la clave en la cabecera «Authorization: Bearer …». Envía mensajes con POST a esta dirección y los lee con GET añadiendo el parámetro group={group} (o {group}.nombre si leen varios programas independientes).",
+          "copy_key": "Copiar clave",
+          "copy_url": "Copiar dirección para el sistema",
+          "done": "Listo",
+          "copied_key": "Clave copiada.",
+          "copied_url": "Dirección copiada.",
+          "copy_failed": "El navegador no permitió copiar — selecciona el texto y cópialo a mano."
+        },
+        "rights": {
+          "window_title": "Derechos de la clave — {name}",
+          "impact_added": "{name} obtendrá los derechos: {rights}.",
+          "impact_removed": "{name} perderá los derechos: {rights}.",
+          "impact_none": "La clave no tendrá derechos sobre este topic ni sobre los patrones de esta instancia y desaparecerá de esta lista, pero seguirá existiendo.",
+          "impact_rest": "Los demás derechos no cambian; la clave en sí no cambia.",
+          "saved_title": "Derechos de la clave guardados"
+        },
+        "revoke": {
+          "button": "Revocar",
+          "window_title": "Revocar clave — {name}",
+          "lead": "No se puede deshacer — habría que emitir una clave nueva.",
+          "impact_title": "Qué pasará al revocar:",
+          "impact": "La clave dejará de funcionar de inmediato. {name} perderá los derechos: {rights}.",
+          "impact_other": "También {n|dejará|dejarán} de funcionar {count} {n|derecho más|derechos más} de esta clave fuera de este topic.",
+          "audit": "La revocación quedará registrada en el registro de auditoría.",
+          "saved_title": "Clave revocada",
+          "saved_text": "{name} ya no puede conectarse a TentaBus."
+        }
       }
     }
   },

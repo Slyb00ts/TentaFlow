@@ -6,7 +6,8 @@
 // Partycje i kopie and the preview, with the reason; Stan's tiles, alerts
 // and consumers come from the live snapshot of this topic only; the
 // partitions table offers "Przenieś prowadzenie" only where a node can take
-// over; a deleted topic says so instead of an empty page.
+// over; a deleted topic says so instead of an empty page. Dostęp is in the
+// menu of the topic's administrators only, never merely disabled.
 // =============================================================================
 
 import { window } from './_test-setup.js';
@@ -15,7 +16,7 @@ import assert from 'node:assert/strict';
 
 if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Document = window.Document;
 
-const { drawTopicDetail, effectiveSection, sectionOpen, topicDetailLoader } = await import('./topic-detail.js');
+const { drawTopicDetail, effectiveSection, sectionOpen, sectionListed, topicDetailLoader } = await import('./topic-detail.js');
 const { stateKpis, topicAlerts, topicConsumers } = await import('./topic-state.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ');
@@ -52,7 +53,7 @@ const replicaTopics = [{
   ],
 }];
 
-function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, section = 'state', detail, error = null, adminLabels = [], topicOverrides = {} } = {}) {
+function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, section = 'state', detail, error = null, adminLabels = [], topicOverrides = {}, accessData = null } = {}) {
   const body = document.createElement('div');
   document.body.appendChild(body);
   const moves = [];
@@ -71,6 +72,8 @@ function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, sec
     lagSeries: new Map(),
     notice: null,
     justMoved: new Set(),
+    accessData,
+    instanceId: 'tentabus-a1b2c3d4',
     instanceLabel: 'Produkcja',
     nowMs: NOW,
   };
@@ -87,16 +90,50 @@ test('sections open with read access, Ustawienia always; a closed one falls back
   assert.equal(effectiveSection('nonsense', { canRead: true }), 'state');
 });
 
+test('Dostęp opens for the topic\'s administrator only and is not even listed for anyone else', () => {
+  assert.equal(sectionOpen('access', { canRead: true, canAdmin: false }), false);
+  assert.equal(sectionOpen('access', { canRead: false, canAdmin: true }), true, 'administration without read access still manages access');
+  assert.equal(sectionListed('access', { canAdmin: false }), false);
+  assert.equal(sectionListed('state', { canRead: false }), true, 'a closed read section stays in the menu with its reason');
+  assert.equal(effectiveSection('access', { canRead: true, canAdmin: false }), 'state');
+  assert.equal(effectiveSection('access', { canRead: true, canAdmin: true }), 'access');
+
+  const reader = mount({ access: { canRead: true, canWrite: false, canAdmin: false }, section: 'access' });
+  const tab = reader.body.querySelector('[data-role="menu"] tf-tab#access');
+  assert.equal(tab.hidden, true);
+  assert.equal(tab.hasAttribute('disabled'), false, 'hidden, not shown as locked');
+  assert.equal(reader.body.querySelector('[data-section="state"]').hidden, false, 'an address naming Dostęp opens Stan');
+  assert.deepEqual([...reader.body.querySelectorAll('[data-role="pick"] select option')].map((o) => o.textContent), ['Stan', 'Ustawienia', 'Nieprzetworzone', 'Partycje i kopie']);
+});
+
+test('Dostęp\'s counter is its entries plus the keys, once they are loaded', () => {
+  const loading = mount();
+  assert.equal(loading.body.querySelector('tf-tab#access').getAttribute('count'), null, 'nothing is guessed before the entries answer');
+  const loaded = mount({
+    accessData: {
+      acl: [
+        { subjectType: 'group', subjectId: 'g-1', accessLevel: 'allow', action: 'read', subjectLabel: 'Lekarze', memberCount: 12 },
+        { subjectType: 'user', subjectId: 'u-1', accessLevel: 'deny', action: 'write', subjectLabel: 'Piotr Zieliński' },
+        { subjectType: 'user', subjectId: 'u-1', accessLevel: 'deny', action: 'read', subjectLabel: 'Piotr Zieliński' },
+        { subjectType: 'api_key', subjectId: 'k-1', accessLevel: 'allow', action: 'read', subjectLabel: 'Portal' },
+      ],
+      keys: null,
+    },
+  });
+  assert.equal(loaded.body.querySelector('tf-tab#access').getAttribute('count'), '3');
+});
+
 test('the page: back link, title with what the topic carries, the vertical menu and one section', () => {
   const { body, moves } = mount();
   assert.equal(body.querySelector('.tb-title').textContent, 'wyniki-badan');
   assert.equal(body.querySelector('[data-role="desc"]').textContent, 'HL7 v2 · bez wzoru');
   const menu = body.querySelector('[data-role="menu"]');
   assert.equal(menu.getAttribute('orientation'), 'vertical');
-  assert.deepEqual([...menu.querySelectorAll('tf-tab')].map((t) => t.id), ['state', 'settings', 'dlq', 'partitions']);
+  assert.deepEqual([...menu.querySelectorAll('tf-tab')].map((t) => t.id), ['state', 'settings', 'access', 'dlq', 'partitions']);
+  assert.equal(menu.querySelector('tf-tab#access').hidden, false, 'the administrator sees Dostęp');
   assert.equal(menu.querySelector('tf-tab#partitions').getAttribute('count'), '2');
   assert.equal(menu.querySelector('tf-tab#dlq').getAttribute('count'), '14', 'the unprocessed count of the stats snapshot');
-  assert.deepEqual([...body.querySelectorAll('[data-section]')].map((s) => [s.dataset.section, s.hidden]), [['state', false], ['settings', true], ['dlq', true], ['partitions', true]]);
+  assert.deepEqual([...body.querySelectorAll('[data-section]')].map((s) => [s.dataset.section, s.hidden]), [['state', false], ['settings', true], ['access', true], ['dlq', true], ['partitions', true]]);
   body.querySelector('[data-go="back"]').click();
   assert.deepEqual(moves, [{ kind: 'back' }]);
 });
@@ -129,7 +166,7 @@ test('moving between sections goes through the shell; the phone list offers the 
   body.querySelector('[data-role="menu"] tf-tab#settings > button').click();
   assert.deepEqual(moves.at(-1), { kind: 'section', section: 'settings' });
   const pick = body.querySelector('[data-role="pick"]');
-  assert.deepEqual([...pick.querySelectorAll('select option')].map((o) => o.textContent), ['Stan', 'Ustawienia', 'Nieprzetworzone', 'Partycje i kopie']);
+  assert.deepEqual([...pick.querySelectorAll('select option')].map((o) => o.textContent), ['Stan', 'Ustawienia', 'Dostęp', 'Nieprzetworzone', 'Partycje i kopie']);
 });
 
 test('Nieprzetworzone is a section of the page; Stan\'s "Zobacz i ponów" leads to it', () => {
