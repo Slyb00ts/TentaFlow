@@ -5684,7 +5684,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forge-cli"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5710,7 +5710,7 @@ dependencies = [
 
 [[package]]
 name = "forge-engine"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "bytemuck",
  "forge-formats",
@@ -5728,7 +5728,7 @@ dependencies = [
 
 [[package]]
 name = "forge-formats"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "forge-types",
  "half",
@@ -5743,7 +5743,7 @@ dependencies = [
 
 [[package]]
 name = "forge-grammar"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "forge-types",
  "serde_json",
@@ -5751,7 +5751,7 @@ dependencies = [
 
 [[package]]
 name = "forge-graph"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "forge-formats",
  "forge-types",
@@ -5759,7 +5759,7 @@ dependencies = [
 
 [[package]]
 name = "forge-hal"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "cudarc",
  "forge-types",
@@ -5770,7 +5770,7 @@ dependencies = [
 
 [[package]]
 name = "forge-kernels"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "bytemuck",
  "forge-formats",
@@ -5788,7 +5788,7 @@ dependencies = [
 
 [[package]]
 name = "forge-model"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "forge-formats",
  "forge-graph",
@@ -5801,7 +5801,7 @@ dependencies = [
 
 [[package]]
 name = "forge-onnx"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "forge-hal",
  "forge-kernels",
@@ -5812,7 +5812,7 @@ dependencies = [
 
 [[package]]
 name = "forge-rdma"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "cc",
  "forge-types",
@@ -5820,7 +5820,7 @@ dependencies = [
 
 [[package]]
 name = "forge-server"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5846,7 +5846,7 @@ dependencies = [
 
 [[package]]
 name = "forge-state"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "forge-hal",
  "forge-types",
@@ -5854,7 +5854,7 @@ dependencies = [
 
 [[package]]
 name = "forge-tokenize"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "chrono",
  "forge-formats",
@@ -5868,7 +5868,7 @@ dependencies = [
 
 [[package]]
 name = "forge-types"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "bytemuck",
  "half",
@@ -5878,7 +5878,7 @@ dependencies = [
 
 [[package]]
 name = "forge-whisper"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "bytemuck",
  "forge-formats",
@@ -14521,7 +14521,7 @@ dependencies = [
 
 [[package]]
 name = "tentaflow"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -18937,7 +18937,7 @@ checksum = "32ac00cd3f8ec9c1d33fb3e7958a82df6989c42d747bd326c822b1d625283547"
 
 [[package]]
 name = "xtask"
-version = "0.4.0-beta"
+version = "0.4.0-beta.1"
 
 [[package]]
 name = "xxhash-rust"

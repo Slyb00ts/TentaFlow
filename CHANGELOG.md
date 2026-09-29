@@ -6,6 +6,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+## [0.4.0-beta.1] — 2026-09-29
+
+Zmiany od tagu `v0.4.0-beta`. Pełny opis zmian od `v0.3.0-beta` znajduje się
+w [sekcji 0.4.0-beta](#040-beta--2026-09-27). Poprzednia próba wydania
+nie zakończyła się publikacją artefaktów; ten tag uruchamia ponowną kompilację
+wszystkich platform. Wynik kompilacji należy sprawdzić w GitHub Actions.
+
+### TentaNas
+
+- Dodano alerty utraty nasłuchu RDMA i rozpoznawanie połączeń NVMe-oF RDMA.
+  Alerty zachowują stan między odczytami, a spóźnione wyniki diagnostyki
+  nie nadpisują aktualnego stanu targetu.
+- Kreator targetów ostrzega o niedostępnym iSER i blokuje niedostępne opcje.
+  Wykrywanie urządzeń RDMA uwzględnia interfejsy VLAN i bond; odczyt GID
+  wykonuje się poza asynchronicznym wątkiem wykonawczym.
+- Ograniczono ujawnianie informacji o peerach należących do innych organizacji.
+
 ### TentaBus
 
 - Topik ma opis i autora. Opis (do 500 znaków) podaje się w pierwszym kroku
@@ -99,6 +116,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### Poprawki
 
+- Kompilacja zvec dla iOS wybiera SDK hosta macOS dla narzędzi uruchamianych
+  podczas budowania. iOS nie należy do macierzy artefaktów tego wydania.
+- Numer wersji aplikacji i pakietów dziedziczących wersję workspace ustawiono
+  na `0.4.0-beta.1`; Android używa `versionCode = 5`.
 - Usunięto błąd kompilacji parsera diagnostyki RDMA na Windows. Rodziny adresów
   IPv4 i IPv6 są rozpoznawane według linuksowego ABI netlink, niezależnie od
   systemu, na którym działa parser.
