@@ -1,0 +1,90 @@
+# =============================================================================
+# Plik: rerun-release-job.yml
+# Opis: Ponawia wskazane nieudane zadanie po weryfikacji aktualnego stanu API.
+# =============================================================================
+name: Ponowienie nieudanego zadania release
+'on':
+  push:
+    branches:
+    - ci/arrow-configure-beta1
+    paths:
+    - .github/workflows/rerun-release-job.yml
+permissions: {}
+concurrency:
+  group: rerun-release-job-109290168068
+  cancel-in-progress: false
+jobs:
+  rerun:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+    - name: Weryfikacja i pojedyncze ponowienie zadania
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        python3 - <<'PYTHON'
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import subprocess
+        import tempfile
+
+        repository = os.environ["GITHUB_REPOSITORY"]
+        job_id = 109290168068
+        run_id = 36532842108
+        token = os.environ["GITHUB_TOKEN"]
+
+        def notice(message, level="notice"):
+            message = str(message).replace(token, "[REDACTED]")
+            message = re.sub(r"(?i)Bearer\s+\S+|\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+", "[REDACTED]", message)
+            message = message[:1800].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"::{level} title=Ponowienie zadania release::{message}")
+
+        def request(path, method="GET"):
+            with tempfile.TemporaryDirectory() as directory:
+                response = Path(directory) / "response.json"
+                args = ["curl", "--silent", "--show-error", "--max-time", "120",
+                        "--request", method, "--output", str(response), "--write-out", "%{http_code}",
+                        "-H", f"Authorization: Bearer {token}",
+                        "-H", "Accept: application/vnd.github+json",
+                        "-H", "X-GitHub-Api-Version: 2022-11-28"]
+                if method == "POST":
+                    args += ["-H", "Content-Type: application/json", "--data", '{"enable_debug_logging":true}']
+                args += [f"https://api.github.com/repos/{repository}/actions/{path}"]
+                result = subprocess.run(args, text=True, capture_output=True)
+                if result.returncode:
+                    notice(f"Błąd transportu curl ({result.returncode}). Żądanie nie będzie ponawiane; sprawdź stan zadania przed kolejną próbą.", "error")
+                    raise SystemExit(1)
+                status = int(result.stdout)
+                raw = response.read_text()
+                try:
+                    data = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    data = {"message": "Odpowiedź API nie zawiera JSON"}
+                if status != (201 if method == "POST" else 200):
+                    notice(f"API {method} {path}: HTTP {status}; {data.get('message', 'brak szczegółów')}. Bez automatycznego ponawiania.", "error")
+                    raise SystemExit(1)
+                return data
+
+        if repository != "Slyb00ts/TentaFlow":
+            notice("Nieoczekiwane repozytorium; pominięto żądanie.", "error")
+            raise SystemExit(1)
+        job = request(f"jobs/{job_id}")
+        run = request(f"runs/{run_id}")
+        if not (job.get("id") == job_id and job.get("run_id") == run_id
+                and run.get("id") == run_id and run.get("repository", {}).get("full_name") == repository):
+            notice("Identyfikatory zadania, przebiegu lub repozytorium są niespójne.", "error")
+            raise SystemExit(1)
+        if job.get("status") != "completed" or job.get("conclusion") != "failure":
+            notice(f"Nie ponawiam: status zadania={job.get('status')}, wynik={job.get('conclusion')}.")
+            raise SystemExit(0)
+        if not isinstance(job.get("run_attempt"), int) or job["run_attempt"] != run.get("run_attempt"):
+            notice("Przebieg ma już inną próbę niż wskazane zadanie; nie ponawiam starej próby.")
+            raise SystemExit(0)
+        notice(f"Zweryfikowano job {job_id}, run {run_id}, attempt {run['run_attempt']}; status przebiegu={run.get('status')}.")
+        request(f"jobs/{job_id}/rerun", "POST")
+        notice(f"GitHub przyjął ponowienie zadania {job_id} i jego zależnych zadań (HTTP 201), z debug logging.")
+        PYTHON
