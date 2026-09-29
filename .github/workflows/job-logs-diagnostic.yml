@@ -22,7 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         job_id:
-        - '109310611051'
+        - '109390714387'
     steps:
     - name: Pobranie i redakcja logów zadania
       env:
