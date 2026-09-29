@@ -4425,7 +4425,7 @@ fn apply_bus_schema_subject(
                 // again — replaces the held one whole, its versions
                 // included: nothing said about the deleted subject applies.
                 (Some(_), _) => {
-                    drop_schema_versions_of_older_incarnation(tx, &row)?;
+                    drop_schema_versions_of_other_incarnations(tx, &row)?;
                     incoming
                 }
                 (None, _) => incoming,
@@ -4520,19 +4520,22 @@ fn subject_relation(held: u64, incoming: u64) -> SubjectRelation {
 }
 
 /// When an incarnation replaces the held one, the versions registered under
-/// the deleted one go first: `resolve_effective` must never validate with
-/// them, and a new version would collide with their numbers. Versions carry
-/// no incarnation of their own; one created before the new incarnation's
-/// creation belongs to an older one (both stamps come from the node that
-/// registered the subject again, which created it after deleting the old).
-fn drop_schema_versions_of_older_incarnation(
+/// any other go first: `resolve_effective` must never validate with them,
+/// and a new version would collide with their numbers. A version from
+/// before incarnations (`subject_generation = 0`) goes too — it was
+/// registered under the subject held so far, never under a stamped
+/// incarnation that is only arriving now. This runs only when a stamped
+/// incarnation replaces the held one; a subject from before incarnations
+/// never replaces anything (`SubjectRelation::Unknown`), so its versions
+/// are never dropped here.
+fn drop_schema_versions_of_other_incarnations(
     tx: &rusqlite::Transaction<'_>,
     row: &crate::db::repository::DbBusSchemaSubject,
 ) -> LedgerResult<()> {
     tx.execute(
         "DELETE FROM bus_schema_versions WHERE instance_id = ?1 AND org_id = ?2 \
-         AND subject = ?3 AND created_at_ms < ?4",
-        rusqlite::params![row.instance_id, row.org_id, row.subject, row.created_at_ms],
+         AND subject = ?3 AND subject_generation <> ?4",
+        rusqlite::params![row.instance_id, row.org_id, row.subject, row.generation as i64],
     )
     .map_err(sql_error)?;
     Ok(())
@@ -4753,25 +4756,50 @@ fn apply_bus_schema_version(
     }
     match operation.body.action {
         ActionType::Insert | ActionType::Update => {
-            let subject_exists: bool = tx
+            let held: Option<i64> = tx
                 .query_row(
-                    "SELECT 1 FROM bus_schema_subjects \
+                    "SELECT generation FROM bus_schema_subjects \
                      WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3",
                     rusqlite::params![row.instance_id, row.org_id, row.subject],
-                    |_| Ok(true),
+                    |r| r.get(0),
                 )
                 .optional()
-                .map_err(sql_error)?
-                .unwrap_or(false);
-            if !subject_exists {
+                .map_err(sql_error)?;
+            let deferred = || {
+                SyncLedgerError::DeferredOrdering(format!(
+                    "bus_schema_versions target subject not found: {}/{}/{} (incarnation {})",
+                    row.instance_id, row.org_id, row.subject, row.subject_generation
+                ))
+            };
+            let incoming = row.subject_generation;
+            match held.map(|g| g as u64) {
                 // Same "arrived out of order" tolerance as
                 // `apply_flow_version`'s missing-flow check — the two bus
                 // schema-registry resources share one partition suffix
-                // precisely so this stays rare, not impossible.
-                return Err(SyncLedgerError::DeferredOrdering(format!(
-                    "bus_schema_versions target subject not found: {}/{}/{}",
-                    row.instance_id, row.org_id, row.subject
-                )));
+                // precisely so this stays rare, not impossible. A version
+                // of an incarnation already deleted here waits for nothing.
+                None => {
+                    let deleted = crate::db::repository::bus_schema_subject_tombstone(
+                        tx,
+                        &row.instance_id,
+                        &row.org_id,
+                        &row.subject,
+                    )
+                    .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+                    if matches!(deleted, Some(d) if d != 0 && incoming != 0 && incoming <= d) {
+                        return Ok(0);
+                    }
+                    return Err(deferred());
+                }
+                // A version of an incarnation newer than the held subject:
+                // its subject op has not arrived yet, and it must not land
+                // under the old one (whose replacement would then drop it).
+                Some(held) if held != 0 && incoming > held => return Err(deferred()),
+                // A version of an older, deleted incarnation: never valid here.
+                Some(held) if held != 0 && incoming != 0 && incoming < held => return Ok(0),
+                // Same incarnation, or either side from before incarnations
+                // (nothing to tell them apart by).
+                Some(_) => {}
             }
             let existing_hash: Option<String> = tx
                 .query_row(
@@ -4787,8 +4815,8 @@ fn apply_bus_schema_version(
                     .execute(
                         "INSERT INTO bus_schema_versions \
                          (instance_id, org_id, subject, version, schema_text, content_hash, \
-                          schema_ref_id, created_by, created_at_ms) \
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                          schema_ref_id, created_by, created_at_ms, subject_generation) \
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                         rusqlite::params![
                             row.instance_id,
                             row.org_id,
@@ -4799,6 +4827,7 @@ fn apply_bus_schema_version(
                             row.schema_ref_id,
                             row.created_by,
                             row.created_at_ms,
+                            row.subject_generation as i64,
                         ],
                     )
                     .map_err(sql_error),
@@ -9089,6 +9118,7 @@ mod tests {
             schema_ref_id,
             created_by: Some("admin-1".to_string()),
             created_at_ms: 1,
+            subject_generation: 0,
         }
     }
 
@@ -10179,11 +10209,15 @@ mod tests {
         assert!(held_subject(&db).is_none());
     }
 
-    /// A newer incarnation replacing the held one takes the deleted one's
-    /// versions with it: validation never resolves to a version of the
-    /// deleted subject, and the new incarnation's versions land.
-    #[test]
-    fn a_new_incarnation_drops_the_versions_of_the_one_it_replaces() {
+    /// `orders` held here as incarnation G1 with its v1, and incarnation G2
+    /// (the name deleted and registered again elsewhere) with its own v1 —
+    /// stamped on a node whose clock ran behind, so the version is older
+    /// than the subject by wall clock.
+    fn two_incarnations() -> (
+        crate::db::DbPool,
+        repository::DbBusSchemaSubject,
+        repository::DbBusSchemaVersion,
+    ) {
         let db = bus_db();
         let mut first = schema_subject_row_for_test("org-1", "orders");
         first.generation = generation_at(1_000);
@@ -10191,31 +10225,101 @@ mod tests {
         apply_core_operation(&db, &at(bus_schema_subject_op(&first, ActionType::Insert), 1_000))
             .unwrap();
         let mut old_v1 = schema_version_row_for_test("org-1", "orders", 1, "hash-old", 801);
-        old_v1.created_at_ms = 1_000;
+        old_v1.subject_generation = first.generation;
         apply_core_operation(&db, &at(bus_schema_version_op(&old_v1, ActionType::Insert), 1_000))
             .unwrap();
-
         let mut second = schema_subject_row_for_test("org-1", "orders");
         second.generation = generation_at(2_000);
         second.created_at_ms = 2_000;
+        let mut new_v1 = schema_version_row_for_test("org-1", "orders", 1, "hash-new", 802);
+        new_v1.subject_generation = second.generation;
+        new_v1.created_at_ms = 1_500;
+        (db, second, new_v1)
+    }
+
+    fn effective_ref(db: &crate::db::DbPool) -> Option<u32> {
+        crate::bus::schema_registry::registry::resolve_effective(
+            db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+        )
+        .unwrap()
+        .map(|e| e.schema_ref_id)
+    }
+
+    /// A newer incarnation replacing the held one takes the deleted one's
+    /// versions with it, and its own versions — whichever order they arrive
+    /// in, whatever the clocks say — are the ones validation resolves to.
+    #[test]
+    fn a_new_incarnation_replaces_the_versions_of_the_one_it_replaces_in_either_order() {
+        let (db, second, new_v1) = two_incarnations();
+        let subject_op = at(bus_schema_subject_op(&second, ActionType::Insert), 2_000);
+        let version_op = at(bus_schema_version_op(&new_v1, ActionType::Insert), 2_000);
+        apply_like_the_inbox(&db, &[subject_op.clone(), version_op.clone()]);
+        assert_eq!(effective_ref(&db), Some(802), "subject first, then its version");
+
+        let (db, _, _) = two_incarnations();
+        assert!(
+            matches!(
+                apply_core_operation(&db, &version_op),
+                Err(SyncLedgerError::DeferredOrdering(_))
+            ),
+            "a version of an incarnation not held yet waits for it"
+        );
+        assert_eq!(effective_ref(&db), Some(801), "nothing landed under the old incarnation");
+        apply_like_the_inbox(&db, &[version_op, subject_op]);
+        assert_eq!(effective_ref(&db), Some(802), "version first, then its subject");
+    }
+
+    /// A version of an incarnation this node has already replaced, or
+    /// deleted, is dropped rather than landed or kept waiting.
+    #[test]
+    fn a_version_of_a_replaced_or_deleted_incarnation_is_dropped() {
+        let (db, second, new_v1) = two_incarnations();
         apply_core_operation(&db, &at(bus_schema_subject_op(&second, ActionType::Insert), 2_000))
             .unwrap();
-        let resolve = |db: &crate::db::DbPool| {
-            crate::bus::schema_registry::registry::resolve_effective(
-                db,
-                "tentabus-00000001",
-                "org-1",
-                "orders",
-            )
-            .unwrap()
-            .map(|e| e.schema_ref_id)
-        };
-        assert_eq!(resolve(&db), None, "no version of the deleted subject validates");
-
-        let mut new_v1 = schema_version_row_for_test("org-1", "orders", 1, "hash-new", 802);
-        new_v1.created_at_ms = 2_000;
         apply_core_operation(&db, &at(bus_schema_version_op(&new_v1, ActionType::Insert), 2_000))
             .unwrap();
-        assert_eq!(resolve(&db), Some(802));
+        let mut stale_v2 = schema_version_row_for_test("org-1", "orders", 2, "hash-stale", 803);
+        stale_v2.subject_generation = generation_at(1_000);
+        let stale = at(bus_schema_version_op(&stale_v2, ActionType::Insert), 2_100);
+        assert_eq!(apply_core_operation(&db, &stale).unwrap(), 0);
+        assert_eq!(effective_ref(&db), Some(802));
+
+        apply_core_operation(&db, &at(bus_schema_subject_op(&second, ActionType::Delete), 3_000))
+            .unwrap();
+        let mut late_v2 = schema_version_row_for_test("org-1", "orders", 2, "hash-late", 804);
+        late_v2.subject_generation = second.generation;
+        let late = at(bus_schema_version_op(&late_v2, ActionType::Insert), 3_100);
+        assert_eq!(
+            apply_core_operation(&db, &late).unwrap(),
+            0,
+            "a version of a deleted incarnation does not wait for it"
+        );
+    }
+
+    /// A registration stamps its version with the subject's incarnation.
+    #[test]
+    fn a_registered_version_carries_its_subjects_incarnation() {
+        let db = bus_db();
+        crate::bus::schema_registry::registry::register(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+            crate::bus::schema_registry::SchemaType::JsonSchema,
+            r#"{"type":"object"}"#,
+            None,
+            None,
+        )
+        .unwrap();
+        let subject = held_subject(&db).unwrap();
+        let version =
+            repository::bus_schema_version_get(&db, "tentabus-00000001", "org-1", "orders", 1)
+                .unwrap()
+                .unwrap();
+        assert_ne!(subject.generation, 0);
+        assert_eq!(version.subject_generation, subject.generation);
     }
 }

@@ -627,6 +627,7 @@ pub fn register(
     // a version-less subject behind — an EXISTING subject is never written
     // by a registration, so there is nothing to undo for it.
     let mut is_new_subject = existing.is_none();
+    let mut subject_generation = existing.as_ref().map_or(0, |row| row.generation);
 
     // An existing subject's row is not written at all: rewriting it from the
     // copy read above would undo a deprecation or compatibility change made
@@ -653,9 +654,11 @@ pub fn register(
                 &crate::sync::runtime::core_hlc_now(),
             ),
         };
+        subject_generation = subject_row.generation;
         if !repository::bus_schema_subject_insert(db, &subject_row)? {
             is_new_subject = false;
             let row = require_subject(db, instance_id, org_id, subject)?;
+            subject_generation = row.generation;
             effective_compatibility = existing_subject_compatibility(&row)?;
             if let Some(latest_row) =
                 repository::bus_schema_version_latest(db, instance_id, org_id, subject)?
@@ -675,6 +678,7 @@ pub fn register(
         schema_ref_id,
         created_by: created_by.map(|s| s.to_string()),
         created_at_ms: now,
+        subject_generation,
     };
     // Best-effort compensation for `is_new_subject`: delete the subject row
     // this call just created, logging (never masking) a secondary failure.
@@ -1651,6 +1655,7 @@ mod tests {
                 schema_ref_id: colliding_id,
                 created_by: None,
                 created_at_ms: 1,
+                subject_generation: 0,
             },
         )
         .unwrap();
@@ -1990,6 +1995,7 @@ mod tests {
                                 schema_ref_id,
                                 created_by: None,
                                 created_at_ms: 1,
+                                subject_generation: 0,
                             },
                         )
                         .expect("the stand-in registration must claim the retry slot");
@@ -2485,6 +2491,7 @@ mod tests {
             schema_ref_id: 1,
             created_by: None,
             created_at_ms: 0,
+            subject_generation: 0,
         };
         assert_eq!(deprecated_at(&merged, &content_a), None, "the late deprecation stays covered");
     }

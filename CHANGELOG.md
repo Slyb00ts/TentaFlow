@@ -28,7 +28,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   `bus_topics.created_by`, `bus_schema_subjects.deprecated_versions_json`
   i `bus_schema_subjects.generation` (wcielenie wzoru: wzór usunięty
   i zarejestrowany ponownie jest nowym wzorem, do którego nie trafia nic,
-  co dotyczyło poprzedniego, łącznie z jego wersjami) oraz tabelę
+  co dotyczyło poprzedniego, łącznie z jego wersjami),
+  `bus_schema_versions.subject_generation` (wcielenie, pod którym
+  zarejestrowano wersję; wersja nowego wcielenia, która dotrze przed nim,
+  czeka na nie, a wersja usuniętego jest pomijana) oraz tabelę
   `bus_schema_subject_tombstones` (usunięty wzór nie wraca po spóźnionej
   zmianie z innego noda). Czasy wycofania i usunięcia wersji są znaczone
   zegarem synchronizacji (HLC), nie zegarem ściennym noda.

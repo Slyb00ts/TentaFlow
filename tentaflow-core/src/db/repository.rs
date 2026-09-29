@@ -32756,10 +32756,19 @@ pub struct DbBusSchemaVersion {
     pub schema_ref_id: u32,
     pub created_by: Option<String>,
     pub created_at_ms: i64,
+    /// The incarnation of the subject this version was registered under
+    /// (`DbBusSchemaSubject::generation`, migration v176), stamped at
+    /// registration and replicated with the row, so a node can tell a
+    /// version of a deleted subject from one of the subject registered again
+    /// under its name (`core_materializer::apply_bus_schema_version`). `0`
+    /// is every version from before v176, and what a peer on an older build
+    /// sends.
+    #[serde(default)]
+    pub subject_generation: u64,
 }
 
 const BUS_SCHEMA_VERSION_COLUMNS: &str = "instance_id, org_id, subject, version, schema_text, \
-     content_hash, schema_ref_id, created_by, created_at_ms";
+     content_hash, schema_ref_id, created_by, created_at_ms, subject_generation";
 
 fn map_bus_schema_version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusSchemaVersion> {
     Ok(DbBusSchemaVersion {
@@ -32772,6 +32781,7 @@ fn map_bus_schema_version_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBus
         schema_ref_id: row.get(6)?,
         created_by: row.get(7)?,
         created_at_ms: row.get(8)?,
+        subject_generation: row.get::<_, i64>(9)? as u64,
     })
 }
 
@@ -32872,7 +32882,7 @@ pub fn bus_schema_version_insert(
     let insert_result = conn.execute(
         &format!(
             "INSERT INTO bus_schema_versions ({BUS_SCHEMA_VERSION_COLUMNS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
         ),
         rusqlite::params![
             row.instance_id,
@@ -32884,6 +32894,7 @@ pub fn bus_schema_version_insert(
             row.schema_ref_id,
             row.created_by,
             row.created_at_ms,
+            row.subject_generation as i64,
         ],
     );
     match insert_result {
@@ -33231,6 +33242,7 @@ pub mod bus_test_support {
                 schema_ref_id INTEGER NOT NULL,
                 created_by TEXT,
                 created_at_ms INTEGER NOT NULL,
+                subject_generation INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (instance_id, org_id, subject, version),
                 FOREIGN KEY (instance_id, org_id, subject)
                     REFERENCES bus_schema_subjects(instance_id, org_id, subject) ON DELETE CASCADE,
@@ -33473,6 +33485,7 @@ mod bus_repository_tests {
             schema_ref_id,
             created_by: Some("admin-1".to_string()),
             created_at_ms: 1_000,
+            subject_generation: 0,
         }
     }
 

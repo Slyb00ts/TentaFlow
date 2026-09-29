@@ -9960,7 +9960,8 @@ ALTER TABLE bus_partition_assignments ADD COLUMN epoch_slots TEXT NOT NULL DEFAU
 /// entries `bus::schema_registry::registry::DeprecatedVersion` defines, and
 /// `bus_schema_subjects.generation` names the subject's incarnation like
 /// `bus_topics.generation` does a topic's (`0` for every subject from before
-/// this migration); `bus_schema_subject_tombstones` records the newest
+/// this migration) and `bus_schema_versions.subject_generation` the
+/// incarnation each version was registered under; `bus_schema_subject_tombstones` records the newest
 /// deleted incarnation of a subject name, like `bus_topic_tombstones` does
 /// for topics. `created_by` is NULL for every topic created before this
 /// migration: its author was never recorded.
@@ -9969,6 +9970,7 @@ ALTER TABLE bus_topics ADD COLUMN description TEXT NOT NULL DEFAULT '';
 ALTER TABLE bus_topics ADD COLUMN created_by TEXT;
 ALTER TABLE bus_schema_subjects ADD COLUMN deprecated_versions_json TEXT NOT NULL DEFAULT '[]';
 ALTER TABLE bus_schema_subjects ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE bus_schema_versions ADD COLUMN subject_generation INTEGER NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS bus_schema_subject_tombstones (
     instance_id TEXT NOT NULL,
     org_id      TEXT NOT NULL,
