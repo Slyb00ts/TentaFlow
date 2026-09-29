@@ -510,7 +510,7 @@ def publish(expected_manifest_sha):
     dist = prepared.parent / 'dist'
     revalidate(manifest, dist)
     find_existing_release()
-    release = mutation('POST', 'releases', {'tag_name': TAG, 'target_commitish': SOURCE_SHA,
+    release = mutation('POST', 'releases', {'tag_name': TAG,
                        'name': 'TentaFlow 0.4.0 beta.1', 'body': manifest['body'],
                        'draft': True, 'prerelease': True, 'make_latest': 'false'})
     release_id = release['id']
