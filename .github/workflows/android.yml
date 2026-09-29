@@ -158,9 +158,10 @@ jobs:
       - name: Name the APK like a release asset
         run: |
           # The release publishes every tentaflow-* artifact as it is, so the
-          # file carries the tag, the ABI and the fact that it is debug-signed.
+          # file carries the version, the ABI and the fact that it is debug-signed.
           mkdir -p dist
-          apk="dist/tentaflow-${GITHUB_REF_NAME}-android-arm64-v8a-debug.apk"
+          VERSION="$(python3 scripts/workspace-version.py --package)"
+          apk="dist/tentaflow-v${VERSION}-android-arm64-v8a-debug.apk"
           cp tentaflow-mobile/android/app/build/outputs/apk/debug/app-debug.apk "$apk"
           (cd dist && sha256sum "$(basename "$apk")" > "$(basename "$apk").sha256")
 

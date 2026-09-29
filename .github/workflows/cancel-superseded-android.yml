@@ -1,0 +1,85 @@
+# =============================================================================
+# Plik: cancel-superseded-android.yml
+# Opis: Anuluje wskazany zastąpiony przebieg diagnostyczny Androida po weryfikacji.
+# =============================================================================
+name: Anulowanie zastąpionego Androida
+'on':
+  push:
+    branches:
+    - ci/arrow-configure-beta1
+    paths:
+    - .github/workflows/cancel-superseded-android.yml
+permissions: {}
+concurrency:
+  group: cancel-superseded-android-36553187362
+  cancel-in-progress: false
+jobs:
+  cancel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+    - name: Weryfikacja i pojedyncze anulowanie przebiegu
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        python3 - <<'PYTHON'
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import subprocess
+        import tempfile
+
+        repository = os.environ["GITHUB_REPOSITORY"]
+        run_id = 36553187362
+        expected_sha = "a21d467880f029d7969d20e3b8476148b75e1f1e"
+        token = os.environ["GITHUB_TOKEN"]
+
+        def notice(message, level="notice"):
+            message = str(message).replace(token, "[REDACTED]")
+            message = re.sub(r"(?i)Bearer\s+\S+|\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+", "[REDACTED]", message)
+            message = message[:1800].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            print(f"::{level} title=Anulowanie zastąpionego Androida::{message}")
+
+        def request(path, method="GET"):
+            with tempfile.TemporaryDirectory() as directory:
+                response = Path(directory) / "response.json"
+                args = ["curl", "--silent", "--show-error", "--max-time", "120",
+                        "--request", method, "--output", str(response), "--write-out", "%{http_code}",
+                        "-H", f"Authorization: Bearer {token}",
+                        "-H", "Accept: application/vnd.github+json",
+                        "-H", "X-GitHub-Api-Version: 2022-11-28"]
+                args += [f"https://api.github.com/repos/{repository}/actions/{path}"]
+                result = subprocess.run(args, text=True, capture_output=True)
+                if result.returncode:
+                    notice(f"Błąd transportu curl ({result.returncode}). Żądanie nie będzie ponawiane; sprawdź stan zadania przed kolejną próbą.", "error")
+                    raise SystemExit(1)
+                status = int(result.stdout)
+                raw = response.read_text()
+                try:
+                    data = json.loads(raw) if raw else {}
+                except json.JSONDecodeError:
+                    data = {"message": "Odpowiedź API nie zawiera JSON"}
+                if status != (202 if method == "POST" else 200):
+                    notice(f"API {method} {path}: HTTP {status}; {data.get('message', 'brak szczegółów')}. Bez automatycznego ponawiania.", "error")
+                    raise SystemExit(1)
+                return data
+
+        if repository != "Slyb00ts/TentaFlow":
+            notice("Nieoczekiwane repozytorium; pominięto żądanie.", "error")
+            raise SystemExit(1)
+        run = request(f"runs/{run_id}")
+        if not (run.get("id") == run_id
+                and run.get("repository", {}).get("full_name") == repository
+                and run.get("head_sha") == expected_sha
+                and run.get("head_branch") == "ci/arrow-configure-beta1"):
+            notice("Identyfikator, repozytorium, commit lub gałąź przebiegu są niespójne.", "error")
+            raise SystemExit(1)
+        if run.get("status") not in ("in_progress", "queued"):
+            notice(f"Nie anuluję: przebieg {run_id} ma status {run.get('status')}.")
+            raise SystemExit(0)
+        request(f"runs/{run_id}/cancel", "POST")
+        notice(f"GitHub przyjął anulowanie zastąpionego przebiegu Androida {run_id} (HTTP 202).")
+        PYTHON
