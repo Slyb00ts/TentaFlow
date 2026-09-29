@@ -1,17 +1,17 @@
 # =============================================================================
-# Plik: cancel-superseded-android.yml
-# Opis: Anuluje wskazany zastąpiony przebieg diagnostyczny Androida po weryfikacji.
+# Plik: cancel-superseded-run.yml
+# Opis: Anuluje wyłącznie wskazany duplikat publikacji po weryfikacji jego pochodzenia.
 # =============================================================================
-name: Anulowanie zastąpionego Androida
+name: Anulowanie duplikatu publikacji
 'on':
   push:
     branches:
     - ci/arrow-configure-beta1
     paths:
-    - .github/workflows/cancel-superseded-android.yml
+    - .github/workflows/cancel-superseded-run.yml
 permissions: {}
 concurrency:
-  group: cancel-superseded-android-36553187362
+  group: cancel-superseded-run-36565988152
   cancel-in-progress: false
 jobs:
   cancel:
@@ -33,15 +33,16 @@ jobs:
         import tempfile
 
         repository = os.environ["GITHUB_REPOSITORY"]
-        run_id = 36553187362
-        expected_sha = "a21d467880f029d7969d20e3b8476148b75e1f1e"
+        run_id = 36565988152
+        protected_run_id = 36565985622
+        expected_sha = "242307e3007e6b7dd147bd5b8135e533575c6128"
         token = os.environ["GITHUB_TOKEN"]
 
         def notice(message, level="notice"):
             message = str(message).replace(token, "[REDACTED]")
             message = re.sub(r"(?i)Bearer\s+\S+|\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+", "[REDACTED]", message)
             message = message[:1800].replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-            print(f"::{level} title=Anulowanie zastąpionego Androida::{message}")
+            print(f"::{level} title=Anulowanie duplikatu publikacji::{message}")
 
         def request(path, method="GET"):
             with tempfile.TemporaryDirectory() as directory:
@@ -67,19 +68,34 @@ jobs:
                     raise SystemExit(1)
                 return data
 
+        def matches_release_run(run, expected_id):
+            return (run.get("id") == expected_id
+                    and run.get("repository", {}).get("full_name") == repository
+                    and run.get("head_sha") == expected_sha
+                    and run.get("head_branch") == "ci/arrow-configure-beta1"
+                    and run.get("path") == ".github/workflows/publish-release-recovery.yml")
+
         if repository != "Slyb00ts/TentaFlow":
             notice("Nieoczekiwane repozytorium; pominięto żądanie.", "error")
             raise SystemExit(1)
-        run = request(f"runs/{run_id}")
-        if not (run.get("id") == run_id
-                and run.get("repository", {}).get("full_name") == repository
-                and run.get("head_sha") == expected_sha
-                and run.get("head_branch") == "ci/arrow-configure-beta1"):
-            notice("Identyfikator, repozytorium, commit lub gałąź przebiegu są niespójne.", "error")
+        if run_id == protected_run_id:
+            notice("Nie wolno anulować aktywnego przebiegu publikacji.", "error")
             raise SystemExit(1)
-        if run.get("status") not in ("in_progress", "queued"):
+        run = request(f"runs/{run_id}")
+        if not matches_release_run(run, run_id):
+            notice("Identyfikator, repozytorium, commit, gałąź lub workflow przebiegu są niespójne.", "error")
+            raise SystemExit(1)
+        if run.get("status") not in ("pending", "queued", "in_progress"):
             notice(f"Nie anuluję: przebieg {run_id} ma status {run.get('status')}.")
             raise SystemExit(0)
+        primary = request(f"runs/{protected_run_id}")
+        if not matches_release_run(primary, protected_run_id):
+            notice("Pochodzenie głównego przebiegu publikacji jest niespójne.", "error")
+            raise SystemExit(1)
+        if not (primary.get("status") == "in_progress"
+                or (primary.get("status") == "completed" and primary.get("conclusion") == "success")):
+            notice(f"Nie anuluję duplikatu: główny przebieg ma status {primary.get('status')} i wynik {primary.get('conclusion')}.")
+            raise SystemExit(0)
         request(f"runs/{run_id}/cancel", "POST")
-        notice(f"GitHub przyjął anulowanie zastąpionego przebiegu Androida {run_id} (HTTP 202).")
+        notice(f"GitHub przyjął anulowanie duplikatu publikacji {run_id} (HTTP 202).")
         PYTHON
