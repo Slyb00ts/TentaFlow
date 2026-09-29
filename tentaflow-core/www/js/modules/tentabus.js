@@ -39,7 +39,7 @@ import { openTopicDelete } from '/js/modules/tentabus/topic-delete.js';
 import { openMessagePreview } from '/js/modules/tentabus/message-preview.js';
 import { drawTopicDetail, effectiveSection, topicDetailLoader } from '/js/modules/tentabus/topic-detail.js';
 import { openSettingsWindow } from '/js/modules/tentabus/topic-settings.js';
-import { subjectRows, keyRows, openAccessGrant, openAccessChange, openAccessRemove, openKeyIssue, openKeyRights, openKeyRevoke } from '/js/modules/tentabus/topic-access.js';
+import { subjectRows, keyRows, openAccessGrant, openAccessChange, openAccessRemove, openKeyIssue, openKeyRights, openKeyRevoke, openGoneKeyClear } from '/js/modules/tentabus/topic-access.js';
 import { openLeaderTransfer, transferChoices } from '/js/modules/tentabus/partitions.js';
 import { drawReplication } from '/js/modules/tentabus/replication.js';
 import { drawConsumers, consumerKey } from '/js/modules/tentabus/consumers.js';
@@ -1399,8 +1399,13 @@ function openAccessWindow(name, action) {
     });
     return;
   }
-  const key = keyRows({ aclEntries: state.access.acl, keys: state.access.keys, instanceId: where.instanceId, orgId: where.orgId })
-    .find((k) => k.keyId === action.keyId && k.known);
+  const keys = keyRows({ aclEntries: state.access.acl, keys: state.access.keys, instanceId: where.instanceId, orgId: where.orgId });
+  if (action.kind === 'key-clear') {
+    const gone = keys.find((k) => k.keyId === action.keyId && k.gone);
+    if (gone) openGoneKeyClear(gone, { ...keyCtx, aclEntries: state.access.acl, setAcl: subjectCtx.setAcl });
+    return;
+  }
+  const key = keys.find((k) => k.keyId === action.keyId && k.known);
   if (!key) return;
   if (action.kind === 'key-rights') {
     openKeyRights(key, { ...keyCtx, scope: reloadAfter(({ kind, payload }) => ApiBinary.action(kind, payload)) });

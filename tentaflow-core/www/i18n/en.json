@@ -11537,7 +11537,8 @@
         "consumers_none": "No consumer reads this topic yet.",
         "consumer_running": "running",
         "consumer_paused": "paused",
-        "consumer_waiting": "{count} waiting"
+        "consumer_waiting": "{count} waiting",
+        "consumer_key_gone": "the key is gone — nobody reads here"
       }
     },
     "settings": {
@@ -11818,7 +11819,12 @@
         "auto_after_success": "After successful processing",
         "explicit": "The program says when it has finished",
         "at_most_once": "Right when it is read"
-      }
+      },
+      "key_group": "Key {name}",
+      "key_group_named": "{name} · {suffix}",
+      "key_gone": "Deleted key",
+      "key_sub": "Consumer of an external system's key",
+      "key_gone_sub": "The key is gone — nobody reads here"
     },
     "consumer": {
       "back": "All consumers",
@@ -12148,7 +12154,9 @@
           "admin": "The role in the organisation decides about it."
         },
         "impact_rest": "The other rights stay as they are.",
-        "saved_title": "Saved"
+        "saved_title": "Saved",
+        "impact_allow": "It will be possible to {doing}.",
+        "impact_deny": "It will not be possible to {doing}, even if the role in the organisation allows it."
       },
       "remove": {
         "button": "Remove",
@@ -12171,8 +12179,6 @@
         "col_rights": "Rights",
         "col_used": "Last used",
         "kind": "API key",
-        "unknown_key": "Unknown key",
-        "unknown_sub": "API key · id {id}",
         "empty": "No external system has a key with rights to this topic yet.",
         "never": "not yet",
         "just_now": "just now",
@@ -12216,7 +12222,11 @@
           "done": "Done",
           "copied_key": "Key copied.",
           "copied_url": "Address copied.",
-          "copy_failed": "The browser did not allow copying — select the text and copy it by hand."
+          "copy_failed": "The browser did not allow copying — select the text and copy it by hand.",
+          "developer": "For the developer",
+          "copy_group": "Copy consumer name",
+          "copied_group": "Consumer name copied.",
+          "close_confirm": "The key will not be visible again. Copy it now or close the window once more."
         },
         "rights": {
           "window_title": "Key rights — {name}",
@@ -12236,6 +12246,16 @@
           "audit": "The revocation is written to the audit log.",
           "saved_title": "Key revoked",
           "saved_text": "{name} can no longer connect to TentaBus."
+        },
+        "gone": "Deleted key",
+        "gone_sub": "The key is gone — these rights do nothing.",
+        "clear": {
+          "button": "Remove rights",
+          "window_title": "Remove the rights of a deleted key",
+          "lead": "The key these rights belong to no longer exists, so nobody can use them. They were left by older data.",
+          "impact": "the deleted key's entries in topic {topic} disappear.",
+          "saved_title": "Rights removed",
+          "saved_text": "The deleted key's rights are no longer on the list."
         }
       }
     }

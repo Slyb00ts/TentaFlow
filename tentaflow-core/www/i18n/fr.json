@@ -10302,7 +10302,8 @@
         "consumers_none": "Aucun consommateur ne lit encore ce topic.",
         "consumer_running": "actif",
         "consumer_paused": "en pause",
-        "consumer_waiting": "{count} en attente"
+        "consumer_waiting": "{count} en attente",
+        "consumer_key_gone": "la clé n’existe plus — personne ne lit ici"
       }
     },
     "settings": {
@@ -10583,7 +10584,12 @@
         "auto_after_success": "Après un traitement réussi",
         "explicit": "Le programme signale quand il a fini",
         "at_most_once": "Dès la lecture"
-      }
+      },
+      "key_group": "Clé {name}",
+      "key_group_named": "{name} · {suffix}",
+      "key_gone": "Clé supprimée",
+      "key_sub": "Destinataire de la clé d’un système externe",
+      "key_gone_sub": "La clé n’existe plus — personne ne lit ici"
     },
     "consumer": {
       "back": "Tous les destinataires",
@@ -10913,7 +10919,9 @@
           "admin": "Le rôle dans l’organisation en décidera."
         },
         "impact_rest": "Les autres droits ne changent pas.",
-        "saved_title": "Enregistré"
+        "saved_title": "Enregistré",
+        "impact_allow": "Il sera possible de {doing}.",
+        "impact_deny": "Il ne sera plus possible de {doing}, même si le rôle dans l’organisation le permet."
       },
       "remove": {
         "button": "Supprimer",
@@ -10936,8 +10944,6 @@
         "col_rights": "Droits",
         "col_used": "Dernière utilisation",
         "kind": "Clé API",
-        "unknown_key": "Clé inconnue",
-        "unknown_sub": "Clé API · identifiant {id}",
         "empty": "Aucun système externe n’a encore de clé avec des droits sur ce topic.",
         "never": "pas encore",
         "just_now": "à l’instant",
@@ -10981,7 +10987,11 @@
           "done": "Terminé",
           "copied_key": "Clé copiée.",
           "copied_url": "Adresse copiée.",
-          "copy_failed": "Le navigateur n’a pas permis la copie — sélectionnez le texte et copiez-le à la main."
+          "copy_failed": "Le navigateur n’a pas permis la copie — sélectionnez le texte et copiez-le à la main.",
+          "developer": "Pour le développeur",
+          "copy_group": "Copier le nom du destinataire",
+          "copied_group": "Nom du destinataire copié.",
+          "close_confirm": "La clé ne sera plus visible. Copiez-la maintenant ou fermez la fenêtre encore une fois."
         },
         "rights": {
           "window_title": "Droits de la clé — {name}",
@@ -11001,6 +11011,16 @@
           "audit": "La révocation sera inscrite dans le journal d’audit.",
           "saved_title": "Clé révoquée",
           "saved_text": "{name} ne peut plus se connecter à TentaBus."
+        },
+        "gone": "Clé supprimée",
+        "gone_sub": "La clé n’existe plus — ces droits ne servent à rien.",
+        "clear": {
+          "button": "Supprimer les droits",
+          "window_title": "Supprimer les droits d’une clé supprimée",
+          "lead": "La clé à laquelle appartiennent ces droits n’existe plus, personne ne peut donc les utiliser. Ils proviennent de données plus anciennes.",
+          "impact": "les entrées de la clé supprimée dans le topic {topic} disparaîtront.",
+          "saved_title": "Droits supprimés",
+          "saved_text": "Les droits de la clé supprimée ne sont plus dans la liste."
         }
       }
     }

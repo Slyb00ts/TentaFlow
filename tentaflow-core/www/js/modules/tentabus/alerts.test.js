@@ -5,15 +5,19 @@
 // minutes of growth AND more than 1 000 waiting; a topic gains unprocessed
 // messages from the first one in the last hour; a paused consumer is an
 // alert only with a backlog; lagging replicas fold into one alert per node.
-// An unmeasured lag raises nothing.
+// An unmeasured lag raises nothing, and neither does the consumer group of an
+// API key that no longer exists; a key's group is named after its key.
 // =============================================================================
 
+import './_test-setup.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
+
+const {
   computeAlerts, isLagging, lagWording, lagSeriesKey, RISING_RECENT_MS, isPausedWithBacklog, delayedGroups, laggingReplicas,
   LAGGING_MIN_RISE_MS, LAGGING_MIN_WAITING,
-} from './alerts.js';
+} = await import('./alerts.js');
+const { consumerLabel } = await import('./format.js');
 
 const NOW = 1_800_000_000_000;
 const MIN = 60_000;
@@ -110,4 +114,18 @@ test('the lagging alert carries the wording its history supports', () => {
   const rising = new Map([[lagSeriesKey('aplikacja-lekarza', 'wyniki-badan'), [{ atMs: NOW - 2 * MIN, lagTotal: 18000 }, { atMs: NOW - MIN, lagTotal: 18420 }]]]);
   assert.equal(computeAlerts({ groups, nowMs: NOW, lagSeries: rising })[0].wording, 'rising');
   assert.equal(computeAlerts({ groups, nowMs: NOW })[0].wording, 'waiting');
+});
+
+test('a gone key\'s group waits for nobody: no alert, no delay; a live key\'s group is named after its key', () => {
+  const gone = group({ group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c', keyGone: true });
+  assert.equal(isLagging(gone, NOW), false);
+  assert.equal(isPausedWithBacklog({ ...gone, paused: true }), false);
+  assert.deepEqual(delayedGroups([gone]), []);
+  assert.deepEqual(computeAlerts({ nowMs: NOW, groups: [gone, { ...gone, paused: true, group: `${gone.group}.nocny` }] }), []);
+  const live = group({ group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c.raporty', keyName: 'Portal' });
+  const [alert] = computeAlerts({ nowMs: NOW, groups: [live] });
+  assert.equal(alert.label, 'Portal · raporty');
+  assert.equal(consumerLabel({ group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c', keyName: 'Portal' }), 'Klucz Portal');
+  assert.equal(consumerLabel(gone), 'Klucz usunięty');
+  assert.equal(consumerLabel({ group: 'aplikacja-lekarza' }), 'aplikacja-lekarza');
 });

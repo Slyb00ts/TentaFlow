@@ -2057,12 +2057,19 @@ mod tests {
         assert_eq!(no_org.status, StatusCode::BAD_REQUEST);
     }
 
-    /// A revoked key's grant stops working even if its rows are still there.
+    /// A key that no longer exists is refused even if rows naming it are
+    /// still there (older data, or rows that reached this node before the
+    /// key's own deletion): revoking removes them, this is the second line.
     #[test]
     fn revoked_key_is_refused() {
         let fx = key_fixture("cccc3004");
         let writer = fx.key(&["write"]);
-        crate::db::repository::delete_api_key_by_uid(&fx.state.db, &writer).unwrap();
+        fx.state
+            .db
+            .write()
+            .unwrap()
+            .execute("DELETE FROM api_keys WHERE uid = ?1", [&writer])
+            .unwrap();
         let reply = fx.publish_as(key_principal(&writer), &org_query(), &ndjson(r#"{"id":1}"#));
         assert_eq!(reply.status, StatusCode::FORBIDDEN);
     }

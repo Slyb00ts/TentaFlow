@@ -688,14 +688,25 @@ pub fn create_api_key_with_scopes(
 
 /// Deletes a key by its stable `uid`. Revocation is keyed by `uid` because the
 /// 24-bit `key_prefix` is display-only and can collide across keys.
-pub fn delete_api_key_by_uid(pool: &DbPool, uid: &str) -> Result<usize> {
+/// Deletes the key and, in the same transaction, every right it held
+/// (`resource_permissions` rows with `subject_type = 'api_key'` of any
+/// resource type), each replicated as its own tombstone — a revoked key must
+/// not leave rights behind that a later key could never be told apart from.
+/// Returns the deleted key rows (0 or 1) and the `(resource_type,
+/// resource_id, action)` of each right removed.
+pub fn delete_api_key_by_uid(
+    pool: &DbPool,
+    uid: &str,
+) -> Result<(usize, Vec<(String, String, String)>)> {
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
     let affected = tx.execute(
         "DELETE FROM api_keys WHERE uid = ?1",
         rusqlite::params![uid],
     )?;
+    let mut rights = Vec::new();
     if affected > 0 {
+        rights = resource_permissions::delete_subject_tx(&tx, "api_key", uid)?;
         record_core_capture_tx(
             &tx,
             crate::sync::core_registry::CoreSyncResourceKind::ApiKey,
@@ -706,7 +717,7 @@ pub fn delete_api_key_by_uid(pool: &DbPool, uid: &str) -> Result<usize> {
         )?;
     }
     tx.commit()?;
-    Ok(affected)
+    Ok((affected, rights))
 }
 
 pub fn get_api_key_by_uid(pool: &DbPool, uid: &str) -> Result<Option<DbApiKey>> {
@@ -22434,6 +22445,54 @@ pub mod resource_permissions {
         Ok(removed.len())
     }
 
+    /// Removes every row of one subject, of every resource type, inside the
+    /// caller's transaction, each replicated as its own Delete tombstone —
+    /// used when the subject itself is deleted (a revoked API key). Returns
+    /// the `(resource_type, resource_id, action)` of each removed row.
+    pub(crate) fn delete_subject_tx(
+        tx: &rusqlite::Transaction<'_>,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> Result<Vec<(String, String, String)>> {
+        let removed: Vec<(String, String, String)> = {
+            let mut stmt = tx.prepare(
+                "DELETE FROM resource_permissions
+                 WHERE subject_type = ?1 AND subject_id = ?2
+                 RETURNING resource_type, resource_id, action",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![subject_type, subject_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        for (resource_type, resource_id, action) in &removed {
+            super::record_core_capture_tx(
+                tx,
+                crate::sync::core_registry::CoreSyncResourceKind::ResourcePermission,
+                super::resource_permission_resource_id_for_action(
+                    resource_type,
+                    resource_id,
+                    subject_type,
+                    subject_id,
+                    action,
+                ),
+                crate::sync::runtime::SqlWriteAction::Delete,
+                super::resource_permission_changed_fields(
+                    resource_type,
+                    resource_id,
+                    subject_type,
+                    subject_id,
+                    action,
+                    None,
+                ),
+                None,
+            )?;
+        }
+        Ok(removed)
+    }
+
     /// Lista wszystkich wpisow dla konkretnego zasobu — dla UI
     /// "kto ma jaki dostep do gpt-4o".
     pub fn list_for_resource(
@@ -28784,7 +28843,7 @@ mod api_key_access_v2_tests {
         )
         .unwrap();
 
-        let affected = delete_api_key_by_uid(&db, &uid1).unwrap();
+        let (affected, _) = delete_api_key_by_uid(&db, &uid1).unwrap();
         assert_eq!(affected, 1, "exactly the targeted key is deleted");
         assert!(
             get_api_key_by_uid(&db, &uid1).unwrap().is_none(),
@@ -28800,7 +28859,67 @@ mod api_key_access_v2_tests {
         );
 
         // Revoking an unknown uid affects nothing.
-        assert_eq!(delete_api_key_by_uid(&db, "no-such-uid").unwrap(), 0);
+        assert_eq!(delete_api_key_by_uid(&db, "no-such-uid").unwrap().0, 0);
+    }
+
+    /// Revoking a key takes every right it held with it — a topic right,
+    /// a pattern right and a model scope alike — each as a replicated
+    /// tombstone, and leaves another key's rights alone.
+    #[test]
+    fn revoking_a_key_removes_all_its_rights_and_replicates_the_removal() {
+        let db = fresh_db();
+        let (_, uid) =
+            create_api_key(&db, "v-rights-1", "sk-...r1", "portal", "general", None, 60).unwrap();
+        let (_, other) =
+            create_api_key(&db, "v-rights-2", "sk-...r2", "lis", "general", None, 60).unwrap();
+        for (subject, resource_type, resource_id, action) in [
+            (&uid, "topic", "t-1", "read"),
+            (&uid, "topic", "t-1", "write"),
+            (&uid, "bus_schema_registry", "s-1", "read"),
+            (&uid, "model", "bielik", "*"),
+            (&other, "topic", "t-1", "read"),
+        ] {
+            resource_permissions::set_with_action(
+                &db,
+                resource_type,
+                resource_id,
+                "api_key",
+                subject,
+                action,
+                "allow",
+            )
+            .unwrap();
+        }
+        let (deleted, mut rights) = delete_api_key_by_uid(&db, &uid).unwrap();
+        assert_eq!(deleted, 1);
+        rights.sort();
+        assert_eq!(
+            rights,
+            vec![
+                (
+                    "bus_schema_registry".to_string(),
+                    "s-1".to_string(),
+                    "read".to_string()
+                ),
+                ("model".to_string(), "bielik".to_string(), "*".to_string()),
+                ("topic".to_string(), "t-1".to_string(), "read".to_string()),
+                ("topic".to_string(), "t-1".to_string(), "write".to_string()),
+            ]
+        );
+        assert!(resource_permissions::list_for_subject(&db, "api_key", &uid)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            resource_permissions::list_for_subject(&db, "api_key", &other)
+                .unwrap()
+                .len(),
+            1
+        );
+        let tombstone =
+            resource_permission_resource_id_for_action("topic", "t-1", "api_key", &uid, "write");
+        let (action, _) =
+            latest_capture(&db, "core.resource_permission", &tombstone).expect("right tombstone");
+        assert_eq!(action, "delete");
     }
 
     // =========================================================================

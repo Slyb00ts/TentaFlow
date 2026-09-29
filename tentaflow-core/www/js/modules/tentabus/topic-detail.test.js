@@ -241,6 +241,26 @@ test('Stan\'s figures come from this topic only', () => {
   assert.deepEqual(topicConsumers(groups).map((c) => [c.group, c.share]), [['aplikacja-lekarza', 100], ['raporty-laboratorium', 0]]);
 });
 
+test('Stan names a key\'s consumer after its key; a gone key\'s consumer is said to be gone and raises nothing', () => {
+  const keyGroups = [
+    { group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki-badan', lagTotal: 40, paused: false, keyName: 'Portal' },
+    { group: 'k:0a1b2c3d-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki-badan', lagTotal: 9000, paused: true, lagRisingSinceMs: NOW - 60 * MIN, keyGone: true },
+  ];
+  const withKeys = { ...stats, groups: [...stats.groups, ...keyGroups] };
+  const k = stateKpis({ topicStats: withKeys.topics[0], stats: withKeys, partitions, groups: withKeys.groups.filter((g) => g.topic === 'wyniki-badan'), nowMs: NOW });
+  assert.deepEqual(k.lagging, ['aplikacja-lekarza'], 'a gone key\'s backlog is nobody\'s delay');
+  assert.deepEqual(topicAlerts({ topic: 'wyniki-badan', stats: withKeys, replicaLags: [], nowMs: NOW }).map((a) => a.kind), ['lagging', 'dlq']);
+  const body = document.createElement('div');
+  document.body.appendChild(body);
+  drawTopicDetail(body, { view: () => ({ ...mount().view, stats: withKeys }), go: () => {} });
+  const rows = [...body.querySelectorAll('.tb-consumer-row')];
+  const names = rows.map((r) => norm(r.querySelector('.job-name').textContent));
+  assert.ok(names.includes('Klucz Portal'));
+  assert.ok(names.includes('Klucz usunięty'));
+  const gone = rows.find((r) => r.textContent.includes('Klucz usunięty'));
+  assert.equal(gone.querySelector('[data-role="state"]').textContent, 'klucza już nie ma — nikt tu nie czyta');
+});
+
 test('only the newest answer about a topic lands: a poll that left before a save cannot paint over it', async () => {
   const pending = [];
   const applied = [];

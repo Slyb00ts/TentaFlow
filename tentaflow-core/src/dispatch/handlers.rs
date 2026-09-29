@@ -856,19 +856,29 @@ pub fn api_key_revoke(
 
     // key_id z protocolu to stabilny uid klucza (NIE key_prefix — ten jest
     // wylacznie do wyswietlania i moze kolidowac miedzy kluczami).
-    let affected = repository::delete_api_key_by_uid(&ctx.state.db, key_id).map_err(db_err)?;
+    let (affected, rights) =
+        repository::delete_api_key_by_uid(&ctx.state.db, key_id).map_err(db_err)?;
     if affected == 0 {
         return Err(ProtocolError::not_found("api key not found"));
     }
+    // A consumer holding a handle re-checks its rights on the next fetch.
+    if rights.iter().any(|(resource_type, _, _)| resource_type == "topic") {
+        crate::services::bus_authorizer::bump_acl_generation();
+    }
 
     let user_id = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    let removed: Vec<String> = rights
+        .iter()
+        .map(|(resource_type, _, action)| format!("{resource_type}:{action}"))
+        .collect();
+    let details = serde_json::json!({ "rights_removed": removed }).to_string();
     repository::log_audit(
         &ctx.state.db,
         user_id.as_deref(),
         None,
         "apikey.delete",
         Some(&format!("apikey:{}", key_id)),
-        None,
+        Some(&details),
         None,
         Some(&ctx.state.local_node_id),
     )

@@ -22,8 +22,8 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 const {
   subjectRows, rightOf, currentRights, subjectTableRow, buildAclRequests, buildAclRemoveRequests, grantImpact, changeImpact, removeFacts,
   keyRows, keyTableRow, lastUsedText, buildKeyCreateRequest, buildKeyRightsRequests, recordsUrl, issueImpact, keyRightsImpact,
-  directoryLoader, pickable, pickLabel, accessCount, paintAccessSection,
-  openAccessGrant, openAccessChange, openAccessRemove, openKeyIssue, openKeyRights, openKeyRevoke,
+  directoryLoader, pickable, pickLabel, accessCount, paintAccessSection, buildGoneKeyClearRequests,
+  openAccessGrant, openAccessChange, openAccessRemove, openKeyIssue, openKeyIssued, openKeyRights, openKeyRevoke, openGoneKeyClear,
 } = await import('./topic-access.js');
 const { busSchemaScopeId, topicScopeId } = await import('../access-keys-scopes.js');
 
@@ -112,21 +112,81 @@ test('a row says who in plain words: the name, the kind, a group\'s size; an unk
 // Requests
 // ---------------------------------------------------------------------------
 
-test('Nadaj: one AclSet per right that is set; nothing for a right left unset', () => {
+test('Nadaj: one AclSet per right that is set, bans before allows; nothing for a right left unset', () => {
   assert.deepEqual(buildAclRequests(INSTANCE, TOPIC, { subjectType: 'group', subjectId: 'g-rej' }, null, { read: 'allow', write: '', admin: 'deny' }), [
-    { instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-rej', accessLevel: 'allow', action: 'read' },
     { instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-rej', accessLevel: 'deny', action: 'admin' },
+    { instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-rej', accessLevel: 'allow', action: 'read' },
   ]);
 });
 
-test('Zmień: only what changes — a deny back to unset clears that right alone; an old every-right entry is cleared first', () => {
+// The entries a sequence of AclSet requests leaves after each step, and the
+// rights they amount to — what the server holds if the sequence stops there.
+function replay(row, requests) {
+  const state = { rights: { ...row.rights }, wildcard: row.wildcard };
+  const after = [];
+  for (const r of requests) {
+    if (r.action === '*') state.wildcard = r.accessLevel === 'clear' ? null : r.accessLevel;
+    else state.rights[r.action] = r.accessLevel === 'clear' ? null : r.accessLevel;
+    after.push(Object.fromEntries(['read', 'write', 'admin'].map((a) => [a, rightOf({ rights: { ...state.rights }, wildcard: state.wildcard }, a)])));
+  }
+  return after;
+}
+const RANK = { deny: 0, null: 1, allow: 2 };
+// Stopping after any request never leaves a right broader than it is both
+// before and after the whole change.
+function neverBroader(row, requests) {
+  const before = Object.fromEntries(['read', 'write', 'admin'].map((a) => [a, rightOf(row, a)]));
+  const steps = replay(row, requests);
+  const final = steps.at(-1) || before;
+  for (const [i, step] of steps.entries()) {
+    for (const a of ['read', 'write', 'admin']) {
+      assert.ok(RANK[step[a]] <= Math.max(RANK[before[a]], RANK[final[a]]), `after request ${i + 1} ${a} is ${step[a]} (before ${before[a]}, after ${final[a]})`);
+    }
+  }
+  return final;
+}
+
+test('Zmień: only what changes; an old every-right ban is replaced by per-right bans before it goes', () => {
   const [ksiegowosc, , piotr] = subjectRows(ACL);
   assert.deepEqual(buildAclRequests(INSTANCE, TOPIC, ksiegowosc, ksiegowosc, { read: 'allow', write: '', admin: '' }), [
     { instanceId: INSTANCE, topic: TOPIC, subjectType: 'group', subjectId: 'g-ksiegowosc', accessLevel: 'clear', action: 'write' },
   ]);
-  assert.deepEqual(buildAclRequests(INSTANCE, TOPIC, piotr, piotr, { read: 'deny', write: 'deny', admin: '' }).map((r) => `${r.accessLevel}:${r.action}`), ['clear:*', 'deny:read', 'deny:write']);
+  const requests = buildAclRequests(INSTANCE, TOPIC, piotr, piotr, { read: 'deny', write: 'deny', admin: '' });
+  assert.deepEqual(requests.map((r) => `${r.accessLevel}:${r.action}`), ['deny:read', 'deny:write', 'clear:*']);
+  assert.deepEqual(neverBroader(piotr, requests), { read: 'deny', write: 'deny', admin: null });
+});
+
+test('every change and every removal, stopped after any request, never grants more than before or after', () => {
+  const rows = [
+    { subjectType: 'user', subjectId: 'a', rights: { read: null, write: null, admin: null }, wildcard: 'deny' },
+    { subjectType: 'user', subjectId: 'b', rights: { read: 'allow', write: null, admin: null }, wildcard: 'allow' },
+    { subjectType: 'user', subjectId: 'c', rights: { read: 'deny', write: 'allow', admin: null }, wildcard: null },
+    { subjectType: 'user', subjectId: 'd', rights: { read: 'allow', write: 'deny', admin: 'allow' }, wildcard: 'deny' },
+  ];
+  const levels = ['', 'allow', 'deny'];
+  for (const row of rows) {
+    for (const read of levels) for (const write of levels) for (const admin of levels) {
+      neverBroader(row, buildAclRequests(INSTANCE, TOPIC, row, row, { read, write, admin }));
+    }
+    const removal = buildAclRemoveRequests(INSTANCE, TOPIC, row);
+    const kinds = removal.map((r) => (r.action === '*' ? row.wildcard : row.rights[r.action]));
+    assert.deepEqual(kinds, [...kinds].sort((x, y) => (x === 'deny') - (y === 'deny')), 'allows go first, bans last');
+    assert.deepEqual(neverBroader(row, removal), { read: null, write: null, admin: null });
+  }
+  // The reviewed case: an every-right ban kept for reading while writing is
+  // allowed — the ban must not lapse before the per-right ban is written.
+  const d = rows[0];
+  const [first] = replay(d, buildAclRequests(INSTANCE, TOPIC, d, d, { read: 'deny', write: 'allow', admin: '' }));
+  assert.equal(first.read, 'deny');
+  assert.equal(first.write, 'deny', 'writing opens only once everything is in place');
+});
+
+test('removing an entry: allows go first, bans last', () => {
+  const [ksiegowosc, , piotr] = subjectRows(ACL);
   assert.deepEqual(buildAclRemoveRequests(INSTANCE, TOPIC, ksiegowosc).map((r) => `${r.accessLevel}:${r.action}`), ['clear:read', 'clear:write']);
   assert.deepEqual(buildAclRemoveRequests(INSTANCE, TOPIC, piotr).map((r) => `${r.accessLevel}:${r.action}`), ['clear:*']);
+  const mixed = { subjectType: 'user', subjectId: 'x', rights: { read: 'deny', write: 'allow', admin: null }, wildcard: null };
+  assert.deepEqual(buildAclRemoveRequests(INSTANCE, TOPIC, mixed).map((r) => `${r.accessLevel}:${r.action}`), ['clear:write', 'clear:read']);
 });
 
 test('"Co się stanie" in the mockups\' words: a group grant, a changed right, a removed entry', () => {
@@ -431,7 +491,6 @@ test('"Wydaj klucz": a name and at least one right, the exact request, then the 
   assert.match(norm(shown.textContent), /group=k:k-new \(albo k:k-new\.nazwa/);
   assert.match(norm(shown.textContent), /Skopiuj klucz teraz\. Później nie będzie można go zobaczyć/);
   closeAll();
-  const { openKeyIssued } = await import('./topic-access.js');
   const again = openKeyIssued({ where, instanceLabel: 'Produkcja', orgName: 'Przychodnia Zdrowie', origin: 'https://tf.local:8090', name: 'X', rights: { readMessages: true }, keyId: 'k-x', token: 'sk-x', copy: async (t) => { copied.push(t); return true; } });
   again.querySelector('[data-act="copy-key"]').click();
   await tick();
@@ -461,4 +520,95 @@ test('"Prawa klucza": one change described, its scope set or cleared; "Unieważn
   confirm.querySelector('[data-act="go"]').click();
   await tick();
   assert.deepEqual(revoked, [{ keyId: 'k-lis' }]);
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes: gone keys, the one-time window, the Zmień sentence
+// ---------------------------------------------------------------------------
+
+const GONE = [
+  { subjectType: 'api_key', subjectId: 'k-gone', accessLevel: 'allow', action: 'read', subjectLabel: null, memberCount: null },
+  { subjectType: 'api_key', subjectId: 'k-gone', accessLevel: 'deny', action: '*', subjectLabel: null, memberCount: null },
+  { subjectType: 'api_key', subjectId: 'k-gone', accessLevel: 'allow', action: 'write', subjectLabel: null, memberCount: null },
+];
+
+test('a key that no longer exists: shown as deleted with grey rights, never counted, removable by the server administrator only', () => {
+  const rows = keyRows({ aclEntries: [...ACL, ...GONE], keys: KEYS, instanceId: INSTANCE, orgId: ORG });
+  const gone = rows.at(-1);
+  assert.equal(gone.keyId, 'k-gone', 'listed last');
+  assert.equal(gone.gone, true);
+  assert.deepEqual(gone.entries.sort(), ['*', 'read', 'write']);
+  const row = keyTableRow(gone, NOW);
+  assert.equal(words(row.who), 'Klucz usunięty Klucza już nie ma — te prawa nic nie dają.');
+  assert.doesNotMatch(row.rights, /tf-chip--outline ok/, 'no green right for a key that cannot use it');
+  assert.match(row.rights, /tf-chip--outline neutral/);
+  assert.equal(accessCount({ acl: [...ACL, ...GONE], keys: KEYS }, { instanceId: INSTANCE, orgId: ORG }), 8, 'the badge leaves it out');
+  assert.equal(accessCount({ acl: [...ACL, ...GONE], keys: null }, { instanceId: INSTANCE, orgId: ORG }), 7);
+  assert.deepEqual(buildGoneKeyClearRequests(INSTANCE, TOPIC, gone, GONE).map((r) => `${r.subjectType}:${r.subjectId}:${r.accessLevel}:${r.action}`),
+    ['api_key:k-gone:clear:read', 'api_key:k-gone:clear:write', 'api_key:k-gone:clear:*']);
+
+  const admin = paint({ siteAdmin: true, acl: [...ACL, ...GONE] });
+  const table = admin.host.querySelector('[data-role="keys"]');
+  const goneRow = table.rows.find((r) => r._gone);
+  assert.deepEqual([...table.rowActions(goneRow, 0).querySelectorAll('tf-button')].map((b) => b.textContent), ['Usuń prawa']);
+  table.rowActions(goneRow, 0).querySelector('[data-act="key-clear"]').click();
+  assert.deepEqual(admin.moves.at(-1), { kind: 'key-clear', keyId: 'k-gone' });
+  assert.equal(admin.host.querySelector('[data-role="keys-count"] tf-chip').getAttribute('label'), '3', 'three live keys; the deleted one is not counted');
+  const reader = paint({ siteAdmin: false, acl: [...ACL, ...GONE] });
+  assert.equal(reader.host.querySelector('[data-role="keys"]').rowActions, null);
+});
+
+test('"Usuń prawa" of a deleted key clears each of its entries, allows first', async () => {
+  closeAll();
+  const sent = [];
+  const saved = [];
+  const gone = keyRows({ aclEntries: GONE, keys: null, instanceId: INSTANCE, orgId: ORG })[0];
+  const win = openGoneKeyClear(gone, { where, aclEntries: GONE, setAcl: async (r) => { sent.push(r); }, describeError: String, onSaved: (n) => saved.push(n) });
+  assert.match(norm(win.querySelector('[data-role="impact"]').textContent), /znikną wpisy usuniętego klucza w topiku wyniki-badan/);
+  win.querySelector('[data-act="go"]').click();
+  await tick();
+  assert.deepEqual(sent.map((r) => `${r.accessLevel}:${r.action}`), ['clear:read', 'clear:write', 'clear:*']);
+  assert.equal(saved[0].title, 'Usunięto prawa');
+});
+
+test('the one-time key window asks once before Escape or the close button drop an uncopied key', async () => {
+  closeAll();
+  const copied = [];
+  const open = () => openKeyIssued({ where, instanceLabel: 'Produkcja', orgName: 'Przychodnia Zdrowie', origin: 'https://tf.local:8090', name: 'X', rights: { readMessages: true }, keyId: 'k-x', token: 'sk-x', copy: async (t) => { copied.push(t); return true; } });
+  const win = open();
+  assert.ok(win.querySelector('details[data-role="developer"] summary'), 'the technical hint is folded under "Dla programisty"');
+  assert.equal(win.querySelector('[data-role="group"]').textContent, 'k:k-x');
+  win.querySelector('[data-act="copy-group"]').click();
+  await tick();
+  assert.deepEqual(copied, ['k:k-x']);
+  assert.equal(win.querySelector('[data-role="copied"]').textContent, 'Skopiowano nazwę odbiorcy.');
+  win.close();
+  await tick(300);
+  assert.equal(win.isConnected, true, 'the first close only asks');
+  assert.match(win.querySelector('[data-role="discard"]').textContent, /Klucz nie będzie już widoczny/);
+  win.close();
+  await tick(300);
+  assert.equal(win.isConnected, false, 'the second close drops it');
+
+  const copiedFirst = open();
+  copiedFirst.querySelector('[data-act="copy-key"]').click();
+  await tick();
+  copiedFirst.close();
+  await tick(300);
+  assert.equal(copiedFirst.isConnected, false, 'a copied key closes at once');
+  const done = open();
+  done.querySelector('[data-act="done"]').click();
+  await tick(300);
+  assert.equal(done.isConnected, false, '"Gotowe" is the explicit way out');
+});
+
+test('"Zmień" says what the new right lets or stops one doing, as the mockup does', () => {
+  assert.equal(
+    changeImpact({ name: 'Lekarze', current: { read: 'allow', write: '', admin: '' }, next: { read: 'allow', write: 'allow', admin: '' } }).join(' '),
+    'Zapis dla „Lekarze” zmieni się z „nie ustawiono” na „pozwolono”. Będzie można wysyłać wiadomości. Pozostałe prawa bez zmian.',
+  );
+  assert.equal(
+    changeImpact({ name: 'Rejestracja', current: { read: 'allow', write: '', admin: '' }, next: { read: 'deny', write: '', admin: '' } })[1],
+    'Nie będzie można czytać wiadomości, nawet jeśli pozwala na to rola w organizacji.',
+  );
 });

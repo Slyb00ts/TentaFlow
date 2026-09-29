@@ -10302,7 +10302,8 @@
         "consumers_none": "Noch kein Empfänger liest dieses Topic.",
         "consumer_running": "läuft",
         "consumer_paused": "angehalten",
-        "consumer_waiting": "{count} warten"
+        "consumer_waiting": "{count} warten",
+        "consumer_key_gone": "den Schlüssel gibt es nicht mehr — hier liest niemand"
       }
     },
     "settings": {
@@ -10583,7 +10584,12 @@
         "auto_after_success": "Nach erfolgreicher Verarbeitung",
         "explicit": "Das Programm meldet, wann es fertig ist",
         "at_most_once": "Sofort beim Lesen"
-      }
+      },
+      "key_group": "Schlüssel {name}",
+      "key_group_named": "{name} · {suffix}",
+      "key_gone": "Gelöschter Schlüssel",
+      "key_sub": "Empfänger des Schlüssels eines externen Systems",
+      "key_gone_sub": "Den Schlüssel gibt es nicht mehr — hier liest niemand"
     },
     "consumer": {
       "back": "Alle Empfänger",
@@ -10913,7 +10919,9 @@
           "admin": "Darüber entscheidet die Rolle in der Organisation."
         },
         "impact_rest": "Die übrigen Rechte bleiben unverändert.",
-        "saved_title": "Gespeichert"
+        "saved_title": "Gespeichert",
+        "impact_allow": "Dann ist es möglich: {doing}.",
+        "impact_deny": "Dann ist es nicht mehr möglich: {doing}, auch wenn die Rolle in der Organisation es erlaubt."
       },
       "remove": {
         "button": "Entfernen",
@@ -10936,8 +10944,6 @@
         "col_rights": "Rechte",
         "col_used": "Zuletzt genutzt",
         "kind": "API-Schlüssel",
-        "unknown_key": "Unbekannter Schlüssel",
-        "unknown_sub": "API-Schlüssel · Kennung {id}",
         "empty": "Noch kein externes System hat einen Schlüssel mit Rechten an diesem Topic.",
         "never": "noch nicht",
         "just_now": "gerade eben",
@@ -10981,7 +10987,11 @@
           "done": "Fertig",
           "copied_key": "Schlüssel kopiert.",
           "copied_url": "Adresse kopiert.",
-          "copy_failed": "Der Browser hat das Kopieren nicht erlaubt — markieren Sie den Text und kopieren Sie ihn von Hand."
+          "copy_failed": "Der Browser hat das Kopieren nicht erlaubt — markieren Sie den Text und kopieren Sie ihn von Hand.",
+          "developer": "Für Entwickler",
+          "copy_group": "Empfängernamen kopieren",
+          "copied_group": "Empfängername kopiert.",
+          "close_confirm": "Der Schlüssel wird nicht mehr angezeigt. Kopieren Sie ihn jetzt oder schließen Sie das Fenster noch einmal."
         },
         "rights": {
           "window_title": "Rechte des Schlüssels — {name}",
@@ -11001,6 +11011,16 @@
           "audit": "Das Widerrufen wird im Audit-Protokoll vermerkt.",
           "saved_title": "Schlüssel widerrufen",
           "saved_text": "{name} kann sich nicht mehr mit TentaBus verbinden."
+        },
+        "gone": "Gelöschter Schlüssel",
+        "gone_sub": "Den Schlüssel gibt es nicht mehr — diese Rechte bewirken nichts.",
+        "clear": {
+          "button": "Rechte entfernen",
+          "window_title": "Rechte eines gelöschten Schlüssels entfernen",
+          "lead": "Den Schlüssel, zu dem diese Rechte gehören, gibt es nicht mehr, niemand kann sie nutzen. Sie stammen aus älteren Daten.",
+          "impact": "die Einträge des gelöschten Schlüssels im Topic {topic} verschwinden.",
+          "saved_title": "Rechte entfernt",
+          "saved_text": "Die Rechte des gelöschten Schlüssels stehen nicht mehr in der Liste."
         }
       }
     }

@@ -322,6 +322,15 @@ pub struct BusGroupSummaryWire {
     /// from a peer built before this field existed.
     #[serde(default)]
     pub can_admin: bool,
+    /// For a general API key's consumer group (`k:<key uid>` or
+    /// `k:<key uid>.<name>`): the key's name while the key exists. `None`
+    /// for every other group and on a peer built before this field existed.
+    #[serde(default)]
+    pub key_name: Option<String>,
+    /// A key's consumer group whose key no longer exists: shown as such and
+    /// left out of every waiting total. `false` on an older peer.
+    #[serde(default)]
+    pub key_gone: bool,
 }
 
 /// One partition's state for `GroupDetailResponse` — `committed_offset` is
@@ -342,6 +351,15 @@ pub struct BusGroupDetailWire {
     pub commit_mode: String,
     pub paused: bool,
     pub partitions: Vec<BusGroupPartitionDetailWire>,
+    /// For a general API key's consumer group (`k:<key uid>` or
+    /// `k:<key uid>.<name>`): the key's name while the key exists. `None`
+    /// for every other group and on a peer built before this field existed.
+    #[serde(default)]
+    pub key_name: Option<String>,
+    /// A key's consumer group whose key no longer exists: shown as such and
+    /// left out of every waiting total. `false` on an older peer.
+    #[serde(default)]
+    pub key_gone: bool,
 }
 
 /// `OffsetResetRequest.mode` (PLAN M04's "4 tryby" reset-offset modal).
@@ -719,6 +737,15 @@ pub struct BusGroupStatsWire {
     /// integer keeps sub-1/s consumers visible.
     #[serde(default)]
     pub consume_rate_per_min: Option<u64>,
+    /// For a general API key's consumer group (`k:<key uid>` or
+    /// `k:<key uid>.<name>`): the key's name while the key exists. `None`
+    /// for every other group and on a peer built before this field existed.
+    #[serde(default)]
+    pub key_name: Option<String>,
+    /// A key's consumer group whose key no longer exists: shown as such and
+    /// left out of every waiting total. `false` on an older peer.
+    #[serde(default)]
+    pub key_gone: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -1699,6 +1726,8 @@ mod tests {
                 updated_at_ms: 2,
                 lag_total: Some(18_420),
                 can_admin: true,
+                key_name: Some("Portal wyników".to_string()),
+                key_gone: false,
             }],
         });
     }
@@ -1720,6 +1749,8 @@ mod tests {
                     committed_offset: 100,
                     lag: 5,
                 }],
+                key_name: None,
+                key_gone: true,
             },
         });
     }
@@ -2002,6 +2033,8 @@ mod tests {
                     paused: false,
                     lag_rising_since_ms: Some(1_755_999_000_000),
                     consume_rate_per_min: Some(24_000),
+                    key_name: None,
+                    key_gone: false,
                 }],
             },
         });

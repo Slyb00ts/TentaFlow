@@ -11537,7 +11537,8 @@
         "consumers_none": "Tego topiku nie czyta jeszcze żaden odbiorca.",
         "consumer_running": "działa",
         "consumer_paused": "wstrzymany",
-        "consumer_waiting": "{count} czeka"
+        "consumer_waiting": "{count} czeka",
+        "consumer_key_gone": "klucza już nie ma — nikt tu nie czyta"
       }
     },
     "settings": {
@@ -11818,7 +11819,12 @@
         "auto_after_success": "Po udanym przetworzeniu",
         "explicit": "Program sam daje znać, że skończył",
         "at_most_once": "Od razu przy odczycie"
-      }
+      },
+      "key_group": "Klucz {name}",
+      "key_group_named": "{name} · {suffix}",
+      "key_gone": "Klucz usunięty",
+      "key_sub": "Odbiorca klucza systemu zewnętrznego",
+      "key_gone_sub": "Klucza już nie ma — nikt tu nie czyta"
     },
     "consumer": {
       "back": "Wszyscy odbiorcy",
@@ -12148,7 +12154,9 @@
           "admin": "Zdecyduje o niej rola w organizacji."
         },
         "impact_rest": "Pozostałe prawa bez zmian.",
-        "saved_title": "Zapisano"
+        "saved_title": "Zapisano",
+        "impact_allow": "Będzie można {doing}.",
+        "impact_deny": "Nie będzie można {doing}, nawet jeśli pozwala na to rola w organizacji."
       },
       "remove": {
         "button": "Usuń",
@@ -12171,8 +12179,6 @@
         "col_rights": "Prawa",
         "col_used": "Ostatnio użyty",
         "kind": "Klucz API",
-        "unknown_key": "Nieznany klucz",
-        "unknown_sub": "Klucz API · identyfikator {id}",
         "empty": "Żaden system zewnętrzny nie ma jeszcze klucza z prawami do tego topiku.",
         "never": "jeszcze nie",
         "just_now": "przed chwilą",
@@ -12216,7 +12222,11 @@
           "done": "Gotowe",
           "copied_key": "Skopiowano klucz.",
           "copied_url": "Skopiowano adres.",
-          "copy_failed": "Przeglądarka nie pozwoliła skopiować — zaznacz tekst i skopiuj go ręcznie."
+          "copy_failed": "Przeglądarka nie pozwoliła skopiować — zaznacz tekst i skopiuj go ręcznie.",
+          "developer": "Dla programisty",
+          "copy_group": "Kopiuj nazwę odbiorcy",
+          "copied_group": "Skopiowano nazwę odbiorcy.",
+          "close_confirm": "Klucz nie będzie już widoczny. Skopiuj go teraz albo zamknij okno jeszcze raz."
         },
         "rights": {
           "window_title": "Prawa klucza — {name}",
@@ -12236,6 +12246,16 @@
           "audit": "Unieważnienie zapisze się w dzienniku audytu.",
           "saved_title": "Unieważniono klucz",
           "saved_text": "{name} nie może już łączyć się z TentaBus."
+        },
+        "gone": "Klucz usunięty",
+        "gone_sub": "Klucza już nie ma — te prawa nic nie dają.",
+        "clear": {
+          "button": "Usuń prawa",
+          "window_title": "Usuń prawa usuniętego klucza",
+          "lead": "Klucz, do którego należą te prawa, już nie istnieje, więc nikt nie może ich użyć. Zostały ze starszych danych.",
+          "impact": "znikną wpisy usuniętego klucza w topiku {topic}.",
+          "saved_title": "Usunięto prawa",
+          "saved_text": "Na liście nie ma już praw usuniętego klucza."
         }
       }
     }

@@ -2417,6 +2417,9 @@ test('U5 without administration: the patterns to read, no change buttons, who ch
 // ----------------------------------------------------------------------------
 
 const accessSection = (page) => section(page, 'access');
+// Names made in these tests carry the run, so a rerun against the same node
+// never meets the previous run's group or key.
+const RUN = Date.now().toString(36).slice(-5);
 const accessWindow = (page) => page.locator('tf-window.tb-access-window');
 const subjectRow = (page, name) => accessSection(page).locator('[data-role="subjects"] tbody tr', { hasText: name });
 
@@ -2462,7 +2465,8 @@ test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, 
   const instanceId = await openInstance(page, 'Produkcja');
   const tomaszId = await ensureUser(page, 'tomasz', 'Tomasz-czyta-1', 'Tomasz Nowak');
   const piotrId = await ensureUser(page, 'piotr', 'Piotr-zakaz-1', 'Piotr Zieliński');
-  const groupId = (await iamCall(page, 'iamCreateGroupRequest', { name: 'Rejestracja', description: '' }))?.groupId;
+  const groupName = `Rejestracja ${RUN}`;
+  const groupId = (await iamCall(page, 'iamCreateGroupRequest', { name: groupName, description: '' }))?.groupId;
   expect(groupId).toBeTruthy();
   await iamCall(page, 'iamSetUserGroupsRequest', { userId: tomaszId, groupIds: [groupId] });
   // An addon that declares the bus and holds bus.read in this instance: the
@@ -2484,9 +2488,9 @@ test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, 
     await s.locator('tf-button[data-go="access-grant"]').click();
     const win = accessWindow(page);
     await expect(win).toHaveCount(1);
-    await expect(win.locator('[data-role="subject"] select option', { hasText: 'Rejestracja (1 osoba)' })).toHaveCount(1, { timeout: 15000 });
-    await win.locator('[data-role="subject"] select').selectOption({ label: 'Rejestracja (1 osoba)' });
-    await expect(win.locator('[data-role="impact"]')).toContainText('1 osoba z grupy Rejestracja będzie mogła czytać wiadomości w topiku wyniki-badan. O zapisie i administracji zdecyduje rola w organizacji.');
+    await expect(win.locator('[data-role="subject"] select option', { hasText: `${groupName} (1 osoba)` })).toHaveCount(1, { timeout: 15000 });
+    await win.locator('[data-role="subject"] select').selectOption({ label: `${groupName} (1 osoba)` });
+    await expect(win.locator('[data-role="impact"]')).toContainText(`1 osoba z grupy ${groupName} będzie mogła czytać wiadomości w topiku wyniki-badan. O zapisie i administracji zdecyduje rola w organizacji.`);
     await windowFits(page, 'tf-window.tb-access-window', DESKTOP.width);
     await settled(page);
     await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-nadaj.png') });
@@ -2515,11 +2519,11 @@ test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, 
     await page.screenshot({ path: path.join(SHOTS, 'tp-dostep.png'), fullPage: true });
 
     // Zmień: Rejestracja may also write — one change, said before saving.
-    await subjectRow(page, 'Rejestracja').locator('tf-button[data-act="change"]').click();
-    await expect(win.locator('.tb-explain-box')).toContainText('Rejestracja');
+    await subjectRow(page, groupName).locator('tf-button[data-act="change"]').click();
+    await expect(win.locator('.tb-explain-box')).toContainText(groupName);
     await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
     await pickSegment(win, 'tf-segmented[data-right="write"]', 'Pozwól');
-    await expect(win.locator('[data-role="impact"]')).toContainText('Zapis dla „Rejestracja” zmieni się z „nie ustawiono” na „pozwolono”. Pozostałe prawa bez zmian.');
+    await expect(win.locator('[data-role="impact"]')).toContainText(`Zapis dla „${groupName}” zmieni się z „nie ustawiono” na „pozwolono”. Będzie można wysyłać wiadomości. Pozostałe prawa bez zmian.`);
     await win.locator('[data-act="save"]').click();
     await expect(win).toHaveCount(0);
     await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Zapisano');
@@ -2559,80 +2563,114 @@ test('U6 Dostęp at 1440: a group gets reading, a person a write ban, a change, 
         await busCall(page, 'busAclSetRequest', { instanceId, topic: 'wyniki-badan', subjectType, subjectId, accessLevel: 'clear', action });
       }
     }
+    await iamCall(page, 'iamDeleteGroupRequest', { groupId });
   }
   expect(await serverEntries(page, instanceId)).toEqual(before);
   expect(errors, errors.join('\n')).toEqual([]);
 });
 
-test('U6 keys: issued with reading, shown once; the key reads over REST and cannot write; its rights change; revoked, it is refused', async ({ page, request }) => {
+test('U6 keys: issued with reading, shown once; the key reads over REST and cannot write; its rights change; revoked, its rights and its reading go with it', async ({ page, request }) => {
   const errors = trackErrors(page);
   await page.setViewportSize(DESKTOP);
   await login(page);
   const instanceId = await openInstance(page, 'Produkcja');
-  await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=access`);
-  const s = accessSection(page);
-  await expect(s.locator('[data-role="keys-sub"]')).toContainText('Klucz działa w instancji Produkcja', { timeout: 20000 });
-  await s.locator('tf-button[data-go="key-issue"]').click();
-  const win = accessWindow(page);
-  await expect(win.locator('[data-role="impact"]')).toContainText('Wpisz nazwę systemu.');
-  await win.locator('[data-role="name"] input').fill('Portal wyników pacjenta');
-  await expect(win.locator('[data-role="impact"]')).toContainText('Zaznacz co najmniej jedno prawo.');
-  await win.locator('tf-checkbox[data-key-right="readMessages"] .tf-checkbox-label').click();
-  await expect(win.locator('[data-role="impact"]')).toContainText('Portal wyników pacjenta dostanie klucz z prawami: czyta wiadomości (topik wyniki-badan). Klucz zobaczysz tylko raz.');
-  await settled(page);
-  await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-wydaj-klucz.png') });
-  await win.locator('[data-act="save"]').click();
+  const keyName = `Portal wyników ${RUN}`;
+  let keyId = null;
+  let revoked = false;
+  try {
+    await page.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=access`);
+    const s = accessSection(page);
+    await expect(s.locator('[data-role="keys-sub"]')).toContainText('Klucz działa w instancji Produkcja', { timeout: 20000 });
+    await s.locator('tf-button[data-go="key-issue"]').click();
+    const win = accessWindow(page);
+    await expect(win.locator('[data-role="impact"]')).toContainText('Wpisz nazwę systemu.');
+    await win.locator('[data-role="name"] input').fill(keyName);
+    await expect(win.locator('[data-role="impact"]')).toContainText('Zaznacz co najmniej jedno prawo.');
+    await win.locator('tf-checkbox[data-key-right="readMessages"] .tf-checkbox-label').click();
+    await expect(win.locator('[data-role="impact"]')).toContainText(`${keyName} dostanie klucz z prawami: czyta wiadomości (topik wyniki-badan). Klucz zobaczysz tylko raz.`);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-wydaj-klucz.png') });
+    await win.locator('[data-act="save"]').click();
 
-  const issued = page.locator('tf-window.tb-key-issued');
-  await expect(issued).toHaveCount(1);
-  const token = (await issued.locator('[data-role="token"]').textContent()).trim();
-  expect(token).toMatch(/^sk-[0-9a-f]{64}$/);
-  const url = (await issued.locator('[data-role="url"]').textContent()).trim();
-  expect(url).toBe(`https://127.0.0.1:${PORT}/v1/bus/instances/${instanceId}/topics/wyniki-badan/records?org_id=org-default`);
-  const group = /group=(k:[0-9A-Za-z-]+)/.exec(await issued.textContent())?.[1];
-  expect(group).toBeTruthy();
-  await expect(issued).toContainText('Produkcja ·');
-  await expect(issued).toContainText('czyta wiadomości · topik wyniki-badan');
-  await settled(page);
-  await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-klucz-wydany.png') });
-  await issued.locator('[data-act="done"]').click();
-  await expect(issued).toHaveCount(0);
-  await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Wydano klucz');
-  const keyRow = s.locator('[data-role="keys"] tbody tr', { hasText: 'Portal wyników pacjenta' });
-  await expect(keyRow).toContainText('Czyta wiadomości');
-  await expect(keyRow).toContainText('jeszcze nie');
-  await expect(keyRow).not.toContainText('Wysyła wiadomości');
+    const issued = page.locator('tf-window.tb-key-issued');
+    await expect(issued).toHaveCount(1);
+    const token = (await issued.locator('[data-role="token"]').textContent()).trim();
+    expect(token).toMatch(/^sk-[0-9a-f]{64}$/);
+    const url = (await issued.locator('[data-role="url"]').textContent()).trim();
+    expect(url).toBe(`https://127.0.0.1:${PORT}/v1/bus/instances/${instanceId}/topics/wyniki-badan/records?org_id=org-default`);
+    const group = (await issued.locator('[data-role="group"]').textContent()).trim();
+    expect(group).toMatch(/^k:[0-9a-f-]{36}$/);
+    keyId = group.slice(2);
+    await expect(issued).toContainText('Produkcja ·');
+    await expect(issued).toContainText('czyta wiadomości · topik wyniki-badan');
+    // The technical hint is folded away; Escape before copying asks first.
+    await expect(issued.locator('details[data-role="developer"]')).not.toHaveAttribute('open', '');
+    await page.keyboard.press('Escape');
+    await expect(issued.locator('[data-role="discard"]')).toBeVisible();
+    await expect(issued).toHaveCount(1);
+    await settled(page);
+    await page.screenshot({ path: path.join(SHOTS, 'tp-dostep-klucz-wydany.png') });
+    await issued.locator('[data-act="done"]').click();
+    await expect(issued).toHaveCount(0);
+    await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Wydano klucz');
+    const keyRow = s.locator('[data-role="keys"] tbody tr', { hasText: keyName });
+    await expect(keyRow).toContainText('Czyta wiadomości');
+    await expect(keyRow).toContainText('jeszcze nie');
+    await expect(keyRow).not.toContainText('Wysyła wiadomości');
 
-  // The key reads the topic under its own group, and nothing more.
-  const auth = { Authorization: `Bearer ${token}` };
-  const read = await request.get(`${url}&group=${encodeURIComponent(group)}&max_records=5&wait_ms=0`, { headers: auth });
-  expect(read.status(), await read.text()).toBe(200);
-  expect((await read.json()).records.length).toBeGreaterThan(0);
-  const line = JSON.stringify({ payload_b64: Buffer.from('MSH|^~\\&|LAB|X|||20260929||ORU^R01|1|P|2.5').toString('base64') });
-  const write = await request.post(url, { headers: { ...auth, 'Content-Type': 'application/x-ndjson' }, data: `${line}\n` });
-  expect(write.status(), await write.text()).toBe(403);
+    // The key reads the topic under its own group, and nothing more.
+    const auth = { Authorization: `Bearer ${token}` };
+    const read = await request.get(`${url}&group=${encodeURIComponent(group)}&max_records=5&wait_ms=0`, { headers: auth });
+    expect(read.status(), await read.text()).toBe(200);
+    expect((await read.json()).records.length).toBeGreaterThan(0);
+    const line = JSON.stringify({ payload_b64: Buffer.from('MSH|^~\\&|LAB|X|||20260929||ORU^R01|1|P|2.5').toString('base64') });
+    const write = await request.post(url, { headers: { ...auth, 'Content-Type': 'application/x-ndjson' }, data: `${line}\n` });
+    expect(write.status(), await write.text()).toBe(403);
 
-  // Prawa klucza: add sending; the key stays the same.
-  await keyRow.locator('tf-button[data-act="key-rights"]').click();
-  await win.locator('tf-checkbox[data-key-right="writeMessages"] .tf-checkbox-label').click();
-  await expect(win.locator('[data-role="impact"]')).toContainText('Portal wyników pacjenta dostanie prawa: wysyła wiadomości. Pozostałe prawa bez zmian; klucz się nie zmienia.');
-  await win.locator('[data-act="save"]').click();
-  await expect(win).toHaveCount(0);
-  await expect(keyRow).toContainText('Wysyła wiadomości');
-  const keyEntries = (await busCall(page, 'busAclListRequest', { instanceId, topic: 'wyniki-badan' })).entries
-    .filter((e) => e.subjectType === 'api_key' && e.subjectLabel === 'Portal wyników pacjenta')
-    .map((e) => `${e.action}:${e.accessLevel}`).sort();
-  expect(keyEntries).toEqual(['read:allow', 'write:allow']);
+    // Prawa klucza: add sending; the key stays the same.
+    await keyRow.locator('tf-button[data-act="key-rights"]').click();
+    await win.locator('tf-checkbox[data-key-right="writeMessages"] .tf-checkbox-label').click();
+    await expect(win.locator('[data-role="impact"]')).toContainText(`${keyName} dostanie prawa: wysyła wiadomości. Pozostałe prawa bez zmian; klucz się nie zmienia.`);
+    await win.locator('[data-act="save"]').click();
+    await expect(win).toHaveCount(0);
+    await expect(keyRow).toContainText('Wysyła wiadomości');
+    const keyEntries = async () => (await busCall(page, 'busAclListRequest', { instanceId, topic: 'wyniki-badan' })).entries
+      .filter((e) => e.subjectType === 'api_key' && e.subjectId === keyId)
+      .map((e) => `${e.action}:${e.accessLevel}`).sort();
+    expect(await keyEntries()).toEqual(['read:allow', 'write:allow']);
 
-  // Unieważnij: at once, for good.
-  await keyRow.locator('tf-button[data-act="key-revoke"]').click();
-  await expect(win.locator('[data-role="impact"]')).toContainText('Klucz przestanie działać od razu. Portal wyników pacjenta straci prawa: czyta wiadomości i wysyła wiadomości.');
-  await win.locator('[data-act="go"]').click();
-  await expect(win).toHaveCount(0);
-  await expect(keyRow).toHaveCount(0);
-  await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Unieważniono klucz');
-  const refused = await request.get(`${url}&group=${encodeURIComponent(group)}&max_records=5&wait_ms=0`, { headers: auth });
-  expect(refused.status()).toBe(401);
+    // Its consumer is named after the key on the topic's Stan.
+    const d = detailSlot(page);
+    await d.locator('[data-role="menu"] tf-tab#state > button').click();
+    const consumerRow = section(page, 'state').locator('.tb-consumer-row', { hasText: `Klucz ${keyName}` });
+    await expect(consumerRow).toHaveCount(1, { timeout: 20000 });
+    await expect(section(page, 'state').locator('.tb-consumer-row', { hasText: group })).toHaveCount(0);
+    await d.locator('[data-role="menu"] tf-tab#access > button').click();
+
+    // Unieważnij: at once, for good, its rights with it.
+    await keyRow.locator('tf-button[data-act="key-revoke"]').click();
+    await expect(win.locator('[data-role="impact"]')).toContainText(`Klucz przestanie działać od razu. ${keyName} straci prawa: czyta wiadomości i wysyła wiadomości.`);
+    await win.locator('[data-act="go"]').click();
+    await expect(win).toHaveCount(0);
+    revoked = true;
+    await expect(keyRow).toHaveCount(0);
+    await expect(s.locator('tf-alert')).toHaveAttribute('title', 'Unieważniono klucz');
+    expect(await keyEntries()).toEqual([]);
+    await expect(s.locator('[data-role="keys"] tbody tr', { hasText: 'Klucz usunięty' })).toHaveCount(0);
+    const refused = await request.get(`${url}&group=${encodeURIComponent(group)}&max_records=5&wait_ms=0`, { headers: auth });
+    expect(refused.status()).toBe(401);
+
+    // Its consumer stays on Stan, said to be gone and counted nowhere.
+    await d.locator('[data-role="menu"] tf-tab#state > button').click();
+    const goneRow = section(page, 'state').locator('.tb-consumer-row', { hasText: 'Klucz usunięty' });
+    await expect(goneRow).toHaveCount(1, { timeout: 20000 });
+    await expect(goneRow).toContainText('klucza już nie ma — nikt tu nie czyta');
+  } finally {
+    if (keyId && !revoked) await page.evaluate(async (id) => {
+      const { ApiBinary } = await import('/js/protocol/api-binary-shim.js');
+      await ApiBinary.action('apiKeyRevokeRequest', { keyId: id }).catch(() => {});
+    }, keyId);
+  }
   expect(errors, errors.join('\n')).toEqual([]);
 });
 

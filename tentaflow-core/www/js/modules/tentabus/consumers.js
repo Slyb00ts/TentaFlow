@@ -15,7 +15,7 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { setAttr, patchHtml } from '/js/lib/dom-patch.js';
-import { T, fmtCount, fmtDayTime } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, fmtDayTime, consumerLabel, isKeyGroup } from '/js/modules/tentabus/format.js';
 import { isLagging, isPausedWithBacklog } from '/js/modules/tentabus/alerts.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
 import '/js/components/tf-table.js';
@@ -63,6 +63,9 @@ export function consumerRows({ groups, stats, nowMs = Date.now() }) {
     const merged = { ...g, ...(s || {}), paused, lagTotal };
     return {
       group: g.group,
+      label: consumerLabel(g),
+      keyGroup: isKeyGroup(g),
+      keyGone: Boolean(g.keyGone),
       topic: g.topic,
       commitMode: g.commitMode || '',
       paused,
@@ -78,14 +81,14 @@ export function consumerRows({ groups, stats, nowMs = Date.now() }) {
 export function filterConsumerRows(rows, { filter = 'all', query = '' } = {}) {
   const list = rows || [];
   const q = String(query || '').trim().toLowerCase();
-  const delayed = (r) => r.waiting != null && r.waiting > 0;
+  const delayed = (r) => !r.keyGone && r.waiting != null && r.waiting > 0;
   const counts = {
     all: list.length,
     delayed: list.filter(delayed).length,
     paused: list.filter((r) => r.paused).length,
   };
   const inFilter = (r) => filter === 'all' || (filter === 'delayed' ? delayed(r) : r.paused);
-  const matches = (r) => !q || r.group.toLowerCase().includes(q) || r.topic.toLowerCase().includes(q);
+  const matches = (r) => !q || r.group.toLowerCase().includes(q) || r.label.toLowerCase().includes(q) || r.topic.toLowerCase().includes(q);
   return {
     rows: list.filter((r) => inFilter(r) && matches(r))
       .sort((a, b) => a.group.localeCompare(b.group) || a.topic.localeCompare(b.topic)),
@@ -97,7 +100,7 @@ export function filterConsumerRows(rows, { filter = 'all', query = '' } = {}) {
 export function consumersFooter(rows) {
   return (rows || []).reduce((acc, r) => ({
     consumers: acc.consumers + 1,
-    waiting: acc.waiting + (r.waiting || 0),
+    waiting: acc.waiting + (r.keyGone ? 0 : r.waiting || 0),
     paused: acc.paused + (r.paused ? 1 : 0),
   }), { consumers: 0, waiting: 0, paused: 0 });
 }
@@ -110,7 +113,9 @@ function tableRow(r, maxWaiting, nowMs) {
     ? `<span class="tf-chip tf-chip--outline warn">${escapeHtml(T('consumers.state_paused'))}</span>`
     : `<span class="tf-chip tf-chip--outline ok">${escapeHtml(T('consumers.state_running'))}</span>`;
   return {
-    group: `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(r.group)}</span></span>`,
+    group: r.keyGroup
+      ? `<span class="tf-table__cell-title">${escapeHtml(r.label)}</span><div class="tf-table__cell-sub">${escapeHtml(T(r.keyGone ? 'consumers.key_gone_sub' : 'consumers.key_sub'))}</div>`
+      : `<span class="tf-table__cell--mono"><span class="tf-table__cell-title">${escapeHtml(r.group)}</span></span>`,
     topic: `<span class="tf-table__cell--mono">${escapeHtml(r.topic)}</span>`,
     commit: commitModeLabel(r.commitMode),
     state,

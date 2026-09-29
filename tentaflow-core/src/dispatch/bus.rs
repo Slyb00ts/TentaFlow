@@ -2148,25 +2148,63 @@ async fn group_list_v1(
     let org_id = g.org_id.clone();
     let svc = g.svc.clone();
     let org_admin = is_org_admin(ctx);
+    let db = ctx.state.db.clone();
     let groups = run_blocking(move || {
         let rows = visible_groups(&svc, &bctx, &org_id)?;
+        let keys = KeyGroupNames::load(&db)?;
         let mut access = TopicAccessCache::default();
         Ok(rows
             .into_iter()
-            .map(|g| BusGroupSummaryWire {
-                lag_total: group_lag_total(&svc, &bctx, &g.group_id, &g.topic),
-                can_admin: org_admin && access.get(&svc, &bctx, &g.topic).2,
-                group: g.group_id,
-                topic: g.topic,
-                commit_mode: g.commit_mode,
-                paused: g.paused,
-                created_at_ms: g.created_at_ms,
-                updated_at_ms: g.updated_at_ms,
+            .map(|g| {
+                let (key_name, key_gone) = keys.of(&g.group_id);
+                BusGroupSummaryWire {
+                    lag_total: group_lag_total(&svc, &bctx, &g.group_id, &g.topic),
+                    can_admin: org_admin && access.get(&svc, &bctx, &g.topic).2,
+                    group: g.group_id,
+                    topic: g.topic,
+                    commit_mode: g.commit_mode,
+                    paused: g.paused,
+                    created_at_ms: g.created_at_ms,
+                    updated_at_ms: g.updated_at_ms,
+                    key_name,
+                    key_gone,
+                }
             })
             .collect())
     })
     .await?;
     Ok(BusPayload::GroupListResponse { groups })
+}
+
+/// The names of the API keys behind `k:<key uid>[.<name>]` consumer groups,
+/// read once per request: a key's group is listed under its key's name, and
+/// the group of a key that no longer exists is marked as such.
+struct KeyGroupNames(std::collections::HashMap<String, String>);
+
+impl KeyGroupNames {
+    fn load(db: &crate::db::DbPool) -> Result<Self, ProtocolError> {
+        Ok(Self(
+            repository::list_api_keys(db)
+                .map_err(|e| db_err("list_api_keys", e))?
+                .into_iter()
+                .map(|k| (k.uid, k.name))
+                .collect(),
+        ))
+    }
+
+    /// `(key_name, key_gone)` of a group: the key's name while the key
+    /// exists, `key_gone` for a key's group whose key does not; `(None,
+    /// false)` for every other group.
+    fn of(&self, group: &str) -> (Option<String>, bool) {
+        let Some(rest) = group.strip_prefix(bus::API_KEY_GROUP_PREFIX) else {
+            return (None, false);
+        };
+        let uid = rest.split_once('.').map_or(rest, |(uid, _)| uid);
+        match self.0.get(uid) {
+            Some(name) => (Some(name.clone()), false),
+            None => (None, true),
+        }
+    }
 }
 
 fn is_org_admin(ctx: &HandlerContext) -> bool {
@@ -2277,6 +2315,9 @@ async fn group_detail_v1(
     })
     .await?;
 
+    let db = ctx.state.db.clone();
+    let keys = run_blocking(move || KeyGroupNames::load(&db)).await?;
+    let (key_name, key_gone) = keys.of(&row.group_id);
     Ok(BusPayload::GroupDetailResponse {
         detail: BusGroupDetailWire {
             group: row.group_id,
@@ -2284,6 +2325,8 @@ async fn group_detail_v1(
             commit_mode: row.commit_mode,
             paused: row.paused,
             partitions,
+            key_name,
+            key_gone,
         },
     })
 }
@@ -3954,7 +3997,8 @@ async fn stats_snapshot_v1(
     let svc = g.svc.clone();
     let instance_id = svc.instance_id().to_string();
     let bctx_groups = bctx.clone();
-    let (topics, groups) = run_blocking(move || {
+    let main_db = ctx.state.db.clone();
+    let (topics, groups, keys) = run_blocking(move || {
         let topics = topics::list_topics(&db, &instance_id, &org_id).map_err(map_bus_error)?;
         // Filtered here, once, exactly like `GroupList` (hidden `tf-*`
         // groups and groups of topics the caller may not read), so every
@@ -3963,7 +4007,8 @@ async fn stats_snapshot_v1(
         // what `GroupList` itself shows (M1-R2 review N-2/N-7, coordinator
         // decisions 3/7).
         let groups = visible_groups(&svc, &bctx_groups, &org_id)?;
-        Ok::<_, ProtocolError>((topics, groups))
+        let keys = KeyGroupNames::load(&main_db)?;
+        Ok::<_, ProtocolError>((topics, groups, keys))
     })
     .await?;
     let topic_count = topics.len() as u32;
@@ -4004,7 +4049,10 @@ async fn stats_snapshot_v1(
                 // A group this session cannot measure here keeps `None` and
                 // stays out of the per-topic sum.
                 let lag_total = group_lag_total(&svc, &bctx2, &row.group_id, &row.topic);
-                if let Some(lag) = lag_total {
+                let (key_name, key_gone) = keys.of(&row.group_id);
+                // Nothing reads for a key that is gone: what waits for its
+                // group waits for nobody, so it is no topic's backlog.
+                if let (Some(lag), false) = (lag_total, key_gone) {
                     *lag_by_topic.entry(row.topic.clone()).or_insert(0) += lag;
                 }
                 // The trend is derived from the same lag, so it is shown
@@ -4022,6 +4070,8 @@ async fn stats_snapshot_v1(
                     paused: row.paused,
                     lag_rising_since_ms: trend.rising_since_ms,
                     consume_rate_per_min: trend.consume_rate_per_min,
+                    key_name,
+                    key_gone,
                 });
             }
 
@@ -8119,6 +8169,128 @@ mod tests {
                 let summary = groups.iter().find(|g| g.group == group).expect("listed");
                 assert_eq!(summary.lag_total, Some(3));
             }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// A key's consumer group is named after its key; the group of a key
+    /// that no longer exists says so and its backlog counts toward no
+    /// topic's waiting total, in the snapshot, the list and the detail alike.
+    #[tokio::test]
+    async fn key_groups_carry_their_keys_name_and_a_gone_keys_group_waits_for_nobody() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, org_id, _) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let topic = format!("wyniki.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                partitions: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("topic create");
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let (_, live_key) = repository::create_api_key(
+            &db,
+            &format!("v-{tag}"),
+            "sk-...live",
+            &format!("Portal {tag}"),
+            "general",
+            None,
+            60,
+        )
+        .unwrap();
+        let live_group = format!("k:{live_key}.raporty");
+        let gone_group = format!("k:{}", uuid::Uuid::new_v4());
+        let plain_group = format!("lekarze-{tag}");
+        let g = gate_read(&ctx, inst.as_str()).expect("gate");
+        for group in [&live_group, &gone_group, &plain_group] {
+            repository::bus_group_upsert(
+                g.svc.local_db(),
+                &repository::DbBusGroup {
+                    org_id: org_id.clone(),
+                    group_id: group.clone(),
+                    topic: topic.clone(),
+                    commit_mode: groups::CommitMode::Explicit.as_str().to_string(),
+                    paused: false,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            )
+            .unwrap();
+        }
+        let now = bus::now_ms();
+        publish_records(
+            &ctx,
+            &topic,
+            (0..3).map(|i| (format!("r-{i}"), now)).collect(),
+        )
+        .await;
+
+        match stats_snapshot_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::StatsSnapshotResponse { snapshot } => {
+                let of = |id: &str| {
+                    snapshot
+                        .groups
+                        .iter()
+                        .find(|g| g.group == id)
+                        .expect("group")
+                };
+                assert_eq!(
+                    of(&live_group).key_name.as_deref(),
+                    Some(format!("Portal {tag}").as_str())
+                );
+                assert!(!of(&live_group).key_gone);
+                assert!(of(&gone_group).key_gone);
+                assert_eq!(of(&gone_group).key_name, None);
+                assert_eq!(
+                    of(&gone_group).lag_total,
+                    Some(3),
+                    "its own backlog is still shown"
+                );
+                assert_eq!(
+                    (of(&plain_group).key_name.clone(), of(&plain_group).key_gone),
+                    (None, false)
+                );
+                let topic_row = snapshot
+                    .topics
+                    .iter()
+                    .find(|t| t.topic == topic)
+                    .expect("topic");
+                assert_eq!(
+                    topic_row.total_lag, 6,
+                    "the gone key's backlog waits for nobody"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match group_list_v1(&ctx, inst.as_str()).await.unwrap() {
+            BusPayload::GroupListResponse { groups } => {
+                let gone = groups
+                    .iter()
+                    .find(|g| g.group == gone_group)
+                    .expect("listed");
+                assert!(gone.key_gone);
+                let live = groups
+                    .iter()
+                    .find(|g| g.group == live_group)
+                    .expect("listed");
+                assert_eq!(
+                    live.key_name.as_deref(),
+                    Some(format!("Portal {tag}").as_str())
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match group_detail_v1(&ctx, inst.as_str(), gone_group.clone(), topic.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::GroupDetailResponse { detail } => assert!(detail.key_gone),
             other => panic!("unexpected response: {other:?}"),
         }
     }

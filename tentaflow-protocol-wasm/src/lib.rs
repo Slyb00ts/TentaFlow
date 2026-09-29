@@ -11744,6 +11744,13 @@ fn bus_group_stats_to_js(g: &tentaflow_protocol::BusGroupStatsWire) -> JsValue {
         "consume_rate_per_min",
         opt_f64_to_js(g.consume_rate_per_min.map(|v| v as f64)),
     );
+    set_bus(
+        &o,
+        "keyName",
+        "key_name",
+        g.key_name.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
+    set_bus(&o, "keyGone", "key_gone", g.key_gone.into());
     o.into()
 }
 
@@ -12052,6 +12059,13 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                     opt_f64_to_js(g.lag_total.map(|v| v as f64)),
                 );
                 set_bus(&o, "canAdmin", "can_admin", g.can_admin.into());
+                set_bus(
+                    &o,
+                    "keyName",
+                    "key_name",
+                    g.key_name.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+                );
+                set_bus(&o, "keyGone", "key_gone", g.key_gone.into());
                 arr.push(&o);
             }
             set(obj, "groups", arr.into());
@@ -12075,6 +12089,13 @@ fn decode_bus_payload(obj: &js_sys::Object, envelope: tentaflow_protocol::BusEnv
                 parr.push(&po);
             }
             set(&o, "partitions", parr.into());
+            set_bus(
+                &o,
+                "keyName",
+                "key_name",
+                detail.key_name.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+            );
+            set_bus(&o, "keyGone", "key_gone", detail.key_gone.into());
             set(obj, "detail", o.into());
         }
         BP::GroupPauseRequest { .. } => set(obj, "variant", "BusGroupPauseRequest".into()),

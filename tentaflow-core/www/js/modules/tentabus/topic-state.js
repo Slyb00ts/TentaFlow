@@ -10,7 +10,7 @@
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { patchHtml, patchKeyedList, paintStatCards, setAttr, setText } from '/js/lib/dom-patch.js';
-import { T, fmtCount, fmtBytes, fmtDate, fmtSince, fmtLagSeconds } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, fmtBytes, fmtDate, fmtSince, fmtLagSeconds, consumerLabel, isKeyGroup } from '/js/modules/tentabus/format.js';
 import { computeAlerts, isLagging } from '/js/modules/tentabus/alerts.js';
 import { userRate } from '/js/modules/tentabus/model.js';
 import { storageFacts } from '/js/modules/tentabus/topic-settings.js';
@@ -29,7 +29,7 @@ const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}
 export function stateKpis({ topicStats, stats, partitions, groups, nowMs }) {
   const rate = Number(topicStats?.msgsInPerSec) || 0;
   const all = userRate(stats);
-  const lagging = groups.filter((g) => isLagging(g, nowMs)).map((g) => g.group).sort();
+  const lagging = groups.filter((g) => isLagging(g, nowMs)).map(consumerLabel).sort();
   const facts = storageFacts(partitions);
   return {
     rate,
@@ -51,6 +51,9 @@ export function topicConsumers(groups) {
   const max = rows.reduce((m, g) => Math.max(m, Number(g.lagTotal) || 0), 0);
   return rows.map((g) => ({
     group: g.group,
+    label: consumerLabel(g),
+    keyGroup: isKeyGroup(g),
+    keyGone: Boolean(g.keyGone),
     paused: Boolean(g.paused),
     waiting: g.lagTotal == null ? null : Number(g.lagTotal),
     share: max > 0 && g.lagTotal != null ? Math.round((Number(g.lagTotal) / max) * 100) : 0,
@@ -151,7 +154,7 @@ function alertTexts(a, nowMs) {
   switch (a.kind) {
     case 'lagging':
       return {
-        title: T('alerts.lagging_title', { group: a.group }),
+        title: T('alerts.lagging_title', { group: a.label }),
         m1: waiting(a.waiting),
         m2: T(a.wording === 'rising' ? 'alerts.rising_since' : 'alerts.waiting_since', { duration: fmtSince(a.risingSinceMs, nowMs) }),
       };
@@ -161,7 +164,7 @@ function alertTexts(a, nowMs) {
         m1: T('detail.state.kpi_dlq_hour', { count: fmtCount(a.lastHour), n: a.lastHour }),
       };
     case 'paused':
-      return { title: T('alerts.paused_title', { group: a.group }), m1: waiting(a.waiting) };
+      return { title: T('alerts.paused_title', { group: a.label }), m1: waiting(a.waiting) };
     default:
       return {
         title: T('alerts.replica_title', { node: a.nodeLabel }),
@@ -171,12 +174,12 @@ function alertTexts(a, nowMs) {
   }
 }
 
-function consumerSkeleton(group) {
+function consumerSkeleton(c) {
   return `
-    <div class="job-row clickable tb-consumer-row" role="link" tabindex="0" data-go="group" data-group="${escapeAttr(group)}">
-      <div class="job-ico">${sprite('users')}</div>
+    <div class="job-row clickable tb-consumer-row" role="link" tabindex="0" data-go="group" data-group="${escapeAttr(c.group)}">
+      <div class="job-ico">${sprite(c.keyGroup ? 'key' : 'users')}</div>
       <div class="job-main">
-        <div class="job-name"><span class="mono">${escapeHtml(group)}</span></div>
+        <div class="job-name">${c.keyGroup ? escapeHtml(c.label) : `<span class="mono">${escapeHtml(c.group)}</span>`}</div>
         <div class="job-sub" data-role="state"></div>
       </div>
       <div class="tb-lag-cell"><span class="v" data-role="waiting"></span><tf-progress-bar data-role="bar" size="sm"></tf-progress-bar></div>
@@ -227,11 +230,11 @@ export function paintStateSection(host, view) {
 
   const consumers = topicConsumers(groups);
   const list = host.querySelector('[data-role="consumers"]');
-  patchKeyedList(list, consumers.map((c) => ({ key: c.group, html: consumerSkeleton(c.group) })));
+  patchKeyedList(list, consumers.map((c) => ({ key: `${c.group}|${c.label}`, html: consumerSkeleton(c) })));
   consumers.forEach((c, i) => {
     const el = list.children[i];
     if (!el) return;
-    setText(el.querySelector('[data-role="state"]'), T(c.paused ? 'detail.state.consumer_paused' : 'detail.state.consumer_running'));
+    setText(el.querySelector('[data-role="state"]'), T(c.keyGone ? 'detail.state.consumer_key_gone' : c.paused ? 'detail.state.consumer_paused' : 'detail.state.consumer_running'));
     setText(el.querySelector('[data-role="waiting"]'), c.waiting == null ? '—' : T('detail.state.consumer_waiting', { count: fmtCount(c.waiting) }));
     const bar = el.querySelector('[data-role="bar"]');
     setAttr(bar, 'value', String(c.share));

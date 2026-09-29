@@ -475,6 +475,8 @@ body:has(tf-modal[open]) .toast-container { z-index: 10000; }
 .tb-window .tb-key-rights { display: flex; flex-direction: column; gap: 12px; padding: 12px; border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm); }
 .tb-window .tb-key-rights tf-checkbox { display: block; }
 .tb-window.tb-key-issued .mono { overflow-wrap: anywhere; word-break: break-all; }
+.tb-window.tb-key-issued .tb-tech .tb-will-happen { margin-top: 8px; }
+.tb-window .tb-key-group { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 @media (max-width: 767px) {
   .tb-window .tb-right-row tf-segmented { width: 100%; }
 }

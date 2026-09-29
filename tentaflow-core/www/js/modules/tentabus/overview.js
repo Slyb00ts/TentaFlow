@@ -13,7 +13,7 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { setAttr, setText, patchHtml, patchKeyedList, paintStatCards, setClass } from '/js/lib/dom-patch.js';
-import { T, fmtCount, fmtBytes, fmtSince, fmtLagSeconds, contentTypeLabel } from '/js/modules/tentabus/format.js';
+import { T, fmtCount, fmtBytes, fmtSince, fmtLagSeconds, contentTypeLabel, consumerLabel } from '/js/modules/tentabus/format.js';
 import { computeAlerts, delayedGroups } from '/js/modules/tentabus/alerts.js';
 import { overviewKpis, busiestTopics, nodeRows, snapshotTopicCount } from '/js/modules/tentabus/model.js';
 import '/js/components/tf-stat-card.js';
@@ -228,7 +228,7 @@ function paintKpis(host, k, stats, mode) {
       suffix: T('overview.kpi_delayed_suffix', { count: fmtCount(k.groups) }),
       accent: delayed.length ? 'warning' : null,
       'delta-type': delayed.length ? 'warn' : 'neutral',
-      delta: delayed.length ? [...new Set(delayed.map((g) => g.group))].sort().join(', ') : T('overview.kpi_delayed_none'),
+      delta: delayed.length ? [...new Set(delayed.map(consumerLabel))].sort().join(', ') : T('overview.kpi_delayed_none'),
     };
   tiles([
     {
@@ -335,14 +335,14 @@ function alertTexts(a, nowMs) {
   switch (a.kind) {
     case 'lagging':
       return {
-        title: T('alerts.lagging_title', { group: a.group }),
+        title: T('alerts.lagging_title', { group: a.label }),
         m1: waiting(a.waiting),
         m2: T(a.wording === 'rising' ? 'alerts.rising_since' : 'alerts.waiting_since', { duration: fmtSince(a.risingSinceMs, nowMs) }),
       };
     case 'dlq':
       return { title: T('alerts.dlq_title'), m1: T('alerts.dlq_meta', { count: fmtCount(a.lastHour), total: fmtCount(a.total) }) };
     case 'paused':
-      return { title: T('alerts.paused_title', { group: a.group }), m1: waiting(a.waiting) };
+      return { title: T('alerts.paused_title', { group: a.label }), m1: waiting(a.waiting) };
     default: {
       const where = a.topics.length === 1
         ? T('alerts.replica_partitions_topic', { count: fmtCount(a.partitions), n: a.partitions, topic: a.topics[0] })

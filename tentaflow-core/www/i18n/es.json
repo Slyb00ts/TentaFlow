@@ -10302,7 +10302,8 @@
         "consumers_none": "Ningún consumidor lee todavía este topic.",
         "consumer_running": "en marcha",
         "consumer_paused": "en pausa",
-        "consumer_waiting": "{count} en espera"
+        "consumer_waiting": "{count} en espera",
+        "consumer_key_gone": "la clave ya no existe — aquí no lee nadie"
       }
     },
     "settings": {
@@ -10583,7 +10584,12 @@
         "auto_after_success": "Tras procesarlo con éxito",
         "explicit": "El programa avisa cuando termina",
         "at_most_once": "En cuanto se lee"
-      }
+      },
+      "key_group": "Clave {name}",
+      "key_group_named": "{name} · {suffix}",
+      "key_gone": "Clave eliminada",
+      "key_sub": "Receptor de la clave de un sistema externo",
+      "key_gone_sub": "La clave ya no existe — aquí no lee nadie"
     },
     "consumer": {
       "back": "Todos los receptores",
@@ -10913,7 +10919,9 @@
           "admin": "Decidirá el rol en la organización."
         },
         "impact_rest": "Los demás derechos no cambian.",
-        "saved_title": "Guardado"
+        "saved_title": "Guardado",
+        "impact_allow": "Se podrá {doing}.",
+        "impact_deny": "No se podrá {doing}, aunque lo permita el rol en la organización."
       },
       "remove": {
         "button": "Quitar",
@@ -10936,8 +10944,6 @@
         "col_rights": "Derechos",
         "col_used": "Último uso",
         "kind": "Clave API",
-        "unknown_key": "Clave desconocida",
-        "unknown_sub": "Clave API · identificador {id}",
         "empty": "Ningún sistema externo tiene todavía una clave con derechos sobre este topic.",
         "never": "todavía no",
         "just_now": "hace un momento",
@@ -10981,7 +10987,11 @@
           "done": "Listo",
           "copied_key": "Clave copiada.",
           "copied_url": "Dirección copiada.",
-          "copy_failed": "El navegador no permitió copiar — selecciona el texto y cópialo a mano."
+          "copy_failed": "El navegador no permitió copiar — selecciona el texto y cópialo a mano.",
+          "developer": "Para el programador",
+          "copy_group": "Copiar nombre del receptor",
+          "copied_group": "Nombre del receptor copiado.",
+          "close_confirm": "La clave ya no se podrá ver. Cópiala ahora o cierra la ventana otra vez."
         },
         "rights": {
           "window_title": "Derechos de la clave — {name}",
@@ -11001,6 +11011,16 @@
           "audit": "La revocación quedará registrada en el registro de auditoría.",
           "saved_title": "Clave revocada",
           "saved_text": "{name} ya no puede conectarse a TentaBus."
+        },
+        "gone": "Clave eliminada",
+        "gone_sub": "La clave ya no existe — estos derechos no hacen nada.",
+        "clear": {
+          "button": "Quitar derechos",
+          "window_title": "Quitar los derechos de una clave eliminada",
+          "lead": "La clave a la que pertenecen estos derechos ya no existe, así que nadie puede usarlos. Quedan de datos anteriores.",
+          "impact": "desaparecerán las entradas de la clave eliminada en el topic {topic}.",
+          "saved_title": "Derechos quitados",
+          "saved_text": "Los derechos de la clave eliminada ya no están en la lista."
         }
       }
     }

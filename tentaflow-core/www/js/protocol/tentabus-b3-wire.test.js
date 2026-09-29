@@ -243,3 +243,25 @@ test('the capabilities answer carries the caller\'s organisation, empty when an 
   assert.equal(older.capabilities.orgId, '');
   assert.equal(older.capabilities.orgName, null);
 });
+
+test('consumer groups carry their key\'s name, or that the key is gone, and decode without both from an older server', { skip }, () => {
+  const stats = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { StatsSnapshotResponse: { snapshot: {
+    topic_count: 1, dlq_topic_count: 0, partition_count_total: 1, group_count: 2, paused_group_count: 0, total_msgs_in_per_sec: 0,
+    total_bytes_in_per_sec: 0, total_bytes_on_disk: 0, total_lag: 0, total_dlq_depth: 0, topics: [],
+    groups: [
+      { group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki', lag_total: 3, paused: false, key_name: 'Portal', key_gone: false },
+      { group: 'k:0a1b2c3d-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki', lag_total: 3, paused: false, key_name: null, key_gone: true },
+      { group: 'lekarze', topic: 'wyniki', lag_total: 3, paused: false },
+    ],
+  } } } } });
+  assert.deepEqual(stats.groups.map((g) => [g.keyName, g.keyGone]), [['Portal', false], [null, true], [null, false]]);
+  const list = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { GroupListResponse: { groups: [
+    { group: 'k:0a1b2c3d-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki', commit_mode: 'explicit', paused: false, created_at_ms: 1, updated_at_ms: 2, key_gone: true },
+  ] } } } });
+  assert.equal(list.groups[0].keyGone, true);
+  const detail = decodeBody({ BusBody: { instance_id: INSTANCE, payload: { GroupDetailResponse: { detail: {
+    group: 'k:6f1c0b52-4e1a-4b3a-9a57-1d2e3f4a5b6c', topic: 'wyniki', commit_mode: 'explicit', paused: false, partitions: [], key_name: 'Portal',
+  } } } } });
+  assert.equal(detail.detail.keyName, 'Portal');
+  assert.equal(detail.detail.keyGone, false);
+});

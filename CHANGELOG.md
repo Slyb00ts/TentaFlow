@@ -190,6 +190,26 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   o identyfikatorze addonu, nieznany klucz, prawo spoza własnej organizacji.
   Protokół: `BusCapabilitiesWire.{org_id, org_name}` (organizacja wywołującego;
   pusta u starszego serwera).
+- Unieważnienie klucza API usuwa w tej samej transakcji wszystkie jego prawa
+  (wiersze `resource_permissions` z `subject_type = 'api_key'` każdego rodzaju
+  zasobu), każde jako zsynchronizowane usunięcie; wpis audytu `apikey.delete`
+  wymienia usunięte prawa. Wpisy klucza, którego już nie ma (starsze dane),
+  karta kluczy pokazuje jako „Klucz usunięty” bez zielonych praw i bez
+  liczenia w liczniku sekcji; administrator serwera usuwa je przyciskiem
+  „Usuń prawa”.
+- Grupa odbiorców klucza (`k:<id klucza>[.<nazwa>]`) nazywa się wszędzie nazwą
+  klucza („Klucz Portal”, „Portal · raporty”); grupa klucza, którego już nie
+  ma, jest opisana jako „Klucz usunięty”, nie wywołuje alertów i nie wlicza się
+  do „Czeka na odbiorców” ani sum zaległości. Protokół:
+  `BusGroupSummaryWire`/`BusGroupStatsWire`/`BusGroupDetailWire.{key_name, key_gone}`.
+- Zmiana i usunięcie wpisu dostępu wysyłają żądania w kolejności, w której
+  przerwanie w dowolnym miejscu nigdy nie daje szerszego dostępu niż przed
+  zmianą i po niej: najpierw nowe zakazy, potem zdjęcie pozwoleń, nowe
+  pozwolenia, a zdjęcie zakazów na końcu (także starego wpisu na wszystkie
+  prawa). Okno „Zmień” mówi, co nowe prawo pozwala albo czego zabrania.
+- Okno z jednorazowo pokazanym kluczem pyta raz przed zamknięciem klawiszem
+  Escape lub krzyżykiem, jeśli klucza nie skopiowano; wskazówka techniczna jest
+  zwinięta w „Dla programisty” z przyciskiem „Kopiuj nazwę odbiorcy”.
 
 ## [0.4.0-beta.1] — 2026-09-29
 

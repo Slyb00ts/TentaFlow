@@ -17,6 +17,12 @@
 //     beats their groups' (`resource_permissions::check_action`);
 //   - a 'user' entry naming an addon is refused on save (`bus.subject_is_addon`)
 //     but can be removed: it is shown as an unknown subject with its id;
+//   - a change is sent as several requests; they are ordered so that stopping
+//     after any of them never leaves more access than before or after it:
+//     new bans first, then allows taken away, then new allows, bans lifted last;
+//   - revoking a key removes its rights with it; an entry of a key that no
+//     longer exists (older data) grants nothing and is shown as such, with
+//     "Usuń prawa" for the server administrator;
 //   - keys are issued, changed and revoked by the server administrator only
 //     (`ApiKeyCreate`/`ScopeSet`/`ScopeClear`/`Revoke` are site-admin and a
 //     topic right also needs the topic's administration); a key's secret is
@@ -144,34 +150,45 @@ export function subjectTableRow(row) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Orders requests so that stopping after any of them never leaves more
+ * access than there was before or will be after: new bans first, then
+ * allows taken away, then new allows, and bans lifted last. `kind` of each
+ * step: 'deny' | 'clear-allow' | 'allow' | 'clear-deny'.
+ */
+const STEP_ORDER = ['deny', 'clear-allow', 'allow', 'clear-deny'];
+function ordered(steps) {
+  return STEP_ORDER.flatMap((kind) => steps.filter((s) => s.kind === kind).map((s) => s.request));
+}
+
+/**
  * The `AclSet` requests that turn `row` (null for a subject without an entry)
  * into `next` = `{ read, write, admin }` ('allow' | 'deny' | ''). An old
- * every-right entry is cleared first, then each right the draft sets is
- * written; a right that goes to '' is cleared only where its own entry exists.
+ * every-right entry is replaced by one entry per right; a right that goes to
+ * '' is cleared only where its own entry exists. See `ordered` for the order.
  */
 export function buildAclRequests(instanceId, topic, subject, row, next) {
   const base = { instanceId, topic, subjectType: subject.subjectType, subjectId: subject.subjectId };
-  const out = [];
+  const steps = [];
   const own = row?.rights || { read: null, write: null, admin: null };
-  if (row?.wildcard) out.push({ ...base, accessLevel: 'clear', action: '*' });
+  if (row?.wildcard) {
+    steps.push({ kind: row.wildcard === 'deny' ? 'clear-deny' : 'clear-allow', request: { ...base, accessLevel: 'clear', action: '*' } });
+  }
   for (const action of ACL_ACTIONS) {
     const want = next[action] || null;
     const had = own[action];
-    if (want) {
-      if (want !== had || row?.wildcard) out.push({ ...base, accessLevel: want, action });
-    } else if (had) {
-      out.push({ ...base, accessLevel: 'clear', action });
-    }
+    if (want && want !== had) steps.push({ kind: want, request: { ...base, accessLevel: want, action } });
+    else if (!want && had) steps.push({ kind: had === 'deny' ? 'clear-deny' : 'clear-allow', request: { ...base, accessLevel: 'clear', action } });
   }
-  return out;
+  return ordered(steps);
 }
 
-/** The `AclSet` requests that take every entry of `row` away. */
+/** The `AclSet` requests that take every entry of `row` away: allows first, bans last. */
 export function buildAclRemoveRequests(instanceId, topic, row) {
   const base = { instanceId, topic, subjectType: row.subjectType, subjectId: row.subjectId };
-  const out = ACL_ACTIONS.filter((a) => row.rights[a]).map((action) => ({ ...base, accessLevel: 'clear', action }));
-  if (row.wildcard) out.push({ ...base, accessLevel: 'clear', action: '*' });
-  return out;
+  const steps = ACL_ACTIONS.filter((a) => row.rights[a])
+    .map((action) => ({ kind: row.rights[action] === 'deny' ? 'clear-deny' : 'clear-allow', request: { ...base, accessLevel: 'clear', action } }));
+  if (row.wildcard) steps.push({ kind: row.wildcard === 'deny' ? 'clear-deny' : 'clear-allow', request: { ...base, accessLevel: 'clear', action: '*' } });
+  return ordered(steps);
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +226,7 @@ export function changeImpact({ name, current, next }) {
   for (const a of changed) {
     lines.push(T('access.change.impact_line', { right: T(`access.right_title.${a}`), name, from: levelWord(current[a]), to: levelWord(next[a]) }));
     if (!next[a]) lines.push(T(`access.change.impact_role.${a}`));
+    else lines.push(T(`access.change.impact_${next[a] === 'allow' ? 'allow' : 'deny'}`, { doing: T(`access.can.${a}`) }));
   }
   if (changed.length && changed.length < ACL_ACTIONS.length) lines.push(T('access.change.impact_rest'));
   return lines;
@@ -234,16 +252,28 @@ export function removeFacts(row) {
  * scopes (`{ keyId, name, lastUsedAtEpoch, scopes }`), or `null` for a reader
  * who is not the server administrator — then only the message rights are
  * known and nothing about the last use. A key is listed when it has a right
- * here. Each row: `{ keyId, name, known, rights, lastUsedMs, otherScopes }`.
+ * here. An entry naming a key that no longer exists (the server names every
+ * existing key, so it has no label) makes a `gone` row: its rights do
+ * nothing and `entries` lists the actions to clear. Each row: `{ keyId, name,
+ * known, gone, rights, entries, lastUsedMs, otherScopes }`; gone rows last.
  */
 export function keyRows({ aclEntries, keys, instanceId, orgId }) {
   const rows = new Map();
   const rowFor = (keyId, name) => {
-    if (!rows.has(keyId)) rows.set(keyId, { keyId, name: name || null, known: false, rights: { readMessages: false, writeMessages: false, readSchemas: false, writeSchemas: false }, lastUsedMs: undefined, otherScopes: 0 });
+    if (!rows.has(keyId)) rows.set(keyId, { keyId, name: name || null, known: false, gone: false, rights: { readMessages: false, writeMessages: false, readSchemas: false, writeSchemas: false }, entries: [], lastUsedMs: undefined, otherScopes: 0 });
     return rows.get(keyId);
   };
   for (const e of aclEntries || []) {
-    if (e.subjectType !== 'api_key' || e.accessLevel !== 'allow') continue;
+    if (e.subjectType !== 'api_key') continue;
+    if (!e.subjectLabel) {
+      const row = rowFor(e.subjectId, null);
+      row.gone = true;
+      row.entries.push(e.action);
+      if (e.accessLevel === 'allow' && e.action === 'read') row.rights.readMessages = true;
+      if (e.accessLevel === 'allow' && e.action === 'write') row.rights.writeMessages = true;
+      continue;
+    }
+    if (e.accessLevel !== 'allow') continue;
     if (e.action === 'read') rowFor(e.subjectId, e.subjectLabel).rights.readMessages = true;
     else if (e.action === 'write') rowFor(e.subjectId, e.subjectLabel).rights.writeMessages = true;
   }
@@ -264,11 +294,18 @@ export function keyRows({ aclEntries, keys, instanceId, orgId }) {
       const shown = Object.values(row.rights).filter(Boolean).length;
       row.otherScopes = Math.max(0, scopes.filter((s) => s.accessLevel === 'allow').length - shown);
     }
-    // A leftover entry of a key that no longer exists is kept visible, so it
-    // is not a silent right; the administrator sees it as unknown.
-    for (const row of rows.values()) if (!row.known) row.name = null;
   }
-  return [...rows.values()].sort((a, b) => String(a.name ?? '￿').localeCompare(String(b.name ?? '￿'), I18n.getLanguage()));
+  return [...rows.values()].sort((a, b) => Number(a.gone) - Number(b.gone)
+    || String(a.name ?? '').localeCompare(String(b.name ?? ''), I18n.getLanguage()));
+}
+
+/** The requests that clear every entry a gone key left on the topic: allows first, bans last. */
+export function buildGoneKeyClearRequests(instanceId, topic, row, aclEntries) {
+  const base = { instanceId, topic, subjectType: 'api_key', subjectId: row.keyId };
+  const steps = (aclEntries || [])
+    .filter((e) => e.subjectType === 'api_key' && e.subjectId === row.keyId)
+    .map((e) => ({ kind: e.accessLevel === 'deny' ? 'clear-deny' : 'clear-allow', request: { ...base, accessLevel: 'clear', action: e.action } }));
+  return ordered(steps);
 }
 
 /** The rights of a key, as the chips and sentences name them. */
@@ -283,12 +320,15 @@ export function lastUsedText(ms, nowMs = Date.now()) {
   return fmtDayTime(ms, nowMs);
 }
 
-/** A table row of the keys' card. */
+/** A table row of the keys' card; a gone key's rights are greyed, they do nothing. */
 export function keyTableRow(row, nowMs = Date.now()) {
   const names = keyRightNames(row.rights);
+  const tone = row.gone ? 'neutral' : 'ok';
   return {
-    who: `<span class="tf-table__cell-title">${escapeHtml(row.name || T('access.keys.unknown_key'))}</span><div class="tf-table__cell-sub">${escapeHtml(row.name ? T('access.keys.kind') : T('access.keys.unknown_sub', { id: row.keyId }))}</div>`,
-    rights: names.map((n) => `<span class="tf-chip tf-chip--outline ok">${escapeHtml(n)}</span>`).join(' '),
+    who: row.gone
+      ? `<span class="tf-table__cell-title">${escapeHtml(T('access.keys.gone'))}</span><div class="tf-table__cell-sub">${escapeHtml(T('access.keys.gone_sub'))}</div>`
+      : `<span class="tf-table__cell-title">${escapeHtml(row.name)}</span><div class="tf-table__cell-sub">${escapeHtml(T('access.keys.kind'))}</div>`,
+    rights: names.map((n) => `<span class="tf-chip tf-chip--outline ${tone}">${escapeHtml(n)}</span>`).join(' '),
     used: escapeHtml(row.known ? lastUsedText(row.lastUsedMs, nowMs) : '—'),
     _key: row.keyId,
   };
@@ -393,7 +433,7 @@ export function pickLabel(entry) {
 /** Entries shown in the menu's counter: people, groups and addons plus keys. */
 export function accessCount(data, where) {
   if (!data?.acl) return null;
-  return subjectRows(data.acl).length + keyRows({ aclEntries: data.acl, keys: data.keys, ...where }).length;
+  return subjectRows(data.acl).length + keyRows({ aclEntries: data.acl, keys: data.keys, ...where }).filter((k) => !k.gone).length;
 }
 
 function skeleton(siteAdmin) {
@@ -510,7 +550,7 @@ export function paintAccessSection(host, view, ctx) {
   if (!keysLoading && !keysError && !keys.length) keysState = `<div class="tb-state">${escapeHtml(T('access.keys.empty'))}</div>`;
   patchHtml(host.querySelector('[data-role="keys-state"]'), keysState);
   keysTable.hidden = keys.length === 0 || keysLoading;
-  chipCount(host.querySelector('[data-role="keys-count"]'), keysLoading ? null : keys.length);
+  chipCount(host.querySelector('[data-role="keys-count"]'), keysLoading ? null : keys.filter((k) => !k.gone).length);
   patchHtml(host.querySelector('[data-role="keys-actions"]'), siteAdmin
     ? `<tf-button variant="secondary" size="sm" icon="key" data-go="key-issue" ${where.orgId ? '' : 'disabled'}>${escapeHtml(T('access.keys.issue.button'))}</tf-button>`
     : '');
@@ -523,9 +563,10 @@ export function paintAccessSection(host, view, ctx) {
   host.querySelector('[data-role="keys-who"]').hidden = siteAdmin;
   if (!keysTable.__tbWired) {
     keysTable.__tbWired = true;
-    keysTable.rowActionsKey = (row) => `${row._key}|${row._known}`;
+    keysTable.rowActionsKey = (row) => `${row._key}|${row._known}|${row._gone}`;
     keysTable.rowActions = siteAdmin ? (row, idx, currentRow) => {
       const live = () => currentRow?.() ?? row;
+      if (row._gone) return rowButtons([['key-clear', T('access.keys.clear.button'), () => ctx.go({ kind: 'key-clear', keyId: live()._key })]]);
       if (!row._known) return null;
       return rowButtons([
         ['key-rights', T('access.change.button'), () => ctx.go({ kind: 'key-rights', keyId: live()._key })],
@@ -534,7 +575,7 @@ export function paintAccessSection(host, view, ctx) {
     } : null;
   }
   const nowMs = view.nowMs ?? Date.now();
-  setRowsIfChanged(keysTable, keys.map((k) => ({ ...keyTableRow(k, nowMs), _known: k.known })));
+  setRowsIfChanged(keysTable, keys.map((k) => ({ ...keyTableRow(k, nowMs), _known: k.known, _gone: k.gone })));
 }
 
 // ---------------------------------------------------------------------------
@@ -781,6 +822,7 @@ export function openKeyIssue(ctx) {
 export function openKeyIssued({ where, instanceLabel, orgName, origin, name, rights, keyId, token, copy }) {
   const url = recordsUrl(origin, where.instanceId, where.topic, where.orgId);
   const rightsText = `${listFormat(keyRightNames(rights).map((r) => r.toLocaleLowerCase(I18n.getLanguage())))} · ${T('access.keys.issued.topic', { topic: where.topic })}`;
+  const group = `k:${keyId || ''}`;
   const kv = [
     [T('access.keys.issued.k_key'), `<span class="mono" data-role="token">${escapeHtml(token || '')}</span>`],
     [T('access.keys.issued.k_system'), escapeHtml(name)],
@@ -793,7 +835,13 @@ export function openKeyIssued({ where, instanceLabel, orgName, origin, name, rig
     <div slot="body" class="stack">
       <div class="tb-danger-box">${sprite('alert')}<div>${escapeHtml(T('access.keys.issued.once'))}</div></div>
       <div class="tb-kv-grid">${kv.map(([k, v]) => `<div class="k">${escapeHtml(k)}</div><div class="v">${v}</div>`).join('')}</div>
-      <div class="tb-will-happen">${sprite('info')}<div>${escapeHtml(T('access.keys.issued.how', { group: `k:${keyId || ''}` }))}</div></div>
+      <details class="tb-tech" data-role="developer">
+        <summary>${escapeHtml(T('access.keys.issued.developer'))}</summary>
+        <div class="tb-will-happen">${sprite('info')}<div>${escapeHtml(T('access.keys.issued.how', { group }))}</div></div>
+        <div class="tb-key-group"><span class="mono" data-role="group">${escapeHtml(group)}</span>
+          <tf-button variant="ghost" size="sm" icon="copy" data-act="copy-group">${escapeHtml(T('access.keys.issued.copy_group'))}</tf-button></div>
+      </details>
+      <div class="tb-window-error" role="alert" data-role="discard" hidden>${sprite('alert')}<div>${escapeHtml(T('access.keys.issued.close_confirm'))}</div></div>
       <div class="muted" data-role="copied" aria-live="polite"></div>
     </div>
     <div slot="footer">
@@ -803,15 +851,29 @@ export function openKeyIssued({ where, instanceLabel, orgName, origin, name, rig
     </div>`;
   document.body.appendChild(win);
   const copied = win.querySelector('[data-role="copied"]');
+  const discard = win.querySelector('[data-role="discard"]');
+  let keyCopied = false;
+  // The secret is shown once: Escape or the close button ask once before it
+  // goes, unless it was copied ("Gotowe" is the explicit way out).
+  win.addEventListener('close-request', (e) => {
+    if (keyCopied || !discard.hidden) return;
+    e.preventDefault();
+    discard.hidden = false;
+  });
+  const texts = {
+    'copy-key': ['access.keys.issued.copied_key', () => token],
+    'copy-url': ['access.keys.issued.copied_url', () => url],
+    'copy-group': ['access.keys.issued.copied_group', () => group],
+  };
   win.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
     if (btn.dataset.act === 'done') { win.close(true); return; }
-    const key = btn.dataset.act === 'copy-key';
-    const ok = await (copy || copyToClipboard)(key ? token : url);
-    copied.textContent = ok
-      ? T(key ? 'access.keys.issued.copied_key' : 'access.keys.issued.copied_url')
-      : T('access.keys.issued.copy_failed');
+    const entry = texts[btn.dataset.act];
+    if (!entry) return;
+    const ok = await (copy || copyToClipboard)(entry[1]());
+    if (ok && btn.dataset.act === 'copy-key') keyCopied = true;
+    copied.textContent = ok ? T(entry[0]) : T('access.keys.issued.copy_failed');
   });
   return win;
 }
@@ -848,6 +910,24 @@ export function openKeyRights(row, ctx) {
     save: (d) => runAll(buildKeyRightsRequests(ctx.where, row.keyId, current, d), ctx.scope),
     describeError: ctx.describeError,
     onSaved: (d) => ctx.onSaved({ title: T('access.keys.rights.saved_title'), text: keyRightsImpact({ name, current, next: d }).join(' ') }),
+  });
+}
+
+/** "Usuń prawa" a gone key left on the topic: they do nothing, they only go. */
+export function openGoneKeyClear(row, ctx) {
+  return openConfirmWindow({
+    title: T('access.keys.clear.window_title'),
+    icon: 'trash',
+    cls: 'tb-unp-confirm tb-access-window',
+    lead: `<div class="tb-explain-box">${escapeHtml(T('access.keys.clear.lead'))}</div>`,
+    impactTitle: T('access.remove.impact_title'),
+    impact: [T('access.keys.clear.impact', { topic: ctx.where.topic })],
+    button: T('access.keys.clear.button'),
+    buttonIcon: 'trash',
+    danger: true,
+    run: () => runAll(buildGoneKeyClearRequests(ctx.where.instanceId, ctx.where.topic, row, ctx.aclEntries), ctx.setAcl),
+    describeError: ctx.describeError,
+    onDone: () => ctx.onSaved({ title: T('access.keys.clear.saved_title'), text: T('access.keys.clear.saved_text') }),
   });
 }
 
