@@ -6,6 +6,41 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ## [Unreleased]
 
+### TentaNas
+
+- Lista dozwolonych targetu iSCSI/NVMe-oF jest zapamiętywana w bazie
+  (migracja 30: `nas_targets.allowlist_mode` i `nas_targets.open_confirmed`).
+  Target z listą dozwolonych, której ostatni wpis usunięto, jest **zamknięty
+  dla wszystkich**: nikt nowy się nie zaloguje (także po restarcie węzła czy
+  przebudowie grupy portali). Na iSCSI sesje usuniętych klientów są zrywane;
+  na NVMe-oF hosty połączone w tej chwili zachowują dostęp, dopóki nie połączą
+  się ponownie (aby odciąć je od razu, zatrzymaj target).
+  Usunięcie ostatniego wpisu (w edytorze listy albo „Rozłącz … i usuń z listy”)
+  nie jest już odrzucane (`refusal:target_last_initiator` wysyłają tylko
+  starsze węzły) i wymaga potwierdzenia na ekranie.
+- „Otwórz dla wszystkich”: jedyna świadoma droga od listy dozwolonych do
+  targetu otwartego, z ostrzeżeniem i przepisaniem nazwy targetu. Usuwa listę
+  i nieużywane wpisy w jądrze; odblokowuje też target, który jądro trzymało
+  zamknięty wbrew zapisowi. Niedostępne dla NVMe-oF z DH-HMAC-CHAP.
+  Protokół: `TargetOpenRequest` (`target_id`, `confirm_name`,
+  `expected_updated_at` — okno, które widziało starszą wersję targetu, dostaje
+  `refusal:target_open_changed`), `TargetGetResponse.open_blocked`,
+  `NasTarget.allowlist_mode`.
+- Nowe alerty: `target_left_disabled` (krytyczny: target po zerwaniu sesji
+  pozostał wyłączony), `target_open_refused` (jądro trzyma listę dozwolonych,
+  której nie ma w zapisie), `target_sessions_reset` (ostrzeżenie: wszystkie
+  sesje targetu zresetowano raz, bo klient spoza listy był zalogowany).
+- Eksport konfiguracji z zamkniętym targetem o pustej liście ma schemat 2 —
+  węzeł starszej wersji odrzuca taki plik w całości, zamiast otworzyć target.
+  Pozostałe eksporty mają nadal schemat 1.
+- `tentanas-helper` ma wersję `0.17.3`; operacje na targetach wymagają tej
+  wersji (bramka wersji odrzuca inną) — po aktualizacji ponów nadanie uprawnień
+  systemowych.
+- Aktualizacja: kolumna „Czas trwania” sesji targetów zaczyna się jednorazowo
+  od nowa dla sesji aktywnych w chwili aktualizacji (klucz sesji zawiera teraz
+  wcielenie grupy portali, aby zatrzymanie i wznowienie targetu nie przedłużało
+  starej sesji).
+
 ## [0.4.0-beta.1] — 2026-09-29
 
 Zmiany od tagu `v0.4.0-beta`. Pełny opis zmian od `v0.3.0-beta` znajduje się

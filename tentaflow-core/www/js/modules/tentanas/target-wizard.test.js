@@ -780,6 +780,79 @@ test('one definition of an interface address, and IPv6 is not one', () => {
   assert.equal(primaryAddress(aliased, 'nope'), '');
 });
 
+// Critic wave 14 R2-FIX-2: the wizard's NVMe-oF edit is the other road that
+// empties an allowlist. It warns that the subsystem closes (and that
+// connected hosts keep access until they reconnect), asks the same question
+// as the detail editor, and sends nothing without a yes.
+test('emptying an allowlisted NVMe-oF host list in the wizard asks first and closes, never opens', async () => {
+  const sent = [];
+  const target = {
+    targetId: 't2',
+    name: 'scratch',
+    protocol: 'nvmet',
+    wwn: 'nqn.2026-09.local.tentaflow:helios.scratch',
+    enabled: true,
+    luns: [{ index: 1, source: 'fast/scratch', sizeBytes: 1099511627776, thin: true, groupId: 1, sourceKind: 'zvol' }],
+    portals: [{ interface: 'storage0', address: '10.10.0.5', port: 4420, transport: 'tcp' }],
+    auth: { method: 'none', secretSet: false },
+    initiators: ['nqn.2014-08.org.nvmexpress:uuid:stary'],
+    allowlistMode: true,
+    portGroups: [{ groupId: 1, state: 'optimized', preferred: false }],
+  };
+  const screen = fakeScreen({
+    tentaNasTargetUpdateRequest: (payload) => { sent.push(payload); return { job: { jobId: 'j9', kind: 'target_update', subject: 'scratch' } }; },
+  });
+  const win = openTargetWizard(screen, { target, capabilities: caps() });
+  await flush();
+  assert.doesNotMatch(win.textContent, /Zostaw pustą, żeby wpuścić każdego/, 'an allowlisted target is never told empty lets everyone in');
+  assert.match(win.textContent, /pusta lista go zamyka/);
+  assert.equal(win.querySelector('[data-testid="wizard-closed-warning"]'), null);
+  typeInto(win.querySelector('#nas-tw-hosts'), '');
+  await flush();
+  assert.match(win.querySelector('[data-testid="wizard-closed-warning"]').textContent, /nikt nowy się nie połączy. Hosty połączone teraz zachowają dostęp/);
+  click(nextButton(win));
+  await flush();
+  // Save → the question; No → nothing sent.
+  click(nextButton(win));
+  await flush();
+  await flush();
+  let confirm = document.querySelector('tf-window.nas-target-close');
+  assert.ok(confirm, 'the closing is confirmed first');
+  assert.match(confirm.textContent, /hosty połączone teraz zachowają pełny dostęp, dopóki nie połączą się ponownie/);
+  click(confirm.querySelector('[data-action="cancel"]'));
+  await flush();
+  await flush();
+  assert.equal(sent.length, 0, 'cancelled: nothing sent');
+  // Yes → the empty list goes.
+  click(nextButton(win));
+  await flush();
+  await flush();
+  confirm = document.querySelector('tf-window.nas-target-close');
+  click(confirm.querySelector('[data-action="confirm"]'));
+  await flush();
+  await flush();
+  await flush();
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].initiators, []);
+  await settled();
+  screen.dispose();
+});
+
+test('a new NVMe-oF subsystem, or an open one, is told truthfully that an empty list lets everyone in', async () => {
+  const screen = fakeScreen({});
+  const open = {
+    targetId: 't3', name: 'otwarty', protocol: 'nvmet', auth: { method: 'none' }, wwn: 'nqn.2026-09.local.tentaflow:helios.otwarty', enabled: true,
+    luns: [{ index: 1, source: 'fast/o', sizeBytes: 1024, thin: true, groupId: 1, sourceKind: 'zvol' }],
+    portals: [{ interface: 'storage0', address: '10.10.0.5', port: 4420, transport: 'tcp' }],
+    initiators: [], allowlistMode: false, portGroups: [{ groupId: 1, state: 'optimized', preferred: false }],
+  };
+  const win = openTargetWizard(screen, { target: open, capabilities: caps() });
+  await flush();
+  assert.match(win.textContent, /Zostaw pustą, żeby wpuścić każdego/);
+  assert.equal(win.querySelector('[data-testid="wizard-closed-warning"]'), null);
+  screen.dispose();
+});
+
 test('editing an NVMe-oF subsystem sends the host NQNs the admin just typed', async () => {
   // The wizard renders the "NQN hostów" field on an EDIT too and `canProceed`
   // is gated on it, so sending the STORED list back means: the admin edits the

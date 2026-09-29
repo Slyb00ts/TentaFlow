@@ -538,6 +538,18 @@ pub struct NasAlert {
     ///   allowlist had to be rebuilt (cached dynamic ACLs), the rebuild
     ///   stopped short and even disabling it failed: the old open portal
     ///   group may still accept any client (helper 0.17.1);
+    /// - 'target_left_disabled' {target} — resetting an excluded client's
+    ///   session switched the target off and switching it on again failed
+    ///   twice: nobody is served, the listed clients included, until an apply
+    ///   succeeds (wave 14);
+    /// - 'target_open_refused' {target} — the target is open on record but
+    ///   the kernel holds an allowlist for it, so every apply is refused until
+    ///   an admin opens it deliberately ("Otwórz dla wszystkich") or stops it
+    ///   (wave 14);
+    /// - 'target_sessions_reset' {target} — a warning: an allowlist apply
+    ///   reset every session of the target once, because a client it
+    ///   excludes was still logged in; the listed clients reconnect by
+    ///   themselves (wave 14);
     /// - 'elevation_unarmed' {};
     /// - 'targets_sweep_failing' {count, alerted, sweep_failed} — `alerted`
     ///   is how many of `count` have an alert their organisation can read,
@@ -1683,6 +1695,12 @@ pub struct NasTarget {
     /// sentence is then all there is.
     #[serde(default)]
     pub state_reasons: Vec<NasHealthReason>,
+    /// The target is ALLOWLISTED (wave 14, migration 30): only `initiators`
+    /// may log in, and with an EMPTY list nobody does (fail closed) until an
+    /// admin opens it on purpose (`TargetOpenRequest`). False from an older
+    /// node, where a non-empty `initiators` is what "allowlisted" means.
+    #[serde(default)]
+    pub allowlist_mode: bool,
 }
 
 /// "Ostatnie połączenie" of one initiator of a target (wave 12): what the
@@ -3371,6 +3389,12 @@ pub enum TentaNasPayload {
         /// listed) | 'unknown' (the table or configfs could not be read).
         #[serde(default)]
         rdma_peers_state: String,
+        /// The target is OPEN on record, but the kernel still holds an
+        /// allowlist for it, so every apply is refused (wave 14): only a
+        /// deliberate `TargetOpenRequest` — or stopping the target — ends it.
+        /// The screen offers "Otwórz dla wszystkich" for it.
+        #[serde(default)]
+        open_blocked: bool,
     },
     /// Wizard "create" (n14). `source` is the zvol as ZFS names it;
     /// `create_size_bytes` > 0 creates it first (n14's "+ Nowy zvol").
@@ -3456,8 +3480,8 @@ pub enum TentaNasPayload {
     /// n19 "Rozłącz" (wave 12): resets the iSCSI session of ONE allowlisted
     /// initiator. The client logs back in by itself (~2 s, measured) and
     /// keeps its access; `revoke` also takes it off the allowlist, which
-    /// drops it for good and is refused when it is the only entry (an empty
-    /// list would open the target). The initiator is named by its IQN — the
+    /// drops it for good; revoking the only entry leaves the target CLOSED to
+    /// everybody (wave 14, migration 30). The initiator is named by its IQN — the
     /// name the screen shows; no session id travels. iSCSI only; refused on a
     /// target without an allowlist (D2). Answers with `JobResponse`.
     TargetSessionResetRequest {
@@ -3465,6 +3489,26 @@ pub enum TentaNasPayload {
         initiator: String,
         #[serde(default)]
         revoke: bool,
+        #[serde(default)]
+        sudo_password: Option<SudoSecret>,
+    },
+    /// "Otwórz dla wszystkich" (wave 14, owner decision 2026-09-29): the one
+    /// deliberate road from an allowlisted target to an OPEN one — every
+    /// client that reaches the portal may log in afterwards. Clears the
+    /// allowlist (and its descriptions), lets the apply open a TPG the kernel
+    /// holds an allowlist for, and removes the static ACLs nobody is logged
+    /// in through. Retype-gated like the delete: `confirm_name` is the
+    /// target's name. Refused on a target that is open already. Answers with
+    /// `JobResponse`.
+    TargetOpenRequest {
+        target_id: String,
+        confirm_name: String,
+        /// The target's `updated_at` as the window showed it: a target
+        /// changed since (another admin saved an allowlist) is refused with
+        /// `refusal:target_open_changed` instead of being overridden. Empty
+        /// (an older client) skips the check.
+        #[serde(default)]
+        expected_updated_at: String,
         #[serde(default)]
         sudo_password: Option<SudoSecret>,
     },
@@ -4812,6 +4856,7 @@ mod tests {
             listen: Vec::new(),
             rdma_peers: Vec::new(),
             rdma_peers_state: String::new(),
+            open_blocked: false,
         });
         let bytes = crate::cbor::encode(&body).expect("encode");
         let back: MessageBody = crate::cbor::decode(&bytes).expect("decode");
@@ -4886,6 +4931,7 @@ mod tests {
                 connections: 49,
             }],
             rdma_peers_state: "measured".into(),
+            open_blocked: false,
         });
         let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode")).expect("decode");
         assert_eq!(back, body);
@@ -4940,6 +4986,55 @@ mod tests {
         .expect("decode");
         let TentaNasPayload::TargetUpdateRequest { initiator_descriptions, .. } = update else { panic!("variant") };
         assert_eq!(initiator_descriptions, None);
+    }
+
+    /// Wave 14 (owner decision 2026-09-29): the allowlist flag, the "open
+    /// blocked" answer and "Otwórz dla wszystkich" round-trip through CBOR,
+    /// and an older peer's messages without them decode as "not allowlisted
+    /// by flag" and "not blocked".
+    #[test]
+    fn the_wave14_allowlist_fields_round_trip_and_default_when_absent() {
+        let body = MessageBody::TentaNasBody(TentaNasPayload::TargetGetResponse {
+            target: NasTarget { allowlist_mode: true, ..Default::default() },
+            sessions: Vec::new(),
+            config_preview: String::new(),
+            initiators_seen: Vec::new(),
+            seen_since: String::new(),
+            listen: Vec::new(),
+            rdma_peers: Vec::new(),
+            rdma_peers_state: String::new(),
+            open_blocked: true,
+        });
+        let back: MessageBody = crate::cbor::decode(&crate::cbor::encode(&body).expect("encode")).expect("decode");
+        assert_eq!(back, body);
+        let old: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "TargetGetResponse": {
+                "target": { "target_id": "t1", "name": "vm-store", "protocol": "iscsi", "wwn": "iqn.x:y",
+                            "enabled": true, "luns": [], "portals": [], "auth": { "method": "none" },
+                            "port_groups": [], "sessions": 0, "state": "active", "state_detail": "",
+                            "created_at": "", "updated_at": "" },
+                "sessions": []
+            }
+        }))
+        .expect("an older answer decodes");
+        let TentaNasPayload::TargetGetResponse { target, open_blocked, .. } = old else { panic!("variant") };
+        assert!(!target.allowlist_mode && !open_blocked);
+
+        let open: TentaNasPayload = serde_json::from_value(serde_json::json!({
+            "TargetOpenRequest": { "target_id": "t1", "confirm_name": "vm-store" }
+        }))
+        .expect("decode");
+        assert_eq!(
+            open,
+            TentaNasPayload::TargetOpenRequest {
+                target_id: "t1".into(),
+                confirm_name: "vm-store".into(),
+                expected_updated_at: String::new(),
+                sudo_password: None,
+            }
+        );
+        let back: TentaNasPayload = crate::cbor::decode(&crate::cbor::encode(&open).expect("encode")).expect("decode");
+        assert_eq!(back, open);
     }
 
     /// An Elastic Array answer round-trips, and — the point of the test — the

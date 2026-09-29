@@ -6832,6 +6832,18 @@
           "title": "Target {target}: nasłuch RDMA zniknął",
           "detail": "Klienci nie połączą się przez {transport} na {portal}. Zatrzymaj i wznów target — portal i nasłuch powstaną od nowa.",
           "detail_shared": "Klienci nie połączą się przez {transport} na {portal}. Nasłuch dzielą inne targety: wraca dopiero, gdy wszystkie targety na nim zostaną zatrzymane, a potem wznowione."
+        },
+        "target_left_disabled": {
+          "title": "Target {target}: pozostał wyłączony — nikt nie jest obsługiwany",
+          "detail": "Zerwanie sesji klienta spoza nowej listy dozwolonych wyłączyło target, a dwie próby ponownego włączenia zawiodły. Wszyscy klienci są odcięci, także ci z listy. Węzeł ponowi przy następnym zastosowaniu zmian."
+        },
+        "target_open_refused": {
+          "title": "Target {target}: jądro trzyma listę dozwolonych, której nie ma w zapisie",
+          "detail": "Target jest zapisany jako otwarty, ale jądro wciąż trzyma dla niego listę dozwolonych, a węzeł nigdy nie otwiera targetu przypadkiem. Każde zastosowanie zmian jest odrzucane, dopóki administrator świadomie go nie otworzy („Otwórz dla wszystkich”) albo nie zatrzyma."
+        },
+        "target_sessions_reset": {
+          "title": "Target {target}: wszystkie sesje zostały raz zresetowane",
+          "detail": "Klient spoza nowej listy dozwolonych był wciąż zalogowany, więc wszystkie sesje targetu zostały raz zresetowane. Klienci z listy łączą się ponownie sami (ok. 2 s), wykluczony nie może."
         }
       },
       "node_text": "Treść węzła",
@@ -7117,7 +7129,8 @@
         "targets": "Targety iSCSI/NVMe-oF",
         "disable": "Wyłączenie TentaNas"
       },
-      "kind_target_session_reset": "Rozłączenie sesji targetu"
+      "kind_target_session_reset": "Rozłączenie sesji targetu",
+      "kind_target_open": "Otwarcie targetu dla wszystkich"
     },
     "elevation": {
       "title": "Kanał uprawnień systemowych",
@@ -9031,7 +9044,7 @@
       "portal_network_shared": "LAN — współdzielony",
       "portal_network_storage": "sieć storage",
       "delete_loss_record": "Zapis targetu zostanie usunięty z bazy:",
-      "delete_loss_allowlist": "Allowlista ({n} initiatorów) zostanie usunięta.",
+      "delete_loss_allowlist": "Allowlista ({n} {n|initiator|initiatory|initiatorów}) zostanie usunięta.",
       "delete_loss_auth": "Zapisane ustawienia uwierzytelniania tego targetu zostaną usunięte.",
       "delete_keep_snapshots": "Snapshoty również pozostają. Usunięcie eksportu nie kasuje danych ani snapshotów wolumenu.",
       "portal_pick_interface": "Wybierz interfejs",
@@ -9061,7 +9074,7 @@
       "group_transitioning": "W trakcie zmiany",
       "group_preferred": "preferowana ścieżka",
       "initiators": "Allowlista initiatorów",
-      "initiators_hint": "Jeden IQN/NQN w linii. IQN/NQN deklaruje klient — to filtr wygody, NIE uwierzytelnienie. Pusta lista oznacza, że wpisy tworzy samo jądro; porządkowanie usuwa tylko te bez sesji, więc klient logujący się dokładnie w tej chwili może raz dostać odmowę i ponawia.",
+      "initiators_hint": "Jeden IQN/NQN w linii. IQN/NQN deklaruje klient — to filtr wygody, NIE uwierzytelnienie. Na otwartym targecie pusta lista oznacza, że wpisy tworzy samo jądro; porządkowanie usuwa tylko te bez sesji, więc klient logujący się dokładnie w tej chwili może raz dostać odmowę i ponawia. Na targecie z listą dozwolonych pusta lista oznacza, że nikt się nie zaloguje.",
       "no_initiators": "Pusta — łączy się każdy, kto dosięgnie portalu.",
       "allowlist_note": "Allowlista to filtr, nie login. Uwierzytelnia wyłącznie (mutual) CHAP / DH-HMAC-CHAP.",
       "save_auth_missing": "Nie można zapisać allowlisty: odpowiedź noda nie zawiera ustawień uwierzytelniania tego targetu. Odśwież okno i spróbuj ponownie.",
@@ -9124,7 +9137,7 @@
       "description_title": "Opis initiatora",
       "description_hint": "Do {n} znaków, np. „Proxmox vmhost-01”. Zmianę zatwierdza przycisk Zapisz.",
       "description_apply": "Ustaw opis",
-      "allowlist_last_warning": "Lista dozwolonych nie może zostać pusta: pusta lista otworzyłaby target dla każdego, kto dosięgnie portalu. Aby odciąć wszystkich, zatrzymaj target.",
+      "allowlist_last_warning": "Lista będzie pusta: po zapisaniu target zostanie zamknięty — nikt się nie zaloguje, a sesje usuniętych klientów zostaną zerwane.",
       "nvmet_remove_keeps_connection": "Usunięcie hosta z listy nie rozłącza hosta, który jest już połączony — zachowuje on pełny dostęp do czasu ponownego połączenia. Aby odciąć go od razu, zatrzymaj target.",
       "listen_listening": "Nasłuch aktywny",
       "listen_target_disabled": "Port otwarty, target wyłączony — logowania odrzucane",
@@ -9163,7 +9176,26 @@
       "rdma_peer": "{n} {n|połączenie RDMA|połączenia RDMA|połączeń RDMA} z {peer}",
       "rdma_peers_none": "Brak połączeń RDMA",
       "rdma_peers_shared": "Port RDMA dzielą inne targety — tablica RDMA jądra nie mówi, które połączenia należą do tego targetu, więc żadne nie są pokazane",
-      "rdma_peers_unknown": "Połączeń RDMA nie zmierzono"
+      "rdma_peers_unknown": "Połączeń RDMA nie zmierzono",
+      "no_initiators_closed": "Pusta — target jest zamknięty: nikt się nie zaloguje, dopóki nie dodasz initiatora albo nie otworzysz go dla wszystkich.",
+      "open_all": "Otwórz dla wszystkich",
+      "open_all_title": "Otwórz target {name} dla wszystkich",
+      "open_all_warning": "Po otwarciu zaloguje się każdy klient, który dosięgnie portalu {portal} i poda poświadczenia CHAP tego targetu — lista dozwolonych przestaje obowiązywać.",
+      "open_all_warning_no_auth": "Po otwarciu każdy klient, który dosięgnie portalu {portal}, dostanie surowy dysk — ten target nie ma uwierzytelnienia, a lista dozwolonych przestaje obowiązywać.",
+      "open_all_loss_allowlist": "Lista dozwolonych ({n} {n|wpis|wpisy|wpisów}) i ich opisy zostaną usunięte.",
+      "open_all_loss_stale": "Wpisy w jądrze, przez które nikt nie jest zalogowany, zostaną usunięte.",
+      "open_all_keep_sessions": "Połączeni teraz klienci nie zostaną rozłączeni.",
+      "open_all_keep_auth": "Uwierzytelnienie targetu nadal obowiązuje.",
+      "open_all_back": "Aby znów wpuszczać tylko wybranych klientów, dodaj initiatora i zapisz — od tej chwili zalogują się tylko klienci z listy (sesje targetu zostaną raz zresetowane).",
+      "open_all_done": "Przyjęto otwarcie targetu {name} — wynik w logu zadania.",
+      "open_blocked_title": "Jądro wciąż trzyma listę dozwolonych.",
+      "open_blocked_note": "Target jest zapisany jako otwarty, ale jądro trzyma dla niego listę dozwolonych, więc każde zastosowanie zmian jest odrzucane. Otwórz go świadomie dla wszystkich albo zatrzymaj target.",
+      "close_all_title": "Zamknij target {name} dla wszystkich",
+      "close_all_text": "Na liście dozwolonych nie zostanie żaden wpis. Po zapisaniu nikt nie będzie mógł się zalogować, a sesje usuniętych klientów zostaną zerwane. Aby znów kogoś wpuścić, dodaj go do listy.",
+      "close_all_confirm": "Zamknij dla wszystkich",
+      "disconnect_revoke_last_text": "To jedyny wpis na liście dozwolonych: po jego usunięciu target zostanie zamknięty i nikt nie będzie mógł się zalogować.",
+      "allowlist_last_warning_nvmet": "Lista będzie pusta: po zapisaniu nikt nowy się nie połączy. Hosty połączone teraz zachowają dostęp, dopóki nie połączą się ponownie — aby odciąć je od razu, zatrzymaj target.",
+      "close_all_text_nvmet": "Na liście dozwolonych nie zostanie żaden host. Po zapisaniu nikt nowy się nie połączy, ale hosty połączone teraz zachowają pełny dostęp, dopóki nie połączą się ponownie. Aby odciąć je od razu, zatrzymaj target."
     },
     "wizard_target": {
       "title": "Nowy target",
@@ -9278,7 +9310,8 @@
       "host_description_label": "Opis — {nqn}",
       "host_description_placeholder": "np. orion (compute)",
       "transport_no_rdma_device": "Interfejs {iface} nie ma urządzenia RDMA — jądro odrzuca nasłuch RDMA na jego adresie. Wybierz TCP albo interfejs z kartą RDMA.",
-      "transport_rdma_link_down": "Urządzenie RDMA {device} na interfejsie {iface} ma nieaktywne łącze — target zostanie zapisany, ale klienci nie połączą się przez RDMA, dopóki łącze nie wstanie."
+      "transport_rdma_link_down": "Urządzenie RDMA {device} na interfejsie {iface} ma nieaktywne łącze — target zostanie zapisany, ale klienci nie połączą się przez RDMA, dopóki łącze nie wstanie.",
+      "dhchap_hosts_filter_note_allowlisted": "Bez uwierzytelniania allowlista NQN jest tylko filtrem, nie loginem: initiator spoza listy zostanie odrzucony, ale ten z listy loguje się bez klucza. Ten target ma listę dozwolonych — pusta lista go zamyka i nikt nowy się nie połączy. Aby wpuścić każdego, użyj „Otwórz dla wszystkich” w szczegółach targetu."
     },
     "journal_owner": {
       "this_instance": "ta instancja TentaNas",
@@ -9333,7 +9366,7 @@
       "sharing_stop_author_gone": "Autor tej prośby nie jest już administratorem platformy w tej organizacji — nie można jej zatwierdzić; odrzuć ją.",
       "sharing_resume_partial": "Udostępnianie wróciło, ale nie w całości — linie zadania wymieniają, co jeszcze nie działa; węzeł ponawia próbę.",
       "sharing_stop_pending_elsewhere": "Na tym węźle czeka już na zatwierdzenie zatrzymanie udostępniania zgłoszone w innej organizacji. Administrator platformy widzi je w TentaNas → Zadania i może je odrzucić.",
-      "target_last_initiator": "To jedyny wpis na liście dozwolonych — jego usunięcie otworzyłoby target dla wszystkich. Zatrzymaj target albo najpierw dodaj inny wpis.",
+      "target_last_initiator": "Węzeł odmówił usunięcia ostatniego wpisu z listy dozwolonych — to starsza wersja, w której pusta lista otwierała target dla wszystkich. Zatrzymaj target albo najpierw zaktualizuj węzeł.",
       "target_description_unlisted": "Opis dotyczy initiatora, którego nie ma na liście dozwolonych — dodaj go do listy albo usuń opis",
       "target_description_too_long": "Opis może mieć najwyżej 80 znaków",
       "target_description_invalid": "Opis nie może zawierać znaków sterujących (np. nowej linii)",
@@ -9418,7 +9451,10 @@
       "disk_wipe_refused": "Węzeł odmawia wyczyszczenia tego dysku — odczytaj plan ponownie, aby zobaczyć dlaczego",
       "disk_wipe_no_journal": "Żaden dziennik macierzy Elastic nie rezerwuje już tego dysku — odczytaj plan ponownie",
       "disk_wipe_journal_unacknowledged": "Dziennik rozwiązanej macierzy Elastic {array} nadal rezerwuje ten dysk — potwierdź utratę tej macierzy albo przywróć ją importem macierzy",
-      "elastic_create_needs_attention": "Macierz została utworzona, ale wymaga interwencji; rezerwacje jej dysków są zachowane"
+      "elastic_create_needs_attention": "Macierz została utworzona, ale wymaga interwencji; rezerwacje jej dysków są zachowane",
+      "target_open_already_open": "Ten target jest już otwarty — nie ma czego otwierać",
+      "target_open_nvmet_auth": "Subsystemu NVMe-oF z DH-HMAC-CHAP nie da się otworzyć dla wszystkich — klucze są zapisane na hostach z listy dozwolonych. Najpierw wyłącz uwierzytelnienie",
+      "target_open_changed": "Target zmienił się, odkąd otwarto to okno (np. ktoś zapisał listę dozwolonych) — odśwież widok i spróbuj ponownie"
     },
     "unreachable": {
       "title": "Węzeł {node} niedostępny",

@@ -6781,6 +6781,18 @@
           "title": "Target {target}: RDMA listener is gone",
           "detail": "Clients cannot connect over {transport} on {portal}. Stop and resume the target — the portal and its listener are created again.",
           "detail_shared": "Clients cannot connect over {transport} on {portal}. Other targets share the listener: it returns only once every target on it has been stopped and then resumed."
+        },
+        "target_left_disabled": {
+          "title": "Target {target}: left disabled — no client is served",
+          "detail": "Resetting the session of a client outside the new allowlist switched the target off, and switching it on again failed twice. Every client is cut off, the listed ones included. The node retries on its next apply."
+        },
+        "target_open_refused": {
+          "title": "Target {target}: the kernel holds an allowlist the record does not",
+          "detail": "The target is recorded as open, but the kernel still holds an allowlist for it, and the node never opens a target by accident. Every apply is refused until an admin opens it on purpose (“Open for everyone”) or stops it."
+        },
+        "target_sessions_reset": {
+          "title": "Target {target}: every session was reset once",
+          "detail": "A client outside the new allowlist was still logged in, so every session of the target was reset once. Listed clients reconnect by themselves (about 2 s); the excluded one cannot."
         }
       },
       "node_text": "The node's text",
@@ -7066,7 +7078,8 @@
         "targets": "iSCSI/NVMe-oF targets",
         "disable": "Disable TentaNas"
       },
-      "kind_target_session_reset": "Target session reset"
+      "kind_target_session_reset": "Target session reset",
+      "kind_target_open": "Open target for everyone"
     },
     "elevation": {
       "title": "System privilege channel",
@@ -8980,7 +8993,7 @@
       "portal_network_shared": "LAN — shared",
       "portal_network_storage": "storage network",
       "delete_loss_record": "The target record will be removed from the database:",
-      "delete_loss_allowlist": "The allowlist ({n} initiators) will be removed.",
+      "delete_loss_allowlist": "The allowlist ({n} {n|initiator|initiators}) will be removed.",
       "delete_loss_auth": "The stored authentication settings of this target will be removed.",
       "delete_keep_snapshots": "Snapshots also remain. Removing the export does not delete volume data or snapshots.",
       "portal_pick_interface": "Choose interface",
@@ -9010,7 +9023,7 @@
       "group_transitioning": "Transitioning",
       "group_preferred": "preferred path",
       "initiators": "Initiator allowlist",
-      "initiators_hint": "One IQN/NQN per line. The client declares its own IQN/NQN — this is a convenience filter, NOT authentication. An empty list means the kernel creates the entries itself; the reconcile removes only those with no session, so a client logging in at exactly that moment can be refused once and retries.",
+      "initiators_hint": "One IQN/NQN per line. The client declares its own IQN/NQN — this is a convenience filter, NOT authentication. On an open target an empty list means the kernel creates the entries itself; the reconcile removes only those with no session, so a client logging in at exactly that moment can be refused once and retries. On a target with an allowlist an empty list means nobody can log in.",
       "no_initiators": "Empty — anyone who reaches the portal connects.",
       "allowlist_note": "The allowlist is a filter, not a login. Only (mutual) CHAP / DH-HMAC-CHAP authenticates.",
       "save_auth_missing": "The allowlist cannot be saved: the node's response carries no authentication settings for this target. Refresh the window and try again.",
@@ -9073,7 +9086,7 @@
       "description_title": "Initiator description",
       "description_hint": "Up to {n} characters, e.g. “Proxmox vmhost-01”. The Save button applies the change.",
       "description_apply": "Set description",
-      "allowlist_last_warning": "The allowlist cannot become empty: an empty list would open the target to anyone who reaches the portal. To cut everyone off, stop the target.",
+      "allowlist_last_warning": "The list will be empty: once saved, the target is closed — nobody can log in, and the removed clients’ sessions are dropped.",
       "nvmet_remove_keeps_connection": "Removing a host from the list does not disconnect a host that is already connected — it keeps full access until it reconnects. To cut it off at once, stop the target.",
       "listen_listening": "Listening",
       "listen_target_disabled": "Port open, target disabled — logins are refused",
@@ -9112,7 +9125,26 @@
       "rdma_peer": "{n} {n|RDMA connection|RDMA connections} from {peer}",
       "rdma_peers_none": "No RDMA connections",
       "rdma_peers_shared": "Other targets share this RDMA port — the kernel's RDMA table does not say which connections belong to this target, so none are shown",
-      "rdma_peers_unknown": "RDMA connections not measured"
+      "rdma_peers_unknown": "RDMA connections not measured",
+      "no_initiators_closed": "Empty — the target is closed: nobody can log in until you add an initiator or open it for everyone.",
+      "open_all": "Open for everyone",
+      "open_all_title": "Open target {name} for everyone",
+      "open_all_warning": "Once open, any client that reaches the portal {portal} and presents this target’s CHAP credentials logs in — the allowlist no longer applies.",
+      "open_all_warning_no_auth": "Once open, any client that reaches the portal {portal} gets the raw disk — this target has no authentication, and the allowlist no longer applies.",
+      "open_all_loss_allowlist": "The allowlist ({n} {n|entry|entries}) and its descriptions will be removed.",
+      "open_all_loss_stale": "Kernel entries nobody is logged in through will be removed.",
+      "open_all_keep_sessions": "Clients connected now stay connected.",
+      "open_all_keep_auth": "The target’s authentication still applies.",
+      "open_all_back": "To let only chosen clients in again, add an initiator and save — from then on only listed clients can log in (the target’s sessions are reset once).",
+      "open_all_done": "Opening target {name} accepted — the result is in the job log.",
+      "open_blocked_title": "The kernel still holds an allowlist.",
+      "open_blocked_note": "The target is recorded as open, but the kernel holds an allowlist for it, so every apply is refused. Open it for everyone on purpose, or stop the target.",
+      "close_all_title": "Close target {name} to everyone",
+      "close_all_text": "No entry will be left on the allowlist. Once saved, nobody can log in, and the removed clients’ sessions are dropped. To let someone in again, add them to the list.",
+      "close_all_confirm": "Close to everyone",
+      "disconnect_revoke_last_text": "This is the only entry on the allowlist: once it is removed, the target is closed and nobody can log in.",
+      "allowlist_last_warning_nvmet": "The list will be empty: once saved, nobody new can connect. Hosts connected now keep access until they reconnect — to cut them off now, stop the target.",
+      "close_all_text_nvmet": "No host will be left on the allowlist. Once saved, nobody new can connect, but hosts connected now keep full access until they reconnect. To cut them off now, stop the target."
     },
     "wizard_target": {
       "title": "New target",
@@ -9227,7 +9259,8 @@
       "host_description_label": "Description — {nqn}",
       "host_description_placeholder": "e.g. orion (compute)",
       "transport_no_rdma_device": "Interface {iface} has no RDMA device — the kernel refuses an RDMA listener on its address. Choose TCP or an interface with an RDMA card.",
-      "transport_rdma_link_down": "RDMA device {device} on interface {iface} has an inactive link — the target will be saved, but clients cannot connect over RDMA until the link comes up."
+      "transport_rdma_link_down": "RDMA device {device} on interface {iface} has an inactive link — the target will be saved, but clients cannot connect over RDMA until the link comes up.",
+      "dhchap_hosts_filter_note_allowlisted": "Without authentication the NQN allowlist is only a filter, not a login: an initiator not on the list is refused, but one on it logs in without a key. This target has an allowlist — an empty list closes it and nobody new can connect. To let everyone in, use “Open for everyone” in the target’s details."
     },
     "journal_owner": {
       "this_instance": "this TentaNas instance",
@@ -9282,7 +9315,7 @@
       "sharing_stop_author_gone": "The author of this request is no longer a platform administrator in this organisation — it cannot be approved; reject it.",
       "sharing_resume_partial": "Sharing is back, but not all of it — the job lines list what does not serve yet; the node retries.",
       "sharing_stop_pending_elsewhere": "A stop of sharing requested in another organisation is already waiting for approval on this node. A platform administrator sees it in TentaNas → Tasks and can reject it.",
-      "target_last_initiator": "This is the only entry on the allowlist — removing it would open the target to everyone. Stop the target or add another entry first.",
+      "target_last_initiator": "The node refused to remove the last allowlist entry — it runs an older version, where an empty list opened the target to everyone. Stop the target or update the node first.",
       "target_description_unlisted": "The description is for an initiator that is not on the allowlist — add it to the list or drop the description",
       "target_description_too_long": "A description can be at most 80 characters long",
       "target_description_invalid": "A description cannot contain control characters (such as a line break)",
@@ -9367,7 +9400,10 @@
       "disk_wipe_refused": "The node refuses to clear this disk — read the plan again to see why",
       "disk_wipe_no_journal": "No Elastic Array journal reserves this disk any more — read the plan again",
       "disk_wipe_journal_unacknowledged": "The journal of the dissolved Elastic Array {array} still reserves this disk — confirm the loss of this array, or bring it back with an array import",
-      "elastic_create_needs_attention": "The array was created but needs intervention; its disk reservations are kept"
+      "elastic_create_needs_attention": "The array was created but needs intervention; its disk reservations are kept",
+      "target_open_already_open": "This target is already open — there is nothing to open",
+      "target_open_nvmet_auth": "An NVMe-oF subsystem with DH-HMAC-CHAP cannot be opened for everyone — its keys are stored on the allowed hosts. Switch authentication off first",
+      "target_open_changed": "The target changed since this window was opened (someone saved an allowlist, for example) — refresh and try again"
     },
     "unreachable": {
       "title": "Node {node} unreachable",

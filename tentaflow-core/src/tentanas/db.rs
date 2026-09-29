@@ -1115,6 +1115,22 @@ the next reconcile replaces this with the current count'
     ) WITHOUT ROWID;
     INSERT OR IGNORE INTO nas_settings (key, value, updated_at)
     VALUES ('target_seen_since', strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));",
+), (
+    30,
+    // Wave 14 (owner decision 2026-09-29, critic wave 12 MINOR 1/2): the row
+    // REMEMBERS that a target is allowlisted. Before, only a non-empty
+    // `nas_target_initiators` said so, and a list emptied by hand came back
+    // OPEN after a reboot (configfs empty, so the helper's backstop had
+    // nothing to compare with). `allowlist_mode = 1` with an empty list is
+    // FAIL CLOSED: nobody logs in until an admin opens the target on purpose.
+    // `open_confirmed = 1` is that purpose ("Otwórz dla wszystkich"): the
+    // only thing that lets an apply open a TPG the kernel holds an allowlist
+    // for; any later allowlist clears it. Every target with an allowlist
+    // today is allowlisted; every other one is open, as it was.
+    "ALTER TABLE nas_targets ADD COLUMN allowlist_mode INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE nas_targets ADD COLUMN open_confirmed INTEGER NOT NULL DEFAULT 0;
+    UPDATE nas_targets SET allowlist_mode = 1
+     WHERE target_id IN (SELECT target_id FROM nas_target_initiators);",
 )];
 
 /// The owner migration 20 gives a legacy share, target or account it cannot
@@ -6717,12 +6733,29 @@ pub struct TargetRow {
     pub state_reasons: Vec<NasHealthReason>,
     pub created_at: String,
     pub updated_at: String,
+    /// The target is ALLOWLISTED whatever `initiators` holds (migration 30):
+    /// with an empty list nobody logs in. See `TargetRow::allowlisted`.
+    pub allowlist_mode: bool,
+    /// An admin deliberately opened this target ("Otwórz dla wszystkich",
+    /// migration 30): the one thing that lets an apply open a TPG the kernel
+    /// holds an allowlist for. Only ever set on an open row.
+    pub open_confirmed: bool,
+}
+
+impl TargetRow {
+    /// Whether the target is allowlisted: the stored flag, or a list — a row
+    /// built in memory without the flag (a test, an older caller) that
+    /// carries initiators is allowlisted all the same, never open.
+    pub fn allowlisted(&self) -> bool {
+        self.allowlist_mode || !self.initiators.is_empty()
+    }
 }
 
 const TARGET_COLUMNS: &str = "target_id, name, protocol, wwn, enabled, spec_json, auth_method, \
                               auth_username, auth_secret, auth_mutual_username, \
                               auth_mutual_secret, dhchap_hash, dhchap_dhgroup, state, \
-                              state_detail, created_at, updated_at, state_reasons";
+                              state_detail, created_at, updated_at, state_reasons, \
+                              allowlist_mode, open_confirmed";
 
 fn target_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
     let spec: String = r.get(5)?;
@@ -6752,6 +6785,8 @@ fn target_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<TargetRow> {
         state_reasons: serde_json::from_str(&r.get::<_, String>(17)?).unwrap_or_default(),
         created_at: r.get(15)?,
         updated_at: r.get(16)?,
+        allowlist_mode: r.get::<_, i64>(18)? != 0,
+        open_confirmed: r.get::<_, i64>(19)? != 0,
     })
 }
 
@@ -6831,6 +6866,25 @@ pub const SEEN_SESSION_CLOSED: &str = "-";
 /// the minute (critic wave 12, MINOR 10).
 pub const SEEN_REFRESH_SECS: i64 = 60;
 
+/// How long the sampler keeps a row for a name that is NOT on the target's
+/// allowlist and has no session now (critic wave 12, MINOR 10). Such rows
+/// come from OPEN targets, where any client declares any name it likes; the
+/// screen shows a date only for listed initiators. They are kept so that an
+/// admin who switches an open target to an allowlist, or adds a client that
+/// used it, sees that client's real "Ostatnie połączenie" at once. A month is
+/// the node's other history horizon (`HISTORY_DAYS`, the disk charts) and
+/// covers a client that connects monthly (a backup host); past it, "no
+/// record" is the honest answer anyway.
+pub const SEEN_OFF_LIST_DAYS: i64 = HISTORY_DAYS as i64;
+
+/// At most this many off-list names are kept per target (the newest by
+/// `last_seen_at`), whatever their age: a client can mint a new name per
+/// login, and a real open target has a handful of clients. Bounds what one
+/// client can make the node store to this many rows per target. A name with
+/// a session NOW is never removed — it is also what the sessions table and
+/// its duration are read from.
+pub const SEEN_OFF_LIST_CAP: i64 = 64;
+
 /// One sampler pass over one target: `seen` is EVERY session the node just
 /// read — a MEASURED reading, the caller never calls with an unknown one — as
 /// `(initiator, session key, address)`. Returns how many rows it wrote.
@@ -6906,8 +6960,43 @@ pub fn record_target_seen(pool: &DbPool, target_id: &str, seen: &[(String, Strin
             close.execute(params![target_id, initiator, SEEN_SESSION_CLOSED])?;
         }
     }
+    // The pruning of off-list names (MINOR 10), in the SAME transaction: it
+    // is due only when something was written — a new name is always a write,
+    // so the growth it bounds cannot happen without it — and it adds no
+    // transaction of its own to the 20 s tick.
+    prune_off_list_seen(&tx, target_id, at)?;
     tx.commit()?;
     Ok(upserts.len() + closes.len())
+}
+
+/// Removes this target's sampler rows for names NOT on its allowlist that
+/// have no session now: every one older than `SEEN_OFF_LIST_DAYS`, and all
+/// but the `SEEN_OFF_LIST_CAP` newest. Listed initiators are never pruned.
+fn prune_off_list_seen(tx: &rusqlite::Transaction<'_>, target_id: &str, at: &str) -> Result<usize> {
+    let off_list = "target_id = ?1 AND initiator NOT IN \
+                    (SELECT initiator FROM nas_target_initiators WHERE target_id = ?1)";
+    let mut removed = 0;
+    if let Ok(now) = chrono::DateTime::parse_from_rfc3339(at) {
+        let cutoff = (now.with_timezone(&chrono::Utc) - chrono::Duration::days(SEEN_OFF_LIST_DAYS))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        removed += tx.execute(
+            &format!(
+                "DELETE FROM nas_target_initiator_seen
+                 WHERE {off_list} AND session_key = ?2 AND last_seen_at < ?3"
+            ),
+            params![target_id, SEEN_SESSION_CLOSED, cutoff],
+        )?;
+    }
+    removed += tx.execute(
+        &format!(
+            "DELETE FROM nas_target_initiator_seen
+             WHERE {off_list} AND session_key = ?2 AND initiator NOT IN (
+                 SELECT initiator FROM nas_target_initiator_seen WHERE {off_list}
+                 ORDER BY last_seen_at DESC, initiator LIMIT ?3)"
+        ),
+        params![target_id, SEEN_SESSION_CLOSED, SEEN_OFF_LIST_CAP],
+    )?;
+    Ok(removed)
 }
 
 /// When this node started recording block-target sessions (migration 29).
@@ -7029,6 +7118,21 @@ pub fn target_by_name(pool: &DbPool, name: &str) -> Result<Option<TargetRow>> {
 /// insert, never moved, and an update of another organisation's row writes
 /// nothing — neither the row nor its allowlist — and fails.
 pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<()> {
+    anyhow::ensure!(upsert_target_when(pool, org_id, target, None)?, "target not found");
+    Ok(())
+}
+
+/// `upsert_target` for an EXISTING row that is written only if its
+/// `updated_at` still reads `expected` — the check and the write are one
+/// statement, so nothing another request saves in between is overridden
+/// (critic wave 14 R2-NIT-4, "Otwórz dla wszystkich"). `Ok(false)`: the row
+/// changed (or is gone, or is another organisation's), and nothing was
+/// written, the allowlist included.
+pub fn update_target_if_unchanged(pool: &DbPool, org_id: &str, target: &TargetRow, expected: &str) -> Result<bool> {
+    upsert_target_when(pool, org_id, target, Some(expected))
+}
+
+fn upsert_target_when(pool: &DbPool, org_id: &str, target: &TargetRow, expected: Option<&str>) -> Result<bool> {
     anyhow::ensure!(!org_id.is_empty(), "a target needs an owning organisation");
     let spec = serde_json::to_string(&TargetSpec {
         luns: target.luns.clone(),
@@ -7037,13 +7141,30 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
     })?;
     let mut conn = write(pool)?;
     let tx = conn.transaction()?;
+    // The precondition is read INSIDE the write transaction, on the one write
+    // connection: nothing can be saved between the check and the write. A
+    // row that is not there (or is another organisation's) is "changed" —
+    // a conditional write never inserts. Returning drops the transaction.
+    if let Some(expected) = expected {
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT updated_at FROM nas_targets WHERE target_id = ?1 AND org_id = ?2",
+                params![target.target_id, org_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(expected) {
+            return Ok(false);
+        }
+    }
     let written = tx.execute(
         "INSERT INTO nas_targets (target_id, name, protocol, wwn, enabled, spec_json,
                                   auth_method, auth_username, auth_secret,
                                   auth_mutual_username, auth_mutual_secret, dhchap_hash,
                                   dhchap_dhgroup, state, state_detail, created_at, updated_at,
-                                  org_id, state_reasons)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+                                  org_id, state_reasons, allowlist_mode, open_confirmed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
+                 ?20, ?21)
          ON CONFLICT(target_id) DO UPDATE SET
             enabled = excluded.enabled, spec_json = excluded.spec_json,
             auth_method = excluded.auth_method, auth_username = excluded.auth_username,
@@ -7052,7 +7173,8 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
             auth_mutual_secret = excluded.auth_mutual_secret,
             dhchap_hash = excluded.dhchap_hash, dhchap_dhgroup = excluded.dhchap_dhgroup,
             state = excluded.state, state_detail = excluded.state_detail,
-            state_reasons = excluded.state_reasons, updated_at = excluded.updated_at
+            state_reasons = excluded.state_reasons, updated_at = excluded.updated_at,
+            allowlist_mode = excluded.allowlist_mode, open_confirmed = excluded.open_confirmed
          WHERE nas_targets.org_id = excluded.org_id",
         params![
             target.target_id,
@@ -7073,10 +7195,17 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
             target.created_at,
             target.updated_at,
             org_id,
-            serde_json::to_string(&target.state_reasons)?
+            serde_json::to_string(&target.state_reasons)?,
+            // A row that carries initiators is allowlisted, whatever the
+            // caller left in the flag: the database never stores a list that
+            // a later emptying could turn into an OPEN target.
+            i64::from(target.allowlisted()),
+            i64::from(target.open_confirmed && !target.allowlisted())
         ],
     )?;
-    anyhow::ensure!(written == 1, "target not found");
+    if written != 1 {
+        return Ok(false);
+    }
     tx.execute(
         "DELETE FROM nas_target_initiators WHERE target_id = ?1",
         params![target.target_id],
@@ -7096,7 +7225,22 @@ pub fn upsert_target(pool: &DbPool, org_id: &str, target: &TargetRow) -> Result<
         }
     }
     tx.commit()?;
-    Ok(())
+    Ok(true)
+}
+
+/// Consumes a deliberate open (critic wave 14, NIT-6): the first apply that
+/// went through has OPENED the kernel object, so the confirmation that lifts
+/// the helper's backstop is not needed any more and is cleared — the backstop
+/// is armed again for anything that later puts an allowlist in the kernel
+/// behind this row's back. Touches only that column, and only on an open row;
+/// `updated_at` stays (it is the admin's, not the reconcile's).
+pub fn consume_open_confirmation(pool: &DbPool, target_id: &str) -> Result<bool> {
+    let conn = write(pool)?;
+    Ok(conn.execute(
+        "UPDATE nas_targets SET open_confirmed = 0
+         WHERE target_id = ?1 AND open_confirmed = 1 AND allowlist_mode = 0",
+        params![target_id],
+    )? == 1)
 }
 
 /// The judged state of one target: the sentence and its codes, written
@@ -10286,6 +10430,8 @@ mod tests {
             state_reasons: vec![super::super::disks::coded_reason("import_secret_needed", &[])],
             created_at: now(),
             updated_at: now(),
+            allowlist_mode: true,
+            open_confirmed: false,
         };
         upsert_target(&p, "org-a", &row).unwrap();
 
@@ -10326,6 +10472,72 @@ mod tests {
         assert!(delete_target(&p, "org-a", "t1").unwrap());
         assert!(target(&p, "org-a", "t1").unwrap().is_none());
         assert!(target_initiators(&p, "t1").unwrap().is_empty());
+    }
+
+    /// Critic wave 14 R2-NIT-4: the conditional write of "Otwórz dla
+    /// wszystkich" writes only the row it read — a save in between, a gone
+    /// row or another organisation's row writes nothing, the list included.
+    #[test]
+    fn a_conditional_target_write_writes_only_the_row_it_read() {
+        let p = pool();
+        let row = TargetRow {
+            target_id: "t-cas".into(),
+            name: "vm-cas".into(),
+            protocol: "iscsi".into(),
+            wwn: "iqn.x:cas".into(),
+            initiators: vec!["iqn.1994-05.com.redhat:vmhost-01".into()],
+            created_at: "2026-09-29T10:00:00Z".into(),
+            updated_at: "2026-09-29T10:00:00Z".into(),
+            ..Default::default()
+        };
+        upsert_target(&p, "org-a", &row).unwrap();
+        let opened = TargetRow {
+            initiators: Vec::new(),
+            allowlist_mode: false,
+            open_confirmed: true,
+            updated_at: "2026-09-29T10:05:00Z".into(),
+            ..row.clone()
+        };
+        // Somebody saved since the read: nothing is written.
+        assert!(!update_target_if_unchanged(&p, "org-a", &opened, "2026-09-29T09:59:59Z").unwrap());
+        assert_eq!(target_initiators(&p, "t-cas").unwrap().len(), 1, "the list is untouched");
+        // Another organisation's row, or one that is not there: nothing.
+        assert!(!update_target_if_unchanged(&p, "org-b", &opened, "2026-09-29T10:00:00Z").unwrap());
+        let ghost = TargetRow { target_id: "t-none".into(), name: "none".into(), wwn: "iqn.x:none".into(), ..opened.clone() };
+        assert!(!update_target_if_unchanged(&p, "org-a", &ghost, "2026-09-29T10:00:00Z").unwrap());
+        assert!(target(&p, "org-a", "t-none").unwrap().is_none(), "a conditional write never inserts");
+        // The row as read: written.
+        assert!(update_target_if_unchanged(&p, "org-a", &opened, "2026-09-29T10:00:00Z").unwrap());
+        let back = target(&p, "org-a", "t-cas").unwrap().unwrap();
+        assert!(back.initiators.is_empty() && back.open_confirmed && !back.allowlist_mode);
+    }
+
+    /// Migration 30 (wave 14): every target with an allowlist today is
+    /// allowlisted, every other one is open as it was, and nobody is
+    /// "deliberately opened" by an upgrade.
+    #[test]
+    fn migration_30_marks_every_target_with_an_allowlist_as_allowlisted() {
+        let conn = Connection::open_in_memory().unwrap();
+        let before = MIGRATIONS.iter().position(|(v, _)| *v == 30).expect("migration 30");
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, &MIGRATIONS[..before]).unwrap();
+        conn.execute_batch(
+            "INSERT INTO nas_targets (target_id, name, protocol, wwn, created_at, updated_at, org_id) VALUES
+               ('t-list', 'vm-list', 'iscsi', 'iqn.x:list', 'now', 'now', 'org-a'),
+               ('t-open', 'vm-open', 'iscsi', 'iqn.x:open', 'now', 'now', 'org-a');
+             INSERT INTO nas_target_initiators (target_id, initiator) VALUES ('t-list', 'iqn.1994-05.com.redhat:vmhost-01');",
+        )
+        .unwrap();
+        crate::addon::app_db::run_versioned_migrations(&conn, APP, MIGRATIONS).unwrap();
+        let flags = |id: &str| -> (i64, i64) {
+            conn.query_row(
+                "SELECT allowlist_mode, open_confirmed FROM nas_targets WHERE target_id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(flags("t-list"), (1, 0));
+        assert_eq!(flags("t-open"), (0, 0));
     }
 
     #[test]

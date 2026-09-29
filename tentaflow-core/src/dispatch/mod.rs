@@ -2561,6 +2561,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Tn::TargetCreateRequest { .. } => "TentaNasTargetCreateRequest",
                 Tn::TargetUpdateRequest { .. } => "TentaNasTargetUpdateRequest",
                 Tn::TargetSessionResetRequest { .. } => "TentaNasTargetSessionResetRequest",
+                Tn::TargetOpenRequest { .. } => "TentaNasTargetOpenRequest",
                 Tn::TargetDeleteRequest { .. } => "TentaNasTargetDeleteRequest",
                 // Added for the TentaNAS session: `variant_name_of` matches
                 // their payload EXHAUSTIVELY, so a variant of theirs does not

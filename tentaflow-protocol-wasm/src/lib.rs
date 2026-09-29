@@ -23950,6 +23950,9 @@ mod elastic_codec_tests {
                 r#"{"target_id":"t1","initiator":"iqn.1994-05.com.redhat:vmhost-01","revoke":true}"#),
             ("TargetUpdateRequest", encode_tentanas_target_update_request,
                 r#"{"target_id":"t1","initiators":["iqn.1994-05.com.redhat:vmhost-01"],"initiator_descriptions":{"iqn.1994-05.com.redhat:vmhost-01":"Proxmox vmhost-01"},"enabled":true}"#),
+            // Wave 14: "Otwórz dla wszystkich", retyped like the delete.
+            ("TargetOpenRequest", encode_tentanas_target_open_request,
+                r#"{"target_id":"t1","confirm_name":"vm-store","expected_updated_at":"2026-09-29T10:00:00Z"}"#),
         ];
         for (variant, encode, fields) in cases {
             let bytes = encode(fields.to_owned()).unwrap();
@@ -24944,6 +24947,14 @@ pub fn encode_tentanas_target_update_request(request_json: String) -> Result<Vec
 #[wasm_bindgen(js_name = encodeTentaNasTargetSessionResetRequest)]
 pub fn encode_tentanas_target_session_reset_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_tentanas_json_request("TargetSessionResetRequest", &request_json)
+}
+
+/// MessageBody::TentaNasBody(TargetOpenRequest) — "Otwórz dla wszystkich" (wave 14): the one
+/// deliberate road from an allowlisted target to an open one, retype-gated by the target's
+/// name. Answers with JobResponse.
+#[wasm_bindgen(js_name = encodeTentaNasTargetOpenRequest)]
+pub fn encode_tentanas_target_open_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_tentanas_json_request("TargetOpenRequest", &request_json)
 }
 
 /// MessageBody::TentaNasBody(TrimScheduleSetRequest) — the recurring trim of one pool.

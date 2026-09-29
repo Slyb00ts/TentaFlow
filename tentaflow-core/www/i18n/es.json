@@ -5537,7 +5537,8 @@
         "targets": "Destinos iSCSI/NVMe-oF",
         "disable": "Desactivar TentaNas"
       },
-      "kind_target_session_reset": "Desconexión de sesión del target"
+      "kind_target_session_reset": "Desconexión de sesión del target",
+      "kind_target_open": "Apertura del target para todos"
     },
     "danger": {
       "retype": "Escribe {name} para confirmar:",
@@ -7066,6 +7067,18 @@
           "title": "Target {target}: la escucha RDMA desapareció",
           "detail": "Los clientes no pueden conectarse por {transport} en {portal}. Detén y reanuda el target — el portal y su escucha se crean de nuevo.",
           "detail_shared": "Los clientes no pueden conectarse por {transport} en {portal}. Otros targets comparten la escucha: solo vuelve cuando todos los targets que la usan se han detenido y luego reanudado."
+        },
+        "target_left_disabled": {
+          "title": "Target {target}: quedó desactivado; no se atiende a ningún cliente",
+          "detail": "Reiniciar la sesión de un cliente fuera de la nueva lista de acceso desactivó el target, y volver a activarlo falló dos veces. Todos los clientes están desconectados, también los de la lista. El nodo lo reintenta en la siguiente aplicación."
+        },
+        "target_open_refused": {
+          "title": "Target {target}: el kernel mantiene una lista de acceso que no está en el registro",
+          "detail": "El target está guardado como abierto, pero el kernel todavía mantiene una lista de acceso para él, y el nodo nunca abre un target por accidente. Cada aplicación se rechaza hasta que un administrador lo abra deliberadamente («Abrir para todos») o lo detenga."
+        },
+        "target_sessions_reset": {
+          "title": "Target {target}: todas las sesiones se reiniciaron una vez",
+          "detail": "Un cliente fuera de la nueva lista de acceso seguía conectado, así que todas las sesiones del target se reiniciaron una vez. Los clientes de la lista se reconectan solos (unos 2 s); el excluido no puede."
         }
       },
       "node_text": "Texto del nodo",
@@ -7764,7 +7777,7 @@
       "portal_network_shared": "LAN — compartida",
       "portal_network_storage": "red de almacenamiento",
       "delete_loss_record": "El registro del target se eliminará de la base de datos:",
-      "delete_loss_allowlist": "Se eliminará la lista de acceso ({n} initiators).",
+      "delete_loss_allowlist": "Se eliminará la lista de acceso ({n} {n|initiator|initiators}).",
       "delete_loss_auth": "Se eliminará la configuración de autenticación guardada de este target.",
       "delete_keep_snapshots": "Las instantáneas también se conservan. Eliminar la exportación no elimina datos ni instantáneas del volumen.",
       "portal_pick_interface": "Elegir interfaz",
@@ -7794,7 +7807,7 @@
       "group_transitioning": "En transición",
       "group_preferred": "ruta preferida",
       "initiators": "Lista de initiators permitidos",
-      "initiators_hint": "Un IQN/NQN por línea. El cliente declara su propio IQN/NQN: es un filtro de comodidad, NO autenticación. Una lista vacía significa que el propio kernel crea las entradas; la reconciliación solo elimina las que no tienen sesión, así que un cliente que inicie sesión justo en ese instante puede ser rechazado una vez y lo reintenta.",
+      "initiators_hint": "Un IQN/NQN por línea. El cliente declara su propio IQN/NQN: es un filtro de comodidad, NO autenticación. En un target abierto, una lista vacía significa que el propio kernel crea las entradas; la reconciliación solo elimina las que no tienen sesión, así que un cliente que inicie sesión justo en ese instante puede ser rechazado una vez y lo reintenta. En un target con lista de acceso, una lista vacía significa que nadie puede iniciar sesión.",
       "no_initiators": "Vacía: se conecta cualquiera que alcance el portal.",
       "allowlist_note": "La lista es un filtro, no un inicio de sesión. Solo CHAP (mutuo) / DH-HMAC-CHAP autentica.",
       "save_auth_missing": "No se puede guardar la lista de permitidos: la respuesta del nodo no incluye la configuración de autenticación de este destino. Actualice la ventana e inténtelo de nuevo.",
@@ -7857,7 +7870,7 @@
       "description_title": "Descripción del iniciador",
       "description_hint": "Hasta {n} caracteres, p. ej. «Proxmox vmhost-01». El botón Guardar aplica el cambio.",
       "description_apply": "Establecer descripción",
-      "allowlist_last_warning": "La lista de permitidos no puede quedar vacía: una lista vacía abriría el target a cualquiera que llegue al portal. Para cortar a todos, detén el target.",
+      "allowlist_last_warning": "La lista quedará vacía: al guardar, el target se cierra; nadie podrá iniciar sesión y las sesiones de los clientes quitados se cortarán.",
       "nvmet_remove_keeps_connection": "Quitar un host de la lista no desconecta a un host que ya está conectado — conserva el acceso completo hasta que vuelva a conectarse. Para cortarlo al instante, detén el target.",
       "listen_listening": "Escuchando",
       "listen_target_disabled": "Puerto abierto, target desactivado — los inicios de sesión se rechazan",
@@ -7896,7 +7909,26 @@
       "rdma_peer": "{n} {n|conexión RDMA|conexiones RDMA} desde {peer}",
       "rdma_peers_none": "Sin conexiones RDMA",
       "rdma_peers_shared": "Otros targets comparten este puerto RDMA — la tabla RDMA del kernel no indica qué conexiones pertenecen a este target, así que no se muestra ninguna",
-      "rdma_peers_unknown": "Conexiones RDMA no medidas"
+      "rdma_peers_unknown": "Conexiones RDMA no medidas",
+      "no_initiators_closed": "Vacía: el target está cerrado; nadie puede iniciar sesión hasta que añadas un initiator o lo abras para todos.",
+      "open_all": "Abrir para todos",
+      "open_all_title": "Abrir el target {name} para todos",
+      "open_all_warning": "Una vez abierto, cualquier cliente que alcance el portal {portal} y presente las credenciales CHAP de este target iniciará sesión; la lista de acceso deja de aplicarse.",
+      "open_all_warning_no_auth": "Una vez abierto, cualquier cliente que alcance el portal {portal} obtiene el disco en bruto: este target no tiene autenticación y la lista de acceso deja de aplicarse.",
+      "open_all_loss_allowlist": "Se eliminarán la lista de acceso ({n} {n|entrada|entradas}) y sus descripciones.",
+      "open_all_loss_stale": "Se eliminarán las entradas del kernel a través de las que no hay nadie conectado.",
+      "open_all_keep_sessions": "Los clientes conectados ahora siguen conectados.",
+      "open_all_keep_auth": "La autenticación del target sigue aplicándose.",
+      "open_all_back": "Para volver a admitir solo a clientes elegidos, añade un initiator y guarda: desde entonces solo los clientes de la lista pueden iniciar sesión (las sesiones del target se reinician una vez).",
+      "open_all_done": "Apertura del target {name} aceptada; el resultado está en el registro de la tarea.",
+      "open_blocked_title": "El kernel todavía mantiene una lista de acceso.",
+      "open_blocked_note": "El target está guardado como abierto, pero el kernel mantiene una lista de acceso para él, así que cada aplicación se rechaza. Ábrelo deliberadamente para todos o detén el target.",
+      "close_all_title": "Cerrar el target {name} para todos",
+      "close_all_text": "No quedará ninguna entrada en la lista de acceso. Al guardar, nadie podrá iniciar sesión y las sesiones de los clientes quitados se cortarán. Para volver a admitir a alguien, añádelo a la lista.",
+      "close_all_confirm": "Cerrar para todos",
+      "disconnect_revoke_last_text": "Es la única entrada de la lista de acceso: al quitarla, el target se cierra y nadie puede iniciar sesión.",
+      "allowlist_last_warning_nvmet": "La lista quedará vacía: al guardar, nadie nuevo podrá conectarse. Los hosts conectados ahora conservan el acceso hasta que se reconecten; para cortarlos ya, detén el target.",
+      "close_all_text_nvmet": "No quedará ningún host en la lista de acceso. Al guardar, nadie nuevo podrá conectarse, pero los hosts conectados ahora conservan el acceso completo hasta que se reconecten. Para cortarlos ya, detén el target."
     },
     "wizard_target": {
       "title": "Nuevo destino",
@@ -8011,7 +8043,8 @@
       "host_description_label": "Descripción — {nqn}",
       "host_description_placeholder": "p. ej. orion (compute)",
       "transport_no_rdma_device": "La interfaz {iface} no tiene dispositivo RDMA — el kernel rechaza una escucha RDMA en su dirección. Elige TCP o una interfaz con tarjeta RDMA.",
-      "transport_rdma_link_down": "El dispositivo RDMA {device} de la interfaz {iface} tiene el enlace inactivo — el target se guardará, pero los clientes no podrán conectarse por RDMA hasta que el enlace se active."
+      "transport_rdma_link_down": "El dispositivo RDMA {device} de la interfaz {iface} tiene el enlace inactivo — el target se guardará, pero los clientes no podrán conectarse por RDMA hasta que el enlace se active.",
+      "dhchap_hosts_filter_note_allowlisted": "Sin autenticación, la lista de acceso NQN es solo un filtro, no un inicio de sesión: un initiator fuera de la lista se rechaza, pero uno de la lista inicia sesión sin clave. Este target tiene lista de acceso: una lista vacía lo cierra y nadie nuevo podrá conectarse. Para dejar entrar a todos, usa «Abrir para todos» en los detalles del target."
     },
     "journal_owner": {
       "this_instance": "esta instancia de TentaNas",
@@ -8066,7 +8099,7 @@
       "sharing_stop_author_gone": "El autor de esta solicitud ya no es administrador de la plataforma en esta organización — no se puede aprobar; recházela.",
       "sharing_resume_partial": "La compartición ha vuelto, pero no del todo — las líneas de la tarea indican lo que aún no sirve; el nodo lo reintenta.",
       "sharing_stop_pending_elsewhere": "En este nodo ya espera aprobación una detención de la compartición solicitada en otra organización. Un administrador de la plataforma la ve en TentaNas → Tareas y puede rechazarla.",
-      "target_last_initiator": "Es la única entrada de la lista de permitidos — quitarla abriría el target a todo el mundo. Detén el target o añade antes otra entrada.",
+      "target_last_initiator": "El nodo rechazó quitar la última entrada de la lista de acceso: ejecuta una versión anterior, en la que una lista vacía abría el target a todo el mundo. Detén el target o actualiza antes el nodo.",
       "target_description_unlisted": "La descripción es de un iniciador que no está en la lista de permitidos — añádelo a la lista o quita la descripción",
       "target_description_too_long": "Una descripción puede tener como máximo 80 caracteres",
       "target_description_invalid": "Una descripción no puede contener caracteres de control (como un salto de línea)",
@@ -8151,7 +8184,10 @@
       "disk_wipe_refused": "El nodo se niega a borrar este disco — vuelva a leer el plan para ver por qué",
       "disk_wipe_no_journal": "Ningún diario de Elastic Array reserva ya este disco — vuelva a leer el plan",
       "disk_wipe_journal_unacknowledged": "El diario de la Elastic Array disuelta {array} todavía reserva este disco — confirme la pérdida de esa matriz o recupérela con una importación de matrices",
-      "elastic_create_needs_attention": "La matriz se creó, pero requiere intervención; se conservan las reservas de sus discos"
+      "elastic_create_needs_attention": "La matriz se creó, pero requiere intervención; se conservan las reservas de sus discos",
+      "target_open_already_open": "Este target ya está abierto: no hay nada que abrir",
+      "target_open_nvmet_auth": "Un subsistema NVMe-oF con DH-HMAC-CHAP no puede abrirse para todos: sus claves se guardan en los hosts permitidos. Desactiva primero la autenticación",
+      "target_open_changed": "El target cambió desde que se abrió esta ventana (por ejemplo, alguien guardó una lista de acceso): actualiza la vista y vuelve a intentarlo"
     },
     "unreachable": {
       "title": "Nodo {node} inaccesible",

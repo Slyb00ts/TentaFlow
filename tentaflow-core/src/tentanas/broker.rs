@@ -876,6 +876,9 @@ pub mod test_channel {
         /// Commands (by `cmd` name) that answer as a FAILED helper run with
         /// this stderr instead of success — how a test drives an error path.
         pub failing: Mutex<HashMap<String, String>>,
+        /// Commands (by `cmd` name) that succeed with this stdout — how a
+        /// test hands the core the lines a helper run prints.
+        pub stdout: Mutex<HashMap<String, String>>,
     }
 
     impl Recorder {
@@ -888,8 +891,17 @@ pub mod test_channel {
             self.calls.lock().unwrap().push((name.clone(), payload));
             match self.failing.lock().unwrap().get(&name) {
                 Some(stderr) => CommandOutput { code: 69, stdout: String::new(), stderr: stderr.clone() },
-                None => CommandOutput { code: 0, stdout: String::new(), stderr: String::new() },
+                None => CommandOutput {
+                    code: 0,
+                    stdout: self.stdout.lock().unwrap().get(&name).cloned().unwrap_or_default(),
+                    stderr: String::new(),
+                },
             }
+        }
+
+        /// Makes every later successful call named `command` print `stdout`.
+        pub fn succeed_with(&self, command: &str, stdout: &str) {
+            self.stdout.lock().unwrap().insert(command.to_string(), stdout.to_string());
         }
 
         /// Makes every later call named `command` fail with `stderr`.

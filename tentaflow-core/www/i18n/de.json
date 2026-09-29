@@ -5537,7 +5537,8 @@
         "targets": "iSCSI/NVMe-oF-Targets",
         "disable": "TentaNas deaktivieren"
       },
-      "kind_target_session_reset": "Target-Sitzung trennen"
+      "kind_target_session_reset": "Target-Sitzung trennen",
+      "kind_target_open": "Target für alle öffnen"
     },
     "danger": {
       "retype": "Zur Bestätigung {name} eingeben:",
@@ -7066,6 +7067,18 @@
           "title": "Target {target}: RDMA-Listener ist verschwunden",
           "detail": "Clients können sich nicht über {transport} mit {portal} verbinden. Target stoppen und fortsetzen — Portal und Listener werden neu angelegt.",
           "detail_shared": "Clients können sich nicht über {transport} mit {portal} verbinden. Andere Targets teilen sich den Listener: Er kehrt erst zurück, wenn alle Targets darauf gestoppt und danach fortgesetzt wurden."
+        },
+        "target_left_disabled": {
+          "title": "Target {target}: bleibt deaktiviert — kein Client wird bedient",
+          "detail": "Das Zurücksetzen der Sitzung eines Clients außerhalb der neuen Zulassungsliste hat das Target ausgeschaltet, und das Wiedereinschalten schlug zweimal fehl. Alle Clients sind getrennt, auch die gelisteten. Der Knoten versucht es beim nächsten Anwenden erneut."
+        },
+        "target_open_refused": {
+          "title": "Target {target}: Der Kernel hält eine Zulassungsliste, die im Datensatz fehlt",
+          "detail": "Das Target ist als offen gespeichert, aber der Kernel hält noch eine Zulassungsliste dafür, und der Knoten öffnet ein Target nie versehentlich. Jedes Anwenden wird abgelehnt, bis ein Administrator es bewusst öffnet („Für alle öffnen“) oder anhält."
+        },
+        "target_sessions_reset": {
+          "title": "Target {target}: Alle Sitzungen wurden einmal zurückgesetzt",
+          "detail": "Ein Client außerhalb der neuen Zulassungsliste war noch angemeldet, daher wurden alle Sitzungen des Targets einmal zurückgesetzt. Gelistete Clients verbinden sich selbst wieder (etwa 2 s), der ausgeschlossene kann es nicht."
         }
       },
       "node_text": "Text des Knotens",
@@ -7764,7 +7777,7 @@
       "portal_network_shared": "LAN — geteilt",
       "portal_network_storage": "Storage-Netzwerk",
       "delete_loss_record": "Der Zieldatensatz wird aus der Datenbank entfernt:",
-      "delete_loss_allowlist": "Die Zugriffsliste ({n} Initiatoren) wird entfernt.",
+      "delete_loss_allowlist": "Die Zugriffsliste ({n} {n|Initiator|Initiatoren}) wird entfernt.",
       "delete_loss_auth": "Die gespeicherten Authentifizierungseinstellungen dieses Ziels werden entfernt.",
       "delete_keep_snapshots": "Snapshots bleiben ebenfalls erhalten. Das Entfernen des Exports löscht weder Volumendaten noch Snapshots.",
       "portal_pick_interface": "Schnittstelle wählen",
@@ -7794,7 +7807,7 @@
       "group_transitioning": "Im Übergang",
       "group_preferred": "bevorzugter Pfad",
       "initiators": "Initiator-Allowlist",
-      "initiators_hint": "Ein IQN/NQN pro Zeile. Der Client gibt seinen IQN/NQN selbst an — das ist ein Komfortfilter, KEINE Authentifizierung. Eine leere Liste bedeutet, dass der Kernel die Einträge selbst anlegt; der Abgleich entfernt nur Einträge ohne Sitzung, ein genau in diesem Moment anmeldender Client kann also einmal abgewiesen werden und versucht es erneut.",
+      "initiators_hint": "Ein IQN/NQN pro Zeile. Der Client gibt seinen IQN/NQN selbst an — das ist ein Komfortfilter, KEINE Authentifizierung. Bei einem offenen Target bedeutet eine leere Liste, dass der Kernel die Einträge selbst anlegt; der Abgleich entfernt nur Einträge ohne Sitzung, ein genau in diesem Moment anmeldender Client kann also einmal abgewiesen werden und versucht es erneut. Bei einem Target mit Zulassungsliste bedeutet eine leere Liste, dass sich niemand anmelden kann.",
       "no_initiators": "Leer — jeder, der das Portal erreicht, verbindet sich.",
       "allowlist_note": "Die Allowlist ist ein Filter, kein Login. Nur (gegenseitiges) CHAP / DH-HMAC-CHAP authentifiziert.",
       "save_auth_missing": "Die Allowlist kann nicht gespeichert werden: Die Antwort des Knotens enthält keine Authentifizierungseinstellungen für dieses Target. Fenster aktualisieren und erneut versuchen.",
@@ -7857,7 +7870,7 @@
       "description_title": "Beschreibung des Initiators",
       "description_hint": "Bis zu {n} Zeichen, z. B. „Proxmox vmhost-01“. Die Änderung übernimmt die Schaltfläche Speichern.",
       "description_apply": "Beschreibung setzen",
-      "allowlist_last_warning": "Die Zulassungsliste darf nicht leer werden: Eine leere Liste würde das Target für jeden öffnen, der das Portal erreicht. Um alle zu trennen, halte das Target an.",
+      "allowlist_last_warning": "Die Liste wird leer: Nach dem Speichern ist das Target geschlossen — niemand kann sich anmelden, und die Sitzungen der entfernten Clients werden getrennt.",
       "nvmet_remove_keeps_connection": "Einen Host aus der Liste zu entfernen trennt einen bereits verbundenen Host nicht — er behält vollen Zugriff bis zur nächsten Verbindung. Um ihn sofort zu trennen, halte das Target an.",
       "listen_listening": "Lauscht",
       "listen_target_disabled": "Port offen, Target deaktiviert — Anmeldungen werden abgelehnt",
@@ -7896,7 +7909,26 @@
       "rdma_peer": "{n} {n|RDMA-Verbindung|RDMA-Verbindungen} von {peer}",
       "rdma_peers_none": "Keine RDMA-Verbindungen",
       "rdma_peers_shared": "Andere Targets teilen sich diesen RDMA-Port — die RDMA-Tabelle des Kernels sagt nicht, welche Verbindungen zu diesem Target gehören, daher wird keine angezeigt",
-      "rdma_peers_unknown": "RDMA-Verbindungen nicht gemessen"
+      "rdma_peers_unknown": "RDMA-Verbindungen nicht gemessen",
+      "no_initiators_closed": "Leer — das Target ist geschlossen: Niemand kann sich anmelden, bis du einen Initiator hinzufügst oder es für alle öffnest.",
+      "open_all": "Für alle öffnen",
+      "open_all_title": "Target {name} für alle öffnen",
+      "open_all_warning": "Nach dem Öffnen meldet sich jeder Client an, der das Portal {portal} erreicht und die CHAP-Anmeldedaten dieses Targets angibt — die Zulassungsliste gilt nicht mehr.",
+      "open_all_warning_no_auth": "Nach dem Öffnen erhält jeder Client, der das Portal {portal} erreicht, die Rohdisk — dieses Target hat keine Authentifizierung, und die Zulassungsliste gilt nicht mehr.",
+      "open_all_loss_allowlist": "Die Zulassungsliste ({n} {n|Eintrag|Einträge}) und ihre Beschreibungen werden entfernt.",
+      "open_all_loss_stale": "Einträge im Kernel, über die niemand angemeldet ist, werden entfernt.",
+      "open_all_keep_sessions": "Jetzt verbundene Clients bleiben verbunden.",
+      "open_all_keep_auth": "Die Authentifizierung des Targets gilt weiterhin.",
+      "open_all_back": "Um wieder nur ausgewählte Clients zuzulassen, füge einen Initiator hinzu und speichere — ab dann können sich nur gelistete Clients anmelden (die Sitzungen des Targets werden einmal zurückgesetzt).",
+      "open_all_done": "Öffnen von Target {name} angenommen — das Ergebnis steht im Auftragsprotokoll.",
+      "open_blocked_title": "Der Kernel hält noch eine Zulassungsliste.",
+      "open_blocked_note": "Das Target ist als offen gespeichert, aber der Kernel hält eine Zulassungsliste dafür, daher wird jedes Anwenden abgelehnt. Öffne es bewusst für alle oder halte das Target an.",
+      "close_all_title": "Target {name} für alle schließen",
+      "close_all_text": "Auf der Zulassungsliste bleibt kein Eintrag. Nach dem Speichern kann sich niemand anmelden, und die Sitzungen der entfernten Clients werden getrennt. Um jemanden wieder zuzulassen, füge ihn der Liste hinzu.",
+      "close_all_confirm": "Für alle schließen",
+      "disconnect_revoke_last_text": "Das ist der einzige Eintrag der Zulassungsliste: Nach dem Entfernen ist das Target geschlossen, und niemand kann sich anmelden.",
+      "allowlist_last_warning_nvmet": "Die Liste wird leer: Nach dem Speichern kann sich niemand Neues verbinden. Jetzt verbundene Hosts behalten den Zugriff, bis sie sich neu verbinden — um sie sofort zu trennen, halte das Target an.",
+      "close_all_text_nvmet": "Auf der Zulassungsliste bleibt kein Host. Nach dem Speichern kann sich niemand Neues verbinden, aber jetzt verbundene Hosts behalten vollen Zugriff, bis sie sich neu verbinden. Um sie sofort zu trennen, halte das Target an."
     },
     "wizard_target": {
       "title": "Neues Target",
@@ -8011,7 +8043,8 @@
       "host_description_label": "Beschreibung — {nqn}",
       "host_description_placeholder": "z. B. orion (compute)",
       "transport_no_rdma_device": "Die Schnittstelle {iface} hat kein RDMA-Gerät — der Kernel lehnt einen RDMA-Listener auf ihrer Adresse ab. Wählen Sie TCP oder eine Schnittstelle mit RDMA-Karte.",
-      "transport_rdma_link_down": "Das RDMA-Gerät {device} an der Schnittstelle {iface} hat keine aktive Verbindung — das Target wird gespeichert, aber Clients können sich erst über RDMA verbinden, wenn die Verbindung steht."
+      "transport_rdma_link_down": "Das RDMA-Gerät {device} an der Schnittstelle {iface} hat keine aktive Verbindung — das Target wird gespeichert, aber Clients können sich erst über RDMA verbinden, wenn die Verbindung steht.",
+      "dhchap_hosts_filter_note_allowlisted": "Ohne Authentifizierung ist die NQN-Zulassungsliste nur ein Filter, keine Anmeldung: Ein Initiator außerhalb der Liste wird abgewiesen, einer auf der Liste meldet sich ohne Schlüssel an. Dieses Target hat eine Zulassungsliste — eine leere Liste schließt es, und niemand Neues kann sich verbinden. Um alle zuzulassen, nutze „Für alle öffnen“ in den Details des Targets."
     },
     "journal_owner": {
       "this_instance": "diese TentaNas-Instanz",
@@ -8066,7 +8099,7 @@
       "sharing_stop_author_gone": "Der Autor dieser Anfrage ist in dieser Organisation kein Plattformadministrator mehr — sie kann nicht genehmigt werden; lehnen Sie sie ab.",
       "sharing_resume_partial": "Die Freigabe ist zurück, aber nicht vollständig — die Auftragszeilen nennen, was noch nicht läuft; der Knoten versucht es erneut.",
       "sharing_stop_pending_elsewhere": "Auf diesem Knoten wartet bereits ein in einer anderen Organisation angefordertes Stoppen der Freigabe auf Genehmigung. Ein Plattformadministrator sieht es unter TentaNas → Aufgaben und kann es ablehnen.",
-      "target_last_initiator": "Das ist der einzige Eintrag der Zulassungsliste — ihn zu entfernen würde das Target für alle öffnen. Halte das Target an oder füge zuerst einen anderen Eintrag hinzu.",
+      "target_last_initiator": "Der Knoten hat das Entfernen des letzten Eintrags der Zulassungsliste abgelehnt — er läuft mit einer älteren Version, in der eine leere Liste das Target für alle öffnete. Halte das Target an oder aktualisiere zuerst den Knoten.",
       "target_description_unlisted": "Die Beschreibung gilt einem Initiator, der nicht auf der Zulassungsliste steht — nimm ihn in die Liste auf oder entferne die Beschreibung",
       "target_description_too_long": "Eine Beschreibung darf höchstens 80 Zeichen lang sein",
       "target_description_invalid": "Eine Beschreibung darf keine Steuerzeichen (etwa einen Zeilenumbruch) enthalten",
@@ -8151,7 +8184,10 @@
       "disk_wipe_refused": "Der Knoten verweigert das Löschen dieses Datenträgers — lesen Sie den Plan erneut, um den Grund zu sehen",
       "disk_wipe_no_journal": "Kein Journal eines Elastic Arrays reserviert diesen Datenträger mehr — lesen Sie den Plan erneut",
       "disk_wipe_journal_unacknowledged": "Das Journal des aufgelösten Elastic Arrays {array} reserviert diesen Datenträger noch — bestätigen Sie den Verlust dieses Arrays oder holen Sie es mit einem Array-Import zurück",
-      "elastic_create_needs_attention": "Das Array wurde erstellt, braucht aber einen Eingriff; die Reservierungen seiner Datenträger bleiben erhalten"
+      "elastic_create_needs_attention": "Das Array wurde erstellt, braucht aber einen Eingriff; die Reservierungen seiner Datenträger bleiben erhalten",
+      "target_open_already_open": "Dieses Target ist bereits offen — es gibt nichts zu öffnen",
+      "target_open_nvmet_auth": "Ein NVMe-oF-Subsystem mit DH-HMAC-CHAP lässt sich nicht für alle öffnen — seine Schlüssel liegen auf den zugelassenen Hosts. Schalte zuerst die Authentifizierung aus",
+      "target_open_changed": "Das Target hat sich geändert, seit dieses Fenster geöffnet wurde (zum Beispiel hat jemand eine Zulassungsliste gespeichert) — aktualisiere die Ansicht und versuche es erneut"
     },
     "unreachable": {
       "title": "Knoten {node} nicht erreichbar",

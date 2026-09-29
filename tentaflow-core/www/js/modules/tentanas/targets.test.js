@@ -1221,10 +1221,13 @@ test('an edited Opis is a draft the save sends, only for initiators still on the
   screen.dispose();
 });
 
-test('the last initiator cannot be saved away: the editor warns and no request is sent', async () => {
+// Owner decision 2026-09-29: emptying an allowlist CLOSES the target. The
+// editor says so, the save asks once more, and only a yes sends the list.
+test('the last initiator can be saved away after a confirmation that the target closes', async () => {
+  const sent = [];
   const screen = fakeScreen({
     tentaNasTargetGetRequest: { target: iscsiTarget({ initiators: [VMHOST1] }), sessions: [], configPreview: '' },
-    tentaNasTargetUpdateRequest: () => { throw new Error('must not be sent'); },
+    tentaNasTargetUpdateRequest: (payload) => { sent.push(payload); return { job: { jobId: 'j9', kind: 'target_update', subject: 'vm-store' } }; },
   });
   const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
   await flush();
@@ -1232,11 +1235,26 @@ test('the last initiator cannot be saved away: the editor warns and no request i
   assert.equal(win.querySelector('[data-testid="allowlist-last-warning"]'), null);
   click(actionsOf(win.querySelector('#nas-td-hosts'), 0).querySelector('[data-act="remove-initiator"]'));
   await flush();
-  assert.match(win.querySelector('[data-testid="allowlist-last-warning"]').textContent, /otworzyłaby target dla każdego/);
+  assert.match(win.querySelector('[data-testid="allowlist-last-warning"]').textContent, /target zostanie zamknięty — nikt się nie zaloguje/);
+  // No: nothing is sent.
   click(win.querySelector('[data-act="save"]'));
   await flush();
+  let confirm = document.querySelector('tf-window.nas-target-close');
+  assert.match(confirm.textContent, /nikt nie będzie mógł się zalogować, a sesje usuniętych klientów zostaną zerwane/);
+  click(confirm.querySelector('[data-action="cancel"]'));
   await flush();
-  assert.equal(screen.calls.filter((c) => c.kind === 'tentaNasTargetUpdateRequest').length, 0);
+  await flush();
+  assert.equal(sent.length, 0, 'cancelled: nothing sent');
+  // Yes: the empty list is sent.
+  click(win.querySelector('[data-act="save"]'));
+  await flush();
+  confirm = document.querySelector('tf-window.nas-target-close');
+  click(confirm.querySelector('[data-action="confirm"]'));
+  await flush();
+  await flush();
+  await flush();
+  assert.equal(sent.length, 1);
+  assert.deepEqual(sent[0].initiators, []);
   screen.dispose();
 });
 
@@ -1288,7 +1306,31 @@ test('the iSCSI sessions table follows n19 and Rozłącz resets or revokes by th
   screen.dispose();
 });
 
-test('Rozłącz on the only entry cannot revoke, and a target without an allowlist offers no Rozłącz (D2)', async () => {
+test('emptying an NVMe-oF allowlist says connected hosts keep access, not that they are dropped', async () => {
+  const screen = fakeScreen({
+    tentaNasTargetGetRequest: { target: nvmetTarget({ auth: { method: 'none' }, initiators: ['nqn.2014-08.org.nvmexpress:uuid:esx01'], allowlistMode: true }), sessions: [], configPreview: '' },
+    tentaNasTargetUpdateRequest: () => { throw new Error('must not be sent'); },
+    tentaNasTargetsListRequest: listAnswer([]),
+  });
+  const win = openTargetDetail(screen, 't2', { body: document.body, capabilities });
+  await flush();
+  await flush();
+  click(actionsOf(win.querySelector('#nas-td-hosts'), 0).querySelector('[data-act="remove-initiator"]'));
+  await flush();
+  const warning = win.querySelector('[data-testid="allowlist-last-warning"]').textContent;
+  assert.match(warning, /Hosty połączone teraz zachowają dostęp, dopóki nie połączą się ponownie/);
+  assert.doesNotMatch(warning, /zostaną zerwane/);
+  click(win.querySelector('[data-act="save"]'));
+  await flush();
+  const confirm = document.querySelector('tf-window.nas-target-close');
+  assert.match(confirm.textContent, /zatrzymaj target/);
+  assert.doesNotMatch(confirm.textContent, /zostaną zerwane/);
+  click(confirm.querySelector('[data-action="cancel"]'));
+  await flush();
+  screen.dispose();
+});
+
+test('Rozłącz on the only entry can revoke and says the target closes, and a target without an allowlist offers no Rozłącz (D2)', async () => {
   const requests = [];
   const screen = fakeScreen({
     tentaNasTargetGetRequest: { target: iscsiTarget({ initiators: [VMHOST1] }), sessions: [liveSession(VMHOST1)], configPreview: '' },
@@ -1300,14 +1342,15 @@ test('Rozłącz on the only entry cannot revoke, and a target without an allowli
   click(actionsOf(win.querySelector('#nas-td-sessions')));
   await flush();
   const dialog = document.querySelector('tf-window.nas-modal');
-  assert.ok(dialog.querySelector('#nas-td-revoke').hasAttribute('disabled'));
-  assert.match(dialog.querySelector('[data-testid="revoke-only-entry"]').textContent, /jedyny wpis/);
+  assert.ok(!dialog.querySelector('#nas-td-revoke').hasAttribute('disabled'));
   const box = dialog.querySelector('#nas-td-revoke');
   box.dispatchEvent(new window.CustomEvent('change', { detail: { checked: true }, bubbles: true }));
+  await flush();
+  assert.match(dialog.textContent, /target zostanie zamknięty i nikt nie będzie mógł się zalogować/);
   click(dialog.querySelector('[data-action="confirm"]'));
   await flush();
   await flush();
-  assert.equal(requests[0].revoke, false, 'the only entry is never revoked from here');
+  assert.equal(requests[0].revoke, true, 'the only entry is revoked: the target closes');
   screen.dispose();
 
   // An open target: a generated session has no address or state, and no button.
@@ -1325,7 +1368,9 @@ test('Rozłącz on the only entry cannot revoke, and a target without an allowli
   open.dispose();
 });
 
-test('a poll that only moves a session duration patches the rows, not the tables', async () => {
+// Critic wave 12, MINOR 13: this test is about "Nasłuch" — it moves nothing
+// else — and says so; the duration has its own test below.
+test('a poll that only moves Nasłuch patches its row in place, not the tables', async () => {
   const target = iscsiTarget({ initiators: [VMHOST1] });
   const first = { target, sessions: [liveSession(VMHOST1)], configPreview: '', listen: [{ address: '10.10.0.5', port: 3260, transport: 'tcp', state: 'listening' }] };
   const second = { ...first, listen: [{ address: '10.10.0.5', port: 3260, transport: 'tcp', state: 'target_disabled' }] };
@@ -1345,6 +1390,113 @@ test('a poll that only moves a session duration patches the rows, not the tables
   } finally {
     screen.dispose();
   }
+});
+
+test('a poll that only moves a session duration patches the rows, not the tables', async () => {
+  const target = iscsiTarget({ initiators: [VMHOST1] });
+  const listen = [{ address: '10.10.0.5', port: 3260, transport: 'tcp', state: 'listening' }];
+  // The ONLY difference between the two answers is when the session began:
+  // the client reconnected, so the node reports a later `connectedAt`.
+  const first = { target, sessions: [liveSession(VMHOST1, { connectedAt: '2026-09-20T07:00:00Z' })], configPreview: '', listen };
+  const second = { ...first, sessions: [liveSession(VMHOST1, { connectedAt: '2026-09-28T07:00:00Z' })] };
+  const screen = detailScreen([first, second]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const sessions = win.querySelector('#nas-td-sessions');
+    const hosts = win.querySelector('#nas-td-hosts');
+    const before = sessions.rows[0].duration;
+    await runPoll(screen);
+    assert.ok(win.querySelector('#nas-td-sessions') === sessions, 'the sessions table survives the poll');
+    assert.ok(win.querySelector('#nas-td-hosts') === hosts, 'the allowlist table survives the poll');
+    assert.notEqual(sessions.rows[0].duration, before, 'the duration moved');
+    assert.match(sessions.rows[0].duration, new RegExp(fmtDate('2026-09-28T07:00:00Z').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), 'from the new start');
+    assert.equal(sessions.rows.length, 1);
+  } finally {
+    screen.dispose();
+  }
+});
+
+// ----- wave 14: "Otwórz dla wszystkich" and the closed empty list -----------
+
+test('an allowlisted target offers «Otwórz dla wszystkich», an open one does not, and a closed empty list says so', async () => {
+  const closed = { target: iscsiTarget({ initiators: [], allowlistMode: true }), sessions: [], configPreview: '' };
+  const open = { target: iscsiTarget({ initiators: [], allowlistMode: false }), sessions: [], configPreview: '' };
+  const blocked = { ...open, openBlocked: true };
+  const screen = detailScreen([closed, open, blocked]);
+  try {
+    const win = openTargetDetail(screen, 't1', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    const hosts = win.querySelector('#nas-td-hosts');
+    assert.ok(win.querySelector('[data-testid="open-all"]'), 'offered on an allowlisted target');
+    assert.match(hosts.getAttribute('empty-message'), /target jest zamknięty: nikt się nie zaloguje/);
+    assert.equal(win.querySelector('[data-testid="open-blocked"]'), null);
+    await runPoll(screen);
+    assert.equal(win.querySelector('[data-testid="open-all"]'), null, 'nothing to open on an open target');
+    assert.equal(hosts.getAttribute('empty-message'), 'Pusta — łączy się każdy, kto dosięgnie portalu.');
+    assert.ok(win.querySelector('#nas-td-hosts') === hosts, 'patched, not rebuilt');
+    await runPoll(screen);
+    assert.ok(win.querySelector('[data-testid="open-all"]'), 'the way out of a blocked target');
+    assert.match(win.querySelector('[data-testid="open-blocked"]').textContent, /Jądro wciąż trzyma listę dozwolonych/);
+    // A node before wave 14 sends no flag: a list is what "allowlisted" means.
+    const { targetAllowlisted } = await import('./targets.js');
+    assert.equal(win.querySelector('[data-testid="open-all-reason"]'), null);
+    assert.equal(targetAllowlisted(iscsiTarget()), true);
+    assert.equal(targetAllowlisted(iscsiTarget({ initiators: [] })), false);
+    assert.equal(targetAllowlisted(iscsiTarget({ initiators: [], allowlistMode: true })), true);
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('«Otwórz dla wszystkich» is off on an NVMe-oF subsystem with DH-HMAC-CHAP, and says why', async () => {
+  const answer = { target: nvmetTarget({ initiators: ['nqn.2014-08.org.nvmexpress:uuid:esx01'], allowlistMode: true }), sessions: [], configPreview: '' };
+  const screen = detailScreen([answer]);
+  try {
+    const win = openTargetDetail(screen, 't2', { body: document.body, capabilities });
+    await flush();
+    await flush();
+    assert.ok(win.querySelector('[data-testid="open-all"]').hasAttribute('disabled'));
+    assert.match(win.querySelector('[data-testid="open-all-reason"]').textContent, /klucze są zapisane na hostach z listy dozwolonych/);
+  } finally {
+    screen.dispose();
+  }
+});
+
+test('«Otwórz dla wszystkich» is retype-gated, says who gets in, and sends the name', async () => {
+  const { openTargetOpenDialog } = await import('./targets.js');
+  let sent = null;
+  const screen = fakeScreen({
+    tentaNasTargetOpenRequest: (payload) => { sent = payload; return { job: { jobId: 'j3', kind: 'target_open', subject: 'vm-store' } }; },
+  });
+  const dialog = openTargetOpenDialog(screen, iscsiTarget({ initiators: [VMHOST1, VMHOST2] }), null);
+  await flush();
+  const text = dialog.textContent;
+  assert.match(text, /zaloguje się każdy klient, który dosięgnie portalu 10\.10\.0\.5:3260 i poda poświadczenia CHAP/);
+  assert.match(text, /Lista dozwolonych \(2 wpisy\)/);
+  assert.match(text, /Połączeni teraz klienci nie zostaną rozłączeni/);
+  const confirm = dialog.querySelector('[data-action="confirm"]');
+  assert.ok(confirm.hasAttribute('disabled'), 'locked until the name is retyped');
+  const input = dialog.querySelector('tf-input');
+  input.value = 'vm-store';
+  input.dispatchEvent(new window.CustomEvent('input', { bubbles: true }));
+  await flush();
+  assert.ok(!confirm.hasAttribute('disabled'), 'the retyped name unlocks it');
+  dialog.dispatchEvent(new window.CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
+  await flush();
+  await flush();
+  assert.deepEqual(sent, { targetId: 't1', confirmName: 'vm-store', expectedUpdatedAt: '2026-09-03T12:00:00Z', sudoPassword: 'hunter2' });
+  await settled();
+  screen.dispose();
+  // Without authentication the window says the raw disk goes to anybody.
+  const bare = openTargetOpenDialog(fakeScreen({}), iscsiTarget({ auth: { method: 'none' }, initiators: [VMHOST1] }), null);
+  await flush();
+  assert.match(bare.textContent, /Lista dozwolonych \(1 wpis\)/, 'the Polish plural');
+  assert.match(bare.textContent, /dostanie surowy dysk — ten target nie ma uwierzytelnienia/);
+  assert.doesNotMatch(bare.textContent, /Uwierzytelnienie targetu nadal obowiązuje/);
+  bare.remove();
 });
 
 test('the Nasłuch words, the last-seen cell and the reset reasons are total functions', async () => {

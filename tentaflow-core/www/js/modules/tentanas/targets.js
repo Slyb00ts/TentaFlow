@@ -577,6 +577,13 @@ export function resetUnavailableText(t) {
 }
 
 /**
+ * Whether the target is allowlisted (wave 14, migration 30): the node's flag,
+ * or — from an older node that does not send it — a non-empty list. An
+ * allowlisted target with an EMPTY list is closed to everybody.
+ */
+export const targetAllowlisted = (t) => Boolean(t?.allowlistMode) || (t?.initiators || []).length > 0;
+
+/**
  * One IQN/NQN per line; blanks and duplicates fall away.
  *
  * Delegates to the wizard's parser rather than repeating it: the two used to
@@ -627,6 +634,9 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     descriptions: {}, descriptionsDirty: false,
     // The sampler's "Ostatnie połączenie" and the per-portal "Nasłuch".
     seen: [], seenSince: '', listen: [], rdmaPeers: [], rdmaPeersState: '',
+    // Wave 14: open on record, but the kernel holds an allowlist the row
+    // does not — every apply is refused until a deliberate open.
+    openBlocked: false,
   };
   let loadSeq = 0;
   // TargetGet-only reads since the list was last read (see LIST_EVERY_POLLS).
@@ -669,6 +679,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       state.listen = r.listen || [];
       state.rdmaPeers = Array.isArray(r.rdmaPeers) ? r.rdmaPeers : [];
       state.rdmaPeersState = String(r.rdmaPeersState || '');
+      state.openBlocked = r.openBlocked === true;
       state.error = '';
       if (!hasDraft && state.initiatorsText === requestDraft) {
         state.initiatorsText = (r.target.initiators || []).join('\n');
@@ -723,12 +734,12 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     const invalidHtml = invalid.length
       ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_target.host_nqn_invalid', { nqns: invalid.join(', ') }))}</div></div>`
       : '';
-    // F2 (MAJOR 27): an emptied list is an OPEN target, so the node refuses
-    // to store one over an allowlist. Said here, while the admin is editing,
-    // not only after the sudo prompt.
-    const emptied = (t.initiators || []).length > 0 && parseInitiators(state.initiatorsText).length === 0;
+    // Owner decision 2026-09-29: an emptied allowlist CLOSES the target —
+    // nobody logs in, and the removed clients' sessions are dropped. Said
+    // here while the admin edits, and confirmed again on save.
+    const emptied = targetAllowlisted(t) && (t.initiators || []).length > 0 && parseInitiators(state.initiatorsText).length === 0;
     const emptiedHtml = emptied
-      ? `<div class="wizard-warning danger" data-testid="allowlist-last-warning">${sprite('alert')}<div>${escapeHtml(T('targets.allowlist_last_warning'))}</div></div>`
+      ? `<div class="wizard-warning danger" data-testid="allowlist-last-warning">${sprite('alert')}<div>${escapeHtml(T(closingKey('warning', t)))}</div></div>`
       : '';
     return sharedHtml + invalidHtml + emptiedHtml;
   };
@@ -945,7 +956,23 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
     // The allowlist field follows the node only while the admin has no draft
     // of their own in it (`load` keeps `initiatorsText` in that case).
     setAttr(win.querySelector('#nas-td-initiators'), 'value', state.initiatorsText);
+    // An empty list means OPEN — or, on an allowlisted target (wave 14),
+    // CLOSED to everybody. The empty table says which.
+    const allowlisted = targetAllowlisted(t);
+    setAttr(win.querySelector('#nas-td-hosts'), 'empty-message', T(allowlisted ? 'targets.no_initiators_closed' : 'targets.no_initiators'));
     updateHosts();
+    // "Otwórz dla wszystkich": the one road from an allowlist to an open
+    // target, and the way out of one the kernel keeps closed.
+    // Not on an NVMe-oF subsystem with DH-HMAC-CHAP: its keys live on the
+    // allowed hosts, so the node refuses to open it — the button is off and
+    // its reason is shown under the list instead of after a retype and sudo.
+    const openable = admin && (allowlisted || state.openBlocked);
+    const openRefused = openable && t.protocol === 'nvmet' && (t.auth?.method || 'none') !== 'none';
+    slotEl(win.querySelector('[data-part="open-all"]'), openable, openRefused ? 'open-all-off' : 'open-all',
+      `<tf-button size="sm" variant="secondary" tone="critical" icon="unlock" data-act="open-all" data-testid="open-all"${openRefused ? ` disabled title="${escapeAttr(T('refusal.target_open_nvmet_auth'))}"` : ''}>${escapeHtml(T('targets.open_all'))}</tf-button>`);
+    setText(slotEl(win.querySelector('[data-part="open-all-reason"]'), openRefused, 'reason', '<p class="muted" data-testid="open-all-reason"></p>'), T('refusal.target_open_nvmet_auth'));
+    slotEl(win.querySelector('[data-part="open-blocked"]'), state.openBlocked, 'blocked',
+      `<div class="wizard-warning danger" data-testid="open-blocked">${sprite('alert')}<div><b>${escapeHtml(T('targets.open_blocked_title'))}</b> ${escapeHtml(T('targets.open_blocked_note'))}</div></div>`);
 
     const authChip = authChipHtml(t.auth);
     slotEl(win.querySelector('[data-part="auth-chip"]'), true, authChip, authChip);
@@ -996,6 +1023,7 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       case 'edit': openTargetWizard(screen, { target: t, capabilities: state.capabilities, targets: state.siblings, onDone: () => { onChange?.(); load({ withList: true }); }, isCurrent }); return;
       case 'repick-portal': openPortalSelection(); return;
       case 'delete': openTargetDeleteDialog(screen, t, () => { onChange?.(); if (isCurrent()) screen.openTarget(null); }, isCurrent); return;
+      case 'open-all': openTargetOpenDialog(screen, t, () => { onChange?.(); if (win.isConnected) load({ withList: true }); }, isCurrent); return;
       case 'pause':
         setTargetEnabled(screen, t, !t.enabled, onChange, isCurrent).then(() => { if (win.isConnected) load(); });
         return;
@@ -1026,12 +1054,9 @@ export function openTargetDetail(screen, targetId, { body, capabilities = null, 
       return;
     }
     const initiators = parseInitiators(state.initiatorsText);
-    // F2: the node refuses this too (coded); refusing it here spares the admin
-    // a sudo prompt for a save that cannot happen.
-    if ((t.initiators || []).length && !initiators.length) {
-      toast(errMessage(new Error('refusal:target_last_initiator')), 'error');
-      return;
-    }
+    // Emptying the list closes the target (owner decision 2026-09-29): a
+    // confirmation that says so first, and nothing is sent without it.
+    if ((t.initiators || []).length && !initiators.length && !(await confirmClosing(t))) return;
     // Only the listed initiators' descriptions travel: the node refuses a
     // description for an initiator that is not on the list.
     const initiatorDescriptions = Object.fromEntries(initiators
@@ -1117,8 +1142,10 @@ function targetDetailHtml(admin, protocol) {
     <div data-part="reset-note" ${SLOT}></div>
     </section>
     <section class="nas-target-card">
-    <div class="section-card-head"><h3 class="title">${sprite('shield')} ${escapeHtml(T('targets.initiators'))}</h3></div>
+    <div class="section-card-head"><h3 class="title">${sprite('shield')} ${escapeHtml(T('targets.initiators'))}</h3><span data-part="open-all" ${SLOT}></span></div>
     <tf-table id="nas-td-hosts" empty-message="${escapeAttr(T('targets.no_initiators'))}">${hostColumns}</tf-table>
+    <div data-part="open-blocked" ${SLOT}></div>
+    <div data-part="open-all-reason" ${SLOT}></div>
     ${admin ? `<details><summary>${escapeHtml(T('targets.edit_initiators'))}</summary>
       <tf-input id="nas-td-initiators" multiline rows="3" spellcheck="false" hint="${escapeAttr(T('targets.initiators_hint'))}"></tf-input>
       </details><p class="muted" data-testid="initiators-draft-hint">${escapeHtml(T('targets.initiators_draft'))}</p>` : ''}
@@ -1275,6 +1302,43 @@ function openSmallDialog({ title, icon, bodyHtml, confirmLabel, confirmIcon, dan
 }
 
 /**
+ * The words of a closing, per protocol (critic wave 14 R2-FIX-1): on iSCSI
+ * the removed clients' ACLs go and their sessions drop with them (measured);
+ * on NVMe-oF only the host link goes and a CONNECTED host keeps full access
+ * until it reconnects — the `_nvmet` sentence says so and names the way to
+ * cut it off now (stop the target).
+ */
+const CLOSING_KEYS = {
+  warning: { iscsi: 'targets.allowlist_last_warning', nvmet: 'targets.allowlist_last_warning_nvmet' },
+  confirm: { iscsi: 'targets.close_all_text', nvmet: 'targets.close_all_text_nvmet' },
+};
+export const closingKey = (kind, target) => CLOSING_KEYS[kind][target?.protocol === 'nvmet' ? 'nvmet' : 'iscsi'];
+
+/**
+ * The confirmation of an allowlist emptied in the editor (owner decision
+ * 2026-09-29): the target stays allowlisted and CLOSES — nobody logs in, and
+ * the removed clients' sessions are dropped. Resolves `true` to go on.
+ */
+export function confirmClosing(target) {
+  return new Promise((resolve) => {
+    let decided = false;
+    const win = openSmallDialog({
+      title: T('targets.close_all_title', { name: target.name }),
+      icon: 'lock',
+      bodyHtml: warningHtml('danger', T(closingKey('confirm', target))),
+      confirmLabel: T('targets.close_all_confirm'),
+      confirmIcon: 'lock',
+      danger: true,
+      onConfirm: () => { decided = true; resolve(true); return true; },
+    });
+    win.classList.add('nas-target-close');
+    // However it goes away (Cancel, the header's close, Escape), an
+    // undecided window means "no".
+    win.addEventListener('closed', () => { if (!decided) resolve(false); });
+  });
+}
+
+/**
  * "Edytuj opis": the admin's own words for one initiator (§4.1: trimmed, at
  * most 80 characters, no control characters). A draft until "Zapisz", like
  * every other change of the list.
@@ -1302,17 +1366,19 @@ export function openDescriptionDialog(identity, current, onSave) {
  * n19 "Rozłącz" for one allowlisted iSCSI initiator (MAJOR 27 §L.7): a
  * session RESET — the client logs back in within about 2 s and keeps its
  * access — or, with "i usuń z listy dozwolonych", a revoke that keeps it out.
- * The texts are the measured behaviour. The checkbox is refused for the only
- * entry: an empty list would OPEN the target (F2). The window names the
+ * The texts are the measured behaviour. Revoking the only entry CLOSES the
+ * target to everybody (owner decision 2026-09-29), and the window says so
+ * when the box is checked. The window names the
  * initiator as the screen shows it; no session id exists to be shown.
  */
 export function openDisconnectDialog(screen, target, identity, onDone, isCurrent) {
+  // The only entry may be revoked (owner decision 2026-09-29): the target
+  // then CLOSES to everybody, and the checked box says so.
   const only = (target.initiators || []).length <= 1;
   const bodyHtml = `
     <p>${escapeHtml(T('targets.disconnect_lead'))} <span class="mono">${hostIdentityHtml(identity)}</span></p>
     <div data-part="disconnect-text">${warningHtml('info', T('targets.disconnect_reset_text'))}</div>
-    <tf-checkbox id="nas-td-revoke" ${only ? 'disabled' : ''} label="${escapeAttr(T('targets.disconnect_revoke_label'))}"></tf-checkbox>
-    ${only ? `<p class="muted" data-testid="revoke-only-entry">${escapeHtml(T('refusal.target_last_initiator'))}</p>` : ''}`;
+    <tf-checkbox id="nas-td-revoke" label="${escapeAttr(T('targets.disconnect_revoke_label'))}"></tf-checkbox>`;
   let revoke = false;
   return openSmallDialog({
     title: T('targets.disconnect_title'),
@@ -1323,9 +1389,9 @@ export function openDisconnectDialog(screen, target, identity, onDone, isCurrent
     danger: true,
     wire: (win) => {
       win.querySelector('#nas-td-revoke')?.addEventListener('change', (e) => {
-        revoke = !only && Boolean(e.detail?.checked ?? e.target.checked);
+        revoke = Boolean(e.detail?.checked ?? e.target.checked);
         patchHtml(win.querySelector('[data-part="disconnect-text"]'), revoke
-          ? warningHtml('danger', T('targets.disconnect_revoke_text'))
+          ? warningHtml('danger', T('targets.disconnect_revoke_text')) + (only ? warningHtml('danger', T('targets.disconnect_revoke_last_text')) : '')
           : warningHtml('info', T('targets.disconnect_reset_text')));
       });
     },
@@ -1333,7 +1399,7 @@ export function openDisconnectDialog(screen, target, identity, onDone, isCurrent
       const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasTargetSessionResetRequest', {
         targetId: target.targetId,
         initiator: identity,
-        revoke: revoke && !only,
+        revoke,
         sudoPassword,
       }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('targets.disconnect_title'), isCurrent);
       if (res === null) return false;
@@ -1341,6 +1407,51 @@ export function openDisconnectDialog(screen, target, identity, onDone, isCurrent
       return true;
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// "Otwórz dla wszystkich" (wave 14, owner decision 2026-09-29)
+// ---------------------------------------------------------------------------
+
+/**
+ * The one deliberate road from an allowlisted target to an OPEN one, retyped
+ * like the delete (N19c's pattern: warning, what goes, what does not). Every
+ * client that reaches the portal may log in afterwards — with the target's
+ * CHAP when it has one, with nothing at all when it has none, which is the
+ * loudest line of the window.
+ */
+export function openTargetOpenDialog(screen, target, onDone, isCurrent) {
+  const listed = (target.initiators || []).length;
+  // Every portal the target answers on, not only the first.
+  const where = [...new Set((target.portals || []).map((p) => `${p.address}:${p.port}`))].join(', ') || '—';
+  const unauthenticated = (target.auth?.method || 'none') === 'none';
+  const bodyHtml = `
+    ${warningHtml('danger', T(unauthenticated ? 'targets.open_all_warning_no_auth' : 'targets.open_all_warning', { portal: where }))}
+    <ul class="loss-list">
+      ${listed ? `<li class="ll bad">${sprite('x')}<span>${escapeHtml(T('targets.open_all_loss_allowlist', { n: listed }))}</span></li>` : ''}
+      <li class="ll bad">${sprite('x')}<span>${escapeHtml(T('targets.open_all_loss_stale'))}</span></li>
+      <li class="ll good">${sprite('check')}<span>${escapeHtml(T('targets.open_all_keep_sessions'))}</span></li>
+      ${unauthenticated ? '' : `<li class="ll good">${sprite('check')}<span>${escapeHtml(T('targets.open_all_keep_auth'))}</span></li>`}
+    </ul>
+    <div class="explain-box mt-md">${escapeHtml(T('targets.open_all_back'))}</div>`;
+  const win = openRetypeDialog({
+    ...NAS_DIALOG,
+    title: T('targets.open_all_title', { name: target.name }),
+    icon: 'unlock',
+    name: target.name,
+    retypeLabel: nasRetypeLabel(target.name),
+    bodyHtml,
+    confirmLabel: T('targets.open_all'),
+    confirmIcon: 'unlock',
+    onConfirm: async () => {
+      const res = await screen.withSudo((sudoPassword) => screen.nas('tentaNasTargetOpenRequest', { targetId: target.targetId, confirmName: target.name, expectedUpdatedAt: target.updatedAt || '', sudoPassword }, { timeoutMs: ADMIN_TIMEOUT_MS }), T('targets.open_all_title', { name: target.name }), isCurrent);
+      if (res === null) return false;
+      followResponse(screen, res, onDone, T('targets.open_all_done', { name: target.name }));
+      return true;
+    },
+  });
+  win.classList.add('nas-target-open');
+  return win;
 }
 
 // ---------------------------------------------------------------------------

@@ -928,6 +928,8 @@ pub fn forget_alerts(db: &DbPool, target_id: &str) -> Result<()> {
     }
     store::resolve_alert(db, &unresettable_alert_key(target_id))?;
     store::resolve_alert(db, &rebuild_alert_key(target_id))?;
+    store::resolve_alert(db, &open_refused_alert_key(target_id))?;
+    store::resolve_alert(db, &sessions_reset_alert_key(target_id))?;
     store::resolve_alert(db, &listener_alert_key(target_id))?;
     LostListeners::global().forget(target_id);
     Ok(())
@@ -950,14 +952,56 @@ fn rebuild_alert_key(target_id: &str) -> String {
     format!("target:{target_id}:rebuild")
 }
 
-/// Raises the two alerts above on the helper's coded failures and closes
-/// them on the next apply of the target that went through. Raised AT ONCE,
-/// not after the sweep's three failures: a client the admin just excluded is
-/// still reading and writing the disk, or may log in again.
-pub(crate) fn note_unresettable(db: &DbPool, target: &TargetRow, error: Option<&str>) {
+/// The alert of a target an apply refused to OPEN because the kernel holds
+/// an allowlist for it that the row does not (`block::OPEN_REFUSED`): a
+/// stale static ACL, or a list emptied by something other than this app.
+/// Only a deliberate "Otwórz dla wszystkich" (or stopping the target)
+/// unblocks it, so the admin is told at once rather than after the sweep's
+/// third failure (critic wave 12, MINOR 2).
+fn open_refused_alert_key(target_id: &str) -> String {
+    format!("target:{target_id}:open")
+}
+
+/// The warning that the allowlist's post-condition reset EVERY session of a
+/// target once (the TPG toggle, `block::SESSIONS_RESET_BY_TOGGLE`): the
+/// listed clients were dropped too, and reconnected by themselves. An event,
+/// not a state — each toggle closes the previous one and raises a new one,
+/// which the admin acknowledges.
+fn sessions_reset_alert_key(target_id: &str) -> String {
+    format!("target:{target_id}:toggled")
+}
+
+/// Raises the alerts above on the helper's coded failures and closes them on
+/// the next apply of the target that went through. Raised AT ONCE, not after
+/// the sweep's three failures: a client the admin just excluded is still
+/// reading and writing the disk, or may log in again — or, when the TPG was
+/// left disabled, nobody is served at all. `lines` is what the apply wrote to
+/// the job log, where a successful toggle says so.
+pub(crate) fn note_unresettable(db: &DbPool, target: &TargetRow, error: Option<&str>, lines: &[String]) {
     note_rebuild_failed(db, target, error);
+    note_open_refused(db, target, error);
+    note_sessions_reset(db, target, error, lines);
     let key = unresettable_alert_key(&target.target_id);
     let outcome = match error {
+        // Checked FIRST: its head starts with the plain one, and it means the
+        // opposite (everybody cut off, not somebody left in).
+        Some(e) if e.contains(block::UNRESETTABLE_LEFT_DISABLED) => store::raise_coded_alert(
+            db,
+            &key,
+            "critical",
+            "target",
+            &target.name,
+            &store::AlertText::new(
+                "target_left_disabled",
+                format!("Target {}: left disabled — no client is served", target.name),
+                "resetting the sessions of a client outside the new allowlist switched the target off, and \
+                 switching it on again failed twice — every client is cut off, the listed ones included; the \
+                 node retries on its next apply"
+                    .to_string(),
+            )
+            .param("target", &target.name),
+        )
+        .map(|_| ()),
         Some(e) if e.contains(block::UNRESETTABLE_SESSION) => store::raise_coded_alert(
             db,
             &key,
@@ -978,6 +1022,67 @@ pub(crate) fn note_unresettable(db: &DbPool, target: &TargetRow, error: Option<&
         Some(_) => Ok(()),
         None => store::resolve_alert(db, &key),
     };
+    if let Err(e) = outcome {
+        tracing::warn!("tentanas targets: alert {key} not written: {e}");
+    }
+}
+
+/// `open_refused` → the warning that only a deliberate open unblocks this
+/// target; closed by the next apply that went through.
+fn note_open_refused(db: &DbPool, target: &TargetRow, error: Option<&str>) {
+    let key = open_refused_alert_key(&target.target_id);
+    let outcome = match error {
+        Some(e) if e.contains(block::OPEN_REFUSED) => store::raise_coded_alert(
+            db,
+            &key,
+            "warning",
+            "target",
+            &target.name,
+            &store::AlertText::new(
+                "target_open_refused",
+                format!("Target {}: the kernel holds an allowlist this target's record does not", target.name),
+                "the target is recorded as open, but the kernel still holds an allowlist for it, and it is \
+                 never opened by accident — every apply of it is refused until an admin opens it on purpose \
+                 (\"Open for everyone\") or stops it"
+                    .to_string(),
+            )
+            .param("target", &target.name),
+        )
+        .map(|_| ()),
+        Some(_) => Ok(()),
+        None => store::resolve_alert(db, &key),
+    };
+    if let Err(e) = outcome {
+        tracing::warn!("tentanas targets: alert {key} not written: {e}");
+    }
+}
+
+/// A successful apply whose job log says the TPG was toggled → a fresh
+/// warning (the previous one closed first, so an acknowledged one does not
+/// swallow the next reset).
+fn note_sessions_reset(db: &DbPool, target: &TargetRow, error: Option<&str>, lines: &[String]) {
+    if error.is_some() || !lines.iter().any(|l| l.contains(block::SESSIONS_RESET_BY_TOGGLE)) {
+        return;
+    }
+    let key = sessions_reset_alert_key(&target.target_id);
+    let outcome = store::resolve_alert(db, &key).and_then(|()| {
+        store::raise_coded_alert(
+            db,
+            &key,
+            "warning",
+            "target",
+            &target.name,
+            &store::AlertText::new(
+                "target_sessions_reset",
+                format!("Target {}: every session was reset once", target.name),
+                "a client outside the new allowlist was still logged in, so every session of the target was \
+                 reset once — the listed clients reconnect by themselves (about 2 s), the excluded one cannot"
+                    .to_string(),
+            )
+            .param("target", &target.name),
+        )
+        .map(|_| ())
+    });
     if let Err(e) = outcome {
         tracing::warn!("tentanas targets: alert {key} not written: {e}");
     }
@@ -1187,6 +1292,11 @@ fn iscsi_spec(target: &TargetRow, secrets: &Secrets) -> IscsiTargetSpec {
             mutual_password: secrets.mutual_password.to_string(),
         },
         initiators: target.initiators.clone(),
+        // Migration 30: an allowlisted row with an empty list is CLOSED, and
+        // only a deliberately opened one may open a TPG the kernel holds an
+        // allowlist for.
+        allowlist_mode: target.allowlisted(),
+        open_confirmed: !target.allowlisted() && target.open_confirmed,
     }
 }
 
@@ -1233,7 +1343,10 @@ fn nvmet_spec(target: &TargetRow, secrets: &Secrets) -> NvmetSubsystemSpec {
                 dhchap_dhgroup: target.dhchap_dhgroup.clone(),
             })
             .collect(),
-        allow_any_host: target.initiators.is_empty(),
+        // An allowlisted row with an empty list allows NO host (migration
+        // 30): fail closed, never "any host".
+        allow_any_host: !target.allowlisted(),
+        open_confirmed: !target.allowlisted() && target.open_confirmed,
     }
 }
 
@@ -1278,10 +1391,27 @@ fn preview_in(target: &TargetRow, nvmet_root: &Path, iscsi_root: &Path) -> Resul
     } else {
         let spec = iscsi_spec(target, &secrets);
         let observed = block::observe_iscsi(iscsi_root, &spec);
-        block::plan_iscsi(&spec, &observed).map_err(|e| anyhow!("{e}"))?
+        let mut steps = block::plan_iscsi(&spec, &observed).map_err(|e| anyhow!("{e}"))?;
+        // The open → allowlist switch rebuilds the TPG before this plan runs
+        // (helper 0.17.1, cached dynamic ACLs), and the preview says so,
+        // asking the helper's own predicate (critic ACL-fix m-5).
+        if block::needs_rebuild(&spec, &observed) {
+            steps.insert(0, block::ConfigfsStep::Note(REBUILD_PREVIEW_NOTE.to_string()));
+        }
+        steps
     };
     Ok(block::render(&steps))
 }
+
+/// The preview's line for an apply that rebuilds an open TPG first: what it
+/// costs every client (measured on rig11: listed clients back in ~2.2 s, one
+/// read stalled ~2 s, no I/O error; the portal not listening for ~0.3 s), and
+/// that the steps below are planned against the portal group as it is now.
+pub const REBUILD_PREVIEW_NOTE: &str = "the target is open and gets an allowlist: its portal group \
+    is rebuilt first, so every session of the target is reset once (~2 s; listed clients reconnect \
+    by themselves) and the portal stops listening for ~0.3 s; param/ and attrib/ values this app \
+    does not manage return to the kernel's defaults; the steps below are planned against the \
+    current portal group";
 
 // =============================================================================
 // Validation
@@ -1408,8 +1538,11 @@ fn validate_options_with(
                 ))
             }
             "dhchap" | "dhchap-bidi" => {
-                // The whole reason the allowlist stops being optional here.
-                if target.initiators.is_empty() {
+                // The whole reason the allowlist stops being optional here:
+                // an OPEN subsystem cannot carry the keys. An allowlisted one
+                // whose list was emptied is closed (migration 30) and
+                // authenticates nobody, which is fine.
+                if !target.allowlisted() {
                     return Err(anyhow!(
                         "nvmet keeps DH-HMAC-CHAP keys on the host objects of the NQN allowlist — \
                          an authenticated subsystem needs at least one allowed host NQN"
@@ -3178,8 +3311,15 @@ async fn apply_one(
     // dropped here. It is never logged: what the job log gets is the helper's
     // own rendering, which redacts.
     let document = Zeroizing::new(document);
+    let from = log.len();
     let outcome = run(db, &command, Some(&document), explicit, log).await;
-    note_unresettable(db, target, outcome.as_ref().err().map(|e| e.to_string()).as_deref());
+    note_unresettable(db, target, outcome.as_ref().err().map(|e| e.to_string()).as_deref(), &log[from..]);
+    // A deliberate open is spent by the apply that carried it out (NIT-6).
+    if outcome.is_ok() && target.open_confirmed && !target.allowlisted() {
+        if let Err(e) = store::consume_open_confirmation(db, &target.target_id) {
+            tracing::warn!("tentanas targets: {}: the open confirmation was not cleared: {e}", target.name);
+        }
+    }
     outcome
 }
 
@@ -4107,6 +4247,8 @@ pub fn readings_from(target: &TargetRow, nvmet: &block::NvmetSessions) -> (Vec<S
     if !nvmet.available {
         return (Vec::new(), false);
     }
+    let subsystem_incarnation =
+        incarnation(&Path::new(block::NVMET_CONFIGFS).join("subsystems").join(&target.wwn));
     let list = nvmet
         .controllers
         .get(&target.wwn)
@@ -4123,7 +4265,11 @@ pub fn readings_from(target: &TargetRow, nvmet: &block::NvmetSessions) -> (Vec<S
                     state: c.state.clone(),
                     transport: nvmet_port_transport(Path::new(block::NVMET_CONFIGFS), &c.port),
                     // `cntlid` is reused by nvmet, so it is not unique alone.
-                    key: session_key(boot_id(), &format!("{}@{}", c.cntlid, c.host_traddr)),
+                    // …and restarts on a re-created subsystem (R2-3).
+                    key: session_key(
+                        boot_id(),
+                        &with_incarnation(&subsystem_incarnation, &format!("{}@{}", c.cntlid, c.host_traddr)),
+                    ),
                 })
                 .collect()
         })
@@ -4137,7 +4283,7 @@ pub fn readings_from(target: &TargetRow, nvmet: &block::NvmetSessions) -> (Vec<S
 /// allowlist shows no address and no state (iSCSI publishes none for a
 /// generated session, and the two protocols are shown alike).
 fn to_wire_session(target: &TargetRow, r: &SessionReading) -> NasShareSession {
-    let allowlisted = !target.initiators.is_empty();
+    let allowlisted = target.allowlisted();
     let client = if target.protocol == "nvmet" && !r.address.is_empty() {
         r.address.clone()
     } else {
@@ -4223,6 +4369,7 @@ fn iscsi_readings_in(root: &Path, target: &TargetRow) -> (Vec<SessionReading>, b
     if !tpg.is_dir() {
         return (Vec::new(), true);
     }
+    let tpg_incarnation = incarnation(&tpg);
     let mut known = true;
     let mut out: Vec<SessionReading> = match std::fs::read(tpg.join("dynamic_sessions")) {
         Ok(bytes) => parse_dynamic_session_names(&String::from_utf8_lossy(&bytes))
@@ -4276,7 +4423,15 @@ fn iscsi_readings_in(root: &Path, target: &TargetRow) -> (Vec<SessionReading>, b
                     // 1 → 10 over nine resets), which is what makes it the
                     // reconnect detector. A block whose id did not parse keeps
                     // the key empty: "fields unknown", never a wrong number.
-                    key: session_key(boot_id(), &session.session_id.map(|id| id.to_string()).unwrap_or_default()),
+                    // With the TPG's incarnation (critic wave 12 R2-3): a
+                    // target stopped and started within one tick restarts
+                    // LIO's session ids on the SAME boot, and without it
+                    // the first session after the restart kept the old
+                    // `session_since`.
+                    key: session_key(
+                        boot_id(),
+                        &with_incarnation(&tpg_incarnation, &session.session_id.map(|id| id.to_string()).unwrap_or_default()),
+                    ),
                 });
             }
         }
@@ -4353,6 +4508,30 @@ pub fn session_key(boot: &str, raw: &str) -> String {
         String::new()
     } else {
         format!("{boot}/{raw}")
+    }
+}
+
+/// Which INCARNATION of a configfs directory this is: its inode number.
+/// configfs gives every object it creates a fresh inode, so a TPG (or nvmet
+/// subsystem) removed and created again — a target stopped and started —
+/// reads a different number, while the one that stays keeps its own.
+/// (Read from the kernel's configfs source — `configfs_new_inode` takes a
+/// new inode per item — not measured on rig11.) Empty where it cannot be
+/// read, which only loses this one distinction.
+fn incarnation(dir: &Path) -> String {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir).map(|m| m.ino().to_string()).unwrap_or_default()
+}
+
+/// A raw session key with the incarnation of the object it lives in
+/// (critic wave 12 R2-3). An empty raw key stays empty (a generated session
+/// has no identity to follow), and an unknown incarnation leaves the raw key
+/// as it was.
+pub fn with_incarnation(incarnation: &str, raw: &str) -> String {
+    if raw.is_empty() || incarnation.is_empty() {
+        raw.to_string()
+    } else {
+        format!("{incarnation}#{raw}")
     }
 }
 
@@ -5245,18 +5424,29 @@ fn nvmet_port_of(portal: &NasTargetPortal, root: &Path) -> std::result::Result<O
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
     };
+    // A port whose `addr_*` could not be READ may be this portal's: finding
+    // no match among the others is then "could not look", never "not
+    // listening" (critic wave 12, MINOR 7; §L.7: any read that fails is
+    // "Nie zmierzono"). A port whose attribute is simply ABSENT is not
+    // configured and cannot be it.
+    let mut unreadable = false;
     for port in ports.flatten() {
         let dir = port.path();
-        let (Ok(Some(trtype)), Ok(Some(traddr)), Ok(Some(trsvcid))) = (
+        let (trtype, traddr, trsvcid) = (
             read_attr(&dir.join("addr_trtype")),
             read_attr(&dir.join("addr_traddr")),
             read_attr(&dir.join("addr_trsvcid")),
-        ) else {
+        );
+        let (Ok(Some(trtype)), Ok(Some(traddr)), Ok(Some(trsvcid))) = (&trtype, &traddr, &trsvcid) else {
+            unreadable |= trtype.is_err() || traddr.is_err() || trsvcid.is_err();
             continue;
         };
-        if trtype == portal.transport && traddr == portal.address && trsvcid == portal.port.to_string() {
+        if *trtype == portal.transport && *traddr == portal.address && *trsvcid == portal.port.to_string() {
             return Ok(Some(dir));
         }
+    }
+    if unreadable {
+        return Err(());
     }
     Ok(None)
 }
@@ -5323,23 +5513,93 @@ fn nvmet_rdma_listen_state(
 // Allowlist edits: the last entry, and "Opis"
 // =============================================================================
 
-/// SECURITY (MAJOR 27 F2): the coded refusal of an edit that would take the
-/// LAST entry off a target's allowlist. An empty list is not "nobody" — it is
-/// `generate_node_acls = 1` / `attr_allow_any_host = 1`, i.e. every client
-/// that reaches the portal (measured: the revoked client was back in 2.2 s).
-/// "Stop the target" is what cuts everybody off, and the refusal says so.
-///
-/// WHY a refusal rather than a closed target with an empty ACL set: n19 and
-/// the wizard define the empty list as OPEN ("Pusta — łączy się każdy, kto
-/// dosięgnie portalu"), and keeping that one meaning is what makes the list
-/// readable; a second, invisible "closed and empty" state would make the same
-/// screen mean two things. `block::plan_iscsi` / `plan_nvmet` refuse the same
-/// transition once more from the kernel's side.
-pub const LAST_INITIATOR_REFUSAL: &str = "refusal:target_last_initiator";
+// Taking the LAST entry off an allowlist (owner decision 2026-09-29): the
+// target stays allowlisted (migration 30) and is then CLOSED to everybody —
+// `generate_node_acls = 0` / `attr_allow_any_host = 0` with nothing listed.
+// On iSCSI the removed client's session is dropped with its ACL; on NVMe-oF
+// a connected host keeps its access until it reconnects. Before migration
+// 30 an empty list meant OPEN (measured: the revoked client was back in
+// 2.2 s), which is why the edit used to be refused as
+// `refusal:target_last_initiator`. This node no longer sends that code; the
+// screens keep its words for an OLDER node that still does.
+//
+// Only `TargetOpenRequest` opens an allowlisted target.
 
-/// Whether an edit from `stored` to `asked` removes the last entry.
-pub fn removes_last_initiator(stored: &[String], asked: &[String]) -> bool {
-    !stored.is_empty() && asked.is_empty()
+// =============================================================================
+// "Otwórz dla wszystkich" (wave 14, owner decision 2026-09-29)
+// =============================================================================
+
+/// The target is open already, and the kernel does not hold an allowlist for
+/// it either: there is nothing to open.
+pub const OPEN_ALREADY_OPEN: &str = "refusal:target_open_already_open";
+
+/// An NVMe-oF subsystem with DH-HMAC-CHAP keeps its keys on the host objects
+/// of its allowlist (`nvmet_spec`), so it cannot be open to any host.
+pub const OPEN_NVMET_AUTH: &str = "refusal:target_open_nvmet_auth";
+
+/// The target changed after the admin opened the window that asked for the
+/// open (another admin saved an allowlist, say): the open is refused instead
+/// of silently overriding that change (critic wave 14, NIT-7).
+pub const OPEN_TARGET_CHANGED: &str = "refusal:target_open_changed";
+
+/// Whether the dialog's reading of the target is stale: `expected` is the
+/// `updated_at` the window showed; empty (an older front) skips the check.
+pub fn open_is_stale(target: &TargetRow, expected: &str) -> bool {
+    !expected.is_empty() && expected != target.updated_at
+}
+
+/// Whether "Otwórz dla wszystkich" can be offered for this row at all:
+/// `None` when it can, or the coded refusal `opened` would give.
+pub fn open_refusal(target: &TargetRow, blocked: bool) -> Option<&'static str> {
+    if !target.allowlisted() && !blocked {
+        return Some(OPEN_ALREADY_OPEN);
+    }
+    if target.protocol == "nvmet" && target.auth_method != "none" {
+        return Some(OPEN_NVMET_AUTH);
+    }
+    None
+}
+
+/// Whether this OPEN row is blocked: the kernel holds an allowlist for the
+/// target that the row does not (a stale static ACL, a list emptied by
+/// something other than this app), so every apply of it is refused
+/// (`block::OPEN_REFUSED`) until an admin opens it deliberately. Read from
+/// configfs, which any user may read; `false` for an allowlisted row and
+/// wherever the kernel holds nothing.
+pub fn open_blocked(target: &TargetRow) -> bool {
+    open_blocked_in(target, Path::new(block::TARGET_CONFIGFS), Path::new(block::NVMET_CONFIGFS))
+}
+
+fn open_blocked_in(target: &TargetRow, iscsi_root: &Path, nvmet_root: &Path) -> bool {
+    if target.allowlisted() {
+        return false;
+    }
+    let non_empty = |dir: &Path| std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some());
+    if target.protocol == "nvmet" {
+        let sub = nvmet_root.join("subsystems").join(&target.wwn);
+        matches!(read_attr(&sub.join("attr_allow_any_host")), Ok(Some(v)) if v == "0")
+            && non_empty(&sub.join("allowed_hosts"))
+    } else {
+        let tpg = iscsi_root.join("iscsi").join(&target.wwn).join("tpgt_1");
+        matches!(read_attr(&tpg.join("attrib").join("generate_node_acls")), Ok(Some(v)) if v == "0")
+            && non_empty(&tpg.join("acls"))
+    }
+}
+
+/// The row a deliberate open leaves: no allowlist, no descriptions, the flag
+/// off and the confirmation on — the one state in which an apply may open a
+/// TPG the kernel holds an allowlist for (`iscsi_spec`, `nvmet_spec`).
+/// `Err` is the coded refusal.
+pub fn opened(target: &TargetRow, blocked: bool) -> std::result::Result<TargetRow, &'static str> {
+    if let Some(code) = open_refusal(target, blocked) {
+        return Err(code);
+    }
+    let mut row = target.clone();
+    row.initiators.clear();
+    row.initiator_descriptions.clear();
+    row.allowlist_mode = false;
+    row.open_confirmed = true;
+    Ok(row)
 }
 
 pub const DESCRIPTION_MAX_CHARS: usize = 80;
@@ -5410,6 +5670,19 @@ pub fn session_reset_refusal(target: &TargetRow, initiator: &str, revoke: bool) 
 }
 
 fn session_reset_refusal_in(root: &Path, target: &TargetRow, initiator: &str, revoke: bool) -> Option<&'static str> {
+    if let Some(code) = row_reset_refusal(target, initiator) {
+        return Some(code);
+    }
+    if !revoke && live_session_key_in(root, target, initiator).is_none() {
+        return Some(RESET_NO_SESSION);
+    }
+    None
+}
+
+/// The refusals the ROW decides — everything but "is there a session", which
+/// only the kernel knows and the helper checks once more as root. Asked again
+/// by the job on the row it re-read (MINOR 3).
+fn row_reset_refusal(target: &TargetRow, initiator: &str) -> Option<&'static str> {
     if target.protocol != "iscsi" {
         // NVMe-oF has no per-host disconnect that works on every kernel: N3
         // (removing the host) does not disconnect, N1 needs debugfs and is
@@ -5422,9 +5695,6 @@ fn session_reset_refusal_in(root: &Path, target: &TargetRow, initiator: &str, re
     if !target.initiators.iter().any(|i| i == initiator) {
         return Some(RESET_NOT_ALLOWLISTED);
     }
-    if revoke && target.initiators.len() == 1 {
-        return Some(LAST_INITIATOR_REFUSAL);
-    }
     if !target.enabled || target.state == "disabled" {
         return Some(RESET_NOT_SERVING);
     }
@@ -5432,9 +5702,6 @@ fn session_reset_refusal_in(root: &Path, target: &TargetRow, initiator: &str, re
     // refuse it anyway, uncoded — refused here, coded.
     if !target.wwn.starts_with(block::APP_IQN_PREFIX) {
         return Some(RESET_NOT_APP_TARGET);
-    }
-    if !revoke && live_session_key_in(root, target, initiator).is_none() {
-        return Some(RESET_NO_SESSION);
     }
     None
 }
@@ -5510,19 +5777,47 @@ async fn await_reconnect_in(root: &Path, target: &TargetRow, initiator: &str, be
 /// A reset whose RE-CREATE failed has cut the initiator off: the target is
 /// re-applied at once in the same job, and marked for the tick's apply sweep
 /// if that fails too, so the ACL comes back without an admin.
+///
+/// The row is READ AGAIN inside the job, under the apply lock (critic wave
+/// 12, MINOR 3): `requested` is the row as it was when the admin clicked, and
+/// a CHAP secret changed since would otherwise re-create the ACL with the OLD
+/// secret until the next apply — or an initiator revoked since would get its
+/// ACL back. The refusals are checked again on the fresh row, coded.
 pub async fn reset_session(
     db: &DbPool,
     cipher: &SettingsCipher,
-    target: &TargetRow,
+    org_id: &str,
+    requested: &TargetRow,
     initiator: &str,
     explicit: Option<&ElevationToken>,
 ) -> (Vec<String>, Result<()>) {
+    reset_session_in(db, cipher, org_id, requested, initiator, explicit, Path::new(block::TARGET_CONFIGFS), RECONNECT_WAIT).await
+}
+
+async fn reset_session_in(
+    db: &DbPool,
+    cipher: &SettingsCipher,
+    org_id: &str,
+    requested: &TargetRow,
+    initiator: &str,
+    explicit: Option<&ElevationToken>,
+    root: &Path,
+    wait: Duration,
+) -> (Vec<String>, Result<()>) {
     let mut log = Vec::new();
-    let before = live_session_key_in(Path::new(block::TARGET_CONFIGFS), target, initiator).unwrap_or_default();
-    let outcome = {
-        let _guard = apply_lock().lock().await;
-        reset_once(db, cipher, target, initiator, explicit, &mut log).await
+    let before = live_session_key_in(root, requested, initiator).unwrap_or_default();
+    let guard = apply_lock().lock().await;
+    let target = match store::target(db, org_id, &requested.target_id) {
+        Ok(Some(row)) => row,
+        Ok(None) => return (log, Err(anyhow!("the target is gone — it was deleted since the request"))),
+        Err(e) => return (log, Err(e)),
     };
+    if let Some(code) = row_reset_refusal(&target, initiator) {
+        return (log, Err(anyhow!("{code}")));
+    }
+    let target = &target;
+    let outcome = reset_once(db, cipher, target, initiator, explicit, &mut log).await;
+    drop(guard);
     if let Err(e) = outcome {
         let text = e.to_string();
         if let Some(code) = helper_refusal(&text) {
@@ -5554,7 +5849,7 @@ pub async fn reset_session(
     }
     // Outside the apply lock: the wait is up to ten seconds of reading one
     // configfs file, and no other target's apply has to queue behind it.
-    log.push(await_reconnect(target, initiator, &before).await);
+    log.push(await_reconnect_in(root, target, initiator, &before, wait).await);
     (log, Ok(()))
 }
 
@@ -5629,6 +5924,7 @@ pub fn to_protocol(target: &TargetRow, sessions: u32, sessions_known: bool) -> N
         created_at: target.created_at.clone(),
         updated_at: target.updated_at.clone(),
         state_reasons: target.state_reasons.clone(),
+        allowlist_mode: target.allowlisted(),
     }
 }
 
@@ -5858,6 +6154,8 @@ mod tests {
             state_reasons: Vec::new(),
             created_at: "2026-09-03T12:00:00Z".into(),
             updated_at: "2026-09-03T12:00:00Z".into(),
+            allowlist_mode: false,
+            open_confirmed: false,
         }
     }
 
@@ -8798,6 +9096,43 @@ mod tests {
         assert!(!found.iter().any(|s| s.identity.contains('\0')));
     }
 
+    /// Critic wave 12 R2-3: a target stopped and started within one tick
+    /// re-creates its TPG, and LIO's session ids restart on the same boot.
+    /// The TPG's incarnation in the key makes the first session after the
+    /// restart a NEW one, even under the same number and with no gap sampled.
+    #[test]
+    fn a_tpg_created_again_starts_a_new_session_under_the_same_number() {
+        let tree = TempTree::new("tpg-incarnation");
+        let mut row = target("iscsi");
+        let who = "iqn.1994-05.com.redhat:vmhost-01";
+        row.initiators = vec![who.into()];
+        let tpg_rel = format!("iscsi/{}/tpgt_1", row.wwn);
+        write(&tree, &format!("{tpg_rel}/acls/{who}/info"), INFO_ACTIVE.as_bytes());
+        let (before, _) = iscsi_readings_in(&tree.0, &row);
+        // Stop and start: the TPG goes and comes back with the same session id.
+        // The old one is moved aside rather than deleted, so its inode stays
+        // taken and the new TPG cannot be handed the same number by this
+        // filesystem (configfs never reuses one for a live item either).
+        std::fs::rename(tree.0.join(&tpg_rel), tree.0.join("stopped-tpg")).expect("stopped");
+        write(&tree, &format!("{tpg_rel}/acls/{who}/info"), INFO_ACTIVE.as_bytes());
+        let (after, _) = iscsi_readings_in(&tree.0, &row);
+        assert_ne!(before[0].key, after[0].key, "a new incarnation, a new key");
+        assert!(after[0].key.ends_with("#7"), "{}", after[0].key);
+        let db = memory_db();
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let sample = |key: &str, at: &str| {
+            store::record_target_seen(&db, &row.target_id, &[(who.to_string(), key.to_string(), "10.10.0.21".into())], at).expect("record")
+        };
+        sample(&before[0].key, "2026-09-26T09:00:00Z");
+        sample(&after[0].key, "2026-09-26T09:00:15Z");
+        let seen = store::target_seen(&db, &row.target_id).expect("seen");
+        assert_eq!(seen[0].session_since, "2026-09-26T09:00:15Z", "the restart is a new session");
+        // An empty raw key stays empty (a generated session has no identity),
+        // and an unknown incarnation leaves the key as it was.
+        assert_eq!(with_incarnation("123", ""), "");
+        assert_eq!(with_incarnation("", "7"), "7");
+    }
+
     #[test]
     fn an_allowlisted_session_carries_the_kernels_address_and_state_and_an_internal_key() {
         let tree = TempTree::new("acl-info");
@@ -8816,7 +9151,8 @@ mod tests {
         assert_eq!(readings[0].identity, "iqn.1994-05.com.redhat:vmhost-01");
         assert_eq!(readings[0].address, "10.10.0.21");
         assert_eq!(readings[0].state, "LOGGED_IN");
-        assert_eq!(readings[0].key, session_key(boot_id(), "7"));
+        let tpg = tree.0.join(format!("iscsi/{}/tpgt_1", row.wwn));
+        assert_eq!(readings[0].key, session_key(boot_id(), &with_incarnation(&incarnation(&tpg), "7")));
         let wire = to_wire_session(&row, &readings[0]);
         assert_eq!((wire.address.as_str(), wire.state.as_str()), ("10.10.0.21", "LOGGED_IN"));
         // No session id, ISID or TSIH anywhere on the wire.
@@ -8835,16 +9171,13 @@ mod tests {
     }
 
     #[test]
-    fn the_last_initiator_is_refused_by_the_core_and_by_the_helpers_plan() {
-        // SECURITY (MAJOR 27 F2). The core's rule…
+    fn an_open_row_over_an_allowlisted_kernel_is_refused_by_the_helpers_plan() {
+        // SECURITY (MAJOR 27 F2): the kernel-side backstop. (Emptying an
+        // allowlisted row's list CLOSES it since migration 30 — see
+        // `an_allowlisted_row_emptied_by_hand_stays_closed`.)
         let one = vec!["iqn.1994-05.com.redhat:vmhost-01".to_string()];
-        assert!(removes_last_initiator(&one, &[]));
-        assert!(!removes_last_initiator(&one, &one));
-        assert!(!removes_last_initiator(&[], &[]), "an open target stays open");
-        assert!(!removes_last_initiator(&one, &["iqn.1994-05.com.redhat:vmhost-02".to_string()]));
-        assert_eq!(LAST_INITIATOR_REFUSAL, "refusal:target_last_initiator");
 
-        // …and the kernel-side backstop, through the SAME spec builder the
+        // Through the SAME spec builder the
         // apply uses (`iscsi_spec` inside `preview_in`): a row whose list was
         // emptied some other way, over a TPG that is allowlisted in the
         // kernel, renders no plan at all instead of one that opens it.
@@ -9631,8 +9964,9 @@ mod tests {
         assert_eq!(refusal(&row, false), Some(RESET_NOT_ALLOWLISTED));
         row.initiators = vec![who.into()];
         assert_eq!(refusal(&row, false), None);
-        // "i usuń z listy" on the only entry would open the target (F2).
-        assert_eq!(refusal(&row, true), Some(LAST_INITIATOR_REFUSAL));
+        // "i usuń z listy" on the only entry CLOSES the target (owner
+        // decision 2026-09-29): allowed.
+        assert_eq!(refusal(&row, true), None);
         row.initiators.push("iqn.1994-05.com.redhat:vmhost-02".into());
         assert_eq!(refusal(&row, true), None);
         // No live session: nothing to reset (the revoke still works).
@@ -9704,7 +10038,7 @@ mod tests {
             store::upsert_target(&db, "org-a", &row).expect("insert");
             let channel = super::super::broker::test_channel::install(&db);
             channel.fail("iscsi_session_reset", stderr);
-            let (log, outcome) = reset_session(&db, &cipher, &row, "iqn.1994-05.com.redhat:vmhost-01", None).await;
+            let (log, outcome) = reset_session(&db, &cipher, "org-a", &row, "iqn.1994-05.com.redhat:vmhost-01", None).await;
             assert!(outcome.is_err(), "{stderr}");
             let names = channel.names();
             let reset_at = names.iter().position(|n| n == "iscsi_session_reset").expect("the reset ran");
@@ -9720,7 +10054,7 @@ mod tests {
         store::upsert_target(&db, "org-a", &row).expect("insert");
         let channel = super::super::broker::test_channel::install(&db);
         channel.fail("iscsi_session_reset", "tentanas-helper: iscsi_session_reset: refused:no_session: x");
-        let (_, outcome) = reset_session(&db, &cipher, &row, "iqn.1994-05.com.redhat:vmhost-01", None).await;
+        let (_, outcome) = reset_session(&db, &cipher, "org-a", &row, "iqn.1994-05.com.redhat:vmhost-01", None).await;
         assert_eq!(outcome.unwrap_err().to_string(), RESET_NO_SESSION);
     }
 
@@ -9791,5 +10125,303 @@ mod tests {
         channel.failing.lock().unwrap().clear();
         apply_one_now(&db, &cipher, &row, None).await.expect("applied");
         assert!(rebuild_alerts(&db).is_empty(), "closed by the next apply");
+    }
+
+    // ----- wave 14: the allowlist flag, "Otwórz dla wszystkich", minors -----
+
+    /// Owner decision 2026-09-29 (critic wave 12, MINOR 1): the ROW remembers
+    /// that a target is allowlisted. A list emptied by hand — the database
+    /// behind the app's back — is CLOSED, also after a reboot, when configfs
+    /// holds nothing the helper's backstop could compare with.
+    #[test]
+    fn an_allowlisted_row_emptied_by_hand_stays_closed() {
+        let db = memory_db();
+        let mut row = target("iscsi");
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        db.write().expect("write").execute("DELETE FROM nas_target_initiators", []).expect("emptied by hand");
+        let back = store::target(&db, "org-a", &row.target_id).expect("read").expect("row");
+        assert!(back.initiators.is_empty());
+        assert!(back.allowlisted(), "the flag outlives the list");
+        let spec = iscsi_spec(&back, &placeholder_secrets("iscsi"));
+        assert!(spec.allowlist_mode && !spec.open_confirmed);
+        // After a reboot: an empty configfs. The plan closes the TPG.
+        let empty = TempTree::new("closed-after-reboot");
+        let text = preview_in(&back, &empty.0, &empty.0).expect("preview");
+        assert!(text.contains("/attrib/generate_node_acls = 0\n"), "{text}");
+        assert!(!text.contains("/attrib/generate_node_acls = 1\n"), "{text}");
+        // NVMe-oF: no host, and not "any host" either.
+        let mut nvme = back.clone();
+        nvme.protocol = "nvmet".into();
+        let spec = nvmet_spec(&nvme, &placeholder_secrets("nvmet"));
+        assert!(spec.hosts.is_empty() && !spec.allow_any_host);
+        // An open row is what it always was.
+        let open = target("iscsi");
+        assert!(!iscsi_spec(&open, &placeholder_secrets("iscsi")).allowlist_mode);
+        assert!(nvmet_spec(&target("nvmet"), &placeholder_secrets("nvmet")).allow_any_host);
+    }
+
+    /// Owner decision 2026-09-29 (MINOR 2): "Otwórz dla wszystkich" is the
+    /// only road to an open spec over a kernel allowlist, and it is refused
+    /// where it means nothing (already open) or cannot hold (DH-HMAC-CHAP).
+    #[test]
+    fn a_deliberate_open_is_the_only_road_to_an_open_spec() {
+        let mut row = target("iscsi");
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        row.initiator_descriptions = BTreeMap::from([("iqn.1994-05.com.redhat:vmhost-01".to_string(), "vmhost".to_string())]);
+        row.allowlist_mode = true;
+        let open = opened(&row, false).expect("an allowlisted target opens");
+        assert!(open.initiators.is_empty() && open.initiator_descriptions.is_empty());
+        assert!(!open.allowlisted() && open.open_confirmed);
+        let spec = iscsi_spec(&open, &placeholder_secrets("iscsi"));
+        assert!(!spec.allowlist_mode && spec.open_confirmed);
+        // Open already, and nothing in the kernel: nothing to open.
+        assert_eq!(opened(&target("iscsi"), false).unwrap_err(), OPEN_ALREADY_OPEN);
+        // Open on record, but blocked by a kernel allowlist: the way out.
+        assert!(opened(&target("iscsi"), true).expect("unblocks").open_confirmed);
+        // DH-HMAC-CHAP lives on the allowed hosts: no open subsystem with it.
+        let mut nvme = target("nvmet");
+        nvme.auth_method = "dhchap".into();
+        nvme.initiators = vec!["nqn.2014-08.org.nvmexpress:uuid:esx01".into()];
+        assert_eq!(opened(&nvme, false).unwrap_err(), OPEN_NVMET_AUTH);
+        // A confirmation never rides along on an allowlisted row.
+        let stale = TargetRow { open_confirmed: true, ..row.clone() };
+        assert!(!iscsi_spec(&stale, &placeholder_secrets("iscsi")).open_confirmed);
+        let db = memory_db();
+        store::upsert_target(&db, "org-a", &stale).expect("insert");
+        assert!(!store::target(&db, "org-a", &row.target_id).expect("read").expect("row").open_confirmed);
+        store::upsert_target(&db, "org-a", &open).expect("opened");
+        let back = store::target(&db, "org-a", &row.target_id).expect("read").expect("row");
+        assert!(back.open_confirmed && !back.allowlisted());
+    }
+
+    #[test]
+    fn a_target_is_blocked_only_where_the_kernel_holds_an_allowlist_its_open_row_does_not() {
+        let tree = TempTree::new("open-blocked");
+        let row = target("iscsi");
+        let tpg = format!("iscsi/{}/tpgt_1", row.wwn);
+        assert!(!open_blocked_in(&row, &tree.0, &tree.0), "nothing in the kernel");
+        write(&tree, &format!("{tpg}/attrib/generate_node_acls"), b"0\n");
+        assert!(!open_blocked_in(&row, &tree.0, &tree.0), "a closed TPG without an ACL is a fresh one");
+        tree.dir(&format!("{tpg}/acls/iqn.1998-01.com.vmware:esx01"));
+        assert!(open_blocked_in(&row, &tree.0, &tree.0));
+        let listed = TargetRow { allowlist_mode: true, ..row.clone() };
+        assert!(!open_blocked_in(&listed, &tree.0, &tree.0), "an allowlisted row is not blocked");
+        write(&tree, &format!("{tpg}/attrib/generate_node_acls"), b"1\n");
+        assert!(!open_blocked_in(&row, &tree.0, &tree.0));
+        let nvme = target("nvmet");
+        let sub = format!("subsystems/{}", nvme.wwn);
+        write(&tree, &format!("{sub}/attr_allow_any_host"), b"0\n");
+        assert!(!open_blocked_in(&nvme, &tree.0, &tree.0));
+        tree.dir(&format!("{sub}/allowed_hosts/nqn.2014-08.org.nvmexpress:uuid:esx01"));
+        assert!(open_blocked_in(&nvme, &tree.0, &tree.0));
+    }
+
+    /// Critic ACL-fix m-5: the preview says that the switch rebuilds the TPG
+    /// and resets every session once, asking the helper's own predicate.
+    #[test]
+    fn the_preview_foretells_the_rebuild_of_an_open_target() {
+        let tree = TempTree::new("preview-rebuild");
+        let mut row = target("iscsi");
+        let tpg = format!("iscsi/{}/tpgt_1", row.wwn);
+        write(&tree, &format!("{tpg}/attrib/generate_node_acls"), b"1\n");
+        let open = preview_in(&row, &tree.0, &tree.0).expect("preview");
+        assert!(!open.contains("note: the target is open and gets an allowlist"), "{open}");
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        let switching = preview_in(&row, &tree.0, &tree.0).expect("preview");
+        assert!(switching.starts_with(&format!("note: {REBUILD_PREVIEW_NOTE}\n")), "{switching}");
+        assert!(switching.contains("every session of the target is reset once (~2 s"), "{switching}");
+        write(&tree, &format!("{tpg}/attrib/generate_node_acls"), b"0\n");
+        let steady = preview_in(&row, &tree.0, &tree.0).expect("preview");
+        assert!(!steady.contains("gets an allowlist"), "the steady state rebuilds nothing: {steady}");
+    }
+
+    /// Critic wave 12 R3-2 and MINOR 2: the helper's new coded failures raise
+    /// their own alerts at once — "left disabled" is NOT worded as "a client
+    /// is still connected" — and the next good apply closes them.
+    #[tokio::test]
+    async fn a_target_left_disabled_and_a_refused_open_raise_their_own_alerts() {
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let db = memory_db();
+        let mut row = target("iscsi");
+        row.target_id = "t-w14-alerts".into();
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let channel = super::super::broker::test_channel::install(&db);
+        let codes = |db: &DbPool| -> Vec<(String, String)> {
+            store::list_alerts(db, true).expect("alerts").into_iter().map(|a| (a.code, a.severity)).collect()
+        };
+        channel.fail(
+            "iscsi_target_apply",
+            &format!("tentanas-helper: iscsi_target_apply: {}: iqn.x: every session was reset …", block::UNRESETTABLE_LEFT_DISABLED),
+        );
+        assert!(apply_one_now(&db, &cipher, &row, None).await.is_err());
+        let open = codes(&db);
+        assert!(open.contains(&("target_left_disabled".into(), "critical".into())), "{open:?}");
+        assert!(!open.iter().any(|(c, _)| c == "target_session_not_reset"), "the opposite claim is not made: {open:?}");
+        channel.failing.lock().unwrap().clear();
+        channel.fail(
+            "iscsi_target_apply",
+            &format!("tentanas-helper: iscsi_target_apply: invalid argument: {}: iqn.x: refusing to open …", block::OPEN_REFUSED),
+        );
+        assert!(apply_one_now(&db, &cipher, &row, None).await.is_err());
+        assert!(codes(&db).contains(&("target_open_refused".into(), "warning".into())));
+        channel.failing.lock().unwrap().clear();
+        apply_one_now(&db, &cipher, &row, None).await.expect("applied");
+        let left = codes(&db);
+        assert!(!left.iter().any(|(c, _)| c == "target_left_disabled" || c == "target_open_refused"), "closed: {left:?}");
+    }
+
+    /// Critic wave 14, NIT-6: the confirmation of a deliberate open is spent
+    /// by the first apply that went through; a failed apply keeps it for the
+    /// retry.
+    #[tokio::test]
+    async fn a_deliberate_open_is_spent_by_the_first_apply_that_goes_through() {
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let db = memory_db();
+        let mut row = target("iscsi");
+        row.target_id = "t-w14-spent".into();
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        let open = opened(&row, false).expect("opens");
+        store::upsert_target(&db, "org-a", &open).expect("insert");
+        let confirmed = || store::target(&db, "org-a", "t-w14-spent").expect("read").expect("row").open_confirmed;
+        assert!(confirmed());
+        let channel = super::super::broker::test_channel::install(&db);
+        channel.fail("iscsi_target_apply", "tentanas-helper: iscsi_target_apply: cannot write x");
+        assert!(apply_one_now(&db, &cipher, &open, None).await.is_err());
+        assert!(confirmed(), "kept for the retry");
+        let sent = channel.last_payload("iscsi_target_apply").expect("sent");
+        assert!(sent.contains("\"open_confirmed\":true"), "{sent}");
+        channel.failing.lock().unwrap().clear();
+        apply_one_now(&db, &cipher, &open, None).await.expect("applied");
+        assert!(!confirmed(), "spent");
+        let back = store::target(&db, "org-a", "t-w14-spent").expect("read").expect("row");
+        assert!(!iscsi_spec(&back, &placeholder_secrets("iscsi")).open_confirmed, "the backstop is armed again");
+    }
+
+    /// Optional item of wave 12 round 3: a toggle that reset EVERY session of
+    /// a target is a warning alert, not only a job-log line — one per reset.
+    #[tokio::test]
+    async fn a_toggle_that_reset_every_session_raises_a_warning_each_time() {
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let db = memory_db();
+        let mut row = target("iscsi");
+        row.target_id = "t-w14-toggle".into();
+        row.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let channel = super::super::broker::test_channel::install(&db);
+        let warnings = |db: &DbPool| -> Vec<_> {
+            store::list_alerts(db, true).expect("alerts").into_iter().filter(|a| a.code == "target_sessions_reset").collect()
+        };
+        apply_one_now(&db, &cipher, &row, None).await.expect("applied");
+        assert!(warnings(&db).is_empty(), "no toggle, no warning");
+        channel.succeed_with(
+            "iscsi_target_apply",
+            &format!("iqn.x: 1 client(s) not on the allowlist were still logged in (\"iqn.x:evil \"); {} — listed clients reconnect\n", block::SESSIONS_RESET_BY_TOGGLE),
+        );
+        apply_one_now(&db, &cipher, &row, None).await.expect("applied");
+        let first = warnings(&db);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].severity, "warning");
+        assert_eq!(first[0].params.get("target").map(String::as_str), Some("vm-store"));
+        apply_one_now(&db, &cipher, &row, None).await.expect("applied");
+        let second = warnings(&db);
+        assert_eq!(second.len(), 1, "the previous one is closed");
+        assert_ne!(second[0].alert_id, first[0].alert_id, "each reset is its own alert");
+    }
+
+    /// Critic wave 12, MINOR 3: the reset is built from the row as it is when
+    /// the JOB runs, under the apply lock — not from the request's copy.
+    #[tokio::test]
+    async fn a_reset_uses_the_row_as_it_is_when_the_job_runs() {
+        let cipher = SettingsCipher::new(&[7u8; 32]);
+        let db = memory_db();
+        let tree = TempTree::new("reset-reread");
+        let who = "iqn.1994-05.com.redhat:vmhost-01";
+        let mut requested = target("iscsi");
+        requested.target_id = "t-w14-reread".into();
+        requested.auth_username = "old-user".into();
+        requested.initiators = vec![who.into(), "iqn.1994-05.com.redhat:vmhost-02".into()];
+        let mut now = requested.clone();
+        now.auth_username = "new-user".into();
+        store::upsert_target(&db, "org-a", &now).expect("changed since the click");
+        let channel = super::super::broker::test_channel::install(&db);
+        let (_, outcome) = reset_session_in(&db, &cipher, "org-a", &requested, who, None, &tree.0, Duration::ZERO).await;
+        outcome.expect("reset");
+        let sent = channel.last_payload("iscsi_session_reset").expect("the reset ran");
+        assert!(sent.contains("new-user") && !sent.contains("old-user"), "{sent}");
+        // Revoked since the click: refused, coded, and the helper never runs.
+        let mut revoked = now.clone();
+        revoked.initiators = vec!["iqn.1994-05.com.redhat:vmhost-02".into()];
+        store::upsert_target(&db, "org-a", &revoked).expect("revoked");
+        let before = channel.names().len();
+        let (_, outcome) = reset_session_in(&db, &cipher, "org-a", &requested, who, None, &tree.0, Duration::ZERO).await;
+        assert_eq!(outcome.unwrap_err().to_string(), RESET_NOT_ALLOWLISTED);
+        assert_eq!(channel.names().len(), before);
+        // Gone since the click, or another organisation's: nothing runs.
+        let (_, outcome) = reset_session_in(&db, &cipher, "org-b", &requested, who, None, &tree.0, Duration::ZERO).await;
+        assert!(outcome.is_err());
+        assert_eq!(channel.names().len(), before);
+    }
+
+    /// Critic wave 12, MINOR 7: an nvmet port whose `addr_*` cannot be READ
+    /// may be this portal's port — "Nie zmierzono", never "not listening".
+    #[test]
+    fn an_unreadable_nvmet_port_address_is_not_measured() {
+        let tree = TempTree::new("nvmet-unreadable-port");
+        let row = target("nvmet");
+        let portal = row.portals[0].clone();
+        write(&tree, "ports/1/addr_trtype", b"tcp\n");
+        write(&tree, "ports/1/addr_trsvcid", format!("{}\n", portal.port).as_bytes());
+        // A directory where the attribute should be: the read fails (EISDIR).
+        tree.dir("ports/1/addr_traddr");
+        let sockets: Vec<(std::net::IpAddr, u16)> = Vec::new();
+        assert_eq!(nvmet_port_of(&portal, &tree.0), Err(()));
+        assert_eq!(nvmet_listen_state(&row, &portal, &tree.0, Some(&sockets)), "unknown");
+        // An ABSENT attribute is a port nobody configured: not this one.
+        std::fs::remove_dir(tree.0.join("ports/1/addr_traddr")).expect("absent");
+        assert_eq!(nvmet_port_of(&portal, &tree.0), Ok(None));
+        assert_eq!(nvmet_listen_state(&row, &portal, &tree.0, Some(&sockets)), "not_listening");
+    }
+
+    /// Critic wave 12, MINOR 10: names seen on an OPEN target are pruned —
+    /// off the list and idle for longer than `SEEN_OFF_LIST_DAYS`, and past
+    /// the newest `SEEN_OFF_LIST_CAP` — while a listed initiator's row, and
+    /// any name with a session now, stays.
+    #[test]
+    fn names_seen_on_an_open_target_are_pruned_but_listed_ones_are_not() {
+        let db = memory_db();
+        let mut row = target("iscsi");
+        row.target_id = "t-w14-prune".into();
+        let listed = "iqn.1994-05.com.redhat:vmhost-01";
+        row.initiators = vec![listed.into()];
+        store::upsert_target(&db, "org-a", &row).expect("insert");
+        let at = |minute: i64| {
+            (chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z").unwrap() + chrono::Duration::minutes(minute))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let sample = |names: &[&str], at: &str| {
+            let seen: Vec<(String, String, String)> = names.iter().map(|n| (n.to_string(), String::new(), String::new())).collect();
+            store::record_target_seen(&db, &row.target_id, &seen, at).expect("record");
+        };
+        sample(&[listed], &at(0));
+        // A client minting a new name on every login.
+        let minted: Vec<String> = (0..100).map(|i| format!("iqn.x:minted-{i:03}")).collect();
+        for (i, name) in minted.iter().enumerate() {
+            sample(&[name.as_str()], &at(1 + i as i64));
+        }
+        let seen = store::target_seen(&db, &row.target_id).expect("seen");
+        let off: Vec<&str> = seen.iter().map(|s| s.initiator.as_str()).filter(|n| *n != listed).collect();
+        assert_eq!(off.len() as i64, store::SEEN_OFF_LIST_CAP, "capped");
+        assert!(off.contains(&"iqn.x:minted-099"), "the newest (and connected) name stays");
+        assert!(!off.contains(&"iqn.x:minted-000"), "the oldest went");
+        assert!(seen.iter().any(|s| s.initiator == listed), "a listed initiator is never pruned");
+        // Past the age: every idle off-list name goes on the next write, the
+        // listed one (idle for as long) stays.
+        let later = at(60 * 24 * (store::SEEN_OFF_LIST_DAYS + 1));
+        sample(&["iqn.x:new"], &later);
+        let seen = store::target_seen(&db, &row.target_id).expect("seen");
+        let names: Vec<&str> = seen.iter().map(|s| s.initiator.as_str()).collect();
+        assert_eq!(names, vec![listed, "iqn.x:new"], "{names:?}");
     }
 }

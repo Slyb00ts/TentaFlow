@@ -367,9 +367,33 @@ pub struct IscsiTargetSpec {
     pub auth: IscsiAuth,
     /// The initiator IQNs that may log in. EMPTY means "generate an ACL for
     /// whoever connects" — see `plan_iscsi` for why that is not the same as
-    /// "no security" when CHAP is on.
+    /// "no security" when CHAP is on — UNLESS `allowlist_mode` says the
+    /// target is allowlisted.
     #[serde(default)]
     pub initiators: Vec<String>,
+    /// The target is ALLOWLISTED whatever `initiators` holds (core migration
+    /// 30, owner decision 2026-09-29). With an empty list that is FAIL CLOSED:
+    /// `generate_node_acls = 0` and no ACL, so nobody logs in — after a reboot
+    /// or a rebuilt TPG too — until an admin deliberately opens the target.
+    /// Without this flag the only thing that said "allowlisted" was a
+    /// non-empty list, so a row emptied by hand came back OPEN after a reboot
+    /// (critic wave 12, MINOR 1). See `IscsiTargetSpec::allowlisted`.
+    #[serde(default)]
+    pub allowlist_mode: bool,
+    /// An admin deliberately opened this target ("Otwórz dla wszystkich").
+    /// Lifts the backstop `plan_iscsi` puts on an open spec over a TPG that
+    /// holds an allowlist — the one road from "allowlisted" to "open" — and
+    /// only then. Refused together with `allowlist_mode`.
+    #[serde(default)]
+    pub open_confirmed: bool,
+}
+
+impl IscsiTargetSpec {
+    /// Whether the TPG is to be allowlisted (`generate_node_acls = 0`): the
+    /// flag, or — for a spec from before it — a non-empty list.
+    pub fn allowlisted(&self) -> bool {
+        self.allowlist_mode || !self.initiators.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -387,6 +411,11 @@ pub struct NvmetSubsystemSpec {
     /// made of.
     #[serde(default)]
     pub allow_any_host: bool,
+    /// An admin deliberately opened this subsystem ("Otwórz dla wszystkich"):
+    /// lifts `plan_nvmet`'s backstop against opening a subsystem the kernel
+    /// holds an allowlist for. Only with `allow_any_host`.
+    #[serde(default)]
+    pub open_confirmed: bool,
 }
 
 // =============================================================================
@@ -1009,6 +1038,9 @@ pub struct IscsiObserved {
     /// exact match, so a value the kernel prints back in another shape than it
     /// takes costs one redundant write and never a wrong state.
     pub attrs: BTreeMap<String, String>,
+    /// `{tpg}` is a directory right now. What `needs_rebuild` asks besides
+    /// `generate_node_acls`: a TPG that does not exist yet has nothing cached.
+    pub tpg_exists: bool,
 }
 
 /// One configfs attribute, or `None` when this process could not read it.
@@ -1196,6 +1228,7 @@ pub fn observe_iscsi(root: &Path, spec: &IscsiTargetSpec) -> IscsiObserved {
         portals: child_dir_names(&tpg.join("np")),
         luns: lun_dirs,
         dynamic_sessions,
+        tpg_exists: tpg.is_dir(),
     }
 }
 
@@ -1727,7 +1760,16 @@ pub fn plan_iscsi(
         return Err(invalid("one observed backstore per LUN is required"));
     }
     let tpg_key = format!("{TARGET_CONFIGFS}/iscsi/{}/tpgt_1", spec.iqn);
-    if spec.initiators.is_empty()
+    // The backstop against opening an allowlisted TPG by accident: the kernel
+    // holds static ACLs with `generate_node_acls = 0` and the spec would open
+    // it. Lifted ONLY by `open_confirmed`, the deliberate "Otwórz dla
+    // wszystkich" — which is also the way out of the case that used to block
+    // a target's every apply: a stale static ACL left in a TPG whose row is
+    // open (critic wave 12, MINOR 2). The prune below then removes every
+    // static ACL this node positively read as idle, on this apply and the
+    // next ones.
+    if !spec.allowlisted()
+        && !spec.open_confirmed
         && observed
             .attrs
             .get(&format!("{tpg_key}/attrib/generate_node_acls"))
@@ -1736,9 +1778,9 @@ pub fn plan_iscsi(
         && !observed.acls.is_empty()
     {
         return Err(invalid(format!(
-            "{}: refusing to open an allowlisted target — the kernel holds an allowlist for it and \
-             this spec has none, which would let every initiator in; stop the target or keep at \
-             least one initiator",
+            "{OPEN_REFUSED}: {}: refusing to open an allowlisted target — the kernel holds an \
+             allowlist for it and this spec has none, which would let every initiator in; open it \
+             deliberately (the open-for-everyone action), stop the target or keep at least one initiator",
             spec.iqn
         )));
     }
@@ -1866,7 +1908,7 @@ pub fn plan_iscsi(
     )));
     steps.push(ConfigfsStep::Mkdir(tpg.clone()));
 
-    let allowlisted = !spec.initiators.is_empty();
+    let allowlisted = spec.allowlisted();
     write(
         &mut steps,
         format!("{tpg}/attrib/generate_node_acls"),
@@ -1992,16 +2034,43 @@ pub fn kernel_name_path_safe(name: &str) -> bool {
 }
 
 /// The coded head of an apply whose allowlist is written but whose excluded
-/// sessions could NOT be reset: the TPG toggle itself failed. The core raises
-/// the target's critical alert on it; a client must not stay connected in
-/// silence behind a screen that shows an allowlist.
+/// sessions could NOT be reset: the TPG toggle itself failed, or a client the
+/// list excludes was still logged in after it. The core raises the target's
+/// critical alert on it; a client must not stay connected in silence behind a
+/// screen that shows an allowlist.
 pub const UNRESETTABLE_SESSION: &str = "unresettable_session";
+
+/// `unresettable_session: left_disabled: …` — the toggle's `enable = 0` went
+/// through and writing `1` failed twice: every session is cut off, the listed
+/// clients' included, and the TPG serves NOBODY until an apply succeeds (the
+/// next apply's plan writes `enable = 1` again). The opposite of what the
+/// plain head says, so the core words its alert apart (critic wave 12 R3-2).
+pub const UNRESETTABLE_LEFT_DISABLED: &str = "unresettable_session: left_disabled";
+
+/// The words of the job-log line an apply writes when the post-condition
+/// had to toggle the TPG: every session of the target — the listed clients'
+/// included — was dropped once. The core raises a warning alert on it.
+pub const SESSIONS_RESET_BY_TOGGLE: &str = "every session of the target was reset once (enable 1 → 0 → 1)";
+
+/// The coded head of the backstop that refuses to OPEN a target the kernel
+/// holds an allowlist for (`plan_iscsi`, `plan_nvmet`) when the spec is not a
+/// deliberate open (`open_confirmed`). The core reads it as "only
+/// «Otwórz dla wszystkich» unblocks this target".
+pub const OPEN_REFUSED: &str = "open_refused";
+
+/// How long `enforce_allowlist` waits, after the toggle, for the excluded
+/// sessions to leave `dynamic_sessions` before it calls the reset failed. The
+/// measured L3 drop took well under a second (listed clients were back in
+/// ~2 s); the wait is a bound, and it ends at the first read that shows none.
+pub const TOGGLE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+const TOGGLE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// The excluded generated sessions still logged in: every name of
 /// `dynamic_sessions` that the spec's allowlist does not carry, compared
 /// EXACTLY (a listed name plus a space is not listed).
 fn excluded_sessions(spec: &IscsiTargetSpec, dynamic: &[String]) -> Vec<String> {
-    if spec.initiators.is_empty() {
+    // An allowlisted target with an EMPTY list excludes everybody.
+    if !spec.allowlisted() {
         return Vec::new();
     }
     dynamic
@@ -2011,6 +2080,19 @@ fn excluded_sessions(spec: &IscsiTargetSpec, dynamic: &[String]) -> Vec<String> 
         .collect()
 }
 
+/// The generated sessions of a TPG (`dynamic_sessions`). An absent file is
+/// "none" — LIO publishes it only while generated ACLs exist; any other
+/// failed read is UNKNOWN and says why (critic wave 12 R3-2: it used to read
+/// as empty, and an unreadable file passed the post-condition in silence).
+#[cfg(unix)]
+fn read_dynamic_sessions(tpg: &Path) -> Result<Vec<String>, String> {
+    match std::fs::read(tpg.join("dynamic_sessions")) {
+        Ok(bytes) => Ok(parse_dynamic_sessions(&String::from_utf8_lossy(&bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("dynamic_sessions could not be read ({e})")),
+    }
+}
+
 /// The post-condition of an allowlisted apply (MAJOR 27 F3, critic wave 12
 /// R2-M1): no client the allowlist excludes is still logged in.
 ///
@@ -2018,52 +2100,117 @@ fn excluded_sessions(spec: &IscsiTargetSpec, dynamic: &[String]) -> Vec<String> 
 /// reset every excluded session whose name is resettable (`mkdir`+`rmdir`);
 /// what is left is a name that could not be used as a path, one the kernel
 /// reported in a shape nobody has measured, or a client that logged in
-/// between the observation and the `generate_node_acls = 0` write. For all of
-/// them the fallback is L3, measured on rig11 (§L.2): `enable` 1 → 0 → 1. The
-/// port keeps listening, every session of the target drops, the listed clients
-/// are back in about 2 s through their static ACLs, and with
-/// `generate_node_acls = 0` already written the excluded one cannot return.
+/// between the observation and the `generate_node_acls = 0` write (round-1
+/// MINOR 4, the F3 race). For all of them the fallback is L3, measured on
+/// rig11 (§L.2): `enable` 1 → 0 → 1. The port keeps listening, every session
+/// of the target drops, the listed clients are back in about 2 s through
+/// their static ACLs, and with `generate_node_acls = 0` already written the
+/// excluded one cannot return.
 ///
-/// `Ok(None)` — nothing was left; `Ok(Some(line))` — the toggle ran (a line for
-/// the job log: every session of the target was reset once); `Err` — the
-/// toggle itself failed, with the `unresettable_session` head, and the apply
-/// fails with it.
+/// A `dynamic_sessions` that cannot be read is NOT "nobody left": the toggle
+/// runs, because only it guarantees the post-condition without the list.
+///
+/// After the toggle the file is read AGAIN (critic wave 12 R3-1), for up to
+/// `settle`: a zero-gap 0 → 1 toggle is not what §L.2 measured (that one had
+/// a 12 s disabled gap), so the reset is checked, not assumed.
+///
+/// `Ok(None)` — nothing was left; `Ok(Some(line))` — the toggle ran (a line
+/// for the job log: every session of the target was reset once); `Err` — the
+/// reset did not hold: the toggle failed, the TPG was left disabled
+/// (`UNRESETTABLE_LEFT_DISABLED`), or an excluded client was still there
+/// after it; every one with the `unresettable_session` head.
 #[cfg(unix)]
 pub fn enforce_allowlist(root: &Path, spec: &IscsiTargetSpec) -> Result<Option<String>, String> {
-    if spec.initiators.is_empty() {
+    enforce_allowlist_within(root, spec, TOGGLE_SETTLE)
+}
+
+/// `enforce_allowlist` with the post-toggle wait injected (a test passes
+/// zero: its fake configfs does whatever it does at once).
+#[cfg(unix)]
+pub(crate) fn enforce_allowlist_within(
+    root: &Path,
+    spec: &IscsiTargetSpec,
+    settle: std::time::Duration,
+) -> Result<Option<String>, String> {
+    if !spec.allowlisted() {
         return Ok(None);
     }
     let tpg = root.join("iscsi").join(&spec.iqn).join("tpgt_1");
-    let dynamic = std::fs::read(tpg.join("dynamic_sessions"))
-        .map(|bytes| parse_dynamic_sessions(&String::from_utf8_lossy(&bytes)))
-        .unwrap_or_default();
-    let left = excluded_sessions(spec, &dynamic);
-    if left.is_empty() {
-        return Ok(None);
-    }
-    let enable = tpg.join("enable");
-    let toggled = write_attr(&enable, "0").and_then(|()| write_attr(&enable, "1"));
-    match toggled {
-        Ok(()) => Ok(Some(format!(
-            "{}: {} client(s) not on the allowlist were still logged in ({}); every session of the \
-             target was reset once (enable 1 → 0 → 1) — listed clients reconnect by themselves, the \
-             excluded ones cannot",
-            spec.iqn,
-            left.len(),
-            left.iter().map(|n| format!("{n:?}")).collect::<Vec<_>>().join(", ")
-        ))),
-        Err(e) => {
-            // Whatever the first write did, try to leave the TPG serving: a
-            // target left disabled cuts every listed client off too.
-            let _ = write_attr(&enable, "1");
-            Err(format!(
-                "{UNRESETTABLE_SESSION}: {}: the allowlist is written, but {} client(s) not on it are \
-                 still logged in and the target's sessions could not be reset ({e}) — stop the target \
-                 to cut every client off",
-                spec.iqn,
-                left.len()
-            ))
+    let names = |list: &[String]| list.iter().map(|n| format!("{n:?}")).collect::<Vec<_>>().join(", ");
+    let (left, unreadable) = match read_dynamic_sessions(&tpg) {
+        Ok(dynamic) => {
+            let left = excluded_sessions(spec, &dynamic);
+            if left.is_empty() {
+                return Ok(None);
+            }
+            (left, None)
         }
+        Err(why) => (Vec::new(), Some(why)),
+    };
+    let found = match &unreadable {
+        None => format!(
+            "{} client(s) not on the allowlist were still logged in ({})",
+            left.len(),
+            names(&left)
+        ),
+        Some(why) => format!(
+            "{why}, so a client the allowlist excludes may still have been logged in"
+        ),
+    };
+    let enable = tpg.join("enable");
+    if let Err(e) = write_attr(&enable, "0") {
+        return Err(format!(
+            "{UNRESETTABLE_SESSION}: {}: the allowlist is written, but {found} and the target's \
+             sessions could not be reset (enable = 0: {e}); the target still serves — stop the \
+             target to cut every client off",
+            spec.iqn
+        ));
+    }
+    // Every session is cut off from here on. Enabling again is retried once:
+    // a target left disabled cuts the listed clients off too.
+    if let Err(first) = write_attr(&enable, "1") {
+        if let Err(second) = write_attr(&enable, "1") {
+            return Err(format!(
+                "{UNRESETTABLE_LEFT_DISABLED}: {}: {found}; every session of the target was reset \
+                 (enable = 0), but the target could not be enabled again ({first}; {second}) — it \
+                 is left DISABLED and serves nobody, listed clients included, until an apply \
+                 succeeds; the node retries",
+                spec.iqn
+            ));
+        }
+    }
+    let toggled = format!(
+        "{}: {found}; {SESSIONS_RESET_BY_TOGGLE} — listed clients reconnect by themselves, the \
+         excluded ones cannot",
+        spec.iqn
+    );
+    let started = std::time::Instant::now();
+    loop {
+        match read_dynamic_sessions(&tpg) {
+            Ok(dynamic) => {
+                let still = excluded_sessions(spec, &dynamic);
+                if still.is_empty() {
+                    return Ok(Some(toggled));
+                }
+                if started.elapsed() >= settle {
+                    return Err(format!(
+                        "{UNRESETTABLE_SESSION}: {}: the allowlist is written and the target's \
+                         sessions were reset (enable 1 → 0 → 1), but {} client(s) not on it are \
+                         still logged in ({}) — stop the target to cut every client off",
+                        spec.iqn,
+                        still.len(),
+                        names(&still)
+                    ));
+                }
+            }
+            // Written `generate_node_acls = 0` and reset: nothing the list
+            // excludes can log in again, but it is not SEEN — the line says so.
+            Err(why) if started.elapsed() >= settle => {
+                return Ok(Some(format!("{toggled}; {why} after the reset, so it is not re-checked")));
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(TOGGLE_POLL);
     }
 }
 
@@ -2288,7 +2435,7 @@ fn prune_iscsi(
     // One known limitation, recorded rather than assumed away: the predicate
     // matches the NEGATIVE sentence, so any other text at all — including a
     // shape nobody has seen — counts as a session and keeps the ACL.
-    let allowlisted = !spec.initiators.is_empty();
+    let allowlisted = spec.allowlisted();
     for acl in &observed.acls {
         if spec.initiators.iter().any(|i| *i == acl.initiator) {
             continue;
@@ -2552,12 +2699,21 @@ pub fn plan_nvmet(
     // SECURITY (MAJOR 27 F2, the nvmet side of `plan_iscsi`'s refusal): an
     // empty host list means `attr_allow_any_host = 1`, so taking the last
     // allowed host off a subsystem that holds an allowlist would open it to
-    // every host. The core refuses that edit first; this is the kernel-side
-    // backstop for any other road to an empty list.
-    if spec.allow_any_host && observed.allow_any_host == "0" && !observed.allowed_hosts.is_empty() {
+    // every host. The core never builds such a spec for an allowlisted row:
+    // since migration 30 an emptied list keeps the row allowlisted and the
+    // spec says `allow_any_host = false` (closed). This is the kernel-side
+    // backstop for any other road to an open spec over an allowlist.
+    // `open_confirmed` (the deliberate "Otwórz dla wszystkich") is the one
+    // thing that lifts it: the host links go first below, then the flag.
+    if spec.allow_any_host
+        && !spec.open_confirmed
+        && observed.allow_any_host == "0"
+        && !observed.allowed_hosts.is_empty()
+    {
         return Err(invalid(format!(
-            "{}: refusing to open an allowlisted subsystem — the kernel holds an allowlist for it \
-             and this spec allows any host; stop the target or keep at least one host",
+            "{OPEN_REFUSED}: {}: refusing to open an allowlisted subsystem — the kernel holds an \
+             allowlist for it and this spec allows any host; open it deliberately (the \
+             open-for-everyone action), stop the target or keep at least one host",
             spec.nqn
         )));
     }
@@ -3182,6 +3338,11 @@ pub fn validate_iscsi(spec: &IscsiTargetSpec) -> Result<(), CatalogError> {
     for initiator in &spec.initiators {
         validate_iqn(initiator)?;
     }
+    if spec.open_confirmed && spec.allowlisted() {
+        return Err(invalid(
+            "a deliberately opened target cannot be allowlisted at the same time",
+        ));
+    }
     if spec.auth.enabled {
         validate_chap_user(&spec.auth.userid)?;
         validate_chap_secret(&spec.auth.password)?;
@@ -3266,13 +3427,20 @@ pub fn validate_nvmet(spec: &NvmetSubsystemSpec) -> Result<(), CatalogError> {
         // `nvmet_allowed_hosts_allow_link`: "can't add hosts when
         // allow_any_host is set!" — and the refusal lands halfway through the
         // apply, after the subsystem exists. The core cannot build this today
-        // (`allow_any_host` is exactly `initiators.is_empty()`), but the
+        // (`allow_any_host` is exactly "not allowlisted": an open row has no
+        // hosts, and since migration 30 an allowlisted row with an empty list
+        // is closed, `allow_any_host = false`), but the
         // catalog rules are the layer that has to catch it: they are what a
         // spec arriving on the helper's stdin is judged by, and the whole
         // point of judging it there is not to trust the caller.
         return Err(invalid(
             "'allow any host' and an explicit host list are mutually exclusive — nvmet refuses \
              the link, and with DH-HMAC-CHAP keys it would bypass the host objects they live on",
+        ));
+    }
+    if spec.open_confirmed && !spec.allow_any_host {
+        return Err(invalid(
+            "a deliberately opened subsystem has to allow any host",
         ));
     }
     Ok(())
@@ -3304,6 +3472,10 @@ fn write_attr(path: &Path, value: &str) -> Result<(), String> {
             path.display()
         ));
     }
+    // A test's fake configfs can refuse a write the way the kernel would
+    // (`tests::refuse_write`).
+    #[cfg(test)]
+    tests::refused_write(path, value)?;
     // `truncate` is what targetcli's `open(path, 'w')` does. configfs ignores
     // it (the size goes to `simple_setattr`, which no attribute sees), so it
     // changes nothing there — but it keeps the shorter of two values from
@@ -3323,6 +3495,10 @@ fn write_attr(path: &Path, value: &str) -> Result<(), String> {
             value.len()
         ));
     }
+    // What the kernel does on such a write, where a test asks for it
+    // (`tests::emulate_toggle`).
+    #[cfg(test)]
+    tests::emulate_write_effect(path, value);
     Ok(())
 }
 
@@ -3834,22 +4010,27 @@ pub const TPG_REBUILD_MAY_SERVE: &str = "tpg_rebuild_failed: not_disabled";
 /// allowlist is written — the target does not serve until an apply succeeds,
 /// and that apply sees the TPG still open and rebuilds again.
 ///
+/// WHAT ELSE IT RESETS (critic ACL-fix m-6), by design for an app target: the
+/// fresh TPG gets the kernel's defaults for every `param/*` and `attrib/*` the
+/// plan does not write — a hand-tuned `MaxBurstLength`, `ImmediateData`,
+/// `FirstBurstLength` or `default_cmdsn_depth` is gone after the switch. The
+/// plan manages `generate_node_acls`, `cache_dynamic_acls`,
+/// `demo_mode_write_protect`, `authentication` and `AuthMethod`; nothing else
+/// of the TPG is this app's, and the job-log line says so.
+///
 /// `Ok(None)` — nothing to do; `Ok(Some(line))` — rebuilt, a line for the job
 /// log; `Err` — the coded failure above.
 #[cfg(unix)]
 pub fn rebuild_open_tpg(root: &Path, spec: &IscsiTargetSpec) -> Result<Option<String>, String> {
-    if spec.initiators.is_empty() {
+    if !spec.allowlisted() {
         return Ok(None);
     }
     // The name becomes a path below; the apply validated the spec already,
     // this keeps the function safe on its own.
     validate_iqn(&spec.iqn).map_err(|e| e.to_string())?;
     let tpg = root.join("iscsi").join(&spec.iqn).join("tpgt_1");
-    if !tpg.is_dir() {
-        return Ok(None);
-    }
     let generate = attr(&tpg.join("attrib"), "generate_node_acls");
-    if generate.as_deref() == Some("0") {
+    if !rebuild_needed(spec.allowlisted(), tpg.is_dir(), generate.as_deref()) {
         return Ok(None);
     }
     let mut log = Vec::new();
@@ -3882,11 +4063,30 @@ pub fn rebuild_open_tpg(root: &Path, spec: &IscsiTargetSpec) -> Result<Option<St
     Ok(Some(format!(
         "{}: the target was open (generate_node_acls = {}) and now gets an allowlist: its portal \
          group was rebuilt so that no ACL LIO cached for a client of the open target survives \
-         (every session of the target was reset once; listed clients reconnect by themselves){}",
+         (every session of the target was reset once; listed clients reconnect by themselves; \
+         param/ and attrib/ values this app does not manage are back at the kernel's defaults){}",
         spec.iqn,
         generate.as_deref().unwrap_or("unreadable"),
         if failures.is_empty() { String::new() } else { format!(" [{failures}]") }
     )))
+}
+
+/// THE predicate of `rebuild_open_tpg`: an allowlisted spec over a TPG that
+/// exists and whose `generate_node_acls` does not positively read `0` (open,
+/// or unreadable — a TPG that cannot be shown to be closed is treated as
+/// open). Pure, so the core's preview asks the very same question
+/// (`needs_rebuild`, critic ACL-fix m-5).
+pub fn rebuild_needed(allowlisted: bool, tpg_exists: bool, generate_node_acls: Option<&str>) -> bool {
+    allowlisted && tpg_exists && generate_node_acls != Some("0")
+}
+
+/// Whether the next apply of `spec` over `observed` rebuilds the TPG — and so
+/// resets every session of the target once (~2 s; the portal does not listen
+/// for ~0.3 s, measured). For a preview; the apply itself decides on its own
+/// fresh reading.
+pub fn needs_rebuild(spec: &IscsiTargetSpec, observed: &IscsiObserved) -> bool {
+    let key = format!("{TARGET_CONFIGFS}/iscsi/{}/tpgt_1/attrib/generate_node_acls", spec.iqn);
+    rebuild_needed(spec.allowlisted(), observed.tpg_exists, observed.attrs.get(&key).map(String::as_str))
 }
 
 /// `IscsiTargetApply` under `root` (the LIO configfs root in production):
@@ -3908,17 +4108,30 @@ pub fn execute_iscsi_apply(root: &Path, spec: &IscsiTargetSpec) -> Result<String
     // AGAIN — the first plan was diffed against the old TPG and would skip
     // writes the fresh one needs.
     let rebuilt = rebuild_open_tpg(root, spec)?;
+    // From here on every failure carries the rebuild line IN FRONT (critic
+    // ACL-fix m-4): a job log that shows a failed step but not that the TPG
+    // was torn down, every session reset, hides the one thing that already
+    // happened. One line: the core keeps only the first line of a helper's
+    // error, and every coded head is found by `contains`.
+    let with_rebuilt = |error: String| match &rebuilt {
+        Some(line) => format!("{line} — and then: {error}"),
+        None => error,
+    };
     if rebuilt.is_some() {
-        plan = plan_iscsi(spec, &observe_iscsi(root, spec)).map_err(|e| e.to_string())?;
+        plan = plan_iscsi(spec, &observe_iscsi(root, spec)).map_err(|e| with_rebuilt(e.to_string()))?;
     }
     // The warnings are the credential-mode check (see `protect_attr`). They go
     // into the job log ABOVE the summary line, because a key that stayed
     // world-readable is the one thing about this apply an admin has to act on.
-    let warnings = apply_plan(&rebased(&plan, root))?;
+    let warnings = match apply_plan(&rebased(&plan, root)) {
+        Ok(warnings) => warnings,
+        Err(error) => return Err(with_rebuilt(failed_after_closing(root, spec, error))),
+    };
     // The post-condition of an allowlist (MAJOR 27 F3): no excluded client is
     // still logged in. Re-read AFTER the plan, and the TPG toggled when one
-    // is — see `enforce_allowlist`. Only a failed toggle fails the apply.
-    let enforced = enforce_allowlist(root, spec)?;
+    // is — see `enforce_allowlist`. Only a reset that did not hold fails the
+    // apply.
+    let enforced = enforce_allowlist(root, spec).map_err(with_rebuilt)?;
     // The rendered plan goes into the job log — `render` is the only rendering
     // there is and it prints `***` for every secret.
     Ok(format!(
@@ -3930,6 +4143,29 @@ pub fn execute_iscsi_apply(root: &Path, spec: &IscsiTargetSpec) -> Result<String
         spec.iqn,
         kernel_step_count(&plan)
     ))
+}
+
+/// The error of a plan that failed part-way, with the allowlist's
+/// post-condition run anyway when the failure came AFTER the TPG was closed
+/// (critic wave 12 R3-2): `generate_node_acls` already reads `0`, so the
+/// clients the list excludes can no longer log in — but the ones logged in
+/// through a generated ACL are still there, and the sweep's retry (backed off
+/// up to 5 min) was the only thing that would have reset them. Their reset is
+/// not worth waiting for: it runs now, and its outcome joins the error.
+///
+/// The head of the plan's error stays first: the apply failed either way.
+#[cfg(unix)]
+fn failed_after_closing(root: &Path, spec: &IscsiTargetSpec, error: String) -> String {
+    let tpg = root.join("iscsi").join(&spec.iqn).join("tpgt_1");
+    if !spec.allowlisted() || attr(&tpg.join("attrib"), "generate_node_acls").as_deref() != Some("0") {
+        return error;
+    }
+    // One line, like every helper error: the core keeps only the first.
+    match enforce_allowlist(root, spec) {
+        Ok(None) => error,
+        Ok(Some(line)) => format!("{error}; {line}"),
+        Err(reset) => format!("{error}; {reset}"),
+    }
 }
 
 /// Takes one app-created iSCSI target out of LIO, backstores included.
@@ -4301,6 +4537,8 @@ mod tests {
             port_groups: vec![group(1, "optimized")],
             auth,
             initiators,
+            allowlist_mode: false,
+            open_confirmed: false,
         }
     }
 
@@ -4321,6 +4559,7 @@ mod tests {
             port_groups: vec![group(1, "optimized")],
             hosts,
             allow_any_host: allow_any,
+            open_confirmed: false,
         }
     }
 
@@ -6975,7 +7214,9 @@ Address 192.168.11.11 SCTP  StatSN: 0xd5371dc2\n";
         }
         // Something excluded is still there — a whitespace name the plan
         // could not reset, a listed name plus a space, a non-ASCII name: the
-        // TPG is toggled and the apply succeeds.
+        // TPG is toggled (and drops every session, as measured) and the apply
+        // succeeds.
+        emulate_toggle();
         for left in [&b"iqn.x:evil \n\0"[..], b"iqn.1998-01.com.vmware:esx01 \n\0", b"caf\xc3\xa9\n\0"] {
             reset();
             std::fs::write(&sessions, left).expect("sessions");
@@ -7017,6 +7258,66 @@ Address 192.168.11.11 SCTP  StatSN: 0xd5371dc2\n";
     /// Makes `mkdir` behave like configfs for the rest of this test thread.
     fn emulate_configfs() {
         CONFIGFS.with(|on| on.set(true));
+    }
+
+    thread_local! {
+        /// Whether `enable = 0` on a TPG drops its generated sessions, the
+        /// way L3 measured it (§L.2). Off unless a test asks.
+        static TOGGLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// A write the fake configfs refuses: `(path suffix, value)`.
+        static REFUSE: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+        /// A client that logs in through a generated ACL at the moment
+        /// `generate_node_acls` is written — the F3 race window.
+        static LOGIN_ON_SWITCH: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// `name` logs in (appears in `dynamic_sessions`) right as the TPG's
+    /// `generate_node_acls` is written, i.e. AFTER the apply observed the TPG.
+    fn login_during_the_switch(name: &str) {
+        LOGIN_ON_SWITCH.with(|l| *l.borrow_mut() = Some(name.to_string()));
+    }
+
+    /// `enable = 0` on a TPG empties its `dynamic_sessions` for the rest of
+    /// this test thread — every session drops, as measured (L3).
+    fn emulate_toggle() {
+        TOGGLE.with(|on| on.set(true));
+    }
+
+    /// Refuses every write of `value` to a path ending in `suffix` for the
+    /// rest of this test thread (or until `allow_writes`).
+    fn refuse_write(suffix: &str, value: &str) {
+        REFUSE.with(|r| *r.borrow_mut() = Some((suffix.to_string(), value.to_string())));
+    }
+
+    fn allow_writes() {
+        REFUSE.with(|r| *r.borrow_mut() = None);
+    }
+
+    pub(super) fn refused_write(path: &Path, value: &str) -> Result<(), String> {
+        REFUSE.with(|r| match &*r.borrow() {
+            Some((suffix, refused)) if path.to_string_lossy().ends_with(suffix.as_str()) && value == refused => {
+                Err(format!("cannot write {}: Invalid argument (os error 22)", path.display()))
+            }
+            _ => Ok(()),
+        })
+    }
+
+    pub(super) fn emulate_write_effect(path: &Path, value: &str) {
+        if path.ends_with("attrib/generate_node_acls") {
+            if let (Some(name), Some(tpg)) = (LOGIN_ON_SWITCH.with(|l| l.borrow_mut().take()), path.parent().and_then(Path::parent)) {
+                std::fs::write(tpg.join("dynamic_sessions"), format!("{name}\n\0")).expect("logged in");
+            }
+        }
+        if !TOGGLE.with(|on| on.get()) || value != "0" || path.file_name().is_none_or(|n| n != "enable") {
+            return;
+        }
+        let Some(tpg) = path.parent().filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("tpgt_"))) else {
+            return;
+        };
+        let sessions = tpg.join("dynamic_sessions");
+        if sessions.is_file() {
+            std::fs::write(sessions, "").expect("sessions dropped");
+        }
     }
 
     /// The attribute files and default groups LIO creates with an item, with
@@ -7134,6 +7435,8 @@ Address 192.168.11.11 SCTP  StatSN: 0xd5371dc2\n";
 
         let out = execute_iscsi_apply(&tree.0, &spec).expect("applied");
         assert!(out.starts_with(&format!("{}: the target was open (generate_node_acls = 1)", spec.iqn)), "{out}");
+        // m-6: the reset of hand-tuned values is said, not silent.
+        assert!(out.contains("param/ and attrib/ values this app does not manage are back at the kernel's defaults"), "{out}");
         assert!(!cached.exists(), "the cached ACL went with the old TPG");
         let read = |rel: &str| std::fs::read_to_string(tpg.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"));
         // The fresh TPG is CLOSED and fully written — including what a stale
@@ -7169,16 +7472,20 @@ Address 192.168.11.11 SCTP  StatSN: 0xd5371dc2\n";
         let spec = listed();
         let (tpg, _, cached) = open_tpg(&closed, &spec);
         closed.attr(&format!("iscsi/{}/tpgt_1/attrib/generate_node_acls", spec.iqn), "0\n");
+        assert!(!needs_rebuild(&spec, &observe_iscsi(&closed.0, &spec)), "the preview asks the same question");
         assert_eq!(rebuild_open_tpg(&closed.0, &spec), Ok(None));
         assert!(tpg.is_dir() && cached.exists());
         // A spec WITHOUT an allowlist keeps the target open: no rebuild.
         let open = TempTree::new("rebuild-open-spec");
         let spec = app_spec(vec![]);
         let (tpg, _, cached) = open_tpg(&open, &spec);
+        assert!(!needs_rebuild(&spec, &observe_iscsi(&open.0, &spec)));
+        assert!(needs_rebuild(&listed(), &observe_iscsi(&open.0, &listed())), "open TPG, allowlisted spec");
         assert_eq!(rebuild_open_tpg(&open.0, &spec), Ok(None));
         assert!(tpg.is_dir() && cached.exists());
         // No TPG yet (first apply, or after a reboot): nothing cached, nothing to do.
         let fresh = TempTree::new("rebuild-fresh");
+        assert!(!needs_rebuild(&listed(), &observe_iscsi(&fresh.0, &listed())));
         assert_eq!(rebuild_open_tpg(&fresh.0, &listed()), Ok(None));
         // `generate_node_acls` unreadable: a TPG that cannot be shown to be
         // closed is treated as open.
@@ -7186,6 +7493,7 @@ Address 192.168.11.11 SCTP  StatSN: 0xd5371dc2\n";
         let spec = listed();
         let (tpg, dev, cached) = open_tpg(&unknown, &spec);
         std::fs::remove_file(tpg.join("attrib/generate_node_acls")).expect("unreadable");
+        assert!(needs_rebuild(&spec, &observe_iscsi(&unknown.0, &spec)));
         let line = rebuild_open_tpg(&unknown.0, &spec).expect("rebuilt").expect("a log line");
         assert!(line.contains("generate_node_acls = unreadable"), "{line}");
         assert!(!tpg.exists() && !cached.exists());
@@ -7264,5 +7572,235 @@ Address 192.168.11.11 SCTP  StatSN: 0xd5371dc2\n";
         assert!(error.contains("not disabled"), "the failed disable is in the answer: {error}");
         assert!(error.contains("may still accept"), "{error}");
         assert!(!error.contains("no client"), "it does not claim nobody is served: {error}");
+    }
+
+    /// Critic wave 12 R3-1: the toggle is CHECKED. A client the list excludes
+    /// that is still in `dynamic_sessions` after it fails the apply with the
+    /// coded head — the fake configfs here does not drop it, the way a toggle
+    /// that did not take would not.
+    #[test]
+    fn an_excluded_client_still_logged_in_after_the_toggle_fails_the_apply() {
+        let tree = TempTree::new("enforce-recheck");
+        let spec = iscsi(mutual_chap(), vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        let tpg_rel = "iscsi/iqn.2026-09.pl.euvic:helios.vm-store/tpgt_1";
+        tree.attr(&format!("{tpg_rel}/enable"), "1");
+        tree.attr(&format!("{tpg_rel}/dynamic_sessions"), "iqn.x:evil \n\0");
+        let error = enforce_allowlist_within(&tree.0, &spec, std::time::Duration::ZERO).expect_err("still there");
+        assert!(error.starts_with(&format!("{UNRESETTABLE_SESSION}: ")), "{error}");
+        assert!(!error.starts_with(UNRESETTABLE_LEFT_DISABLED), "{error}");
+        assert!(error.contains("still logged in (\"iqn.x:evil \")"), "{error}");
+        assert_eq!(std::fs::read_to_string(tree.0.join(format!("{tpg_rel}/enable"))).expect("enable"), "1", "left serving");
+        // The same with the kernel dropping the session: nothing to report.
+        emulate_toggle();
+        let line = enforce_allowlist_within(&tree.0, &spec, std::time::Duration::ZERO).expect("reset").expect("line");
+        assert!(line.contains("enable 1 → 0 → 1"), "{line}");
+    }
+
+    /// Critic wave 12 R3-2: an unreadable `dynamic_sessions` is UNKNOWN, not
+    /// empty — the toggle runs, and the line says the list could not be read.
+    #[test]
+    fn an_unreadable_dynamic_sessions_is_unknown_and_the_target_is_reset() {
+        let tree = TempTree::new("enforce-unreadable");
+        let spec = iscsi(mutual_chap(), vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        let tpg_rel = "iscsi/iqn.2026-09.pl.euvic:helios.vm-store/tpgt_1";
+        tree.attr(&format!("{tpg_rel}/enable"), "untouched");
+        // A directory where the file should be: every read fails (EISDIR).
+        tree.dir(&format!("{tpg_rel}/dynamic_sessions"));
+        let line = enforce_allowlist_within(&tree.0, &spec, std::time::Duration::ZERO)
+            .expect("reset")
+            .expect("the toggle ran");
+        assert!(line.contains("dynamic_sessions could not be read"), "{line}");
+        assert!(line.contains("enable 1 → 0 → 1") && line.contains("not re-checked"), "{line}");
+        assert_eq!(std::fs::read_to_string(tree.0.join(format!("{tpg_rel}/enable"))).expect("enable"), "1");
+        // ABSENT is not unreadable: LIO publishes the file only while it has
+        // generated ACLs, so nothing is toggled.
+        let absent = TempTree::new("enforce-absent");
+        absent.attr(&format!("{tpg_rel}/enable"), "untouched");
+        assert_eq!(enforce_allowlist_within(&absent.0, &spec, std::time::Duration::ZERO), Ok(None));
+        assert_eq!(std::fs::read_to_string(absent.0.join(format!("{tpg_rel}/enable"))).expect("enable"), "untouched");
+    }
+
+    /// Critic wave 12 R3-2: `enable = 1` failing twice after `enable = 0`
+    /// leaves the TPG DISABLED — everybody is cut off, the opposite of "a
+    /// client is still connected" — and the head says so.
+    #[test]
+    fn an_enable_that_cannot_be_written_back_says_the_target_is_left_disabled() {
+        let tree = TempTree::new("enforce-left-disabled");
+        let spec = iscsi(mutual_chap(), vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        let tpg_rel = "iscsi/iqn.2026-09.pl.euvic:helios.vm-store/tpgt_1";
+        tree.attr(&format!("{tpg_rel}/enable"), "1");
+        tree.attr(&format!("{tpg_rel}/dynamic_sessions"), "iqn.x:evil \n\0");
+        emulate_toggle();
+        refuse_write("tpgt_1/enable", "1");
+        let outcome = enforce_allowlist_within(&tree.0, &spec, std::time::Duration::ZERO);
+        allow_writes();
+        let error = outcome.expect_err("left disabled");
+        assert!(error.starts_with(&format!("{UNRESETTABLE_LEFT_DISABLED}: ")), "{error}");
+        assert!(error.contains("left DISABLED") && error.contains("serves nobody"), "{error}");
+        assert!(!error.contains("stop the target"), "no advice to stop a target that serves nobody: {error}");
+        assert_eq!(std::fs::read_to_string(tree.0.join(format!("{tpg_rel}/enable"))).expect("enable"), "0");
+    }
+
+    /// Owner decision 2026-09-29 (critic wave 12, MINOR 1): an allowlisted
+    /// target with an EMPTY list is closed — `generate_node_acls = 0`, no
+    /// ACL — on a fresh TPG (after a reboot), over an open one (rebuilt, so no
+    /// cached ACL lets a former client in) and with a generated session on it.
+    #[test]
+    fn an_allowlisted_target_with_an_empty_list_lets_nobody_in() {
+        let closed = IscsiTargetSpec { allowlist_mode: true, ..app_spec(vec![]) };
+        assert!(closed.allowlisted() && !app_spec(vec![]).allowlisted());
+        // After a reboot: configfs is empty.
+        let fresh = TempTree::new("closed-fresh");
+        let (tpg, _, _) = open_tpg(&fresh, &closed);
+        std::fs::remove_dir_all(tpg.parent().expect("target")).expect("no TPG yet");
+        emulate_configfs();
+        let out = execute_iscsi_apply(&fresh.0, &closed).expect("applied");
+        let tpg = fresh.0.join(format!("iscsi/{}/tpgt_1", closed.iqn));
+        assert_eq!(std::fs::read_to_string(tpg.join("attrib/generate_node_acls")).expect("gna"), "0", "{out}");
+        assert!(child_dir_names(&tpg.join("acls")).is_empty(), "no ACL: nobody gets in");
+        assert!(!out.contains("generate_node_acls = 1"), "{out}");
+        // Over an OPEN TPG: rebuilt, the cached ACL gone with it.
+        let open = TempTree::new("closed-over-open");
+        let (tpg, _, cached) = open_tpg(&open, &closed);
+        let out = execute_iscsi_apply(&open.0, &closed).expect("applied");
+        assert!(out.contains("was open (generate_node_acls = 1)"), "{out}");
+        assert!(!cached.exists(), "no cached ACL survives");
+        assert_eq!(std::fs::read_to_string(tpg.join("attrib/generate_node_acls")).expect("gna"), "0");
+        // A client logged in through a generated ACL is excluded by an empty list.
+        let observed = IscsiObserved {
+            dynamic_sessions: vec!["iqn.2004-10.com.ubuntu:01:35ed4c1b7a".into()],
+            devices: vec![IscsiDeviceObserved::default()],
+            ..Default::default()
+        };
+        let text = render(&plan_iscsi(&closed, &observed).expect("plan"));
+        let root = "/sys/kernel/config/target";
+        assert!(text.contains(&format!("rmdir {root}/iscsi/{}/tpgt_1/acls/iqn.2004-10.com.ubuntu:01:35ed4c1b7a\n", closed.iqn)), "{text}");
+        // Without the flag an empty list is still what it always was: open.
+        let text = render(&plan_iscsi(&app_spec(vec![]), &observed).expect("plan"));
+        assert!(text.contains("/attrib/generate_node_acls = 1\n"), "{text}");
+    }
+
+    /// Owner decision 2026-09-29 (critic wave 12, MINOR 2): "Otwórz dla
+    /// wszystkich" is the one road from allowlisted to open. Without the
+    /// confirmation the backstop refuses, coded; with it the TPG opens and a
+    /// STALE static ACL — the one that used to block every apply of a target
+    /// whose row is open — is removed.
+    #[test]
+    fn a_deliberate_open_lifts_the_backstop_and_clears_the_stale_acl() {
+        let tree = TempTree::new("open-deliberately");
+        let stale = "iqn.1998-01.com.vmware:esx01";
+        let tpg_rel = "iscsi/iqn.2026-09.pl.euvic:helios.vm-store/tpgt_1";
+        allowlisted_tpg(&tree, tpg_rel, stale, &format!("No active iSCSI Session for Initiator Endpoint: {stale}\n"));
+        let open = iscsi(mutual_chap(), vec![]);
+        let refused = plan_iscsi(&open, &observe_iscsi(&tree.0, &open)).expect_err("not deliberate");
+        assert!(refused.to_string().contains(&format!("{OPEN_REFUSED}: ")), "{refused}");
+        let confirmed = IscsiTargetSpec { open_confirmed: true, ..open.clone() };
+        let text = render(&plan_iscsi(&confirmed, &observe_iscsi(&tree.0, &confirmed)).expect("a deliberate open plans"));
+        let root = "/sys/kernel/config/target";
+        assert!(text.contains(&format!("write {root}/{tpg_rel}/attrib/generate_node_acls = 1\n")), "{text}");
+        assert!(text.contains(&format!("rmdir {root}/{tpg_rel}/acls/{stale}\n")), "the stale ACL goes: {text}");
+        // An ACL with a LIVE session stays (the prune's rule): a client let in
+        // by name is not logged out on an open target.
+        std::fs::write(tree.0.join(format!("{tpg_rel}/acls/{stale}/info")), ACL_INFO_ACTIVE).expect("live");
+        let text = render(&plan_iscsi(&confirmed, &observe_iscsi(&tree.0, &confirmed)).expect("plans"));
+        assert!(!text.contains(&format!("rmdir {root}/{tpg_rel}/acls/{stale}\n")), "{text}");
+        // Both at once is no spec at all.
+        let both = IscsiTargetSpec { allowlist_mode: true, open_confirmed: true, ..open };
+        assert!(validate_iscsi(&both).is_err());
+    }
+
+    #[test]
+    fn a_deliberate_open_lifts_the_nvmet_backstop_too() {
+        let mut observed = fresh_nvmet(1, 1);
+        observed.allow_any_host = "0".into();
+        observed.allowed_hosts = vec!["nqn.2014-08.org.nvmexpress:uuid:9f2c0000-0000-0000-0000-00000000a17b".into()];
+        let open = nvmet(vec![], true);
+        let refused = plan_nvmet(&open, &observed).expect_err("not deliberate");
+        assert!(refused.to_string().contains(&format!("{OPEN_REFUSED}: ")), "{refused}");
+        let confirmed = NvmetSubsystemSpec { open_confirmed: true, ..open };
+        let text = render(&plan_nvmet(&confirmed, &observed).expect("a deliberate open plans"));
+        let unlink = text.find("unlink ").expect("the host link goes");
+        let flag = text.find("attr_allow_any_host = 1").expect("then the flag");
+        assert!(unlink < flag, "{text}");
+        let closed = NvmetSubsystemSpec { allow_any_host: false, ..confirmed };
+        assert!(validate_nvmet(&closed).is_err(), "a deliberate open that allows nobody is no spec");
+    }
+
+    /// Critic ACL-fix m-4: a plan that fails AFTER a successful rebuild keeps
+    /// the rebuild line — the TPG was torn down and every session reset.
+    #[test]
+    fn a_plan_failing_after_the_rebuild_keeps_the_rebuild_line() {
+        let tree = TempTree::new("rebuild-then-fail");
+        let spec = app_spec(vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        let (tpg, _, _) = open_tpg(&tree, &spec);
+        emulate_configfs();
+        refuse_write("attrib/demo_mode_write_protect", "0");
+        let outcome = execute_iscsi_apply(&tree.0, &spec);
+        allow_writes();
+        let error = outcome.expect_err("the plan failed");
+        assert!(error.contains("demo_mode_write_protect"), "the failing step: {error}");
+        assert!(error.starts_with(&format!("{}: the target was open (generate_node_acls = 1)", spec.iqn)), "the rebuild line first: {error}");
+        assert_eq!(error.lines().count(), 1, "one line: the core keeps the first");
+        assert!(error.contains("every session of the target was reset once"), "{error}");
+        assert!(tpg.is_dir(), "the fresh TPG exists");
+    }
+
+    /// Critic wave 12 R3-2: a plan that fails AFTER `generate_node_acls = 0`
+    /// runs the post-condition anyway — the clients the list excludes are
+    /// reset now, not on the sweep's backed-off retry.
+    #[test]
+    fn a_plan_failing_after_the_allowlist_is_on_still_resets_the_excluded() {
+        let tree = TempTree::new("fail-after-gna");
+        let listed = "iqn.1998-01.com.vmware:esx01";
+        let spec = app_spec(vec![listed.into()]);
+        let tpg_rel = format!("iscsi/{}/tpgt_1", spec.iqn);
+        // A configured backstore and a TPG that is ALREADY allowlisted (no
+        // rebuild), with its credential files, the listed client's live ACL
+        // and a generated session the list excludes.
+        open_tpg(&tree, &spec);
+        tree.attr(&format!("{tpg_rel}/attrib/generate_node_acls"), "0\n");
+        for name in ["userid", "password", "userid_mutual", "password_mutual"] {
+            tree.attr(&format!("{tpg_rel}/auth/{name}"), "");
+        }
+        live_acl(&tree, &spec, listed);
+        tree.attr(&format!("{tpg_rel}/dynamic_sessions"), "iqn.x:evil \n\0");
+        tree.attr(&format!("{tpg_rel}/np/10.10.0.5:3260/iser"), "1\n");
+        emulate_toggle();
+        refuse_write("np/10.10.0.5:3260/iser", "0");
+        let outcome = execute_iscsi_apply(&tree.0, &spec);
+        allow_writes();
+        let error = outcome.expect_err("the portal write failed");
+        assert!(error.contains("iser"), "the plan's own error comes first: {error}");
+        assert!(error.contains("enable 1 → 0 → 1"), "the excluded client was reset anyway: {error}");
+        assert_eq!(error.lines().count(), 1, "one line: the core keeps the first");
+        assert_eq!(std::fs::read_to_string(tree.0.join(format!("{tpg_rel}/dynamic_sessions"))).expect("sessions"), "");
+        // An OPEN spec that fails is just the failure: nothing to enforce.
+        let open = TempTree::new("fail-open");
+        let spec = app_spec(vec![]);
+        open.attr(&format!("{tpg_rel}/attrib/generate_node_acls"), "1\n");
+        open.attr(&format!("{tpg_rel}/np/10.10.0.5:3260/iser"), "1\n");
+        refuse_write("np/10.10.0.5:3260/iser", "0");
+        let outcome = execute_iscsi_apply(&open.0, &spec);
+        allow_writes();
+        assert!(!outcome.expect_err("failed").contains("enable 1 → 0 → 1"));
+    }
+
+    /// Critic wave 12, MINOR 4 (the F3 race): a client that logs in AFTER
+    /// the apply observed the TPG — between the observation and the
+    /// `generate_node_acls = 0` write — is not in the plan's list, and is
+    /// reset by the post-condition in the same apply, not "on the next one".
+    #[test]
+    fn a_client_logging_in_during_the_switch_is_reset_in_the_same_apply() {
+        let tree = TempTree::new("f3-race");
+        let spec = app_spec(vec!["iqn.1998-01.com.vmware:esx01".into()]);
+        let (tpg, _, _) = open_tpg(&tree, &spec);
+        emulate_configfs();
+        emulate_toggle();
+        login_during_the_switch("iqn.2026-01.x:raced");
+        let out = execute_iscsi_apply(&tree.0, &spec).expect("applied");
+        assert!(!out.contains("mkdir /sys/kernel/config/target/iscsi/iqn.2026-09.local.tentaflow:helios.vm-store/tpgt_1/acls/iqn.2026-01.x:raced"), "the plan never saw it: {out}");
+        assert!(out.contains("(\"iqn.2026-01.x:raced\")") && out.contains(SESSIONS_RESET_BY_TOGGLE), "reset in this apply: {out}");
+        assert_eq!(std::fs::read_to_string(tpg.join("dynamic_sessions")).expect("sessions"), "", "nobody excluded is left");
+        assert_eq!(std::fs::read_to_string(tpg.join("enable")).expect("enable"), "1");
     }
 }

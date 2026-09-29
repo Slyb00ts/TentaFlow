@@ -5537,7 +5537,8 @@
         "targets": "Cibles iSCSI/NVMe-oF",
         "disable": "Désactivation de TentaNas"
       },
-      "kind_target_session_reset": "Déconnexion d’une session de cible"
+      "kind_target_session_reset": "Déconnexion d’une session de cible",
+      "kind_target_open": "Ouverture de la cible à tous"
     },
     "danger": {
       "retype": "Saisissez {name} pour confirmer :",
@@ -7066,6 +7067,18 @@
           "title": "Cible {target} : l’écoute RDMA a disparu",
           "detail": "Les clients ne peuvent pas se connecter en {transport} sur {portal}. Arrêtez puis reprenez la cible — le portail et son écoute sont recréés.",
           "detail_shared": "Les clients ne peuvent pas se connecter en {transport} sur {portal}. D’autres cibles partagent l’écoute : elle ne revient qu’une fois toutes les cibles qui l’utilisent arrêtées puis reprises."
+        },
+        "target_left_disabled": {
+          "title": "Cible {target} : restée désactivée — aucun client n’est servi",
+          "detail": "La réinitialisation de la session d’un client hors de la nouvelle liste d’accès a désactivé la cible, et sa réactivation a échoué deux fois. Tous les clients sont coupés, y compris ceux de la liste. Le nœud réessaie à la prochaine application."
+        },
+        "target_open_refused": {
+          "title": "Cible {target} : le noyau conserve une liste d’accès absente de l’enregistrement",
+          "detail": "La cible est enregistrée comme ouverte, mais le noyau conserve encore une liste d’accès pour elle, et le nœud n’ouvre jamais une cible par accident. Chaque application est refusée jusqu’à ce qu’un administrateur l’ouvre délibérément (« Ouvrir à tous ») ou l’arrête."
+        },
+        "target_sessions_reset": {
+          "title": "Cible {target} : toutes les sessions ont été réinitialisées une fois",
+          "detail": "Un client hors de la nouvelle liste d’accès était encore connecté, donc toutes les sessions de la cible ont été réinitialisées une fois. Les clients de la liste se reconnectent d’eux-mêmes (environ 2 s) ; le client exclu ne le peut pas."
         }
       },
       "node_text": "Texte du nœud",
@@ -7764,7 +7777,7 @@
       "portal_network_shared": "LAN — partagé",
       "portal_network_storage": "réseau de stockage",
       "delete_loss_record": "L’enregistrement de la cible sera supprimé de la base :",
-      "delete_loss_allowlist": "La liste d’accès ({n} initiateurs) sera supprimée.",
+      "delete_loss_allowlist": "La liste d’accès ({n} {n|initiateur|initiateurs}) sera supprimée.",
       "delete_loss_auth": "Les paramètres d’authentification enregistrés de cette cible seront supprimés.",
       "delete_keep_snapshots": "Les instantanés sont aussi conservés. Supprimer l’export ne supprime ni les données ni les instantanés du volume.",
       "portal_pick_interface": "Choisir l’interface",
@@ -7794,7 +7807,7 @@
       "group_transitioning": "En transition",
       "group_preferred": "chemin préféré",
       "initiators": "Liste d'initiateurs autorisés",
-      "initiators_hint": "Un IQN/NQN par ligne. Le client déclare lui-même son IQN/NQN : c'est un filtre de confort, PAS une authentification. Une liste vide signifie que le noyau crée lui-même les entrées ; la réconciliation ne supprime que celles sans session, un client qui se connecte à cet instant précis peut donc être refusé une fois et réessaie.",
+      "initiators_hint": "Un IQN/NQN par ligne. Le client déclare lui-même son IQN/NQN : c’est un filtre de confort, PAS une authentification. Sur une cible ouverte, une liste vide signifie que le noyau crée lui-même les entrées ; la réconciliation ne supprime que celles sans session, un client qui se connecte à cet instant précis peut donc être refusé une fois et réessaie. Sur une cible avec liste d’accès, une liste vide signifie que personne ne peut se connecter.",
       "no_initiators": "Vide : quiconque atteint le portail se connecte.",
       "allowlist_note": "La liste est un filtre, pas une connexion. Seul CHAP (mutuel) / DH-HMAC-CHAP authentifie.",
       "save_auth_missing": "Impossible d'enregistrer la liste d'autorisation : la réponse du nœud ne contient pas les réglages d'authentification de cette cible. Actualisez la fenêtre et réessayez.",
@@ -7857,7 +7870,7 @@
       "description_title": "Description de l’initiateur",
       "description_hint": "Jusqu’à {n} caractères, p. ex. « Proxmox vmhost-01 ». Le bouton Enregistrer applique la modification.",
       "description_apply": "Définir la description",
-      "allowlist_last_warning": "La liste d’autorisation ne peut pas devenir vide : une liste vide ouvrirait la cible à quiconque atteint le portail. Pour couper tout le monde, arrêtez la cible.",
+      "allowlist_last_warning": "La liste sera vide : une fois enregistrée, la cible est fermée — personne ne peut se connecter, et les sessions des clients retirés sont coupées.",
       "nvmet_remove_keeps_connection": "Retirer un hôte de la liste ne déconnecte pas un hôte déjà connecté — il garde un accès complet jusqu’à sa prochaine reconnexion. Pour le couper immédiatement, arrêtez la cible.",
       "listen_listening": "À l’écoute",
       "listen_target_disabled": "Port ouvert, cible désactivée — les connexions sont refusées",
@@ -7896,7 +7909,26 @@
       "rdma_peer": "{n} {n|connexion RDMA|connexions RDMA} depuis {peer}",
       "rdma_peers_none": "Aucune connexion RDMA",
       "rdma_peers_shared": "D’autres cibles partagent ce port RDMA — la table RDMA du noyau ne dit pas quelles connexions appartiennent à cette cible, donc aucune n’est affichée",
-      "rdma_peers_unknown": "Connexions RDMA non mesurées"
+      "rdma_peers_unknown": "Connexions RDMA non mesurées",
+      "no_initiators_closed": "Vide : la cible est fermée — personne ne peut se connecter tant que vous n’ajoutez pas d’initiateur ou ne l’ouvrez pas à tous.",
+      "open_all": "Ouvrir à tous",
+      "open_all_title": "Ouvrir la cible {name} à tous",
+      "open_all_warning": "Une fois ouverte, tout client qui atteint le portail {portal} et présente les identifiants CHAP de cette cible se connecte — la liste d’accès ne s’applique plus.",
+      "open_all_warning_no_auth": "Une fois ouverte, tout client qui atteint le portail {portal} obtient le disque brut — cette cible n’a pas d’authentification, et la liste d’accès ne s’applique plus.",
+      "open_all_loss_allowlist": "La liste d’accès ({n} {n|entrée|entrées}) et ses descriptions seront supprimées.",
+      "open_all_loss_stale": "Les entrées du noyau par lesquelles personne n’est connecté seront supprimées.",
+      "open_all_keep_sessions": "Les clients connectés maintenant restent connectés.",
+      "open_all_keep_auth": "L’authentification de la cible s’applique toujours.",
+      "open_all_back": "Pour n’autoriser à nouveau que des clients choisis, ajoutez un initiateur et enregistrez — dès lors, seuls les clients de la liste peuvent se connecter (les sessions de la cible sont réinitialisées une fois).",
+      "open_all_done": "Ouverture de la cible {name} acceptée — le résultat est dans le journal de la tâche.",
+      "open_blocked_title": "Le noyau conserve encore une liste d’accès.",
+      "open_blocked_note": "La cible est enregistrée comme ouverte, mais le noyau conserve une liste d’accès pour elle, donc chaque application est refusée. Ouvrez-la délibérément à tous, ou arrêtez la cible.",
+      "close_all_title": "Fermer la cible {name} à tous",
+      "close_all_text": "Aucune entrée ne restera sur la liste d’accès. Une fois enregistrée, personne ne peut se connecter, et les sessions des clients retirés sont coupées. Pour autoriser à nouveau quelqu’un, ajoutez-le à la liste.",
+      "close_all_confirm": "Fermer à tous",
+      "disconnect_revoke_last_text": "C’est la seule entrée de la liste d’accès : une fois retirée, la cible est fermée et personne ne peut se connecter.",
+      "allowlist_last_warning_nvmet": "La liste sera vide : une fois enregistrée, plus personne de nouveau ne peut se connecter. Les hôtes connectés maintenant gardent l’accès jusqu’à leur reconnexion — pour les couper tout de suite, arrêtez la cible.",
+      "close_all_text_nvmet": "Aucun hôte ne restera sur la liste d’accès. Une fois enregistrée, plus personne de nouveau ne peut se connecter, mais les hôtes connectés maintenant gardent un accès complet jusqu’à leur reconnexion. Pour les couper tout de suite, arrêtez la cible."
     },
     "wizard_target": {
       "title": "Nouvelle cible",
@@ -8011,7 +8043,8 @@
       "host_description_label": "Description — {nqn}",
       "host_description_placeholder": "p. ex. orion (compute)",
       "transport_no_rdma_device": "L’interface {iface} n’a pas de périphérique RDMA — le noyau refuse une écoute RDMA sur son adresse. Choisissez TCP ou une interface avec une carte RDMA.",
-      "transport_rdma_link_down": "Le périphérique RDMA {device} de l’interface {iface} a un lien inactif — la cible sera enregistrée, mais les clients ne pourront pas se connecter en RDMA tant que le lien n’est pas actif."
+      "transport_rdma_link_down": "Le périphérique RDMA {device} de l’interface {iface} a un lien inactif — la cible sera enregistrée, mais les clients ne pourront pas se connecter en RDMA tant que le lien n’est pas actif.",
+      "dhchap_hosts_filter_note_allowlisted": "Sans authentification, la liste d’accès NQN n’est qu’un filtre, pas une connexion : un initiateur hors de la liste est refusé, mais un initiateur de la liste se connecte sans clé. Cette cible a une liste d’accès — une liste vide la ferme et plus personne de nouveau ne peut se connecter. Pour laisser entrer tout le monde, utilisez « Ouvrir à tous » dans les détails de la cible."
     },
     "journal_owner": {
       "this_instance": "cette instance TentaNas",
@@ -8066,7 +8099,7 @@
       "sharing_stop_author_gone": "L'auteur de cette demande n'est plus administrateur de la plateforme dans cette organisation — elle ne peut pas être approuvée ; rejetez-la.",
       "sharing_resume_partial": "Le partage est revenu, mais pas entièrement — les lignes de la tâche indiquent ce qui ne sert pas encore ; le nœud réessaie.",
       "sharing_stop_pending_elsewhere": "Un arrêt du partage demandé dans une autre organisation attend déjà son approbation sur ce nœud. Un administrateur de la plateforme le voit dans TentaNas → Tâches et peut le rejeter.",
-      "target_last_initiator": "C’est la seule entrée de la liste d’autorisation — la retirer ouvrirait la cible à tout le monde. Arrêtez la cible ou ajoutez d’abord une autre entrée.",
+      "target_last_initiator": "Le nœud a refusé de retirer la dernière entrée de la liste d’accès — il exécute une version antérieure, où une liste vide ouvrait la cible à tout le monde. Arrêtez la cible ou mettez d’abord le nœud à jour.",
       "target_description_unlisted": "La description concerne un initiateur absent de la liste d’autorisation — ajoutez-le à la liste ou retirez la description",
       "target_description_too_long": "Une description ne peut pas dépasser 80 caractères",
       "target_description_invalid": "Une description ne peut pas contenir de caractères de contrôle (comme un saut de ligne)",
@@ -8151,7 +8184,10 @@
       "disk_wipe_refused": "Le nœud refuse d’effacer ce disque — relisez le plan pour voir pourquoi",
       "disk_wipe_no_journal": "Aucun journal d’Elastic Array ne réserve plus ce disque — relisez le plan",
       "disk_wipe_journal_unacknowledged": "Le journal de l’Elastic Array dissoute {array} réserve encore ce disque — confirmez la perte de cette grappe ou récupérez-la par un import de grappe",
-      "elastic_create_needs_attention": "La grappe a été créée mais demande une intervention ; les réservations de ses disques sont conservées"
+      "elastic_create_needs_attention": "La grappe a été créée mais demande une intervention ; les réservations de ses disques sont conservées",
+      "target_open_already_open": "Cette cible est déjà ouverte — il n’y a rien à ouvrir",
+      "target_open_nvmet_auth": "Un sous-système NVMe-oF avec DH-HMAC-CHAP ne peut pas être ouvert à tous — ses clés sont stockées sur les hôtes autorisés. Désactivez d’abord l’authentification",
+      "target_open_changed": "La cible a changé depuis l’ouverture de cette fenêtre (quelqu’un a enregistré une liste d’accès, par exemple) — actualisez et réessayez"
     },
     "unreachable": {
       "title": "Nœud {node} injoignable",

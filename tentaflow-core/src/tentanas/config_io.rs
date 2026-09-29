@@ -38,6 +38,55 @@ use crate::profiling::collectors::elevation::ElevationToken;
 /// know rather than guessing at half of it.
 pub const SCHEMA: u32 = 1;
 
+/// The schema of a document that holds a CLOSED target with an EMPTY
+/// allowlist (migration 30, critic wave 14 MINOR-5). In schema 1 an empty
+/// `initiators` means OPEN, and a node from before wave 14 ignores
+/// `allowlist_mode`: it would bring that target back open to every client
+/// that reaches the portal. Such a document is therefore written as schema 2,
+/// which every older node refuses whole ("export schema 2 cannot be read by
+/// this version") — it fails loudly instead of opening anything. Every other
+/// document stays schema 1, readable everywhere as before.
+///
+/// Chosen over the alternatives: a placeholder initiator is a name any client
+/// may declare (the allowlist is a filter, not a login), and exporting the
+/// target disabled leaves it one "Wznów" away from open on the older node.
+pub const SCHEMA_CLOSED_EMPTY: u32 = 2;
+
+/// The targets half of an export, and the schema the document needs for
+/// them (critic wave 14 R2-MINOR-3): pure, so the guard that keeps a
+/// closed-empty target from reaching an older node as OPEN — the flag on
+/// every target, and schema 2 when one is closed and empty — is tested on
+/// the very function the export calls. The four secret columns are not read.
+pub fn targets_section(rows: Vec<store::TargetRow>) -> (Vec<TargetConfig>, u32) {
+    let targets: Vec<TargetConfig> = rows
+        .into_iter()
+        .map(|t| TargetConfig {
+            allowlist_mode: Some(t.allowlisted()),
+            name: t.name,
+            protocol: t.protocol,
+            wwn: t.wwn,
+            enabled: t.enabled,
+            luns: t.luns,
+            portals: t.portals,
+            port_groups: t.port_groups,
+            initiators: t.initiators,
+            initiator_descriptions: t.initiator_descriptions,
+            auth_method: t.auth_method,
+            auth_username: t.auth_username,
+            auth_mutual_username: t.auth_mutual_username,
+            dhchap_hash: t.dhchap_hash,
+            dhchap_dhgroup: t.dhchap_dhgroup,
+        })
+        .collect();
+    let schema = if needs_closed_schema(&targets) { SCHEMA_CLOSED_EMPTY } else { SCHEMA };
+    (targets, schema)
+}
+
+/// Whether a document with these targets needs `SCHEMA_CLOSED_EMPTY`.
+fn needs_closed_schema(targets: &[TargetConfig]) -> bool {
+    targets.iter().any(|t| t.allowlist_mode == Some(true) && t.initiators.is_empty())
+}
+
 const STEP_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -101,6 +150,64 @@ pub struct ShareUserConfig {
     pub description: String,
 }
 
+/// The "Opis" of one imported target as the node stores it, and one job-log
+/// line for every change the import makes to what the document said
+/// (critic wave 12, MINOR 14): a save REFUSES such text (§4.1), an import
+/// cannot ask anybody, so it changes it and says so.
+///
+/// Control characters are removed, the text trimmed and cut to
+/// `DESCRIPTION_MAX_CHARS` characters (trimmed first, so leading blanks do
+/// not eat the limit); a description of an initiator the document does not
+/// list, or one left empty, is dropped. The lines name the target and the
+/// initiator, never the text.
+pub fn imported_descriptions(
+    target: &str,
+    initiators: &[String],
+    asked: &std::collections::BTreeMap<String, String>,
+) -> (std::collections::BTreeMap<String, String>, Vec<String>) {
+    let max = super::targets::DESCRIPTION_MAX_CHARS;
+    let mut kept = std::collections::BTreeMap::new();
+    let mut notes = Vec::new();
+    for (initiator, text) in asked {
+        if !initiators.contains(initiator) {
+            notes.push(format!(
+                "target {target}: the description of {initiator} was not imported — it is not on the target's allowlist"
+            ));
+            continue;
+        }
+        let visible: String = text.chars().filter(|c| !c.is_control()).collect();
+        if visible.len() != text.len() {
+            notes.push(format!("target {target}: control characters were removed from the description of {initiator}"));
+        }
+        let trimmed = visible.trim();
+        let cut: String = trimmed.chars().take(max).collect();
+        let cut = cut.trim_end().to_string();
+        if trimmed.chars().count() > max {
+            notes.push(format!(
+                "target {target}: the description of {initiator} was cut to {max} characters (it had {})",
+                trimmed.chars().count()
+            ));
+        }
+        if cut.is_empty() {
+            if !text.is_empty() {
+                notes.push(format!("target {target}: the description of {initiator} was empty after cleaning and was dropped"));
+            }
+            continue;
+        }
+        kept.insert(initiator.clone(), cut);
+    }
+    // The save's own rule, once more: what it would refuse is not stored. It
+    // cannot refuse what the cleaning above leaves, and if it ever does, the
+    // log says so instead of dropping the lot in silence.
+    match super::targets::clean_descriptions(initiators, &kept) {
+        Ok(clean) => (clean, notes),
+        Err(code) => {
+            notes.push(format!("target {target}: no description was imported ({code})"));
+            (std::collections::BTreeMap::new(), notes)
+        }
+    }
+}
+
 /// One block target in the exported document.
 ///
 /// The authentication METHOD and the user names travel; the CHAP and
@@ -123,6 +230,11 @@ pub struct TargetConfig {
     /// travels; absent from an older document.
     #[serde(default)]
     pub initiator_descriptions: std::collections::BTreeMap<String, String>,
+    /// The target is allowlisted (migration 30) — with an empty
+    /// `initiators`, CLOSED. Absent from an older document, where a
+    /// non-empty `initiators` is what "allowlisted" meant.
+    #[serde(default)]
+    pub allowlist_mode: Option<bool>,
     pub auth_method: String,
     #[serde(default)]
     pub auth_username: String,
@@ -295,28 +407,10 @@ async fn export_scoped(db: &DbPool, org_id: Option<&str>) -> Result<ConfigDocume
         Some(org) => store::list_targets_of_org(db, org)?,
         None => store::list_targets(db)?,
     };
-    let targets = targets
-        .into_iter()
-        .map(|t| TargetConfig {
-            name: t.name,
-            protocol: t.protocol,
-            wwn: t.wwn,
-            enabled: t.enabled,
-            luns: t.luns,
-            portals: t.portals,
-            port_groups: t.port_groups,
-            initiators: t.initiators,
-            initiator_descriptions: t.initiator_descriptions,
-            auth_method: t.auth_method,
-            auth_username: t.auth_username,
-            auth_mutual_username: t.auth_mutual_username,
-            dhchap_hash: t.dhchap_hash,
-            dhchap_dhgroup: t.dhchap_dhgroup,
-        })
-        .collect();
+    let (targets, schema) = targets_section(targets);
 
     Ok(ConfigDocument {
-        schema: SCHEMA,
+        schema,
         exported_at: store::now(),
         node_id: super::fleet_mounts::local_node_id(),
         node_name: hostname(),
@@ -391,9 +485,9 @@ pub fn write_backup(document: &ConfigDocument) -> Result<std::path::PathBuf> {
 pub fn parse(json: &str) -> Result<ConfigDocument> {
     let document: ConfigDocument =
         serde_json::from_str(json).map_err(|e| anyhow!("the file is not a TentaNas export: {e}"))?;
-    if document.schema != SCHEMA {
+    if document.schema != SCHEMA && document.schema != SCHEMA_CLOSED_EMPTY {
         return Err(anyhow!(
-            "export schema {} cannot be read by this version (expected {SCHEMA})",
+            "export schema {} cannot be read by this version (expected {SCHEMA} or {SCHEMA_CLOSED_EMPTY})",
             document.schema
         ));
     }
@@ -1152,17 +1246,21 @@ pub async fn apply_with(
             initiators: target.initiators.clone(),
             // Only the descriptions of listed initiators, judged by the same
             // rule as a save: an edited document cannot smuggle in text the
-            // editor would refuse.
-            initiator_descriptions: super::targets::clean_descriptions(
-                &target.initiators,
-                &target
-                    .initiator_descriptions
-                    .iter()
-                    .filter(|(k, _)| target.initiators.contains(k))
-                    .map(|(k, v)| (k.clone(), v.chars().filter(|c| !c.is_control()).take(super::targets::DESCRIPTION_MAX_CHARS).collect()))
-                    .collect(),
-            )
-            .unwrap_or_default(),
+            // editor would refuse. What the import changes is said in the
+            // job log (critic wave 12, MINOR 14) — the one place §4.1's
+            // "refused, not dropped" does not hold.
+            initiator_descriptions: {
+                let (kept, notes) = imported_descriptions(&target.name, &target.initiators, &target.initiator_descriptions);
+                for note in notes {
+                    handle.log(note);
+                }
+                kept
+            },
+            allowlist_mode: target.allowlist_mode.unwrap_or(!target.initiators.is_empty()),
+            // An import is never a deliberate open: a kernel that holds an
+            // allowlist for this WWN keeps refusing the apply until an admin
+            // opens the target on purpose.
+            open_confirmed: false,
             auth_method: target.auth_method.clone(),
             auth_username: target.auth_username.clone(),
             auth_secret: String::new(),
@@ -1358,6 +1456,98 @@ pub async fn apply_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Critic wave 14, MINOR-5: a closed target with an empty list is written
+    /// in a schema an older node refuses, so it can never come back OPEN
+    /// there; every other document keeps schema 1.
+    #[test]
+    fn a_closed_empty_target_is_exported_in_a_schema_older_nodes_refuse() {
+        let closed = TargetConfig { allowlist_mode: Some(true), ..Default::default() };
+        let listed = TargetConfig { allowlist_mode: Some(true), initiators: vec!["iqn.x:y".into()], ..Default::default() };
+        let open = TargetConfig { allowlist_mode: Some(false), ..Default::default() };
+        assert!(needs_closed_schema(&[listed.clone(), closed.clone()]));
+        assert!(!needs_closed_schema(&[listed, open]));
+        assert!(!needs_closed_schema(&[TargetConfig::default()]), "an older document's target (no flag) is not closed");
+        // This version reads both; a node from before wave 14 checks
+        // `schema != 1` and refuses the second whole.
+        let mut doc = document();
+        doc.schema = SCHEMA_CLOSED_EMPTY;
+        doc.targets = vec![closed];
+        let back = parse(&serde_json::to_string(&doc).unwrap()).expect("read here");
+        assert_eq!(back.targets[0].allowlist_mode, Some(true));
+        assert!(SCHEMA_CLOSED_EMPTY != SCHEMA);
+    }
+
+    /// Critic wave 14 R2-MINOR-3: the export's own targets half. A row whose
+    /// list was emptied (written through the store, then emptied behind its
+    /// back) is exported with its flag and makes the document schema 2; an
+    /// open target and a listed one leave it at schema 1.
+    #[test]
+    fn the_export_writes_a_closed_empty_target_flagged_and_in_schema_2() {
+        let conn = rusqlite::Connection::open_in_memory().expect("db");
+        super::super::db::migrate(&conn).expect("migrate");
+        let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+        let row = |id: &str, name: &str, initiators: Vec<String>| store::TargetRow {
+            target_id: id.into(),
+            name: name.into(),
+            protocol: "iscsi".into(),
+            wwn: format!("iqn.2026-09.local.tentaflow:helios.{name}"),
+            initiators,
+            created_at: store::now(),
+            updated_at: store::now(),
+            ..Default::default()
+        };
+        store::upsert_target(&db, "org-a", &row("t-open", "otwarty", vec![])).expect("open");
+        store::upsert_target(&db, "org-a", &row("t-list", "lista", vec!["iqn.1994-05.com.redhat:vmhost-01".into()])).expect("listed");
+        let (targets, schema) = targets_section(store::list_targets(&db).expect("rows"));
+        assert_eq!(schema, SCHEMA, "an open and a listed target: readable by every node");
+        assert_eq!(targets.iter().find(|t| t.name == "lista").unwrap().allowlist_mode, Some(true));
+        assert_eq!(targets.iter().find(|t| t.name == "otwarty").unwrap().allowlist_mode, Some(false));
+        db.write()
+            .expect("write")
+            .execute("DELETE FROM nas_target_initiators WHERE target_id = 't-list'", [])
+            .expect("emptied");
+        let (targets, schema) = targets_section(store::list_targets(&db).expect("rows"));
+        assert_eq!(schema, SCHEMA_CLOSED_EMPTY, "a closed-empty target: an older node refuses the file");
+        let closed = targets.iter().find(|t| t.name == "lista").unwrap();
+        assert!(closed.initiators.is_empty());
+        assert_eq!(closed.allowlist_mode, Some(true));
+    }
+
+    /// Critic wave 12, MINOR 14: the import changes a description a save
+    /// would refuse — and says so in the job log, naming the target and the
+    /// initiator, never the text.
+    #[test]
+    fn an_import_says_what_it_did_to_a_description() {
+        let listed = "iqn.1994-05.com.redhat:vmhost-01".to_string();
+        let other = "iqn.1994-05.com.redhat:vmhost-02".to_string();
+        let initiators = vec![listed.clone(), other.clone()];
+        let long = format!("   {}", "x".repeat(100));
+        let asked = std::collections::BTreeMap::from([
+            (listed.clone(), long),
+            (other.clone(), "Proxmox\tvm\u{7}".to_string()),
+            ("iqn.x:stray".to_string(), "secret-ish text".to_string()),
+        ]);
+        let (kept, notes) = imported_descriptions("vm-store", &initiators, &asked);
+        assert_eq!(kept[&listed], "x".repeat(super::super::targets::DESCRIPTION_MAX_CHARS), "trimmed before the cut");
+        assert_eq!(kept[&other], "Proxmoxvm");
+        assert!(!kept.contains_key("iqn.x:stray"));
+        let joined = notes.join("\n");
+        assert!(joined.contains(&format!("target vm-store: the description of {listed} was cut to 80 characters (it had 100)")), "{joined}");
+        assert!(joined.contains(&format!("target vm-store: control characters were removed from the description of {other}")), "{joined}");
+        assert!(joined.contains("the description of iqn.x:stray was not imported — it is not on the target's allowlist"), "{joined}");
+        assert!(!joined.contains("secret-ish") && !joined.contains("Proxmox"), "never the text itself: {joined}");
+        // A clean document leaves the log alone.
+        let clean = std::collections::BTreeMap::from([(listed.clone(), "Proxmox vmhost-01".to_string())]);
+        let (kept, notes) = imported_descriptions("vm-store", &initiators, &clean);
+        assert_eq!(kept, clean);
+        assert!(notes.is_empty(), "{notes:?}");
+        // Only control characters: dropped, and said.
+        let blank = std::collections::BTreeMap::from([(listed.clone(), "\u{1}\u{2}".to_string())]);
+        let (kept, notes) = imported_descriptions("vm-store", &initiators, &blank);
+        assert!(kept.is_empty());
+        assert!(notes.iter().any(|n| n.contains("was empty after cleaning and was dropped")), "{notes:?}");
+    }
 
     fn document() -> ConfigDocument {
         ConfigDocument {
@@ -1989,6 +2179,7 @@ mod tests {
             port_groups: super::super::targets::default_port_groups(),
             initiators: vec![esx.to_string()],
             initiator_descriptions: Default::default(),
+            allowlist_mode: None,
             auth_method: method.to_string(),
             auth_username: String::new(),
             auth_mutual_username: String::new(),
@@ -1997,6 +2188,9 @@ mod tests {
         };
         let mut document = document();
         document.targets = vec![target("vm-a", "dhchap"), target("vm-b", "none")];
+        // A description the import has to drop (critic wave 12, MINOR 14).
+        document.targets[1].initiator_descriptions =
+            std::collections::BTreeMap::from([("iqn.x:stray".to_string(), "x".to_string())]);
         document.shares.clear();
         document.datasets.clear();
         document.pools.clear();
@@ -2034,6 +2228,11 @@ mod tests {
         assert!(collision.contains(esx), "{collision}");
         assert!(collision.contains("vm-a"), "{collision}");
         assert!(collision.contains("only one of these two targets can be applied"), "{collision}");
+        // What the import did to a description is in the same log.
+        assert!(
+            log.iter().any(|l| l.contains("target vm-b: the description of iqn.x:stray was not imported")),
+            "the import dropped a description in silence:\n{log:#?}"
+        );
     }
 
     #[tokio::test]
@@ -2105,6 +2304,7 @@ mod tests {
             port_groups: super::super::targets::default_port_groups(),
             initiators: vec!["nqn.2014-08.org.nvmexpress:uuid:esx01".to_string()],
             initiator_descriptions: Default::default(),
+            allowlist_mode: None,
             auth_method: "dhchap".to_string(),
             auth_username: String::new(),
             auth_mutual_username: String::new(),

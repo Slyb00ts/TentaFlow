@@ -607,6 +607,11 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
   // else. Rendered into its own container so a keystroke repaints this and not
   // the whole step: `draw()` replaces the wizard's `innerHTML`, which took the
   // caret out of the field on every character typed.
+  // The target being edited is allowlisted (wave 14): an emptied host list
+  // then CLOSES it — nobody new connects — instead of letting everyone in.
+  // Spelled here and not imported from targets.js, which imports this module.
+  const wasAllowlisted = editing && (Boolean(target.allowlistMode) || (target.initiators || []).length > 0);
+  const closesTarget = () => wasAllowlisted && state.protocol === 'nvmet' && parseHostNqns(state.hostNqnText).length === 0;
   const hostAllowlistWarnings = () => {
     // ONE place picks the sentence — `sharedHostWarning` — because picking it
     // from `state.method` alone told two of the four combinations wrong.
@@ -615,7 +620,8 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     return `
       ${shared ? `<div class="wizard-warning">${sprite('alert')}<div>${escapeHtml(T(shared.key, { nqns: shared.nqns, targets: shared.targets }))}</div></div>` : ''}
       ${invalid.length ? `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_target.host_nqn_invalid', { nqns: invalid.join(', ') }))}</div></div>` : ''}
-      ${state.method === 'none' || parseHostNqns(state.hostNqnText).length ? '' : `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_target.dhchap_hosts_required'))}</div></div>`}`;
+      ${state.method === 'none' || parseHostNqns(state.hostNqnText).length ? '' : `<div class="wizard-warning danger">${sprite('alert')}<div>${escapeHtml(T('wizard_target.dhchap_hosts_required'))}</div></div>`}
+      ${state.method === 'none' && closesTarget() ? `<div class="wizard-warning danger" data-testid="wizard-closed-warning">${sprite('alert')}<div>${escapeHtml(T('targets.allowlist_last_warning_nvmet'))}</div></div>` : ''}`;
   };
 
   // The NQN allowlist is NOT an auth field, and used to be rendered as one.
@@ -629,7 +635,7 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
     if (state.protocol !== 'nvmet') return '';
     return `
       <tf-input id="nas-tw-hosts" multiline rows="2" label="${escapeAttr(T('wizard_target.dhchap_hosts_label'))}" spellcheck="false" placeholder="nqn.2014-08.org.nvmexpress:uuid:…" value="${escapeAttr(state.hostNqnText)}" hint="${escapeAttr(T('wizard_target.dhchap_hosts_hint'))}"></tf-input>
-      <div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T(state.method === 'none' ? 'wizard_target.dhchap_hosts_filter_note' : 'wizard_target.dhchap_hosts_note'))}</div></div>
+      <div class="wizard-warning info">${sprite('info')}<div>${escapeHtml(T(state.method !== 'none' ? 'wizard_target.dhchap_hosts_note' : wasAllowlisted ? 'wizard_target.dhchap_hosts_filter_note_allowlisted' : 'wizard_target.dhchap_hosts_filter_note'))}</div></div>
       ${editing ? `<div class="wizard-warning" data-testid="nvmet-remove-note">${sprite('alert')}<div>${escapeHtml(T('targets.nvmet_remove_keeps_connection'))}</div></div>` : ''}
       <div id="nas-tw-hosts-warn">${hostAllowlistWarnings()}</div>
       <div id="nas-tw-host-descs" class="stack"></div>`;
@@ -1118,6 +1124,14 @@ export function openTargetWizard(screen, { target = null, capabilities = null, t
   };
 
   const run = async () => {
+    // Emptying an allowlisted subsystem's host list closes it: the same
+    // confirmation as the detail editor, and nothing is sent without it
+    // (owner decision 2026-09-29, critic wave 14 R2-FIX-2). Loaded on use:
+    // targets.js imports this module.
+    if (closesTarget()) {
+      const { confirmClosing } = await import('/js/modules/tentanas/targets.js');
+      if (!(await confirmClosing(target))) return;
+    }
     state.busy = true;
     draw();
     const kind = editing ? 'tentaNasTargetUpdateRequest' : 'tentaNasTargetCreateRequest';

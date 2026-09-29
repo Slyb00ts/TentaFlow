@@ -729,6 +729,20 @@ const ALERT_WORDS = new Map([
     const t = textParams(p, ['target']);
     return t ? { title: T('alerts.code.target_rebuild_not_disabled.title', t), detail: T('alerts.code.target_rebuild_not_disabled.detail') } : null;
   }],
+  // Wave 14: the reset left the target DISABLED (nobody is served); an
+  // open row the kernel keeps closed; a toggle that reset every session.
+  ['target_left_disabled', (p) => {
+    const t = textParams(p, ['target']);
+    return t ? { title: T('alerts.code.target_left_disabled.title', t), detail: T('alerts.code.target_left_disabled.detail') } : null;
+  }],
+  ['target_open_refused', (p) => {
+    const t = textParams(p, ['target']);
+    return t ? { title: T('alerts.code.target_open_refused.title', t), detail: T('alerts.code.target_open_refused.detail') } : null;
+  }],
+  ['target_sessions_reset', (p) => {
+    const t = textParams(p, ['target']);
+    return t ? { title: T('alerts.code.target_sessions_reset.title', t), detail: T('alerts.code.target_sessions_reset.detail') } : null;
+  }],
   ['elevation_unarmed', () => ({ title: T('alerts.code.elevation_unarmed.title'), detail: T('alerts.code.elevation_unarmed.detail') })],
   // Raised by tentanas/sharing.rs (wave 10): the resume of a node's sharing.
   ['sharing_resume_failed', (p) => {

@@ -10077,6 +10077,23 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::TentaNasBody(TargetOpenRequest) — "Otwórz dla wszystkich" (wave 14): the one
+   *  deliberate road from an allowlisted target to an open one; retype-gated like the
+   *  delete (`confirm_name` is the target's name). JobResponse. */
+  tentaNasTargetOpenRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      target_id: csText(payload.targetId ?? payload.target_id),
+      confirm_name: csText(payload.confirmName ?? payload.confirm_name),
+      // The window's reading of the target (critic wave 14, NIT-7): a target
+      // changed since is refused instead of overridden. Empty skips the check.
+      expected_updated_at: csText(payload.expectedUpdatedAt ?? payload.expected_updated_at),
+      sudo_password: csOptText(payload.sudoPassword ?? payload.sudo_password),
+    };
+    const body = _wasm.encodeTentaNasTargetOpenRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::TentaNasBody(TargetDeleteRequest) — retype-gated; the zvol and its data stay. */
   tentaNasTargetDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

@@ -3271,6 +3271,7 @@ async fn target_get(ctx: &HandlerContext, target_id: &str) -> Result<MessageBody
         listen: rdma.listen,
         rdma_peers: rdma.peers,
         rdma_peers_state: rdma.peers_state.to_string(),
+        open_blocked: tentanas::targets::open_blocked(&row),
     }))
 }
 
@@ -3596,6 +3597,10 @@ async fn target_create(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
         state_reasons: Vec::new(),
         created_at: now.clone(),
         updated_at: now,
+        // Migration 30: a target created with a list is allowlisted for good
+        // — emptying the list later closes it, never opens it.
+        allowlist_mode: !initiators.is_empty(),
+        open_confirmed: false,
         target_id,
     };
     // BEFORE the zvol exists. A validation failure after `ZfsCreate` would
@@ -3659,17 +3664,10 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     };
     let g = gate_targets(ctx)?;
     let mut row = target_row(&g, target_id)?;
-    // SECURITY (MAJOR 27 F2): the last entry never leaves the allowlist. An
-    // empty list is an OPEN target, so "revoke the last initiator" would let
-    // everybody in — the one it meant to shut out first (measured: back in
-    // 2.2 s). The coded refusal names what does cut everybody off: stopping
-    // the target.
-    if tentanas::targets::removes_last_initiator(&row.initiators, initiators) {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::Conflict,
-            tentanas::targets::LAST_INITIATOR_REFUSAL,
-        ));
-    }
+    // Taking the last entry off an allowlist CLOSES the target (owner
+    // decision 2026-09-29, migration 30): the row stays allowlisted below.
+    // Read BEFORE the list is replaced.
+    let was_allowlisted = row.allowlisted();
     // "Opis": `None` (an older client) keeps what the initiators that stay
     // already had; `Some` replaces it and is judged like the create's.
     let descriptions = match initiator_descriptions {
@@ -3712,6 +3710,13 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
     .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     row.initiators = initiators.clone();
     row.initiator_descriptions = descriptions;
+    // A list makes the target allowlisted and ends a deliberate open; an
+    // EMPTY list changes neither — an allowlisted target it leaves empty
+    // stays CLOSED (migration 30), only `TargetOpenRequest` opens one.
+    row.allowlist_mode = was_allowlisted || !row.initiators.is_empty();
+    if row.allowlist_mode {
+        row.open_confirmed = false;
+    }
     if !port_groups.is_empty() {
         row.port_groups = port_groups.clone();
     }
@@ -3749,8 +3754,8 @@ async fn target_update(ctx: &HandlerContext, req: &P) -> Result<MessageBody, Pro
 ///
 /// `revoke` is no new helper command: the row loses the initiator and the
 /// ordinary apply runs, whose ACL `rmdir` drops the session at once
-/// (measured) — refused when it is the only entry, because an empty list
-/// opens the target (F2).
+/// (measured). Revoking the only entry CLOSES the target to everybody
+/// (owner decision 2026-09-29, migration 30).
 async fn target_session_reset(ctx: &HandlerContext, req: &P) -> Result<MessageBody, ProtocolError> {
     let P::TargetSessionResetRequest {
         target_id,
@@ -3778,6 +3783,7 @@ async fn target_session_reset(ctx: &HandlerContext, req: &P) -> Result<MessageBo
     let cipher = ctx.state.settings_cipher.clone();
     let who = initiator.clone();
     let subject = row.name.clone();
+    let org_id = g.org_id.clone();
     let job = tentanas::jobs::spawn_owned(
         &g.db,
         "target_session_reset",
@@ -3790,7 +3796,7 @@ async fn target_session_reset(ctx: &HandlerContext, req: &P) -> Result<MessageBo
             let db = h.db().clone();
             h.log(format!("{}: resetting the session of {who}", row.name));
             let (lines, outcome) =
-                tentanas::targets::reset_session(&db, &cipher, &row, &who, explicit.as_deref()).await;
+                tentanas::targets::reset_session(&db, &cipher, &org_id, &row, &who, explicit.as_deref()).await;
             drop(explicit);
             for line in lines {
                 h.log(line);
@@ -3801,6 +3807,48 @@ async fn target_session_reset(ctx: &HandlerContext, req: &P) -> Result<MessageBo
     )
     .map_err(|e| internal("job", e))?;
     Ok(job_response(ctx, job))
+}
+
+/// "Otwórz dla wszystkich" (wave 14, owner decision 2026-09-29): the one
+/// deliberate road from an allowlisted target to an OPEN one. Nothing else
+/// opens a target — an edit that empties the list leaves it closed
+/// (migration 30) — so the admin retypes the name, like the delete, and the
+/// dialog says who gets in afterwards.
+///
+/// Also the way out of a target whose every apply is refused because the
+/// kernel holds an allowlist its OPEN row does not (`targets::open_blocked`):
+/// the confirmation lets the apply open the TPG, and the prune removes the
+/// static ACLs nobody is logged in through.
+async fn target_open(ctx: &HandlerContext, req: &P) -> Result<MessageBody, ProtocolError> {
+    let P::TargetOpenRequest {
+        target_id,
+        confirm_name,
+        expected_updated_at,
+        sudo_password,
+    } = req
+    else {
+        return Err(ProtocolError::bad_request("expected TargetOpenRequest"));
+    };
+    let g = gate_targets(ctx)?;
+    let row = target_row(&g, target_id)?;
+    require_confirm(&row.name, confirm_name)?;
+    // Optimistic concurrency (critic wave 14, NIT-7): the window's reading
+    // of the target, or nothing from an older front.
+    if tentanas::targets::open_is_stale(&row, expected_updated_at) {
+        return Err(ProtocolError::new(ProtocolErrorCode::Conflict, tentanas::targets::OPEN_TARGET_CHANGED));
+    }
+    let mut row = tentanas::targets::opened(&row, tentanas::targets::open_blocked(&row))
+        .map_err(|code| ProtocolError::new(ProtocolErrorCode::Conflict, code))?;
+    // Written only if the row is still the one read above — the check and
+    // the write are one transaction (critic wave 14 R2-NIT-4): a save that
+    // lands in between makes this open fail instead of being overridden.
+    let read_at = row.updated_at.clone();
+    row.updated_at = store::now();
+    let name = row.name.clone();
+    if !store::update_target_if_unchanged(&g.db, &g.org_id, &row, &read_at).map_err(|e| internal("targets", e))? {
+        return Err(ProtocolError::new(ProtocolErrorCode::Conflict, tentanas::targets::OPEN_TARGET_CHANGED));
+    }
+    spawn_target_job(ctx, &g, "target_open", &name, target_id, sudo_password.as_ref())
 }
 
 /// Deleting a target cuts a live client off from a raw disk mid-write, which
@@ -6527,6 +6575,7 @@ pub async fn tentanas_dispatch(req: &MessageBody, ctx: &HandlerContext) -> Resul
         P::TargetCreateRequest { .. } => target_create(ctx, payload).await,
         P::TargetUpdateRequest { .. } => target_update(ctx, payload).await,
         P::TargetSessionResetRequest { .. } => target_session_reset(ctx, payload).await,
+        P::TargetOpenRequest { .. } => target_open(ctx, payload).await,
         P::TargetDeleteRequest {
             target_id,
             confirm_name,
@@ -7016,6 +7065,7 @@ register_tentanas_variant!("TentaNasTargetGetRequest", "tentaflow_ws_handler_nas
 register_tentanas_variant!("TentaNasTargetCreateRequest", "tentaflow_ws_handler_nas_target_create");
 register_tentanas_variant!("TentaNasTargetUpdateRequest", "tentaflow_ws_handler_nas_target_update");
 register_tentanas_variant!("TentaNasTargetSessionResetRequest", "tentaflow_ws_handler_nas_target_session_reset");
+register_tentanas_variant!("TentaNasTargetOpenRequest", "tentaflow_ws_handler_nas_target_open");
 register_tentanas_variant!("TentaNasTargetDeleteRequest", "tentaflow_ws_handler_nas_target_delete");
 register_tentanas_variant!(
     "TentaNasElasticCapabilitiesRequest",
@@ -8365,9 +8415,8 @@ mod registration_tests {
     }
 
     /// Wave 12 (MAJOR 27): the allowlist edits and "Rozłącz" are refused
-    /// with a CODE before any probe, row write or job. The last initiator
-    /// never leaves the list (an empty list OPENS the target — F2), a
-    /// description for an unlisted initiator is refused, and a reset needs an
+    /// with a CODE before any probe, row write or job. A description for an
+    /// unlisted initiator is refused, and a reset needs an
     /// allowlisted iSCSI initiator with a live session (D2, D4).
     #[tokio::test]
     async fn the_last_initiator_descriptions_and_the_session_reset_are_refused_with_codes() {
@@ -8409,10 +8458,6 @@ mod registration_tests {
             enabled: true,
             sudo_password: None,
         };
-        // F2: emptying the list is refused, coded.
-        let refused = target_update(&fixture.ctx, &update(Vec::new(), None)).await.unwrap_err();
-        assert_eq!(refused.code, ProtocolErrorCode::Conflict);
-        assert_eq!(refused.message, "refusal:target_last_initiator");
         // "Opis" for an initiator that is not on the list.
         let stray = std::collections::BTreeMap::from([("iqn.x:stray".to_string(), "x".to_string())]);
         let refused = target_update(&fixture.ctx, &update(vec![who.into()], Some(stray))).await.unwrap_err();
@@ -8431,11 +8476,6 @@ mod registration_tests {
         assert_eq!(
             code(target_session_reset(&fixture.ctx, &reset("iqn.x:stranger", false)).await.unwrap_err()),
             "refusal:target_session_reset_not_allowlisted"
-        );
-        // Revoking the only entry would open the target.
-        assert_eq!(
-            code(target_session_reset(&fixture.ctx, &reset(who, true)).await.unwrap_err()),
-            "refusal:target_last_initiator"
         );
         // This host has no LIO object for the target: no live session.
         assert_eq!(
@@ -8457,6 +8497,186 @@ mod registration_tests {
         .unwrap_err();
         assert_eq!(refused.message, "refusal:target_session_reset_nvmet");
         assert!(store::list_jobs(&g.db, 100).unwrap().is_empty(), "no job behind any refusal");
+    }
+
+    /// Wave 14 (owner decision 2026-09-29): an edit that empties an
+    /// allowlisted target's list leaves it CLOSED, and "Otwórz dla wszystkich"
+    /// — retyped, refused where it means nothing — is the one way to open it.
+    #[tokio::test]
+    async fn only_a_retyped_open_turns_an_allowlisted_target_open() {
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        crate::dispatch::app_gate::test_support::set_permission(
+            &fixture.ctx.state,
+            &fixture.addon_id,
+            "user",
+            &fixture.ctx.org_context.as_ref().unwrap().user_id,
+            PERM_TARGETS,
+            "allow",
+        );
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        // Closed: allowlisted, list empty (as a hand-emptied row reads).
+        let row = store::TargetRow {
+            target_id: "t-w14".into(),
+            name: "vm-w14".into(),
+            protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.local.tentaflow:n.vm-w14".into(),
+            enabled: true,
+            auth_method: "none".into(),
+            state: "active".into(),
+            created_at: store::now(),
+            updated_at: store::now(),
+            allowlist_mode: true,
+            ..Default::default()
+        };
+        store::upsert_target(&g.db, &g.org_id, &row).unwrap();
+        let open = |confirm: &str, target_id: &str| P::TargetOpenRequest {
+            target_id: target_id.into(),
+            confirm_name: confirm.into(),
+            expected_updated_at: String::new(),
+            sudo_password: None,
+        };
+        let stored = |id: &str| store::target(&g.db, &g.org_id, id).unwrap().unwrap();
+        // A wrong retype changes nothing and starts nothing.
+        let refused = target_open(&fixture.ctx, &open("vm-w1", "t-w14")).await.unwrap_err();
+        assert!(refused.message.starts_with("refusal:confirm_mismatch"), "{}", refused.message);
+        assert!(stored("t-w14").allowlisted());
+        assert!(store::list_jobs(&g.db, 100).unwrap().is_empty());
+        // A window that read the target before somebody changed it is
+        // refused instead of overriding that change (NIT-7).
+        let stale = P::TargetOpenRequest {
+            target_id: "t-w14".into(),
+            confirm_name: "vm-w14".into(),
+            expected_updated_at: "2020-01-01T00:00:00Z".into(),
+            sudo_password: None,
+        };
+        let refused = target_open(&fixture.ctx, &stale).await.unwrap_err();
+        assert_eq!(refused.message, "refusal:target_open_changed");
+        assert!(stored("t-w14").allowlisted());
+        let current = P::TargetOpenRequest {
+            target_id: "t-w14".into(),
+            confirm_name: "vm-w14".into(),
+            expected_updated_at: stored("t-w14").updated_at,
+            sudo_password: None,
+        };
+        // The retyped open: the list, the flag and the confirmation, one job.
+        target_open(&fixture.ctx, &current).await.expect("opened");
+        let back = stored("t-w14");
+        assert!(!back.allowlisted() && back.open_confirmed && back.initiators.is_empty());
+        let jobs = store::list_jobs(&g.db, 100).unwrap();
+        assert_eq!(jobs.iter().filter(|j| j.kind == "target_open").count(), 1);
+        // Open already, nothing in the kernel: refused, coded.
+        let refused = target_open(&fixture.ctx, &open("vm-w14", "t-w14")).await.unwrap_err();
+        assert_eq!(refused.message, "refusal:target_open_already_open");
+        // An allowlist ends the deliberate open; emptying it again CLOSES the
+        // target — it never reopens it.
+        let mut listed = back.clone();
+        listed.initiators = vec!["iqn.1994-05.com.redhat:vmhost-01".into()];
+        store::upsert_target(&g.db, &g.org_id, &listed).unwrap();
+        let after = stored("t-w14");
+        assert!(after.allowlisted() && !after.open_confirmed);
+        // An authenticated NVMe-oF subsystem cannot be open to any host.
+        let nvme = store::TargetRow {
+            target_id: "t-w14n".into(),
+            name: "vm-w14n".into(),
+            protocol: "nvmet".into(),
+            wwn: "nqn.2026-09.local.tentaflow:n.vm-w14n".into(),
+            auth_method: "dhchap".into(),
+            initiators: vec!["nqn.2014-08.org.nvmexpress:uuid:esx01".into()],
+            ..row.clone()
+        };
+        store::upsert_target(&g.db, &g.org_id, &nvme).unwrap();
+        let refused = target_open(&fixture.ctx, &open("vm-w14n", "t-w14n")).await.unwrap_err();
+        assert_eq!(refused.message, "refusal:target_open_nvmet_auth");
+        assert!(stored("t-w14n").allowlisted());
+    }
+
+    /// Owner decision 2026-09-29: taking the LAST entry off an allowlist is
+    /// allowed and CLOSES the target — through the editor and through
+    /// "Rozłącz … i usuń z listy" — and never opens it; a DH-HMAC-CHAP
+    /// subsystem may be emptied too (closed, it authenticates nobody).
+    #[tokio::test]
+    async fn removing_the_last_initiator_closes_the_target() {
+        let mut fixture = dispatch_fixture();
+        elastic_admin(&mut fixture);
+        crate::dispatch::app_gate::test_support::set_permission(
+            &fixture.ctx.state,
+            &fixture.addon_id,
+            "user",
+            &fixture.ctx.org_context.as_ref().unwrap().user_id,
+            PERM_TARGETS,
+            "allow",
+        );
+        let g = gate(&fixture.ctx, PERM_READ).unwrap();
+        let who = "iqn.1994-05.com.redhat:vmhost-01";
+        let row = store::TargetRow {
+            target_id: "t-last".into(),
+            name: "vm-last".into(),
+            protocol: "iscsi".into(),
+            wwn: "iqn.2026-09.local.tentaflow:n.vm-last".into(),
+            enabled: true,
+            initiators: vec![who.into()],
+            // Every interface, confirmed below: the portal half of the
+            // edit is not what this test is about.
+            portals: vec![tentaflow_protocol::tentanas::NasTargetPortal {
+                interface: String::new(),
+                address: "0.0.0.0".into(),
+                port: 3260,
+                transport: "tcp".into(),
+            }],
+            port_groups: tentanas::targets::default_port_groups(),
+            luns: vec![tentanas::targets::lun_for("iscsi", "tank/vm-last", 1 << 30, true, "t-last")],
+            auth_method: "none".into(),
+            state: "active".into(),
+            created_at: store::now(),
+            updated_at: store::now(),
+            ..Default::default()
+        };
+        store::upsert_target(&g.db, &g.org_id, &row).unwrap();
+        let stored = |id: &str| store::target(&g.db, &g.org_id, id).unwrap().unwrap();
+        let emptied = P::TargetUpdateRequest {
+            target_id: "t-last".into(),
+            portals: Vec::new(),
+            repick_portal: false,
+            auth: Some(tentaflow_protocol::tentanas::NasTargetAuth { method: "none".into(), ..Default::default() }),
+            initiators: Vec::new(),
+            initiator_descriptions: None,
+            port_groups: Vec::new(),
+            confirm_all_interfaces: true,
+            enabled: true,
+            sudo_password: None,
+        };
+        target_update(&fixture.ctx, &emptied).await.expect("the last entry may be removed");
+        let back = stored("t-last");
+        assert!(back.initiators.is_empty() && back.allowlisted() && !back.open_confirmed, "emptied, and CLOSED");
+        // "Rozłącz … i usuń z listy" on the only entry: allowed, closed.
+        let mut other = row.clone();
+        other.target_id = "t-last2".into();
+        other.name = "vm-last2".into();
+        other.wwn = "iqn.2026-09.local.tentaflow:n.vm-last2".into();
+        store::upsert_target(&g.db, &g.org_id, &other).unwrap();
+        target_session_reset(
+            &fixture.ctx,
+            &P::TargetSessionResetRequest { target_id: "t-last2".into(), initiator: who.into(), revoke: true, sudo_password: None },
+        )
+        .await
+        .expect("the only entry may be revoked");
+        let back = stored("t-last2");
+        assert!(back.initiators.is_empty() && back.allowlisted(), "closed, not open");
+        // A DH-HMAC-CHAP subsystem emptied the same way stays valid: closed.
+        let mut nvme = store::TargetRow {
+            protocol: "nvmet".into(),
+            auth_method: "dhchap".into(),
+            allowlist_mode: true,
+            ..row.clone()
+        };
+        nvme.initiators.clear();
+        let caps = tentaflow_protocol::tentanas::NasBlockCapabilities { nvmet: true, dhchap: true, ..Default::default() };
+        let refused = tentanas::targets::validate_options(&nvme, &[], &caps, true).err().map(|e| e.to_string()).unwrap_or_default();
+        assert!(!refused.contains("needs at least one allowed host"), "{refused}");
+        nvme.allowlist_mode = false;
+        let refused = tentanas::targets::validate_options(&nvme, &[], &caps, true).expect_err("an open subsystem cannot carry keys");
+        assert!(refused.to_string().contains("needs at least one allowed host"), "{refused}");
     }
 
     /// Critic wave 12: a remote LUN is refused, coded, by every path that
