@@ -9957,12 +9957,16 @@ ALTER TABLE bus_partition_assignments ADD COLUMN epoch_slots TEXT NOT NULL DEFAU
 /// versions live on the SUBJECT row because `bus_schema_versions` replicates
 /// insert-if-absent: a mutable column there would never converge.
 /// `deprecated_versions_json` is a JSON array of
-/// `{"version": u32, "deprecated_at_ms": i64}`. `created_by` is NULL for
-/// every topic created before this migration: its author was never recorded.
+/// entries `bus::schema_registry::registry::DeprecatedVersion` defines, and
+/// `bus_schema_subjects.generation` names the subject's incarnation like
+/// `bus_topics.generation` does a topic's (`0` for every subject from before
+/// this migration). `created_by` is NULL for every topic created before this
+/// migration: its author was never recorded.
 const BUS_TOPIC_DESCRIPTION_AND_SCHEMA_VERSION_DEPRECATION: &str = r#"
 ALTER TABLE bus_topics ADD COLUMN description TEXT NOT NULL DEFAULT '';
 ALTER TABLE bus_topics ADD COLUMN created_by TEXT;
 ALTER TABLE bus_schema_subjects ADD COLUMN deprecated_versions_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE bus_schema_subjects ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
 "#;
 
 const BUS_TOPIC_INCARNATIONS: &str = r#"
@@ -13765,15 +13769,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(topic, (String::new(), None, 2, Some("orders".to_string())));
-        let subject: (String, Option<i64>, Option<String>) = conn
+        let subject: (String, i64, Option<i64>, Option<String>) = conn
             .query_row(
-                "SELECT deprecated_versions_json, deprecated_at_ms, created_by \
+                "SELECT deprecated_versions_json, generation, deprecated_at_ms, created_by \
                  FROM bus_schema_subjects WHERE subject = 'orders'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(subject, ("[]".to_string(), Some(5), Some("admin-1".to_string())));
+        assert_eq!(subject, ("[]".to_string(), 0, Some(5), Some("admin-1".to_string())));
     }
 
     #[test]

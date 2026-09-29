@@ -25,7 +25,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   podaje `deprecated_at_ms` (`BusSchemaVersionWire`, REST), a wpis audytu
   `bus.schema.deprecate` podaje numer wersji.
 - Aktualizacja: migracja bazy 176 dodaje `bus_topics.description`,
-  `bus_topics.created_by` i `bus_schema_subjects.deprecated_versions_json`.
+  `bus_topics.created_by`, `bus_schema_subjects.deprecated_versions_json`
+  i `bus_schema_subjects.generation` (wcielenie wzoru: wzór usunięty
+  i zarejestrowany ponownie jest nowym wzorem, do którego nie trafia nic,
+  co dotyczyło poprzedniego).
   Opis i autor synchronizują się w wierszu topiku (ostatni zapis wygrywa,
   autor zostaje ustalony przy tworzeniu). Wycofania wersji i wycofanie całego
   wzoru synchronizują się jako suma: dwa jednoczesne wycofania na różnych

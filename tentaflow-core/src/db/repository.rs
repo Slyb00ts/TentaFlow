@@ -32322,11 +32322,20 @@ pub struct DbBusSchemaSubject {
     /// deprecations to add (`core_materializer::apply_bus_schema_subject`).
     #[serde(default)]
     pub deprecated_versions_json: Option<String>,
+    /// Which incarnation of this subject name the row is (migration v176):
+    /// the packed HLC of its creation (`bus_topic_generation_at`), stamped
+    /// once and replicated with the row. A subject deleted and registered
+    /// again is a new incarnation, and nothing an op says about an older one
+    /// — its deprecations above all — may reach it
+    /// (`core_materializer::bus_schema_subject_op_wins`). `0` is every
+    /// subject created before v176, and what a peer on an older build sends.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 const BUS_SCHEMA_SUBJECT_COLUMNS: &str = "instance_id, org_id, subject, schema_type, \
      compatibility, deprecated_at_ms, created_by, created_at_ms, updated_at_ms, \
-     deprecated_versions_json";
+     deprecated_versions_json, generation";
 
 fn map_bus_schema_subject_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusSchemaSubject> {
     Ok(DbBusSchemaSubject {
@@ -32340,6 +32349,7 @@ fn map_bus_schema_subject_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBus
         created_at_ms: row.get(7)?,
         updated_at_ms: row.get(8)?,
         deprecated_versions_json: Some(row.get(9)?),
+        generation: row.get::<_, i64>(10)? as u64,
     })
 }
 
@@ -32410,7 +32420,7 @@ pub fn bus_schema_subject_insert(pool: &DbPool, row: &DbBusSchemaSubject) -> Res
     let inserted = conn.execute(
         &format!(
             "INSERT INTO bus_schema_subjects ({BUS_SCHEMA_SUBJECT_COLUMNS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
              ON CONFLICT(instance_id, org_id, subject) DO NOTHING"
         ),
         rusqlite::params![
@@ -32424,6 +32434,7 @@ pub fn bus_schema_subject_insert(pool: &DbPool, row: &DbBusSchemaSubject) -> Res
             row.created_at_ms,
             row.updated_at_ms,
             row.deprecated_versions_json.as_deref().unwrap_or("[]"),
+            row.generation as i64,
         ],
     )? == 1;
     drop(conn);
@@ -32440,14 +32451,16 @@ pub fn bus_schema_subject_insert(pool: &DbPool, row: &DbBusSchemaSubject) -> Res
 /// Changes one subject row as a single read-modify-write inside an
 /// IMMEDIATE transaction, so two local writers (a deprecation racing a
 /// compatibility change) never write back each other's stale copy. `edit`
-/// gets the current row and returns whether it changed it; only a changed
-/// row is written and published. `Ok(None)` when the subject does not exist.
+/// gets the transaction — to read what the change depends on inside it —
+/// and the current row, and returns whether it changed the row; only a
+/// changed row is written and published. `Ok(None)` when the subject does
+/// not exist. The incarnation (`generation`) is never changed here.
 pub fn bus_schema_subject_modify(
     pool: &DbPool,
     instance_id: &str,
     org_id: &str,
     subject: &str,
-    edit: impl FnOnce(&mut DbBusSchemaSubject) -> bool,
+    edit: impl FnOnce(&rusqlite::Transaction<'_>, &mut DbBusSchemaSubject) -> Result<bool>,
 ) -> Result<Option<DbBusSchemaSubject>> {
     let changed = with_writer_tx(pool, |tx| {
         let Some(mut row) = tx
@@ -32463,7 +32476,7 @@ pub fn bus_schema_subject_modify(
         else {
             return Ok(None);
         };
-        if !edit(&mut row) {
+        if !edit(tx, &mut row)? {
             return Ok(Some((row, false)));
         }
         tx.execute(
@@ -32864,6 +32877,18 @@ pub fn bus_schema_version_get(
     version: u32,
 ) -> Result<Option<DbBusSchemaVersion>> {
     let conn = acquire(pool)?;
+    bus_schema_version_get_on(&conn, instance_id, org_id, subject, version)
+}
+
+/// `bus_schema_version_get` on a connection the caller holds — inside the
+/// transaction of `bus_schema_subject_modify`, say.
+pub fn bus_schema_version_get_on(
+    conn: &rusqlite::Connection,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+    version: u32,
+) -> Result<Option<DbBusSchemaVersion>> {
     conn.query_row(
         &format!(
             "SELECT {BUS_SCHEMA_VERSION_COLUMNS} FROM bus_schema_versions \
@@ -33113,6 +33138,7 @@ pub mod bus_test_support {
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 deprecated_versions_json TEXT NOT NULL DEFAULT '[]',
+                generation INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (instance_id, org_id, subject)
             );
             CREATE TABLE IF NOT EXISTS bus_schema_versions (
@@ -33345,6 +33371,7 @@ mod bus_repository_tests {
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
             deprecated_versions_json: Some("[]".to_string()),
+            generation: 0,
         }
     }
 
@@ -33390,11 +33417,11 @@ mod bus_repository_tests {
         assert_eq!(fetched.created_by.as_deref(), Some("admin-1"));
 
         // Modify updates mutable fields and leaves created_at_ms alone.
-        bus_schema_subject_modify(&db, T1, "org-1", "orders.v1", |r| {
+        bus_schema_subject_modify(&db, T1, "org-1", "orders.v1", |_, r| {
             r.compatibility = "full".to_string();
             r.deprecated_at_ms = Some(2_000);
             r.updated_at_ms = 2_000;
-            true
+            Ok(true)
         })
         .unwrap()
         .expect("subject exists");
