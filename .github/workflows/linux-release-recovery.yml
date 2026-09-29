@@ -1,0 +1,497 @@
+# =============================================================================
+# Plik: linux-release-recovery.yml
+# Opis: Buduje i sprawdza wydanie Linux beta.1 z odzyskanych bibliotek natywnych.
+# =============================================================================
+name: Linux release recovery beta.1
+on:
+  push:
+    branches: [ci/arrow-configure-beta1]
+    paths:
+      - .github/workflows/linux-release-recovery.yml
+      - scripts/ci-local/hydrate-release-native.py
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: linux-release-recovery-beta1
+  cancel-in-progress: false
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  TENTAFLOW_TARGET: x86_64-unknown-linux-gnu
+  RELEASE_TAG: v0.4.0-beta.1
+jobs:
+  hydrate-native:
+    name: hydrate native (${{ matrix.variant }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - linux-x86_64-vulkan
+          - linux-x86_64-cuda12
+          - linux-x86_64-cuda13
+          - linux-aarch64-vulkan
+          - linux-aarch64-cuda12
+          - linux-aarch64-cuda13
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate provenance and recover native libraries
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci-local/hydrate-release-native.py "${{ matrix.variant }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-libs-${{ matrix.variant }}
+          path: recovered/native
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-provenance-${{ matrix.variant }}
+          path: recovered/provenance.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    name: build (${{ matrix.platform }}, ${{ matrix.asset }})
+    needs: hydrate-native
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `asset` is the suffix in the archive name and the `variant` written
+          # into the install receipt, which is what `tentaflow update` uses to
+          # pick its download. Renaming one without the other breaks updates.
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            edition: slim
+            asset: slim
+            nl_backend: vulkan
+            cargo_flags: "--no-default-features"
+            expect: "libzvec_c_api.so"
+            forbid_cuda: "yes"
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            edition: full
+            asset: full-vulkan
+            nl_backend: vulkan
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
+            forbid_cuda: "yes"
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            edition: full
+            asset: full-cuda12
+            nl_backend: cuda12
+            cuda_apt: "12-8"
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
+          - platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            edition: full
+            asset: full-cuda13
+            nl_backend: cuda13
+            cuda_apt: "13-2"
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
+          - platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            edition: slim
+            asset: slim
+            nl_backend: vulkan
+            cargo_flags: "--no-default-features"
+            expect: "libzvec_c_api.so"
+            forbid_cuda: "yes"
+          - platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            edition: full
+            asset: full-vulkan
+            nl_backend: vulkan
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
+            forbid_cuda: "yes"
+          - platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            edition: full
+            asset: full-cuda12
+            nl_backend: cuda12
+            cuda_apt: "12-8"
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
+          - platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            edition: full
+            asset: full-cuda13
+            nl_backend: cuda13
+            cuda_apt: "13-2"
+            cargo_flags: "--features gpu-vulkan"
+            expect: "libcudart.so libwhisper_tf.so libzvec_c_api.so libonnxruntime.so"
+
+    env:
+      TENTAFLOW_TARGET: ${{ matrix.target }}
+      # Which native-libs subdirectory the vendored -sys crates link against.
+      # The build scripts name that directory after the backend they were given
+      # (only the default `auto` produces `multi`), so it is derived from
+      # nl_backend rather than stated again: a variant that disagrees with the
+      # artifact fails the build, or worse, links the wrong backend silently.
+      LLAMA_CPP_NATIVE_VARIANT: ${{ startsWith(matrix.nl_backend, 'cuda') && 'cuda' || 'vulkan' }}
+      WHISPER_CPP_NATIVE_VARIANT: ${{ startsWith(matrix.nl_backend, 'cuda') && 'cuda' || 'vulkan' }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c7220f148747718ab7b511787de77dc104bffa38
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Free disk before a CUDA toolkit lands on it
+        if: matrix.cuda_apt != ''
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/powershell || true
+          df -h /
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-libs-${{ matrix.platform }}-${{ matrix.nl_backend }}
+          path: native-libs/${{ matrix.platform }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install the CUDA toolkit
+        if: matrix.cuda_apt != ''
+        run: |
+          # Linking libggml-cuda.a needs -lcudart and -lcublas, so the toolkit is
+          # a BUILD dependency here even though no GPU is present.
+          case "${{ matrix.platform }}" in
+            linux-x86_64)  NV_ARCH=x86_64 ;;
+            linux-aarch64) NV_ARCH=sbsa ;;
+          esac
+          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/$NV_ARCH/cuda-keyring_1.1-1_all.deb"
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-${{ matrix.cuda_apt }}
+          CUDA_DIR="/usr/local/cuda-$(echo ${{ matrix.cuda_apt }} | tr - .)"
+          echo "$CUDA_DIR/bin" >> "$GITHUB_PATH"
+          echo "CUDA_HOME=$CUDA_DIR" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$CUDA_DIR/lib64" >> "$GITHUB_ENV"
+
+      - name: Install build dependencies
+        run: |
+          # The hosted image carries third-party apt sources (microsoft, docker,
+          # git-core). One of them answering 404 or a hash mismatch makes
+          # `apt-get update` exit 100, and with bash -e that kills the job even
+          # though every package below lives in the Ubuntu archive. Retry, then
+          # let the install be the step whose failure actually means something.
+          sudo apt-get update || sudo apt-get update || sudo apt-get update || \
+            echo "::warning::apt-get update failed 3x — installing from existing lists"
+          # The hosted image preinstalls LLVM's libunwind-14-dev, which Breaks
+          # Ubuntu's libunwind-dev — the exact package libgstreamer1.0-dev
+          # depends on, so the install dies with "held broken packages". LLVM's
+          # unwinder is used by nothing we build; removing it is the way out.
+          sudo apt-get remove -y libunwind-14-dev || true
+          # libasound2-dev: sherpa-rs links -lasound.
+          # libvulkan-dev: LunarG's vulkan-sdk ships glslc and headers but no
+          # libvulkan.so to link against, so the final link fails on -lvulkan.
+          sudo apt-get install -y \
+            build-essential cmake pkg-config protobuf-compiler \
+            libssl-dev libasound2-dev libvulkan-dev \
+            libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            clang libclang-dev git curl ca-certificates
+
+      - name: WASM toolchain
+        run: |
+          # Without these the dashboard glue (wasm_glue_bg.wasm) and every
+          # bundled addon are skipped by build.rs — with a warning, not an
+          # error, so the release would ship a dashboard that cannot load.
+          rustup target add wasm32-unknown-unknown wasm32-wasip1
+          cargo install wasm-bindgen-cli --version "$(python3 scripts/workspace-version.py wasm-bindgen)" --locked
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ matrix.platform }}-${{ matrix.asset }}-${{ hashFiles('Cargo.lock') }}
+          # Any lockfile change invalidates the exact key; without a fallback the
+          # whole dependency tree rebuilds from zero, which on macOS cost five
+          # hours and nearly hit the six-hour job limit.
+          restore-keys: |
+            cargo-${{ matrix.platform }}-${{ matrix.asset }}-
+            cargo-${{ matrix.platform }}-
+
+      - name: Meeting sidecar (fail fast, before an hour of Rust)
+        run: |
+          # tentaflow/build.rs builds this too and reuses this target dir, so
+          # doing it first costs nothing and turns a broken sidecar into a
+          # three-minute failure instead of one found at packaging time.
+          cd tentaflow-containers/agents/native/teams-bot
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-meeting-bot" python3 "$GITHUB_WORKSPACE/scripts/cargo-build.py" build --release --locked --bin tentaflow-meeting
+
+      - name: Coding-agent bridge (fail fast, before an hour of Rust)
+        run: |
+          # tentaflow/build.rs builds this too and reuses this target dir, so it
+          # costs nothing to do first — and a broken bridge becomes a
+          # three-minute failure instead of one found at packaging time. The
+          # archive must carry the executable: a node installs a coding agent
+          # with no Rust toolchain and no route to a crate registry, so it can
+          # not build this itself.
+          cd tentaflow-containers/agents/native/coding-agent-bridge
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target-coding-agent-bridge" python3 "$GITHUB_WORKSPACE/scripts/cargo-build.py" build --release --locked
+
+      - name: Reserve memory for the release link
+        run: |
+          # ThinLTO i biblioteki natywne mogą przekroczyć RAM runnera podczas
+          # końcowego linkowania. Dodatkowy swap ogranicza ryzyko ubicia joba.
+          # Obraz ma już aktywny /swapfile, dlatego używamy osobnego pliku.
+          # Brak miejsca na dodatkowy swap nie przerywa próby kompilacji.
+          SWAP_FILE=/tentaflow-swapfile
+          AVAIL_GB=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "${AVAIL_GB:-0}" -ge 52 ]; then
+            if sudo fallocate -l 32G "$SWAP_FILE" \
+               && sudo chmod 600 "$SWAP_FILE" \
+               && sudo mkswap "$SWAP_FILE" >/dev/null \
+               && sudo swapon "$SWAP_FILE"; then
+              echo "added 32G of swap at $SWAP_FILE"
+            else
+              echo "::warning::could not add swap — linking with what the image provides"
+              sudo rm -f "$SWAP_FILE" || true
+            fi
+          else
+            echo "::warning::only ${AVAIL_GB}G free — linking without extra swap"
+          fi
+          echo "cores: $(nproc)"
+          free -h
+          true
+
+      - name: Build
+        working-directory: tentaflow
+        env:
+          # whisper-rs-sys and llama-cpp-sys-2 each bundle a ggml copy, so the
+          # linker sees multiple definitions of every quantize_* symbol. Taking
+          # the first is safe — they are binary-identical.
+          RUSTFLAGS: "-C link-arg=-Wl,--allow-multiple-definition"
+        run: |
+          df -h /
+          # Sampled so a kill leaves the memory curve in the log: a process that
+          # dies by OOM never gets to report its own peak.
+          ( while :; do
+              free -m | awk -v t="$(date +%T)" '/Mem:/{printf "[mem] %s used=%sM avail=%sM\n", t, $3, $7}
+                                                /Swap:/{printf "[swap] used=%sM\n", $3}'
+              sleep 30
+            done ) &
+          SAMPLER=$!
+          trap 'kill $SAMPLER 2>/dev/null || true' EXIT
+          time python3 ../scripts/cargo-build.py build --release --locked --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          kill $SAMPLER 2>/dev/null || true
+          df -h /
+
+      - name: Stage archive
+        id: stage
+        run: |
+          # The target directory is resolved, never hardcoded: .cargo/config.toml
+          # redirects it to target_shared and a hardcoded path silently staged
+          # nothing for months.
+          TARGET_DIR=$(cd tentaflow && cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+          OUT="$TARGET_DIR/$TENTAFLOW_TARGET/release"
+          STAGE="tentaflow-${RELEASE_TAG}-${TENTAFLOW_TARGET}-${{ matrix.asset }}"
+          mkdir -p "$STAGE"
+
+          # Everything the binary needs and no package manager can provide. A
+          # missing file fails the job: shipping an archive whose binary cannot
+          # start is worse than shipping nothing.
+          require() {
+            test -f "$1" || { echo "::error::missing required artifact: $1"; exit 1; }
+            cp "$1" "$STAGE/"
+          }
+          require "$OUT/tentaflow"
+          require "native-libs/${{ matrix.platform }}/lib-dynamic/libzvec_c_api.so"
+          # pdfium is a mandatory dependency loaded at runtime (bind_to_library),
+          # not a feature — document ingest needs it in both editions.
+          require "native-libs/${{ matrix.platform }}/lib-dynamic/libpdfium.so"
+          require "scripts/install/tentaflow.service.in"
+          require "LICENSE"
+          require "README.md"
+          # The meeting sidecar goes in BOTH editions. `slim` means no local
+          # inference engine, not fewer features: core's meeting module is not
+          # feature-gated, the bot reaches models through FlowInvoke — which slim
+          # answers with cloud providers — and the binary needs nothing beyond
+          # libc, so there is no technical reason to withhold it.
+          require "$OUT/tentaflow-meeting"
+          # The coding-agent bridge goes in BOTH editions for the same reason as
+          # the sidecar: a coding agent drives a vendor CLI through Core, it is
+          # not a local inference engine, so slim keeps it. Installing an agent
+          # on a node must not need a Rust toolchain, which is why the executable
+          # travels here rather than being compiled at engine-install time.
+          require "$OUT/tentaflow-coding-agent-bridge"
+
+          # No silero_vad.onnx here: nothing in the build produces one, and
+          # Core downloads it (with the wespeaker embedding) on first start into
+          # <data>/models/audio. `required_assets` only prefers a repo copy when
+          # it is running from a source checkout, which an installation is not.
+          if [ "${{ matrix.edition }}" = "full" ]; then
+            require "$OUT/libwhisper_tf.so"
+            # The version comes from scripts/versions.env, so it is matched, not
+            # named. build-onnxruntime.sh removes the previous one before it
+            # unpacks: two files mean a stale cache, none means no ONNX Runtime.
+            set -- native-libs/${{ matrix.platform }}/lib-dynamic/libonnxruntime.so.[0-9]*.[0-9]*.[0-9]*
+            if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+              echo "::error::expected exactly one libonnxruntime.so.<version>, found: $*"
+              exit 1
+            fi
+            require "$1"
+            # sherpa-onnx links the runtime, so the binary NEEDs it by its
+            # SONAME (libonnxruntime.so.<major>), which $ORIGIN must resolve.
+            ORT_FILE=$(basename "$1")
+            ORT_SONAME="${ORT_FILE%.*.*}"
+            ln -s "$ORT_FILE" "$STAGE/$ORT_SONAME"
+          fi
+
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          ls -lh "$STAGE.tar.gz"
+
+      - name: Verify the binary links what it should
+        run: |
+          BIN="${{ steps.stage.outputs.stage }}/tentaflow"
+          readelf -d "$BIN" | grep NEEDED
+          SONAMES=$(readelf -d "$BIN" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')
+          for lib in ${{ matrix.expect }}; do
+            # A soname carries its version (libcudart.so.12), so an exact match
+            # rejects a correctly linked binary. Accept the name plus any
+            # numeric suffix, with the dots taken literally.
+            esc=$(printf '%s' "$lib" | sed 's/\./\\./g')
+            printf '%s\n' "$SONAMES" | grep -q "^$esc\(\.[0-9][0-9]*\)*$" || {
+              echo "::error::$BIN does not link $lib"
+              exit 1
+            }
+          done
+          # Every ONNX Runtime the binary NEEDs must resolve inside the archive:
+          # $ORIGIN is the only place an installed binary looks for it.
+          for lib in $(printf '%s\n' "$SONAMES" | grep '^libonnxruntime' || true); do
+            test -f "${{ steps.stage.outputs.stage }}/$lib" || {
+              echo "::error::$BIN needs $lib, which the archive does not carry"
+              exit 1
+            }
+          done
+          # A CUDA link in a portable build means the artifact cannot start on a
+          # machine without the NVIDIA stack — so the vulkan and slim variants
+          # must have none, and the cuda ones must have it (checked above).
+          if [ "${{ matrix.forbid_cuda }}" = "yes" ] \
+             && readelf -d "$BIN" | grep -qE "libcud(art|a)|libcublas"; then
+            echo "::error::$BIN links CUDA — this variant must not"
+            exit 1
+          fi
+          # Core starts this per account from beside its own binary, and the node
+          # installing an engine has no toolchain to rebuild it with.
+          test -x "${{ steps.stage.outputs.stage }}/tentaflow-coding-agent-bridge" || {
+            echo "::error::brak wykonywalnego tentaflow-coding-agent-bridge w archiwum"
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tentaflow-${{ matrix.platform }}-${{ matrix.asset }}
+          path: |
+            tentaflow-*.tar.gz
+            tentaflow-*.tar.gz.sha256
+
+  verify:
+    name: verify (${{ matrix.platform }}, ${{ matrix.asset }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Only the variants a GPU-less runner can actually RUN. A CUDA build
+          # installs fine and then fails to start for want of libcudart, which
+          # would report a packaging problem that is not one — those variants are
+          # verified by their NEEDED list at build time instead.
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            asset: slim
+            edition: slim
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            asset: full-vulkan
+            edition: full
+          - platform: linux-aarch64
+            runner: ubuntu-22.04-arm
+            asset: slim
+            edition: slim
+          - platform: linux-aarch64
+            runner: ubuntu-22.04-arm
+            asset: full-vulkan
+            edition: full
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: c7220f148747718ab7b511787de77dc104bffa38
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tentaflow-${{ matrix.platform }}-${{ matrix.asset }}
+          path: dist
+
+      - name: Install from the archive
+        env:
+          TENTAFLOW_EDITION: ${{ matrix.edition }}
+        run: |
+          ARCHIVE=$(ls dist/*.tar.gz)
+          sudo -E env TENTAFLOW_ASSET_FILE="$PWD/$ARCHIVE" \
+            sh scripts/install/install.sh
+
+      - name: The service must be enabled, running and answering
+        run: |
+          systemctl is-enabled tentaflow.service
+          for _ in $(seq 1 30); do
+            systemctl is-active --quiet tentaflow.service && break
+            sleep 2
+          done
+          systemctl is-active tentaflow.service
+          tentaflow status
+          # The status line is human-readable; this is the assertion. First boot
+          # generates a TLS identity and a database before the socket opens.
+          for _ in $(seq 1 60); do
+            curl -fsk https://127.0.0.1:8090/health >/dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -fsk https://127.0.0.1:8090/health >/dev/null
+          test -f /etc/tentaflow/config.toml
+          test -f /etc/tentaflow/install-receipt.json
+
+      - name: Dump the journal when it did not come up
+        if: failure()
+        run: sudo journalctl -u tentaflow.service --no-pager -n 200
+
+      - name: Uninstall must leave nothing behind
+        run: |
+          sudo sh scripts/install/uninstall.sh --purge
+          ! systemctl is-enabled tentaflow.service 2>/dev/null
+          test ! -e /opt/tentaflow
+
