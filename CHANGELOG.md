@@ -97,6 +97,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
     nodzie i może zostać ponowiona jeszcze raz, także przez „Ponów wszystkie”.
     Nowy prowadzący nie pobiera oznaczeń od pozostałych kopii.
 
+### Poprawki
+
+- Usunięto błąd kompilacji parsera diagnostyki RDMA na Windows. Rodziny adresów
+  IPv4 i IPv6 są rozpoznawane według linuksowego ABI netlink, niezależnie od
+  systemu, na którym działa parser.
+- Dodano artefakt diagnostyczny kompilacji Androida z logiem kompilacji oraz
+  pomiarami pamięci RAM, swapu i miejsca na dysku, ułatwiający analizę przerwań.
+
 ## [0.4.0-beta] — 2026-09-27
 
 Zmiany od tagu `v0.3.0-beta` do `v0.4.0-beta`. Wydanie testowe.

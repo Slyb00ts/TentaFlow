@@ -89,7 +89,28 @@ jobs:
           # which find_android_ndk already looks through — no third-party action
           # needed to place a toolchain.
           set -o pipefail
+          ( while :; do
+              {
+                free -m | awk -v t="$(date +%T)" '/Mem:/{printf "[mem] %s used=%sM avail=%sM\n", t, $3, $7}
+                                                  /Swap:/{printf "[swap] used=%sM\n", $3}'
+                df -h /
+              } | tee -a build-resources.log
+              sleep 30
+            done ) &
+          SAMPLER=$!
+          trap 'kill $SAMPLER 2>/dev/null || true' EXIT
           bash tentaflow-mobile/android/scripts/build-rust.sh 2>&1 | tee build-rust.log
+
+      - name: Upload Android build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-diagnostics
+          path: |
+            build-rust.log
+            build-resources.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Quote the failed native build
         if: failure()
