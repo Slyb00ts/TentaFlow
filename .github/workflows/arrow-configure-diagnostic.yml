@@ -1,0 +1,84 @@
+# =============================================================================
+# Plik: arrow-configure-diagnostic.yml
+# Opis: Odtwarza konfigurację Arrow na ARM64 w środowisku CUDA 12.8.
+# =============================================================================
+name: Diagnostyka konfiguracji Arrow ARM64 CUDA12
+'on':
+  push:
+    branches:
+    - ci/arrow-configure-beta1
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  configure:
+    runs-on: ubuntu-22.04-arm
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Free disk before a CUDA toolkit lands on it
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/powershell || true
+        df -h /
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update || sudo apt-get update || sudo apt-get update || \
+          echo "::warning::apt-get update failed 3x — installing from existing lists"
+        sudo apt-get install -y \
+          build-essential gcc-11 g++-11 ninja-build pkg-config \
+          git curl wget ca-certificates unzip xz-utils \
+          python3 python3-pip protobuf-compiler libssl-dev
+    - name: Pin cmake into the window zvec requires
+      run: |
+        pip3 install "cmake<4"
+        cmake --version
+    - name: Install the CUDA toolkit
+      run: |
+        case "linux-aarch64" in
+          linux-x86_64)  NV_ARCH=x86_64 ;;
+          linux-aarch64) NV_ARCH=sbsa ;;
+        esac
+        wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/$NV_ARCH/cuda-keyring_1.1-1_all.deb"
+        sudo dpkg -i cuda-keyring_1.1-1_all.deb
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends cuda-toolkit-12-8
+        echo "/usr/local/cuda-$(echo 12-8 | tr - .)/bin" >> "$GITHUB_PATH"
+        echo "CUDA_HOME=/usr/local/cuda-$(echo 12-8 | tr - .)" >> "$GITHUB_ENV"
+        df -h /
+    - name: Konfiguracja Arrow bez kompilacji zvec
+      env:
+        LLAMA_CPP_BACKENDS: cuda
+        WHISPER_CPP_BACKENDS: cuda
+        CMAKE_CUDA_ARCHITECTURES: 80-real;86-real;87-real;89-real;90-real;100-real;120-real;120-virtual
+        ONNXRUNTIME_GPU: '0'
+      run: |
+        set -euo pipefail
+        python3 - <<'PYTHON'
+        from pathlib import Path
+        path = Path("scripts/build-zvec.sh")
+        source = path.read_text()
+        old = '        ninja zvec_c_api -j"$(nproc)" )'
+        new = ('        ninja thirdparty/arrow/arrow/src/ARROW.BUILD-stamp/ARROW.BUILD-configure )'
+               '\n      exit 0')
+        assert source.count(old) == 1, "Niejednoznaczny cel natywnej kompilacji zvec"
+        path.write_text(source.replace(old, new))
+        PYTHON
+        command -v gcc-11 g++-11 ninja
+        python3 -c 'import subprocess; v = subprocess.check_output(["cmake", "--version"], text=True).split()[2]; major, minor = map(int, v.split(".")[:2]); assert major == 3 and minor >= 26, v'
+        bash -n scripts/build-zvec.sh
+        ./scripts/build-zvec.sh linux-aarch64
+    - name: Zapis logów Arrow
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: arrow-configure-linux-aarch64-cuda12
+        path: /tmp/zvec-build/build_zvec/thirdparty/arrow/arrow/src/ARROW.BUILD-stamp/*.log
+        if-no-files-found: ignore
+        retention-days: 3

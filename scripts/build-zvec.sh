@@ -215,6 +215,32 @@ done
 # Arrow/protobuf + a static libstdc++ and exports only the C API). Mobile builds
 # need a static archive instead — see the ios/android note below.
 
+report_zvec_failure() {
+  local code="$1"
+  [ "$code" -ne 0 ] || return 0
+  local build_dir="$SRC_DIR/build_zvec" log excerpt
+  case "$PLATFORM" in
+    ios-*) build_dir="$SRC_DIR/build_ios_${PLATFORM}" ;;
+    android-*) build_dir="$SRC_DIR/build_android_$(android_abi_for_platform "$PLATFORM")" ;;
+  esac
+  [ -d "$build_dir" ] || return "$code"
+  # ExternalProject ukrywa właściwe błędy konfiguracji i kompilacji w plikach.
+  while IFS= read -r log; do
+    [ -s "$log" ] || continue
+    excerpt="$(tail -n 80 "$log")"
+    printf '\n=== %s ===\n%s\n' "${log#"$build_dir"/}" "$excerpt" >&2
+    if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+      excerpt="${excerpt//'%'/'%25'}"
+      excerpt="${excerpt//$'\r'/'%0D'}"
+      excerpt="${excerpt//$'\n'/'%0A'}"
+      printf '::notice title=zvec ExternalProject log::%s%%0A%s\n' "${log#"$build_dir"/}" "$excerpt"
+    fi
+  done < <(find "$build_dir" -type f -path '*-stamp/*' -name '*.log' | sort)
+  return "$code"
+}
+
+trap 'code=$?; report_zvec_failure "$code" || true; exit "$code"' EXIT
+
 case "$PLATFORM" in
   linux-x86_64|linux-aarch64)
     # The shared lib statically bundles protobuf/abseil/RocksDB/Arrow AND a
