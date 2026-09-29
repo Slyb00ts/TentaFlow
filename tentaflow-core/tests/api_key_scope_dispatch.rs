@@ -449,7 +449,7 @@ fn bus_topic(instance_id: &str, org_id: &str, name: &str) -> repository::DbBusTo
         updated_at_ms: 1,
         durability_class: None,
         generation: 1,
-        description: String::new(),
+        description: Some(String::new()),
         created_by: None,
     }
 }

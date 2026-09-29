@@ -441,7 +441,7 @@ export function openSettingsWindow(cardKey, ctx) {
       icon: 'file-text',
       current,
       fields: () => `
-        <tf-textarea id="tb-set-description" rows="3" autogrow maxlength="${DESCRIPTION_MAX}" label="${escapeAttr(T('settings.about.description_label'))}"
+        <tf-textarea id="tb-set-description" rows="3" autogrow label="${escapeAttr(T('settings.about.description_label'))}"
           value="${escapeAttr(current.description)}" hint="${escapeAttr(T('topics.creator.description_hint', { max: fmtCount(DESCRIPTION_MAX) }))}"></tf-textarea>`,
       wire: (win, sync) => {
         const d = win.querySelector('#tb-set-description');

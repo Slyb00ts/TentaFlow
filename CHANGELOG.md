@@ -26,13 +26,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   `bus.schema.deprecate` podaje numer wersji.
 - Aktualizacja: migracja bazy 176 dodaje `bus_topics.description`,
   `bus_topics.created_by` i `bus_schema_subjects.deprecated_versions_json`.
-  Nowe kolumny synchronizują się w całych wierszach topiku i wzoru (ostatni
-  zapis wygrywa). W klastrze z nodami w starszej wersji zmiana topiku
-  wykonana na starszym nodzie czyści jego opis na pozostałych, a zmiana wzoru
-  (np. nowa wersja lub tryb zgodności) wykonana na starszym nodzie cofa
-  wycofanie jego pojedynczych wersji; autor topiku zostaje zachowany.
-  Zaktualizuj wszystkie nody instancji przed korzystaniem z opisów i
-  wycofywania wersji.
+  Opis i autor synchronizują się w wierszu topiku (ostatni zapis wygrywa,
+  autor zostaje ustalony przy tworzeniu). Wycofania wersji i wycofanie całego
+  wzoru synchronizują się jako suma: dwa jednoczesne wycofania na różnych
+  nodach przetrwają oba, a zapis z noda, który jeszcze nie widział wycofania,
+  go nie cofa; wersja usunięta na stałe nie wraca jako wycofana. W klastrze
+  z nodami w starszej wersji ich zmiany topiku i wzoru nie czyszczą opisu ani
+  wycofań zapisanych na nowszych nodach; starsze nody same nie znają opisów
+  ani wycofanych wersji (dla nich wzór sprawdza zawsze najnowszą wersję),
+  więc do czasu aktualizacji wszystkich nodów instancji walidacja może się
+  między nimi różnić. Opis spoza limitów tej wersji (np. dłuższy niż
+  500 znaków) jest przy synchronizacji skracany.
 
 - Nieprzetworzone wiadomości: usunięto ograniczenia opisane w wydaniu 0.4.0-beta.
   „Wczytaj więcej” nie powtarza wierszy przy wielu partycjach. Ponowienie

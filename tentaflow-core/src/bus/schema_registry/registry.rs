@@ -86,6 +86,22 @@ fn require_subject(
     })
 }
 
+/// `repository::bus_schema_subject_modify` with the registry's errors: a
+/// subject deleted meanwhile is `SchemaNotFound`.
+fn modify_subject(
+    db: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+    edit: impl FnOnce(&mut DbBusSchemaSubject) -> bool,
+) -> Result<DbBusSchemaSubject, BusServiceError> {
+    repository::bus_schema_subject_modify(db, instance_id, org_id, subject, edit)?.ok_or_else(
+        || BusServiceError::SchemaNotFound {
+            subject: subject.to_string(),
+        },
+    )
+}
+
 /// Subject-level view — `SchemaSubjectListRequest`'s wire response, and
 /// `bus::topics`' binding guard (via a direct `bus_schema_subject_get`, not
 /// this struct — that guard only needs the row, not the derived
@@ -124,25 +140,36 @@ fn version_info(row: &DbBusSchemaVersion, deprecated: &[DeprecatedVersion]) -> V
         content_hash: row.content_hash.clone(),
         created_by: row.created_by.clone(),
         created_at_ms: row.created_at_ms,
-        deprecated_at_ms: deprecated_at(deprecated, row.version),
+        deprecated_at_ms: deprecated_at(deprecated, row),
     }
 }
 
 /// One entry of `bus_schema_subjects.deprecated_versions_json`. The list
 /// lives on the subject row, not on the version: version rows replicate
-/// insert-if-absent and never change, the subject row replicates LWW.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// insert-if-absent and never change, the subject row replicates LWW — and
+/// its deprecations as a union on top of that
+/// (`core_materializer::apply_bus_schema_subject`), since a deprecation is
+/// never taken back. An entry names the version by number AND content: a
+/// number freed by a hard delete and taken by a new registration is another
+/// version, which a deprecation of the old one — possibly still travelling
+/// from a node that had not seen the delete — must not reach.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DeprecatedVersion {
     pub version: u32,
+    pub content_hash: String,
     pub deprecated_at_ms: i64,
 }
 
-/// Decodes a subject row's `deprecated_versions_json`. A value that does not
-/// decode is a corrupt row, reported like a corrupt `schema_type`.
+/// Decodes a `deprecated_versions_json` value; `None` (a payload from a
+/// build before the column) is no deprecation. A value that does not decode
+/// is a corrupt row, reported like a corrupt `schema_type`.
 pub fn parse_deprecated_versions(
     subject: &str,
-    json: &str,
+    json: Option<&str>,
 ) -> Result<Vec<DeprecatedVersion>, BusServiceError> {
+    let Some(json) = json else {
+        return Ok(Vec::new());
+    };
     serde_json::from_str(json).map_err(|e| {
         BusServiceError::Db(format!(
             "corrupt bus_schema_subjects.deprecated_versions_json for subject '{subject}': {e}"
@@ -150,16 +177,41 @@ pub fn parse_deprecated_versions(
     })
 }
 
-/// Encodes the list sorted by version, one entry per version.
-fn encode_deprecated_versions(mut list: Vec<DeprecatedVersion>) -> String {
-    list.sort_by_key(|d| d.version);
-    list.dedup_by_key(|d| d.version);
-    serde_json::to_string(&list).expect("a list of plain numbers always serializes")
+fn subject_deprecations(row: &DbBusSchemaSubject) -> Result<Vec<DeprecatedVersion>, BusServiceError> {
+    parse_deprecated_versions(&row.subject, row.deprecated_versions_json.as_deref())
 }
 
-fn deprecated_at(list: &[DeprecatedVersion], version: u32) -> Option<i64> {
+/// Encodes the list sorted by version, one entry per (version, content).
+pub fn encode_deprecated_versions(list: Vec<DeprecatedVersion>) -> String {
+    serde_json::to_string(&merge_deprecated_versions(list, Vec::new()))
+        .expect("a list of plain values always serializes")
+}
+
+/// The union of two deprecation lists: one entry per (version, content),
+/// the later `deprecated_at_ms` of the two when both carry it.
+pub fn merge_deprecated_versions(
+    a: Vec<DeprecatedVersion>,
+    b: Vec<DeprecatedVersion>,
+) -> Vec<DeprecatedVersion> {
+    let mut merged: std::collections::BTreeMap<(u32, String), i64> =
+        std::collections::BTreeMap::new();
+    for d in a.into_iter().chain(b) {
+        let at = merged.entry((d.version, d.content_hash)).or_insert(d.deprecated_at_ms);
+        *at = (*at).max(d.deprecated_at_ms);
+    }
+    merged
+        .into_iter()
+        .map(|((version, content_hash), deprecated_at_ms)| DeprecatedVersion {
+            version,
+            content_hash,
+            deprecated_at_ms,
+        })
+        .collect()
+}
+
+fn deprecated_at(list: &[DeprecatedVersion], version: &DbBusSchemaVersion) -> Option<i64> {
     list.iter()
-        .find(|d| d.version == version)
+        .find(|d| d.version == version.version && d.content_hash == version.content_hash)
         .map(|d| d.deprecated_at_ms)
 }
 
@@ -180,7 +232,7 @@ fn effective_version<'a>(
     versions
         .iter()
         .rev()
-        .find(|v| deprecated_at(deprecated, v.version).is_none())
+        .find(|v| deprecated_at(deprecated, v).is_none())
         .or(Some(latest))
 }
 
@@ -244,7 +296,7 @@ pub fn list_versions(
     subject: &str,
 ) -> Result<Vec<VersionInfo>, BusServiceError> {
     let row = require_subject(db, instance_id, org_id, subject)?;
-    let deprecated = parse_deprecated_versions(subject, &row.deprecated_versions_json)?;
+    let deprecated = subject_deprecations(&row)?;
     Ok(
         repository::bus_schema_version_list(db, instance_id, org_id, subject)?
             .iter()
@@ -263,7 +315,7 @@ pub fn get(
     version: Option<u32>,
 ) -> Result<(VersionInfo, String), BusServiceError> {
     let subject_row = require_subject(db, instance_id, org_id, subject)?;
-    let deprecated = parse_deprecated_versions(subject, &subject_row.deprecated_versions_json)?;
+    let deprecated = subject_deprecations(&subject_row)?;
     let row = match version {
         Some(v) => repository::bus_schema_version_get(db, instance_id, org_id, subject, v)?
             .ok_or_else(|| BusServiceError::SchemaVersionNotFound {
@@ -486,42 +538,42 @@ pub fn register(
     // that helper would be a much larger repository-wide change than this
     // fix warrants. Every REJECTABLE check (name/size/compile/dedup/
     // compatibility) already runs above, before either write, so the ONLY
-    // window left is between the subject upsert below and the version
+    // window left is between the subject insert below and the version
     // insert after it. That window only matters for a subject THIS CALL
     // just created (`is_new_subject`): if `bus_schema_version_insert` then
     // fails, best-effort delete the subject row again rather than leaving
-    // a version-less subject behind — an EXISTING subject being re-upserted
-    // (same shape, idempotent) is harmless to leave in place on failure,
-    // since it was already there before this call.
+    // a version-less subject behind — an EXISTING subject is never written
+    // by a registration, so there is nothing to undo for it.
     let is_new_subject = existing.is_none();
 
-    let subject_row = DbBusSchemaSubject {
-        instance_id: instance_id.to_string(),
-        org_id: org_id.to_string(),
-        subject: subject.to_string(),
-        schema_type: schema_type.as_str().to_string(),
-        compatibility: effective_compatibility.as_str().to_string(),
-        deprecated_at_ms: None,
-        created_by: existing
-            .as_ref()
-            .and_then(|r| r.created_by.clone())
-            .or_else(|| created_by.map(|s| s.to_string())),
-        created_at_ms: existing.as_ref().map(|r| r.created_at_ms).unwrap_or(now),
-        updated_at_ms: now,
-        // A version number freed by a hard delete is taken again by this
-        // registration; a deprecation recorded for the old one must not
-        // carry over to it.
-        deprecated_versions_json: match &existing {
-            Some(row) => encode_deprecated_versions(
-                parse_deprecated_versions(subject, &row.deprecated_versions_json)?
-                    .into_iter()
-                    .filter(|d| d.version < next_version)
-                    .collect(),
-            ),
-            None => encode_deprecated_versions(Vec::new()),
-        },
-    };
-    repository::bus_schema_subject_upsert(db, &subject_row)?;
+    // An existing subject's row is not written at all: rewriting it from the
+    // copy read above would undo a deprecation or compatibility change made
+    // since. A registration that finds the subject created meanwhile by a
+    // concurrent one re-checks it like an existing subject would have been.
+    if is_new_subject {
+        let subject_row = DbBusSchemaSubject {
+            instance_id: instance_id.to_string(),
+            org_id: org_id.to_string(),
+            subject: subject.to_string(),
+            schema_type: schema_type.as_str().to_string(),
+            compatibility: effective_compatibility.as_str().to_string(),
+            deprecated_at_ms: None,
+            created_by: created_by.map(|s| s.to_string()),
+            created_at_ms: now,
+            updated_at_ms: now,
+            deprecated_versions_json: Some(encode_deprecated_versions(Vec::new())),
+        };
+        if !repository::bus_schema_subject_insert(db, &subject_row)? {
+            let row = require_subject(db, instance_id, org_id, subject)?;
+            let (existing_type, _) = decode_subject(&row)?;
+            if existing_type != schema_type || row.deprecated_at_ms.is_some() {
+                return Err(BusServiceError::InvalidArgument(format!(
+                    "subject '{subject}' was registered concurrently as a different or \
+                     deprecated subject; register again"
+                )));
+            }
+        }
+    }
 
     let version_row = DbBusSchemaVersion {
         instance_id: instance_id.to_string(),
@@ -724,11 +776,6 @@ pub fn set_compatibility(
     compatibility: Compatibility,
 ) -> Result<(), BusServiceError> {
     let row = require_subject(db, instance_id, org_id, subject)?;
-    if row.deprecated_at_ms.is_some() {
-        return Err(BusServiceError::InvalidArgument(format!(
-            "subject '{subject}' is deprecated; cannot change its compatibility mode"
-        )));
-    }
     let (schema_type, _existing) = decode_subject(&row)?;
     if compatibility != Compatibility::None && !schema_type.has_validator() {
         return Err(BusServiceError::SchemaTypeUnsupported {
@@ -736,13 +783,23 @@ pub fn set_compatibility(
             operation: "check_compatibility",
         });
     }
-    let now = crate::bus::now_ms();
-    let updated = DbBusSchemaSubject {
-        compatibility: compatibility.as_str().to_string(),
-        updated_at_ms: now,
-        ..row
-    };
-    repository::bus_schema_subject_upsert(db, &updated)?;
+    // The deprecation check runs on the row the write itself reads, so a
+    // deprecation landing in between is never written over.
+    let mut deprecated = false;
+    modify_subject(db, instance_id, org_id, subject, |row| {
+        if row.deprecated_at_ms.is_some() {
+            deprecated = true;
+            return false;
+        }
+        row.compatibility = compatibility.as_str().to_string();
+        row.updated_at_ms = crate::bus::now_ms();
+        true
+    })?;
+    if deprecated {
+        return Err(BusServiceError::InvalidArgument(format!(
+            "subject '{subject}' is deprecated; cannot change its compatibility mode"
+        )));
+    }
     bump_generation();
     Ok(())
 }
@@ -766,29 +823,34 @@ pub fn delete(
     version: Option<u32>,
     deprecate_only: bool,
 ) -> Result<Vec<u32>, BusServiceError> {
-    let row = require_subject(db, instance_id, org_id, subject)?;
-    let deprecated = parse_deprecated_versions(subject, &row.deprecated_versions_json)?;
+    require_subject(db, instance_id, org_id, subject)?;
 
     if let (true, Some(v)) = (deprecate_only, version) {
-        repository::bus_schema_version_get(db, instance_id, org_id, subject, v)?.ok_or_else(
-            || BusServiceError::SchemaVersionNotFound {
+        let version_row = repository::bus_schema_version_get(db, instance_id, org_id, subject, v)?
+            .ok_or_else(|| BusServiceError::SchemaVersionNotFound {
                 subject: subject.to_string(),
                 version: v,
-            },
-        )?;
-        if deprecated_at(&deprecated, v).is_none() {
-            let now = crate::bus::now_ms();
-            let mut list = deprecated;
-            list.push(DeprecatedVersion {
-                version: v,
-                deprecated_at_ms: now,
+            })?;
+        let mut outcome = Ok(false);
+        modify_subject(db, instance_id, org_id, subject, |row| {
+            outcome = subject_deprecations(row).map(|list| {
+                if deprecated_at(&list, &version_row).is_some() {
+                    return false;
+                }
+                let now = crate::bus::now_ms();
+                let mut list = list;
+                list.push(DeprecatedVersion {
+                    version: v,
+                    content_hash: version_row.content_hash.clone(),
+                    deprecated_at_ms: now,
+                });
+                row.deprecated_versions_json = Some(encode_deprecated_versions(list));
+                row.updated_at_ms = now;
+                true
             });
-            let updated = DbBusSchemaSubject {
-                deprecated_versions_json: encode_deprecated_versions(list),
-                updated_at_ms: now,
-                ..row
-            };
-            repository::bus_schema_subject_upsert(db, &updated)?;
+            matches!(outcome, Ok(true))
+        })?;
+        if outcome? {
             bump_generation();
         }
         return Ok(Vec::new());
@@ -797,14 +859,18 @@ pub fn delete(
     if deprecate_only {
         // A deprecation removes nothing — every version stays stored and the
         // latest keeps validating — so the "removed" list is empty.
-        if row.deprecated_at_ms.is_none() {
+        let mut changed = false;
+        modify_subject(db, instance_id, org_id, subject, |row| {
+            if row.deprecated_at_ms.is_some() {
+                return false;
+            }
             let now = crate::bus::now_ms();
-            let updated = DbBusSchemaSubject {
-                deprecated_at_ms: Some(now),
-                updated_at_ms: now,
-                ..row
-            };
-            repository::bus_schema_subject_upsert(db, &updated)?;
+            row.deprecated_at_ms = Some(now);
+            row.updated_at_ms = now;
+            changed = true;
+            true
+        })?;
+        if changed {
             bump_generation();
         }
         return Ok(Vec::new());
@@ -846,17 +912,30 @@ pub fn delete(
                 },
             )?;
             repository::bus_schema_version_delete(db, instance_id, org_id, subject, v)?;
-            if deprecated_at(&deprecated, v).is_some() {
-                let updated = DbBusSchemaSubject {
-                    deprecated_versions_json: encode_deprecated_versions(
-                        deprecated.into_iter().filter(|d| d.version != v).collect(),
-                    ),
-                    updated_at_ms: crate::bus::now_ms(),
-                    ..row
+            // The deleted version's entry goes with it. A copy still travelling
+            // from a node that had not seen the delete names the old content,
+            // so it never reaches a version registered under the freed number.
+            let mut corrupt = None;
+            modify_subject(db, instance_id, org_id, subject, |row| {
+                let list = match subject_deprecations(row) {
+                    Ok(list) => list,
+                    Err(e) => {
+                        corrupt = Some(e);
+                        return false;
+                    }
                 };
-                repository::bus_schema_subject_upsert(db, &updated)?;
-            }
+                let kept: Vec<_> = list.iter().filter(|d| d.version != v).cloned().collect();
+                if kept.len() == list.len() {
+                    return false;
+                }
+                row.deprecated_versions_json = Some(encode_deprecated_versions(kept));
+                row.updated_at_ms = crate::bus::now_ms();
+                true
+            })?;
             bump_generation();
+            if let Some(e) = corrupt {
+                return Err(e);
+            }
             Ok(vec![v])
         }
     }
@@ -897,7 +976,7 @@ pub fn resolve_effective(
     let Some(row) = repository::bus_schema_subject_get(db, instance_id, org_id, subject)? else {
         return Ok(None);
     };
-    let deprecated = parse_deprecated_versions(subject, &row.deprecated_versions_json)?;
+    let deprecated = subject_deprecations(&row)?;
     let chosen = if deprecated.is_empty() {
         repository::bus_schema_version_latest(db, instance_id, org_id, subject)?
     } else {
@@ -1459,7 +1538,7 @@ mod tests {
         // forces `bus_schema_version_insert` to fail with
         // `SchemaRefIdCollision` the moment `register` tries to claim the
         // same id for "new-subject"'s very first version.
-        repository::bus_schema_subject_upsert(
+        repository::bus_schema_subject_insert(
             &db,
             &DbBusSchemaSubject {
                 instance_id: "tentabus-00000001".to_string(),
@@ -1471,7 +1550,7 @@ mod tests {
                 created_by: None,
                 created_at_ms: 1,
                 updated_at_ms: 1,
-                deprecated_versions_json: "[]".to_string(),
+                deprecated_versions_json: Some("[]".to_string()),
             },
         )
         .unwrap();
@@ -2110,14 +2189,66 @@ mod tests {
     #[test]
     fn a_corrupt_deprecated_versions_column_is_reported_not_ignored() {
         let db = three_versions();
-        let mut row = repository::bus_schema_subject_get(&db, INST, "org-1", "orders")
-            .unwrap()
-            .unwrap();
-        row.deprecated_versions_json = "not json".to_string();
-        repository::bus_schema_subject_upsert(&db, &row).unwrap();
+        repository::bus_schema_subject_modify(&db, INST, "org-1", "orders", |row| {
+            row.deprecated_versions_json = Some("not json".to_string());
+            true
+        })
+        .unwrap();
         assert!(matches!(
             resolve_effective(&db, INST, "org-1", "orders"),
             Err(BusServiceError::Db(_))
         ));
+    }
+
+    /// A deprecation made while a registration is between reading the
+    /// subject and writing its version — of a version, and of the whole
+    /// subject — survives the registration: it no longer writes the subject
+    /// row back from the copy it read.
+    #[test]
+    fn a_registration_never_writes_back_a_deprecation_made_meanwhile() {
+        let db = fresh_db();
+        for text in [V1, V2_ADD_OPTIONAL] {
+            register(&db, INST, "org-1", "race", SchemaType::JsonSchema, text, None, None).unwrap();
+        }
+        let before = repository::bus_schema_subject_get(&db, INST, "org-1", "race")
+            .unwrap()
+            .unwrap();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_db = db.clone();
+        let hook_fired = fired.clone();
+        let _guard = install_hook_for_test(std::sync::Arc::new(move |stage, subject, _| {
+            if stage == test_hooks::Stage::SlotDecided
+                && subject == "race"
+                && !hook_fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                delete(&hook_db, INST, "org-1", "race", Some(1), true).unwrap();
+                delete(&hook_db, INST, "org-1", "race", None, true).unwrap();
+            }
+        }));
+        let out = register(
+            &db,
+            INST,
+            "org-1",
+            "race",
+            SchemaType::JsonSchema,
+            V3_ADD_ANOTHER_OPTIONAL,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(fired.load(std::sync::atomic::Ordering::SeqCst), "the hook ran");
+        assert_eq!(out.version, 3);
+        let after = repository::bus_schema_subject_get(&db, INST, "org-1", "race")
+            .unwrap()
+            .unwrap();
+        assert!(after.deprecated_at_ms.is_some(), "the subject's deprecation survives");
+        assert!(after.updated_at_ms >= before.updated_at_ms);
+        let deprecated: Vec<u32> = list_versions(&db, INST, "org-1", "race")
+            .unwrap()
+            .into_iter()
+            .filter(|v| v.deprecated_at_ms.is_some())
+            .map(|v| v.version)
+            .collect();
+        assert_eq!(deprecated, vec![1], "the version's deprecation survives");
     }
 }

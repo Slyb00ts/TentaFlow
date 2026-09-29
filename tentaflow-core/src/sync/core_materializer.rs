@@ -185,8 +185,16 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
         ),
     };
     if lww_tracked && !wins(&tx)? {
+        let merged = if descriptor.kind == CoreSyncResourceKind::BusSchemaSubject {
+            merge_losing_bus_schema_subject(&tx, operation)?
+        } else {
+            0
+        };
         tx.commit()
             .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+        if merged > 0 {
+            crate::bus::schema_registry::bump_generation();
+        }
         return Ok(0);
     }
 
@@ -3694,6 +3702,24 @@ fn apply_bus_topic(
             .as_str()
             .to_string();
     }
+    // The description is shown as is and must pass the local validation of
+    // the next update made here, so an over-long or control-character-bearing
+    // one (a peer on another build) is cut to what this build accepts
+    // instead of being stored verbatim. `None` (a peer from before the
+    // column) keeps the stored one.
+    if let Some(description) = row.description.as_mut() {
+        let clean = crate::bus::topics::sanitize_description(description);
+        if clean != *description {
+            tracing::warn!(
+                "core sync: bus topic '{}/{}' from node '{}' carries a description this \
+                 build does not accept — storing it shortened / without control characters",
+                row.org_id,
+                row.name,
+                operation.body.actor_node_id
+            );
+            *description = clean;
+        }
+    }
     // A row from a peer on a build before topic incarnations carries no
     // generation (`0` by serde default). That says nothing about which
     // incarnation it updates, so it keeps the one this node already holds
@@ -3724,14 +3750,14 @@ fn apply_bus_topic(
                   replication_factor, acks, durability, max_inline_bytes, compression, \
                   environment, created_at_ms, updated_at_ms, durability_class, generation, \
                   description, created_by) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,COALESCE(?26, ''),?27) \
                  ON CONFLICT(instance_id, org_id, name) DO UPDATE SET \
                  created_at_ms = CASE WHEN generation = excluded.generation \
                                  THEN created_at_ms ELSE excluded.created_at_ms END, \
                  created_by = CASE WHEN generation = excluded.generation \
                               THEN COALESCE(created_by, excluded.created_by) \
                               ELSE excluded.created_by END, \
-                 description = excluded.description, \
+                 description = COALESCE(?26, bus_topics.description), \
                  generation = excluded.generation, \
                  partitions = excluded.partitions, retention_ms = excluded.retention_ms, \
                  retention_bytes = excluded.retention_bytes, cleanup_policy = excluded.cleanup_policy, \
@@ -4364,33 +4390,13 @@ fn apply_bus_schema_subject(
     tx: &rusqlite::Transaction<'_>,
     operation: &SyncOperation,
 ) -> LedgerResult<usize> {
-    let row_json = field_string(operation, "row_json")?;
-    let row: crate::db::repository::DbBusSchemaSubject =
-        serde_json::from_str(&row_json).map_err(|e| {
-            SyncLedgerError::Runtime(format!("invalid bus_schema_subject payload: {e}"))
-        })?;
-    crate::bus::schema_registry::registry::parse_deprecated_versions(
-        &row.subject,
-        &row.deprecated_versions_json,
-    )
-    .map_err(|e| SyncLedgerError::Runtime(format!("invalid bus_schema_subject payload: {e}")))?;
-    if !bus_instance_is_local(tx, operation, &row.instance_id)? {
+    let Some((row, incoming)) = decode_bus_schema_subject(tx, operation)? else {
         return Ok(0);
-    }
-    let expected_id = crate::sync::resource_id::composite_resource_id(&[
-        &row.instance_id,
-        &row.org_id,
-        &row.subject,
-    ]);
-    if expected_id != operation.body.resource_id {
-        return Err(SyncLedgerError::Runtime(format!(
-            "bus_schema_subject composite id mismatch: body={}, payload={}",
-            operation.body.resource_id, expected_id
-        )));
-    }
+    };
     match operation.body.action {
-        ActionType::Insert | ActionType::Update => tx
-            .execute(
+        ActionType::Insert | ActionType::Update => {
+            let merged = merged_schema_deprecations(tx, &row, incoming)?;
+            tx.execute(
                 "INSERT INTO bus_schema_subjects \
                  (instance_id, org_id, subject, schema_type, compatibility, deprecated_at_ms, \
                   created_by, created_at_ms, updated_at_ms, deprecated_versions_json) \
@@ -4398,7 +4404,8 @@ fn apply_bus_schema_subject(
                  ON CONFLICT(instance_id, org_id, subject) DO UPDATE SET \
                  schema_type = excluded.schema_type, \
                  compatibility = excluded.compatibility, \
-                 deprecated_at_ms = excluded.deprecated_at_ms, \
+                 deprecated_at_ms = COALESCE(bus_schema_subjects.deprecated_at_ms, \
+                                             excluded.deprecated_at_ms), \
                  updated_at_ms = excluded.updated_at_ms, \
                  deprecated_versions_json = excluded.deprecated_versions_json",
                 rusqlite::params![
@@ -4411,10 +4418,11 @@ fn apply_bus_schema_subject(
                     row.created_by,
                     row.created_at_ms,
                     row.updated_at_ms,
-                    row.deprecated_versions_json,
+                    merged,
                 ],
             )
-            .map_err(sql_error),
+            .map_err(sql_error)
+        }
         // `ON DELETE CASCADE` on `bus_schema_versions.(instance_id, org_id,
         // subject)` removes this subject's versions on every replica the
         // same way it does locally
@@ -4428,6 +4436,129 @@ fn apply_bus_schema_subject(
             )
             .map_err(sql_error),
     }
+}
+
+/// The payload of a `core.bus_schema_subject` op with its decoded
+/// deprecations, after the instance and composite-id checks; `None` for an
+/// instance this node does not host.
+fn decode_bus_schema_subject(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<
+    Option<(
+        crate::db::repository::DbBusSchemaSubject,
+        Vec<crate::bus::schema_registry::registry::DeprecatedVersion>,
+    )>,
+> {
+    let invalid =
+        |e: String| SyncLedgerError::Runtime(format!("invalid bus_schema_subject payload: {e}"));
+    let row_json = field_string(operation, "row_json")?;
+    let row: crate::db::repository::DbBusSchemaSubject =
+        serde_json::from_str(&row_json).map_err(|e| invalid(e.to_string()))?;
+    let incoming = crate::bus::schema_registry::registry::parse_deprecated_versions(
+        &row.subject,
+        row.deprecated_versions_json.as_deref(),
+    )
+    .map_err(|e| invalid(e.to_string()))?;
+    if !bus_instance_is_local(tx, operation, &row.instance_id)? {
+        return Ok(None);
+    }
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[
+        &row.instance_id,
+        &row.org_id,
+        &row.subject,
+    ]);
+    if expected_id != operation.body.resource_id {
+        return Err(SyncLedgerError::Runtime(format!(
+            "bus_schema_subject composite id mismatch: body={}, payload={}",
+            operation.body.resource_id, expected_id
+        )));
+    }
+    Ok(Some((row, incoming)))
+}
+
+/// A subject's deprecations are a set that only grows (nothing takes a
+/// deprecation back), so whole-row LWW would lose one of two concurrent
+/// deprecations made on different nodes, and a node that had not seen a
+/// deprecation yet would erase it with its next write. The stored and the
+/// incoming lists are merged instead, whichever op wins the row. An entry
+/// names its version by number and content; one this node can tell belongs
+/// to a version that is gone is dropped — its number now holds other
+/// content (freed by a hard delete and registered again), or no row holds it
+/// although later versions exist (hard-deleted). An entry for a number past
+/// every version held here is kept: that version has not arrived yet.
+fn merged_schema_deprecations(
+    tx: &rusqlite::Transaction<'_>,
+    row: &crate::db::repository::DbBusSchemaSubject,
+    incoming: Vec<crate::bus::schema_registry::registry::DeprecatedVersion>,
+) -> LedgerResult<String> {
+    use crate::bus::schema_registry::registry::{
+        encode_deprecated_versions, merge_deprecated_versions, parse_deprecated_versions,
+    };
+    let stored_json: Option<String> = tx
+        .query_row(
+            "SELECT deprecated_versions_json FROM bus_schema_subjects \
+             WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3",
+            rusqlite::params![row.instance_id, row.org_id, row.subject],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    // A stored value this build cannot read is replaced rather than kept
+    // failing every later op for the subject.
+    let stored = parse_deprecated_versions(&row.subject, stored_json.as_deref()).unwrap_or_default();
+    let held: std::collections::BTreeMap<u32, String> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT version, content_hash FROM bus_schema_versions \
+                 WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3",
+            )
+            .map_err(sql_error)?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![row.instance_id, row.org_id, row.subject],
+                |r| Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?)),
+            )
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sql_error)?;
+        rows
+    };
+    let newest = held.keys().next_back().copied();
+    let merged = merge_deprecated_versions(stored, incoming)
+        .into_iter()
+        .filter(|d| match held.get(&d.version) {
+            Some(hash) => *hash == d.content_hash,
+            None => newest.is_none_or(|n| d.version > n),
+        })
+        .collect();
+    Ok(encode_deprecated_versions(merged))
+}
+
+/// A `core.bus_schema_subject` op that lost the LWW order to a later write
+/// still carries deprecations the winner may not know of: they are merged
+/// into the stored row (and the subject's own deprecation, once made, is
+/// kept) while every other field stays the winner's. Returns the rows
+/// changed.
+fn merge_losing_bus_schema_subject(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    if operation.body.action == ActionType::Delete {
+        return Ok(0);
+    }
+    let Some((row, incoming)) = decode_bus_schema_subject(tx, operation)? else {
+        return Ok(0);
+    };
+    let merged = merged_schema_deprecations(tx, &row, incoming)?;
+    tx.execute(
+        "UPDATE bus_schema_subjects SET deprecated_versions_json = ?4, \
+         deprecated_at_ms = COALESCE(deprecated_at_ms, ?5) \
+         WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3 \
+         AND (deprecated_versions_json IS NOT ?4 OR deprecated_at_ms IS NOT COALESCE(deprecated_at_ms, ?5))",
+        rusqlite::params![row.instance_id, row.org_id, row.subject, merged, row.deprecated_at_ms],
+    )
+    .map_err(sql_error)
 }
 
 /// Materializes a replicated `core.bus_schema_version` op into
@@ -7352,7 +7483,7 @@ mod tests {
             updated_at_ms: 1,
             durability_class: None,
             generation: 0,
-            description: String::new(),
+            description: Some(String::new()),
             created_by: None,
         }
     }
@@ -8788,7 +8919,7 @@ mod tests {
             created_by: Some("admin-1".to_string()),
             created_at_ms: 1,
             updated_at_ms: 1,
-            deprecated_versions_json: "[]".to_string(),
+            deprecated_versions_json: Some("[]".to_string()),
         }
     }
 
@@ -9391,34 +9522,35 @@ mod tests {
 
     // -------------------------------------------------------------------
     // Migration 176 — topic description/author and deprecated schema
-    // versions ride inside the LWW rows.
+    // versions ride inside the LWW rows; deprecations merge as a set.
     // -------------------------------------------------------------------
+
+    fn topic_description_and_author(db: &crate::db::DbPool) -> (Option<String>, Option<String>) {
+        let row = repository::bus_topic_get(db, "tentabus-00000001", "org-1", "orders")
+            .unwrap()
+            .expect("topic materialized");
+        (row.description, row.created_by)
+    }
 
     /// Two nodes receive two concurrent edits of one topic's description in
     /// opposite orders and end on the later one. The author is set once per
-    /// incarnation: an edit that carries none (a peer from before the
-    /// column) keeps it, and a new incarnation brings its own.
+    /// incarnation: an edit that carries none keeps it, and a new
+    /// incarnation brings its own.
     #[test]
     fn topic_description_converges_on_the_last_writer_and_the_author_stays() {
         let mut created = incarnation(1_000);
         created.created_by = Some("u-anna".to_string());
         let create = at(bus_topic_op(&created, ActionType::Insert), 1_000);
         let mut first = created.clone();
-        first.description = "Wyniki RTG".to_string();
+        first.description = Some("Wyniki RTG".to_string());
         let mut edit_a = at(bus_topic_op(&first, ActionType::Update), 2_000);
         edit_a.body.hlc_timestamp.node_id = "node-a".to_string();
         let mut second = created.clone();
-        second.description = "Wyniki RTG i USG".to_string();
+        second.description = Some("Wyniki RTG i USG".to_string());
         second.created_by = None;
         let mut edit_b = at(bus_topic_op(&second, ActionType::Update), 3_000);
         edit_b.body.hlc_timestamp.node_id = "node-b".to_string();
 
-        let read = |db: &crate::db::DbPool| {
-            let row = repository::bus_topic_get(db, "tentabus-00000001", "org-1", "orders")
-                .unwrap()
-                .expect("topic materialized");
-            (row.description, row.created_by)
-        };
         for order in [[&edit_a, &edit_b], [&edit_b, &edit_a]] {
             let db = bus_db();
             apply_core_operation(&db, &create).unwrap();
@@ -9426,23 +9558,95 @@ mod tests {
                 apply_core_operation(&db, op).unwrap();
             }
             assert_eq!(
-                read(&db),
-                ("Wyniki RTG i USG".to_string(), Some("u-anna".to_string()))
+                topic_description_and_author(&db),
+                (Some("Wyniki RTG i USG".to_string()), Some("u-anna".to_string()))
             );
 
             let mut recreated = incarnation(5_000);
             recreated.created_by = Some("u-bob".to_string());
             apply_core_operation(&db, &at(bus_topic_op(&recreated, ActionType::Insert), 5_000))
                 .unwrap();
-            assert_eq!(read(&db), (String::new(), Some("u-bob".to_string())));
+            assert_eq!(
+                topic_description_and_author(&db),
+                (Some(String::new()), Some("u-bob".to_string()))
+            );
         }
     }
 
-    /// Deprecating versions writes the subject row, whose ops are LWW: two
-    /// nodes that receive two concurrent deprecations in opposite orders end
-    /// with the same list and validate with the same version.
+    /// A peer on a build before migration 176 sends a topic row without the
+    /// description: its later edit (here, retention) lands, and the stored
+    /// description stays.
     #[test]
-    fn deprecated_schema_versions_converge_on_the_last_writer() {
+    fn a_topic_edit_without_a_description_keeps_the_stored_one() {
+        let db = bus_db();
+        let mut created = incarnation(1_000);
+        created.description = Some("Wyniki RTG".to_string());
+        apply_core_operation(&db, &at(bus_topic_op(&created, ActionType::Insert), 1_000)).unwrap();
+        let mut older_build = created.clone();
+        older_build.description = None;
+        older_build.retention_ms += 1;
+        apply_core_operation(&db, &at(bus_topic_op(&older_build, ActionType::Update), 2_000))
+            .unwrap();
+        let row = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.retention_ms, older_build.retention_ms);
+        assert_eq!(row.description.as_deref(), Some("Wyniki RTG"));
+
+        // A new topic from such a peer starts without a description.
+        let mut fresh = bus_topic_row("org-1", "fresh");
+        fresh.description = None;
+        apply_core_operation(&db, &at(bus_topic_op(&fresh, ActionType::Insert), 3_000)).unwrap();
+        let row = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "fresh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.description.as_deref(), Some(""));
+    }
+
+    /// A description another build let through — too long, or carrying
+    /// control characters — is stored in a shape this build's own update
+    /// accepts, so a later local change of the topic is not refused over it.
+    #[test]
+    fn a_replicated_description_this_build_refuses_is_stored_cleaned() {
+        let db = bus_db();
+        let mut created = incarnation(1_000);
+        // The fixture's placeholder values are no topic this build's update
+        // accepts; give it a valid config, so only the description is at stake.
+        {
+            use crate::bus::topics::*;
+            created.validation = "off".to_string();
+            created.retention_ms = DEFAULT_RETENTION_MS;
+            created.retention_bytes = DEFAULT_RETENTION_BYTES_PER_PARTITION;
+            created.dedup_window_ms = DEFAULT_DEDUP_WINDOW_MS;
+            created.max_delivery_attempts = DEFAULT_MAX_DELIVERY_ATTEMPTS;
+            created.retry_backoff_ms = DEFAULT_RETRY_BACKOFF_MS;
+            created.max_inline_bytes = DEFAULT_MAX_INLINE_BYTES as i64;
+        }
+        created.description = Some(format!("a\u{7}b\r{}", "x".repeat(600)));
+        apply_core_operation(&db, &at(bus_topic_op(&created, ActionType::Insert), 1_000)).unwrap();
+        let stored = topic_description_and_author(&db).0.unwrap();
+        assert!(stored.starts_with("abx"));
+        assert_eq!(stored.chars().count(), crate::bus::topics::MAX_DESCRIPTION_CHARS);
+        let cfg = crate::bus::topics::update_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+            crate::bus::topics::TopicOptions {
+                description: Some(stored.clone()),
+                ..Default::default()
+            },
+            2_000,
+        );
+        assert!(cfg.is_ok(), "{cfg:?}");
+    }
+
+    fn deprecation(version: u32, at_ms: i64) -> String {
+        format!(r#"{{"version":{version},"content_hash":"hash-{version}","deprecated_at_ms":{at_ms}}}"#)
+    }
+
+    /// `orders` with versions 1–3 (content `hash-<n>`) on a fresh node.
+    fn subject_with_three_versions() -> (repository::DbBusSchemaSubject, Vec<SyncOperation>) {
         let row = schema_subject_row_for_test("org-1", "orders");
         let mut setup = vec![at(bus_schema_subject_op(&row, ActionType::Insert), 1)];
         for v in 1..=3u32 {
@@ -9454,49 +9658,165 @@ mod tests {
                 1,
             ));
         }
-        let mut newest_withdrawn = row.clone();
-        newest_withdrawn.deprecated_versions_json =
-            r#"[{"version":3,"deprecated_at_ms":2}]"#.to_string();
-        newest_withdrawn.updated_at_ms = 2;
-        let mut on_a = at(bus_schema_subject_op(&newest_withdrawn, ActionType::Update), 2);
-        on_a.body.hlc_timestamp.node_id = "node-a".to_string();
-        let mut two_withdrawn = row.clone();
-        two_withdrawn.deprecated_versions_json =
-            r#"[{"version":2,"deprecated_at_ms":3},{"version":3,"deprecated_at_ms":3}]"#.to_string();
-        two_withdrawn.updated_at_ms = 3;
-        let mut on_b = at(bus_schema_subject_op(&two_withdrawn, ActionType::Update), 3);
-        on_b.body.hlc_timestamp.node_id = "node-b".to_string();
+        (row, setup)
+    }
 
-        for order in [[&on_a, &on_b], [&on_b, &on_a]] {
+    fn subject_update(
+        row: &repository::DbBusSchemaSubject,
+        list: Option<String>,
+        wall_ms: i64,
+        node: &str,
+    ) -> SyncOperation {
+        let mut edited = row.clone();
+        edited.deprecated_versions_json = list;
+        edited.updated_at_ms = wall_ms;
+        let mut op = at(bus_schema_subject_op(&edited, ActionType::Update), wall_ms);
+        op.body.hlc_timestamp.node_id = node.to_string();
+        op
+    }
+
+    fn deprecated_versions_after(setup: &[SyncOperation], ops: &[&SyncOperation]) -> (Vec<u32>, u32) {
+        let db = bus_db();
+        for op in setup.iter().chain(ops.iter().copied()) {
+            apply_core_operation(&db, op).unwrap();
+        }
+        let list = crate::bus::schema_registry::registry::list_versions(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|v| v.deprecated_at_ms.is_some())
+        .map(|v| v.version)
+        .collect();
+        let effective = crate::bus::schema_registry::registry::resolve_effective(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+        )
+        .unwrap()
+        .unwrap()
+        .version;
+        (list, effective)
+    }
+
+    /// Node A deprecates v3 and node B, concurrently, v2. Whole-row LWW kept
+    /// only the later list on every node; merged, both deprecations survive
+    /// in either delivery order, and validation lands on v1 everywhere.
+    #[test]
+    fn concurrent_deprecations_on_two_nodes_both_survive_in_either_order() {
+        let (row, setup) = subject_with_three_versions();
+        let on_a = subject_update(&row, Some(format!("[{}]", deprecation(3, 2))), 2, "node-a");
+        let on_b = subject_update(&row, Some(format!("[{}]", deprecation(2, 3))), 3, "node-b");
+        assert_eq!(deprecated_versions_after(&setup, &[&on_a, &on_b]), (vec![2, 3], 1));
+        assert_eq!(deprecated_versions_after(&setup, &[&on_b, &on_a]), (vec![2, 3], 1));
+    }
+
+    /// A node that had not seen a deprecation yet writes the subject (a
+    /// compatibility change, with its empty list) later than it — or a peer
+    /// on a build before the column writes it with no list at all. Neither
+    /// erases the deprecation, nor the subject's own.
+    #[test]
+    fn a_write_from_a_node_that_had_not_seen_a_deprecation_does_not_erase_it() {
+        let (row, setup) = subject_with_three_versions();
+        let mut deprecated_subject = row.clone();
+        deprecated_subject.deprecated_versions_json = Some(format!("[{}]", deprecation(3, 2)));
+        deprecated_subject.deprecated_at_ms = Some(2);
+        deprecated_subject.updated_at_ms = 2;
+        let mut on_a = at(bus_schema_subject_op(&deprecated_subject, ActionType::Update), 2);
+        on_a.body.hlc_timestamp.node_id = "node-a".to_string();
+        let mut stale = row.clone();
+        stale.compatibility = "full".to_string();
+        let stale_empty = subject_update(&stale, Some("[]".to_string()), 3, "node-b");
+        let stale_absent = subject_update(&stale, None, 4, "node-c");
+        for order in [
+            [&on_a, &stale_empty, &stale_absent],
+            [&stale_empty, &stale_absent, &on_a],
+            [&stale_absent, &on_a, &stale_empty],
+        ] {
             let db = bus_db();
-            for op in &setup {
-                apply_core_operation(&db, op).unwrap();
-            }
-            for op in order {
+            for op in setup.iter().chain(order) {
                 apply_core_operation(&db, op).unwrap();
             }
             let subject =
                 repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders")
                     .unwrap()
                     .unwrap();
-            assert_eq!(subject.deprecated_versions_json, two_withdrawn.deprecated_versions_json);
-            let effective = crate::bus::schema_registry::registry::resolve_effective(
-                &db,
-                "tentabus-00000001",
-                "org-1",
+            assert_eq!(subject.compatibility, "full", "the later write still wins its fields");
+            assert_eq!(subject.deprecated_at_ms, Some(2));
+            let list = crate::bus::schema_registry::registry::parse_deprecated_versions(
                 "orders",
+                subject.deprecated_versions_json.as_deref(),
             )
+            .unwrap();
+            assert_eq!(list.iter().map(|d| d.version).collect::<Vec<_>>(), vec![3]);
+        }
+    }
+
+    /// A deprecation from a node that had not seen a hard delete is not
+    /// resurrected: an entry whose number now holds other content (freed and
+    /// registered again), or whose version is gone while later ones exist,
+    /// is dropped. One for a version this node does not hold yet is kept.
+    #[test]
+    fn a_deprecation_of_a_deleted_version_is_not_brought_back() {
+        let (row, mut setup) = subject_with_three_versions();
+        let mut delete_v2 = bus_schema_version_op(
+            &schema_version_row_for_test("org-1", "orders", 2, "hash-2", 702),
+            ActionType::Delete,
+        );
+        delete_v2.body.hlc_timestamp.wall_time_ms = 2;
+        setup.push(delete_v2);
+        let mut delete_v3 = bus_schema_version_op(
+            &schema_version_row_for_test("org-1", "orders", 3, "hash-3", 703),
+            ActionType::Delete,
+        );
+        delete_v3.body.hlc_timestamp.wall_time_ms = 2;
+        setup.push(delete_v3);
+        setup.push(at(
+            bus_schema_version_op(
+                &schema_version_row_for_test("org-1", "orders", 3, "hash-3b", 713),
+                ActionType::Insert,
+            ),
+            3,
+        ));
+        let stale = subject_update(
+            &row,
+            Some(format!("[{},{},{}]", deprecation(2, 1), deprecation(3, 1), deprecation(9, 1))),
+            4,
+            "node-b",
+        );
+        let db = bus_db();
+        for op in setup.iter().chain([&stale]) {
+            apply_core_operation(&db, op).unwrap();
+        }
+        let subject = repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders")
             .unwrap()
             .unwrap();
-            assert_eq!(effective.version, 1);
-        }
+        let list = crate::bus::schema_registry::registry::parse_deprecated_versions(
+            "orders",
+            subject.deprecated_versions_json.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(list.iter().map(|d| d.version).collect::<Vec<_>>(), vec![9]);
+        let effective = crate::bus::schema_registry::registry::resolve_effective(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((effective.version, effective.schema_ref_id), (3, 713));
     }
 
     #[test]
     fn a_subject_with_an_unreadable_deprecated_versions_list_is_refused() {
         let db = bus_db();
         let mut row = schema_subject_row_for_test("org-1", "orders");
-        row.deprecated_versions_json = r#"[{"version":"two"}]"#.to_string();
+        row.deprecated_versions_json = Some(r#"[{"version":"two"}]"#.to_string());
         assert!(apply_core_operation(&db, &bus_schema_subject_op(&row, ActionType::Insert)).is_err());
         assert!(
             repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders")

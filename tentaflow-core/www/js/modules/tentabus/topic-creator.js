@@ -128,7 +128,12 @@ export function copiesReason(plan) {
   return T(`topics.creator.copies_reason_${plan.kind}`, { nodes: fmtCount(plan.nodes), n: plan.nodes, max: fmtCount(MAX_COPIES), m: MAX_COPIES });
 }
 
-/** Whether a description fits: at most `DESCRIPTION_MAX` characters once trimmed. */
+/**
+ * Whether a description fits: at most `DESCRIPTION_MAX` characters once
+ * trimmed, counted as the server counts them — code points, so an emoji is
+ * one character here too. The field carries no `maxlength`: the browser
+ * counts UTF-16 units and would cut such a text short of the real limit.
+ */
 export function descriptionFits(text) {
   return [...String(text ?? '').trim()].length <= DESCRIPTION_MAX;
 }
@@ -243,7 +248,7 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
       <tf-input id="tb-cr-name" class="tb-mono-input" label="${escapeAttr(T('topics.creator.name_label'))}" placeholder="${escapeAttr(T('topics.creator.name_placeholder'))}" autocomplete="off" spellcheck="false" autocapitalize="off" value="${escapeAttr(draft.name)}" hint="${escapeAttr(T('topics.creator.name_hint'))}" error="${escapeAttr(nameError())}"></tf-input>
       <tf-input id="tb-cr-partitions" type="number" inputmode="numeric" stepper min="${PARTITIONS_MIN}" max="${PARTITIONS_MAX}" step="1" label="${escapeAttr(T('topics.creator.partitions_label'))}" value="${escapeAttr(draft.partitions ?? '')}" hint="${escapeAttr(T('topics.creator.partitions_hint'))}" stepper-dec-label="${escapeAttr(T('topics.creator.partitions_less'))}" stepper-inc-label="${escapeAttr(T('topics.creator.partitions_more'))}"></tf-input>
     </div>
-    <tf-textarea id="tb-cr-description" class="mt-md" rows="2" autogrow maxlength="${DESCRIPTION_MAX}" label="${escapeAttr(T('topics.creator.description_label'))}" placeholder="${escapeAttr(T('topics.creator.description_placeholder'))}" hint="${escapeAttr(T('topics.creator.description_hint', { max: fmtCount(DESCRIPTION_MAX) }))}" value="${escapeAttr(draft.description)}" error="${escapeAttr(descriptionFits(draft.description) ? '' : T('topics.creator.description_too_long', { max: fmtCount(DESCRIPTION_MAX) }))}"></tf-textarea>
+    <tf-textarea id="tb-cr-description" class="mt-md" rows="2" autogrow label="${escapeAttr(T('topics.creator.description_label'))}" placeholder="${escapeAttr(T('topics.creator.description_placeholder'))}" hint="${escapeAttr(T('topics.creator.description_hint', { max: fmtCount(DESCRIPTION_MAX) }))}" value="${escapeAttr(draft.description)}" error="${escapeAttr(descriptionFits(draft.description) ? '' : T('topics.creator.description_too_long', { max: fmtCount(DESCRIPTION_MAX) }))}"></tf-textarea>
     ${kinds.length ? `
       <div class="field mt-md">
         <label id="tb-cr-kind-label">${escapeHtml(T('topics.creator.kind_label'))}</label>

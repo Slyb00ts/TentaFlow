@@ -644,6 +644,14 @@ test('T04 creator: name checks, three steps, pattern for the chosen content, the
   await creator(page).locator('#tb-cr-kind tf-choice-card[value="application/json"]').click();
   await creator(page).locator('#tb-cr-partitions .tf-input-step--inc').click();
   await expect(creator(page).locator('#tb-cr-partitions input')).toHaveValue('4');
+  // Opis: optional; over 500 characters locks Dalej with the reason.
+  const description = creator(page).locator('#tb-cr-description');
+  await description.locator('textarea').fill('x'.repeat(501));
+  await expect(description.locator('.tf-error-text')).toContainText('najwyżej 500 znaków');
+  await expect(nextButton(page)).toHaveAttribute('disabled', '');
+  await description.locator('textarea').fill('Wyniki z pracowni dla aplikacji lekarza');
+  await expect(description.locator('.tf-error-text')).toBeHidden();
+  await expect(nextButton(page)).not.toHaveAttribute('disabled', '');
   await page.screenshot({ path: path.join(SHOTS, 't04-krok1.png') });
   await nextButton(page).click();
 
@@ -666,6 +674,7 @@ test('T04 creator: name checks, three steps, pattern for the chosen content, the
   expect(summary).toContain('1, bo ta instancja ma jeden node');
   expect(summary).toContain('krytyczna');
   expect(summary).toContain('wizyta, najnowsza wersja');
+  expect(summary).toContain('Opis Wyniki z pracowni dla aplikacji lekarza');
   await page.screenshot({ path: path.join(SHOTS, 't04-krok3.png') });
   // Wstecz keeps what was chosen.
   await creator(page).locator('[data-act="back"]').click();
@@ -685,6 +694,9 @@ test('T04 creator: name checks, three steps, pattern for the chosen content, the
   await expect(row).toContainText('JSON · wzór wizyta');
   await expect(row).toContainText('90 dni');
   await expect(page.locator('#tb-tabs tf-tab#topics')).toHaveAttribute('count', '4', { timeout: 15000 });
+  const created = await busCall(page, 'busTopicDetailRequest', { instanceId: hashParams(page).instance, name: 'wyniki-z-pracowni' });
+  expect(created.topic.description).toBe('Wyniki z pracowni dla aplikacji lekarza');
+  expect(created.topic.createdByLabel).toBeTruthy();
   await assertNoOverflow(page);
   await page.screenshot({ path: path.join(SHOTS, 't04-utworzono.png'), fullPage: true });
   expect(errors, errors.join('\n')).toEqual([]);

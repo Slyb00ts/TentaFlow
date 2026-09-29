@@ -30703,11 +30703,12 @@ pub struct DbBusTopic {
     /// peer on an older build sends.
     #[serde(default)]
     pub generation: u64,
-    /// Free text an admin gives the topic (migration v176); empty when none.
-    /// A peer on a build before v176 sends no such field, which decodes as
-    /// empty — its update of the topic clears the description.
+    /// Free text an admin gives the topic (migration v176); `Some("")` when
+    /// none. Always `Some` from this build; `None` only in a payload from a
+    /// peer on a build before v176, which must leave the stored description
+    /// alone (`core_materializer::apply_bus_topic`).
     #[serde(default)]
-    pub description: String,
+    pub description: Option<String>,
     /// Who created this incarnation: a user id, or `api_key:<uid>` for a
     /// REST caller (migration v176). Set once at creation, never by an
     /// update; `None` for a topic created before v176.
@@ -30742,7 +30743,7 @@ fn map_bus_topic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusTopic> {
         updated_at_ms: row.get(22)?,
         durability_class: row.get(23)?,
         generation: row.get::<_, i64>(24)? as u64,
-        description: row.get(25)?,
+        description: Some(row.get(25)?),
         created_by: row.get(26)?,
     })
 }
@@ -30936,7 +30937,7 @@ fn bus_topic_insert(
                 row.updated_at_ms,
                 row.durability_class,
                 row.generation as i64,
-                row.description,
+                row.description.as_deref().unwrap_or_default(),
                 row.created_by,
             ],
         )?;
@@ -31008,7 +31009,7 @@ pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
          max_delivery_attempts=?11, retry_backoff_ms=?12, schema_id=?13, validation=?14, \
          content_type=?15, replication_factor=?16, acks=?17, durability=?18, \
          max_inline_bytes=?19, compression=?20, environment=?21, updated_at_ms=?22, \
-         durability_class=?23, description=?24 \
+         durability_class=?23, description=COALESCE(?24, description) \
          WHERE instance_id=?1 AND org_id=?2 AND name=?3",
         rusqlite::params![
             row.instance_id,
@@ -32313,17 +32314,14 @@ pub struct DbBusSchemaSubject {
     pub created_by: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    /// Deprecated versions of this subject (migration v176), a JSON array of
-    /// `{"version", "deprecated_at_ms"}` — read through
-    /// `bus::schema_registry::registry`, which owns the format. Kept on the
-    /// subject row because version rows replicate insert-if-absent. A peer
-    /// on a build before v176 sends no such field, which decodes as `[]`.
-    #[serde(default = "empty_json_array")]
-    pub deprecated_versions_json: String,
-}
-
-fn empty_json_array() -> String {
-    "[]".to_string()
+    /// Deprecated versions of this subject (migration v176), a JSON array
+    /// read and written only through `bus::schema_registry::registry`, which
+    /// owns the format. Kept on the subject row because version rows
+    /// replicate insert-if-absent. Always `Some` from this build; `None` only
+    /// in a payload from a peer on a build before v176, which carries no
+    /// deprecations to add (`core_materializer::apply_bus_schema_subject`).
+    #[serde(default)]
+    pub deprecated_versions_json: Option<String>,
 }
 
 const BUS_SCHEMA_SUBJECT_COLUMNS: &str = "instance_id, org_id, subject, schema_type, \
@@ -32341,7 +32339,7 @@ fn map_bus_schema_subject_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBus
         created_by: row.get(6)?,
         created_at_ms: row.get(7)?,
         updated_at_ms: row.get(8)?,
-        deprecated_versions_json: row.get(9)?,
+        deprecated_versions_json: Some(row.get(9)?),
     })
 }
 
@@ -32404,23 +32402,16 @@ pub(crate) fn publish_bus_schema_subject_capture(
     Ok(Some(recorded.op_id))
 }
 
-/// Upsert — one row per `(instance_id, org_id, subject)`. Always captured as
-/// `SqlWriteAction::Update`, same convention as `bus_field_policy_set`: the
-/// materializer's own `INSERT ... ON CONFLICT DO UPDATE` treats Insert and
-/// Update identically. `created_by`/`created_at_ms` are only ever set on the
-/// first insert and never touched by an update.
-pub fn bus_schema_subject_upsert(pool: &DbPool, row: &DbBusSchemaSubject) -> Result<()> {
+/// Inserts a new subject row; `Ok(false)` (nothing written, nothing
+/// published) when the subject already exists — a concurrent registration
+/// created it, and its row, deprecations included, must not be overwritten.
+pub fn bus_schema_subject_insert(pool: &DbPool, row: &DbBusSchemaSubject) -> Result<bool> {
     let conn = acquire(pool)?;
-    conn.execute(
+    let inserted = conn.execute(
         &format!(
             "INSERT INTO bus_schema_subjects ({BUS_SCHEMA_SUBJECT_COLUMNS}) VALUES \
              (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
-             ON CONFLICT(instance_id, org_id, subject) DO UPDATE SET \
-             schema_type = excluded.schema_type, \
-             compatibility = excluded.compatibility, \
-             deprecated_at_ms = excluded.deprecated_at_ms, \
-             updated_at_ms = excluded.updated_at_ms, \
-             deprecated_versions_json = excluded.deprecated_versions_json"
+             ON CONFLICT(instance_id, org_id, subject) DO NOTHING"
         ),
         rusqlite::params![
             row.instance_id,
@@ -32432,16 +32423,76 @@ pub fn bus_schema_subject_upsert(pool: &DbPool, row: &DbBusSchemaSubject) -> Res
             row.created_by,
             row.created_at_ms,
             row.updated_at_ms,
-            row.deprecated_versions_json,
+            row.deprecated_versions_json.as_deref().unwrap_or("[]"),
         ],
-    )?;
+    )? == 1;
     drop(conn);
-    let _ = publish_bus_schema_subject_capture(
-        pool,
-        row,
-        crate::sync::runtime::SqlWriteAction::Update,
-    )?;
-    Ok(())
+    if inserted {
+        let _ = publish_bus_schema_subject_capture(
+            pool,
+            row,
+            crate::sync::runtime::SqlWriteAction::Insert,
+        )?;
+    }
+    Ok(inserted)
+}
+
+/// Changes one subject row as a single read-modify-write inside an
+/// IMMEDIATE transaction, so two local writers (a deprecation racing a
+/// compatibility change) never write back each other's stale copy. `edit`
+/// gets the current row and returns whether it changed it; only a changed
+/// row is written and published. `Ok(None)` when the subject does not exist.
+pub fn bus_schema_subject_modify(
+    pool: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    subject: &str,
+    edit: impl FnOnce(&mut DbBusSchemaSubject) -> bool,
+) -> Result<Option<DbBusSchemaSubject>> {
+    let changed = with_writer_tx(pool, |tx| {
+        let Some(mut row) = tx
+            .query_row(
+                &format!(
+                    "SELECT {BUS_SCHEMA_SUBJECT_COLUMNS} FROM bus_schema_subjects \
+                     WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3"
+                ),
+                rusqlite::params![instance_id, org_id, subject],
+                map_bus_schema_subject_row,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        if !edit(&mut row) {
+            return Ok(Some((row, false)));
+        }
+        tx.execute(
+            "UPDATE bus_schema_subjects SET compatibility = ?4, deprecated_at_ms = ?5, \
+             updated_at_ms = ?6, deprecated_versions_json = ?7 \
+             WHERE instance_id = ?1 AND org_id = ?2 AND subject = ?3",
+            rusqlite::params![
+                instance_id,
+                org_id,
+                subject,
+                row.compatibility,
+                row.deprecated_at_ms,
+                row.updated_at_ms,
+                row.deprecated_versions_json.as_deref().unwrap_or("[]"),
+            ],
+        )?;
+        Ok(Some((row, true)))
+    })?;
+    let Some((row, changed)) = changed else {
+        return Ok(None);
+    };
+    if changed {
+        let _ = publish_bus_schema_subject_capture(
+            pool,
+            &row,
+            crate::sync::runtime::SqlWriteAction::Update,
+        )?;
+    }
+    Ok(Some(row))
 }
 
 pub fn bus_schema_subject_get(
@@ -33145,7 +33196,7 @@ mod bus_repository_tests {
             updated_at_ms: 1_000,
             durability_class: None,
             generation: 0,
-            description: String::new(),
+            description: Some(String::new()),
             created_by: None,
         }
     }
@@ -33293,7 +33344,7 @@ mod bus_repository_tests {
             created_by: Some("admin-1".to_string()),
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
-            deprecated_versions_json: "[]".to_string(),
+            deprecated_versions_json: Some("[]".to_string()),
         }
     }
 
@@ -33319,10 +33370,16 @@ mod bus_repository_tests {
     }
 
     #[test]
-    fn bus_schema_subject_upsert_get_list_delete_round_trip() {
+    fn bus_schema_subject_insert_modify_get_list_delete_round_trip() {
         let db = fresh_db();
         let row = schema_subject_row(T1, "org-1", "orders.v1");
-        bus_schema_subject_upsert(&db, &row).unwrap();
+        assert!(bus_schema_subject_insert(&db, &row).unwrap());
+        let mut again = row.clone();
+        again.compatibility = "none".to_string();
+        assert!(
+            !bus_schema_subject_insert(&db, &again).unwrap(),
+            "an existing subject is never overwritten by an insert"
+        );
 
         let fetched = bus_schema_subject_get(&db, T1, "org-1", "orders.v1")
             .unwrap()
@@ -33332,12 +33389,15 @@ mod bus_repository_tests {
         assert_eq!(fetched.deprecated_at_ms, None);
         assert_eq!(fetched.created_by.as_deref(), Some("admin-1"));
 
-        // Upsert updates mutable fields and leaves created_at_ms alone.
-        let mut updated_row = row.clone();
-        updated_row.compatibility = "full".to_string();
-        updated_row.deprecated_at_ms = Some(2_000);
-        updated_row.updated_at_ms = 2_000;
-        bus_schema_subject_upsert(&db, &updated_row).unwrap();
+        // Modify updates mutable fields and leaves created_at_ms alone.
+        bus_schema_subject_modify(&db, T1, "org-1", "orders.v1", |r| {
+            r.compatibility = "full".to_string();
+            r.deprecated_at_ms = Some(2_000);
+            r.updated_at_ms = 2_000;
+            true
+        })
+        .unwrap()
+        .expect("subject exists");
         let updated = bus_schema_subject_get(&db, T1, "org-1", "orders.v1")
             .unwrap()
             .expect("subject must still exist");
@@ -33347,7 +33407,7 @@ mod bus_repository_tests {
         assert_eq!(updated.created_at_ms, 1_000);
 
         let other = schema_subject_row(T1, "org-1", "orders.v2");
-        bus_schema_subject_upsert(&db, &other).unwrap();
+        bus_schema_subject_insert(&db, &other).unwrap();
         let listed = bus_schema_subject_list(&db, T1, "org-1").unwrap();
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].subject, "orders.v1");
@@ -33372,7 +33432,7 @@ mod bus_repository_tests {
     #[test]
     fn bus_schema_version_insert_list_latest_and_by_content_hash() {
         let db = fresh_db();
-        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
+        bus_schema_subject_insert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
 
         bus_schema_version_insert(
             &db,
@@ -33418,7 +33478,7 @@ mod bus_repository_tests {
     #[test]
     fn bus_schema_version_insert_rejects_duplicate_content_hash_within_a_subject() {
         let db = fresh_db();
-        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
+        bus_schema_subject_insert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
         bus_schema_version_insert(
             &db,
             &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 301),
@@ -33435,8 +33495,8 @@ mod bus_repository_tests {
     #[test]
     fn bus_schema_version_insert_reports_a_distinguishable_error_on_schema_ref_id_collision() {
         let db = fresh_db();
-        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
-        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v2")).unwrap();
+        bus_schema_subject_insert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
+        bus_schema_subject_insert(&db, &schema_subject_row(T1, "org-1", "orders.v2")).unwrap();
         bus_schema_version_insert(
             &db,
             &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 401),
@@ -33463,8 +33523,8 @@ mod bus_repository_tests {
     #[test]
     fn two_instances_can_reuse_the_same_schema_ref_id_in_the_same_org() {
         let db = fresh_db();
-        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
-        bus_schema_subject_upsert(&db, &schema_subject_row(T2, "org-1", "orders.v1")).unwrap();
+        bus_schema_subject_insert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
+        bus_schema_subject_insert(&db, &schema_subject_row(T2, "org-1", "orders.v1")).unwrap();
         bus_schema_version_insert(
             &db,
             &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 401),
@@ -33488,7 +33548,7 @@ mod bus_repository_tests {
     #[test]
     fn bus_schema_version_insert_reports_a_distinguishable_error_on_a_version_slot_pk_collision() {
         let db = fresh_db();
-        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
+        bus_schema_subject_insert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
         bus_schema_version_insert(
             &db,
             &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 501),
@@ -34033,13 +34093,13 @@ mod bus_repository_tests {
         )
         .unwrap();
 
-        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
+        bus_schema_subject_insert(&db, &schema_subject_row(T1, "org-1", "orders.v1")).unwrap();
         bus_schema_version_insert(
             &db,
             &schema_version_row(T1, "org-1", "orders.v1", 1, "hash-a", 601),
         )
         .unwrap();
-        bus_schema_subject_upsert(&db, &schema_subject_row(T1, "org-2", "invoices.v1")).unwrap();
+        bus_schema_subject_insert(&db, &schema_subject_row(T1, "org-2", "invoices.v1")).unwrap();
         bus_schema_version_insert(
             &db,
             &schema_version_row(T1, "org-2", "invoices.v1", 1, "hash-b", 602),

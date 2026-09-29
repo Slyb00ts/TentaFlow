@@ -248,6 +248,10 @@ pub const MAX_MAX_INLINE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 /// the topic's name, not a document.
 pub const MAX_DESCRIPTION_CHARS: usize = 500;
 
+fn description_char_allowed(c: char) -> bool {
+    !c.is_control() || matches!(c, '\n' | '\t')
+}
+
 /// A description is plain text shown under the topic name: line breaks and
 /// tabs are the only control characters it may carry.
 fn validate_description(description: &str) -> Result<(), BusServiceError> {
@@ -259,15 +263,25 @@ fn validate_description(description: &str) -> Result<(), BusServiceError> {
             ),
         });
     }
-    if description
-        .chars()
-        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-    {
+    if !description.chars().all(description_char_allowed) {
         return Err(BusServiceError::InvalidTopicConfig {
             reason: "description must not contain control characters".to_string(),
         });
     }
     Ok(())
+}
+
+/// A description `validate_description` accepts, made from one it may not:
+/// disallowed control characters dropped, then cut to
+/// `MAX_DESCRIPTION_CHARS`. For a description another node's build wrote
+/// (`core_materializer::apply_bus_topic`), which this build must store in a
+/// shape its own next update of the topic accepts.
+pub fn sanitize_description(description: &str) -> String {
+    description
+        .chars()
+        .filter(|c| description_char_allowed(*c))
+        .take(MAX_DESCRIPTION_CHARS)
+        .collect()
 }
 
 /// Validates every numeric setting in PLAN §7.1's range table except
@@ -349,7 +363,7 @@ fn validate_ranges(cfg: &TopicConfig) -> Result<(), BusServiceError> {
             ));
         }
     }
-    validate_description(&cfg.description)
+    Ok(())
 }
 
 /// Validates `idempotency_key`: the field is a CEL expression per PLAN
@@ -942,6 +956,7 @@ impl TopicConfig {
             created_by: opts.created_by,
         };
         validate_ranges(&cfg)?;
+        validate_description(&cfg.description)?;
         Ok(cfg)
     }
 
@@ -1034,8 +1049,14 @@ impl TopicConfig {
         if let Some(v) = opts.compression {
             self.compression = v;
         }
+        // Checked only when this update changes it: a description stored by
+        // another build is this build's to show, not a reason to refuse an
+        // unrelated change of the topic.
         if let Some(v) = opts.description {
-            self.description = v;
+            if v != self.description {
+                validate_description(&v)?;
+                self.description = v;
+            }
         }
         validate_ranges(self)?;
         Ok(())
@@ -1108,7 +1129,7 @@ impl From<&TopicConfig> for DbBusTopic {
             updated_at_ms: c.updated_at_ms,
             durability_class: c.durability_class.map(|k| k.as_str().to_string()),
             generation: c.generation,
-            description: c.description.clone(),
+            description: Some(c.description.clone()),
             created_by: c.created_by.clone(),
         }
     }
@@ -1163,7 +1184,7 @@ impl TryFrom<DbBusTopic> for TopicConfig {
             created_at_ms: row.created_at_ms,
             updated_at_ms: row.updated_at_ms,
             generation: row.generation,
-            description: row.description,
+            description: row.description.unwrap_or_default(),
             created_by: row.created_by,
         })
     }
@@ -2719,7 +2740,11 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.description, text);
 
-        for bad in ["x".repeat(MAX_DESCRIPTION_CHARS + 1), "bell\u{7}".to_string()] {
+        for bad in [
+            "x".repeat(MAX_DESCRIPTION_CHARS + 1),
+            "bell\u{7}".to_string(),
+            "carriage\rreturn".to_string(),
+        ] {
             let err = create_topic(
                 &db,
                 "tentabus-00000001",
@@ -2761,6 +2786,56 @@ mod tests {
         let cleared = update_topic(&db, "tentabus-00000001", "org-1", "orders.described", with(""), 5_000)
             .unwrap();
         assert_eq!(cleared.description, "");
+    }
+
+    /// A description stored by another build that this one would refuse
+    /// does not block an update that leaves it alone; replacing it is
+    /// checked as usual.
+    #[test]
+    fn an_update_that_leaves_a_stored_description_alone_does_not_check_it() {
+        let db = delivery_test_db();
+        let (cfg, _) = create_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.legacy",
+            TopicOptions::default(),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .unwrap();
+        let mut row = DbBusTopic::from(&cfg);
+        row.description = Some("y".repeat(MAX_DESCRIPTION_CHARS + 10));
+        repository::bus_topic_update(&db, &row).unwrap();
+
+        let updated = update_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.legacy",
+            TopicOptions {
+                retention_ms: Some(2 * DEFAULT_RETENTION_MS),
+                description: Some(row.description.clone().unwrap()),
+                ..Default::default()
+            },
+            2_000,
+        )
+        .expect("an unchanged description is not re-checked");
+        assert_eq!(updated.retention_ms, 2 * DEFAULT_RETENTION_MS);
+        let err = update_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.legacy",
+            TopicOptions {
+                description: Some("z".repeat(MAX_DESCRIPTION_CHARS + 1)),
+                ..Default::default()
+            },
+            3_000,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }), "{err:?}");
+        assert_eq!(sanitize_description("a\u{7}b\r\nc\td").as_str(), "ab\nc\td");
     }
 
     /// The author is written at creation from the options `BusService`

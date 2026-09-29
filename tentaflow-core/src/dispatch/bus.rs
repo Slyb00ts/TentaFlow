@@ -1905,8 +1905,13 @@ async fn topic_detail_v1(
         can_admin: topic_admin && is_org_admin(ctx),
     };
     let admin_labels = topic_admin_labels(ctx, &g, &name).await?;
-    let topic_wire = topic_to_wire(ctx, cfg.clone()).await?;
+    let mut topic_wire = topic_to_wire(ctx, cfg.clone()).await?;
     if !can_read {
+        // The description and the author say what the topic carries and who
+        // runs it — content of the topic, not of the list every reader sees.
+        topic_wire.description = String::new();
+        topic_wire.created_by = None;
+        topic_wire.created_by_label = None;
         return Ok(BusPayload::TopicDetailResponse {
             topic: topic_wire,
             partitions: Vec::new(),
@@ -7430,6 +7435,18 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
+        topic_update_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire {
+                description: Some("Wyniki badań".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("describe the topic");
+
         // A reader without the org Admin role (and without bus.write) sees
         // the administrators by name and no admin/write rights of its own.
         let reader_id = format!("u-reader-{}", uuid::Uuid::new_v4());
@@ -7440,11 +7457,14 @@ mod tests {
             .unwrap()
         {
             BusPayload::TopicDetailResponse {
+                topic: cfg,
                 access,
                 admin_labels,
                 partitions,
                 ..
             } => {
+                assert_eq!(cfg.description, "Wyniki badań");
+                assert!(cfg.created_by.is_some());
                 let access = access.expect("access");
                 assert!(access.can_read);
                 assert!(!access.can_write);
@@ -7483,6 +7503,9 @@ mod tests {
                 assert!(partitions.is_empty());
                 assert!(groups.is_empty());
                 assert!(!access.expect("access").can_read);
+                // What the topic carries and who runs it is withheld too.
+                assert_eq!(cfg.description, "");
+                assert_eq!((cfg.created_by, cfg.created_by_label), (None, None));
             }
             other => panic!("unexpected response: {other:?}"),
         }

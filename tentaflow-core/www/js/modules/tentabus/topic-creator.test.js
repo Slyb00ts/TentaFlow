@@ -103,6 +103,8 @@ test('a description is sent trimmed, and a blank one is not sent at all', () => 
   assert.equal(descriptionFits('ą'.repeat(500)), true, 'characters are counted, not bytes');
   assert.equal(descriptionFits(`${'a'.repeat(500)}  `), true, 'the spaces around it are not kept');
   assert.equal(descriptionFits('a'.repeat(501)), false);
+  assert.equal(descriptionFits('😀'.repeat(500)), true, 'an emoji is one character, as on the server');
+  assert.equal(descriptionFits('😀'.repeat(501)), false);
 });
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -184,7 +186,7 @@ test('step 1: an optional description, too long stops Dalej, and it reaches the 
   const { win, sent } = open();
   typeName(win, 'wyniki-z-pracowni');
   const field = win.querySelector('#tb-cr-description');
-  assert.equal(field.getAttribute('maxlength'), '500');
+  assert.equal(field.hasAttribute('maxlength'), false, 'the limit is counted in code points, not by the browser');
   assert.equal(nextBtn(win).hasAttribute('disabled'), false, 'the description is optional');
   const typeDescription = (value) => {
     field.value = value;

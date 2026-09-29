@@ -207,7 +207,10 @@ test('the description window: what saving does, a text over the limit, a cleared
   const field = win.querySelector('#tb-set-description');
   const save = win.querySelector('[data-act="save"]');
   assert.equal(field.value, 'Wyniki z pracowni RTG');
+  assert.equal(field.hasAttribute('maxlength'), false);
   assert.ok(save.hasAttribute('disabled'));
+  type(field, '😀'.repeat(500));
+  assert.equal(field.hasAttribute('error'), false, '500 emoji are 500 characters, as on the server');
   type(field, 'y'.repeat(501));
   assert.match(field.getAttribute('error'), /najwyżej 500 znaków/);
   assert.ok(save.hasAttribute('disabled'));
