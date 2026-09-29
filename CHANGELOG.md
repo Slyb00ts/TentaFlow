@@ -98,6 +98,38 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   przyjmują identyfikator podmiotu tylko z liter, cyfr i znaków `-_.:@*`
   (do 128 znaków). Każda próba podglądu, także odrzucona, zostawia wpis
   audytu z wynikiem (`outcome=ok` albo `outcome=refused:<kod>`).
+- Klucz ogólny może czytać i wysyłać wiadomości wybranych topików przez REST
+  rekordów (`/v1/bus/instances/{instancja}/topics/{topik}/records?org_id=…`,
+  decyzja P5: jeden klucz ogólny na wszystko). Działa jako on sam, nie jako
+  osoba: prawem jest wyłącznie wiersz dostępu topiku `subject_type = 'api_key'`
+  z działaniem `read` albo `write` w tej instancji i organizacji; bez takiego
+  wiersza klucz nie ma żadnego dostępu (domyślnie zakaz), a czytanie i wysyłanie
+  są osobnymi prawami. Klucz nie potrzebuje wpisu w macierzy uprawnień i nigdy
+  nie administruje topikiem: nie tworzy topików (także przez
+  `create_if_missing`), nie zmienia ustawień ani dostępu, nie czyta
+  „Nieprzetworzonych wiadomości” ani topików wewnętrznych. Odbiera tylko pod
+  własnymi grupami odbiorców — `<id klucza>` albo `<id klucza>.<nazwa>` — więc
+  nie przesunie potwierdzeń cudzej grupy. Prawo jest sprawdzane przed
+  wyszukaniem instancji: klucz bez prawa dostaje 403 także dla instancji, która
+  nie istnieje. Klucz usunięty albo przypisany do osoby nie korzysta z wierszy
+  klucza; klucz przypisany do osoby działa jak dotąd — jako ta osoba.
+- Prawa klucza do wiadomości nadaje administrator serwera
+  (`ApiKeyCreateRequest.scope_resources`, `ApiKeyScopeSetRequest`) albo
+  administrator topiku (`AclSetRequest` z `subject_type = 'api_key'`).
+  Zakres `topic` wymaga działania `read` albo `write` i poprawnego
+  identyfikatora (instancja, organizacja, istniejący topik); `admin` i `'*'`
+  są odrzucane, a `AclSetRequest` przyjmuje tylko istniejący klucz ogólny.
+  `ApiKeyScopeListResponse` zwraca prawa klucza z działaniem,
+  a `ApiKeyScopeClearRequest` z działaniem usuwa tylko to jedno prawo.
+  Wcześniej zapisany wiersz klucza z działaniem `'*'` niczego nie przyznaje
+  (nadal może tylko zabraniać) i można go usunąć.
+- Ukrywanie danych obejmuje klucze: klucz ogólny czyta według zasady dla
+  wszystkich (zasady nie da się przypisać kluczowi), nigdy według zasady osoby
+  o tym samym identyfikatorze.
+- Audyt: każde odrzucone żądanie REST rekordów klucza ogólnego zostawia wpis
+  `bus.rest.publish` albo `bus.rest.consume` z identyfikatorem i nazwą
+  klucza, kodem HTTP i powodem (bez treści wiadomości); udane żądania są
+  zapisywane raz na minutę na klucz i topik, z liczbą żądań.
 - Aktualizacja: migracja bazy 177 przebudowuje `resource_permissions`
   (dopuszcza `subject_type = 'addon'`) bez zmiany istniejących wierszy.
   Nod w starszej wersji odrzuca zsynchronizowany wiersz addonu (operacja

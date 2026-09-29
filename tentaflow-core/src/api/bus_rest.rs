@@ -26,29 +26,44 @@
 // surface (openai/server.rs) jest jednoorganizacyjny w praktyce — zaden
 // handler tam nie ma pojecia `org_id`, `Principal`/`UserContext` tez go nie
 // niosa. TentaBus jest jednak z zalozenia wieloorganizacyjny (`BusCallContext.
-// org_id` wymagane wszedzie indziej). Zamiast zgadywac jedna organizacje
-// (np. `DEFAULT_ORG_ID`) lub wymyslac nowy bypass authorization, ten endpoint
-// wymaga jawnego `?org_id=` I klucza API zwiazanego z realnym uzytkownikiem
-// (`Principal::User`) — weryfikuje CZLONKOSTWO w tej organizacji
-// (`org::repo::get_user_role_in_org`, fail-closed 403 gdy brak), a nastepnie
-// wola `BusService::publish`/`open_consumer` z `ctx.actor = user_id` —
-// dokladnie ta sama, juz przetestowana sciezka `RbacBusAuthorizer` (globalny
-// RBAC `bus.read`/`bus.write` + per-topic ACL) ktora obsluguje kazdego innego
-// wywolujacego busa. Zero nowego bypassu authorization. `Group`/`ApiKey`
-// principale (klucze bez zwiazanego uzytkownika) sa poza zakresem tego
-// endpointu — nie maja czlonkostwa w zadnej organizacji do zweryfikowania.
+// org_id` wymagane wszedzie indziej), so every call names its organisation
+// with an explicit `?org_id=`. Two kinds of key are accepted:
+//
+// * A user-bound key (`Principal::User`) acts as its user: membership in the
+//   organisation is verified (`org::repo::get_user_role_in_org`, fail-closed
+//   403), then `BusService::publish`/`open_consumer` run with `ctx.actor =
+//   user_id` through `InstanceBusAuthorizer` (permission matrix + per-topic
+//   ACL), exactly like every other caller of the bus.
+// * A general key (`Principal::ApiKey`, package K, owner decision P5: one
+//   general key may also carry read/write rights to the messages of chosen
+//   topics) acts as the key itself (`ActorKind::ApiKey`, `ctx.actor` = key
+//   uid). Its only rights are the topic's `api_key` ACL rows for exactly
+//   `read`/`write` — default DENY, no matrix row, never `admin`, never a
+//   reserved topic, never auto-creation (`bus_authorizer`'s `API KEY
+//   SUBJECTS` doc). The right is checked before the instance is looked up,
+//   so a key without a grant learns nothing about which instances or topics
+//   exist, and again by the engine's authorizer on the call itself. A key
+//   consumes only under its own groups (`<key uid>` / `<key uid>.<name>`).
+//   Every refused key request writes an `audit_log` row naming the key; its
+//   successful requests are recorded once per key, topic and minute
+//   (`KEY_AUDIT_WINDOW`).
+//
+// A group-bound key (`Principal::Group`) is refused: it has neither a user
+// to act as nor grants of its own.
 // =============================================================================
 
-use crate::api::openai::server::OpenAIBody;
+use crate::api::openai::server::{OpenAIBody, V1PeerIp};
 use crate::auth::acl::Principal;
+use crate::auth::actor::ActorKind;
 use crate::bus::groups::CommitMode;
 use crate::bus::instance::BusInstanceId;
 use crate::bus::{
-    self, BusCallContext, BusServiceError, ConsumerConfig, FetchedRecordMeta, PublishBatch,
-    PublishRecord, PublishResult, TopicPartition,
+    self, BusAction, BusCallContext, BusServiceError, ConsumerConfig, FetchedRecordMeta,
+    PublishBatch, PublishRecord, PublishResult, TopicPartition,
 };
 use crate::dispatch::app_gate::{self, SoleInstanceError};
 use crate::routing::router::Router;
+use crate::services::bus_authorizer::{api_key_owns_group, api_key_topic_allows};
 
 use base64::Engine;
 use http_body_util::{BodyExt, StreamBody};
@@ -287,21 +302,69 @@ pub(crate) fn map_bus_error(e: &BusServiceError) -> Response<OpenAIBody> {
     }
 }
 
-/// Resolves the caller into `(user_id, org_id)` for a `BusCallContext`, or an
-/// error response — see this file's header doc for why `org_id` must be
-/// explicit and the principal must be a real user.
+// ---- Caller resolution and key audit (package K) ---------------------------
+
+/// Who the `/v1` gate authenticated behind a records REST call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestCaller {
+    /// A user-bound key: the call acts as that user, who must belong to
+    /// `?org_id=`, and meets the permission matrix + topic ACL like every
+    /// dashboard call of that user.
+    User { user_id: String },
+    /// A general key: the call acts as the key itself and holds only the
+    /// topic rights granted to it (`bus_authorizer::api_key_topic_allows`).
+    ApiKey { uid: String },
+}
+
+/// The resolved caller plus the organisation the call is scoped to.
+#[derive(Debug)]
+struct RestActor {
+    caller: RestCaller,
+    org_id: String,
+}
+
+impl RestActor {
+    fn call_context(&self, instance_id: BusInstanceId) -> BusCallContext {
+        let (actor, actor_kind) = match &self.caller {
+            RestCaller::User { user_id } => (user_id.clone(), ActorKind::User),
+            RestCaller::ApiKey { uid } => (uid.clone(), ActorKind::ApiKey),
+        };
+        BusCallContext {
+            instance_id,
+            org_id: self.org_id.clone(),
+            actor: Some(actor),
+            actor_kind,
+            correlation_id: None,
+            origin: "v1.bus.rest".to_string(),
+        }
+    }
+}
+
+/// Resolves the caller and `?org_id=` into a `RestActor`, or an error
+/// response — see this file's header doc for why `org_id` must be explicit.
+/// A general key's uid and organisation are noted in `facts` as soon as they
+/// are known, so even an early refusal is audited under the key.
 fn resolve_actor(
     db: &crate::db::DbPool,
     principal: Option<&Principal>,
     query: &BusRecordsQuery,
-) -> std::result::Result<(String, String), Response<OpenAIBody>> {
-    let user_id = match principal {
-        Some(Principal::User { user_id, .. }) => user_id.clone(),
-        Some(_) => {
+    facts: &mut KeyAuditFacts,
+) -> std::result::Result<RestActor, Response<OpenAIBody>> {
+    let caller = match principal {
+        Some(Principal::User { user_id, .. }) => RestCaller::User {
+            user_id: user_id.clone(),
+        },
+        Some(Principal::ApiKey { uid }) => {
+            facts.key_uid = Some(uid.clone());
+            RestCaller::ApiKey { uid: uid.clone() }
+        }
+        Some(Principal::Group { .. }) => {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                "TentaBus REST access requires a user-bound API key (a 'group' or 'general' key has no organization to scope this call to)".to_string(),
+                "TentaBus REST access requires a user-bound API key or a general API key with \
+                 topic rights (a 'group' key has no organization or grant to act with)"
+                    .to_string(),
             ))
         }
         None => {
@@ -315,26 +378,265 @@ fn resolve_actor(
     let org_id = match &query.org_id {
         Some(o) if !o.is_empty() => o.clone(),
         _ => {
+            facts.reason = Some("missing_org_id".to_string());
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "missing required query parameter 'org_id'".to_string(),
-            ))
+            ));
         }
     };
-    match crate::services::org::repo::get_user_role_in_org(db, &user_id, &org_id) {
-        Ok(Some(_)) => Ok((user_id, org_id)),
-        Ok(None) => Err(error_response(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            format!("user has no membership in org '{org_id}'"),
-        )),
-        Err(e) => Err(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            format!("org membership lookup failed: {e}"),
-        )),
+    match caller {
+        RestCaller::User { user_id } => {
+            match crate::services::org::repo::get_user_role_in_org(db, &user_id, &org_id) {
+                Ok(Some(_)) => Ok(RestActor {
+                    caller: RestCaller::User { user_id },
+                    org_id,
+                }),
+                Ok(None) => Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "permission_error",
+                    format!("user has no membership in org '{org_id}'"),
+                )),
+                Err(e) => Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    format!("org membership lookup failed: {e}"),
+                )),
+            }
+        }
+        // A key belongs to no organisation: its grants do. Every topic right
+        // is stored under `(instance, org, topic)`, so naming an organisation
+        // the key holds nothing in finds no row and is refused by the topic
+        // check — the same binding the schema registry REST gets from its
+        // `(instance, org)` scope id.
+        RestCaller::ApiKey { uid } => {
+            if let Err(e) = crate::bus::topics::validate_org_id(&org_id) {
+                facts.reason = Some("invalid_org_id".to_string());
+                return Err(map_bus_error(&e));
+            }
+            facts.org_id = Some(org_id.clone());
+            Ok(RestActor {
+                caller: RestCaller::ApiKey { uid },
+                org_id,
+            })
+        }
     }
+}
+
+/// A general key's right to `action` on `topic`, asked before the instance's
+/// engine is looked up (same order as the schema registry REST), so a key
+/// without a grant learns nothing about which instances or topics exist. The
+/// engine's own authorizer asks the same question again on the call itself.
+/// A no-op for a user caller, whose request keeps its original order.
+fn precheck_api_key(
+    db: &crate::db::DbPool,
+    actor: &RestActor,
+    instance: Option<&str>,
+    topic: &str,
+    action: BusAction,
+    facts: &mut KeyAuditFacts,
+) -> std::result::Result<(), Response<OpenAIBody>> {
+    let RestCaller::ApiKey { uid } = &actor.caller else {
+        return Ok(());
+    };
+    let instance_id = match instance {
+        Some(raw) => BusInstanceId::parse(raw).map_err(|e| {
+            facts.reason = Some("invalid_instance_id".to_string());
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                e.to_string(),
+            )
+        })?,
+        // The legacy path names no instance: only its sole enabled instance
+        // can be meant, and resolving it reveals nothing a key could not
+        // learn from the 409/404 every caller gets there.
+        None => resolve_instance(db, None).inspect_err(|_| {
+            facts.reason = Some("instance_unavailable".to_string());
+        })?,
+    };
+    if api_key_topic_allows(db, instance_id.as_str(), &actor.org_id, topic, uid, action) {
+        return Ok(());
+    }
+    let verb = match action {
+        BusAction::Produce => "write",
+        _ => "read",
+    };
+    facts.reason = Some(format!("api_key_topic_denied:{verb}"));
+    Err(error_response(
+        StatusCode::FORBIDDEN,
+        "permission_error",
+        format!(
+            "this API key may not {verb} messages of this topic for organisation '{}'",
+            actor.org_id
+        ),
+    ))
+}
+
+/// What a general key's REST request is audited with, filled in as the
+/// request is understood. `key_uid` being `Some` is what marks a key
+/// request: a user-bound key's call is audited by the bus itself, as that
+/// user, exactly as before package K.
+#[derive(Default)]
+struct KeyAuditFacts {
+    key_uid: Option<String>,
+    org_id: Option<String>,
+    reason: Option<String>,
+    records: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RestOperation {
+    Publish,
+    Consume,
+}
+
+impl RestOperation {
+    fn audit_action(self) -> &'static str {
+        match self {
+            Self::Publish => "bus.rest.publish",
+            Self::Consume => "bus.rest.consume",
+        }
+    }
+}
+
+/// Successful requests of one key on one topic write at most one audit row
+/// per window. A publisher calls this endpoint many times a second, and one
+/// row per call would flood the shared, hash-chained `audit_log` — the same
+/// reason the bus windows its own `bus.produce.denied` rows. Refusals and
+/// errors are never windowed: each one is a row.
+const KEY_AUDIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+type KeyAuditWindowKey = (String, String, String, String, RestOperation);
+
+/// `(window start, successful requests since the last row)` per
+/// `(key uid, instance, org, topic, operation)`. Only a request the key was
+/// allowed to make lands here, so the map is bounded by the grants that exist.
+static KEY_AUDIT_WINDOWS: std::sync::LazyLock<
+    dashmap::DashMap<KeyAuditWindowKey, (std::time::Instant, u64)>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// `Some(n)` when this successful request writes a row covering `n` requests
+/// (itself plus those counted since the previous row); `None` when it was
+/// only counted.
+fn key_success_window(key: KeyAuditWindowKey) -> Option<u64> {
+    let now = std::time::Instant::now();
+    let mut created = false;
+    let mut entry = KEY_AUDIT_WINDOWS.entry(key).or_insert_with(|| {
+        created = true;
+        (now, 0)
+    });
+    if created {
+        return Some(1);
+    }
+    let (window_start, counted) = entry.value_mut();
+    if now.duration_since(*window_start) >= KEY_AUDIT_WINDOW {
+        let covered = *counted + 1;
+        *window_start = now;
+        *counted = 0;
+        Some(covered)
+    } else {
+        *counted += 1;
+        None
+    }
+}
+
+/// Writes the audit row of a general key's records REST request: always for
+/// a refusal or an error, windowed for a success (`KEY_AUDIT_WINDOW`). The
+/// row names the key by uid and by its current name; payloads never reach it.
+#[allow(clippy::too_many_arguments)]
+fn audit_key_request(
+    db: &crate::db::DbPool,
+    operation: RestOperation,
+    instance: Option<&str>,
+    topic: &str,
+    status: StatusCode,
+    facts: &KeyAuditFacts,
+    peer_ip: Option<&str>,
+    user_agent: Option<&str>,
+) {
+    let Some(key_uid) = facts.key_uid.as_deref() else {
+        return;
+    };
+    // The path segment is caller-controlled; only a well-formed topic name
+    // is written as the row's resource.
+    let topic_label = if crate::bus::topics::validate_user_topic_name(topic).is_ok() {
+        topic
+    } else {
+        "<invalid>"
+    };
+    let instance_label = instance
+        .filter(|raw| BusInstanceId::parse(raw).is_ok())
+        .unwrap_or(if instance.is_some() { "<invalid>" } else { "" });
+    let requests = if status.is_success() {
+        match key_success_window((
+            key_uid.to_string(),
+            instance_label.to_string(),
+            facts.org_id.clone().unwrap_or_default(),
+            topic_label.to_string(),
+            operation,
+        )) {
+            Some(covered) => covered,
+            None => return,
+        }
+    } else {
+        1
+    };
+    let (result, severity) = match status.as_u16() {
+        200..=299 => ("ok", "info"),
+        401 | 403 => ("denied", "warn"),
+        400..=499 => ("rejected", "warn"),
+        _ => ("error", "error"),
+    };
+    let key_name = crate::db::repository::get_api_key_by_uid(db, key_uid)
+        .ok()
+        .flatten()
+        .map(|k| k.name);
+    let details = serde_json::json!({
+        "surface": "v1.bus.records.rest",
+        "instance_id": instance_label,
+        "auth": "api_key",
+        "api_key_uid": key_uid,
+        "api_key_name": key_name,
+        "http_status": status.as_u16(),
+        "reason": facts.reason,
+        "records": facts.records,
+        "requests": requests,
+        "user_agent": user_agent.unwrap_or_default(),
+    })
+    .to_string();
+    if let Err(e) = crate::db::repository::log_audit_full(
+        db,
+        None,
+        None,
+        operation.audit_action(),
+        Some("bus_topic"),
+        Some(topic_label),
+        Some(&details),
+        severity,
+        match operation {
+            RestOperation::Publish => "B",
+            RestOperation::Consume => "C",
+        },
+        Some(result),
+        facts.org_id.as_deref(),
+        peer_ip,
+        None,
+    ) {
+        tracing::warn!(error = %e, action = operation.audit_action(), "bus records REST: audit write failed");
+    }
+}
+
+/// Peer address and user agent of a request, for its audit row.
+fn request_origin<B>(req: &Request<B>) -> (Option<String>, Option<String>) {
+    let peer_ip = req.extensions().get::<V1PeerIp>().map(|p| p.0.clone());
+    let user_agent = req
+        .headers()
+        .get(hyper::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.chars().take(256).collect::<String>());
+    (peer_ip, user_agent)
 }
 
 // ---- Instance resolution (plan-app-platform §3.2) --------------------------
@@ -556,21 +858,56 @@ pub async fn handle_publish(
     instance: Option<String>,
     topic: String,
 ) -> std::result::Result<Response<OpenAIBody>, hyper::Error> {
-    let Some(db) = router.db.as_ref() else {
+    let Some(db) = router.db.clone() else {
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "internal_error",
             "database unavailable".to_string(),
         ));
     };
-    // Resolved (and the running engine looked up) before touching the
-    // request body — §3.2: a request addressed to instance B must never
-    // fall back to A, and a malformed/unavailable instance should fail as
-    // cheaply as possible.
-    let (instance_id, svc) = match resolve_engine(db, instance.as_deref()) {
-        Ok(v) => v,
-        Err(resp) => return Ok(resp),
-    };
+    Ok(publish(req, &db, instance.as_deref(), &topic).await)
+}
+
+/// Serves one publish request and, for a general key, writes its audit row.
+/// Generic over the body so tests drive the exact production path with
+/// in-memory bodies.
+pub(crate) async fn publish<B>(
+    req: Request<B>,
+    db: &crate::db::DbPool,
+    instance: Option<&str>,
+    topic: &str,
+) -> Response<OpenAIBody>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: std::fmt::Display,
+{
+    let (peer_ip, user_agent) = request_origin(&req);
+    let mut facts = KeyAuditFacts::default();
+    let response = serve_publish(req, db, instance, topic, &mut facts).await;
+    audit_key_request(
+        db,
+        RestOperation::Publish,
+        instance,
+        topic,
+        response.status(),
+        &facts,
+        peer_ip.as_deref(),
+        user_agent.as_deref(),
+    );
+    response
+}
+
+async fn serve_publish<B>(
+    req: Request<B>,
+    db: &crate::db::DbPool,
+    instance: Option<&str>,
+    topic: &str,
+    facts: &mut KeyAuditFacts,
+) -> Response<OpenAIBody>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: std::fmt::Display,
+{
     let principal = req.extensions().get::<Principal>().cloned();
     let is_cbor = req
         .headers()
@@ -581,29 +918,55 @@ pub async fn handle_publish(
     let query = match parse_query(req.uri().query().unwrap_or("")) {
         Ok(q) => q,
         Err(e) => {
-            return Ok(error_response(
+            facts.reason = Some(e.to_string());
+            return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 e.to_string(),
-            ))
+            );
         }
     };
-    let (user_id, org_id) = match resolve_actor(db, principal.as_ref(), &query) {
+    let actor = match resolve_actor(db, principal.as_ref(), &query, facts) {
         Ok(v) => v,
-        Err(resp) => return Ok(resp),
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = precheck_api_key(db, &actor, instance, topic, BusAction::Produce, facts) {
+        return resp;
+    }
+    // Resolved (and the running engine looked up) before touching the
+    // request body — §3.2: a request addressed to instance B must never
+    // fall back to A, and a malformed/unavailable instance should fail as
+    // cheaply as possible.
+    let (instance_id, svc) = match resolve_engine(db, instance) {
+        Ok(v) => v,
+        Err(resp) => {
+            facts.reason = Some("instance_unavailable".to_string());
+            return resp;
+        }
     };
 
-    let body_bytes = req.collect().await?.to_bytes();
+    let body_bytes = match req.into_body().collect().await {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) => {
+            facts.reason = Some("body_unreadable".to_string());
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("failed to read request body: {e}"),
+            );
+        }
+    };
 
     let (records, create_if_missing) = if is_cbor {
         let input: BusPublishInput = match minicbor::decode(&body_bytes) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(error_response(
+                facts.reason = Some("invalid_cbor".to_string());
+                return error_response(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
                     format!("invalid CBOR body: {e}"),
-                ))
+                );
             }
         };
         (
@@ -614,42 +977,35 @@ pub async fn handle_publish(
         let records = match parse_ndjson_records(&body_bytes) {
             Ok(r) => r,
             Err(msg) => {
-                return Ok(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    msg,
-                ))
+                facts.reason = Some("invalid_ndjson".to_string());
+                return error_response(StatusCode::BAD_REQUEST, "invalid_request_error", msg);
             }
         };
         (records, query.create_if_missing.unwrap_or(false))
     };
 
     if records.is_empty() {
-        return Ok(error_response(
+        facts.reason = Some("empty_batch".to_string());
+        return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "publish batch has no records".to_string(),
-        ));
+        );
     }
     if records.len() > MAX_PUBLISH_RECORDS {
-        return Ok(error_response(
+        facts.reason = Some("batch_too_large".to_string());
+        return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             format!(
                 "batch of {} records exceeds the {MAX_PUBLISH_RECORDS} limit",
                 records.len()
             ),
-        ));
+        );
     }
+    facts.records = Some(records.len());
 
-    let ctx = BusCallContext {
-        instance_id,
-        org_id,
-        actor: Some(user_id),
-        actor_kind: crate::auth::actor::ActorKind::User,
-        correlation_id: None,
-        origin: "v1.bus.rest".to_string(),
-    };
+    let ctx = actor.call_context(instance_id);
     let batch = PublishBatch {
         partition: None,
         producer: None,
@@ -657,22 +1013,24 @@ pub async fn handle_publish(
     };
     // Same create-if-missing retry shape as `host_functions/bus.rs`'s
     // `bus_publish_v1`: try the publish first, and only pay for a
-    // `create_topic` round-trip on the (rare) miss.
+    // `create_topic` round-trip on the (rare) miss. Auto-creation is an
+    // administrative act (`BusAction::Admin`), which a general key never
+    // holds (`bus_authorizer`'s `API KEY SUBJECTS` doc).
     //
     // Both `publish` and `create_topic` block the calling thread
     // (`Partition::append_batch` ends in `blocking_recv` on the writer
     // thread's channel), and `bus::mod`'s own doc requires every async
     // caller to hand that off — `block_in_place` here, the same way
-    // `handle_consume` below already does it for `ConsumerHandle::fetch`.
+    // `consume` below already does it for `ConsumerHandle::fetch`.
     // Called straight from this async fn it panicked ("Cannot block the
     // current thread from within a runtime") and the client saw an empty
     // reply on a killed connection, not an error: every REST publish failed
     // that way.
-    let result = tokio::task::block_in_place(|| match svc.publish(&ctx, &topic, batch.clone()) {
+    let result = tokio::task::block_in_place(|| match svc.publish(&ctx, topic, batch.clone()) {
         Ok(r) => Ok(r),
         Err(BusServiceError::TopicNotFound { .. }) if create_if_missing => svc
-            .autocreate_topic(&ctx, &topic)
-            .and_then(|_| svc.publish(&ctx, &topic, batch)),
+            .autocreate_topic(&ctx, topic)
+            .and_then(|_| svc.publish(&ctx, topic, batch)),
         Err(e) => Err(e),
     });
 
@@ -683,13 +1041,27 @@ pub async fn handle_publish(
             // failed validation and whose quarantine copy could not be
             // written — lost. Both additive, always present.
             let body = publish_response_json(&r);
-            Ok(json_response(
+            json_response(
                 StatusCode::OK,
                 serde_json::to_vec(&body).unwrap_or_default(),
-            ))
+            )
         }
-        Err(e) => Ok(map_bus_error(&e)),
+        Err(e) => {
+            facts.reason = Some(bus_error_reason(&e));
+            map_bus_error(&e)
+        }
     }
+}
+
+/// The reason an audit row gives for a refused bus call: the error's variant,
+/// never its text — a field-policy or schema error can quote payload fields.
+fn bus_error_reason(e: &BusServiceError) -> String {
+    let debug = format!("{e:?}");
+    let variant = debug
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or_default();
+    format!("bus:{variant}")
 }
 
 /// The body of a successful publish.
@@ -728,40 +1100,94 @@ pub async fn handle_consume(
     instance: Option<String>,
     topic: String,
 ) -> std::result::Result<Response<OpenAIBody>, hyper::Error> {
-    let Some(db) = router.db.as_ref() else {
+    let Some(db) = router.db.clone() else {
         return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "internal_error",
             "database unavailable".to_string(),
         ));
     };
-    // See `handle_publish`'s identical comment — resolved before anything
-    // else so an addressed-but-unavailable instance never falls back.
-    let (instance_id, svc) = match resolve_engine(db, instance.as_deref()) {
-        Ok(v) => v,
-        Err(resp) => return Ok(resp),
-    };
+    Ok(consume(req, &db, instance.as_deref(), &topic).await)
+}
+
+/// Serves one consume request and, for a general key, writes its audit row.
+pub(crate) async fn consume<B>(
+    req: Request<B>,
+    db: &crate::db::DbPool,
+    instance: Option<&str>,
+    topic: &str,
+) -> Response<OpenAIBody> {
+    let (peer_ip, user_agent) = request_origin(&req);
+    let mut facts = KeyAuditFacts::default();
+    let response = serve_consume(&req, db, instance, topic, &mut facts);
+    audit_key_request(
+        db,
+        RestOperation::Consume,
+        instance,
+        topic,
+        response.status(),
+        &facts,
+        peer_ip.as_deref(),
+        user_agent.as_deref(),
+    );
+    response
+}
+
+fn serve_consume<B>(
+    req: &Request<B>,
+    db: &crate::db::DbPool,
+    instance: Option<&str>,
+    topic: &str,
+    facts: &mut KeyAuditFacts,
+) -> Response<OpenAIBody> {
     let principal = req.extensions().get::<Principal>().cloned();
     let query = match parse_query(req.uri().query().unwrap_or("")) {
         Ok(q) => q,
         Err(e) => {
-            return Ok(error_response(
+            facts.reason = Some(e.to_string());
+            return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 e.to_string(),
-            ))
+            );
         }
     };
+    let actor = match resolve_actor(db, principal.as_ref(), &query, facts) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let Some(group) = query.group.clone().filter(|g| !g.is_empty()) else {
-        return Ok(error_response(
+        facts.reason = Some("missing_group".to_string());
+        return error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "missing required query parameter 'group'".to_string(),
-        ));
+        );
     };
-    let (user_id, org_id) = match resolve_actor(db, principal.as_ref(), &query) {
+    if let RestCaller::ApiKey { uid } = &actor.caller {
+        if !api_key_owns_group(uid, &group) {
+            facts.reason = Some("api_key_group_not_owned".to_string());
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                format!(
+                    "a general API key consumes only under its own consumer groups: \
+                     '{uid}' or '{uid}.<name>'"
+                ),
+            );
+        }
+    }
+    if let Err(resp) = precheck_api_key(db, &actor, instance, topic, BusAction::Consume, facts) {
+        return resp;
+    }
+    // See `serve_publish`'s identical comment — an addressed-but-unavailable
+    // instance never falls back.
+    let (instance_id, svc) = match resolve_engine(db, instance) {
         Ok(v) => v,
-        Err(resp) => return Ok(resp),
+        Err(resp) => {
+            facts.reason = Some("instance_unavailable".to_string());
+            return resp;
+        }
     };
     let max_records = query
         .max_records
@@ -775,14 +1201,7 @@ pub async fn handle_consume(
         .saturating_mul(CONSUME_RECORD_BYTE_ESTIMATE)
         .max(64 * 1024);
 
-    let ctx = BusCallContext {
-        instance_id,
-        org_id,
-        actor: Some(user_id),
-        actor_kind: crate::auth::actor::ActorKind::User,
-        correlation_id: None,
-        origin: "v1.bus.rest".to_string(),
-    };
+    let ctx = actor.call_context(instance_id);
     // Blocking too, though not through the `blocking_recv` that `bus::mod`'s
     // BLOCKING note names for `publish`/`fetch`: `open_consumer` opens a full
     // `Partition` — writer thread and directory flock included — for every
@@ -792,7 +1211,7 @@ pub async fn handle_consume(
         svc.open_consumer(
             &ctx,
             &group,
-            std::slice::from_ref(&topic),
+            &[topic.to_string()],
             ConsumerConfig {
                 commit_mode: CommitMode::Explicit,
             },
@@ -800,26 +1219,35 @@ pub async fn handle_consume(
     });
     let handle = match opened {
         Ok(h) => h,
-        Err(e) => return Ok(map_bus_error(&e)),
+        Err(e) => {
+            facts.reason = Some(bus_error_reason(&e));
+            return map_bus_error(&e);
+        }
     };
 
     // `ConsumerHandle::fetch` blocks the calling thread for up to
     // `max_wait_ms` (its own doc: callers on a Tokio executor MUST NOT call
     // it directly from an async fn) — `block_in_place` is the same pattern
     // `host_functions/bus.rs`'s `bus_consume_next_v1` already uses for this
-    // exact call.
+    // exact call. The records it returns are already projected through the
+    // caller's data-hiding rules (`ConsumerHandle::fetch`) — for a general
+    // key, the topic-wide rule (`field_policies::resolve`).
     let fetched = tokio::task::block_in_place(|| handle.fetch(max_bytes, max_wait_ms));
     let batch = match fetched {
         Ok(b) => b,
-        Err(e) => return Ok(map_bus_error(&e)),
+        Err(e) => {
+            facts.reason = Some(bus_error_reason(&e));
+            return map_bus_error(&e);
+        }
     };
+    facts.records = Some(batch.records.len());
 
     if batch.records.is_empty() {
         let body = serde_json::json!({ "records": [] });
-        return Ok(json_response(
+        return json_response(
             StatusCode::OK,
             serde_json::to_vec(&body).unwrap_or_default(),
-        ));
+        );
     }
 
     // At-least-once: commit right after a successful HTTP response is built,
@@ -840,7 +1268,7 @@ pub async fn handle_consume(
         .map(|(partition, offset)| {
             (
                 TopicPartition {
-                    topic: topic.clone(),
+                    topic: topic.to_string(),
                     partition,
                 },
                 offset + 1,
@@ -862,10 +1290,10 @@ pub async fn handle_consume(
     }
 
     let body = serde_json::json!({ "records": records_json });
-    Ok(json_response(
+    json_response(
         StatusCode::OK,
         serde_json::to_vec(&body).unwrap_or_default(),
-    ))
+    )
 }
 
 /// Fixtures shared by the records REST tests below and the schema registry
@@ -905,6 +1333,42 @@ pub(crate) mod test_support {
         }
     }
 
+    /// An admin session backed by a real, active account — the dispatcher
+    /// refuses a session whose account does not exist before any handler runs.
+    pub(crate) fn admin_ctx(
+        state: Arc<crate::dispatch::state::AppState>,
+    ) -> crate::dispatch::HandlerContext {
+        let id = crate::db::repository::create_user_account(
+            &state.db,
+            &format!("bus-admin-{}", uuid::Uuid::new_v4()),
+            "not-a-login-hash",
+            "Bus admin",
+            "",
+        )
+        .expect("admin account");
+        state
+            .db
+            .write()
+            .unwrap()
+            .execute(
+                "UPDATE user_accounts SET must_change_password = 0, is_active = 1 WHERE id = ?1",
+                [&id],
+            )
+            .expect("activate admin account");
+        crate::dispatch::HandlerContext {
+            session: tentaflow_protocol::SessionAuth::UserSession {
+                user_id: *uuid::Uuid::parse_str(&id).unwrap().as_bytes(),
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state,
+            origin: crate::dispatch::RequestOrigin::Local,
+            org_context: None,
+        }
+    }
+
     /// Installs an ENABLED `tentabus` instance (`suffix` must be 8 lowercase
     /// hex chars — `BusInstanceId::parse`'s shape) and starts a real,
     /// registry-visible engine for it (`bus::init_instance`, exactly what
@@ -913,6 +1377,17 @@ pub(crate) mod test_support {
     pub(crate) fn start_test_instance(
         state: &Arc<crate::dispatch::state::AppState>,
         suffix: &str,
+    ) -> (tempfile::TempDir, BusInstanceId, Arc<bus::BusService>) {
+        start_test_instance_with(state, suffix, |_| Arc::new(AllowAllAuthorizer))
+    }
+
+    /// `start_test_instance` with the authorizer `authorizer` builds for the
+    /// new instance's id — the production `InstanceBusAuthorizer` for the
+    /// suites that test who may publish and consume.
+    pub(crate) fn start_test_instance_with(
+        state: &Arc<crate::dispatch::state::AppState>,
+        suffix: &str,
+        authorizer: impl FnOnce(&BusInstanceId) -> Arc<dyn bus::BusAuthorizer>,
     ) -> (tempfile::TempDir, BusInstanceId, Arc<bus::BusService>) {
         let addon_id = app_gate::test_support::install_app_instance(
             state,
@@ -930,7 +1405,7 @@ pub(crate) mod test_support {
             local_db,
             bus_dir: dir.path().to_path_buf(),
             db: state.db.clone(),
-            authorizer: Arc::new(AllowAllAuthorizer),
+            authorizer: authorizer(&id),
             retention_interval: None,
             dedup_expected_rate_per_sec: 10_000,
             partition_handle_lru: None,
@@ -1276,5 +1751,646 @@ mod tests {
             body,
             serde_json::json!({"published": 1, "schema_rejected": 0, "schema_dropped": 2})
         );
+    }
+
+    // ---- General API keys (package K, owner decision P5) --------------------
+
+    use crate::addon::permissions::PermissionChecker;
+    use crate::bus::field_policies;
+    use crate::db::models::AuditLogFilters;
+    use crate::services::bus_authorizer::{topic_acl_resource_id, InstanceBusAuthorizer};
+    use http_body_util::Full;
+    use test_support::{admin_ctx, start_test_instance_with};
+
+    const ORG: &str = "org-1";
+    const TOPIC: &str = "orders";
+
+    /// A real engine behind the production `InstanceBusAuthorizer`, with one
+    /// JSON topic `orders` in `org-1`, created by a matrix admin.
+    struct KeyFixture {
+        state: Arc<crate::dispatch::state::AppState>,
+        _dir: tempfile::TempDir,
+        instance: BusInstanceId,
+        svc: Arc<bus::BusService>,
+        checker: Arc<PermissionChecker>,
+    }
+
+    fn key_fixture(suffix: &str) -> KeyFixture {
+        let state = test_state();
+        let checker = Arc::new(PermissionChecker::new(state.db.clone()));
+        let (db, auth_checker) = (state.db.clone(), checker.clone());
+        let (dir, instance, svc) = start_test_instance_with(&state, suffix, move |id| {
+            Arc::new(InstanceBusAuthorizer::new(db, id.clone(), auth_checker))
+        });
+        let fx = KeyFixture {
+            state,
+            _dir: dir,
+            instance,
+            svc,
+            checker,
+        };
+        fx.grant("u-admin", "bus.admin");
+        fx.grant("u-admin", "bus.write");
+        fx.svc
+            .create_topic(
+                &fx.user_ctx("u-admin"),
+                TOPIC,
+                TopicOptions {
+                    partitions: Some(1),
+                    content_type: Some("application/json".to_string()),
+                    ..TopicOptions::default()
+                },
+            )
+            .expect("create topic");
+        fx
+    }
+
+    impl KeyFixture {
+        fn db(&self) -> crate::db::DbPool {
+            self.state.db.clone()
+        }
+
+        fn grant(&self, user_id: &str, perm: &str) {
+            crate::db::repository::upsert_permission(
+                &self.state.db,
+                self.instance.as_str(),
+                "user",
+                user_id,
+                perm,
+                "allow",
+                None,
+            )
+            .unwrap();
+            self.checker.refresh_addon(self.instance.as_str());
+        }
+
+        fn user_ctx(&self, user_id: &str) -> BusCallContext {
+            BusCallContext {
+                instance_id: self.instance.clone(),
+                org_id: ORG.to_string(),
+                actor: Some(user_id.to_string()),
+                actor_kind: ActorKind::User,
+                correlation_id: None,
+                origin: "test".to_string(),
+            }
+        }
+
+        /// A general key holding exactly `actions` on `orders` in `org-1`.
+        fn key(&self, actions: &[&str]) -> String {
+            let (_, uid) = crate::db::repository::create_api_key(
+                &self.state.db,
+                &format!("verifier-{}", uuid::Uuid::new_v4()),
+                "sk-...abcdef",
+                "Laboratorium LIS",
+                "general",
+                None,
+                60,
+            )
+            .unwrap();
+            let resource_id = topic_acl_resource_id(self.instance.as_str(), ORG, TOPIC);
+            for action in actions {
+                assert!(crate::db::repository::resource_permissions::set_topic_rule(
+                    &self.state.db,
+                    &resource_id,
+                    "api_key",
+                    &uid,
+                    action,
+                    "allow",
+                )
+                .unwrap());
+            }
+            uid
+        }
+
+        fn publish_as(&self, principal: Option<Principal>, query: &str, body: &str) -> Reply {
+            self.send_to(
+                self.instance.as_str(),
+                TOPIC,
+                "POST",
+                principal,
+                query,
+                body,
+            )
+        }
+
+        fn consume_as(&self, principal: Option<Principal>, query: &str) -> Reply {
+            self.send_to(self.instance.as_str(), TOPIC, "GET", principal, query, "")
+        }
+
+        /// Sends one request through `publish`/`consume` exactly as the
+        /// router does, on a multi-threaded runtime (both block in place).
+        fn send_to(
+            &self,
+            instance: &str,
+            topic: &str,
+            method: &str,
+            principal: Option<Principal>,
+            query: &str,
+            body: &str,
+        ) -> Reply {
+            let mut builder = Request::builder().method(method).uri(format!(
+                "/v1/bus/instances/{instance}/topics/{topic}/records?{query}"
+            ));
+            if let Some(p) = principal {
+                builder = builder.extension(p);
+            }
+            let req = builder
+                .extension(V1PeerIp("203.0.113.9".to_string()))
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap();
+            let (db, instance, topic) = (self.db(), instance.to_string(), topic.to_string());
+            let is_post = method == "POST";
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let resp = tokio::spawn(async move {
+                    if is_post {
+                        publish(req, &db, Some(&instance), &topic).await
+                    } else {
+                        consume(req, &db, Some(&instance), &topic).await
+                    }
+                })
+                .await
+                .expect("request task");
+                let status = resp.status();
+                let bytes = resp
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("collect body")
+                    .to_bytes();
+                Reply {
+                    status,
+                    json: serde_json::from_slice(&bytes).expect("json body"),
+                }
+            })
+        }
+
+        fn audit_rows(&self, action: &str) -> Vec<crate::db::models::AuditLogEntry> {
+            crate::db::repository::list_audit_logs(
+                &self.state.db,
+                &AuditLogFilters {
+                    action: Some(action.to_string()),
+                    ..Default::default()
+                },
+                0,
+                100,
+            )
+            .expect("list audit")
+        }
+    }
+
+    struct Reply {
+        status: StatusCode,
+        json: serde_json::Value,
+    }
+
+    fn key_principal(uid: &str) -> Option<Principal> {
+        Some(Principal::ApiKey {
+            uid: uid.to_string(),
+        })
+    }
+
+    fn ndjson(payload: &str) -> String {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        format!(r#"{{"payload_b64":"{b64}"}}"#)
+    }
+
+    fn payloads(reply: &Reply) -> Vec<serde_json::Value> {
+        reply.json["records"]
+            .as_array()
+            .expect("records array")
+            .iter()
+            .map(|r| {
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(r["payload"].as_str().unwrap())
+                    .unwrap();
+                serde_json::from_slice(&raw).expect("json payload")
+            })
+            .collect()
+    }
+
+    fn org_query() -> String {
+        format!("org_id={ORG}")
+    }
+
+    fn group_query(group: &str) -> String {
+        format!("org_id={ORG}&group={group}&wait_ms=0")
+    }
+
+    /// Default DENY, refused before the instance is looked up: a key with no
+    /// grant gets the same 403 for a real instance and for one that was never
+    /// installed, and every refusal is audited under the key's id and name.
+    #[test]
+    fn key_without_a_grant_is_refused_and_learns_nothing() {
+        let fx = key_fixture("cccc3001");
+        let key = fx.key(&[]);
+        let publish = fx.publish_as(key_principal(&key), &org_query(), &ndjson(r#"{"id":1}"#));
+        assert_eq!(publish.status, StatusCode::FORBIDDEN);
+        let consume = fx.consume_as(key_principal(&key), &group_query(&key));
+        assert_eq!(consume.status, StatusCode::FORBIDDEN);
+        let unknown = fx.send_to(
+            "tentabus-deadbeef",
+            TOPIC,
+            "POST",
+            key_principal(&key),
+            &org_query(),
+            &ndjson(r#"{"id":1}"#),
+        );
+        assert_eq!(unknown.status, StatusCode::FORBIDDEN);
+
+        let rows = fx.audit_rows("bus.rest.publish");
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            let details: serde_json::Value =
+                serde_json::from_str(row.details.as_deref().unwrap()).unwrap();
+            assert_eq!(details["api_key_uid"], key.as_str());
+            assert_eq!(details["api_key_name"], "Laboratorium LIS");
+            assert_eq!(details["reason"], "api_key_topic_denied:write");
+        }
+        assert_eq!(fx.audit_rows("bus.rest.consume").len(), 1);
+    }
+
+    /// Read and write are separate grants over REST too, and a key consumes
+    /// only under groups named after itself.
+    #[test]
+    fn write_key_publishes_and_read_key_consumes_under_its_own_group() {
+        let fx = key_fixture("cccc3002");
+        let writer = fx.key(&["write"]);
+        let reader = fx.key(&["read"]);
+
+        let published = fx.publish_as(key_principal(&writer), &org_query(), &ndjson(r#"{"id":1}"#));
+        assert_eq!(published.status, StatusCode::OK, "{}", published.json);
+        assert_eq!(published.json["published"], 1);
+        assert_eq!(
+            fx.consume_as(key_principal(&writer), &group_query(&writer))
+                .status,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            fx.publish_as(key_principal(&reader), &org_query(), &ndjson(r#"{"id":2}"#))
+                .status,
+            StatusCode::FORBIDDEN
+        );
+
+        let foreign = fx.consume_as(key_principal(&reader), &group_query("billing"));
+        assert_eq!(foreign.status, StatusCode::FORBIDDEN);
+        let own = fx.consume_as(
+            key_principal(&reader),
+            &group_query(&format!("{reader}.lis")),
+        );
+        assert_eq!(own.status, StatusCode::OK, "{}", own.json);
+        assert_eq!(payloads(&own), vec![serde_json::json!({"id": 1})]);
+    }
+
+    /// A grant belongs to one organisation; the call must name one.
+    #[test]
+    fn key_grant_does_not_reach_another_organisation() {
+        let fx = key_fixture("cccc3003");
+        let reader = fx.key(&["read"]);
+        let other_org = fx.consume_as(
+            key_principal(&reader),
+            &format!("org_id=org-2&group={reader}&wait_ms=0"),
+        );
+        assert_eq!(other_org.status, StatusCode::FORBIDDEN);
+        let no_org = fx.consume_as(key_principal(&reader), &format!("group={reader}"));
+        assert_eq!(no_org.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A revoked key's grant stops working even if its rows are still there.
+    #[test]
+    fn revoked_key_is_refused() {
+        let fx = key_fixture("cccc3004");
+        let writer = fx.key(&["write"]);
+        crate::db::repository::delete_api_key_by_uid(&fx.state.db, &writer).unwrap();
+        let reply = fx.publish_as(key_principal(&writer), &org_query(), &ndjson(r#"{"id":1}"#));
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    }
+
+    /// Auto-creation is administrative: a key with write rights on one topic
+    /// cannot conjure another, and learns nothing about whether it exists.
+    #[test]
+    fn key_cannot_create_a_topic() {
+        let fx = key_fixture("cccc3005");
+        let writer = fx.key(&["write"]);
+        let reply = fx.send_to(
+            fx.instance.as_str(),
+            "invoices",
+            "POST",
+            key_principal(&writer),
+            &format!("{}&create_if_missing=true", org_query()),
+            &ndjson(r#"{"id":1}"#),
+        );
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        assert!(
+            crate::bus::topics::get_topic(&fx.state.db, fx.instance.as_str(), ORG, "invoices")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A user-bound key keeps acting as its user: organisation membership
+    /// plus the permission matrix, no key rows, no key audit rows.
+    #[test]
+    fn user_bound_key_keeps_acting_as_its_user() {
+        let fx = key_fixture("cccc3006");
+        {
+            let conn = fx.state.db.write().unwrap();
+            conn.execute(
+                "INSERT OR IGNORE INTO organizations (org_id, name, slug, status, created_at) \
+                 VALUES (?1, ?1, ?1, 'active', '2026-09-29T00:00:00Z')",
+                rusqlite::params![ORG],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO user_accounts (id, username, password_hash, display_name) \
+                 VALUES ('u-writer', 'writer', 'x', 'Writer')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
+                 VALUES (?1, 'u-writer', 'role-supervisor', '2026-09-29T00:00:00Z', 'test')",
+                rusqlite::params![ORG],
+            )
+            .unwrap();
+        }
+        fx.grant("u-writer", "bus.write");
+        let user = |id: &str| {
+            Some(Principal::User {
+                user_id: id.to_string(),
+                role: "user".to_string(),
+            })
+        };
+        let ok = fx.publish_as(user("u-writer"), &org_query(), &ndjson(r#"{"id":1}"#));
+        assert_eq!(ok.status, StatusCode::OK, "{}", ok.json);
+        let outsider = fx.publish_as(user("u-outsider"), &org_query(), &ndjson(r#"{"id":1}"#));
+        assert_eq!(outsider.status, StatusCode::FORBIDDEN);
+        let group_key = fx.publish_as(
+            Some(Principal::Group {
+                group_id: "g-1".to_string(),
+            }),
+            &org_query(),
+            &ndjson(r#"{"id":1}"#),
+        );
+        assert_eq!(group_key.status, StatusCode::BAD_REQUEST);
+        assert!(fx.audit_rows("bus.rest.publish").is_empty());
+    }
+
+    /// Data hiding applies to a key's reads: a key reads through the
+    /// topic-wide rule — never the raw record, and never a user's rule that
+    /// happens to carry the key's id.
+    #[test]
+    fn key_reads_are_projected_through_data_hiding() {
+        let fx = key_fixture("cccc3007");
+        let own_rule = fx.key(&["read"]);
+        let wildcard_only = fx.key(&["read"]);
+        let fields = |names: &[&str]| -> std::collections::BTreeSet<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        };
+        let set = |subject_type: &str, subject_id: &str, allowed: &[&str]| {
+            field_policies::set_policy(
+                &fx.state.db,
+                fx.instance.as_str(),
+                ORG,
+                TOPIC,
+                subject_type,
+                subject_id,
+                field_policies::Direction::Read,
+                &fields(allowed),
+                &fields(&[]),
+            )
+            .expect("set policy")
+        };
+        set("any", field_policies::SUBJECT_ANY, &["id", "name"]);
+        set("user", &own_rule, &["id", "name", "pesel"]);
+        fx.svc
+            .publish(
+                &fx.user_ctx("u-admin"),
+                TOPIC,
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![PublishRecord {
+                        key: None,
+                        headers: vec![],
+                        payload: Bytes::from_static(
+                            br#"{"id":1,"name":"Jan","pesel":"44051401359"}"#,
+                        ),
+                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                        schema_id: 0,
+                    }],
+                },
+            )
+            .expect("publish");
+
+        let own = fx.consume_as(key_principal(&own_rule), &group_query(&own_rule));
+        assert_eq!(own.status, StatusCode::OK, "{}", own.json);
+        assert_eq!(payloads(&own), vec![serde_json::json!({"id": 1, "name": "Jan"})]);
+        let wildcard = fx.consume_as(key_principal(&wildcard_only), &group_query(&wildcard_only));
+        assert_eq!(wildcard.status, StatusCode::OK, "{}", wildcard.json);
+        assert_eq!(
+            payloads(&wildcard),
+            vec![serde_json::json!({"id": 1, "name": "Jan"})]
+        );
+    }
+
+    /// Successful key requests are audited once per window, not per call.
+    #[test]
+    fn successful_key_requests_are_audited_once_per_window() {
+        let fx = key_fixture("cccc3008");
+        let writer = fx.key(&["write"]);
+        for id in 0..3 {
+            let reply = fx.publish_as(
+                key_principal(&writer),
+                &org_query(),
+                &ndjson(&format!(r#"{{"id":{id}}}"#)),
+            );
+            assert_eq!(reply.status, StatusCode::OK);
+        }
+        let rows = fx.audit_rows("bus.rest.publish");
+        assert_eq!(rows.len(), 1);
+        let details: serde_json::Value =
+            serde_json::from_str(rows[0].details.as_deref().unwrap()).unwrap();
+        assert_eq!(details["api_key_uid"], writer.as_str());
+        assert_eq!(details["http_status"], 200);
+        assert_eq!(details["requests"], 1);
+        assert_eq!(details["records"], 1);
+    }
+
+    // ---- Issuing topic rights to a key from the dashboard (binary protocol) --
+
+    use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
+
+    fn dispatch_blocking(
+        req: &MessageBody,
+        ctx: &crate::dispatch::HandlerContext,
+    ) -> Result<MessageBody, ProtocolError> {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        match rt.block_on(crate::dispatch::dispatch(req, ctx)) {
+            (MessageBody::Error(e), true) => Err(e),
+            (other, false) => Ok(other),
+            (other, is_err) => panic!("unexpected dispatch result {other:?} ({is_err})"),
+        }
+    }
+
+    fn topic_scope(resource_id: &str, action: Option<&str>) -> tentaflow_protocol::ResourceRef {
+        tentaflow_protocol::ResourceRef {
+            resource_type: "topic".to_string(),
+            resource_id: resource_id.to_string(),
+            action: action.map(str::to_string),
+        }
+    }
+
+    fn create_general_key(
+        ctx: &crate::dispatch::HandlerContext,
+        scopes: Vec<tentaflow_protocol::ResourceRef>,
+    ) -> Result<String, ProtocolError> {
+        let req = MessageBody::ApiKeyCreateRequestBody(tentaflow_protocol::ApiKeyCreateRequest {
+            name: "Laboratorium LIS".to_string(),
+            key_type: "general".to_string(),
+            subject_id: None,
+            scope_resources: scopes,
+        });
+        match dispatch_blocking(&req, ctx)? {
+            MessageBody::ApiKeyCreateResponseBody(r) => Ok(r.key_id),
+            other => panic!("unexpected create response {other:?}"),
+        }
+    }
+
+    fn scope_set(
+        ctx: &crate::dispatch::HandlerContext,
+        key_uid: &str,
+        resource_id: &str,
+        action: Option<&str>,
+    ) -> Result<MessageBody, ProtocolError> {
+        dispatch_blocking(
+            &MessageBody::ApiKeyScopeSetRequest {
+                key_uid: key_uid.to_string(),
+                resource_type: "topic".to_string(),
+                resource_id: resource_id.to_string(),
+                access_level: "allow".to_string(),
+                action: action.map(str::to_string),
+            },
+            ctx,
+        )
+    }
+
+    fn scope_list(ctx: &crate::dispatch::HandlerContext, key_uid: &str) -> Vec<(String, String)> {
+        match dispatch_blocking(
+            &MessageBody::ApiKeyScopeListRequest {
+                key_uid: key_uid.to_string(),
+            },
+            ctx,
+        )
+        .expect("scope list")
+        {
+            MessageBody::ApiKeyScopeListResponse { entries } => {
+                let mut rows: Vec<_> = entries
+                    .into_iter()
+                    .map(|e| (e.resource_type, e.action))
+                    .collect();
+                rows.sort();
+                rows
+            }
+            other => panic!("unexpected list response {other:?}"),
+        }
+    }
+
+    fn assert_code(result: Result<impl std::fmt::Debug, ProtocolError>, code: ProtocolErrorCode) {
+        let err = result.expect_err("must be refused");
+        assert_eq!(err.code, code, "{err:?}");
+    }
+
+    /// A key's topic right names `read` or `write` over a well-formed
+    /// `(instance, org, topic)` id of an existing topic; anything else is
+    /// refused by the scope validation itself, at creation and at set.
+    #[test]
+    fn topic_scopes_need_read_or_write_on_an_existing_topic() {
+        let fx = key_fixture("cccc3101");
+        let ctx = admin_ctx(fx.state.clone());
+        let id = topic_acl_resource_id(fx.instance.as_str(), ORG, TOPIC);
+
+        for action in [None, Some("*"), Some("admin")] {
+            assert_code(
+                create_general_key(&ctx, vec![topic_scope(&id, action)]),
+                ProtocolErrorCode::BadRequest,
+            );
+        }
+        let uid = create_general_key(&ctx, vec![]).unwrap();
+        for action in [None, Some("*"), Some("admin")] {
+            assert_code(
+                scope_set(&ctx, &uid, &id, action),
+                ProtocolErrorCode::BadRequest,
+            );
+        }
+        let two_parts =
+            crate::sync::resource_id::composite_resource_id(&[fx.instance.as_str(), ORG]);
+        let bad_instance = topic_acl_resource_id("not-an-instance", ORG, TOPIC);
+        let reserved = topic_acl_resource_id(fx.instance.as_str(), ORG, "__dlq.orders");
+        for bad in [
+            two_parts.as_str(),
+            bad_instance.as_str(),
+            reserved.as_str(),
+            TOPIC,
+        ] {
+            assert_code(
+                scope_set(&ctx, &uid, bad, Some("read")),
+                ProtocolErrorCode::BadRequest,
+            );
+        }
+        let missing = topic_acl_resource_id(fx.instance.as_str(), ORG, "invoices");
+        assert_code(
+            scope_set(&ctx, &uid, &missing, Some("read")),
+            ProtocolErrorCode::NotFound,
+        );
+        assert!(scope_list(&ctx, &uid).is_empty());
+    }
+
+    /// Issued from the dashboard, read and write are separate rows: the
+    /// list shows both, clearing one keeps the other, and the REST follows.
+    #[test]
+    fn dashboard_grants_and_revokes_topic_rights_per_action() {
+        let fx = key_fixture("cccc3102");
+        let ctx = admin_ctx(fx.state.clone());
+        let id = topic_acl_resource_id(fx.instance.as_str(), ORG, TOPIC);
+        let uid = create_general_key(&ctx, vec![topic_scope(&id, Some("write"))]).unwrap();
+        scope_set(&ctx, &uid, &id, Some("read")).expect("grant read");
+        assert_eq!(
+            scope_list(&ctx, &uid),
+            vec![
+                ("topic".to_string(), "read".to_string()),
+                ("topic".to_string(), "write".to_string()),
+            ]
+        );
+        let published = fx.publish_as(key_principal(&uid), &org_query(), &ndjson(r#"{"id":1}"#));
+        assert_eq!(published.status, StatusCode::OK, "{}", published.json);
+
+        dispatch_blocking(
+            &MessageBody::ApiKeyScopeClearRequest {
+                key_uid: uid.clone(),
+                resource_type: "topic".to_string(),
+                resource_id: id.clone(),
+                action: Some("write".to_string()),
+            },
+            &ctx,
+        )
+        .expect("revoke write");
+        assert_eq!(
+            scope_list(&ctx, &uid),
+            vec![("topic".to_string(), "read".to_string())]
+        );
+        let refused = fx.publish_as(key_principal(&uid), &org_query(), &ndjson(r#"{"id":2}"#));
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        let read = fx.consume_as(key_principal(&uid), &group_query(&uid));
+        assert_eq!(read.status, StatusCode::OK, "{}", read.json);
+        assert_eq!(payloads(&read), vec![serde_json::json!({"id": 1})]);
     }
 }

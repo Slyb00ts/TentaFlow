@@ -793,7 +793,7 @@ fn audit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::bus_rest::test_support::start_test_instance;
+    use crate::api::bus_rest::test_support::{admin_ctx, start_test_instance};
     use crate::bus::topics::TopicOptions;
     use crate::bus::BusCallContext;
     use crate::db::models::AuditLogFilters;
@@ -1604,40 +1604,6 @@ mod tests {
     }
 
     // ---- issuing the scope from the dashboard (binary protocol) -------------
-
-    /// An admin session backed by a real, active account — the dispatcher
-    /// refuses a session whose account does not exist before any handler runs.
-    fn admin_ctx(state: Arc<AppState>) -> crate::dispatch::HandlerContext {
-        let id = crate::db::repository::create_user_account(
-            &state.db,
-            &format!("schema-admin-{}", uuid::Uuid::new_v4()),
-            "not-a-login-hash",
-            "Schema admin",
-            "",
-        )
-        .expect("admin account");
-        state
-            .db
-            .write()
-            .unwrap()
-            .execute(
-                "UPDATE user_accounts SET must_change_password = 0, is_active = 1 WHERE id = ?1",
-                [&id],
-            )
-            .expect("activate admin account");
-        crate::dispatch::HandlerContext {
-            session: tentaflow_protocol::SessionAuth::UserSession {
-                user_id: *uuid::Uuid::parse_str(&id).unwrap().as_bytes(),
-                role: Some("admin".to_string()),
-            },
-            correlation_id: 1,
-            connection_id: 0,
-            resume_secret: None,
-            state,
-            origin: crate::dispatch::RequestOrigin::Local,
-            org_context: None,
-        }
-    }
 
     fn scope_ref(resource_id: &str, action: Option<&str>) -> tentaflow_protocol::ResourceRef {
         tentaflow_protocol::ResourceRef {

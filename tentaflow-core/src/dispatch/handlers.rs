@@ -503,10 +503,11 @@ pub fn api_key_list_request(
 /// one of the supported ACL kinds and `resource_id` must be non-empty, so neither
 /// creation seeding nor scope set/clear can persist a garbage or empty-id rule.
 ///
-/// Returns the action the row is stored under. `bus_schema_registry` requires an
-/// explicit `read` or `write` — never `'*'`, which would let one row answer both
-/// questions and make a write grant readable. Every other type carries no action
-/// and is stored as `'*'`.
+/// Returns the action the row is stored under. `bus_schema_registry` and `topic`
+/// require an explicit `read` or `write` — never `'*'`, which would let one row
+/// answer both questions and make a write grant readable (a key's topic rights,
+/// package K: `bus_authorizer::api_key_topic_allows` counts an allow only for
+/// the exact action). Every other type carries no action and is stored as `'*'`.
 fn validate_scope_resource(
     db: &crate::db::DbPool,
     resource_type: &str,
@@ -535,9 +536,16 @@ fn validate_scope_resource(
         validate_bus_schema_scope_id(db, resource_id)?;
         return Ok(action);
     }
+    if resource_type == "topic" {
+        let action = topic_scope_action(action)?;
+        let (_, _, topic) = parse_topic_scope_id(resource_id)?;
+        crate::bus::topics::validate_user_topic_name(topic)
+            .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+        return Ok(action);
+    }
     if !matches!(action, None | Some("*")) {
         return Err(ProtocolError::bad_request(
-            "action is only valid for bus_schema_registry scopes",
+            "action is only valid for bus_schema_registry and topic scopes",
         ));
     }
     // model_bundle scopes gate the /models/* endpoints — only refs the bundle
@@ -571,15 +579,25 @@ fn topic_scope_target_exists(
 }
 
 /// The action a scope clear removes: `Some` (exactly that row) for
-/// `bus_schema_registry`, `None` (every row of the pair) for every other type.
-/// Only the shape is checked for `bus_schema_registry` — a grant whose instance
-/// or organisation has gone away since must still be revocable.
+/// `bus_schema_registry` and `topic`, `None` (every row of the pair) for every
+/// other type. Only the shape is checked for those two — a grant whose
+/// instance, organisation or topic has gone away since, or whose topic name a
+/// later rule made invalid, must still be revocable. A topic clear also takes
+/// `'*'`: rows written before key rights were split into read and write carry
+/// it, and they must stay removable.
 fn clear_scope_action(
     db: &crate::db::DbPool,
     resource_type: &str,
     resource_id: &str,
     action: Option<&str>,
 ) -> Result<Option<&'static str>, ProtocolError> {
+    if resource_type == "topic" {
+        parse_topic_scope_id(resource_id)?;
+        return match action {
+            Some("*") => Ok(Some("*")),
+            other => topic_scope_action(other).map(Some),
+        };
+    }
     if resource_type != crate::api::bus_schema_rest::BUS_SCHEMA_REGISTRY_RESOURCE_TYPE {
         validate_scope_resource(db, resource_type, resource_id, action)?;
         return Ok(None);
@@ -587,6 +605,39 @@ fn clear_scope_action(
     let action = bus_schema_scope_action(action)?;
     parse_bus_schema_scope_id(resource_id)?;
     Ok(Some(action))
+}
+
+/// A key reads or writes a topic's messages; `admin` is never a key's, and
+/// `'*'` would grant both at once.
+fn topic_scope_action(action: Option<&str>) -> Result<&'static str, ProtocolError> {
+    match action {
+        Some("read") => Ok("read"),
+        Some("write") => Ok("write"),
+        _ => Err(ProtocolError::bad_request(
+            "topic scopes need action 'read' or 'write'",
+        )),
+    }
+}
+
+/// Shape of a `topic` scope id: `bus_authorizer::topic_acl_resource_id(
+/// instance_id, org_id, topic)` — the id the topic ACL is looked up under —
+/// with a well-formed instance id and a non-empty organisation and topic.
+/// Whether the topic exists is the write's own check (`set_topic_rule`).
+fn parse_topic_scope_id(resource_id: &str) -> Result<(&str, &str, &str), ProtocolError> {
+    let segments = crate::sync::resource_id::decode_segments(resource_id).unwrap_or_default();
+    let [instance_id, org_id, topic] = segments.as_slice() else {
+        return Err(ProtocolError::bad_request(
+            "topic resource_id must name exactly an instance, an organisation and a topic",
+        ));
+    };
+    crate::bus::instance::BusInstanceId::parse(instance_id)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    if org_id.is_empty() || topic.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "topic resource_id names no organisation or no topic",
+        ));
+    }
+    Ok((instance_id, org_id, topic))
 }
 
 /// `read` and `write` are separate grants on this surface; `'*'` (both at once)

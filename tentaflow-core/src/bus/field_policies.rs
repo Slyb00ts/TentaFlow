@@ -141,12 +141,17 @@ pub(crate) fn decode(row: DbBusFieldPolicy, topic: &str) -> Result<FieldPolicy, 
 /// `BusCallContext.actor` itself carries no type tag.
 ///
 /// Precedence, most to least specific:
-///   1. the subject's own row (`'user'`, `'addon'` or `'group'`);
+///   1. the subject's own row (`'user'`, `'addon'` or `'group'`). No row
+///      can name an API key (`set_policy` and the table's CHECK admit no
+///      `'api_key'` subject), so a general key reading over the records REST
+///      (package K) meets only step 3 — the topic-wide rule, never a user's
+///      rule that happens to carry the same id;
 ///   2. for a `User` only, a `subject_type='group'` row for one of the
 ///      groups the user belongs to (`repository::get_user_groups` — the
 ///      platform's one source of group membership; groups are not a
-///      meaningful concept for an addon actor, so this step is skipped for
-///      `Addon`, and a `Group` subject has already been matched in step 1).
+///      meaningful concept for an addon or API key actor, so this step is
+///      skipped for `Addon` and `ApiKey`, and a `Group` subject has already
+///      been matched in step 1).
 ///      Group rows are checked in the same `(group.id)` ascending order
 ///      `get_user_groups` already returns; the first match wins if a user
 ///      belongs to more than one group with a row on this topic — arbitrary

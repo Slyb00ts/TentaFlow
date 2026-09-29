@@ -44,6 +44,29 @@
 // the pre-177 way of restricting one, kept fail-closed on every node (see
 // `resource_permissions::check_action`).
 //
+// API KEY SUBJECTS (package K, owner decision P5, SUM/tentabus/
+// DECYZJE-2026-09-22.md: "one general key for everything"): a general API key
+// calling the records REST (`api/bus_rest.rs`) acts as itself —
+// `BusCallContext::actor_kind = ApiKey`, `actor` = the key's uid. A key has no
+// identity in the addon permission matrix (that matrix grants per user), so
+// the matrix layer is NOT consulted for it and no matrix row is required;
+// instead the per-topic ACL is its only source of rights, default DENY:
+//   * only `Produce` (ACL action `write`) and `Consume` (`read`) exist for a
+//     key — `Admin` (topic create/delete/config, ACL and data-hiding edits,
+//     auto-creation, DLQ retry/discard, group pause/reset) is refused
+//     whatever rows exist;
+//   * reserved `__`-prefixed topics (the DLQ, `__bus.metrics`) are refused —
+//     they are broker infrastructure, never an external system's contract;
+//   * the key must still exist, be active and be a GENERAL key: a user-bound
+//     key reaches the REST as its user, and a revoked key's leftover rows
+//     must not keep working through any other path (a flow started by the
+//     key, a replicated row);
+//   * an allow counts only for the exact action (`resource_permissions::
+//     check_action`); a `'*'` row still denies;
+//   * a key consumes only under its own consumer groups — `<key uid>` or
+//     `<key uid>.<name>` (`api_key_owns_group`) — so it can never move the
+//     committed offsets of a group some other application consumes with.
+//
 // DLQ rule (PLAN §3.3 + this task's brief): `__dlq.<topic>` is never ACL'd
 // on its own — both consuming FROM `__dlq.<topic>` and the broker's own
 // internal republish INTO it (`bus::note_delivery_failure`) are gated on
@@ -205,6 +228,65 @@ fn topic_acl_allows(
     }
 }
 
+/// Whether `group` is one of the consumer groups the API key `key_uid` may
+/// consume under: its uid itself, or its uid followed by `.` and a name.
+/// A key's uid is a lowercase UUID, which the group-name charset admits, so
+/// a key cannot choose a group that another key or a user already consumes
+/// with unless that group is named after this very key.
+pub fn api_key_owns_group(key_uid: &str, group: &str) -> bool {
+    match group.strip_prefix(key_uid) {
+        Some(rest) => rest.is_empty() || (rest.len() > 1 && rest.starts_with('.')),
+        None => false,
+    }
+}
+
+/// The whole per-topic decision for a general API key (this file's `API KEY
+/// SUBJECTS` doc): `Produce`/`Consume` only, never a reserved topic, only
+/// while the key is an active general key, and only through an explicit
+/// allow row for exactly that action. `topic` is the topic as addressed, a
+/// `__dlq.<topic>` included — which is refused like every reserved topic.
+/// Shared with the records REST, which asks it before resolving the
+/// instance so a key without a grant learns nothing about which exist.
+pub fn api_key_topic_allows(
+    db: &DbPool,
+    instance_id: &str,
+    org_id: &str,
+    topic: &str,
+    key_uid: &str,
+    action: BusAction,
+) -> bool {
+    if action == BusAction::Admin || topic.starts_with(RESERVED_PREFIX) {
+        return false;
+    }
+    match repository::get_api_key_by_uid(db, key_uid) {
+        Ok(Some(key)) if key.is_active && key.key_type == "general" => {}
+        Ok(_) => return false,
+        Err(e) => {
+            tracing::warn!(error = %e, "bus ACL: API key lookup failed, denying");
+            return false;
+        }
+    }
+    let resource_id = topic_acl_resource_id(instance_id, org_id, topic);
+    match repository::resource_permissions::check_action(
+        db,
+        "topic",
+        &resource_id,
+        acl_action(action),
+        ActorKind::ApiKey,
+        key_uid,
+        false, // default DENY: a key holds only what was granted to it.
+    ) {
+        Ok(allowed) => allowed,
+        Err(e) => {
+            tracing::warn!(
+                resource_id, error = %e,
+                "bus ACL lookup for an API key failed, denying"
+            );
+            false
+        }
+    }
+}
+
 /// Production `bus::BusAuthorizer` wired at `bus::init_instance` time —
 /// plan-app-platform §4.5. Named for what it now is: ONE TentaBus instance's
 /// authorizer, backed by the addon permission matrix rather than org-RBAC
@@ -238,6 +320,22 @@ impl crate::bus::BusAuthorizer for InstanceBusAuthorizer {
         let Some(actor) = ctx.actor.as_deref() else {
             return Err(denied(action, topic));
         };
+        // Before the SYSTEM_ACTOR bypass: that sentinel is a system caller's,
+        // and an API key's uid can never make a key one.
+        if ctx.actor_kind == ActorKind::ApiKey {
+            return if api_key_topic_allows(
+                &self.db,
+                self.instance.as_str(),
+                &ctx.org_id,
+                topic,
+                actor,
+                action,
+            ) {
+                Ok(())
+            } else {
+                Err(denied(action, topic))
+            };
+        }
         if actor == SYSTEM_ACTOR && topic.starts_with(RESERVED_PREFIX) {
             return Ok(());
         }
@@ -269,11 +367,20 @@ impl crate::bus::BusAuthorizer for InstanceBusAuthorizer {
         ctx: &BusCallContext,
         action: BusAction,
         topic: &str,
-        _group: &str,
+        group: &str,
     ) -> Result<(), BusServiceError> {
         // The matrix/ACL model is topic-scoped, not group-scoped
         // (`BusAuthorizer::authorize_group`'s own doc explicitly allows this
-        // thin delegation for such an authorizer).
+        // thin delegation for such an authorizer) — except for an API key,
+        // which consumes only under groups named after itself.
+        if ctx.actor_kind == ActorKind::ApiKey
+            && !ctx
+                .actor
+                .as_deref()
+                .is_some_and(|key_uid| api_key_owns_group(key_uid, group))
+        {
+            return Err(denied(action, topic));
+        }
         self.authorize(ctx, action, topic)
     }
 
@@ -813,5 +920,193 @@ mod tests {
         assert!(auth
             .authorize(&c, BusAction::Produce, "orders.created")
             .is_err());
+    }
+
+    // ---- API key subjects (package K, owner decision P5) --------------------
+
+    /// Creates an active API key of `key_type` and returns its uid.
+    fn api_key(pool: &DbPool, key_type: &str) -> String {
+        let subject = (key_type == "user").then_some("u-owner");
+        let (_, uid) = repository::create_api_key(
+            pool,
+            &format!("verifier-{}", uuid::Uuid::new_v4()),
+            "sk-...abcdef",
+            "Laboratorium LIS",
+            key_type,
+            subject,
+            60,
+        )
+        .unwrap();
+        uid
+    }
+
+    fn key_ctx(org_id: &str, key_uid: &str) -> BusCallContext {
+        BusCallContext {
+            actor_kind: ActorKind::ApiKey,
+            ..ctx(org_id, key_uid)
+        }
+    }
+
+    fn key_rule(pool: &DbPool, org_id: &str, key_uid: &str, action: &str, level: &str) {
+        let resource_id = topic_acl_resource_id(instance_a().as_str(), org_id, "orders.created");
+        repository::resource_permissions::set_with_action(
+            pool,
+            "topic",
+            &resource_id,
+            "api_key",
+            key_uid,
+            action,
+            level,
+        )
+        .unwrap();
+    }
+
+    fn key_may(auth: &InstanceBusAuthorizer, c: &BusCallContext, action: BusAction) -> bool {
+        auth.authorize(c, action, "orders.created").is_ok()
+    }
+
+    /// Default DENY: a general key with no row holds nothing — unlike a user,
+    /// whose topic ACL is default-allow behind the matrix.
+    #[test]
+    fn api_key_without_a_row_holds_nothing() {
+        let (_d, pool) = open_pool();
+        let checker = checker(&pool);
+        let key = api_key(&pool, "general");
+        // A matrix grant naming the key's uid must not matter: a key has no
+        // matrix identity and the matrix is never asked about it.
+        grant(&pool, &checker, &instance_a(), &key, "bus.read");
+        grant(&pool, &checker, &instance_a(), &key, "bus.write");
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        let c = key_ctx("org-1", &key);
+        assert!(!key_may(&auth, &c, BusAction::Consume));
+        assert!(!key_may(&auth, &c, BusAction::Produce));
+    }
+
+    /// Read and write are separate grants; neither implies the other, and no
+    /// matrix row is needed for either.
+    #[test]
+    fn api_key_read_and_write_are_separate_grants() {
+        let (_d, pool) = open_pool();
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker(&pool));
+        let reader = api_key(&pool, "general");
+        let writer = api_key(&pool, "general");
+        key_rule(&pool, "org-1", &reader, "read", "allow");
+        key_rule(&pool, "org-1", &writer, "write", "allow");
+        let r = key_ctx("org-1", &reader);
+        let w = key_ctx("org-1", &writer);
+        assert!(key_may(&auth, &r, BusAction::Consume));
+        assert!(!key_may(&auth, &r, BusAction::Produce));
+        assert!(key_may(&auth, &w, BusAction::Produce));
+        assert!(!key_may(&auth, &w, BusAction::Consume));
+    }
+
+    /// A key never administers a topic, and a `'*'` row — the shape written
+    /// before key rights were split — grants nothing while still denying.
+    #[test]
+    fn api_key_never_admin_and_star_rows_only_deny() {
+        let (_d, pool) = open_pool();
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker(&pool));
+        let key = api_key(&pool, "general");
+        key_rule(&pool, "org-1", &key, "admin", "allow");
+        key_rule(&pool, "org-1", &key, "*", "allow");
+        let c = key_ctx("org-1", &key);
+        assert!(!key_may(&auth, &c, BusAction::Admin));
+        assert!(!key_may(&auth, &c, BusAction::Consume));
+        assert!(!key_may(&auth, &c, BusAction::Produce));
+
+        let denied = api_key(&pool, "general");
+        key_rule(&pool, "org-1", &denied, "read", "allow");
+        key_rule(&pool, "org-1", &denied, "*", "deny");
+        assert!(!key_may(
+            &auth,
+            &key_ctx("org-1", &denied),
+            BusAction::Consume
+        ));
+    }
+
+    /// A grant belongs to one organisation: naming another one finds no row.
+    #[test]
+    fn api_key_grant_is_bound_to_its_organisation() {
+        let (_d, pool) = open_pool();
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker(&pool));
+        let key = api_key(&pool, "general");
+        key_rule(&pool, "org-1", &key, "read", "allow");
+        assert!(key_may(&auth, &key_ctx("org-1", &key), BusAction::Consume));
+        assert!(!key_may(&auth, &key_ctx("org-2", &key), BusAction::Consume));
+        // Nor does the grant reach the same topic on another instance.
+        let auth_b = InstanceBusAuthorizer::new(pool.clone(), instance_b(), checker(&pool));
+        let other = BusCallContext {
+            instance_id: instance_b(),
+            ..key_ctx("org-1", &key)
+        };
+        assert!(!key_may(&auth_b, &other, BusAction::Consume));
+    }
+
+    /// Only an existing, active, general key acts as itself: a revoked key's
+    /// leftover row and a user-bound key's row admit nothing.
+    #[test]
+    fn api_key_rows_count_only_for_a_live_general_key() {
+        let (_d, pool) = open_pool();
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker(&pool));
+        let key = api_key(&pool, "general");
+        key_rule(&pool, "org-1", &key, "read", "allow");
+        assert!(key_may(&auth, &key_ctx("org-1", &key), BusAction::Consume));
+        repository::delete_api_key_by_uid(&pool, &key).unwrap();
+        assert!(!key_may(&auth, &key_ctx("org-1", &key), BusAction::Consume));
+
+        let user_key = api_key(&pool, "user");
+        key_rule(&pool, "org-1", &user_key, "read", "allow");
+        assert!(!key_may(
+            &auth,
+            &key_ctx("org-1", &user_key),
+            BusAction::Consume
+        ));
+    }
+
+    /// A key reads no reserved topic, not even the DLQ of a topic it reads,
+    /// and its uid never passes for the system actor.
+    #[test]
+    fn api_key_never_reaches_a_reserved_topic() {
+        let (_d, pool) = open_pool();
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker(&pool));
+        let key = api_key(&pool, "general");
+        key_rule(&pool, "org-1", &key, "read", "allow");
+        let c = key_ctx("org-1", &key);
+        assert!(auth
+            .authorize(&c, BusAction::Consume, "__dlq.orders.created")
+            .is_err());
+        let as_system = key_ctx("org-1", SYSTEM_ACTOR);
+        assert!(auth
+            .authorize(&as_system, BusAction::Consume, "__bus.metrics")
+            .is_err());
+    }
+
+    /// A key consumes only under groups named after itself, so it can never
+    /// move the offsets of a group another application consumes with.
+    #[test]
+    fn api_key_consumes_only_under_its_own_groups() {
+        let (_d, pool) = open_pool();
+        let auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker(&pool));
+        let key = api_key(&pool, "general");
+        key_rule(&pool, "org-1", &key, "read", "allow");
+        let c = key_ctx("org-1", &key);
+        let group = |g: &str| auth.authorize_group(&c, BusAction::Consume, "orders.created", g);
+        assert!(group(&key).is_ok());
+        assert!(group(&format!("{key}.lis")).is_ok());
+        assert!(group("billing").is_err());
+        assert!(group(&format!("{key}x")).is_err());
+        assert!(group(&format!("{key}.")).is_err());
+        // A user is not held to the key namespace.
+        let checker = checker(&pool);
+        grant(&pool, &checker, &instance_a(), "u-op", "bus.read");
+        let user_auth = InstanceBusAuthorizer::new(pool.clone(), instance_a(), checker);
+        assert!(user_auth
+            .authorize_group(
+                &ctx("org-1", "u-op"),
+                BusAction::Consume,
+                "orders.created",
+                "billing"
+            )
+            .is_ok());
     }
 }

@@ -22778,6 +22778,12 @@ pub mod resource_permissions {
     /// node apart from the ledger. A `'user'` allow row never admits an
     /// addon; with `default_allow` it would not change the answer anyway.
     ///
+    /// An `ApiKey` is allowed only by an `'api_key'` row recorded for exactly
+    /// the action asked about; its `'*'` rows still DENY but never allow.
+    /// Read and write are separate grants for a key (owner decision P5), and
+    /// a `'*'` allow written before keys were enforced on topics would
+    /// otherwise turn into both at once without anyone having chosen that.
+    ///
     /// No admin-role bypass: unlike `check_inner`'s Tier-1 shape, the bus
     /// topic ACL sits BEHIND the addon permission matrix's own `bus.admin`
     /// check, so folding a second, org-role-based bypass in here would let an
@@ -22799,13 +22805,13 @@ pub mod resource_permissions {
             .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
 
         let mut own_stmt = conn.prepare_cached(
-            "SELECT access_level FROM resource_permissions
+            "SELECT access_level, action FROM resource_permissions
              WHERE resource_type = ?1 AND resource_id = ?2 AND subject_id = ?4
                AND (subject_type = ?3
                     OR (?6 AND subject_type = 'user' AND access_level = 'deny'))
                AND (action = ?5 OR action = '*')",
         )?;
-        let own_levels: Vec<String> = own_stmt
+        let own_rows: Vec<(String, String)> = own_stmt
             .query_map(
                 rusqlite::params![
                     resource_type,
@@ -22815,13 +22821,15 @@ pub mod resource_permissions {
                     action,
                     subject_kind == ActorKind::Addon,
                 ],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        if own_levels.iter().any(|l| l == "deny") {
+        if own_rows.iter().any(|(level, _)| level == "deny") {
             return Ok(false);
         }
-        if own_levels.iter().any(|l| l == "allow") {
+        if own_rows.iter().any(|(level, row_action)| {
+            level == "allow" && (subject_kind != ActorKind::ApiKey || row_action == action)
+        }) {
             return Ok(true);
         }
         if subject_kind != ActorKind::User {

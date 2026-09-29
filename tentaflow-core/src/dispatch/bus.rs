@@ -2860,6 +2860,31 @@ async fn acl_set_v1(
     } else {
         require_valid_subject_id(&subject_id)?;
     }
+    // An API key reads or writes a topic's messages and nothing else
+    // (package K, `bus_authorizer`'s `API KEY SUBJECTS` doc): its `admin`
+    // rows would never be honoured and a `'*'` allow would grant read and
+    // write in one row, so neither is written. Only a general key acts as
+    // itself on the bus; a row for any other key would never be consulted.
+    if access_level != "clear" && subject_type == "api_key" {
+        if !matches!(action.as_str(), "read" | "write") {
+            return Err(ProtocolError::bad_request(
+                "bus.invalid_argument: an API key's topic right is 'read' or 'write'",
+            ));
+        }
+        let db = ctx.state.db.clone();
+        let id = subject_id.clone();
+        let is_general_key = run_blocking(move || {
+            repository::get_api_key_by_uid(&db, &id)
+                .map(|key| key.is_some_and(|k| k.key_type == "general"))
+                .map_err(|e| db_err("get_api_key_by_uid", e))
+        })
+        .await?;
+        if !is_general_key {
+            return Err(ProtocolError::not_found(
+                "bus.subject_not_found: no general API key with this id",
+            ));
+        }
+    }
     // A `'user'` row naming an addon admits nothing and only denies through
     // the fail-closed fallback — never what an administrator granting access
     // meant. Clearing one stays possible: that is how a pre-177 stand-in row
@@ -6962,6 +6987,94 @@ mod tests {
             }],
             "clearing 'write' must not remove the separately-set 'read' row"
         );
+    }
+
+    /// Package K: an API key's topic entry is `read` or `write` for a
+    /// general key — never `admin`, never `'*'`, never for a key that does
+    /// not exist or acts as its user. Clearing stays possible for any row.
+    #[tokio::test]
+    async fn acl_set_holds_api_key_entries_to_read_or_write_for_a_general_key() {
+        let (_guard, db) = bus_fixture();
+        let user_id = "u-acl-admin-keys".to_string();
+        let org_id = seed_membership(&db, &user_id, "org.admin");
+        let org = org_context(&org_id, &user_id, &["org.admin"]);
+        let ctx = handler_ctx(db.clone(), org);
+        let instance = fixture_instance_id();
+        let topic = format!("acl.keys.{}", uuid::Uuid::new_v4().simple());
+        topic_create_v1(
+            &ctx,
+            instance.as_str(),
+            topic.clone(),
+            BusTopicOptionsWire::default(),
+        )
+        .await
+        .expect("topic create");
+        let key = |key_type: &str| {
+            repository::create_api_key(
+                &db,
+                &format!("verifier-{}", uuid::Uuid::new_v4()),
+                "sk-...abcdef",
+                "LIS",
+                key_type,
+                (key_type == "user").then_some(user_id.as_str()),
+                60,
+            )
+            .unwrap()
+            .1
+        };
+        let general = key("general");
+        let user_bound = key("user");
+        let set = |subject_id: String, level: &str, action: &str| {
+            acl_set_v1(
+                &ctx,
+                instance.as_str(),
+                topic.clone(),
+                "api_key".to_string(),
+                subject_id,
+                level.to_string(),
+                action.to_string(),
+            )
+        };
+
+        for action in ["admin", "*"] {
+            let err = set(general.clone(), "allow", action)
+                .await
+                .expect_err("a key holds read or write only");
+            assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{err:?}");
+        }
+        for subject in [user_bound.clone(), "no-such-key".to_string()] {
+            let err = set(subject, "allow", "read")
+                .await
+                .expect_err("only a general key acts as itself");
+            assert_eq!(err.code, ProtocolErrorCode::NotFound, "{err:?}");
+        }
+        set(general.clone(), "allow", "read").await.expect("read");
+        set(general.clone(), "deny", "write")
+            .await
+            .expect("write deny");
+        set(general.clone(), "clear", "*")
+            .await
+            .expect("clearing any action");
+        set(user_bound, "clear", "read")
+            .await
+            .expect("clearing any key");
+
+        let entries = match acl_list_v1(&ctx, instance.as_str(), topic.clone())
+            .await
+            .expect("list")
+        {
+            BusPayload::AclListResponse { entries } => entries,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        let mut actions: Vec<_> = entries
+            .iter()
+            .map(|e| (e.action.as_str(), e.access_level.as_str()))
+            .collect();
+        actions.sort();
+        assert_eq!(actions, vec![("read", "allow"), ("write", "deny")]);
+        assert!(entries
+            .iter()
+            .all(|e| e.subject_label.as_deref() == Some("LIS")));
     }
 
     #[tokio::test]
