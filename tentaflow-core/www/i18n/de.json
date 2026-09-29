@@ -9842,7 +9842,7 @@
       "admin_only": "Muster fügt der Instanzadministrator hinzu, ändert, zieht zurück und löscht sie.",
       "action_open": "Muster öffnen",
       "action_delete": "Muster löschen",
-      "delete_blocked": "Löschen nicht möglich: {n|Topic|Topics} {topics} {n|verwendet|verwenden} es. Wählen Sie dort zuerst ein anderes Muster oder ziehen Sie dieses zurück.",
+      "delete_blocked": "Löschen nicht möglich: {n|Topic|Topics} {topics} {n|verwendet|verwenden} es. Sie können es löschen, sobald Sie in den Einstellungen {n|dieses Topics|dieser Topics} ein anderes Muster wählen.",
       "added_title": "Muster {name} hinzugefügt",
       "added_text": "{format}, Version 1. Sie wählen es in den Einstellungen eines {where}.",
       "kind_for": {
@@ -9905,7 +9905,8 @@
         "added_text_used": "{n|Topic|Topics} {topics} {n|prüft|prüfen} Nachrichten nach ihr.",
         "added_text_unused": "Noch verwendet kein Topic dieses Muster.",
         "same_title": "Keine neue Version hinzugefügt",
-        "same_text": "Version {version} hat bereits denselben Text. Nichts hat sich geändert."
+        "same_text": "Version {version} hat bereits denselben Text. Nichts hat sich geändert.",
+        "load_failed": "Der Text von Version {version} konnte nicht geladen werden."
       },
       "incompat": {
         "lead": "Dieses Muster hat die Kompatibilität „{compat}“, und {reason}.",
@@ -9923,7 +9924,8 @@
         "fix_required_new": "Entfernen Sie „{field}“ aus den Pflichtfeldern oder ändern Sie die Kompatibilität des Musters.",
         "fix_required_old": "Lassen Sie „{field}“ unter den Pflichtfeldern oder ändern Sie die Kompatibilität des Musters.",
         "fix_generic": "Korrigieren Sie den Text oder ändern Sie die Kompatibilität des Musters.",
-        "technical": "Technische Details"
+        "technical": "Technische Details",
+        "widened": "die neue Version erweitert die Werteart des Felds „{field}“, alte Programme akzeptieren aber nur die engere"
       },
       "compat_window": {
         "title": "Kompatibilität ändern — {name}",
@@ -9959,12 +9961,12 @@
       "delete": {
         "title": "Muster {name} löschen",
         "irreversible": "Das lässt sich nicht rückgängig machen.",
-        "everything": "Muster {name} ({format}) und seine {count} {n|Version|Versionen} verschwinden.",
+        "everything": "Muster {name} ({format}) und alle seine Versionen verschwinden.",
         "unused": "Kein Topic verwendet dieses Muster.",
         "audit": "Das Löschen wird im Audit-Protokoll vermerkt.",
         "retype": "Geben Sie zur Bestätigung den Namen des Musters ein:",
         "button": "Muster löschen",
-        "refused_used": "Nicht gelöscht: {n|Topic|Topics} {topics} {n|verwendet|verwenden} es. Wählen Sie dort zuerst ein anderes Muster.",
+        "refused_used": "Nicht gelöscht: {n|Topic|Topics} {topics} {n|verwendet|verwenden} es. Wählen Sie zuerst in den Einstellungen {n|dieses Topics|dieser Topics} ein anderes Muster.",
         "done_title": "Muster {name} gelöscht"
       },
       "detail": {
@@ -10006,8 +10008,12 @@
         "compat_locked": "Das Muster ist zurückgezogen — neue Versionen werden nicht hinzugefügt, daher wird die Kompatibilität nicht geändert.",
         "missing_title": "Muster {name} gibt es nicht mehr",
         "missing_text": "Es wurde möglicherweise gelöscht. Kehren Sie zur Musterliste zurück.",
-        "error_title": "Muster konnte nicht geladen werden"
-      }
+        "error_title": "Muster konnte nicht geladen werden",
+        "show": "Anzeigen"
+      },
+      "added_existing_title": "Muster {name} gab es bereits",
+      "added_existing_version": "Jemand hat es inzwischen hinzugefügt, daher ging der Text als Version {version} hinein.",
+      "added_existing_same": "Jemand hat es inzwischen mit demselben Text hinzugefügt (Version {version}) — nichts hat sich geändert."
     },
     "topics": {
       "title": "Topics",
@@ -10371,7 +10377,8 @@
         "saved_title": "Beschreibung gespeichert.",
         "saved_text": "Unter dem Namen des Topics steht jetzt: {text}",
         "saved_text_none": "Das Topic hat keine Beschreibung mehr."
-      }
+      },
+      "discard_confirm": "Die Änderungen sind nicht gespeichert. Schließen Sie das Fenster noch einmal, um sie zu verwerfen, oder bearbeiten Sie weiter."
     },
     "partitions": {
       "explain": "Eine Partition ist eine eigene Warteschlange im Topic — mit mehreren Partitionen lesen Empfänger Nachrichten parallel. Eine Kopie ist dasselbe Protokoll auf einem anderen Node. Der führende Node nimmt Schreibvorgänge an, die anderen halten Kopien. Jede Nachricht einer Partition hat die nächste Nummer.",

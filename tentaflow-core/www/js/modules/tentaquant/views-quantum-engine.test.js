@@ -109,7 +109,7 @@ function fakeScreen(over = {}) {
 
 const cleanup = () => { window.document.body.innerHTML = ''; };
 
-/// Records what `files.js::downloadText` hands the browser — the blob it built
+/// Records what `lib/download.js::downloadText` hands the browser — the blob it built
 /// and the name on the anchor it clicked — and answers the restore function.
 function captureDownloads(into) {
   const anchors = window.HTMLAnchorElement.prototype;

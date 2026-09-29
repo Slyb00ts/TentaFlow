@@ -67,8 +67,8 @@ wszystkich platform. Wynik kompilacji należy sprawdzić w GitHub Actions.
 - Wzory wiadomości w panelu: wiersz listy otwiera stronę wzoru, a
   administrator instancji dodaje wzór („Dodaj wzór”: nazwa, zgodność, format
   z tych, które serwer sprawdza, tekst wpisany albo wczytany z pliku) i usuwa
-  wzór, którego nie używa żaden topik — dla używanego kosz jest wyłączony
-  i podaje topiki. Strona wzoru pokazuje format, wersję, stan, kto i kiedy
+  wzór, którego nie używa żaden topik — przy używanym zamiast kosza jest
+  kłódka, która po kliknięciu podaje topiki. Strona wzoru pokazuje format, wersję, stan, kto i kiedy
   go dodał, topiki i zgodność, tekst wybranej wersji tylko do odczytu
   z „Kopiuj” i „Pobierz” oraz opis zapisany w samym wzorze (`description`
   JSON Schema, `doc` Avro), wersje z „Wycofaj” przy każdej aktywnej i kartę
@@ -79,8 +79,13 @@ wszystkich platform. Wynik kompilacji należy sprawdzić w GitHub Actions.
   „pilne”, którego stare wiadomości mogą nie mieć”), a nieznany powód
   pokazuje z tekstem serwera w zwijanym bloku; tekst odrzuconej wersji
   wraca przy następnej próbie. Wycofany wzór ma ostrzeżenie „Wzór wycofany”
-  i nie przyjmuje nowych wersji. Adres strony wzoru:
+  i nie przyjmuje nowych wersji. Gdy wzór o tej samej nazwie powstał w
+  międzyczasie, „Dodaj wzór” mówi, że dodano do niego wersję (albo że nic
+  się nie zmieniło), zamiast ogłaszać nowy wzór. Adres strony wzoru:
   `#/tentabus?instance=…&tab=schemas&subject=…`.
+- Edytor kodu w panelu (`tf-code-editor`) po podmianie całego tekstu
+  pokazywał wiersze poprzedniego dokumentu, gdy miał on tyle samo linii;
+  teraz rysuje nowy tekst.
 
 - Nieprzetworzone wiadomości: usunięto ograniczenia opisane w wydaniu 0.4.0-beta.
   „Wczytaj więcej” nie powtarza wierszy przy wielu partycjach. Ponowienie

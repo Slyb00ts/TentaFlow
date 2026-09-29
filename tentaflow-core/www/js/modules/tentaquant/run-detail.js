@@ -17,7 +17,7 @@
 
 import { escapeHtml, escapeAttr, formatBytes, fmtMs, toast } from '/js/utils.js';
 import { T, sprite, fmtDate, errMessage, mimeLabels, shortId } from '/js/modules/tentaquant/format.js';
-import { downloadUrl } from '/js/modules/tentaquant/files.js';
+import { downloadUrl } from '/js/lib/download.js';
 import {
   canControlRun, cancelRun, runDurationMs, runIsLive, runNodeName, runSourceLabel,
   runStatusLabel, runStatusTone, runTier, runTimeline, setRunPinned,

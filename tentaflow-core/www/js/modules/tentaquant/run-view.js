@@ -24,7 +24,7 @@ import { escapeHtml, escapeAttr, formatBytes, toast } from '/js/utils.js';
 import {
   T, sprite, blochLabels, errMessage, fmtDate, shortId,
 } from '/js/modules/tentaquant/format.js';
-import { downloadUrl } from '/js/modules/tentaquant/files.js';
+import { downloadUrl } from '/js/lib/download.js';
 import {
   canControlRun, runIsLive, runNodeName, runStatusLabel, runStatusTone, runTier, setRunPinned,
 } from '/js/modules/tentaquant/run-model.js';

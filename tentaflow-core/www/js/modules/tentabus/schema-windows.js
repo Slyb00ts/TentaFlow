@@ -153,6 +153,26 @@ export function parseIncompatible(message) {
   return m ? { mode: m[1], detail: m[2].trim() } : null;
 }
 
+/** The types a field of a JSON Schema allows, or `null` for no `type` (anything). */
+function fieldTypes(schema, field) {
+  const type = schema?.properties?.[field]?.type;
+  if (type == null) return null;
+  return (Array.isArray(type) ? type : [type]).map(String).sort();
+}
+
+/**
+ * The reader's types in the checker's sentence `… reader allows Some({"a", "b"})`
+ * (`None` = anything), or `undefined` when the sentence does not say.
+ */
+function readerTypes(detail) {
+  const m = /reader allows (?:Some\(\{([^}]*)\}\)|(None))/.exec(detail);
+  if (!m) return undefined;
+  if (m[2]) return null;
+  return [...m[1].matchAll(/"([^"]*)"/g)].map((x) => x[1]).sort();
+}
+
+const sameTypes = (a, b) => a !== undefined && JSON.stringify(a) === JSON.stringify(b);
+
 /**
  * The reason a new version breaks the compatibility, in words, with what to
  * do about it — `{ reason, fix }` — or `null` for a reason this screen does
@@ -177,7 +197,13 @@ export function incompatibilityReason({ mode, detail, newText }) {
     return { reason: T(added ? 'schemas.incompat.extra_added' : 'schemas.incompat.extra_unknown', { field }), fix: generic };
   }
   field = quoted(/^property '([^']+)' type is narrowed/);
-  if (field != null) return { reason: T('schemas.incompat.narrowed', { field }), fix: generic };
+  if (field != null) {
+    // The reader is the new version under "backward", the old one under
+    // "forward"; under "w obie strony" the reader's types in the sentence
+    // tell which side it was.
+    const newIsReader = mode === 'backward' || (mode === 'full' && sameTypes(readerTypes(detail), fieldTypes(after, field)));
+    return { reason: T(newIsReader ? 'schemas.incompat.narrowed' : 'schemas.incompat.widened', { field }), fix: generic };
+  }
   field = quoted(/^property '([^']+)' subschema differs beyond 'type' widening/);
   if (field != null) return { reason: T('schemas.incompat.changed', { field }), fix: generic };
   if (/^writer schema allows additional properties but reader schema rejects them/.test(detail)
@@ -280,6 +306,21 @@ export function subjectDeprecateImpact({ usedByTopics }) {
   return lines;
 }
 
+/**
+ * What "Dodaj wzór" did, from the server's answer: a new pattern, or — when a
+ * pattern of that name appeared after the list was read — a version added to
+ * it, or nothing at all when that version already had the same text.
+ */
+export function addedNotice({ subject, schemaType, version, deduplicated }) {
+  if (deduplicated) return { tone: 'warning', title: T('schemas.added_existing_title', { name: subject }), text: T('schemas.added_existing_same', { version: fmtCount(version) }) };
+  if (version > 1) return { tone: 'warning', title: T('schemas.added_existing_title', { name: subject }), text: T('schemas.added_existing_version', { version: fmtCount(version) }) };
+  return {
+    tone: 'success',
+    title: T('schemas.added_title', { name: subject }),
+    text: T('schemas.added_text', { format: schemaFormatLabel(schemaType), where: T(`schemas.kind_for.${schemaKind(schemaType) || 'binary'}`) }),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The windows
 // ---------------------------------------------------------------------------
@@ -308,6 +349,7 @@ function wireTextField(win, sync, formatOf) {
     if (!file) return;
     if (file.size > TEXT_MAX_BYTES) {
       text.setAttribute('error', T('schemas.text_too_big'));
+      sync();
       return;
     }
     text.value = await file.text();
@@ -317,9 +359,15 @@ function wireTextField(win, sync, formatOf) {
   return check;
 }
 
+// A text field marked with an error (a file too big to load) holds nothing sendable.
+const textMarked = (win) => win.querySelector('[data-role="text"]').hasAttribute('error');
+
 /**
- * "Dodaj wzór". `ctx` = `{ instanceId, schemaTypes, existingNames,
- * register(request), describeError, onAdded({ subject, schemaType, version }) }`.
+ * "Dodaj wzór". `ctx` = `{ instanceId, schemaTypes, existingNames(),
+ * register(request), describeError, onAdded({ subject, schemaType, version,
+ * deduplicated }) }` — `existingNames()` is asked on every check, so a list
+ * reloaded while the window is open counts. The server's answer, not the
+ * window, says what was added: a name taken meanwhile gets a version.
  */
 export function openSchemaAdd(ctx) {
   const types = (ctx.schemaTypes || []).filter(Boolean);
@@ -333,6 +381,7 @@ export function openSchemaAdd(ctx) {
     cls: 'tb-schema-window',
     current: { subject: '', compatibility: DEFAULT_COMPATIBILITY, schemaType: initialType, schemaText: '' },
     saveLabel: T('schemas.add.button'),
+    guardDiscard: true,
     saveIcon: 'plus',
     willHappen: T('schemas.will_happen_add'),
     fields: () => `
@@ -350,7 +399,7 @@ export function openSchemaAdd(ctx) {
     wire: (win, sync) => {
       const name = win.querySelector('[data-role="name"]');
       name.addEventListener('input', () => {
-        const problem = name.value.trim() ? subjectNameProblem(name.value, ctx.existingNames) : null;
+        const problem = name.value.trim() ? subjectNameProblem(name.value, ctx.existingNames()) : null;
         if (problem) name.setAttribute('error', T(NAME_ERRORS[problem]));
         else name.removeAttribute('error');
         sync();
@@ -366,7 +415,7 @@ export function openSchemaAdd(ctx) {
       const subject = win.querySelector('[data-role="name"]').value.trim();
       const schemaType = win.querySelector('[data-role="format"]')?.value || '';
       const schemaText = win.querySelector('[data-role="text"]').value;
-      if (subjectNameProblem(subject, ctx.existingNames) || !schemaType || schemaTextProblem(schemaText, schemaType)) return null;
+      if (subjectNameProblem(subject, ctx.existingNames()) || !schemaType || schemaTextProblem(schemaText, schemaType) || textMarked(win)) return null;
       return { subject, compatibility: win.querySelector('[data-role="compat"]').value, schemaType, schemaText };
     },
     impact: (d) => [T('schemas.add.impact', { name: d.subject, format: schemaFormatLabel(d.schemaType) }), T('schemas.add.impact_unused')],
@@ -380,7 +429,7 @@ export function openSchemaAdd(ctx) {
       describeError: ctx.describeError,
     }),
     describeError: ctx.describeError,
-    onSaved: (d, resp) => ctx.onAdded({ subject: d.subject, schemaType: d.schemaType, version: Number(resp?.version) || 1 }),
+    onSaved: (d, resp) => ctx.onAdded({ subject: d.subject, schemaType: d.schemaType, version: Number(resp?.version) || 1, deduplicated: resp?.deduplicated === true }),
   });
 }
 
@@ -404,6 +453,7 @@ export function openSchemaVersion(ctx) {
     cls: 'tb-schema-window',
     current: { schemaText: ctx.latestText ?? '' },
     saveLabel: T('schemas.version.button'),
+    guardDiscard: true,
     saveIcon: 'plus',
     willHappen: T('schemas.will_happen_add'),
     fields: () => `
@@ -423,7 +473,7 @@ export function openSchemaVersion(ctx) {
     },
     draft: (win) => {
       const schemaText = win.querySelector('[data-role="text"]').value;
-      return schemaTextProblem(schemaText, info.schemaType) ? null : { schemaText };
+      return schemaTextProblem(schemaText, info.schemaType) || textMarked(win) ? null : { schemaText };
     },
     impact: () => versionImpact({ nextVersion: next, latestVersion: latest || null, compatibility: info.compatibility, usedByTopics: info.usedByTopics }),
     save: async (d) => ctx.register(buildRegisterRequest(ctx.instanceId, { subject: info.subject, schemaType: info.schemaType, schemaText: d.schemaText })),
@@ -533,7 +583,6 @@ export function openVersionDeprecate(ctx) {
 export function openSchemaDelete(ctx) {
   const info = ctx.subject;
   const name = info.subject;
-  const versions = Number(info.latestVersion) || 0;
   return openRetypeDialog({
     title: T('schemas.delete.title', { name }),
     icon: 'alert',
@@ -542,7 +591,7 @@ export function openSchemaDelete(ctx) {
     className: 'tb-window tb-delete-window',
     width: 560,
     bodyHtml: `
-      <div class="tb-danger-box">${sprite('alert')}<div><b>${escapeHtml(T('schemas.delete.irreversible'))}</b> ${escapeHtml(T('schemas.delete.everything', { name, format: schemaFormatLabel(info.schemaType), count: fmtCount(versions), n: versions }))}</div></div>
+      <div class="tb-danger-box">${sprite('alert')}<div><b>${escapeHtml(T('schemas.delete.irreversible'))}</b> ${escapeHtml(T('schemas.delete.everything', { name, format: schemaFormatLabel(info.schemaType) }))}</div></div>
       <ul class="tb-impact-list">
         <li>${sprite('check')}<span>${escapeHtml(T('schemas.delete.unused'))}</span></li>
         <li>${sprite('file-text')}<span>${escapeHtml(T('schemas.delete.audit'))}</span></li>

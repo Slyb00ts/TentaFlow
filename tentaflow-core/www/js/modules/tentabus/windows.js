@@ -41,15 +41,19 @@ export function windowEl({ title, icon, width, cls }) {
  * valid), `impact(draft)` = the "Co się stanie" sentences, `save(draft)` sends
  * it and may throw: the window stays open with the refusal —
  * `errorHtml(err, draft)` when given (markup), else `describeError(err)` as
- * text. A refusal is hidden again as soon as the fields change. `onSaved(draft,
+ * text. The refused draft cannot be sent again as it is: the refusal and the
+ * locked button go as soon as the fields change. `onSaved(draft,
  * result)` runs after the window closed. `saveLabel`/`saveIcon` name the
  * action and `willHappen` the impact line; `current` is what is there now —
- * the save unlocks only once the draft differs from it.
+ * the save unlocks only once the draft differs from it. "Popraw zaznaczone
+ * pole" is said only once a field is actually marked. With `guardDiscard`
+ * the close button and Escape ask once before dropping a changed draft
+ * ("Anuluj" is the explicit way out and never asks).
  */
 export function openChangeWindow({
   title, icon, width = 620, cls = 'tb-change-window', fields, wire, draft, current, impact,
   save, describeError, errorHtml = null, onSaved,
-  saveLabel = T('settings.save'), saveIcon = 'check', willHappen = T('settings.will_happen'),
+  saveLabel = T('settings.save'), saveIcon = 'check', willHappen = T('settings.will_happen'), guardDiscard = false,
 }) {
   const win = windowEl({ title, icon, width, cls });
   win.innerHTML = `
@@ -57,6 +61,7 @@ export function openChangeWindow({
       ${fields()}
       <div class="tb-will-happen" data-role="impact" aria-live="polite"></div>
       <div class="tb-window-error" role="alert" data-role="error" hidden>${sprite('alert')}<div data-role="error-text"></div></div>
+      <div class="tb-window-error" role="alert" data-role="discard" hidden>${sprite('alert')}<div>${escapeHtml(T('settings.discard_confirm'))}</div></div>
     </div>
     <div slot="footer">
       <tf-button variant="ghost" data-act="cancel">${escapeHtml(I18n.t('common.cancel'))}</tf-button>
@@ -69,24 +74,34 @@ export function openChangeWindow({
   const cancelBtn = win.querySelector('[data-act="cancel"]');
   const errEl = win.querySelector('[data-role="error"]');
   const changed = (d) => d != null && Object.keys(d).some((k) => d[k] !== current[k]);
+  const impactEl = win.querySelector('[data-role="impact"]');
+  const discardEl = win.querySelector('[data-role="discard"]');
   const sync = () => {
     const d = draft(win);
     const lines = d == null ? [] : impact(d);
-    patchHtml(win.querySelector('[data-role="impact"]'), d == null
+    const marked = win.querySelector('[slot="body"] [error]') != null;
+    patchHtml(impactEl, d == null
       ? `${sprite('info')}<div>${escapeHtml(T('settings.fix_fields'))}</div>`
       : changed(d)
         ? `${sprite('info')}<div><b>${escapeHtml(willHappen)}</b> ${lines.map(escapeHtml).join(' ')}</div>`
         : `${sprite('info')}<div>${escapeHtml(T('settings.nothing_changed'))}</div>`);
-    saveBtn.toggleAttribute('disabled', busy || !changed(d));
-    cancelBtn.toggleAttribute('disabled', busy);
+    impactEl.hidden = d == null && !marked;
     if (refusedSig != null && JSON.stringify(d) !== refusedSig) {
       refusedSig = null;
       errEl.hidden = true;
     }
+    discardEl.hidden = true;
+    saveBtn.toggleAttribute('disabled', busy || !changed(d) || refusedSig != null);
+    cancelBtn.toggleAttribute('disabled', busy);
   };
   wire(win, sync);
   sync();
-  win.addEventListener('close-request', (e) => { if (busy) e.preventDefault(); });
+  win.addEventListener('close-request', (e) => {
+    if (busy) { e.preventDefault(); return; }
+    if (!guardDiscard || !discardEl.hidden || !changed(draft(win))) return;
+    e.preventDefault();
+    discardEl.hidden = false;
+  });
   win.addEventListener('click', async (e) => {
     const btn = e.target.closest('[data-act]');
     if (!btn || btn.hasAttribute('disabled')) return;
@@ -108,6 +123,7 @@ export function openChangeWindow({
       else text.textContent = describeError(err);
       errEl.hidden = false;
       refusedSig = JSON.stringify(d);
+      sync();
       return;
     }
     win.close(true);

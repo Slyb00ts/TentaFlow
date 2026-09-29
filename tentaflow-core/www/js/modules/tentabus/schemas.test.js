@@ -28,9 +28,9 @@ test('state: withdrawn first, then in use, else unused', () => {
 
 test('filters count and select; search matches names and using topics', () => {
   const all = filterSchemas(subjects);
-  assert.deepEqual(all.counts, { all: 4, used: 1, deprecated: 2 });
+  assert.deepEqual(all.counts, { all: 4, used: 2, deprecated: 2 });
   assert.deepEqual(all.rows.map((s) => s.subject), ['faktura', 'powiadomienie', 'wizyta', 'wizyta-2025']);
-  assert.deepEqual(filterSchemas(subjects, { filter: 'used' }).rows.map((s) => s.subject), ['wizyta']);
+  assert.deepEqual(filterSchemas(subjects, { filter: 'used' }).rows.map((s) => s.subject), ['faktura', 'wizyta'], 'a withdrawn pattern a topic still checks with is in use');
   assert.deepEqual(filterSchemas(subjects, { filter: 'deprecated' }).rows.map((s) => s.subject), ['faktura', 'wizyta-2025']);
   assert.deepEqual(filterSchemas(subjects, { query: 'FAKTURY' }).rows.map((s) => s.subject), ['faktura']);
 });
@@ -57,7 +57,7 @@ test('list: one row per pattern, filter options with counts', () => {
   assert.match(table.rows[2].used, /wizyty/);
   assert.match(table.rows[1].used, /żaden topik/);
   const labels = [...body.querySelectorAll('[data-role="filter"] .tf-seg-opt')].map((b) => b.textContent);
-  assert.deepEqual(labels, ['Wszystkie 4', 'W użyciu 1', 'Wycofane 2']);
+  assert.deepEqual(labels, ['Wszystkie 4', 'W użyciu 2', 'Wycofane 2']);
 });
 
 test('empty (T11) and error (T12) states', () => {
@@ -71,27 +71,31 @@ test('empty (T11) and error (T12) states', () => {
 
 test('why a pattern cannot be deleted names the topics holding it', () => {
   assert.equal(deleteBlocker(subjects[1]), null);
-  assert.equal(deleteBlocker(subjects[0]), 'Nie można usunąć: używa go topik wizyty. Najpierw wybierz w nim inny wzór albo wycofaj ten wzór.');
-  assert.equal(deleteBlocker({ usedByTopics: ['b', 'a'] }), 'Nie można usunąć: używają go topiki a i b. Najpierw wybierz w nich inny wzór albo wycofaj ten wzór.');
+  assert.equal(deleteBlocker(subjects[0]), 'Nie można usunąć: używa go topik wizyty. Usuniesz go, gdy w ustawieniach tego topiku wybierzesz inny wzór.');
+  assert.equal(deleteBlocker({ usedByTopics: ['b', 'a'] }), 'Nie można usunąć: używają go topiki a i b. Usuniesz go, gdy w ustawieniach tych topików wybierzesz inny wzór.');
+  assert.doesNotMatch(deleteBlocker(subjects[0]), /wycofaj/, 'withdrawing never makes a used pattern deletable');
   assert.deepEqual(['json_schema', 'xsd', 'hl7v2_profile', 'thrift', 'cbor'].map(schemaKind), ['json', 'xml', 'hl7v2', 'binary', '']);
 });
 
-test('an administrator: "Dodaj wzór", a row opens its pattern, the bin only for an unused one', () => {
+test('an administrator: "Dodaj wzór", a row opens its pattern, the bin only for an unused one, a lock that answers for a used one', () => {
   const { body, moves } = mount({ subjects, canAdmin: true });
   assert.equal(body.querySelector('.tb-admin-note'), null);
   body.querySelector('[data-go="add"]').click();
   const table = body.querySelector('[data-role="table"]');
   table.dispatchEvent(new CustomEvent('row-click', { detail: { row: table.rows[2] } }));
   const used = table.rowActions(table.rows[2], 2);
-  const bin = used.querySelector('[data-act="delete"]');
-  assert.ok(bin.hasAttribute('disabled'));
-  assert.equal(bin.title, 'Nie można usunąć: używa go topik wizyty. Najpierw wybierz w nim inny wzór albo wycofaj ten wzór.');
-  bin.click();
+  assert.equal(used.querySelector('[data-act="delete"]'), null);
+  const lock = used.querySelector('[data-act="delete-blocked"]');
+  assert.equal(lock.hasAttribute('disabled'), false, 'a disabled button would keep the reason from a tap and the keyboard');
+  assert.equal(lock.getAttribute('icon'), 'lock');
+  assert.equal(lock.getAttribute('aria-label'), 'Nie można usunąć: używa go topik wizyty. Usuniesz go, gdy w ustawieniach tego topiku wybierzesz inny wzór.');
+  lock.click();
   table.rowActions(table.rows[1], 1).querySelector('[data-act="delete"]').click();
   table.rowActions(table.rows[3], 3).querySelector('[data-act="open"]').click();
   assert.deepEqual(moves, [
     { kind: 'add' },
     { kind: 'open', subject: 'wizyta' },
+    { kind: 'delete-blocked', subject: 'wizyta', reason: 'Nie można usunąć: używa go topik wizyty. Usuniesz go, gdy w ustawieniach tego topiku wybierzesz inny wzór.' },
     { kind: 'delete', subject: 'powiadomienie' },
     { kind: 'open', subject: 'wizyta-2025' },
   ]);

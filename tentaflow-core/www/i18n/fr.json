@@ -9842,7 +9842,7 @@
       "admin_only": "Les modèles sont ajoutés, modifiés, retirés et supprimés par l’administrateur de l’instance.",
       "action_open": "Ouvrir le modèle",
       "action_delete": "Supprimer le modèle",
-      "delete_blocked": "Suppression impossible : {n|le topic|les topics} {topics} {n|l’utilise|l’utilisent}. Choisissez d’abord un autre modèle pour {n|lui|eux} ou retirez celui-ci.",
+      "delete_blocked": "Suppression impossible : {n|le topic|les topics} {topics} {n|l’utilise|l’utilisent}. Vous pourrez le supprimer après avoir choisi un autre modèle dans les paramètres de {n|ce topic|ces topics}.",
       "added_title": "Modèle {name} ajouté",
       "added_text": "{format}, version 1. Vous le choisissez dans les paramètres d’un {where}.",
       "kind_for": {
@@ -9905,7 +9905,8 @@
         "added_text_used": "{n|Le topic|Les topics} {topics} {n|vérifie|vérifient} les messages selon elle.",
         "added_text_unused": "Aucun topic n’utilise encore ce modèle.",
         "same_title": "Aucune nouvelle version ajoutée",
-        "same_text": "La version {version} a déjà le même texte. Rien n’a changé."
+        "same_text": "La version {version} a déjà le même texte. Rien n’a changé.",
+        "load_failed": "Impossible de charger le texte de la version {version}."
       },
       "incompat": {
         "lead": "Ce modèle a la compatibilité « {compat} », et {reason}.",
@@ -9923,7 +9924,8 @@
         "fix_required_new": "Retirez « {field} » des champs obligatoires ou changez la compatibilité du modèle.",
         "fix_required_old": "Laissez « {field} » parmi les champs obligatoires ou changez la compatibilité du modèle.",
         "fix_generic": "Corrigez le texte ou changez la compatibilité du modèle.",
-        "technical": "Détails techniques"
+        "technical": "Détails techniques",
+        "widened": "la nouvelle version élargit le type de valeur du champ « {field} », alors que les anciens programmes n’acceptent que le plus étroit"
       },
       "compat_window": {
         "title": "Changer la compatibilité — {name}",
@@ -9959,12 +9961,12 @@
       "delete": {
         "title": "Supprimer le modèle {name}",
         "irreversible": "C’est irréversible.",
-        "everything": "Le modèle {name} ({format}) et ses {count} {n|version|versions} disparaîtront.",
+        "everything": "Le modèle {name} ({format}) et toutes ses versions disparaîtront.",
         "unused": "Aucun topic n’utilise ce modèle.",
         "audit": "La suppression est inscrite au journal d’audit.",
         "retype": "Retapez le nom du modèle pour confirmer :",
         "button": "Supprimer le modèle",
-        "refused_used": "Non supprimé : {n|le topic|les topics} {topics} {n|l’utilise|l’utilisent}. Choisissez d’abord un autre modèle pour {n|lui|eux}.",
+        "refused_used": "Non supprimé : {n|le topic|les topics} {topics} {n|l’utilise|l’utilisent}. Choisissez d’abord un autre modèle dans les paramètres de {n|ce topic|ces topics}.",
         "done_title": "Modèle {name} supprimé"
       },
       "detail": {
@@ -10006,8 +10008,12 @@
         "compat_locked": "Le modèle est retiré — on n’ajoute plus de versions, la compatibilité n’est donc pas modifiée.",
         "missing_title": "Le modèle {name} n’existe plus",
         "missing_text": "Il a peut-être été supprimé. Revenez à la liste des modèles.",
-        "error_title": "Impossible de charger le modèle"
-      }
+        "error_title": "Impossible de charger le modèle",
+        "show": "Afficher"
+      },
+      "added_existing_title": "Le modèle {name} existait déjà",
+      "added_existing_version": "Quelqu’un l’a ajouté entre-temps, le texte y est donc entré en version {version}.",
+      "added_existing_same": "Quelqu’un l’a ajouté entre-temps avec le même texte (version {version}) — rien n’a changé."
     },
     "topics": {
       "title": "Topics",
@@ -10371,7 +10377,8 @@
         "saved_title": "Description enregistrée.",
         "saved_text": "S’affiche maintenant sous le nom du topic : {text}",
         "saved_text_none": "Le topic n’a plus de description."
-      }
+      },
+      "discard_confirm": "Les modifications ne sont pas enregistrées. Refermez la fenêtre pour les abandonner, ou reprenez la saisie."
     },
     "partitions": {
       "explain": "Une partition est une file séparée dans le topic — avec plusieurs partitions, les consommateurs lisent en parallèle. Une copie est le même journal sur un autre node. Le node principal reçoit les écritures, les autres gardent des copies. Chaque message d’une partition a le numéro suivant.",

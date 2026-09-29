@@ -8,6 +8,7 @@ import { escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, sprite, ADMIN_TIMEOUT_MS, errMessage, jobKindLabel } from '/js/modules/tentanas/format.js';
 import { reportParked } from '/js/modules/tentanas/approvals.js';
+import { downloadText } from '/js/lib/download.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-file-input.js';
@@ -31,20 +32,6 @@ const KIND_LABEL = {
 // dialog markup as cell classes.
 function kindLabel(kind) {
   return KIND_LABEL[kind] ? T(KIND_LABEL[kind]) : String(kind || '');
-}
-
-/** Hands a text blob to the browser as a file download; the object URL is released once the click has been dispatched. */
-export function downloadText(text, filename, type = 'application/json') {
-  const blob = new Blob([text], { type });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.hidden = true;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
 }
 
 /** Opens the configuration window on its export side; the download starts from the window's "Pobierz plik". */
@@ -151,7 +138,7 @@ export function openConfigWindow(screen, { segment = 'export', onDone = null } =
   downloadBtn.addEventListener('click', () => {
     if (!state.exportRes) return;
     const filename = state.exportRes.filename || 'tentanas-config.json';
-    downloadText(state.exportRes.json, filename);
+    downloadText(filename, state.exportRes.json, 'application/json');
     toast(T('config.exported', { file: filename }), 'success');
     win.close(true);
   });

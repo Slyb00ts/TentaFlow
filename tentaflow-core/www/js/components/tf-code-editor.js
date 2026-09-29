@@ -1363,6 +1363,10 @@ export class TfCodeEditor extends HTMLElement {
     // --- document model ---
     this._lines = [''];
     this._vers = [0];          // per-line version, bumped on change
+    // Bumped by every `value =`: per-line versions restart at 0 for a new
+    // document, so a row cache key without it would match the previous
+    // document's rows and leave their text on screen.
+    this._loadGen = 0;
     this._states = [''];       // tokenizer state BEFORE each line
     this._statesValidTo = 0;   // states[0.._statesValidTo] are valid
     this._tokCache = new Map();
@@ -1559,6 +1563,7 @@ export class TfCodeEditor extends HTMLElement {
     const text = String(v ?? '');
     this._lines = text.split('\n');
     this._vers = this._lines.map(() => 0);
+    this._loadGen += 1;
     this._states = [''];
     this._statesValidTo = 0;
     this._tokCache.clear();
@@ -2039,7 +2044,7 @@ export class TfCodeEditor extends HTMLElement {
     const fold = lastSeg ? this._foldAt(line) : null;
 
     // --- text layer (rebuilt only when the line/tokens/fold changed) ---
-    const tkey = `${line}:${seg}:${this._vers[line]}:${this._states[line]}:${fold ? fold.end : ''}`;
+    const tkey = `${this._loadGen}:${line}:${seg}:${this._vers[line]}:${this._states[line]}:${fold ? fold.end : ''}`;
     if (div._tkey !== tkey) {
       div._tkey = tkey;
       const txt = div._txt;

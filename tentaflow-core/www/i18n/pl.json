@@ -11077,7 +11077,7 @@
       "admin_only": "Wzory dodaje, zmienia, wycofuje i usuwa administrator instancji.",
       "action_open": "Otwórz wzór",
       "action_delete": "Usuń wzór",
-      "delete_blocked": "Nie można usunąć: {n|używa go topik|używają go topiki|używają go topiki} {topics}. Najpierw wybierz w {n|nim|nich|nich} inny wzór albo wycofaj ten wzór.",
+      "delete_blocked": "Nie można usunąć: {n|używa go topik|używają go topiki|używają go topiki} {topics}. Usuniesz go, gdy w ustawieniach {n|tego topiku|tych topików|tych topików} wybierzesz inny wzór.",
       "added_title": "Dodano wzór {name}",
       "added_text": "{format}, wersja 1. Wybierzesz go w ustawieniach {where}.",
       "kind_for": {
@@ -11140,7 +11140,8 @@
         "added_text_used": "{n|Topik|Topiki|Topiki} {topics} {n|sprawdza|sprawdzają|sprawdzają} wiadomości według niej.",
         "added_text_unused": "Żaden topik jeszcze nie używa tego wzoru.",
         "same_title": "Nie dodano nowej wersji",
-        "same_text": "Taki sam tekst ma już wersja {version}. Nic się nie zmieniło."
+        "same_text": "Taki sam tekst ma już wersja {version}. Nic się nie zmieniło.",
+        "load_failed": "Nie udało się wczytać tekstu wersji {version}."
       },
       "incompat": {
         "lead": "Ten wzór ma zgodność „{compat}”, a {reason}.",
@@ -11158,7 +11159,8 @@
         "fix_required_new": "Usuń „{field}” z pól wymaganych albo zmień zgodność wzoru.",
         "fix_required_old": "Zostaw „{field}” wśród pól wymaganych albo zmień zgodność wzoru.",
         "fix_generic": "Popraw tekst albo zmień zgodność wzoru.",
-        "technical": "Szczegóły techniczne"
+        "technical": "Szczegóły techniczne",
+        "widened": "nowa wersja poszerza rodzaj wartości pola „{field}”, a stare programy przyjmują tylko węższy"
       },
       "compat_window": {
         "title": "Zmień zgodność — {name}",
@@ -11194,12 +11196,12 @@
       "delete": {
         "title": "Usuń wzór {name}",
         "irreversible": "Tego nie da się cofnąć.",
-        "everything": "Wzór {name} ({format}) i {count} {n|jego wersja|jego wersje|jego wersji} znikną.",
+        "everything": "Wzór {name} ({format}) i wszystkie jego wersje znikną.",
         "unused": "Żaden topik nie używa tego wzoru.",
         "audit": "Usunięcie zapisze się w dzienniku audytu.",
         "retype": "Przepisz nazwę wzoru, aby potwierdzić:",
         "button": "Usuń wzór",
-        "refused_used": "Nie usunięto: {n|używa go topik|używają go topiki|używają go topiki} {topics}. Najpierw wybierz w {n|nim|nich|nich} inny wzór.",
+        "refused_used": "Nie usunięto: {n|używa go topik|używają go topiki|używają go topiki} {topics}. Najpierw wybierz inny wzór w ustawieniach {n|tego topiku|tych topików|tych topików}.",
         "done_title": "Usunięto wzór {name}"
       },
       "detail": {
@@ -11241,8 +11243,12 @@
         "compat_locked": "Wzór jest wycofany — nowych wersji się nie dodaje, więc zgodności się nie zmienia.",
         "missing_title": "Wzoru {name} już nie ma",
         "missing_text": "Mógł zostać usunięty. Wróć do listy wzorów.",
-        "error_title": "Nie udało się wczytać wzoru"
-      }
+        "error_title": "Nie udało się wczytać wzoru",
+        "show": "Pokaż"
+      },
+      "added_existing_title": "Wzór {name} już istniał",
+      "added_existing_version": "Ktoś dodał go w międzyczasie, więc tekst trafił do niego jako wersja {version}.",
+      "added_existing_same": "Ktoś dodał go w międzyczasie z takim samym tekstem (wersja {version}) — nic się nie zmieniło."
     },
     "topics": {
       "title": "Topiki",
@@ -11606,7 +11612,8 @@
         "saved_title": "Zapisano opis.",
         "saved_text": "Pod nazwą topiku widać teraz: {text}",
         "saved_text_none": "Topik nie ma już opisu."
-      }
+      },
+      "discard_confirm": "Zmiany nie są zapisane. Zamknij okno jeszcze raz, żeby je porzucić, albo wróć do edycji."
     },
     "partitions": {
       "explain": "Partycja to osobna kolejka w topiku — dzięki kilku partycjom odbiorcy czytają wiadomości równolegle. Kopia to ten sam zapis na innym nodzie. Node prowadzący przyjmuje zapisy, a pozostałe trzymają kopie. Każda wiadomość w partycji ma kolejny numer.",

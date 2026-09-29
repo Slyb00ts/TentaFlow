@@ -19,7 +19,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 
 const {
   subjectNameProblem, schemaTextProblem, buildRegisterRequest, buildDeleteRequest, jsonSchemaChanges, parseIncompatible,
-  incompatibilityReason, refusalHtml, boundTopics, effectiveVersion, versionImpact, versionDeprecateImpact, subjectDeprecateImpact,
+  addedNotice, incompatibilityReason, refusalHtml, boundTopics, effectiveVersion, versionImpact, versionDeprecateImpact, subjectDeprecateImpact,
   openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete,
 } = await import('./schema-windows.js');
 
@@ -101,7 +101,13 @@ test('every sentence of the compatibility check has plain words, with the direct
   const extra = "property 'gabinet' present in the writer schema has no counterpart in the reader schema, which rejects additional properties";
   assert.match(incompatibilityReason({ mode: 'forward', detail: extra, newText: V2 }).reason, /dodaje pole „gabinet”/);
   assert.match(incompatibilityReason({ mode: 'backward', detail: extra, newText: V1 }).reason, /nie zna pola „gabinet”/);
-  assert.match(incompatibilityReason({ mode: 'backward', detail: "property 'termin' type is narrowed: writer allows {\"string\"}, reader allows {\"integer\"}", newText: V1 }).reason, /zawęża rodzaj wartości pola „termin”/);
+  const narrowed = (reader) => `property 'termin' type is narrowed: writer allows Some({"number"}), reader allows ${reader}`;
+  const intTermin = JSON.stringify({ ...JSON.parse(V1), properties: { ...JSON.parse(V1).properties, termin: { type: 'integer' } } });
+  const numTermin = JSON.stringify({ ...JSON.parse(V1), properties: { ...JSON.parse(V1).properties, termin: { type: 'number' } } });
+  assert.match(incompatibilityReason({ mode: 'backward', detail: narrowed('Some({"integer"})'), newText: intTermin }).reason, /zawęża rodzaj wartości pola „termin”/);
+  assert.match(incompatibilityReason({ mode: 'forward', detail: narrowed('Some({"integer"})'), newText: numTermin }).reason, /poszerza rodzaj wartości pola „termin”/, 'under "forward" the old version is the reader');
+  assert.match(incompatibilityReason({ mode: 'full', detail: narrowed('Some({"integer"})'), newText: intTermin }).reason, /zawęża/, 'the reader types are the new version: it narrowed');
+  assert.match(incompatibilityReason({ mode: 'full', detail: narrowed('Some({"integer"})'), newText: numTermin }).reason, /poszerza/, 'the reader types are the old version: it widened');
   assert.match(incompatibilityReason({ mode: 'backward', detail: "property 'termin' subschema differs beyond 'type' widening", newText: V1 }).reason, /pole „termin” zmieniło się/);
   assert.match(incompatibilityReason({ mode: 'forward', detail: 'writer schema allows additional properties but reader schema rejects them (additionalProperties: false)', newText: V1 }).reason, /dodatkowe pola/);
   assert.match(incompatibilityReason({ mode: 'full', detail: "root keyword 'additionalProperties' (schema form) changed", newText: V1 }).reason, /dodatkowe pola/);
@@ -166,12 +172,13 @@ test('a refused delete names the topics that took the pattern', () => {
 
 test('"Dodaj wzór": formats from the server, a taken name and a broken text keep it locked, then one request', async () => {
   closeAll();
+  const names = [];
   const sent = [];
   const added = [];
   const win = openSchemaAdd({
     instanceId: 'tentabus-1a2b3c4d',
     schemaTypes: ['json_schema', 'avro', 'protobuf', 'thrift'],
-    existingNames: ['wizyta'],
+    existingNames: () => names,
     register: async (request) => { sent.push(request); return { version: 1, schemaRefId: 7, deduplicated: false }; },
     describeError: () => 'Odmowa serwera.',
     onAdded: (a) => added.push(a),
@@ -182,8 +189,13 @@ test('"Dodaj wzór": formats from the server, a taken name and a broken text kee
   assert.equal(win.querySelector('[data-role="compat"]').value, 'backward');
   const save = win.querySelector('[data-act="save"]');
   assert.equal(norm(save.textContent), 'Dodaj wzór');
+  assert.equal(win.querySelector('[data-role="impact"]').hidden, true, 'nothing is marked yet, so nothing to fix is said');
+  // The list read when the window opened arrives after it: the name is taken now.
+  names.push('wizyta');
   const name = win.querySelector('[data-role="name"]');
   type(name, 'wizyta');
+  assert.equal(win.querySelector('[data-role="impact"]').hidden, false);
+  assert.match(win.querySelector('[data-role="impact"]').textContent, /Popraw zaznaczone pole/);
   assert.match(name.getAttribute('error'), /już jest/);
   type(win.querySelector('[data-role="text"]'), '{"type": ');
   assert.match(win.querySelector('[data-role="text"]').getAttribute('error'), /To nie jest poprawny JSON/);
@@ -196,7 +208,7 @@ test('"Dodaj wzór": formats from the server, a taken name and a broken text kee
   save.click();
   await tick();
   assert.deepEqual(sent, [{ instanceId: 'tentabus-1a2b3c4d', subject: 'skierowanie', schemaType: 'json_schema', schemaText: V1, compatibility: 'full' }]);
-  assert.deepEqual(added, [{ subject: 'skierowanie', schemaType: 'json_schema', version: 1 }]);
+  assert.deepEqual(added, [{ subject: 'skierowanie', schemaType: 'json_schema', version: 1, deduplicated: false }]);
 });
 
 test('"Dodaj wzór": a file loads into the text; the server\'s refusal stays in the window and clears on the next edit', async () => {
@@ -204,7 +216,7 @@ test('"Dodaj wzór": a file loads into the text; the server\'s refusal stays in 
   const win = openSchemaAdd({
     instanceId: 'i',
     schemaTypes: ['json_schema'],
-    existingNames: [],
+    existingNames: () => [],
     register: async () => { throw new Error("protocol error BadRequest: bus.invalid_argument: schema: invalid schema: /: unknown type 'strin'"); },
     describeError: () => 'Odmowa serwera.',
     onAdded: () => assert.fail('nothing was added'),
@@ -220,12 +232,15 @@ test('"Dodaj wzór": a file loads into the text; the server\'s refusal stays in 
   assert.equal(error.hidden, false);
   assert.match(norm(error.textContent), /^Nie dodano wzoru skierowanie\. Serwer nie przyjął tekstu/);
   assert.ok(win.isConnected, 'the window stays open with the refusal');
+  assert.ok(win.querySelector('[data-act="save"]').hasAttribute('disabled'), 'the refused text is not sent again as it is');
   type(win.querySelector('[data-role="text"]'), '{"type": "string"}');
   assert.equal(error.hidden, true, 'an edited text is no longer the refused one');
+  assert.equal(win.querySelector('[data-act="save"]').hasAttribute('disabled'), false);
   const big = { size: 256 * 1024 + 1, text: async () => 'x' };
   win.querySelector('[data-role="file"]').dispatchEvent(new CustomEvent('change', { detail: { files: [big] } }));
   await tick();
   assert.match(win.querySelector('[data-role="text"]').getAttribute('error'), /najwyżej 256 KB/);
+  assert.ok(win.querySelector('[data-act="save"]').hasAttribute('disabled'), 'a file that did not load leaves nothing to send');
 });
 
 test('"Nowa wersja": starts from the newest text, says the difference, is refused in plain words and keeps the draft', async () => {
@@ -334,14 +349,14 @@ test('"Usuń…": locked until the name is retyped; a topic that took the patter
     describeError: () => 'Odmowa serwera.',
     onDeleted: () => assert.fail('refused'),
   });
-  assert.match(norm(win.querySelector('.tb-danger-box').textContent), /Tego nie da się cofnąć\. Wzór wizyta-2025 \(JSON Schema\) i 7 jego wersji znikną\./);
+  assert.match(norm(win.querySelector('.tb-danger-box').textContent), /Tego nie da się cofnąć\. Wzór wizyta-2025 \(JSON Schema\) i wszystkie jego wersje znikną\./);
   const confirm = win.querySelector('[data-action="confirm"]');
   assert.ok(confirm.hasAttribute('disabled'));
   type(win.querySelector('#retype-input'), 'wizyta-2025');
   assert.equal(confirm.hasAttribute('disabled'), false);
   win.dispatchEvent(new CustomEvent('action', { detail: { action: 'confirm' }, cancelable: true }));
   await tick();
-  assert.equal(norm(win.querySelector('#retype-error').textContent), 'Nie usunięto: używa go topik wizyty. Najpierw wybierz w nim inny wzór.');
+  assert.equal(norm(win.querySelector('#retype-error').textContent), 'Nie usunięto: używa go topik wizyty. Najpierw wybierz inny wzór w ustawieniach tego topiku.');
 
   closeAll();
   const sent = [];
@@ -352,4 +367,53 @@ test('"Usuń…": locked until the name is retyped; a topic that took the patter
   await tick();
   assert.deepEqual(sent, [{ instanceId: 'i', subject: 'wizyta-2025', deprecateOnly: false }]);
   assert.equal(deleted, 1);
+});
+
+test('the note after "Dodaj wzór" says what the server did: a new pattern, a version of one taken meanwhile, or nothing', () => {
+  assert.deepEqual(addedNotice({ subject: 'skierowanie', schemaType: 'json_schema', version: 1, deduplicated: false }),
+    { tone: 'success', title: 'Dodano wzór skierowanie', text: 'JSON Schema, wersja 1. Wybierzesz go w ustawieniach topiku z treścią JSON.' });
+  const version = addedNotice({ subject: 'wizyta', schemaType: 'json_schema', version: 4, deduplicated: false });
+  assert.equal(version.tone, 'warning');
+  assert.equal(version.title, 'Wzór wizyta już istniał');
+  assert.match(version.text, /jako wersja 4/);
+  assert.match(addedNotice({ subject: 'wizyta', schemaType: 'json_schema', version: 3, deduplicated: true }).text, /\(wersja 3\) — nic się nie zmieniło/);
+});
+
+test('Escape on a changed draft asks once; "Anuluj" leaves without asking', async () => {
+  closeAll();
+  const open = () => openSchemaAdd({ instanceId: 'i', schemaTypes: ['json_schema'], existingNames: () => [], register: async () => ({}), describeError: String, onAdded: () => {} });
+  const win = open();
+  win.close();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(win.isConnected, false, 'an untouched window just closes');
+
+  const dirty = open();
+  type(dirty.querySelector('[data-role="name"]'), 'skierowanie');
+  dirty.close();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(dirty.isConnected, true, 'the first close only asks');
+  assert.match(dirty.querySelector('[data-role="discard"]').textContent, /Zamknij okno jeszcze raz/);
+  dirty.close();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(dirty.isConnected, false, 'the second close drops the draft');
+
+  const cancelled = open();
+  type(cancelled.querySelector('[data-role="name"]'), 'skierowanie');
+  cancelled.querySelector('[data-act="cancel"]').click();
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(cancelled.isConnected, false);
+});
+
+test('"Dodaj wzór" hands on what the server did when the name was taken meanwhile', async () => {
+  closeAll();
+  const added = [];
+  const win = openSchemaAdd({
+    instanceId: 'i', schemaTypes: ['json_schema'], existingNames: () => [],
+    register: async () => ({ version: 4, schemaRefId: 1, deduplicated: true }), describeError: String, onAdded: (a) => added.push(a),
+  });
+  type(win.querySelector('[data-role="name"]'), 'wizyta');
+  type(win.querySelector('[data-role="text"]'), V1);
+  win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual(added, [{ subject: 'wizyta', schemaType: 'json_schema', version: 4, deduplicated: true }]);
 });

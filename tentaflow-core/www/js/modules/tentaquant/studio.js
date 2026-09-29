@@ -35,7 +35,8 @@ import {
   editorLabels, viewportAllowsEditing, watchEditViewport,
 } from '/js/modules/tentaquant/format.js';
 import { DEFAULT_CIRCUIT_SOURCE } from '/js/modules/tentaquant/cells.js';
-import { downloadText, uploadFile } from '/js/modules/tentaquant/files.js';
+import { uploadFile } from '/js/modules/tentaquant/files.js';
+import { downloadText } from '/js/lib/download.js';
 import { saveCircuitToNotebook, openNotebookPicker } from '/js/modules/tentaquant/notebook.js';
 import {
   MAX_LIVE_STATE_QUBITS, MS_PER_GATE, T0_MAX_QUBITS, advance, appliedColumns,

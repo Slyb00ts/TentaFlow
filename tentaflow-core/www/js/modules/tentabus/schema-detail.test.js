@@ -17,7 +17,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 
 const {
   schemaDescription, displayText, versionState, downloadName, editorLanguage, headerLine, withdrawnText, versionRows,
-  drawSchemaDetail, shareShownText, saveText,
+  drawSchemaDetail, shareShownText,
 } = await import('./schema-detail.js');
 
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -108,7 +108,7 @@ test('an administrator\'s page: header, the text of the version topics check wit
   assert.equal(editor.value, TEXT);
   const del = body.querySelector('[data-role="delete"]');
   assert.ok(del.hasAttribute('disabled'), 'a topic uses it');
-  assert.equal(del.getAttribute('title'), 'Nie można usunąć: używa go topik wizyty. Najpierw wybierz w nim inny wzór albo wycofaj ten wzór.');
+  assert.equal(del.getAttribute('title'), 'Nie można usunąć: używa go topik wizyty. Usuniesz go, gdy w ustawieniach tego topiku wybierzesz inny wzór.');
   assert.equal(norm(body.querySelector('[data-role="delete-note"]').textContent), del.getAttribute('title'));
   assert.equal(body.querySelector('[data-role="new-version"]').hasAttribute('disabled'), false);
   assert.equal(body.querySelector('[data-role="versions-count"]').getAttribute('label'), '3');
@@ -158,6 +158,16 @@ test('a withdrawn pattern: the warning, nothing new to add, no compatibility cha
   assert.equal(body.querySelector('[data-role="compat"]'), null);
   assert.match(body.querySelector('[data-role="compat-card"]').textContent, /zgodności się nie zmienia/);
   assert.match(body.querySelector('[data-role="versions-sub"]').textContent, /wycofane są wszystkie jego wersje/);
+});
+
+test('right after withdrawing, the note of it stands alone; "Pokaż" is a word, not only an eye', () => {
+  const { body } = mount({ info: { ...wizyta, deprecatedAtMs: ADDED }, notice: { tone: 'success', withdrawn: true, title: 'Wycofano wzór wizyta', text: 'x' } });
+  assert.equal(body.querySelectorAll('tf-alert').length, 1);
+  assert.equal(body.querySelector('[data-role="notice"] tf-alert').getAttribute('title'), 'Wycofano wzór wizyta');
+  const table = body.querySelector('[data-role="versions"]');
+  const show = table.rowActions(table.rows[1], 1).querySelector('[data-act="show-version"]');
+  assert.equal(show.textContent, 'Pokaż');
+  assert.equal(show.getAttribute('aria-label'), 'Pokaż wersję 2');
 });
 
 test('every version withdrawn but the pattern not: the newest still checks and the page says so', () => {
@@ -211,7 +221,6 @@ test('"Kopiuj" writes the shown text to the clipboard; "Pobierz" saves it under 
     assert.deepEqual(saved, [{ href: 'blob:tb-test', download: 'wizyta-v3.json', attached: true }]);
     assert.equal(await created[0].text(), TEXT);
     assert.match(created[0].type, /^application\/schema\+json/);
-    saveText('a.txt', 'x');
     assert.equal(document.querySelectorAll('a[download]').length, 0, 'the link does not stay in the page');
   } finally {
     URL.createObjectURL = originalCreate;

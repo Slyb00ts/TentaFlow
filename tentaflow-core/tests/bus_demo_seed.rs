@@ -988,6 +988,12 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
     if existing.is_some() {
         println!("seed[clinic]: pattern '{VISIT_SCHEMA}' already exists — skipping");
     } else {
+        // Patterns record their author by user id — the page shows the
+        // person's name, so the seed writes the real id of the admin account.
+        let author = repository::get_user_account_by_username(db, ACTOR)
+            .expect("read the admin account")
+            .map(|u| u.id)
+            .expect("the admin account exists after the first boot");
         for text in VISIT_SCHEMA_VERSIONS {
             schema_registry::register(
                 db,
@@ -997,7 +1003,7 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
                 SchemaType::JsonSchema,
                 text,
                 Some(Compatibility::Backward),
-                Some(ACTOR),
+                Some(author.as_str()),
             )
             .expect("register a version of pattern wizyta");
         }
@@ -1012,7 +1018,7 @@ fn seed_clinic_production(svc: &BusService, local_db: &DbPool, db: &DbPool, ctx:
             SchemaType::JsonSchema,
             VISIT_SCHEMA_VERSIONS[0],
             Some(Compatibility::Backward),
-            Some(ACTOR),
+            Some(author.as_str()),
         )
         .expect("register pattern wizyta-2025");
         schema_registry::delete(db, &instance, &ctx.org_id, VISIT_SCHEMA_OLD, None, true)

@@ -29,9 +29,9 @@ import { MAIN_TABS, DEFAULT_TAB, DEFAULT_SECTION, TOPIC_SECTIONS, CONSUMER_SECTI
 import { shellCounts, userTopics, userRate } from '/js/modules/tentabus/model.js';
 import { laggingReplicas, isLagging, lagSeriesKey } from '/js/modules/tentabus/alerts.js';
 import { drawOverview, pushOverviewSample, CHART_WINDOW_SECS } from '/js/modules/tentabus/overview.js';
-import { drawSchemas, schemaFormatLabel, schemaKind, listText, compatLabel } from '/js/modules/tentabus/schemas.js';
+import { drawSchemas, listText, compatLabel } from '/js/modules/tentabus/schemas.js';
 import { drawSchemaDetail, shareShownText } from '/js/modules/tentabus/schema-detail.js';
-import { openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
+import { addedNotice, openSchemaAdd, openSchemaVersion, openSchemaCompat, openSchemaDeprecate, openVersionDeprecate, openSchemaDelete } from '/js/modules/tentabus/schema-windows.js';
 import { drawTopics } from '/js/modules/tentabus/topics.js';
 import { openTopicCreator } from '/js/modules/tentabus/topic-creator.js';
 import { openTopicDelete } from '/js/modules/tentabus/topic-delete.js';
@@ -524,6 +524,8 @@ const TentaBusScreen = {
     state.schemasNotice = null;
     state.schema = freshSchemaPage();
     state.schemaDrafts = new Map();
+    subjectsTurn += 1;
+    newVersionOpening = false;
     state.unprocessed = freshUnprocessed();
     unprocessedTurns.clear();
     unprocessedLoads.clear();
@@ -731,15 +733,21 @@ async function loadShellMeta() {
   await loadSubjects();
 }
 
+// Only the newest answer lands: a list asked before a change must not paint
+// over the one asked after it.
+let subjectsTurn = 0;
+
 async function loadSubjects() {
   const instanceId = state.instanceId;
+  const turn = ++subjectsTurn;
+  const current = () => state.instanceId === instanceId && subjectsTurn === turn;
   try {
     const subjects = await ApiBinary.list('busSchemaSubjectListRequest', { arrayKey: 'subjects', payload: { instanceId: requireInstanceId(instanceId) } });
-    if (state.instanceId !== instanceId) return;
+    if (!current()) return;
     state.shell.subjects = subjects || [];
     state.shell.subjectsError = null;
   } catch (err) {
-    if (state.instanceId !== instanceId) return;
+    if (!current()) return;
     state.shell.subjectsError = err;
   }
   paintShell();
@@ -1849,6 +1857,7 @@ const schemasContext = {
     if (action.kind === 'open') openSchema(action.subject);
     else if (action.kind === 'add') openSchemaAddWindow();
     else if (action.kind === 'delete') openSchemaDeleteWindow(action.subject);
+    else if (action.kind === 'delete-blocked') toast(action.reason, 'info');
     else if (action.kind === 'retry') { state.shell.subjectsError = null; renderPanel(); loadSubjects(); }
   },
 };
@@ -1887,13 +1896,14 @@ const loadSchemaPage = topicDetailLoader({
       ApiBinary.one('busSchemaGetRequest', { instanceId: iid, subject: name, version: selected ?? undefined })
         .then((r) => ({ version: r?.schema?.version ?? selected, text: r?.schemaText ?? '', error: null }), (error) => ({ version: selected, text: null, error })),
     ]);
-    return { versions: list?.versions || [], shown: got };
+    return { versions: list?.versions || [], shown: got, selected };
   },
   context: () => ({ instanceId: state.instanceId, name: openSchemaName() }),
   apply({ detail, error }) {
     if (!error) {
       state.schema.versions = detail.versions;
-      state.schema.shown = detail.shown;
+      // A version picked with "Pokaż" while this was out keeps its own text.
+      if (detail.selected === state.schema.selected) state.schema.shown = detail.shown;
       state.schema.error = null;
     } else if (!state.schema.versions) {
       state.schema.error = error;
@@ -1989,33 +1999,39 @@ function openSchemaAddWindow() {
   openSchemaAdd({
     instanceId: requireInstanceId(instanceId),
     schemaTypes: state.capabilities?.schemaTypes || [],
-    existingNames: (state.shell.subjects || []).map((s) => s.subject),
+    existingNames: () => (state.shell.subjects || []).map((s) => s.subject),
     register: (request) => ApiBinary.action('busSchemaRegisterRequest', request),
     describeError: describeBusError,
-    onAdded: async ({ subject, schemaType }) => {
+    onAdded: async (added) => {
       if (state.instanceId !== instanceId) return;
-      const notice = {
-        tone: 'success',
-        title: T('schemas.added_title', { name: subject }),
-        text: T('schemas.added_text', { format: schemaFormatLabel(schemaType), where: T(`schemas.kind_for.${schemaKind(schemaType) || 'binary'}`) }),
-      };
+      const notice = addedNotice(added);
       if (!state.view && state.tab === 'schemas') state.schemasNotice = notice;
-      else toast(notice.title, 'success');
+      else toast(notice.title, notice.tone === 'success' ? 'success' : 'warning');
       await loadSubjects();
     },
   });
+  // The names the window refuses come from a list read now, not whenever the tab opened.
+  loadSubjects();
 }
+
+// Set while "Nowa wersja" reads the newest text: a second click does not open a second window.
+let newVersionOpening = false;
 
 async function openNewVersionWindow(name) {
   const info = subjectByName(name);
-  if (!canAdmin() || !info || info.deprecatedAtMs != null) return;
+  if (!canAdmin() || !info || info.deprecatedAtMs != null || newVersionOpening) return;
   const instanceId = state.instanceId;
   let latestText = state.schema.shown?.version === info.latestVersion ? state.schema.shown.text : null;
   if (latestText == null && info.latestVersion != null) {
+    newVersionOpening = true;
     try {
       latestText = (await ApiBinary.one('busSchemaGetRequest', { instanceId: requireInstanceId(instanceId), subject: name, version: info.latestVersion }))?.schemaText ?? null;
-    } catch {
-      latestText = null;
+    } catch (err) {
+      // Without the newest text the window would start empty and compare with nothing.
+      toast(`${T('schemas.version.load_failed', { version: fmtCount(info.latestVersion) })} ${describeBusError(err)}`, 'error');
+      return;
+    } finally {
+      newVersionOpening = false;
     }
     if (state.instanceId !== instanceId || openSchemaName() !== name) return;
   }
@@ -2069,7 +2085,7 @@ function openSchemaWithdrawWindow(name) {
     onDone: () => {
       state.schemaDrafts.delete(name);
       if (state.instanceId !== instanceId) return;
-      afterSchemaChange(name, { tone: 'success', title: T('schemas.withdraw.done_title', { name }), text: usedByText(info, 'schemas.withdraw.done_text') });
+      afterSchemaChange(name, { tone: 'success', withdrawn: true, title: T('schemas.withdraw.done_title', { name }), text: usedByText(info, 'schemas.withdraw.done_text') });
     },
   });
 }

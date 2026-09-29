@@ -11077,7 +11077,7 @@
       "admin_only": "Patterns are added, changed, withdrawn and deleted by the instance administrator.",
       "action_open": "Open pattern",
       "action_delete": "Delete pattern",
-      "delete_blocked": "Cannot delete: {n|topic|topics} {topics} {n|uses|use} it. First choose another pattern there or withdraw this one.",
+      "delete_blocked": "Cannot delete: {n|topic|topics} {topics} {n|uses|use} it. You can delete it once you choose another pattern in the settings of {n|that topic|those topics}.",
       "added_title": "Pattern {name} added",
       "added_text": "{format}, version 1. You choose it in the settings of a {where}.",
       "kind_for": {
@@ -11140,7 +11140,8 @@
         "added_text_used": "{n|Topic|Topics} {topics} {n|checks|check} messages against it.",
         "added_text_unused": "No topic uses this pattern yet.",
         "same_title": "No new version added",
-        "same_text": "Version {version} already has the same text. Nothing changed."
+        "same_text": "Version {version} already has the same text. Nothing changed.",
+        "load_failed": "Could not load the text of version {version}."
       },
       "incompat": {
         "lead": "This pattern has compatibility “{compat}”, and {reason}.",
@@ -11158,7 +11159,8 @@
         "fix_required_new": "Remove “{field}” from the required fields or change the pattern's compatibility.",
         "fix_required_old": "Keep “{field}” among the required fields or change the pattern's compatibility.",
         "fix_generic": "Fix the text or change the pattern's compatibility.",
-        "technical": "Technical details"
+        "technical": "Technical details",
+        "widened": "the new version widens the kind of value of field “{field}”, while old programs accept only the narrower one"
       },
       "compat_window": {
         "title": "Change compatibility — {name}",
@@ -11194,12 +11196,12 @@
       "delete": {
         "title": "Delete pattern {name}",
         "irreversible": "This cannot be undone.",
-        "everything": "Pattern {name} ({format}) and its {count} {n|version|versions} will be gone.",
+        "everything": "Pattern {name} ({format}) and all its versions will be gone.",
         "unused": "No topic uses this pattern.",
         "audit": "Deleting is written to the audit log.",
         "retype": "Retype the pattern name to confirm:",
         "button": "Delete pattern",
-        "refused_used": "Not deleted: {n|topic|topics} {topics} {n|uses|use} it. First choose another pattern there.",
+        "refused_used": "Not deleted: {n|topic|topics} {topics} {n|uses|use} it. First choose another pattern in the settings of {n|that topic|those topics}.",
         "done_title": "Pattern {name} deleted"
       },
       "detail": {
@@ -11241,8 +11243,12 @@
         "compat_locked": "The pattern is withdrawn — no new versions are added, so the compatibility is not changed.",
         "missing_title": "Pattern {name} no longer exists",
         "missing_text": "It may have been deleted. Go back to the pattern list.",
-        "error_title": "Could not load the pattern"
-      }
+        "error_title": "Could not load the pattern",
+        "show": "Show"
+      },
+      "added_existing_title": "Pattern {name} already existed",
+      "added_existing_version": "Someone added it meanwhile, so the text went into it as version {version}.",
+      "added_existing_same": "Someone added it meanwhile with the same text (version {version}) — nothing changed."
     },
     "topics": {
       "title": "Topics",
@@ -11606,7 +11612,8 @@
         "saved_title": "Description saved.",
         "saved_text": "Shown under the topic name now: {text}",
         "saved_text_none": "The topic no longer has a description."
-      }
+      },
+      "discard_confirm": "The changes are not saved. Close the window again to discard them, or go back to editing."
     },
     "partitions": {
       "explain": "A partition is a separate queue within the topic — with several partitions consumers read messages in parallel. A copy is the same log on another node. The leading node takes the writes, the others keep copies. Every message in a partition has the next number.",

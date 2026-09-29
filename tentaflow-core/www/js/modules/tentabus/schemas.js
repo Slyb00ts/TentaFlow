@@ -5,8 +5,8 @@
 // compatibility legend. A row opens the pattern's page (schema-detail.js);
 // "Dodaj wzór" and the row's bin open the windows in schema-windows.js. The
 // bin is offered only for a pattern no topic uses — the server refuses to
-// delete a bound pattern (`registry::delete`), so for a used one it is
-// disabled and says which topic holds it. Adding, withdrawing and deleting
+// delete a bound pattern (`registry::delete`), so for a used one it turns
+// into a lock that says, on hover, focus and tap alike, which topic holds it. Adding, withdrawing and deleting
 // are the instance administrator's (`gate_admin`); a reader sees the list
 // with one line saying so.
 
@@ -55,7 +55,11 @@ export function schemaState(s) {
   return isUsed(s) ? 'used' : 'unused';
 }
 
-/** Rows of one filter + search, and the per-filter counts of the segmented control. */
+/**
+ * Rows of one filter + search, and the per-filter counts of the segmented
+ * control. "W użyciu" is what a topic checks with — a withdrawn pattern a
+ * topic still uses is in it (and in "Wycofane").
+ */
 export function filterSchemas(subjects, { filter = 'all', query = '' } = {}) {
   const list = subjects || [];
   const q = String(query || '').trim().toLowerCase();
@@ -63,11 +67,11 @@ export function filterSchemas(subjects, { filter = 'all', query = '' } = {}) {
     || (s.usedByTopics || []).some((t) => t.toLowerCase().includes(q));
   const counts = {
     all: list.length,
-    used: list.filter((s) => schemaState(s) === 'used').length,
+    used: list.filter(isUsed).length,
     deprecated: list.filter(isDeprecated).length,
   };
   const rows = list
-    .filter((s) => filter === 'all' || (filter === 'used' ? schemaState(s) === 'used' : isDeprecated(s)))
+    .filter((s) => filter === 'all' || (filter === 'used' ? isUsed(s) : isDeprecated(s)))
     .filter(matches)
     .sort((a, b) => a.subject.localeCompare(b.subject));
   return { rows, counts };
@@ -121,30 +125,33 @@ function tableRow(s) {
   };
 }
 
-// The row's own buttons: delete (administrators; disabled with the reason
-// while a topic uses the pattern) and the arrow that opens it. Each stops the
-// click so it acts instead of opening the row.
+// The row's own buttons: delete (administrators) and the arrow that opens it.
+// While a topic uses the pattern the bin is a lock that still answers a
+// click, a tap and Enter with the reason — a disabled button would keep it
+// in a hover-only tooltip. Each stops the click so it acts instead of
+// opening the row.
 function rowActions(ctx, canAdmin) {
   return (row, idx, currentRow) => {
     const live = () => currentRow?.() ?? row;
     const wrap = document.createElement('div');
     wrap.className = 'tf-table__row-actions';
-    const add = (icon, label, kind, blocker = null) => {
+    const add = (icon, label, kind) => {
       const b = document.createElement('tf-button');
       b.setAttribute('variant', 'ghost');
       b.setAttribute('size', 'sm');
       b.setAttribute('icon', icon);
       b.setAttribute('aria-label', label);
-      b.title = blocker || label;
+      b.title = label;
       b.dataset.act = kind;
-      if (blocker) b.setAttribute('disabled', '');
       b.addEventListener('click', (e) => {
         e.stopPropagation();
-        if (!b.hasAttribute('disabled')) ctx.go({ kind, subject: live()._subject });
+        const current = live();
+        ctx.go(kind === 'delete-blocked' ? { kind, subject: current._subject, reason: current._blocker } : { kind, subject: current._subject });
       });
       wrap.appendChild(b);
     };
-    if (canAdmin) add('trash', T('schemas.action_delete'), 'delete', row._blocker);
+    if (canAdmin && row._blocker) add('lock', row._blocker, 'delete-blocked');
+    else if (canAdmin) add('trash', T('schemas.action_delete'), 'delete');
     add('chevron-right', T('schemas.action_open'), 'open');
     return wrap;
   };
@@ -206,7 +213,8 @@ function emptyHtml(canAdmin) {
 /**
  * Draws or repaints the tab from `ctx.view()` = `{ subjects, error,
  * errorKind, instanceLabel, canAdmin, notice }`. `ctx.go(action)`:
- * `{ kind: 'open' | 'delete', subject }`, `{ kind: 'add' }`, `{ kind:
+ * `{ kind: 'open' | 'delete', subject }`, `{ kind: 'delete-blocked', subject,
+ * reason }`, `{ kind: 'add' }`, `{ kind:
  * 'retry' }`. The filter and the search survive a repaint (they live on the body).
  */
 export function drawSchemas(body, ctx) {

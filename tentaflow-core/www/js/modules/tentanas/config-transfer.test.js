@@ -67,7 +67,7 @@ test('the export side previews the node JSON and "Pobierz plik" downloads it und
     click(download);
     await flush();
     assert.equal(seen.urls.length, 1);
-    assert.equal(seen.urls[0].blob.type, 'application/json');
+    assert.equal(seen.urls[0].blob.type, 'application/json;charset=utf-8');
     assert.equal(await seen.urls[0].blob.text(), CONFIG_JSON);
     assert.equal(seen.clicks.length, 1);
     assert.equal(seen.clicks[0].download, 'tentanas-orion-2026-09-02.json');

@@ -23,6 +23,7 @@ import { T, fmtCount, fmtDate } from '/js/modules/tentabus/format.js';
 import { loadErrorHtml } from '/js/modules/tentabus/overview.js';
 import { schemaFormatLabel, schemaState, compatLabel, deleteBlocker, listText } from '/js/modules/tentabus/schemas.js';
 import { effectiveVersion } from '/js/modules/tentabus/schema-windows.js';
+import { downloadText } from '/js/lib/download.js';
 import { valueRow } from '/js/modules/tentabus/topic-settings.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
@@ -34,9 +35,9 @@ import '/js/components/tf-spinner.js';
 
 const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}"/></svg>`;
 
-const EDITOR_LANGUAGE = { json_schema: 'json', avro: 'json', hl7v2_profile: 'json', xsd: 'html' };
-const FILE_EXTENSION = { json_schema: 'json', avro: 'avsc', protobuf: 'proto', thrift: 'thrift', xsd: 'xsd', hl7v2_profile: 'json' };
-const FILE_MIME = { json_schema: 'application/schema+json', avro: 'application/json', xsd: 'application/xml', hl7v2_profile: 'application/json' };
+const EDITOR_LANGUAGE = { json_schema: 'json', avro: 'json' };
+const FILE_EXTENSION = { json_schema: 'json', avro: 'avsc', protobuf: 'proto', thrift: 'thrift' };
+const FILE_MIME = { json_schema: 'application/schema+json', avro: 'application/json' };
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -112,19 +113,6 @@ export function withdrawnText(info, effective) {
 /** Why a new version cannot be added, or `null` when it can. */
 export function newVersionBlocker(info) {
   return info.deprecatedAtMs != null ? T('schemas.detail.no_new_version') : null;
-}
-
-/** Saves `text` as a file through a Blob and a download link. */
-export function saveText(name, text, mime = 'text/plain') {
-  const url = URL.createObjectURL(new Blob([text], { type: `${mime};charset=utf-8` }));
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = name;
-  link.hidden = true;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 /** Copies `text` to the clipboard; resolves `false` when the browser refuses. */
@@ -258,6 +246,7 @@ function versionActions(ctx) {
       b.setAttribute('icon', 'eye');
       b.setAttribute('aria-label', label);
       b.title = label;
+      b.textContent = T('schemas.detail.show');
       b.dataset.act = 'show-version';
       b.addEventListener('click', (e) => { e.stopPropagation(); ctx.go({ kind: 'show-version', version: live()._version }); });
       wrap.appendChild(b);
@@ -321,7 +310,8 @@ function paintPage(body, view) {
   patchHtml(body.querySelector('[data-role="notice"]'), notice
     ? `<tf-alert tone="${escapeAttr(notice.tone || 'success')}" title="${escapeAttr(notice.title)}" message="${escapeAttr(notice.text || '')}"></tf-alert>`
     : '');
-  patchHtml(body.querySelector('[data-role="warning"]'), subjectDeprecated
+  // The note of the withdrawal itself already says all the warning would.
+  patchHtml(body.querySelector('[data-role="warning"]'), subjectDeprecated && !notice?.withdrawn
     ? `<tf-alert tone="warning" title="${escapeAttr(T('schemas.detail.withdrawn_title'))}" message="${escapeAttr(withdrawnText(info, effective))}"></tf-alert>`
     : '');
 
@@ -380,7 +370,7 @@ export async function shareShownText(kind, view) {
   const { info, shown } = view;
   if (shown?.text == null) return;
   if (kind === 'download') {
-    saveText(downloadName(info.subject, shown.version, info.schemaType), shown.text, FILE_MIME[info.schemaType]);
+    downloadText(downloadName(info.subject, shown.version, info.schemaType), shown.text, FILE_MIME[info.schemaType]);
     return;
   }
   const done = await copyText(shown.text);

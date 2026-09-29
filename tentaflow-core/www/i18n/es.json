@@ -9842,7 +9842,7 @@
       "admin_only": "Los patrones los añade, cambia, retira y elimina el administrador de la instancia.",
       "action_open": "Abrir patrón",
       "action_delete": "Eliminar patrón",
-      "delete_blocked": "No se puede eliminar: lo {n|usa el topic|usan los topics} {topics}. Primero elige allí otro patrón o retira este.",
+      "delete_blocked": "No se puede eliminar: lo {n|usa el topic|usan los topics} {topics}. Podrás eliminarlo cuando elijas otro patrón en la configuración de {n|ese topic|esos topics}.",
       "added_title": "Patrón {name} añadido",
       "added_text": "{format}, versión 1. Lo eliges en la configuración de un {where}.",
       "kind_for": {
@@ -9905,7 +9905,8 @@
         "added_text_used": "{n|El topic|Los topics} {topics} {n|comprueba|comprueban} los mensajes con ella.",
         "added_text_unused": "Ningún topic usa todavía este patrón.",
         "same_title": "No se añadió ninguna versión nueva",
-        "same_text": "La versión {version} ya tiene el mismo texto. No cambió nada."
+        "same_text": "La versión {version} ya tiene el mismo texto. No cambió nada.",
+        "load_failed": "No se pudo cargar el texto de la versión {version}."
       },
       "incompat": {
         "lead": "Este patrón tiene la compatibilidad «{compat}», y {reason}.",
@@ -9923,7 +9924,8 @@
         "fix_required_new": "Quita «{field}» de los campos obligatorios o cambia la compatibilidad del patrón.",
         "fix_required_old": "Deja «{field}» entre los campos obligatorios o cambia la compatibilidad del patrón.",
         "fix_generic": "Corrige el texto o cambia la compatibilidad del patrón.",
-        "technical": "Detalles técnicos"
+        "technical": "Detalles técnicos",
+        "widened": "la nueva versión amplía el tipo de valor del campo «{field}», y los programas antiguos solo aceptan el más restringido"
       },
       "compat_window": {
         "title": "Cambiar compatibilidad — {name}",
@@ -9959,12 +9961,12 @@
       "delete": {
         "title": "Eliminar el patrón {name}",
         "irreversible": "No se puede deshacer.",
-        "everything": "El patrón {name} ({format}) y sus {count} {n|versión|versiones} desaparecerán.",
+        "everything": "El patrón {name} ({format}) y todas sus versiones desaparecerán.",
         "unused": "Ningún topic usa este patrón.",
         "audit": "La eliminación se anota en el registro de auditoría.",
         "retype": "Escribe de nuevo el nombre del patrón para confirmar:",
         "button": "Eliminar patrón",
-        "refused_used": "No se eliminó: lo {n|usa el topic|usan los topics} {topics}. Primero elige allí otro patrón.",
+        "refused_used": "No se eliminó: lo {n|usa el topic|usan los topics} {topics}. Primero elige otro patrón en la configuración de {n|ese topic|esos topics}.",
         "done_title": "Patrón {name} eliminado"
       },
       "detail": {
@@ -10006,8 +10008,12 @@
         "compat_locked": "El patrón está retirado: no se añaden versiones nuevas, así que la compatibilidad no se cambia.",
         "missing_title": "El patrón {name} ya no existe",
         "missing_text": "Puede que se haya eliminado. Vuelve a la lista de patrones.",
-        "error_title": "No se pudo cargar el patrón"
-      }
+        "error_title": "No se pudo cargar el patrón",
+        "show": "Mostrar"
+      },
+      "added_existing_title": "El patrón {name} ya existía",
+      "added_existing_version": "Alguien lo añadió mientras tanto, así que el texto entró como versión {version}.",
+      "added_existing_same": "Alguien lo añadió mientras tanto con el mismo texto (versión {version}): no cambió nada."
     },
     "topics": {
       "title": "Tópicos",
@@ -10371,7 +10377,8 @@
         "saved_title": "Descripción guardada.",
         "saved_text": "Bajo el nombre del topic se muestra ahora: {text}",
         "saved_text_none": "El topic ya no tiene descripción."
-      }
+      },
+      "discard_confirm": "Los cambios no están guardados. Cierra la ventana otra vez para descartarlos o vuelve a editar."
     },
     "partitions": {
       "explain": "Una partición es una cola separada dentro del topic: con varias particiones los consumidores leen en paralelo. Una copia es el mismo registro en otro nodo. El nodo principal recibe las escrituras y los demás guardan copias. Cada mensaje de una partición tiene el número siguiente.",
