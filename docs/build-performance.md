@@ -198,6 +198,27 @@ oraz wszystkie jego niesystemowe zależności ELF. Zapobiega to deklarowaniu
 architektur dodanych wyłącznie przez zależności AAR, bez biblioteki aplikacji.
 Test decyzji o ponownym użyciu cache: `python3 scripts/ci-local/test-android-native-cache.py`.
 
+### Pamięć i diagnostyka Androida w CI
+
+Workflow `.github/workflows/android.yml` buduje `arm64-v8a`. W kroku kompilacji
+Rust ustawia `CARGO_BUILD_JOBS=1`, `CARGO_PROFILE_RELEASE_LTO=off` oraz
+`CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`, aby ograniczyć zapotrzebowanie na pamięć
+podczas optymalizacji LLVM. Runner otrzymuje dodatkowy plik swap o rozmiarze
+16 GiB. Te ustawienia dotyczą procesu CI; profile w głównym `Cargo.toml`
+pozostają źródłem domyślnych ustawień lokalnej kompilacji.
+
+Podczas budowania co 30 sekund zapisywane są użycie RAM i swapu, wolne miejsce
+na dysku oraz PID, nazwa i RSS sześciu procesów zajmujących najwięcej pamięci.
+Artefakt `android-build-diagnostics` przechowuje `build-rust.log` oraz
+`build-resources.log` przez siedem dni; krok wysyłania działa również po błędzie
+kompilacji. Logi pozwalają ustalić przyczynę przerwania, ale nie zastępują
+potwierdzenia sukcesu kompilacji, Gradle i kontroli JNI gotowego APK.
+
+Nazwa pakietu ma postać `tentaflow-v<wersja>-android-arm64-v8a-debug.apk`.
+Wersję odczytuje `python3 scripts/workspace-version.py --package` z workspace,
+więc nazwa pozostaje poprawna także przy uruchomieniu workflow na gałęzi.
+Obok APK powstaje plik `.sha256`.
+
 ## Wyniki pomiarów z 7 września 2026
 
 Pomiary wykonano na Ryzen 9 7950X (16 rdzeni, 32 wątki), z 61,9 GiB RAM

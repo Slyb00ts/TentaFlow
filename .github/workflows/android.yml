@@ -81,9 +81,23 @@ jobs:
       - name: cargo-ndk
         run: cargo install cargo-ndk --locked
 
+      - name: Increase build swap capacity
+        run: |
+          set -euo pipefail
+          swap_file="$(sudo mktemp /var/tmp/tentaflow-build-swap.XXXXXX)"
+          sudo fallocate -l 16G "$swap_file"
+          sudo chmod 600 "$swap_file"
+          sudo mkswap "$swap_file"
+          sudo swapon "$swap_file"
+          free -m
+
       - name: Rust core + native libraries
         env:
           ANDROID_ABIS: arm64-v8a
+          # Runner 16 GB wymaga ograniczenia równoległości i pamięci optymalizacji LLVM.
+          CARGO_BUILD_JOBS: "1"
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
         run: |
           # The hosted image ships the NDK under $ANDROID_HOME/ndk/<version>,
           # which find_android_ndk already looks through — no third-party action
@@ -94,6 +108,7 @@ jobs:
                 free -m | awk -v t="$(date +%T)" '/Mem:/{printf "[mem] %s used=%sM avail=%sM\n", t, $3, $7}
                                                   /Swap:/{printf "[swap] used=%sM\n", $3}'
                 df -h /
+                ps -eo pid,comm,rss --sort=-rss | sed -n '1,7p'
               } | tee -a build-resources.log
               sleep 30
             done ) &
@@ -143,9 +158,10 @@ jobs:
       - name: Name the APK like a release asset
         run: |
           # The release publishes every tentaflow-* artifact as it is, so the
-          # file carries the tag, the ABI and the fact that it is debug-signed.
+          # file carries the version, the ABI and the fact that it is debug-signed.
           mkdir -p dist
-          apk="dist/tentaflow-${GITHUB_REF_NAME}-android-arm64-v8a-debug.apk"
+          VERSION="$(python3 scripts/workspace-version.py --package)"
+          apk="dist/tentaflow-v${VERSION}-android-arm64-v8a-debug.apk"
           cp tentaflow-mobile/android/app/build/outputs/apk/debug/app-debug.apk "$apk"
           (cd dist && sha256sum "$(basename "$apk")" > "$(basename "$apk").sha256")
 
