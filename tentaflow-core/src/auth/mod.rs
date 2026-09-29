@@ -4,6 +4,7 @@
 // =============================================================================
 
 pub mod acl;
+pub mod actor;
 pub mod rate_limit;
 pub mod sso;
 

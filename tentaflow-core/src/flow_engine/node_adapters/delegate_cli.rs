@@ -2710,7 +2710,7 @@ mod tests {
             ctx.user_id = Some(USER.to_string());
             ctx.org_id = Some(ORG.to_string());
             ctx.origin = crate::flow_engine::dispatcher::FlowOrigin::CodeStudio;
-            ctx.actor_kind = crate::flow_engine::dispatcher::ActorKind::User;
+            ctx.actor_kind = crate::auth::actor::ActorKind::User;
             ctx.actor_user_id = Some(USER.to_string());
 
             // Both of these outlive the call: a parked run's future is held

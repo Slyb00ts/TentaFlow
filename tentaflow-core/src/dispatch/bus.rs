@@ -74,6 +74,7 @@ use tentaflow_protocol::{
 };
 
 use super::HandlerContext;
+use crate::auth::actor::ActorKind;
 use crate::bus::{
     self, dlq, field_policies, instance::BusInstanceId, quota, schema_registry, topics,
     BusCallContext, BusServiceError, PartitionReplicaInfo, ReplError, ReplicaLagInfo,
@@ -209,6 +210,7 @@ fn bus_ctx(ctx: &HandlerContext, g: &Gate) -> BusCallContext {
         instance_id: g.instance.clone(),
         org_id: g.org_id.clone(),
         actor: Some(g.user_id.clone()),
+        actor_kind: ActorKind::User,
         correlation_id: Some(ctx.correlation_id.to_string()),
         origin: "ui".to_string(),
     }
@@ -2850,10 +2852,24 @@ async fn acl_set_v1(
             "bus.invalid_argument: subject_type must be 'user', 'group', 'api_key' or 'addon'",
         ));
     }
-    if subject_id.is_empty() {
-        return Err(ProtocolError::bad_request(
-            "bus.invalid_argument: subject_id must not be empty",
-        ));
+    require_valid_subject_id(&subject_id)?;
+    // A `'user'` row naming an addon admits nothing and only denies through
+    // the fail-closed fallback — never what an administrator granting access
+    // meant. Clearing one stays possible: that is how a pre-177 stand-in row
+    // is removed.
+    if access_level != "clear" && subject_type == "user" {
+        let db = ctx.state.db.clone();
+        let id = subject_id.clone();
+        let names_addon = run_blocking(move || {
+            repository::names_an_addon_not_a_user(&db, &id)
+                .map_err(|e| db_err("names_an_addon_not_a_user", e))
+        })
+        .await?;
+        if names_addon {
+            return Err(ProtocolError::bad_request(format!(
+                "bus.subject_is_addon: '{subject_id}' is an addon, not a user — use subject_type 'addon'"
+            )));
+        }
     }
     let db = ctx.state.db.clone();
     let instance = g.instance.as_str().to_string();
@@ -2990,6 +3006,7 @@ async fn field_policy_set_v1(
     required_fields: Vec<String>,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
+    require_valid_subject_id(&subject_id)?;
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
         ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
     })?;
@@ -3040,6 +3057,7 @@ async fn field_policy_delete_v1(
     direction: String,
 ) -> Result<BusPayload, ProtocolError> {
     let g = gate_admin(ctx, instance_id)?;
+    require_valid_subject_id(&subject_id)?;
     let dir = field_policies::Direction::parse(&direction).ok_or_else(|| {
         ProtocolError::bad_request("bus.invalid_argument: direction must be 'write' or 'read'")
     })?;
@@ -3214,8 +3232,107 @@ async fn field_policy_preview_v1(
     subject_type: String,
     subject_id: String,
 ) -> Result<BusPayload, ProtocolError> {
-    let g = gate_admin(ctx, instance_id)?;
+    let result = match gate_admin(ctx, instance_id) {
+        Ok(g) => {
+            field_policy_preview(
+                ctx,
+                g,
+                topic.clone(),
+                partition,
+                offset,
+                subject_type.clone(),
+                subject_id.clone(),
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    // Every outcome is audited, a refusal too: probing which subjects exist
+    // or which records a topic holds leaves a trail. Only validated values
+    // enter the row, each quoted, so no request can forge another field.
+    let outcome = match &result {
+        Ok(_) => "ok".to_string(),
+        Err(e) => format!("refused:{}", audit_error_code(e)),
+    };
+    let shown = |value: &str, valid: bool| {
+        if valid {
+            value.to_string()
+        } else {
+            "<invalid>".to_string()
+        }
+    };
+    let _ = repository::log_audit(
+        &ctx.state.db,
+        ctx.org_context.as_ref().map(|o| o.user_id.as_str()),
+        None,
+        "bus.field_policy.preview",
+        Some(&topic),
+        Some(&format!(
+            "outcome={outcome} subject_type={:?} subject_id={:?} partition={partition} offset={offset}",
+            shown(&subject_type, matches!(subject_type.as_str(), "user" | "group" | "addon" | "any")),
+            shown(&subject_id, valid_subject_id(&subject_id)),
+        )),
+        None,
+        Some(&ctx.state.local_node_id),
+    );
+    result
+}
+
+/// The stable code a refusal carries as the first token of its message
+/// (`bus.permission_denied`, …), else the coarse protocol code.
+fn audit_error_code(e: &ProtocolError) -> String {
+    let head = e.message.split(':').next().unwrap_or_default();
+    if !head.is_empty()
+        && head
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '.' || c == '_')
+    {
+        head.to_string()
+    } else {
+        format!("{:?}", e.code)
+    }
+}
+
+/// Longest accepted subject id, in characters.
+const SUBJECT_ID_MAX_CHARS: usize = 128;
+
+/// A subject id names a user/group (UUID), an addon (slug), an API key (uid)
+/// or the wildcard `*`: ASCII letters, digits and `-_.:@*`, at most
+/// `SUBJECT_ID_MAX_CHARS`. Anything else — spaces, `=`, quotes, control
+/// characters — could only be an attempt to shape an audit row or a label.
+fn valid_subject_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().count() <= SUBJECT_ID_MAX_CHARS
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '@' | '*'))
+}
+
+fn require_valid_subject_id(id: &str) -> Result<(), ProtocolError> {
+    if valid_subject_id(id) {
+        Ok(())
+    } else {
+        Err(ProtocolError::bad_request(format!(
+            "bus.invalid_argument: subject_id must be 1-{SUBJECT_ID_MAX_CHARS} characters of \
+             letters, digits and -_.:@*"
+        )))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// The preview behind the admin gate `field_policy_preview_v1` already
+/// passed (and audits, whatever the outcome).
+async fn field_policy_preview(
+    ctx: &HandlerContext,
+    g: Gate,
+    topic: String,
+    partition: u32,
+    offset: u64,
+    subject_type: String,
+    subject_id: String,
+) -> Result<BusPayload, ProtocolError> {
     topics::validate_user_topic_name(&topic).map_err(map_bus_error)?;
+    require_valid_subject_id(&subject_id)?;
     if field_policies::PolicySubject::parse(&subject_type, &subject_id).is_none() {
         return Err(ProtocolError::bad_request(format!(
             "bus.invalid_argument: subject_type must be 'user', 'group', 'addon' or 'any' \
@@ -3241,7 +3358,7 @@ async fn field_policy_preview_v1(
         }
         let subject = field_policies::PolicySubject::parse(&subject_type2, &subject_id2)
             .expect("validated before the blocking task");
-        if let field_policies::PolicySubject::User(user_id) = subject {
+        if let field_policies::PolicySubject::Actor(ActorKind::User, user_id) = subject {
             let member = repository::is_active_org_member(&db, &org_id, user_id)
                 .map_err(|e| db_err("is_active_org_member", e))?;
             if !member {
@@ -3274,7 +3391,7 @@ async fn field_policy_preview_v1(
             &instance,
             &org_id,
             &topic,
-            field_policies::PolicySubject::User(&caller),
+            field_policies::PolicySubject::Actor(ActorKind::User, &caller),
             read,
         )
         .map_err(map_bus_error)?;
@@ -3307,18 +3424,6 @@ async fn field_policy_preview_v1(
         Ok((record_to_preview(&rec), applied, limited_by_caller))
     })
     .await?;
-    let _ = repository::log_audit(
-        &ctx.state.db,
-        Some(&g.user_id),
-        None,
-        "bus.field_policy.preview",
-        Some(&topic),
-        Some(&format!(
-            "subject_type={subject_type} subject_id={subject_id} partition={partition} offset={offset}"
-        )),
-        None,
-        Some(&ctx.state.local_node_id),
-    );
     Ok(BusPayload::FieldPolicyPreviewResponse {
         record,
         applied,
@@ -9938,6 +10043,55 @@ mod tests {
             "{}",
             err.message
         );
+
+        // A `'user'` row naming an installed addon would never admit it —
+        // refused with the kind to use; clearing one stays possible.
+        let addon_id = format!("asystent-{}", uuid::Uuid::new_v4().simple());
+        seed_bus_addon(&db, &addon_id, "Asystent");
+        let err = acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            addon_id.clone(),
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect_err("a user row naming an addon");
+        assert!(
+            err.message.starts_with("bus.subject_is_addon"),
+            "{}",
+            err.message
+        );
+        assert!(err.message.contains("'addon'"), "{}", err.message);
+        acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            addon_id,
+            "clear".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect("clearing a stand-in row stays possible");
+        let err = acl_set_v1(
+            &ctx,
+            inst.as_str(),
+            topic.clone(),
+            "user".to_string(),
+            "x action=admin".to_string(),
+            "deny".to_string(),
+            "read".to_string(),
+        )
+        .await
+        .expect_err("an id shaped to forge an audit field");
+        assert!(
+            err.message.starts_with("bus.invalid_argument"),
+            "{}",
+            err.message
+        );
         match acl_list_v1(&ctx, inst.as_str(), topic).await.unwrap() {
             BusPayload::AclListResponse { entries } => {
                 assert_eq!(entries.len(), 1);
@@ -10198,6 +10352,14 @@ mod tests {
             "{}",
             err.message
         );
+        let err = preview(&f, "user", "x partition=9 offset=9")
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.starts_with("bus.invalid_argument"),
+            "{}",
+            err.message
+        );
         let err = field_policy_preview_v1(
             &f.ctx,
             inst.as_str(),
@@ -10243,5 +10405,43 @@ mod tests {
             "{}",
             err.message
         );
+
+        // Every refusal above left a row, and none carries the forged text.
+        let rows = repository::list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("bus.field_policy.preview".to_string()),
+                ..Default::default()
+            },
+            0,
+            500,
+        )
+        .expect("audit");
+        let details: Vec<String> = rows
+            .iter()
+            .filter(|r| r.resource.as_deref() == Some(f.topic.as_str()))
+            .filter_map(|r| r.details.clone())
+            .collect();
+        let refused = |code: &str| {
+            details
+                .iter()
+                .filter(|d| d.starts_with(&format!("outcome=refused:{code} ")))
+                .count()
+        };
+        assert_eq!(refused("bus.subject_not_found"), 1);
+        assert_eq!(refused("bus.invalid_argument"), 2);
+        assert_eq!(refused("bus.record_not_found"), 1);
+        assert_eq!(refused("bus.permission_denied"), 1);
+        assert_eq!(
+            details
+                .iter()
+                .filter(|d| d.starts_with("outcome=refused:"))
+                .count(),
+            6
+        );
+        assert!(details
+            .iter()
+            .any(|d| d.contains("subject_id=\"<invalid>\" partition=0 offset=0")));
+        assert!(details.iter().all(|d| !d.contains("partition=9")));
     }
 }

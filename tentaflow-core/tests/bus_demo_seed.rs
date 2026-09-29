@@ -231,6 +231,7 @@ fn call_ctx(instance_id: &BusInstanceId) -> BusCallContext {
         instance_id: instance_id.clone(),
         org_id: DEFAULT_ORG_ID.to_string(),
         actor: Some(ACTOR.to_string()),
+        actor_kind: tentaflow_core::auth::actor::ActorKind::User,
         correlation_id: Some("bus-demo-seed".to_string()),
         origin: ORIGIN.to_string(),
     }

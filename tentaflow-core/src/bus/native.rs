@@ -1395,6 +1395,7 @@ mod tests {
             instance_id: id.clone(),
             org_id: crate::services::org::DEFAULT_ORG_ID.to_string(),
             actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+            actor_kind: crate::auth::actor::ActorKind::System,
             correlation_id: None,
             origin: "test".to_string(),
         };

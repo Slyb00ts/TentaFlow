@@ -686,10 +686,7 @@ mod provenance_tests {
         .await
         .expect("seed envelope");
         assert_eq!(meta.origin, FlowOrigin::Api);
-        assert_eq!(
-            meta.actor_kind,
-            crate::flow_engine::dispatcher::ActorKind::ApiKey
-        );
+        assert_eq!(meta.actor_kind, crate::auth::actor::ActorKind::ApiKey);
         assert_eq!(meta.actor_id.as_deref(), Some("key-42"));
         assert_eq!(meta.actor_user_id.as_deref(), Some("user-7"));
     }

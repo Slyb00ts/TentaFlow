@@ -1961,6 +1961,7 @@ fn harness_ctx(svc: &tentaflow_core::bus::BusService, org: &str) -> BusCallConte
             .expect("BusService::instance_id() is always a valid BusInstanceId"),
         org_id: org.to_string(),
         actor: Some("chaos-harness".to_string()),
+        actor_kind: tentaflow_core::auth::actor::ActorKind::User,
         correlation_id: None,
         origin: "process_three_node_bus_failover".to_string(),
     }
@@ -2211,6 +2212,7 @@ async fn handle_child_command(
                     .expect("BusService::instance_id() is always a valid BusInstanceId"),
                 org_id: org.to_string(),
                 actor: Some("chaos-harness".to_string()),
+                actor_kind: tentaflow_core::auth::actor::ActorKind::User,
                 correlation_id: None,
                 origin: "process_three_node_bus_failover".to_string(),
             };
@@ -2254,6 +2256,7 @@ async fn handle_child_command(
                     .expect("BusService::instance_id() is always a valid BusInstanceId"),
                 org_id: org.to_string(),
                 actor: Some("chaos-harness".to_string()),
+                actor_kind: tentaflow_core::auth::actor::ActorKind::User,
                 correlation_id: None,
                 origin: "process_three_node_bus_failover".to_string(),
             };

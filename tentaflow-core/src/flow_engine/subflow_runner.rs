@@ -344,8 +344,9 @@ fn wrap_outcome_as_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::actor::ActorKind;
     use crate::flow_engine::dispatcher::{
-        build_registry_for_test, ActorKind, FlowActor, FlowOrigin, FlowRequestMeta,
+        build_registry_for_test, FlowActor, FlowOrigin, FlowRequestMeta,
     };
     use std::path::Path;
 

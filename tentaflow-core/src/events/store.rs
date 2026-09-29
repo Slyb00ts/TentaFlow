@@ -39,9 +39,10 @@ use anyhow::{anyhow, Result};
 use rusqlite::{OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 
+use crate::auth::actor::ActorKind;
 use crate::code_studio::redact;
 use crate::db::{repository, DbPool};
-use crate::flow_engine::dispatcher::{ActorKind, FlowActor, FlowOrigin, FlowRequestMeta};
+use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
 
 /// Largest page ANY reader of `run_events` will return, whatever the caller
 /// asks for — `read_run` and the browse query share it, so no entry point can

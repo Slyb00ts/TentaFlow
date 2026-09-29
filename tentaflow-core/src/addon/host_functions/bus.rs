@@ -273,6 +273,7 @@ fn call_context(state: &AddonState, svc: &bus::BusService) -> BusCallContext {
             .clone()
             .unwrap_or_else(|| DEFAULT_ORG_ID.to_string()),
         actor: Some(state.addon_id.clone()),
+        actor_kind: crate::auth::actor::ActorKind::Addon,
         correlation_id: None,
         origin: bus::ADDON_ORIGIN.to_string(),
     }
@@ -1168,6 +1169,7 @@ mod tests {
                 .expect("valid instance id"),
             org_id: DEFAULT_ORG_ID.to_string(),
             actor: Some("test-actor".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         };
@@ -1443,6 +1445,7 @@ mod tests {
             instance_id: id_b.clone(),
             org_id: DEFAULT_ORG_ID.to_string(),
             actor: Some("test-actor".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         };
@@ -1451,6 +1454,7 @@ mod tests {
             instance_id: id_a.clone(),
             org_id: DEFAULT_ORG_ID.to_string(),
             actor: Some("test-actor".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         };

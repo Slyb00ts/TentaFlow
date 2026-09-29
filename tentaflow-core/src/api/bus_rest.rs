@@ -646,6 +646,7 @@ pub async fn handle_publish(
         instance_id,
         org_id,
         actor: Some(user_id),
+        actor_kind: crate::auth::actor::ActorKind::User,
         correlation_id: None,
         origin: "v1.bus.rest".to_string(),
     };
@@ -778,6 +779,7 @@ pub async fn handle_consume(
         instance_id,
         org_id,
         actor: Some(user_id),
+        actor_kind: crate::auth::actor::ActorKind::User,
         correlation_id: None,
         origin: "v1.bus.rest".to_string(),
     };
@@ -1155,6 +1157,7 @@ mod tests {
             instance_id: id_a.clone(),
             org_id: "org-1".to_string(),
             actor: Some("tester".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         };
@@ -1162,6 +1165,7 @@ mod tests {
             instance_id: id_b.clone(),
             org_id: "org-1".to_string(),
             actor: Some("tester".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         };

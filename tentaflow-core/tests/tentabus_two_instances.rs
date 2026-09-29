@@ -122,6 +122,7 @@ fn bus_ctx(instance: &BusInstanceId) -> BusCallContext {
         instance_id: instance.clone(),
         org_id: ORG.to_string(),
         actor: Some(ACTOR.to_string()),
+        actor_kind: tentaflow_core::auth::actor::ActorKind::User,
         correlation_id: Some("w10".to_string()),
         origin: "test".to_string(),
     }

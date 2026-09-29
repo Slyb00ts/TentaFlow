@@ -30,6 +30,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 
+use crate::auth::actor::ActorKind;
 use crate::bus::instance::BusInstanceId;
 use crate::bus::{self, BusCallContext, PublishBatch, PublishRecord};
 use crate::flow_engine::envelope::{FlowEnvelope, NodeInput};
@@ -59,6 +60,7 @@ impl Default for BusPublishNodeAdapter {
 /// executing flow's actor/origin/correlation carry straight through, the same
 /// way `bus::mod`'s own doc says `BusCallContext` mirrors `ExecutionContext`).
 fn call_context(ctx: &ExecutionContext, svc: &bus::BusService) -> BusCallContext {
+    let (actor, actor_kind) = call_actor(ctx);
     BusCallContext {
         instance_id: bus::instance::BusInstanceId::parse(svc.instance_id())
             .expect("BusService::instance_id() is always a valid BusInstanceId"),
@@ -66,9 +68,22 @@ fn call_context(ctx: &ExecutionContext, svc: &bus::BusService) -> BusCallContext
             .org_id
             .clone()
             .unwrap_or_else(|| DEFAULT_ORG_ID.to_string()),
-        actor: ctx.actor_id.clone().or_else(|| ctx.actor_user_id.clone()),
+        actor,
+        actor_kind,
         correlation_id: ctx.correlation_id.clone(),
         origin: ctx.origin.as_str().to_string(),
+    }
+}
+
+/// The run's own actor, with its own kind. A run without an actor id acts for
+/// the user it resolves to, so that user's rules apply — never the kind the
+/// run's origin (e.g. an addon that started it) would suggest: the topic ACL
+/// and the data-hiding rules match the actor only against rows of its kind.
+fn call_actor(ctx: &ExecutionContext) -> (Option<String>, ActorKind) {
+    match (&ctx.actor_id, &ctx.actor_user_id) {
+        (Some(id), _) => (Some(id.clone()), ctx.actor_kind),
+        (None, Some(user_id)) => (Some(user_id.clone()), ActorKind::User),
+        (None, None) => (None, ctx.actor_kind),
     }
 }
 
@@ -300,6 +315,39 @@ mod tests {
             label: None,
             region: None,
         }
+    }
+
+    /// A run that an addon started for a user publishes as that user — its
+    /// actor kind, not its origin, decides which access rows apply, so the
+    /// user's deny rows cannot be sidestepped by the origin label.
+    #[test]
+    fn a_flow_publishes_with_its_actors_kind_not_its_origin() {
+        use crate::flow_engine::dispatcher::FlowOrigin;
+        let mut ctx = crate::flow_engine::node_adapter::test_support::stub_ctx();
+        ctx.origin = FlowOrigin::Addon;
+        ctx.actor_kind = ActorKind::User;
+        ctx.actor_id = Some("u-anna".to_string());
+        ctx.actor_user_id = Some("u-anna".to_string());
+        assert_eq!(
+            call_actor(&ctx),
+            (Some("u-anna".to_string()), ActorKind::User)
+        );
+
+        ctx.actor_kind = ActorKind::Addon;
+        ctx.actor_id = Some("asystent".to_string());
+        ctx.actor_user_id = None;
+        assert_eq!(
+            call_actor(&ctx),
+            (Some("asystent".to_string()), ActorKind::Addon)
+        );
+
+        ctx.actor_kind = ActorKind::ApiKey;
+        ctx.actor_id = None;
+        ctx.actor_user_id = Some("u-bound".to_string());
+        assert_eq!(
+            call_actor(&ctx),
+            (Some("u-bound".to_string()), ActorKind::User)
+        );
     }
 
     /// plan-app-platform §3.3: `instance_id` is REQUIRED, read exactly like

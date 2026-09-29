@@ -4870,7 +4870,8 @@ fn resolve_embedded_tts_repo(engine_id: &str, model_name: &str) -> String {
 #[cfg(test)]
 mod provenance_tests {
     use super::*;
-    use crate::flow_engine::dispatcher::{ActorKind, FlowActor, FlowOrigin};
+    use crate::auth::actor::ActorKind;
+    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
 
     /// §2.5 — the shared `/v1` + addon envelope builders must NOT guess where a
     /// request came from; they stamp exactly what the entry point handed them.

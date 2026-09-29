@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::dispatcher::{ActorKind, CallProvenance, FlowActor, FlowOrigin};
+use super::dispatcher::{CallProvenance, FlowActor, FlowOrigin};
 use super::dispatchers::{
     AuditSink, Clock, ConversationHistoryStore, DocumentsDispatcher, EmbeddingsDispatcher,
     LlmDispatcher, MemoryStore, MetricsSink, PiiRulesStore, ProgressSink, PromptStore,
@@ -23,6 +23,7 @@ use super::dispatchers::{
 };
 use super::envelope::{FlowEnvelope, NodeInput, TokenUsage};
 use super::types::{FlowDataType, FlowNode};
+use crate::auth::actor::ActorKind;
 use crate::flow_engine::blob_store::BlobStore;
 
 /// Akumulator usage per-node — adaptery LLM/Embeddings pushują tu wynik,

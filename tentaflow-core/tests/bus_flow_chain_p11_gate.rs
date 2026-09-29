@@ -119,6 +119,7 @@ fn call_ctx() -> BusCallContext {
         instance_id: instance_id(),
         org_id: ORG_ID.to_string(),
         actor: Some("p11-gate".to_string()),
+        actor_kind: tentaflow_core::auth::actor::ActorKind::User,
         correlation_id: Some("bus-flow-chain-p11-gate".to_string()),
         origin: "p11-gate-test".to_string(),
     }

@@ -4763,7 +4763,7 @@ mod tests {
     /// arguments would prove nothing about the entry point.
     #[test]
     fn camera_entry_point_stamps_camera_origin_and_names_the_camera() {
-        use crate::flow_engine::dispatcher::ActorKind;
+        use crate::auth::actor::ActorKind;
 
         let meta = camera_flow_request_meta("front-door");
         assert_eq!(meta.origin, FlowOrigin::Camera);

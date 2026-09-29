@@ -12938,6 +12938,18 @@ pub fn list_bus_addon_candidates(pool: &DbPool) -> Result<Vec<(String, String)>>
         .collect())
 }
 
+/// Whether `id` names an installed, non-native addon and no user account —
+/// a topic rule written for it as a `'user'` would never admit anything.
+pub fn names_an_addon_not_a_user(pool: &DbPool, id: &str) -> Result<bool> {
+    let conn = acquire(pool)?;
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM addons WHERE addon_id = ?1 AND runtime <> 'native') \
+            AND NOT EXISTS(SELECT 1 FROM user_accounts WHERE id = ?1)",
+        rusqlite::params![id],
+        |row| row.get(0),
+    )?)
+}
+
 /// Batched `addon_id -> label` (`display_name`, else `name`); unknown ids
 /// are absent.
 pub fn lookup_addon_names(pool: &DbPool, ids: &[String]) -> Result<HashMap<String, String>> {
@@ -22699,7 +22711,7 @@ pub mod resource_permissions {
                     resource_type,
                     resource_id,
                     action,
-                    crate::bus::field_policies::ActorKind::User,
+                    crate::auth::actor::ActorKind::User,
                     user_id,
                     false,
                 )
@@ -22754,35 +22766,43 @@ pub mod resource_permissions {
     /// rows recorded as `'*'` (matches every action — what every pre-168 row
     /// means, per the migration's own mapping note).
     ///
-    /// `subject_kind` says what `subject_id` names (migration 177): a `User`
-    /// is matched against `subject_type = 'user'` rows and then through its
-    /// `group_members` rows; an `Addon` only against `subject_type = 'addon'`
-    /// rows — groups hold users, and a user row with an addon's id is not the
-    /// addon. No admin-role bypass: unlike `check_inner`'s Tier-1 shape, the
-    /// bus topic ACL sits BEHIND the addon permission matrix's own
-    /// `bus.admin` check, so folding a second, org-role-based bypass in here
-    /// would let an org admin who was never granted `bus.admin` on this
-    /// instance skip that layer entirely. The /v1 `User` branch of
-    /// `check_subject_default_deny` applies its own site-admin bypass before
-    /// calling this.
+    /// `subject_kind` says what `subject_id` names: its own level is the rows
+    /// of that `subject_type`, and only a `User` goes on to the rows of its
+    /// groups. An `Addon` (migration 177) is allowed only by an `'addon'` row
+    /// but denied ALSO by a `'user'` deny row carrying its id: before
+    /// migration 177 the only way to restrict an addon was such a stand-in
+    /// row, and it keeps denying wherever it exists — replayed from the sync
+    /// ledger, on a node that installs the addon later, or naming an id that
+    /// is both a user and an addon. Failing closed on those rows is what lets
+    /// the migration leave them untouched instead of rewriting them on each
+    /// node apart from the ledger. A `'user'` allow row never admits an
+    /// addon; with `default_allow` it would not change the answer anyway.
+    ///
+    /// No admin-role bypass: unlike `check_inner`'s Tier-1 shape, the bus
+    /// topic ACL sits BEHIND the addon permission matrix's own `bus.admin`
+    /// check, so folding a second, org-role-based bypass in here would let an
+    /// org admin who was never granted `bus.admin` on this instance skip that
+    /// layer entirely. The /v1 `User` branch of `check_subject_default_deny`
+    /// applies its own site-admin bypass before calling this.
     pub fn check_action(
         pool: &DbPool,
         resource_type: &str,
         resource_id: &str,
         action: &str,
-        subject_kind: crate::bus::field_policies::ActorKind,
+        subject_kind: crate::auth::actor::ActorKind,
         subject_id: &str,
         default_allow: bool,
     ) -> Result<bool> {
-        use crate::bus::field_policies::ActorKind;
+        use crate::auth::actor::ActorKind;
         let conn = pool
             .read()
             .map_err(|_| anyhow::anyhow!("resource_permissions: db lock poisoned"))?;
 
         let mut own_stmt = conn.prepare_cached(
             "SELECT access_level FROM resource_permissions
-             WHERE resource_type = ?1 AND resource_id = ?2
-               AND subject_type = ?3 AND subject_id = ?4
+             WHERE resource_type = ?1 AND resource_id = ?2 AND subject_id = ?4
+               AND (subject_type = ?3
+                    OR (?6 AND subject_type = 'user' AND access_level = 'deny'))
                AND (action = ?5 OR action = '*')",
         )?;
         let own_levels: Vec<String> = own_stmt
@@ -22790,9 +22810,10 @@ pub mod resource_permissions {
                 rusqlite::params![
                     resource_type,
                     resource_id,
-                    subject_kind.subject_type_str(),
+                    subject_kind.as_str(),
                     subject_id,
-                    action
+                    action,
+                    subject_kind == ActorKind::Addon,
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -22803,7 +22824,7 @@ pub mod resource_permissions {
         if own_levels.iter().any(|l| l == "allow") {
             return Ok(true);
         }
-        if subject_kind == ActorKind::Addon {
+        if subject_kind != ActorKind::User {
             return Ok(default_allow);
         }
 
@@ -28197,10 +28218,12 @@ mod api_key_access_v2_tests {
 
     /// `check_action` keeps the two subject kinds apart: the addon's own
     /// rows decide for the addon (no group step), the user's own and group
-    /// rows for the user, whatever the ids.
+    /// rows for the user, whatever the ids — except that a `'user'` DENY row
+    /// naming a shared id denies the addon too (fail closed), while a
+    /// `'user'` allow row never admits it past an addon deny.
     #[test]
     fn check_action_matches_rows_of_the_subjects_own_kind() {
-        use crate::bus::field_policies::ActorKind;
+        use crate::auth::actor::ActorKind;
         let db = fresh_db();
         seed_user(&db, "shared-id", "user");
         seed_group_member(&db, "g-readers", "shared-id");
@@ -28232,6 +28255,35 @@ mod api_key_access_v2_tests {
         assert!(check(ActorKind::User, "read"));
         assert!(!check(ActorKind::User, "write"));
         assert!(check(ActorKind::Addon, "write"));
+
+        resource_permissions::set_with_action(
+            &db,
+            "topic",
+            "t1",
+            "user",
+            "shared-id",
+            "admin",
+            "deny",
+        )
+        .unwrap();
+        assert!(
+            !check(ActorKind::Addon, "admin"),
+            "a user deny with the id denies the addon"
+        );
+        resource_permissions::set_with_action(
+            &db,
+            "topic",
+            "t1",
+            "user",
+            "shared-id",
+            "read",
+            "allow",
+        )
+        .unwrap();
+        assert!(
+            !check(ActorKind::Addon, "read"),
+            "a user allow never lifts an addon deny"
+        );
     }
 
     fn seed_user(db: &DbPool, id: &str, role: &str) {

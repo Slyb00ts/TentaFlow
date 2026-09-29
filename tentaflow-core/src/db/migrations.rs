@@ -9989,25 +9989,23 @@ CREATE TABLE IF NOT EXISTS bus_schema_subject_tombstones (
 /// (owner decision P6, SUM/tentabus/DECYZJE-2026-09-22.md). Until now the bus
 /// authorizer looked an addon's calls up as `subject_type = 'user'` with the
 /// addon id, so the only way to restrict an addon was a row pretending to be
-/// a user of that id — and a user who ever got that id would have inherited
-/// it. The authorizer now asks with the actor's kind, so the CHECK widens to
-/// accept `'addon'` (the table is rebuilt; SQLite cannot alter a CHECK).
+/// a user of that id. The authorizer now asks with the actor's kind, so the
+/// CHECK widens to accept `'addon'` (the table is rebuilt; SQLite cannot
+/// alter a CHECK). Every row is copied unchanged.
 ///
-/// Existing rows keep their meaning: a `topic` row stored as `'user'` whose
-/// id names an installed, non-native addon and no user account is exactly
-/// such a stand-in, and is converted to `'addon'` — without the conversion it
-/// would stop applying to the addon it was written for. Every other row is
-/// copied unchanged. No converted row can collide with an existing one: no
-/// `'addon'` row existed before this rung.
+/// The old stand-in rows are deliberately NOT rewritten to `'addon'`: a
+/// rewrite here would happen on each node apart from the sync ledger, which
+/// still carries the `'user'` operation and replays it — on a node joining
+/// later, rebuilt from the ledger, or installing the addon later — so an
+/// addon deny would silently turn into default allow there. Instead
+/// `resource_permissions::check_action` keeps applying a `'user'` DENY row
+/// to the addon with that id (fail closed), and only an `'addon'` row can
+/// allow one; that holds identically on every node and in every replay.
 ///
-/// SYNC: the conversion runs on every node against its own copy and is not
-/// replayed through the ledger. A node where the addon is not installed keeps
-/// the `'user'` row; it names no user there, and the addon (which does not
-/// run on that node) is never looked up against it, so the row is inert until
-/// an administrator clears it. A node that has not taken this rung rejects a
-/// replicated `'addon'` row at the CHECK — the inbox records the operation as
-/// a conflict and that node keeps evaluating addons as users — so the nodes of
-/// a mesh must be upgraded together for an addon rule to hold everywhere.
+/// SYNC: a node that has not taken this rung rejects a replicated `'addon'`
+/// row at the CHECK — the inbox records the operation as a conflict and that
+/// node keeps evaluating addons as users — so the nodes of a mesh must be
+/// upgraded together for an addon rule to hold everywhere.
 const TOPIC_ACL_ADDON_SUBJECTS: &str = "
 DROP INDEX IF EXISTS idx_resperm_subject;
 DROP INDEX IF EXISTS idx_resperm_resource;
@@ -10025,14 +10023,8 @@ CREATE TABLE resource_permissions_new (
 );
 INSERT INTO resource_permissions_new
     (id, resource_type, resource_id, subject_type, subject_id, action, access_level, created_at)
-    SELECT rp.id, rp.resource_type, rp.resource_id,
-           CASE WHEN rp.resource_type = 'topic' AND rp.subject_type = 'user'
-                 AND EXISTS (SELECT 1 FROM addons a
-                             WHERE a.addon_id = rp.subject_id AND a.runtime <> 'native')
-                 AND NOT EXISTS (SELECT 1 FROM user_accounts u WHERE u.id = rp.subject_id)
-                THEN 'addon' ELSE rp.subject_type END,
-           rp.subject_id, rp.action, rp.access_level, rp.created_at
-    FROM resource_permissions rp;
+    SELECT id, resource_type, resource_id, subject_type, subject_id, action, access_level, created_at
+    FROM resource_permissions;
 DROP TABLE resource_permissions;
 ALTER TABLE resource_permissions_new RENAME TO resource_permissions;
 CREATE INDEX idx_resperm_subject ON resource_permissions(subject_type, subject_id);
@@ -13850,34 +13842,46 @@ mod tests {
         assert_eq!(subject, ("[]".to_string(), 0, Some(5), Some("admin-1".to_string())));
     }
 
-    /// v177 on a database at v176: a topic row that stood in for an addon
-    /// (`'user'` + an installed addon's id) becomes an `'addon'` row; a real
-    /// user's row, an id that is also a user, a native app instance's id and
-    /// every non-topic row are copied unchanged; the widened CHECK then takes
-    /// a new `'addon'` row.
+    /// v177 on a database at v176: every row — a stand-in `'user'` row with
+    /// an installed addon's id included — is copied unchanged (the ledger
+    /// still carries it; `check_action` keeps its deny), and the widened CHECK
+    /// then takes an `'addon'` row while still refusing an unknown type.
     #[test]
-    fn migration_177_turns_addon_stand_in_rows_into_addon_subjects() {
+    fn migration_177_widens_the_subject_check_and_keeps_every_row() {
         let conn = Connection::open_in_memory().unwrap();
         run_ladder_up_to(&conn, 176);
         conn.execute_batch(
             "INSERT INTO addons (addon_id, name, version, runtime) VALUES
-                 ('asystent-lekarza', 'Asystent lekarza', '1.0.0', 'wasmtime'),
-                 ('both-ids', 'Both', '1.0.0', 'wasmtime'),
-                 ('tentabus-00000001', 'TentaBus', '1.0.0', 'native');
-             INSERT INTO user_accounts (id, username, password_hash) VALUES
-                 ('u-anna', 'anna', 'x'),
-                 ('both-ids', 'both', 'x');
+                 ('asystent-lekarza', 'Asystent lekarza', '1.0.0', 'wasmtime');
              INSERT INTO resource_permissions
                  (resource_type, resource_id, subject_type, subject_id, action, access_level)
              VALUES
                  ('topic', 't1', 'user', 'asystent-lekarza', 'read', 'deny'),
-                 ('topic', 't1', 'user', 'u-anna', 'read', 'allow'),
-                 ('topic', 't1', 'user', 'both-ids', 'write', 'deny'),
-                 ('topic', 't1', 'user', 'tentabus-00000001', '*', 'deny'),
-                 ('topic', 't1', 'group', 'asystent-lekarza', 'read', 'allow'),
-                 ('model', 'm1', 'user', 'asystent-lekarza', '*', 'deny');",
+                 ('topic', 't1', 'group', 'g-1', 'write', 'allow'),
+                 ('model', 'm1', 'api_key', 'k-1', '*', 'deny');",
         )
         .unwrap();
+        let snapshot = |conn: &Connection| -> Vec<(i64, String, String, String, String, String)> {
+            conn.prepare(
+                "SELECT id, resource_type, subject_type, subject_id, action, access_level \
+                 FROM resource_permissions ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let before = snapshot(&conn);
 
         run(&conn).unwrap();
 
@@ -13889,38 +13893,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(applied, "topic_acl_addon_subjects");
-        let rows: Vec<(String, String, String, String, String)> = conn
-            .prepare(
-                "SELECT resource_type, subject_type, subject_id, action, access_level \
-                 FROM resource_permissions ORDER BY resource_type, subject_id, subject_type",
-            )
-            .unwrap()
-            .query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        let row = |t: &str, st: &str, id: &str, a: &str, l: &str| {
-            (
-                t.to_string(),
-                st.to_string(),
-                id.to_string(),
-                a.to_string(),
-                l.to_string(),
-            )
-        };
-        assert_eq!(
-            rows,
-            vec![
-                row("model", "user", "asystent-lekarza", "*", "deny"),
-                row("topic", "addon", "asystent-lekarza", "read", "deny"),
-                row("topic", "group", "asystent-lekarza", "read", "allow"),
-                row("topic", "user", "both-ids", "write", "deny"),
-                row("topic", "user", "tentabus-00000001", "*", "deny"),
-                row("topic", "user", "u-anna", "read", "allow"),
-            ]
-        );
+        assert_eq!(snapshot(&conn), before);
         conn.execute(
             "INSERT INTO resource_permissions \
              (resource_type, resource_id, subject_type, subject_id, action, access_level) \

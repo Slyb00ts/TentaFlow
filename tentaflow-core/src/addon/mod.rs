@@ -4466,7 +4466,8 @@ mod tests {
     /// call.
     #[test]
     fn scheduled_calls_report_the_job_not_the_addon() {
-        use crate::flow_engine::dispatcher::{ActorKind, FlowOrigin};
+        use crate::auth::actor::ActorKind;
+        use crate::flow_engine::dispatcher::FlowOrigin;
 
         let scheduled = AddonCallProvenance::scheduler("job-42");
         assert_eq!(scheduled.origin, FlowOrigin::Scheduler);

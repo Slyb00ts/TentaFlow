@@ -842,8 +842,8 @@ pub fn start_unified_server_with_permissions(
 mod tests {
     use super::*;
     use crate::auth::acl::Principal;
+    use crate::auth::actor::ActorKind;
     use crate::db::models::DbApiKey;
-    use crate::flow_engine::dispatcher::ActorKind;
     use std::path::Path;
 
     fn fresh_db() -> db::DbPool {

@@ -115,6 +115,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use tentaflow_protocol::environment::NodeEnvironment;
 
+use crate::auth::actor::ActorKind;
 use crate::db::DbPool;
 use crate::flow_engine::envelope::FlowValue;
 use crate::flow_engine::expr;
@@ -1039,18 +1040,22 @@ pub struct BusCallContext {
     pub instance_id: BusInstanceId,
     pub org_id: String,
     pub actor: Option<String>,
+    /// What `actor` names, as the entry point that authenticated it decided
+    /// (dashboard/REST: a user, the addon host functions: an addon, a flow:
+    /// its run's actor kind, broker-internal work: the system). The topic ACL
+    /// and the data-hiding rules match `actor` only against rows of this
+    /// kind, so it must never be derived from `origin`, a free-text label.
+    pub actor_kind: ActorKind,
     pub correlation_id: Option<String>,
     pub origin: String,
 }
 
 /// The `origin` value `addon::host_functions::bus::call_context` stamps on
 /// every `BusCallContext` it builds — the SOLE entry point through which an
-/// addon's wasm code reaches `BusService`. `ActorKind::from_origin` is the
-/// only reader: it is how a field policy (`FP-subject-type`,
-/// SUM/tentabus/DECYZJE-2026-09-22.md) and the topic ACL
-/// (`services::bus_authorizer`, migration 177) tell an addon actor apart from
-/// a human/service user actor, since `BusCallContext.actor` itself carries no
-/// type tag either way.
+/// addon's wasm code reaches `BusService`. A provenance label for audit rows
+/// and record headers only: what KIND of caller a call carries is
+/// `BusCallContext::actor_kind`, never this string — a flow run started by an
+/// addon still acts for whoever its actor is.
 pub const ADDON_ORIGIN: &str = "addon";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5150,9 +5155,9 @@ impl BusService {
             &self.instance_id,
             &ctx.org_id,
             topic,
-            field_policies::PolicySubject::actor(
+            field_policies::PolicySubject::Actor(
+                ctx.actor_kind,
                 ctx.actor.as_deref().unwrap_or(""),
-                field_policies::ActorKind::from_origin(&ctx.origin),
             ),
             field_policies::Direction::Write,
         )? {
@@ -5286,6 +5291,7 @@ impl BusService {
                 // already-valid traffic.
                 let quarantine_ctx = BusCallContext {
                     actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+                    actor_kind: crate::auth::actor::ActorKind::System,
                     ..ctx.clone()
                 };
                 let dlq_topic = dlq::dlq_topic_name(topic);
@@ -6941,9 +6947,9 @@ impl BusService {
             &self.instance_id,
             &ctx.org_id,
             topic,
-            field_policies::PolicySubject::actor(
+            field_policies::PolicySubject::Actor(
+                ctx.actor_kind,
                 ctx.actor.as_deref().unwrap_or(""),
-                field_policies::ActorKind::from_origin(&ctx.origin),
             ),
             field_policies::Direction::Read,
         )?
@@ -7010,6 +7016,7 @@ impl BusService {
             instance_id: self.typed_instance_id(),
             org_id: crate::services::org::DEFAULT_ORG_ID.to_string(),
             actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+            actor_kind: crate::auth::actor::ActorKind::System,
             correlation_id: None,
             origin: "bus.metrics.rollup".to_string(),
         };
@@ -8606,9 +8613,9 @@ impl ConsumerHandle {
                                 &self.instance_id,
                                 &self.org_id,
                                 &rec.topic,
-                                field_policies::PolicySubject::actor(
+                                field_policies::PolicySubject::Actor(
+                                    self.ctx.actor_kind,
                                     self.ctx.actor.as_deref().unwrap_or(""),
-                                    field_policies::ActorKind::from_origin(&self.ctx.origin),
                                 ),
                                 field_policies::Direction::Read,
                             )?;
@@ -9277,6 +9284,7 @@ mod tests {
             instance_id,
             org_id: org.to_string(),
             actor: Some(actor.to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: Some("corr-1".to_string()),
             origin: "test".to_string(),
         }
@@ -14926,7 +14934,7 @@ mod tests {
             svc.instance_id(),
             "org-a",
             "orders.created",
-            field_policies::PolicySubject::actor("anyone", field_policies::ActorKind::User),
+            field_policies::PolicySubject::Actor(crate::auth::actor::ActorKind::User, "anyone"),
             field_policies::Direction::Read,
         )
         .unwrap()
@@ -14945,7 +14953,7 @@ mod tests {
                 svc.instance_id(),
                 "org-b",
                 "orders.created",
-                field_policies::PolicySubject::actor("anyone", field_policies::ActorKind::User),
+                field_policies::PolicySubject::Actor(crate::auth::actor::ActorKind::User, "anyone"),
                 field_policies::Direction::Read,
             )
             .unwrap()
@@ -16831,6 +16839,7 @@ mod tests {
         // somehow present, because it exercises the preflight itself.
         let system_ctx = BusCallContext {
             actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+            actor_kind: crate::auth::actor::ActorKind::System,
             ..ctx.clone()
         };
         open_leader_writes(&svc, &system_ctx, &dlq_name, 0);
@@ -18530,6 +18539,7 @@ mod tests {
             instance_id: test_instance_id(),
             org_id: org_id.clone(),
             actor: Some("u-admin".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         };
@@ -18537,6 +18547,7 @@ mod tests {
             instance_id: test_instance_id(),
             org_id: org_id.clone(),
             actor: Some("u-writer".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         };

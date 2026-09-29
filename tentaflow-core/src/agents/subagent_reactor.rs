@@ -406,9 +406,10 @@ pub fn init_global(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::actor::ActorKind;
     use crate::db::migrations;
     use crate::db::models::{AgentParams, AgentRunStatusUpdate, FlowParams, NewAgentRun};
-    use crate::flow_engine::dispatcher::{ActorKind, FlowActor, FlowOrigin};
+    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::Duration;

@@ -5580,9 +5580,10 @@ mod provenance_persistence_tests {
     //! in a test body would prove only that the column accepts a value, never
     //! that the product supplies one.
     use super::execute_blocking;
+    use crate::auth::actor::ActorKind;
     use crate::db::{repository, DbPool};
     use crate::flow_engine::cache::CompiledFlow;
-    use crate::flow_engine::dispatcher::{ActorKind, FlowOrigin};
+    use crate::flow_engine::dispatcher::FlowOrigin;
     use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
     use crate::flow_engine::node_adapter::{
         test_support::stub_ctx, AdapterRegistry, ExecutionContext, NodeAdapter, PortSpec,

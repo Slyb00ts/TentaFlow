@@ -39,6 +39,7 @@ use std::collections::BTreeSet;
 
 use bytes::Bytes;
 
+use crate::auth::actor::ActorKind;
 use crate::db::repository::{self, DbBusFieldPolicy};
 use crate::db::DbPool;
 
@@ -53,67 +54,26 @@ use super::{topics, BusServiceError};
 /// `NULL`-based uniqueness check.
 pub const SUBJECT_ANY: &str = "*";
 
-/// What kind of subject `actor` names (`FP-subject-type`,
-/// SUM/tentabus/DECYZJE-2026-09-22.md). `BusCallContext.actor` is a raw
-/// string with no type tag of its own, so the CALLER decides the kind from
-/// context it already has — a dashboard/REST/CLI caller is always `User`,
-/// `addon::host_functions::bus::call_context` is the one place that builds
-/// an `Addon` caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActorKind {
-    User,
-    Addon,
-}
-
-impl ActorKind {
-    /// `origin == bus::ADDON_ORIGIN` is the only signal recorded today that a
-    /// call crossed the addon wasm boundary — see that constant's doc.
-    /// Everything else (dashboard, REST, host CLI, the metrics rollup) is a
-    /// human/service user.
-    pub fn from_origin(origin: &str) -> ActorKind {
-        if origin == super::ADDON_ORIGIN {
-            ActorKind::Addon
-        } else {
-            ActorKind::User
-        }
-    }
-
-    /// The `subject_type` spelling rows about this kind of actor carry —
-    /// in `bus_field_policies` and in a topic's `resource_permissions`.
-    pub fn subject_type_str(self) -> &'static str {
-        match self {
-            ActorKind::User => "user",
-            ActorKind::Addon => "addon",
-        }
-    }
-}
-
-/// Whose rule `resolve` looks up. An actor (`User`/`Addon`) is what a
-/// publish/fetch/peek resolves for; `Group` and `Any` exist for the
+/// Whose rule `resolve` looks up. An actor is what a publish/fetch/peek
+/// resolves for, with the kind its entry point authenticated
+/// (`BusCallContext::actor_kind`, `FP-subject-type`,
+/// SUM/tentabus/DECYZJE-2026-09-22.md); `Group` and `Any` exist for the
 /// administrator's "how does … see it" preview, which asks about a group or
 /// the topic-wide rule directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicySubject<'a> {
-    User(&'a str),
-    Addon(&'a str),
+    Actor(ActorKind, &'a str),
     Group(&'a str),
     Any,
 }
 
 impl<'a> PolicySubject<'a> {
-    pub fn actor(actor: &'a str, kind: ActorKind) -> Self {
-        match kind {
-            ActorKind::User => PolicySubject::User(actor),
-            ActorKind::Addon => PolicySubject::Addon(actor),
-        }
-    }
-
-    /// Parses a wire `(subject_type, subject_id)` pair; `None` for an
-    /// unknown type or an `any` subject whose id is not `SUBJECT_ANY`.
+    /// Parses a wire `(subject_type, subject_id)` pair; `None` for a type no
+    /// rule can name or an `any` subject whose id is not `SUBJECT_ANY`.
     pub fn parse(subject_type: &str, subject_id: &'a str) -> Option<Self> {
         match subject_type {
-            "user" => Some(PolicySubject::User(subject_id)),
-            "addon" => Some(PolicySubject::Addon(subject_id)),
+            "user" => Some(PolicySubject::Actor(ActorKind::User, subject_id)),
+            "addon" => Some(PolicySubject::Actor(ActorKind::Addon, subject_id)),
             "group" => Some(PolicySubject::Group(subject_id)),
             "any" if subject_id == SUBJECT_ANY => Some(PolicySubject::Any),
             _ => None,
@@ -177,7 +137,7 @@ pub(crate) fn decode(row: DbBusFieldPolicy, topic: &str) -> Result<FieldPolicy, 
 /// Resolves the effective policy for `(org_id, topic, direction)` for
 /// `subject`. For an actor the caller decides its KIND (`FP-subject-type`,
 /// SUM/tentabus/DECYZJE-2026-09-22.md) from context it already has
-/// (`PolicySubject::actor` + `ActorKind::from_origin`) —
+/// (`BusCallContext::actor_kind`) —
 /// `BusCallContext.actor` itself carries no type tag.
 ///
 /// Precedence, most to least specific:
@@ -243,8 +203,7 @@ pub fn resolve(
         )
     };
     let own = match subject {
-        PolicySubject::User(id) => Some(("user", id)),
-        PolicySubject::Addon(id) => Some(("addon", id)),
+        PolicySubject::Actor(kind, id) => Some((kind.as_str(), id)),
         PolicySubject::Group(id) => Some(("group", id)),
         PolicySubject::Any => None,
     };
@@ -253,7 +212,7 @@ pub fn resolve(
             return decode(row, topic).map(Some);
         }
     }
-    if let PolicySubject::User(user_id) = subject {
+    if let PolicySubject::Actor(ActorKind::User, user_id) = subject {
         let groups = repository::get_user_groups(pool, user_id)
             .map_err(|e| BusServiceError::Db(e.to_string()))?;
         for group in groups {
@@ -724,7 +683,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             &dlq_topic,
-            PolicySubject::actor("some-actor", ActorKind::User),
+            PolicySubject::Actor(ActorKind::User, "some-actor"),
             Direction::Read,
         )
         .expect("resolve on the DLQ topic")
@@ -736,7 +695,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             source,
-            PolicySubject::actor("some-actor", ActorKind::User),
+            PolicySubject::Actor(ActorKind::User, "some-actor"),
             Direction::Read,
         )
         .expect("resolve on the source topic")
@@ -778,7 +737,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             &dlq_topic,
-            PolicySubject::actor("some-actor", ActorKind::User),
+            PolicySubject::Actor(ActorKind::User, "some-actor"),
             Direction::Read,
         )
         .expect("resolve on the DLQ topic");
@@ -795,7 +754,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             "__bus.metrics",
-            PolicySubject::actor("some-actor", ActorKind::User),
+            PolicySubject::Actor(ActorKind::User, "some-actor"),
             Direction::Read,
         )
         .expect("resolve on a broker-internal topic");
@@ -838,7 +797,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             topic,
-            PolicySubject::actor("meeting-recorder", ActorKind::Addon),
+            PolicySubject::Actor(ActorKind::Addon, "meeting-recorder"),
             Direction::Read,
         )
         .expect("resolve as the addon actor")
@@ -850,7 +809,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             topic,
-            PolicySubject::actor("meeting-recorder", ActorKind::User),
+            PolicySubject::Actor(ActorKind::User, "meeting-recorder"),
             Direction::Read,
         )
         .expect("resolve as a user actor sharing the same raw id string");
@@ -917,7 +876,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             topic,
-            PolicySubject::actor(&member_id, ActorKind::User),
+            PolicySubject::Actor(ActorKind::User, &member_id),
             Direction::Read,
         )
         .expect("resolve for the group member")
@@ -929,7 +888,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             topic,
-            PolicySubject::actor(&outsider_id, ActorKind::User),
+            PolicySubject::Actor(ActorKind::User, &outsider_id),
             Direction::Read,
         )
         .expect("resolve for a non-member");
@@ -998,7 +957,7 @@ mod tests {
             TEST_INSTANCE,
             TEST_ORG,
             topic,
-            PolicySubject::actor(&member_id, ActorKind::User),
+            PolicySubject::Actor(ActorKind::User, &member_id),
             Direction::Read,
         )
         .expect("resolve for the user")
@@ -1104,7 +1063,7 @@ mod tests {
         );
         assert_eq!(fields_of(PolicySubject::Any), Some(field_set(&["id"])));
         assert_eq!(
-            fields_of(PolicySubject::User(&member_id)),
+            fields_of(PolicySubject::Actor(ActorKind::User, &member_id)),
             Some(field_set(&["id", "name", "pesel"]))
         );
     }
@@ -1113,11 +1072,11 @@ mod tests {
     fn policy_subject_parse_accepts_the_four_kinds_only() {
         assert_eq!(
             PolicySubject::parse("user", "u-1"),
-            Some(PolicySubject::User("u-1"))
+            Some(PolicySubject::Actor(ActorKind::User, "u-1"))
         );
         assert_eq!(
             PolicySubject::parse("addon", "a"),
-            Some(PolicySubject::Addon("a"))
+            Some(PolicySubject::Actor(ActorKind::Addon, "a"))
         );
         assert_eq!(
             PolicySubject::parse("group", "g"),

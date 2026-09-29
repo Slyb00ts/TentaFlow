@@ -97,6 +97,7 @@ fn call_ctx(org_id: &str) -> BusCallContext {
             .expect("valid instance id"),
         org_id: org_id.to_string(),
         actor: Some("m1-gate".to_string()),
+        actor_kind: tentaflow_core::auth::actor::ActorKind::User,
         correlation_id: Some("bus-full-path-1m".to_string()),
         origin: ORIGIN.to_string(),
     }

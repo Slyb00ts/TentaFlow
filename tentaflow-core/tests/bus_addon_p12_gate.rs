@@ -259,6 +259,7 @@ async fn run_gate(cycles: u64) {
                     .expect("BusService::instance_id() is always a valid BusInstanceId"),
                 org_id: ORG_ID.to_string(),
                 actor: Some("p12-gate".to_string()),
+                actor_kind: tentaflow_core::auth::actor::ActorKind::User,
                 correlation_id: Some("bus-addon-p12-gate".to_string()),
                 origin: "p12-gate-test".to_string(),
             };

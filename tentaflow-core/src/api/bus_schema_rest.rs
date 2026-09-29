@@ -1460,6 +1460,7 @@ mod tests {
             instance_id: fx.instance.clone(),
             org_id: ORG.to_string(),
             actor: Some("tester".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         };

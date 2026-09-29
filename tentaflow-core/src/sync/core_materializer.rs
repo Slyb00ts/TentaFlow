@@ -8375,6 +8375,51 @@ mod tests {
         );
     }
 
+    /// The HIGH case behind migration 177 keeping stand-in rows: a `'user'`
+    /// deny with an addon's id written before the upgrade is still in the
+    /// ledger and replays unchanged — to a node joining later, rebuilt, or
+    /// installing the addon only afterwards. Replayed, it must still deny the
+    /// addon (and only an `'addon'` row could allow it).
+    #[test]
+    fn a_replayed_user_deny_with_an_addon_id_still_denies_the_addon() {
+        use crate::auth::actor::ActorKind;
+        let db = bus_db();
+        let create = at(bus_topic_op(&incarnation(1_000), ActionType::Insert), 1_000);
+        let mut stand_in = at(topic_acl_op("user", "asystent-lekarza", "read"), 1_500);
+        stand_in.body.changed_fields.insert(
+            "access_level".to_string(),
+            FieldValue::String("deny".to_string()),
+        );
+        apply_like_the_inbox(&db, &[create, stand_in]);
+        // Installed only now, after the row arrived.
+        db.write()
+            .unwrap()
+            .execute(
+                "INSERT INTO addons (addon_id, name, version) VALUES ('asystent-lekarza', 'A', '1')",
+                [],
+            )
+            .unwrap();
+        let acl = crate::services::bus_authorizer::topic_acl_resource_id(
+            "tentabus-00000001",
+            "org-1",
+            "orders",
+        );
+        let check = |kind| {
+            repository::resource_permissions::check_action(
+                &db,
+                "topic",
+                &acl,
+                "read",
+                kind,
+                "asystent-lekarza",
+                true,
+            )
+            .unwrap()
+        };
+        assert!(!check(ActorKind::Addon));
+        assert!(!check(ActorKind::User));
+    }
+
     fn dlq_row(wall_ms: i64) -> repository::DbBusTopic {
         let mut row = bus_topic_row("org-1", "__dlq.orders");
         row.generation = generation_at(wall_ms);
@@ -8477,6 +8522,7 @@ mod tests {
             instance_id: instance,
             org_id: "org-1".to_string(),
             actor: Some("anna".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         };

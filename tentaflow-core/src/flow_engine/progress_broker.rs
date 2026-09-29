@@ -15,8 +15,9 @@ use dashmap::DashMap;
 use tokio::sync::broadcast;
 use tracing::warn;
 
+use crate::auth::actor::ActorKind;
 use crate::events::store::now_ms;
-use crate::flow_engine::dispatcher::{ActorKind, FlowOrigin, FlowRequestMeta};
+use crate::flow_engine::dispatcher::{FlowOrigin, FlowRequestMeta};
 use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
 
 /// Process-global broker. The dashboard server builds one `AppState` per WS

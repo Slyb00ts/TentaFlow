@@ -930,6 +930,7 @@ mod tests {
             instance_id: instance_id.clone(),
             org_id: org.org_id.clone(),
             actor: Some("test-actor".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         };

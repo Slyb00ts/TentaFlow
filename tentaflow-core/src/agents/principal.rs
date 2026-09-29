@@ -3,8 +3,9 @@
 // (Harness §3.3). A run ALWAYS has a principal; `user_id == None` is the
 // unattended-call case where addon tools are denied (core.* still work). =====
 
+use crate::auth::actor::ActorKind;
 use crate::db::models::DbAgentRun;
-use crate::flow_engine::dispatcher::{ActorKind, FlowActor, FlowOrigin};
+use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
 
 /// Principal of an agent run. `user_id` gates every addon tool call through the
 /// addon permission engine; `org_id` attributes the run for compliance audit.

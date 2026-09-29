@@ -993,6 +993,7 @@ mod tests {
                 .expect("valid instance id"),
             org_id: "org-1".to_string(),
             actor: actor.map(str::to_string),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: correlation_id.map(str::to_string),
             origin: "test".to_string(),
         }

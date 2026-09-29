@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::auth::acl;
+use crate::auth::actor::ActorKind;
 use crate::db::{repository, DbPool};
 use crate::flow_engine::blob_store::BlobStore;
 use crate::flow_engine::cache::{CachedFlow, CompiledFlow, FlowCache};
@@ -265,40 +266,6 @@ impl FlowOrigin {
             "agent" => FlowOrigin::Agent,
             "system" => FlowOrigin::System,
             "bus" => FlowOrigin::Bus,
-            _ => return None,
-        })
-    }
-}
-
-/// Kind of authenticated caller behind a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActorKind {
-    User,
-    ApiKey,
-    Addon,
-    System,
-}
-
-impl ActorKind {
-    /// Stable wire spelling — persisted in the event log and rendered by the UI.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ActorKind::User => "user",
-            ActorKind::ApiKey => "api_key",
-            ActorKind::Addon => "addon",
-            ActorKind::System => "system",
-        }
-    }
-
-    /// Exact inverse of [`ActorKind::as_str`]. `None` for anything else — see
-    /// [`FlowOrigin::parse`]: reading an unknown actor kind as `System` would
-    /// turn an API key into unattended core work.
-    pub fn parse(value: &str) -> Option<Self> {
-        Some(match value {
-            "user" => ActorKind::User,
-            "api_key" => ActorKind::ApiKey,
-            "addon" => ActorKind::Addon,
-            "system" => ActorKind::System,
             _ => return None,
         })
     }

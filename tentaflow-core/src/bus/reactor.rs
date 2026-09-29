@@ -529,6 +529,7 @@ async fn run_cycle(
         instance_id: svc.typed_instance_id(),
         org_id: config.org_id.clone(),
         actor: None,
+        actor_kind: crate::auth::actor::ActorKind::System,
         correlation_id: None,
         origin: FlowOrigin::Bus.as_str().to_string(),
     };
@@ -1257,6 +1258,7 @@ mod tests {
                 .expect("valid instance id"),
             org_id: org.to_string(),
             actor: Some("tester".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         }
@@ -1267,6 +1269,7 @@ mod tests {
             instance_id: instance_id.clone(),
             org_id: org.to_string(),
             actor: Some("tester".to_string()),
+            actor_kind: crate::auth::actor::ActorKind::User,
             correlation_id: None,
             origin: "test".to_string(),
         }

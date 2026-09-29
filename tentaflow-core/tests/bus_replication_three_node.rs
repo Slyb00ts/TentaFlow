@@ -206,6 +206,7 @@ fn ctx() -> BusCallContext {
             .expect("valid instance id"),
         org_id: ORG.to_string(),
         actor: Some("test".to_string()),
+        actor_kind: tentaflow_core::auth::actor::ActorKind::User,
         correlation_id: None,
         origin: "bus_replication_three_node".to_string(),
     }

@@ -81,18 +81,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
   administrowania topikiem; wpis audytu `bus.field_policy.preview` nie
   zawiera treści wiadomości.
 - Addon jest osobnym rodzajem podmiotu w dostępie do topiku
-  (`subject_type = 'addon'` w `AclSetRequest`/`AclListResponse`). Wywołania
-  addonu są sprawdzane wyłącznie wierszami addonu — użytkownik o tym samym
-  identyfikatorze nie dziedziczy jego wiersza i odwrotnie. Liczba członków
-  grupy w liście dostępu i zasadach ukrywania danych liczy teraz tylko
-  członków organizacji, tak jak katalog, a wiersz addonu ma jego nazwę.
+  (`subject_type = 'addon'` w `AclSetRequest`/`AclListResponse`). Addon
+  dostaje dostęp wyłącznie z wiersza addonu, a użytkownik nie dziedziczy
+  wiersza addonu. Wiersz „użytkownik” z zakazem i identyfikatorem addonu
+  (dotychczasowy sposób ograniczania addonu) nadal blokuje ten addon na każdym
+  nodzie — także po synchronizacji, odbudowie noda i instalacji addonu
+  później. Nowego wiersza „użytkownik” z identyfikatorem zainstalowanego
+  addonu nie da się zapisać (`bus.subject_is_addon`); usunąć stary można.
+  Rodzaj wywołującego (użytkownik, addon, klucz API, system) niesie teraz
+  jawnie kontekst wywołania busa, ustalany przez punkt wejścia, a nie z pola
+  `origin` — flow uruchomiony przez addon w imieniu użytkownika podlega
+  zasadom tego użytkownika. Liczba członków grupy w liście dostępu i zasadach
+  ukrywania danych liczy teraz tylko członków organizacji, tak jak katalog,
+  a wiersz addonu ma jego nazwę.
+- Podgląd „jak widzi…” i zapisy dostępu oraz zasad ukrywania danych
+  przyjmują identyfikator podmiotu tylko z liter, cyfr i znaków `-_.:@*`
+  (do 128 znaków). Każda próba podglądu, także odrzucona, zostawia wpis
+  audytu z wynikiem (`outcome=ok` albo `outcome=refused:<kod>`).
 - Aktualizacja: migracja bazy 177 przebudowuje `resource_permissions`
-  (dopuszcza `subject_type = 'addon'`) i zamienia wiersze topików zapisane
-  dotąd jako użytkownik z identyfikatorem zainstalowanego addonu (i bez
-  konta o tym identyfikatorze) na wiersze addonu. Zamiana działa na każdym
-  nodzie osobno; na nodzie bez tego addonu stary wiersz zostaje i nie działa
-  na nikogo. Nod w starszej wersji odrzuca zsynchronizowany wiersz addonu
-  (operacja trafia do konfliktów synchronizacji) i dalej traktuje addony jak
+  (dopuszcza `subject_type = 'addon'`) bez zmiany istniejących wierszy.
+  Nod w starszej wersji odrzuca zsynchronizowany wiersz addonu (operacja
+  trafia do konfliktów synchronizacji) i dalej traktuje addony jak
   użytkowników — nody trzeba zaktualizować razem.
 
 ## [0.4.0-beta.1] — 2026-09-29
