@@ -4650,6 +4650,7 @@ impl BusService {
             .authorize(ctx, BusAction::Admin, name)
             .map_err(|_| deny(BusAction::Admin, name))?;
         self.enforce_topic_resource_quota(&ctx.org_id, &opts)?;
+        opts.created_by = ctx.actor.clone();
         let env = crate::services::environment::get_node_environment(&self.db);
 
         // Placement (who leads which partition) is resolved and proposed
@@ -4777,7 +4778,7 @@ impl BusService {
         let durability_detail = match before {
             Some(b) => format!(
                 "partitions={}->{} durability={}->{} durability_class={}->{} \
-                 durability_explicit={}->{}",
+                 durability_explicit={}->{} description_changed={}",
                 b.partitions,
                 cfg.partitions,
                 b.durability.to_wire_string(),
@@ -4786,6 +4787,7 @@ impl BusService {
                 cfg.durability_class().as_str(),
                 b.durability_explicit(),
                 cfg.durability_explicit(),
+                b.description != cfg.description,
             ),
             None => format!(
                 "durability={} durability_class={} durability_explicit={}",
@@ -20384,5 +20386,76 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    /// A topic records who created it from the call context — a caller cannot
+    /// name somebody else through the options.
+    #[test]
+    fn create_topic_records_the_calling_actor_as_its_author() {
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        let cfg = svc
+            .create_topic(
+                &ctx,
+                "orders.authored",
+                topics::TopicOptions {
+                    created_by: Some("someone-else".to_string()),
+                    description: Some("Wyniki RTG".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cfg.created_by.as_deref(), Some("tester"));
+        let stored = topics::get_topic(&svc.db, svc.instance_id(), "org-1", "orders.authored")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.created_by.as_deref(), Some("tester"));
+        assert_eq!(stored.description, "Wyniki RTG");
+    }
+
+    /// Deprecating a version reaches a topic's validation through the
+    /// validator cache: with v2 withdrawn the topic checks against v1 again,
+    /// and with every version withdrawn it checks against the latest.
+    #[test]
+    fn deprecating_a_schema_version_moves_a_bound_topic_to_the_active_one() {
+        const WITH_NOTE: &str = r#"{"type":"object","properties":{"id":{"type":"string"},
+            "status":{"type":"string"},"note":{"type":"string"}},"required":["id"],
+            "additionalProperties":false}"#;
+        let (_tmp, svc) = test_service();
+        let ctx = test_ctx("org-1");
+        register_schema(&svc, "org-1", "orders", SCHEMA_V1_ID_REQUIRED);
+        assert_eq!(register_schema(&svc, "org-1", "orders", WITH_NOTE).version, 2);
+        svc.create_topic(
+            &ctx,
+            "orders.events",
+            topics::TopicOptions {
+                schema_id: Some("orders".to_string()),
+                validation: Some(topics::ValidationMode::Dlq),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let publish_note = || {
+            svc.publish(
+                &ctx,
+                "orders.events",
+                PublishBatch {
+                    partition: None,
+                    producer: None,
+                    records: vec![record(r#"{"id":"a","note":"only v2 knows this field"}"#)],
+                },
+            )
+            .unwrap()
+        };
+        assert_eq!(publish_note().accepted, 1, "v2 is in force");
+
+        schema_registry::registry::delete(&svc.db, svc.instance_id(), "org-1", "orders", Some(2), true)
+            .unwrap();
+        let withdrawn = publish_note();
+        assert_eq!((withdrawn.accepted, withdrawn.schema_rejected), (0, 1), "v1 is in force");
+
+        schema_registry::registry::delete(&svc.db, svc.instance_id(), "org-1", "orders", Some(1), true)
+            .unwrap();
+        assert_eq!(publish_note().accepted, 1, "every version withdrawn: the latest validates");
     }
 }

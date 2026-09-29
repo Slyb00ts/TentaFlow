@@ -8,6 +8,32 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) /
 
 ### TentaBus
 
+- Topik ma opis i autora. Opis (do 500 znaków) podaje się w pierwszym kroku
+  kreatora „Nowy topik” albo w oknie „Zmień” karty „Opis” w Ustawieniach
+  topiku; strona topiku pokazuje go pod nazwą, a bez opisu — jak dotąd rodzaj
+  treści i wzór. Karta „Opis” pokazuje też, kto utworzył topik (nazwę osoby
+  albo klucza API). Autor jest zapisywany z sesji przy tworzeniu i nie zmienia
+  go żadna aktualizacja; topiki utworzone przed tą wersją nie mają autora.
+  Protokół: `BusTopicOptionsWire.description`,
+  `BusTopicConfigWire.{description, created_by, created_by_label}`.
+- Wycofanie pojedynczej wersji wzoru wiadomości: `SchemaDeleteRequest`
+  z `version` i `deprecate_only` (oraz REST `DELETE …?version=N&deprecate_only=true`)
+  oznacza tę wersję jako wycofaną zamiast odrzucać żądanie. Topik sprawdza
+  wiadomości najwyższą niewycofaną wersją; gdy wycofany jest cały wzór albo
+  wszystkie jego wersje, sprawdza dalej ostatnią wersją. Wycofany wzór nadal
+  nie przyjmuje nowych wersji ani nowych powiązań z topikami. Lista wersji
+  podaje `deprecated_at_ms` (`BusSchemaVersionWire`, REST), a wpis audytu
+  `bus.schema.deprecate` podaje numer wersji.
+- Aktualizacja: migracja bazy 176 dodaje `bus_topics.description`,
+  `bus_topics.created_by` i `bus_schema_subjects.deprecated_versions_json`.
+  Nowe kolumny synchronizują się w całych wierszach topiku i wzoru (ostatni
+  zapis wygrywa). W klastrze z nodami w starszej wersji zmiana topiku
+  wykonana na starszym nodzie czyści jego opis na pozostałych, a zmiana wzoru
+  (np. nowa wersja lub tryb zgodności) wykonana na starszym nodzie cofa
+  wycofanie jego pojedynczych wersji; autor topiku zostaje zachowany.
+  Zaktualizuj wszystkie nody instancji przed korzystaniem z opisów i
+  wycofywania wersji.
+
 - Nieprzetworzone wiadomości: usunięto ograniczenia opisane w wydaniu 0.4.0-beta.
   „Wczytaj więcej” nie powtarza wierszy przy wielu partycjach. Ponowienie
   i odrzucenie wykonuje tylko node prowadzący partycję nieprzetworzonych

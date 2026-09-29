@@ -1,8 +1,8 @@
 // ===== File: modules/tentabus/topic-creator.js — "Nowy topik" (T04): a three-step window over the topic list =====
 //
-// Step 1 names the topic, picks what the programs will send (the kinds this
-// server can read, `BusCapabilities.contentTypes`) and how many partitions it
-// has; step 2 how long it keeps messages and how safely it writes them, with
+// Step 1 names the topic, takes an optional description, picks what the
+// programs will send (the kinds this server can read,
+// `BusCapabilities.contentTypes`) and how many partitions it has; step 2 how long it keeps messages and how safely it writes them, with
 // the sentence about copies taken from the server's own resolution
 // (`defaultReplicationFactor` / `nodeCount` — the number `create_topic`
 // will use, so the window never promises a different one); step 3 the
@@ -18,6 +18,7 @@ import { schemaFormatLabel } from '/js/modules/tentabus/schemas.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
+import '/js/components/tf-textarea.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-toggle.js';
 import '/js/components/tf-choice-card.js';
@@ -29,6 +30,9 @@ const sprite = (id) => `<svg class="icon" aria-hidden="true"><use href="#i-${id}
 // not 127: the topic's dead-letter topic `__dlq.<name>` must fit in 127 too.
 export const TOPIC_NAME_MAX = 121;
 const TOPIC_NAME_RE = new RegExp(`^[a-z0-9][a-z0-9.-]{1,${TOPIC_NAME_MAX - 1}}$`);
+
+// `bus::topics::MAX_DESCRIPTION_CHARS`.
+export const DESCRIPTION_MAX = 500;
 
 export const PARTITIONS_MIN = 1;
 export const PARTITIONS_MAX = 256;
@@ -124,6 +128,11 @@ export function copiesReason(plan) {
   return T(`topics.creator.copies_reason_${plan.kind}`, { nodes: fmtCount(plan.nodes), n: plan.nodes, max: fmtCount(MAX_COPIES), m: MAX_COPIES });
 }
 
+/** Whether a description fits: at most `DESCRIPTION_MAX` characters once trimmed. */
+export function descriptionFits(text) {
+  return [...String(text ?? '').trim()].length <= DESCRIPTION_MAX;
+}
+
 /** The partition count typed in the field, or `null` when it is not a whole number in range. */
 export function partitionsValue(raw) {
   const text = String(raw ?? '').trim();
@@ -136,6 +145,7 @@ export function partitionsValue(raw) {
 export function newDraft(kinds) {
   return {
     name: '',
+    description: '',
     contentType: kinds[0]?.contentType || '',
     partitions: 3,
     retentionDays: 30,
@@ -160,6 +170,8 @@ export function buildTopicCreateRequest(instanceId, draft) {
     durabilityClass: draft.durabilityClass === 'critical' ? 'critical' : 'standard',
   };
   if (draft.contentType) options.contentType = draft.contentType;
+  const description = String(draft.description ?? '').trim();
+  if (description) options.description = description;
   if (Number(draft.limitGb) > 0) options.retentionBytesPerPartition = Number(draft.limitGb) * GIB;
   if (draft.validate && draft.schemaId) {
     options.schemaId = draft.schemaId;
@@ -200,7 +212,7 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
   const nameProblem = () => topicNameProblem(draft.name, existingNames);
   const canProceed = () => {
     if (state.busy) return false;
-    if (state.step === 0) return nameProblem() === null && draft.partitions != null;
+    if (state.step === 0) return nameProblem() === null && draft.partitions != null && descriptionFits(draft.description);
     if (state.step === 2) return !draft.validate || Boolean(draft.schemaId);
     return true;
   };
@@ -231,6 +243,7 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
       <tf-input id="tb-cr-name" class="tb-mono-input" label="${escapeAttr(T('topics.creator.name_label'))}" placeholder="${escapeAttr(T('topics.creator.name_placeholder'))}" autocomplete="off" spellcheck="false" autocapitalize="off" value="${escapeAttr(draft.name)}" hint="${escapeAttr(T('topics.creator.name_hint'))}" error="${escapeAttr(nameError())}"></tf-input>
       <tf-input id="tb-cr-partitions" type="number" inputmode="numeric" stepper min="${PARTITIONS_MIN}" max="${PARTITIONS_MAX}" step="1" label="${escapeAttr(T('topics.creator.partitions_label'))}" value="${escapeAttr(draft.partitions ?? '')}" hint="${escapeAttr(T('topics.creator.partitions_hint'))}" stepper-dec-label="${escapeAttr(T('topics.creator.partitions_less'))}" stepper-inc-label="${escapeAttr(T('topics.creator.partitions_more'))}"></tf-input>
     </div>
+    <tf-textarea id="tb-cr-description" class="mt-md" rows="2" autogrow maxlength="${DESCRIPTION_MAX}" label="${escapeAttr(T('topics.creator.description_label'))}" placeholder="${escapeAttr(T('topics.creator.description_placeholder'))}" hint="${escapeAttr(T('topics.creator.description_hint', { max: fmtCount(DESCRIPTION_MAX) }))}" value="${escapeAttr(draft.description)}" error="${escapeAttr(descriptionFits(draft.description) ? '' : T('topics.creator.description_too_long', { max: fmtCount(DESCRIPTION_MAX) }))}"></tf-textarea>
     ${kinds.length ? `
       <div class="field mt-md">
         <label id="tb-cr-kind-label">${escapeHtml(T('topics.creator.kind_label'))}</label>
@@ -287,6 +300,7 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
   const summary = () => {
     const rows = [
       [T('topics.creator.summary_name'), `<span class="mono">${escapeHtml(draft.name.trim())}</span>`],
+      ...(draft.description.trim() ? [[T('topics.creator.summary_description'), escapeHtml(draft.description.trim())]] : []),
       [T('topics.creator.kind_label'), escapeHtml(contentTypeLabel(draft.contentType) || T('topics.creator.summary_kind_default'))],
       [T('topics.creator.partitions_label'), escapeHtml(fmtCount(draft.partitions))],
       [T('topics.creator.summary_storage'), escapeHtml(summaryRetention())],
@@ -371,6 +385,15 @@ export function openTopicCreator({ instanceLabel, capabilities = {}, subjects = 
       name.addEventListener('input', onName);
       name.addEventListener('change', onName);
       name.addEventListener('keydown', (e) => { if (e.key === 'Enter' && canProceed()) advance(); });
+    }
+    const description = win.querySelector('#tb-cr-description');
+    if (description) {
+      description.addEventListener('input', () => {
+        draft.description = description.value;
+        if (descriptionFits(draft.description)) description.removeAttribute('error');
+        else description.setAttribute('error', T('topics.creator.description_too_long', { max: fmtCount(DESCRIPTION_MAX) }));
+        syncNext();
+      });
     }
     const partitions = win.querySelector('#tb-cr-partitions');
     if (partitions) {

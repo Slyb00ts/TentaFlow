@@ -1,4 +1,4 @@
-// ===== File: modules/tentabus/topic-settings.js — a topic's Ustawienia section: values to read and the four "Zmień" windows =====
+// ===== File: modules/tentabus/topic-settings.js — a topic's Ustawienia section: values to read and the five "Zmień" windows =====
 //
 // The page shows each setting as "label — value" with one sentence of what it
 // means; a value the page does not change carries a lock and the reason. Each
@@ -26,12 +26,13 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { T, fmtCount, fmtBytes, fmtRetention, fmtDuration, contentTypeLabel } from '/js/modules/tentabus/format.js';
-import { compatibleSchemas, compatibleFormatsLabel } from '/js/modules/tentabus/topic-creator.js';
+import { compatibleSchemas, compatibleFormatsLabel, descriptionFits, DESCRIPTION_MAX } from '/js/modules/tentabus/topic-creator.js';
 import { schemaFormatLabel } from '/js/modules/tentabus/schemas.js';
 import { patchHtml } from '/js/lib/dom-patch.js';
 import '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-input.js';
+import '/js/components/tf-textarea.js';
 import '/js/components/tf-select.js';
 import '/js/components/tf-segmented.js';
 import '/js/components/tf-alert.js';
@@ -192,6 +193,18 @@ export function retryImpact({ current, next }) {
   return lines;
 }
 
+/** "Co się stanie" of the description window. */
+export function aboutImpact({ current, next }) {
+  if (next.description === current.description) return [];
+  return [T(next.description ? 'settings.about.impact_set' : 'settings.about.impact_cleared')];
+}
+
+/** Who created the topic, in words; `null` when this topic has no recorded author. */
+export function createdByText(topic) {
+  if (!topic.createdBy) return null;
+  return topic.createdByLabel || T('settings.about.created_by_unknown');
+}
+
 /** "Co się stanie" of the pattern window. */
 export function patternImpact({ current, next, versionOf }) {
   const lines = [];
@@ -266,6 +279,14 @@ export function settingsHtml(view) {
   const facts = storageFacts(partitions);
   const subject = boundSubject(topic, subjects);
 
+  const description = String(topic.description || '').trim();
+  const about = [
+    valueRow(T('settings.about.description_label'), description || T('settings.about.description_none'),
+      T(description ? 'settings.about.description_hint' : 'settings.about.description_none_hint')),
+  ];
+  const author = createdByText(topic);
+  if (author) about.push(valueRow(T('settings.about.created_by_label'), author, T('settings.about.created_by_lock'), true));
+
   const retention = [
     valueRow(T('settings.retention.period_label'), fmtRetention(topic.retentionMs), T('settings.retention.period_hint', { minutes: fmtCount(SWEEP_MINUTES) })),
     valueRow(T('settings.retention.limit_label'), fmtBytes(topic.retentionBytesPerPartition), facts.largest != null && facts.largest > 0
@@ -304,6 +325,7 @@ export function settingsHtml(view) {
     ${notice ? `<tf-alert tone="${escapeAttr(notice.tone || 'success')}" title="${escapeAttr(notice.title)}" message="${escapeAttr(notice.text || '')}" data-role="saved"></tf-alert>` : ''}
     ${access?.canRead ? '' : `<div class="tb-who-can">${sprite('lock')}<span>${escapeHtml(T('detail.no_read', { name: topic.name }))}</span></div>`}
     ${canAdmin ? '' : `<div class="tb-who-can">${sprite('lock')}<span>${escapeHtml(whoCanChange(adminLabels))}</span></div>`}
+    ${settingsCard('about', 'file-text', T('settings.about.title'), about, canAdmin)}
     ${settingsCard('retention', 'clock', T('settings.retention.title'), retention, canAdmin)}
     ${settingsCard('write', 'shield', T('settings.write.title'), write, canAdmin)}
     ${settingsCard('retry', 'rotate', T('settings.retry.title'), retry, canAdmin)}
@@ -409,6 +431,39 @@ export function openSettingsWindow(cardKey, ctx) {
   const titleOf = (key) => T(`settings.${key}.window_title`, { name: topic.name });
   const send = (current) => (next) => ctx.update(buildTopicUpdateRequest(instanceId, topic.name, current, next));
   const common = { describeError: ctx.describeError };
+
+  if (cardKey === 'about') {
+    const current = { description: String(topic.description || '').trim() };
+    const tooLong = T('settings.about.too_long', { max: fmtCount(DESCRIPTION_MAX) });
+    return openChangeWindow({
+      ...common,
+      title: titleOf('about'),
+      icon: 'file-text',
+      current,
+      fields: () => `
+        <tf-textarea id="tb-set-description" rows="3" autogrow maxlength="${DESCRIPTION_MAX}" label="${escapeAttr(T('settings.about.description_label'))}"
+          value="${escapeAttr(current.description)}" hint="${escapeAttr(T('topics.creator.description_hint', { max: fmtCount(DESCRIPTION_MAX) }))}"></tf-textarea>`,
+      wire: (win, sync) => {
+        const d = win.querySelector('#tb-set-description');
+        d.addEventListener('input', () => {
+          if (descriptionFits(d.value)) d.removeAttribute('error');
+          else d.setAttribute('error', tooLong);
+          sync();
+        });
+      },
+      draft: (win) => {
+        const value = win.querySelector('#tb-set-description').value;
+        return descriptionFits(value) ? { description: value.trim() } : null;
+      },
+      impact: (d) => aboutImpact({ current, next: d }),
+      save: send(current),
+      onSaved: (d) => ctx.onSaved({
+        card: 'about',
+        title: T('settings.about.saved_title'),
+        text: d.description ? T('settings.about.saved_text', { text: d.description }) : T('settings.about.saved_text_none'),
+      }),
+    });
+  }
 
   if (cardKey === 'retention') {
     const current = { retentionMs: Number(topic.retentionMs), retentionBytesPerPartition: Number(topic.retentionBytesPerPartition) };

@@ -107,6 +107,10 @@ pub struct BusTopicOptionsWire {
     /// 'lz4' | 'none'.
     #[serde(default)]
     pub compression: Option<String>,
+    /// Free text shown under the topic's name, at most 500 characters.
+    /// `Some("")` clears it on update.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// Full topic config as read back after create/update/detail — mirrors
@@ -156,6 +160,18 @@ pub struct BusTopicConfigWire {
     pub environment: String,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Empty when the topic has no description, and on a peer built before
+    /// this field existed.
+    #[serde(default)]
+    pub description: String,
+    /// Who created the topic: a user id, or `api_key:<uid>`. `None` for a
+    /// topic created before its author was recorded.
+    #[serde(default)]
+    pub created_by: Option<String>,
+    /// `created_by` resolved to a display name (a user's name, or an API
+    /// key's name). `None` when the author is unknown to this node.
+    #[serde(default)]
+    pub created_by_label: Option<String>,
 }
 
 /// One row of `TopicListResponse`. Deliberately narrower than
@@ -576,6 +592,10 @@ pub struct BusSchemaVersionWire {
     /// See `BusSchemaSubjectWire::created_by_label`'s doc.
     #[serde(default)]
     pub created_by_label: Option<String>,
+    /// When this version was deprecated (`SchemaDeleteRequest` with a
+    /// `version` and `deprecate_only`); `None` while it is active.
+    #[serde(default)]
+    pub deprecated_at_ms: Option<i64>,
 }
 
 // =============================================================================
@@ -1273,6 +1293,8 @@ pub enum BusPayload {
     SchemaCompatibilitySetResponse,
     SchemaDeleteRequest {
         subject: String,
+        /// With `deprecate_only`, deprecates this one version instead of the
+        /// whole subject; without it, hard-deletes this one version.
         #[serde(default)]
         version: Option<u32>,
         /// `#[serde(default)]` (review finding #10) so a legacy encoder
@@ -1398,6 +1420,7 @@ mod tests {
             durability_class: Some("critical".to_string()),
             max_inline_bytes: Some(1024 * 1024),
             compression: Some("lz4".to_string()),
+            description: Some("Nowe badania z PACS".to_string()),
         }
     }
 
@@ -1426,6 +1449,9 @@ mod tests {
             environment: "prod".to_string(),
             created_at_ms: 1,
             updated_at_ms: 2,
+            description: "Nowe badania z PACS".to_string(),
+            created_by: Some("api_key:k-1".to_string()),
+            created_by_label: Some("Integracja PACS".to_string()),
         }
     }
 
@@ -2367,6 +2393,7 @@ mod tests {
             created_by: Some("u-admin".to_string()),
             created_at_ms: 1500,
             created_by_label: Some("Anna Kowalska".to_string()),
+            deprecated_at_ms: Some(1700),
         };
 
         round_trip(BusPayload::SchemaSubjectListRequest {});
@@ -2573,6 +2600,63 @@ mod tests {
     // is `#[serde(default)]`; each test below encodes the shape a peer built
     // BEFORE the field existed sends and decodes it with today's types.
     // =========================================================================
+
+    /// Encodes `value`, drops `fields` from the top-level map — the shape a
+    /// peer built before those fields existed sends — and decodes it back.
+    fn decode_without<T>(value: &T, fields: &[&str]) -> T
+    where
+        T: SerdeSerialize + serde::de::DeserializeOwned,
+    {
+        let bytes = crate::cbor::encode(value).expect("encode");
+        let decoded: ciborium::Value = crate::cbor::decode(&bytes).expect("decode as value");
+        let ciborium::Value::Map(entries) = decoded else {
+            panic!("a struct encodes as a map");
+        };
+        let before = entries.len();
+        let kept: Vec<_> = entries
+            .into_iter()
+            .filter(|(k, _)| !fields.iter().any(|f| k.as_text() == Some(*f)))
+            .collect();
+        assert_eq!(before - kept.len(), fields.len(), "every field must be present to drop");
+        let bytes = crate::cbor::encode(&ciborium::Value::Map(kept)).expect("re-encode");
+        crate::cbor::decode(&bytes).expect("decode the older shape")
+    }
+
+    #[test]
+    fn topic_config_without_description_and_author_decodes() {
+        let decoded = decode_without(
+            &sample_topic_config(),
+            &["description", "created_by", "created_by_label"],
+        );
+        assert_eq!(decoded.description, "");
+        assert_eq!(decoded.created_by, None);
+        assert_eq!(decoded.created_by_label, None);
+        assert_eq!(decoded.name, "pacs.badania.nowe");
+    }
+
+    #[test]
+    fn topic_options_without_description_leave_it_unchanged() {
+        let decoded = decode_without(&sample_topic_options(), &["description"]);
+        assert_eq!(decoded.description, None);
+        assert_eq!(decoded.partitions, Some(8));
+    }
+
+    #[test]
+    fn schema_version_without_deprecated_at_decodes_as_active() {
+        let version = BusSchemaVersionWire {
+            subject: "orders".to_string(),
+            version: 3,
+            schema_ref_id: 7,
+            content_hash: "h".to_string(),
+            created_by: None,
+            created_at_ms: 1,
+            created_by_label: None,
+            deprecated_at_ms: Some(9),
+        };
+        let decoded = decode_without(&version, &["deprecated_at_ms"]);
+        assert_eq!(decoded.deprecated_at_ms, None);
+        assert_eq!(decoded.version, 3);
+    }
 
     #[test]
     fn topic_summary_without_content_type_and_schema_id_decodes() {

@@ -1,7 +1,8 @@
 // ===== File: modules/tentabus/topic-detail.js — a topic's page: title, section menu and one section at a time =====
 //
 // The page lives under the Topiki tab (PROJEKT-SZCZEGOLOW.md): "← Wszystkie
-// topiki", the topic's name with what it carries and checks, "Podgląd
+// topiki", the topic's name with its description (or, without one, what it
+// carries and checks), "Podgląd
 // wiadomości" on the right, then a vertical section menu (tf-tabs
 // orientation="vertical"; a "Sekcja: …" list on a phone) beside exactly one
 // section: Stan, Ustawienia, Nieprzetworzone, Partycje i kopie. Sections are
@@ -66,6 +67,13 @@ export function topicDetailLoader({ fetch, context, apply }) {
     }
     if (stillWanted()) apply(outcome);
   };
+}
+
+/** The line under the topic's name: its description, else what it carries and checks. */
+export function titleLine(topic) {
+  const description = String(topic.description || '').trim();
+  if (description) return description;
+  return topicSubline({ contentLabel: contentTypeLabel(topic.contentType), schemaId: topic.schemaId || '' });
 }
 
 /** Whether a section can be opened with these rights. */
@@ -185,7 +193,7 @@ function paintPage(body, view, ctx) {
   const access = detail.access || { canRead: false, canWrite: false, canAdmin: false };
   const section = effectiveSection(view.section, access);
 
-  setText(body.querySelector('[data-role="desc"]'), topicSubline({ contentLabel: contentTypeLabel(topic.contentType), schemaId: topic.schemaId || '' }));
+  setText(body.querySelector('[data-role="desc"]'), titleLine(topic));
   const preview = body.querySelector('[data-role="preview"]');
   setAttr(preview, 'disabled', !access.canRead);
   const note = body.querySelector('[data-role="preview-note"]');

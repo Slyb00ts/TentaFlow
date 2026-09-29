@@ -9920,7 +9920,12 @@
         "partitions_invalid": "Geben Sie eine Anzahl Partitionen von {min} bis {max} ein.",
         "summary_schema_versioned": "{name}, neueste Version ({version})",
         "schemas_loading": "Nachrichtenmuster werden geladen…",
-        "schemas_failed": "Die Nachrichtenmuster der Instanz {instance} konnten nicht geladen werden. Versuchen Sie es erneut oder legen Sie das Topic ohne Muster an — ein Muster können Sie später in den Einstellungen des Topics wählen."
+        "schemas_failed": "Die Nachrichtenmuster der Instanz {instance} konnten nicht geladen werden. Versuchen Sie es erneut oder legen Sie das Topic ohne Muster an — ein Muster können Sie später in den Einstellungen des Topics wählen.",
+        "description_label": "Beschreibung (optional)",
+        "description_placeholder": "z. B. Befunde aus der Röntgenabteilung für das Kliniksystem",
+        "description_hint": "Ein oder zwei Sätze dazu, wofür das Topic dient. Sie erscheinen unter dem Namen des Topics. Höchstens {max} Zeichen.",
+        "description_too_long": "Die Beschreibung darf höchstens {max} Zeichen haben.",
+        "summary_description": "Beschreibung"
       },
       "delete": {
         "title": "Topic {name} löschen",
@@ -10147,6 +10152,23 @@
         "lead": "Topic {name} löschen",
         "text": "— alle seine Nachrichten, unverarbeiteten Nachrichten, Zugriffseinträge und Regeln zum Ausblenden von Daten verschwinden. Das lässt sich nicht rückgängig machen.",
         "button": "Topic löschen…"
+      },
+      "about": {
+        "title": "Beschreibung",
+        "window_title": "Beschreibung ändern — {name}",
+        "description_label": "Beschreibung",
+        "description_none": "Keine Beschreibung",
+        "description_hint": "Sie erscheint unter dem Namen des Topics.",
+        "description_none_hint": "Unter dem Namen des Topics stehen die Art des Inhalts und das Nachrichtenmuster.",
+        "created_by_label": "Angelegt von",
+        "created_by_unknown": "Ein Konto, das dieser Node nicht kennt",
+        "created_by_lock": "Das ändert sich nicht: Es ist die Person oder der Schlüssel, die das Topic angelegt haben.",
+        "too_long": "Die Beschreibung darf höchstens {max} Zeichen haben.",
+        "impact_set": "Jeder, der dieses Topic sieht, sieht diese Beschreibung unter seinem Namen, auf allen Nodes der Instanz. Nachrichten und Empfänger bleiben unverändert.",
+        "impact_cleared": "Unter dem Namen des Topics stehen wieder die Art des Inhalts und das Nachrichtenmuster. Nachrichten und Empfänger bleiben unverändert.",
+        "saved_title": "Beschreibung gespeichert.",
+        "saved_text": "Unter dem Namen des Topics steht jetzt: {text}",
+        "saved_text_none": "Das Topic hat keine Beschreibung mehr."
       }
     },
     "partitions": {

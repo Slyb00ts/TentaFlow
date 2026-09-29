@@ -643,6 +643,7 @@ async fn run_route(
                             "schema_ref_id": v.schema_ref_id,
                             "content_hash": v.content_hash,
                             "created_at_ms": v.created_at_ms,
+                            "deprecated_at_ms": v.deprecated_at_ms,
                         })
                     })
                     .collect();
@@ -726,7 +727,11 @@ async fn run_route(
                         "removed_versions": removed,
                         "deprecated": deprecate_only,
                     }),
-                    Some(serde_json::json!({ "versions": removed })),
+                    Some(if deprecate_only {
+                        serde_json::json!({ "version": version })
+                    } else {
+                        serde_json::json!({ "versions": removed })
+                    }),
                 )
             }
         })

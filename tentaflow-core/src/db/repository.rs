@@ -30703,6 +30703,16 @@ pub struct DbBusTopic {
     /// peer on an older build sends.
     #[serde(default)]
     pub generation: u64,
+    /// Free text an admin gives the topic (migration v176); empty when none.
+    /// A peer on a build before v176 sends no such field, which decodes as
+    /// empty — its update of the topic clears the description.
+    #[serde(default)]
+    pub description: String,
+    /// Who created this incarnation: a user id, or `api_key:<uid>` for a
+    /// REST caller (migration v176). Set once at creation, never by an
+    /// update; `None` for a topic created before v176.
+    #[serde(default)]
+    pub created_by: Option<String>,
 }
 
 fn map_bus_topic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusTopic> {
@@ -30732,6 +30742,8 @@ fn map_bus_topic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusTopic> {
         updated_at_ms: row.get(22)?,
         durability_class: row.get(23)?,
         generation: row.get::<_, i64>(24)? as u64,
+        description: row.get(25)?,
+        created_by: row.get(26)?,
     })
 }
 
@@ -30739,7 +30751,7 @@ const BUS_TOPIC_COLUMNS: &str = "instance_id, org_id, name, partitions, retentio
     retention_bytes, cleanup_policy, delivery, idempotency_key, dedup_window_ms, \
     max_delivery_attempts, retry_backoff_ms, schema_id, validation, content_type, \
     replication_factor, acks, durability, max_inline_bytes, compression, environment, \
-    created_at_ms, updated_at_ms, durability_class, generation";
+    created_at_ms, updated_at_ms, durability_class, generation, description, created_by";
 
 /// Builds the `core.bus_topic` capture for one `bus_topics` row: the composite
 /// resource id and the one-field `row_json` payload. Split out of
@@ -30896,7 +30908,7 @@ fn bus_topic_insert(
             &format!(
                 "INSERT INTO bus_topics ({BUS_TOPIC_COLUMNS}) VALUES \
                  (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,\
-                  ?23,?24,?25)"
+                  ?23,?24,?25,?26,?27)"
             ),
             rusqlite::params![
                 row.instance_id,
@@ -30924,6 +30936,8 @@ fn bus_topic_insert(
                 row.updated_at_ms,
                 row.durability_class,
                 row.generation as i64,
+                row.description,
+                row.created_by,
             ],
         )?;
         let removed = delete_topic_rules_tx(tx, &row.instance_id, &row.org_id, &row.name)?;
@@ -30994,7 +31008,7 @@ pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
          max_delivery_attempts=?11, retry_backoff_ms=?12, schema_id=?13, validation=?14, \
          content_type=?15, replication_factor=?16, acks=?17, durability=?18, \
          max_inline_bytes=?19, compression=?20, environment=?21, updated_at_ms=?22, \
-         durability_class=?23 \
+         durability_class=?23, description=?24 \
          WHERE instance_id=?1 AND org_id=?2 AND name=?3",
         rusqlite::params![
             row.instance_id,
@@ -31025,6 +31039,7 @@ pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
             // referenced by the SQL above.
             row.updated_at_ms,
             row.durability_class,
+            row.description,
         ],
     )?;
     // Released before the publish: `record_core_capture` reads and writes the
@@ -32298,10 +32313,22 @@ pub struct DbBusSchemaSubject {
     pub created_by: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+    /// Deprecated versions of this subject (migration v176), a JSON array of
+    /// `{"version", "deprecated_at_ms"}` — read through
+    /// `bus::schema_registry::registry`, which owns the format. Kept on the
+    /// subject row because version rows replicate insert-if-absent. A peer
+    /// on a build before v176 sends no such field, which decodes as `[]`.
+    #[serde(default = "empty_json_array")]
+    pub deprecated_versions_json: String,
+}
+
+fn empty_json_array() -> String {
+    "[]".to_string()
 }
 
 const BUS_SCHEMA_SUBJECT_COLUMNS: &str = "instance_id, org_id, subject, schema_type, \
-     compatibility, deprecated_at_ms, created_by, created_at_ms, updated_at_ms";
+     compatibility, deprecated_at_ms, created_by, created_at_ms, updated_at_ms, \
+     deprecated_versions_json";
 
 fn map_bus_schema_subject_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusSchemaSubject> {
     Ok(DbBusSchemaSubject {
@@ -32314,6 +32341,7 @@ fn map_bus_schema_subject_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBus
         created_by: row.get(6)?,
         created_at_ms: row.get(7)?,
         updated_at_ms: row.get(8)?,
+        deprecated_versions_json: row.get(9)?,
     })
 }
 
@@ -32386,12 +32414,13 @@ pub fn bus_schema_subject_upsert(pool: &DbPool, row: &DbBusSchemaSubject) -> Res
     conn.execute(
         &format!(
             "INSERT INTO bus_schema_subjects ({BUS_SCHEMA_SUBJECT_COLUMNS}) VALUES \
-             (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
              ON CONFLICT(instance_id, org_id, subject) DO UPDATE SET \
              schema_type = excluded.schema_type, \
              compatibility = excluded.compatibility, \
              deprecated_at_ms = excluded.deprecated_at_ms, \
-             updated_at_ms = excluded.updated_at_ms"
+             updated_at_ms = excluded.updated_at_ms, \
+             deprecated_versions_json = excluded.deprecated_versions_json"
         ),
         rusqlite::params![
             row.instance_id,
@@ -32403,6 +32432,7 @@ pub fn bus_schema_subject_upsert(pool: &DbPool, row: &DbBusSchemaSubject) -> Res
             row.created_by,
             row.created_at_ms,
             row.updated_at_ms,
+            row.deprecated_versions_json,
         ],
     )?;
     drop(conn);
@@ -32975,6 +33005,8 @@ pub mod bus_test_support {
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 generation INTEGER NOT NULL DEFAULT 0,
+                description TEXT NOT NULL DEFAULT '',
+                created_by TEXT,
                 PRIMARY KEY (instance_id, org_id, name)
             );
             CREATE TABLE IF NOT EXISTS bus_groups (
@@ -33029,6 +33061,7 @@ pub mod bus_test_support {
                 created_by TEXT,
                 created_at_ms INTEGER NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
+                deprecated_versions_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (instance_id, org_id, subject)
             );
             CREATE TABLE IF NOT EXISTS bus_schema_versions (
@@ -33112,6 +33145,8 @@ mod bus_repository_tests {
             updated_at_ms: 1_000,
             durability_class: None,
             generation: 0,
+            description: String::new(),
+            created_by: None,
         }
     }
 
@@ -33258,6 +33293,7 @@ mod bus_repository_tests {
             created_by: Some("admin-1".to_string()),
             created_at_ms: 1_000,
             updated_at_ms: 1_000,
+            deprecated_versions_json: "[]".to_string(),
         }
     }
 

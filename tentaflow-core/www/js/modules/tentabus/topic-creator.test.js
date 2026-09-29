@@ -16,7 +16,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 
 const {
   topicNameProblem, creatorContentTypes, compatibleSchemas, copiesPlan, copiesReason, copiesCount,
-  buildTopicCreateRequest, newDraft, openTopicCreator, partitionsValue,
+  buildTopicCreateRequest, newDraft, openTopicCreator, partitionsValue, descriptionFits, DESCRIPTION_MAX,
 } = await import('./topic-creator.js');
 
 const CONTENT = ['application/json', 'application/xml', 'application/hl7-v2'];
@@ -94,6 +94,17 @@ test('the create request carries what the window asked, never the copies', () =>
   assert.equal('replicationFactor' in plain.options, false);
 });
 
+test('a description is sent trimmed, and a blank one is not sent at all', () => {
+  const draft = { ...newDraft(creatorContentTypes(CONTENT)), name: 'wyniki', description: '  Wyniki z pracowni RTG  ' };
+  assert.equal(buildTopicCreateRequest('tentabus-1a2b3c4d', draft).options.description, 'Wyniki z pracowni RTG');
+  const blank = buildTopicCreateRequest('tentabus-1a2b3c4d', { ...draft, description: '   ' });
+  assert.equal('description' in blank.options, false);
+  assert.equal(DESCRIPTION_MAX, 500);
+  assert.equal(descriptionFits('ą'.repeat(500)), true, 'characters are counted, not bytes');
+  assert.equal(descriptionFits(`${'a'.repeat(500)}  `), true, 'the spaces around it are not kept');
+  assert.equal(descriptionFits('a'.repeat(501)), false);
+});
+
 const tick = () => new Promise((r) => setTimeout(r, 0));
 const norm = (s) => String(s).replace(/[  ]/g, ' ').replace(/\s+/g, ' ').trim();
 const summaryText = (win) => norm([...win.querySelectorAll('.tb-kv-grid > div')].map((d) => d.textContent).join(' '));
@@ -167,6 +178,29 @@ test('the whole walk: kind, storage with the copies sentence, pattern, summary, 
   assert.equal(sent[0].options.retentionMs, 90 * 86_400_000);
   assert.equal(created.length, 1);
   assert.equal(created[0].name, 'wyniki-z-pracowni');
+});
+
+test('step 1: an optional description, too long stops Dalej, and it reaches the summary and the request', async () => {
+  const { win, sent } = open();
+  typeName(win, 'wyniki-z-pracowni');
+  const field = win.querySelector('#tb-cr-description');
+  assert.equal(field.getAttribute('maxlength'), '500');
+  assert.equal(nextBtn(win).hasAttribute('disabled'), false, 'the description is optional');
+  const typeDescription = (value) => {
+    field.value = value;
+    field.dispatchEvent(new CustomEvent('input', { detail: { value } }));
+  };
+  typeDescription('x'.repeat(501));
+  assert.match(field.getAttribute('error'), /najwyżej 500 znaków/);
+  assert.ok(nextBtn(win).hasAttribute('disabled'));
+  typeDescription(' Wyniki z pracowni RTG ');
+  assert.equal(field.hasAttribute('error'), false);
+  nextBtn(win).click();
+  nextBtn(win).click();
+  assert.match(summaryText(win), /Opis Wyniki z pracowni RTG/);
+  nextBtn(win).click();
+  await tick();
+  assert.equal(sent[0].options.description, 'Wyniki z pracowni RTG');
 });
 
 test('HL7 v2 with no fitting pattern: step 3 says the topic starts without one', () => {

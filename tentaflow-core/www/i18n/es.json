@@ -9920,7 +9920,12 @@
         "partitions_invalid": "Escribe un número de particiones de {min} a {max}.",
         "summary_schema_versioned": "{name}, versión más reciente ({version})",
         "schemas_loading": "Cargando los patrones de mensajes…",
-        "schemas_failed": "No se pudieron cargar los patrones de mensajes de la instancia {instance}. Inténtalo de nuevo o crea el tópico sin patrón; podrás elegir uno más tarde en la configuración del tópico."
+        "schemas_failed": "No se pudieron cargar los patrones de mensajes de la instancia {instance}. Inténtalo de nuevo o crea el tópico sin patrón; podrás elegir uno más tarde en la configuración del tópico.",
+        "description_label": "Descripción (opcional)",
+        "description_placeholder": "p. ej. Resultados del laboratorio de rayos X para el sistema del hospital",
+        "description_hint": "Una o dos frases sobre para qué sirve el topic. Se muestra bajo su nombre. Como máximo {max} caracteres.",
+        "description_too_long": "La descripción puede tener como máximo {max} caracteres.",
+        "summary_description": "Descripción"
       },
       "delete": {
         "title": "Eliminar el tópico {name}",
@@ -10147,6 +10152,23 @@
         "lead": "Eliminar el topic {name}",
         "text": ": desaparecerán todos sus mensajes, mensajes sin procesar, entradas de acceso y reglas de ocultación de datos. No se puede deshacer.",
         "button": "Eliminar topic…"
+      },
+      "about": {
+        "title": "Descripción",
+        "window_title": "Cambiar la descripción — {name}",
+        "description_label": "Descripción",
+        "description_none": "Sin descripción",
+        "description_hint": "Se muestra bajo el nombre del topic.",
+        "description_none_hint": "Bajo el nombre del topic se muestran el tipo de contenido y el patrón de mensaje.",
+        "created_by_label": "Creado por",
+        "created_by_unknown": "Una cuenta que este node no conoce",
+        "created_by_lock": "Esto no cambia: es la persona o la clave que creó el topic.",
+        "too_long": "La descripción puede tener como máximo {max} caracteres.",
+        "impact_set": "Todos los que ven este topic verán esta descripción bajo su nombre, en todos los nodes de la instancia. Los mensajes y los consumidores no cambian.",
+        "impact_cleared": "Bajo el nombre del topic volverán a mostrarse el tipo de contenido y el patrón de mensaje. Los mensajes y los consumidores no cambian.",
+        "saved_title": "Descripción guardada.",
+        "saved_text": "Bajo el nombre del topic se muestra ahora: {text}",
+        "saved_text_none": "El topic ya no tiene descripción."
       }
     },
     "partitions": {

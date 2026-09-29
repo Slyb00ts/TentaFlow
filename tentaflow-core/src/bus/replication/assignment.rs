@@ -599,6 +599,8 @@ mod tests {
                 updated_at_ms: 1,
                 durability_class: None,
                 generation: 0,
+                description: String::new(),
+                created_by: None,
             },
         )
         .expect("seed parent bus_topic");
@@ -642,6 +644,8 @@ mod tests {
             updated_at_ms: 1,
             durability_class: None,
             generation: 0,
+            description: String::new(),
+            created_by: None,
         }
     }
 

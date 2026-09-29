@@ -52,13 +52,13 @@ const replicaTopics = [{
   ],
 }];
 
-function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, section = 'state', detail, error = null, adminLabels = [] } = {}) {
+function mount({ access = { canRead: true, canWrite: true, canAdmin: true }, section = 'state', detail, error = null, adminLabels = [], topicOverrides = {} } = {}) {
   const body = document.createElement('div');
   document.body.appendChild(body);
   const moves = [];
   const view = {
     name: 'wyniki-badan',
-    detail: detail === undefined ? { topic, partitions, groups: [], access, adminLabels } : detail,
+    detail: detail === undefined ? { topic: { ...topic, ...topicOverrides }, partitions, groups: [], access, adminLabels } : detail,
     error,
     errorKind: error ? 'lost' : null,
     section,
@@ -99,6 +99,13 @@ test('the page: back link, title with what the topic carries, the vertical menu 
   assert.deepEqual([...body.querySelectorAll('[data-section]')].map((s) => [s.dataset.section, s.hidden]), [['state', false], ['settings', true], ['dlq', true], ['partitions', true]]);
   body.querySelector('[data-go="back"]').click();
   assert.deepEqual(moves, [{ kind: 'back' }]);
+});
+
+test('a description takes the line under the title; without one it says what the topic carries', () => {
+  const described = mount({ topicOverrides: { description: '  Wyniki z pracowni RTG\ndla systemu szpitalnego ' } });
+  assert.equal(described.body.querySelector('[data-role="desc"]').textContent, 'Wyniki z pracowni RTG\ndla systemu szpitalnego');
+  const blank = mount({ topicOverrides: { description: '   ' } });
+  assert.equal(blank.body.querySelector('[data-role="desc"]').textContent, 'HL7 v2 · bez wzoru');
 });
 
 test('Stan: four tiles of this topic, its alerts with where to act, its consumers', () => {

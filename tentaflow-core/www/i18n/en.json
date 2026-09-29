@@ -11155,7 +11155,12 @@
         "partitions_invalid": "Enter a number of partitions from {min} to {max}.",
         "summary_schema_versioned": "{name}, newest version ({version})",
         "schemas_loading": "Loading message patterns…",
-        "schemas_failed": "The message patterns of instance {instance} could not be loaded. Try again, or create the topic without a pattern — you can choose one later in the topic settings."
+        "schemas_failed": "The message patterns of instance {instance} could not be loaded. Try again, or create the topic without a pattern — you can choose one later in the topic settings.",
+        "description_label": "Description (optional)",
+        "description_placeholder": "e.g. X-ray lab results for the hospital system",
+        "description_hint": "One or two sentences on what the topic is for. It is shown under the topic name. At most {max} characters.",
+        "description_too_long": "The description can have at most {max} characters.",
+        "summary_description": "Description"
       },
       "delete": {
         "title": "Delete topic {name}",
@@ -11382,6 +11387,23 @@
         "lead": "Delete topic {name}",
         "text": "— all its messages, unprocessed messages, access entries and data hiding rules go. This cannot be undone.",
         "button": "Delete topic…"
+      },
+      "about": {
+        "title": "Description",
+        "window_title": "Change description — {name}",
+        "description_label": "Description",
+        "description_none": "No description",
+        "description_hint": "It is shown under the topic name.",
+        "description_none_hint": "The kind of content and the message pattern are shown under the topic name.",
+        "created_by_label": "Created by",
+        "created_by_unknown": "An account this node does not know",
+        "created_by_lock": "This does not change: it is the person or key that created the topic.",
+        "too_long": "The description can have at most {max} characters.",
+        "impact_set": "Everyone who can see this topic will see this description under its name, on every node of the instance. Messages and consumers stay as they are.",
+        "impact_cleared": "The kind of content and the message pattern will be shown under the topic name again. Messages and consumers stay as they are.",
+        "saved_title": "Description saved.",
+        "saved_text": "Shown under the topic name now: {text}",
+        "saved_text_none": "The topic no longer has a description."
       }
     },
     "partitions": {

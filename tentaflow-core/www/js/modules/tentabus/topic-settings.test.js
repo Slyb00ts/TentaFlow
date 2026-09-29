@@ -2,7 +2,7 @@
 // File: modules/tentabus/topic-settings.test.js
 // Description: A topic's Ustawienia section (U2): the values the page reads
 // out, with locks where the page does not change them; who may change the
-// topic; the "Co się stanie po zapisaniu" sentences of the four windows,
+// topic; the "Co się stanie po zapisaniu" sentences of the five windows,
 // computed from what the server does with each change; the update that sends
 // only what a window changed; the windows themselves (a save, a field that
 // is not valid, a refusal that stays in the window).
@@ -16,7 +16,7 @@ if (typeof globalThis.Document === 'undefined' && window.Document) globalThis.Do
 
 const {
   retentionChoices, limitChoices, backoffChoices, quorumOf, backoffSchedule, storageFacts,
-  retentionImpact, writeImpact, retryImpact, patternImpact, acksHint,
+  retentionImpact, writeImpact, retryImpact, patternImpact, aboutImpact, createdByText, acksHint,
   buildTopicUpdateRequest, whoCanChange, settingsHtml, openSettingsWindow, partitionCount, attemptCount,
 } = await import('./topic-settings.js');
 
@@ -39,6 +39,9 @@ const topic = {
   contentType: 'application/json',
   schemaId: 'wizyta',
   validation: 'dlq',
+  description: 'Wyniki z pracowni RTG',
+  createdBy: 'u-anna',
+  createdByLabel: 'Anna Kowalska',
 };
 const subjects = [
   { subject: 'wizyta', schemaType: 'json_schema', latestVersion: 3, deprecatedAtMs: null },
@@ -170,17 +173,60 @@ function host(html) {
   return el;
 }
 
-test('the section for an administrator: four cards with "Zmień", locks with their reasons, the delete card', () => {
+test('the section for an administrator: five cards with "Zmień", locks with their reasons, the delete card', () => {
   const el = host(settingsHtml({ topic, partitions: [], subjects, access: { canRead: true, canAdmin: true }, adminLabels: [] }));
-  assert.equal(el.querySelectorAll('[data-go="change"]').length, 4);
-  assert.deepEqual([...el.querySelectorAll('[data-go="change"]')].map((b) => b.dataset.card), ['retention', 'write', 'retry', 'pattern']);
+  assert.equal(el.querySelectorAll('[data-go="change"]').length, 5);
+  assert.deepEqual([...el.querySelectorAll('[data-go="change"]')].map((b) => b.dataset.card), ['about', 'retention', 'write', 'retry', 'pattern']);
   assert.ok(el.querySelector('[data-go="delete"]'));
   assert.equal(el.querySelector('.tb-who-can'), null);
   const text = norm(el.textContent);
   assert.match(text, /Jak długo trzymać wiadomości30 dni/);
   assert.match(text, /Kiedy zapis jest potwierdzonygdy zapisze większość kopiiZapis czeka, aż wiadomość będzie na 2 z 3 nodów\./);
   assert.match(text, /wizyta \(JSON Schema\)Sprawdzana jest zawsze najnowsza wersja — teraz 3\./);
-  assert.equal(el.querySelectorAll('.tb-vr-lock').length, 4, 'cleanup, copies, durability, content kind');
+  assert.match(text, /OpisWyniki z pracowni RTGWidać go pod nazwą topiku\./);
+  assert.match(text, /UtworzyłAnna Kowalska/);
+  assert.equal(el.querySelectorAll('.tb-vr-lock').length, 5, 'author, cleanup, copies, durability, content kind');
+});
+
+test('the description card: none said so, and the author only when one was recorded', () => {
+  const bare = host(settingsHtml({ topic: { ...topic, description: '', createdBy: null, createdByLabel: null }, partitions: [], subjects, access: { canRead: true, canAdmin: true }, adminLabels: [] }));
+  const text = norm(bare.querySelector('[data-card="about"]').textContent);
+  assert.match(text, /OpisBrak opisuPod nazwą topiku widać rodzaj treści i wzór wiadomości\./);
+  assert.doesNotMatch(text, /Utworzył/);
+  assert.equal(createdByText({ createdBy: null }), null);
+  assert.equal(createdByText({ createdBy: 'api_key:k-1', createdByLabel: 'Integracja PACS' }), 'Integracja PACS');
+  assert.equal(createdByText({ createdBy: 'u-gone', createdByLabel: null }), 'Konto, którego ten node nie zna');
+});
+
+test('the description window: what saving does, a text over the limit, a cleared description', async () => {
+  assert.deepEqual(aboutImpact({ current: { description: 'a' }, next: { description: 'a' } }), []);
+  assert.match(aboutImpact({ current: { description: '' }, next: { description: 'b' } })[0], /na wszystkich nodach instancji/);
+  assert.match(aboutImpact({ current: { description: 'a' }, next: { description: '' } })[0], /znów będzie widać rodzaj treści/);
+
+  const { win, sent, saved } = openWindow('about');
+  const field = win.querySelector('#tb-set-description');
+  const save = win.querySelector('[data-act="save"]');
+  assert.equal(field.value, 'Wyniki z pracowni RTG');
+  assert.ok(save.hasAttribute('disabled'));
+  type(field, 'y'.repeat(501));
+  assert.match(field.getAttribute('error'), /najwyżej 500 znaków/);
+  assert.ok(save.hasAttribute('disabled'));
+  assert.match(win.querySelector('[data-role="impact"]').textContent, /Popraw zaznaczone pole/);
+  type(field, '  Wyniki RTG i USG  ');
+  assert.equal(field.hasAttribute('error'), false);
+  assert.match(win.querySelector('[data-role="impact"]').textContent, /Co się stanie po zapisaniu: Ten opis zobaczy/);
+  save.click();
+  await tick();
+  assert.deepEqual(sent, [{ instanceId: 'tentabus-1a2b3c4d', name: 'wyniki-badan', options: { description: 'Wyniki RTG i USG' } }]);
+  assert.equal(saved[0].card, 'about');
+  assert.equal(saved[0].text, 'Pod nazwą topiku widać teraz: Wyniki RTG i USG');
+
+  const cleared = openWindow('about');
+  type(cleared.win.querySelector('#tb-set-description'), '   ');
+  cleared.win.querySelector('[data-act="save"]').click();
+  await tick();
+  assert.deepEqual(cleared.sent[0].options, { description: '' });
+  assert.equal(cleared.saved[0].text, 'Topik nie ma już opisu.');
 });
 
 test('the section for a reader: no buttons, who can change it, and why the rest is closed without read access', () => {

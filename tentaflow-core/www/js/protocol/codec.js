@@ -3444,8 +3444,8 @@ export const encode = {
 
   /**
    * BusPayload::SchemaDeleteRequest. payload: { subject, version?, deprecateOnly }. `version`
-   * omitted/null deletes every version of `subject`; `deprecateOnly` marks it deprecated
-   * instead of a hard delete.
+   * omitted/null addresses the whole subject, a number one version; `deprecateOnly` marks
+   * it deprecated instead of a hard delete.
    */
   busSchemaDeleteRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();

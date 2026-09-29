@@ -9920,7 +9920,12 @@
         "partitions_invalid": "Saisissez un nombre de partitions de {min} à {max}.",
         "summary_schema_versioned": "{name}, version la plus récente ({version})",
         "schemas_loading": "Chargement des modèles de messages…",
-        "schemas_failed": "Les modèles de messages de l’instance {instance} n’ont pas pu être chargés. Réessayez, ou créez le topic sans modèle : vous pourrez en choisir un plus tard dans les réglages du topic."
+        "schemas_failed": "Les modèles de messages de l’instance {instance} n’ont pas pu être chargés. Réessayez, ou créez le topic sans modèle : vous pourrez en choisir un plus tard dans les réglages du topic.",
+        "description_label": "Description (facultative)",
+        "description_placeholder": "p. ex. Résultats du service de radiologie pour le système de l’hôpital",
+        "description_hint": "Une ou deux phrases sur l’usage du topic. Elles s’affichent sous son nom. Au plus {max} caractères.",
+        "description_too_long": "La description peut compter au plus {max} caractères.",
+        "summary_description": "Description"
       },
       "delete": {
         "title": "Supprimer le topic {name}",
@@ -10147,6 +10152,23 @@
         "lead": "Supprimer le topic {name}",
         "text": "— tous ses messages, messages non traités, entrées d’accès et règles de masquage des données disparaissent. C’est irréversible.",
         "button": "Supprimer le topic…"
+      },
+      "about": {
+        "title": "Description",
+        "window_title": "Modifier la description — {name}",
+        "description_label": "Description",
+        "description_none": "Aucune description",
+        "description_hint": "Elle s’affiche sous le nom du topic.",
+        "description_none_hint": "Le type de contenu et le modèle de message s’affichent sous le nom du topic.",
+        "created_by_label": "Créé par",
+        "created_by_unknown": "Un compte que ce node ne connaît pas",
+        "created_by_lock": "Cela ne change pas : c’est la personne ou la clé qui a créé le topic.",
+        "too_long": "La description peut compter au plus {max} caractères.",
+        "impact_set": "Toute personne qui voit ce topic verra cette description sous son nom, sur tous les nodes de l’instance. Les messages et les consommateurs restent inchangés.",
+        "impact_cleared": "Le type de contenu et le modèle de message s’afficheront de nouveau sous le nom du topic. Les messages et les consommateurs restent inchangés.",
+        "saved_title": "Description enregistrée.",
+        "saved_text": "S’affiche maintenant sous le nom du topic : {text}",
+        "saved_text_none": "Le topic n’a plus de description."
       }
     },
     "partitions": {

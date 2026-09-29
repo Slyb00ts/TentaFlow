@@ -2613,8 +2613,8 @@ pub fn encode_bus_schema_compatibility_set_request(
     .map_err(|e| JsError::new(&e))
 }
 
-/// `version: None` deletes every version of `subject`; `deprecate_only`
-/// marks it deprecated instead of a hard delete.
+/// `version: None` addresses the whole subject, `Some(v)` one version;
+/// `deprecate_only` marks it deprecated instead of a hard delete.
 #[wasm_bindgen(js_name = encodeBusSchemaDeleteRequest)]
 pub fn encode_bus_schema_delete_request(
     instance_id: String,
@@ -11524,6 +11524,19 @@ fn bus_topic_config_to_js(t: &tentaflow_protocol::BusTopicConfigWire) -> JsValue
     set(&o, "created_at_ms", (t.created_at_ms as f64).into());
     set(&o, "updatedAtMs", (t.updated_at_ms as f64).into());
     set(&o, "updated_at_ms", (t.updated_at_ms as f64).into());
+    set(&o, "description", t.description.clone().into());
+    set_bus(
+        &o,
+        "createdBy",
+        "created_by",
+        t.created_by.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
+    set_bus(
+        &o,
+        "createdByLabel",
+        "created_by_label",
+        t.created_by_label.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
     o.into()
 }
 
@@ -11817,6 +11830,14 @@ fn bus_schema_version_to_js(v: &tentaflow_protocol::BusSchemaVersionWire) -> JsV
         "createdByLabel",
         "created_by_label",
         v.created_by_label.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+    );
+    set_bus(
+        &o,
+        "deprecatedAtMs",
+        "deprecated_at_ms",
+        v.deprecated_at_ms
+            .map(|ms| JsValue::from(ms as f64))
+            .unwrap_or(JsValue::NULL),
     );
     o.into()
 }

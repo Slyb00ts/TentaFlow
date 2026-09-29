@@ -666,11 +666,30 @@ fn topic_options_from_wire(w: BusTopicOptionsWire) -> Result<topics::TopicOption
             w.compression,
             topics::CompressionPolicy::parse,
         )?,
+        description: w.description,
+        created_by: None,
     })
 }
 
-fn topic_config_to_wire(cfg: &topics::TopicConfig) -> BusTopicConfigWire {
+/// `topic_config_to_wire` with the author's display name resolved.
+async fn topic_to_wire(
+    ctx: &HandlerContext,
+    cfg: topics::TopicConfig,
+) -> Result<BusTopicConfigWire, ProtocolError> {
+    let db = ctx.state.db.clone();
+    run_blocking(move || {
+        let actors: Vec<String> = cfg.created_by.iter().cloned().collect();
+        let labels = SubjectLabels::resolve(&db, &[], &actors)?;
+        Ok(topic_config_to_wire(&cfg, &labels))
+    })
+    .await
+}
+
+fn topic_config_to_wire(cfg: &topics::TopicConfig, labels: &SubjectLabels) -> BusTopicConfigWire {
     BusTopicConfigWire {
+        description: cfg.description.clone(),
+        created_by: cfg.created_by.clone(),
+        created_by_label: cfg.created_by.as_deref().and_then(|a| labels.actor(a)),
         name: cfg.name.clone(),
         partitions: cfg.partitions,
         retention_ms: cfg.retention_ms,
@@ -1816,7 +1835,7 @@ async fn topic_create_v1(
     let cfg =
         run_blocking(move || svc.create_topic(&bctx, &name, opts).map_err(map_bus_error)).await?;
     Ok(BusPayload::TopicCreateResponse {
-        topic: topic_config_to_wire(&cfg),
+        topic: topic_to_wire(ctx, cfg).await?,
     })
 }
 
@@ -1833,7 +1852,7 @@ async fn topic_update_v1(
     let cfg =
         run_blocking(move || svc.update_topic(&bctx, &name, opts).map_err(map_bus_error)).await?;
     Ok(BusPayload::TopicUpdateResponse {
-        topic: topic_config_to_wire(&cfg),
+        topic: topic_to_wire(ctx, cfg).await?,
     })
 }
 
@@ -1886,9 +1905,10 @@ async fn topic_detail_v1(
         can_admin: topic_admin && is_org_admin(ctx),
     };
     let admin_labels = topic_admin_labels(ctx, &g, &name).await?;
+    let topic_wire = topic_to_wire(ctx, cfg.clone()).await?;
     if !can_read {
         return Ok(BusPayload::TopicDetailResponse {
-            topic: topic_config_to_wire(&cfg),
+            topic: topic_wire,
             partitions: Vec::new(),
             groups: Vec::new(),
             access: Some(access),
@@ -2003,7 +2023,7 @@ async fn topic_detail_v1(
     .await?;
 
     Ok(BusPayload::TopicDetailResponse {
-        topic: topic_config_to_wire(&cfg),
+        topic: topic_wire,
         partitions: partitions_wire,
         groups: groups_wire,
         access: Some(access),
@@ -3017,6 +3037,7 @@ fn schema_version_to_wire(
         content_hash: info.content_hash,
         created_by: info.created_by,
         created_at_ms: info.created_at_ms,
+        deprecated_at_ms: info.deprecated_at_ms,
     }
 }
 
@@ -3266,7 +3287,11 @@ async fn schema_delete_v1(
     // — distinct audit actions so an operator reviewing the log does not
     // have to inspect `details` to tell them apart.
     let (action, details) = if deprecate_only {
-        ("bus.schema.deprecate", "deprecated=true".to_string())
+        let details = match version {
+            Some(v) => format!("deprecated=true version={v}"),
+            None => "deprecated=true".to_string(),
+        };
+        ("bus.schema.deprecate", details)
     } else {
         (
             "bus.schema.delete",
@@ -9129,5 +9154,124 @@ mod tests {
                  found, or has no gate call in its own body"
             );
         }
+    }
+
+    /// A topic's description and author reach the wire: the author as the
+    /// creating session's user with that user's name, the description as
+    /// given, changed and cleared by `TopicUpdate`; an over-long one is
+    /// refused at the boundary and changes nothing.
+    #[tokio::test]
+    async fn topics_carry_their_description_and_their_authors_name() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, user_id) = admin_session(&db);
+        seed_user(&db, &user_id, "Anna Kowalska");
+        let inst = fixture_instance_id();
+        let topic = format!("rtg.{}", uuid::Uuid::new_v4().simple());
+        let describe = |text: &str| BusTopicOptionsWire {
+            description: Some(text.to_string()),
+            ..Default::default()
+        };
+        match topic_create_v1(&ctx, inst.as_str(), topic.clone(), describe("Wyniki RTG"))
+            .await
+            .expect("topic create")
+        {
+            BusPayload::TopicCreateResponse { topic: cfg } => {
+                assert_eq!(cfg.description, "Wyniki RTG");
+                assert_eq!(cfg.created_by.as_deref(), Some(user_id.as_str()));
+                assert_eq!(cfg.created_by_label.as_deref(), Some("Anna Kowalska"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        assert!(topic_update_v1(&ctx, inst.as_str(), topic.clone(), describe(&"x".repeat(501)))
+            .await
+            .is_err());
+        match topic_update_v1(&ctx, inst.as_str(), topic.clone(), describe(""))
+            .await
+            .expect("topic update")
+        {
+            BusPayload::TopicUpdateResponse { topic: cfg } => {
+                assert_eq!(cfg.description, "");
+                assert_eq!(cfg.created_by_label.as_deref(), Some("Anna Kowalska"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        topic_update_v1(&ctx, inst.as_str(), topic.clone(), describe("Wyniki RTG i USG"))
+            .await
+            .expect("topic update");
+        match topic_detail_v1(&ctx, inst.as_str(), topic.clone()).await.unwrap() {
+            BusPayload::TopicDetailResponse { topic: cfg, .. } => {
+                assert_eq!(cfg.description, "Wyniki RTG i USG");
+                assert_eq!(cfg.created_by_label.as_deref(), Some("Anna Kowalska"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// `SchemaDelete` with a version and `deprecate_only` deprecates that
+    /// version: nothing is removed, the version list says when, and the audit
+    /// row names the version.
+    #[tokio::test]
+    async fn deprecating_one_schema_version_is_listed_and_audited_with_its_number() {
+        let (_guard, db) = bus_fixture();
+        let (ctx, _org_id, _user_id) = admin_session(&db);
+        let inst = fixture_instance_id();
+        let subject = format!("wizyta-{}", uuid::Uuid::new_v4().simple());
+        for text in [
+            r#"{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}"#,
+            r#"{"type":"object","properties":{"id":{"type":"string"},"note":{"type":"string"}},"required":["id"]}"#,
+        ] {
+            schema_register_v1(
+                &ctx,
+                inst.as_str(),
+                subject.clone(),
+                "json_schema".to_string(),
+                text.to_string(),
+                None,
+            )
+            .await
+            .expect("register");
+        }
+        match schema_delete_v1(&ctx, inst.as_str(), subject.clone(), Some(1), true)
+            .await
+            .expect("deprecate v1")
+        {
+            BusPayload::SchemaDeleteResponse {
+                removed_versions,
+                deprecated,
+            } => {
+                assert!(removed_versions.is_empty());
+                assert!(deprecated);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match schema_version_list_v1(&ctx, inst.as_str(), subject.clone())
+            .await
+            .unwrap()
+        {
+            BusPayload::SchemaVersionListResponse { versions } => {
+                let state: Vec<(u32, bool)> = versions
+                    .iter()
+                    .map(|v| (v.version, v.deprecated_at_ms.is_some()))
+                    .collect();
+                assert_eq!(state, vec![(1, true), (2, false)]);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let rows = repository::list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("bus.schema.deprecate".to_string()),
+                ..Default::default()
+            },
+            0,
+            100,
+        )
+        .expect("list audit logs");
+        let row = rows
+            .iter()
+            .find(|r| r.resource.as_deref() == Some(subject.as_str()))
+            .expect("a bus.schema.deprecate row for the subject");
+        assert_eq!(row.details.as_deref(), Some("deprecated=true version=1"));
     }
 }

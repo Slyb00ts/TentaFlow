@@ -11155,7 +11155,12 @@
         "partitions_invalid": "Wpisz liczbę partycji od {min} do {max}.",
         "summary_schema_versioned": "{name}, najnowsza wersja ({version})",
         "schemas_loading": "Wczytywanie wzorów wiadomości…",
-        "schemas_failed": "Nie udało się wczytać wzorów wiadomości instancji {instance}. Spróbuj ponownie albo utwórz topik bez wzoru — wzór wybierzesz później w ustawieniach topiku."
+        "schemas_failed": "Nie udało się wczytać wzorów wiadomości instancji {instance}. Spróbuj ponownie albo utwórz topik bez wzoru — wzór wybierzesz później w ustawieniach topiku.",
+        "description_label": "Opis (nieobowiązkowy)",
+        "description_placeholder": "np. Wyniki badań z pracowni RTG dla systemu szpitalnego",
+        "description_hint": "Jedno lub dwa zdania o tym, do czego służy topik. Widać je pod nazwą topiku. Najwyżej {max} znaków.",
+        "description_too_long": "Opis może mieć najwyżej {max} znaków.",
+        "summary_description": "Opis"
       },
       "delete": {
         "title": "Usuń topik {name}",
@@ -11382,6 +11387,23 @@
         "lead": "Usuń topik {name}",
         "text": "— znikną wszystkie jego wiadomości, nieprzetworzone wiadomości, wpisy dostępu i zasady ukrywania danych. Tego nie da się cofnąć.",
         "button": "Usuń topik…"
+      },
+      "about": {
+        "title": "Opis",
+        "window_title": "Zmień opis — {name}",
+        "description_label": "Opis",
+        "description_none": "Brak opisu",
+        "description_hint": "Widać go pod nazwą topiku.",
+        "description_none_hint": "Pod nazwą topiku widać rodzaj treści i wzór wiadomości.",
+        "created_by_label": "Utworzył",
+        "created_by_unknown": "Konto, którego ten node nie zna",
+        "created_by_lock": "Tego się nie zmienia: to osoba albo klucz, które założyły topik.",
+        "too_long": "Opis może mieć najwyżej {max} znaków.",
+        "impact_set": "Ten opis zobaczy pod nazwą topiku każdy, kto widzi ten topik, na wszystkich nodach instancji. Wiadomości i odbiorcy się nie zmienią.",
+        "impact_cleared": "Pod nazwą topiku znów będzie widać rodzaj treści i wzór wiadomości. Wiadomości i odbiorcy się nie zmienią.",
+        "saved_title": "Zapisano opis.",
+        "saved_text": "Pod nazwą topiku widać teraz: {text}",
+        "saved_text_none": "Topik nie ma już opisu."
       }
     },
     "partitions": {

@@ -1096,6 +1096,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "bus_assignment_epoch_slots",
             MigrationStep::Sql(BUS_ASSIGNMENT_EPOCH_SLOTS),
         ),
+        (
+            176,
+            "bus_topic_description_and_schema_version_deprecation",
+            MigrationStep::Sql(BUS_TOPIC_DESCRIPTION_AND_SCHEMA_VERSION_DEPRECATION),
+        ),
     ]
 }
 
@@ -4928,6 +4933,12 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "flow_versions",
             "created_by",
             "free-text author marker on the version snapshot, no user_accounts FK",
+        ),
+        t(
+            "bus_topics",
+            "created_by",
+            "author marker (user id or `api_key:<uid>`), synced with the topic to nodes \
+             that may not hold the account, so no user_accounts FK",
         ),
         t(
             "legal_documents",
@@ -9939,6 +9950,21 @@ const BUS_ASSIGNMENT_EPOCH_SLOTS: &str = r#"
 ALTER TABLE bus_partition_assignments ADD COLUMN epoch_slots TEXT NOT NULL DEFAULT '{}';
 "#;
 
+/// v176 — a topic's free-text description and its author, and which
+/// versions of a schema subject are deprecated. Both tables replicate as
+/// whole LWW rows (`core.bus_topic`, `core.bus_schema_subject`), so the new
+/// columns ride inside the existing `row_json` payloads. The deprecated
+/// versions live on the SUBJECT row because `bus_schema_versions` replicates
+/// insert-if-absent: a mutable column there would never converge.
+/// `deprecated_versions_json` is a JSON array of
+/// `{"version": u32, "deprecated_at_ms": i64}`. `created_by` is NULL for
+/// every topic created before this migration: its author was never recorded.
+const BUS_TOPIC_DESCRIPTION_AND_SCHEMA_VERSION_DEPRECATION: &str = r#"
+ALTER TABLE bus_topics ADD COLUMN description TEXT NOT NULL DEFAULT '';
+ALTER TABLE bus_topics ADD COLUMN created_by TEXT;
+ALTER TABLE bus_schema_subjects ADD COLUMN deprecated_versions_json TEXT NOT NULL DEFAULT '[]';
+"#;
+
 const BUS_TOPIC_INCARNATIONS: &str = r#"
 ALTER TABLE bus_topics ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE bus_partition_assignments ADD COLUMN topic_generation INTEGER NOT NULL DEFAULT 0;
@@ -13689,6 +13715,65 @@ mod tests {
             left,
             vec![("tentabus-00000001".to_string(), "orders.live".to_string())]
         );
+    }
+
+    /// v176 on a database at v175: rows written before the upgrade keep
+    /// every value and read the new columns as "no description", "author
+    /// unknown" and "no deprecated version".
+    #[test]
+    fn migration_176_adds_topic_description_author_and_deprecated_versions() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_ladder_up_to(&conn, 175);
+        conn.execute(
+            "INSERT INTO bus_topics (\
+                instance_id, org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                acks, durability, max_inline_bytes, compression, environment, \
+                created_at_ms, updated_at_ms \
+             ) VALUES (\
+                'tentabus-00000001', 'org-1', 'orders.live', 2, 604800000, 10737418240, 'delete', \
+                'at_least_once', NULL, 86400000, 5, 1000, 'orders', 'off', \
+                'application/json', 1, 'leader', 'fsync_batch_full', 1048576, \
+                'lz4', 'prod', 1000, 2000 \
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO bus_schema_subjects \
+             (instance_id, org_id, subject, schema_type, compatibility, deprecated_at_ms, \
+              created_by, created_at_ms, updated_at_ms) \
+             VALUES ('tentabus-00000001', 'org-1', 'orders', 'json_schema', 'backward', 5, \
+              'admin-1', 1, 2)",
+            [],
+        )
+        .unwrap();
+
+        run(&conn).unwrap();
+
+        let applied: String = conn
+            .query_row("SELECT name FROM _migrations WHERE version = 176", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(applied, "bus_topic_description_and_schema_version_deprecation");
+        let topic: (String, Option<String>, i64, Option<String>) = conn
+            .query_row(
+                "SELECT description, created_by, partitions, schema_id FROM bus_topics \
+                 WHERE name = 'orders.live'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(topic, (String::new(), None, 2, Some("orders".to_string())));
+        let subject: (String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT deprecated_versions_json, deprecated_at_ms, created_by \
+                 FROM bus_schema_subjects WHERE subject = 'orders'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(subject, ("[]".to_string(), Some(5), Some("admin-1".to_string())));
     }
 
     #[test]

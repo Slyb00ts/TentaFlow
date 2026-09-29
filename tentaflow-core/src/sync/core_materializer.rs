@@ -3722,11 +3722,16 @@ fn apply_bus_topic(
                   cleanup_policy, delivery, idempotency_key, dedup_window_ms, \
                   max_delivery_attempts, retry_backoff_ms, schema_id, validation, content_type, \
                   replication_factor, acks, durability, max_inline_bytes, compression, \
-                  environment, created_at_ms, updated_at_ms, durability_class, generation) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25) \
+                  environment, created_at_ms, updated_at_ms, durability_class, generation, \
+                  description, created_by) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27) \
                  ON CONFLICT(instance_id, org_id, name) DO UPDATE SET \
                  created_at_ms = CASE WHEN generation = excluded.generation \
                                  THEN created_at_ms ELSE excluded.created_at_ms END, \
+                 created_by = CASE WHEN generation = excluded.generation \
+                              THEN COALESCE(created_by, excluded.created_by) \
+                              ELSE excluded.created_by END, \
+                 description = excluded.description, \
                  generation = excluded.generation, \
                  partitions = excluded.partitions, retention_ms = excluded.retention_ms, \
                  retention_bytes = excluded.retention_bytes, cleanup_policy = excluded.cleanup_policy, \
@@ -3765,6 +3770,8 @@ fn apply_bus_topic(
                     row.updated_at_ms,
                     row.durability_class,
                     row.generation as i64,
+                    row.description,
+                    row.created_by,
                 ],
             )
             .map_err(sql_error)
@@ -4362,6 +4369,11 @@ fn apply_bus_schema_subject(
         serde_json::from_str(&row_json).map_err(|e| {
             SyncLedgerError::Runtime(format!("invalid bus_schema_subject payload: {e}"))
         })?;
+    crate::bus::schema_registry::registry::parse_deprecated_versions(
+        &row.subject,
+        &row.deprecated_versions_json,
+    )
+    .map_err(|e| SyncLedgerError::Runtime(format!("invalid bus_schema_subject payload: {e}")))?;
     if !bus_instance_is_local(tx, operation, &row.instance_id)? {
         return Ok(0);
     }
@@ -4381,13 +4393,14 @@ fn apply_bus_schema_subject(
             .execute(
                 "INSERT INTO bus_schema_subjects \
                  (instance_id, org_id, subject, schema_type, compatibility, deprecated_at_ms, \
-                  created_by, created_at_ms, updated_at_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                  created_by, created_at_ms, updated_at_ms, deprecated_versions_json) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
                  ON CONFLICT(instance_id, org_id, subject) DO UPDATE SET \
                  schema_type = excluded.schema_type, \
                  compatibility = excluded.compatibility, \
                  deprecated_at_ms = excluded.deprecated_at_ms, \
-                 updated_at_ms = excluded.updated_at_ms",
+                 updated_at_ms = excluded.updated_at_ms, \
+                 deprecated_versions_json = excluded.deprecated_versions_json",
                 rusqlite::params![
                     row.instance_id,
                     row.org_id,
@@ -4398,6 +4411,7 @@ fn apply_bus_schema_subject(
                     row.created_by,
                     row.created_at_ms,
                     row.updated_at_ms,
+                    row.deprecated_versions_json,
                 ],
             )
             .map_err(sql_error),
@@ -7338,6 +7352,8 @@ mod tests {
             updated_at_ms: 1,
             durability_class: None,
             generation: 0,
+            description: String::new(),
+            created_by: None,
         }
     }
 
@@ -8772,6 +8788,7 @@ mod tests {
             created_by: Some("admin-1".to_string()),
             created_at_ms: 1,
             updated_at_ms: 1,
+            deprecated_versions_json: "[]".to_string(),
         }
     }
 
@@ -9370,5 +9387,121 @@ mod tests {
         );
         peer.body.actor_node_id = "node-peer".to_string();
         assert_eq!(apply_agent_runtime_engine(&tx, &peer).unwrap(), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // Migration 176 — topic description/author and deprecated schema
+    // versions ride inside the LWW rows.
+    // -------------------------------------------------------------------
+
+    /// Two nodes receive two concurrent edits of one topic's description in
+    /// opposite orders and end on the later one. The author is set once per
+    /// incarnation: an edit that carries none (a peer from before the
+    /// column) keeps it, and a new incarnation brings its own.
+    #[test]
+    fn topic_description_converges_on_the_last_writer_and_the_author_stays() {
+        let mut created = incarnation(1_000);
+        created.created_by = Some("u-anna".to_string());
+        let create = at(bus_topic_op(&created, ActionType::Insert), 1_000);
+        let mut first = created.clone();
+        first.description = "Wyniki RTG".to_string();
+        let mut edit_a = at(bus_topic_op(&first, ActionType::Update), 2_000);
+        edit_a.body.hlc_timestamp.node_id = "node-a".to_string();
+        let mut second = created.clone();
+        second.description = "Wyniki RTG i USG".to_string();
+        second.created_by = None;
+        let mut edit_b = at(bus_topic_op(&second, ActionType::Update), 3_000);
+        edit_b.body.hlc_timestamp.node_id = "node-b".to_string();
+
+        let read = |db: &crate::db::DbPool| {
+            let row = repository::bus_topic_get(db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .expect("topic materialized");
+            (row.description, row.created_by)
+        };
+        for order in [[&edit_a, &edit_b], [&edit_b, &edit_a]] {
+            let db = bus_db();
+            apply_core_operation(&db, &create).unwrap();
+            for op in order {
+                apply_core_operation(&db, op).unwrap();
+            }
+            assert_eq!(
+                read(&db),
+                ("Wyniki RTG i USG".to_string(), Some("u-anna".to_string()))
+            );
+
+            let mut recreated = incarnation(5_000);
+            recreated.created_by = Some("u-bob".to_string());
+            apply_core_operation(&db, &at(bus_topic_op(&recreated, ActionType::Insert), 5_000))
+                .unwrap();
+            assert_eq!(read(&db), (String::new(), Some("u-bob".to_string())));
+        }
+    }
+
+    /// Deprecating versions writes the subject row, whose ops are LWW: two
+    /// nodes that receive two concurrent deprecations in opposite orders end
+    /// with the same list and validate with the same version.
+    #[test]
+    fn deprecated_schema_versions_converge_on_the_last_writer() {
+        let row = schema_subject_row_for_test("org-1", "orders");
+        let mut setup = vec![at(bus_schema_subject_op(&row, ActionType::Insert), 1)];
+        for v in 1..=3u32 {
+            setup.push(at(
+                bus_schema_version_op(
+                    &schema_version_row_for_test("org-1", "orders", v, &format!("hash-{v}"), 700 + v),
+                    ActionType::Insert,
+                ),
+                1,
+            ));
+        }
+        let mut newest_withdrawn = row.clone();
+        newest_withdrawn.deprecated_versions_json =
+            r#"[{"version":3,"deprecated_at_ms":2}]"#.to_string();
+        newest_withdrawn.updated_at_ms = 2;
+        let mut on_a = at(bus_schema_subject_op(&newest_withdrawn, ActionType::Update), 2);
+        on_a.body.hlc_timestamp.node_id = "node-a".to_string();
+        let mut two_withdrawn = row.clone();
+        two_withdrawn.deprecated_versions_json =
+            r#"[{"version":2,"deprecated_at_ms":3},{"version":3,"deprecated_at_ms":3}]"#.to_string();
+        two_withdrawn.updated_at_ms = 3;
+        let mut on_b = at(bus_schema_subject_op(&two_withdrawn, ActionType::Update), 3);
+        on_b.body.hlc_timestamp.node_id = "node-b".to_string();
+
+        for order in [[&on_a, &on_b], [&on_b, &on_a]] {
+            let db = bus_db();
+            for op in &setup {
+                apply_core_operation(&db, op).unwrap();
+            }
+            for op in order {
+                apply_core_operation(&db, op).unwrap();
+            }
+            let subject =
+                repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders")
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(subject.deprecated_versions_json, two_withdrawn.deprecated_versions_json);
+            let effective = crate::bus::schema_registry::registry::resolve_effective(
+                &db,
+                "tentabus-00000001",
+                "org-1",
+                "orders",
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(effective.version, 1);
+        }
+    }
+
+    #[test]
+    fn a_subject_with_an_unreadable_deprecated_versions_list_is_refused() {
+        let db = bus_db();
+        let mut row = schema_subject_row_for_test("org-1", "orders");
+        row.deprecated_versions_json = r#"[{"version":"two"}]"#.to_string();
+        assert!(apply_core_operation(&db, &bus_schema_subject_op(&row, ActionType::Insert)).is_err());
+        assert!(
+            repository::bus_schema_subject_get(&db, "tentabus-00000001", "org-1", "orders")
+                .unwrap()
+                .is_none()
+        );
     }
 }

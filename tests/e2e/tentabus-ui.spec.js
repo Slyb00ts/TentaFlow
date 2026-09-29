@@ -11,7 +11,7 @@
 //              footer, the creator (validation, three steps, the new row),
 //              the message preview, delete with the retyped name, the phone
 //              layout, the empty instance's creator; then U2: a topic's page
-//              (Stan, Ustawienia with its four windows and delete, Partycje
+//              (Stan, Ustawienia with its five windows and delete, Partycje
 //              i kopie), Kopie i nody, the phone layout and a reader without
 //              administration or read access; then U3: Odbiorcy (the list,
 //              its filters, pause and resume), a consumer's page (Stan,
@@ -948,10 +948,11 @@ test('U2 Ustawienia: values to read with locks; Przechowywanie saved through its
   await login(page);
   await openTopicPage(page, 'wyniki-badan', 'settings');
   const s = section(page, 'settings');
-  await expect(s.locator('.section-card')).toHaveCount(4, { timeout: 15000 });
-  await expect(s.locator('[data-go="change"]')).toHaveCount(4);
+  await expect(s.locator('.section-card')).toHaveCount(5, { timeout: 15000 });
+  await expect(s.locator('[data-go="change"]')).toHaveCount(5);
   await expect(s.locator('.tb-danger-zone')).toContainText('Usuń topik wyniki-badan');
-  await expect(s.locator('.tb-vr-lock')).toHaveCount(4);
+  // Author, cleanup, copies, durability, content kind.
+  await expect(s.locator('.tb-vr-lock')).toHaveCount(5);
   await expect(s.locator('.section-card[data-card="write"]')).toContainText('Ustalone przy tworzeniu topiku');
   const retentionValue = s.locator('.section-card[data-card="retention"] .tb-vrow').first().locator('.tb-vr-value');
   await expect(retentionValue).toHaveText('7 dni');
@@ -984,6 +985,42 @@ test('U2 Ustawienia: values to read with locks; Przechowywanie saved through its
   await detailSlot(page).locator('[data-role="menu"] tf-tab#state > button').click();
   await detailSlot(page).locator('[data-role="menu"] tf-tab#settings > button').click();
   await expect(s.locator('tf-alert[data-role="saved"]')).toHaveCount(0);
+  expect(errors, errors.join('\n')).toEqual([]);
+});
+
+test('U2 Opis: written through its window, shown under the name, and cleared again', async ({ page }) => {
+  const errors = trackErrors(page);
+  await page.setViewportSize(DESKTOP);
+  await login(page);
+  const instanceId = await openTopicPage(page, 'wyniki-badan', 'settings');
+  const s = section(page, 'settings');
+  const about = s.locator('.section-card[data-card="about"]');
+  await expect(about).toContainText('Brak opisu', { timeout: 15000 });
+  await expect(about).toContainText('Utworzył');
+  const desc = detailSlot(page).locator('[data-role="desc"]');
+  const text = 'Wyniki badań z pracowni dla aplikacji lekarza';
+
+  await s.locator('[data-go="change"][data-card="about"]').click();
+  const win = changeWindow(page);
+  await expect(win.locator('[data-act="save"]')).toHaveAttribute('disabled', '');
+  await win.locator('#tb-set-description textarea').fill(text);
+  await expect(win.locator('[data-role="impact"]')).toContainText('Co się stanie po zapisaniu: Ten opis zobaczy');
+  await page.screenshot({ path: path.join(SHOTS, 'tp-ustawienia-zmien-opis.png') });
+  await win.locator('[data-act="save"]').click();
+  await expect(win).toHaveCount(0);
+  await expect(s.locator('tf-alert[data-role="saved"]')).toHaveAttribute('title', 'Zapisano opis.');
+  await expect(desc).toHaveText(text, { timeout: 15000 });
+  await expect(about).toContainText(text);
+  const detail = await busCall(page, 'busTopicDetailRequest', { instanceId, name: 'wyniki-badan' });
+  expect(detail.topic.description).toBe(text);
+
+  await s.locator('[data-go="change"][data-card="about"]').click();
+  await win.locator('#tb-set-description textarea').fill('');
+  await expect(win.locator('[data-role="impact"]')).toContainText('znów będzie widać rodzaj treści');
+  await win.locator('[data-act="save"]').click();
+  await expect(win).toHaveCount(0);
+  await expect(desc).toHaveText('HL7 v2 · bez wzoru', { timeout: 15000 });
+  await assertNoBannedWords(page);
   expect(errors, errors.join('\n')).toEqual([]);
 });
 
@@ -1217,7 +1254,7 @@ test('U2 without administration: no change buttons, who can change, reading stil
     await rp.goto(`https://127.0.0.1:${PORT}/#/tentabus?instance=${instanceId}&tab=topics&topic=wyniki-badan&section=settings`);
     const d = rp.locator('#tb-panel > [data-tb-view-slot="detail"]');
     const settings = d.locator('[data-section="settings"]');
-    await expect(settings.locator('.section-card')).toHaveCount(4, { timeout: 20000 });
+    await expect(settings.locator('.section-card')).toHaveCount(5, { timeout: 20000 });
     await expect(settings.locator('tf-button')).toHaveCount(0);
     await expect(settings.locator('.tb-danger-zone')).toHaveCount(0);
     await expect(settings.locator('.tb-who-can')).toContainText('Zmiany w tym topiku może robić administrator topiku (');

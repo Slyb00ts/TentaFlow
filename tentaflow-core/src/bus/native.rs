@@ -991,6 +991,8 @@ mod tests {
                 updated_at_ms: 0,
                 durability_class: None,
                 generation: 0,
+                description: String::new(),
+                created_by: None,
             },
         )
         .expect("create topic");
@@ -1117,6 +1119,8 @@ mod tests {
                     updated_at_ms: 0,
                     durability_class: None,
                     generation: 0,
+                    description: String::new(),
+                    created_by: None,
                 },
             )
             .expect("create topic");

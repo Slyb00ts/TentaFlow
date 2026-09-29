@@ -244,6 +244,32 @@ pub const MAX_RETRY_BACKOFF_MS: u32 = 3_600_000; // 1 hour
 pub const MIN_MAX_INLINE_BYTES: usize = 4 * 1024; // 4 KiB
 pub const MAX_MAX_INLINE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
+/// Longest topic description, in characters: one or two sentences shown under
+/// the topic's name, not a document.
+pub const MAX_DESCRIPTION_CHARS: usize = 500;
+
+/// A description is plain text shown under the topic name: line breaks and
+/// tabs are the only control characters it may carry.
+fn validate_description(description: &str) -> Result<(), BusServiceError> {
+    let chars = description.chars().count();
+    if chars > MAX_DESCRIPTION_CHARS {
+        return Err(BusServiceError::InvalidTopicConfig {
+            reason: format!(
+                "description must be at most {MAX_DESCRIPTION_CHARS} characters, got {chars}"
+            ),
+        });
+    }
+    if description
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(BusServiceError::InvalidTopicConfig {
+            reason: "description must not contain control characters".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Validates every numeric setting in PLAN §7.1's range table except
 /// `partitions` (checked separately, at construction, because its rule
 /// differs on update — grow-only) and `replication_factor` (silently
@@ -323,7 +349,7 @@ fn validate_ranges(cfg: &TopicConfig) -> Result<(), BusServiceError> {
             ));
         }
     }
-    Ok(())
+    validate_description(&cfg.description)
 }
 
 /// Validates `idempotency_key`: the field is a CEL expression per PLAN
@@ -787,6 +813,11 @@ pub struct TopicConfig {
     /// (`PartitionAssignment::topic_generation`), and so does the local log
     /// directory (`BusService::ensure_topic_incarnation`).
     pub generation: u64,
+    /// Free text shown under the topic's name; empty when none was given.
+    pub description: String,
+    /// Who created this incarnation (`DbBusTopic::created_by`); `None` for a
+    /// topic created before its author was recorded.
+    pub created_by: Option<String>,
 }
 
 /// Partial overrides for `create_topic`/`update_topic`; unset fields fall
@@ -833,6 +864,12 @@ pub struct TopicOptions {
     pub durability_reset_to_class: bool,
     pub max_inline_bytes: Option<usize>,
     pub compression: Option<CompressionPolicy>,
+    /// `Some("")` clears the description on update.
+    pub description: Option<String>,
+    /// The creating caller, stamped by `BusService` from its call context —
+    /// never taken from a client. Read only on create: an update never
+    /// changes who created the topic.
+    pub created_by: Option<String>,
 }
 
 impl TopicConfig {
@@ -901,6 +938,8 @@ impl TopicConfig {
             // The creator's HLC is past every delete it has observed, so an
             // incarnation created after a delete always sorts after it.
             generation: repository::bus_topic_generation_at(&crate::sync::runtime::core_hlc_now()),
+            description: opts.description.unwrap_or_default(),
+            created_by: opts.created_by,
         };
         validate_ranges(&cfg)?;
         Ok(cfg)
@@ -995,6 +1034,9 @@ impl TopicConfig {
         if let Some(v) = opts.compression {
             self.compression = v;
         }
+        if let Some(v) = opts.description {
+            self.description = v;
+        }
         validate_ranges(self)?;
         Ok(())
     }
@@ -1066,6 +1108,8 @@ impl From<&TopicConfig> for DbBusTopic {
             updated_at_ms: c.updated_at_ms,
             durability_class: c.durability_class.map(|k| k.as_str().to_string()),
             generation: c.generation,
+            description: c.description.clone(),
+            created_by: c.created_by.clone(),
         }
     }
 }
@@ -1119,6 +1163,8 @@ impl TryFrom<DbBusTopic> for TopicConfig {
             created_at_ms: row.created_at_ms,
             updated_at_ms: row.updated_at_ms,
             generation: row.generation,
+            description: row.description,
+            created_by: row.created_by,
         })
     }
 }
@@ -2640,5 +2686,118 @@ mod tests {
         assert!(validate_org_id("Org-1").is_err(), "uppercase");
         assert!(validate_org_id("org_1").is_err(), "underscore mid-string");
         assert!(validate_org_id("org 1").is_err(), "space");
+    }
+
+    /// A description is stored as given (up to 500 characters, counted as
+    /// characters, line breaks allowed), survives a reload, is changed and
+    /// cleared by an update and left alone by an update that does not name
+    /// it. Longer text or other control characters are refused on create and
+    /// on update, and nothing is written.
+    #[test]
+    fn topic_description_is_validated_stored_and_changed_by_update() {
+        let db = delivery_test_db();
+        let with = |description: &str| TopicOptions {
+            description: Some(description.to_string()),
+            ..Default::default()
+        };
+        let text = format!("{}\nRTG", "ż".repeat(MAX_DESCRIPTION_CHARS - 4));
+        let cfg = create_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.described",
+            with(&text),
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(cfg.description, text);
+        assert_eq!(cfg.created_by, None, "no caller was named");
+        let reloaded = get_topic(&db, "tentabus-00000001", "org-1", "orders.described")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.description, text);
+
+        for bad in ["x".repeat(MAX_DESCRIPTION_CHARS + 1), "bell\u{7}".to_string()] {
+            let err = create_topic(
+                &db,
+                "tentabus-00000001",
+                "org-1",
+                "orders.refused",
+                with(&bad),
+                NodeEnvironment::Prod,
+                1_000,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, BusServiceError::InvalidTopicConfig { ref reason } if reason.contains("description")),
+                "{err:?}"
+            );
+            let err = update_topic(&db, "tentabus-00000001", "org-1", "orders.described", with(&bad), 2_000)
+                .unwrap_err();
+            assert!(matches!(err, BusServiceError::InvalidTopicConfig { .. }), "{err:?}");
+        }
+        assert!(get_topic(&db, "tentabus-00000001", "org-1", "orders.refused")
+            .unwrap()
+            .is_none());
+
+        let untouched = update_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.described",
+            TopicOptions {
+                retention_ms: Some(2 * DEFAULT_RETENTION_MS),
+                ..Default::default()
+            },
+            3_000,
+        )
+        .unwrap();
+        assert_eq!(untouched.description, text);
+        let changed = update_topic(&db, "tentabus-00000001", "org-1", "orders.described", with("Wyniki"), 4_000)
+            .unwrap();
+        assert_eq!(changed.description, "Wyniki");
+        let cleared = update_topic(&db, "tentabus-00000001", "org-1", "orders.described", with(""), 5_000)
+            .unwrap();
+        assert_eq!(cleared.description, "");
+    }
+
+    /// The author is written at creation from the options `BusService`
+    /// fills in, and no update — even one that names someone else — moves it.
+    #[test]
+    fn topic_author_is_set_at_creation_and_never_by_an_update() {
+        let db = delivery_test_db();
+        create_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.authored",
+            TopicOptions {
+                created_by: Some("u-anna".to_string()),
+                ..Default::default()
+            },
+            NodeEnvironment::Prod,
+            1_000,
+        )
+        .unwrap();
+        let cfg = update_topic(
+            &db,
+            "tentabus-00000001",
+            "org-1",
+            "orders.authored",
+            TopicOptions {
+                created_by: Some("u-mallory".to_string()),
+                description: Some("x".to_string()),
+                ..Default::default()
+            },
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(cfg.created_by.as_deref(), Some("u-anna"));
+        let row = repository::bus_topic_get(&db, "tentabus-00000001", "org-1", "orders.authored")
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.created_by.as_deref(), Some("u-anna"));
     }
 }

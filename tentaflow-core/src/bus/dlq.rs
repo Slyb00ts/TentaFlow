@@ -804,6 +804,8 @@ mod tests {
                 created_at_ms: 0,
                 updated_at_ms: 0,
                 generation: 0,
+                description: String::new(),
+                created_by: None,
             }
         }
 
@@ -872,6 +874,8 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             generation: 0,
+            description: String::new(),
+            created_by: None,
         };
         let opts = dlq_topic_options(&source);
         assert_eq!(opts.max_inline_bytes, Some(8 * 1024 * 1024));
