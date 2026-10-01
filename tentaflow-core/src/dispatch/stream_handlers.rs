@@ -1844,9 +1844,7 @@ fn project_studio_archive_stream_handler(
         }
         crate::project_studio::archive::job(&guarded_job_id).is_some_and(|job| {
             job.owner_user_id == org.user_id
-                && (job.export_ref.is_empty()
-                    || super::project_studio::require_project_access(ctx, org, &job.project_id)
-                        .is_ok_and(|(_, access)| access.project_admin))
+                && super::project_studio::require_archive_job_access(ctx, &job).is_ok()
         })
     };
     if !allowed(&ctx) {
@@ -6706,6 +6704,7 @@ mod tests {
             &user_id,
             dir.to_str().expect("utf-8 project dir"),
             "",
+            None, false, false, false,
             &[],
         )
         .expect("create project");
@@ -6817,6 +6816,7 @@ mod tests {
             &user_id,
             dir.to_str().expect("utf-8 project dir"),
             "",
+            None, false, false, false,
             &[],
         )
         .expect("create project");
@@ -7054,6 +7054,7 @@ mod tests {
             "try-grants-owner",
             &dir.to_string_lossy(),
             "",
+            None, false, false, false,
             &[],
         )
         .expect("project");
@@ -7246,6 +7247,7 @@ mod tests {
             "queue-owner",
             &dir.to_string_lossy(),
             "",
+            None, false, false, false,
             &[MemberInput {
                 user_id: actor.clone(),
                 functions: vec!["tester".into()],
@@ -7465,6 +7467,7 @@ mod tests {
                     "stream-owner",
                     &dir.to_string_lossy(),
                     "",
+            None, false, false, false,
                     &[MemberInput {
                         user_id: actor.clone(),
                         functions: vec!["developer".into(), "tester".into()],

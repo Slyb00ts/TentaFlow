@@ -38,6 +38,90 @@ pub struct ProjectInfo {
     pub updated_at: String,
     #[serde(default)]
     pub access: access::ProjectAccessWire,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub depth: u32,
+    #[serde(default)]
+    pub is_private: bool,
+    #[serde(default)]
+    pub inherit_modules: bool,
+    #[serde(default)]
+    pub inherit_task_types: bool,
+    #[serde(default)]
+    pub lifecycle: String,
+    #[serde(default)]
+    pub ended_at: Option<String>,
+    #[serde(default)]
+    pub can_create_child: bool,
+    #[serde(default)]
+    pub can_move: bool,
+    #[serde(default)]
+    pub can_archive: bool,
+    #[serde(default)]
+    pub can_unarchive: bool,
+    #[serde(default)]
+    pub can_delete: bool,
+    #[serde(default)]
+    pub can_end: bool,
+    #[serde(default)]
+    pub can_resume: bool,
+    #[serde(default)]
+    pub can_export: bool,
+    #[serde(default)]
+    pub task_type_source_project_id: String,
+    #[serde(default)]
+    pub own_open_tasks: u32,
+    #[serde(default)]
+    pub descendant_open_tasks: u32,
+    #[serde(default)]
+    pub my_open_tasks: u32,
+    #[serde(default)]
+    pub overdue_tasks: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectBreadcrumb {
+    pub project_id: String,
+    pub name: String,
+    pub depth: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectImportNodePreview {
+    pub project_id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub key_prefix: String,
+    pub depth: u32,
+    pub is_private: bool,
+    pub lifecycle: String,
+    pub inventory: ArchiveInventoryWire,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectTreeScope {
+    #[default]
+    Node,
+    Subtree,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectTaskScope {
+    #[default]
+    Single,
+    Descendants,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectScopeOperation {
+    Archive,
+    Export,
 }
 
 /// Project member with display data resolved server-side.
@@ -63,6 +147,10 @@ pub struct MemberInfo {
     pub active: bool,
     #[serde(default)]
     pub access: access::ProjectAccessWire,
+    #[serde(default)]
+    pub origin_projects: Vec<ProjectBreadcrumb>,
+    #[serde(default)]
+    pub inherited: bool,
 }
 
 /// Member entry sent by the client when creating a project or adding members.
@@ -544,6 +632,29 @@ pub struct TaskInfo {
     pub created_at: String,
     pub updated_at: String,
     pub archived_at: Option<String>,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub project_name: String,
+    #[serde(default)]
+    pub task_type_name: String,
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TaskAggregateSummary {
+    pub todo: u32,
+    pub in_progress: u32,
+    pub review: u32,
+    pub done: u32,
+    pub own_total: u32,
+    pub descendant_total: u32,
+    pub source_revision: i64,
+    pub applied_revision: i64,
+    pub indexed_at: Option<String>,
 }
 
 /// Task comment with author display data resolved server-side.
@@ -589,6 +700,14 @@ pub struct TaskLinkWire {
     pub lag_days: i32,
     pub counterparty_task_key: String,
     pub counterparty_task_title: String,
+    #[serde(default)]
+    pub relation_id: String,
+    #[serde(default)]
+    pub source_project_id: String,
+    #[serde(default)]
+    pub target_project_id: String,
+    #[serde(default)]
+    pub counterparty_project_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -973,6 +1092,14 @@ pub enum ProjectStudioPayload {
         template: String,
         modules: Vec<String>,
         members: Vec<MemberInputWire>,
+        #[serde(default)]
+        parent_id: Option<String>,
+        #[serde(default)]
+        is_private: bool,
+        #[serde(default)]
+        inherit_modules: Option<bool>,
+        #[serde(default)]
+        inherit_task_types: Option<bool>,
     },
     ProjectCreateResponse {
         project_id: String,
@@ -995,6 +1122,8 @@ pub enum ProjectStudioPayload {
     ProjectArchiveRequest {
         project_id: String,
         archived: bool,
+        #[serde(default)]
+        scope: ProjectTreeScope,
     },
     ProjectArchiveResult {
         ok: bool,
@@ -1737,10 +1866,16 @@ pub enum ProjectStudioPayload {
         severity: String,
         #[serde(default)]
         include_archived: bool,
+        #[serde(default)]
+        scope: ProjectTaskScope,
+        #[serde(default)]
+        source_project_ids: Vec<String>,
     },
     TasksListResponse {
         tasks: Vec<TaskInfo>,
         total: u32,
+        #[serde(default)]
+        summary: TaskAggregateSummary,
     },
     TaskGetRequest {
         project_id: String,
@@ -1836,6 +1971,8 @@ pub enum ProjectStudioPayload {
     },
     TaskTypesListResponse {
         types: Vec<TaskTypeWire>,
+        #[serde(default)]
+        source_project_id: String,
     },
     TaskTypeSaveRequest {
         project_id: String,
@@ -2449,6 +2586,8 @@ pub enum ProjectStudioPayload {
         /// Copies display names into the archive so historical authorship
         /// stays readable on the target node (personal data — audited).
         include_user_names: bool,
+        #[serde(default)]
+        scope: ProjectTreeScope,
     },
     ProjectExportStartResponse {
         job_id: String,
@@ -2506,6 +2645,8 @@ pub enum ProjectStudioPayload {
         vectors_reusable: bool,
         vectors_reason: String,
         has_runs: bool,
+        #[serde(default)]
+        tree_nodes: Vec<ProjectImportNodePreview>,
     },
     ProjectImportApplyRequest {
         upload_id: String,
@@ -2550,6 +2691,129 @@ pub enum ProjectStudioPayload {
         error: Option<String>,
     },
     Access(access::ProjectAccessPayload),
+    ProjectTreeRequest {
+        project_id: Option<String>,
+        include_ended: bool,
+        include_archived: bool,
+    },
+    ProjectTreeResponse {
+        projects: Vec<ProjectInfo>,
+        breadcrumbs: Vec<ProjectBreadcrumb>,
+        can_create: bool,
+        can_administer: bool,
+    },
+    ProjectMoveRequest {
+        project_id: String,
+        new_parent_id: Option<String>,
+    },
+    ProjectMoveResult {
+        ok: bool,
+    },
+    ProjectInheritancePreviewRequest {
+        project_id: String,
+        inherit_modules: bool,
+        inherit_task_types: bool,
+    },
+    ProjectInheritancePreviewResponse {
+        current_modules: Vec<String>,
+        proposed_modules: Vec<String>,
+        current_task_types: Vec<TaskTypeWire>,
+        proposed_task_types: Vec<TaskTypeWire>,
+    },
+    ProjectInheritanceSaveRequest {
+        project_id: String,
+        is_private: bool,
+        inherit_modules: bool,
+        inherit_task_types: bool,
+        modules: Vec<String>,
+    },
+    ProjectInheritanceSaveResult {
+        ok: bool,
+        effective_modules: Vec<String>,
+        task_type_source_project_id: String,
+    },
+    ProjectLifecyclePreviewRequest {
+        project_id: String,
+    },
+    ProjectLifecyclePreviewResponse {
+        open_task_count: u32,
+        active_children: Vec<ProjectBreadcrumb>,
+        exclusive_member_count: u32,
+        can_end: bool,
+    },
+    ProjectLifecycleRequest {
+        project_id: String,
+        ended: bool,
+        confirmation_key: String,
+        reason: String,
+    },
+    ProjectLifecycleResult {
+        ok: bool,
+    },
+    TaskNotPursuedRequest {
+        project_id: String,
+        task_id: String,
+        reason: String,
+    },
+    TaskNotPursuedResult {
+        ok: bool,
+        event_id: i64,
+    },
+    TaskTransferPreviewRequest {
+        source_project_id: String,
+        destination_project_id: String,
+        task_id: String,
+    },
+    TaskTransferPreviewResponse {
+        task_ids: Vec<String>,
+        old_keys: Vec<String>,
+        destination_type_valid: bool,
+        widens_access: bool,
+        blocking_reasons: Vec<String>,
+    },
+    TaskTransferRequest {
+        source_project_id: String,
+        destination_project_id: String,
+        task_id: String,
+        confirm_wider_access: bool,
+    },
+    TaskTransferResult {
+        operation_id: String,
+        task_id: String,
+        destination_project_id: String,
+        new_key: String,
+        moved_task_ids: Vec<String>,
+    },
+    TaskKeyResolveRequest {
+        task_key: Option<String>,
+        task_id: Option<String>,
+        origin_project_id: Option<String>,
+        origin_event_id: Option<String>,
+    },
+    TaskKeyResolveResponse {
+        project_id: String,
+        task_id: String,
+        current_key: String,
+        event_id: Option<i64>,
+    },
+    TaskIndexStatusRequest {
+        project_id: String,
+    },
+    TaskIndexStatusResponse {
+        project_id: String,
+        source_revision: i64,
+        applied_revision: i64,
+        lag: i64,
+        indexed_at: Option<String>,
+    },
+    ProjectScopePreviewRequest {
+        project_id: String,
+        scope: ProjectTreeScope,
+        operation: ProjectScopeOperation,
+    },
+    ProjectScopePreviewResponse {
+        nodes: Vec<ProjectBreadcrumb>,
+    },
 }
 
 #[cfg(test)]
@@ -2572,6 +2836,10 @@ mod tests {
                 project_admin: false,
                 expires_at: Some("2026-12-31T23:59:59Z".to_string()),
             }],
+            parent_id: None,
+            is_private: false,
+            inherit_modules: None,
+            inherit_task_types: None,
         };
         let bytes = crate::cbor::encode(&payload).expect("encode");
         let decoded = crate::cbor::decode::<ProjectStudioPayload>(&bytes).expect("decode");
@@ -2999,8 +3267,9 @@ mod tests {
             can_create_tasks: true,
             can_manage_members: false,
             can_manage_settings: false,
+            ended: false,
         };
-        assert_eq!(crate::cbor::encode(&access).expect("access"),hex_bytes("ac6a6861735f616363657373f56d70726f6a6563745f61646d696ef4696170705f61646d696ef46869735f6f776e6572f4686172636869766564f46966756e6374696f6e738269646576656c6f706572667465737465726a657870697265735f6174f66f656e61626c65645f6d6f64756c657382657461736b7365746573747365617265617382a36461726561657461736b73656c6576656c65777269746567656e61626c6564f5a36461726561657465737473656c6576656c6561646d696e67656e61626c6564f57063616e5f6372656174655f7461736b73f57263616e5f6d616e6167655f6d656d62657273f47363616e5f6d616e6167655f73657474696e6773f4"));
+        assert_eq!(crate::cbor::encode(&access).expect("access"),hex_bytes("ad6a6861735f616363657373f56d70726f6a6563745f61646d696ef4696170705f61646d696ef46869735f6f776e6572f4686172636869766564f46966756e6374696f6e738269646576656c6f706572667465737465726a657870697265735f6174f66f656e61626c65645f6d6f64756c657382657461736b7365746573747365617265617382a36461726561657461736b73656c6576656c65777269746567656e61626c6564f5a36461726561657465737473656c6576656c6561646d696e67656e61626c6564f57063616e5f6372656174655f7461736b73f57263616e5f6d616e6167655f6d656d62657273f47363616e5f6d616e6167655f73657474696e6773f465656e646564f4"));
         assert_eq!(
             crate::cbor::decode::<ProjectAccessWire>(
                 &crate::cbor::encode(&access).expect("encode")

@@ -20831,6 +20831,10 @@ pub fn encode_project_studio_project_create_request(
     template: String,
     modules_json: String,
     members_json: String,
+    parent_id: Option<String>,
+    is_private: bool,
+    inherit_modules: Option<bool>,
+    inherit_task_types: Option<bool>,
 ) -> Result<Vec<u8>, JsError> {
     let modules: Vec<String> = serde_json::from_str(&modules_json)
         .map_err(|e| JsError::new(&format!("invalid modules_json: {e}")))?;
@@ -20845,6 +20849,10 @@ pub fn encode_project_studio_project_create_request(
             template,
             modules,
             members,
+            parent_id,
+            is_private,
+            inherit_modules,
+            inherit_task_types,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -20883,11 +20891,18 @@ pub fn encode_project_studio_project_update_request(
 pub fn encode_project_studio_project_archive_request(
     project_id: String,
     archived: bool,
+    scope: String,
 ) -> Result<Vec<u8>, JsError> {
+    let scope = match scope.as_str() {
+        "node" => tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+        "subtree" => tentaflow_protocol::project_studio::ProjectTreeScope::Subtree,
+        _ => return Err(JsError::new("invalid project tree scope")),
+    };
     encode_body_inner(&MessageBody::ProjectStudioBody(
         tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectArchiveRequest {
             project_id,
             archived,
+            scope,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -21946,7 +21961,16 @@ pub fn encode_project_studio_tasks_list_request(
     limit: u32,
     severity: Option<String>,
     include_archived: bool,
+    scope: String,
+    source_project_ids_json: String,
 ) -> Result<Vec<u8>, JsError> {
+    let scope = match scope.as_str() {
+        "single" => tentaflow_protocol::project_studio::ProjectTaskScope::Single,
+        "descendants" => tentaflow_protocol::project_studio::ProjectTaskScope::Descendants,
+        _ => return Err(JsError::new("invalid project task scope")),
+    };
+    let source_project_ids: Vec<String> = serde_json::from_str(&source_project_ids_json)
+        .map_err(|error| JsError::new(&format!("invalid source_project_ids_json: {error}")))?;
     encode_body_inner(&MessageBody::ProjectStudioBody(
         tentaflow_protocol::project_studio::ProjectStudioPayload::TasksListRequest {
             project_id,
@@ -21958,6 +21982,8 @@ pub fn encode_project_studio_tasks_list_request(
             limit,
             severity: severity.unwrap_or_default(),
             include_archived,
+            scope,
+            source_project_ids,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -22860,6 +22886,66 @@ pub fn encode_project_studio_archive_stream_request(job_id: String) -> Result<Ve
         tentaflow_protocol::project_studio::ProjectStudioPayload::ArchiveStreamRequest { job_id },
     ))
     .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioProjectTreeRequest)]
+pub fn encode_project_studio_project_tree_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectTreeRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioProjectMoveRequest)]
+pub fn encode_project_studio_project_move_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectMoveRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioProjectInheritancePreviewRequest)]
+pub fn encode_project_studio_project_inheritance_preview_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectInheritancePreviewRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioProjectInheritanceSaveRequest)]
+pub fn encode_project_studio_project_inheritance_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectInheritanceSaveRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioProjectLifecyclePreviewRequest)]
+pub fn encode_project_studio_project_lifecycle_preview_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectLifecyclePreviewRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioProjectLifecycleRequest)]
+pub fn encode_project_studio_project_lifecycle_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectLifecycleRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskNotPursuedRequest)]
+pub fn encode_project_studio_task_not_pursued_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskNotPursuedRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskTransferPreviewRequest)]
+pub fn encode_project_studio_task_transfer_preview_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskTransferPreviewRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskTransferRequest)]
+pub fn encode_project_studio_task_transfer_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskTransferRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskKeyResolveRequest)]
+pub fn encode_project_studio_task_key_resolve_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskKeyResolveRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskIndexStatusRequest)]
+pub fn encode_project_studio_task_index_status_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskIndexStatusRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioProjectScopePreviewRequest)]
+pub fn encode_project_studio_project_scope_preview_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectScopePreviewRequest", &request_json)
 }
 
 // =============================================================================

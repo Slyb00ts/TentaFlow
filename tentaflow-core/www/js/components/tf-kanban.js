@@ -15,7 +15,7 @@
 //   host through `labels` (English fallbacks only).
 //
 //   Attributes: empty-text, card-min-width, dense, readonly.
-//   Properties: columns, cards, readOnly, labels.
+//   Properties: columns (optional authoritative count), cards, readOnly, labels.
 //   Methods   : setCards(cards), patchCard(id, partial), revertMove(cardId).
 //   Events    : "card-move"   {cardId, from, to, index} — emitted BEFORE the
 //                 host persists anything; the board already shows the new
@@ -27,7 +27,7 @@
 //
 // Example:
 //   const b = document.createElement('tf-kanban');
-//   b.columns = [{ id: 'todo', label: 'To do', accent: 'info', limit: 5 }];
+//   b.columns = [{ id: 'todo', label: 'To do', accent: 'info', limit: 5, count: 12 }];
 //   b.cards = [{ id: 'DEF-1', column: 'todo', title: 'Export fails',
 //                badge: 'defect', badgeKind: 'danger', badgeIcon: 'alert',
 //                meta: [{ text: 'high', tone: 'warning' }],
@@ -753,7 +753,8 @@ export class TfKanban extends HTMLElement {
     const emptyText = this.getAttribute('empty-text') || this._labels.empty;
     this._colEls.forEach((col, id) => {
       const cards = this._visibleCards(col.body);
-      const n = cards.length;
+      const supplied = this._columns.find((column) => column.id === id)?.count;
+      const n = Number.isInteger(supplied) && supplied >= 0 ? supplied : cards.length;
       const limit = this._columnLimit(id);
       col.count.textContent = limit
         ? fmt(this._labels.limitLabel, { n, limit })
@@ -762,7 +763,7 @@ export class TfKanban extends HTMLElement {
       col.root.classList.toggle('over-limit', over);
       col.count.title = over ? fmt(this._labels.limitExceeded, { n, limit }) : '';
       col.empty.textContent = emptyText;
-      col.empty.hidden = n > 0 || !!this._drag;
+      col.empty.hidden = cards.length > 0 || !!this._drag;
       col.root.setAttribute('aria-label', `${col.label}, ${fmt(this._labels.cardsLabel, { n })}`);
       col.body.setAttribute('aria-label', col.label);
     });

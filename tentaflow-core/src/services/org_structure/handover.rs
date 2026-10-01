@@ -960,10 +960,12 @@ fn execute(
         org_failed = !failures.is_empty();
         let failed_keys: HashMap<&str, &str> =
             failures.iter().map(|(k, c)| (k.as_str(), *c)).collect();
-        let conn = pool.write().map_err(|e| E::Db(e.to_string()))?;
         for item in &org_items {
             if let Some(code) = failed_keys.get(item.key.as_str()) {
-                record::set_status(&conn, &header.id, &item.key, "failed", Some(code), None)?;
+                {
+                    let conn = pool.write().map_err(|e| E::Db(e.to_string()))?;
+                    record::set_status(&conn, &header.id, &item.key, "failed", Some(code), None)?;
+                }
                 done.insert(item.key.clone(), outcome(item, "failed", Some(code)));
             } else if org_failed {
                 done.insert(
@@ -1007,15 +1009,17 @@ fn execute(
             Step::Skipped(reason) => ("skipped", Some(reason), None),
             Step::Refused(reason) => ("failed", Some(reason), None),
         };
-        let conn = pool.write().map_err(|e| E::Db(e.to_string()))?;
-        record::set_status(
-            &conn,
-            &header.id,
-            &item.key,
-            status,
-            reason,
-            detail.as_ref(),
-        )?;
+        {
+            let conn = pool.write().map_err(|e| E::Db(e.to_string()))?;
+            record::set_status(
+                &conn,
+                &header.id,
+                &item.key,
+                status,
+                reason,
+                detail.as_ref(),
+            )?;
+        }
         done.insert(item.key.clone(), outcome(item, status, reason));
     }
     Ok(items.iter().filter_map(|i| done.remove(&i.key)).collect())

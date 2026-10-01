@@ -37,14 +37,163 @@ use crate::db::DbPool;
 use crate::deploy::log_bus::{self, BusMessage, LogLine};
 use crate::routing::router::Router;
 
+#[derive(Serialize, Deserialize)]
+struct DeletionJournal {
+    project_id: String,
+    org_id: String,
+    directory: PathBuf,
+    quarantine: PathBuf,
+    operation_id: String,
+}
+
+fn deletion_journal_dir() -> Result<PathBuf> {
+    let root = crate::paths::data_dir().join("projects");
+    std::fs::create_dir_all(&root)?;
+    super::media::safe_directory(&root, ".deletions")
+}
+
+pub fn finish_project_delete(
+    core_db: &DbPool,
+    project: &super::models::ProjectRecord,
+    operation_id: &str,
+) -> Result<()> {
+    uuid::Uuid::parse_str(operation_id)?;
+    let directory = PathBuf::from(&project.dir_path);
+    let parent = directory
+        .parent()
+        .ok_or_else(|| anyhow!("project directory has no parent"))?;
+    let quarantine = parent.join(format!(".deleted-{operation_id}"));
+    let path = deletion_journal_dir()?.join(format!("{operation_id}.json"));
+    let journal = DeletionJournal {
+        project_id: project.project_id.clone(),
+        org_id: project.org_id.clone(),
+        directory: directory.clone(),
+        quarantine: quarantine.clone(),
+        operation_id: operation_id.into(),
+    };
+    super::media::write_metadata(&path, &journal)?;
+    super::media::cancel_project(core_db, &project.project_id)?;
+    for path in [&directory, &quarantine] {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => bail!("project deletion storage is not a regular directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if directory.exists() {
+        if !std::fs::symlink_metadata(&directory)?.file_type().is_dir() || quarantine.exists() {
+            bail!("project deletion directory identity is invalid");
+        }
+        let (pool, _) = super::project_db::open_pool_at(&directory)?;
+        for link in super::ml_link::list(&pool)? {
+            super::ml_link::detach(&pool, &project.project_id, &link, true)?;
+        }
+        drop(pool);
+        super::project_db::close(&project.project_id);
+        super::media::with_publication_gate(|| {
+            std::fs::rename(&directory, &quarantine)?;
+            #[cfg(unix)]
+            std::fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })?;
+    } else if !quarantine.exists() {
+        let registry = super::db::pool()?;
+        let mirrored: i64 = registry.read()?.query_row(
+            "SELECT COUNT(*) FROM project_ml_grants WHERE project_id=?1",
+            [&project.project_id],
+            |row| row.get(0),
+        )?;
+        if mirrored != 0 {
+            bail!("missing project storage prevents grant revocation");
+        }
+    }
+    super::ingest::drop_project_namespaces(core_db, &project.org_id, &project.project_id)?;
+    super::ingest::drop_project_graph(core_db, &project.org_id, &project.project_id)?;
+    super::repository::delete_project_rows(&project.project_id, operation_id)?;
+    super::schedules::delete_hint(&project.project_id);
+    cleanup_deleted_project(&journal, &path)
+}
+
+fn cleanup_deleted_project(journal: &DeletionJournal, path: &Path) -> Result<()> {
+    uuid::Uuid::parse_str(&journal.operation_id)?;
+    let parent = journal
+        .directory
+        .parent()
+        .ok_or_else(|| anyhow!("invalid deletion directory"))?;
+    if journal.quarantine != parent.join(format!(".deleted-{}", journal.operation_id)) {
+        bail!("invalid deletion quarantine path");
+    }
+    if journal.quarantine.exists() {
+        if !std::fs::symlink_metadata(&journal.quarantine)?
+            .file_type()
+            .is_dir()
+        {
+            bail!("deletion quarantine is not a directory");
+        }
+        std::fs::remove_dir_all(&journal.quarantine)?;
+    }
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+pub fn recover_operations(core_db: &DbPool) -> Result<()> {
+    crate::services::ingest_jobs::init(&crate::paths::data_dir().join("jobs.db"))?;
+    for pending in super::repository::pending_project_deletions()? {
+        finish_project_delete(core_db, &pending.project, &pending.operation_id)?;
+    }
+    for entry in std::fs::read_dir(deletion_journal_dir()?)? {
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let journal: DeletionJournal = serde_json::from_reader(super::media::open_regular(&path)?)?;
+        if super::repository::get_project(&journal.org_id, &journal.project_id)?.is_some() {
+            bail!("project deletion journal is missing its durable admission");
+        }
+        cleanup_deleted_project(&journal, &path)?;
+    }
+    for pending in super::repository::pending_project_tree_imports()? {
+        for node in pending.nodes {
+            let dir = PathBuf::from(&node.dir_path);
+            if super::repository::get_project(&pending.org_id, &node.project_id)?.is_some() {
+                bail!("prepared import contains a published project");
+            }
+            if dir.exists() {
+                std::fs::remove_dir_all(dir)?;
+            }
+        }
+        let staging = crate::paths::data_dir()
+            .join("projects/.imports")
+            .join(&pending.operation_id);
+        if staging.exists() {
+            std::fs::remove_dir_all(staging)?;
+        }
+        super::repository::abort_project_tree_import(&pending.operation_id)?;
+    }
+    let staging_root = crate::paths::data_dir().join("projects/.imports");
+    if staging_root.exists() {
+        for entry in std::fs::read_dir(&staging_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir()
+                || uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err()
+            {
+                bail!("import staging contains an invalid operation directory");
+            }
+            std::fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// Archive layout version. An import refuses anything it does not understand
 /// rather than guessing.
-pub const ARCHIVE_VERSION: u32 = 2;
+pub const ARCHIVE_VERSION: u32 = 3;
 
 const MANIFEST_ENTRY: &str = "manifest.json";
 /// Entry prefixes an import will unpack. Anything else is a foreign archive (or
 /// an attempt to smuggle a file past the layout) and aborts the import.
-const ALLOWED_PREFIXES: [&str; 4] = ["db/", "files/", "runs/", "vectors/"];
+const ALLOWED_PREFIXES: [&str; 5] = ["db/", "files/", "runs/", "vectors/", "nodes/"];
 
 /// Import guards. Generous for a real project (thousands of documents plus run
 /// artifacts), still bounded against a zip bomb.
@@ -80,6 +229,14 @@ pub struct FileEntry {
 /// `org_id` are informational: the import always re-owns to the importer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectMeta {
+    pub parent_id: Option<String>,
+    pub path: String,
+    pub depth: u32,
+    pub is_private: bool,
+    pub inherit_modules: bool,
+    pub inherit_task_types: bool,
+    pub lifecycle: String,
+    pub ended_at: Option<String>,
     pub project_id: String,
     #[serde(default)]
     pub key_prefix: String,
@@ -137,6 +294,7 @@ pub struct ExportOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveManifest {
+    pub nodes: Vec<TreeArchiveNode>,
     pub version: u32,
     /// project.db schema version of the snapshot. A NEWER schema than this
     /// binary understands is refused before anything is unpacked.
@@ -150,6 +308,75 @@ pub struct ArchiveManifest {
     pub files: Vec<FileEntry>,
     #[serde(default)]
     pub functions: Vec<tentaflow_protocol::project_studio::access::ProjectFunctionWire>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeArchiveNode {
+    pub entry: FileEntry,
+    pub manifest: Box<ArchiveManifest>,
+}
+
+pub fn project_meta(record: &super::models::ProjectRecord) -> Result<ProjectMeta> {
+    Ok(ProjectMeta {
+        project_id: record.project_id.clone(),
+        key_prefix: record.key_prefix.clone(),
+        name: record.name.clone(),
+        description: record.description.clone(),
+        template: record.template.clone(),
+        modules: super::repository::effective_project_settings(&record.project_id)?.0,
+        owner_user_id: record.owner_user_id.clone(),
+        org_id: record.org_id.clone(),
+        parent_id: record.parent_id.clone(),
+        path: record.path.clone(),
+        depth: record.depth,
+        is_private: record.is_private,
+        inherit_modules: record.inherit_modules,
+        inherit_task_types: record.inherit_task_types,
+        lifecycle: record.lifecycle.clone(),
+        ended_at: record.ended_at.clone(),
+    })
+}
+
+fn require_export_access(task: &ExportTask) -> Result<()> {
+    use tentaflow_protocol::project_studio::ProjectTreeScope;
+    let actor = crate::db::repository::get_user_account_by_id(&task.core_db, &task.user_id)?
+        .ok_or_else(|| anyhow!("export actor account is unavailable"))?;
+    if !actor.is_active {
+        bail!("export actor account is disabled");
+    }
+    let mut current = if task.scope == ProjectTreeScope::Subtree {
+        super::repository::list_descendants(&task.org_id, &task.project_id, true)?
+    } else {
+        vec![
+            super::repository::get_project(&task.org_id, &task.project_id)?
+                .ok_or_else(|| anyhow!("export project is unavailable"))?,
+        ]
+    };
+    current.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+    let mut expected = task
+        .nodes
+        .iter()
+        .map(|node| node.project_id.clone())
+        .collect::<Vec<_>>();
+    if expected.is_empty() {
+        bail!("export scope is empty");
+    }
+    expected.sort();
+    if current
+        .iter()
+        .map(|node| &node.project_id)
+        .collect::<Vec<_>>()
+        != expected.iter().collect::<Vec<_>>()
+    {
+        bail!("export scope changed; prepare the scope again");
+    }
+    for node in current {
+        let access = super::repository::project_access(&node, &task.user_id, false)?;
+        if !access.has_access || !access.project_admin {
+            bail!("export scope access was revoked");
+        }
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -171,6 +398,7 @@ pub struct ArchiveJob {
     pub export_ref: String,
     pub archive_bytes: u64,
     pub inventory: Option<Inventory>,
+    pub scope_project_ids: Vec<String>,
     pub vectors_imported: bool,
     pub reindex_job_ids: Vec<String>,
 }
@@ -268,7 +496,10 @@ fn finish(
 // =============================================================================
 
 /// Everything the export task needs, captured before the spawn.
+#[derive(Clone)]
 pub struct ExportTask {
+    pub nodes: Vec<super::models::ProjectRecord>,
+    pub scope: tentaflow_protocol::project_studio::ProjectTreeScope,
     pub core_db: DbPool,
     pub org_id: String,
     pub user_id: String,
@@ -297,6 +528,11 @@ pub fn spawn_export(task: ExportTask) -> Result<String> {
             owner_user_id: task.user_id.clone(),
             project_id: task.project_id.clone(),
             export_ref: task.export_ref.clone(),
+            scope_project_ids: task
+                .nodes
+                .iter()
+                .map(|node| node.project_id.clone())
+                .collect(),
             ..ArchiveJob::default()
         },
     );
@@ -346,13 +582,20 @@ fn stored_options() -> zip::write::FileOptions<'static, ()> {
 
 /// Streams `src` into the archive through a fixed buffer, hashing as it goes so
 /// the file is read exactly once regardless of size.
-fn write_file(zip: &mut ZipOut, arch_path: &str, src: &Path) -> Result<FileEntry> {
+fn write_file(
+    zip: &mut ZipOut,
+    arch_path: &str,
+    src: &Path,
+    allowed: &dyn Fn() -> Result<()>,
+) -> Result<FileEntry> {
     zip.start_file(arch_path.to_string(), stored_options())?;
-    let mut f = std::fs::File::open(src).with_context(|| format!("otwarcie {}", src.display()))?;
+    let mut f =
+        super::media::open_regular(src).with_context(|| format!("open {}", src.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; COPY_BUF];
     let mut size = 0u64;
     loop {
+        allowed()?;
         let n = f.read(&mut buf)?;
         if n == 0 {
             break;
@@ -538,6 +781,10 @@ fn build_export(
     tx: &tokio::sync::broadcast::Sender<BusMessage>,
     task: &ExportTask,
 ) -> Result<(u64, Inventory)> {
+    require_export_access(task)?;
+    if task.nodes.len() > 1 {
+        return build_tree_export(job_id, tx, task);
+    }
     let functions = super::repository::list_functions(&task.project_id)?;
     super::repository::validate_function_catalogue(&functions)?;
     let pool = super::project_db::open(&task.project_id)?;
@@ -561,7 +808,53 @@ fn build_export(
     }
     let tmp = task.dest_zip.with_extension("zip.tmp");
     let snapshot = tmp.with_extension("db");
+    let type_source = super::repository::effective_project_settings(&task.project_id)?.1;
+    let types = super::tasks::list_task_types(&super::project_db::open(&type_source)?)?;
     snapshot_database(&pool, &snapshot, &task.options)?;
+    let copy = rusqlite::Connection::open(&snapshot)?;
+    let transaction = copy.unchecked_transaction()?;
+    for kind in types {
+        transaction.execute("INSERT INTO task_types(type_id,name,description,sort_order,built_in,active) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(type_id) DO UPDATE SET name=excluded.name,description=excluded.description,sort_order=excluded.sort_order,built_in=excluded.built_in,active=excluded.active",
+            params![kind.type_id,kind.name,kind.description,kind.sort_order,kind.built_in,kind.active])?;
+    }
+    let transfers = {
+        let mut query = transaction
+            .prepare("SELECT event_id,before_json FROM task_events WHERE kind='transferred'")?;
+        let rows = query.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (event, before) in transfers {
+        let before: serde_json::Value = serde_json::from_str(&before)?;
+        if before.is_null() {
+            continue;
+        }
+        let source = before
+            .get("project_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| anyhow!("transfer event source missing"))?;
+        let visible = super::repository::get_project(&task.org_id, source)?
+            .map(|record| super::repository::project_access(&record, &task.user_id, false))
+            .transpose()?
+            .is_some_and(|access| {
+                access.allows(
+                    tentaflow_protocol::project_studio::access::ProjectArea::Tasks,
+                    tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Read,
+                ) || access.allows(
+                    tentaflow_protocol::project_studio::access::ProjectArea::Board,
+                    tentaflow_protocol::project_studio::access::ProjectPermissionLevel::Read,
+                )
+            });
+        if !visible {
+            transaction.execute(
+                "UPDATE task_events SET before_json='null' WHERE event_id=?1",
+                [event],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    drop(copy);
     emit(tx, job_id, "writing", "zapis migawki bazy", 20);
 
     let mut files: Vec<FileEntry> = Vec::new();
@@ -569,7 +862,9 @@ fn build_export(
         let file = std::fs::File::create(&tmp)?;
         let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
 
-        files.push(write_file(&mut zip, "db/project.db", &snapshot)?);
+        files.push(write_file(&mut zip, "db/project.db", &snapshot, &|| {
+            require_export_access(task)
+        })?);
 
         let registry = serde_json::json!({
             "name": task.project.name,
@@ -595,17 +890,51 @@ fn build_export(
         }
 
         emit(tx, job_id, "writing", "pakowanie plikow zrodel", 35);
+        let referenced = super::repository::referenced_blob_sha256s(&pool)?;
         for (rel, abs) in walk_sorted(&task.dir_path.join("files"))? {
-            let entry = write_file(&mut zip, &format!("files/{rel}"), &abs)?;
+            if rel.starts_with(".uploads/") || rel.starts_with(".previews/") {
+                continue;
+            }
+            if super::media::is_sha256(&rel) && !referenced.contains(&rel) {
+                continue;
+            }
+            let entry = write_file(&mut zip, &format!("files/{rel}"), &abs, &|| {
+                require_export_access(task)
+            })?;
             inventory.bytes_files += entry.size;
             inventory.files += 1;
             files.push(entry);
         }
 
+        for sha in &referenced {
+            if let Ok(path) = super::media::preview_path(&task.dir_path, sha) {
+                let state = super::media::read_preview_state(&task.dir_path, sha)?
+                    .ok_or_else(|| anyhow!("completed preview metadata disappeared"))?;
+                let entry = write_file(
+                    &mut zip,
+                    &format!("files/.previews/{sha}.mp4"),
+                    &path,
+                    &|| require_export_access(task),
+                )?;
+                if entry.size != state.total_size {
+                    bail!("completed preview changed during export");
+                }
+                inventory.bytes_files += entry.size;
+                files.push(entry);
+                files.push(write_bytes(
+                    &mut zip,
+                    &format!("files/.previews/{sha}.json"),
+                    &serde_json::to_vec(&state)?,
+                )?);
+            }
+        }
+
         if task.options.include_runs {
             emit(tx, job_id, "writing", "pakowanie artefaktow przebiegow", 60);
             for (rel, abs) in walk_sorted(&task.dir_path.join("runs"))? {
-                let entry = write_file(&mut zip, &format!("runs/{rel}"), &abs)?;
+                let entry = write_file(&mut zip, &format!("runs/{rel}"), &abs, &|| {
+                    require_export_access(task)
+                })?;
                 inventory.bytes_runs += entry.size;
                 files.push(entry);
             }
@@ -614,11 +943,17 @@ fn build_export(
         if task.options.include_vectors {
             emit(tx, job_id, "writing", "pakowanie indeksu wektorow", 80);
             for (rel, abs) in walk_sorted(&task.dir_path.join("vectors"))? {
-                files.push(write_file(&mut zip, &format!("vectors/{rel}"), &abs)?);
+                files.push(write_file(
+                    &mut zip,
+                    &format!("vectors/{rel}"),
+                    &abs,
+                    &|| require_export_access(task),
+                )?);
             }
         }
 
         let manifest = ArchiveManifest {
+            nodes: Vec::new(),
             version: ARCHIVE_VERSION,
             schema_version: super::project_db::LATEST_SCHEMA_VERSION,
             exported_at: chrono::Utc::now().to_rfc3339(),
@@ -645,9 +980,124 @@ fn build_export(
             return Err(e);
         }
     };
+    require_export_access(task)?;
     std::fs::rename(&tmp, &task.dest_zip)?;
     emit(tx, job_id, "done", "archiwum gotowe", 100);
     Ok((bytes, inventory))
+}
+
+fn add_inventory(total: &mut Inventory, next: &Inventory) -> Result<()> {
+    total.cases = total
+        .cases
+        .checked_add(next.cases)
+        .ok_or_else(|| anyhow!("archive inventory overflow"))?;
+    total.suites = total
+        .suites
+        .checked_add(next.suites)
+        .ok_or_else(|| anyhow!("archive inventory overflow"))?;
+    total.runs = total
+        .runs
+        .checked_add(next.runs)
+        .ok_or_else(|| anyhow!("archive inventory overflow"))?;
+    total.tasks = total
+        .tasks
+        .checked_add(next.tasks)
+        .ok_or_else(|| anyhow!("archive inventory overflow"))?;
+    total.documents = total
+        .documents
+        .checked_add(next.documents)
+        .ok_or_else(|| anyhow!("archive inventory overflow"))?;
+    total.sources = total
+        .sources
+        .checked_add(next.sources)
+        .ok_or_else(|| anyhow!("archive inventory overflow"))?;
+    total.files = total
+        .files
+        .checked_add(next.files)
+        .ok_or_else(|| anyhow!("archive inventory overflow"))?;
+    total.bytes_files = total
+        .bytes_files
+        .checked_add(next.bytes_files)
+        .ok_or_else(|| anyhow!("archive inventory overflow"))?;
+    total.bytes_runs = total
+        .bytes_runs
+        .checked_add(next.bytes_runs)
+        .ok_or_else(|| anyhow!("archive inventory overflow"))?;
+    total.vectors = total
+        .vectors
+        .checked_add(next.vectors)
+        .ok_or_else(|| anyhow!("archive inventory overflow"))?;
+    Ok(())
+}
+
+fn build_tree_export(
+    job_id: &str,
+    tx: &tokio::sync::broadcast::Sender<BusMessage>,
+    task: &ExportTask,
+) -> Result<(u64, Inventory)> {
+    let staging = task.dest_zip.with_extension("nodes");
+    std::fs::create_dir_all(&staging)?;
+    let temp = task.dest_zip.with_extension("zip.tmp");
+    let result = (|| -> Result<(u64, Inventory)> {
+        let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(std::fs::File::create(&temp)?));
+        let mut nodes = Vec::new();
+        let mut inventory = Inventory::default();
+        let mut records = task.nodes.clone();
+        records.sort_by(|a, b| a.path.cmp(&b.path));
+        for node in records {
+            require_export_access(task)?;
+            let archive = staging.join(format!("{}.zip", node.project_id));
+            let inner = ExportTask {
+                nodes: vec![node.clone()],
+                scope: tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+                project_id: node.project_id.clone(),
+                dir_path: node.dir_path.clone().into(),
+                project: project_meta(&node)?,
+                dest_zip: archive.clone(),
+                ..task.clone()
+            };
+            build_export(job_id, tx, &inner)?;
+            let manifest = read_manifest(&archive)?;
+            add_inventory(&mut inventory, &manifest.inventory)?;
+            let entry = write_file(
+                &mut zip,
+                &format!("nodes/{}.zip", node.project_id),
+                &archive,
+                &|| require_export_access(task),
+            )?;
+            nodes.push(TreeArchiveNode {
+                entry,
+                manifest: Box::new(manifest),
+            });
+            std::fs::remove_file(archive)?;
+        }
+        require_export_access(task)?;
+        let manifest = ArchiveManifest {
+            version: ARCHIVE_VERSION,
+            schema_version: super::project_db::LATEST_SCHEMA_VERSION,
+            exported_at: chrono::Utc::now().to_rfc3339(),
+            source_node_id: task.node_id.clone(),
+            project: task.project.clone(),
+            options: task.options,
+            embedding: None,
+            inventory: inventory.clone(),
+            files: nodes.iter().map(|node| node.entry.clone()).collect(),
+            functions: super::repository::list_functions(&task.project_id)?,
+            nodes,
+        };
+        write_bytes(&mut zip, MANIFEST_ENTRY, &serde_json::to_vec(&manifest)?)?;
+        let mut file = zip.finish()?;
+        file.flush()?;
+        file.get_ref().sync_all()?;
+        require_export_access(task)?;
+        std::fs::rename(&temp, &task.dest_zip)?;
+        Ok((std::fs::metadata(&task.dest_zip)?.len(), inventory))
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// Display names of every identity referenced by the project's own rows.
@@ -720,8 +1170,85 @@ pub fn read_manifest(zip_path: &Path) -> Result<ArchiveManifest> {
             super::project_db::LATEST_SCHEMA_VERSION
         );
     }
-    super::repository::validate_function_catalogue(&manifest.functions)?;
+    validate_manifest(&manifest)?;
     Ok(manifest)
+}
+
+fn validate_manifest(manifest: &ArchiveManifest) -> Result<()> {
+    super::repository::validate_function_catalogue(&manifest.functions)?;
+    validated_registry_meta(&manifest.project)?;
+    if manifest.nodes.is_empty() {
+        if manifest
+            .files
+            .iter()
+            .any(|file| file.path.starts_with("nodes/"))
+        {
+            bail!("single-node archive contains tree entries");
+        }
+        return Ok(());
+    }
+    let mut ids = HashSet::new();
+    let mut entries = HashSet::new();
+    let mut total = 0u64;
+    for node in &manifest.nodes {
+        if !node.manifest.nodes.is_empty()
+            || node.manifest.version != ARCHIVE_VERSION
+            || node.manifest.schema_version > super::project_db::LATEST_SCHEMA_VERSION
+        {
+            bail!("invalid nested node archive");
+        }
+        if !ids.insert(node.manifest.project.project_id.clone())
+            || !entries.insert(node.entry.path.clone())
+        {
+            bail!("tree archive contains duplicate node identities");
+        }
+        if node.entry.path != format!("nodes/{}.zip", node.manifest.project.project_id)
+            || node.entry.path.contains("..")
+            || node.entry.path.contains('\\')
+        {
+            bail!("tree archive node path is invalid");
+        }
+        validate_manifest(&node.manifest)?;
+        total = node.manifest.files.iter().try_fold(total, |n, file| {
+            n.checked_add(file.size)
+                .ok_or_else(|| anyhow!("archive size overflow"))
+        })?;
+    }
+    if total > MAX_IMPORT_BYTES || !ids.contains(&manifest.project.project_id) {
+        bail!("tree archive inventory is invalid");
+    }
+    if manifest.files.len() != manifest.nodes.len()
+        || manifest.files.iter().any(|entry| {
+            !manifest.nodes.iter().any(|node| {
+                node.entry.path == entry.path
+                    && node.entry.sha256 == entry.sha256
+                    && node.entry.size == entry.size
+            })
+        })
+    {
+        bail!("tree archive entries differ from manifest");
+    }
+    for node in &manifest.nodes {
+        let mut seen = HashSet::new();
+        let mut current = &node.manifest.project;
+        while current.project_id != manifest.project.project_id {
+            if !seen.insert(current.project_id.clone()) || seen.len() >= 4 {
+                bail!("tree archive exceeds project depth or contains a cycle");
+            }
+            let parent = current
+                .parent_id
+                .as_ref()
+                .ok_or_else(|| anyhow!("tree archive is disconnected"))?;
+            current = &manifest
+                .nodes
+                .iter()
+                .find(|node| &node.manifest.project.project_id == parent)
+                .ok_or_else(|| anyhow!("tree archive parent is missing"))?
+                .manifest
+                .project;
+        }
+    }
+    Ok(())
 }
 
 /// Metadata schema of the passage namespace in the SAME shape the vector
@@ -878,7 +1405,13 @@ fn extract_all(zip_path: &Path, staging: &Path, manifest: &ArchiveManifest) -> R
         .iter()
         .map(|f| (f.path.as_str(), f))
         .collect();
-    let total: u64 = manifest.files.iter().map(|f| f.size).sum();
+    if expected.len() != manifest.files.len() {
+        bail!("archive declares duplicate file paths");
+    }
+    let total = manifest.files.iter().try_fold(0u64, |n, file| {
+        n.checked_add(file.size)
+            .ok_or_else(|| anyhow!("archive size overflow"))
+    })?;
     if total > MAX_IMPORT_BYTES {
         bail!("archiwum deklaruje {total} B po rozpakowaniu — limit to {MAX_IMPORT_BYTES} B");
     }
@@ -893,6 +1426,7 @@ fn extract_all(zip_path: &Path, staging: &Path, manifest: &ArchiveManifest) -> R
         );
     }
 
+    let mut seen = HashSet::new();
     let mut written: u64 = 0;
     let mut buf = vec![0u8; COPY_BUF];
     for i in 0..archive.len() {
@@ -900,6 +1434,9 @@ fn extract_all(zip_path: &Path, staging: &Path, manifest: &ArchiveManifest) -> R
         let Some(rel) = safe_entry_path(&entry)? else {
             continue;
         };
+        if !seen.insert(rel.clone()) {
+            bail!("archive contains duplicate entries");
+        }
         let out_path = staging.join(&rel);
         if entry.is_dir() {
             std::fs::create_dir_all(&out_path)?;
@@ -954,6 +1491,7 @@ fn extract_all(zip_path: &Path, staging: &Path, manifest: &ArchiveManifest) -> R
 // =============================================================================
 
 pub struct ImportTask {
+    pub context: crate::dispatch::HandlerContext,
     pub core_db: DbPool,
     pub router: Arc<Router>,
     pub org_id: String,
@@ -963,6 +1501,20 @@ pub struct ImportTask {
     pub name_override: String,
     pub import_vectors: bool,
     pub import_runs: bool,
+}
+
+fn require_import_access(task: &ImportTask) -> Result<()> {
+    let actor = crate::db::repository::get_user_account_by_id(&task.core_db, &task.user_id)?
+        .filter(|account| account.is_active)
+        .ok_or_else(|| anyhow!("import actor account is unavailable"))?;
+    let org =
+        crate::services::rbac::resolve_org_context(&task.core_db, &actor.id, Some(&task.org_id))
+            .map_err(|error| anyhow!(error))?;
+    let mut context = task.context.clone();
+    context.org_context = Some(org);
+    crate::dispatch::project_studio::require_import_grant(&context)
+        .map_err(|error| anyhow!(error.message))?;
+    Ok(())
 }
 
 /// Starts an import. All-or-nothing: any failure removes the freshly created
@@ -1013,30 +1565,203 @@ fn run_import(
     tx: &tokio::sync::broadcast::Sender<BusMessage>,
     task: &ImportTask,
 ) -> Result<()> {
-    let project_id = uuid::Uuid::new_v4().to_string();
-    let dir = super::project_dir(&project_id);
-    let staging =
-        crate::paths::project_studio_import_staging_dir().join(format!("unpack_{project_id}"));
-    std::fs::create_dir_all(&staging)?;
-
-    let result = apply_import(job_id, tx, task, &project_id, &dir, &staging);
-    let _ = std::fs::remove_dir_all(&staging);
-    if let Err(e) = result {
-        // All-or-nothing: nothing half-imported survives.
-        super::project_db::close(&project_id);
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = super::repository::delete_project_rows(&project_id);
-        super::schedules::delete_hint(&project_id);
-        // The namespace row may already have been created by `restore_vectors`;
-        // it would survive as an orphan pointing at the directory just deleted.
-        let _ = crate::services::vector_namespace_manager(&task.core_db).delete_namespace(
+    require_import_access(task)?;
+    validate_manifest(&task.manifest)?;
+    let root = crate::paths::data_dir().join("projects");
+    std::fs::create_dir_all(&root)?;
+    let imports = super::media::safe_directory(&root, ".imports")?;
+    let staging = imports.join(job_id);
+    std::fs::create_dir(&staging)?;
+    let operation_id = job_id.to_string();
+    let mut reserved = false;
+    let mut published = false;
+    let mut destinations = Vec::new();
+    let result = (|| -> Result<()> {
+        let hash = super::media::hash_file(&task.archive_path, &|| require_import_access(task))?;
+        extract_all(&task.archive_path, &staging.join("archive"), &task.manifest)?;
+        let manifests = if task.manifest.nodes.is_empty() {
+            vec![(task.manifest.clone(), staging.join("archive"))]
+        } else {
+            let mut nodes = Vec::new();
+            for node in &task.manifest.nodes {
+                let archive = staging.join("archive").join(&node.entry.path);
+                let actual = read_manifest(&archive)?;
+                if serde_json::to_vec(&actual)? != serde_json::to_vec(&*node.manifest)? {
+                    bail!("nested node manifest differs from tree manifest");
+                }
+                let directory = staging.join(&actual.project.project_id);
+                extract_all(&archive, &directory, &actual)?;
+                nodes.push((actual, directory));
+            }
+            nodes
+        };
+        let mut project_map = HashMap::new();
+        let mut task_map = HashMap::new();
+        for (manifest, directory) in &manifests {
+            require_import_access(task)?;
+            let id = uuid::Uuid::new_v4().to_string();
+            if project_map
+                .insert(manifest.project.project_id.clone(), id)
+                .is_some()
+            {
+                bail!("duplicate source project identity");
+            }
+            let (pool, version) = super::project_db::open_pool_at(&directory.join("db"))?;
+            if version > super::project_db::LATEST_SCHEMA_VERSION {
+                bail!("archive contains a future project schema");
+            }
+            let conn = pool.read()?;
+            let mut statement = conn.prepare("SELECT task_id FROM tasks")?;
+            for row in statement.query_map([], |row| row.get::<_, String>(0))? {
+                if task_map
+                    .insert(row?, uuid::Uuid::new_v4().to_string())
+                    .is_some()
+                {
+                    bail!("tree archive contains duplicate task identities");
+                }
+            }
+        }
+        let source_root = &task.manifest.project.project_id;
+        let mut nodes = Vec::new();
+        for (manifest, _) in &manifests {
+            let meta = &manifest.project;
+            let (description, template, modules) = validated_registry_meta(meta)?;
+            let raw_name =
+                if &meta.project_id == source_root && !task.name_override.trim().is_empty() {
+                    task.name_override.trim()
+                } else {
+                    meta.name.trim()
+                };
+            if raw_name.is_empty() || raw_name.len() > 200 {
+                bail!("archive project name is invalid");
+            }
+            let id = project_map
+                .get(&meta.project_id)
+                .ok_or_else(|| anyhow!("import identity missing"))?;
+            let parent = meta
+                .parent_id
+                .as_ref()
+                .and_then(|id| project_map.get(id))
+                .cloned();
+            nodes.push(super::models::ProjectImportNode {
+                project_id: id.clone(),
+                parent_id: parent.clone(),
+                name: raw_name.into(),
+                description,
+                template,
+                modules_json: serde_json::to_string(&modules)?,
+                owner_user_id: task.user_id.clone(),
+                dir_path: super::project_dir(id).to_string_lossy().into_owned(),
+                key_prefix: meta.key_prefix.clone(),
+                is_private: meta.is_private,
+                inherit_modules: parent.is_some() && meta.inherit_modules,
+                inherit_task_types: parent.is_some() && meta.inherit_task_types,
+                status: "active".into(),
+                lifecycle: meta.lifecycle.clone(),
+                members: Vec::new(),
+                functions: manifest.functions.clone(),
+            });
+        }
+        let resolved = super::repository::prepare_project_tree_import(
+            &operation_id,
             &task.org_id,
-            &super::ingest::vector_scope(&project_id),
-            super::ingest::VECTOR_NAMESPACE,
-        );
-        return Err(e);
+            &hash,
+            &nodes,
+        )?;
+        reserved = true;
+        destinations = resolved.clone();
+        for (manifest, directory) in &manifests {
+            let id = project_map
+                .get(&manifest.project.project_id)
+                .ok_or_else(|| anyhow!("import identity missing"))?;
+            let node = resolved
+                .iter()
+                .find(|node| &node.project_id == id)
+                .ok_or_else(|| anyhow!("reserved import identity missing"))?;
+            let child = ImportTask {
+                manifest: manifest.clone(),
+                archive_path: task.archive_path.clone(),
+                name_override: node.name.clone(),
+                context: task.context.clone(),
+                core_db: task.core_db.clone(),
+                router: task.router.clone(),
+                org_id: task.org_id.clone(),
+                user_id: task.user_id.clone(),
+                import_runs: task.import_runs,
+                import_vectors: task.import_vectors,
+            };
+            apply_import(job_id, tx, &child, node, directory, &task_map, &project_map)?;
+        }
+        require_import_access(task)?;
+        super::repository::publish_project_tree_import(
+            &operation_id,
+            &task.org_id,
+            &hash,
+            &resolved,
+        )?;
+        published = true;
+        let root_id = project_map
+            .get(source_root)
+            .ok_or_else(|| anyhow!("import root identity missing"))?;
+        update_job(job_id, |job| {
+            job.project_id = root_id.clone();
+            job.scope_project_ids = resolved
+                .iter()
+                .map(|node| node.project_id.clone())
+                .collect();
+        });
+        let mut published_nodes = Vec::new();
+        for node in &resolved {
+            let record = super::repository::get_project(&task.org_id, &node.project_id)?
+                .ok_or_else(|| anyhow!("published import registry is missing"))?;
+            let pool = super::project_db::open(&node.project_id)?;
+            while super::task_index::sync_project(&record, &pool, 256)?.lag != 0 {}
+            published_nodes.push((record, pool));
+        }
+        for (record, pool) in published_nodes {
+            super::task_transfer::reconcile_project_relations(&record, &pool)?;
+        }
+        for (manifest, directory) in &manifests {
+            let id = &project_map[&manifest.project.project_id];
+            let node = resolved
+                .iter()
+                .find(|node| &node.project_id == id)
+                .ok_or_else(|| anyhow!("published import identity missing"))?;
+            let child = ImportTask {
+                manifest: manifest.clone(),
+                archive_path: task.archive_path.clone(),
+                name_override: node.name.clone(),
+                context: task.context.clone(),
+                core_db: task.core_db.clone(),
+                router: task.router.clone(),
+                org_id: task.org_id.clone(),
+                user_id: task.user_id.clone(),
+                import_runs: task.import_runs,
+                import_vectors: task.import_vectors,
+            };
+            finish_import(job_id, tx, &child, node, directory)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() && reserved && !published {
+        let any_published = destinations.iter().try_fold(false, |found, node| {
+            Ok::<_, anyhow::Error>(
+                found || super::repository::get_project(&task.org_id, &node.project_id)?.is_some(),
+            )
+        })?;
+        if !any_published {
+            for node in &destinations {
+                super::project_db::close(&node.project_id);
+                let dir = Path::new(&node.dir_path);
+                if dir.exists() {
+                    std::fs::remove_dir_all(dir)?;
+                }
+            }
+            super::repository::abort_project_tree_import(&operation_id)?;
+        }
     }
-    Ok(())
+    std::fs::remove_dir_all(&staging)?;
+    result
 }
 
 /// Registry fields carried by a manifest, validated like the wire input of
@@ -1046,6 +1771,12 @@ fn run_import(
 /// typed it into a form on this node.
 fn validated_registry_meta(project: &ProjectMeta) -> Result<(String, String, Vec<String>)> {
     let description: String = project.description.trim().chars().take(2_000).collect();
+    if !matches!(project.lifecycle.as_str(), "active" | "ended") {
+        bail!("archive lifecycle is invalid");
+    }
+    if super::db::normalize_key_prefix(&project.key_prefix).is_none() {
+        bail!("archive project prefix is invalid");
+    }
     if !super::VALID_TEMPLATES.contains(&project.template.as_str()) {
         bail!("archiwum deklaruje nieznany szablon '{}'", project.template);
     }
@@ -1065,171 +1796,89 @@ fn apply_import(
     job_id: &str,
     tx: &tokio::sync::broadcast::Sender<BusMessage>,
     task: &ImportTask,
-    project_id: &str,
-    dir: &Path,
+    node: &super::models::ProjectImportNode,
     staging: &Path,
+    task_map: &HashMap<String, String>,
+    project_map: &HashMap<String, String>,
 ) -> Result<()> {
-    super::repository::validate_function_catalogue(&task.manifest.functions)?;
-    emit(tx, job_id, "extracting", "rozpakowywanie archiwum", 10);
-    extract_all(&task.archive_path, staging, &task.manifest)?;
-
-    emit(tx, job_id, "registering", "odtwarzanie zawartosci", 40);
+    let dir = Path::new(&node.dir_path);
+    if dir.exists() {
+        bail!("reserved import directory already exists");
+    }
     std::fs::create_dir_all(dir.join("files"))?;
-    std::fs::copy(
-        staging.join("db").join("project.db"),
-        dir.join("project.db"),
-    )?;
+    std::fs::rename(staging.join("db/project.db"), dir.join("project.db"))?;
     move_tree(&staging.join("files"), &dir.join("files"))?;
     if task.import_runs && task.manifest.options.include_runs {
         move_tree(&staging.join("runs"), &dir.join("runs"))?;
     }
-
     let (pool, version) = super::project_db::open_pool_at(dir)?;
-    // `read_manifest` only checked the schema version the archive DECLARES, and
-    // that value is written by whoever built the archive. This is the version of
-    // the database actually on disk, after this binary's migrations ran.
     if version > super::project_db::LATEST_SCHEMA_VERSION {
-        bail!(
-            "baza w archiwum ma schemat {version} > {} — zaktualizuj wezel",
-            super::project_db::LATEST_SCHEMA_VERSION
-        );
+        bail!("imported schema is newer than this binary");
     }
+    rekey_imported_tasks(
+        &pool,
+        &node.key_prefix,
+        &node.project_id,
+        task_map,
+        project_map,
+    )?;
     remap_identities(&pool, &task.user_id)?;
     if !task.import_runs {
         drop_run_history(&pool)?;
     }
     if task.manifest.options.include_user_names {
-        let names = std::fs::read(staging.join("db").join("user_names.json")).unwrap_or_default();
-        if !names.is_empty() {
-            super::repository::set_setting(
-                &pool,
-                "imported_user_display_names",
-                &String::from_utf8_lossy(&names),
-            )?;
-        }
+        let names = std::fs::read_to_string(staging.join("db/user_names.json"))?;
+        let _: HashMap<String, String> = serde_json::from_str(&names)?;
+        super::repository::set_setting(&pool, "imported_user_display_names", &names)?;
     }
-
-    // The registry row is created only once the content is in place, so a
-    // failure above never leaves a visible-but-empty project.
-    let (description, template, modules) = validated_registry_meta(&task.manifest.project)?;
-    let raw_name = if task.name_override.trim().is_empty() {
-        task.manifest.project.name.as_str()
-    } else {
-        task.name_override.as_str()
-    };
-    // Same bound as `project_create`: the manifest name is untrusted input.
-    let wanted: String = raw_name.trim().chars().take(200).collect();
-    if wanted.is_empty() {
-        bail!("archiwum nie zawiera nazwy projektu");
-    }
-    let name = unique_project_name(&task.org_id, &wanted)?;
-    let requested_prefix = task.manifest.project.key_prefix.trim();
-    if !requested_prefix.is_empty() && super::db::normalize_key_prefix(requested_prefix).is_none() {
-        bail!("archive project key prefix is invalid");
-    }
-    let available_prefix = if requested_prefix.is_empty() {
-        String::new()
-    } else {
-        let central = super::db::pool()?;
-        let conn = central
-            .read()
-            .map_err(|e| anyhow!("projects registry read: {e}"))?;
-        let taken: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM projects WHERE org_id = ?1 AND key_prefix = ?2",
-                params![task.org_id, requested_prefix],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if taken.is_some() {
-            String::new()
-        } else {
-            requested_prefix.to_ascii_uppercase()
-        }
-    };
-    super::repository::create_project(
-        project_id,
-        &task.org_id,
-        &name,
-        &description,
-        &template,
-        &serde_json::to_string(&modules).unwrap_or_else(|_| "[]".to_string()),
-        &task.user_id,
-        &dir.to_string_lossy(),
-        &available_prefix,
-        &[],
-    )?;
-    let registry = super::repository::get_project(&task.org_id, project_id)?
-        .ok_or_else(|| anyhow!("imported project missing from registry"))?;
-    rekey_imported_tasks(&pool, &registry.key_prefix)?;
-    super::repository::restore_function_catalogue(project_id, &task.manifest.functions)?;
-    update_job(job_id, |j| j.project_id = project_id.to_string());
-    let _ = super::schedules::refresh_hint(project_id, &task.org_id);
-
-    emit(tx, job_id, "registering", "odtwarzanie bazy wiedzy", 70);
-    let (reused, reason) = restore_vectors(task, project_id, dir, staging)?;
-    let mut reindex_jobs = Vec::new();
-    if !reused {
-        reindex_jobs = reindex_sources(task, project_id, &pool, dir);
-    }
-    update_job(job_id, |j| {
-        j.vectors_imported = reused;
-        j.reindex_job_ids = reindex_jobs.clone();
-    });
-
-    super::repository::set_setting(
-        &pool,
-        "imported_from",
-        &serde_json::json!({
-            "source_node_id": task.manifest.source_node_id,
-            "source_project_id": task.manifest.project.project_id,
-            "exported_at": task.manifest.exported_at,
-            "imported_at": chrono::Utc::now().to_rfc3339(),
-        })
-        .to_string(),
-    )?;
-    super::repository::set_setting(
-        &pool,
-        "imported_vectors",
-        &serde_json::json!({ "reused": reused, "reason": reason }).to_string(),
-    )?;
-
-    super::activity::record(
-        &pool,
-        &task.user_id,
-        "user",
-        "project.imported",
-        "project",
-        project_id,
-        &serde_json::json!({
-            "name": name,
-            "source_node_id": task.manifest.source_node_id,
-            "vectors_reused": reused,
-        })
-        .to_string(),
-    );
-    super::notifications::notify(
-        &task.org_id,
-        &task.user_id,
-        project_id,
-        "project_imported",
-        "Projekt zaimportowany",
-        &format!(
-            "„{name}” jest gotowy{}",
-            if reused {
-                ""
-            } else {
-                " — baza wiedzy jest przebudowywana"
-            }
-        ),
-        &serde_json::json!({ "project_id": project_id }).to_string(),
-    );
-    emit(tx, job_id, "done", "import zakonczony", 100);
+    super::repository::set_setting(&pool,"imported_from",&serde_json::json!({
+        "source_node_id":task.manifest.source_node_id,"source_project_id":task.manifest.project.project_id,
+        "exported_at":task.manifest.exported_at,"imported_at":chrono::Utc::now().to_rfc3339()}).to_string())?;
+    emit(tx, job_id, "staging", "validated node content staged", 50);
     Ok(())
 }
 
-/// Moves every file of `src` under `dest`, falling back to copy across
-/// filesystems (staging may live on another mount than the data directory).
+fn finish_import(
+    job_id: &str,
+    tx: &tokio::sync::broadcast::Sender<BusMessage>,
+    task: &ImportTask,
+    node: &super::models::ProjectImportNode,
+    staging: &Path,
+) -> Result<()> {
+    let dir = Path::new(&node.dir_path);
+    let pool = super::project_db::open(&node.project_id)?;
+    super::schedules::refresh_hint(&node.project_id, &task.org_id)?;
+    let (reused, reason) = restore_vectors(task, &node.project_id, dir, staging)?;
+    let reindex = if !reused && node.lifecycle == "active" {
+        reindex_sources(task, &node.project_id, &pool, dir)
+    } else {
+        Vec::new()
+    };
+    update_job(job_id, |job| {
+        job.vectors_imported |= reused;
+        job.reindex_job_ids.extend(reindex.clone());
+    });
+    super::repository::set_setting(
+        &pool,
+        "imported_vectors",
+        &serde_json::json!({"reused":reused,"reason":reason}).to_string(),
+    )?;
+    super::activity::record(&pool,&task.user_id,"user","project.imported","project",&node.project_id,
+        &serde_json::json!({"name":node.name,"source_node_id":task.manifest.source_node_id,"vectors_reused":reused}).to_string());
+    super::notifications::notify(
+        &task.org_id,
+        &task.user_id,
+        &node.project_id,
+        "project_imported",
+        "Project imported",
+        &node.name,
+        &serde_json::json!({"project_id":node.project_id}).to_string(),
+    );
+    emit(tx, job_id, "done", "import completed", 100);
+    Ok(())
+}
+
+/// Import staging shares the destination filesystem so content publication is a rename.
 fn move_tree(src: &Path, dest: &Path) -> Result<()> {
     if !src.is_dir() {
         return Ok(());
@@ -1239,9 +1888,7 @@ fn move_tree(src: &Path, dest: &Path) -> Result<()> {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if std::fs::rename(&abs, &target).is_err() {
-            std::fs::copy(&abs, &target)?;
-        }
+        std::fs::rename(&abs, &target)?;
     }
     Ok(())
 }
@@ -1294,78 +1941,95 @@ fn remap_identities(pool: &DbPool, importer: &str) -> Result<()> {
     Ok(())
 }
 
-fn rekey_imported_tasks(pool: &DbPool, prefix: &str) -> Result<()> {
-    let conn = pool
-        .write()
-        .map_err(|e| anyhow!("imported project write: {e}"))?;
+fn rekey_imported_tasks(
+    pool: &DbPool,
+    prefix: &str,
+    destination_project_id: &str,
+    task_uuid_map: &HashMap<String, String>,
+    project_uuid_map: &HashMap<String, String>,
+) -> Result<()> {
+    let conn = pool.write()?;
     let tx = conn.unchecked_transaction()?;
-    let mut stmt = tx.prepare("SELECT task_id,task_no,task_key FROM tasks ORDER BY task_no")?;
-    let rows = stmt
-        .query_map([], |row| {
+    tx.pragma_update(None, "defer_foreign_keys", true)?;
+    tx.execute("DELETE FROM task_index_outbox", [])?;
+    tx.execute(
+        "DELETE FROM sqlite_sequence WHERE name='task_index_outbox'",
+        [],
+    )?;
+    let rows = {
+        let mut query = tx.prepare(
+            "SELECT task_id,task_no,task_key,parent_task_id FROM tasks ORDER BY task_no",
+        )?;
+        let rows = query.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
             ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(stmt);
-    for (task_id, task_no, old_key) in rows {
-        let new_key = format!("{prefix}-{task_no}");
-        if new_key != old_key {
-            tx.execute(
-                "UPDATE tasks SET task_key = ?1 WHERE task_id = ?2",
-                params![new_key, task_id],
-            )?;
-        }
-        let event_count: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM task_events WHERE task_id = ?1",
-            params![task_id],
-            |row| row.get(0),
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let relations = {
+        let mut query=tx.prepare("SELECT link_id,source_task_id,target_task_id,source_project_id,target_project_id FROM task_links")?;
+        let rows = query.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (old_id, number, old_key, parent) in rows {
+        let id = task_uuid_map
+            .get(&old_id)
+            .ok_or_else(|| anyhow!("import task identity map is incomplete"))?;
+        let parent = parent
+            .as_ref()
+            .map(|parent| {
+                task_uuid_map
+                    .get(parent)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("import parent task identity is missing"))
+            })
+            .transpose()?;
+        let key = format!("{prefix}-{number}");
+        tx.execute(
+            "UPDATE tasks SET task_id=?1,task_key=?2,parent_task_id=?3 WHERE task_id=?4",
+            params![id, key, parent, old_id],
         )?;
-        if event_count == 0 {
-            tx.execute(
-                "INSERT INTO task_events(task_id,actor_kind,actor_id,kind,after_json) \
-                 SELECT task_id,'system','','imported',json_object('task_key',task_key, \
-                 'task_type',task_type,'status',status,'title',title) FROM tasks WHERE task_id = ?1",
-                params![task_id],
-            )?;
-        }
-        if new_key == old_key {
-            continue;
-        }
-        let historical_events: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM task_events WHERE task_id = ?1 AND kind <> 'imported'",
-            params![task_id],
-            |row| row.get(0),
+        tx.execute(
+            "UPDATE task_comments SET task_id=?1 WHERE task_id=?2",
+            params![id, old_id],
         )?;
-        if historical_events > 0 {
-            tx.execute(
-                "INSERT INTO task_events(task_id,actor_kind,actor_id,kind,before_json,after_json) \
-                 VALUES (?1,'system','','import_key_changed',?2,?3)",
-                params![
-                    task_id,
-                    serde_json::json!(old_key).to_string(),
-                    serde_json::json!(new_key).to_string()
-                ],
-            )?;
+        tx.execute(
+            "UPDATE task_events SET task_id=?1 WHERE task_id=?2",
+            params![id, old_id],
+        )?;
+        tx.execute("INSERT INTO task_events(task_id,actor_kind,actor_id,kind,before_json,after_json) VALUES(?1,'system','','imported',?2,?3)",
+            params![id,serde_json::json!({"task_id":old_id,"task_key":old_key}).to_string(),
+                serde_json::json!({"task_id":id,"task_key":key,"project_id":destination_project_id}).to_string()])?;
+    }
+    for (link, source, target, source_project, target_project) in relations {
+        let endpoints = task_uuid_map.get(&source).zip(task_uuid_map.get(&target));
+        let projects = project_uuid_map
+            .get(&source_project)
+            .zip(project_uuid_map.get(&target_project));
+        if let (Some((source, target)), Some((source_project, target_project))) =
+            (endpoints, projects)
+        {
+            tx.execute("UPDATE task_links SET relation_id=?1,source_task_id=?2,target_task_id=?3,source_project_id=?4,target_project_id=?5 WHERE link_id=?6",
+                params![uuid::Uuid::new_v4().to_string(),source,target,source_project,target_project,link])?;
+        } else {
+            tx.execute("DELETE FROM task_links WHERE link_id=?1", [link])?;
         }
     }
-    tx.execute(
-        "INSERT INTO settings(key,value) VALUES ('project_key_prefix',?1) \
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![prefix],
-    )?;
-    tx.execute(
-        "UPDATE settings SET value = CASE WHEN EXISTS(SELECT 1 FROM tasks) THEN '1' ELSE value END \
-         WHERE key = 'project_key_prefix_locked'",
-        [],
-    )?;
-    tx.execute(
-        "UPDATE settings SET value = CAST(MAX(CAST(value AS INTEGER), \
-         (SELECT COALESCE(MAX(task_no),0)+1 FROM tasks)) AS TEXT) WHERE key = 'task_next_no'",
-        [],
-    )?;
+    tx.execute("INSERT INTO settings(key,value) VALUES('project_key_prefix',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[prefix])?;
+    tx.execute("UPDATE settings SET value=CASE WHEN EXISTS(SELECT 1 FROM tasks) THEN '1' ELSE value END WHERE key='project_key_prefix_locked'",[])?;
+    tx.execute("UPDATE settings SET value=CAST(MAX(CAST(value AS INTEGER),(SELECT COALESCE(MAX(task_no),0)+1 FROM tasks)) AS TEXT) WHERE key='task_next_no'",[])?;
     tx.commit()?;
     Ok(())
 }
@@ -1390,32 +2054,7 @@ fn drop_run_history(pool: &DbPool) -> Result<()> {
 }
 
 /// Appends a numeric suffix until the name is free in the org.
-fn unique_project_name(org_id: &str, wanted: &str) -> Result<String> {
-    let pool = super::db::pool()?;
-    let conn = pool.read().map_err(|e| anyhow!("registry read: {e}"))?;
-    let taken = |name: &str| -> Result<bool> {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM projects WHERE org_id = ?1 AND name = ?2",
-            params![org_id, name],
-            |row| row.get(0),
-        )?;
-        Ok(n > 0)
-    };
-    if !taken(wanted)? {
-        return Ok(wanted.to_string());
-    }
-    for suffix in 2..1000 {
-        let candidate = format!("{wanted} ({suffix})");
-        if !taken(&candidate)? {
-            return Ok(candidate);
-        }
-    }
-    bail!("nie udalo sie wygenerowac unikalnej nazwy projektu")
-}
 
-/// Moves the archived vector index into the new project and registers it under
-/// the new scope — but ONLY when the embedding fingerprint matches. Returns
-/// whether the index was reused and why not when it was not.
 fn restore_vectors(
     task: &ImportTask,
     project_id: &str,
@@ -1558,6 +2197,127 @@ pub fn reap_export_archives() {
 mod unit_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn recovery_finishes_quarantined_delete_and_aborts_unpublished_tree() {
+        let tmp = tempfile::tempdir().expect("operation storage");
+        let _ = super::super::db::init(&tmp.path().join("projects.db"));
+        let state = crate::dispatch::state::AppState::for_test();
+        let org = format!("recovery-{}", uuid::Uuid::new_v4());
+        let id = uuid::Uuid::new_v4().to_string();
+        let dir = tmp.path().join(&id);
+        std::fs::create_dir_all(&dir).expect("actual project directory");
+        super::super::repository::create_project(
+            &id,
+            &org,
+            "Recover deletion",
+            "",
+            "custom",
+            "[\"tasks\"]",
+            "owner",
+            &dir.to_string_lossy(),
+            "",
+            None,
+            false,
+            false,
+            false,
+            &[],
+        )
+        .expect("actual registry row");
+        let content = super::super::project_db::open(&id).expect("actual content database");
+        drop(content);
+        super::super::project_db::close(&id);
+        let operation = super::super::repository::prepare_project_delete(&org, &id, "owner")
+            .expect("durable delete admission");
+        let quarantine = tmp.path().join(format!(".deleted-{operation}"));
+        let journal_path = deletion_journal_dir()
+            .expect("journal storage")
+            .join(format!("{operation}.json"));
+        super::super::media::write_metadata(
+            &journal_path,
+            &DeletionJournal {
+                project_id: id.clone(),
+                org_id: org.clone(),
+                directory: dir.clone(),
+                quarantine: quarantine.clone(),
+                operation_id: operation.clone(),
+            },
+        )
+        .expect("durable deletion journal");
+        std::fs::rename(&dir, &quarantine).expect("destructive cut point before registry commit");
+        assert!(
+            super::super::project_db::open(&id).is_err(),
+            "an admitted deletion must not recreate content"
+        );
+        recover_operations(&state.db).expect("restart completes quarantined deletion");
+        assert!(super::super::repository::get_project(&org, &id)
+            .expect("registry")
+            .is_none());
+        assert!(!dir.exists() && !quarantine.exists() && !journal_path.exists());
+
+        let operation = uuid::Uuid::new_v4().to_string();
+        let root = uuid::Uuid::new_v4().to_string();
+        let child = uuid::Uuid::new_v4().to_string();
+        let node = |project_id: String, parent_id: Option<String>, name: &str| {
+            super::super::models::ProjectImportNode {
+                dir_path: tmp.path().join(&project_id).to_string_lossy().into_owned(),
+                project_id,
+                parent_id,
+                name: name.into(),
+                description: String::new(),
+                template: "custom".into(),
+                modules_json: "[\"tasks\"]".into(),
+                owner_user_id: "owner".into(),
+                key_prefix: String::new(),
+                is_private: false,
+                inherit_modules: false,
+                inherit_task_types: false,
+                status: "active".into(),
+                lifecycle: "active".into(),
+                functions: super::super::models::default_project_functions(),
+                members: Vec::new(),
+            }
+        };
+        let nodes = super::super::repository::prepare_project_tree_import(
+            &operation,
+            &org,
+            &"a".repeat(64),
+            &[
+                node(root.clone(), None, "Recovered import root"),
+                node(child.clone(), Some(root.clone()), "Recovered import child"),
+            ],
+        )
+        .expect("whole-tree durable reservations");
+        std::fs::create_dir_all(&nodes[0].dir_path).expect("first node staging directory");
+        let (content, _) = super::super::project_db::open_pool_at(Path::new(&nodes[0].dir_path))
+            .expect("first node staged");
+        drop(content);
+        std::fs::create_dir_all(&nodes[1].dir_path).expect("second node staging directory");
+        std::fs::write(
+            Path::new(&nodes[1].dir_path).join("project.db"),
+            b"invalid sqlite content",
+        )
+        .expect("interrupted invalid second node");
+        assert!(super::super::project_db::open_pool_at(Path::new(&nodes[1].dir_path)).is_err());
+        assert!(super::super::repository::get_project(&org, &root)
+            .expect("root")
+            .is_none());
+        assert!(super::super::repository::get_project(&org, &child)
+            .expect("child")
+            .is_none());
+        recover_operations(&state.db).expect("restart aborts unpublished tree as one operation");
+        assert!(nodes.iter().all(|node| !Path::new(&node.dir_path).exists()));
+        assert!(!super::super::repository::pending_project_tree_imports()
+            .expect("pending journals")
+            .iter()
+            .any(|pending| pending.operation_id == operation));
+        assert!(super::super::repository::get_project(&org, &root)
+            .expect("root")
+            .is_none());
+        assert!(super::super::repository::get_project(&org, &child)
+            .expect("child")
+            .is_none());
+    }
+
     /// Builds a minimal archive on disk WITHOUT the async job machinery, so the
     /// extraction guards can be exercised directly.
     fn zip_with(entries: &[(&str, &[u8])], symlink: Option<&str>) -> (tempfile::TempDir, PathBuf) {
@@ -1589,12 +2349,19 @@ mod unit_tests {
             });
         }
         let manifest = ArchiveManifest {
+            nodes: Vec::new(),
             version: ARCHIVE_VERSION,
             schema_version: 1,
             exported_at: "t".to_string(),
             source_node_id: "n1".to_string(),
             project: ProjectMeta {
-                name: "Projekt".to_string(),
+                project_id: "archive-node".into(),
+                name: "Archive project".into(),
+                key_prefix: "ARC".into(),
+                template: "custom".into(),
+                lifecycle: "active".into(),
+                depth: 1,
+                path: "/archive-node".into(),
                 ..ProjectMeta::default()
             },
             options: ExportOptions::default(),
@@ -1662,6 +2429,7 @@ mod unit_tests {
             vector_count: 4200,
         };
         let manifest = |embedding: Option<EmbeddingMeta>| ArchiveManifest {
+            nodes: Vec::new(),
             version: ARCHIVE_VERSION,
             schema_version: 1,
             exported_at: "t".to_string(),
@@ -1879,6 +2647,48 @@ mod unit_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _ = super::super::db::init(&tmp.path().join("projects.db"));
         let state = crate::dispatch::state::AppState::for_test();
+        crate::dispatch::app_gate::test_support::install_app(
+            &state,
+            "projekty",
+            &["project_studio.read"],
+        );
+        let owner = crate::db::repository::create_user_account(
+            &state.db,
+            "archive-source-owner",
+            "hash",
+            "Archive owner",
+            "owner@example.test",
+        )
+        .expect("owner account");
+        let importer = crate::db::repository::create_user_account(
+            &state.db,
+            "archive-importer",
+            "hash",
+            "Archive importer",
+            "importer@example.test",
+        )
+        .expect("importer account");
+        let target_org = crate::services::org::DEFAULT_ORG_ID;
+        crate::services::org::add_membership(
+            &state.db,
+            target_org,
+            &importer,
+            "role-org-admin",
+            "test",
+        )
+        .expect("importer organization");
+        let context = crate::dispatch::HandlerContext {
+            session: tentaflow_protocol::SessionAuth::Anonymous,
+            correlation_id: 0,
+            connection_id: 0,
+            resume_secret: None,
+            state: state.clone(),
+            org_context: Some(
+                crate::services::rbac::resolve_org_context(&state.db, &importer, Some(target_org))
+                    .expect("importer access"),
+            ),
+            origin: crate::dispatch::RequestOrigin::Local,
+        };
 
         let source_id = format!("src-{}", uuid::Uuid::new_v4());
         let dir = tmp.path().join("source-project");
@@ -1932,6 +2742,23 @@ mod unit_tests {
             hex(&hasher.finalize())
         };
         std::fs::write(dir.join("files").join(&sha), blob).expect("blob");
+        let (source_pool, _) = super::super::project_db::open_pool_at(&dir).expect("source pool");
+        source_pool
+            .write()
+            .expect("writer")
+            .execute(
+                "UPDATE tasks SET attachments_json=?1 WHERE task_id='t1'",
+                [serde_json::to_string(&vec![
+                    tentaflow_protocol::project_studio::AttachmentWire {
+                        sha256: sha.clone(),
+                        name: "document.txt".into(),
+                        size_bytes: blob.len() as u64,
+                        mime: "text/plain".into(),
+                    },
+                ])
+                .expect("attachment")],
+            )
+            .expect("referenced blob");
 
         let project_id = format!("exp-{}", uuid::Uuid::new_v4());
         super::super::repository::create_project(
@@ -1941,9 +2768,13 @@ mod unit_tests {
             "opis",
             "tests",
             "[\"knowledge\",\"tests\"]",
-            "wlasciciel-obcy",
+            &owner,
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[],
         )
         .expect("registry row");
@@ -1971,26 +2802,19 @@ mod unit_tests {
 
         let export_ref = format!("psexp_{}", uuid::Uuid::new_v4());
         let dest = tmp.path().join(format!("{export_ref}.zip"));
+        let source_record = super::super::repository::get_project("org-t", &project_id)
+            .expect("registry")
+            .expect("source");
         let task = ExportTask {
+            nodes: vec![source_record.clone()],
+            scope: tentaflow_protocol::project_studio::ProjectTreeScope::Node,
             core_db: state.db.clone(),
             org_id: "org-t".to_string(),
-            user_id: "wlasciciel-obcy".to_string(),
+            user_id: owner.clone(),
             node_id: "node-a".to_string(),
             project_id: project_id.clone(),
             dir_path: dir.clone(),
-            project: ProjectMeta {
-                project_id: project_id.clone(),
-                key_prefix: super::super::repository::get_project("org-t", &project_id)
-                    .expect("registry")
-                    .expect("project")
-                    .key_prefix,
-                name: format!("Projekt {project_id}"),
-                description: "opis".to_string(),
-                template: "tests".to_string(),
-                modules: vec!["knowledge".to_string(), "tests".to_string()],
-                owner_user_id: "wlasciciel-obcy".to_string(),
-                org_id: "org-t".to_string(),
-            },
+            project: project_meta(&source_record).expect("source metadata"),
             options: ExportOptions {
                 include_runs: false,
                 include_vectors: false,
@@ -2019,45 +2843,84 @@ mod unit_tests {
             .any(|f| f.path == "db/user_names.json"));
 
         // --- import as a brand-new project on the "target" node ---
-        let target_id = format!("imp-{}", uuid::Uuid::new_v4());
-        let target_dir = tmp.path().join("target-project");
-        std::fs::create_dir_all(&target_dir).expect("target dir");
-        let staging = tmp.path().join("staging");
-        std::fs::create_dir_all(&staging).expect("staging");
+        let denial = crate::dispatch::project_studio::require_import_grant(&context).expect_err(
+            "readable archive and organization membership do not grant project creation",
+        );
+        assert_eq!(
+            denial.code,
+            tentaflow_protocol::ProtocolErrorCode::PolicyDenied
+        );
+        assert_eq!(
+            denial.message,
+            "importing a project requires a creator grant"
+        );
+        super::super::repository::set_creator_grant(&importer, target_org, &importer, true)
+            .expect("actual project creator grant");
+        crate::dispatch::project_studio::require_import_grant(&context)
+            .expect("importer now has the current creator grant");
         let import = ImportTask {
+            context,
             core_db: state.db.clone(),
             router: state.router.clone(),
-            org_id: "org-target".to_string(),
-            user_id: "importer-1".to_string(),
+            org_id: target_org.into(),
+            user_id: importer.clone(),
             archive_path: dest.clone(),
             manifest,
             name_override: String::new(),
             import_vectors: false,
             import_runs: false,
         };
-        apply_import(
-            "test-import",
-            &log_bus::sender_for("test-import"),
-            &import,
-            &target_id,
-            &target_dir,
-            &staging,
-        )
-        .expect("import");
+        let import_id = uuid::Uuid::new_v4().to_string();
+        set_job(
+            &import_id,
+            ArchiveJob {
+                owner_user_id: importer.clone(),
+                ..ArchiveJob::default()
+            },
+        );
+        run_import(&import_id, &log_bus::sender_for(&import_id), &import).expect("import");
+        let target_id = job(&import_id).expect("actual import job").project_id;
+        assert!(!target_id.is_empty());
+        let target_dir = super::super::project_dir(&target_id);
 
         // The registry row belongs to the IMPORTER and their org, never to the
         // identity recorded in the archive.
-        let record = super::super::repository::get_project("org-target", &target_id)
+        let record = super::super::repository::get_project(target_org, &target_id)
             .expect("get")
             .expect("row");
-        assert_eq!(record.owner_user_id, "importer-1");
-        assert_eq!(record.org_id, "org-target");
+        assert_eq!(record.owner_user_id, importer);
+        assert_eq!(record.org_id, target_org);
         assert_eq!(record.template, "tests");
-        let membership = super::super::repository::member_access(&target_id, "importer-1")
+        let cloned_ids: Vec<String> = super::super::project_db::open(&target_id)
+            .expect("clone pool")
+            .read()
+            .expect("clone reader")
+            .prepare("SELECT task_id FROM tasks ORDER BY task_no")
+            .expect("query")
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .collect::<rusqlite::Result<_>>()
+            .expect("identities");
+        assert!(
+            cloned_ids.iter().all(|id| id != "t1" && id != "t2"),
+            "import clones task UUIDs instead of redirecting source tasks"
+        );
+        let membership = super::super::repository::member_access(&target_id, &importer)
             .expect("membership")
             .expect("owner member");
         assert!(membership.project_admin);
-        assert_eq!(membership.functions.len(), 9);
+        let archived_function_ids: HashSet<_> = import
+            .manifest
+            .functions
+            .iter()
+            .map(|function| function.function_id.clone())
+            .collect();
+        assert!(archived_function_ids.contains("external_reviewer"));
+        assert_eq!(
+            membership.functions.iter().cloned().collect::<HashSet<_>>(),
+            archived_function_ids,
+            "the importer receives exactly the archived catalogue, including the custom function"
+        );
         assert!(membership.expires_at.is_none());
         assert_eq!(
             super::super::repository::list_members(&target_id)
@@ -2079,24 +2942,20 @@ mod unit_tests {
                 |r| r.get(0),
             )
             .expect("case");
-        assert_eq!(case_author, "importer-1", "authorship is re-mapped");
+        assert_eq!(case_author, importer, "authorship is re-mapped");
         let open_assignee: String = conn
-            .query_row(
-                "SELECT assigned_to FROM tasks WHERE task_id = 't1'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT assigned_to FROM tasks WHERE task_no = 1", [], |r| {
+                r.get(0)
+            })
             .expect("open task");
         assert_eq!(
             open_assignee, "",
             "an open assignment to a user who cannot see the project is cleared"
         );
         let done_assignee: String = conn
-            .query_row(
-                "SELECT assigned_to FROM tasks WHERE task_id = 't2'",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT assigned_to FROM tasks WHERE task_no = 2", [], |r| {
+                r.get(0)
+            })
             .expect("done task");
         assert_eq!(done_assignee, "obcy-2", "history keeps its assignee");
         let (secret, status): (String, String) = conn
@@ -2149,6 +3008,8 @@ mod unit_tests {
             description: format!("  {}  ", "o".repeat(5_000)),
             template: template.to_string(),
             modules: modules.iter().map(|m| m.to_string()).collect(),
+            key_prefix: "ARC".into(),
+            lifecycle: "active".into(),
             ..ProjectMeta::default()
         };
 

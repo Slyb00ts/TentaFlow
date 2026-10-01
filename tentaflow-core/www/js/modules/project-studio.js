@@ -30,7 +30,8 @@ import { activityLabels } from '/js/lib/agent-activity-bridge.js';
 import { openActionMenu, openConfirmWindow, openHandoverWindow, showUndoToast } from '/js/lib/actions/index.js';
 import { openHandover } from '/js/modules/org-structure/handover-nav.js';
 import { PROJECT_AREAS, PERMISSION_LEVELS, BUILTIN_FUNCTIONS, allowsArea, canCreateTask, projectTabs, catalogueLabel, memberGroup, expiryToInstant, expiryToLocal } from './project-studio-access.js';
-import { TASK_LINK_KINDS, projectKeySuggestion, taskTypeLabel, taskTypeDescription, taskDuration, taskEventValue, taskEventTaskIds, taskEventAttachments, taskNotificationText, activeTaskTypes, parentCandidates } from './project-studio-tasks.js';
+import { TASK_LINK_KINDS, projectKeySuggestion, taskTypeLabel, taskTypeDescription, taskDuration, taskEventValue, taskEventReferences, taskEventAttachments, taskNotificationText, activeTaskTypes, parentCandidates } from './project-studio-tasks.js';
+import { projectAncestors, projectRoots, projectTreeNodes, readTaskScope, writeTaskScope } from './project-studio-tree.js';
 import { uploadProjectAttachment, pendingAttachmentUploads, cancelAttachmentUpload, refreshAttachmentUpload, acknowledgeAttachmentUploads, openAttachmentStream, downloadProjectAttachment } from './project-studio-media.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
@@ -66,6 +67,8 @@ import '/js/components/tf-kanban.js';
 import '/js/components/tf-combobox.js';
 import '/js/components/tf-person-picker.js';
 import '/js/components/tf-timeline.js';
+import '/js/components/tf-tree.js';
+import '/js/components/tf-multiselect.js';
 import '/js/components/tf-video-stream.js';
 
 // Wizard templates map 1:1 to the wire `template` field; modules are the
@@ -75,6 +78,12 @@ const TEMPLATES = [
   { id: 'tests', icon: 'list', modules: ['knowledge', 'tests', 'tasks'] },
   { id: 'docs', icon: 'file-text', modules: ['knowledge', 'docs', 'chat'] },
   { id: 'tests_docs', icon: 'grid-2x2', modules: ['knowledge', 'tests', 'docs', 'tasks', 'chat'] },
+];
+
+const CHILD_TEMPLATES = [
+  { id: 'deployment', modules: ['tasks', 'tests', 'knowledge', 'docs', 'chat'] },
+  { id: 'maintenance', modules: ['tasks', 'tests', 'knowledge', 'chat'] },
+  { id: 'empty', modules: [] },
 ];
 
 const MODULE_DEFS = [
@@ -177,9 +186,8 @@ const TASK_BOARD_COLUMNS = [
 const BOARD_PAGE_SIZE = 200;
 const TASKS_VIEW_KEY = 'ps.tasks.view';
 
-// Archive uploads use 4 MiB chunks (the server caps a single import chunk
-// there); progress is polled because the stream is only a live log view.
-const IMPORT_CHUNK_BYTES = 4 * 1024 * 1024;
+// Leave room for CBOR metadata inside the global 1 MiB WebSocket frame budget.
+const IMPORT_CHUNK_BYTES = 512 * 1024;
 const ARCHIVE_POLL_MS = 2000;
 const ARCHIVE_LOG_CAP = 200;
 
@@ -189,6 +197,8 @@ const state = {
   // P01
   canCreate: false,
   projects: [],
+  breadcrumbs: [],
+  expandedProjects: new Set(),
   listFilter: 'active',
   functionFilter: 'all',
   catalogues: new Map(),
@@ -292,18 +302,19 @@ function freshTasksState() {
   return {
     rows: [], total: 0, page: 1,
     filters: { type: '', status: '', severity: '', mine: false, search: '', includeArchived: false },
-    // 'list' | 'board' — remembered per project in localStorage.
+    // 'list' | 'board' — remembered per signed-in user and project.
     mode: 'list',
-    // Board rows are a separate, unpaginated fetch: a kanban with a page cut
-    // in the middle of a column would silently hide cards.
+    // The board appends bounded pages and uses server totals for its counters.
     boardRows: [],
+    scope: 'single', sourceProjectIds: [], summary: null,
+    renderGeneration: 0,
   };
 }
 
 // localStorage is best-effort (private mode / disabled storage throws).
 function readTasksViewMode(id) {
   try {
-    const mode = window.localStorage.getItem(`${TASKS_VIEW_KEY}.${id}`);
+    const mode = window.localStorage.getItem(`${TASKS_VIEW_KEY}.${currentUserId()}.${id}`);
     return mode === 'board' ? 'board' : 'list';
   } catch {
     return 'list';
@@ -312,7 +323,7 @@ function readTasksViewMode(id) {
 
 function writeTasksViewMode(id, mode) {
   try {
-    window.localStorage.setItem(`${TASKS_VIEW_KEY}.${id}`, mode);
+    window.localStorage.setItem(`${TASKS_VIEW_KEY}.${currentUserId()}.${id}`, mode);
   } catch {
     /* storage unavailable — the mode simply does not survive a reload */
   }
@@ -361,13 +372,13 @@ function projectAccess(project = state.project) {
 }
 
 const canArea = (area, minimum = 'read') => allowsArea(projectAccess(), area, minimum);
-const canManageMembers = () => !!fv(projectAccess(), 'can_manage_members') && !projectAccess().archived;
-const canTransferOwnership = () => !!fv(projectAccess(), 'is_owner') && !projectAccess().archived;
+const canManageMembers = () => !!fv(projectAccess(), 'can_manage_members') && !projectAccess().archived && !projectAccess().ended;
+const canTransferOwnership = () => !!fv(projectAccess(), 'is_owner') && !projectAccess().archived && !projectAccess().ended;
 const canSendChat = () => canArea('chat', 'write') && canArea('knowledge');
 const canTryRun = () => canArea('tests', 'write') && canArea('environments');
 const canGenerateTests = () => canArea('tests', 'write') && canArea('knowledge');
 const canRunSchedule = (schedule) => canArea('tests', 'write') && (fv(schedule, 'run_type') === 'manual' || canArea('environments'));
-const canLifecycle = (project = state.project) => !!fv(projectAccess(project), 'has_access') && (!!fv(projectAccess(project), 'is_owner') || !!fv(projectAccess(project), 'app_admin'));
+const canProject = (action, project = state.project) => project?.[`can_${action}`] === true;
 
 function functionLabel(definition) {
   return catalogueLabel(definition, 'name', t);
@@ -430,6 +441,7 @@ function readMemberAccess(host) {
 
 function orientationLabel(project) {
   const template = project.template;
+  if (CHILD_TEMPLATES.some((entry) => entry.id === template)) return t(`subproject_template_${template}`);
   if (template === 'tests') return t('orientation_tests');
   if (template === 'docs') return t('orientation_docs');
   if (template === 'tests_docs') return t('orientation_tests_docs');
@@ -707,37 +719,23 @@ function openDeleteWindow({ title, targetName, targetSub, targetIcon = 'folder',
 
 async function loadProjects() {
   try {
-    const resp = await ApiBinary.one('projectStudioProjectsListRequest', {
-      includeArchived: state.listFilter !== 'active',
-    });
-    state.projects = Array.isArray(resp.projects) ? resp.projects : [];
-    state.canCreate = !!fv(resp, 'can_create');
+    const response = await ApiBinary.one('projectStudioProjectTreeRequest', { projectId: null, includeEnded: true, includeArchived: true });
+    state.projects = response.projects;
+    state.breadcrumbs = response.breadcrumbs;
+    state.canCreate = response.can_create;
+    state.isAdmin = response.can_administer;
     state.catalogues.clear();
-    state.isAdmin = !!fv(resp, 'can_administer');
-    await Promise.allSettled(state.projects.map((project) => loadCatalogue(fv(project, 'project_id'))));
-    const functionFilter = byId('ps-function-filter');
-    if (functionFilter) {
-      const choices = new Map();
-      for (const catalogue of state.catalogues.values()) for (const definition of catalogue) choices.set(fv(definition, 'function_id'), definition);
-      functionFilter.setOptions([{ value: 'all', label: t('project_function_filter') }, ...[...choices].map(([value, definition]) => ({ value, label: functionLabel(definition) }))], state.functionFilter);
-    }
-  } catch (err) {
-    toast(`${t('load_failed')}: ${err.message}`, 'error');
-    return;
-  }
-  const newBtn = byId('ps-new');
-  if (newBtn) newBtn.hidden = !state.canCreate;
-  // Importing writes a brand-new project, so it needs the same creation grant.
-  const importBtn = byId('ps-import');
-  if (importBtn) importBtn.hidden = !state.canCreate;
-  const hint = byId('ps-create-hint');
-  if (hint) hint.hidden = !state.canCreate;
-  const sub = byId('ps-list-sub');
-  if (sub) {
-    const active = state.projects.filter((p) => p.status === 'active').length;
-    const archived = state.projects.filter((p) => p.status === 'archived').length;
-    sub.textContent = t('subtitle_stats', { count: state.projects.length, active, archived });
-  }
+    await Promise.allSettled(projectRoots(visibleProjects()).map((project) => loadCatalogue(project.project_id)));
+    const choices = new Map(BUILTIN_FUNCTIONS.map((definition) => [definition.functionId, definition]));
+    for (const catalogue of state.catalogues.values()) for (const definition of catalogue) choices.set(fv(definition, 'function_id'), definition);
+    byId('ps-function-filter')?.setOptions([{ value: 'all', label: t('project_function_filter') }, ...[...choices].map(([value, definition]) => ({ value, label: functionLabel(definition) }))], state.functionFilter);
+  } catch (error) { toast(`${t('load_failed')}: ${error.message}`, 'error'); return; }
+  byId('ps-new').hidden = !state.canCreate;
+  byId('ps-import').hidden = !state.canCreate;
+  byId('ps-create-hint').hidden = !state.canCreate;
+  const active = state.projects.filter((project) => project.status === 'active' && project.lifecycle === 'active').length;
+  const archived = state.projects.filter((project) => project.status === 'archived').length;
+  byId('ps-list-sub').textContent = t('subtitle_stats', { count: state.projects.length, active, archived });
   syncListFilterChips();
   renderProjectGrid();
 }
@@ -747,11 +745,12 @@ async function loadProjects() {
 function syncListFilterChips() {
   const filter = byId('ps-filter');
   if (!filter) return;
-  const active = state.projects.filter((p) => p.status === 'active').length;
+  const active = state.projects.filter((p) => p.status === 'active' && p.lifecycle === 'active').length;
   const archived = state.projects.filter((p) => p.status === 'archived').length;
   filter.filters = [
     { id: 'active', label: `${t('filter_active')} ${active}`, active: state.listFilter === 'active' },
     { id: 'archived', label: `${t('filter_archived')} ${archived}`, active: state.listFilter === 'archived' },
+    { id: 'ended', label: `${t('status_ended')} ${state.projects.filter((p) => p.lifecycle === 'ended').length}`, active: state.listFilter === 'ended' },
     { id: 'all', label: `${t('filter_all')} ${state.projects.length}`, active: state.listFilter === 'all' },
   ];
 }
@@ -759,8 +758,9 @@ function syncListFilterChips() {
 function visibleProjects() {
   const query = state.searchQuery.trim().toLowerCase();
   return state.projects.filter((p) => {
-    if (state.listFilter === 'active' && p.status !== 'active') return false;
+    if (state.listFilter === 'active' && (p.status !== 'active' || p.lifecycle !== 'active')) return false;
     if (state.listFilter === 'archived' && p.status !== 'archived') return false;
+    if (state.listFilter === 'ended' && p.lifecycle !== 'ended') return false;
     if (state.functionFilter !== 'all' && !projectAccess(p).functions?.includes(state.functionFilter)) return false;
     if (query) {
       const haystack = `${p.name} ${p.description || ''}`.toLowerCase();
@@ -780,12 +780,15 @@ function projectCardHtml(project) {
   const menuItems = [
     `<tf-menu-item action="open" icon="external-link">${escapeHtml(t('action_open'))}</tf-menu-item>`,
   ];
-  if (canLifecycle(project)) {
+  if (canProject(archived ? 'unarchive' : 'archive', project)) {
     menuItems.push(archived
       ? `<tf-menu-item action="unarchive" icon="refresh">${escapeHtml(t('action_unarchive'))}</tf-menu-item>`
       : `<tf-menu-item action="archive" icon="clock">${escapeHtml(t('action_archive'))}</tf-menu-item>`);
   }
-  if (canLifecycle(project)) {
+  if (canProject('create_child', project)) menuItems.push(`<tf-menu-item action="child" icon="plus">${escapeHtml(t('subproject_new'))}</tf-menu-item>`);
+  if (canProject('move', project)) menuItems.push(`<tf-menu-item action="move" icon="branch">${escapeHtml(t('subproject_move'))}</tf-menu-item>`);
+  if (canProject('end', project) || canProject('resume', project)) menuItems.push(`<tf-menu-item action="lifecycle" icon="clock">${escapeHtml(t(project.lifecycle === 'ended' ? 'project_resume' : 'project_end'))}</tf-menu-item>`);
+  if (canProject('delete', project)) {
     menuItems.push('<tf-menu-divider></tf-menu-divider>');
     menuItems.push(`<tf-menu-item action="delete" icon="trash" danger>${escapeHtml(t('action_delete'))}</tf-menu-item>`);
   }
@@ -797,9 +800,13 @@ function projectCardHtml(project) {
           <div class="ps-card-name">${escapeHtml(project.name)}</div>
           <div class="ps-card-desc">${escapeHtml(project.description || '')}</div>
         </div>
-        <tf-chip status="${archived ? 'warn' : 'ok'}" dot>${escapeHtml(t(archived ? 'status_archived' : 'status_active'))}</tf-chip>
+        <tf-chip status="${archived || project.lifecycle === 'ended' ? 'warn' : 'ok'}" dot>${escapeHtml(t(archived ? 'status_archived' : project.lifecycle === 'ended' ? 'status_ended' : 'status_active'))}</tf-chip>
       </div>
+      ${project.parent_id ? `<div class="ps-card-ancestors">${escapeHtml(projectAncestors(project, state.projects, state.breadcrumbs).map((row) => row.name).join(' / '))}</div>` : ''}
       <div class="ps-card-stats">
+        <span class="ps-card-stat">${escapeHtml(t('tree_open_count', { own: project.own_open_tasks, descendants: project.descendant_open_tasks }))}</span>
+        <span class="ps-card-stat">${escapeHtml(t('tree_my_count', { count: project.my_open_tasks }))}</span>
+        <span class="ps-card-stat">${escapeHtml(t('tree_overdue_count', { count: project.overdue_tasks }))}</span>
         <span class="ps-card-stat">${sprite('users')}<b>${memberCount}</b>&nbsp;${escapeHtml(t('stat_members'))}</span>
         <span class="ps-card-stat">${sprite('database')}<b>${sourcesReady}/${sourceCount}</b>&nbsp;${escapeHtml(t('stat_sources'))}</span>
       </div>
@@ -807,11 +814,13 @@ function projectCardHtml(project) {
         <tf-chip status="accent">${escapeHtml(accessSummary(project))}</tf-chip>
         ${functionChips(access.functions, state.catalogues.get(projectId) || [])}
         <tf-chip status="info">${escapeHtml(orientationLabel(project))}</tf-chip>
+        ${state.projects.some((child) => child.parent_id === projectId) ? `<tf-button variant="ghost" size="sm" icon="${state.expandedProjects.has(projectId) ? 'chevron-up' : 'chevron-down'}" data-expand-project aria-expanded="${state.expandedProjects.has(projectId)}">${escapeHtml(t('tree_children_count', { count: state.projects.filter((child) => child.parent_id === projectId).length }))}</tf-button>` : ''}
         <div class="ps-card-menu-wrap">
           <tf-button variant="ghost" size="sm" icon="chevron-down" data-more title="${escapeAttr(t('action_more'))}"></tf-button>
           <tf-menu placement="bottom-end" data-card-menu>${menuItems.join('')}</tf-menu>
         </div>
       </div>
+      ${state.expandedProjects.has(projectId) ? '<div data-card-children class="ps-project-tree"><tf-tree></tf-tree></div>' : ''}
     </div>
   `;
 }
@@ -819,7 +828,7 @@ function projectCardHtml(project) {
 function renderProjectGrid() {
   const host = byId('ps-grid-host');
   if (!host) return;
-  const visible = visibleProjects();
+  const visible = projectRoots(visibleProjects());
   if (!visible.length && !state.canCreate) {
     host.innerHTML = `<tf-empty-state icon="folder" title="${escapeAttr(t('empty_list'))}"></tf-empty-state>`;
     return;
@@ -838,6 +847,10 @@ function renderProjectGrid() {
     return;
   }
   host.innerHTML = `<div class="ps-grid">${visible.map(projectCardHtml).join('')}${addCard}</div>`;
+  for (const project of visible) {
+    const tree = host.querySelector(`[data-project-id="${CSS.escape(project.project_id)}"] [data-card-children] tf-tree`);
+    if (tree) fillProjectTree(tree, descendantsOf(project.project_id, false));
+  }
 }
 
 function renderProjectTable(host, visible) {
@@ -881,6 +894,14 @@ function wireGridEvents() {
   if (!host) return;
 
   host.addEventListener('click', (e) => {
+    const expand = e.target.closest('[data-expand-project]');
+    if (expand) {
+      e.stopPropagation();
+      const id = expand.closest('[data-project-id]').dataset.projectId;
+      if (state.expandedProjects.has(id)) state.expandedProjects.delete(id); else state.expandedProjects.add(id);
+      renderProjectGrid(); return;
+    }
+    if (e.target.closest('[data-card-children]')) return;
     const more = e.target.closest('[data-more]');
     if (more) {
       e.stopPropagation();
@@ -919,23 +940,19 @@ function wireGridEvents() {
       case 'open': openProject(projectId); break;
       case 'archive': setProjectArchived(projectId, true); break;
       case 'unarchive': setProjectArchived(projectId, false); break;
+      case 'child': if (project) openSubprojectWindow(project); break;
+      case 'move': if (project) openProjectMoveWindow(project); break;
+      case 'lifecycle': if (project) openProjectLifecycleWindow(project); break;
       case 'delete': if (project) confirmDeleteProject(project, { fromList: true }); break;
       default: break;
     }
   });
 }
 
-async function setProjectArchived(projectId, archived) {
-  try {
-    await ApiBinary.one('projectStudioProjectArchiveRequest', { projectId, archived });
-    toast(t(archived ? 'archive_ok' : 'unarchive_ok'), 'success');
-    await loadProjects();
-    if (state.project && (state.project.project_id ?? state.project.projectId) === projectId) {
-      await refreshProjectHeader();
-    }
-  } catch (err) {
-    toast(`${t('archive_failed')}: ${err.message}`, 'error');
-  }
+function setProjectArchived(projectId, archived) {
+  const project = state.projects.find((row) => row.project_id === projectId) || (state.project?.project_id === projectId ? state.project : null);
+  if (!canProject(archived ? 'archive' : 'unarchive', project)) return;
+  openProjectArchiveWindow(project, archived);
 }
 
 function confirmDeleteProject(project, { fromList = false } = {}) {
@@ -960,6 +977,326 @@ function confirmDeleteProject(project, { fromList = false } = {}) {
       if (!fromList) closeProject();
       await loadProjects();
     },
+  });
+}
+
+function descendantsOf(id, includeSelf = true) {
+  const project = state.projects.find((row) => row.project_id === id) || (state.project?.project_id === id ? state.project : null);
+  if (!project) return [];
+  return state.projects.filter((row) => includeSelf && row.project_id === id || row.path.startsWith(`${project.path}/`));
+}
+
+async function switchProject(id) {
+  if (id === projectId()) return;
+  const tab = state.tab;
+  const tasksMode = state.tasksView?.mode;
+  closeAllWindows();
+  await openProject(id, { tab, tasksMode });
+  updateProjectRoute();
+}
+
+function projectTreeActions(project, anchor) {
+  const items = [{ label: t('action_open'), icon: 'external-link', run: () => switchProject(project.project_id) }];
+  if (allowsArea(project.access, 'settings', 'write')) items.push({ label: t('inheritance_title'), icon: 'settings', run: () => openProjectInheritanceWindow(project) });
+  if (canProject('create_child', project)) items.push({ label: t('subproject_new'), icon: 'plus', run: () => openSubprojectWindow(project) });
+  if (canProject('move', project)) items.push({ label: t('subproject_move'), icon: 'branch', run: () => openProjectMoveWindow(project) });
+  if (canProject('end', project) || canProject('resume', project)) items.push({ label: t(project.lifecycle === 'ended' ? 'project_resume' : 'project_end'), icon: 'clock', run: () => openProjectLifecycleWindow(project) });
+  if (canProject(project.status === 'archived' ? 'unarchive' : 'archive', project)) items.push({ label: t(project.status === 'archived' ? 'action_unarchive' : 'action_archive'), icon: 'archive', run: () => setProjectArchived(project.project_id, project.status !== 'archived') });
+  if (canProject('delete', project)) items.push({ label: t('action_delete'), icon: 'trash', danger: true, run: () => confirmDeleteProject(project, { fromList: state.project?.project_id !== project.project_id }) });
+  openActionMenu(anchor, items, project.name);
+}
+
+function fillProjectTree(tree, projects, { onSelect, allowMove = false, breadcrumbs = state.breadcrumbs } = {}) {
+  tree.nodes = projectTreeNodes(projects, breadcrumbs, (project) => {
+    const actions = document.createElement('tf-button');
+    actions.setAttribute('variant', 'ghost'); actions.setAttribute('size', 'sm'); actions.setAttribute('icon', 'more'); actions.setAttribute('title', t('action_more'));
+    actions.addEventListener('click', (event) => { event.stopPropagation(); projectTreeActions(project, actions); });
+    return { actions, draggable: allowMove && canProject('move', project), droppable: allowMove && project.depth < 4 && project.access.is_owner && !project.access.archived && !project.access.ended,
+      badge: { text: t('tree_open_count', { own: project.own_open_tasks, descendants: project.descendant_open_tasks }), tone: 'info' } };
+  });
+  const expanded = [];
+  const expand = (nodes) => { for (const node of nodes) if (node.children.length) { expanded.push(node.id); expand(node.children); } };
+  expand(tree.nodes);
+  tree.expandedIds = expanded;
+  tree.addEventListener('expand', (event) => { tree.expandedIds = [...new Set([...tree.expandedIds, event.detail.id])]; });
+  tree.addEventListener('collapse', (event) => { tree.expandedIds = [...tree.expandedIds].filter((id) => id !== event.detail.id); });
+  tree.addEventListener('select', (event) => {
+    const project = projects.find((row) => row.project_id === event.detail.id);
+    if (project) (onSelect || ((row) => switchProject(row.project_id)))(project);
+  });
+  tree.addEventListener('move', (event) => {
+    const source = projects.find((row) => row.project_id === event.detail.id);
+    if (source) openProjectMoveWindow(source, event.detail.parentId);
+  });
+}
+
+function openProjectPicker() {
+  const { body, foot, cleanup } = openWindow({ title: t('tree_picker'), icon: 'folder', width: 820 });
+  body.innerHTML = `<tf-searchbox data-tree-search placeholder="${escapeAttr(t('tree_search'))}" debounce="200"></tf-searchbox><div class="ps-tree-filters"><tf-checkbox data-tree-my label="${escapeAttr(t('tree_my_only'))}"></tf-checkbox><tf-checkbox data-tree-open label="${escapeAttr(t('tree_open_only'))}"></tf-checkbox><tf-checkbox data-tree-due label="${escapeAttr(t('tree_overdue_only'))}"></tf-checkbox><tf-checkbox data-tree-ended label="${escapeAttr(t('tree_show_ended'))}"></tf-checkbox></div><div data-picker-tree class="ps-project-tree"></div>`;
+  foot.innerHTML = `<div></div><tf-button variant="ghost" data-close>${escapeHtml(t('action_close'))}</tf-button>`;
+  foot.querySelector('[data-close]').addEventListener('click', cleanup);
+  const render = () => {
+    const query = body.querySelector('[data-tree-search]').value.trim().toLowerCase();
+    const projects = state.projects.filter((project) => (!query || `${project.name} ${project.description}`.toLowerCase().includes(query)) && (!body.querySelector('[data-tree-my]').checked || project.my_open_tasks > 0) && (!body.querySelector('[data-tree-open]').checked || project.own_open_tasks + project.descendant_open_tasks > 0) && (!body.querySelector('[data-tree-due]').checked || project.overdue_tasks > 0) && (body.querySelector('[data-tree-ended]').checked || project.lifecycle !== 'ended'));
+    const host = body.querySelector('[data-picker-tree]');
+    host.innerHTML = projects.length ? '<tf-tree></tf-tree>' : `<tf-empty-state icon="folder" title="${escapeAttr(t('tree_empty'))}"></tf-empty-state>`;
+    if (projects.length) {
+      const filteredIds = new Set(projects.map((project) => project.project_id));
+      const ancestors = state.projects.filter((project) => !filteredIds.has(project.project_id) && projects.some((child) => child.path.startsWith(`${project.path}/`))).map(({ project_id, name, depth }) => ({ project_id, name, depth }));
+      fillProjectTree(host.querySelector('tf-tree'), projects, { breadcrumbs: [...state.breadcrumbs, ...ancestors], onSelect: async (project) => { cleanup(); await switchProject(project.project_id); } });
+    }
+  };
+  body.querySelector('[data-tree-search]').addEventListener('search', render);
+  body.querySelectorAll('.ps-tree-filters tf-checkbox').forEach((control) => control.addEventListener('change', render));
+  render();
+}
+
+function moduleChips(modules) {
+  return modules.length ? modules.map((id) => `<tf-chip status="info">${escapeHtml(t(`module_${id}`))}</tf-chip>`).join(' ') : '—';
+}
+
+function openSubprojectWindow(parent) {
+  if (!canProject('create_child', parent)) return;
+  const { body, foot, cleanup } = openWindow({ title: t('subproject_new'), subtitle: parent.name, icon: 'branch', width: 720 });
+  body.innerHTML = `<tf-input data-child-name label="${escapeAttr(t('wizard_name_label'))}"></tf-input><tf-input data-child-prefix label="${escapeAttr(t('project_key_prefix'))}" maxlength="8" hint="${escapeAttr(t('project_key_prefix_hint'))}"></tf-input><tf-textarea data-child-desc rows="3" label="${escapeAttr(t('wizard_desc_label'))}"></tf-textarea><tf-select data-child-template label="${escapeAttr(t('wizard_template_label'))}" value="deployment">${CHILD_TEMPLATES.map((preset) => `<option value="${preset.id}">${escapeHtml(t(`subproject_template_${preset.id}`))}</option>`).join('')}</tf-select><span data-template-hint class="ps-field-hint"></span><tf-checkbox data-child-inherit-modules checked label="${escapeAttr(t('inherit_modules'))}"></tf-checkbox><tf-checkbox data-child-inherit-types checked label="${escapeAttr(t('inherit_task_types'))}"></tf-checkbox><div data-child-effective class="ps-module-preview"></div><tf-checkbox data-child-private label="${escapeAttr(t('subproject_private'))}"></tf-checkbox><span class="ps-field-hint">${escapeHtml(t('subproject_private_hint'))}</span><span class="ps-field-hint">${escapeHtml(t('inheritance_members_hint'))}</span><div data-form-error class="ps-form-error" hidden></div>`;
+  foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="plus" data-action="save">${escapeHtml(t('wizard_create'))}</tf-button></div>`;
+  let prefixEdited = false;
+  body.querySelector('[data-child-template]').setOptions(CHILD_TEMPLATES.map((preset) => ({ value: preset.id, label: t(`subproject_template_${preset.id}`) })), 'deployment');
+  body.querySelector('[data-child-prefix]').addEventListener('input', () => { prefixEdited = true; });
+  body.querySelector('[data-child-name]').addEventListener('input', () => { if (!prefixEdited) body.querySelector('[data-child-prefix]').value = projectKeySuggestion(body.querySelector('[data-child-name]').value); });
+  const sync = () => {
+    const preset = CHILD_TEMPLATES.find((entry) => entry.id === body.querySelector('[data-child-template]').value);
+    body.querySelector('[data-template-hint]').textContent = t(`subproject_template_${preset.id}_hint`);
+    const inherited = body.querySelector('[data-child-inherit-modules]').checked;
+    body.querySelector('[data-child-effective]').innerHTML = `<b>${escapeHtml(t(inherited ? 'inheritance_parent_modules' : 'subproject_own_preset'))}</b><div>${moduleChips(inherited ? parent.modules : preset.modules)}</div><span class="ps-field-hint">${escapeHtml(t(inherited ? 'inheritance_live' : 'inheritance_own'))}</span>`;
+  };
+  body.addEventListener('change', sync); sync();
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]');
+    if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    const name = body.querySelector('[data-child-name]').value.trim();
+    const keyPrefix = body.querySelector('[data-child-prefix]').value.trim().toUpperCase();
+    const errorEl = body.querySelector('[data-form-error]');
+    if (name.length < 3 || !/^[A-Z][A-Z0-9]{1,7}$/.test(keyPrefix)) { errorEl.hidden = false; errorEl.textContent = t(name.length < 3 ? 'err_name_short' : 'err_project_key_prefix'); return; }
+    button.setAttribute('disabled', '');
+    const preset = CHILD_TEMPLATES.find((entry) => entry.id === body.querySelector('[data-child-template]').value);
+    try {
+      const result = await ApiBinary.one('projectStudioProjectCreateRequest', { name, description: body.querySelector('[data-child-desc]').value.trim(), keyPrefix, template: preset.id, modules: preset.modules, parentId: parent.project_id, isPrivate: body.querySelector('[data-child-private]').checked, inheritModules: body.querySelector('[data-child-inherit-modules]').checked, inheritTaskTypes: body.querySelector('[data-child-inherit-types]').checked, members: [] });
+      toast(t('subproject_created'), 'success'); cleanup(); await loadProjects(); await openProject(result.project_id);
+    } catch (error) { errorEl.hidden = false; errorEl.textContent = `${t('create_failed')}: ${error.message}`; button.removeAttribute('disabled'); }
+  });
+}
+
+function openProjectMoveWindow(project, targetId = null) {
+  if (!canProject('move', project)) return;
+  const height = Math.max(project.depth, ...descendantsOf(project.project_id).map((row) => row.depth)) - project.depth;
+  const destinations = state.projects.filter((row) => row.access.is_owner && !row.access.archived && !row.access.ended && row.project_id !== project.project_id && !row.path.startsWith(`${project.path}/`) && row.depth + 1 + height <= 4);
+  if (targetId && !destinations.some((row) => row.project_id === targetId)) { toast(t('subproject_move_invalid_target'), 'error'); return; }
+  const { body, foot, cleanup } = openWindow({ title: t('subproject_move'), subtitle: project.name, icon: 'branch', width: 650 });
+  body.innerHTML = `<div class="ps-banner-warn">${escapeHtml(t('subproject_move_hint'))}</div><tf-select data-move-parent label="${escapeAttr(t('subproject_parent'))}" value="${escapeAttr(targetId || '')}"><option value="">${escapeHtml(t('subproject_root'))}</option>${destinations.map((row) => `<option value="${escapeAttr(row.project_id)}" ${row.project_id === targetId ? 'selected' : ''}>${escapeHtml([...projectAncestors(row, state.projects, state.breadcrumbs).map((item) => item.name), row.name].join(' / '))}</option>`).join('')}</tf-select><div data-form-error class="ps-form-error" hidden></div>`;
+  foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="branch" data-action="save">${escapeHtml(t('subproject_move'))}</tf-button></div>`;
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]'); if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    button.setAttribute('disabled', '');
+    try { await ApiBinary.one('projectStudioProjectMoveRequest', { projectId: project.project_id, newParentId: body.querySelector('[data-move-parent]').value || null }); toast(t('subproject_moved'), 'success'); cleanup(); await loadProjects(); if (state.project) await refreshProjectHeader(); }
+    catch (error) { const el = body.querySelector('[data-form-error]'); el.hidden = false; el.textContent = error.message; button.removeAttribute('disabled'); }
+  });
+}
+
+function renderSubprojectSettings(host) {
+  if (!host) return;
+  host.innerHTML = `<div class="ps-members-toolbar">${canProject('create_child') ? `<tf-button variant="primary" icon="plus" data-child-create>${escapeHtml(t('subproject_new'))}</tf-button>` : ''}${canProject('move') ? `<tf-button variant="ghost" icon="branch" data-child-move>${escapeHtml(t('subproject_move'))}</tf-button>` : ''}</div><div class="ps-subproject-layout"><div class="ps-project-tree"><tf-tree></tf-tree></div><div data-inheritance-inspector></div></div>`;
+  host.querySelector('[data-child-create]')?.addEventListener('click', () => openSubprojectWindow(state.project));
+  host.querySelector('[data-child-move]')?.addEventListener('click', () => openProjectMoveWindow(state.project));
+  const inspector = host.querySelector('[data-inheritance-inspector]');
+  fillProjectTree(host.querySelector('tf-tree'), descendantsOf(projectId()), { allowMove: true, onSelect: (project) => renderProjectInheritance(inspector, project) });
+  renderProjectInheritance(inspector, state.project);
+}
+
+function openProjectInheritanceWindow(project) {
+  const { body, foot, cleanup } = openWindow({ title: t('inheritance_title'), subtitle: project.name, icon: 'branch', width: 820 });
+  foot.innerHTML = `<div></div><tf-button variant="ghost" data-close>${escapeHtml(t('action_close'))}</tf-button>`;
+  foot.querySelector('[data-close]').addEventListener('click', cleanup);
+  renderProjectInheritance(body, project);
+}
+
+function renderProjectInheritance(host, project) {
+  const mutable = allowsArea(project.access, 'settings', 'write');
+  host.classList.add('ps-inheritance-editor');
+  host.innerHTML = `<h3>${escapeHtml(project.name)}</h3><span class="ps-field-hint">${escapeHtml(t('inheritance_members_hint'))}</span><tf-checkbox data-inheritance-private label="${escapeAttr(t('subproject_private'))}" ${project.is_private ? 'checked' : ''} ${mutable ? '' : 'disabled'}></tf-checkbox><span class="ps-field-hint">${escapeHtml(t('subproject_private_hint'))}</span><tf-checkbox data-inheritance-modules label="${escapeAttr(t('inherit_modules'))}" ${project.inherit_modules ? 'checked' : ''} ${mutable && project.parent_id ? '' : 'disabled'}></tf-checkbox><tf-checkbox data-inheritance-types label="${escapeAttr(t('inherit_task_types'))}" ${project.inherit_task_types ? 'checked' : ''} ${mutable && project.parent_id ? '' : 'disabled'}></tf-checkbox><div class="ps-members-toolbar">${mutable && project.parent_id ? `<tf-button variant="ghost" data-detach>${escapeHtml(t('inheritance_detach'))}</tf-button><tf-button variant="ghost" data-reinherit>${escapeHtml(t('inheritance_reinherit'))}</tf-button>` : ''}</div><div data-inheritance-diff></div>${mutable ? `<tf-button variant="primary" icon="check" data-inheritance-save disabled>${escapeHtml(t('action_save'))}</tf-button>` : ''}<div class="ps-form-error" data-form-error hidden></div>`;
+  let generation = 0;
+  let proposedModules = null;
+  const showError = (error) => { const el = host.querySelector('[data-form-error]'); el.hidden = false; el.textContent = error.message; };
+  const preview = async () => {
+    const request = ++generation;
+    proposedModules = null;
+    const save = host.querySelector('[data-inheritance-save]'); save?.setAttribute('disabled', '');
+    try {
+      const result = await ApiBinary.one('projectStudioProjectInheritancePreviewRequest', { projectId: project.project_id, inheritModules: host.querySelector('[data-inheritance-modules]').checked, inheritTaskTypes: host.querySelector('[data-inheritance-types]').checked });
+      if (!host.isConnected || request !== generation) return;
+      proposedModules = result.proposed_modules;
+      const types = (rows) => rows.map((row) => `${escapeHtml(taskTypeLabel(row, t))}${row.active ? '' : ` (${escapeHtml(t('task_type_inactive'))})`}`).join(', ') || '—';
+      host.querySelector('[data-inheritance-diff]').innerHTML = `<div class="ps-inheritance-diff"><div><b>${escapeHtml(t('inheritance_diff_current'))}</b><div>${moduleChips(result.current_modules)}</div><p>${types(result.current_task_types)}</p></div><div><b>${escapeHtml(t('inheritance_diff_proposed'))}</b><div>${moduleChips(result.proposed_modules)}</div><p>${types(result.proposed_task_types)}</p></div></div><span class="ps-field-hint">${escapeHtml(t('inheritance_diff_hint'))}</span>`;
+      save?.removeAttribute('disabled');
+    } catch (error) { if (request === generation) showError(error); }
+  };
+  host.onchange = mutable ? preview : null;
+  host.querySelector('[data-detach]')?.addEventListener('click', () => { host.querySelector('[data-inheritance-modules]').checked = false; host.querySelector('[data-inheritance-types]').checked = false; preview(); });
+  host.querySelector('[data-reinherit]')?.addEventListener('click', () => { host.querySelector('[data-inheritance-modules]').checked = true; host.querySelector('[data-inheritance-types]').checked = true; preview(); });
+  host.querySelector('[data-inheritance-save]')?.addEventListener('click', async (event) => {
+    if (proposedModules === null) return;
+    event.currentTarget.setAttribute('disabled', '');
+    try {
+      await ApiBinary.one('projectStudioProjectInheritanceSaveRequest', { projectId: project.project_id, isPrivate: host.querySelector('[data-inheritance-private]').checked, inheritModules: host.querySelector('[data-inheritance-modules]').checked, inheritTaskTypes: host.querySelector('[data-inheritance-types]').checked, modules: proposedModules });
+      toast(t('inheritance_saved'), 'success'); await loadProjects();
+      if (projectId() === project.project_id) await refreshProjectHeader();
+      else { const current = state.projects.find((row) => row.project_id === project.project_id); if (current && host.isConnected) renderProjectInheritance(host, current); }
+    } catch (error) { showError(error); event.currentTarget.removeAttribute('disabled'); }
+  });
+  if (mutable) preview();
+  else host.querySelector('[data-inheritance-diff]').innerHTML = `<div class="ps-module-preview"><div>${moduleChips(project.modules)}</div><span class="ps-field-hint">${escapeHtml(t(project.inherit_modules || project.inherit_task_types ? 'inheritance_live' : 'inheritance_own'))}</span></div>`;
+}
+
+function openProjectArchiveWindow(project, archived) {
+  const actionLabel = t(archived ? 'action_archive' : 'action_unarchive');
+  const { body, foot, cleanup } = openWindow({ title: actionLabel, subtitle: project.name, icon: 'archive', width: 650 });
+  body.innerHTML = `<tf-select data-archive-scope label="${escapeAttr(t('archive_scope'))}" value="node"><option value="node">${escapeHtml(t('scope_node'))}</option><option value="subtree">${escapeHtml(t('scope_subtree'))}</option></tf-select><div data-scope-nodes></div><div data-form-error class="ps-form-error" hidden></div>`;
+  foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="archive" data-action="archive" disabled>${escapeHtml(actionLabel)}</tf-button></div>`;
+  let version = 0;
+  const preview = async () => {
+    const query = ++version; const button = foot.querySelector('[data-action="archive"]'); button.setAttribute('disabled', '');
+    const errorElement = body.querySelector('[data-form-error]'); errorElement.hidden = true; errorElement.textContent = '';
+    try { const result = await ApiBinary.one('projectStudioProjectScopePreviewRequest', { projectId: project.project_id, scope: body.querySelector('[data-archive-scope]').value, operation: 'archive' }); if (query !== version || !body.isConnected) return; body.querySelector('[data-scope-nodes]').innerHTML = scopeNodesHtml(result.nodes); button.removeAttribute('disabled'); }
+    catch (error) { if (query !== version || !body.isConnected) return; errorElement.hidden = false; errorElement.textContent = error.message; }
+  };
+  body.querySelector('[data-archive-scope]').addEventListener('change', preview); preview();
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]'); if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    button.setAttribute('disabled', '');
+    try { await ApiBinary.one('projectStudioProjectArchiveRequest', { projectId: project.project_id, archived, scope: body.querySelector('[data-archive-scope]').value }); toast(t(archived ? 'archive_ok' : 'unarchive_ok'), 'success'); cleanup(); await loadProjects(); if (state.project) await refreshProjectHeader(); }
+    catch (error) { const el = body.querySelector('[data-form-error]'); el.hidden = false; el.textContent = error.message; button.removeAttribute('disabled'); }
+  });
+}
+
+function scopeNodesHtml(nodes) {
+  return `<b>${escapeHtml(t('scope_exact_nodes'))}</b><ul class="ps-scope-nodes">${nodes.map((row) => `<li>${escapeHtml(row.name)} <span class="ps-field-hint">${row.depth}</span></li>`).join('')}</ul>`;
+}
+
+async function openProjectLifecycleWindow(project) {
+  const ended = project.lifecycle === 'ended';
+  if (!canProject(ended ? 'resume' : 'end', project)) return;
+  const { body, foot, cleanup } = openWindow({ title: t(ended ? 'project_resume' : 'project_lifecycle_title'), subtitle: project.name, icon: 'clock', width: 820 });
+  body.innerHTML = `<div class="ps-loading">${escapeHtml(t('loading'))}</div>`;
+  foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" data-action="apply" disabled>${escapeHtml(t(ended ? 'project_resume' : 'project_end'))}</tf-button></div>`;
+  let preview;
+  let taskStatus = 'todo';
+  let taskPage = 1;
+  let taskGeneration = 0;
+  const loadTaskRows = async () => {
+    const host = body.querySelector('[data-lifecycle-tasks]');
+    if (!host) return;
+    const generation = ++taskGeneration;
+    try {
+      const result = await ApiBinary.one('projectStudioTasksListRequest', { projectId: project.project_id, scope: 'single', sourceProjectIds: [], taskType: '', status: taskStatus, assignedTo: '', search: '', severity: '', includeArchived: false, offset: (taskPage - 1) * F2_PAGE_SIZE, limit: F2_PAGE_SIZE });
+      if (!host.isConnected || generation !== taskGeneration) return;
+      const lastPage = Math.max(1, Math.ceil(result.total / F2_PAGE_SIZE));
+      if (taskPage > lastPage) { taskPage = lastPage; await loadTaskRows(); return; }
+      host.innerHTML = `<tf-select data-lifecycle-status label="${escapeAttr(t('tasks_col_status'))}" value="${taskStatus}">${TASK_STATUSES.filter((status) => status !== 'done').map((status) => `<option value="${status}" ${status === taskStatus ? 'selected' : ''}>${escapeHtml(t(`task_status_${status}`))}</option>`).join('')}</tf-select><tf-table page-size="${F2_PAGE_SIZE}" page="${taskPage}" total="${result.total}"><tf-column key="key" label="#"></tf-column><tf-column key="title" label="${escapeAttr(t('tasks_col_title'))}"></tf-column><tf-column key="status" label="${escapeAttr(t('tasks_col_status'))}"></tf-column></tf-table>`;
+      host.querySelector('[data-lifecycle-status]').addEventListener('change', (event) => { taskStatus = event.detail.value; taskPage = 1; loadTaskRows(); });
+      const table = host.querySelector('tf-table');
+      table.rows = result.tasks.map((task) => ({ _id: task.task_id, key: task.task_key, title: task.title, status: t(`task_status_${task.status}`) }));
+      table.addEventListener('page-change', (event) => { taskPage = Number(event.detail.page); loadTaskRows(); });
+      table.addEventListener('row-click', (event) => { cleanup(); openProject(project.project_id, { tab: 'tasks', taskId: event.detail.row._id }); });
+      table.rowActions = (row) => {
+        if (!allowsArea(project.access, 'tasks', 'write')) return null;
+        const button = document.createElement('tf-button'); button.setAttribute('variant', 'ghost'); button.setAttribute('size', 'sm'); button.setAttribute('icon', 'more'); button.setAttribute('title', t('action_more'));
+        const task = result.tasks.find((item) => item.task_id === row._id);
+        button.addEventListener('click', (event) => { event.stopPropagation(); openActionMenu(button, [{ label: t('task_not_pursued'), icon: 'check', run: () => openTaskResolutionWindow(task, project, load) }, ...(project.access.is_owner ? [{ label: t('task_transfer'), icon: 'branch', run: () => openTaskTransferWindow(task, project, load) }] : [])], task.title); });
+        return button;
+      };
+    } catch (error) { if (host.isConnected && generation === taskGeneration) host.innerHTML = `<div class="ps-form-error">${escapeHtml(error.message)}</div>`; }
+  };
+  const load = async () => {
+    try {
+      preview = await ApiBinary.one('projectStudioProjectLifecyclePreviewRequest', { projectId: project.project_id });
+      if (!body.isConnected) return;
+      body.innerHTML = `<div class="ps-banner-warn">${escapeHtml(t(ended ? 'project_resume_hint' : 'project_lifecycle_effect'))}</div><div class="ps-lifecycle-stats"><tf-stat-card label="${escapeAttr(t('project_lifecycle_open', { count: preview.open_task_count }))}" value="${preview.open_task_count}"></tf-stat-card><tf-stat-card label="${escapeAttr(t('project_lifecycle_members', { count: preview.exclusive_member_count }))}" value="${preview.exclusive_member_count}"></tf-stat-card></div>${preview.active_children.length ? `<b>${escapeHtml(t('project_lifecycle_children'))}</b><div class="ps-lifecycle-children">${preview.active_children.map((row) => `<tf-button variant="ghost" data-lifecycle-child="${escapeAttr(row.project_id)}">${escapeHtml(row.name)}</tf-button>`).join('')}</div>` : ''}${!ended && !preview.can_end ? `<div class="ps-banner-warn">${escapeHtml(t('project_lifecycle_blocked'))}</div><div data-lifecycle-tasks></div><tf-button variant="ghost" icon="refresh" data-lifecycle-refresh>${escapeHtml(t('refresh'))}</tf-button>` : ''}<tf-textarea data-lifecycle-reason label="${escapeAttr(t('project_lifecycle_reason'))}" rows="3"></tf-textarea><tf-input data-lifecycle-confirm label="${escapeAttr(t('project_lifecycle_confirm', { prefix: project.key_prefix }))}"></tf-input><div class="ps-form-error" data-form-error hidden></div>`;
+      foot.querySelector('[data-action="apply"]').toggleAttribute('disabled', !(ended || preview.can_end));
+      body.querySelectorAll('[data-lifecycle-child]').forEach((button) => button.addEventListener('click', () => { cleanup(); switchProject(button.dataset.lifecycleChild); }));
+      body.querySelector('[data-lifecycle-refresh]')?.addEventListener('click', load);
+      if (!ended && preview.open_task_count && (allowsArea(project.access, 'tasks') || allowsArea(project.access, 'board'))) {
+        await loadTaskRows();
+      }
+    } catch (error) { body.innerHTML = `<div class="ps-form-error">${escapeHtml(error.message)}</div>`; }
+  };
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]'); if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    const reason = body.querySelector('[data-lifecycle-reason]').value.trim();
+    const confirmationKey = body.querySelector('[data-lifecycle-confirm]').value.trim();
+    const errorEl = body.querySelector('[data-form-error]');
+    if (!reason || confirmationKey !== project.key_prefix) { errorEl.hidden = false; errorEl.textContent = t(!reason ? 'project_lifecycle_reason' : 'project_lifecycle_confirm', { prefix: project.key_prefix }); return; }
+    button.setAttribute('disabled', '');
+    try { await ApiBinary.one('projectStudioProjectLifecycleRequest', { projectId: project.project_id, ended: !ended, confirmationKey, reason }); toast(t(ended ? 'project_resumed_ok' : 'project_ended_ok'), 'success'); cleanup(); await loadProjects(); if (state.project?.project_id === project.project_id) await refreshProjectHeader(); }
+    catch (error) { errorEl.hidden = false; errorEl.textContent = error.message; button.removeAttribute('disabled'); }
+  });
+  await load();
+}
+
+function openTaskResolutionWindow(task, project = state.project, onSaved) {
+  if (!allowsArea(project.access, 'tasks', 'write') || task.status === 'done' || task.archived_at) return;
+  const { body, foot, cleanup } = openWindow({ title: t('task_not_pursued'), subtitle: `${task.task_key} · ${task.title}`, icon: 'check', width: 620 });
+  body.innerHTML = `<tf-textarea data-resolution-reason label="${escapeAttr(t('task_resolution_reason'))}" rows="3"></tf-textarea><div class="ps-form-error" data-form-error hidden></div>`;
+  foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]'); if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    const reason = body.querySelector('[data-resolution-reason]').value.trim();
+    const errorEl = body.querySelector('[data-form-error]');
+    if (!reason) { errorEl.hidden = false; errorEl.textContent = t('task_resolution_reason'); return; }
+    button.setAttribute('disabled', '');
+    try { await ApiBinary.one('projectStudioTaskNotPursuedRequest', { projectId: project.project_id, taskId: task.task_id, reason }); toast(t('task_not_pursued_ok'), 'success'); cleanup(); if (onSaved) await onSaved(); else if (projectId() === project.project_id && state.tab === 'tasks') await renderTasksTab(); }
+    catch (error) { errorEl.hidden = false; errorEl.textContent = error.message; button.removeAttribute('disabled'); }
+  });
+}
+
+function openTaskTransferWindow(task, source = state.project, onSaved) {
+  if (!source.access.is_owner || source.access.archived || source.access.ended || task.archived_at) return;
+  const destinations = state.projects.filter((project) => project.project_id !== source.project_id && project.access.is_owner && !project.access.archived && !project.access.ended && project.modules.includes('tasks'));
+  const { body, foot, cleanup } = openWindow({ title: t('task_transfer'), subtitle: `${task.task_key} · ${task.title}`, icon: 'branch', width: 760 });
+  body.innerHTML = `<tf-select data-transfer-destination label="${escapeAttr(t('task_transfer_destination'))}" value=""><option value="">—</option>${destinations.map((project) => `<option value="${escapeAttr(project.project_id)}">${escapeHtml([...projectAncestors(project, state.projects, state.breadcrumbs).map((row) => row.name), project.name].join(' / '))}</option>`).join('')}</tf-select><div data-transfer-preview></div><div class="ps-field-hint">${escapeHtml(t('task_transfer_alias_hint'))}</div><div data-form-error class="ps-form-error" hidden></div>`;
+  foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="branch" data-action="transfer" disabled>${escapeHtml(t('task_transfer'))}</tf-button></div>`;
+  let version = 0;
+  let preview = null;
+  const ready = () => !!preview && preview.destination_type_valid && preview.blocking_reasons.length === 0 && (!preview.widens_access || body.querySelector('[data-confirm-wider]')?.checked === true);
+  const sync = () => foot.querySelector('[data-action="transfer"]').toggleAttribute('disabled', !ready());
+  body.querySelector('[data-transfer-destination]').addEventListener('change', async () => {
+    const generation = ++version; preview = null; sync();
+    const destinationProjectId = body.querySelector('[data-transfer-destination]').value;
+    const host = body.querySelector('[data-transfer-preview]'); host.innerHTML = '';
+    if (!destinationProjectId) return;
+    try {
+      const result = await ApiBinary.one('projectStudioTaskTransferPreviewRequest', { sourceProjectId: source.project_id, destinationProjectId, taskId: task.task_id });
+      if (!body.isConnected || generation !== version) return;
+      preview = result;
+      host.innerHTML = `<h3>${escapeHtml(t('task_transfer_preview'))}</h3><p>${escapeHtml(t('task_transfer_closure', { count: result.task_ids.length }))}</p><div class="ps-function-choices">${result.old_keys.map((key) => `<tf-chip status="info">${escapeHtml(key)}</tf-chip>`).join(' ')}</div>${!result.destination_type_valid ? `<div class="ps-form-error">${escapeHtml(t('task_transfer_invalid_type'))}</div>` : ''}${result.blocking_reasons.length ? `<div class="ps-form-error">${escapeHtml(t('task_transfer_blocked'))}</div><ul>${result.blocking_reasons.map((reason) => `<li>${escapeHtml(t(`task_transfer_reason_${reason}`))}</li>`).join('')}</ul>` : ''}${result.widens_access ? `<div class="ps-banner-warn">${escapeHtml(t('task_transfer_wider_hint'))}</div><tf-checkbox data-confirm-wider label="${escapeAttr(t('task_transfer_confirm_wider'))}"></tf-checkbox>` : ''}`;
+      host.querySelector('[data-confirm-wider]')?.addEventListener('change', sync); sync();
+    } catch (error) { const el = body.querySelector('[data-form-error]'); el.hidden = false; el.textContent = error.message; }
+  });
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]'); if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    if (!ready()) return;
+    button.setAttribute('disabled', '');
+    try {
+      const result = await ApiBinary.one('projectStudioTaskTransferRequest', { sourceProjectId: source.project_id, destinationProjectId: body.querySelector('[data-transfer-destination]').value, taskId: task.task_id, confirmWiderAccess: body.querySelector('[data-confirm-wider]')?.checked === true });
+      toast(t('task_transfer_success', { key: result.new_key }), 'success'); cleanup();
+      if (onSaved) await onSaved(result);
+      else await openProject(result.destination_project_id, { tab: 'tasks', taskId: result.task_id });
+    } catch (error) { const el = body.querySelector('[data-form-error]'); el.hidden = false; el.textContent = error.message; sync(); }
   });
 }
 
@@ -1155,6 +1492,7 @@ function openWizard() {
         keyPrefix,
         template: wz.template,
         modules: [...wz.modules],
+        parentId: null, isPrivate: false, inheritModules: false, inheritTaskTypes: false,
         members: wz.members.map((member, index) => ({ userId: member.userId, ...readMemberAccess(body.querySelector(`[data-team-member="${index}"]`)) })),
       });
       const projectId = resp.projectId ?? resp.project_id;
@@ -1285,6 +1623,13 @@ function openWizard() {
 // notification panel / "my test work" cross-project navigation:
 // { tab, sub? (tests sub-view), runId?, genId?, taskId? }.
 async function openProject(projectId, deep = null) {
+  if (deep?.taskId || deep?.taskKey) {
+    try {
+      const target = await ApiBinary.one('projectStudioTaskKeyResolveRequest', { taskKey: deep.taskKey || null, taskId: deep.taskId || null, originProjectId: deep.eventId == null ? null : projectId, originEventId: deep.eventId == null ? null : String(deep.eventId) });
+      projectId = target.project_id;
+      deep = { ...deep, taskId: target.task_id, taskKey: null, eventId: target.event_id, tab: 'tasks' };
+    } catch (error) { toast(`${t('task_load_failed')}: ${error.message}`, 'error'); return; }
+  }
   let project = null;
   try {
     const resp = await ApiBinary.one('projectStudioProjectGetRequest', { projectId });
@@ -1314,7 +1659,8 @@ async function openProject(projectId, deep = null) {
   state.chatMessages = [];
   state.f2 = freshF2State();
   state.tasksView = freshTasksState();
-  state.tasksView.mode = readTasksViewMode(projectId);
+  state.tasksView.mode = deep?.tasksMode || readTasksViewMode(projectId);
+  state.tasksView.scope = readTaskScope(currentUserId(), projectId, state.tasksView.mode, descendantsOf(projectId, false).length > 0);
   state.connections = null;
 
   const listView = byId('ps-list-view');
@@ -1334,14 +1680,7 @@ async function openProject(projectId, deep = null) {
   if (deep?.runId && state.tab === 'tests') await openRunByType(deep.runId, deep.runType);
   else if (deep?.genId && state.tab === 'tests') await openGenDetail(deep.genId);
   else if (deep?.taskId && state.tab === 'tasks') await openTaskWindow({ taskId: deep.taskId, eventId: deep.eventId, commentId: deep.commentId });
-  else if (deep?.taskKey && (canArea('tasks') || canArea('board'))) {
-    try {
-      const response = await ApiBinary.one('projectStudioTasksListRequest', { projectId, taskType: '', status: '', assignedTo: '', search: deep.taskKey, severity: '', includeArchived: true, offset: 0, limit: 50 });
-      const task = response.tasks.find((row) => row.task_key === deep.taskKey);
-      if (!task) throw new Error(t('task_key_not_found', { key: deep.taskKey }));
-      await openTaskWindow({ taskId: task.task_id, eventId: deep.eventId, commentId: deep.commentId });
-    } catch (error) { toast(`${t('task_load_failed')}: ${error.message}`, 'error'); }
-  }
+
 }
 
 function updateProjectRoute(fields = {}) {
@@ -1409,17 +1748,20 @@ function renderProjectShell() {
   const memberCount = project.member_count ?? project.memberCount ?? 0;
   const sourceCount = project.source_count ?? project.sourceCount ?? 0;
   const tabs = enabledTabs();
+  const ancestors = projectAncestors(project, state.projects, state.breadcrumbs);
 
   host.innerHTML = `
     <tf-breadcrumb class="ps-project-crumbs" id="ps-crumbs">
       <tf-breadcrumb-item href="#">${escapeHtml(t('title'))}</tf-breadcrumb-item>
+      ${ancestors.map((row) => `<tf-breadcrumb-item ${state.projects.some((item) => item.project_id === row.project_id) ? `href="#ancestor:${escapeAttr(row.project_id)}"` : ''}>${escapeHtml(row.name)}</tf-breadcrumb-item>`).join('')}
       <tf-breadcrumb-item href="#project">${escapeHtml(project.name)}</tf-breadcrumb-item>
       <tf-breadcrumb-item current>${escapeHtml(t(`tab_${state.tab}`))}</tf-breadcrumb-item>
     </tf-breadcrumb>
 
     <tf-detail-header title="${escapeAttr(project.name)}" subtitle="${escapeAttr(projectHeaderSubtitle(project))}" icon="folder">
+      <span slot="title-actions"><tf-button variant="ghost" icon="chevron-down" data-project-picker title="${escapeAttr(t('tree_picker'))}"></tf-button></span>
       <span slot="status">
-        <tf-chip status="${archived ? 'warn' : 'ok'}" dot>${escapeHtml(t(archived ? 'status_archived' : 'status_active'))}</tf-chip>
+        <tf-chip status="${archived || project.lifecycle === 'ended' ? 'warn' : 'ok'}" dot>${escapeHtml(t(archived ? 'status_archived' : project.lifecycle === 'ended' ? 'status_ended' : 'status_active'))}</tf-chip>
       </span>
       <span slot="badges" class="ps-head-badges">
         <tf-chip status="accent">${sprite('users')} ${escapeHtml(t('head_members', { count: memberCount }))}</tf-chip>
@@ -1430,8 +1772,10 @@ function renderProjectShell() {
       </span>
       <span slot="actions">
         ${bellHtml()}
+        ${canProject('create_child') ? `<tf-button variant="ghost" icon="plus" data-new-child>${escapeHtml(t('subproject_new'))}</tf-button>` : ''}
+        ${canProject('end') || canProject('resume') ? `<tf-button variant="ghost" icon="clock" data-lifecycle>${escapeHtml(t(project.lifecycle === 'ended' ? 'project_resume' : 'project_end'))}</tf-button>` : ''}
         ${canCreateTask(projectAccess()) ? `<tf-button variant="primary" icon="plus" data-new-task>${escapeHtml(t('tasks_new'))}</tf-button>` : ''}
-        ${fv(projectAccess(), 'has_access') && fv(projectAccess(), 'project_admin') ? `<tf-button variant="ghost" icon="download" data-export>${escapeHtml(t('export_btn'))}</tf-button>` : ''}
+        ${canProject('export') ? `<tf-button variant="ghost" icon="download" data-export>${escapeHtml(t('export_btn'))}</tf-button>` : ''}
         <tf-button variant="ghost" icon="users" data-goto-members ${state.tab === 'members' ? 'aria-current="page"' : ''}>${escapeHtml(t('tab_members'))}</tf-button>
         ${canArea('settings') ? `<tf-button variant="ghost" icon="settings" data-goto-settings ${state.tab === 'settings' ? 'aria-current="page"' : ''}>${escapeHtml(t('tab_settings'))}</tf-button>` : ''}
       </span>
@@ -1453,9 +1797,14 @@ function renderProjectShell() {
     const link = e.target.closest('a.tf-breadcrumb-item');
     if (!link) return;
     e.preventDefault();
-    if (link.getAttribute('href') === '#project') selectTab('overview');
+    const href = link.getAttribute('href');
+    if (href === '#project') selectTab('overview');
+    else if (href.startsWith('#ancestor:')) switchProject(href.slice(10));
     else closeProject();
   });
+  host.querySelector('[data-project-picker]').addEventListener('click', openProjectPicker);
+  host.querySelector('[data-new-child]')?.addEventListener('click', () => openSubprojectWindow(project));
+  host.querySelector('[data-lifecycle]')?.addEventListener('click', () => openProjectLifecycleWindow(project));
   host.querySelector('[data-new-task]')?.addEventListener('click', () => openTaskWindow({}));
   host.querySelector('[data-export]')?.addEventListener('click', () => openExportWindow());
   host.querySelector('[data-goto-members]')?.addEventListener('click', () => selectTab('members'));
@@ -1650,7 +1999,7 @@ async function renderOverview() {
       <tf-section-card title="${escapeAttr(t('quick_actions_title'))}" icon="play">
         <div class="ps-quick-actions">
           ${quickActions.map((qa) => `
-            <tf-button variant="ghost" class="ps-quick-action" data-qa="${escapeAttr(qa.id)}">
+            <tf-button variant="ghost" wrap class="ps-quick-action" data-qa="${escapeAttr(qa.id)}">
               <div class="ps-qa-ico">${sprite(qa.icon)}</div>
               <div>
                 <div class="ps-qa-name">${escapeHtml(qa.name)}</div>
@@ -3589,7 +3938,7 @@ function renderMembersList() {
   const visible = state.members.filter((member) =>
     (state.memberFunctionFilter === 'all' || member.functions?.includes(state.memberFunctionFilter))
     && (!query || `${fv(member, 'display_name')} ${member.email || ''}`.toLowerCase().includes(query)));
-  const groups = ['people', 'temporary', 'expired'];
+  const groups = ['people', 'inherited', 'temporary', 'expired'];
   host.innerHTML = groups.map((group) => {
     const rows = visible.filter((member) => memberGroup(member) === group);
     return `<tf-section-card title="${escapeAttr(t(`members_${group}`))}" icon="${group === 'people' ? 'users' : 'clock'}">
@@ -3619,7 +3968,7 @@ function renderMembersList() {
           ${isMe(userId) ? `<tf-chip status="accent">${escapeHtml(t('you_chip'))}</tf-chip>` : ''}
           <div class="ps-member-mail">${escapeHtml(member.email || '')}</div>
           <div class="ps-member-markers">${fv(member, 'is_owner') ? `<tf-chip status="accent">${escapeHtml(t('access_owner'))}</tf-chip>` : ''}
-          ${fv(member, 'project_admin') ? `<tf-chip status="accent">${escapeHtml(t('access_project_admin'))}</tf-chip>` : ''}</div></div></div>`,
+          ${fv(member, 'project_admin') ? `<tf-chip status="accent">${escapeHtml(t('access_project_admin'))}</tf-chip>` : ''}</div>${member.origin_projects?.some((row) => row.project_id !== projectId()) ? `<div class="ps-field-hint">${escapeHtml(t('members_origin', { projects: member.origin_projects.filter((row) => row.project_id !== projectId()).map((row) => row.name).join(', ') }))}</div>` : ''}</div></div>`,
         functions: `<div class="ps-member-function-chips">${functionChips(member.functions)}</div>`,
         access: effectiveAccessHtml(member.access),
         expiry: `${escapeHtml(fv(member, 'expires_at') ? formatTimestamp(fv(member, 'expires_at')) : t('members_permanent'))}
@@ -3637,9 +3986,9 @@ function renderMembersList() {
         const owner = !!fv(member, 'is_owner');
         const self = isMe(row._id);
         const items = [];
-        if (canManageMembers()) items.push({ label: t('access_edit'), icon: 'edit', run: () => openMemberAccessWindow(member) });
-        if (canTransferOwnership() && !owner && !self) items.push({ label: t('members_transfer'), icon: 'key', disabled: !member.active, reason: t('members_expired_badge'), run: () => transferOwnership(row._id) });
-        if (canManageMembers()) items.push({ label: t('members_handover'), icon: 'arrow', danger: true, disabled: owner || self,
+        if (canManageMembers()) items.push({ label: t(member.inherited ? 'members_add_local' : 'access_edit'), icon: member.inherited ? 'plus' : 'edit', run: () => openMemberAccessWindow(member) });
+        if (canTransferOwnership() && !member.inherited && !owner && !self) items.push({ label: t('members_transfer'), icon: 'key', disabled: !member.active, reason: t('members_expired_badge'), run: () => transferOwnership(row._id) });
+        if (canManageMembers() && !member.inherited) items.push({ label: t('members_handover'), icon: 'arrow', danger: true, disabled: owner || self,
           reason: t(owner ? 'members_owner_handover' : 'members_self_remove'),
           run: () => openHandover({ userId: row._id, reason: 'project_removal', projectId: projectId() }) });
         openActionMenu(button, items, fv(member, 'display_name') || row._id);
@@ -3737,8 +4086,8 @@ function openFunctionWindow(definition = null) {
 
 function openMemberAccessWindow(member) {
   if (!canManageMembers()) return;
-  const { body, foot, cleanup } = openWindow({ title: t('access_edit'), subtitle: fv(member, 'display_name') || fv(member, 'user_id'), icon: 'users', width: 640 });
-  body.innerHTML = `${memberAccessFields(member, state.functions)}<div class="ps-field-hint">${escapeHtml(t('access_no_functions_hint'))}</div><div class="ps-form-error" data-form-error hidden></div>`;
+  const { body, foot, cleanup } = openWindow({ title: t(member.inherited ? 'members_add_local' : 'access_edit'), subtitle: fv(member, 'display_name') || fv(member, 'user_id'), icon: 'users', width: 640 });
+  body.innerHTML = `${memberAccessFields(member, state.functions)}${member.origin_projects?.some((row) => row.project_id !== projectId()) ? `<div class="ps-field-hint">${escapeHtml(t('members_local_removal_hint'))}</div>` : ''}<div class="ps-field-hint">${escapeHtml(t('access_no_functions_hint'))}</div><div class="ps-form-error" data-form-error hidden></div>`;
   foot.innerHTML = `<div class="ps-footer-left"></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
   foot.addEventListener('click', async (event) => {
     const button = event.target.closest('[data-action]');
@@ -3747,8 +4096,10 @@ function openMemberAccessWindow(member) {
     try {
       const access = readMemberAccess(body);
       button.setAttribute('disabled', '');
-      const response = await ApiBinary.one('projectStudioMemberAccessSetRequest', { projectId: projectId(), userId: fv(member, 'user_id'), ...access });
-      if (!response.ok) throw new Error(t('members_failed'));
+      const response = member.inherited
+        ? await ApiBinary.one('projectStudioMembersAddRequest', { projectId: projectId(), members: [{ userId: fv(member, 'user_id'), ...access }] })
+        : await ApiBinary.one('projectStudioMemberAccessSetRequest', { projectId: projectId(), userId: fv(member, 'user_id'), ...access });
+      if (member.inherited ? response.added !== 1 : !response.ok) throw new Error(t('members_failed'));
       cleanup();
       toast(t('access_saved'), 'success');
       await refreshProjectHeader();
@@ -3799,7 +4150,8 @@ function openInviteWindow() {
   const renderCandidates = () => {
     const host = body.querySelector('[data-invite-candidates]');
     const chosen = new Set(invite.selected.map((person) => fv(person, 'user_id')));
-    const rows = invite.candidates.filter((person) => !chosen.has(fv(person, 'user_id')));
+    const effectiveIds = new Set(state.members.filter((member) => member.access.has_access).map((member) => member.user_id));
+    const rows = invite.candidates.filter((person) => !chosen.has(fv(person, 'user_id')) && !effectiveIds.has(fv(person, 'user_id')));
     host.hidden = !rows.length;
     host.innerHTML = rows.map((person) => `<tf-button variant="ghost" data-invite-candidate="${escapeAttr(fv(person, 'user_id'))}">${escapeHtml(`${fv(person, 'display_name') || ''} · ${person.email || ''}`)}</tf-button>`).join('');
   };
@@ -3880,6 +4232,7 @@ async function renderSettings() {
   const enabledModules = new Set(
     Array.isArray(settings.modules) ? settings.modules : (Array.isArray(state.project?.modules) ? state.project.modules : []),
   );
+  const moduleLocked = (mod) => mod.locked && !state.project.parent_id && state.project.template !== 'empty';
   const graphExtraction = fv(settings, 'graph_extraction') === true;
 
   const bindingOf = (fn) => agents.find((a) => a.function === fn)
@@ -3941,15 +4294,16 @@ async function renderSettings() {
             <div class="ps-module-main">
               <div class="ps-module-name">
                 ${escapeHtml(t(`module_${mod.id}`))}
-                ${mod.locked ? `<tf-chip status="accent">${escapeHtml(t('module_required'))}</tf-chip>` : ''}
+                ${moduleLocked(mod) ? `<tf-chip status="accent">${escapeHtml(t('module_required'))}</tf-chip>` : ''}
               </div>
               <div class="ps-module-desc">${escapeHtml(t(`module_${mod.id}_desc`))}</div>
             </div>
-            <tf-toggle data-module="${escapeAttr(mod.id)}" ${mod.locked || enabledModules.has(mod.id) ? 'checked' : ''} ${mod.locked ? 'disabled' : ''}></tf-toggle>
+            <tf-toggle data-module="${escapeAttr(mod.id)}" ${enabledModules.has(mod.id) ? 'checked' : ''} ${moduleLocked(mod) || state.project.inherit_modules ? 'disabled' : ''}></tf-toggle>
           </div>
         `).join('')}
       </div>
-      <tf-button variant="primary" icon="check" id="ps-set-modules-save">${escapeHtml(t('settings_save'))}</tf-button>
+      ${state.project.inherit_modules ? `<span class="ps-field-hint">${escapeHtml(t('inheritance_live'))}</span>` : ''}
+      <tf-button variant="primary" icon="check" id="ps-set-modules-save" ${state.project.inherit_modules ? 'disabled' : ''}>${escapeHtml(t('settings_save'))}</tf-button>
     </tf-section-card>
 
     <tf-section-card title="${escapeAttr(t('settings_graph_title'))}" icon="network">
@@ -3993,6 +4347,8 @@ async function renderSettings() {
       </div>
     </tf-section-card>
 
+    <tf-section-card title="${escapeAttr(t('subprojects_title'))}" icon="branch"><span slot="subtitle">${escapeHtml(t('subprojects_hint'))}</span><div id="ps-set-subprojects"></div></tf-section-card>
+
     <div class="ps-danger-zone">
       <div class="ps-danger-title">${sprite('alert')}${escapeHtml(t('danger_title'))}</div>
       <div class="ps-danger-row">
@@ -4000,20 +4356,20 @@ async function renderSettings() {
           <div class="ps-sr-label">${escapeHtml(t(archived ? 'danger_unarchive_label' : 'danger_archive_label'))}</div>
           <div class="ps-sr-desc">${escapeHtml(t('danger_archive_desc'))}</div>
         </div>
-        <tf-button variant="ghost" icon="clock" id="ps-danger-archive" ${canLifecycle() ? '' : 'disabled'}>${escapeHtml(t(archived ? 'action_unarchive' : 'action_archive'))}</tf-button>
+        <tf-button variant="ghost" icon="clock" id="ps-danger-archive" ${canProject(archived ? 'unarchive' : 'archive') ? '' : 'disabled'}>${escapeHtml(t(archived ? 'action_unarchive' : 'action_archive'))}</tf-button>
       </div>
       <div class="ps-danger-row">
         <div class="ps-sr-main">
           <div class="ps-sr-label">${escapeHtml(t('danger_delete_label'))}</div>
           <div class="ps-sr-desc">${escapeHtml(t('danger_delete_desc'))}</div>
         </div>
-        <tf-button variant="danger-solid" icon="trash" id="ps-danger-delete" ${canLifecycle() ? '' : `disabled title="${escapeAttr(t('danger_owner_only'))}"`}>${escapeHtml(t('action_delete'))}</tf-button>
+        <tf-button variant="danger-solid" icon="trash" id="ps-danger-delete" ${canProject('delete') ? '' : `disabled title="${escapeAttr(t('danger_owner_only'))}"`}>${escapeHtml(t('action_delete'))}</tf-button>
       </div>
     </div>
   `;
 
   if (!mutable) panel.querySelectorAll('tf-input, tf-textarea, tf-select, tf-toggle, tf-button').forEach((control) => {
-    if (canLifecycle() && ['ps-danger-archive', 'ps-danger-delete'].includes(control.id)) return;
+    if (control.id === 'ps-danger-archive' && canProject(archived ? 'unarchive' : 'archive') || control.id === 'ps-danger-delete' && canProject('delete')) return;
     control.setAttribute('disabled', '');
   });
   const descField = panel.querySelector('#ps-set-desc');
@@ -4037,14 +4393,16 @@ async function renderSettings() {
     }
   });
 
+  renderSubprojectSettings(byId('ps-set-subprojects'));
   if (byId('ps-set-task-types')) await renderTaskTypes(byId('ps-set-task-types'));
 
-  // `modules` REPLACES the enabled set server-side, so the full list is read
-  // off the toggles; `knowledge` is locked on and always submitted.
+  // Modules replace the enabled set; only the original non-empty root presets
+  // require Knowledge. An own empty preset can remain a grouping node.
   byId('ps-set-modules-save')?.addEventListener('click', async () => {
+    if (state.project.inherit_modules || !canArea('settings', 'write')) return;
     const host = byId('ps-set-modules');
     const modules = MODULE_DEFS
-      .filter((mod) => mod.locked || host?.querySelector(`tf-toggle[data-module="${CSS.escape(mod.id)}"]`)?.hasAttribute('checked'))
+      .filter((mod) => moduleLocked(mod) || host?.querySelector(`tf-toggle[data-module="${CSS.escape(mod.id)}"]`)?.hasAttribute('checked'))
       .map((mod) => mod.id);
     try {
       await ApiBinary.one('projectStudioSettingsSaveRequest', { projectId: projectId(), modules });
@@ -4169,7 +4527,7 @@ async function renderSettings() {
     setProjectArchived(projectId(), !archived);
   });
   byId('ps-danger-delete')?.addEventListener('click', () => {
-    if (canLifecycle()) confirmDeleteProject(state.project);
+    if (canProject('delete')) confirmDeleteProject(state.project);
   });
 }
 
@@ -4295,7 +4653,7 @@ async function ensureF2Members() {
 
 // Only current test writers can execute an assigned run.
 function testerMembers() {
-  return (f2().membersCache || []).filter((member) => member.active && allowsArea(member.access, 'tests', 'write'));
+  return (f2().membersCache || []).filter((member) => allowsArea(member.access, 'tests', 'write'));
 }
 
 function memberName(userId) {
@@ -10294,9 +10652,12 @@ function taskNoLabel(task) {
   return fv(task, 'task_key');
 }
 
-async function loadTaskTypes() {
-  const response = await ApiBinary.one('projectStudioTaskTypesListRequest', { projectId: projectId() });
+async function loadTaskTypes(isCurrent = () => true) {
+  const id = projectId();
+  const response = await ApiBinary.one('projectStudioTaskTypesListRequest', { projectId: id });
+  if (projectId() !== id || !isCurrent()) return;
   state.taskTypes = response.types;
+  state.taskTypeSourceProjectId = response.source_project_id;
   return state.taskTypes;
 }
 
@@ -10309,9 +10670,9 @@ async function renderTaskTypes(host) {
   if (!host) return;
   try { await loadTaskTypes(); }
   catch (error) { host.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('task_types_failed')}: ${error.message}`)}</div>`; return; }
-  const mutable = canArea('tasks', 'admin');
+  const mutable = canArea('tasks', 'admin') && !state.project.inherit_task_types;
   host.classList.add('ps-task-types');
-  host.innerHTML = `<div class="ps-members-toolbar"><span class="ps-field-hint">${escapeHtml(t('task_types_hint'))}</span>${mutable ? `<tf-button variant="primary" icon="plus" data-new-type>${escapeHtml(t('task_type_new'))}</tf-button>` : ''}</div><tf-table><tf-column key="name" label="${escapeAttr(t('task_type_name'))}" renderer="html"></tf-column><tf-column key="description" label="${escapeAttr(t('task_type_description'))}"></tf-column><tf-column key="active" label="${escapeAttr(t('task_type_state'))}" renderer="chip"></tf-column><tf-column key="order" label="${escapeAttr(t('task_type_order'))}" renderer="num"></tf-column></tf-table>`;
+  host.innerHTML = `${state.project.inherit_task_types ? `<div class="ps-banner-info">${escapeHtml(t('inheritance_types_readonly', { project: [...state.projects, ...state.breadcrumbs].find((row) => row.project_id === state.taskTypeSourceProjectId)?.name || t('subproject_parent') }))}</div>` : ''}<div class="ps-members-toolbar"><span class="ps-field-hint">${escapeHtml(t('task_types_hint'))}</span>${mutable ? `<tf-button variant="primary" icon="plus" data-new-type>${escapeHtml(t('task_type_new'))}</tf-button>` : ''}</div><tf-table><tf-column key="name" label="${escapeAttr(t('task_type_name'))}" renderer="html"></tf-column><tf-column key="description" label="${escapeAttr(t('task_type_description'))}"></tf-column><tf-column key="active" label="${escapeAttr(t('task_type_state'))}" renderer="chip"></tf-column><tf-column key="order" label="${escapeAttr(t('task_type_order'))}" renderer="num"></tf-column></tf-table>`;
   const table = host.querySelector('tf-table');
   table.rows = state.taskTypes.map((type) => ({ _id: type.type_id, name: `<div class="ps-task-type-name">${escapeHtml(taskTypeLabel(type, t))}</div><div class="ps-field-hint">${escapeHtml(t(type.built_in ? 'task_type_builtin' : 'task_type_custom'))} · ${escapeHtml(type.type_id)}</div>`, description: taskTypeDescription(type, t), active: chipCell(type.active ? 'ok' : 'info', t(type.active ? 'task_type_active' : 'task_type_inactive')), order: type.sort_order }));
   table.rowActions = (row) => {
@@ -10343,7 +10704,7 @@ function openTaskTypesWindow() {
 }
 
 function openTaskTypeEditor(type, onSaved) {
-  if (!canArea('tasks', 'admin') || type?.built_in) return;
+  if (!canArea('tasks', 'admin') || state.project.inherit_task_types || type?.built_in) return;
   const { body, foot, cleanup } = openWindow({ title: t(type ? 'task_type_edit' : 'task_type_new'), icon: 'list', width: 600 });
   body.innerHTML = `<tf-input id="ps-type-id" label="${escapeAttr(t('task_type_id'))}" hint="${escapeAttr(t('task_type_id_hint'))}" value="${escapeAttr(type?.type_id || '')}" ${type ? 'readonly' : ''}></tf-input><tf-input id="ps-type-name" label="${escapeAttr(t('task_type_name'))}" value="${escapeAttr(type?.name || '')}"></tf-input><tf-textarea id="ps-type-desc" label="${escapeAttr(t('task_type_description'))}" rows="3"></tf-textarea><tf-input id="ps-type-order" type="number" min="0" label="${escapeAttr(t('task_type_order'))}" value="${type?.sort_order ?? (Math.max(0, ...state.taskTypes.map((entry) => entry.sort_order)) + 10)}"></tf-input><div class="ps-toggle-inline"><tf-toggle id="ps-type-active" ${!type || type.active ? 'checked' : ''}></tf-toggle><span>${escapeHtml(t('task_type_active'))}</span></div><div class="ps-form-error" data-form-error hidden></div>`;
   body.querySelector('#ps-type-desc').value = type?.description || '';
@@ -10362,58 +10723,83 @@ function openTaskTypeEditor(type, onSaved) {
   });
 }
 
-async function loadTasksPage() {
-  const tv = state.tasksView || (state.tasksView = freshTasksState());
-  const resp = await ApiBinary.one('projectStudioTasksListRequest', {
-    projectId: projectId(),
-    taskType: tv.filters.type,
-    status: tv.filters.status,
-    assignedTo: tv.filters.mine ? 'me' : '',
-    search: tv.filters.search,
-    severity: tv.filters.severity,
-    includeArchived: tv.filters.includeArchived,
-    offset: (tv.page - 1) * F2_PAGE_SIZE,
-    limit: F2_PAGE_SIZE,
-  });
-  tv.rows = Array.isArray(resp.tasks) ? resp.tasks : [];
-  tv.total = Number(resp.total ?? tv.rows.length);
+function taskSourceProject(task) {
+  return state.projects.find((project) => project.project_id === task.project_id);
 }
 
-// Board mode loads the whole (filtered) task set: a paginated kanban would cut
-// a column in half and silently hide cards.
-async function loadTasksBoard() {
+function taskRowTypeName(task) {
+  const builtIn = ['feature', 'defect', 'technical', 'security', 'subtask', 'epic'].includes(task.task_type);
+  return taskTypeLabel({ type_id: task.task_type, built_in: builtIn, name: task.task_type_name }, t);
+}
+
+async function openTaskRecord(task, fields = {}) {
+  await openProject(task.project_id, { tab: 'tasks', taskId: task.task_id, ...fields });
+}
+
+async function loadTaskScopeProjects(isCurrent) {
+  const id = projectId();
+  const tv = state.tasksView;
+  const response = await ApiBinary.one('projectStudioProjectTreeRequest', { projectId: id, includeEnded: false, includeArchived: true });
+  if (projectId() !== id || tv !== state.tasksView || !isCurrent()) return;
+  const previous = new Set(descendantsOf(id).map((row) => row.project_id));
+  state.projects = [...state.projects.filter((row) => !previous.has(row.project_id)), ...response.projects];
+  state.breadcrumbs = [...new Map([...state.breadcrumbs, ...response.breadcrumbs].map((row) => [row.project_id, row])).values()];
+  const current = response.projects.find((row) => row.project_id === id);
+  if (current) state.project = current;
+  const allowed = new Set(response.projects.map((row) => row.project_id));
+  tv.sourceProjectIds = tv.sourceProjectIds.filter((projectId) => allowed.has(projectId));
+}
+
+function taskListFields(tv, id) {
+  return { projectId: id, scope: tv.scope, sourceProjectIds: tv.sourceProjectIds, taskType: tv.filters.type,
+    assignedTo: tv.filters.mine ? 'me' : '', search: tv.filters.search, severity: tv.filters.severity, includeArchived: tv.filters.includeArchived };
+}
+
+async function loadTasksPage(isCurrent = () => true) {
   const tv = state.tasksView || (state.tasksView = freshTasksState());
-  const resp = await ApiBinary.one('projectStudioTasksListRequest', {
-    projectId: projectId(),
-    taskType: tv.filters.type,
-    status: '',
-    assignedTo: tv.filters.mine ? 'me' : '',
-    search: tv.filters.search,
-    severity: tv.filters.severity,
-    includeArchived: tv.filters.includeArchived,
-    offset: 0,
-    limit: BOARD_PAGE_SIZE,
-  });
-  tv.boardRows = Array.isArray(resp.tasks) ? resp.tasks : [];
-  tv.total = Number(resp.total ?? tv.boardRows.length);
+  const id = projectId();
+  const generation = tv.renderGeneration;
+  const response = await ApiBinary.one('projectStudioTasksListRequest', { ...taskListFields(tv, id), status: tv.filters.status, offset: (tv.page - 1) * F2_PAGE_SIZE, limit: F2_PAGE_SIZE });
+  if (projectId() !== id || tv !== state.tasksView || generation !== tv.renderGeneration || !isCurrent()) return;
+  tv.rows = response.tasks; tv.total = response.total; tv.summary = response.summary;
+}
+
+async function loadTasksBoard(append = false, isCurrent = () => true) {
+  const tv = state.tasksView || (state.tasksView = freshTasksState());
+  const id = projectId();
+  const generation = tv.renderGeneration;
+  const response = await ApiBinary.one('projectStudioTasksListRequest', { ...taskListFields(tv, id), status: '', offset: append ? tv.boardRows.length : 0, limit: BOARD_PAGE_SIZE });
+  if (projectId() !== id || tv !== state.tasksView || generation !== tv.renderGeneration || !isCurrent()) return;
+  tv.boardRows = append ? [...tv.boardRows, ...response.tasks] : response.tasks;
+  tv.total = response.total; tv.summary = response.summary;
 }
 
 async function renderTasksTab() {
   const panel = byId('ps-tab-panel');
   if (!panel) return;
   const tv = state.tasksView || (state.tasksView = freshTasksState());
+  const id = projectId();
+  const generation = ++tv.renderGeneration;
+  const isCurrentPanel = () => state.tab === 'tasks' && projectId() === id && state.tasksView === tv &&
+    panel.isConnected && byId('ps-tab-panel') === panel;
+  const isCurrent = () => isCurrentPanel() && tv.renderGeneration === generation;
   if (!canArea(tv.mode === 'board' ? 'board' : 'tasks')) tv.mode = canArea('tasks') ? 'list' : 'board';
   const board = tv.mode === 'board';
   await ensureF2Members();
+  if (!isCurrent()) return;
   try {
-    await loadTaskTypes();
-    if (board) await loadTasksBoard();
-    else await loadTasksPage();
+    await loadTaskScopeProjects(isCurrent);
+    if (!isCurrent()) return;
+    await loadTaskTypes(isCurrent);
+    if (!isCurrent()) return;
+    if (board) await loadTasksBoard(false, isCurrent);
+    else await loadTasksPage(isCurrent);
   } catch (err) {
+    if (!isCurrent()) return;
     panel.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('tasks_failed')}: ${err.message}`)}</div>`;
     return;
   }
-  if (state.tab !== 'tasks') return;
+  if (!isCurrent()) return;
 
   panel.innerHTML = `
     <div class="ps-tests-toolbar">
@@ -10421,6 +10807,8 @@ async function renderTasksTab() {
         <option value="list" ${canArea('tasks') ? '' : 'disabled'}>${escapeHtml(t('tasks_view_list'))}</option>
         <option value="board" ${canArea('board') ? '' : 'disabled'}>${escapeHtml(t('tasks_view_board'))}</option>
       </tf-segmented>
+      <tf-segmented id="ps-tasks-scope" value="${tv.scope}"><option value="single">${escapeHtml(t('scope_single'))}</option><option value="descendants">${escapeHtml(t('scope_descendants'))}</option></tf-segmented>
+      ${tv.scope === 'descendants' ? `<tf-multiselect id="ps-tasks-project-filter" label="${escapeAttr(t('scope_project_filter'))}" placeholder="${escapeAttr(t('scope_all_projects'))}"></tf-multiselect>` : ''}
       <tf-searchbox id="ps-tasks-search" placeholder="${escapeAttr(t('tasks_search_placeholder'))}" debounce="300" value="${escapeAttr(tv.filters.search)}"></tf-searchbox>
       <tf-select id="ps-tasks-f-type" label="${escapeAttr(t('tasks_col_type'))}" value="${escapeAttr(tv.filters.type)}">
         <option value="">${escapeHtml(t('tasks_filter_all'))}</option>
@@ -10449,41 +10837,57 @@ async function renderTasksTab() {
       ${canArea('tasks', 'admin') ? `<tf-button variant="ghost" icon="settings" id="ps-tasks-types">${escapeHtml(t('task_types_title'))}</tf-button>` : ''}
       ${canCreateTask(projectAccess()) ? `<tf-button variant="primary" icon="plus" id="ps-tasks-new">${escapeHtml(t('tasks_new'))}</tf-button>` : ''}
     </div>
+    <div class="ps-task-index-state" id="ps-task-index-state"></div>
     <div id="ps-tasks-table-host">
       ${(board ? tv.boardRows : tv.rows).length ? '' : `<tf-empty-state icon="check" title="${escapeAttr(t('tasks_empty'))}"></tf-empty-state>`}
     </div>
   `;
 
-  const reload = () => { tv.page = 1; renderTasksTab(); };
-  byId('ps-tasks-mode')?.addEventListener('change', (e) => {
+  const toolbar = panel.querySelector('.ps-tests-toolbar');
+  const isActive = () => isCurrentPanel() && toolbar.isConnected;
+  const reload = () => { if (!isActive()) return; tv.page = 1; renderTasksTab(); };
+  panel.querySelector('#ps-tasks-mode')?.addEventListener('change', (e) => {
+    if (!isActive()) return;
     const mode = e.detail?.value === 'board' ? 'board' : 'list';
     if (mode === tv.mode || !canArea(mode === 'board' ? 'board' : 'tasks')) return;
     tv.mode = mode;
     writeTasksViewMode(projectId(), mode);
+    tv.scope = readTaskScope(currentUserId(), projectId(), mode, descendantsOf(projectId(), false).length > 0);
+    tv.sourceProjectIds = [];
     reload();
   });
-  byId('ps-tasks-search')?.addEventListener('search', (e) => { tv.filters.search = String(e.detail?.value ?? ''); reload(); });
-  byId('ps-tasks-f-type')?.addEventListener('change', (e) => {
+  panel.querySelector('#ps-tasks-scope').addEventListener('change', (event) => { if (!isActive()) return; tv.scope = event.detail.value; writeTaskScope(currentUserId(), projectId(), tv.mode, tv.scope); tv.sourceProjectIds = []; reload(); });
+  const projectFilter = panel.querySelector('#ps-tasks-project-filter');
+  if (projectFilter) {
+    projectFilter.options = descendantsOf(projectId()).filter((project) => allowsArea(project.access, 'tasks') || allowsArea(project.access, 'board')).map((project) => ({ value: project.project_id, label: project.name }));
+    projectFilter.value = tv.sourceProjectIds;
+    projectFilter.addEventListener('change', (event) => { if (!isActive()) return; tv.sourceProjectIds = event.detail.value; reload(); });
+  }
+  renderTaskIndexState();
+  panel.querySelector('#ps-tasks-search')?.addEventListener('search', (e) => { if (!isActive()) return; tv.filters.search = String(e.detail?.value ?? ''); reload(); });
+  panel.querySelector('#ps-tasks-f-type')?.addEventListener('change', (e) => {
+    if (!isActive()) return;
     tv.filters.type = e.detail?.value ?? '';
     reload();
   });
-  byId('ps-tasks-f-status')?.addEventListener('change', (e) => { tv.filters.status = e.detail?.value ?? e.target.value ?? ''; reload(); });
-  byId('ps-tasks-f-mine')?.addEventListener('change', (e) => { tv.filters.mine = !!(e.detail?.checked ?? e.target.checked); reload(); });
-  byId('ps-tasks-f-archived')?.addEventListener('change', (e) => { tv.filters.includeArchived = !!(e.detail?.checked ?? e.target.checked); reload(); });
-  byId('ps-tasks-f-severity')?.addEventListener('change', (e) => { tv.filters.severity = e.detail?.value ?? ''; reload(); });
-  byId('ps-tasks-new')?.addEventListener('click', () => openTaskWindow({}));
-  byId('ps-tasks-types')?.addEventListener('click', () => openTaskTypesWindow());
-  byId('ps-tasks-storage')?.addEventListener('click', () => openAttachmentUsageWindow());
+  panel.querySelector('#ps-tasks-f-status')?.addEventListener('change', (e) => { if (!isActive()) return; tv.filters.status = e.detail?.value ?? e.target.value ?? ''; reload(); });
+  panel.querySelector('#ps-tasks-f-mine')?.addEventListener('change', (e) => { if (!isActive()) return; tv.filters.mine = !!(e.detail?.checked ?? e.target.checked); reload(); });
+  panel.querySelector('#ps-tasks-f-archived')?.addEventListener('change', (e) => { if (!isActive()) return; tv.filters.includeArchived = !!(e.detail?.checked ?? e.target.checked); reload(); });
+  panel.querySelector('#ps-tasks-f-severity')?.addEventListener('change', (e) => { if (!isActive()) return; tv.filters.severity = e.detail?.value ?? ''; reload(); });
+  panel.querySelector('#ps-tasks-new')?.addEventListener('click', () => openTaskWindow({}));
+  panel.querySelector('#ps-tasks-types')?.addEventListener('click', () => openTaskTypesWindow());
+  panel.querySelector('#ps-tasks-storage')?.addEventListener('click', () => openAttachmentUsageWindow());
 
   if (board) {
-    if (tv.boardRows.length) renderTaskBoard();
+    renderTaskBoard();
     return;
   }
   if (!tv.rows.length) return;
-  byId('ps-tasks-table-host').innerHTML = `
+  panel.querySelector('#ps-tasks-table-host').innerHTML = `
     <tf-table id="ps-tasks-table" page-size="${F2_PAGE_SIZE}" total="${tv.total}" page="${tv.page}">
       <tf-column key="no" label="#"></tf-column>
       <tf-column key="title" label="${escapeAttr(t('tasks_col_title'))}"></tf-column>
+      ${tv.scope === 'descendants' ? `<tf-column key="project" label="${escapeAttr(t('task_source_project'))}"></tf-column>` : ''}
       <tf-column key="type" label="${escapeAttr(t('tasks_col_type'))}" renderer="chip"></tf-column>
       <tf-column key="severity" label="${escapeAttr(t('tasks_col_severity'))}" renderer="chip"></tf-column>
       <tf-column key="priority" label="${escapeAttr(t('tasks_col_priority'))}" renderer="chip"></tf-column>
@@ -10494,20 +10898,20 @@ async function renderTasksTab() {
       <tf-column key="comments" label="${escapeAttr(t('tasks_col_comments'))}" renderer="num"></tf-column>
     </tf-table>
   `;
-  const table = byId('ps-tasks-table');
+  const table = panel.querySelector('#ps-tasks-table');
   const assignRows = () => {
     table.rows = tv.rows.map((task) => {
       const type = fv(task, 'task_type');
       return {
         _id: fv(task, 'task_id'),
         no: taskNoLabel(task),
-        title: task.title,
-        type: chipCell(type === 'defect' ? 'err' : 'info', taskTypeName(type)),
+        title: task.title, project: task.project_name,
+        type: chipCell(type === 'defect' ? 'err' : 'info', taskRowTypeName(task)),
         severity: task.severity
           ? chipCell(PRIORITY_CHIP[task.severity], t(`sev_${task.severity}`))
           : chipCell('info', '—'),
         priority: chipCell(PRIORITY_CHIP[task.priority], t(`prio_${task.priority}`)),
-        status: task.archived_at ? chipCell('warn', t('task_archived')) : chipCell(TASK_STATUS_CHIP[task.status], t(`task_status_${task.status}`)),
+        status: task.archived_at ? chipCell('warn', t('task_archived')) : task.resolution === 'not_pursued' ? chipCell('info', t('task_not_pursued')) : chipCell(TASK_STATUS_CHIP[task.status], t(`task_status_${task.status}`)),
         assignee: fv(task, 'assigned_to_name') || '—',
         due: fv(task, 'due_date') || '—',
         links: taskLinkLabels(task),
@@ -10518,20 +10922,13 @@ async function renderTasksTab() {
   assignRows();
   table.addEventListener('row-click', (e) => {
     const taskId = e.detail?.row?._id;
-    if (taskId) openTaskWindow({ taskId });
+    const task = tv.rows.find((row) => row.task_id === taskId);
+    if (task) openTaskRecord(task);
   });
-  table.addEventListener('page-change', async (e) => {
+  table.addEventListener('page-change', (e) => {
+    if (!isActive()) return;
     tv.page = Number(e.detail?.page ?? 1);
-    try {
-      await loadTasksPage();
-    } catch (err) {
-      toast(`${t('tasks_failed')}: ${err.message}`, 'error');
-      return;
-    }
-    table.setAttribute('page', String(tv.page));
-    table.setAttribute('total', String(tv.total));
-    assignRows();
-    syncTasksFooter();
+    renderTasksTab();
   });
   syncTasksFooter();
 }
@@ -10546,7 +10943,18 @@ function syncTasksFooter() {
     footer.className = 'ps-table-footer';
     host.appendChild(footer);
   }
-  footer.textContent = t('tasks_footer', { shown: tv.rows.length, total: tv.total });
+  footer.textContent = t('tasks_scope_footer', { shown: tv.mode === 'board' ? tv.boardRows.length : tv.rows.length, total: tv.total, own: tv.summary.own_total, descendants: tv.summary.descendant_total });
+}
+
+function renderTaskIndexState() {
+  const host = byId('ps-task-index-state');
+  const summary = state.tasksView?.summary;
+  if (!host || !summary) return;
+  const lag = Math.max(0, Number(summary.source_revision) - Number(summary.applied_revision));
+  host.textContent = summary.indexed_at ? t('index_freshness', { date: formatTimestamp(summary.indexed_at) }) : t('index_time_unavailable');
+  if (lag) {
+    const chip = document.createElement('tf-chip'); chip.setAttribute('status', 'warn'); chip.textContent = t('index_lag', { count: lag }); host.append(' ', chip);
+  }
 }
 
 // =============================================================================
@@ -10685,6 +11093,7 @@ async function openTaskWindow(opts = {}) {
     assignedTo: '', dueDate: '', parentTaskId: opts.parentTaskId || null,
     links: Array.isArray(opts.links) ? opts.links.slice() : [], taskLinks: [],
     attachments: [], comments: [], events: [], eventsHasMore: false, durations: [], handoverCommentId: null, info: null, busy: false,
+    ...opts.draft,
   };
   await ensureF2Members();
   const readDetail = async () => {
@@ -10701,6 +11110,7 @@ async function openTaskWindow(opts = {}) {
   };
   try {
     await loadTaskTypes();
+    if (!tw.taskId && !state.taskTypes.some((type) => type.active && type.type_id === tw.taskType)) tw.taskType = state.taskTypes.find((type) => type.active)?.type_id || '';
     if (tw.taskId) {
       const detail = await readDetail();
       const info = detail.info;
@@ -10730,9 +11140,9 @@ async function openTaskWindow(opts = {}) {
   const mayArchive = !!tw.taskId && canArea('tasks', 'write');
   const mayReadTasks = canArea('tasks') || canArea('board');
   const mayComment = !archived && !!tw.taskId && canArea('tasks', 'write');
-  const mayHandover = !projectAccess().archived && !archived && tw.status !== 'done' && !!tw.taskId && (canArea('tasks', 'write') || isMe(tw.assignedTo));
+  const mayHandover = !projectAccess().archived && !projectAccess().ended && !archived && tw.status !== 'done' && !!tw.taskId && (canArea('tasks', 'write') || isMe(tw.assignedTo));
   const types = activeTaskTypes(state.taskTypes, tw.taskType);
-  const members = (f2().membersCache || []).filter((member) => member.active);
+  const members = (f2().membersCache || []).filter((member) => member.access.has_access);
   const assignees = members.filter((member) => allowsArea(member.access, 'tasks', 'write'));
   const readers = members.filter((member) => allowsArea(member.access, 'tasks') || allowsArea(member.access, 'board'));
   const { body, foot, cleanup, signal } = openWindow({
@@ -10743,6 +11153,7 @@ async function openTaskWindow(opts = {}) {
   body.classList.add('ps-task-card');
   if (tw.info) updateProjectRoute({ taskKey: tw.info.task_key, taskId: null, eventId: opts.eventId || null, commentId: opts.commentId || null });
   body.innerHTML = `
+    ${tw.info?.resolution === 'not_pursued' ? `<div class="ps-task-resolution"><tf-chip status="info">${escapeHtml(t('task_not_pursued'))}</tf-chip><span>${escapeHtml(tw.info.resolution_reason)}</span></div>` : ''}
     ${archived ? `<div class="ps-task-archived"><tf-chip status="warn">${escapeHtml(t('task_archived'))}</tf-chip><span>${escapeHtml(t('task_archived_hint'))}</span></div>` : ''}
     <div class="ps-task-layout">
       <div class="ps-task-main">
@@ -10768,6 +11179,7 @@ async function openTaskWindow(opts = {}) {
       <aside class="ps-task-sidebar">
         <tf-section-card title="${escapeAttr(t('task_metadata_title'))}" icon="settings">
           <div class="ps-task-metadata">
+            ${!tw.taskId ? `<tf-select id="ps-task-project" label="${escapeAttr(t('task_source_project'))}" value="${escapeAttr(pid)}">${descendantsOf(pid).filter((project) => canCreateTask(project.access)).map((project) => `<option value="${escapeAttr(project.project_id)}" ${project.project_id === pid ? 'selected' : ''}>${escapeHtml(project.name)}</option>`).join('')}</tf-select><span class="ps-field-hint" data-task-project-hint hidden>${escapeHtml(t('task_project_change_upload_hint'))}</span>` : `<span class="ps-field-hint">${escapeHtml(state.project.name)}</span>`}
             <tf-select id="ps-task-type" label="${escapeAttr(t('task_type_label'))}" value="${escapeAttr(tw.taskType)}" ${mayEdit ? '' : 'disabled'}>
               ${types.map((type) => `<option value="${escapeAttr(type.type_id)}" ${type.type_id === tw.taskType ? 'selected' : ''} ${!type.active && type.type_id !== tw.taskType || type.type_id === 'subtask' && !mayReadTasks ? 'disabled' : ''}>${escapeHtml(taskTypeLabel(type, t))}${type.active ? '' : ` · ${escapeHtml(t('task_type_inactive'))}`}</option>`).join('')}
             </tf-select>
@@ -10800,7 +11212,7 @@ async function openTaskWindow(opts = {}) {
       </aside>
     </div>
     <div class="ps-form-error" data-form-error hidden></div>`;
-  foot.innerHTML = `<div class="ps-footer-left">${mayArchive ? `<tf-button variant="ghost" icon="${archived ? 'refresh' : 'archive'}" data-action="archive">${escapeHtml(t(archived ? 'task_restore' : 'action_archive'))}</tf-button>` : ''}${tw.info ? `<tf-button variant="ghost" icon="link" data-action="copy-link">${escapeHtml(t('task_copy_link'))}</tf-button>` : ''}</div>
+  foot.innerHTML = `<div class="ps-footer-left">${tw.info && projectAccess().is_owner && !projectAccess().archived && !projectAccess().ended && !archived ? `<tf-button variant="ghost" icon="branch" data-action="transfer">${escapeHtml(t('task_transfer'))}</tf-button>` : ''}${mayEdit && tw.taskId && tw.status !== 'done' ? `<tf-button variant="ghost" icon="check" data-action="resolve">${escapeHtml(t('task_not_pursued'))}</tf-button>` : ''}${mayArchive ? `<tf-button variant="ghost" icon="${archived ? 'refresh' : 'archive'}" data-action="archive">${escapeHtml(t(archived ? 'task_restore' : 'action_archive'))}</tf-button>` : ''}${tw.info ? `<tf-button variant="ghost" icon="link" data-action="copy-link">${escapeHtml(t('task_copy_link'))}</tf-button>` : ''}</div>
     <div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_close'))}</tf-button>${mayEdit || maySetStatus ? `<tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button>` : ''}</div>`;
   const errorEl = body.querySelector('[data-form-error]');
   const showError = (message) => { errorEl.hidden = !message; errorEl.textContent = message || ''; };
@@ -10817,7 +11229,9 @@ async function openTaskWindow(opts = {}) {
 
   const historyTaskNames = new Map();
   const historyTaskRequests = new Set();
-  const rememberHistoryTask = (task) => historyTaskNames.set(task.task_id, `${task.task_key} · ${task.title}`);
+  const historyProjectNames = new Map([[pid, state.project.name]]);
+  const historyProjectRequests = new Set();
+  const rememberHistoryTask = (task) => { historyTaskNames.set(task.task_id, `${task.task_key} · ${task.title}`); historyProjectNames.set(task.project_id, task.project_name); };
   for (const task of [...(state.tasksView?.rows || []), ...(state.tasksView?.boardRows || [])]) rememberHistoryTask(task);
   if (tw.info) rememberHistoryTask(tw.info);
   for (const link of tw.taskLinks) historyTaskNames.set(link.source_task_id === tw.taskId ? link.target_task_id : link.source_task_id, `${link.counterparty_task_key} · ${link.counterparty_task_title}`);
@@ -10828,7 +11242,7 @@ async function openTaskWindow(opts = {}) {
   const findParents = async (search = '') => {
     if (!parent || !mayEdit || tw.taskType === 'epic') return;
     const query = ++parentQuery;
-    const response = await ApiBinary.one('projectStudioTasksListRequest', { projectId: pid, taskType: tw.taskType === 'subtask' ? '' : 'epic', status: '', assignedTo: '', search, severity: '', offset: 0, limit: 50 });
+    const response = await ApiBinary.one('projectStudioTasksListRequest', { projectId: pid, scope: 'single', sourceProjectIds: [], taskType: tw.taskType === 'subtask' ? '' : 'epic', status: '', assignedTo: '', search, severity: '', offset: 0, limit: 50 });
     if (!parent.isConnected || query !== parentQuery) return;
     parentRows = parentCandidates(response.tasks, tw.taskType, tw.taskId);
     for (const task of parentRows) rememberHistoryTask(task);
@@ -10863,9 +11277,9 @@ async function openTaskWindow(opts = {}) {
     host.innerHTML = tw.taskLinks.length ? tw.taskLinks.map((link) => {
       const otherId = link.source_task_id === tw.taskId ? link.target_task_id : link.source_task_id;
       const direction = ['related', 'duplicate'].includes(link.kind) ? '' : t(link.source_task_id === tw.taskId ? 'task_relation_outgoing' : 'task_relation_incoming');
-      return `<div class="ps-task-relation"><tf-button variant="ghost" data-related-task="${escapeAttr(otherId)}">${escapeHtml(link.counterparty_task_key)} · ${escapeHtml(link.counterparty_task_title)}</tf-button><span>${escapeHtml(t(`task_relation_${link.kind}`))}${direction ? ` · ${escapeHtml(direction)}` : ''}${link.lag_days ? ` · ${escapeHtml(t('task_relation_lag_value', { days: link.lag_days }))}` : ''}</span>${mayEdit ? `<tf-button variant="ghost" size="sm" icon="x" data-unlink="${link.link_id}" title="${escapeAttr(t('task_relation_remove'))}"></tf-button>` : ''}</div>`;
+      return `<div class="ps-task-relation"><tf-button variant="ghost" data-related-task="${escapeAttr(otherId)}" data-related-project="${escapeAttr(link.counterparty_project_id)}">${escapeHtml(link.counterparty_task_key)} · ${escapeHtml(link.counterparty_task_title)}</tf-button><span>${escapeHtml(t(`task_relation_${link.kind}`))}${direction ? ` · ${escapeHtml(direction)}` : ''}${link.lag_days ? ` · ${escapeHtml(t('task_relation_lag_value', { days: link.lag_days }))}` : ''}</span>${mayEdit ? `<tf-button variant="ghost" size="sm" icon="x" data-unlink="${link.link_id}" title="${escapeAttr(t('task_relation_remove'))}"></tf-button>` : ''}</div>`;
     }).join('') : `<span class="ps-field-hint">${escapeHtml(t('task_relations_empty'))}</span>`;
-    host.querySelectorAll('[data-related-task]').forEach((button) => button.addEventListener('click', () => { cleanup(); openTaskWindow({ taskId: button.dataset.relatedTask }); }));
+    host.querySelectorAll('[data-related-task]').forEach((button) => button.addEventListener('click', () => { cleanup(); openProject(button.dataset.relatedProject, { tab: 'tasks', taskId: button.dataset.relatedTask }); }));
     host.querySelectorAll('[data-unlink]').forEach((button) => button.addEventListener('click', async () => {
       button.setAttribute('disabled', '');
       try { await ApiBinary.one('projectStudioTaskLinkDeleteRequest', { projectId: pid, linkId: Number(button.dataset.unlink) }); await refreshRecorded(); }
@@ -10878,7 +11292,7 @@ async function openTaskWindow(opts = {}) {
     const history = body.querySelector('#ps-task-history');
     if (!history) return;
     const markedId = history.querySelector('.ps-task-target [data-task-event]')?.dataset.taskEvent;
-    const eventValue = (json, kind) => taskEventValue(json, { translate: t, memberName, taskName: (id) => historyTaskNames.get(id), typeName: taskTypeName, kind });
+    const eventValue = (json, kind) => taskEventValue(json, { translate: t, memberName, taskName: (id) => historyTaskNames.get(id), projectName: (id) => historyProjectNames.get(id), typeName: taskTypeName, kind });
     history.entries = tw.events.map((event) => ({
       title: `<span data-task-event="${event.event_id}">${escapeHtml(t(`task_event_${event.kind}`))}</span>`, time: escapeHtml(formatTimestamp(event.at)),
       description: `<span class="ps-task-history-actor">${escapeHtml(event.actor_kind === 'user' ? memberName(event.actor_id) || t('task_history_unavailable_person') : t(`task_actor_${event.actor_kind}`))}</span><div class="ps-task-history-values">${escapeHtml(eventValue(event.before_json, event.kind))}<span aria-hidden="true"> → </span>${escapeHtml(eventValue(event.after_json, event.kind))}</div>${taskEventAttachments(event).map((attachment, index) => `<tf-button variant="ghost" size="sm" icon="paperclip" data-history-attachment="${event.event_id}:${index}">${escapeHtml(attachment.name)}</tf-button>`).join('')}`,
@@ -10898,14 +11312,28 @@ async function openTaskWindow(opts = {}) {
   };
   const resolveHistoryTasks = async (events) => {
     if (!mayReadTasks || !tw.taskId) return;
-    const ids = [...new Set(events.flatMap(taskEventTaskIds))].filter((id) => !historyTaskNames.has(id) && !historyTaskRequests.has(id));
-    for (const id of ids) historyTaskRequests.add(id);
-    for (let i = 0; i < ids.length && !signal.aborted; i += 5) {
-      await Promise.all(ids.slice(i, i + 5).map(async (id) => {
+    const references = events.map(taskEventReferences);
+    const jobs = [];
+    for (const id of new Set(references.flatMap((entry) => entry.tasks))) {
+      if (historyTaskNames.has(id) || historyTaskRequests.has(id)) continue;
+      historyTaskRequests.add(id); jobs.push({ kind: 'task', id });
+    }
+    for (const id of new Set(references.flatMap((entry) => entry.projects))) {
+      if (historyProjectNames.has(id) || historyProjectRequests.has(id)) continue;
+      historyProjectRequests.add(id); jobs.push({ kind: 'project', id });
+    }
+    for (let i = 0; i < jobs.length && !signal.aborted; i += 5) {
+      await Promise.all(jobs.slice(i, i + 5).map(async ({ kind, id }) => {
         try {
-          const response = await ApiBinary.one('projectStudioTaskGetRequest', { projectId: pid, taskId: id });
-          if (!signal.aborted) rememberHistoryTask(response.detail.info);
-        } catch { historyTaskNames.set(id, null); }
+          if (kind === 'project') {
+            const response = await ApiBinary.one('projectStudioProjectGetRequest', { projectId: id });
+            if (!signal.aborted) historyProjectNames.set(id, response.project.name);
+          } else {
+            const target = await ApiBinary.one('projectStudioTaskKeyResolveRequest', { taskKey: null, taskId: id, originProjectId: null, originEventId: null });
+            const response = await ApiBinary.one('projectStudioTaskGetRequest', { projectId: target.project_id, taskId: target.task_id });
+            if (!signal.aborted) rememberHistoryTask(response.detail.info);
+          }
+        } catch { (kind === 'project' ? historyProjectNames : historyTaskNames).set(id, null); }
       }));
       if (!signal.aborted && body.isConnected) renderHistory();
     }
@@ -11001,6 +11429,15 @@ async function openTaskWindow(opts = {}) {
   for (const [id, field] of [['severity', 'severity'], ['priority', 'priority'], ['status', 'status'], ['assignee', 'assignedTo']]) body.querySelector(`#ps-task-${id}`).addEventListener('change', (event) => { tw[field] = event.detail?.value ?? ''; });
   body.querySelector('#ps-task-due').addEventListener('change', (event) => { tw.dueDate = String(event.target.value ?? ''); });
   const uploads = wireTaskUploads({ body, foot, signal, attachments: tw.attachments, pid, onAdded: (attachment) => { if (!tw.attachments.some((entry) => entry.sha256 === attachment.sha256)) tw.attachments.push(attachment); renderAtts(); } });
+  body.querySelector('#ps-task-project')?.addEventListener('change', async (event) => {
+    const destinationId = event.detail.value;
+    if (destinationId === pid) return;
+    if (tw.attachments.length || uploads.busy) { body.querySelector('#ps-task-project').value = pid; body.querySelector('[data-task-project-hint]').hidden = false; return; }
+    const destination = descendantsOf(pid).find((project) => project.project_id === destinationId && canCreateTask(project.access));
+    if (!destination) return;
+    const draft = { taskType: tw.taskType, title: tw.title, descriptionMd: tw.descriptionMd, severity: tw.severity, priority: tw.priority, status: tw.status, dueDate: tw.dueDate };
+    cleanup(); await switchProject(destinationId); await openTaskWindow({ draft });
+  });
   foot.addEventListener('click', async (event) => {
     const button = event.target.closest('[data-action]');
     if (!button || button.hasAttribute('disabled') || tw.busy || uploads.busy && button.dataset.action !== 'cancel') return;
@@ -11010,6 +11447,8 @@ async function openTaskWindow(opts = {}) {
       catch (error) { showError(`${t('task_link_copy_failed')}: ${error.message}`); }
       return;
     }
+    if (button.dataset.action === 'transfer') { openTaskTransferWindow(tw.info, state.project, async (result) => { cleanup(); await openProject(result.destination_project_id, { tab: 'tasks', taskId: result.task_id }); }); return; }
+    if (button.dataset.action === 'resolve') { openTaskResolutionWindow(tw.info, state.project, async () => { cleanup(); await renderTasksTab(); }); return; }
     if (button.dataset.action === 'archive') {
       try { await setTaskArchived(tw.taskId, !archived, pid); cleanup(); }
       catch (error) { showError(`${t('task_archive_failed')}: ${error.message}`); }
@@ -11091,7 +11530,7 @@ function openTaskLinkWindow(sourceTaskId, onSaved) {
   const showError = (message) => { const el = body.querySelector('[data-form-error]'); el.hidden = !message; el.textContent = message || ''; };
   const search = async (query = '') => {
     const request = ++queryId;
-    const response = await ApiBinary.one('projectStudioTasksListRequest', { projectId: projectId(), taskType: '', status: '', assignedTo: '', search: query, severity: '', offset: 0, limit: 50 });
+    const response = await ApiBinary.one('projectStudioTasksListRequest', { projectId: projectId(), scope: 'descendants', sourceProjectIds: [], taskType: '', status: '', assignedTo: '', search: query, severity: '', offset: 0, limit: 50 });
     if (!target.isConnected || queryId !== request) return;
     target.options = response.tasks.filter((task) => task.task_id !== sourceTaskId && !task.archived_at).map((task) => ({ value: task.task_id, label: `${task.task_key} · ${task.title}` }));
   };
@@ -11347,12 +11786,7 @@ async function openGenDetailFromNotif(genId) {
 }
 
 async function openTaskWindowFromNotif(taskId, target) {
-  if (state.tab !== 'tasks') {
-    state.tab = 'tasks';
-    renderTabsValue();
-    await switchTab('tasks');
-  }
-  await openTaskWindow({ taskId, ...target });
+  await openProject(projectId(), { tab: 'tasks', taskId, ...target });
 }
 
 async function openMyWorkWindow() {
@@ -12806,7 +13240,7 @@ function openMlSettingsWindow(link) {
 // =============================================================================
 
 function canMoveTask(task) {
-  return !task.archived_at && canArea('board', 'write');
+  return !task.archived_at && allowsArea(taskSourceProject(task)?.access, 'board', 'write');
 }
 
 // Card order is NOT persisted in F4 — the board sorts by priority and then by
@@ -12834,6 +13268,9 @@ function taskCardModel(task) {
     }
   })();
   const meta = [];
+  if (state.tasksView.scope === 'descendants') meta.push({ text: task.project_name, icon: 'folder' });
+  meta.push({ text: taskRowTypeName(task) });
+  if (task.resolution === 'not_pursued') meta.push({ text: t('task_not_pursued'), tone: 'info' });
   if (task.archived_at) meta.push({ text: t('task_archived'), tone: 'warning', icon: 'archive' });
   if (severity) {
     meta.push({
@@ -12848,7 +13285,7 @@ function taskCardModel(task) {
   }
 
   const menu = [{ id: 'open', label: t('action_open'), icon: 'external-link' }];
-  if (canArea('tasks', 'write')) {
+  if (allowsArea(taskSourceProject(task)?.access, 'tasks', 'write')) {
     menu.push({ id: task.archived_at ? 'restore' : 'archive', label: t(task.archived_at ? 'task_restore' : 'action_archive'), icon: task.archived_at ? 'refresh' : 'archive' });
   }
 
@@ -12896,14 +13333,15 @@ function renderTaskBoard() {
   board.columns = TASK_BOARD_COLUMNS.map((col) => ({
     id: col.id,
     label: t(`task_status_${col.id}`),
-    accent: col.accent,
+    accent: col.accent, count: tv.summary[col.id],
   }));
-  board.readOnly = !canArea('board', 'write');
+  board.readOnly = !descendantsOf(projectId()).some((project) => allowsArea(project.access, 'board', 'write'));
   board.cards = boardSortedTasks(tv.boardRows).map(taskCardModel);
 
   board.addEventListener('card-open', (e) => {
     const taskId = e.detail?.cardId;
-    if (taskId) openTaskWindow({ taskId });
+    const task = tv.boardRows.find((row) => row.task_id === taskId);
+    if (task) openTaskRecord(task);
   });
   board.addEventListener('column-add', (e) => {
     if (!canCreateTask(projectAccess())) return;
@@ -12913,9 +13351,9 @@ function renderTaskBoard() {
     const taskId = e.detail?.cardId;
     const task = tv.boardRows.find((row) => fv(row, 'task_id') === taskId);
     if (!task) return;
-    if (e.detail?.actionId === 'open') { openTaskWindow({ taskId }); return; }
+    if (e.detail?.actionId === 'open') { openTaskRecord(task); return; }
     if (e.detail?.actionId === 'archive') confirmArchiveBoardTask(task);
-    if (e.detail?.actionId === 'restore' && canArea('tasks', 'write')) setTaskArchived(taskId, false).catch((error) => toast(`${t('task_archive_failed')}: ${error.message}`, 'error'));
+    if (e.detail?.actionId === 'restore' && allowsArea(taskSourceProject(task)?.access, 'tasks', 'write')) setTaskArchived(taskId, false, task.project_id).catch((error) => toast(`${t('task_archive_failed')}: ${error.message}`, 'error'));
   });
   // The board already shows the new position when this fires; a rejected write
   // is undone with revertMove so the UI never drifts from the server.
@@ -12928,10 +13366,12 @@ function renderTaskBoard() {
     task.status = to;
     try {
       await ApiBinary.one('projectStudioTaskStatusSetRequest', {
-        projectId: projectId(),
+        projectId: task.project_id,
         taskId: cardId,
         status: to,
       });
+      await loadTasksBoard();
+      renderTaskBoard(); renderTaskIndexState();
     } catch (err) {
       task.status = previous;
       board.revertMove(cardId);
@@ -12940,13 +13380,19 @@ function renderTaskBoard() {
   });
 
   host.replaceChildren(board);
+  syncTasksFooter();
+  if (tv.boardRows.length < tv.total) {
+    const more = document.createElement('tf-button'); more.setAttribute('variant', 'ghost'); more.textContent = t('activity_more');
+    more.addEventListener('click', async () => { more.setAttribute('disabled', ''); try { await loadTasksBoard(true); renderTaskBoard(); renderTaskIndexState(); } catch (error) { more.removeAttribute('disabled'); toast(`${t('tasks_failed')}: ${error.message}`, 'error'); } });
+    host.appendChild(more);
+  }
 }
 
 async function confirmArchiveBoardTask(task) {
-  if (!canArea('tasks', 'write')) return;
+  if (!allowsArea(taskSourceProject(task)?.access, 'tasks', 'write')) return;
   const confirmed = await TfWindow.confirm({ title: t('task_archive_title'), message: t('task_archive_message', { key: taskNoLabel(task), title: task.title }), confirmLabel: t('action_archive'), cancelLabel: t('action_cancel') });
   if (!confirmed) return;
-  try { await setTaskArchived(fv(task, 'task_id'), true); }
+  try { await setTaskArchived(fv(task, 'task_id'), true, task.project_id); }
   catch (error) { toast(`${t('task_archive_failed')}: ${error.message}`, 'error'); }
 }
 
@@ -13000,8 +13446,8 @@ function trackArchiveJob(jobId, kind, { onStatus, onLog }) {
       return;
     }
     if (state.archiveJob !== job) return;
-    onStatus(status);
     if (String(status.status || '') !== 'running') stopArchiveJob();
+    await onStatus(status);
   };
   job.pollTimer = setInterval(poll, ARCHIVE_POLL_MS);
   poll();
@@ -13036,10 +13482,13 @@ function openExportWindow() {
     icon: 'download',
     width: 680,
   });
-  const ew = { jobId: null, signedUrl: '', busy: false };
+  if (!canProject('export')) { cleanup(); return; }
+  const ew = { scope: 'node', jobId: null, signedUrl: '', busy: false };
 
   body.innerHTML = `
     <div class="ps-banner-info">${sprite('info')}<span>${escapeHtml(t('export_intro'))}</span></div>
+    <tf-select id="ps-export-scope" label="${escapeAttr(t('export_scope'))}" value="node"><option value="node">${escapeHtml(t('scope_node'))}</option><option value="subtree">${escapeHtml(t('scope_subtree'))}</option></tf-select>
+    <div data-export-nodes></div>
     <div class="ps-export-options">
       <div class="ps-toggle-inline">
         <tf-checkbox id="ps-exp-runs" checked></tf-checkbox>
@@ -13070,7 +13519,7 @@ function openExportWindow() {
     <div class="ps-footer-left"></div>
     <div class="ps-footer-right">
       <tf-button variant="ghost" data-action="close-export">${escapeHtml(t('action_close'))}</tf-button>
-      <tf-button variant="primary" icon="download" data-action="start">${escapeHtml(t('export_start'))}</tf-button>
+      <tf-button variant="primary" icon="download" data-action="start" disabled>${escapeHtml(t('export_start'))}</tf-button>
     </div>
   `;
 
@@ -13078,6 +13527,19 @@ function openExportWindow() {
     const el = body.querySelector('[data-form-error]');
     if (el) { el.hidden = !msg; el.textContent = msg || ''; }
   };
+
+  let scopeGeneration = 0;
+  const previewScope = async () => {
+    const query = ++scopeGeneration;
+    const button = foot.querySelector('[data-action="start"]'); button.setAttribute('disabled', '');
+    ew.scope = body.querySelector('#ps-export-scope').value;
+    try {
+      const response = await ApiBinary.one('projectStudioProjectScopePreviewRequest', { projectId: projectId(), scope: ew.scope, operation: 'export' });
+      if (query !== scopeGeneration || !body.isConnected) return;
+      body.querySelector('[data-export-nodes]').innerHTML = scopeNodesHtml(response.nodes); button.removeAttribute('disabled');
+    } catch (error) { showError(error.message); }
+  };
+  body.querySelector('#ps-export-scope').addEventListener('change', previewScope); previewScope();
 
   const onStatus = (status) => {
     const pct = Number(fv(status, 'progress_pct') ?? 0);
@@ -13125,11 +13587,13 @@ function openExportWindow() {
     try {
       const resp = await ApiBinary.one('projectStudioProjectExportStartRequest', {
         projectId: projectId(),
+        scope: ew.scope,
         includeRuns: !!body.querySelector('#ps-exp-runs')?.checked,
         includeVectors: !!body.querySelector('#ps-exp-vectors')?.checked,
         includeUserNames: !!body.querySelector('#ps-exp-names')?.checked,
       });
       ew.jobId = fv(resp, 'job_id');
+      body.querySelector('#ps-export-scope').setAttribute('disabled', '');
       body.querySelector('[data-export-progress]').hidden = false;
       trackArchiveJob(ew.jobId, 'export', {
         onStatus,
@@ -13255,10 +13719,11 @@ function openImportWindow() {
           version: Number(fv(preview, 'archive_version') ?? 0),
         }))}</div>
         <div class="ps-preview-chips">
-          <tf-chip status="info">${escapeHtml(t(`tpl_${fv(preview, 'template') || 'custom'}_name`))}</tf-chip>
+          <tf-chip status="info">${escapeHtml(orientationLabel({ template: preview.template, modules: preview.modules }))}</tf-chip>
           ${modules.map((m) => `<tf-chip>${escapeHtml(t(`module_${m}`))}</tf-chip>`).join('')}
         </div>
       </div>
+      <tf-section-card title="${escapeAttr(t('import_tree_title'))}" icon="branch"><div class="ps-field-hint">${escapeHtml(t('import_prefix_allocation'))}</div><tf-table data-import-tree><tf-column key="name" label="${escapeAttr(t('table_col_project'))}"></tf-column><tf-column key="prefix" label="${escapeAttr(t('import_source_prefix'))}"></tf-column><tf-column key="visibility" label="${escapeAttr(t('subproject_private'))}"></tf-column><tf-column key="status" label="${escapeAttr(t('table_col_status'))}"></tf-column><tf-column key="tasks" label="${escapeAttr(t('inv_tasks'))}" renderer="num"></tf-column></tf-table></tf-section-card>
       ${inventoryHtml(preview.inventory, fv(preview, 'total_uncompressed_bytes'))}
       <div class="ps-banner-${reusable ? 'info' : 'warn'}">
         ${sprite(reusable ? 'info' : 'alert')}
@@ -13279,15 +13744,28 @@ function openImportWindow() {
         <span>${escapeHtml(t('import_take_runs'))}</span>
       </div>
     `;
+    const nodes = new Map(preview.tree_nodes.map((row) => [row.project_id, row]));
+    const nodePath = (row) => {
+      const names = [row.name];
+      let ancestor = nodes.get(row.parent_id);
+      for (let level = 1; ancestor && level < 4; level++) { names.unshift(ancestor.name); ancestor = nodes.get(ancestor.parent_id); }
+      return names.join(' / ');
+    };
+    const treeTable = host.querySelector('[data-import-tree]');
+    treeTable.rowKey = '_id';
+    treeTable.rows = preview.tree_nodes.map((row) => ({ _id: row.project_id, name: nodePath(row), prefix: row.key_prefix, visibility: row.is_private ? t('subproject_private') : '—', status: t(row.lifecycle === 'ended' ? 'status_ended' : 'status_active'), tasks: row.inventory.tasks }));
+    const detail = document.createElement('div'); treeTable.after(detail);
+    treeTable.addEventListener('row-click', (event) => { const row = preview.tree_nodes.find((node) => node.project_id === event.detail.row._id); detail.innerHTML = `<h3>${escapeHtml(row.name)}</h3>${inventoryHtml(row.inventory, null)}`; });
   };
 
-  const onStatus = (status) => {
+  const onStatus = async (status) => {
     const pct = Number(fv(status, 'progress_pct') ?? 0);
     body.querySelector('#ps-imp-bar')?.setAttribute('value', String(pct));
     const phase = body.querySelector('[data-import-phase]');
     if (phase) phase.textContent = t('import_phase', { phase: status.phase || '—', pct });
     const state_ = String(status.status || '');
     if (state_ === 'running') return;
+    iw.busy = false;
     const result = body.querySelector('[data-import-result]');
     if (!result) return;
     if (state_ !== 'success') {
@@ -13303,6 +13781,7 @@ function openImportWindow() {
       <div class="ps-export-download">
         <tf-button variant="primary" icon="external-link" data-action="open-imported">${escapeHtml(t('import_open_project'))}</tf-button>
       </div>
+      <tf-section-card title="${escapeAttr(t('import_saved_tree'))}" icon="branch"><div data-imported-tree-status class="ps-field-hint">${escapeHtml(t('loading'))}</div><tf-table data-imported-tree hidden><tf-column key="name" label="${escapeAttr(t('table_col_project'))}"></tf-column><tf-column key="prefix" label="${escapeAttr(t('project_key_prefix'))}"></tf-column></tf-table></tf-section-card>
     `;
     result.querySelector('[data-action="open-imported"]')?.addEventListener('click', async () => {
       stopArchiveJob();
@@ -13310,6 +13789,19 @@ function openImportWindow() {
       await loadProjects();
       if (newProjectId) await openProject(newProjectId);
     });
+    try {
+      const tree = await ApiBinary.one('projectStudioProjectTreeRequest', { projectId: newProjectId, includeEnded: true, includeArchived: true });
+      if (!result.isConnected) return;
+      const table = result.querySelector('[data-imported-tree]');
+      table.rowKey = '_id';
+      table.rows = tree.projects.map((project) => ({ _id: project.project_id, name: [...projectAncestors(project, tree.projects, tree.breadcrumbs).map((ancestor) => ancestor.name), project.name].join(' / '), prefix: project.key_prefix }));
+      table.hidden = false;
+      result.querySelector('[data-imported-tree-status]').remove();
+      await loadProjects();
+    } catch (error) {
+      const hint = result.querySelector('[data-imported-tree-status]');
+      if (hint && result.isConnected) hint.textContent = `${t('load_failed')}: ${error.message}`;
+    }
   };
 
   foot.addEventListener('click', async (e) => {

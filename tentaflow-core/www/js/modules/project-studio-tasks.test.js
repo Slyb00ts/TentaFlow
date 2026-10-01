@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { projectKeySuggestion, taskTypeLabel, taskTypeDescription, activeTaskTypes, parentCandidates, taskDuration, taskEventValue, taskEventTaskIds, taskEventAttachments, taskNotificationText } from './project-studio-tasks.js';
+import { projectKeySuggestion, taskTypeLabel, taskTypeDescription, activeTaskTypes, parentCandidates, taskDuration, taskEventValue, taskEventReferences, taskEventAttachments, taskNotificationText } from './project-studio-tasks.js';
 
 const translate = (key, fields) => fields ? `${key}:${JSON.stringify(fields)}` : key;
 
@@ -65,13 +65,17 @@ test('history uses authorized record labels and translated values without intern
     const localized = (key) => { assert.equal(typeof dictionary[key], 'string', `${locale}: ${key}`); return dictionary[key]; };
     const context = { translate: localized, memberName: (id) => id === 'actual-person' ? 'Actual person' : null,
       taskName: (id) => id === parentId ? 'WF-1 · Actual parent' : null,
+      projectName: (id) => id === parentId ? 'Authorized source project' : null,
       typeName: (id) => id === 'release_review' ? 'Customer review' : null };
     const created = taskEventValue(JSON.stringify({ task_type: 'release_review', status: 'in_progress', priority: 'high', severity: 'critical', parent_task_id: parentId, assigned_to: unavailableId }), context);
     assert.ok(created.includes('Customer review')); assert.ok(created.includes('WF-1 · Actual parent'));
     for (const key of ['task_status_in_progress', 'prio_high', 'sev_critical', 'task_history_unavailable_person']) assert.ok(created.includes(dictionary[key]));
     assert.equal(created.includes(parentId), false); assert.equal(created.includes(unavailableId), false);
     assert.equal(created.includes('release_review'), false);
-    const relation = taskEventValue(JSON.stringify({ link_id: 32, source_task_id: parentId, target_task_id: unavailableId, kind: 'related', lag_days: 3 }), context);
+    const relation = taskEventValue(JSON.stringify({ relation_id: unavailableId, operation_id: parentId, link_id: 32, source_task_id: parentId, target_task_id: unavailableId, source_project_id: parentId, target_project_id: unavailableId, kind: 'related', lag_days: 3 }), context);
+    assert.ok(relation.includes('Authorized source project'));
+    assert.ok(relation.includes(dictionary.task_history_field_source_project_id)); assert.ok(relation.includes(dictionary.task_history_field_target_project_id));
+    assert.equal(relation.includes('task_history_field_relation_id'), false); assert.equal(relation.includes('task_history_field_operation_id'), false);
     assert.ok(relation.includes(dictionary.task_relation_related)); assert.ok(relation.includes(dictionary.task_history_unavailable_record));
     assert.equal(relation.includes(parentId), false); assert.equal(relation.includes(unavailableId), false); assert.equal(relation.includes('32'), false);
     const comment = taskEventValue(JSON.stringify({ comment_id: unavailableId, handover_id: parentId, body_md: 'Recorded comment', mention_user_ids: ['actual-person', unavailableId] }), context);
@@ -85,11 +89,12 @@ test('history uses authorized record labels and translated values without intern
   }
 });
 
-test('historical record resolution collects only structural task endpoints', () => {
-  assert.deepEqual(taskEventTaskIds({ kind: 'parent_task_id', before_json: '"previous"', after_json: '"current"' }), ['previous', 'current']);
-  assert.deepEqual(taskEventTaskIds({ kind: 'link_deleted', before_json: '{"source_task_id":"source","target_task_id":"target","link_id":42}', after_json: 'null' }), ['source', 'target']);
-  assert.deepEqual(taskEventTaskIds({ kind: 'created', before_json: 'null', after_json: '{"parent_task_id":"parent","comment_id":"private-comment","title":"User text"}' }), ['parent']);
-  assert.deepEqual(taskEventTaskIds({ kind: 'comment_deleted', before_json: '{"comment_id":"private-comment"}', after_json: 'null' }), []);
+test('historical record resolution collects only structural task and project endpoints', () => {
+  assert.deepEqual(taskEventReferences({ kind: 'parent_task_id', before_json: '"previous"', after_json: '"current"' }), { tasks: ['previous', 'current'], projects: [] });
+  assert.deepEqual(taskEventReferences({ kind: 'link_deleted', before_json: '{"source_task_id":"source","target_task_id":"target","link_id":42}', after_json: 'null' }), { tasks: ['source', 'target'], projects: [] });
+  assert.deepEqual(taskEventReferences({ kind: 'created', before_json: 'null', after_json: '{"parent_task_id":"parent","comment_id":"private-comment","title":"User text"}' }), { tasks: ['parent'], projects: [] });
+  assert.deepEqual(taskEventReferences({ kind: 'transferred', before_json: '{"project_id":"previous-project","operation_id":"not-a-project"}', after_json: '{"project_id":"current-project","task_key":"CH-1"}' }), { tasks: [], projects: ['previous-project', 'current-project'] });
+  assert.deepEqual(taskEventReferences({ kind: 'comment_deleted', before_json: '{"comment_id":"private-comment"}', after_json: 'null' }), { tasks: [], projects: [] });
 });
 
 test('task notifications use structured keys and translated status names in every supported language', () => {
@@ -114,4 +119,28 @@ test('task notifications use structured keys and translated status names in ever
     }
   }
   assert.equal(taskNotificationText({ kind: 'run_finished' }, translate), null);
+});
+
+test('current resolution and transfer history use localized human values in all five languages', () => {
+  for (const locale of ['pl', 'en', 'de', 'es', 'fr']) {
+    const dictionary = JSON.parse(readFileSync(new URL(`../../i18n/${locale}.json`, import.meta.url))).project_studio;
+    const translate = (key) => { assert.equal(typeof dictionary[key], 'string', `${locale}: ${key}`); return dictionary[key]; };
+    const context = { translate, projectName: (id) => id === 'current-project' ? 'Current authorized destination' : null, kind: 'resolution_changed' };
+    const value = taskEventValue('{"status":"done","resolution":"not_pursued","resolution_reason":"Actual recorded reason"}', context);
+    assert.ok(value.includes(dictionary.task_status_done));
+    assert.ok(value.includes(dictionary.task_not_pursued));
+    assert.ok(value.includes('Actual recorded reason'));
+    assert.equal(value.includes('not_pursued'), false);
+    const transferred = taskEventValue('{"task_key":"CH-42","project_id":"current-project","project_name":"Stale historical name","operation_id":"private-operation-id"}', { ...context, kind: 'transferred' });
+    assert.ok(transferred.includes('CH-42')); assert.ok(transferred.includes('Current authorized destination'));
+    assert.equal(transferred.includes('Stale historical name'), false); assert.equal(transferred.includes('private-operation-id'), false);
+    const denied = taskEventValue('{"task_key":"OLD-4","project_id":"denied-project","project_name":"Private stale name"}', { ...context, kind: 'transferred' });
+    assert.ok(denied.includes(dictionary.task_history_unavailable_record)); assert.equal(denied.includes('Private stale name'), false); assert.equal(denied.includes('denied-project'), false);
+    assert.equal(taskEventValue('null', { ...context, kind: 'transferred' }), dictionary.task_history_unavailable_record);
+    assert.equal(taskEventValue('null', context), dictionary.task_history_empty_value);
+    for (const code of ['project_read_only', 'task_archived', 'task_transfer_in_progress', 'destination_type_unavailable', 'hierarchy_requires_group', 'attachment_unavailable', 'assignee_loses_access']) {
+      const text = translate(`task_transfer_reason_${code}`);
+      assert.equal(text.includes('task_transfer_reason_'), false);
+    }
+  }
 });

@@ -329,7 +329,7 @@ pub async fn handle_ws_connection<S>(
         let sys_state = app_state.clone();
         let sys_session = session.clone();
         tokio::spawn(async move {
-            while let Ok(event) = sys_rx.recv().await {
+            while let Ok(mut event) = sys_rx.recv().await {
                 // UserNotification is private per user: the broadcast channel
                 // reaches every open dashboard, so forward it only to
                 // connections authenticated as the target user. All other
@@ -338,8 +338,9 @@ pub async fn handle_ws_connection<S>(
                     user_id: target_user_id,
                     project_id,
                     kind,
+                    link_json,
                     ..
-                } = &event
+                } = &mut event
                 {
                     if sys_user_id.as_deref() != Some(target_user_id.as_str()) {
                         continue;
@@ -361,27 +362,13 @@ pub async fn handle_ws_connection<S>(
                             org_context: Some(org),
                             origin: crate::dispatch::RequestOrigin::Local,
                         };
-                        if kind.starts_with("task_")
-                            && !crate::project_studio::notifications::task_reader(
-                                &ctx,
-                                project_id,
-                                target_user_id,
-                            )
-                        {
+                        let Ok(Some(target)) = crate::project_studio::notifications::current_target(
+                            &ctx, project_id, kind, link_json,
+                        ) else {
                             continue;
-                        }
-                        let visible = crate::dispatch::project_studio::require_read(&ctx)
-                            .and_then(|org| {
-                                crate::dispatch::project_studio::require_project_access(
-                                    &ctx, org, project_id,
-                                )
-                            })
-                            .is_ok_and(|(_, access)| {
-                                crate::dispatch::project_studio::notification_visible(&access, kind)
-                            });
-                        if !visible {
-                            continue;
-                        }
+                        };
+                        *project_id = target.project_id;
+                        *link_json = target.link_json;
                     }
                 }
                 if send_body(

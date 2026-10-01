@@ -22,12 +22,12 @@ use tentaflow_protocol::project_studio::{
     CsvImportError, EnvApprovalItem, EnvironmentInfo, GenerationRunInfo, IngestJobWire, KbHit,
     MemberInfo, MemberInputWire, MlLinkInfo, MlProjectSummaryWire, MlRoleMapEntry,
     MlSyncOutcomeWire, MyWorkEntry, NotificationWire, OverviewKpis, PerfStatsWire,
-    PerfTimelinePoint, ProjectAgentBinding, ProjectInfo, ProjectSettings, ProjectStudioPayload,
-    RunAssignmentWire, RunItemWire, RunStepWire, RunnerInfo, RunnerToolchain, ScheduleInfo,
-    ScheduleRunWire, SourceFileInfo, SourceInfo, SuiteCaseRef, SuiteInfo, TagInfo,
-    TaskAttachmentUsageWire, TaskCommentWire, TaskDetail, TaskEventWire, TaskInfo, TaskLinkWire,
-    TaskStatusDurationWire, TaskTypeWire, TestCaseDetail, TestCaseInfo, TestRunInfo,
-    TestRunItemAutoWire, UserRefWire,
+    PerfTimelinePoint, ProjectAgentBinding, ProjectBreadcrumb, ProjectInfo, ProjectScopeOperation,
+    ProjectSettings, ProjectStudioPayload, ProjectTaskScope, ProjectTreeScope, RunAssignmentWire,
+    RunItemWire, RunStepWire, RunnerInfo, RunnerToolchain, ScheduleInfo, ScheduleRunWire,
+    SourceFileInfo, SourceInfo, SuiteCaseRef, SuiteInfo, TagInfo, TaskAttachmentUsageWire,
+    TaskCommentWire, TaskDetail, TaskEventWire, TaskInfo, TaskLinkWire, TaskStatusDurationWire,
+    TaskTypeWire, TestCaseDetail, TestCaseInfo, TestRunInfo, TestRunItemAutoWire, UserRefWire,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
@@ -35,7 +35,7 @@ use super::HandlerContext;
 use crate::project_studio::models::{
     source_write_area, ActivityRecord, CaseListItem, EnvironmentRecord, GenerationRunRecord,
     IngestJobRecord, MemberInput, ProjectRecord, RunCounts, RunItemRecord, RunRecord,
-    RunStepRecord, SourceListItem, TaskCommentRecord, TaskRecord,
+    RunStepRecord, SourceListItem, TaskCommentRecord,
 };
 use crate::project_studio::{
     activity, api_spec, archive, auto_runs, build_profiles, environments, generation, git_source,
@@ -185,7 +185,7 @@ pub(crate) fn require_task_access(
 }
 
 fn require_owner(access: &ProjectAccessWire) -> Result<(), ProtocolError> {
-    if !access.is_owner && !access.app_admin {
+    if !access.is_owner {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             "project ownership required",
@@ -382,7 +382,11 @@ fn require_active(record: &ProjectRecord) -> Result<(), ProtocolError> {
     if record.status == "archived" {
         return Err(ProtocolError::bad_request("project is archived"));
     }
-    Ok(())
+    if record.lifecycle != "active" {
+        return Err(ProtocolError::bad_request("project is ended"));
+    }
+    repository::project_write_admission(&record.project_id)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))
 }
 
 /// Polls the given ingest jobs until each reaches a terminal status (250 ms
@@ -518,18 +522,61 @@ fn activity_to_wire(
 
 /// Builds the full `ProjectInfo` for one record (list + detail views).
 fn project_info(
+    ctx: &HandlerContext,
     record: &ProjectRecord,
     access: ProjectAccessWire,
     owner_names: &HashMap<String, (String, String)>,
 ) -> Result<ProjectInfo, ProtocolError> {
-    let member_count =
-        repository::member_count(&record.project_id).map_err(|e| db_error("member_count", e))?;
+    let mut member_ids: HashSet<String> = repository::list_members(&record.project_id)
+        .map_err(|e| db_error("member_count", e))?
+        .into_iter()
+        .map(|member| member.user_id)
+        .collect();
+    member_ids.extend(
+        repository::effective_principals(
+            &record.project_id,
+            ProjectArea::Settings,
+            ProjectPermissionLevel::None,
+        )
+        .map_err(|e| db_error("member_count", e))?
+        .into_iter()
+        .map(|member| member.user_id),
+    );
+    let member_count = u32::try_from(member_ids.len())
+        .map_err(|_| ProtocolError::internal("project member count exceeds range"))?;
     let (source_count, sources_ready) =
         if access.allows(ProjectArea::Knowledge, ProjectPermissionLevel::Read) {
             repository::read_source_counts(&record.dir_path)
         } else {
             (0, 0)
         };
+    let org = require_read(ctx)?;
+    let (effective_modules, task_type_source_project_id) =
+        repository::effective_project_settings(&record.project_id)
+            .map_err(|e| db_error("project_settings", e))?;
+    let historical_tasks = (record.lifecycle == "ended" || record.status == "archived")
+        && (access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Read)
+            || access.allows(ProjectArea::Board, ProjectPermissionLevel::Read));
+    let count_scope = if historical_tasks {
+        ProjectTaskScope::Single
+    } else {
+        ProjectTaskScope::Descendants
+    };
+    let allowed = readable_task_projects(ctx, org, &record.project_id, count_scope)?;
+    let counts = repository::project_task_counts(
+        &allowed,
+        std::slice::from_ref(&record.project_id),
+        &org.user_id,
+    )
+    .map_err(|e| db_error("project_task_counts", e))?;
+    let count = counts.get(&record.project_id);
+    let children = repository::list_descendants(&org.org_id, &record.project_id, false)
+        .map_err(|e| db_error("project_children", e))?;
+    let active = record.status == "active"
+        && record.lifecycle == "active"
+        && !access.archived
+        && !access.ended;
+    let owner = access.has_access && record.owner_user_id == org.user_id;
     Ok(ProjectInfo {
         project_id: record.project_id.clone(),
         key_prefix: record.key_prefix.clone(),
@@ -541,7 +588,7 @@ fn project_info(
         description: record.description.clone(),
         status: record.status.clone(),
         template: record.template.clone(),
-        modules: parse_modules_json(&record.modules_json),
+        modules: effective_modules,
         owner_user_id: record.owner_user_id.clone(),
         owner_name: owner_names
             .get(&record.owner_user_id)
@@ -551,10 +598,433 @@ fn project_info(
         source_count,
         sources_ready,
         my_role: None,
+        parent_id: record.parent_id.clone(),
+        path: record.path.clone(),
+        depth: record.depth,
+        is_private: record.is_private,
+        inherit_modules: record.inherit_modules,
+        inherit_task_types: record.inherit_task_types,
+        lifecycle: record.lifecycle.clone(),
+        ended_at: record.ended_at.clone(),
+        can_create_child: active && access.project_admin && record.depth < 4,
+        can_move: active && owner,
+        can_archive: owner && record.status == "active",
+        can_unarchive: owner && record.status == "archived",
+        can_delete: owner
+            && children.is_empty()
+            && (record.parent_id.is_none() || record.lifecycle == "ended"),
+        can_end: active && owner,
+        can_resume: owner && record.lifecycle == "ended" && record.status == "active",
+        can_export: access.has_access && access.project_admin,
+        task_type_source_project_id,
+        own_open_tasks: count.map_or(0, |entry| entry.own_open),
+        descendant_open_tasks: count.map_or(0, |entry| entry.descendant_open),
+        my_open_tasks: count.map_or(0, |entry| entry.my_open),
+        overdue_tasks: count.map_or(0, |entry| entry.overdue),
         access,
         created_at: record.created_at.clone(),
         updated_at: record.updated_at.clone(),
     })
+}
+
+fn breadcrumb(record: &ProjectRecord) -> ProjectBreadcrumb {
+    ProjectBreadcrumb {
+        project_id: record.project_id.clone(),
+        name: record.name.clone(),
+        depth: record.depth,
+    }
+}
+
+fn readable_task_projects(
+    ctx: &HandlerContext,
+    org: &OrgContext,
+    project_id: &str,
+    scope: ProjectTaskScope,
+) -> Result<Vec<String>, ProtocolError> {
+    let mut ids = Vec::new();
+    let candidates = if scope == ProjectTaskScope::Single {
+        vec![repository::get_project(&org.org_id, project_id)
+            .map_err(|e| db_error("project", e))?
+            .ok_or_else(not_found)?]
+    } else {
+        repository::list_descendants(&org.org_id, project_id, true)
+            .map_err(|e| db_error("project_tree", e))?
+    };
+    for record in candidates {
+        let access = repository::project_access(&record, &org.user_id, is_admin(ctx))
+            .map_err(|e| db_error("project_access", e))?;
+        if task_access(&access, ProjectPermissionLevel::Read)
+            && (scope == ProjectTaskScope::Single
+                || (record.lifecycle == "active"
+                    && !access.ended
+                    && record.status == "active"
+                    && !access.archived))
+        {
+            ids.push(record.project_id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+fn project_tree(
+    ctx: &HandlerContext,
+    project_id: Option<&str>,
+    include_ended: bool,
+    include_archived: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let records = if let Some(id) = project_id {
+        require_project_access(ctx, org, id)?;
+        repository::list_descendants(&org.org_id, id, true)
+            .map_err(|e| db_error("project_tree", e))?
+    } else {
+        repository::list_projects(&org.org_id, include_archived)
+            .map_err(|e| db_error("project_tree", e))?
+    };
+    let names = repository::resolve_user_refs(
+        &records
+            .iter()
+            .map(|record| record.owner_user_id.clone())
+            .collect::<Vec<_>>(),
+    );
+    let mut projects = Vec::new();
+    let mut ancestors = HashMap::new();
+    for record in records {
+        if (!include_ended && record.lifecycle == "ended")
+            || (!include_archived && record.status == "archived")
+        {
+            continue;
+        }
+        let access = repository::project_access(&record, &org.user_id, is_admin(ctx))
+            .map_err(|e| db_error("project_access", e))?;
+        if !access.has_access {
+            continue;
+        }
+        for ancestor in repository::project_ancestry(&org.org_id, &record.project_id)
+            .map_err(|e| db_error("project_ancestry", e))?
+        {
+            ancestors.insert(ancestor.project_id.clone(), ancestor);
+        }
+        projects.push(project_info(ctx, &record, access, &names)?);
+    }
+    let visible: HashSet<&str> = projects
+        .iter()
+        .map(|project| project.project_id.as_str())
+        .collect();
+    let mut breadcrumbs: Vec<_> = ancestors
+        .values()
+        .filter(|record| !visible.contains(record.project_id.as_str()))
+        .map(breadcrumb)
+        .collect();
+    breadcrumbs.sort_by(|left, right| {
+        (left.depth, &left.project_id).cmp(&(right.depth, &right.project_id))
+    });
+    projects.sort_by(|left, right| left.path.cmp(&right.path));
+    let can_create = is_admin(ctx)
+        || repository::has_creator_grant(&org.user_id, &org.org_id)
+            .map_err(|e| db_error("creator_grant", e))?;
+    Ok(ps(ProjectStudioPayload::ProjectTreeResponse {
+        projects,
+        breadcrumbs,
+        can_create,
+        can_administer: is_admin(ctx),
+    }))
+}
+
+fn project_move(
+    ctx: &HandlerContext,
+    project_id: &str,
+    parent_id: Option<&str>,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_owner(&access)?;
+    require_active(&record)?;
+    if let Some(id) = parent_id {
+        let (parent, access) = require_project_access(ctx, org, id)?;
+        require_owner(&access)?;
+        require_active(&parent)?;
+    }
+    let ok = repository::move_project(&org.org_id, project_id, parent_id)
+        .map_err(|e| task_mutation_error("project_move", e))?;
+    if ok {
+        record_access_mutation(
+            ctx,
+            org,
+            project_id,
+            "project.moved",
+            project_id,
+            &serde_json::json!({"from_parent_id":record.parent_id,"to_parent_id":parent_id})
+                .to_string(),
+        );
+    }
+    Ok(ps(ProjectStudioPayload::ProjectMoveResult { ok }))
+}
+
+fn project_inheritance_preview(
+    ctx: &HandlerContext,
+    project_id: &str,
+    inherit_modules: bool,
+    inherit_task_types: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_active(&record)?;
+    let (current_modules, current_type_source) = repository::effective_project_settings(project_id)
+        .map_err(|e| db_error("project_settings", e))?;
+    let parent =
+        if inherit_modules || inherit_task_types {
+            Some(record.parent_id.as_deref().ok_or_else(|| {
+                ProtocolError::bad_request("root project cannot inherit settings")
+            })?)
+        } else {
+            record.parent_id.as_deref()
+        };
+    let proposed_modules = if inherit_modules {
+        repository::effective_project_settings(parent.expect("checked parent"))
+            .map_err(|e| db_error("parent_settings", e))?
+            .0
+    } else {
+        current_modules.clone()
+    };
+    let proposed_type_source = if inherit_task_types {
+        repository::effective_project_settings(parent.expect("checked parent"))
+            .map_err(|e| db_error("parent_settings", e))?
+            .1
+    } else {
+        current_type_source.clone()
+    };
+    let current_pool = open_project_pool(&current_type_source)?;
+    let proposed_pool = open_project_pool(&proposed_type_source)?;
+    let current_task_types = tasks::list_task_types(&current_pool)
+        .map_err(|e| db_error("task_types", e))?
+        .into_iter()
+        .map(task_type_to_wire)
+        .collect();
+    let proposed_task_types = tasks::list_task_types(&proposed_pool)
+        .map_err(|e| db_error("task_types", e))?
+        .into_iter()
+        .map(task_type_to_wire)
+        .collect();
+    Ok(ps(
+        ProjectStudioPayload::ProjectInheritancePreviewResponse {
+            current_modules,
+            proposed_modules,
+            current_task_types,
+            proposed_task_types,
+        },
+    ))
+}
+
+fn project_inheritance_save(
+    ctx: &HandlerContext,
+    project_id: &str,
+    is_private: bool,
+    inherit_modules: bool,
+    inherit_task_types: bool,
+    modules: &[String],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_active(&record)?;
+    let (_, source) = repository::effective_project_settings(project_id)
+        .map_err(|e| db_error("project_settings", e))?;
+    let modules = normalize_modules(modules)?;
+    let ok = repository::save_project_inheritance(
+        &org.org_id,
+        project_id,
+        is_private,
+        inherit_modules,
+        inherit_task_types,
+        &serde_json::to_string(&modules).map_err(|e| db_error("modules", e))?,
+        &source,
+    )
+    .map_err(|e| task_mutation_error("project_inheritance", e))?;
+    let (effective_modules, task_type_source_project_id) =
+        repository::effective_project_settings(project_id)
+            .map_err(|e| db_error("project_settings", e))?;
+    if ok {
+        record_access_mutation(ctx, org, project_id, "project.inheritance_changed", project_id,
+        &serde_json::json!({"is_private":is_private,"inherit_modules":inherit_modules,"inherit_task_types":inherit_task_types,"modules":effective_modules}).to_string());
+    }
+    Ok(ps(ProjectStudioPayload::ProjectInheritanceSaveResult {
+        ok,
+        effective_modules,
+        task_type_source_project_id,
+    }))
+}
+
+fn authorized_scope(
+    ctx: &HandlerContext,
+    project_id: &str,
+    scope: ProjectTreeScope,
+    operation: ProjectScopeOperation,
+) -> Result<Vec<ProjectRecord>, ProtocolError> {
+    let org = require_read(ctx)?;
+    require_project_access(ctx, org, project_id)?;
+    let all = repository::list_descendants(&org.org_id, project_id, true)
+        .map_err(|e| db_error("project_scope", e))?;
+    if operation == ProjectScopeOperation::Archive
+        && scope == ProjectTreeScope::Node
+        && all.len() != 1
+    {
+        return Err(ProtocolError::bad_request(
+            "project has children; select subtree scope",
+        ));
+    }
+    let nodes: Vec<_> = all
+        .into_iter()
+        .filter(|node| scope == ProjectTreeScope::Subtree || node.project_id == project_id)
+        .collect();
+    for node in &nodes {
+        let (_, access) = require_project_access(ctx, org, &node.project_id)?;
+        match operation {
+            ProjectScopeOperation::Archive => require_owner(&access)?,
+            ProjectScopeOperation::Export if !access.project_admin => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::PolicyDenied,
+                    "project export access denied",
+                ))
+            }
+            ProjectScopeOperation::Export => {}
+        }
+    }
+    Ok(nodes)
+}
+
+fn project_scope_preview(
+    ctx: &HandlerContext,
+    project_id: &str,
+    scope: ProjectTreeScope,
+    operation: ProjectScopeOperation,
+) -> Result<MessageBody, ProtocolError> {
+    let nodes = authorized_scope(ctx, project_id, scope, operation)?
+        .iter()
+        .map(breadcrumb)
+        .collect();
+    Ok(ps(ProjectStudioPayload::ProjectScopePreviewResponse {
+        nodes,
+    }))
+}
+
+fn project_lifecycle_preview(
+    ctx: &HandlerContext,
+    project_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_owner(&access)?;
+    let pool = open_project_pool(project_id)?;
+    let conn = pool.read().map_err(|e| db_error("project_content", e))?;
+    let open_task_count: u32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE status<>'done' AND archived_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| db_error("project_tasks", e))?;
+    drop(conn);
+    let active_children: Vec<_> = repository::list_descendants(&org.org_id, project_id, false)
+        .map_err(|e| db_error("project_children", e))?
+        .into_iter()
+        .filter(|node| {
+            node.parent_id.as_deref() == Some(project_id)
+                && node.status == "active"
+                && node.lifecycle == "active"
+        })
+        .map(|node| breadcrumb(&node))
+        .collect();
+    let all_projects = repository::list_projects(&org.org_id, false)
+        .map_err(|e| db_error("project_members", e))?;
+    let mut exclusive_member_count = 0;
+    for member in
+        repository::list_members(project_id).map_err(|e| db_error("project_members", e))?
+    {
+        if !member.is_active() {
+            continue;
+        }
+        let mut elsewhere = false;
+        for other in all_projects
+            .iter()
+            .filter(|other| other.project_id != project_id)
+        {
+            if repository::project_access(other, &member.user_id, false)
+                .map_err(|e| db_error("member_access", e))?
+                .has_access
+            {
+                elsewhere = true;
+                break;
+            }
+        }
+        if !elsewhere {
+            exclusive_member_count += 1;
+        }
+    }
+    let can_end = record.status == "active"
+        && record.lifecycle == "active"
+        && open_task_count == 0
+        && active_children.is_empty();
+    Ok(ps(ProjectStudioPayload::ProjectLifecyclePreviewResponse {
+        open_task_count,
+        active_children,
+        exclusive_member_count,
+        can_end,
+    }))
+}
+
+fn project_lifecycle(
+    ctx: &HandlerContext,
+    project_id: &str,
+    ended: bool,
+    confirmation_key: &str,
+    reason: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    require_owner(&access)?;
+    if confirmation_key.trim() != record.key_prefix {
+        return Err(ProtocolError::bad_request(
+            "project key confirmation does not match",
+        ));
+    }
+    if reason.trim().is_empty() || reason.len() > 10000 {
+        return Err(ProtocolError::bad_request(
+            "project lifecycle reason is required",
+        ));
+    }
+    let ok = if ended {
+        let pool = open_project_pool(project_id)?;
+        let operation_id =
+            repository::prepare_project_end(&org.org_id, project_id, &org.user_id, reason)
+                .map_err(|e| task_mutation_error("project_end", e))?;
+        match media::with_publication_gate(|| {
+            repository::finalize_project_end(&org.org_id, project_id, &operation_id, &pool)
+        }) {
+            Ok(ok) => ok,
+            Err(error) => {
+                repository::abort_project_end(&org.org_id, project_id, &operation_id)
+                    .map_err(|e| db_error("project_end_abort", e))?;
+                return Err(task_mutation_error("project_end", error));
+            }
+        }
+    } else {
+        repository::resume_project(&org.org_id, project_id, &org.user_id, reason)
+            .map_err(|e| task_mutation_error("project_resume", e))?
+    };
+    Ok(ps(ProjectStudioPayload::ProjectLifecycleResult { ok }))
 }
 
 // =============================================================================
@@ -575,6 +1045,53 @@ pub async fn project_studio_dispatch(
 
     use ProjectStudioPayload as P;
     match payload {
+        P::ProjectTreeRequest {
+            project_id,
+            include_ended,
+            include_archived,
+        } => project_tree(
+            ctx,
+            project_id.as_deref(),
+            *include_ended,
+            *include_archived,
+        ),
+        P::ProjectMoveRequest {
+            project_id,
+            new_parent_id,
+        } => project_move(ctx, project_id, new_parent_id.as_deref()),
+        P::ProjectInheritancePreviewRequest {
+            project_id,
+            inherit_modules,
+            inherit_task_types,
+        } => project_inheritance_preview(ctx, project_id, *inherit_modules, *inherit_task_types),
+        P::ProjectInheritanceSaveRequest {
+            project_id,
+            is_private,
+            inherit_modules,
+            inherit_task_types,
+            modules,
+        } => project_inheritance_save(
+            ctx,
+            project_id,
+            *is_private,
+            *inherit_modules,
+            *inherit_task_types,
+            modules,
+        ),
+        P::ProjectLifecyclePreviewRequest { project_id } => {
+            project_lifecycle_preview(ctx, project_id)
+        }
+        P::ProjectLifecycleRequest {
+            project_id,
+            ended,
+            confirmation_key,
+            reason,
+        } => project_lifecycle(ctx, project_id, *ended, confirmation_key, reason),
+        P::ProjectScopePreviewRequest {
+            project_id,
+            scope,
+            operation,
+        } => project_scope_preview(ctx, project_id, *scope, *operation),
         P::Access(access) => access_dispatch(ctx, access),
         P::ProjectsListRequest { include_archived } => projects_list_v1(ctx, *include_archived),
         P::ProjectCreateRequest {
@@ -583,6 +1100,10 @@ pub async fn project_studio_dispatch(
             template,
             modules,
             key_prefix,
+            parent_id,
+            is_private,
+            inherit_modules,
+            inherit_task_types,
             members,
         } => project_create_v1(
             ctx,
@@ -591,6 +1112,10 @@ pub async fn project_studio_dispatch(
             template,
             modules,
             key_prefix,
+            parent_id.as_deref(),
+            *is_private,
+            *inherit_modules,
+            *inherit_task_types,
             members,
         ),
         P::ProjectGetRequest { project_id } => project_get_v1(ctx, project_id),
@@ -603,7 +1128,8 @@ pub async fn project_studio_dispatch(
         P::ProjectArchiveRequest {
             project_id,
             archived,
-        } => project_archive_v1(ctx, project_id, *archived),
+            scope,
+        } => project_archive_v1(ctx, project_id, *archived, *scope),
         P::ProjectDeleteRequest { project_id } => project_delete_v1(ctx, project_id).await,
         P::MembersListRequest { project_id } => members_list_v1(ctx, project_id),
         P::MemberCandidatesRequest {
@@ -1023,6 +1549,41 @@ pub async fn project_studio_dispatch(
             attachments_json,
         ),
         P::MyTestWorkRequest => my_test_work_v1(ctx),
+        P::TaskNotPursuedRequest {
+            project_id,
+            task_id,
+            reason,
+        } => task_not_pursued(ctx, project_id, task_id, reason),
+        P::TaskTransferPreviewRequest {
+            source_project_id,
+            destination_project_id,
+            task_id,
+        } => task_transfer_preview(ctx, source_project_id, destination_project_id, task_id),
+        P::TaskTransferRequest {
+            source_project_id,
+            destination_project_id,
+            task_id,
+            confirm_wider_access,
+        } => task_transfer(
+            ctx,
+            source_project_id,
+            destination_project_id,
+            task_id,
+            *confirm_wider_access,
+        ),
+        P::TaskKeyResolveRequest {
+            task_key,
+            task_id,
+            origin_project_id,
+            origin_event_id,
+        } => task_key_resolve(
+            ctx,
+            task_key.as_deref(),
+            task_id.as_deref(),
+            origin_project_id.as_deref(),
+            origin_event_id.as_deref(),
+        ),
+        P::TaskIndexStatusRequest { project_id } => task_index_status(ctx, project_id),
         P::TasksListRequest {
             project_id,
             task_type,
@@ -1033,6 +1594,8 @@ pub async fn project_studio_dispatch(
             limit,
             severity,
             include_archived,
+            scope,
+            source_project_ids,
         } => tasks_list_v1(
             ctx,
             project_id,
@@ -1044,6 +1607,8 @@ pub async fn project_studio_dispatch(
             *limit,
             severity,
             *include_archived,
+            *scope,
+            source_project_ids,
         ),
         P::TaskGetRequest {
             project_id,
@@ -1441,12 +2006,14 @@ pub async fn project_studio_dispatch(
             include_runs,
             include_vectors,
             include_user_names,
+            scope,
         } => project_export_start_v1(
             ctx,
             project_id,
             *include_runs,
             *include_vectors,
             *include_user_names,
+            *scope,
         ),
         P::ProjectExportStatusRequest { project_id, job_id } => {
             project_export_status_v1(ctx, project_id, job_id)
@@ -1473,7 +2040,19 @@ pub async fn project_studio_dispatch(
         | P::CodeAssistRequest { .. } => Err(ProtocolError::bad_request(
             "use streaming subscribe for this variant",
         )),
-        P::ProjectsListResponse { .. }
+        P::ProjectTreeResponse { .. }
+        | P::ProjectMoveResult { .. }
+        | P::ProjectInheritancePreviewResponse { .. }
+        | P::ProjectInheritanceSaveResult { .. }
+        | P::ProjectLifecyclePreviewResponse { .. }
+        | P::ProjectLifecycleResult { .. }
+        | P::ProjectScopePreviewResponse { .. }
+        | P::TaskNotPursuedResult { .. }
+        | P::TaskTransferPreviewResponse { .. }
+        | P::TaskTransferResult { .. }
+        | P::TaskKeyResolveResponse { .. }
+        | P::TaskIndexStatusResponse { .. }
+        | P::ProjectsListResponse { .. }
         | P::ProjectCreateResponse { .. }
         | P::ProjectGetResponse { .. }
         | P::ProjectUpdateResult { .. }
@@ -1636,6 +2215,54 @@ macro_rules! register_project_studio_variant {
 register_project_studio_variant!(
     "ProjectStudioProjectsListRequest",
     "tentaflow_ws_handler_ps_projects_list"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectTreeRequest",
+    "tentaflow_ws_handler_ps_project_tree"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectMoveRequest",
+    "tentaflow_ws_handler_ps_project_move"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectInheritancePreviewRequest",
+    "tentaflow_ws_handler_ps_project_inheritance_preview"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectInheritanceSaveRequest",
+    "tentaflow_ws_handler_ps_project_inheritance_save"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectLifecyclePreviewRequest",
+    "tentaflow_ws_handler_ps_project_lifecycle_preview"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectLifecycleRequest",
+    "tentaflow_ws_handler_ps_project_lifecycle"
+);
+register_project_studio_variant!(
+    "ProjectStudioProjectScopePreviewRequest",
+    "tentaflow_ws_handler_ps_project_scope_preview"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskNotPursuedRequest",
+    "tentaflow_ws_handler_ps_task_not_pursued"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskTransferPreviewRequest",
+    "tentaflow_ws_handler_ps_task_transfer_preview"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskTransferRequest",
+    "tentaflow_ws_handler_ps_task_transfer"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskKeyResolveRequest",
+    "tentaflow_ws_handler_ps_task_key_resolve"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskIndexStatusRequest",
+    "tentaflow_ws_handler_ps_task_index_status"
 );
 register_project_studio_variant!(
     "ProjectStudioProjectCreateRequest",
@@ -2178,21 +2805,15 @@ fn projects_list_v1(
     let admin = is_admin(ctx);
     let records = repository::list_projects(&org.org_id, include_archived)
         .map_err(|e| db_error("projects_list", e))?;
-    let memberships = repository::member_accesses_for_user(&org.user_id)
-        .map_err(|e| db_error("member_accesses", e))?;
-
-    let visible: Vec<&ProjectRecord> = records
-        .iter()
-        .filter(|r| admin || memberships.contains_key(&r.project_id))
-        .collect();
-    let owner_ids: Vec<String> = visible.iter().map(|r| r.owner_user_id.clone()).collect();
+    let owner_ids: Vec<String> = records.iter().map(|r| r.owner_user_id.clone()).collect();
     let names = repository::resolve_user_refs(&owner_ids);
-
-    let mut projects = Vec::with_capacity(visible.len());
-    for record in visible {
+    let mut projects = Vec::new();
+    for record in &records {
         let access = repository::project_access(record, &org.user_id, admin)
             .map_err(|e| db_error("project_access", e))?;
-        projects.push(project_info(record, access, &names)?);
+        if access.has_access && !access.ended {
+            projects.push(project_info(ctx, record, access, &names)?);
+        }
     }
 
     let can_create = admin
@@ -2212,18 +2833,30 @@ fn project_create_v1(
     template: &str,
     modules: &[String],
     key_prefix: &str,
+    parent_id: Option<&str>,
+    is_private: bool,
+    inherit_modules: Option<bool>,
+    inherit_task_types: Option<bool>,
     members: &[MemberInputWire],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let can_create = is_admin(ctx)
-        || repository::has_creator_grant(&org.user_id, &org.org_id)
-            .map_err(|e| db_error("creator_grant", e))?;
-    if !can_create {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "project creation requires a creator grant",
-        ));
+    if let Some(parent_id) = parent_id {
+        let (parent, access) = require_project_access(ctx, org, parent_id)?;
+        require_project_admin(&access)?;
+        require_active(&parent)?;
+    } else {
+        let can_create = is_admin(ctx)
+            || repository::has_creator_grant(&org.user_id, &org.org_id)
+                .map_err(|e| db_error("creator_grant", e))?;
+        if !can_create {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                "project creation requires a creator grant",
+            ));
+        }
     }
+    let inherit_modules = inherit_modules.unwrap_or(parent_id.is_some());
+    let inherit_task_types = inherit_task_types.unwrap_or(parent_id.is_some());
 
     let name = name.trim();
     if name.is_empty() || name.len() > 200 {
@@ -2265,6 +2898,10 @@ fn project_create_v1(
         &org.user_id,
         &dir.to_string_lossy(),
         key_prefix,
+        parent_id,
+        is_private,
+        inherit_modules,
+        inherit_task_types,
         &initial,
     ) {
         // Registry insert failed (e.g. duplicate name) — the freshly created
@@ -2306,7 +2943,7 @@ fn project_get_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody,
     let org = require_read(ctx)?;
     let (record, my_access) = require_project_access(ctx, org, project_id)?;
     let names = repository::resolve_user_refs(std::slice::from_ref(&record.owner_user_id));
-    let project = project_info(&record, my_access, &names)?;
+    let project = project_info(ctx, &record, my_access, &names)?;
     Ok(ps(ProjectStudioPayload::ProjectGetResponse { project }))
 }
 
@@ -2364,31 +3001,42 @@ fn project_archive_v1(
     ctx: &HandlerContext,
     project_id: &str,
     archived: bool,
+    scope: ProjectTreeScope,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, access) = require_project_access(ctx, org, project_id)?;
-    require_owner(&access)?;
-    // Record while the pool may still be open; archiving closes it afterwards.
-    if let Ok(pool) = project_db::open(project_id) {
-        activity::record(
-            &pool,
-            &org.user_id,
-            "user",
+    let nodes = authorized_scope(ctx, project_id, scope, ProjectScopeOperation::Archive)?;
+    let ids: Vec<String> = nodes.iter().map(|node| node.project_id.clone()).collect();
+    let pools = nodes
+        .iter()
+        .map(|node| open_project_pool(&node.project_id))
+        .collect::<Result<Vec<_>, _>>()?;
+    let ok = media::with_publication_gate(|| {
+        repository::set_project_archived(&org.org_id, project_id, archived, scope, &ids)
+    })
+    .map_err(|e| task_mutation_error("project_archive", e))?;
+    if ok {
+        for node in nodes {
+            if let Ok(pool) = project_db::open(&node.project_id) {
+                activity::record(
+                    &pool,
+                    &org.user_id,
+                    "user",
+                    if archived {
+                        "project.archived"
+                    } else {
+                        "project.unarchived"
+                    },
+                    "project",
+                    &node.project_id,
+                    &serde_json::json!({"scope":scope}).to_string(),
+                );
+            }
             if archived {
-                "project.archived"
-            } else {
-                "project.unarchived"
-            },
-            "project",
-            project_id,
-            "{}",
-        );
+                project_db::close(&node.project_id);
+            }
+        }
     }
-    let ok = repository::set_project_archived(&org.org_id, project_id, archived)
-        .map_err(|e| db_error("project_archive", e))?;
-    if archived {
-        project_db::close(project_id);
-    }
+    drop(pools);
     Ok(ps(ProjectStudioPayload::ProjectArchiveResult { ok }))
 }
 
@@ -2400,11 +3048,35 @@ async fn project_delete_v1(
     let (record, access) = require_project_access(ctx, org, project_id)?;
     require_owner(&access)?;
 
+    let pending = repository::pending_project_deletions()
+        .map_err(|e| db_error("project_delete.pending", e))?
+        .into_iter()
+        .find(|operation| operation.project.project_id == project_id);
+    let operation_id = if let Some(pending) = pending {
+        let operation_id =
+            repository::prepare_project_delete(&org.org_id, project_id, &org.user_id)
+                .map_err(|e| task_mutation_error("project_delete.prepare", e))?;
+        if operation_id != pending.operation_id {
+            return Err(ProtocolError::bad_request(
+                "project deletion changed; retry the current operation",
+            ));
+        }
+        Some(operation_id)
+    } else {
+        None
+    };
     let content_pool = if std::path::Path::new(&record.dir_path)
         .join("project.db")
         .is_file()
     {
-        Some(project_db::open(project_id).map_err(|e| db_error("project_storage", e))?)
+        let pool = if operation_id.is_some() {
+            project_db::open_pool_at(std::path::Path::new(&record.dir_path))
+                .map_err(|e| db_error("project_delete.storage", e))?
+                .0
+        } else {
+            project_db::open(project_id).map_err(|e| db_error("project_storage", e))?
+        };
+        Some(pool)
     } else {
         let central =
             crate::project_studio::db::pool().map_err(|e| db_error("project_registry", e))?;
@@ -2425,6 +3097,11 @@ async fn project_delete_v1(
         }
         None
     };
+    let operation_id = match operation_id {
+        Some(operation_id) => operation_id,
+        None => repository::prepare_project_delete(&org.org_id, project_id, &org.user_id)
+            .map_err(|e| task_mutation_error("project_delete.prepare", e))?,
+    };
     if let Some(pool) = content_pool.as_ref() {
         let ids = repository::running_jobs(pool)
             .map_err(|e| db_error("running_jobs", e))?
@@ -2438,38 +3115,9 @@ async fn project_delete_v1(
     }
     let (record, access) = require_project_access(ctx, org, project_id)?;
     require_owner(&access)?;
-    if let Some(pool) = content_pool.as_ref() {
-        for link in ml_link::list(pool).map_err(|e| db_error("ml_links", e))? {
-            ml_link::detach(pool, project_id, &link, true).map_err(|e| db_error("ml_revoke", e))?;
-        }
-    }
     drop(content_pool);
-    // 2. Drop the cached pool (checkpoint + release the SQLite handle).
-    project_db::close(project_id);
-    // 3. Drop every vector namespace of the `ps-<id>` scope (registry rows in
-    //    tentaflow.db + on-disk data inside the project dir).
-    ingest::drop_project_namespaces(&ctx.state.db, &org.org_id, project_id)
-        .map_err(|e| db_error("drop_namespaces", e))?;
-    // 4. Same for the knowledge graph: the registry rows live in tentaflow.db,
-    //    so removing the project directory alone would leave them dangling.
-    ingest::drop_project_graph(&ctx.state.db, &org.org_id, project_id)
-        .map_err(|e| db_error("drop_graph", e))?;
-    // 5. Remove the project directory (project.db, files/, vectors/, graph/).
-    let dir = std::path::PathBuf::from(&record.dir_path);
-    let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir))
-        .await
-        .map_err(|_| ProtocolError::internal("project dir removal task panicked"))?;
-    if let Err(e) = removed {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            return Err(ProtocolError::internal(format!("project dir removal: {e}")));
-        }
-    }
-    // 6. Central registry rows last — a crash above leaves the project
-    //    visible (and the delete retryable) instead of orphaning data.
-    repository::delete_project_rows(project_id).map_err(|e| db_error("project_delete", e))?;
-    // The schedule loop reads the hint table, not `projects` — a leftover row
-    // would keep pointing at a project that no longer exists.
-    schedules::delete_hint(project_id);
+    archive::finish_project_delete(&ctx.state.db, &record, &operation_id)
+        .map_err(|e| db_error("project_delete", e))?;
 
     activity::record_org_security(
         &ctx.state.db,
@@ -2488,41 +3136,83 @@ async fn project_delete_v1(
 
 fn members_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _access) = require_project_access(ctx, org, project_id)?;
-    let rows = repository::list_members(project_id).map_err(|e| db_error("members_list", e))?;
-    let mut ids: Vec<String> = rows.iter().map(|m| m.user_id.clone()).collect();
-    ids.extend(rows.iter().map(|m| m.invited_by.clone()));
-    let names = repository::resolve_user_refs(&ids);
-    let members = rows
+    let (record, _) = require_project_access(ctx, org, project_id)?;
+    let mut local: HashMap<String, _> = repository::list_members(project_id)
+        .map_err(|e| db_error("members", e))?
         .into_iter()
-        .map(|m| -> Result<MemberInfo, ProtocolError> {
-            Ok(MemberInfo {
-                display_name: names
-                    .get(&m.user_id)
-                    .map(|(n, _)| n.clone())
-                    .unwrap_or_else(|| m.user_id.clone()),
-                email: names
-                    .get(&m.user_id)
-                    .map(|(_, e)| e.clone())
-                    .unwrap_or_default(),
-                invited_by_name: names
-                    .get(&m.invited_by)
-                    .map(|(n, _)| n.clone())
-                    .unwrap_or_else(|| m.invited_by.clone()),
-                access: repository::project_access(&record, &m.user_id, false)
-                    .map_err(|e| db_error("member_access", e))?,
-                is_owner: record.owner_user_id == m.user_id,
-                active: m.is_active(),
-                functions: m.functions,
-                project_admin: m.project_admin,
-                expires_at: m.expires_at,
-                user_id: m.user_id,
-                role: String::new(),
-                invited_by: m.invited_by,
-                created_at: m.created_at,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|member| (member.user_id.clone(), member))
+        .collect();
+    let principals = repository::effective_principals(
+        project_id,
+        ProjectArea::Settings,
+        ProjectPermissionLevel::None,
+    )
+    .map_err(|e| db_error("effective_members", e))?;
+    let mut origins: HashMap<String, Vec<String>> = principals
+        .into_iter()
+        .map(|principal| (principal.user_id, principal.origin_project_ids))
+        .collect();
+    let ancestry: HashMap<String, _> = repository::project_ancestry(&org.org_id, project_id)
+        .map_err(|e| db_error("member_origins", e))?
+        .into_iter()
+        .map(|node| (node.project_id.clone(), node))
+        .collect();
+    let mut ids: Vec<String> = local.keys().chain(origins.keys()).cloned().collect();
+    ids.sort();
+    ids.dedup();
+    let mut identities = ids.clone();
+    identities.extend(local.values().map(|member| member.invited_by.clone()));
+    let names = repository::resolve_user_refs(&identities);
+    let mut members = Vec::new();
+    for id in ids {
+        let member = local.remove(&id);
+        let access = repository::project_access(&record, &id, false)
+            .map_err(|e| db_error("member_access", e))?;
+        let inherited = member.is_none();
+        let active = member
+            .as_ref()
+            .map_or(access.has_access, |member| member.is_active());
+        let mut origin_ids = origins.remove(&id).unwrap_or_default();
+        if member.is_some() && !origin_ids.contains(&record.project_id) {
+            origin_ids.push(record.project_id.clone());
+        }
+        let mut origin_projects: Vec<_> = origin_ids
+            .iter()
+            .filter_map(|id| ancestry.get(id))
+            .map(breadcrumb)
+            .collect();
+        origin_projects.sort_by_key(|origin| origin.depth);
+        let invited_by = member
+            .as_ref()
+            .map_or_else(String::new, |member| member.invited_by.clone());
+        members.push(MemberInfo {
+            display_name: names
+                .get(&id)
+                .map(|(name, _)| name.clone())
+                .unwrap_or_else(|| id.clone()),
+            email: names
+                .get(&id)
+                .map(|(_, email)| email.clone())
+                .unwrap_or_default(),
+            invited_by_name: display_name(&names, &invited_by),
+            invited_by,
+            created_at: member
+                .as_ref()
+                .map_or_else(String::new, |member| member.created_at.clone()),
+            functions: member
+                .as_ref()
+                .map_or_else(Vec::new, |member| member.functions.clone()),
+            project_admin: member.as_ref().is_some_and(|member| member.project_admin),
+            expires_at: member.and_then(|member| member.expires_at),
+            is_owner: record.owner_user_id == id,
+            active,
+            access,
+            user_id: id,
+            role: String::new(),
+            inherited,
+            origin_projects,
+        });
+    }
     Ok(ps(ProjectStudioPayload::MembersListResponse { members }))
 }
 
@@ -2703,15 +3393,28 @@ fn ownership_transfer_v1(
     // Owner tier: the owner themselves, or an org admin taking over an
     // orphaned project.
     let (record, access) = require_project_access(ctx, org, project_id)?;
-    require_owner(&access)?;
+    let owner_active =
+        crate::db::repository::get_user_account_by_id(&ctx.state.db, &record.owner_user_id)
+            .map_err(|e| db_error("project_owner", e))?
+            .is_some_and(|owner| owner.is_active);
+    if !access.is_owner && !(access.app_admin && !owner_active) {
+        require_owner(&access)?;
+    }
     require_active(&record)?;
     if new_owner_user_id == record.owner_user_id {
         return Err(ProtocolError::bad_request("user is already the owner"));
     }
-    repository::member_access(project_id, new_owner_user_id)
-        .map_err(|e| db_error("member_access", e))?
-        .filter(|member| member.is_active())
-        .ok_or_else(|| ProtocolError::bad_request("new owner must be an active project member"))?;
+    let recipient_active =
+        crate::db::repository::get_user_account_by_id(&ctx.state.db, new_owner_user_id)
+            .map_err(|e| db_error("project_owner", e))?
+            .is_some_and(|owner| owner.is_active);
+    let recipient = repository::project_access(&record, new_owner_user_id, false)
+        .map_err(|e| db_error("project_owner_access", e))?;
+    if !recipient_active || !recipient.has_access {
+        return Err(ProtocolError::bad_request(
+            "new owner must be an active project member",
+        ));
+    }
     repository::transfer_ownership(project_id, &record.owner_user_id, new_owner_user_id)
         .map_err(|e| db_error("ownership_transfer", e))?;
     if let Ok(pool) = project_db::open(project_id) {
@@ -4281,6 +4984,7 @@ fn normalize_attachments(
     let dir = std::path::Path::new(&record.dir_path);
     let files = media::safe_directory(dir, "files")
         .map_err(|_| ProtocolError::bad_request("attachment storage is unavailable"))?;
+    let pool = open_project_pool(&record.project_id)?;
     for entry in &list {
         if !is_sha256_hex(&entry.sha256) {
             return Err(ProtocolError::bad_request(
@@ -4296,7 +5000,7 @@ fn normalize_attachments(
         );
         let retained = owner
             .and_then(|owner| {
-                require_attachment(ctx, &record.project_id, owner, &entry.sha256).ok()
+                require_attachment(ctx, &pool, &record.project_id, owner, &entry.sha256).ok()
             })
             .map(|(_, attachment)| attachment);
         let authorized = match (staged, retained) {
@@ -4556,8 +5260,19 @@ fn step_to_wire(record: RunStepRecord) -> RunStepWire {
     }
 }
 
-fn task_to_wire(record: TaskRecord, names: &HashMap<String, (String, String)>) -> TaskInfo {
+fn task_to_wire(
+    record: crate::project_studio::models::TaskIndexSnapshot,
+    project_id: &str,
+    project_name: &str,
+    task_type_name: &str,
+    names: &HashMap<String, (String, String)>,
+) -> TaskInfo {
     TaskInfo {
+        project_id: project_id.into(),
+        project_name: project_name.into(),
+        task_type_name: task_type_name.into(),
+        resolution: record.resolution,
+        resolution_reason: record.resolution_reason,
         assigned_to_name: display_name(names, &record.assigned_to),
         created_by_name: display_name(names, &record.created_by),
         task_id: record.task_id,
@@ -5223,6 +5938,7 @@ fn cases_import_csv_v1(
 
 pub(crate) fn require_attachment(
     ctx: &HandlerContext,
+    pool: &crate::db::DbPool,
     project_id: &str,
     owner: &media::AttachmentOwner,
     sha256: &str,
@@ -5249,9 +5965,8 @@ pub(crate) fn require_attachment(
             ProjectPermissionLevel::Read,
         )?
     };
-    let pool = open_project_pool(project_id)?;
     let attachment = if owner.kind == AttachmentOwnerKind::Task {
-        tasks::task_attachment_metadata(&pool, &owner.id, sha256).map_err(|e| db_error("task_attachment", e))?
+        tasks::task_attachment_metadata(pool, &owner.id, sha256).map_err(|e| db_error("task_attachment", e))?
     } else {
         use rusqlite::OptionalExtension;
         let conn = pool.read().map_err(|e| db_error("attachment_reference", e))?;
@@ -5279,7 +5994,10 @@ async fn attachment_get_v1(
     max_bytes: u32,
     preview: bool,
 ) -> Result<MessageBody, ProtocolError> {
-    let (record, attachment) = require_attachment(ctx, project_id, owner, sha256)?;
+    let org = require_read(ctx)?;
+    require_project_access(ctx, org, project_id)?;
+    let pool = open_project_pool(project_id)?;
+    let (record, attachment) = require_attachment(ctx, &pool, project_id, owner, sha256)?;
     if max_bytes == 0 || max_bytes as usize > ingest::MAX_UPLOAD_CHUNK_BYTES {
         return Err(ProtocolError::bad_request("read length must be 1..4 MiB"));
     }
@@ -5296,7 +6014,7 @@ async fn attachment_get_v1(
             .await
             .map_err(|_| ProtocolError::internal("attachment read worker failed"))?
             .map_err(|_| ProtocolError::not_found("attachment range not found"))?;
-    require_attachment(ctx, project_id, owner, sha256)?;
+    require_attachment(ctx, &pool, project_id, owner, sha256)?;
     let mime = if preview {
         "video/mp4".to_string()
     } else {
@@ -5465,7 +6183,6 @@ fn attachment_preview(
     sha: &str,
     retry: bool,
 ) -> Result<MessageBody, ProtocolError> {
-    require_attachment(ctx, project_id, owner, sha)?;
     let state = media::request_preview(ctx, project_id, owner, sha, retry)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     Ok(ps(ProjectStudioPayload::AttachmentPreviewResponse {
@@ -6609,6 +7326,120 @@ fn my_test_work_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
 // F2: tasks + defects (Z01, Z02)
 // =============================================================================
 
+fn task_not_pursued(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_id: &str,
+    reason: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (project, _) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_active(&project)?;
+    let pool = open_project_pool(project_id)?;
+    let (mutation, event_id) = tasks::mark_task_not_pursued(&pool, task_id, reason, &org.user_id)
+        .map_err(|e| task_mutation_error("task_not_pursued", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    notifications::notify_task_changes(ctx, project_id, &mutation);
+    sync_task_index(ctx, project_id, &pool);
+    Ok(ps(ProjectStudioPayload::TaskNotPursuedResult {
+        ok: true,
+        event_id,
+    }))
+}
+
+fn task_key_resolve(
+    ctx: &HandlerContext,
+    key: Option<&str>,
+    id: Option<&str>,
+    origin_project: Option<&str>,
+    origin_event: Option<&str>,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    if key.is_some() == id.is_some() || origin_project.is_some() != origin_event.is_some() {
+        return Err(ProtocolError::bad_request(
+            "provide one task identity and both origin event fields together",
+        ));
+    }
+    let location = if let Some(id) = id {
+        repository::task_location(id)
+    } else {
+        repository::resolve_task_key(&org.org_id, key.expect("validated task key"))
+    }
+    .map_err(|e| db_error("task_resolve", e))?
+    .filter(|task| task.org_id == org.org_id)
+    .ok_or_else(|| ProtocolError::not_found("task unavailable"))?;
+    require_task_access(ctx, org, &location.project_id, ProjectPermissionLevel::Read)?;
+    tasks::get_task(&open_project_pool(&location.project_id)?, &location.task_id)
+        .map_err(|e| db_error("task_resolve", e))?
+        .ok_or_else(|| ProtocolError::not_found("task unavailable"))?;
+    let event_id = if let (Some(project), Some(event)) = (origin_project, origin_event) {
+        let event = event
+            .parse::<i64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .ok_or_else(|| ProtocolError::bad_request("invalid origin event id"))?;
+        let mapped = repository::resolve_task_event(&location.task_id, project, event)
+            .map_err(|e| db_error("event_resolve", e))?
+            .filter(|(project, _)| project == &location.project_id)
+            .ok_or_else(|| ProtocolError::not_found("task event unavailable"))?;
+        Some(mapped.1)
+    } else {
+        None
+    };
+    Ok(ps(ProjectStudioPayload::TaskKeyResolveResponse {
+        project_id: location.project_id,
+        task_id: location.task_id,
+        current_key: location.current_key,
+        event_id,
+    }))
+}
+
+fn task_index_status(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    if !access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Read)
+        && !access.allows(ProjectArea::Board, ProjectPermissionLevel::Read)
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "task index access denied",
+        ));
+    }
+    let pool = open_project_pool(project_id)?;
+    let source = crate::project_studio::task_index::source_revision(&pool)
+        .map_err(|e| db_error("task_index", e))?;
+    let status = repository::task_index_status(&record.project_id, source)
+        .map_err(|e| db_error("task_index", e))?;
+    Ok(ps(ProjectStudioPayload::TaskIndexStatusResponse {
+        project_id: record.project_id,
+        source_revision: status.source_revision,
+        applied_revision: status.applied_revision,
+        lag: status.lag,
+        indexed_at: status.indexed_at,
+    }))
+}
+
+fn task_type_names(project_id: &str) -> Result<(String, HashMap<String, String>), ProtocolError> {
+    let source = repository::effective_project_settings(project_id)
+        .map_err(|e| db_error("task_type_source", e))?
+        .1;
+    let types = tasks::list_task_types(&open_project_pool(&source)?)
+        .map_err(|e| db_error("task_types", e))?;
+    Ok((
+        source,
+        types
+            .into_iter()
+            .map(|kind| (kind.type_id, kind.name))
+            .collect(),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn tasks_list_v1(
     ctx: &HandlerContext,
@@ -6621,38 +7452,79 @@ fn tasks_list_v1(
     limit: u32,
     severity: &str,
     include_archived: bool,
+    scope: ProjectTaskScope,
+    source_project_ids: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _access) =
-        require_task_access(ctx, org, project_id, ProjectPermissionLevel::Read)?;
-    let pool = open_project_pool(project_id)?;
-    let limit = limit.clamp(1, 200);
-    // "me" is a UI-level alias, not a stored user id — resolve it to the caller.
-    let assigned_to = if assigned_to == "me" {
-        org.user_id.as_str()
-    } else {
-        assigned_to
-    };
-    let filters = tasks::TaskFilters {
-        task_type,
-        status,
-        assigned_to,
-        search,
-        severity,
+    require_project_access(ctx, org, project_id)?;
+    let mut allowed = readable_task_projects(ctx, org, project_id, scope)?;
+    if !source_project_ids.is_empty() {
+        allowed.retain(|id| source_project_ids.contains(id));
+    }
+    let filter = crate::project_studio::models::TaskIndexFilter {
+        task_type: task_type.into(),
+        status: status.into(),
+        assigned_to: if assigned_to == "me" {
+            org.user_id.clone()
+        } else {
+            assigned_to.into()
+        },
+        search: search.into(),
+        severity: severity.into(),
         include_archived,
+        offset,
+        limit: limit.clamp(1, 200),
     };
     let (rows, total) =
-        tasks::list_tasks(&pool, &filters, offset, limit).map_err(|e| db_error("tasks_list", e))?;
-    let mut ids: Vec<String> = rows.iter().map(|t| t.created_by.clone()).collect();
-    ids.extend(rows.iter().map(|t| t.assigned_to.clone()));
-    let names = repository::resolve_user_refs(&ids);
-    let tasks_wire = rows
-        .into_iter()
-        .map(|record| task_to_wire(record, &names))
-        .collect();
+        repository::list_indexed_tasks(&allowed, &filter).map_err(|e| db_error("tasks_list", e))?;
+    let summary = repository::task_aggregate_summary(&allowed, project_id, &filter)
+        .map_err(|e| db_error("task_summary", e))?;
+    let users = rows
+        .iter()
+        .flat_map(|row| {
+            [
+                row.snapshot.created_by.clone(),
+                row.snapshot.assigned_to.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let names = repository::resolve_user_refs(&users);
+    let mut catalogues = HashMap::<String, HashMap<String, String>>::new();
+    let mut sources = HashMap::new();
+    for row in &rows {
+        let source = repository::effective_project_settings(&row.project_id)
+            .map_err(|e| db_error("task_type_source", e))?
+            .1;
+        if !catalogues.contains_key(&source) {
+            let types = repository::projected_task_type_names(&source)
+                .map_err(|e| db_error("task_types", e))?;
+            catalogues.insert(source.clone(), types);
+        }
+        sources.insert(row.project_id.clone(), source);
+    }
+    let mut items = Vec::with_capacity(rows.len());
+    for row in rows {
+        let source = sources
+            .get(&row.project_id)
+            .ok_or_else(|| ProtocolError::internal("task type source missing"))?;
+        let type_name = catalogues
+            .get(source)
+            .and_then(|types| types.get(&row.snapshot.task_type))
+            .ok_or_else(|| {
+                ProtocolError::internal("task type is missing from its effective catalogue")
+            })?;
+        items.push(task_to_wire(
+            row.snapshot,
+            &row.project_id,
+            &row.project_name,
+            type_name,
+            &names,
+        ));
+    }
     Ok(ps(ProjectStudioPayload::TasksListResponse {
-        tasks: tasks_wire,
+        tasks: items,
         total,
+        summary,
     }))
 }
 
@@ -6662,16 +7534,22 @@ fn task_get_v1(
     task_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (_record, _access) =
+    let (project, _access) =
         require_task_access(ctx, org, project_id, ProjectPermissionLevel::Read)?;
+    if let Some(location) =
+        repository::task_location(task_id).map_err(|e| db_error("task_location", e))?
+    {
+        if location.org_id != org.org_id || location.project_id != project_id {
+            return Err(ProtocolError::not_found("task not found"));
+        }
+    }
     let pool = open_project_pool(project_id)?;
     let record = tasks::get_task(&pool, task_id)
         .map_err(|e| db_error("task_get", e))?
         .ok_or_else(|| ProtocolError::not_found("task not found"))?;
     let (events, events_has_more) = tasks::list_task_events(&pool, task_id, None, 50)
         .map_err(|e| db_error("task_events", e))?;
-    let task_links =
-        tasks::list_task_links(&pool, task_id).map_err(|e| db_error("task_links", e))?;
+    let task_links = readable_task_links(ctx, task_id)?;
     let status_durations =
         tasks::task_status_durations(&pool, task_id).map_err(|e| db_error("task_durations", e))?;
     let comments = tasks::list_comments(&pool, task_id).map_err(|e| db_error("comments", e))?;
@@ -6679,14 +7557,21 @@ fn task_get_v1(
     ids.push(record.created_by.clone());
     ids.push(record.assigned_to.clone());
     let names = repository::resolve_user_refs(&ids);
+    let (_, types) = task_type_names(project_id)?;
+    let type_name = types
+        .get(&record.task_type)
+        .ok_or_else(|| ProtocolError::internal("task type missing from effective catalogue"))?;
     let description_md = record.description_md.clone();
     let attachments = attachments_from_json(&record.attachments_json);
     Ok(ps(ProjectStudioPayload::TaskGetResponse {
         detail: TaskDetail {
             handover_comment_id: tasks::latest_handover_comment_id(&pool, task_id)
                 .map_err(|e| db_error("handover_comment", e))?,
-            task_links: task_links.into_iter().map(task_link_to_wire).collect(),
-            events: events.into_iter().map(task_event_to_wire).collect(),
+            task_links,
+            events: events
+                .into_iter()
+                .map(|event| task_event_to_wire(ctx, event))
+                .collect::<Result<Vec<_>, _>>()?,
             events_has_more,
             status_durations: status_durations
                 .into_iter()
@@ -6697,7 +7582,13 @@ fn task_get_v1(
                     seconds: entry.seconds,
                 })
                 .collect(),
-            info: task_to_wire(record, &names),
+            info: task_to_wire(
+                tasks::task_index_snapshot(&record),
+                project_id,
+                &project.name,
+                type_name,
+                &names,
+            ),
             description_md,
             attachments,
             comments: comments
@@ -6729,8 +7620,25 @@ fn task_type_to_wire(record: crate::project_studio::models::TaskTypeRecord) -> T
     }
 }
 
-fn task_event_to_wire(record: crate::project_studio::models::TaskEventRecord) -> TaskEventWire {
-    TaskEventWire {
+fn task_event_to_wire(
+    ctx: &HandlerContext,
+    mut record: crate::project_studio::models::TaskEventRecord,
+) -> Result<TaskEventWire, ProtocolError> {
+    if record.kind == "transferred" {
+        let before: serde_json::Value =
+            serde_json::from_str(&record.before_json).map_err(|e| db_error("task_history", e))?;
+        if !before.is_null() {
+            let source = before
+                .get("project_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| ProtocolError::internal("transfer event source is missing"))?;
+            let org = require_read(ctx)?;
+            if require_task_access(ctx, org, source, ProjectPermissionLevel::Read).is_err() {
+                record.before_json = "null".into();
+            }
+        }
+    }
+    Ok(TaskEventWire {
         event_id: record.event_id,
         task_id: record.task_id,
         at: record.at,
@@ -6739,11 +7647,18 @@ fn task_event_to_wire(record: crate::project_studio::models::TaskEventRecord) ->
         kind: record.kind,
         before_json: record.before_json,
         after_json: record.after_json,
-    }
+    })
 }
 
-fn task_link_to_wire(record: crate::project_studio::models::TaskLinkRecord) -> TaskLinkWire {
+fn task_link_to_wire(
+    record: crate::project_studio::models::TaskLinkRecord,
+    counterparty_project_id: &str,
+) -> TaskLinkWire {
     TaskLinkWire {
+        relation_id: record.relation_id,
+        source_project_id: record.source_project_id,
+        target_project_id: record.target_project_id,
+        counterparty_project_id: counterparty_project_id.into(),
         link_id: record.link_id,
         source_task_id: record.source_task_id,
         target_task_id: record.target_task_id,
@@ -6870,6 +7785,7 @@ fn task_save_v1(
         );
         notifications::notify_task_changes(ctx, project_id, &mutation);
     }
+    sync_task_index(ctx, project_id, &pool);
     Ok(ps(ProjectStudioPayload::TaskSaveResponse {
         task_id: mutation.task_id,
         task_no: mutation.task_no,
@@ -6923,6 +7839,7 @@ fn task_delete_v1(
                 .to_string(),
         );
     }
+    sync_task_index(ctx, project_id, &pool);
     Ok(ps(ProjectStudioPayload::TaskDeleteResult {
         ok: true,
         archived: mutation.archived,
@@ -6963,6 +7880,7 @@ fn task_archive(
             &serde_json::json!({"event_ids":mutation.event_ids}).to_string(),
         );
     }
+    sync_task_index(ctx, project_id, &pool);
     Ok(ps(ProjectStudioPayload::TaskArchiveResult {
         ok: true,
         event_id: mutation.event_ids.first().copied(),
@@ -7040,6 +7958,7 @@ fn task_comment_add_v1(
         &serde_json::json!({"event_id":mutation.event_id}).to_string(),
     );
     let names = repository::resolve_user_refs(std::slice::from_ref(&comment.author_user_id));
+    sync_task_index(ctx, project_id, &pool);
     Ok(ps(ProjectStudioPayload::TaskCommentAddResponse {
         comment: comment_to_wire(comment, &names),
     }))
@@ -7084,6 +8003,7 @@ fn task_comment_edit_v1(
             &serde_json::json!({"event_id":mutation.event_id}).to_string(),
         );
     }
+    sync_task_index(ctx, project_id, &pool);
     Ok(ps(ProjectStudioPayload::TaskCommentEditResult { ok: true }))
 }
 
@@ -7127,6 +8047,7 @@ fn task_comment_delete_v1(
             &serde_json::json!({"event_id":mutation.event_id}).to_string(),
         );
     }
+    sync_task_index(ctx, project_id, &pool);
     Ok(ps(ProjectStudioPayload::TaskCommentDeleteResult {
         ok: true,
     }))
@@ -7202,11 +8123,112 @@ fn task_handover(
             &|user| notifications::task_reader(ctx, project_id, user),
         );
     }
+    sync_task_index(ctx, project_id, &pool);
     Ok(ps(ProjectStudioPayload::TaskHandoverResult {
         ok: true,
         event_ids: mutation.event_ids,
         comment_id: mutation.handover_comment_id,
     }))
+}
+
+fn task_transfer_preview(
+    ctx: &HandlerContext,
+    source_id: &str,
+    destination_id: &str,
+    task_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (source, source_access) =
+        require_task_access(ctx, org, source_id, ProjectPermissionLevel::Read)?;
+    let (destination, destination_access) = require_project_access(ctx, org, destination_id)?;
+    require_owner(&source_access)?;
+    require_owner(&destination_access)?;
+    let source_pool = open_project_pool(source_id)?;
+    let destination_pool = open_project_pool(destination_id)?;
+    let location = repository::task_location(task_id).map_err(|e| db_error("task_location", e))?;
+    if !location.is_some_and(|task| task.org_id == org.org_id && task.project_id == source_id) {
+        return Err(ProtocolError::not_found("task not found"));
+    }
+    let plan = crate::project_studio::task_transfer::preview_transfer(
+        &source,
+        &destination,
+        &source_pool,
+        &destination_pool,
+        task_id,
+    )
+    .map_err(|e| task_mutation_error("task_transfer_preview", e))?;
+    Ok(ps(ProjectStudioPayload::TaskTransferPreviewResponse {
+        task_ids: plan.task_ids,
+        old_keys: plan.old_keys,
+        destination_type_valid: plan.destination_type_valid,
+        widens_access: plan.widens_access,
+        blocking_reasons: plan.blocking_reasons,
+    }))
+}
+
+fn task_transfer(
+    ctx: &HandlerContext,
+    source_id: &str,
+    destination_id: &str,
+    task_id: &str,
+    confirm_wider_access: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (source, source_access) = require_project(
+        ctx,
+        org,
+        source_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Write,
+    )?;
+    let (destination, destination_access) = require_project(
+        ctx,
+        org,
+        destination_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_owner(&source_access)?;
+    require_owner(&destination_access)?;
+    require_active(&source)?;
+    require_active(&destination)?;
+    let source_pool = open_project_pool(source_id)?;
+    let destination_pool = open_project_pool(destination_id)?;
+    let location = repository::task_location(task_id).map_err(|e| db_error("task_location", e))?;
+    if !location.is_some_and(|task| task.org_id == org.org_id && task.project_id == source_id) {
+        return Err(ProtocolError::not_found("task not found"));
+    }
+    let outcome = crate::project_studio::task_transfer::transfer_task(
+        &ctx.state,
+        &source,
+        &destination,
+        &source_pool,
+        &destination_pool,
+        task_id,
+        &org.user_id,
+        confirm_wider_access,
+    )
+    .map_err(|e| task_mutation_error("task_transfer", e))?;
+    Ok(ps(ProjectStudioPayload::TaskTransferResult {
+        operation_id: outcome.operation_id,
+        task_id: outcome.task_id,
+        destination_project_id: outcome.destination_project_id,
+        new_key: outcome.new_key,
+        moved_task_ids: outcome.moved_task_ids,
+    }))
+}
+
+fn sync_task_index(ctx: &HandlerContext, project_id: &str, pool: &crate::db::DbPool) {
+    let result = (|| -> anyhow::Result<()> {
+        let org = require_read(ctx).map_err(|e| anyhow::anyhow!(e.message))?;
+        let project = repository::get_project(&org.org_id, project_id)?
+            .ok_or_else(|| anyhow::anyhow!("project not found"))?;
+        while crate::project_studio::task_index::sync_project(&project, pool, 256)?.lag != 0 {}
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::error!(%error,project_id,"committed task mutation awaits index recovery");
+    }
 }
 
 fn task_types_list(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
@@ -7222,9 +8244,13 @@ fn task_types_list(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody
             "task catalogue is disabled",
         ));
     }
-    let types = tasks::list_task_types(&open_project_pool(project_id)?)
+    let source_project_id = repository::effective_project_settings(project_id)
+        .map_err(|e| db_error("task_type_source", e))?
+        .1;
+    let types = tasks::list_task_types(&open_project_pool(&source_project_id)?)
         .map_err(|e| db_error("task_types", e))?;
     Ok(ps(ProjectStudioPayload::TaskTypesListResponse {
+        source_project_id,
         types: types.into_iter().map(task_type_to_wire).collect(),
     }))
 }
@@ -7247,6 +8273,11 @@ fn task_type_save(
         ProjectPermissionLevel::Admin,
     )?;
     require_active(&record)?;
+    if record.inherit_task_types {
+        return Err(ProtocolError::bad_request(
+            "detach the inherited task catalogue before editing it",
+        ));
+    }
     let task_type = tasks::save_task_type(
         &open_project_pool(project_id)?,
         type_id,
@@ -7278,9 +8309,68 @@ fn task_events(
         tasks::list_task_events(&pool, task_id, before_id, limit.clamp(1, 100))
             .map_err(|e| db_error("task_events", e))?;
     Ok(ps(ProjectStudioPayload::TaskEventsResponse {
-        events: events.into_iter().map(task_event_to_wire).collect(),
+        events: events
+            .into_iter()
+            .map(|event| task_event_to_wire(ctx, event))
+            .collect::<Result<Vec<_>, _>>()?,
         has_more,
     }))
+}
+
+fn readable_task_links(
+    ctx: &HandlerContext,
+    task_id: &str,
+) -> Result<Vec<TaskLinkWire>, ProtocolError> {
+    let org = require_read(ctx)?;
+    let routes = repository::relation_routes_for_task(task_id)
+        .map_err(|e| db_error("task_relation_routes", e))?;
+    let mut links = Vec::new();
+    for route in routes {
+        let source = repository::task_location(&route.source_task_id)
+            .map_err(|e| db_error("task_location", e))?;
+        let target = repository::task_location(&route.target_task_id)
+            .map_err(|e| db_error("task_location", e))?;
+        let (Some(source), Some(target)) = (source, target) else {
+            continue;
+        };
+        if source.org_id != org.org_id
+            || target.org_id != org.org_id
+            || require_task_access(ctx, org, &source.project_id, ProjectPermissionLevel::Read)
+                .is_err()
+            || require_task_access(ctx, org, &target.project_id, ProjectPermissionLevel::Read)
+                .is_err()
+        {
+            continue;
+        }
+        let link =
+            tasks::get_task_link(&open_project_pool(&route.owning_project_id)?, route.link_id)
+                .map_err(|e| db_error("task_relation", e))?
+                .ok_or_else(|| ProtocolError::internal("canonical task relation is missing"))?;
+        if link.relation_id != route.relation_id
+            || link.source_project_id != source.project_id
+            || link.target_project_id != target.project_id
+        {
+            return Err(ProtocolError::internal(
+                "canonical task relation location differs from its route",
+            ));
+        }
+        let counterparty = if route.source_task_id == task_id {
+            &target
+        } else {
+            &source
+        };
+        let other = tasks::get_task(
+            &open_project_pool(&counterparty.project_id)?,
+            &counterparty.task_id,
+        )
+        .map_err(|e| db_error("task_counterparty", e))?
+        .ok_or_else(|| ProtocolError::not_found("task relation endpoint unavailable"))?;
+        let mut link = link;
+        link.other_task_key = other.task_key;
+        link.other_task_title = other.title;
+        links.push(task_link_to_wire(link, &counterparty.project_id));
+    }
+    Ok(links)
 }
 
 fn task_links_list(
@@ -7290,13 +8380,11 @@ fn task_links_list(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     require_task_access(ctx, org, project_id, ProjectPermissionLevel::Read)?;
-    let pool = open_project_pool(project_id)?;
-    tasks::get_task(&pool, task_id)
+    tasks::get_task(&open_project_pool(project_id)?, task_id)
         .map_err(|e| db_error("task_get", e))?
         .ok_or_else(|| ProtocolError::not_found("task not found"))?;
-    let links = tasks::list_task_links(&pool, task_id).map_err(|e| db_error("task_links", e))?;
     Ok(ps(ProjectStudioPayload::TaskLinksListResponse {
-        links: links.into_iter().map(task_link_to_wire).collect(),
+        links: readable_task_links(ctx, task_id)?,
     }))
 }
 
@@ -7309,16 +8397,31 @@ fn task_link_save(
     lag: i32,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _) = require_project(
-        ctx,
-        org,
-        project_id,
-        ProjectArea::Tasks,
-        ProjectPermissionLevel::Write,
-    )?;
-    require_active(&record)?;
-    let mutation = tasks::add_task_link(
-        &open_project_pool(project_id)?,
+    let source_location = repository::task_location(source)
+        .map_err(|e| db_error("task_location", e))?
+        .filter(|task| task.org_id == org.org_id && task.project_id == project_id)
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    let target_location = repository::task_location(target)
+        .map_err(|e| db_error("task_location", e))?
+        .filter(|task| task.org_id == org.org_id)
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    for id in [&source_location.project_id, &target_location.project_id] {
+        let (record, _) = require_project(
+            ctx,
+            org,
+            id,
+            ProjectArea::Tasks,
+            ProjectPermissionLevel::Write,
+        )?;
+        require_active(&record)?;
+    }
+    let source_pool = open_project_pool(&source_location.project_id)?;
+    let target_pool = open_project_pool(&target_location.project_id)?;
+    let mut mutation = tasks::add_task_link(
+        &source_pool,
+        &target_pool,
+        &source_location.project_id,
+        &target_location.project_id,
         source,
         target,
         kind,
@@ -7326,8 +8429,13 @@ fn task_link_save(
         &org.user_id,
     )
     .map_err(|e| task_mutation_error("task_link_save", e))?;
+    let other = tasks::get_task(&target_pool, target)
+        .map_err(|e| db_error("task_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("task relation endpoint unavailable"))?;
+    mutation.link.other_task_key = other.task_key;
+    mutation.link.other_task_title = other.title;
     Ok(ps(ProjectStudioPayload::TaskLinkSaveResult {
-        link: task_link_to_wire(mutation.link),
+        link: task_link_to_wire(mutation.link, &target_location.project_id),
         source_event_id: mutation.source_event_id,
         target_event_id: mutation.target_event_id,
     }))
@@ -7339,16 +8447,37 @@ fn task_link_delete(
     link_id: i64,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _) = require_project(
+    let route = repository::resolve_task_link(project_id, link_id)
+        .map_err(|e| db_error("task_relation_route", e))?
+        .ok_or_else(|| ProtocolError::not_found("task relation not found"))?;
+    require_task_access(
         ctx,
         org,
-        project_id,
-        ProjectArea::Tasks,
-        ProjectPermissionLevel::Write,
+        &route.current_project_id,
+        ProjectPermissionLevel::Read,
     )?;
-    require_active(&record)?;
-    let mutation = tasks::delete_task_link(&open_project_pool(project_id)?, link_id, &org.user_id)
-        .map_err(|e| task_mutation_error("task_link_delete", e))?;
+    let source_pool = open_project_pool(&route.current_project_id)?;
+    let link = tasks::get_task_link(&source_pool, route.current_link_id)
+        .map_err(|e| db_error("task_relation", e))?
+        .ok_or_else(|| ProtocolError::not_found("task relation not found"))?;
+    for id in [&link.source_project_id, &link.target_project_id] {
+        let (record, _) = require_project(
+            ctx,
+            org,
+            id,
+            ProjectArea::Tasks,
+            ProjectPermissionLevel::Write,
+        )?;
+        require_active(&record)?;
+    }
+    let target_pool = open_project_pool(&link.target_project_id)?;
+    let mutation = tasks::delete_task_link(
+        &source_pool,
+        &target_pool,
+        route.current_link_id,
+        &org.user_id,
+    )
+    .map_err(|e| task_mutation_error("task_link_delete", e))?;
     Ok(ps(ProjectStudioPayload::TaskLinkDeleteResult {
         ok: mutation.is_some(),
         source_event_id: mutation.as_ref().map(|m| m.source_event_id),
@@ -7793,62 +8922,19 @@ fn notifications_list_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let limit = limit.clamp(1, 100);
-    let (rows, _unread_count, has_more) =
-        notifications::list(&org.user_id, only_unread, before_id, limit)
-            .map_err(|e| db_error("notifications_list", e))?;
-    let mut access_by_project = HashMap::new();
-    let mut visible = Vec::new();
-    for row in rows {
-        if !access_by_project.contains_key(&row.project_id) {
-            let access = repository::get_project(&org.org_id, &row.project_id)
-                .map_err(|e| db_error("notification_project", e))?
-                .map(|record| repository::project_access(&record, &org.user_id, is_admin(ctx)))
-                .transpose()
-                .map_err(|e| db_error("notification_access", e))?;
-            access_by_project.insert(row.project_id.clone(), access);
-        }
-        if access_by_project
-            .get(&row.project_id)
-            .and_then(Option::as_ref)
-            .is_some_and(|access| notification_visible(access, &row.kind))
-        {
-            visible.push(row);
-        }
-    }
-    let unread_groups: Vec<(String, String, u32)> = {
-        let registry =
-            crate::project_studio::db::pool().map_err(|e| db_error("notification_registry", e))?;
-        let conn = registry
-            .read()
-            .map_err(|e| db_error("notification_unread", e))?;
-        let mut stmt = conn.prepare("SELECT project_id, kind, COUNT(*) FROM notifications WHERE user_id = ?1 AND read_at IS NULL GROUP BY project_id, kind")
-            .map_err(|e| db_error("notification_unread", e))?;
-        let rows = stmt
-            .query_map([&org.user_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .map_err(|e| db_error("notification_unread", e))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|e| db_error("notification_unread", e))?
-    };
-    let mut unread_count = 0u32;
-    for (project_id, kind, count) in unread_groups {
-        if !access_by_project.contains_key(&project_id) {
-            let access = repository::get_project(&org.org_id, &project_id)
-                .map_err(|e| db_error("notification_project", e))?
-                .map(|record| repository::project_access(&record, &org.user_id, is_admin(ctx)))
-                .transpose()
-                .map_err(|e| db_error("notification_access", e))?;
-            access_by_project.insert(project_id.clone(), access);
-        }
-        if access_by_project
-            .get(&project_id)
-            .and_then(Option::as_ref)
-            .is_some_and(|access| notification_visible(access, &kind))
-        {
-            unread_count = unread_count.saturating_add(count);
-        }
-    }
+    let (visible, unread_count, has_more) =
+        notifications::list(&org.user_id, only_unread, before_id, limit, &|row| {
+            let Some(target) =
+                notifications::current_target(ctx, &row.project_id, &row.kind, &row.link_json)?
+            else {
+                return Ok(false);
+            };
+            row.project_id = target.project_id;
+            row.project_name = target.project_name;
+            row.link_json = target.link_json;
+            Ok(true)
+        })
+        .map_err(|e| db_error("notifications_list", e))?;
     let notifications_wire = visible
         .into_iter()
         .map(|n| NotificationWire {
@@ -7878,8 +8964,11 @@ fn notifications_mark_read_v1(
     if notification_ids.len() > 500 {
         return Err(ProtocolError::bad_request("too many notification ids"));
     }
-    notifications::mark_read(&org.user_id, notification_ids)
-        .map_err(|e| db_error("notifications_mark_read", e))?;
+    notifications::mark_read(&org.user_id, notification_ids, &|row| {
+        notifications::current_target(ctx, &row.project_id, &row.kind, &row.link_json)
+            .map(|target| target.is_some())
+    })
+    .map_err(|e| db_error("notifications_mark_read", e))?;
     Ok(ps(ProjectStudioPayload::NotificationsMarkReadResult {
         ok: true,
     }))
@@ -10464,6 +11553,7 @@ fn task_status_set_v1(
         );
         notifications::notify_task_changes(ctx, project_id, &mutation);
     }
+    sync_task_index(ctx, project_id, &pool);
     Ok(ps(ProjectStudioPayload::TaskStatusSetResult {
         ok: true,
         updated_at: task.updated_at,
@@ -10597,6 +11687,7 @@ fn project_export_start_v1(
     include_runs: bool,
     include_vectors: bool,
     include_user_names: bool,
+    scope: ProjectTreeScope,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     // An ARCHIVED project may still be exported — that is often exactly why it
@@ -10608,28 +11699,22 @@ fn project_export_start_v1(
             "project export access denied",
         ));
     }
+    let nodes = authorized_scope(ctx, project_id, scope, ProjectScopeOperation::Export)?;
     archive::reap_export_archives();
     prune_export_refs();
 
     let export_ref = format!("psexp_{}", uuid::Uuid::new_v4());
     let dest = crate::api::project_studio_export::export_archive_path(&export_ref);
     let job_id = archive::spawn_export(archive::ExportTask {
+        nodes,
+        scope,
         core_db: ctx.state.db.clone(),
         org_id: org.org_id.clone(),
         user_id: org.user_id.clone(),
         node_id: ctx.state.local_node_id.to_string(),
         project_id: project_id.to_string(),
         dir_path: std::path::PathBuf::from(&record.dir_path),
-        project: archive::ProjectMeta {
-            project_id: project_id.to_string(),
-            key_prefix: record.key_prefix.clone(),
-            name: record.name.clone(),
-            description: record.description.clone(),
-            template: record.template.clone(),
-            modules: parse_modules_json(&record.modules_json),
-            owner_user_id: record.owner_user_id.clone(),
-            org_id: record.org_id.clone(),
-        },
+        project: archive::project_meta(&record).map_err(|e| db_error("export_project_meta", e))?,
         options: archive::ExportOptions {
             include_runs,
             include_vectors,
@@ -10677,6 +11762,35 @@ fn project_export_start_v1(
     }))
 }
 
+pub(crate) fn require_archive_job_access(
+    ctx: &HandlerContext,
+    job: &archive::ArchiveJob,
+) -> Result<(), ProtocolError> {
+    let org = require_read(ctx)?;
+    if job.owner_user_id != org.user_id {
+        return Err(ProtocolError::not_found("export job not found"));
+    }
+    if !crate::db::repository::get_user_account_by_id(&ctx.state.db, &org.user_id)
+        .map_err(|error| db_error("archive_actor", error))?
+        .is_some_and(|account| account.is_active)
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "archive actor account is unavailable",
+        ));
+    }
+    for project_id in &job.scope_project_ids {
+        let (_, access) = require_project_access(ctx, org, project_id)?;
+        if !job.export_ref.is_empty() && !access.project_admin {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                "project export access denied",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn project_export_status_v1(
     ctx: &HandlerContext,
     project_id: &str,
@@ -10694,6 +11808,7 @@ fn project_export_status_v1(
     let job = archive::job(job_id)
         .filter(|j| j.owner_user_id == org.user_id && j.project_id == project_id)
         .ok_or_else(|| ProtocolError::not_found("export job not found"))?;
+    require_archive_job_access(ctx, &job)?;
 
     let mut signed_url = String::new();
     let mut export_ref = String::new();
@@ -10740,7 +11855,7 @@ fn project_export_status_v1(
 /// Importing creates a NEW project, so it needs the creator grant — exactly like
 /// the create wizard. Membership in the archived project means nothing here: it
 /// came from another node.
-fn require_import_grant(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
+pub(crate) fn require_import_grant(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
     let org = require_read(ctx)?;
     let can_create = is_admin(ctx)
         || repository::has_creator_grant(&org.user_id, &org.org_id)
@@ -10885,17 +12000,51 @@ fn project_import_preview_v1(
     // Reads the manifest ONLY: nothing is unpacked before the user confirms,
     // and an archive from a newer schema is refused right here.
     let manifest = archive::read_manifest(&path)
-        .map_err(|e| ProtocolError::bad_request(format!("nie mozna odczytac archiwum: {e:#}")))?;
+        .map_err(|e| ProtocolError::bad_request(format!("cannot read project archive: {e:#}")))?;
     let (vectors_reusable, vectors_reason) =
         archive::vectors_reusable(&ctx.state.db, &org.org_id, &manifest);
+    let source_nodes: Vec<_> = if manifest.nodes.is_empty() {
+        vec![&manifest]
+    } else {
+        manifest
+            .nodes
+            .iter()
+            .map(|node| node.manifest.as_ref())
+            .collect()
+    };
+    let tree_nodes = source_nodes
+        .iter()
+        .map(
+            |node| tentaflow_protocol::project_studio::ProjectImportNodePreview {
+                project_id: node.project.project_id.clone(),
+                parent_id: if node.project.project_id == manifest.project.project_id {
+                    None
+                } else {
+                    node.project.parent_id.clone()
+                },
+                name: node.project.name.clone(),
+                key_prefix: node.project.key_prefix.clone(),
+                depth: node.project.depth.saturating_sub(manifest.project.depth) + 1,
+                is_private: node.project.is_private,
+                lifecycle: node.project.lifecycle.clone(),
+                inventory: inventory_to_wire(&node.inventory),
+            },
+        )
+        .collect();
+    let total_uncompressed_bytes = source_nodes
+        .iter()
+        .flat_map(|node| node.files.iter())
+        .try_fold(0u64, |total, file| total.checked_add(file.size))
+        .ok_or_else(|| ProtocolError::bad_request("archive size exceeds range"))?;
     Ok(ps(ProjectStudioPayload::ProjectImportPreviewResponse {
+        tree_nodes,
         archive_version: manifest.version,
         exported_at: manifest.exported_at,
         source_node_id: manifest.source_node_id,
         project_name: manifest.project.name,
         template: manifest.project.template,
         modules: manifest.project.modules,
-        total_uncompressed_bytes: manifest.files.iter().map(|f| f.size).sum(),
+        total_uncompressed_bytes,
         has_runs: manifest.options.include_runs && manifest.inventory.runs > 0,
         inventory: inventory_to_wire(&manifest.inventory),
         vectors_reusable,
@@ -10913,8 +12062,9 @@ fn project_import_apply_v1(
     let org = require_import_grant(ctx)?;
     let path = staged_archive_path(org, upload_id, true)?;
     let manifest = archive::read_manifest(&path)
-        .map_err(|e| ProtocolError::bad_request(format!("nie mozna odczytac archiwum: {e:#}")))?;
+        .map_err(|e| ProtocolError::bad_request(format!("cannot read project archive: {e:#}")))?;
     let job_id = archive::spawn_import(archive::ImportTask {
+        context: ctx.clone(),
         core_db: ctx.state.db.clone(),
         router: ctx.state.router.clone(),
         // The org is the caller's session org — NEVER the one in the archive.
@@ -10957,6 +12107,7 @@ fn project_import_status_v1(
     let job = archive::job(job_id)
         .filter(|j| j.owner_user_id == org.user_id)
         .ok_or_else(|| ProtocolError::not_found("import job not found"))?;
+    require_archive_job_access(ctx, &job)?;
     Ok(ps(ProjectStudioPayload::ProjectImportStatusResponse {
         job_id: job_id.to_string(),
         status: job.status,
@@ -10967,6 +12118,628 @@ fn project_import_status_v1(
         reindex_job_ids: job.reindex_job_ids,
         vectors_imported: job.vectors_imported,
     }))
+}
+
+#[cfg(test)]
+mod p1b_tests {
+    use super::p1_tests::{bell, call, fixture, user};
+    use super::*;
+
+    async fn child(
+        ctx: &HandlerContext,
+        parent: &str,
+        name: &str,
+        private: bool,
+        detached: bool,
+        members: Vec<MemberInputWire>,
+    ) -> String {
+        let response = call(
+            ctx,
+            ProjectStudioPayload::ProjectCreateRequest {
+                name: name.into(),
+                key_prefix: String::new(),
+                description: String::new(),
+                template: "custom".into(),
+                modules: vec!["tasks".into()],
+                members,
+                parent_id: Some(parent.into()),
+                is_private: private,
+                inherit_modules: Some(!detached),
+                inherit_task_types: Some(!detached),
+            },
+        )
+        .await
+        .expect("real child create");
+        let ProjectStudioPayload::ProjectCreateResponse { project_id } = response else {
+            panic!("child response")
+        };
+        project_id
+    }
+
+    async fn task(ctx: &HandlerContext, project_id: &str, title: &str) -> (String, String) {
+        let response = call(
+            ctx,
+            ProjectStudioPayload::TaskSaveRequest {
+                project_id: project_id.into(),
+                task_id: None,
+                task_type: "technical".into(),
+                title: title.into(),
+                description_md: String::new(),
+                severity: String::new(),
+                priority: "medium".into(),
+                status: "todo".into(),
+                assigned_to: String::new(),
+                due_date: String::new(),
+                parent_task_id: None,
+                links_json: "[]".into(),
+                attachments_json: "[]".into(),
+            },
+        )
+        .await
+        .expect("real task create");
+        let ProjectStudioPayload::TaskSaveResponse {
+            task_id, task_key, ..
+        } = response
+        else {
+            panic!("task response")
+        };
+        assert_eq!(
+            repository::task_location(&task_id)
+                .expect("actual source projection")
+                .expect("created task has a canonical location")
+                .project_id,
+            project_id
+        );
+        (task_id, task_key)
+    }
+
+    fn list(project: &str, scope: ProjectTaskScope) -> ProjectStudioPayload {
+        ProjectStudioPayload::TasksListRequest {
+            project_id: project.into(),
+            task_type: String::new(),
+            status: String::new(),
+            assigned_to: String::new(),
+            search: String::new(),
+            severity: String::new(),
+            offset: 0,
+            limit: 200,
+            include_archived: false,
+            scope,
+            source_project_ids: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_dispatch_filters_private_tasks_before_counting_and_keeps_ended_own_history() {
+        let f = fixture();
+        let owner = &f.contexts[0];
+        let reader = &f.contexts[2];
+        crate::services::ingest_jobs::init(
+            &std::path::Path::new(&f.project.dir_path).join("test-jobs.db"),
+        )
+        .expect("actual global queue");
+        task(owner, &f.project.project_id, "Root work").await;
+        let public = child(
+            owner,
+            &f.project.project_id,
+            "Public work",
+            false,
+            false,
+            Vec::new(),
+        )
+        .await;
+        let private = child(
+            owner,
+            &f.project.project_id,
+            "Private work",
+            true,
+            false,
+            Vec::new(),
+        )
+        .await;
+        let ended = child(
+            owner,
+            &f.project.project_id,
+            "Completed work",
+            false,
+            false,
+            Vec::new(),
+        )
+        .await;
+        task(owner, &public, "Visible task").await;
+        task(owner, &private, "Hidden task").await;
+        let (closed, _) = task(owner, &ended, "Historical task").await;
+        let org = &f.project.org_id;
+        let record = repository::get_project(org, &ended)
+            .expect("project")
+            .expect("row");
+        assert!(
+            call(
+                owner,
+                ProjectStudioPayload::ProjectLifecycleRequest {
+                    project_id: ended.clone(),
+                    ended: true,
+                    confirmation_key: record.key_prefix.clone(),
+                    reason: "Work completed".into()
+                }
+            )
+            .await
+            .is_err(),
+            "unfinished work blocks ending"
+        );
+        call(
+            owner,
+            ProjectStudioPayload::TaskNotPursuedRequest {
+                project_id: ended.clone(),
+                task_id: closed.clone(),
+                reason: "Cancelled scope".into(),
+            },
+        )
+        .await
+        .expect("real resolution");
+        call(
+            owner,
+            ProjectStudioPayload::ProjectLifecycleRequest {
+                project_id: ended.clone(),
+                ended: true,
+                confirmation_key: record.key_prefix,
+                reason: "Work completed".into(),
+            },
+        )
+        .await
+        .expect("actual end");
+        let ProjectStudioPayload::TasksListResponse { tasks, total, .. } = call(
+            reader,
+            list(&f.project.project_id, ProjectTaskScope::Descendants),
+        )
+        .await
+        .expect("permitted aggregate") else {
+            panic!("list")
+        };
+        assert_eq!(total, 2);
+        assert_eq!(tasks.len(), 2);
+        assert!(tasks
+            .iter()
+            .all(|task| task.project_id != private && task.project_id != ended));
+        let ProjectStudioPayload::TasksListResponse { tasks, total, .. } =
+            call(owner, list(&ended, ProjectTaskScope::Single))
+                .await
+                .expect("ended own read")
+        else {
+            panic!("own list")
+        };
+        assert_eq!(total, 1);
+        assert_eq!(tasks[0].task_id, closed);
+        assert_eq!(tasks[0].resolution.as_deref(), Some("not_pursued"));
+        assert!(call(
+            owner,
+            ProjectStudioPayload::TaskStatusSetRequest {
+                project_id: ended,
+                task_id: closed,
+                status: "todo".into()
+            }
+        )
+        .await
+        .is_err());
+        assert!(call(
+            reader,
+            ProjectStudioPayload::ProjectScopePreviewRequest {
+                project_id: f.project.project_id.clone(),
+                scope: ProjectTreeScope::Subtree,
+                operation: ProjectScopeOperation::Export
+            }
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn transfer_alias_and_old_notification_follow_only_the_current_task_reader() {
+        let f = fixture();
+        let owner = &f.contexts[0];
+        let reader = &f.contexts[2];
+        crate::services::ingest_jobs::init(
+            &std::path::Path::new(&f.project.dir_path).join("test-jobs.db"),
+        )
+        .expect("actual global queue");
+        let destination = child(
+            owner,
+            &f.project.project_id,
+            "Private destination",
+            true,
+            true,
+            vec![MemberInputWire {
+                user_id: user(reader).into(),
+                role: String::new(),
+                functions: vec!["observer".into()],
+                project_admin: false,
+                expires_at: None,
+            }],
+        )
+        .await;
+        let (task_id, old_key) = task(owner, &f.project.project_id, "Routed task").await;
+        call(
+            owner,
+            ProjectStudioPayload::TaskCommentAddRequest {
+                project_id: f.project.project_id.clone(),
+                task_id: task_id.clone(),
+                body_md: "Please inspect".into(),
+                mention_user_ids: vec![user(reader).into()],
+            },
+        )
+        .await
+        .expect("real mention");
+        let committed = notifications::list(user(reader), false, None, 100, &|_| Ok(true))
+            .expect("actual persisted notification rows")
+            .0
+            .into_iter()
+            .find(|entry| entry.kind == "task_mentioned")
+            .expect("durably committed mention");
+        let original = bell(reader)
+            .await
+            .into_iter()
+            .find(|entry| entry.kind == "task_mentioned")
+            .expect("current reader sees the committed mention");
+        assert_eq!(original.notification_id, committed.notification_id);
+        let event = serde_json::from_str::<serde_json::Value>(&original.link_json).expect("link")
+            ["event_id"]
+            .as_i64()
+            .expect("event");
+        let ProjectStudioPayload::TaskKeyResolveResponse {
+            project_id,
+            event_id,
+            ..
+        } = call(
+            reader,
+            ProjectStudioPayload::TaskKeyResolveRequest {
+                task_key: None,
+                task_id: Some(task_id.clone()),
+                origin_project_id: Some(f.project.project_id.clone()),
+                origin_event_id: Some(event.to_string()),
+            },
+        )
+        .await
+        .expect("authorized current event without a transfer alias")
+        else {
+            panic!("current event")
+        };
+        assert_eq!(project_id, f.project.project_id);
+        assert_eq!(event_id, Some(event));
+        let result = call(
+            owner,
+            ProjectStudioPayload::TaskTransferRequest {
+                source_project_id: f.project.project_id.clone(),
+                destination_project_id: destination.clone(),
+                task_id: task_id.clone(),
+                confirm_wider_access: false,
+            },
+        )
+        .await
+        .expect("actual transfer");
+        let ProjectStudioPayload::TaskTransferResult { new_key, .. } = result else {
+            panic!("transfer")
+        };
+        assert_ne!(new_key, old_key);
+        repository::remove_member(&f.project.project_id, user(reader))
+            .expect("remove old local contribution");
+        let ProjectStudioPayload::TaskKeyResolveResponse {
+            project_id,
+            event_id,
+            ..
+        } = call(
+            reader,
+            ProjectStudioPayload::TaskKeyResolveRequest {
+                task_key: Some(old_key),
+                task_id: None,
+                origin_project_id: Some(f.project.project_id.clone()),
+                origin_event_id: Some(event.to_string()),
+            },
+        )
+        .await
+        .expect("authorized current alias")
+        else {
+            panic!("alias")
+        };
+        assert_eq!(project_id, destination);
+        assert!(event_id.is_some());
+        let routed = bell(reader)
+            .await
+            .into_iter()
+            .find(|entry| entry.notification_id == original.notification_id)
+            .expect("current recipient notification");
+        assert_eq!(routed.project_id, destination);
+        let ProjectStudioPayload::TaskGetResponse { detail } = call(
+            reader,
+            ProjectStudioPayload::TaskGetRequest {
+                project_id: destination.clone(),
+                task_id: task_id.clone(),
+            },
+        )
+        .await
+        .expect("current detail") else {
+            panic!("detail")
+        };
+        assert_eq!(
+            detail
+                .events
+                .iter()
+                .find(|event| event.kind == "transferred")
+                .expect("real transfer event")
+                .before_json,
+            "null"
+        );
+        repository::remove_member(&destination, user(reader)).expect("revoke destination");
+        assert!(bell(reader).await.is_empty());
+        assert!(call(
+            reader,
+            ProjectStudioPayload::TaskKeyResolveRequest {
+                task_key: None,
+                task_id: Some(task_id),
+                origin_project_id: None,
+                origin_event_id: None
+            }
+        )
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn end_fence_rejects_an_admitted_task_writer_and_resume_keeps_expiry() {
+        let f = fixture();
+        let owner = &f.contexts[0];
+        let reader = &f.contexts[2];
+        let project_id = child(
+            owner,
+            &f.project.project_id,
+            "Ending private work",
+            true,
+            false,
+            vec![MemberInputWire {
+                user_id: user(reader).into(),
+                role: String::new(),
+                functions: vec!["observer".into()],
+                project_admin: false,
+                expires_at: None,
+            }],
+        )
+        .await;
+        let expires = chrono::Utc::now() + chrono::Duration::seconds(2);
+        repository::set_member_access(
+            &project_id,
+            user(reader),
+            &["observer".into()],
+            false,
+            Some(&expires.to_rfc3339()),
+        )
+        .expect("actual expiring local grant");
+        let stored_expiry = repository::member_access(&project_id, user(reader))
+            .expect("stored expiry")
+            .expect("local grant")
+            .expires_at;
+        call(reader, list(&project_id, ProjectTaskScope::Single))
+            .await
+            .expect("current reader before expiry");
+        let org = require_read(owner).expect("actor organization");
+        let (record, access) =
+            require_project_access(owner, org, &project_id).expect("actual creation gate");
+        assert!(access.can_create_tasks);
+        require_active(&record).expect("admitted before end fence");
+        let pool = open_project_pool(&project_id).expect("already-open content");
+        let held_writer = pool.write().expect("writer already held by source work");
+        let waiting_pool = pool.clone();
+        let actor = user(owner).to_owned();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            started_tx.send(()).expect("writer attempt");
+            tasks::create_task(
+                &waiting_pool,
+                &tasks::TaskInput {
+                    task_type: "technical",
+                    title: "Work admitted before ending",
+                    description_md: "",
+                    severity: "",
+                    priority: "medium",
+                    status: "todo",
+                    assigned_to: "",
+                    due_date: "",
+                    parent_task_id: None,
+                    links_json: "[]",
+                    attachments_json: "[]",
+                },
+                &actor,
+            )
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("real writer is pending");
+        assert!(!waiting.is_finished());
+        let operation = repository::prepare_project_end(
+            &record.org_id,
+            &project_id,
+            user(owner),
+            "No remaining work",
+        )
+        .expect("durable fence without waiting for content writer");
+        let end_record = record.clone();
+        let end_pool = pool.clone();
+        let ending = std::thread::spawn(move || {
+            repository::finalize_project_end(
+                &end_record.org_id,
+                &end_record.project_id,
+                &operation,
+                &end_pool,
+            )
+        });
+        drop(held_writer);
+        assert!(waiting.join().expect("task writer completed").is_err());
+        assert!(ending
+            .join()
+            .expect("end writer completed")
+            .expect("actual end"));
+        assert_eq!(
+            pool.read()
+                .expect("content reader")
+                .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get::<_, i64>(0))
+                .expect("real task count"),
+            0
+        );
+        while chrono::Utc::now() <= expires {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        call(
+            owner,
+            ProjectStudioPayload::ProjectLifecycleRequest {
+                project_id: project_id.clone(),
+                ended: false,
+                confirmation_key: record.key_prefix,
+                reason: "Scope reopened".into(),
+            },
+        )
+        .await
+        .expect("actual owner resumes project");
+        assert!(call(reader, list(&project_id, ProjectTaskScope::Single))
+            .await
+            .is_err());
+        assert_eq!(
+            repository::member_access(&project_id, user(reader))
+                .expect("stored grant")
+                .expect("expired record retained")
+                .expires_at,
+            stored_expiry
+        );
+    }
+
+    #[tokio::test]
+    async fn thirty_detached_catalogues_report_actual_refresh_cost_and_exact_summary() {
+        let f = fixture();
+        let owner = &f.contexts[0];
+        for index in 0..30 {
+            let project = child(
+                owner,
+                &f.project.project_id,
+                &format!("Detached catalogue {index:02}"),
+                false,
+                true,
+                Vec::new(),
+            )
+            .await;
+            task(owner, &project, &format!("Work {index:02}")).await;
+        }
+        for refresh in 0..3 {
+            let before = project_db::cold_open_count();
+            let start = std::time::Instant::now();
+            let ProjectStudioPayload::TasksListResponse {
+                tasks,
+                total,
+                summary,
+            } = call(
+                owner,
+                list(&f.project.project_id, ProjectTaskScope::Descendants),
+            )
+            .await
+            .expect("actual board refresh")
+            else {
+                panic!("list")
+            };
+            assert_eq!(total, 30);
+            assert_eq!(tasks.len(), 30);
+            assert_eq!(summary.descendant_total, 30);
+            assert!(tasks
+                .iter()
+                .all(|task| task.task_type_name == "Technical task"));
+            let cold_opens = project_db::cold_open_count() - before;
+            eprintln!(
+                "detached_catalogue_refresh={refresh} cold_opens={} elapsed_us={}",
+                cold_opens,
+                start.elapsed().as_micros()
+            );
+            assert_eq!(
+                cold_opens, 0,
+                "converged board reads use the central projection"
+            );
+        }
+        let type_save = |project_id: &str, name: &str| ProjectStudioPayload::TaskTypeSaveRequest {
+            project_id: project_id.into(),
+            type_id: "projection_note".into(),
+            name: name.into(),
+            description: "Current catalogue projection".into(),
+            sort_order: 10,
+            active: true,
+        };
+        call(owner, type_save(&f.project.project_id, "Original type"))
+            .await
+            .expect("actual source catalogue type");
+        let inherited = child(
+            owner,
+            &f.project.project_id,
+            "Projected inherited work",
+            false,
+            false,
+            Vec::new(),
+        )
+        .await;
+        call(
+            owner,
+            ProjectStudioPayload::TaskSaveRequest {
+                project_id: inherited.clone(),
+                task_id: None,
+                task_type: "projection_note".into(),
+                title: "Catalogue-sensitive work".into(),
+                description_md: String::new(),
+                severity: String::new(),
+                priority: "medium".into(),
+                status: "todo".into(),
+                assigned_to: String::new(),
+                due_date: String::new(),
+                parent_task_id: None,
+                links_json: "[]".into(),
+                attachments_json: "[]".into(),
+            },
+        )
+        .await
+        .expect("real inherited custom-type task");
+        for (inherit, parent_name, local_name, expected) in [
+            (true, "Renamed parent type", None, "Renamed parent type"),
+            (false, "New parent type", None, "Renamed parent type"),
+            (false, "New parent type", Some("Local type"), "Local type"),
+            (true, "New parent type", None, "New parent type"),
+        ] {
+            let modules = repository::effective_project_settings(&inherited)
+                .expect("preserve actual effective modules during catalogue changes")
+                .0;
+            call(
+                owner,
+                ProjectStudioPayload::ProjectInheritanceSaveRequest {
+                    project_id: inherited.clone(),
+                    is_private: false,
+                    inherit_modules: true,
+                    inherit_task_types: inherit,
+                    modules,
+                },
+            )
+            .await
+            .expect("actual catalogue inheritance transition");
+            call(owner, type_save(&f.project.project_id, parent_name))
+                .await
+                .expect("actual parent rename");
+            if let Some(local_name) = local_name {
+                call(owner, type_save(&inherited, local_name))
+                    .await
+                    .expect("actual detached local rename");
+            }
+            let before = project_db::cold_open_count();
+            let ProjectStudioPayload::TasksListResponse { tasks, total, .. } =
+                call(owner, list(&inherited, ProjectTaskScope::Single))
+                    .await
+                    .expect("current projected catalogue read")
+            else {
+                panic!("catalogue list")
+            };
+            assert_eq!(total, 1);
+            assert_eq!(tasks[0].task_type_name, expected);
+            assert_eq!(project_db::cold_open_count() - before, 0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -10996,6 +12769,10 @@ mod tests {
             "owner-gate",
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[
                 member("developer-gate", &["developer"]),
                 member("tester-gate", &["tester"]),
@@ -11386,7 +13163,14 @@ mod tests {
                 .code,
             ProtocolErrorCode::PolicyDenied
         );
-        repository::set_project_archived("org-gate", &project_id, true).expect("archive");
+        repository::set_project_archived(
+            "org-gate",
+            &project_id,
+            true,
+            tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+            &[project_id.to_string()],
+        )
+        .expect("archive");
         assert!(project_studio_dispatch(&get(), &ctx("multi-gate"))
             .await
             .is_ok());
@@ -11421,11 +13205,22 @@ mod tests {
             "owner-a",
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[],
         )
         .expect("create project");
 
-        assert!(repository::set_project_archived("org-a", &project_id, true).expect("archive"));
+        assert!(repository::set_project_archived(
+            "org-a",
+            &project_id,
+            true,
+            tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+            &[project_id.to_string()]
+        )
+        .expect("archive"));
         let record = repository::get_project("org-a", &project_id)
             .expect("get")
             .expect("record");
@@ -11433,7 +13228,14 @@ mod tests {
         assert_eq!(err.code, ProtocolErrorCode::BadRequest);
         assert_eq!(err.message, "project is archived");
 
-        assert!(repository::set_project_archived("org-a", &project_id, false).expect("unarchive"));
+        assert!(repository::set_project_archived(
+            "org-a",
+            &project_id,
+            false,
+            tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+            &[project_id.to_string()]
+        )
+        .expect("unarchive"));
         let record = repository::get_project("org-a", &project_id)
             .expect("get")
             .expect("record");
@@ -11611,6 +13413,10 @@ mod tests {
             "owner-s",
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[MemberInput {
                 user_id: "editor-s".to_string(),
                 functions: vec!["developer".to_string(), "devops".to_string()],
@@ -11731,6 +13537,10 @@ mod tests {
             "owner-h",
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[],
         )
         .expect("create project");
@@ -11890,13 +13700,28 @@ mod tests {
             "export-owner",
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[],
         )
         .expect("project");
-        repository::set_project_archived("org-export", &id, true).expect("archive");
+        repository::set_project_archived(
+            "org-export",
+            &id,
+            true,
+            tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+            &[id.to_string()],
+        )
+        .expect("archive");
         let state = super::super::state::AppState::for_test();
         let instance =
             super::super::app_gate::test_support::install_app(&state, PACKAGE_ID, &[PERM_READ]);
+        state.db.write().expect("account writer").execute(
+            "INSERT INTO user_accounts(id,username,password_hash,display_name,email,is_active,must_change_password) \
+             VALUES ('export-owner','export-owner','hash','Export owner','export@example.test',1,0)",[],
+        ).expect("real active export actor");
         let ctx = HandlerContext {
             session: tentaflow_protocol::SessionAuth::UserSession {
                 user_id: [0x45; 16],
@@ -11935,7 +13760,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            project_export_start_v1(&admin_ctx, &id, false, false, false)
+            project_export_start_v1(&admin_ctx, &id, false, false, false, ProjectTreeScope::Node)
                 .expect_err("app admin has no export entitlement")
                 .code,
             ProtocolErrorCode::PolicyDenied
@@ -11946,6 +13771,7 @@ mod tests {
                 include_runs: false,
                 include_vectors: false,
                 include_user_names: false,
+                scope: ProjectTreeScope::Node,
             }),
             &ctx,
         )
@@ -12023,6 +13849,10 @@ mod tests {
             &owner,
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[],
         )
         .expect("project");
@@ -12117,6 +13947,10 @@ mod tests {
             &owner,
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[MemberInput {
                 user_id: actor.clone(),
                 functions: functions
@@ -12435,8 +14269,14 @@ mod tests {
             if change == "expiry" {
                 crate::project_studio::db::pool().expect("registry").write().expect("write").execute("UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2", rusqlite::params![project.project_id, actor]).expect("expire during preparation");
             } else {
-                repository::set_project_archived(&project.org_id, &project.project_id, true)
-                    .expect("archive during preparation");
+                repository::set_project_archived(
+                    &project.org_id,
+                    &project.project_id,
+                    true,
+                    tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+                    &[project.project_id.to_string()],
+                )
+                .expect("archive during preparation");
             }
             release_tx.send(()).expect("complete real preparation");
             let error = creation
@@ -12508,8 +14348,14 @@ mod tests {
             if change == "expiry" {
                 crate::project_studio::db::pool().expect("registry").write().expect("write").execute("UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2", rusqlite::params![project.project_id, actor]).expect("expire while deletion waits");
             } else {
-                repository::set_project_archived(&project.org_id, &project.project_id, true)
-                    .expect("archive while deletion waits");
+                repository::set_project_archived(
+                    &project.org_id,
+                    &project.project_id,
+                    true,
+                    tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+                    &[project.project_id.to_string()],
+                )
+                .expect("archive while deletion waits");
             }
             repository::finish_ingest_job(&pool, &job_id, "cancelled", "processing stopped")
                 .expect("finish actual job row");
@@ -12548,6 +14394,8 @@ mod tests {
             .parent()
             .expect("root")
             .join("ml.db");
+        crate::services::ingest_jobs::init(&ml_path.with_file_name("jobs.db"))
+            .expect("actual durable media queue");
         let _ = crate::ml_studio::db::init(&ml_path).expect("ML database");
         let (link_id, ml_id, _, _) = ml_link::create_from_project(
             &pool,
@@ -12613,7 +14461,46 @@ mod tests {
         assert!(ml_link::get(&pool, &link_id).expect("link").is_some());
         assert_eq!(
             repository::ml_grant_origins(&ml_id, &actor).expect("retained provenance"),
+            vec![(project.project_id.clone(), link_id.clone())]
+        );
+        let pending = repository::pending_project_deletions()
+            .expect("durable deletion admission")
+            .into_iter()
+            .find(|pending| pending.project.project_id == project.project_id)
+            .expect("failed revocation retains the deletion operation");
+        let journal_path = crate::paths::data_dir()
+            .join("projects/.deletions")
+            .join(format!("{}.json", pending.operation_id));
+        let journal: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&journal_path).expect("durable deletion journal"),
+        )
+        .expect("actual deletion journal");
+        assert_eq!(journal["operation_id"], pending.operation_id);
+        assert_eq!(journal["project_id"], project.project_id);
+        assert!(!std::path::Path::new(&project.dir_path)
+            .parent()
+            .expect("project root")
+            .join(format!(".deleted-{}", pending.operation_id))
+            .exists());
+        assert!(project_db::open(&project.project_id).is_err());
+        let revoke_error =
+            archive::finish_project_delete(&owner_ctx.state.db, &project, &pending.operation_id)
+                .expect_err("the admitted delete reaches the induced ML revoke failure");
+        assert!(
+            revoke_error
+                .to_string()
+                .contains("owned revoke unavailable"),
+            "the SQLite revoke trigger caused the failure: {revoke_error}"
+        );
+        assert_eq!(
+            repository::ml_grant_origins(&ml_id, &actor).expect("still retained provenance"),
             vec![(project.project_id.clone(), link_id)]
+        );
+        assert_eq!(
+            crate::ml_studio::repository::member_role(&ml_id, &manual)
+                .expect("independent grant survives the failed delete")
+                .as_deref(),
+            Some("editor")
         );
         ml_db
             .write()
@@ -12793,8 +14680,14 @@ mod tests {
             if change == "expiry" {
                 crate::project_studio::db::pool().expect("registry").write().expect("write").execute("UPDATE project_members SET expires_at='2000-01-01T00:00:00Z' WHERE project_id=?1 AND user_id=?2", rusqlite::params![project.project_id, actor]).expect("expire during real fetch");
             } else {
-                repository::set_project_archived(&project.org_id, &project.project_id, true)
-                    .expect("archive during real fetch");
+                repository::set_project_archived(
+                    &project.org_id,
+                    &project.project_id,
+                    true,
+                    tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+                    &[project.project_id.to_string()],
+                )
+                .expect("archive during real fetch");
             }
             std::fs::write(&release, "complete actual upload-pack").expect("release actual fetch");
             let error = tokio::time::timeout(std::time::Duration::from_secs(10), refresh)
@@ -12839,26 +14732,35 @@ mod p1_tests {
     use super::*;
     use sha2::Digest;
 
-    struct Fixture {
-        project: ProjectRecord,
-        pool: crate::db::DbPool,
-        contexts: Vec<HandlerContext>,
+    pub(super) struct Fixture {
+        pub(super) project: ProjectRecord,
+        pub(super) pool: crate::db::DbPool,
+        pub(super) contexts: Vec<HandlerContext>,
     }
 
-    fn fixture() -> Fixture {
+    pub(super) fn fixture() -> Fixture {
         let root = tempfile::tempdir().expect("tempdir");
         crate::project_studio::db::init(&root.path().join("projects.db")).expect("registry");
-        let state = crate::dispatch::AppState::for_test();
+        let mut state = crate::dispatch::AppState::for_test();
+        let core = crate::db::global_pool().expect("actual shared core directory");
+        // Member validation uses the process directory, so the request and
+        // its permission checker must use that same real database.
+        let state_mut = std::sync::Arc::get_mut(&mut state).expect("sole fixture state");
+        state_mut.db = core.clone();
+        state_mut.permission_checker = Some(std::sync::Arc::new(
+            crate::addon::permissions::PermissionChecker::new(core),
+        ));
         super::super::app_gate::test_support::install_app(&state, PACKAGE_ID, &[PERM_READ]);
         let org_id = crate::services::org::DEFAULT_ORG_ID;
         let mut users = Vec::new();
         for name in ["owner", "developer", "observer", "empty"] {
+            let username = format!("{name}-{}", uuid::Uuid::new_v4());
             let user = crate::db::repository::create_user_account(
                 &state.db,
-                name,
+                &username,
                 "hash",
                 name,
-                &format!("{name}@example.test"),
+                &format!("{username}@example.test"),
             )
             .expect("actual account");
             crate::services::org::add_membership(
@@ -12893,6 +14795,10 @@ mod p1_tests {
             &users[0],
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[
                 MemberInput {
                     user_id: users[1].clone(),
@@ -12945,7 +14851,7 @@ mod p1_tests {
         }
     }
 
-    async fn call(
+    pub(super) async fn call(
         ctx: &HandlerContext,
         request: ProjectStudioPayload,
     ) -> Result<ProjectStudioPayload, ProtocolError> {
@@ -12981,11 +14887,11 @@ mod p1_tests {
         }
     }
 
-    fn user(ctx: &HandlerContext) -> &str {
+    pub(super) fn user(ctx: &HandlerContext) -> &str {
         &ctx.org_context.as_ref().expect("org").user_id
     }
 
-    async fn create(f: &Fixture, assigned: &str, attachments: &str) -> String {
+    pub(super) async fn create(f: &Fixture, assigned: &str, attachments: &str) -> String {
         let result = call(&f.contexts[0], save(f, None, assigned, "todo", attachments))
             .await
             .expect("real task create");
@@ -13003,7 +14909,7 @@ mod p1_tests {
         task_id
     }
 
-    async fn bell(ctx: &HandlerContext) -> Vec<NotificationWire> {
+    pub(super) async fn bell(ctx: &HandlerContext) -> Vec<NotificationWire> {
         let result = call(
             ctx,
             ProjectStudioPayload::NotificationsListRequest {
@@ -13126,7 +15032,7 @@ mod p1_tests {
         .await
         .expect_err("no task read is not an eligible recipient");
         assert_eq!(denied.code, ProtocolErrorCode::BadRequest);
-        let stored_notifications = notifications::list(observer, false, None, 100)
+        let stored_notifications = notifications::list(observer, false, None, 100, &|_| Ok(true))
             .expect("stored notification history")
             .0
             .len();
@@ -13236,7 +15142,7 @@ mod p1_tests {
             "expired membership hides old assignment and transition details"
         );
         assert!(
-            notifications::list(assigned, false, None, 100)
+            notifications::list(assigned, false, None, 100, &|_| Ok(true))
                 .expect("stored history")
                 .0
                 .len()
@@ -13426,7 +15332,7 @@ mod p1_tests {
         )
         .await
         .expect("no-function creator can pick types");
-        let ProjectStudioPayload::TaskTypesListResponse { types } = types else {
+        let ProjectStudioPayload::TaskTypesListResponse { types, .. } = types else {
             panic!("types")
         };
         assert_eq!(types.iter().filter(|t| t.built_in).count(), 6);
@@ -13494,15 +15400,22 @@ mod p1_tests {
             tasks::latest_handover_comment_id(&f.pool, &task_id).expect("pin"),
             Some(comment_id.clone())
         );
+        let mentions: Vec<_> = bell(&f.contexts[2])
+            .await
+            .into_iter()
+            .filter(|notification| notification.kind == "task_mentioned")
+            .collect();
+        assert_eq!(mentions.len(), 1, "committed handover mentions are sent");
+        let mention: serde_json::Value =
+            serde_json::from_str(&mentions[0].link_json).expect("committed handover mention");
+        assert_eq!(mention["task_id"], task_id);
+        assert_eq!(mention["comment_id"], comment_id);
         assert_eq!(
-            bell(&f.contexts[2])
-                .await
-                .iter()
-                .filter(|n| n.kind == "task_mentioned")
-                .count(),
-            1,
-            "committed handover mentions are sent"
+            mention["event_id"],
+            *event_ids.last().expect("handover event")
         );
+        assert!(events.iter().any(|event| event.kind == "handed_over"
+            && event.event_id == *event_ids.last().expect("handover event")));
         assert_eq!(
             call(
                 reader,
@@ -13613,6 +15526,8 @@ mod p1_tests {
             limit: 100,
             severity: String::new(),
             include_archived,
+            scope: ProjectTaskScope::Single,
+            source_project_ids: Vec::new(),
         };
         let ProjectStudioPayload::TasksListResponse { tasks: active, .. } =
             call(owner, list(false)).await.expect("active list")
@@ -13984,8 +15899,14 @@ mod p1_tests {
         assert_eq!(total_bytes, 21 * 1024);
         assert_eq!(per_task.len(), 1);
         assert_eq!(per_task[0].file_count, 21);
-        repository::set_project_archived(&f.project.org_id, &f.project.project_id, true)
-            .expect("archive project");
+        repository::set_project_archived(
+            &f.project.org_id,
+            &f.project.project_id,
+            true,
+            tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+            &[f.project.project_id.to_string()],
+        )
+        .expect("archive project");
         call(&f.contexts[2], read(sha, &task_id, 0, 1024))
             .await
             .expect("archived read remains valid");

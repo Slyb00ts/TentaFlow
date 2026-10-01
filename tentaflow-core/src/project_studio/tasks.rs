@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 
 use super::models::{
-    TaskCommentRecord, TaskEventRecord, TaskLinkRecord, TaskRecord, TaskStatusDurationRecord,
-    TaskTypeRecord,
+    TaskCommentRecord, TaskEventRecord, TaskIndexSnapshot, TaskLinkRecord, TaskRecord,
+    TaskStatusDurationRecord, TaskTypeRecord,
 };
 use crate::db::DbPool;
 use tentaflow_protocol::project_studio::AttachmentWire;
@@ -35,6 +35,19 @@ fn read_err(e: impl std::fmt::Display) -> anyhow::Error {
 
 fn write_err(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("project_studio tasks write: {e}")
+}
+
+fn admit_write(pool: &DbPool, task_id: Option<&str>) -> Result<()> {
+    if let Some(project_id) = super::project_db::project_id_of(pool) {
+        if let Some(task_id) = task_id {
+            super::repository::task_write_admission(&project_id, task_id)
+        } else {
+            super::repository::project_write_admission(&project_id)
+        }
+    } else {
+        // Unregistered pools are used only while validating an unpublished archive import.
+        Ok(())
+    }
 }
 
 fn escape_like(input: &str) -> String {
@@ -65,6 +78,8 @@ fn read_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
         archived_at: row.get(18)?,
+        resolution: row.get(19)?,
+        resolution_reason: row.get(20)?,
     })
 }
 
@@ -73,7 +88,31 @@ const TASK_COLS: &str =
      t.severity, t.priority, t.status, t.assigned_to, t.due_date, t.parent_task_id, t.links_json, \
      t.attachments_json, \
      (SELECT COUNT(*) FROM task_comments c WHERE c.task_id = t.task_id), \
-     t.created_by, t.created_at, t.updated_at, t.archived_at";
+     t.created_by, t.created_at, t.updated_at, t.archived_at, t.resolution, t.resolution_reason";
+
+pub fn task_index_snapshot(task: &TaskRecord) -> TaskIndexSnapshot {
+    TaskIndexSnapshot {
+        task_id: task.task_id.clone(),
+        task_no: task.task_no,
+        task_key: task.task_key.clone(),
+        task_type: task.task_type.clone(),
+        title: task.title.clone(),
+        severity: task.severity.clone(),
+        priority: task.priority.clone(),
+        status: task.status.clone(),
+        assigned_to: task.assigned_to.clone(),
+        due_date: task.due_date.clone(),
+        parent_task_id: task.parent_task_id.clone(),
+        links_json: task.links_json.clone(),
+        comment_count: task.comment_count,
+        created_by: task.created_by.clone(),
+        created_at: task.created_at.clone(),
+        updated_at: task.updated_at.clone(),
+        archived_at: task.archived_at.clone(),
+        resolution: task.resolution.clone(),
+        resolution_reason: task.resolution_reason.clone(),
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct TaskFilters<'a> {
@@ -196,6 +235,7 @@ pub fn reassign_open(
     }
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
+    admit_write(pool, Some(task_id))?;
     let Some(old) = get_task_tx(&tx, task_id)? else {
         return Ok(None);
     };
@@ -362,8 +402,8 @@ fn record_event(
     Ok(tx.last_insert_rowid())
 }
 
-fn validate_task_type(tx: &Transaction<'_>, task_type: &str, unchanged: bool) -> Result<()> {
-    let active: Option<bool> = tx
+fn validate_task_type(conn: &rusqlite::Connection, task_type: &str, unchanged: bool) -> Result<()> {
+    let active: Option<bool> = conn
         .query_row(
             "SELECT active FROM task_types WHERE type_id = ?1",
             params![task_type],
@@ -375,6 +415,31 @@ fn validate_task_type(tx: &Transaction<'_>, task_type: &str, unchanged: bool) ->
         Some(false) if unchanged => Ok(()),
         _ => bail!("task type is unavailable"),
     }
+}
+
+fn type_source_before_write(pool: &DbPool) -> Result<Option<(String, String, Option<DbPool>)>> {
+    let Some(project_id) = super::project_db::project_id_of(pool) else {
+        return Ok(None);
+    };
+    let (_, source_id) = super::repository::effective_project_settings(&project_id)?;
+    let source_pool = if source_id == project_id {
+        None
+    } else {
+        Some(super::project_db::open(&source_id)?)
+    };
+    Ok(Some((project_id, source_id, source_pool)))
+}
+
+fn validate_type_source_after_lock(
+    source: &Option<(String, String, Option<DbPool>)>,
+) -> Result<()> {
+    if let Some((project_id, source_id, _)) = source {
+        let (_, current) = super::repository::effective_project_settings(project_id)?;
+        if current != *source_id {
+            bail!("task type source changed; retry task mutation");
+        }
+    }
+    Ok(())
 }
 
 fn validate_parent(
@@ -427,10 +492,32 @@ fn validate_parent(
 
 /// Creates a task and its initial event in one transaction.
 pub fn create_task(pool: &DbPool, input: &TaskInput<'_>, created_by: &str) -> Result<TaskMutation> {
-    let mut conn = pool.write().map_err(write_err)?;
+    let type_source = type_source_before_write(pool)?;
+    let mut source_guard = None;
+    let mut conn = if let Some((project_id, source_id, Some(source_pool))) = &type_source {
+        if source_id < project_id {
+            source_guard = Some(source_pool.write().map_err(write_err)?);
+            pool.write().map_err(write_err)?
+        } else {
+            let child = pool.write().map_err(write_err)?;
+            source_guard = Some(source_pool.write().map_err(write_err)?);
+            child
+        }
+    } else {
+        pool.write().map_err(write_err)?
+    };
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    validate_task_type(&tx, input.task_type, false)?;
+    admit_write(pool, None)?;
+    validate_type_source_after_lock(&type_source)?;
+    let catalogue: &rusqlite::Connection = match source_guard.as_ref() {
+        Some(guard) => &**guard,
+        None => &tx,
+    };
+    validate_task_type(catalogue, input.task_type, false)?;
     validate_parent(&tx, None, input.task_type, input.parent_task_id)?;
+    if let Some(parent_id) = input.parent_task_id {
+        admit_write(pool, Some(parent_id))?;
+    }
     let task_no: i64 = tx.query_row(
         "SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'task_next_no'",
         [],
@@ -509,16 +596,38 @@ pub fn update_task(
     input: &TaskInput<'_>,
     actor: &str,
 ) -> Result<Option<TaskMutation>> {
-    let conn = pool.write().map_err(write_err)?;
+    let type_source = type_source_before_write(pool)?;
+    let mut source_guard = None;
+    let conn = if let Some((project_id, source_id, Some(source_pool))) = &type_source {
+        if source_id < project_id {
+            source_guard = Some(source_pool.write().map_err(write_err)?);
+            pool.write().map_err(write_err)?
+        } else {
+            let child = pool.write().map_err(write_err)?;
+            source_guard = Some(source_pool.write().map_err(write_err)?);
+            child
+        }
+    } else {
+        pool.write().map_err(write_err)?
+    };
     let tx = conn.unchecked_transaction()?;
+    admit_write(pool, Some(task_id))?;
+    validate_type_source_after_lock(&type_source)?;
     let Some(old) = get_task_tx(&tx, task_id)? else {
         return Ok(None);
     };
     if old.archived_at.is_some() {
         bail!("archived task cannot be edited");
     }
-    validate_task_type(&tx, input.task_type, input.task_type == old.task_type)?;
+    let catalogue: &rusqlite::Connection = match source_guard.as_ref() {
+        Some(guard) => &**guard,
+        None => &tx,
+    };
+    validate_task_type(catalogue, input.task_type, input.task_type == old.task_type)?;
     validate_parent(&tx, Some(task_id), input.task_type, input.parent_task_id)?;
+    if let Some(parent_id) = input.parent_task_id {
+        admit_write(pool, Some(parent_id))?;
+    }
     let mut mutation = TaskMutation::from_task(&old);
     for (kind, before, after) in [
         ("task_type", json!(old.task_type), json!(input.task_type)),
@@ -568,6 +677,18 @@ pub fn update_task(
             }
         }
     }
+    if old.resolution.is_some() && input.status != "done" {
+        let event_id = record_event(
+            &tx,
+            task_id,
+            actor,
+            "resolution_changed",
+            json!({"status":old.status,"resolution":old.resolution,
+                   "resolution_reason":old.resolution_reason}),
+            json!({"status":input.status,"resolution":null,"resolution_reason":null}),
+        )?;
+        mutation.record(event_id);
+    }
     if !mutation.changed {
         return Ok(Some(mutation));
     }
@@ -582,7 +703,10 @@ pub fn update_task(
     tx.execute(
         "UPDATE tasks SET task_type = ?1, title = ?2, description_md = ?3, severity = ?4, \
             priority = ?5, status = ?6, assigned_to = ?7, due_date = ?8, parent_task_id = ?9, \
-            links_json = ?10, attachments_json = ?11, updated_at = datetime('now') \
+            links_json = ?10, attachments_json = ?11, \
+            resolution = CASE WHEN ?6='done' THEN resolution ELSE NULL END, \
+            resolution_reason = CASE WHEN ?6='done' THEN resolution_reason ELSE NULL END, \
+            updated_at = datetime('now') \
          WHERE task_id = ?12",
         params![
             input.task_type,
@@ -615,6 +739,7 @@ pub fn set_task_status(
 ) -> Result<Option<TaskMutation>> {
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
+    admit_write(pool, Some(task_id))?;
     let Some(old) = get_task_tx(&tx, task_id)? else {
         return Ok(None);
     };
@@ -624,7 +749,10 @@ pub fn set_task_status(
     let mut mutation = TaskMutation::from_task(&old);
     if status != old.status {
         tx.execute(
-            "UPDATE tasks SET status = ?1, updated_at = datetime('now') WHERE task_id = ?2",
+            "UPDATE tasks SET status = ?1, \
+             resolution=CASE WHEN ?1='done' THEN resolution ELSE NULL END, \
+             resolution_reason=CASE WHEN ?1='done' THEN resolution_reason ELSE NULL END, \
+             updated_at = datetime('now') WHERE task_id = ?2",
             params![status, task_id],
         )?;
         let event_id = record_event(
@@ -637,17 +765,95 @@ pub fn set_task_status(
         )?;
         mutation.record(event_id);
         mutation.status_event_id = Some(event_id);
-        mutation.previous_status = Some(old.status);
+        mutation.previous_status = Some(old.status.clone());
         mutation.current_status = status.to_string();
+        if old.resolution.is_some() && status != "done" {
+            let event_id = record_event(
+                &tx,
+                task_id,
+                actor,
+                "resolution_changed",
+                json!({"status":old.status,"resolution":old.resolution,
+                       "resolution_reason":old.resolution_reason}),
+                json!({"status":status,"resolution":null,"resolution_reason":null}),
+            )?;
+            mutation.record(event_id);
+        }
     }
     tx.commit()?;
     Ok(Some(mutation))
+}
+
+pub fn mark_task_not_pursued(
+    pool: &DbPool,
+    task_id: &str,
+    reason: &str,
+    actor: &str,
+) -> Result<Option<(TaskMutation, i64)>> {
+    let reason = reason.trim();
+    if reason.is_empty() || reason.chars().count() > 2000 {
+        bail!("not-pursued reason is required and cannot exceed 2000 characters");
+    }
+    let conn = pool.write().map_err(write_err)?;
+    let tx = conn.unchecked_transaction()?;
+    admit_write(pool, Some(task_id))?;
+    let Some(old) = get_task_tx(&tx, task_id)? else {
+        return Ok(None);
+    };
+    if old.archived_at.is_some() {
+        bail!("archived task cannot be resolved");
+    }
+    let mut mutation = TaskMutation::from_task(&old);
+    if old.status == "done"
+        && old.resolution.as_deref() == Some("not_pursued")
+        && old.resolution_reason.as_deref() == Some(reason)
+    {
+        let event_id: i64 = tx.query_row(
+            "SELECT event_id FROM task_events WHERE task_id=?1 AND kind='resolution_changed' \
+             ORDER BY event_id DESC LIMIT 1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        return Ok(Some((mutation, event_id)));
+    }
+    tx.execute(
+        "UPDATE tasks SET status='done',resolution='not_pursued',resolution_reason=?1, \
+         updated_at=datetime('now') WHERE task_id=?2",
+        params![reason, task_id],
+    )?;
+    if old.status != "done" {
+        let event_id = record_event(
+            &tx,
+            task_id,
+            actor,
+            "status_changed",
+            json!(old.status),
+            json!("done"),
+        )?;
+        mutation.record(event_id);
+        mutation.status_event_id = Some(event_id);
+        mutation.previous_status = Some(old.status.clone());
+        mutation.current_status = "done".into();
+    }
+    let event_id = record_event(
+        &tx,
+        task_id,
+        actor,
+        "resolution_changed",
+        json!({"status":old.status,"resolution":old.resolution,
+               "resolution_reason":old.resolution_reason}),
+        json!({"status":"done","resolution":"not_pursued","resolution_reason":reason}),
+    )?;
+    mutation.record(event_id);
+    tx.commit()?;
+    Ok(Some((mutation, event_id)))
 }
 
 /// Removes an untouched mistake; archives any task that has acquired work.
 pub fn delete_task(pool: &DbPool, task_id: &str, actor: &str) -> Result<Option<TaskMutation>> {
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
+    admit_write(pool, Some(task_id))?;
     let Some(old) = get_task_tx(&tx, task_id)? else {
         return Ok(None);
     };
@@ -770,6 +976,7 @@ pub fn add_comment(
     let mentions = canonical_mentions(mention_user_ids);
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
+    admit_write(pool, Some(task_id))?;
     let Some(task) = get_task_tx(&tx, task_id)? else {
         bail!("task not found")
     };
@@ -813,11 +1020,13 @@ pub fn edit_comment(
 ) -> Result<Option<CommentMutation>> {
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
+    admit_write(pool, None)?;
     let old = tx.query_row(
         &format!("SELECT {COMMENT_COLS} FROM task_comments WHERE comment_id = ?1 AND author_user_id = ?2"),
         params![comment_id, author], read_comment,
     ).optional()?;
     let Some(old) = old else { return Ok(None) };
+    admit_write(pool, Some(&old.task_id))?;
     if get_task_tx(&tx, &old.task_id)?
         .ok_or_else(|| anyhow!("task not found"))?
         .archived_at
@@ -873,6 +1082,7 @@ pub fn delete_comment(
 ) -> Result<Option<CommentMutation>> {
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
+    admit_write(pool, None)?;
     let old = tx
         .query_row(
             &format!("SELECT {COMMENT_COLS} FROM task_comments WHERE comment_id = ?1"),
@@ -881,6 +1091,7 @@ pub fn delete_comment(
         )
         .optional()?;
     let Some(old) = old else { return Ok(None) };
+    admit_write(pool, Some(&old.task_id))?;
     if get_task_tx(&tx, &old.task_id)?
         .ok_or_else(|| anyhow!("task not found"))?
         .archived_at
@@ -911,6 +1122,10 @@ pub fn delete_comment(
 
 pub fn list_task_types(pool: &DbPool) -> Result<Vec<TaskTypeRecord>> {
     let conn = pool.read().map_err(read_err)?;
+    list_task_types_on(&conn)
+}
+
+pub(crate) fn list_task_types_on(conn: &rusqlite::Connection) -> Result<Vec<TaskTypeRecord>> {
     let mut stmt = conn.prepare(
         "SELECT type_id,name,description,sort_order,built_in,active FROM task_types ORDER BY sort_order,type_id",
     )?;
@@ -926,6 +1141,70 @@ pub fn list_task_types(pool: &DbPool) -> Result<Vec<TaskTypeRecord>> {
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+pub(crate) fn materialize_task_type_catalogue(
+    source: &rusqlite::Connection,
+    target: &rusqlite::Connection,
+) -> Result<()> {
+    let mut stmt = source.prepare(
+        "SELECT type_id,name,description,sort_order,built_in,active FROM task_types ORDER BY sort_order,type_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(TaskTypeRecord {
+                type_id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                sort_order: row.get(3)?,
+                built_in: row.get(4)?,
+                active: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let tx = target.unchecked_transaction()?;
+    tx.execute("UPDATE task_types SET active=0 WHERE built_in=0", [])?;
+    for row in rows {
+        tx.execute(
+            "INSERT INTO task_types(type_id,name,description,sort_order,built_in,active) \
+             VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(type_id) DO UPDATE SET \
+             name=excluded.name,description=excluded.description,sort_order=excluded.sort_order,\
+             built_in=excluded.built_in,active=excluded.active",
+            params![
+                row.type_id,
+                row.name,
+                row.description,
+                row.sort_order,
+                row.built_in,
+                row.active
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn validate_reinherited_task_types(
+    source: &rusqlite::Connection,
+    target: &rusqlite::Connection,
+) -> Result<()> {
+    let mut stmt = target.prepare("SELECT DISTINCT task_type FROM tasks ORDER BY task_type")?;
+    let types = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for type_id in types {
+        let exists: Option<i64> = source
+            .query_row(
+                "SELECT 1 FROM task_types WHERE type_id=?1",
+                [&type_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            bail!("task type used by project is absent from inherited catalogue");
+        }
+    }
+    Ok(())
 }
 
 pub fn save_task_type(
@@ -950,6 +1229,13 @@ pub fn save_task_type(
     }
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
+    admit_write(pool, None)?;
+    if let Some(project_id) = super::project_db::project_id_of(pool) {
+        let (_, source_id) = super::repository::effective_project_settings(&project_id)?;
+        if source_id != project_id {
+            bail!("inherited task types must be edited at their source");
+        }
+    }
     let built_in: Option<bool> = tx
         .query_row(
             "SELECT built_in FROM task_types WHERE type_id = ?1",
@@ -967,6 +1253,12 @@ pub fn save_task_type(
         params![type_id, name.trim(), description.trim(), sort_order, active],
     )?;
     tx.commit()?;
+    drop(conn);
+    if let Some(project_id) = super::project_db::project_id_of(pool) {
+        let project = super::repository::project_record(&project_id)?
+            .ok_or_else(|| anyhow!("task catalogue project missing"))?;
+        super::task_index::sync_catalogue(&project, pool)?;
+    }
     Ok(TaskTypeRecord {
         type_id: type_id.to_string(),
         name: name.trim().to_string(),
@@ -1079,6 +1371,7 @@ pub fn set_task_archived(
 ) -> Result<Option<TaskMutation>> {
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
+    admit_write(pool, Some(task_id))?;
     let Some(old) = get_task_tx(&tx, task_id)? else {
         return Ok(None);
     };
@@ -1271,8 +1564,10 @@ pub struct TaskLinkMutation {
 pub fn list_task_links(pool: &DbPool, task_id: &str) -> Result<Vec<TaskLinkRecord>> {
     let conn = pool.read().map_err(read_err)?;
     let mut stmt = conn.prepare(
-        "SELECT l.link_id,l.source_task_id,l.target_task_id,l.kind,l.lag_days, \
-         other.task_key,other.title FROM task_links l JOIN tasks other ON other.task_id = \
+        "SELECT l.link_id,l.relation_id,l.source_task_id,l.target_task_id,\
+         l.source_project_id,l.target_project_id,l.kind,l.lag_days, \
+         COALESCE(other.task_key,''),COALESCE(other.title,'') \
+         FROM task_links l LEFT JOIN tasks other ON other.task_id = \
          CASE WHEN l.source_task_id = ?1 THEN l.target_task_id ELSE l.source_task_id END \
          WHERE l.source_task_id = ?1 OR l.target_task_id = ?1 ORDER BY l.link_id",
     )?;
@@ -1284,17 +1579,38 @@ pub fn list_task_links(pool: &DbPool, task_id: &str) -> Result<Vec<TaskLinkRecor
 fn read_task_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskLinkRecord> {
     Ok(TaskLinkRecord {
         link_id: row.get(0)?,
-        source_task_id: row.get(1)?,
-        target_task_id: row.get(2)?,
-        kind: row.get(3)?,
-        lag_days: row.get(4)?,
-        other_task_key: row.get(5)?,
-        other_task_title: row.get(6)?,
+        relation_id: row.get(1)?,
+        source_task_id: row.get(2)?,
+        target_task_id: row.get(3)?,
+        source_project_id: row.get(4)?,
+        target_project_id: row.get(5)?,
+        kind: row.get(6)?,
+        lag_days: row.get(7)?,
+        other_task_key: row.get(8)?,
+        other_task_title: row.get(9)?,
     })
 }
 
+pub fn get_task_link(pool: &DbPool, link_id: i64) -> Result<Option<TaskLinkRecord>> {
+    let conn = pool.read().map_err(read_err)?;
+    conn.query_row(
+        "SELECT l.link_id,l.relation_id,l.source_task_id,l.target_task_id,\
+         l.source_project_id,l.target_project_id,l.kind,l.lag_days,\
+         COALESCE(other.task_key,''),COALESCE(other.title,'') \
+         FROM task_links l LEFT JOIN tasks other ON other.task_id=l.target_task_id \
+         WHERE l.link_id=?1",
+        [link_id],
+        read_task_link,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub fn add_task_link(
-    pool: &DbPool,
+    source_pool: &DbPool,
+    target_pool: &DbPool,
+    source_project_id: &str,
+    target_project_id: &str,
     source_task_id: &str,
     target_task_id: &str,
     kind: &str,
@@ -1302,140 +1618,314 @@ pub fn add_task_link(
     actor: &str,
 ) -> Result<TaskLinkMutation> {
     if source_task_id == target_task_id {
-        bail!("task cannot link to itself")
+        bail!("task cannot link to itself");
     }
     if !["related", "duplicate", "fs", "ss", "ff", "sf"].contains(&kind) {
         bail!("invalid task link kind");
     }
     if !(-3650..=3650).contains(&lag_days) {
-        bail!("task link lag is out of range")
+        bail!("task link lag is out of range");
     }
     if ["related", "duplicate"].contains(&kind) && lag_days != 0 {
         bail!("symmetric task links cannot have lag");
     }
-    let conn = pool.write().map_err(write_err)?;
-    let tx = conn.unchecked_transaction()?;
-    let source =
-        get_task_tx(&tx, source_task_id)?.ok_or_else(|| anyhow!("source task not found"))?;
-    let target =
-        get_task_tx(&tx, target_task_id)?.ok_or_else(|| anyhow!("target task not found"))?;
-    if source.archived_at.is_some() || target.archived_at.is_some() {
-        bail!("cannot link archived tasks");
+    if (source_project_id == target_project_id) != std::sync::Arc::ptr_eq(source_pool, target_pool)
+    {
+        bail!("task relation pools do not match endpoint projects");
     }
-    let duplicate: Option<i64> = tx
-        .query_row(
-            "SELECT 1 FROM task_links WHERE kind = ?1 AND \
-         ((source_task_id = ?2 AND target_task_id = ?3) OR \
-          (?4 = 1 AND source_task_id = ?3 AND target_task_id = ?2))",
-            params![
-                kind,
-                source_task_id,
-                target_task_id,
-                ["related", "duplicate"].contains(&kind)
-            ],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if duplicate.is_some() {
-        bail!("task link already exists")
-    }
-    if !["related", "duplicate"].contains(&kind) {
-        let cycle: i64 = tx.query_row(
-            "WITH RECURSIVE reachable(task_id) AS (
-                SELECT ?1 UNION SELECT l.target_task_id FROM task_links l
-                JOIN reachable r ON l.source_task_id = r.task_id
-                WHERE l.kind IN ('fs','ss','ff','sf')
-             ) SELECT COUNT(*) FROM reachable WHERE task_id = ?2",
-            params![target_task_id, source_task_id],
-            |row| row.get(0),
-        )?;
-        if cycle != 0 {
-            bail!("task dependency would create a cycle")
+    let project_pools = if source_project_id == target_project_id {
+        vec![(source_project_id, source_pool)]
+    } else {
+        vec![
+            (source_project_id, source_pool),
+            (target_project_id, target_pool),
+        ]
+    };
+    for (project_id, pool) in project_pools {
+        let record = super::repository::project_record(project_id)?
+            .ok_or_else(|| anyhow!("task relation project missing"))?;
+        let status = super::task_index::sync_project(&record, pool, 4096)?;
+        if status.lag != 0 {
+            bail!("task relation endpoint index has not caught up");
         }
     }
-    tx.execute(
-        "INSERT INTO task_links(source_task_id,target_task_id,kind,lag_days,created_by) \
-         VALUES (?1,?2,?3,?4,?5)",
-        params![source_task_id, target_task_id, kind, lag_days, actor],
-    )?;
-    let link_id = tx.last_insert_rowid();
-    let payload = json!({"link_id": link_id, "source_task_id": source_task_id,
-        "target_task_id": target_task_id, "kind": kind, "lag_days": lag_days});
-    let source_event_id = record_event(
-        &tx,
-        source_task_id,
-        actor,
-        "link_added",
-        Value::Null,
-        payload.clone(),
-    )?;
-    let target_event_id = record_event(
-        &tx,
-        target_task_id,
-        actor,
-        "link_added",
-        Value::Null,
-        payload,
-    )?;
-    tx.commit()?;
-    Ok(TaskLinkMutation {
-        link: TaskLinkRecord {
-            link_id,
-            source_task_id: source_task_id.to_string(),
-            target_task_id: target_task_id.to_string(),
-            kind: kind.to_string(),
-            lag_days,
-            other_task_key: target.task_key,
-            other_task_title: target.title,
-        },
-        source_event_id,
-        target_event_id,
-    })
+    let relation_id = uuid::Uuid::new_v4().to_string();
+    let pending = super::models::TaskRelationRoute {
+        relation_id: relation_id.clone(),
+        owning_project_id: source_project_id.to_string(),
+        link_id: 0,
+        source_task_id: source_task_id.to_string(),
+        target_task_id: target_task_id.to_string(),
+        source_project_id: source_project_id.to_string(),
+        target_project_id: target_project_id.to_string(),
+        kind: kind.to_string(),
+    };
+    super::repository::prepare_task_relation_route(&pending)?;
+    let mut row_committed = false;
+    let result = (|| -> Result<TaskLinkMutation> {
+        let mut target_guard = None;
+        let source_conn = if source_project_id == target_project_id {
+            source_pool.write().map_err(write_err)?
+        } else if source_project_id < target_project_id {
+            let source = source_pool.write().map_err(write_err)?;
+            target_guard = Some(target_pool.write().map_err(write_err)?);
+            source
+        } else {
+            target_guard = Some(target_pool.write().map_err(write_err)?);
+            source_pool.write().map_err(write_err)?
+        };
+        let tx = source_conn.unchecked_transaction()?;
+        admit_write(source_pool, Some(source_task_id))?;
+        if source_project_id != target_project_id {
+            admit_write(target_pool, Some(target_task_id))?;
+        }
+        let source =
+            get_task_tx(&tx, source_task_id)?.ok_or_else(|| anyhow!("source task not found"))?;
+        let target = if source_project_id == target_project_id {
+            get_task_tx(&tx, target_task_id)?
+        } else {
+            let conn = target_guard.as_ref().expect("target writer is held");
+            conn.query_row(
+                &format!("SELECT {TASK_COLS} FROM tasks t WHERE t.task_id=?1"),
+                [target_task_id],
+                read_task,
+            )
+            .optional()?
+        }
+        .ok_or_else(|| anyhow!("target task not found"))?;
+        if source.archived_at.is_some() || target.archived_at.is_some() {
+            bail!("cannot link archived tasks");
+        }
+        tx.execute(
+            "INSERT INTO task_links(relation_id,source_task_id,target_task_id,             source_project_id,target_project_id,kind,lag_days,created_by)              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![relation_id,source_task_id,target_task_id,source_project_id,
+                    target_project_id,kind,lag_days,actor],
+        )?;
+        let link_id = tx.last_insert_rowid();
+        let payload = json!({"relation_id":relation_id,"link_id":link_id,
+            "source_task_id":source_task_id,"target_task_id":target_task_id,
+            "source_project_id":source_project_id,"target_project_id":target_project_id,
+            "kind":kind,"lag_days":lag_days});
+        let source_event_id = record_event(
+            &tx,
+            source_task_id,
+            actor,
+            "link_added",
+            Value::Null,
+            payload.clone(),
+        )?;
+        let target_event_id = if source_project_id == target_project_id {
+            record_event(
+                &tx,
+                target_task_id,
+                actor,
+                "link_added",
+                Value::Null,
+                payload.clone(),
+            )?
+        } else {
+            0
+        };
+        tx.commit()?;
+        row_committed = true;
+        let target_event_id = if source_project_id == target_project_id {
+            target_event_id
+        } else {
+            let conn = target_guard.as_ref().expect("target writer is held");
+            let tx = conn.unchecked_transaction()?;
+            admit_write(target_pool, Some(target_task_id))?;
+            let event_id = record_event(
+                &tx,
+                target_task_id,
+                actor,
+                "link_added",
+                Value::Null,
+                payload,
+            )?;
+            tx.commit()?;
+            event_id
+        };
+        Ok(TaskLinkMutation {
+            link: TaskLinkRecord {
+                link_id,
+                relation_id: relation_id.clone(),
+                source_task_id: source_task_id.to_string(),
+                target_task_id: target_task_id.to_string(),
+                source_project_id: source_project_id.to_string(),
+                target_project_id: target_project_id.to_string(),
+                kind: kind.to_string(),
+                lag_days,
+                other_task_key: target.task_key,
+                other_task_title: target.title,
+            },
+            source_event_id,
+            target_event_id,
+        })
+    })();
+    let mutation = match result {
+        Ok(mutation) => mutation,
+        Err(error) => {
+            if !row_committed {
+                super::repository::abort_task_relation_route(&relation_id)?;
+            }
+            return Err(error);
+        }
+    };
+    super::repository::publish_task_relation_route(&super::models::TaskRelationRoute {
+        link_id: mutation.link.link_id,
+        ..pending
+    })?;
+    Ok(mutation)
 }
 
 pub fn delete_task_link(
-    pool: &DbPool,
+    source_pool: &DbPool,
+    target_pool: &DbPool,
     link_id: i64,
     actor: &str,
 ) -> Result<Option<TaskLinkMutation>> {
-    let conn = pool.write().map_err(write_err)?;
-    let tx = conn.unchecked_transaction()?;
+    let Some(existing) = get_task_link(source_pool, link_id)? else {
+        return Ok(None);
+    };
+    if (existing.source_project_id == existing.target_project_id)
+        != std::sync::Arc::ptr_eq(source_pool, target_pool)
+    {
+        bail!("task relation pools do not match endpoint projects");
+    }
+    let mut target_guard = None;
+    let source_conn = if existing.source_project_id == existing.target_project_id {
+        source_pool.write().map_err(write_err)?
+    } else if existing.source_project_id < existing.target_project_id {
+        let source = source_pool.write().map_err(write_err)?;
+        target_guard = Some(target_pool.write().map_err(write_err)?);
+        source
+    } else {
+        target_guard = Some(target_pool.write().map_err(write_err)?);
+        source_pool.write().map_err(write_err)?
+    };
+    let tx = source_conn.unchecked_transaction()?;
+    admit_write(source_pool, Some(&existing.source_task_id))?;
+    if existing.source_project_id != existing.target_project_id {
+        admit_write(target_pool, Some(&existing.target_task_id))?;
+    }
     let link = tx.query_row(
-        "SELECT l.link_id,l.source_task_id,l.target_task_id,l.kind,l.lag_days,t.task_key,t.title \
-         FROM task_links l JOIN tasks t ON t.task_id = l.target_task_id WHERE l.link_id = ?1",
-        params![link_id], read_task_link,
+        "SELECT l.link_id,l.relation_id,l.source_task_id,l.target_task_id,         l.source_project_id,l.target_project_id,l.kind,l.lag_days,         COALESCE(t.task_key,''),COALESCE(t.title,'')          FROM task_links l LEFT JOIN tasks t ON t.task_id=l.target_task_id WHERE l.link_id=?1",
+        [link_id],read_task_link,
     ).optional()?;
-    let Some(link) = link else { return Ok(None) };
+    let Some(link) = link else {
+        return Ok(None);
+    };
+    if link.relation_id != existing.relation_id
+        || link.source_project_id != existing.source_project_id
+        || link.target_project_id != existing.target_project_id
+    {
+        bail!("task relation changed while deleting");
+    }
     let source =
         get_task_tx(&tx, &link.source_task_id)?.ok_or_else(|| anyhow!("source task not found"))?;
-    let target =
-        get_task_tx(&tx, &link.target_task_id)?.ok_or_else(|| anyhow!("target task not found"))?;
+    let target = if link.source_project_id == link.target_project_id {
+        get_task_tx(&tx, &link.target_task_id)?
+    } else {
+        target_guard
+            .as_ref()
+            .expect("target writer is held")
+            .query_row(
+                &format!("SELECT {TASK_COLS} FROM tasks t WHERE t.task_id=?1"),
+                [&link.target_task_id],
+                read_task,
+            )
+            .optional()?
+    }
+    .ok_or_else(|| anyhow!("target task not found"))?;
     if source.archived_at.is_some() || target.archived_at.is_some() {
         bail!("archived task links cannot be deleted");
     }
-    let payload = json!({"link_id": link.link_id, "source_task_id": link.source_task_id,
-        "target_task_id": link.target_task_id, "kind": link.kind, "lag_days": link.lag_days});
-    tx.execute(
-        "DELETE FROM task_links WHERE link_id = ?1",
-        params![link_id],
-    )?;
-    let source_event_id = record_event(
-        &tx,
-        &link.source_task_id,
+    let payload = json!({"relation_id":link.relation_id,"link_id":link.link_id,
+        "source_task_id":link.source_task_id,"target_task_id":link.target_task_id,
+        "source_project_id":link.source_project_id,"target_project_id":link.target_project_id,
+        "kind":link.kind,"lag_days":link.lag_days});
+    super::repository::prepare_task_relation_deletion(
+        &super::models::TaskRelationRoute {
+            relation_id: link.relation_id.clone(),
+            owning_project_id: link.source_project_id.clone(),
+            link_id: link.link_id,
+            source_task_id: link.source_task_id.clone(),
+            target_task_id: link.target_task_id.clone(),
+            source_project_id: link.source_project_id.clone(),
+            target_project_id: link.target_project_id.clone(),
+            kind: link.kind.clone(),
+        },
         actor,
-        "link_deleted",
-        payload.clone(),
-        Value::Null,
     )?;
-    let target_event_id = record_event(
-        &tx,
-        &link.target_task_id,
-        actor,
-        "link_deleted",
-        payload,
-        Value::Null,
-    )?;
-    tx.commit()?;
+    let mut source_committed = false;
+    let deletion = (|| -> Result<(i64, i64)> {
+        tx.execute("DELETE FROM task_links WHERE link_id=?1", [link_id])?;
+        let source_event_id = record_event(
+            &tx,
+            &link.source_task_id,
+            actor,
+            "link_deleted",
+            payload.clone(),
+            Value::Null,
+        )?;
+        let target_event_id = if link.source_project_id == link.target_project_id {
+            record_event(
+                &tx,
+                &link.target_task_id,
+                actor,
+                "link_deleted",
+                payload.clone(),
+                Value::Null,
+            )?
+        } else {
+            0
+        };
+        tx.commit()?;
+        source_committed = true;
+        if link.source_project_id == link.target_project_id {
+            Ok((source_event_id, target_event_id))
+        } else {
+            let conn = target_guard.as_ref().expect("target writer is held");
+            let tx = conn.unchecked_transaction()?;
+            let exists: i64 = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task_events WHERE task_id=?1 AND kind='link_deleted' \
+                 AND json_extract(before_json,'$.relation_id')=?2)",
+                params![link.target_task_id, link.relation_id],
+                |row| row.get(0),
+            )?;
+            let target_event_id = if exists == 0 {
+                record_event(
+                    &tx,
+                    &link.target_task_id,
+                    actor,
+                    "link_deleted",
+                    payload,
+                    Value::Null,
+                )?
+            } else {
+                tx.query_row(
+                    "SELECT event_id FROM task_events WHERE task_id=?1 AND kind='link_deleted' \
+                     AND json_extract(before_json,'$.relation_id')=?2 ORDER BY event_id DESC LIMIT 1",
+                    params![link.target_task_id, link.relation_id],
+                    |row| row.get(0),
+                )?
+            };
+            tx.commit()?;
+            Ok((source_event_id, target_event_id))
+        }
+    })();
+    let (source_event_id, target_event_id) = match deletion {
+        Ok(ids) => ids,
+        Err(error) => {
+            if !source_committed {
+                super::repository::abort_task_relation_deletion(&link.relation_id)?;
+            }
+            return Err(error);
+        }
+    };
+    drop(target_guard);
+    drop(source_conn);
+    super::repository::finish_task_relation_deletion(&link.relation_id)?;
     Ok(Some(TaskLinkMutation {
         link,
         source_event_id,
@@ -1450,7 +1940,29 @@ mod tests {
 
     fn storage() -> (tempfile::TempDir, DbPool) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (pool, _) = project_db::open_pool_at(dir.path()).expect("project schema");
+        let central_dir = tempfile::tempdir().expect("registry tempdir");
+        let _ = crate::project_studio::db::init(&central_dir.path().join("projects.db"));
+        std::mem::forget(central_dir);
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let org_id = uuid::Uuid::new_v4().to_string();
+        crate::project_studio::repository::create_project(
+            &project_id,
+            &org_id,
+            "Test project",
+            "",
+            "custom",
+            "[\"tasks\"]",
+            "u1",
+            dir.path().to_str().expect("path"),
+            "PR",
+            None,
+            false,
+            false,
+            false,
+            &[],
+        )
+        .expect("registered project");
+        let pool = project_db::open(&project_id).expect("project schema");
         (dir, pool)
     }
 
@@ -1632,8 +2144,18 @@ mod tests {
             .expect("comment")
             .comment
             .expect("comment row");
-        let link = add_task_link(&pool, &first.task_id, &second.task_id, "related", 0, "u1")
-            .expect("link");
+        let link = add_task_link(
+            &pool,
+            &pool,
+            &project_db::project_id_of(&pool).expect("project id"),
+            &project_db::project_id_of(&pool).expect("project id"),
+            &first.task_id,
+            &second.task_id,
+            "related",
+            0,
+            "u1",
+        )
+        .expect("link");
         set_task_archived(&pool, &first.task_id, true, "u1")
             .expect("archive")
             .expect("task");
@@ -1647,7 +2169,7 @@ mod tests {
             .len();
         assert!(edit_comment(&pool, &comment.comment_id, "u1", "Changed", &[]).is_err());
         assert!(delete_comment(&pool, &comment.comment_id, "u1").is_err());
-        assert!(delete_task_link(&pool, link.link.link_id, "u1").is_err());
+        assert!(delete_task_link(&pool, &pool, link.link.link_id, "u1").is_err());
         assert_eq!(
             get_comment(&pool, &comment.comment_id)
                 .expect("comment")
@@ -1680,7 +2202,7 @@ mod tests {
         set_task_archived(&pool, &second.task_id, true, "u1")
             .expect("archive target")
             .expect("task");
-        assert!(delete_task_link(&pool, link.link.link_id, "u1").is_err());
+        assert!(delete_task_link(&pool, &pool, link.link.link_id, "u1").is_err());
         set_task_archived(&pool, &second.task_id, false, "u1")
             .expect("restore target")
             .expect("task");
@@ -1696,7 +2218,7 @@ mod tests {
                 .expect("comment")
                 .changed
         );
-        assert!(delete_task_link(&pool, link.link.link_id, "u1")
+        assert!(delete_task_link(&pool, &pool, link.link.link_id, "u1")
             .expect("unlink restored")
             .is_some());
     }
@@ -1717,9 +2239,30 @@ mod tests {
         save_task_type(&pool, "incident", "Incident", "Operational work", 70, false)
             .expect("deactivate");
         assert!(create_task(&pool, &input("incident", "Another", "todo"), "u1").is_err());
-        assert!(add_task_link(&pool, &child.task_id, &child.task_id, "related", 0, "u1").is_err());
-        let link = add_task_link(&pool, &child.task_id, &other.task_id, "fs", 2, "u1")
-            .expect("dependency");
+        assert!(add_task_link(
+            &pool,
+            &pool,
+            &project_db::project_id_of(&pool).expect("project id"),
+            &project_db::project_id_of(&pool).expect("project id"),
+            &child.task_id,
+            &child.task_id,
+            "related",
+            0,
+            "u1"
+        )
+        .is_err());
+        let link = add_task_link(
+            &pool,
+            &pool,
+            &project_db::project_id_of(&pool).expect("project id"),
+            &project_db::project_id_of(&pool).expect("project id"),
+            &child.task_id,
+            &other.task_id,
+            "fs",
+            2,
+            "u1",
+        )
+        .expect("dependency");
         assert_eq!(link.link.kind, "fs");
         assert_eq!(
             list_task_links(&pool, &other.task_id)
@@ -1727,9 +2270,31 @@ mod tests {
                 .len(),
             1
         );
-        assert!(add_task_link(&pool, &other.task_id, &child.task_id, "ss", 0, "u1").is_err());
-        assert!(add_task_link(&pool, &child.task_id, &other.task_id, "fs", 2, "u1").is_err());
-        assert!(delete_task_link(&pool, link.link.link_id, "u1")
+        assert!(add_task_link(
+            &pool,
+            &pool,
+            &project_db::project_id_of(&pool).expect("project id"),
+            &project_db::project_id_of(&pool).expect("project id"),
+            &other.task_id,
+            &child.task_id,
+            "ss",
+            0,
+            "u1"
+        )
+        .is_err());
+        assert!(add_task_link(
+            &pool,
+            &pool,
+            &project_db::project_id_of(&pool).expect("project id"),
+            &project_db::project_id_of(&pool).expect("project id"),
+            &child.task_id,
+            &other.task_id,
+            "fs",
+            2,
+            "u1"
+        )
+        .is_err());
+        assert!(delete_task_link(&pool, &pool, link.link.link_id, "u1")
             .expect("delete")
             .is_some());
         assert_eq!(

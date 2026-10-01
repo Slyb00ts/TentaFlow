@@ -10,6 +10,7 @@
 pub mod activity;
 pub mod api_spec;
 pub mod archive;
+pub mod attachments;
 pub mod auto_runs;
 pub mod build_profiles;
 pub mod code_assist;
@@ -19,8 +20,8 @@ pub mod generation;
 pub mod git_source;
 pub mod ingest;
 pub mod knowledge;
-pub mod ml_link;
 pub mod media;
+pub mod ml_link;
 pub mod models;
 pub mod notifications;
 pub mod project_db;
@@ -28,6 +29,8 @@ pub mod reports;
 pub mod repository;
 pub mod runs;
 pub mod schedules;
+pub mod task_index;
+pub mod task_transfer;
 pub mod tasks;
 pub mod tests;
 pub mod zip_source;
@@ -38,7 +41,15 @@ use crate::db::DbPool;
 
 /// Project templates and content modules accepted anywhere a registry row is
 /// written — the wire (`project_create`) and an import manifest alike.
-pub const VALID_TEMPLATES: &[&str] = &["tests", "docs", "tests_docs", "custom"];
+pub const VALID_TEMPLATES: &[&str] = &[
+    "tests",
+    "docs",
+    "tests_docs",
+    "custom",
+    "deployment",
+    "maintenance",
+    "empty",
+];
 pub const VALID_MODULES: &[&str] = &["knowledge", "tests", "docs", "chat", "tasks"];
 
 /// Initialises Project Studio: opens `<data>/projects.db`, runs its
@@ -46,9 +57,14 @@ pub const VALID_MODULES: &[&str] = &["knowledge", "tests", "docs", "chat", "task
 /// migration, publishes the pool and starts the idle sweeper for cached
 /// per-project pools. Call once at startup, next to `ml_studio::init`,
 /// from within the tokio runtime (the sweeper spawns a task).
-pub fn init() -> Result<DbPool> {
+pub fn init(core_db: &DbPool) -> Result<DbPool> {
     let pool = db::init(&crate::paths::data_dir().join("projects.db"))?;
     heal_project_dir_paths(&pool);
+    archive::recover_operations(core_db)?;
+    let deferred = task_index::reconcile_startup()?;
+    if !deferred.is_empty() {
+        tracing::warn!(projects = ?deferred, "task projection waits for transfer recovery");
+    }
     ml_link::restore_grant_index()?;
     project_db::spawn_idle_sweeper();
     Ok(pool)

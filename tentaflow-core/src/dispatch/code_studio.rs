@@ -12602,6 +12602,7 @@ mod tests {
             "project-owner",
             &dir.to_string_lossy(),
             "",
+            None, false, false, false,
             &[crate::project_studio::models::MemberInput {
                 user_id: "u-devops-link".into(),
                 functions: vec!["devops".into()],
@@ -12652,7 +12653,9 @@ mod tests {
             ProtocolErrorCode::PolicyDenied
         );
         crate::project_studio::project_db::close(&project_id);
-        crate::project_studio::repository::delete_project_rows(&project_id)
+        let deletion=crate::project_studio::repository::prepare_project_delete("org-1",&project_id,"project-owner")
+            .expect("prepare registry cleanup");
+        crate::project_studio::repository::delete_project_rows(&project_id,&deletion)
             .expect("registry cleanup");
         release();
     }

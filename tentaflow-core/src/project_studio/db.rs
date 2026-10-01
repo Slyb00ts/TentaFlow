@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tracing::info;
 
 use crate::db::DbPool;
@@ -102,19 +102,37 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     for (version, sql) in MIGRATIONS {
         if *version > current {
             info!("Migracja Project Studio {}", version);
+            if *version == 5 {
+                conn.pragma_update(None, "foreign_keys", "OFF")?;
+            }
             let tx = conn.unchecked_transaction()?;
-            tx.execute_batch(sql)?;
-            if *version == 3 {
-                migrate_project_functions(&tx)?;
+            let result = (|| -> Result<()> {
+                tx.execute_batch(sql)?;
+                if *version == 3 {
+                    migrate_project_functions(&tx)?;
+                }
+                if *version == 4 {
+                    assign_project_key_prefixes(&tx)?;
+                }
+                tx.execute(
+                    "INSERT INTO project_studio_schema_version (version) VALUES (?1)",
+                    rusqlite::params![version],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })();
+            if *version == 5 {
+                conn.pragma_update(None, "foreign_keys", "ON")?;
+                if result.is_ok() {
+                    let violation: Option<String> = conn
+                        .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+                        .optional()?;
+                    if let Some(table) = violation {
+                        return Err(anyhow!("project registry foreign key violation in {table}"));
+                    }
+                }
             }
-            if *version == 4 {
-                assign_project_key_prefixes(&tx)?;
-            }
-            tx.execute(
-                "INSERT INTO project_studio_schema_version (version) VALUES (?1)",
-                rusqlite::params![version],
-            )?;
-            tx.commit()?;
+            result?;
         }
     }
     Ok(())
@@ -127,7 +145,176 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, CENTRAL_SCHEMA_V2),
     (3, CENTRAL_SCHEMA_V3),
     (4, CENTRAL_SCHEMA_V4),
+    (5, CENTRAL_SCHEMA_V5),
 ];
+
+const CENTRAL_SCHEMA_V5: &str = "
+CREATE TABLE projects_tree (
+    project_id TEXT PRIMARY KEY, org_id TEXT NOT NULL, name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+    template TEXT NOT NULL DEFAULT '',
+    modules_json TEXT NOT NULL DEFAULT '[\"knowledge\",\"chat\"]',
+    owner_user_id TEXT NOT NULL, dir_path TEXT NOT NULL,
+    schema_version_cache INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    key_prefix TEXT NOT NULL,
+    parent_id TEXT REFERENCES projects(project_id),
+    path TEXT NOT NULL,
+    depth INTEGER NOT NULL CHECK(depth BETWEEN 1 AND 4),
+    is_private INTEGER NOT NULL DEFAULT 0 CHECK(is_private IN (0,1)),
+    inherit_modules INTEGER NOT NULL DEFAULT 0 CHECK(inherit_modules IN (0,1)),
+    inherit_task_types INTEGER NOT NULL DEFAULT 0 CHECK(inherit_task_types IN (0,1)),
+    module_disabled_json TEXT NOT NULL DEFAULT '[]',
+    lifecycle TEXT NOT NULL DEFAULT 'active' CHECK(lifecycle IN ('active','ended')),
+    ended_at TEXT
+);
+INSERT INTO projects_tree(project_id,org_id,name,description,status,template,modules_json,
+    owner_user_id,dir_path,schema_version_cache,created_at,updated_at,key_prefix,path,depth)
+SELECT project_id,org_id,name,description,status,template,modules_json,
+    owner_user_id,dir_path,schema_version_cache,created_at,updated_at,key_prefix,
+    '/' || project_id,1 FROM projects;
+DROP TABLE projects;
+ALTER TABLE projects_tree RENAME TO projects;
+CREATE INDEX idx_projects_org_status ON projects(org_id,status);
+CREATE UNIQUE INDEX idx_projects_org_key_prefix ON projects(org_id,key_prefix);
+CREATE UNIQUE INDEX idx_projects_root_name ON projects(org_id,name) WHERE parent_id IS NULL;
+CREATE UNIQUE INDEX idx_projects_sibling_name ON projects(org_id,parent_id,name) WHERE parent_id IS NOT NULL;
+CREATE INDEX idx_projects_parent ON projects(parent_id);
+CREATE INDEX idx_projects_path ON projects(org_id,path);
+CREATE TABLE IF NOT EXISTS project_prefix_reservations (
+    org_id TEXT NOT NULL, key_prefix TEXT NOT NULL,
+    project_id TEXT NOT NULL, reserved_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY(org_id,key_prefix)
+);
+INSERT OR IGNORE INTO project_prefix_reservations(org_id,key_prefix,project_id)
+SELECT org_id,key_prefix,project_id FROM projects;
+CREATE TABLE task_index (
+    project_id TEXT NOT NULL, task_id TEXT NOT NULL, org_id TEXT NOT NULL,
+    revision INTEGER NOT NULL, task_key TEXT NOT NULL, task_no INTEGER NOT NULL,
+    task_type TEXT NOT NULL, title TEXT NOT NULL, severity TEXT NOT NULL,
+    priority TEXT NOT NULL, status TEXT NOT NULL, status_category TEXT NOT NULL,
+    assigned_to TEXT NOT NULL, due_date TEXT NOT NULL, parent_task_id TEXT,
+    links_json TEXT NOT NULL,
+    comment_count INTEGER NOT NULL, created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL, archived_at TEXT,
+    resolution TEXT, resolution_reason TEXT,
+    PRIMARY KEY(project_id,task_id)
+);
+CREATE INDEX idx_task_index_browse ON task_index(org_id,project_id,status,updated_at DESC);
+CREATE INDEX idx_task_index_assignee ON task_index(org_id,assigned_to,status);
+CREATE TABLE task_index_cursor (
+    project_id TEXT PRIMARY KEY, last_revision INTEGER NOT NULL DEFAULT 0,
+    observed_source_revision INTEGER NOT NULL DEFAULT 0,
+    indexed_at TEXT, observed_at TEXT
+);
+CREATE TABLE task_type_names (
+    source_project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    type_id TEXT NOT NULL, name TEXT NOT NULL,
+    PRIMARY KEY(source_project_id,type_id)
+);
+CREATE TABLE task_type_catalogue_cursor (
+    source_project_id TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL
+);
+CREATE TABLE task_locations (
+    task_id TEXT PRIMARY KEY, org_id TEXT NOT NULL,
+    project_id TEXT NOT NULL, current_key TEXT NOT NULL,
+    UNIQUE(org_id,current_key)
+);
+CREATE INDEX idx_task_locations_project ON task_locations(project_id);
+CREATE TABLE task_key_aliases (
+    org_id TEXT NOT NULL, alias_key TEXT NOT NULL, task_id TEXT NOT NULL,
+    target_project_id TEXT NOT NULL, current_key TEXT NOT NULL,
+    PRIMARY KEY(org_id,alias_key)
+);
+CREATE INDEX idx_task_key_aliases_task ON task_key_aliases(task_id);
+CREATE TABLE task_event_aliases (
+    task_id TEXT NOT NULL, origin_project_id TEXT NOT NULL, origin_event_id INTEGER NOT NULL,
+    current_project_id TEXT NOT NULL, current_event_id INTEGER NOT NULL,
+    PRIMARY KEY(task_id,origin_project_id,origin_event_id)
+);
+CREATE TABLE task_link_aliases (
+    relation_id TEXT NOT NULL, origin_project_id TEXT NOT NULL,
+    origin_link_id INTEGER NOT NULL, current_project_id TEXT NOT NULL,
+    current_link_id INTEGER NOT NULL,
+    PRIMARY KEY(origin_project_id,origin_link_id)
+);
+CREATE INDEX idx_task_link_aliases_relation ON task_link_aliases(relation_id);
+CREATE TABLE task_relation_routes (
+    relation_id TEXT PRIMARY KEY, owning_project_id TEXT NOT NULL,
+    link_id INTEGER NOT NULL, source_task_id TEXT NOT NULL,target_task_id TEXT NOT NULL,
+    source_project_id TEXT NOT NULL,target_project_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('related','duplicate','fs','ss','ff','sf')),
+    UNIQUE(owning_project_id,link_id)
+);
+CREATE INDEX idx_task_relation_source ON task_relation_routes(source_task_id);
+CREATE INDEX idx_task_relation_target ON task_relation_routes(target_task_id);
+CREATE TABLE task_relation_admissions (
+    relation_id TEXT PRIMARY KEY, owning_project_id TEXT NOT NULL,
+    source_task_id TEXT NOT NULL,target_task_id TEXT NOT NULL,
+    source_project_id TEXT NOT NULL,target_project_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('related','duplicate','fs','ss','ff','sf')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_task_relation_admission_source ON task_relation_admissions(source_task_id);
+CREATE INDEX idx_task_relation_admission_target ON task_relation_admissions(target_task_id);
+CREATE TABLE task_relation_deletions (
+    relation_id TEXT PRIMARY KEY REFERENCES task_relation_routes(relation_id),
+    actor_user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE task_transfer_journal (
+    operation_id TEXT PRIMARY KEY, org_id TEXT NOT NULL,
+    source_project_id TEXT NOT NULL, destination_project_id TEXT NOT NULL,
+    actor_user_id TEXT NOT NULL, task_ids_json TEXT NOT NULL,
+    consent_wider_access INTEGER NOT NULL CHECK(consent_wider_access IN (0,1)),
+    phase TEXT NOT NULL CHECK(phase IN ('prepared','copied','published','cleaned')),
+    sha_manifest_json TEXT NOT NULL DEFAULT '[]',
+    key_map_json TEXT NOT NULL DEFAULT '{}',
+    event_map_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE task_transfer_event_map (
+    operation_id TEXT NOT NULL, task_id TEXT NOT NULL,
+    source_project_id TEXT NOT NULL, source_event_id INTEGER NOT NULL,
+    destination_event_id INTEGER NOT NULL,
+    PRIMARY KEY(operation_id,task_id,source_project_id,source_event_id)
+);
+CREATE TABLE project_admissions (
+    project_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL CHECK(kind IN ('end','delete')),
+    actor_user_id TEXT NOT NULL, reason TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE project_lifecycle_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL UNIQUE, actor_user_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('ended','resumed')),
+    reason TEXT NOT NULL, at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE task_transfer_fences (
+    task_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL,
+    source_project_id TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE project_import_journal (
+    operation_id TEXT PRIMARY KEY, org_id TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    nodes_json TEXT NOT NULL,
+    phase TEXT NOT NULL CHECK(phase IN ('prepared','published')),
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE project_import_reservations (
+    operation_id TEXT NOT NULL, org_id TEXT NOT NULL,
+    project_id TEXT NOT NULL UNIQUE, key_prefix TEXT NOT NULL,
+    name TEXT NOT NULL, parent_id TEXT,
+    PRIMARY KEY(operation_id,project_id),
+    UNIQUE(org_id,key_prefix)
+);
+";
 
 const CENTRAL_SCHEMA_V4: &str = "
 ALTER TABLE projects ADD COLUMN key_prefix TEXT NOT NULL DEFAULT '';
@@ -167,19 +354,31 @@ pub(crate) fn reserve_key_prefix(
     name: &str,
     requested: &str,
 ) -> Result<String> {
-    use rusqlite::OptionalExtension;
+    let import_reservations_exist: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_import_reservations')",
+        [],|row| row.get(0),
+    )?;
+    let reserved = |candidate: &str| -> Result<bool> {
+        let permanent: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM project_prefix_reservations WHERE org_id=?1 AND key_prefix=?2)",
+            rusqlite::params![org_id,candidate],|row| row.get(0),
+        )?;
+        if permanent {
+            return Ok(true);
+        }
+        if !import_reservations_exist {
+            return Ok(false);
+        }
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM project_import_reservations WHERE org_id=?1 AND key_prefix=?2)",
+            rusqlite::params![org_id,candidate],|row| row.get(0),
+        ).map_err(Into::into)
+    };
 
     if !requested.trim().is_empty() {
         let prefix = normalize_key_prefix(requested)
             .ok_or_else(|| anyhow!("key prefix must match [A-Z][A-Z0-9]{{1,7}}"))?;
-        let taken: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM projects WHERE org_id = ?1 AND key_prefix = ?2",
-                rusqlite::params![org_id, prefix],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if taken.is_some() {
+        if reserved(&prefix)? {
             return Err(anyhow!("key prefix already exists in organization"));
         }
         return Ok(prefix);
@@ -192,14 +391,7 @@ pub(crate) fn reserve_key_prefix(
             let suffix = number.to_string();
             format!("{}{}", &base[..base.len().min(8 - suffix.len())], suffix)
         };
-        let taken: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM projects WHERE org_id = ?1 AND key_prefix = ?2",
-                rusqlite::params![org_id, candidate],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if taken.is_none() {
+        if !reserved(&candidate)? {
             return Ok(candidate);
         }
     }
@@ -207,6 +399,13 @@ pub(crate) fn reserve_key_prefix(
 }
 
 fn assign_project_key_prefixes(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS project_prefix_reservations (
+            org_id TEXT NOT NULL, key_prefix TEXT NOT NULL,
+            project_id TEXT NOT NULL, reserved_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY(org_id,key_prefix)
+        );",
+    )?;
     let mut stmt = tx.prepare(
         "SELECT project_id,org_id,name FROM projects ORDER BY org_id,created_at,project_id",
     )?;
@@ -225,6 +424,10 @@ fn assign_project_key_prefixes(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         tx.execute(
             "UPDATE projects SET key_prefix = ?1 WHERE project_id = ?2",
             rusqlite::params![prefix, project_id],
+        )?;
+        tx.execute(
+            "INSERT INTO project_prefix_reservations(org_id,key_prefix,project_id) VALUES (?1,?2,?3)",
+            rusqlite::params![org_id,prefix,project_id],
         )?;
     }
     tx.execute_batch(
@@ -424,6 +627,98 @@ fn migrate_project_functions(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_v5_preserves_v4_project_identity_prefix_and_members() {
+        let dir = tempfile::tempdir().expect("registry directory");
+        let conn = Connection::open(dir.path().join("projects.db")).expect("registry file");
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON; CREATE TABLE project_studio_schema_version(\
+             version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL DEFAULT (datetime('now')));",
+        )
+        .expect("version table");
+        for (version, sql) in MIGRATIONS.iter().take(4) {
+            let tx = conn.unchecked_transaction().expect("migration transaction");
+            tx.execute_batch(sql).expect("legacy schema");
+            if *version == 3 {
+                migrate_project_functions(&tx).expect("v3 function conversion");
+            }
+            if *version == 4 {
+                assign_project_key_prefixes(&tx).expect("v4 prefix assignment");
+            }
+            tx.execute(
+                "INSERT INTO project_studio_schema_version(version) VALUES (?1)",
+                [version],
+            )
+            .expect("migration version");
+            tx.commit().expect("legacy commit");
+        }
+        let org = uuid::Uuid::new_v4().to_string();
+        let project = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO projects(project_id,org_id,name,description,template,modules_json,\
+             owner_user_id,dir_path,key_prefix,created_at) VALUES (?1,?2,'Legacy project',\
+             'P1 description','custom','[\"tasks\"]','owner','/unused','LEG',\
+             '2026-01-01 00:00:00')",
+            rusqlite::params![project, org],
+        )
+        .expect("v4 project");
+        conn.execute(
+            "INSERT INTO project_members(project_id,user_id,project_admin,invited_by) \
+             VALUES (?1,'owner',1,'owner')",
+            [&project],
+        )
+        .expect("v4 owner");
+        run_migrations(&conn).expect("upgrade to v5");
+        let migrated: (String, String, String, String, String, String, i64) = conn
+            .query_row(
+                "SELECT project_id,org_id,key_prefix,description,path,owner_user_id,depth \
+                 FROM projects WHERE project_id=?1",
+                [&project],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("migrated project");
+        assert_eq!(
+            migrated,
+            (
+                project.clone(),
+                org.clone(),
+                "LEG".into(),
+                "P1 description".into(),
+                format!("/{project}"),
+                "owner".into(),
+                1,
+            )
+        );
+        let owner_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_members WHERE project_id=?1 AND user_id='owner' \
+                 AND project_admin=1",
+                [&project],
+                |row| row.get(0),
+            )
+            .expect("owner grant");
+        assert_eq!(owner_count, 1);
+        run_migrations(&conn).expect("reopen v5");
+        let reservation: String = conn
+            .query_row(
+                "SELECT project_id FROM project_prefix_reservations WHERE org_id=?1 AND key_prefix='LEG'",
+                [&org],
+                |row| row.get(0),
+            )
+            .expect("reserved original prefix");
+        assert_eq!(reservation, project);
+    }
 
     #[test]
     fn migration_assigns_stable_unique_project_prefixes_per_organization() {

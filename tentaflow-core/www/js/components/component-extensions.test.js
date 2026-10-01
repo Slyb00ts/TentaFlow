@@ -949,6 +949,60 @@ test('tf-button: the label attribute stays the direct text channel', () => {
   assert.equal(btn.querySelector('button').className, 'tf-btn tf-btn-primary');
 });
 
+test('tf-button: optional wrapping reacts in place and preserves rich content and the default line policy', () => {
+  const styles = document.createElement('style');
+  styles.textContent = readFileSync(join(WWW_ROOT, 'css/controls.css'), 'utf8');
+  document.head.appendChild(styles);
+  const btn = new TfButton();
+  btn.innerHTML = '<strong>Saved files</strong><span>Largest attachments and available disk space</span>';
+  mount(btn, { variant: 'ghost' });
+  const inner = btn.querySelector('button');
+  const content = inner.querySelector(':scope > span');
+  const originalContent = content.innerHTML;
+  try {
+    assert.equal(window.getComputedStyle(inner).whiteSpace, 'nowrap');
+    btn.setAttribute('wrap', '');
+    assert.equal(btn.querySelector('button'), inner);
+    assert.equal(window.getComputedStyle(inner).whiteSpace, 'normal');
+    assert.equal(Number.parseFloat(window.getComputedStyle(content).minWidth), 0);
+    assert.equal(window.getComputedStyle(content).overflowWrap, 'anywhere');
+    assert.equal(content.innerHTML, originalContent);
+    btn.removeAttribute('wrap');
+    assert.equal(window.getComputedStyle(inner).whiteSpace, 'nowrap');
+    assert.equal(inner.classList.contains('tf-btn-wrap'), false);
+    assert.equal(content.innerHTML, originalContent);
+  } finally { btn.remove(); styles.remove(); }
+});
+
+test('tf-button: wrapping survives content adoption and preserves native focus and disabled actions', async () => {
+  const btn = mount(new TfButton(), { variant: 'secondary', wrap: '', 'full-width': '', type: 'button' });
+  btn.textContent = 'Save an attachment with a meaningful description';
+  await flush();
+  let inner = btn.querySelector('button');
+  let actions = 0;
+  btn.addEventListener('click', () => { actions += 1; });
+  assert.ok(inner.classList.contains('tf-btn-wrap'));
+  assert.ok(inner.classList.contains('tf-btn-full-width'));
+  inner.focus(); assert.equal(document.activeElement, inner);
+  inner.click(); assert.equal(actions, 1);
+  btn.setAttribute('disabled', '');
+  assert.equal(inner.disabled, true); assert.equal(btn.getAttribute('aria-disabled'), 'true');
+  inner.click(); assert.equal(actions, 1);
+  btn.removeAttribute('disabled');
+  btn.setAttribute('label', 'Updated wrapped action');
+  assert.equal(inner.textContent, 'Updated wrapped action');
+  assert.ok(inner.classList.contains('tf-btn-wrap'));
+  inner.focus(); assert.equal(document.activeElement, inner);
+  inner.click(); assert.equal(actions, 2);
+  btn.removeAttribute('label');
+  btn.textContent = 'Rich content replaced after the upgrade'; await flush();
+  inner = btn.querySelector('button');
+  assert.ok(inner.classList.contains('tf-btn-wrap')); assert.equal(inner.type, 'button');
+  assert.equal(inner.textContent, 'Rich content replaced after the upgrade');
+  inner.click(); assert.equal(actions, 3);
+  btn.remove();
+});
+
 // ---------------------------------------------------------------------------
 // 8. Icon sprite
 // ---------------------------------------------------------------------------

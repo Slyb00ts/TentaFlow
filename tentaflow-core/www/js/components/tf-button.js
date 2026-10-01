@@ -2,7 +2,7 @@
 // Plik: tf-button.js
 // Opis: Komponent <tf-button> — renderuje standardowy button z klasami .tf-btn.
 //       Light DOM (bez Shadow DOM) zeby controls.css obslugiwal style.
-//       Atrybuty: variant, tone, size, icon, disabled, full-width.
+//       Atrybuty: variant, tone, size, icon, disabled, full-width, wrap.
 //       `aria-label` is copied onto the inner <button>: the host is not
 //       focusable, so an icon-only button needs its name on the real control.
 // Przyklad: <tf-button variant="primary" icon="plus">Dodaj</tf-button>
@@ -49,7 +49,7 @@ const TONE_CLASS = {
 
 class TfButton extends HTMLElement {
   static get observedAttributes() {
-    return ['variant', 'tone', 'size', 'icon', 'trailing-icon', 'disabled', 'type', 'label', 'full-width'];
+    return ['variant', 'tone', 'size', 'icon', 'trailing-icon', 'disabled', 'type', 'label', 'full-width', 'wrap'];
   }
 
   constructor() {
@@ -175,6 +175,7 @@ class TfButton extends HTMLElement {
     if (size === 'sm') classes.push('tf-btn-sm');
     if (icon && !hasText) classes.push('tf-btn-icon');
     if (this.hasAttribute('full-width')) classes.push('tf-btn-full-width');
+    if (this.hasAttribute('wrap')) classes.push('tf-btn-wrap');
     this._btn.className = classes.join(' ');
 
     if (this.hasAttribute('disabled')) {

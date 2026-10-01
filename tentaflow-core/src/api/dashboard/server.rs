@@ -229,7 +229,12 @@ impl DashboardServer {
         let mesh_relay_health = self.mesh_relay_health.clone();
         let port_allocator = self.port_allocator.clone();
         let mesh_services_registry = self.mesh_services_registry.clone();
-
+        let project_state=build_app_state(db.clone(),router.clone(),mesh_peer_store.clone(),service_manager.clone(),
+            metrics.clone(),settings_cipher.clone(),cipher.clone(),quic_mesh.clone(),local_node_id.clone(),
+            mesh_security.clone(),permission_checker.clone(),addon_manager.clone(),license.clone(),
+            mesh_relay_health.clone(),port_allocator.clone(),mesh_services_registry.clone());
+        crate::project_studio::task_transfer::recover_transfers(&project_state)?;
+        crate::project_studio::media::start_workers(project_state.clone())?;
 
         crate::scheduler::start(db.clone(), addon_manager.clone());
 
@@ -1030,7 +1035,6 @@ pub fn build_app_state(
         progress_broker: crate::flow_engine::progress_broker::global_broker(),
         agent_run_manager: crate::agents::agent_run_manager_global(),
     });
-    crate::project_studio::media::start_workers(state.clone());
     state
 }
 

@@ -36,7 +36,7 @@ Router.navigate = async (view, params) => { navigation.push({ view, params }); r
 
 function access(overrides = {}) {
   return { has_access: true, project_admin: false, app_admin: false, is_owner: false,
-    archived: false, functions: [], expires_at: null, enabled_modules: ['knowledge', 'tasks'],
+    archived: false, ended: false, functions: [], expires_at: null, enabled_modules: ['knowledge', 'tasks'],
     areas: PROJECT_AREAS.map((area) => ({ area, enabled: ['knowledge', 'repos', 'tasks', 'board', 'sprints', 'settings'].includes(area), level: 'none' })),
     can_create_tasks: true, can_manage_members: false, can_manage_settings: false, ...overrides };
 }
@@ -53,28 +53,44 @@ function taskTypes() {
   return ['feature', 'defect', 'technical', 'security', 'subtask', 'epic'].map((type_id, i) => ({ type_id, name: type_id, description: type_id, sort_order: i * 10, built_in: true, active: true }));
 }
 
+function projectFixture(projectAccess, overrides = {}) {
+  return { parent_id: null, path: '/p0-project', depth: 1, lifecycle: projectAccess.ended ? 'ended' : 'active', ended_at: null, is_private: false, inherit_modules: false, inherit_task_types: false, task_type_source_project_id: 'p0-project', own_open_tasks: 0, descendant_open_tasks: 0, my_open_tasks: 0, overdue_tasks: 0, can_create_child: projectAccess.project_admin && !projectAccess.archived && !projectAccess.ended, can_move: projectAccess.is_owner && !projectAccess.archived && !projectAccess.ended, can_archive: projectAccess.is_owner && !projectAccess.archived && !projectAccess.ended, can_unarchive: projectAccess.is_owner && projectAccess.archived, can_delete: projectAccess.is_owner, can_end: projectAccess.is_owner && !projectAccess.archived && !projectAccess.ended, can_resume: projectAccess.is_owner && projectAccess.ended, can_export: projectAccess.project_admin && projectAccess.has_access, project_id: 'p0-project', name: 'Workflow', description: '', template: 'custom', status: projectAccess.archived ? 'archived' : 'active', modules: ['knowledge', 'tasks'], key_prefix: 'WF', key_prefix_locked: false, access: projectAccess, member_count: 3, ...overrides };
+}
+
 async function mount(projectAccess, overrides = {}, params = null) {
   screen.unmount();
   calls.length = 0;
   navigation.length = 0;
-  const project = { project_id: 'p0-project', name: 'Workflow', description: '', template: 'custom', status: projectAccess.archived ? 'archived' : 'active', modules: ['knowledge', 'tasks'], key_prefix: 'WF', key_prefix_locked: false, access: projectAccess, member_count: 3 };
+  const project = projectFixture(projectAccess);
   const fixtures = {
     // An AuthMe role never substitutes for project or application permissions.
     authMeRequest: { userId: new Uint8Array(16), username: 'Creator', role: 'admin' },
-    projectStudioProjectsListRequest: { projects: [project], can_create: false, can_administer: false },
+    projectStudioProjectTreeRequest: { projects: [project], breadcrumbs: [], can_create: false, can_administer: false },
     projectStudioCatalogueGetRequest: { functions: catalogue() },
     projectStudioProjectGetRequest: { project },
     projectStudioOverviewRequest: { kpis: {}, activity: [] },
     projectStudioNotificationsListRequest: { notifications: [], unread_count: 0 },
     projectStudioMembersListRequest: { members: [] },
     projectStudioTaskSaveRequest: { task_id: 'created-task', task_no: 1, task_key: 'WF-1', event_ids: [1] },
-    projectStudioTaskTypesListRequest: { types: taskTypes() },
+    projectStudioTaskTypesListRequest: { types: taskTypes(), source_project_id: 'p0-project' },
+    projectStudioTaskKeyResolveRequest: (input) => {
+      assert.notEqual(input.taskKey != null, input.taskId != null, 'the resolver receives exactly one task identity');
+      assert.equal(input.originProjectId != null, input.originEventId != null, 'origin metadata is supplied as a complete pair');
+      return { project_id: 'p0-project', task_id: input.taskId || 'task-one', current_key: input.taskKey || 'WF-7', event_id: input.originEventId == null ? null : Number(input.originEventId) };
+    },
+    projectStudioProjectInheritancePreviewRequest: { current_modules: project.modules, proposed_modules: project.modules, current_task_types: taskTypes(), proposed_task_types: taskTypes() },
     ...overrides,
   };
   ApiBinary.one = async (kind, payload) => {
     calls.push({ kind, payload });
     if (!(kind in fixtures)) throw new Error(`unexpected request ${kind}`);
-    return typeof fixtures[kind] === 'function' ? fixtures[kind](payload) : fixtures[kind];
+    const result = await (typeof fixtures[kind] === 'function' ? fixtures[kind](payload) : fixtures[kind]);
+    if (kind === 'projectStudioTasksListRequest') {
+      const rows = result.tasks.map((task) => ({ project_id: 'p0-project', project_name: 'Workflow', task_type_name: task.task_type, resolution: null, resolution_reason: null, ...task }));
+      const summary = { todo: rows.filter((task) => task.status === 'todo').length, in_progress: rows.filter((task) => task.status === 'in_progress').length, review: rows.filter((task) => task.status === 'review').length, done: rows.filter((task) => task.status === 'done').length, own_total: result.total, descendant_total: 0, source_revision: 1, applied_revision: 1, indexed_at: '2026-10-01T12:00:00Z' };
+      return { summary, ...result, tasks: rows };
+    }
+    return result;
   };
   document.body.innerHTML = `<main>${screen.render()}</main>`;
   await screen.mount(params || {});
@@ -424,6 +440,34 @@ test('Tasks Write with Board None keeps the list and refuses the unavailable boa
   screen.unmount();
 });
 
+test('task view preferences belong to the signed-in user and do not reuse the old project-only key', async () => {
+  const reader = access({ areas: PROJECT_AREAS.map((area) => ({ area, enabled: true, level: ['tasks', 'board'].includes(area) ? 'read' : 'none' })) });
+  const userA = new Uint8Array(16).fill(1);
+  const userB = new Uint8Array(16).fill(2);
+  localStorage.setItem('ps.tasks.view.p0-project', 'board');
+  await mount(reader, {
+    authMeRequest: { userId: userA, username: 'First person' },
+    projectStudioTasksListRequest: { tasks: [], total: 0 },
+  });
+  await openTasks();
+  assert.equal(document.querySelector('#ps-tasks-mode').getAttribute('value'), 'list');
+  document.querySelector('#ps-tasks-mode').dispatchEvent(new CustomEvent('change', { detail: { value: 'board' }, bubbles: true }));
+  await settle();
+  assert.equal(localStorage.getItem(`ps.tasks.view.${'01'.repeat(16)}.p0-project`), 'board');
+  await mount(reader, {
+    authMeRequest: { userId: userB, username: 'Second person' },
+    projectStudioTasksListRequest: { tasks: [], total: 0 },
+  });
+  await openTasks();
+  assert.equal(document.querySelector('#ps-tasks-mode').getAttribute('value'), 'list');
+  await mount(reader, {
+    authMeRequest: { userId: userA, username: 'First person' },
+    projectStudioTasksListRequest: { tasks: [], total: 0 },
+  });
+  await openTasks();
+  assert.equal(document.querySelector('#ps-tasks-mode').getAttribute('value'), 'board');
+});
+
 test('editing a function saves one complete row of the matrix in one mutation', async () => {
   await mount(access({ project_admin: true, can_manage_members: true }), { projectStudioFunctionSaveRequest: { ok: true } });
   document.querySelector('[data-goto-members]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -449,7 +493,7 @@ function tasksAccess(level = 'write', board = 'read') {
 }
 
 function taskFixture(overrides = {}) {
-  return { task_id: 'task-one', task_no: 7, task_key: 'WF-7', task_type: 'technical', title: 'Persistent task', description_md: '', severity: '', priority: 'medium', status: 'in_progress', assigned_to: '', assigned_to_name: '', due_date: '', parent_task_id: null, links_json: '[]', comment_count: 0, created_by: 'author', created_by_name: 'Author', created_at: '2026-10-01T10:00:00Z', updated_at: '2026-10-01T10:00:00Z', archived_at: null, ...overrides };
+  return { project_id: 'p0-project', project_name: 'Workflow', task_type_name: 'Technical', resolution: null, resolution_reason: null, task_id: 'task-one', task_no: 7, task_key: 'WF-7', task_type: 'technical', title: 'Persistent task', description_md: '', severity: '', priority: 'medium', status: 'in_progress', assigned_to: '', assigned_to_name: '', due_date: '', parent_task_id: null, links_json: '[]', comment_count: 0, created_by: 'author', created_by_name: 'Author', created_at: '2026-10-01T10:00:00Z', updated_at: '2026-10-01T10:00:00Z', archived_at: null, ...overrides };
 }
 
 function detailFixture(info, overrides = {}) {
@@ -652,6 +696,53 @@ test('a full history page resolves every before and after reference with bounded
   assert.equal(calls.filter((call) => call.kind === 'projectStudioTaskGetRequest').length, 101);
 });
 
+test('history does not reuse cached or historical project names after a current read denial', async () => {
+  const info = taskFixture();
+  const current = treeProject('p0-project', 'Current <authorized> project', tasksAccess('read'));
+  const stale = treeProject('old-private-project', 'Cached private name', tasksAccess('read'));
+  const events = [{ event_id: 7, task_id: info.task_id, at: '2026-10-01T11:00:00Z', actor_kind: 'system', actor_id: '', kind: 'transferred',
+    before_json: JSON.stringify({ project_id: stale.project_id, project_name: 'Historical private name', task_key: 'OLD-7' }),
+    after_json: JSON.stringify({ project_id: current.project_id, project_name: 'Historical public name', task_key: 'WF-7', operation_id: 'private-operation-uuid' }) }];
+  await mount(current.access, treeFixtures([current, stale], {
+    projectStudioProjectGetRequest: ({ projectId }) => { if (projectId === current.project_id) return { project: current }; throw new Error('Current project access was denied'); },
+    projectStudioTasksListRequest: { tasks: [info], total: 1 },
+    projectStudioTaskGetRequest: { detail: detailFixture({ ...info, project_name: current.name }, { events }) },
+  }));
+  await openTaskCard(); await settle();
+  const history = document.querySelector('#ps-task-history');
+  assert.ok(history.textContent.includes(current.name));
+  assert.ok(history.textContent.includes(I18n.t('project_studio.task_history_unavailable_record')));
+  for (const privateText of [stale.project_id, stale.name, 'Historical private name', 'Historical public name', 'private-operation-uuid']) assert.equal(history.textContent.includes(privateText), false);
+  assert.equal(history.querySelector('authorized'), null);
+  assert.equal(calls.filter(call => call.kind === 'projectStudioProjectGetRequest' && call.payload.projectId === stale.project_id).length, 1);
+});
+
+test('history resolves one hundred task and project references with shared concurrency and current project authorization', async () => {
+  const info = taskFixture();
+  const events = Array.from({ length: 50 }, (_, index) => ({ event_id: 50 - index, task_id: info.task_id, at: '2026-10-01T11:00:00Z', actor_kind: 'system', actor_id: '', kind: 'link_created', before_json: 'null', after_json: JSON.stringify({ source_task_id: info.task_id, target_task_id: `task-ref-${index}`, source_project_id: info.project_id, target_project_id: `project-ref-${index}`, relation_id: `relation-ref-${index}`, kind: 'related', lag_days: 0 }) }));
+  let active = 0, peak = 0, resolved = 0;
+  const resolve = async (id, create) => {
+    active += 1; peak = Math.max(peak, active); await flush(); active -= 1; resolved += 1;
+    if (id.endsWith('-49')) throw new Error('Current project read was denied');
+    return create();
+  };
+  await mount(tasksAccess('read'), {
+    projectStudioTasksListRequest: { tasks: [info], total: 1 },
+    projectStudioProjectGetRequest: ({ projectId }) => projectId === info.project_id ? { project: projectFixture(tasksAccess('read')) } : resolve(projectId, () => ({ project: projectFixture(tasksAccess('read'), { project_id: projectId, name: `Current project <${projectId.slice(12)}>` }) })),
+    projectStudioTaskGetRequest: ({ taskId }) => taskId === info.task_id ? { detail: detailFixture(info, { events }) } : resolve(taskId, () => ({ detail: detailFixture(taskFixture({ task_id: taskId, task_key: `CH-${taskId.slice(9)}`, title: 'Currently authorized task', project_id: `project-ref-${taskId.slice(9)}`, project_name: `Current project <${taskId.slice(9)}>` })) })),
+  });
+  await openTaskCard();
+  for (let index = 0; resolved < 100 && index < 100; index += 1) await flush();
+  assert.equal(resolved, 100); assert.ok(peak > 1 && peak <= 5);
+  const history = document.querySelector('#ps-task-history');
+  assert.ok(history.textContent.includes('Current project <48>'));
+  assert.ok(history.textContent.includes('CH-48 · Currently authorized task'));
+  assert.ok(history.textContent.includes(I18n.t('project_studio.task_history_unavailable_record')));
+  for (const internal of ['project-ref-', 'task-ref-', 'relation-ref-']) assert.equal(history.textContent.includes(internal), false);
+  assert.equal(history.querySelector('current'), null);
+  assert.equal(calls.filter(call => call.kind === 'projectStudioProjectGetRequest' && call.payload.projectId.startsWith('project-ref-')).length, 50);
+});
+
 test('comment add and edit retain structural mention IDs with equal display names', async () => {
   const info = taskFixture();
   const actor = '0'.repeat(32);
@@ -732,6 +823,14 @@ test('archived tasks are discoverable and immutable while explicit restore and a
   assert.deepEqual(calls.filter((call) => call.kind === 'projectStudioTaskArchiveRequest').map((call) => call.payload.archived), [false, true]);
 });
 
+test('a task row opens its stable UUID without supplying partial origin-event metadata', async () => {
+  const info = taskFixture();
+  await mount(tasksAccess('read'), { projectStudioTasksListRequest: { tasks: [info], total: 1 }, projectStudioTaskGetRequest: { detail: detailFixture(info) } });
+  await openTaskCard();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioTaskKeyResolveRequest').payload, { taskKey: null, taskId: info.task_id, originProjectId: null, originEventId: null });
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioTaskGetRequest').payload, { projectId: info.project_id, taskId: info.task_id });
+});
+
 test('a key deep link resolves the exact archived task and closing the card preserves the project route', async () => {
   const info = taskFixture({ archived_at: '2026-10-01T12:00:00Z' });
   const original = { current: Router.current, currentParams: Router.currentParams, replaceParams: Router.replaceParams };
@@ -742,8 +841,9 @@ test('a key deep link resolves the exact archived task and closing the card pres
     assert.ok(document.querySelector('#ps-task-title'));
     assert.equal(params.taskKey, 'WF-7');
     assert.equal(params.instance, 'native-projects');
-    const resolve = calls.find((call) => call.kind === 'projectStudioTasksListRequest' && call.payload.search === 'WF-7');
-    assert.equal(resolve.payload.includeArchived, true);
+    const resolve = calls.find((call) => call.kind === 'projectStudioTaskKeyResolveRequest');
+    assert.deepEqual(resolve.payload, { taskKey: 'WF-7', taskId: null, originProjectId: null, originEventId: null });
+    assert.equal(calls.some((call) => call.kind === 'projectStudioTasksListRequest' && call.payload.search === 'WF-7'), false);
     click(document.querySelector('#ps-task-title').closest('tf-window').querySelector('[data-action="cancel"]'));
     assert.equal(params.taskKey, null);
     assert.equal(params.projectId, 'p0-project');
@@ -816,4 +916,519 @@ test('previous assignees see localized reassignment and removal notifications li
     assert.ok(document.querySelector(`[data-task-event="${eventId}"]`).closest('.tf-timeline-item').classList.contains('ps-task-target'));
     assert.equal(calls.find((call) => call.kind === 'projectStudioTaskGetRequest').payload.taskId, info.task_id);
   }
+});
+
+function treeProject(id, name, projectAccess, overrides = {}) {
+  return projectFixture(projectAccess, { project_id: id, name, path: `/${id}`, task_type_source_project_id: id, key_prefix: id === 'p0-project' ? 'WF' : 'CH', ...overrides });
+}
+
+function treeFixtures(projects, overrides = {}) {
+  return {
+    projectStudioProjectTreeRequest: { projects, breadcrumbs: [], can_create: false, can_administer: false },
+    projectStudioProjectGetRequest: ({ projectId }) => ({ project: projects.find((project) => project.project_id === projectId) }),
+    projectStudioTaskTypesListRequest: ({ projectId }) => ({ types: taskTypes(), source_project_id: projects.find((project) => project.project_id === projectId).task_type_source_project_id }),
+    ...overrides,
+  };
+}
+
+function selectValue(control, value) {
+  assert.ok(control); control.value = value;
+  control.dispatchEvent(new CustomEvent('change', { detail: { value }, bubbles: true }));
+}
+
+function checkValue(control, checked) {
+  assert.ok(control); control.checked = checked;
+  control.dispatchEvent(new CustomEvent('change', { detail: { checked }, bubbles: true }));
+}
+
+test('an accessible child-only card exposes ancestor names without parent actions or hidden metadata', async () => {
+  const child = treeProject('child', 'Private accessible child', tasksAccess('read'), { parent_id: 'name-only', path: '/name-only/child', depth: 2, is_private: true, own_open_tasks: 4, my_open_tasks: 2, overdue_tasks: 1 });
+  await mount(child.access, treeFixtures([child], { projectStudioProjectTreeRequest: { projects: [child], breadcrumbs: [{ project_id: 'name-only', name: 'Ancestor label only', depth: 1 }], can_create: false, can_administer: false } }), {});
+  const cards = document.querySelectorAll('.ps-card[data-project-id]');
+  assert.equal(cards.length, 1); assert.match(cards[0].textContent, /Ancestor label only/);
+  click(cards[0]); await settle();
+  const crumbs = document.querySelector('#ps-crumbs');
+  assert.ok([...crumbs.querySelectorAll('span.tf-breadcrumb-item')].some((item) => item.textContent === 'Ancestor label only'));
+  assert.equal(crumbs.querySelector('a[href="#ancestor:name-only"]'), null);
+  click(document.querySelector('[data-project-picker]'));
+  const nodes = document.querySelector('[data-picker-tree] tf-tree').nodes;
+  assert.equal(nodes[0].disabled, true); assert.equal(nodes[0].actions, undefined);
+  assert.equal(calls.some((call) => call.payload?.projectId === 'name-only'), false);
+  assert.equal(document.querySelector('[data-new-child]'), null);
+});
+
+test('project picker retains searched nodes through input blur and selects on the first click', async () => {
+  const reader = tasksAccess('read');
+  const parent = treeProject('p0-project', 'Parent project', reader);
+  const child = treeProject('child', 'Inherited work', reader, { parent_id: parent.project_id, path: '/p0-project/child', depth: 2, own_open_tasks: 1 });
+  await mount(reader, treeFixtures([parent, child]), { projectId: parent.project_id });
+  click(document.querySelector('[data-project-picker]'));
+  const search = document.querySelector('[data-tree-search] input');
+  search.value = 'Inherited';
+  search.dispatchEvent(new Event('input', { bubbles: true }));
+  await new Promise((resolve) => setTimeout(resolve, 230));
+  const tree = document.querySelector('[data-picker-tree] tf-tree');
+  const target = tree.querySelector('[data-node-id="child"] > .tf-tree__row > .tf-tree__label');
+  assert.ok(target);
+  search.dispatchEvent(new Event('change', { bubbles: true }));
+  assert.ok(document.querySelector('[data-picker-tree] tf-tree') === tree, 'native input change retains the existing result tree');
+  assert.equal(target.isConnected, true);
+  checkValue(document.querySelector('[data-tree-open]'), true);
+  const filtered = document.querySelector('[data-picker-tree] tf-tree');
+  assert.ok(filtered !== tree, 'the semantic checkbox change refreshes its filtered results');
+  assert.equal(filtered.nodes[0].children[0].id, child.project_id);
+  click(filtered.querySelector('[data-node-id="child"] > .tf-tree__row > .tf-tree__label'));
+  await settle();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(!!document.querySelector('[data-picker-tree]'), false);
+  assert.equal(document.querySelector('tf-detail-header').getAttribute('title'), child.name);
+  assert.ok(calls.some((call) => call.kind === 'projectStudioProjectGetRequest' && call.payload.projectId === child.project_id));
+});
+
+test('child creation distinguishes an Empty own preset from live parent inheritance without a root creator grant', async () => {
+  const admin = access({ project_admin: true });
+  const parent = treeProject('p0-project', 'Grouping parent', admin, { template: 'empty', modules: [] });
+  let created;
+  const projects = [parent];
+  await mount(admin, treeFixtures(projects, {
+    projectStudioProjectCreateRequest: (input) => { created = treeProject('created-child', input.name, admin, { parent_id: parent.project_id, path: '/p0-project/created-child', depth: 2, template: input.template, modules: input.modules, is_private: input.isPrivate, inherit_modules: input.inheritModules, inherit_task_types: input.inheritTaskTypes }); projects.push(created); return { project_id: created.project_id }; },
+  }), { projectId: parent.project_id });
+  assert.equal(document.querySelector('#ps-new').hidden, true);
+  click(document.querySelector('[data-new-child]'));
+  document.querySelector('[data-child-name]').value = 'Explicit empty child';
+  document.querySelector('[data-child-prefix]').value = 'EMPTY';
+  selectValue(document.querySelector('[data-child-template]'), 'empty');
+  assert.match(document.querySelector('[data-child-effective]').textContent, /Current parent modules/);
+  checkValue(document.querySelector('[data-child-inherit-modules]'), false);
+  checkValue(document.querySelector('[data-child-inherit-types]'), false);
+  checkValue(document.querySelector('[data-child-private]'), true);
+  assert.match(document.querySelector('[data-child-effective]').textContent, /Own preset modules/);
+  assert.equal(document.querySelector('[data-child-effective] tf-chip'), null);
+  click(document.querySelector('[data-child-name]').closest('tf-window').querySelector('[data-action="save"]')); await settle();
+  const request = calls.find((call) => call.kind === 'projectStudioProjectCreateRequest');
+  assert.deepEqual(request.payload, { name: 'Explicit empty child', description: '', keyPrefix: 'EMPTY', template: 'empty', modules: [], parentId: parent.project_id, isPrivate: true, inheritModules: false, inheritTaskTypes: false, members: [] });
+  assert.equal(document.querySelector('tf-detail-header').getAttribute('title'), created.name);
+});
+
+test('a Settings reader sees current inheritance without sending a write-protected preview', async () => {
+  const reader = access({ areas: [{ area: 'settings', enabled: true, level: 'read' }] });
+  const child = treeProject('child', 'Read-only inheritance', reader, { parent_id: 'parent', path: '/parent/child', depth: 2, inherit_modules: true, inherit_task_types: true });
+  await mount(reader, treeFixtures([child], { projectStudioSettingsGetRequest: { settings: { modules: child.modules, tags: [], agents: [] } }, agentsListRequest: { agentsJson: '[]' } }), { projectId: child.project_id, tab: 'settings' });
+  assert.equal(document.querySelector('[data-inheritance-save]'), null);
+  assert.ok(document.querySelector('[data-inheritance-modules]').hasAttribute('disabled'));
+  assert.equal(calls.some((call) => call.kind === 'projectStudioProjectInheritancePreviewRequest'), false);
+  assert.match(document.querySelector('[data-inheritance-diff]').textContent, /parent/i);
+});
+
+test('detaching and re-inheriting use the actual diff and one atomic inheritance save', async () => {
+  const writer = access({ areas: [{ area: 'settings', enabled: true, level: 'write' }] });
+  const child = treeProject('child', 'Live child', writer, { parent_id: 'parent', path: '/parent/child', depth: 2, inherit_modules: true, inherit_task_types: true });
+  await mount(writer, treeFixtures([child], {
+    projectStudioSettingsGetRequest: { settings: { modules: child.modules, tags: [], agents: [] } }, agentsListRequest: { agentsJson: '[]' },
+    projectStudioProjectInheritancePreviewRequest: (input) => ({ current_modules: child.modules, proposed_modules: input.inheritModules ? ['knowledge', 'tasks', 'tests'] : child.modules, current_task_types: taskTypes(), proposed_task_types: taskTypes() }),
+    projectStudioProjectInheritanceSaveRequest: (input) => { Object.assign(child, { inherit_modules: input.inheritModules, inherit_task_types: input.inheritTaskTypes, is_private: input.isPrivate }); return { ok: true, effective_modules: child.modules, task_type_source_project_id: child.project_id }; },
+  }), { projectId: child.project_id, tab: 'settings' });
+  await settle();
+  click(document.querySelector('[data-detach]')); await settle();
+  assert.equal(document.querySelector('[data-inheritance-modules]').checked, false);
+  assert.equal(document.querySelector('[data-inheritance-types]').checked, false);
+  checkValue(document.querySelector('[data-inheritance-private]'), true); await settle();
+  click(document.querySelector('[data-inheritance-save]')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioProjectInheritanceSaveRequest').payload, { projectId: 'child', isPrivate: true, inheritModules: false, inheritTaskTypes: false, modules: child.modules });
+  click(document.querySelector('[data-reinherit]')); await settle();
+  const previews = calls.filter((call) => call.kind === 'projectStudioProjectInheritancePreviewRequest');
+  assert.deepEqual(previews.at(-1).payload, { projectId: 'child', inheritModules: true, inheritTaskTypes: true });
+  assert.match(document.querySelector('[data-inheritance-diff]').textContent, /Tests/);
+  assert.equal(calls.filter((call) => call.kind === 'projectStudioProjectInheritanceSaveRequest').length, 1);
+  click(document.querySelector('[data-inheritance-save]')); await settle();
+  assert.deepEqual(calls.filter((call) => call.kind === 'projectStudioProjectInheritanceSaveRequest').at(-1).payload, { projectId: 'child', isPrivate: true, inheritModules: true, inheritTaskTypes: true, modules: ['knowledge', 'tasks', 'tests'] });
+});
+
+test('physical move permits root without a creator grant and excludes cycles, depth five and non-owned targets', async () => {
+  const owner = access({ is_owner: true, areas: [{ area: 'settings', enabled: true, level: 'write' }] });
+  const moving = treeProject('moving', 'Moving subtree', owner, { parent_id: 'root', path: '/root/moving', depth: 2 });
+  const leaf = treeProject('leaf', 'Existing grandchild', owner, { parent_id: 'moving', path: '/root/moving/leaf', depth: 3 });
+  const target = treeProject('target', 'Valid destination', owner);
+  const deep = treeProject('deep', 'Too deep destination', owner, { depth: 3, path: '/a/b/deep', parent_id: 'b' });
+  const denied = treeProject('denied', 'Non-owner destination', access());
+  await mount(owner, treeFixtures([moving, leaf, target, deep, denied], { projectStudioSettingsGetRequest: { settings: { modules: moving.modules, tags: [], agents: [] } }, agentsListRequest: { agentsJson: '[]' }, projectStudioProjectMoveRequest: () => { moving.parent_id = null; moving.path = '/moving'; moving.depth = 1; return { ok: true }; } }), { projectId: moving.project_id, tab: 'settings' });
+  document.querySelector('.ps-subproject-layout tf-tree').dispatchEvent(new CustomEvent('move', { detail: { id: moving.project_id, parentId: deep.project_id }, bubbles: true }));
+  assert.equal(document.querySelector('[data-move-parent]'), null);
+  assert.equal(calls.some((call) => call.kind === 'projectStudioProjectMoveRequest'), false);
+  click(document.querySelector('[data-child-move]'));
+  const selector = document.querySelector('[data-move-parent]');
+  assert.deepEqual([...selector.querySelectorAll('option')].map((item) => item.value), ['', 'target']);
+  click(selector.closest('tf-window').querySelector('[data-action="save"]')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioProjectMoveRequest').payload, { projectId: 'moving', newParentId: null });
+});
+
+test('aggregate List and Board use authoritative counts, source filters and owning-project status rights', async () => {
+  const root = treeProject('p0-project', 'Root aggregate', tasksAccess('write', 'write'), { descendant_open_tasks: 12 });
+  const child = treeProject('child', 'Read-only child', tasksAccess('read', 'read'), { parent_id: root.project_id, path: '/p0-project/child', depth: 2 });
+  const rows = [taskFixture({ task_id: 'root-task', status: 'todo' }), taskFixture({ project_id: 'child', project_name: child.name, task_id: 'child-task', task_key: 'CH-9', status: 'todo', task_type: 'custom_review', task_type_name: 'Actual child review' })];
+  const summary = { todo: 21, in_progress: 3, review: 4, done: 2, own_total: 10, descendant_total: 20, source_revision: 103, applied_revision: 100, indexed_at: '2026-10-01T12:00:00Z' };
+  await mount(root.access, treeFixtures([root, child], { projectStudioTasksListRequest: { tasks: rows, total: 30, summary } }), { projectId: root.project_id, tab: 'tasks' });
+  assert.equal(calls.find((call) => call.kind === 'projectStudioTasksListRequest').payload.scope, 'descendants');
+  const table = document.querySelector('#ps-tasks-table');
+  assert.equal(table.rows[1].project, child.name); assert.equal(table.rows[1].type.label, 'Actual child review');
+  assert.match(document.querySelector('.ps-table-footer').textContent, /30.*10.*20/);
+  assert.match(document.querySelector('#ps-task-index-state').textContent, /3/);
+  selectValue(document.querySelector('#ps-tasks-project-filter'), ['child']); await settle();
+  assert.deepEqual(calls.filter((call) => call.kind === 'projectStudioTasksListRequest').at(-1).payload.sourceProjectIds, ['child']);
+  selectValue(document.querySelector('#ps-tasks-mode'), 'board'); await settle();
+  const board = document.querySelector('tf-kanban');
+  assert.ok(board); assert.equal(board.columns[0].count, 21); assert.equal(board.cards.find((card) => card.id === 'child-task').disabled, true);
+  board.dispatchEvent(new CustomEvent('card-move', { detail: { cardId: 'child-task', to: 'review' }, bubbles: true })); await settle();
+  assert.equal(calls.some((call) => call.kind === 'projectStudioTaskStatusSetRequest'), false);
+  selectValue(document.querySelector('#ps-tasks-mode'), 'list'); await settle();
+});
+
+test('delayed task renders cannot cross project navigation or replace a newer task filter', async () => {
+  const stages = ['projectStudioMembersListRequest', 'projectStudioProjectTreeRequest', 'projectStudioTaskTypesListRequest', 'projectStudioTasksListRequest'];
+  for (const stage of stages) {
+    const first = treeProject('p0-project', 'First project', tasksAccess('write', 'write'));
+    const current = treeProject('current-project', 'Current project', tasksAccess('write', 'write'));
+    let delayedKind = null;
+    let complete;
+    const replies = {
+      projectStudioMembersListRequest: () => ({ members: [] }),
+      projectStudioProjectTreeRequest: ({ projectId }) => ({ projects: projectId ? [projectId === first.project_id ? first : current] : [first, current], breadcrumbs: [], can_create: false, can_administer: false }),
+      projectStudioTaskTypesListRequest: ({ projectId }) => ({ types: [...taskTypes(), { type_id: 'current_type', name: projectId === first.project_id ? 'First type' : 'Current type', active: true, built_in: false, sort_order: 100 }], source_project_id: projectId }),
+      projectStudioTasksListRequest: ({ projectId, search }) => ({ tasks: [taskFixture({ project_id: projectId, task_id: `${projectId}-${search || 'initial'}`, title: `${projectId}: ${search || 'initial'}` })], total: 1 }),
+    };
+    const fixtures = Object.fromEntries(stages.map((kind) => [kind, async (payload) => {
+      const result = replies[kind](payload);
+      if (kind !== delayedKind) return result;
+      delayedKind = null;
+      return new Promise((resolve, reject) => { complete = { resolve: () => resolve(result), reject }; });
+    }]));
+    await mount(first.access, treeFixtures([first, current], fixtures), { projectId: first.project_id });
+    delayedKind = stage;
+    selectValue(document.querySelector('#ps-project-tabs'), 'tasks');
+    for (let i = 0; i < 20 && !complete; i++) await flush();
+    assert.ok(complete, `${stage} must actually remain pending`);
+    const stale = complete; complete = null;
+    click(document.querySelector('#ps-crumbs a.tf-breadcrumb-item'));
+    await settle();
+    click(document.querySelector(`.ps-card[data-project-id="${current.project_id}"]`)); await settle();
+    selectValue(document.querySelector('#ps-project-tabs'), 'tasks'); await settle();
+    const currentTable = document.querySelector('#ps-tasks-table');
+    assert.equal(currentTable.rows[0].title, `${current.project_id}: initial`);
+    stale.resolve(); await settle();
+    assert.equal(document.querySelector('#ps-tasks-table'), currentTable, `${stage} cannot replace the current task table`);
+    assert.equal(currentTable.rows[0].title, `${current.project_id}: initial`);
+    assert.equal(document.querySelector('tf-detail-header').getAttribute('title'), current.name);
+    assert.ok(document.querySelector('#ps-tasks-f-type').textContent.includes('Current type'));
+    selectValue(document.querySelector('#ps-tasks-scope'), 'single'); await settle();
+    assert.equal(calls.filter((call) => call.kind === 'projectStudioTasksListRequest').at(-1).payload.projectId, current.project_id);
+
+    if (stage === 'projectStudioTasksListRequest') {
+      delayedKind = stage;
+      document.querySelector('#ps-tasks-search').dispatchEvent(new CustomEvent('search', { detail: { value: 'earlier' }, bubbles: true }));
+      await settle(); assert.ok(complete); const earlier = complete; complete = null;
+      document.querySelector('#ps-tasks-search').dispatchEvent(new CustomEvent('search', { detail: { value: 'latest' }, bubbles: true }));
+      await settle();
+      const latestTable = document.querySelector('#ps-tasks-table');
+      assert.equal(latestTable.rows[0].title, `${current.project_id}: latest`);
+      earlier.resolve(); await settle();
+      assert.equal(document.querySelector('#ps-tasks-table'), latestTable);
+      assert.equal(latestTable.rows[0].title, `${current.project_id}: latest`);
+      delayedKind = stage;
+      document.querySelector('#ps-tasks-search').dispatchEvent(new CustomEvent('search', { detail: { value: 'leave' }, bubbles: true }));
+      await settle(); assert.ok(complete); const failed = complete; complete = null;
+      selectValue(document.querySelector('#ps-project-tabs'), 'overview'); await settle();
+      const overview = document.querySelector('#ps-tab-panel').innerHTML;
+      failed.reject(new Error('Delayed previous task view failed')); await settle();
+      assert.equal(document.querySelector('#ps-tab-panel').innerHTML, overview);
+      assert.equal(document.querySelector('#ps-tasks-scope'), null);
+    }
+  }
+});
+
+test('an aggregate without a scope timestamp reports unavailable timing and preserves actual lag', async () => {
+  const root = treeProject('p0-project', 'Root aggregate', tasksAccess('write', 'write'));
+  const child = treeProject('child', 'Current child', tasksAccess('read', 'read'), { parent_id: root.project_id, path: '/p0-project/child', depth: 2 });
+  const rows = Array.from({ length: 7 }, (_, index) => taskFixture({ project_id: 'child', task_id: `child-${index}`, task_key: `CH-${index + 1}`, status: 'todo' }));
+  const summary = { todo: 7, in_progress: 0, review: 0, done: 0, own_total: 0, descendant_total: 7, source_revision: 7, applied_revision: 7, indexed_at: null };
+  await mount(root.access, treeFixtures([root, child], { projectStudioTasksListRequest: { tasks: rows, total: 7, summary } }), { projectId: root.project_id, tab: 'tasks' });
+  const timing = () => document.querySelector('#ps-task-index-state');
+  assert.equal(document.querySelector('#ps-tasks-table').rows.length, 7);
+  assert.equal(timing().textContent, I18n.t('project_studio.index_time_unavailable'));
+  assert.equal(timing().querySelector('tf-chip'), null);
+  summary.source_revision = 9;
+  selectValue(document.querySelector('#ps-tasks-mode'), 'board'); await settle();
+  assert.ok(timing().textContent.includes(I18n.t('project_studio.index_time_unavailable')));
+  assert.equal(timing().querySelector('tf-chip').textContent, I18n.t('project_studio.index_lag', { count: 2 }));
+  for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
+    const dictionary = JSON.parse(readFileSync(new URL(`../../i18n/${language}.json`, import.meta.url))).project_studio;
+    assert.equal(typeof dictionary.index_time_unavailable, 'string');
+    assert.equal('index_waiting' in dictionary, false);
+  }
+  selectValue(document.querySelector('#ps-tasks-mode'), 'list'); await settle();
+});
+
+test('inherited writers remain eligible after a local grant expires, with local-only administration', async () => {
+  const admin = tasksAccess(); admin.project_admin = true; admin.can_manage_members = true;
+  const info = taskFixture();
+  const origins = [{ project_id: 'ancestor', name: 'Named ancestor', depth: 1 }];
+  const members = [
+    { user_id: 'inherited', display_name: 'Inherited writer', inherited: true, origin_projects: origins, active: true, functions: [], project_admin: false, expires_at: null, access: tasksAccess() },
+    { user_id: 'expired-local', display_name: 'Expired local with active ancestor', inherited: false, origin_projects: origins, active: false, functions: ['observer'], project_admin: false, expires_at: '2020-01-01T00:00:00Z', access: tasksAccess() },
+    { user_id: 'expired-all', display_name: 'Expired everywhere', inherited: false, origin_projects: [], active: false, functions: ['developer'], expires_at: '2020-01-01T00:00:00Z', access: access({ has_access: false, can_create_tasks: false }) },
+  ];
+  await mount(admin, { projectStudioMembersListRequest: { members }, projectStudioTasksListRequest: { tasks: [info], total: 1 }, projectStudioTaskGetRequest: { detail: detailFixture(info) }, projectStudioMembersAddRequest: { added: 1 } });
+  await openTaskCard();
+  assert.deepEqual([...document.querySelectorAll('#ps-task-assignee option')].map((option) => option.value), ['', 'inherited', 'expired-local']);
+  assert.deepEqual(document.querySelector('#ps-task-mentions').items.map((item) => item.id), ['inherited', 'expired-local']);
+  click(document.querySelector('#ps-task-title').closest('tf-window').querySelector('[data-action="cancel"]')); await settle();
+  click(document.querySelector('[data-goto-members]')); await settle();
+  const table = document.querySelector('[data-member-table="inherited"]');
+  assert.match(table.rows[0].person, /Named ancestor/);
+  const menu = table.rowActions(table.rows[0]); document.body.appendChild(menu); click(menu);
+  const labels = [...document.querySelectorAll('tf-menu-item')].map((item) => item.getAttribute('label'));
+  assert.ok(labels.includes('Add a local grant')); assert.equal(labels.includes('Remove'), false);
+  menuAction('Add a local grant');
+  assert.equal(document.querySelectorAll('[data-member-function][checked]').length, 0);
+  checkValue(document.querySelector('[data-member-function="tester"]'), true);
+  click(document.querySelector('[data-member-expiry]').closest('tf-window').querySelector('[data-action="save"]')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioMembersAddRequest').payload, { projectId: 'p0-project', members: [{ userId: 'inherited', functions: ['tester'], projectAdmin: false, expiresAt: null }] });
+  assert.equal(calls.some((call) => call.kind === 'projectStudioMemberAccessSetRequest'), false);
+  assert.match(document.querySelector('[data-member-table="expired"]').rows.find((row) => row._id === 'expired-local').person, /Named ancestor/);
+  const expiredTable = document.querySelector('[data-member-table="expired"]');
+  const localMenu = expiredTable.rowActions(expiredTable.rows.find((row) => row._id === 'expired-local'));
+  document.body.appendChild(localMenu); click(localMenu); menuAction(I18n.t('project_studio.members_handover'));
+  assert.deepEqual(navigation.at(-1), { view: 'org-structure', params: { tab: 'list', handover: 'expired-local', reason: 'project_removal', project: 'p0-project' } });
+});
+
+test('lifecycle resolves paged open tasks with a real reason before end becomes admissible', async () => {
+  const owner = tasksAccess(); owner.is_owner = true;
+  const project = treeProject('p0-project', 'Lifecycle project', owner);
+  let open = 63;
+  await mount(owner, treeFixtures([project], {
+    projectStudioProjectLifecyclePreviewRequest: () => ({ open_task_count: open, active_children: [], exclusive_member_count: 2, can_end: open === 0 }),
+    projectStudioTasksListRequest: (input) => ({ tasks: [taskFixture({ task_id: `open-${input.offset}`, task_key: `WF-${input.offset + 1}`, status: input.status })], total: input.status === 'todo' ? 63 : 1 }),
+    projectStudioTaskNotPursuedRequest: () => { open = 0; return { ok: true, event_id: 91 }; },
+    projectStudioProjectLifecycleRequest: (input) => { project.lifecycle = 'ended'; project.access = { ...owner, ended: true }; return { ok: true }; },
+  }), { projectId: project.project_id });
+  click(document.querySelector('[data-lifecycle]')); await settle();
+  assert.ok(document.querySelector('[data-action="apply"]').hasAttribute('disabled'));
+  let table = document.querySelector('[data-lifecycle-tasks] tf-table');
+  table.dispatchEvent(new CustomEvent('page-change', { detail: { page: 3 }, bubbles: true })); await settle();
+  assert.equal(calls.filter((call) => call.kind === 'projectStudioTasksListRequest').at(-1).payload.offset, 50);
+  selectValue(document.querySelector('[data-lifecycle-status]'), 'review'); await settle();
+  const request = calls.filter((call) => call.kind === 'projectStudioTasksListRequest').at(-1).payload;
+  assert.equal(request.status, 'review'); assert.equal(request.offset, 0); assert.equal(request.scope, 'single');
+  table = document.querySelector('[data-lifecycle-tasks] tf-table');
+  const action = table.rowActions(table.rows[0]); document.body.appendChild(action); click(action); menuAction('Will not be pursued');
+  const resolution = document.querySelector('[data-resolution-reason]');
+  click(resolution.closest('tf-window').querySelector('[data-action="save"]')); await settle();
+  assert.equal(calls.some((call) => call.kind === 'projectStudioTaskNotPursuedRequest'), false);
+  resolution.value = 'The contract was completed elsewhere.';
+  click(resolution.closest('tf-window').querySelector('[data-action="save"]')); await settle();
+  assert.equal(calls.find((call) => call.kind === 'projectStudioTaskNotPursuedRequest').payload.reason, resolution.value);
+  assert.equal(document.querySelector('[data-action="apply"]').hasAttribute('disabled'), false);
+  document.querySelector('[data-lifecycle-confirm]').value = project.key_prefix;
+  document.querySelector('[data-lifecycle-reason]').value = 'All remaining work was resolved.';
+  click(document.querySelector('[data-action="apply"]')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioProjectLifecycleRequest').payload, { projectId: project.project_id, ended: true, confirmationKey: 'WF', reason: 'All remaining work was resolved.' });
+  assert.equal(document.querySelector('[data-new-task]'), null);
+});
+
+test('transfer checks the actual closure and wider access confirmation before opening the canonical destination', async () => {
+  const owner = tasksAccess(); owner.is_owner = true;
+  const root = treeProject('p0-project', 'Source project', owner);
+  const destination = treeProject('destination', 'Destination project', owner);
+  let info = taskFixture();
+  let blocked = true;
+  await mount(owner, treeFixtures([root, destination], {
+    projectStudioTasksListRequest: () => ({ tasks: [info], total: 1 }),
+    projectStudioTaskGetRequest: () => ({ detail: detailFixture(info) }),
+    projectStudioTaskTransferPreviewRequest: () => ({ task_ids: [info.task_id, 'subtask'], old_keys: ['WF-7', 'WF-8'], destination_type_valid: true, widens_access: true, blocking_reasons: blocked ? ['attachment_unavailable'] : [] }),
+    projectStudioTaskTransferRequest: () => { info = { ...info, project_id: destination.project_id, project_name: destination.name, task_key: 'CH-12' }; return { operation_id: 'transfer-op', task_id: info.task_id, destination_project_id: destination.project_id, new_key: info.task_key, moved_task_ids: [info.task_id, 'subtask'] }; },
+    projectStudioTaskKeyResolveRequest: (input) => ({ project_id: info.project_id, task_id: info.task_id, current_key: info.task_key, event_id: null }),
+  }), { projectId: root.project_id, tab: 'tasks' });
+  const table = document.querySelector('#ps-tasks-table'); table.dispatchEvent(new CustomEvent('row-click', { detail: { row: table.rows[0] }, bubbles: true })); await settle();
+  click(document.querySelector('[data-action="transfer"]')); await settle();
+  selectValue(document.querySelector('[data-transfer-destination]'), destination.project_id); await settle();
+  assert.match(document.querySelector('[data-transfer-preview]').textContent, /WF-7.*WF-8/);
+  assert.match(document.querySelector('[data-transfer-preview]').textContent, /original attachment is unavailable/i);
+  assert.ok(document.querySelector('[data-transfer-preview]').closest('tf-window').querySelector('[data-action="transfer"]').hasAttribute('disabled'));
+  blocked = false; selectValue(document.querySelector('[data-transfer-destination]'), destination.project_id); await settle();
+  const preview = document.querySelector('[data-transfer-preview]');
+  const submit = preview.closest('tf-window').querySelector('[data-action="transfer"]');
+  assert.ok(submit.hasAttribute('disabled'));
+  checkValue(preview.querySelector('[data-confirm-wider]'), true);
+  click(submit); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioTaskTransferRequest').payload, { sourceProjectId: root.project_id, destinationProjectId: destination.project_id, taskId: info.task_id, confirmWiderAccess: true });
+  assert.equal(document.querySelector('tf-detail-header').getAttribute('title'), destination.name);
+  const card = [...document.querySelectorAll('#ps-task-title')].at(-1).closest('tf-window');
+  assert.match(card.shadowRoot.querySelector('.tf-window-title-text').textContent, /CH-12/);
+});
+
+test('an old task key and origin event resolve before fetching source metadata or opening current history', async () => {
+  const reader = tasksAccess('read');
+  const destination = treeProject('destination', 'Current permitted project', reader);
+  const info = taskFixture({ project_id: destination.project_id, project_name: destination.name, task_key: 'CH-99' });
+  await mount(reader, treeFixtures([destination], {
+    projectStudioTaskKeyResolveRequest: (input) => { assert.deepEqual(input, { taskKey: 'OLD-7', taskId: null, originProjectId: 'now-private-source', originEventId: '777' }); return { project_id: destination.project_id, task_id: info.task_id, current_key: info.task_key, event_id: 33 }; },
+    projectStudioTasksListRequest: { tasks: [info], total: 1 },
+    projectStudioTaskGetRequest: { detail: detailFixture(info, { events: [{ event_id: 33, task_id: info.task_id, kind: 'transferred', actor_kind: 'user', actor_id: '', at: '2026-10-01T12:00:00Z', before_json: 'null', after_json: '{"task_key":"CH-99","project_id":"destination","project_name":"Current permitted project"}' }] }) },
+  }), { projectId: 'now-private-source', taskKey: 'OLD-7', eventId: '777' });
+  assert.equal(calls.some((call) => call.kind === 'projectStudioProjectGetRequest' && call.payload.projectId === 'now-private-source'), false);
+  assert.match(document.querySelector('#ps-task-history').textContent, /CH-99[\s\S]*Current permitted project/);
+  assert.equal(document.querySelector('#ps-task-history').textContent.includes('now-private-source'), false);
+  assert.ok(document.querySelector('#ps-task-history [data-event-id="33"]') || document.querySelector('#ps-task-history').textContent.includes('Transferred'));
+});
+
+test('an own Empty node saves the exact empty module set and inherited modules remain read-only', async () => {
+  const writer = access({ areas: [{ area: 'settings', enabled: true, level: 'write' }] });
+  const node = treeProject('empty-node', 'Empty grouping node', writer, { template: 'empty', modules: [] });
+  await mount(writer, treeFixtures([node], { projectStudioSettingsGetRequest: { settings: { modules: [], tags: [], agents: [] } }, agentsListRequest: { agentsJson: '[]' }, projectStudioSettingsSaveRequest: { ok: true } }), { projectId: node.project_id, tab: 'settings' });
+  assert.equal(document.querySelector('#ps-set-modules tf-toggle[checked]'), null);
+  assert.equal(document.querySelector('#ps-set-modules tf-toggle[data-module="knowledge"]').hasAttribute('disabled'), false);
+  click(document.querySelector('#ps-set-modules-save')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioSettingsSaveRequest').payload, { projectId: node.project_id, modules: [] });
+  node.parent_id = 'parent'; node.path = '/parent/empty-node'; node.depth = 2; node.inherit_modules = true;
+  await mount(writer, treeFixtures([node], { projectStudioSettingsGetRequest: { settings: { modules: [], tags: [], agents: [] } }, agentsListRequest: { agentsJson: '[]' } }), { projectId: node.project_id, tab: 'settings' });
+  assert.ok(document.querySelector('#ps-set-modules tf-toggle[data-module="knowledge"]').hasAttribute('disabled'));
+  assert.ok(document.querySelector('#ps-set-modules-save').hasAttribute('disabled'));
+  click(document.querySelector('#ps-set-modules-save')); await settle();
+  assert.equal(calls.some((call) => call.kind === 'projectStudioSettingsSaveRequest'), false);
+});
+
+test('new-task project selection reloads the destination catalogue and preserves the actual draft', async () => {
+  const root = treeProject('p0-project', 'Draft source', tasksAccess());
+  const child = treeProject('child', 'Draft destination', tasksAccess(), { parent_id: root.project_id, path: '/p0-project/child', depth: 2 });
+  await mount(root.access, treeFixtures([root, child], { projectStudioTaskSaveRequest: { task_id: 'created', task_no: 2, task_key: 'CH-2', event_ids: [1] } }), { projectId: root.project_id });
+  click(document.querySelector('[data-new-task]')); await settle();
+  document.querySelector('#ps-task-title').value = 'Retained draft title'; document.querySelector('#ps-task-title').dispatchEvent(new Event('input', { bubbles: true }));
+  selectValue(document.querySelector('#ps-task-project'), child.project_id); await settle();
+  const form = [...document.querySelectorAll('#ps-task-title')].at(-1).closest('tf-window');
+  assert.equal(form.querySelector('#ps-task-title').value, 'Retained draft title');
+  assert.equal(document.querySelector('tf-detail-header').getAttribute('title'), child.name);
+  assert.equal(calls.filter((call) => call.kind === 'projectStudioTaskTypesListRequest').at(-1).payload.projectId, child.project_id);
+  click(form.querySelector('[data-action="save"]')); await settle();
+  assert.equal(calls.find((call) => call.kind === 'projectStudioTaskSaveRequest').payload.projectId, child.project_id);
+});
+
+test('archive and export preview the exact selected scope before submitting the same scope', async () => {
+  const owner = access({ is_owner: true, project_admin: true });
+  const root = treeProject('p0-project', 'Scoped root', owner);
+  const child = treeProject('child', 'Scoped child', owner, { parent_id: root.project_id, path: '/p0-project/child', depth: 2 });
+  await mount(owner, treeFixtures([root, child], {
+    projectStudioProjectScopePreviewRequest: ({ scope }) => ({ nodes: (scope === 'subtree' ? [root, child] : [root]).map(({ project_id, name, depth }) => ({ project_id, name, depth })) }),
+    projectStudioProjectArchiveRequest: { ok: true }, projectStudioProjectExportStartRequest: { job_id: 'export' },
+    projectStudioProjectExportStatusRequest: { status: 'success', progress_pct: 100, phase: 'done', signed_url: 'https://example.invalid/authorized-download', archive_bytes: 512000, inventory: { tasks: 2 } },
+  }), {});
+  const card = document.querySelector('[data-project-id="p0-project"]');
+  click(card.querySelector('[data-more]'));
+  click(card.querySelector('tf-menu-item[action="archive"] .tf-menu-item')); await settle();
+  selectValue(document.querySelector('[data-archive-scope]'), 'subtree'); await settle();
+  assert.match(document.querySelector('[data-scope-nodes]').textContent, /Scoped root.*Scoped child/);
+  click(document.querySelector('[data-archive-scope]').closest('tf-window').querySelector('[data-action="archive"]')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioProjectArchiveRequest').payload, { projectId: root.project_id, archived: true, scope: 'subtree' });
+  click(document.querySelector('[data-project-id="p0-project"]')); await settle();
+  click(document.querySelector('[data-export]')); await settle();
+  selectValue(document.querySelector('#ps-export-scope'), 'subtree'); await settle();
+  assert.match(document.querySelector('[data-export-nodes]').textContent, /Scoped root.*Scoped child/);
+  click(document.querySelector('#ps-export-scope').closest('tf-window').querySelector('[data-action="start"]')); await settle();
+  assert.equal(calls.find((call) => call.kind === 'projectStudioProjectExportStartRequest').payload.scope, 'subtree');
+  const operations = calls.filter((call) => call.kind === 'projectStudioProjectScopePreviewRequest' && call.payload.scope === 'subtree').map((call) => call.payload.operation);
+  assert.deepEqual(operations, ['archive', 'export']);
+});
+
+test('unarchive previews the selected owned subtree and preserves errors without a premature mutation', async () => {
+  const owner = access({ is_owner: true, project_admin: true, archived: true });
+  const root = treeProject('p0-project', 'Archived root', owner);
+  const child = treeProject('child', 'Archived child', owner, { parent_id: root.project_id, path: '/p0-project/child', depth: 2 });
+  let completePreview;
+  let mutationDenied = true;
+  await mount(owner, treeFixtures([root, child], {
+    projectStudioProjectScopePreviewRequest: ({ scope }) => {
+      if (scope !== 'subtree') throw new Error('project has children; select subtree scope');
+      return new Promise((resolve) => { completePreview = () => resolve({ nodes: [root, child].map(({ project_id, name, depth }) => ({ project_id, name, depth })) }); });
+    },
+    projectStudioProjectArchiveRequest: () => {
+      if (mutationDenied) throw new Error('Current owner access changed');
+      for (const project of [root, child]) Object.assign(project, { status: 'active', access: { ...owner, archived: false }, can_archive: true, can_unarchive: false });
+      return { ok: true };
+    },
+  }), {});
+  document.querySelector('#ps-filter').dispatchEvent(new CustomEvent('change', { detail: { id: 'all' }, bubbles: true })); await settle();
+  const card = document.querySelector('[data-project-id="p0-project"]');
+  click(card.querySelector('[data-more]'));
+  click(card.querySelector('tf-menu-item[action="unarchive"] .tf-menu-item')); await settle();
+  const window = document.querySelector('[data-archive-scope]').closest('tf-window');
+  selectValue(window.querySelector('[data-archive-scope]'), 'node'); await settle();
+  const submit = window.querySelector('[data-action="archive"]');
+  assert.equal(submit.textContent, I18n.t('project_studio.action_unarchive'));
+  assert.match(window.querySelector('[data-form-error]').textContent, /select subtree scope/);
+  assert.ok(submit.hasAttribute('disabled'));
+  assert.equal(calls.some((call) => call.kind === 'projectStudioProjectArchiveRequest'), false);
+  selectValue(window.querySelector('[data-archive-scope]'), 'subtree'); await settle();
+  assert.ok(submit.hasAttribute('disabled'));
+  assert.equal(window.querySelector('[data-form-error]').hidden, true);
+  click(submit); await settle();
+  assert.equal(calls.some((call) => call.kind === 'projectStudioProjectArchiveRequest'), false);
+  completePreview(); await settle();
+  assert.match(window.querySelector('[data-scope-nodes]').textContent, /Archived root.*Archived child/);
+  click(submit); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioProjectArchiveRequest').payload, { projectId: root.project_id, archived: false, scope: 'subtree' });
+  assert.match(window.querySelector('[data-form-error]').textContent, /Current owner access changed/);
+  assert.equal(root.status, 'archived');
+  mutationDenied = false; click(submit); await settle();
+  assert.equal(root.status, 'active'); assert.equal(child.status, 'active');
+  for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
+    const dictionary = JSON.parse(readFileSync(new URL(`../../i18n/${language}.json`, import.meta.url))).project_studio;
+    for (const key of ['action_unarchive', 'archive_scope', 'scope_node', 'scope_subtree', 'action_cancel']) assert.equal(typeof dictionary[key], 'string');
+  }
+});
+
+test('unarchive does not expose a mutation or scope preview without current ownership', async () => {
+  const reader = access({ archived: true });
+  const project = treeProject('p0-project', 'Archived read-only project', reader);
+  await mount(reader, treeFixtures([project]), {});
+  document.querySelector('#ps-filter').dispatchEvent(new CustomEvent('change', { detail: { id: 'all' }, bubbles: true })); await settle();
+  const card = document.querySelector('[data-project-id="p0-project"]');
+  assert.equal(card.querySelector('tf-menu-item[action="unarchive"]'), null);
+  card.querySelector('tf-menu').dispatchEvent(new CustomEvent('action', { detail: { action: 'unarchive' }, bubbles: true })); await settle();
+  assert.equal(document.querySelector('[data-archive-scope]'), null);
+  assert.equal(calls.some((call) => ['projectStudioProjectScopePreviewRequest', 'projectStudioProjectArchiveRequest'].includes(call.kind)), false);
+});
+
+test('archive import uploads bounded slices and distinguishes source prefixes from the actual saved tree', async () => {
+  const project = projectFixture(access());
+  const nodes = ['One', 'Two', 'Three', 'Four'].map((name, index) => ({ project_id: `node-${index}`, parent_id: index ? `node-${index - 1}` : null, name, key_prefix: `N${index}`, depth: index + 1, is_private: index === 3, lifecycle: index === 3 ? 'ended' : 'active', inventory: { tasks: index + 1, files: index, bytes_files: index * 512 } }));
+  const saved = nodes.map((node, index) => treeProject(`clone-${index}`, `${node.name} copy`, project.access, { parent_id: index ? `clone-${index - 1}` : null, path: '/' + nodes.slice(0, index + 1).map((entry, position) => `clone-${position}`).join('/'), depth: index + 1, key_prefix: `COPY${index}` }));
+  const slices = [];
+  const file = { name: 'Actual staged tree.tfproj.zip', size: 1024 * 1024 + 7, arrayBuffer() { throw new Error('No full archive read'); }, slice(start, end) { slices.push([start, end]); return { arrayBuffer: async () => new Uint8Array(end - start).buffer }; } };
+  await mount(project.access, treeFixtures([project], {
+    projectStudioProjectTreeRequest: ({ projectId }) => ({ projects: projectId === saved[0].project_id ? saved : [project], breadcrumbs: [], can_create: true, can_administer: false }),
+    projectStudioProjectImportUploadChunkRequest: { ok: true },
+    projectStudioProjectImportPreviewRequest: { project_name: 'One', modules: ['tasks'], template: 'deployment', archive_version: 2, total_uncompressed_bytes: file.size, exported_at: '2026-10-01T12:00:00Z', vectors_reusable: false, vectors_reason: 'No vectors', has_runs: false, inventory: { tasks: 10 }, tree_nodes: nodes },
+    projectStudioProjectImportApplyRequest: { job_id: 'saved-import' },
+    projectStudioProjectImportStatusRequest: { status: 'success', progress_pct: 100, phase: 'done', project_id: saved[0].project_id, reindex_job_ids: [], vectors_imported: false },
+  }), {});
+  click(document.querySelector('#ps-import')); await settle();
+  document.querySelector('#ps-imp-file').dispatchEvent(new CustomEvent('change', { detail: { files: [file] }, bubbles: true }));
+  click(document.querySelector('#ps-imp-file').closest('tf-window').querySelector('[data-action="upload"]')); await settle();
+  assert.deepEqual(slices, [[0, 524288], [524288, 1048576], [1048576, 1048583]]);
+  const chunks = calls.filter((call) => call.kind === 'projectStudioProjectImportUploadChunkRequest');
+  assert.deepEqual(chunks.map((call) => [call.payload.seq, call.payload.totalChunks, call.payload.bytes.length]), [[0, 3, 524288], [1, 3, 524288], [2, 3, 7]]);
+  const table = document.querySelector('[data-import-tree]');
+  assert.equal(table.querySelector('tf-column[key="prefix"]').getAttribute('label'), 'Source prefix');
+  assert.match(table.parentElement.textContent, /collisions receive new unique values/);
+  assert.equal(table.rows[3].name, 'One / Two / Three / Four'); assert.equal(table.rows[3].tasks, 4);
+  assert.equal(table.rows[3].status, 'Ended'); assert.match(table.rows[3].visibility, /Private/);
+  table.dispatchEvent(new CustomEvent('row-click', { detail: { row: table.rows[3] }, bubbles: true }));
+  assert.match(table.parentElement.textContent, /Four/);
+  assert.equal(calls.some((call) => call.kind === 'projectStudioProjectImportApplyRequest'), false);
+  click(table.closest('tf-window').querySelector('[data-action="apply"]')); await settle();
+  const actual = document.querySelector('[data-imported-tree]');
+  assert.equal(actual.rows[3].name, 'One copy / Two copy / Three copy / Four copy');
+  assert.deepEqual(actual.rows.map((row) => row.prefix), ['COPY0', 'COPY1', 'COPY2', 'COPY3']);
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioProjectTreeRequest' && call.payload.projectId === saved[0].project_id).payload, { projectId: saved[0].project_id, includeEnded: true, includeArchived: true });
+  click(actual.closest('tf-window').querySelector('[data-action="close-import"]')); await settle();
+  await new Promise((resolve) => setTimeout(resolve, 280));
+  assert.equal(actual.isConnected, false);
 });

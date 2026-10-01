@@ -82,6 +82,10 @@ fetch('/index.html').then(r => r.text()).then(html => {
     <tf-button variant="secondary" size="sm" icon="settings"></tf-button>
     <tf-button variant="primary" disabled>Disabled</tf-button>
   </div>
+  <div class="label">Optional wrapping in a bounded width</div>
+  <div class="row">
+    <tf-button variant="ghost" wrap full-width style="width:190px">Saved files, largest attachments and available disk space</tf-button>
+  </div>
 </div>
 
 <!-- ========== CHIPS ========== -->
@@ -285,6 +289,7 @@ fetch('/index.html').then(r => r.text()).then(html => {
 <div class="section">
   <div class="section-label">Detail Header — tf-detail-header</div>
   <tf-detail-header title="TentaVision" subtitle="Image analysis · deployment depo-warszawa-pn" icon="video" version="v0.4.2">
+    <span slot="title-actions"><tf-button variant="ghost" size="sm" icon="chevron-down">Change project</tf-button></span>
     <span slot="badges">
       <tf-chip status="accent" icon="cameras">22 / 24 cameras</tf-chip>
       <tf-chip status="info" icon="brain">8 detectors active</tf-chip>
@@ -299,6 +304,11 @@ fetch('/index.html').then(r => r.text()).then(html => {
 </div>
 
 <!-- ========== BREADCRUMB ========== -->
+<div class="section">
+  <div class="section-label">Tree — tf-tree controlled movement and row actions</div>
+  <div class="box"><tf-tree id="demo-move-tree"></tf-tree></div>
+  <p id="demo-tree-intent">Drag Child onto Destination. The component emits intent; the caller owns persistence.</p>
+</div>
 <div class="section">
   <div class="section-label">Breadcrumb — tf-breadcrumb</div>
   <tf-breadcrumb>
@@ -748,6 +758,16 @@ fetch('/index.html').then(r => r.text()).then(html => {
 </div><!-- /demo-scroll -->
 
 <script type="module">
+import '/js/components/tf-tree.js';
+const moveTree = document.getElementById('demo-move-tree');
+moveTree.nodes = [
+  { id: 'parent', label: 'Parent', droppable: true, children: [{ id: 'child', label: 'Child', draggable: true }] },
+  { id: 'destination', label: 'Destination', droppable: true },
+];
+moveTree.expandedIds = ['parent'];
+moveTree.addEventListener('expand', (event) => { moveTree.expandedIds = [...moveTree.expandedIds, event.detail.id]; });
+moveTree.addEventListener('collapse', (event) => { moveTree.expandedIds = [...moveTree.expandedIds].filter((id) => id !== event.detail.id); });
+moveTree.addEventListener('move', (event) => { document.getElementById('demo-tree-intent').textContent = `Move requested: ${event.detail.id} → ${event.detail.parentId}`; });
 // Populate data-driven components
 const kv = document.getElementById('kv-runtime');
 if (kv) kv.entries = [

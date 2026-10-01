@@ -2138,6 +2138,7 @@ mod unit_tests {
             "prepared-owner",
             &dir.to_string_lossy(),
             "",
+            None, false, false, false,
             &[super::super::models::MemberInput {
                 user_id: actor.clone(),
                 functions: vec!["tester".into()],

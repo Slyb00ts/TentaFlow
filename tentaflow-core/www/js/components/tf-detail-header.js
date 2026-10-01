@@ -1,7 +1,7 @@
 // =============================================================================
 // File: tf-detail-header.js
 // Description: <tf-detail-header> — addon/entity detail header with large icon,
-//              title, subtitle, version chip, badges slot and actions slot.
+//              title, subtitle, version chip, title-actions, badges and actions slots.
 // Example:
 //   <tf-detail-header title="Eureka" subtitle="MF Public Data" icon="database" version="1.0.0">
 //     <span slot="badges"><tf-chip class="ok">Active</tf-chip></span>
@@ -40,6 +40,7 @@ class TfDetailHeader extends HTMLElement {
     const actionsSlot = this.querySelector(':scope > [slot="actions"]');
     const iconSlot = this.querySelector(':scope > [slot="icon"]');
     const statusSlot = this.querySelector(':scope > [slot="status"]');
+    const titleActionsSlot = this.querySelector(':scope > [slot="title-actions"]');
     this.innerHTML = '';
 
     const root = document.createElement('div');
@@ -79,6 +80,10 @@ class TfDetailHeader extends HTMLElement {
     if (statusSlot) {
       statusSlot.removeAttribute('slot');
       topRow.appendChild(statusSlot);
+    }
+    if (titleActionsSlot) {
+      titleActionsSlot.removeAttribute('slot');
+      topRow.appendChild(titleActionsSlot);
     }
 
     const subtitleEl = document.createElement('div');

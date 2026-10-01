@@ -112,6 +112,8 @@ pub struct ProjectAccessWire {
     pub can_create_tasks: bool,
     pub can_manage_members: bool,
     pub can_manage_settings: bool,
+    #[serde(default)]
+    pub ended: bool,
 }
 
 impl ProjectAccessWire {

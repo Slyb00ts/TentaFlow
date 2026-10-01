@@ -1653,15 +1653,14 @@ where
 /// into `worker_loop` and kill the worker for the life of the process.
 async fn run_supervised(job: crate::services::ingest_jobs::QueuedJob) {
     let job_id = job.job_id.clone();
-    let payload_json = job.payload_json.clone();
+    let recovery_job = job.clone();
     if supervised(&job_id, "job", run_claimed(job)).await {
         return;
     }
     // The recovery runs supervised too: it opens the same project database
     // that may be what panicked.
-    let recovery_id = job_id.clone();
     supervised(&job_id, "panic recovery", async move {
-        close_panicked_job(&recovery_id, &payload_json);
+        close_panicked_job(&recovery_job);
     })
     .await;
 }
@@ -1671,13 +1670,14 @@ async fn run_supervised(job: crate::services::ingest_jobs::QueuedJob) {
 /// `running` row owned by a LIVE instance is invisible to reconciliation), the
 /// project row is closed if the pipeline had not closed it already, and the
 /// stream is ended with whatever the row actually says.
-fn close_panicked_job(job_id: &str, payload_json: &str) {
+fn close_panicked_job(job: &crate::services::ingest_jobs::QueuedJob) {
+    let job_id = job.job_id.as_str();
     if let Ok(pool) = ingest_jobs::pool() {
-        finish_queue_row(&pool, job_id);
+        finish_queue_row(&pool, job);
     }
     let mut status = "failed".to_string();
     let mut error = PANIC_ERROR.to_string();
-    if let Ok(payload) = serde_json::from_str::<JobPayload>(payload_json) {
+    if let Ok(payload) = serde_json::from_str::<JobPayload>(&job.payload_json) {
         if let Ok(project_pool) = super::project_db::open(&payload.project_id) {
             if repository::finish_ingest_job(&project_pool, job_id, "failed", PANIC_ERROR)
                 .unwrap_or(false)
@@ -1709,13 +1709,21 @@ const PANIC_ERROR: &str = "ingest worker panicked";
 /// deletion failed. Discarding that error would make the row immortal: `claim`
 /// only takes `queued`, `is_pending` keeps answering yes, and nothing in this
 /// process would ever look at the row again.
-fn undeleted() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static UNDELETED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        OnceLock::new();
+fn undeleted() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, crate::services::ingest_jobs::QueuedJob>,
+> {
+    static UNDELETED: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::services::ingest_jobs::QueuedJob>,
+        >,
+    > = OnceLock::new();
     UNDELETED.get_or_init(Default::default)
 }
 
-fn undeleted_lock() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+fn undeleted_lock() -> std::sync::MutexGuard<
+    'static,
+    std::collections::HashMap<String, crate::services::ingest_jobs::QueuedJob>,
+> {
     undeleted()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1725,8 +1733,9 @@ fn undeleted_lock() -> std::sync::MutexGuard<'static, std::collections::HashSet<
 /// failure is REMEMBERED rather than retried on the spot — the worker loop
 /// tries again on its next pass, which bounds the retry to the loop's own
 /// cadence instead of spinning on a file that is not writable.
-fn finish_queue_row(pool: &DbPool, job_id: &str) {
-    match ingest_jobs::finish(pool, job_id) {
+fn finish_queue_row(pool: &DbPool, job: &crate::services::ingest_jobs::QueuedJob) {
+    let job_id = job.job_id.as_str();
+    match ingest_jobs::finish(pool, job) {
         Ok(()) => {
             undeleted_lock().remove(job_id);
         }
@@ -1736,16 +1745,16 @@ fn finish_queue_row(pool: &DbPool, job_id: &str) {
                 error = %e,
                 "ingest queue row not deleted; retrying on the next worker pass"
             );
-            undeleted_lock().insert(job_id.to_string());
+            undeleted_lock().insert(job_id.to_string(), job.clone());
         }
     }
 }
 
 /// One delete attempt per remembered row per worker pass.
 fn retry_undeleted(pool: &DbPool) {
-    let pending: Vec<String> = undeleted_lock().iter().cloned().collect();
-    for job_id in pending {
-        finish_queue_row(pool, &job_id);
+    let pending: Vec<_> = undeleted_lock().values().cloned().collect();
+    for job in pending {
+        finish_queue_row(pool, &job);
     }
 }
 
@@ -1767,7 +1776,7 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
             // Nothing can ever run this row; leaving it would make it a job
             // claimed and released forever.
             tracing::error!(job_id = %job.job_id, error = %e, "unreadable ingest job payload");
-            finish_queue_row(&pool, &job.job_id);
+            finish_queue_row(&pool, &job);
             return;
         }
     };
@@ -1777,7 +1786,7 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
     // Closes the claim window: a cancel that landed between the claim and the
     // registration above exists ONLY in the queue row.
     if !matches!(
-        ingest_jobs::heartbeat(&pool, &job_id),
+        ingest_jobs::heartbeat(&pool, &job),
         Ok(ingest_jobs::JobLiveness::Running)
     ) {
         cancel.store(true, Ordering::Relaxed);
@@ -1787,7 +1796,7 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(job_id = %job_id, error = %e, "ingest job project unavailable");
-            finish_queue_row(&pool, &job_id);
+            finish_queue_row(&pool, &job);
             emit_end_and_close(&tx, &job_id, "failed", &format!("project unavailable: {e}"));
             unregister_cancel(&job_id);
             return;
@@ -1842,10 +1851,11 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
         };
         let tx_run = tx.clone();
         let cancel_run = cancel.clone();
+        let queue_claim = job.clone();
         run_guarded(&project_pool, &job_id, async move {
             let content = task.project_pool.clone();
             let run_id = task.job_id.clone();
-            let pipeline = run_job(task, tx_run, cancel_run.clone());
+            let pipeline = run_job(task, tx_run, cancel_run.clone(), queue_claim);
             tokio::pin!(pipeline);
             loop {
                 tokio::select! {
@@ -1869,7 +1879,7 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
     };
     // The queue row goes only AFTER the project row is terminal: a missing
     // queue row must always mean the job is accounted for elsewhere.
-    finish_queue_row(&pool, &job_id);
+    finish_queue_row(&pool, &job);
     emit_end_and_close(&tx, &job_id, &status, &error);
     unregister_cancel(&job_id);
 }
@@ -2046,6 +2056,7 @@ async fn run_job(
     task: IngestTask,
     tx: tokio::sync::broadcast::Sender<BusMessage>,
     cancel: Arc<AtomicBool>,
+    queue_claim: crate::services::ingest_jobs::QueuedJob,
 ) {
     let IngestTask {
         core_db,
@@ -2099,7 +2110,7 @@ async fn run_job(
         // between the claim and the local registration).
         if let Ok(queue) = ingest_jobs::pool() {
             if !matches!(
-                ingest_jobs::heartbeat(&queue, &job_id),
+                ingest_jobs::heartbeat(&queue, &queue_claim),
                 Ok(ingest_jobs::JobLiveness::Running)
             ) {
                 cancel.store(true, Ordering::Relaxed);
@@ -2848,7 +2859,7 @@ mod tests {
         while let Some(job) =
             ingest_jobs::claim(pool, ingest_jobs::QUEUE_PROJECT_STUDIO).expect("drain claim")
         {
-            ingest_jobs::finish(pool, &job.job_id).expect("drain finish");
+            ingest_jobs::finish(pool, &job).expect("drain finish");
         }
         (guard, pool.clone())
     }
@@ -2938,7 +2949,7 @@ mod tests {
         assert_eq!(payload.project_id, project_id);
         assert_eq!(payload.files.len(), 1);
         assert_eq!(payload.dir_path, tmp.path());
-        ingest_jobs::finish(&queue, &job_id).expect("finish");
+        ingest_jobs::finish(&queue, &claimed).expect("finish");
     }
 
     /// A `running` project row whose job the queue no longer holds belongs to a
@@ -2965,7 +2976,13 @@ mod tests {
             .expect("row");
         assert_eq!(dead.status, "failed");
         assert_eq!(dead.error, "interrupted by restart");
-        ingest_jobs::finish(&queue, &queued_id).expect("finish");
+        ingest_jobs::finish(
+            &queue,
+            &ingest_jobs::job(&queue, &queued_id)
+                .expect("read queue")
+                .expect("queued claim record"),
+        )
+        .expect("finish");
     }
 
     /// Cancellation of a job nobody has claimed: it leaves the queue at once
@@ -3021,7 +3038,7 @@ mod tests {
         let job_id = format!("job-{}", uuid::Uuid::new_v4());
         ingest_jobs::enqueue(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO, &job_id, "{}")
             .expect("enqueue");
-        ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
+        let claim = ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
             .expect("claim")
             .expect("job");
         assert_eq!(
@@ -3029,10 +3046,10 @@ mod tests {
             ingest_jobs::CancelOutcome::Signalled
         );
         assert_eq!(
-            ingest_jobs::heartbeat(&queue, &job_id).expect("beat"),
+            ingest_jobs::heartbeat(&queue, &claim).expect("beat"),
             ingest_jobs::JobLiveness::CancelRequested
         );
-        ingest_jobs::finish(&queue, &job_id).expect("finish");
+        ingest_jobs::finish(&queue, &claim).expect("finish");
     }
 
     /// A panicking pipeline must leave the job FAILED. Without the guard the row
@@ -3075,6 +3092,10 @@ mod tests {
             "tester",
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[],
         )
         .expect("registry row");
@@ -3248,12 +3269,12 @@ mod tests {
             &claimed,
             "claimed.rs",
         ));
-        ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
+        let claim = ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
             .expect("claim")
             .expect("job");
         assert!(signal_cancel(&claimed), "a claimed job is cancellable");
         assert_eq!(
-            ingest_jobs::heartbeat(&queue, &claimed).expect("beat"),
+            ingest_jobs::heartbeat(&queue, &claim).expect("beat"),
             ingest_jobs::JobLiveness::CancelRequested,
             "the worker learns about the cancel at its next beat"
         );
@@ -3265,7 +3286,7 @@ mod tests {
             "running",
             "a claimed job is closed by its worker, not by the cancel"
         );
-        ingest_jobs::finish(&queue, &claimed).expect("finish");
+        ingest_jobs::finish(&queue, &claim).expect("finish");
     }
 
     /// A panic OUTSIDE the pipeline — in `run_claimed` itself, where the
@@ -3559,7 +3580,7 @@ mod tests {
         while let Some(job) =
             ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO).expect("drain claim")
         {
-            ingest_jobs::finish(&queue, &job.job_id).expect("drain finish");
+            ingest_jobs::finish(&queue, &job).expect("drain finish");
         }
     }
 
@@ -4042,7 +4063,14 @@ mod tests {
             }
             match scenario {
                 "archived" => {
-                    repository::set_project_archived("org-1", &project_id, true).expect("archive");
+                    repository::set_project_archived(
+                        "org-1",
+                        &project_id,
+                        true,
+                        tentaflow_protocol::project_studio::ProjectTreeScope::Node,
+                        &[project_id.to_string()],
+                    )
+                    .expect("archive");
                 }
                 "disabled" => {
                     repository::update_project_modules("org-1", &project_id, "[]")

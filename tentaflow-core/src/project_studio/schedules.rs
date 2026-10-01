@@ -1548,6 +1548,7 @@ mod unit_tests {
             "u1",
             &tmp.path().to_string_lossy(),
             "",
+            None, false, false, false,
             &[],
         )
         .expect("create schedule project");

@@ -38,7 +38,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use tracing::{info, warn};
 
 use crate::db::DbPool;
@@ -147,7 +147,21 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, INITIAL_SCHEMA)];
+const MIGRATIONS: &[(i64, &str)] = &[(1, INITIAL_SCHEMA), (2, TRANSFER_SCHEMA)];
+
+const TRANSFER_SCHEMA: &str = "
+ALTER TABLE ingest_jobs ADD COLUMN claim_token TEXT NOT NULL DEFAULT '';
+ALTER TABLE ingest_jobs ADD COLUMN suspended_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE ingest_jobs ADD COLUMN restart_requested INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE project_media_transfers (
+    queue TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    intent_json TEXT NOT NULL,
+    PRIMARY KEY(queue,operation_id,project_id,sha256)
+);
+";
 
 /// `status` admits only the two NON-terminal states, because a finished job is
 /// deleted rather than kept — the CHECK is how that decision stays true.
@@ -209,6 +223,7 @@ pub struct QueuedJob {
     pub payload_json: String,
     pub cancel_requested: bool,
     pub enqueued_at_ms: i64,
+    pub claim_token: String,
 }
 
 /// What a heartbeat learned about the job it beat for.
@@ -250,12 +265,66 @@ pub enum CancelOutcome {
 /// needs no sort) and is what the consumer reports; `rowid` decides ties.
 pub fn enqueue(pool: &DbPool, queue: &str, job_id: &str, payload_json: &str) -> Result<()> {
     let conn = pool.write().map_err(write_err)?;
+    enqueue_in(&conn, queue, job_id, payload_json)
+}
+
+pub(crate) fn enqueue_in(
+    conn: &Connection,
+    queue: &str,
+    job_id: &str,
+    payload_json: &str,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO ingest_jobs (job_id, queue, payload_json, enqueued_at_ms) \
          VALUES (?1, ?2, ?3, ?4)",
         params![job_id, queue, payload_json, now_ms()],
     )?;
     Ok(())
+}
+
+/// Publication and transfer snapshots share SQLite's writer admission, including
+/// consumers using another pool or process. Callers resolve their content pools
+/// first and keep hashing, conversion and cancellation waits outside this scope.
+pub(crate) fn with_transaction<T>(
+    pool: &DbPool,
+    action: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    let conn = pool.write().map_err(write_err)?;
+    let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+    let result = action(&tx)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+#[cfg(test)]
+pub(crate) fn job(pool: &DbPool, job_id: &str) -> Result<Option<QueuedJob>> {
+    let conn = pool.read().map_err(read_err)?;
+    job_in(&conn, job_id)
+}
+
+pub(crate) fn job_in(conn: &Connection, job_id: &str) -> Result<Option<QueuedJob>> {
+    conn.query_row(
+        "SELECT job_id, queue, payload_json, cancel_requested, enqueued_at_ms, claim_token \
+         FROM ingest_jobs WHERE job_id = ?1",
+        params![job_id],
+        read_job,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub(crate) fn replace_payload(
+    conn: &Connection,
+    job_id: &str,
+    expected_payload: &str,
+    payload_json: &str,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "UPDATE ingest_jobs SET payload_json = ?3 \
+         WHERE job_id = ?1 AND payload_json = ?2 AND cancel_requested = 0 \
+           AND status IN ('queued', 'running')",
+        params![job_id, expected_payload, payload_json],
+    )? == 1)
 }
 
 /// Claims the oldest queued job of `queue` for this process as a SINGLE atomic
@@ -271,11 +340,12 @@ pub fn claim(pool: &DbPool, queue: &str) -> Result<Option<QueuedJob>> {
     let conn = pool.write().map_err(write_err)?;
     conn.query_row(
         "UPDATE ingest_jobs \
-            SET status = 'running', owner_instance = ?2, claimed_at_ms = ?3, heartbeat_at_ms = ?3 \
+            SET status = 'running', owner_instance = ?2, claimed_at_ms = ?3, heartbeat_at_ms = ?3, \
+                claim_token = lower(hex(randomblob(16))) \
           WHERE job_id = (SELECT job_id FROM ingest_jobs \
-                           WHERE queue = ?1 AND status = 'queued' \
+                           WHERE queue = ?1 AND status = 'queued' AND suspended_by = '' \
                            ORDER BY enqueued_at_ms, rowid LIMIT 1) \
-          RETURNING job_id, queue, payload_json, cancel_requested, enqueued_at_ms",
+          RETURNING job_id, queue, payload_json, cancel_requested, enqueued_at_ms, claim_token",
         params![queue, instance_id(), now_ms()],
         read_job,
     )
@@ -290,6 +360,7 @@ fn read_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedJob> {
         payload_json: row.get(2)?,
         cancel_requested: row.get::<_, i64>(3)? != 0,
         enqueued_at_ms: row.get(4)?,
+        claim_token: row.get(5)?,
     })
 }
 
@@ -298,14 +369,18 @@ fn read_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueuedJob> {
 /// only place a cancel that arrived through another process — or during the
 /// window between the claim and the in-memory cancel registration — becomes
 /// visible to the running job.
-pub fn heartbeat(pool: &DbPool, job_id: &str) -> Result<JobLiveness> {
+pub fn heartbeat(pool: &DbPool, job: &QueuedJob) -> Result<JobLiveness> {
     let conn = pool.write().map_err(write_err)?;
+    heartbeat_in(&conn, job)
+}
+
+pub(crate) fn heartbeat_in(conn: &Connection, job: &QueuedJob) -> Result<JobLiveness> {
     let state: Option<i64> = conn
         .query_row(
             "UPDATE ingest_jobs SET heartbeat_at_ms = ?2 \
-              WHERE job_id = ?1 AND status = 'running' AND owner_instance = ?3 \
+              WHERE job_id = ?1 AND status = 'running' AND owner_instance = ?3 AND claim_token = ?4 \
               RETURNING cancel_requested",
-            params![job_id, now_ms(), instance_id()],
+            params![job.job_id, now_ms(), instance_id(), job.claim_token],
             |row| row.get(0),
         )
         .optional()?;
@@ -316,13 +391,61 @@ pub fn heartbeat(pool: &DbPool, job_id: &str) -> Result<JobLiveness> {
     })
 }
 
-/// Drops the job from the queue. Called after the consumer has written its own
-/// terminal record, so the absence of a queue row always means "this job is
-/// accounted for somewhere else".
-pub fn finish(pool: &DbPool, job_id: &str) -> Result<()> {
-    let conn = pool.write().map_err(write_err)?;
-    conn.execute("DELETE FROM ingest_jobs WHERE job_id = ?1", params![job_id])?;
+/// A suspended conversion must acknowledge termination before the next claim
+/// can reuse its partial-file paths. A stale claim cannot acknowledge or remove
+/// that later attempt. Ordinary completion follows the consumer's terminal record.
+pub fn finish(pool: &DbPool, job: &QueuedJob) -> Result<()> {
+    with_transaction(pool, |conn| {
+        conn.execute(
+            "UPDATE ingest_jobs SET status='queued',owner_instance='',claim_token='',\
+             cancel_requested=0,restart_requested=0,claimed_at_ms=NULL,heartbeat_at_ms=NULL \
+             WHERE job_id=?1 AND claim_token=?2 AND owner_instance=?3 AND status='running' \
+               AND (suspended_by<>'' OR restart_requested<>0)",
+            params![job.job_id, job.claim_token, instance_id()],
+        )?;
+        conn.execute(
+            "DELETE FROM ingest_jobs WHERE job_id=?1 AND claim_token=?2 \
+             AND (status='queued' OR owner_instance=?3) \
+             AND suspended_by='' AND restart_requested=0",
+            params![job.job_id, job.claim_token, instance_id()],
+        )?;
+        Ok(())
+    })
+}
+
+pub(crate) fn suspend_in(conn: &Connection, job_id: &str, operation_id: &str) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE ingest_jobs SET suspended_by=?2,\
+         cancel_requested=CASE WHEN status='running' THEN 1 ELSE cancel_requested END \
+         WHERE job_id=?1 AND suspended_by IN ('',?2)",
+        params![job_id, operation_id],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("queue job cannot be suspended by this operation");
+    }
     Ok(())
+}
+
+pub(crate) fn resume_in(conn: &Connection, job_id: &str, operation_id: &str) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE ingest_jobs SET suspended_by='',\
+         restart_requested=CASE WHEN status='running' THEN 1 ELSE 0 END \
+         WHERE job_id=?1 AND suspended_by=?2",
+        params![job_id, operation_id],
+    )?;
+    if changed != 1 {
+        anyhow::bail!("queue job has lost its operation suspension");
+    }
+    Ok(())
+}
+
+pub(crate) fn suspension_in(conn: &Connection, job_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ingest_jobs WHERE job_id=?1 \
+         AND (suspended_by<>'' OR restart_requested<>0))",
+        [job_id],
+        |row| row.get(0),
+    )?)
 }
 
 /// How many jobs of `queue` are outstanding AHEAD of `job_id` — enqueued
@@ -375,6 +498,10 @@ pub fn is_pending(pool: &DbPool, job_id: &str) -> Result<bool> {
 /// exist here.
 pub fn request_cancel(pool: &DbPool, job_id: &str) -> Result<CancelOutcome> {
     let conn = pool.write().map_err(write_err)?;
+    request_cancel_in(&conn, job_id)
+}
+
+pub(crate) fn request_cancel_in(conn: &Connection, job_id: &str) -> Result<CancelOutcome> {
     let dequeued: Option<String> = conn
         .query_row(
             "DELETE FROM ingest_jobs WHERE job_id = ?1 AND status = 'queued' \
@@ -406,15 +533,24 @@ pub fn request_cancel(pool: &DbPool, job_id: &str) -> Result<CancelOutcome> {
 /// notification a consumer gets: deleting another queue's row here would erase
 /// the job while its owner never hears about it.
 pub fn reconcile_orphans(pool: &DbPool, queue: &str) -> Result<Vec<QueuedJob>> {
-    let conn = pool.write().map_err(write_err)?;
-    let mut stmt = conn.prepare(
-        "DELETE FROM ingest_jobs \
+    let orphans = with_transaction(pool, |conn| {
+        conn.execute(
+            "UPDATE ingest_jobs SET status='queued',owner_instance='',claim_token='',\
+             cancel_requested=0,restart_requested=0,claimed_at_ms=NULL,heartbeat_at_ms=NULL \
+             WHERE queue=?1 AND status='running' AND owner_instance<>?2 \
+             AND (suspended_by<>'' OR restart_requested<>0)",
+            params![queue, instance_id()],
+        )?;
+        let mut stmt = conn.prepare(
+            "DELETE FROM ingest_jobs \
           WHERE queue = ?1 AND status = 'running' AND owner_instance <> ?2 \
-         RETURNING job_id, queue, payload_json, cancel_requested, enqueued_at_ms",
-    )?;
-    let orphans = stmt
-        .query_map(params![queue, instance_id()], read_job)?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+         RETURNING job_id, queue, payload_json, cancel_requested, enqueued_at_ms, claim_token",
+        )?;
+        let rows = stmt
+            .query_map(params![queue, instance_id()], read_job)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })?;
     if !orphans.is_empty() {
         warn!(
             count = orphans.len(),
@@ -427,6 +563,162 @@ pub fn reconcile_orphans(pool: &DbPool, queue: &str) -> Result<Vec<QueuedJob>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspended_running_job_waits_for_ack_and_rejects_old_claim() {
+        let dir = tempfile::tempdir().expect("queue storage");
+        let path = dir.path().join("jobs.db");
+        let pool = open_pool_at(&path).expect("queue");
+        let independent = open_pool_at(&path).expect("independent connection");
+        enqueue(&pool, "media", "preview", "actual-payload").expect("enqueue");
+        let original = claim(&pool, "media").expect("claim").expect("job");
+        with_transaction(&independent, |conn| {
+            suspend_in(conn, "preview", "operation")
+        })
+        .expect("durable pause");
+        assert_eq!(
+            heartbeat(&pool, &original).expect("beat"),
+            JobLiveness::CancelRequested
+        );
+        with_transaction(&independent, |conn| resume_in(conn, "preview", "operation"))
+            .expect("rollback resume");
+        assert!(claim(&independent, "media")
+            .expect("cannot overlap native work")
+            .is_none());
+        finish(&pool, &original).expect("old consumer acknowledged cancellation");
+        let retry = claim(&independent, "media")
+            .expect("claim retry")
+            .expect("pending work retained");
+        assert_ne!(original.claim_token, retry.claim_token);
+        assert_eq!(
+            heartbeat(&pool, &original).expect("old beat"),
+            JobLiveness::Gone
+        );
+        finish(&pool, &original).expect("late finalizer");
+        assert_eq!(
+            heartbeat(&independent, &retry).expect("current beat"),
+            JobLiveness::Running
+        );
+        finish(&independent, &retry).expect("current completion");
+        assert!(!is_pending(&pool, "preview").expect("pending"));
+    }
+
+    #[test]
+    fn suspension_and_running_resume_survive_a_queue_restart() {
+        let dir = tempfile::tempdir().expect("queue storage");
+        let path = dir.path().join("jobs.db");
+        let old = {
+            let pool = open_pool_at(&path).expect("queue");
+            enqueue(&pool, "media", "preview", "actual-payload").expect("enqueue");
+            with_transaction(&pool, |conn| suspend_in(conn, "preview", "operation"))
+                .expect("queued pause");
+            assert!(claim(&pool, "media").expect("held work").is_none());
+            with_transaction(&pool, |conn| resume_in(conn, "preview", "operation"))
+                .expect("queued rollback");
+            let old = claim(&pool, "media")
+                .expect("claim")
+                .expect("resumed queued work");
+            with_transaction(&pool,|conn| {
+                suspend_in(conn,"preview","operation")?;
+                resume_in(conn,"preview","operation")?;
+                conn.execute("UPDATE ingest_jobs SET owner_instance='terminated-process' WHERE job_id='preview'",[])?;
+                Ok(())
+            }).expect("running rollback cut point");
+            old
+        };
+        let restarted = open_pool_at(&path).expect("restart connection");
+        assert!(reconcile_orphans(&restarted, "media")
+            .expect("recover intent")
+            .is_empty());
+        let retry = claim(&restarted, "media")
+            .expect("claim")
+            .expect("restart retained actual payload");
+        assert_eq!(retry.payload_json, "actual-payload");
+        assert_ne!(retry.claim_token, old.claim_token);
+        finish(&restarted, &old).expect("old process completion cannot discard retry");
+        assert_eq!(
+            heartbeat(&restarted, &retry).expect("beat"),
+            JobLiveness::Running
+        );
+        finish(&restarted, &retry).expect("finish");
+    }
+
+    #[test]
+    fn publication_transaction_blocks_claims_on_an_independent_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jobs.db");
+        let publisher = open_pool_at(&path).expect("publisher");
+        let consumer = open_pool_at(&path).expect("consumer");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let mut worker = None;
+        with_transaction(&publisher, |conn| {
+            enqueue_in(conn, "media", "preview", "{\"owner\":\"task-a\"}")?;
+            worker = Some(std::thread::spawn(move || {
+                started_tx.send(()).expect("started");
+                claimed_tx.send(claim(&consumer, "media")).expect("claimed");
+            }));
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("consumer started");
+            assert!(claimed_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err());
+            assert_eq!(job_in(conn, "preview")?.expect("own row").job_id, "preview");
+            Ok(())
+        })
+        .expect("publish");
+        let claimed = claimed_rx
+            .recv_timeout(std::time::Duration::from_secs(6))
+            .expect("consumer after commit")
+            .expect("claim")
+            .expect("published job");
+        assert_eq!(claimed.payload_json, "{\"owner\":\"task-a\"}");
+        worker.expect("worker").join().expect("join");
+    }
+
+    #[test]
+    fn payload_rebinding_preserves_running_claim_and_rolls_back_on_failure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pool = open_pool_at(&dir.path().join("jobs.db")).expect("open");
+        let original = "{\"owner\":\"task-a\"}";
+        let remaining = "{\"owner\":\"case-b\"}";
+        enqueue(&pool, "media", "preview", original).expect("enqueue");
+        let before = claim(&pool, "media").expect("claim").expect("job");
+        with_transaction(&pool, |conn| {
+            assert!(replace_payload(conn, "preview", original, remaining)?);
+            assert_eq!(heartbeat_in(conn, &before)?, JobLiveness::Running);
+            assert!(!replace_payload(conn, "preview", original, "stale")?);
+            Ok(())
+        })
+        .expect("rebind");
+        let current = job(&pool, "preview").expect("read").expect("job");
+        assert_eq!(current.payload_json, remaining);
+        assert_eq!(current.enqueued_at_ms, before.enqueued_at_ms);
+        assert_eq!(current.queue, before.queue);
+        let rejected: Result<()> = with_transaction(&pool, |conn| {
+            assert!(replace_payload(conn, "preview", remaining, "uncommitted")?);
+            anyhow::bail!("publication rejected");
+        });
+        assert!(rejected.is_err());
+        assert_eq!(
+            job(&pool, "preview")
+                .expect("after rollback")
+                .expect("job")
+                .payload_json,
+            remaining
+        );
+        assert_eq!(
+            request_cancel(&pool, "preview").expect("cancel"),
+            CancelOutcome::Signalled
+        );
+        with_transaction(&pool, |conn| {
+            assert!(!replace_payload(conn, "preview", remaining, original)?);
+            assert_eq!(heartbeat_in(conn, &before)?, JobLiveness::CancelRequested);
+            Ok(())
+        })
+        .expect("cancel preserved");
+    }
 
     fn test_pool() -> (tempfile::TempDir, DbPool) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -455,11 +747,8 @@ mod tests {
             .expect("the job outlived the process");
         assert_eq!(job.job_id, "job-1");
         assert_eq!(job.payload_json, "{\"n\":1}");
-        assert_eq!(
-            heartbeat(&pool, "job-1").expect("beat"),
-            JobLiveness::Running
-        );
-        finish(&pool, "job-1").expect("finish");
+        assert_eq!(heartbeat(&pool, &job).expect("beat"), JobLiveness::Running);
+        finish(&pool, &job).expect("finish");
         assert!(!is_pending(&pool, "job-1").expect("pending"));
         assert!(claim(&pool, QUEUE_PROJECT_STUDIO).expect("claim").is_none());
     }
@@ -555,7 +844,7 @@ mod tests {
                 .expect("claim")
                 .expect("job");
             assert_eq!(&job.job_id, id, "claim {i} broke arrival order");
-            finish(&pool, &job.job_id).expect("finish");
+            finish(&pool, &job).expect("finish");
         }
     }
 
@@ -586,10 +875,7 @@ mod tests {
         assert_eq!(orphans[0].job_id, "dead");
         assert!(!is_pending(&pool, "dead").expect("pending"));
         // The job THIS process supervises is untouched, and so is the queued one.
-        assert_eq!(
-            heartbeat(&pool, "mine").expect("beat"),
-            JobLiveness::Running
-        );
+        assert_eq!(heartbeat(&pool, &mine).expect("beat"), JobLiveness::Running);
         assert!(is_pending(&pool, "waiting").expect("pending"));
     }
 
@@ -604,7 +890,7 @@ mod tests {
         assert!(claim(&pool, QUEUE_PROJECT_STUDIO).expect("claim").is_none());
 
         enqueue(&pool, QUEUE_PROJECT_STUDIO, "live", "{}").expect("enqueue");
-        claim(&pool, QUEUE_PROJECT_STUDIO)
+        let live = claim(&pool, QUEUE_PROJECT_STUDIO)
             .expect("claim")
             .expect("job");
         assert_eq!(
@@ -612,15 +898,15 @@ mod tests {
             CancelOutcome::Signalled
         );
         assert_eq!(
-            heartbeat(&pool, "live").expect("beat"),
+            heartbeat(&pool, &live).expect("beat"),
             JobLiveness::CancelRequested
         );
-        finish(&pool, "live").expect("finish");
+        finish(&pool, &live).expect("finish");
         assert_eq!(
             request_cancel(&pool, "live").expect("cancel"),
             CancelOutcome::Unknown
         );
-        assert_eq!(heartbeat(&pool, "live").expect("beat"), JobLiveness::Gone);
+        assert_eq!(heartbeat(&pool, &live).expect("beat"), JobLiveness::Gone);
     }
 
     /// The queue is runtime state of a single node and cannot be swept into the

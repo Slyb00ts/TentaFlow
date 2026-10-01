@@ -6539,6 +6539,10 @@ export const encode = {
       String(payload.template ?? ''),
       JSON.stringify(modules),
       JSON.stringify(members),
+      (payload.parentId ?? payload.parent_id) == null ? undefined : String(payload.parentId ?? payload.parent_id),
+      !!(payload.isPrivate ?? payload.is_private ?? false),
+      (payload.inheritModules ?? payload.inherit_modules) == null ? undefined : !!(payload.inheritModules ?? payload.inherit_modules),
+      (payload.inheritTaskTypes ?? payload.inherit_task_types) == null ? undefined : !!(payload.inheritTaskTypes ?? payload.inherit_task_types),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -6568,6 +6572,7 @@ export const encode = {
     const body = _wasm.encodeProjectStudioProjectArchiveRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       !!payload.archived,
+      String(payload.scope ?? 'node'),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -7406,6 +7411,8 @@ export const encode = {
       Number(payload.limit ?? 50),
       payload.severity == null || payload.severity === '' ? undefined : String(payload.severity),
       !!(payload.includeArchived ?? payload.include_archived ?? false),
+      String(payload.scope ?? 'single'),
+      JSON.stringify(Array.isArray(payload.sourceProjectIds ?? payload.source_project_ids) ? (payload.sourceProjectIds ?? payload.source_project_ids).map(String) : []),
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
@@ -8105,6 +8112,7 @@ export const encode = {
       include_runs: !!(payload.includeRuns ?? payload.include_runs ?? false),
       include_vectors: !!(payload.includeVectors ?? payload.include_vectors ?? false),
       include_user_names: !!(payload.includeUserNames ?? payload.include_user_names ?? false),
+      scope: String(payload.scope ?? 'node'),
     };
     const body = _wasm.encodeProjectStudioProjectExportStartRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
@@ -8166,6 +8174,133 @@ export const encode = {
   projectStudioArchiveStreamRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     const body = _wasm.encodeProjectStudioArchiveStreamRequest(String(payload.jobId ?? payload.job_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioProjectTreeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: (payload.projectId ?? payload.project_id) == null ? null : String(payload.projectId ?? payload.project_id),
+      include_ended: !!(payload.includeEnded ?? payload.include_ended ?? false),
+      include_archived: !!(payload.includeArchived ?? payload.include_archived ?? false),
+    };
+    const body = _wasm.encodeProjectStudioProjectTreeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioProjectMoveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      new_parent_id: (payload.newParentId ?? payload.new_parent_id) == null ? null : String(payload.newParentId ?? payload.new_parent_id),
+    };
+    const body = _wasm.encodeProjectStudioProjectMoveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioProjectInheritancePreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      inherit_modules: !!(payload.inheritModules ?? payload.inherit_modules),
+      inherit_task_types: !!(payload.inheritTaskTypes ?? payload.inherit_task_types),
+    };
+    const body = _wasm.encodeProjectStudioProjectInheritancePreviewRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioProjectInheritanceSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      is_private: !!(payload.isPrivate ?? payload.is_private),
+      inherit_modules: !!(payload.inheritModules ?? payload.inherit_modules),
+      inherit_task_types: !!(payload.inheritTaskTypes ?? payload.inherit_task_types),
+      modules: Array.isArray(payload.modules) ? payload.modules.map(String) : [],
+    };
+    const body = _wasm.encodeProjectStudioProjectInheritanceSaveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioProjectLifecyclePreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioProjectLifecyclePreviewRequest(JSON.stringify({ project_id: String(payload.projectId ?? payload.project_id ?? '') }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioProjectLifecycleRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      ended: !!payload.ended,
+      confirmation_key: String(payload.confirmationKey ?? payload.confirmation_key ?? ''),
+      reason: String(payload.reason ?? ''),
+    };
+    const body = _wasm.encodeProjectStudioProjectLifecycleRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioTaskNotPursuedRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      task_id: String(payload.taskId ?? payload.task_id ?? ''),
+      reason: String(payload.reason ?? ''),
+    };
+    const body = _wasm.encodeProjectStudioTaskNotPursuedRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioTaskTransferPreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      source_project_id: String(payload.sourceProjectId ?? payload.source_project_id ?? ''),
+      destination_project_id: String(payload.destinationProjectId ?? payload.destination_project_id ?? ''),
+      task_id: String(payload.taskId ?? payload.task_id ?? ''),
+    };
+    const body = _wasm.encodeProjectStudioTaskTransferPreviewRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioTaskTransferRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      source_project_id: String(payload.sourceProjectId ?? payload.source_project_id ?? ''),
+      destination_project_id: String(payload.destinationProjectId ?? payload.destination_project_id ?? ''),
+      task_id: String(payload.taskId ?? payload.task_id ?? ''),
+      confirm_wider_access: !!(payload.confirmWiderAccess ?? payload.confirm_wider_access),
+    };
+    const body = _wasm.encodeProjectStudioTaskTransferRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioTaskKeyResolveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const eventId = payload.originEventId ?? payload.origin_event_id;
+    const request = {
+      task_key: (payload.taskKey ?? payload.task_key) == null ? null : String(payload.taskKey ?? payload.task_key),
+      task_id: (payload.taskId ?? payload.task_id) == null ? null : String(payload.taskId ?? payload.task_id),
+      origin_project_id: (payload.originProjectId ?? payload.origin_project_id) == null ? null : String(payload.originProjectId ?? payload.origin_project_id),
+      origin_event_id: eventId == null ? null : String(eventId),
+    };
+    const body = _wasm.encodeProjectStudioTaskKeyResolveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioTaskIndexStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeProjectStudioTaskIndexStatusRequest(JSON.stringify({ project_id: String(payload.projectId ?? payload.project_id ?? '') }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  projectStudioProjectScopePreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      project_id: String(payload.projectId ?? payload.project_id ?? ''),
+      scope: String(payload.scope ?? 'node'),
+      operation: String(payload.operation ?? 'export'),
+    };
+    const body = _wasm.encodeProjectStudioProjectScopePreviewRequest(JSON.stringify(request));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 

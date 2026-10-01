@@ -15,8 +15,7 @@
 //! items to members of the same project, and every one is written to that
 //! project's activity log (docs: the departure is the administrator's decision).
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use serde_json::{json, Value as Json};
@@ -42,6 +41,7 @@ pub(super) struct ProjectFacts {
     pub archived: bool,
     pub owner: String,
     members: Vec<(String, ProjectAccessWire)>,
+    active_accounts: HashSet<String>,
 }
 
 impl ProjectFacts {
@@ -60,7 +60,9 @@ impl ProjectFacts {
     ) -> HashSet<String> {
         self.members
             .iter()
-            .filter(|(id, access)| id != person && access.allows(area, minimum))
+            .filter(|(id, access)| {
+                id != person && self.active_accounts.contains(id) && access.allows(area, minimum)
+            })
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -68,7 +70,9 @@ impl ProjectFacts {
     fn managers(&self, person: &str) -> Vec<String> {
         self.members
             .iter()
-            .filter(|(id, access)| id != person && access.can_manage_members)
+            .filter(|(id, access)| {
+                id != person && self.active_accounts.contains(id) && access.can_manage_members
+            })
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -78,7 +82,6 @@ impl ProjectFacts {
 pub(super) struct ProjectDirectory {
     core_db: crate::db::DbPool,
     org_id: String,
-    cache: RefCell<HashMap<String, Option<Rc<ProjectFacts>>>>,
 }
 
 impl ProjectDirectory {
@@ -86,7 +89,6 @@ impl ProjectDirectory {
         Self {
             core_db: core_db.clone(),
             org_id: org_id.to_string(),
-            cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -96,62 +98,83 @@ impl ProjectDirectory {
     }
 
     pub fn facts(&self, project_id: &str) -> Result<Option<Rc<ProjectFacts>>> {
-        if let Some(hit) = self.cache.borrow().get(project_id) {
-            return Ok(hit.clone());
-        }
-        let loaded = match repository::get_project(&self.org_id, project_id)? {
-            None => None,
-            Some(record) => {
-                let members = repository::list_members(project_id)?
-                    .into_iter()
-                    .map(|m| {
-                        let access = repository::project_access(&record, &m.user_id, false)?;
-                        Ok((m.user_id, access))
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                Some(Rc::new(ProjectFacts {
-                    id: record.project_id,
-                    name: record.name,
-                    archived: record.status == "archived",
-                    owner: record.owner_user_id,
-                    members,
-                }))
-            }
+        let Some(record) = repository::get_project(&self.org_id, project_id)? else {
+            return Ok(None);
         };
-        self.cache
-            .borrow_mut()
-            .insert(project_id.to_string(), loaded.clone());
-        Ok(loaded)
+        let ancestors = repository::project_ancestry(&self.org_id, project_id)?;
+        let private_start = ancestors
+            .iter()
+            .rposition(|node| node.is_private)
+            .unwrap_or(0);
+        let mut users = HashSet::new();
+        for node in &ancestors[private_start..] {
+            users.extend(
+                repository::list_members(&node.project_id)?
+                    .into_iter()
+                    .map(|member| member.user_id),
+            );
+        }
+        users.extend(
+            repository::effective_principals(
+                project_id,
+                ProjectArea::Settings,
+                ProjectPermissionLevel::None,
+            )?
+            .into_iter()
+            .map(|principal| principal.user_id),
+        );
+        let mut members = Vec::new();
+        let mut active_accounts = HashSet::new();
+        for user in users {
+            if crate::db::repository::get_user_account_by_id(&self.core_db, &user)?
+                .is_some_and(|account| account.is_active)
+            {
+                active_accounts.insert(user.clone());
+            }
+            let access = repository::project_access(&record, &user, false)?;
+            members.push((user, access));
+        }
+        members.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(Some(Rc::new(ProjectFacts {
+            id: record.project_id,
+            name: record.name,
+            owner: record.owner_user_id,
+            archived: ancestors
+                .iter()
+                .any(|node| node.status == "archived" || node.lifecycle == "ended"),
+            members,
+            active_accounts,
+        })))
     }
 
-    /// The projects the person belongs to, or just `only`.
+    /// Stored expired origins still identify held work; only active effective
+    /// principals may receive it. Every apply reloads facts after the preview.
     pub fn projects_of(&self, user: &str, only: Option<&str>) -> Result<Vec<Rc<ProjectFacts>>> {
         if !Self::available() {
             return Ok(Vec::new());
         }
-        let mut ids: Vec<String> = match only {
-            Some(id) => vec![id.to_string()],
-            None => repository::list_projects(&self.org_id, true)?
-                .into_iter()
-                .filter_map(
-                    |project| match repository::member_access(&project.project_id, user) {
-                        Ok(Some(_)) => Some(Ok(project.project_id)),
-                        Ok(None) => None,
-                        Err(error) => Some(Err(error)),
-                    },
-                )
-                .collect::<anyhow::Result<Vec<_>>>()?,
+        let candidates = if let Some(id) = only {
+            repository::list_descendants(&self.org_id, id, true)?
+        } else {
+            repository::list_projects(&self.org_id, true)?
         };
-        ids.sort();
         let mut out = Vec::new();
-        for id in ids {
-            if let Some(facts) = self.facts(&id)? {
+        for project in candidates {
+            if let Some(facts) = self.facts(&project.project_id)? {
                 if facts.access_of(user).is_some() {
                     out.push(facts);
                 }
             }
         }
+        out.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(out)
+    }
+
+    fn sync_index(&self, project_id: &str, pool: &crate::db::DbPool) -> Result<()> {
+        let record = repository::get_project(&self.org_id, project_id)?
+            .ok_or_else(|| anyhow::anyhow!("project missing"))?;
+        while crate::project_studio::task_index::sync_project(&record, pool, 256)?.lag != 0 {}
+        Ok(())
     }
 }
 
@@ -231,7 +254,24 @@ impl HandoverProvider for TaskProvider<'_> {
     fn list(&self, cx: &ListCx<'_>) -> Result<Vec<Held>> {
         let mut out = Vec::new();
         for facts in self.projects.projects_of(cx.user_id, cx.project)? {
+            if cx.reason == Reason::ProjectRemoval {
+                if let Some(removed_project) = cx.project {
+                    let record = repository::get_project(&self.projects.org_id, &facts.id)?
+                        .ok_or_else(|| anyhow::anyhow!("project missing"))?;
+                    let after = repository::project_access_after_member_removal(
+                        &record,
+                        cx.user_id,
+                        removed_project,
+                    )?;
+                    if after.allows(ProjectArea::Tasks, ProjectPermissionLevel::Read)
+                        || after.allows(ProjectArea::Board, ProjectPermissionLevel::Read)
+                    {
+                        continue;
+                    }
+                }
+            }
             let pool = open_pool(&facts.id)?;
+            self.projects.sync_index(&facts.id, &pool)?;
             let eligible = facts.eligible(
                 ProjectArea::Tasks,
                 ProjectPermissionLevel::Write,
@@ -276,7 +316,9 @@ fn taker_of<'a>(
 ) -> std::result::Result<&'a str, &'static str> {
     let taker = item.taker.as_deref().ok_or("taker_required")?;
     match facts.access_of(taker) {
-        Some(access) if access.allows(area, minimum) => Ok(taker),
+        Some(access) if facts.active_accounts.contains(taker) && access.allows(area, minimum) => {
+            Ok(taker)
+        }
         _ => Err("taker_not_eligible"),
     }
 }
@@ -286,6 +328,11 @@ impl WorkProvider for TaskProvider<'_> {
         let Some((project_id, task_id)) = parse_key(&item.key, "task") else {
             return Ok(Step::Refused("bad_key"));
         };
+        if repository::task_location(task_id)?.is_none_or(|location| {
+            location.org_id != cx.org_id || location.project_id != project_id
+        }) {
+            return Ok(Step::Refused("task_moved"));
+        }
         let Some(facts) = self.projects.facts(project_id)? else {
             return Ok(Step::Refused("project_missing"));
         };
@@ -362,6 +409,7 @@ impl WorkProvider for TaskProvider<'_> {
                 },
             );
         }
+        self.projects.sync_index(project_id, &pool)?;
         Ok(Step::Done(json!({
             "status": before.map(|t| t.status).unwrap_or_default(),
         })))
@@ -371,6 +419,11 @@ impl WorkProvider for TaskProvider<'_> {
         let Some((project_id, task_id)) = parse_key(&item.key, "task") else {
             return Ok(Returned::Kept("bad_key"));
         };
+        if repository::task_location(task_id)?.is_none_or(|location| {
+            location.org_id != cx.org_id || location.project_id != project_id
+        }) {
+            return Ok(Returned::Kept("task_moved"));
+        }
         let (Some(taker), Some(facts)) = (item.taker.as_deref(), self.projects.facts(project_id)?)
         else {
             return Ok(Returned::Kept("project_missing"));
@@ -443,6 +496,7 @@ impl WorkProvider for TaskProvider<'_> {
                 },
             );
         }
+        self.projects.sync_index(project_id, &pool)?;
         Ok(Returned::Back)
     }
 }
@@ -463,6 +517,20 @@ impl HandoverProvider for TestItemProvider<'_> {
     fn list(&self, cx: &ListCx<'_>) -> Result<Vec<Held>> {
         let mut out = Vec::new();
         for facts in self.projects.projects_of(cx.user_id, cx.project)? {
+            if cx.reason == Reason::ProjectRemoval {
+                if let Some(removed_project) = cx.project {
+                    let record = repository::get_project(&self.projects.org_id, &facts.id)?
+                        .ok_or_else(|| anyhow::anyhow!("project missing"))?;
+                    let after = repository::project_access_after_member_removal(
+                        &record,
+                        cx.user_id,
+                        removed_project,
+                    )?;
+                    if after.allows(ProjectArea::Tests, ProjectPermissionLevel::Write) {
+                        continue;
+                    }
+                }
+            }
             let pool = open_pool(&facts.id)?;
             let eligible = facts.eligible(
                 ProjectArea::Tests,
@@ -633,12 +701,22 @@ pub(crate) fn remove_project_member(
     if project.owner_user_id == user {
         return Ok(MemberRemoval::Owner);
     }
-    let pool = open_pool(project_id)?;
-    if !tasks::open_tasks_of(&pool, user)?.is_empty()
-        || !runs::open_items_of(&pool, user)?.is_empty()
-    {
-        return Ok(MemberRemoval::HoldsWork);
+    for node in repository::list_descendants(org_id, project_id, true)? {
+        let after = repository::project_access_after_member_removal(&node, user, project_id)?;
+        let task_access = after.allows(ProjectArea::Tasks, ProjectPermissionLevel::Read)
+            || after.allows(ProjectArea::Board, ProjectPermissionLevel::Read);
+        let test_access = after.allows(ProjectArea::Tests, ProjectPermissionLevel::Write);
+        if task_access && test_access {
+            continue;
+        }
+        let content = open_pool(&node.project_id)?;
+        if (!task_access && !tasks::open_tasks_of(&content, user)?.is_empty())
+            || (!test_access && !runs::open_items_of(&content, user)?.is_empty())
+        {
+            return Ok(MemberRemoval::HoldsWork);
+        }
     }
+    let pool = open_pool(project_id)?;
     if !repository::remove_member(project_id, user)? {
         return Ok(MemberRemoval::Missing);
     }
@@ -666,11 +744,21 @@ impl HandoverProvider for MembershipProvider<'_> {
             return Ok(out);
         }
         for facts in self.projects.projects_of(cx.user_id, cx.project)? {
+            if cx.project.is_some_and(|selected| selected != facts.id) {
+                continue;
+            }
+            if repository::member_access(&facts.id, cx.user_id)?.is_none()
+                && facts.owner != cx.user_id
+            {
+                continue;
+            }
             let owner = facts.owner == cx.user_id;
             let eligible = facts
                 .members
                 .iter()
-                .filter(|(id, access)| id != cx.user_id && access.has_access)
+                .filter(|(id, access)| {
+                    id != cx.user_id && facts.active_accounts.contains(id) && access.has_access
+                })
                 .map(|(id, _)| id.clone())
                 .collect::<HashSet<_>>();
             let managers = facts.managers(cx.user_id);
@@ -822,5 +910,226 @@ mod tests {
         assert_eq!(parse_key("member:p-1", "task"), None);
         // A prefix must be a whole word: "tasks:..." is not a task key.
         assert_eq!(parse_key("tasks:p-1:t-9", "task"), None);
+    }
+
+    #[tokio::test]
+    async fn inherited_held_work_respects_private_cuts_surviving_grants_and_moved_uuid() {
+        use crate::project_studio::models::MemberInput;
+        let root = tempfile::tempdir().expect("actual project storage");
+        let _ = ps_db::init(&root.path().join("projects.db"));
+        crate::services::ingest_jobs::init(&root.path().join("jobs.db"))
+            .expect("actual media queue for transfer");
+        let state = crate::dispatch::AppState::for_test();
+        let org = crate::services::org::DEFAULT_ORG_ID;
+        let mut users = Vec::new();
+        for name in ["owner", "giver", "taker"] {
+            let id = crate::db::repository::create_user_account(
+                &state.db,
+                name,
+                "hash",
+                name,
+                &format!("{name}@example.test"),
+            )
+            .expect("actual account");
+            crate::services::org::add_membership(&state.db, org, &id, "role-org-viewer", "test")
+                .expect("actual organization member");
+            users.push(id);
+        }
+        let owner = &users[0];
+        let giver = &users[1];
+        let taker = &users[2];
+        let grant = |user: &str| MemberInput {
+            user_id: user.into(),
+            functions: vec!["developer".into()],
+            project_admin: false,
+            expires_at: None,
+        };
+        let project = |name: &str, parent: Option<&str>, private: bool, members: &[MemberInput]| {
+            let id = uuid::Uuid::new_v4().to_string();
+            let dir = root.path().join(&id);
+            std::fs::create_dir_all(dir.join("files")).expect("actual project directory");
+            repository::create_project(
+                &id,
+                org,
+                &format!("{name} {id}"),
+                "",
+                "custom",
+                "[\"tasks\",\"tests\"]",
+                owner,
+                &dir.to_string_lossy(),
+                "",
+                parent,
+                private,
+                parent.is_some(),
+                parent.is_some(),
+                members,
+            )
+            .expect("actual tree node");
+            repository::get_project(org, &id)
+                .expect("lookup")
+                .expect("project")
+        };
+        let ancestor = project("Ancestor", None, false, &[grant(giver), grant(taker)]);
+        let public = project("Inherited work", Some(&ancestor.project_id), false, &[]);
+        let private = project("Private cut", Some(&ancestor.project_id), true, &[]);
+        let destination = project(
+            "Private destination",
+            Some(&ancestor.project_id),
+            true,
+            &[grant(giver), grant(taker)],
+        );
+        let pool = project_db::open(&public.project_id).expect("content");
+        let task = tasks::create_task(
+            &pool,
+            &tasks::TaskInput {
+                task_type: "technical",
+                title: "Inherited assignee work",
+                description_md: "",
+                severity: "",
+                priority: "medium",
+                status: "todo",
+                assigned_to: giver,
+                due_date: "",
+                parent_task_id: None,
+                links_json: "[]",
+                attachments_json: "[]",
+            },
+            owner,
+        )
+        .expect("actual held task");
+        let directory = ProjectDirectory::new(org, &state.db);
+        directory
+            .sync_index(&public.project_id, &pool)
+            .expect("current UUID location");
+        assert!(directory
+            .facts(&private.project_id)
+            .expect("private facts")
+            .expect("private project")
+            .access_of(giver)
+            .is_none());
+        let provider = TaskProvider {
+            projects: &directory,
+        };
+        let day = chrono::Utc::now().date_naive();
+        let read_held = |reason, project| {
+            let conn = state.db.read().expect("organization reader");
+            let advice = super::super::advice::Advice::load(&conn, org, giver, day, day)
+                .expect("actual F07 advice");
+            let names = std::collections::HashMap::new();
+            let members = users.iter().cloned().collect();
+            provider
+                .list(&ListCx {
+                    conn: &conn,
+                    org_id: org,
+                    user_id: giver,
+                    reason,
+                    date: day,
+                    project,
+                    advice: &advice,
+                    names: &names,
+                    members: &members,
+                })
+                .expect("real provider inventory")
+        };
+        let preview = read_held(Reason::ProjectRemoval, Some(ancestor.project_id.as_str()));
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].key, task_key(&public.project_id, &task.task_id));
+        assert!(preview[0]
+            .eligible
+            .as_ref()
+            .expect("actual takers")
+            .contains(taker));
+        assert_eq!(
+            remove_project_member(org, &ancestor.project_id, giver, owner, "{}")
+                .expect("shared removal guard"),
+            MemberRemoval::HoldsWork
+        );
+        repository::add_members(&public.project_id, &[grant(giver)], owner)
+            .expect("surviving local contribution");
+        assert!(read_held(Reason::ProjectRemoval, Some(ancestor.project_id.as_str())).is_empty());
+        assert_eq!(
+            remove_project_member(org, &ancestor.project_id, giver, owner, "{}")
+                .expect("remove only ancestor contribution"),
+            MemberRemoval::Removed
+        );
+        assert!(repository::project_access(&public, giver, false)
+            .expect("same effective evaluator")
+            .allows(ProjectArea::Tasks, ProjectPermissionLevel::Write));
+        let expires = chrono::Utc::now() + chrono::Duration::seconds(2);
+        let mut expiring = grant(giver);
+        expiring.expires_at = Some(expires.to_rfc3339());
+        repository::add_members(&ancestor.project_id, &[expiring], owner)
+            .expect("actual expiring ancestor contribution");
+        repository::remove_member(&public.project_id, giver)
+            .expect("ancestor still supplies access");
+        while chrono::Utc::now() <= expires {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let expired_preview = read_held(Reason::Departure, None);
+        assert_eq!(expired_preview.len(), 1);
+        assert_eq!(expired_preview[0].key, preview[0].key);
+        assert!(expired_preview[0]
+            .eligible
+            .as_ref()
+            .expect("current eligible takers")
+            .contains(taker));
+        assert!(
+            !repository::project_access(&public, giver, false)
+                .expect("expired effective access")
+                .has_access
+        );
+        let planned = Planned {
+            key: expired_preview[0].key.clone(),
+            category: Category::Task,
+            title: expired_preview[0].title.clone(),
+            project_id: Some(public.project_id.clone()),
+            taker: Some(taker.clone()),
+        };
+        let destination_pool = project_db::open(&destination.project_id).expect("destination");
+        crate::project_studio::task_transfer::transfer_task(
+            &state,
+            &public,
+            &destination,
+            &pool,
+            &destination_pool,
+            &task.task_id,
+            owner,
+            true,
+        )
+        .expect("actual UUID transfer with explicit wider-access consent");
+        let operation = uuid::Uuid::new_v4().to_string();
+        let cx = ApplyCx {
+            org_id: org,
+            actor: owner,
+            actor_is_admin: false,
+            handover_id: &operation,
+            from_user: giver,
+            reason: Reason::Departure,
+            date: day,
+            today: day,
+            note: "Stale handover preview",
+            note_digest: "",
+        };
+        assert!(matches!(
+            provider
+                .apply(&cx, &planned)
+                .expect("fresh current-location check"),
+            Step::Refused("task_moved")
+        ));
+        assert_eq!(
+            tasks::get_task(&destination_pool, &task.task_id)
+                .expect("current owning project")
+                .expect("same task UUID")
+                .assigned_to,
+            *giver
+        );
+        assert_eq!(
+            repository::task_location(&task.task_id)
+                .expect("canonical route")
+                .expect("task")
+                .project_id,
+            destination.project_id
+        );
+        std::mem::forget(root);
     }
 }

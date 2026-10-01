@@ -375,7 +375,7 @@ async fn run_server(args: Args) -> Result<()> {
     }
     // Project Studio ("Projekty") mirrors the same pattern: central registry in
     // `data/projects.db` + per-project pools with an idle sweeper.
-    if let Err(e) = tentaflow_core::project_studio::init() {
+    if let Err(e) = tentaflow_core::project_studio::init(&db) {
         error!("Blad inicjalizacji bazy Project Studio: {}", e);
         return Err(e);
     }

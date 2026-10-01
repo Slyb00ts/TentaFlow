@@ -272,8 +272,7 @@ pub fn start_unified_server_with_permissions(
     // also starts assertion-key rotation — a node that never paired needs that.
     let owner_license: Arc<dyn crate::license::LicenseChecker> =
         Arc::new(crate::license::StaticLicenseChecker::free());
-    let installed = crate::code_studio::remote_proxy::install_owner_context(
-        crate::api::dashboard::server::build_app_state(
+    let owner_state=crate::api::dashboard::server::build_app_state(
             db.clone(),
             router.clone(),
             mesh_peer_store.clone(),
@@ -290,8 +289,10 @@ pub fn start_unified_server_with_permissions(
             mesh_relay_health.clone(),
             port_allocator.clone(),
             mesh_services_registry.clone(),
-        ),
-    );
+        );
+    crate::project_studio::task_transfer::recover_transfers(&owner_state)?;
+    crate::project_studio::media::start_workers(owner_state.clone())?;
+    let installed = crate::code_studio::remote_proxy::install_owner_context(owner_state);
     info!("Code Studio owner context installed: {installed}");
 
     // Initialise the process-wide pickup mTLS profile from the loaded config.

@@ -3803,3 +3803,38 @@
   .ps-task-card .ps-task-comment { flex-wrap: wrap; }
   .ps-task-card .ps-task-comment-actions { margin-left: auto; }
 }
+
+/* Project trees keep names readable while the existing page header and tabs retain their layout. */
+.ps-card-name,
+.ps-card-ancestors { overflow-wrap: anywhere; }
+.ps-card-ancestors { color: var(--text-3); font-size: 12px; }
+.ps-project-tree { min-width: 0; padding-block: 8px; }
+.ps-project-tree .tf-tree__row { flex-wrap: wrap; height: auto; min-height: 32px; }
+.ps-project-tree .tf-tree__label { white-space: normal; text-overflow: clip; overflow: visible; overflow-wrap: anywhere; min-width: 120px; }
+.ps-project-tree .tf-tree__badge { white-space: normal; overflow-wrap: anywhere; }
+.ps-project-tree .tf-tree__actions { margin-left: auto; }
+.ps-tree-filters { display: flex; flex-wrap: wrap; gap: 10px 18px; margin-block: 12px; }
+.ps-subproject-layout { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(0, 1.3fr); gap: 20px; }
+.ps-subproject-layout > div { min-width: 0; }
+.ps-inheritance-editor { display: grid; gap: 10px; align-content: start; min-width: 0; }
+.ps-inheritance-editor > tf-button { justify-self: start; }
+.ps-inheritance-diff { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-block: 12px; }
+.ps-inheritance-diff > div { padding: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); }
+.ps-inheritance-diff p { overflow-wrap: anywhere; line-height: 1.5; }
+.ps-inheritance-diff tf-chip { margin: 6px 4px 0 0; }
+.ps-module-preview { padding-block: 12px; display: grid; gap: 8px; }
+.ps-scope-nodes { padding-left: 20px; line-height: 1.7; overflow-wrap: anywhere; }
+.ps-lifecycle-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-block: 12px; }
+.ps-lifecycle-children { display: flex; flex-wrap: wrap; gap: 8px; }
+.ps-task-index-state { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px; color: var(--text-3); font-size: 12px; }
+.ps-tests-toolbar tf-multiselect { flex: 1 1 220px; min-width: 180px; }
+.ps-task-resolution { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; align-items: center; overflow-wrap: anywhere; }
+.ps-window-footer .ps-footer-left { flex-wrap: wrap; }
+@media (max-width: 900px) {
+  .ps-subproject-layout { grid-template-columns: 1fr; }
+}
+@media (max-width: 560px) {
+  .ps-inheritance-diff,
+  .ps-lifecycle-stats { grid-template-columns: 1fr; }
+}
+.ps-card-desc { display: block; overflow: visible; -webkit-line-clamp: unset; overflow-wrap: anywhere; }

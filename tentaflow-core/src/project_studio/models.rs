@@ -23,6 +23,181 @@ pub struct ProjectRecord {
     pub dir_path: String,
     pub created_at: String,
     pub updated_at: String,
+    pub parent_id: Option<String>,
+    pub path: String,
+    pub depth: u32,
+    pub is_private: bool,
+    pub inherit_modules: bool,
+    pub inherit_task_types: bool,
+    pub module_disabled_json: String,
+    pub lifecycle: String,
+    pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TaskIndexSnapshot {
+    pub task_id: String,
+    pub task_no: u32,
+    pub task_key: String,
+    pub task_type: String,
+    pub title: String,
+    pub severity: String,
+    pub priority: String,
+    pub status: String,
+    pub assigned_to: String,
+    pub due_date: String,
+    pub parent_task_id: Option<String>,
+    pub links_json: String,
+    pub comment_count: u32,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub archived_at: Option<String>,
+    pub resolution: Option<String>,
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskIndexEvent {
+    pub revision: i64,
+    pub task_id: String,
+    pub op: String,
+    pub snapshot_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexedTask {
+    pub project_id: String,
+    pub project_name: String,
+    pub org_id: String,
+    pub revision: i64,
+    pub snapshot: TaskIndexSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskIndexFilter {
+    pub task_type: String,
+    pub status: String,
+    pub assigned_to: String,
+    pub search: String,
+    pub severity: String,
+    pub include_archived: bool,
+    pub offset: u32,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskIndexStatus {
+    pub project_id: String,
+    pub source_revision: i64,
+    pub applied_revision: i64,
+    pub lag: i64,
+    pub indexed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProjectTaskCounts {
+    pub own_open: u32,
+    pub descendant_open: u32,
+    pub my_open: u32,
+    pub overdue: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ProjectImportNode {
+    pub project_id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub description: String,
+    pub template: String,
+    pub modules_json: String,
+    pub owner_user_id: String,
+    pub dir_path: String,
+    pub key_prefix: String,
+    pub is_private: bool,
+    pub inherit_modules: bool,
+    pub inherit_task_types: bool,
+    pub status: String,
+    pub lifecycle: String,
+    pub functions: Vec<tentaflow_protocol::project_studio::access::ProjectFunctionWire>,
+    pub members: Vec<MemberInput>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectImportJournal {
+    pub operation_id: String,
+    pub org_id: String,
+    pub manifest_sha256: String,
+    pub nodes: Vec<ProjectImportNode>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectDeletionAdmission {
+    pub project: ProjectRecord,
+    pub operation_id: String,
+    pub actor_user_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskLocation {
+    pub task_id: String,
+    pub org_id: String,
+    pub project_id: String,
+    pub current_key: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskKeyAlias {
+    pub org_id: String,
+    pub alias_key: String,
+    pub task_id: String,
+    pub target_project_id: String,
+    pub current_key: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskEventAlias {
+    pub task_id: String,
+    pub origin_project_id: String,
+    pub origin_event_id: i64,
+    pub current_project_id: String,
+    pub current_event_id: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TaskLinkAlias {
+    pub relation_id: String,
+    pub origin_project_id: String,
+    pub origin_link_id: i64,
+    pub current_project_id: String,
+    pub current_link_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TaskRelationRoute {
+    pub relation_id: String,
+    pub owning_project_id: String,
+    pub link_id: i64,
+    pub source_task_id: String,
+    pub target_task_id: String,
+    pub source_project_id: String,
+    pub target_project_id: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskTransferJournal {
+    pub operation_id: String,
+    pub org_id: String,
+    pub source_project_id: String,
+    pub destination_project_id: String,
+    pub actor_user_id: String,
+    pub task_ids: Vec<String>,
+    pub consent_wider_access: bool,
+    pub phase: String,
+    pub sha_manifest_json: String,
+    pub key_map_json: String,
+    pub event_map_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -48,7 +223,7 @@ impl MemberRecord {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MemberInput {
     pub user_id: String,
     pub functions: Vec<String>,
@@ -314,6 +489,8 @@ pub struct TaskRecord {
     pub created_at: String,
     pub updated_at: String,
     pub archived_at: Option<String>,
+    pub resolution: Option<String>,
+    pub resolution_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -352,8 +529,11 @@ pub struct TaskEventRecord {
 #[derive(Debug, Clone)]
 pub struct TaskLinkRecord {
     pub link_id: i64,
+    pub relation_id: String,
     pub source_task_id: String,
     pub target_task_id: String,
+    pub source_project_id: String,
+    pub target_project_id: String,
     pub kind: String,
     pub lag_days: i32,
     pub other_task_key: String,
@@ -578,6 +758,16 @@ pub struct NotificationRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn evaluate_project_access(
+        project: &ProjectRecord,
+        member: Option<&MemberRecord>,
+        catalogue: &[tentaflow_protocol::project_studio::access::ProjectFunctionWire],
+        app_admin: bool,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> tentaflow_protocol::project_studio::access::ProjectAccessWire {
+        super::evaluate_project_access(project, member, catalogue, app_admin, now, false)
+    }
     use chrono::{TimeZone, Utc};
     use tentaflow_protocol::project_studio::access::{
         ProjectArea, ProjectPermissionLevel as Level,
@@ -598,6 +788,15 @@ mod tests {
             dir_path: "unused".to_string(),
             created_at: String::new(),
             updated_at: String::new(),
+            parent_id: None,
+            path: "/p".to_string(),
+            depth: 1,
+            is_private: false,
+            inherit_modules: false,
+            inherit_task_types: false,
+            module_disabled_json: "[]".to_string(),
+            lifecycle: "active".to_string(),
+            ended_at: None,
         }
     }
 

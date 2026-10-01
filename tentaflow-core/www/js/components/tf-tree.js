@@ -6,10 +6,13 @@
 //              component: expansion/selection state comes in via
 //              `expandedIds`/`selectedId` properties; user intent is emitted as
 //              `expand`/`collapse`/`select` events (non-bubbling, detail
-//              `{ id }`, expand adds `lazy`). Light DOM.
+//              `{ id }`, expand adds `lazy`). Draggable nodes emit controlled
+//              `move` intent `{ id, parentId }`; callers persist or reject it.
+//              Light DOM.
 //
 //              Node shape: { id, label, children?, hasChildren?, disabled?,
-//                icon? (a DOM element, rendered BEFORE the label),
+//                icon? (a DOM element, rendered BEFORE the label), actions?
+//                (a DOM element after the badge), draggable?, droppable?,
 //                badge? (a short status marker rendered AFTER the label and
 //                  pushed to the row's right edge — either a string, or
 //                  { text, tone } with tone a|m|d|c = added/modified/deleted/
@@ -56,6 +59,7 @@ class TfTree extends HTMLElement {
     this._selectedId = null;
     this._flatVisible = [];
     this._nodeElements = new Map();
+    this._draggedId = null;
   }
 
   connectedCallback() {
@@ -109,6 +113,14 @@ class TfTree extends HTMLElement {
     el.setAttribute('role', 'tree');
     el.addEventListener('click', (e) => this._onClick(e));
     el.addEventListener('keydown', (e) => this._onKeydown(e));
+    el.addEventListener('dragstart', (e) => this._onDragStart(e));
+    el.addEventListener('dragover', (e) => this._onDragOver(e));
+    el.addEventListener('dragleave', (e) => {
+      const row = e.target.closest('.tf-tree__row');
+      if (row && !row.contains(e.relatedTarget)) row.classList.remove('tf-tree__row--drop-target');
+    });
+    el.addEventListener('drop', (e) => this._onDrop(e));
+    el.addEventListener('dragend', () => this._finishDrag());
     const root = document.createElement('ul');
     root.classList.add('tf-tree__root');
     root.setAttribute('role', 'group');
@@ -141,6 +153,10 @@ class TfTree extends HTMLElement {
       const li = this._renderNode(node, 0);
       if (li) this._rootList.appendChild(li);
     }
+    const tabId = this._nodeElements.has(focusedId) ? focusedId
+      : this._nodeElements.has(this._selectedId) ? this._selectedId
+        : (this._flatVisible.find((node) => !node.disabled) || this._flatVisible[0])?.id;
+    this._nodeElements.get(tabId)?.querySelector('.tf-tree__row')?.setAttribute('tabindex', '0');
     if (focusedId != null) this._restoreFocus(focusedId);
   }
 
@@ -164,6 +180,7 @@ class TfTree extends HTMLElement {
     row.classList.add('tf-tree__row');
     row.style.paddingLeft = `${depth * 1.25}em`;
     row.setAttribute('tabindex', '-1');
+    if (!disabled && node.draggable === true) row.setAttribute('draggable', 'true');
 
     const expanded = this._expandedIds.has(node.id);
     const hasChildren = this._hasChildren(node);
@@ -200,6 +217,12 @@ class TfTree extends HTMLElement {
       badgeEl.textContent = badge.text;
       row.appendChild(badgeEl);
     }
+    if (node.actions?.nodeType === 1) {
+      const actions = document.createElement('span');
+      actions.className = 'tf-tree__actions';
+      actions.appendChild(node.actions);
+      row.appendChild(actions);
+    }
 
     if (this._selectedId === node.id) {
       li.classList.add('tf-tree__node--selected');
@@ -210,7 +233,8 @@ class TfTree extends HTMLElement {
     }
 
     li.appendChild(row);
-    this._flatVisible.push({ id: node.id, depth, hasChildren, expanded, disabled });
+    this._flatVisible.push({ id: node.id, depth, hasChildren, expanded, disabled,
+      draggable: node.draggable === true, droppable: node.droppable === true });
 
     if (hasChildren && expanded && Array.isArray(node.children) && node.children.length > 0) {
       const childList = document.createElement('ul');
@@ -226,6 +250,7 @@ class TfTree extends HTMLElement {
   }
 
   _onClick(e) {
+    if (e.target.closest('.tf-tree__actions')) return;
     const row = e.target.closest('.tf-tree__row');
     if (!row || !this._container.contains(row)) return;
     const li = row.parentElement;
@@ -247,6 +272,7 @@ class TfTree extends HTMLElement {
   }
 
   _onKeydown(e) {
+    if (e.target.closest('.tf-tree__actions')) return;
     const active = document.activeElement;
     const activeRow = active && active.closest ? active.closest('.tf-tree__row') : null;
     if (!activeRow || !this._container.contains(activeRow)) return;
@@ -316,6 +342,54 @@ class TfTree extends HTMLElement {
     if (!row) return null;
     const li = row.parentElement;
     return li && li.hasAttribute('data-node-id') ? li.getAttribute('data-node-id') : null;
+  }
+
+  _onDragStart(e) {
+    const row = e.target.closest('.tf-tree__row');
+    const id = row?.parentElement.getAttribute('data-node-id');
+    const node = this._flatVisible.find((item) => item.id === id);
+    if (!node?.draggable || node.disabled || !e.dataTransfer || e.target.closest('.tf-tree__actions')) {
+      e.preventDefault();
+      return;
+    }
+    this._draggedId = id;
+    e.dataTransfer.setData('application/x-tf-tree-node', id);
+    e.dataTransfer.effectAllowed = 'move';
+  }
+
+  _canDrop(parentId) {
+    if (!this._draggedId || parentId === this._draggedId) return false;
+    const source = this._flatVisible.find((node) => node.id === this._draggedId);
+    if (!source?.draggable || source.disabled) return false;
+    const target = this._flatVisible.find((node) => node.id === parentId);
+    if (!target?.droppable || target.disabled) return false;
+    return !this._nodeElements.get(this._draggedId)?.contains(this._nodeElements.get(parentId));
+  }
+
+  _onDragOver(e) {
+    const row = e.target.closest('.tf-tree__row');
+    const id = row?.parentElement.getAttribute('data-node-id');
+    if (!this._canDrop(id)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+    for (const target of this._container.querySelectorAll('.tf-tree__row--drop-target')) target.classList.remove('tf-tree__row--drop-target');
+    row.classList.add('tf-tree__row--drop-target');
+  }
+
+  _onDrop(e) {
+    const row = e.target.closest('.tf-tree__row');
+    const parentId = row?.parentElement.getAttribute('data-node-id');
+    if (this._canDrop(parentId)) {
+      e.preventDefault();
+      const id = this._draggedId;
+      this._finishDrag();
+      this._emit('move', { id, parentId });
+    } else this._finishDrag();
+  }
+
+  _finishDrag() {
+    this._draggedId = null;
+    for (const row of this._container.querySelectorAll('.tf-tree__row--drop-target')) row.classList.remove('tf-tree__row--drop-target');
   }
 
   _restoreFocus(id) {

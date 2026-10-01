@@ -308,6 +308,7 @@ mod tests {
             owner,
             &dir.to_string_lossy(),
             "",
+            None, false, false, false,
             &member_rows,
         )
         .expect("create project");

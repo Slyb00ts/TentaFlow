@@ -53,6 +53,15 @@ test('expired memberships form a separate group using server activity', () => {
   assert.equal(memberGroup({ active: true, expiresAt: null }), 'people');
   assert.equal(memberGroup({ active: true, expires_at: '2030-01-01T00:00:00Z' }), 'temporary');
   assert.equal(memberGroup({ active: false, expires_at: '2030-01-01T00:00:00Z' }), 'expired');
+  assert.equal(memberGroup({ active: true, inherited: true }), 'inherited');
+  assert.equal(memberGroup({ active: false, access: { has_access: true } }), 'expired', 'local expiry stays visible when an ancestor still grants access');
+});
+
+test('ended projects keep current reads but refuse ordinary writes and task creation', () => {
+  const access = { has_access: true, ended: true, can_create_tasks: true, areas: [{ area: 'tasks', enabled: true, level: 'admin' }] };
+  assert.equal(allowsArea(access, 'tasks'), true);
+  assert.equal(allowsArea(access, 'tasks', 'write'), false);
+  assert.equal(canCreateTask(access), false);
 });
 
 test('expiry editor preserves the local instant and rejects invalid or elapsed values', () => {

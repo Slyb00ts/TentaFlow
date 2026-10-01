@@ -23,13 +23,13 @@ export function accessField(value, key) {
 export function allowsArea(access, area, minimum = 'read') {
   const required = PERMISSION_LEVELS.indexOf(minimum);
   if (!accessField(access, 'has_access') || required < 1) return false;
-  if (access.archived && required > 1) return false;
+  if ((access.archived || access.ended) && required > 1) return false;
   const grant = access.areas?.find((entry) => entry.area === area);
   return grant?.enabled === true && PERMISSION_LEVELS.indexOf(grant.level) >= required;
 }
 
 export function canCreateTask(access) {
-  return accessField(access, 'has_access') === true && accessField(access, 'can_create_tasks') === true && !access.archived;
+  return accessField(access, 'has_access') === true && accessField(access, 'can_create_tasks') === true && !access.archived && !access.ended;
 }
 
 export function projectTabs(access) {
@@ -54,6 +54,7 @@ export function catalogueLabel(definition, field, translate) {
 }
 
 export function memberGroup(member) {
+  if (member.inherited) return 'inherited';
   if (member.active !== true) return 'expired';
   return accessField(member, 'expires_at') ? 'temporary' : 'people';
 }

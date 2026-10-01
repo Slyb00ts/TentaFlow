@@ -327,85 +327,214 @@ fn insert_deduped(
     Ok(Some(notification_id))
 }
 
-/// Lists the caller's notifications newest-first with rowid keyset pagination
-/// (`before_id` = notification_id of the previous page's last row). Returns
-/// `(rows, unread_count, has_more)`. Project names resolve from the central
-/// `projects` table in the same database.
+pub struct NotificationTarget {
+    pub project_id: String,
+    pub project_name: String,
+    pub link_json: String,
+}
+
+pub fn current_target(
+    ctx: &HandlerContext,
+    project_id: &str,
+    kind: &str,
+    link_json: &str,
+) -> Result<Option<NotificationTarget>> {
+    let org = crate::dispatch::project_studio::require_read(ctx)
+        .map_err(|error| anyhow!(error.message))?;
+    if !crate::db::repository::get_user_account_by_id(&ctx.state.db, &org.user_id)?
+        .is_some_and(|account| account.is_active)
+    {
+        return Ok(None);
+    }
+    if project_id.is_empty() && !kind.starts_with("task_") {
+        return Ok(Some(NotificationTarget {
+            project_id: String::new(),
+            project_name: String::new(),
+            link_json: link_json.into(),
+        }));
+    }
+    let mut link: serde_json::Value = serde_json::from_str(link_json)?;
+    let mut current_project_id = project_id.to_string();
+    if kind.starts_with("task_") {
+        let Some(task_id) = link
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Ok(None);
+        };
+        let Some(location) = super::repository::task_location(&task_id)? else {
+            return Ok(None);
+        };
+        if location.org_id != org.org_id {
+            return Ok(None);
+        }
+        if !task_reader(ctx, &location.project_id, &org.user_id) {
+            return Ok(None);
+        }
+        if let Some(event_id) = link.get("event_id").and_then(serde_json::Value::as_i64) {
+            let origin = link
+                .get("origin_project_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(project_id);
+            let Some((event_project_id, current_event_id)) =
+                super::repository::resolve_task_event(&task_id, origin, event_id)?
+            else {
+                return Ok(None);
+            };
+            if event_project_id != location.project_id {
+                return Ok(None);
+            }
+            link["event_id"] = current_event_id.into();
+            link["origin_project_id"] = event_project_id.into();
+        }
+        link["project_id"] = location.project_id.clone().into();
+        link["task_key"] = location.current_key.into();
+        current_project_id = location.project_id;
+    }
+    let Some(project) = super::repository::get_project(&org.org_id, &current_project_id)? else {
+        return Ok(None);
+    };
+    let access = super::repository::project_access(
+        &project,
+        &org.user_id,
+        crate::dispatch::project_studio::is_admin(ctx),
+    )?;
+    if !crate::dispatch::project_studio::notification_visible(&access, kind) {
+        return Ok(None);
+    }
+    Ok(Some(NotificationTarget {
+        project_id: project.project_id,
+        project_name: project.name,
+        link_json: serde_json::to_string(&link)?,
+    }))
+}
+
+fn notification_page(
+    user_id: &str,
+    only_unread: bool,
+    before_rowid: Option<i64>,
+    limit: u32,
+) -> Result<Vec<(i64, NotificationRecord)>> {
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(read_err)?;
+    let mut stmt = conn.prepare(
+        "SELECT n.rowid,n.notification_id,n.project_id,COALESCE(p.name,''),n.kind,n.title, \
+                n.body,n.link_json,n.read_at,n.created_at \
+         FROM notifications n LEFT JOIN projects p ON p.project_id=n.project_id \
+         WHERE n.user_id=?1 AND (?2 IS NULL OR n.rowid<?2) AND (?3=0 OR n.read_at IS NULL) \
+         ORDER BY n.rowid DESC LIMIT ?4",
+    )?;
+    let rows = stmt.query_map(params![user_id, before_rowid, only_unread, limit], |row| {
+        Ok((
+            row.get(0)?,
+            NotificationRecord {
+                notification_id: row.get(1)?,
+                project_id: row.get(2)?,
+                project_name: row.get(3)?,
+                kind: row.get(4)?,
+                title: row.get(5)?,
+                body: row.get(6)?,
+                link_json: row.get(7)?,
+                read_at: row.get(8)?,
+                created_at: row.get(9)?,
+            },
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn notification_cursor(user_id: &str, notification_id: Option<&str>) -> Result<Option<i64>> {
+    let Some(id) = notification_id else {
+        return Ok(None);
+    };
+    let pool = super::db::pool()?;
+    let conn = pool.read().map_err(read_err)?;
+    Ok(conn
+        .query_row(
+            "SELECT rowid FROM notifications WHERE user_id=?1 AND notification_id=?2",
+            params![user_id, id],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Authorization precedes the visible page and count. The callback resolves
+/// current task routes; bounded batches never keep a registry guard across it.
 pub fn list(
     user_id: &str,
     only_unread: bool,
     before_id: Option<&str>,
     limit: u32,
+    visible: &dyn Fn(&mut NotificationRecord) -> Result<bool>,
 ) -> Result<(Vec<NotificationRecord>, u32, bool)> {
-    let pool = super::db::pool()?;
-    let conn = pool.read().map_err(read_err)?;
-    let before_rowid: Option<i64> = match before_id {
-        Some(id) => conn
-            .query_row(
-                "SELECT rowid FROM notifications WHERE notification_id = ?1 AND user_id = ?2",
-                params![id, user_id],
-                |row| row.get(0),
-            )
-            .optional()?,
-        None => None,
-    };
-    let unread_filter = if only_unread {
-        "AND n.read_at IS NULL"
-    } else {
-        ""
-    };
-    let fetch = (limit as i64) + 1;
-    let mut stmt = conn.prepare(&format!(
-        "SELECT n.notification_id, n.project_id, COALESCE(p.name, ''), n.kind, n.title, \
-                n.body, n.link_json, n.read_at, n.created_at \
-         FROM notifications n LEFT JOIN projects p ON p.project_id = n.project_id \
-         WHERE n.user_id = ?1 AND (?2 IS NULL OR n.rowid < ?2) {unread_filter} \
-         ORDER BY n.rowid DESC LIMIT ?3"
-    ))?;
-    let rows = stmt.query_map(params![user_id, before_rowid, fetch], |row| {
-        Ok(NotificationRecord {
-            notification_id: row.get(0)?,
-            project_id: row.get(1)?,
-            project_name: row.get(2)?,
-            kind: row.get(3)?,
-            title: row.get(4)?,
-            body: row.get(5)?,
-            link_json: row.get(6)?,
-            read_at: row.get(7)?,
-            created_at: row.get(8)?,
-        })
-    })?;
-    let mut entries = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-    let has_more = entries.len() as i64 > limit as i64;
-    entries.truncate(limit as usize);
-    let unread: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM notifications WHERE user_id = ?1 AND read_at IS NULL",
-        params![user_id],
-        |row| row.get(0),
-    )?;
-    Ok((entries, unread as u32, has_more))
-}
-
-/// Marks the given notifications read; an empty list marks ALL of the
-/// caller's unread rows. Always caller-scoped.
-pub fn mark_read(user_id: &str, notification_ids: &[String]) -> Result<()> {
-    let pool = super::db::pool()?;
-    let conn = pool.write().map_err(write_err)?;
-    if notification_ids.is_empty() {
-        conn.execute(
-            "UPDATE notifications SET read_at = datetime('now') \
-             WHERE user_id = ?1 AND read_at IS NULL",
-            params![user_id],
-        )?;
-    } else {
-        for id in notification_ids {
-            conn.execute(
-                "UPDATE notifications SET read_at = datetime('now') \
-                 WHERE user_id = ?1 AND notification_id = ?2 AND read_at IS NULL",
-                params![user_id, id],
-            )?;
+    let mut cursor = notification_cursor(user_id, before_id)?;
+    let mut entries = Vec::new();
+    while entries.len() <= limit as usize {
+        let rows = notification_page(user_id, only_unread, cursor, 128)?;
+        if rows.is_empty() {
+            break;
+        }
+        cursor = rows.last().map(|(rowid, _)| *rowid);
+        for (_, mut row) in rows {
+            if visible(&mut row)? {
+                entries.push(row);
+                if entries.len() > limit as usize {
+                    break;
+                }
+            }
         }
     }
+    let has_more = entries.len() > limit as usize;
+    entries.truncate(limit as usize);
+    let mut unread = 0u32;
+    let mut cursor = None;
+    loop {
+        let rows = notification_page(user_id, true, cursor, 128)?;
+        if rows.is_empty() {
+            break;
+        }
+        cursor = rows.last().map(|(rowid, _)| *rowid);
+        for (_, mut row) in rows {
+            if visible(&mut row)? {
+                unread = unread.saturating_add(1);
+            }
+        }
+    }
+    Ok((entries, unread, has_more))
+}
+
+pub fn mark_read(
+    user_id: &str,
+    notification_ids: &[String],
+    visible: &dyn Fn(&mut NotificationRecord) -> Result<bool>,
+) -> Result<()> {
+    let mut cursor = None;
+    let mut accepted = Vec::new();
+    loop {
+        let rows = notification_page(user_id, true, cursor, 128)?;
+        if rows.is_empty() {
+            break;
+        }
+        cursor = rows.last().map(|(rowid, _)| *rowid);
+        for (_, mut row) in rows {
+            if (notification_ids.is_empty() || notification_ids.contains(&row.notification_id))
+                && visible(&mut row)?
+            {
+                accepted.push(row.notification_id);
+            }
+        }
+    }
+    let pool = super::db::pool()?;
+    let conn = pool.write().map_err(write_err)?;
+    let tx = conn.unchecked_transaction()?;
+    for id in accepted {
+        tx.execute(
+            "UPDATE notifications SET read_at=datetime('now') WHERE user_id=?1 AND notification_id=?2 AND read_at IS NULL",
+            params![user_id,id],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -435,10 +564,10 @@ mod unit_tests {
             .expect("other insert");
         assert!(other.is_some());
 
-        let (rows_a, unread_a, _) = list(&ua, false, None, 50).expect("list a");
+        let (rows_a, unread_a, _) = list(&ua, false, None, 50, &|_| Ok(true)).expect("list a");
         assert_eq!(rows_a.len(), 1);
         assert_eq!(unread_a, 1);
-        let (rows_b, unread_b, _) = list(&ub, false, None, 50).expect("list b");
+        let (rows_b, unread_b, _) = list(&ub, false, None, 50, &|_| Ok(true)).expect("list b");
         assert_eq!(rows_b.len(), 1);
         assert_eq!(unread_b, 1);
         assert_ne!(
@@ -447,13 +576,13 @@ mod unit_tests {
         );
 
         // Marking B's id as A must not touch B's row.
-        mark_read(&ua, &[rows_b[0].notification_id.clone()]).expect("cross mark");
-        let (_, unread_b, _) = list(&ub, false, None, 50).expect("list b again");
+        mark_read(&ua, &[rows_b[0].notification_id.clone()], &|_| Ok(true)).expect("cross mark");
+        let (_, unread_b, _) = list(&ub, false, None, 50, &|_| Ok(true)).expect("list b again");
         assert_eq!(unread_b, 1, "user A cannot mark user B's notification");
 
         // Marking all as A clears only A.
-        mark_read(&ua, &[]).expect("mark all");
-        let (_, unread_a, _) = list(&ua, false, None, 50).expect("list a again");
+        mark_read(&ua, &[], &|_| Ok(true)).expect("mark all");
+        let (_, unread_a, _) = list(&ua, false, None, 50, &|_| Ok(true)).expect("list a again");
         assert_eq!(unread_a, 0);
         // After the read, the same (kind, link) may notify again.
         let again = insert_deduped("org-t", &ua, "p1", "run_item_assigned", "T", "B", link)

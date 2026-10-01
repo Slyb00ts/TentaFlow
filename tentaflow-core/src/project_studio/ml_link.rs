@@ -311,8 +311,11 @@ pub fn restore_grant_index() -> Result<()> {
     let registry = super::db::pool()?;
     let projects = {
         let conn = registry.read().map_err(read_err)?;
-        let mut stmt =
-            conn.prepare("SELECT project_id, dir_path FROM projects ORDER BY project_id")?;
+        let mut stmt = conn.prepare(
+            "SELECT p.project_id,p.dir_path FROM projects p WHERE NOT EXISTS (\
+             SELECT 1 FROM project_admissions a WHERE a.project_id=p.project_id AND a.kind='delete') \
+             ORDER BY p.project_id",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -640,7 +643,11 @@ pub fn sync_link(project_id: &str, pool: &DbPool, link: &MlLinkRecord) -> SyncOu
     };
 
     let role_map = role_map_from_json(&link.role_map_json);
-    let members = match super::repository::list_members(project_id) {
+    let members = match super::repository::effective_principals(
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    ) {
         Ok(members) => members,
         Err(e) => {
             outcome.result = "partial".to_string();
@@ -649,7 +656,7 @@ pub fn sync_link(project_id: &str, pool: &DbPool, link: &MlLinkRecord) -> SyncOu
             return outcome;
         }
     };
-    let project = match crate::ml_studio::repository::get_project(&owner, &link.ml_project_id)
+    let _project = match crate::ml_studio::repository::get_project(&owner, &link.ml_project_id)
         .and_then(|ml| ml.ok_or_else(|| anyhow!("ML project missing")))
         .and_then(|ml| super::repository::get_project(&ml.project.org_id, project_id))
     {
@@ -661,13 +668,13 @@ pub fn sync_link(project_id: &str, pool: &DbPool, link: &MlLinkRecord) -> SyncOu
         }
     };
     let mut desired: HashMap<String, String> = HashMap::new();
-    for member in members {
-        if member.user_id == owner {
+    for principal in members {
+        if principal.user_id == owner {
             continue;
         }
         let manual = super::repository::get_setting(
             pool,
-            &format!("ml_link_manual:{}:{}", link.link_id, member.user_id),
+            &format!("ml_link_manual:{}:{}", link.link_id, principal.user_id),
         )
         .ok()
         .flatten()
@@ -675,16 +682,9 @@ pub fn sync_link(project_id: &str, pool: &DbPool, link: &MlLinkRecord) -> SyncOu
         if manual {
             continue;
         }
-        let access = match super::repository::project_access(&project, &member.user_id, false) {
-            Ok(access) => access,
-            Err(error) => {
-                outcome.errors.push(error.to_string());
-                continue;
-            }
-        };
-        match ml_role_for(&role_map, &access) {
+        match ml_role_for(&role_map, &principal.access) {
             Some(role) => {
-                desired.insert(member.user_id, role);
+                desired.insert(principal.user_id, role);
             }
             None => outcome.skipped += 1,
         }
@@ -920,28 +920,31 @@ fn apply_role_map(
     role_map: &[(String, String)],
 ) -> Result<(u32, u32, HashSet<String>)> {
     let mut granted = HashSet::new();
-    let members = super::repository::list_members(project_id)?;
+    let members = super::repository::effective_principals(
+        project_id,
+        ProjectArea::Knowledge,
+        ProjectPermissionLevel::Read,
+    )?;
     let ml = crate::ml_studio::repository::get_project(creator_user_id, ml_project_id)?
         .ok_or_else(|| anyhow!("ML project missing"))?;
-    let project = super::repository::get_project(&ml.project.org_id, project_id)?
+    let _project = super::repository::get_project(&ml.project.org_id, project_id)?
         .ok_or_else(|| anyhow!("project unavailable"))?;
     let mut mapped = 0u32;
     let mut skipped = 0u32;
-    for member in members {
-        if member.user_id == creator_user_id {
+    for principal in members {
+        if principal.user_id == creator_user_id {
             skipped += 1;
             continue;
         }
-        let access = super::repository::project_access(&project, &member.user_id, false)?;
-        let Some(role) = ml_role_for(role_map, &access) else {
+        let Some(role) = ml_role_for(role_map, &principal.access) else {
             skipped += 1;
             continue;
         };
-        if crate::ml_studio::repository::member_role(ml_project_id, &member.user_id)?.is_some() {
+        if crate::ml_studio::repository::member_role(ml_project_id, &principal.user_id)?.is_some() {
             skipped += 1;
             continue;
         }
-        granted.insert(member.user_id.clone());
+        granted.insert(principal.user_id.clone());
         set_granted_users(pool, link_id, &granted)?;
         super::repository::replace_ml_grants(
             project_id,
@@ -952,12 +955,12 @@ fn apply_role_map(
         match crate::ml_studio::repository::invite_member(
             ml_project_id,
             creator_user_id,
-            &member.user_id,
+            &principal.user_id,
             &role,
         ) {
             Ok(_) => mapped += 1,
             Err(error) => {
-                granted.remove(&member.user_id);
+                granted.remove(&principal.user_id);
                 set_granted_users(pool, link_id, &granted)?;
                 super::repository::replace_ml_grants(
                     project_id,
@@ -1200,6 +1203,10 @@ mod unit_tests {
             &creator,
             &tmp.path().join(&project_id).to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[
                 super::super::models::MemberInput {
                     user_id: manager.clone(),
@@ -1261,19 +1268,25 @@ mod unit_tests {
             None,
         )
         .expect("promote");
+        assert_eq!(
+            ml_role(&tester).as_deref(),
+            Some("editor"),
+            "committed access changes reconcile the ML mirror immediately"
+        );
         let link = get(&pool, &link_id).expect("get").expect("row");
         let outcome = sync_link(&project_id, &pool, &link);
         assert_eq!(outcome.result, "ok", "errors: {:?}", outcome.errors);
-        assert_eq!(outcome.applied_update, 1);
+        assert_eq!(outcome.applied_update, 0, "repeat sync is idempotent");
         assert_eq!(outcome.applied_add, 0);
         assert_eq!(outcome.applied_remove, 0);
         assert_eq!(ml_role(&tester).as_deref(), Some("editor"));
 
-        // Losing project membership revokes ML access on the next pass.
+        // A committed membership removal reconciles the mirror immediately.
         super::super::repository::remove_member(&project_id, &viewer).expect("remove");
-        let outcome = sync_link(&project_id, &pool, &link);
-        assert_eq!(outcome.applied_remove, 1, "errors: {:?}", outcome.errors);
         assert!(ml_role(&viewer).is_none(), "removal propagates immediately");
+        let outcome = sync_link(&project_id, &pool, &link);
+        assert_eq!(outcome.result, "ok", "errors: {:?}", outcome.errors);
+        assert_eq!(outcome.applied_remove, 0, "repeat sync is idempotent");
         assert_eq!(
             ml_role(&creator).as_deref(),
             Some("owner"),
@@ -1338,6 +1351,10 @@ mod unit_tests {
             &ghost,
             &tmp.path().join(&project_id).to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[],
         )
         .expect("create project");
@@ -1423,6 +1440,10 @@ mod unit_tests {
             &owner,
             &tmp.path().join(&project_id).to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[super::super::models::MemberInput {
                 user_id: mate.clone(),
                 functions: vec!["pm".into()],
@@ -1476,9 +1497,13 @@ mod unit_tests {
 
         // What the link granted IS revoked when project membership goes away.
         super::super::repository::remove_member(&project_id, &mate).expect("remove");
+        assert!(
+            ml_role(&mate).is_none(),
+            "committed removal revokes the mirror"
+        );
         let outcome = sync_link(&project_id, &pool, &link);
-        assert_eq!(outcome.applied_remove, 1, "errors: {:?}", outcome.errors);
-        assert!(ml_role(&mate).is_none());
+        assert_eq!(outcome.result, "ok", "errors: {:?}", outcome.errors);
+        assert_eq!(outcome.applied_remove, 0, "repeat sync is idempotent");
         assert_eq!(
             ml_role(&outsider).as_deref(),
             Some("editor"),
@@ -1520,6 +1545,10 @@ mod unit_tests {
             &owner,
             &dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[super::super::models::MemberInput {
                 user_id: user.clone(),
                 functions: vec!["developer".into()],
@@ -1662,6 +1691,7 @@ mod unit_tests {
             Some("owner")
         );
 
+        pool.write().expect("write").execute_batch("CREATE TRIGGER deny_ml_ledger BEFORE INSERT ON settings WHEN NEW.key LIKE 'ml_link_granted:%' BEGIN SELECT RAISE(ABORT, 'ledger write denied'); END;").expect("deny ledger writes");
         super::super::repository::add_members(
             &project_id,
             &[super::super::models::MemberInput {
@@ -1673,7 +1703,16 @@ mod unit_tests {
             &owner,
         )
         .expect("new member");
-        pool.write().expect("write").execute_batch("CREATE TRIGGER deny_ml_ledger BEFORE INSERT ON settings WHEN NEW.key LIKE 'ml_link_granted:%' BEGIN SELECT RAISE(ABORT, 'ledger write denied'); END;").expect("deny ledger writes");
+        assert!(crate::ml_studio::repository::member_role(&ml_id, &newcomer)
+            .expect("automatic mirror result")
+            .is_none());
+        assert_eq!(
+            get(&pool, &link_id)
+                .expect("automatic result")
+                .expect("link")
+                .last_sync_result,
+            "partial"
+        );
         let link = get(&pool, &link_id).expect("get").expect("link");
         let failed = sync_link(&project_id, &pool, &link);
         assert_eq!(
@@ -1745,6 +1784,10 @@ mod unit_tests {
             &owner,
             &missing.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[],
         )
         .expect("broken registry fixture");
@@ -1761,7 +1804,10 @@ mod unit_tests {
                 .len(),
             1
         );
-        super::super::repository::delete_project_rows("0").expect("remove broken fixture");
+        let delete_id = super::super::repository::prepare_project_delete("org-ml", "0", &owner)
+            .expect("prepare broken fixture cleanup");
+        super::super::repository::delete_project_rows("0", &delete_id)
+            .expect("remove broken fixture");
         std::mem::forget(tmp);
     }
 }

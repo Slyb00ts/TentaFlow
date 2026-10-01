@@ -391,6 +391,10 @@ fn project(w: &World, name: &str, owner: &str, members: &[(&str, &str)], holder:
         owner,
         &path.to_string_lossy(),
         "",
+        None,
+        false,
+        false,
+        false,
         &members
             .iter()
             .filter(|(user, _)| *user != owner)

@@ -8,8 +8,10 @@
 // transparently upgrades a project the first time it is touched.
 
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -37,12 +39,24 @@ fn registry() -> &'static DashMap<String, Arc<Entry>> {
     REG.get_or_init(DashMap::new)
 }
 
+fn pool_identities() -> &'static DashMap<usize, (Weak<crate::db::Db>, String)> {
+    static IDENTITIES: OnceLock<DashMap<usize, (Weak<crate::db::Db>, String)>> = OnceLock::new();
+    IDENTITIES.get_or_init(DashMap::new)
+}
+
 fn opening_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
 static FROZEN: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static COLD_OPEN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub fn cold_open_count() -> u64 {
+    COLD_OPEN_COUNT.load(Ordering::Relaxed)
+}
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -70,6 +84,20 @@ pub fn validate_project_id(project_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn registered_dir(project_id: &str) -> Result<String> {
+    let central = super::db::pool()?;
+    let conn = central
+        .read()
+        .map_err(|e| anyhow!("projects registry read: {e}"))?;
+    conn.query_row(
+        "SELECT p.dir_path FROM projects p WHERE p.project_id=?1 AND NOT EXISTS (\
+         SELECT 1 FROM project_admissions a WHERE a.project_id=p.project_id AND a.kind='delete')",
+        [project_id],
+        |row| row.get(0),
+    )
+    .map_err(|_| anyhow!("project is unavailable in registry"))
+}
+
 /// Returns the pool for `project_id`, opening `<dir_path>/project.db` when it
 /// is not cached. `dir_path` is read from the central registry (single source
 /// of truth — NOT recomputed from the id), migrations run on every fresh open
@@ -81,6 +109,7 @@ pub fn open(project_id: &str) -> Result<DbPool> {
         return Err(anyhow!("project storage is frozen (migration in progress)"));
     }
 
+    registered_dir(project_id)?;
     if let Some(entry) = registry().get(project_id) {
         entry.last_used_ms.store(now_ms(), Ordering::Relaxed);
         return Ok(entry.pool.clone());
@@ -92,25 +121,15 @@ pub fn open(project_id: &str) -> Result<DbPool> {
     if FROZEN.load(Ordering::SeqCst) {
         return Err(anyhow!("project storage is frozen (migration in progress)"));
     }
+    let dir_path = registered_dir(project_id)?;
     if let Some(entry) = registry().get(project_id) {
         entry.last_used_ms.store(now_ms(), Ordering::Relaxed);
         return Ok(entry.pool.clone());
     }
 
-    let dir_path: String = {
-        let central = super::db::pool()?;
-        let conn = central
-            .read()
-            .map_err(|e| anyhow!("projects registry read: {e}"))?;
-        conn.query_row(
-            "SELECT dir_path FROM projects WHERE project_id = ?1",
-            rusqlite::params![project_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| anyhow!("project not found in registry"))?
-    };
-
     let (pool, version) = open_pool_at(Path::new(&dir_path))?;
+    #[cfg(test)]
+    COLD_OPEN_COUNT.fetch_add(1, Ordering::Relaxed);
     {
         let content_conn = pool
             .write()
@@ -139,6 +158,20 @@ pub fn open(project_id: &str) -> Result<DbPool> {
             "UPDATE tasks SET task_key = ?1 || '-' || task_no WHERE task_key <> ?1 || '-' || task_no",
             rusqlite::params![prefix],
         )?;
+        let legacy_links: Vec<i64> = {
+            let mut stmt = content_tx
+                .prepare("SELECT link_id FROM task_links WHERE relation_id='' ORDER BY link_id")?;
+            let rows = stmt.query_map([], |row| row.get(0))?;
+            let links = rows.collect::<rusqlite::Result<_>>()?;
+            links
+        };
+        for link_id in legacy_links {
+            content_tx.execute(
+                "UPDATE task_links SET relation_id=?1,source_project_id=?2,target_project_id=?2 \
+                 WHERE link_id=?3 AND relation_id=''",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), project_id, link_id],
+            )?;
+        }
         content_tx.commit()?;
     }
 
@@ -163,6 +196,10 @@ pub fn open(project_id: &str) -> Result<DbPool> {
         pool: pool.clone(),
         last_used_ms: AtomicI64::new(now_ms()),
     });
+    pool_identities().insert(
+        Arc::as_ptr(&pool) as usize,
+        (Arc::downgrade(&pool), project_id.to_string()),
+    );
     registry().insert(project_id.to_string(), entry);
     evict_lru_over_cap();
     Ok(pool)
@@ -201,10 +238,20 @@ pub(crate) fn open_pool_at(dir: &Path) -> Result<(DbPool, i64)> {
 /// its project — the terminal-run path (`schedules::settle`) has nothing else
 /// to resolve a notification target from.
 pub fn project_id_of(pool: &DbPool) -> Option<String> {
-    registry()
-        .iter()
-        .find(|entry| Arc::ptr_eq(&entry.value().pool, pool))
-        .map(|entry| entry.key().clone())
+    let key = Arc::as_ptr(pool) as usize;
+    let identity = pool_identities().get(&key)?;
+    if identity
+        .value()
+        .0
+        .upgrade()
+        .is_some_and(|known| Arc::ptr_eq(&known, pool))
+    {
+        Some(identity.value().1.clone())
+    } else {
+        drop(identity);
+        pool_identities().remove(&key);
+        None
+    }
 }
 
 /// Checkpoints and drops the cached pool for `project_id`. The SQLite file is
@@ -243,6 +290,7 @@ fn evict_lru_over_cap() {
             None => break,
         }
     }
+    pool_identities().retain(|_, (pool, _)| pool.strong_count() != 0);
 }
 
 /// Spawns the background sweeper closing pools idle for longer than
@@ -323,7 +371,7 @@ fn run_project_migrations(conn: &Connection) -> Result<i64> {
 
 /// Highest per-project schema version this binary knows. An archive produced by
 /// a NEWER node is refused on import rather than migrated blindly.
-pub const LATEST_SCHEMA_VERSION: i64 = 5;
+pub const LATEST_SCHEMA_VERSION: i64 = 6;
 
 /// Ordered per-project schema migrations (F4+ tables land as further entries).
 const MIGRATIONS_PROJECT: &[(i64, &str)] = &[
@@ -332,6 +380,7 @@ const MIGRATIONS_PROJECT: &[(i64, &str)] = &[
     (3, PROJECT_SCHEMA_V3),
     (4, PROJECT_SCHEMA_V4),
     (5, PROJECT_SCHEMA_V5),
+    (6, PROJECT_SCHEMA_V6),
 ];
 
 const PROJECT_SCHEMA_V1: &str = "
@@ -814,6 +863,104 @@ INSERT INTO settings(key,value)
 SELECT 'project_key_prefix_locked',CASE WHEN COUNT(*) > 0 THEN '1' ELSE '0' END FROM tasks;
 ";
 
+const PROJECT_SCHEMA_V6: &str = "
+ALTER TABLE tasks ADD COLUMN resolution TEXT;
+ALTER TABLE tasks ADD COLUMN resolution_reason TEXT;
+CREATE TABLE task_type_catalogue_revision (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    revision INTEGER NOT NULL
+);
+INSERT INTO task_type_catalogue_revision(singleton,revision) VALUES (1,1);
+CREATE TRIGGER task_type_catalogue_insert AFTER INSERT ON task_types BEGIN
+    UPDATE task_type_catalogue_revision SET revision=revision+1 WHERE singleton=1;
+END;
+CREATE TRIGGER task_type_catalogue_update AFTER UPDATE ON task_types BEGIN
+    UPDATE task_type_catalogue_revision SET revision=revision+1 WHERE singleton=1;
+END;
+CREATE TRIGGER task_type_catalogue_delete AFTER DELETE ON task_types BEGIN
+    UPDATE task_type_catalogue_revision SET revision=revision+1 WHERE singleton=1;
+END;
+DROP INDEX idx_task_links_target;
+ALTER TABLE task_links RENAME TO task_links_legacy;
+CREATE TABLE task_links (
+    link_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    relation_id TEXT NOT NULL,
+    source_task_id TEXT NOT NULL,
+    target_task_id TEXT NOT NULL,
+    source_project_id TEXT NOT NULL,
+    target_project_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('related','duplicate','fs','ss','ff','sf')),
+    lag_days INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK(source_task_id <> target_task_id),
+    UNIQUE(source_task_id,target_task_id,kind)
+);
+INSERT INTO task_links(link_id,relation_id,source_task_id,target_task_id,
+    source_project_id,target_project_id,kind,lag_days,created_by,created_at)
+SELECT link_id,'',source_task_id,target_task_id,'','',kind,lag_days,created_by,created_at
+FROM task_links_legacy;
+DROP TABLE task_links_legacy;
+CREATE INDEX idx_task_links_target ON task_links(target_task_id);
+CREATE UNIQUE INDEX idx_task_links_relation ON task_links(relation_id) WHERE relation_id<>'';
+CREATE TABLE task_index_outbox (
+    revision INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    op TEXT NOT NULL CHECK(op IN ('upsert','delete')),
+    snapshot_json TEXT NOT NULL
+);
+CREATE INDEX idx_task_index_outbox_task ON task_index_outbox(task_id,revision);
+CREATE VIEW task_index_snapshots AS
+SELECT t.task_id, json_object(
+    'task_id',t.task_id,'task_no',t.task_no,'task_key',t.task_key,
+    'task_type',t.task_type,'title',t.title,'severity',t.severity,
+    'priority',t.priority,'status',t.status,'assigned_to',t.assigned_to,
+    'due_date',t.due_date,'parent_task_id',t.parent_task_id,
+    'links_json',t.links_json,
+    'comment_count',(SELECT COUNT(*) FROM task_comments c WHERE c.task_id=t.task_id),
+    'created_by',t.created_by,'created_at',t.created_at,'updated_at',t.updated_at,
+    'archived_at',t.archived_at,'resolution',t.resolution,
+    'resolution_reason',t.resolution_reason
+) AS snapshot_json FROM tasks t;
+INSERT INTO task_index_outbox(task_id,op,snapshot_json)
+SELECT task_id,'upsert',snapshot_json FROM task_index_snapshots ORDER BY task_id;
+CREATE TRIGGER task_index_insert AFTER INSERT ON tasks BEGIN
+    INSERT INTO task_index_outbox(task_id,op,snapshot_json)
+    SELECT task_id,'upsert',snapshot_json FROM task_index_snapshots WHERE task_id=NEW.task_id;
+END;
+CREATE TRIGGER task_index_update AFTER UPDATE ON tasks BEGIN
+    INSERT INTO task_index_outbox(task_id,op,snapshot_json)
+    SELECT task_id,'upsert',snapshot_json FROM task_index_snapshots WHERE task_id=NEW.task_id;
+END;
+CREATE TRIGGER task_index_delete AFTER DELETE ON tasks BEGIN
+    INSERT INTO task_index_outbox(task_id,op,snapshot_json) VALUES (OLD.task_id,'delete','null');
+END;
+CREATE TRIGGER task_index_comment_insert AFTER INSERT ON task_comments BEGIN
+    INSERT INTO task_index_outbox(task_id,op,snapshot_json)
+    SELECT task_id,'upsert',snapshot_json FROM task_index_snapshots WHERE task_id=NEW.task_id;
+END;
+CREATE TRIGGER task_index_comment_update AFTER UPDATE ON task_comments BEGIN
+    INSERT INTO task_index_outbox(task_id,op,snapshot_json)
+    SELECT task_id,'upsert',snapshot_json FROM task_index_snapshots WHERE task_id=NEW.task_id;
+END;
+CREATE TRIGGER task_index_comment_delete AFTER DELETE ON task_comments BEGIN
+    INSERT INTO task_index_outbox(task_id,op,snapshot_json)
+    SELECT task_id,'upsert',snapshot_json FROM task_index_snapshots WHERE task_id=OLD.task_id;
+END;
+CREATE TRIGGER task_resolution_insert BEFORE INSERT ON tasks
+WHEN (NEW.resolution IS NOT NULL AND
+      (NEW.status<>'done' OR NEW.resolution<>'not_pursued' OR
+       NEW.resolution_reason IS NULL OR trim(NEW.resolution_reason)='')) OR
+     (NEW.resolution IS NULL AND NEW.resolution_reason IS NOT NULL)
+BEGIN SELECT RAISE(ABORT,'invalid task resolution'); END;
+CREATE TRIGGER task_resolution_update BEFORE UPDATE ON tasks
+WHEN (NEW.resolution IS NOT NULL AND
+      (NEW.status<>'done' OR NEW.resolution<>'not_pursued' OR
+       NEW.resolution_reason IS NULL OR trim(NEW.resolution_reason)='')) OR
+     (NEW.resolution IS NULL AND NEW.resolution_reason IS NOT NULL)
+BEGIN SELECT RAISE(ABORT,'invalid task resolution'); END;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,7 +1020,8 @@ mod tests {
 
     #[test]
     fn migration_v5_preserves_legacy_tasks_and_records_only_a_baseline() {
-        let conn = Connection::open_in_memory().expect("database");
+        let dir = tempfile::tempdir().expect("project directory");
+        let conn = Connection::open(dir.path().join("project.db")).expect("database");
         conn.execute_batch(
             "PRAGMA foreign_keys=ON; CREATE TABLE project_schema_version( \
              version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')));",
@@ -900,7 +1048,10 @@ mod tests {
             [],
         )
         .expect("legacy comment");
-        assert_eq!(run_project_migrations(&conn).expect("upgrade"), 5);
+        conn.execute_batch(PROJECT_SCHEMA_V5)
+            .expect("upgrade to v5");
+        conn.execute("INSERT INTO project_schema_version(version) VALUES (5)", [])
+            .expect("v5 version");
         let migrated: (String, String, String, String) = conn.query_row(
             "SELECT task_key,task_type,description_md,attachments_json FROM tasks WHERE task_id='legacy'",
             [],
@@ -926,11 +1077,60 @@ mod tests {
             )
             .expect("migration time");
         assert_ne!(imported_at, "2020-01-01 00:00:00");
-        assert_eq!(run_project_migrations(&conn).expect("reopen"), 5);
+        conn.execute(
+            "INSERT INTO tasks(task_id,task_no,task_key,task_type,title,created_by) \
+             VALUES ('sibling',8,'PR-8','defect','Sibling','u1')",
+            [],
+        )
+        .expect("second task");
+        conn.execute(
+            "INSERT INTO task_links(source_task_id,target_task_id,kind,created_by) \
+             VALUES ('legacy','sibling','related','u1')",
+            [],
+        )
+        .expect("legacy relation");
+        conn.execute(
+            "INSERT INTO task_events(task_id,actor_kind,actor_id,kind,before_json,after_json) \
+             VALUES ('legacy','user','u1','status_changed',?1,?2)",
+            rusqlite::params![r#"{"status":"todo"}"#, r#"{"status":"review"}"#],
+        )
+        .expect("real history");
+        assert_eq!(run_project_migrations(&conn).expect("upgrade to v6"), 6);
+        let relation: (String, String, String, String) = conn
+            .query_row(
+                "SELECT source_task_id,target_task_id,kind,relation_id FROM task_links",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("relation survives v6");
+        assert_eq!(
+            relation,
+            (
+                "legacy".into(),
+                "sibling".into(),
+                "related".into(),
+                "".into()
+            )
+        );
+        let history: (String, String) = conn
+            .query_row(
+                "SELECT before_json,after_json FROM task_events WHERE kind='status_changed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("original event survives v6");
+        assert_eq!(
+            history,
+            (
+                r#"{"status":"todo"}"#.into(),
+                r#"{"status":"review"}"#.into()
+            )
+        );
+        assert_eq!(run_project_migrations(&conn).expect("reopen"), 6);
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM task_events", [], |row| row.get(0))
             .expect("events");
-        assert_eq!(count, 1);
+        assert_eq!(count, 2);
         let comment: String = conn
             .query_row(
                 "SELECT body_md FROM task_comments WHERE comment_id='c1'",
@@ -939,6 +1139,59 @@ mod tests {
             )
             .expect("comment survives");
         assert_eq!(comment, "Existing comment");
+        drop(conn);
+
+        let registry = tempfile::tempdir().expect("registry directory");
+        let _ = crate::project_studio::db::init(&registry.path().join("projects.db"));
+        std::mem::forget(registry);
+        let project_id = uuid::Uuid::new_v4().to_string();
+        crate::project_studio::repository::create_project(
+            &project_id,
+            &uuid::Uuid::new_v4().to_string(),
+            "Migrated content",
+            "",
+            "custom",
+            "[\"tasks\"]",
+            "owner",
+            dir.path().to_str().expect("project path"),
+            "LEG",
+            None,
+            false,
+            false,
+            false,
+            &[],
+        )
+        .expect("register old content");
+        let pool = open(&project_id).expect("canonical content open");
+        let canonical: (String, String, String, String) = pool
+            .read()
+            .expect("content read")
+            .query_row(
+                "SELECT t.task_key,l.relation_id,l.source_project_id,l.target_project_id \
+                 FROM tasks t JOIN task_links l ON l.source_task_id=t.task_id \
+                 WHERE t.task_id='legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("canonical migrated relation");
+        assert_eq!(canonical.0, "LEG-7");
+        assert!(uuid::Uuid::parse_str(&canonical.1).is_ok());
+        assert_eq!(canonical.2, project_id);
+        assert_eq!(canonical.3, project_id);
+        let unchanged: (String, String, i64) = pool
+            .read()
+            .expect("content read")
+            .query_row(
+                "SELECT e.before_json,e.after_json, \
+                 (SELECT COUNT(*) FROM task_events WHERE task_id='legacy') \
+                 FROM task_events e WHERE e.task_id='legacy' AND e.kind='status_changed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("history after canonical open");
+        assert_eq!(unchanged.0, r#"{"status":"todo"}"#);
+        assert_eq!(unchanged.1, r#"{"status":"review"}"#);
+        assert_eq!(unchanged.2, 2);
     }
 
     /// Golden round-trip for the v3 12-step rebuild: a genuine v2 database

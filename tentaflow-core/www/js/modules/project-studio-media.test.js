@@ -71,6 +71,20 @@ test('the final encoded upload envelope fits the actual WebSocket frame budget i
   assert.ok(previousSize.byteLength > frameLimit, 'a raw 1 MiB chunk cannot fit after real encoding');
 });
 
+test('archive import slices fit the actual final WebSocket envelope without widening its frame budget', async () => {
+  const module = readFileSync(new URL('./project-studio.js', import.meta.url), 'utf8');
+  const chunkBytes = Number(module.match(/const IMPORT_CHUNK_BYTES = (\d+) \* (\d+);/)[1]) * Number(module.match(/const IMPORT_CHUNK_BYTES = (\d+) \* (\d+);/)[2]);
+  const server = readFileSync(new URL('../../../src/api/dashboard/ws_binary.rs', import.meta.url), 'utf8');
+  const frameLimit = Number(server.match(/const MAX_FRAME_SIZE: usize = ([\d_]+);/)[1].replaceAll('_', ''));
+  await codecReady;
+  const payload = { uploadId: '11111111-2222-4333-8444-555555555555', filename: `${'界'.repeat(255)}.tfproj.zip`, seq: 4294967294, totalChunks: 4294967295, bytes: new Uint8Array(chunkBytes) };
+  const encoded = encode.projectStudioProjectImportUploadChunkRequest(18446744073709551615n, payload, 18446744073709551615n);
+  assert.ok(encoded.byteLength > chunkBytes);
+  assert.ok(encoded.byteLength < frameLimit);
+  assert.ok(frameLimit - encoded.byteLength > 500000);
+  assert.ok(encode.projectStudioProjectImportUploadChunkRequest(1, { ...payload, bytes: new Uint8Array(frameLimit) }).byteLength > frameLimit);
+});
+
 test('pause preserves the confirmed offset and resume obtains the server offset before writing', async () => {
   const file = boundedFile(ATTACHMENT_CHUNK_BYTES * 2 + 17);
   const requests = [];

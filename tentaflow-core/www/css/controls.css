@@ -249,6 +249,8 @@ tf-window [slot="footer"] {
   outline-offset: 2px;
 }
 .tf-btn-full-width { width: 100%; }
+.tf-btn-wrap { white-space: normal; }
+.tf-btn-wrap > span { min-width: 0; overflow-wrap: anywhere; }
 
 /* tones — tint only the text-only variants (ghost/outline/danger). Solid
    variants (primary/secondary/danger-solid/success) keep their own colour. */
@@ -7334,6 +7336,8 @@ tf-skeleton {
 }
 .tf-tree--variant-compact .tf-tree__row { padding: 0.15em 0.5em; }
 .tf-tree__row:hover { background: var(--tf-bg-3); }
+.tf-tree__row--drop-target { outline: 2px solid var(--tf-accent); outline-offset: -2px; background: var(--tf-bg-3); }
+.tf-tree__actions { flex: 0 0 auto; display: inline-flex; align-items: center; }
 .tf-tree__row:focus-visible {
   outline: 2px solid var(--tf-accent-1);
   outline-offset: -2px;

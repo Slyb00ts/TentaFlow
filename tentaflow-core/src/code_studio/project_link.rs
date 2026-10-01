@@ -413,25 +413,20 @@ pub fn sync_link(db: &DbPool, workspace_id: &str, project_id: &str) -> Result<Mi
     }
     let workspace = repository::get_workspace(db, workspace_id)?
         .ok_or_else(|| anyhow!("workspace not found"))?;
-    let Some(project) =
-        crate::project_studio::repository::get_project(&workspace.org_id, project_id)?
-    else {
+    if crate::project_studio::repository::get_project(&workspace.org_id, project_id)?.is_none() {
         return Ok(MirrorOutcome {
             revoked: revoke_mirror(db, workspace_id, project_id)?,
             ..MirrorOutcome::default()
         });
-    };
-    let members = crate::project_studio::repository::list_members(project_id)?
-        .into_iter()
-        .map(|member| {
-            let access = crate::project_studio::repository::project_access(
-                &project,
-                &member.user_id,
-                false,
-            )?;
-            Ok((member.user_id, access))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    }
+    let members = crate::project_studio::repository::effective_principals(
+        project_id,
+        ProjectArea::Repos,
+        ProjectPermissionLevel::Read,
+    )?
+    .into_iter()
+    .map(|principal| (principal.user_id, principal.access))
+    .collect::<Vec<_>>();
     apply_mirror(db, workspace_id, project_id, &members)
 }
 
@@ -940,6 +935,10 @@ mod tests {
             "u-owner",
             &project_dir.to_string_lossy(),
             "",
+            None,
+            false,
+            false,
+            false,
             &[crate::project_studio::models::MemberInput {
                 user_id: "u-mirror".into(),
                 functions: vec!["developer".into()],

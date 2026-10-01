@@ -148,13 +148,20 @@ pub fn evaluate_project_access(
     catalogue: &[ProjectFunctionWire],
     app_admin: bool,
     now: DateTime<Utc>,
+    root_owner: bool,
 ) -> ProjectAccessWire {
     use ProjectPermissionLevel::{Admin, None, Read, Write};
     let active_member =
         member.filter(|member| member.project_id == project.project_id && member.is_active_at(now));
     let functions = active_member.map_or_else(Vec::new, |member| member.functions.clone());
     let project_admin = active_member.is_some_and(|member| member.project_admin);
-    let has_access = active_member.is_some() || app_admin;
+    let ended = project.lifecycle == "ended";
+    let is_owner = project.owner_user_id == active_member.map_or("", |member| member.user_id.as_str());
+    let has_access = if ended {
+        is_owner || root_owner || app_admin
+    } else {
+        active_member.is_some() || app_admin
+    };
     let enabled_modules: Vec<String> =
         serde_json::from_str(&project.modules_json).unwrap_or_default();
     let archived = project.status != "active";
@@ -182,6 +189,9 @@ pub fn evaluate_project_access(
             if !enabled {
                 level = None;
             }
+            if ended {
+                level = level.min(Read);
+            }
             ProjectAreaAccessWire {
                 area,
                 level,
@@ -193,18 +203,20 @@ pub fn evaluate_project_access(
         has_access,
         project_admin,
         app_admin,
-        is_owner: member.is_some_and(|member| member.user_id == project.owner_user_id),
+        is_owner,
         archived,
         functions,
         expires_at: member.and_then(|member| member.expires_at.clone()),
         enabled_modules,
         areas,
         can_create_tasks: false,
-        can_manage_members: has_access && project_admin && !archived,
+        can_manage_members: has_access && project_admin && !archived && !ended,
         can_manage_settings: false,
+        ended,
     };
     access.can_create_tasks = has_access
         && !archived
+        && !ended
         && access
             .enabled_modules
             .iter()
