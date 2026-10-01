@@ -76,13 +76,15 @@ impl ProjectFacts {
 
 /// Projects of the organization, read once per request.
 pub(super) struct ProjectDirectory {
+    core_db: crate::db::DbPool,
     org_id: String,
     cache: RefCell<HashMap<String, Option<Rc<ProjectFacts>>>>,
 }
 
 impl ProjectDirectory {
-    pub fn new(org_id: &str) -> Self {
+    pub fn new(org_id: &str, core_db: &crate::db::DbPool) -> Self {
         Self {
+            core_db: core_db.clone(),
             org_id: org_id.to_string(),
             cache: RefCell::new(HashMap::new()),
         }
@@ -301,38 +303,65 @@ impl WorkProvider for TaskProvider<'_> {
         };
         let pool = open_pool(project_id)?;
         let before = tasks::get_task(&pool, task_id)?;
-        let moved = tasks::reassign_open(&pool, task_id, cx.from_user, taker)?;
-        let resumed = !moved
-            && before
-                .as_ref()
-                .is_some_and(|t| t.assigned_to == taker && t.status != "done");
-        if !moved && !resumed {
-            return Ok(Step::Skipped("no_longer_held"));
-        }
-        // The note is what the taker starts from: it goes on the task itself.
-        let already = tasks::list_comments(&pool, task_id)?
-            .iter()
-            .any(|c| c.author_user_id == cx.actor && c.body_md == cx.note);
-        if !already {
-            tasks::add_comment(&pool, task_id, cx.actor, cx.note)?;
-        }
-        activity::record(
+        let Some(mutation) = tasks::reassign_open(
             &pool,
-            cx.actor,
-            "user",
-            "task.handed_over",
-            "task",
             task_id,
-            &json!({
-                "from": cx.from_user,
-                "to": taker,
-                "handover_id": cx.handover_id,
-                "reason": cx.reason.as_str(),
-                "note_chars": cx.note.chars().count(),
-                "note_sha256": cx.note_digest,
-            })
-            .to_string(),
-        );
+            cx.from_user,
+            taker,
+            &tasks::TaskHandoverInput {
+                actor: cx.actor,
+                note_md: cx.note,
+                mention_user_ids: &[],
+                direction: tasks::TaskHandoverDirection::Over,
+                handover_id: Some(cx.handover_id),
+            },
+        )?
+        else {
+            return Ok(Step::Skipped("no_longer_held"));
+        };
+        if mutation.changed {
+            activity::record(
+                &pool,
+                cx.actor,
+                "user",
+                "task.handed_over",
+                "task",
+                task_id,
+                &json!({
+                    "from": cx.from_user,
+                    "to": taker,
+                    "handover_id": cx.handover_id,
+                    "reason": cx.reason.as_str(),
+                    "note_chars": cx.note.chars().count(),
+                    "note_sha256": cx.note_digest,
+                })
+                .to_string(),
+            );
+            notifications::notify_task_handover(
+                cx.org_id,
+                cx.actor,
+                project_id,
+                &mutation,
+                tasks::TaskHandoverDirection::Over,
+                &|user| {
+                    if !crate::db::repository::get_user_account_by_id(&self.projects.core_db, user)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|account| account.is_active)
+                    {
+                        return false;
+                    }
+                    repository::get_project(cx.org_id, project_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|project| repository::project_access(&project, user, false).ok())
+                        .is_some_and(|access| {
+                            access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Read)
+                                || access.allows(ProjectArea::Board, ProjectPermissionLevel::Read)
+                        })
+                },
+            );
+        }
         Ok(Step::Done(json!({
             "status": before.map(|t| t.status).unwrap_or_default(),
         })))
@@ -356,37 +385,64 @@ impl WorkProvider for TaskProvider<'_> {
         if task.status == "done" {
             return Ok(Returned::Kept("closed"));
         }
-        if task.assigned_to != taker {
-            return Ok(Returned::Kept("changed"));
-        }
         if facts
             .access_of(&item.from_user)
             .is_none_or(|access| !access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Write))
         {
             return Ok(Returned::Kept("not_member"));
         }
-        if !tasks::reassign_open(&pool, task_id, taker, &item.from_user)? {
-            return Ok(Returned::Kept("changed"));
-        }
-        activity::record(
+        let Some(mutation) = tasks::reassign_open(
             &pool,
-            cx.actor,
-            "system",
-            "task.handed_back",
-            "task",
             task_id,
-            &json!({ "from": taker, "to": item.from_user, "handover_id": cx.handover_id })
-                .to_string(),
-        );
-        notify_pair(
-            cx,
-            project_id,
-            "work_handed_back",
-            [item.from_user.as_str(), taker],
-            "Zadanie wróciło do właściciela",
-            &format!("#{} „{}”", task.task_no, task.title),
-            json!({ "project_id": project_id, "task_id": task_id }),
-        );
+            taker,
+            &item.from_user,
+            &tasks::TaskHandoverInput {
+                actor: cx.actor,
+                note_md: cx.note,
+                mention_user_ids: &[],
+                direction: tasks::TaskHandoverDirection::Back,
+                handover_id: Some(cx.handover_id),
+            },
+        )?
+        else {
+            return Ok(Returned::Kept("changed"));
+        };
+        if mutation.changed {
+            activity::record(
+                &pool,
+                cx.actor,
+                "user",
+                "task.handed_back",
+                "task",
+                task_id,
+                &json!({ "from": taker, "to": item.from_user, "handover_id": cx.handover_id })
+                    .to_string(),
+            );
+            notifications::notify_task_handover(
+                cx.org_id,
+                cx.actor,
+                project_id,
+                &mutation,
+                tasks::TaskHandoverDirection::Back,
+                &|user| {
+                    if !crate::db::repository::get_user_account_by_id(&self.projects.core_db, user)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|account| account.is_active)
+                    {
+                        return false;
+                    }
+                    repository::get_project(cx.org_id, project_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|project| repository::project_access(&project, user, false).ok())
+                        .is_some_and(|access| {
+                            access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Read)
+                                || access.allows(ProjectArea::Board, ProjectPermissionLevel::Read)
+                        })
+                },
+            );
+        }
         Ok(Returned::Back)
     }
 }

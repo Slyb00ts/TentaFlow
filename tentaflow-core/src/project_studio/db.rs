@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use tracing::info;
 
@@ -107,6 +107,9 @@ fn run_migrations(conn: &Connection) -> Result<()> {
             if *version == 3 {
                 migrate_project_functions(&tx)?;
             }
+            if *version == 4 {
+                assign_project_key_prefixes(&tx)?;
+            }
             tx.execute(
                 "INSERT INTO project_studio_schema_version (version) VALUES (?1)",
                 rusqlite::params![version],
@@ -123,7 +126,112 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, INITIAL_SCHEMA),
     (2, CENTRAL_SCHEMA_V2),
     (3, CENTRAL_SCHEMA_V3),
+    (4, CENTRAL_SCHEMA_V4),
 ];
+
+const CENTRAL_SCHEMA_V4: &str = "
+ALTER TABLE projects ADD COLUMN key_prefix TEXT NOT NULL DEFAULT '';
+";
+
+pub(crate) fn normalize_key_prefix(input: &str) -> Option<String> {
+    let prefix = input.trim().to_ascii_uppercase();
+    (prefix.len() >= 2
+        && prefix.len() <= 8
+        && prefix.as_bytes()[0].is_ascii_uppercase()
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()))
+    .then_some(prefix)
+}
+
+pub(crate) fn suggest_key_prefix(name: &str) -> String {
+    let mut prefix: String = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(8)
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect();
+    if prefix.is_empty() || !prefix.as_bytes()[0].is_ascii_uppercase() {
+        prefix.insert(0, 'P');
+    }
+    if prefix.len() == 1 {
+        prefix.push('P');
+    }
+    prefix.truncate(8);
+    prefix
+}
+
+pub(crate) fn reserve_key_prefix(
+    tx: &rusqlite::Transaction<'_>,
+    org_id: &str,
+    name: &str,
+    requested: &str,
+) -> Result<String> {
+    use rusqlite::OptionalExtension;
+
+    if !requested.trim().is_empty() {
+        let prefix = normalize_key_prefix(requested)
+            .ok_or_else(|| anyhow!("key prefix must match [A-Z][A-Z0-9]{{1,7}}"))?;
+        let taken: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM projects WHERE org_id = ?1 AND key_prefix = ?2",
+                rusqlite::params![org_id, prefix],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if taken.is_some() {
+            return Err(anyhow!("key prefix already exists in organization"));
+        }
+        return Ok(prefix);
+    }
+    let base = suggest_key_prefix(name);
+    for number in 1..=1_000_000 {
+        let candidate = if number == 1 {
+            base.clone()
+        } else {
+            let suffix = number.to_string();
+            format!("{}{}", &base[..base.len().min(8 - suffix.len())], suffix)
+        };
+        let taken: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM projects WHERE org_id = ?1 AND key_prefix = ?2",
+                rusqlite::params![org_id, candidate],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if taken.is_none() {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow!("organization has exhausted project key prefixes"))
+}
+
+fn assign_project_key_prefixes(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mut stmt = tx.prepare(
+        "SELECT project_id,org_id,name FROM projects ORDER BY org_id,created_at,project_id",
+    )?;
+    let projects = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (project_id, org_id, name) in projects {
+        let prefix = reserve_key_prefix(tx, &org_id, &name, "")?;
+        tx.execute(
+            "UPDATE projects SET key_prefix = ?1 WHERE project_id = ?2",
+            rusqlite::params![prefix, project_id],
+        )?;
+    }
+    tx.execute_batch(
+        "CREATE UNIQUE INDEX idx_projects_org_key_prefix ON projects(org_id,key_prefix);",
+    )?;
+    Ok(())
+}
 
 const INITIAL_SCHEMA: &str = "
 CREATE TABLE projects (
@@ -317,6 +425,55 @@ fn migrate_project_functions(conn: &Connection) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn migration_assigns_stable_unique_project_prefixes_per_organization() {
+        let conn = Connection::open_in_memory().expect("registry");
+        conn.execute_batch(
+            "CREATE TABLE project_studio_schema_version(version INTEGER PRIMARY KEY);",
+        )
+        .expect("versions");
+        conn.execute_batch(INITIAL_SCHEMA).expect("v1");
+        conn.execute(
+            "INSERT INTO project_studio_schema_version(version) VALUES (1)",
+            [],
+        )
+        .expect("version");
+        for (id, org, name) in [
+            ("p1", "o1", "Alpha"),
+            ("p2", "o1", "Alpha!"),
+            ("p3", "o2", "Alpha"),
+        ] {
+            conn.execute(
+                "INSERT INTO projects(project_id,org_id,name,owner_user_id,dir_path,created_at) \
+                 VALUES (?1,?2,?3,'u1','/unused','2026-01-01 00:00:00')",
+                rusqlite::params![id, org, name],
+            )
+            .expect("project");
+        }
+        run_migrations(&conn).expect("migrate");
+        let prefixes: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT key_prefix FROM projects ORDER BY project_id")
+                .expect("query");
+            stmt.query_map([], |row| row.get(0))
+                .expect("rows")
+                .collect::<rusqlite::Result<_>>()
+                .expect("values")
+        };
+        assert_eq!(prefixes, ["ALPHA", "ALPHA2", "ALPHA"]);
+        run_migrations(&conn).expect("reopen");
+        let unchanged: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT key_prefix FROM projects ORDER BY project_id")
+                .expect("query");
+            stmt.query_map([], |row| row.get(0))
+                .expect("rows")
+                .collect::<rusqlite::Result<_>>()
+                .expect("values")
+        };
+        assert_eq!(unchanged, prefixes);
+    }
+
     /// v1 → v2 on a REAL registry database: the seeded rows survive, the hint
     /// table is queryable with its index, a NULL `next_run_at` stays out of
     /// the due query (an empty string would sort before every timestamp) and
@@ -402,7 +559,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("version count");
-        assert_eq!(versions, 3);
+        assert_eq!(versions, MIGRATIONS.len() as i64);
         let hints: i64 = conn
             .query_row("SELECT COUNT(*) FROM project_schedule_hints", [], |r| {
                 r.get(0)

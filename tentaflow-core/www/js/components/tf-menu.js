@@ -24,6 +24,7 @@
 
 import { adoptControlsInto } from './shared-styles.js';
 import { Sfx } from '/js/lib/sfx.js';
+import { nextOverlayLayer } from './tf-window.js';
 
 function escapeHtml(s) {
   if (s === null || s === undefined) return '';
@@ -207,6 +208,7 @@ class TfMenu extends HTMLElement {
     this._headingEl.hidden = !heading;
     const isOpen = this.hasAttribute('open');
     if (isOpen) {
+      if (!this._wasOpen) this._box.style.zIndex = String(nextOverlayLayer());
       if (!this._wasOpen) Sfx.play('menu-open');
       this._wasOpen = true;
       this._box.classList.add('open');
@@ -230,7 +232,7 @@ class TfMenu extends HTMLElement {
   _position() {
     const box = this._box;
     if (!this._anchor || !this._anchor.isConnected) {
-      box.style.cssText = '';
+      box.style.cssText = `z-index: ${box.style.zIndex};`;
       return;
     }
     const a = this._anchor.getBoundingClientRect();
@@ -316,6 +318,7 @@ class TfMenu extends HTMLElement {
       return;
     }
     if (!this.contains(document.activeElement)) return;
+    if (e.key === 'Tab') { this.close(); return; }
     const rows = [...this.querySelectorAll(':scope > tf-menu-item > .tf-menu-item')];
     const at = rows.indexOf(document.activeElement);
     if (at < 0) return;

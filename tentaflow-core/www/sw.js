@@ -18,8 +18,11 @@ try {
   // dziala wtedy jako pass-through, bez precache.
 }
 
+importScripts('/js/lib/project-attachment-worker.js');
+
 const BUILD_HASH = self.__ASSET_BUILD_HASH || 'dev';
 const CACHE_VERSION = `tentaflow-${BUILD_HASH}`;
+const INITIAL_INSTALL_KEY = new URL('__sw_initial_install__', self.registration.scope).href;
 // Pelna lista zasobow + bootstrap ('/' i manifest ESM czytany przez klienta).
 const PRECACHE = [
   '/',
@@ -29,6 +32,7 @@ const PRECACHE = [
 ];
 
 self.addEventListener('install', (event) => {
+  const firstInstall = !self.registration.active;
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE_VERSION);
     // allowFail — pojedynczy 404 nie wywala instalacji calego kompletu.
@@ -38,16 +42,17 @@ self.addEventListener('install', (event) => {
         if (resp.ok) await cache.put(url, resp);
       } catch { /* ignore */ }
     }));
-    // NIE robimy skipWaiting/clients.claim — nowy SW czeka i przejmuje kontrole
-    // dopiero po przeladowaniu strony. Bez tego dzialajaca STARA strona moglaby
-    // dostac z nowego cache swiezo lazy-loadowane chunki JS/CSS => mieszane
-    // wersje frontu w jednej sesji. Reload (banner "nowa wersja" albo hardReload)
-    // jest jedynym punktem swapu, wiec front jest zawsze spojny.
+    // Persist the first-install decision across worker suspension. Updates still
+    // wait for the existing reload flow, so an old page cannot load new chunks.
+    await cache.put(INITIAL_INSTALL_KEY, new Response(firstInstall ? '1' : '0'));
   })());
 });
 
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_VERSION);
+    const initialInstall = await cache.match(INITIAL_INSTALL_KEY);
+    await cache.delete(INITIAL_INSTALL_KEY);
     const names = await caches.keys();
     // Skasuj stare cache TentaFlow (tylko nasze, nie cudze na tym originie).
     await Promise.all(
@@ -55,6 +60,7 @@ self.addEventListener('activate', (event) => {
         .filter((n) => n.startsWith('tentaflow-') && n !== CACHE_VERSION)
         .map((n) => caches.delete(n)),
     );
+    if (initialInstall && await initialInstall.text() === '1') await self.clients.claim();
   })());
 });
 
@@ -63,8 +69,12 @@ self.addEventListener('activate', (event) => {
 // nowy cache z precache. API/WS/WT zawsze przez network.
 self.addEventListener('fetch', (event) => {
   const req = event.request;
-  if (req.method !== 'GET') return;
   const url = new URL(req.url);
+  if (url.origin === self.location.origin && url.pathname.startsWith('/__project_attachment/')) {
+    event.respondWith(self.ProjectAttachmentWorker.respond(event));
+    return;
+  }
+  if (req.method !== 'GET') return;
   if (
     url.pathname.startsWith('/api/') ||
     url.pathname.startsWith('/ws/') ||

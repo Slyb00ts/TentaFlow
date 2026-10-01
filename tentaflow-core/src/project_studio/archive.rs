@@ -81,6 +81,8 @@ pub struct FileEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectMeta {
     pub project_id: String,
+    #[serde(default)]
+    pub key_prefix: String,
     pub name: String,
     pub description: String,
     pub template: String,
@@ -571,6 +573,7 @@ fn build_export(
 
         let registry = serde_json::json!({
             "name": task.project.name,
+            "key_prefix": task.project.key_prefix,
             "description": task.project.description,
             "template": task.project.template,
             "modules": task.project.modules,
@@ -1120,6 +1123,30 @@ fn apply_import(
         bail!("archiwum nie zawiera nazwy projektu");
     }
     let name = unique_project_name(&task.org_id, &wanted)?;
+    let requested_prefix = task.manifest.project.key_prefix.trim();
+    if !requested_prefix.is_empty() && super::db::normalize_key_prefix(requested_prefix).is_none() {
+        bail!("archive project key prefix is invalid");
+    }
+    let available_prefix = if requested_prefix.is_empty() {
+        String::new()
+    } else {
+        let central = super::db::pool()?;
+        let conn = central
+            .read()
+            .map_err(|e| anyhow!("projects registry read: {e}"))?;
+        let taken: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM projects WHERE org_id = ?1 AND key_prefix = ?2",
+                params![task.org_id, requested_prefix],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if taken.is_some() {
+            String::new()
+        } else {
+            requested_prefix.to_ascii_uppercase()
+        }
+    };
     super::repository::create_project(
         project_id,
         &task.org_id,
@@ -1129,8 +1156,12 @@ fn apply_import(
         &serde_json::to_string(&modules).unwrap_or_else(|_| "[]".to_string()),
         &task.user_id,
         &dir.to_string_lossy(),
+        &available_prefix,
         &[],
     )?;
+    let registry = super::repository::get_project(&task.org_id, project_id)?
+        .ok_or_else(|| anyhow!("imported project missing from registry"))?;
+    rekey_imported_tasks(&pool, &registry.key_prefix)?;
     super::repository::restore_function_catalogue(project_id, &task.manifest.functions)?;
     update_job(job_id, |j| j.project_id = project_id.to_string());
     let _ = super::schedules::refresh_hint(project_id, &task.org_id);
@@ -1232,6 +1263,8 @@ fn remap_identities(pool: &DbPool, importer: &str) -> Result<()> {
         "UPDATE test_suites SET created_by = ?1",
         "UPDATE test_runs SET created_by = ?1, closed_by = ''",
         "UPDATE tasks SET created_by = ?1",
+        "UPDATE task_links SET created_by = ?1",
+        "UPDATE task_events SET actor_id = ?1 WHERE actor_kind = 'user'",
         "UPDATE task_comments SET author_user_id = ?1",
         "UPDATE sources SET created_by = ?1",
         "UPDATE ingest_jobs SET started_by = ?1",
@@ -1248,6 +1281,7 @@ fn remap_identities(pool: &DbPool, importer: &str) -> Result<()> {
         "UPDATE tasks SET assigned_to = '' WHERE status <> 'done'",
         [],
     )?;
+    tx.execute("UPDATE task_comments SET mention_user_ids_json = '[]'", [])?;
     tx.execute(
         "UPDATE test_run_items SET assigned_to = '' \
          WHERE status IN ('pending', 'in_progress', 'running')",
@@ -1256,6 +1290,82 @@ fn remap_identities(pool: &DbPool, importer: &str) -> Result<()> {
     // ML links cannot follow a project across nodes: the ML project id belongs
     // to the exporting node's ML Studio registry.
     tx.execute("DELETE FROM ml_links", [])?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn rekey_imported_tasks(pool: &DbPool, prefix: &str) -> Result<()> {
+    let conn = pool
+        .write()
+        .map_err(|e| anyhow!("imported project write: {e}"))?;
+    let tx = conn.unchecked_transaction()?;
+    let mut stmt = tx.prepare("SELECT task_id,task_no,task_key FROM tasks ORDER BY task_no")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    for (task_id, task_no, old_key) in rows {
+        let new_key = format!("{prefix}-{task_no}");
+        if new_key != old_key {
+            tx.execute(
+                "UPDATE tasks SET task_key = ?1 WHERE task_id = ?2",
+                params![new_key, task_id],
+            )?;
+        }
+        let event_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        if event_count == 0 {
+            tx.execute(
+                "INSERT INTO task_events(task_id,actor_kind,actor_id,kind,after_json) \
+                 SELECT task_id,'system','','imported',json_object('task_key',task_key, \
+                 'task_type',task_type,'status',status,'title',title) FROM tasks WHERE task_id = ?1",
+                params![task_id],
+            )?;
+        }
+        if new_key == old_key {
+            continue;
+        }
+        let historical_events: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?1 AND kind <> 'imported'",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        if historical_events > 0 {
+            tx.execute(
+                "INSERT INTO task_events(task_id,actor_kind,actor_id,kind,before_json,after_json) \
+                 VALUES (?1,'system','','import_key_changed',?2,?3)",
+                params![
+                    task_id,
+                    serde_json::json!(old_key).to_string(),
+                    serde_json::json!(new_key).to_string()
+                ],
+            )?;
+        }
+    }
+    tx.execute(
+        "INSERT INTO settings(key,value) VALUES ('project_key_prefix',?1) \
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        params![prefix],
+    )?;
+    tx.execute(
+        "UPDATE settings SET value = CASE WHEN EXISTS(SELECT 1 FROM tasks) THEN '1' ELSE value END \
+         WHERE key = 'project_key_prefix_locked'",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE settings SET value = CAST(MAX(CAST(value AS INTEGER), \
+         (SELECT COALESCE(MAX(task_no),0)+1 FROM tasks)) AS TEXT) WHERE key = 'task_next_no'",
+        [],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -1783,14 +1893,14 @@ mod unit_tests {
             )
             .expect("case");
             conn.execute(
-                "INSERT INTO tasks (task_id, task_no, title, status, assigned_to, created_by) \
-                 VALUES ('t1', 1, 'Otwarte', 'todo', 'obcy-1', 'autor-obcy')",
+                "INSERT INTO tasks (task_id, task_no, task_key, task_type, title, status, assigned_to, created_by) \
+                 VALUES ('t1', 1, 'PR-1', 'technical', 'Otwarte', 'todo', 'obcy-1', 'autor-obcy')",
                 [],
             )
             .expect("open task");
             conn.execute(
-                "INSERT INTO tasks (task_id, task_no, title, status, assigned_to, created_by) \
-                 VALUES ('t2', 2, 'Zamkniete', 'done', 'obcy-2', 'autor-obcy')",
+                "INSERT INTO tasks (task_id, task_no, task_key, task_type, title, status, assigned_to, created_by) \
+                 VALUES ('t2', 2, 'PR-2', 'technical', 'Zamkniete', 'done', 'obcy-2', 'autor-obcy')",
                 [],
             )
             .expect("done task");
@@ -1833,6 +1943,7 @@ mod unit_tests {
             "[\"knowledge\",\"tests\"]",
             "wlasciciel-obcy",
             &dir.to_string_lossy(),
+            "",
             &[],
         )
         .expect("registry row");
@@ -1869,6 +1980,10 @@ mod unit_tests {
             dir_path: dir.clone(),
             project: ProjectMeta {
                 project_id: project_id.clone(),
+                key_prefix: super::super::repository::get_project("org-t", &project_id)
+                    .expect("registry")
+                    .expect("project")
+                    .key_prefix,
                 name: format!("Projekt {project_id}"),
                 description: "opis".to_string(),
                 template: "tests".to_string(),

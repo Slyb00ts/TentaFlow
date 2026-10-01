@@ -117,7 +117,7 @@ pub fn run_due(pool: &DbPool, org_id: &str, today: NaiveDate) -> Result<DueRepor
         );
         return Ok(report);
     }
-    let projects = ProjectDirectory::new(org_id);
+    let projects = ProjectDirectory::new(org_id, pool);
 
     for (header, item) in returns {
         let Some(provider) = provider_for(item.category, &projects) else {

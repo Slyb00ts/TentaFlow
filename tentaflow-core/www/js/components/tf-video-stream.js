@@ -10,6 +10,7 @@
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
+import { I18n } from '/js/i18n.js';
 
 // Domyslna wysokosc tile'a w px gdy atrybut nie ustawiony.
 const DEFAULT_HEIGHT_PX = 320;
@@ -56,7 +57,7 @@ const MAX_APPEND_QUEUE = 200;
 
 class TfVideoStream extends HTMLElement {
   static get observedAttributes() {
-    return ['stream-id', 'label', 'height-px'];
+    return ['stream-id', 'src', 'controls', 'label', 'height-px'];
   }
 
   constructor() {
@@ -98,6 +99,8 @@ class TfVideoStream extends HTMLElement {
     return this._basePtsNs;
   }
 
+  get mediaElement() { return this._video; }
+
   connectedCallback() {
     this._disposed = false;
     if (!this._video) this._build();
@@ -108,6 +111,7 @@ class TfVideoStream extends HTMLElement {
       this.addEventListener('dblclick', this._onDblClick);
     }
     this._applyAttributes();
+    if (this.hasAttribute('src')) { this._startFileSource(); return; }
     // The SDK reconciler can rip this element out of the DOM and re-insert it in
     // the same tick (disconnect→connect churn). If a deferred stop is pending
     // from such a disconnect, cancel it and KEEP the live subscription — do not
@@ -123,6 +127,7 @@ class TfVideoStream extends HTMLElement {
 
   disconnectedCallback() {
     this._disposed = true;
+    if (this.hasAttribute('src')) { this._stopSubscription('recorded source detached'); return; }
     // Defer the unsubscribe: a reconcile-driven disconnect is usually followed by
     // an immediate reconnect (same element) or a replacement tile subscribing to
     // the same stream. Holding the subscription open for a short grace period
@@ -138,12 +143,13 @@ class TfVideoStream extends HTMLElement {
   attributeChangedCallback(name, oldValue, newValue) {
     if (!this._video) return;
     if (oldValue === newValue) return;
-    if (name === 'stream-id') {
+    if (name === 'stream-id' || name === 'src') {
       // Restart pelnego pipeline'u: nowe MediaSource + nowa subskrypcja.
       this._stopSubscription('stream-id changed');
       this._applyAttributes();
       if (this.isConnected && !this._disposed) {
-        this._startSubscription();
+        if (this.hasAttribute('src')) this._startFileSource();
+        else this._startSubscription();
       }
       return;
     }
@@ -169,6 +175,9 @@ class TfVideoStream extends HTMLElement {
     this._video.muted = true;
     this._video.playsInline = true;
     this._video.setAttribute('playsinline', '');
+    this._video.addEventListener('error', () => {
+      if (this.hasAttribute('src')) this.dispatchEvent(new CustomEvent('media-error', { detail: { code: this._video.error?.code }, bubbles: true }));
+    });
 
     // Podwojny klik -> fullscreen tej kamery. Fullscreen bierzemy na kontenerze
     // kafelka (rodzic hosta), zeby nakladka detekcji <canvas> — dolaczana jako
@@ -188,6 +197,12 @@ class TfVideoStream extends HTMLElement {
   }
 
   _applyAttributes() {
+    const recorded = this.hasAttribute('src');
+    this._video.controls = recorded && this.hasAttribute('controls');
+    this._video.autoplay = !recorded;
+    this._video.muted = !recorded;
+    this._video.preload = recorded ? 'metadata' : 'auto';
+    this._video.style.objectFit = recorded ? 'contain' : 'cover';
     const label = this.getAttribute('label') ?? '';
     if (label.length > 0) {
       this._labelEl.textContent = label;
@@ -200,6 +215,16 @@ class TfVideoStream extends HTMLElement {
     const height =
       Number.isFinite(heightRaw) && heightRaw > 0 ? Math.floor(heightRaw) : DEFAULT_HEIGHT_PX;
     this.style.setProperty('--tf-video-stream-height', `${height}px`);
+  }
+
+  _startFileSource() {
+    if (this.hasAttribute('stream-id') || !this.getAttribute('src')) {
+      this._setStatus(I18n.t('project_studio.attachment_video_source_error'));
+      this.dispatchEvent(new CustomEvent('media-error', { detail: { code: this.hasAttribute('stream-id') ? 'ambiguous_source' : 'missing_source' }, bubbles: true }));
+      return;
+    }
+    this._statusEl.hidden = true;
+    this._video.src = this.getAttribute('src');
   }
 
   // Przelacza fullscreen dla kafelka kamery. Wchodzimy na kontenerze kafelka
@@ -251,6 +276,7 @@ class TfVideoStream extends HTMLElement {
   }
 
   _startSubscription() {
+    if (this.hasAttribute('src')) return;
     const streamId = this.getAttribute('stream-id') ?? '';
     if (!streamId) {
       this._setStatus('Brak identyfikatora strumienia.');

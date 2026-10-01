@@ -6,7 +6,7 @@
 //   Property: .options (array of {value, label, description, icon, group,
 //   disabled}); icon may be a string or a DOM Element (e.g. an SVG node).
 //   Events: change (detail: {value, label} — value/label are null on clear,
-//   free-input commits carry {value: <raw text>, label: null, free: true}),
+//   free-input commits on Enter or change carry {value: <raw text>, label: null, free: true}),
 //   input (detail: {query}).
 // =============================================================================
 
@@ -26,6 +26,8 @@ class TfCombobox extends HTMLElement {
     this._options = [];
     this._activeIdx = -1;
     this._isOpen = false;
+    this._wantsOpen = false;
+    this._committedText = null;
     // Stable per-instance prefix for option element ids (aria-activedescendant).
     this._uid = `tfcb-${Math.random().toString(36).slice(2, 8)}`;
     this._onInput = this._onInput.bind(this);
@@ -50,7 +52,9 @@ class TfCombobox extends HTMLElement {
   }
 
   attributeChangedCallback(name, oldVal, newVal) {
-    if (oldVal === newVal || !this._wrap) return;
+    if (oldVal === newVal) return;
+    if (name === 'value') this._committedText = newVal ?? '';
+    if (!this._wrap) return;
     this._update();
   }
 
@@ -60,6 +64,7 @@ class TfCombobox extends HTMLElement {
 
   set value(v) {
     const next = v ?? '';
+    this._committedText = next;
     this.setAttribute('value', next);
     // Never clobber in-progress typing — mirror only when not focused.
     if (this._input && document.activeElement !== this._input) this._input.value = next;
@@ -80,6 +85,9 @@ class TfCombobox extends HTMLElement {
   set options(arr) {
     this._options = Array.isArray(arr) ? arr : [];
     this._rebuildOptions();
+    if (!this._input) return;
+    this._filterOptions(this._input.value);
+    if (this._wantsOpen && document.activeElement === this._input) this._open();
   }
 
   focus() { this._input?.focus(); }
@@ -103,6 +111,10 @@ class TfCombobox extends HTMLElement {
     input.setAttribute('aria-expanded', 'false');
     input.setAttribute('aria-autocomplete', 'list');
     input.addEventListener('input', this._onInput);
+    input.addEventListener('change', (event) => {
+      event.stopPropagation();
+      if (this.hasAttribute('free-input')) this._commitFreeText();
+    });
     input.addEventListener('keydown', this._onKeyDown);
     input.addEventListener('focus', this._onFocus);
     wrap.appendChild(input);
@@ -118,6 +130,7 @@ class TfCombobox extends HTMLElement {
       e.stopPropagation();
       if (this.hasAttribute('disabled')) return;
       this._input.value = '';
+      this._committedText = '';
       this.setAttribute('value', '');
       this._close();
       this._syncClear();
@@ -297,12 +310,14 @@ class TfCombobox extends HTMLElement {
   }
 
   _open() {
-    if (this._isOpen || this.hasAttribute('disabled')) return;
+    if (this.hasAttribute('disabled')) return;
     // Gate every open path (input, focus, arrow keys): never open with no
     // options, and respect the min-chars search threshold.
-    if (this._optionEls.length === 0) return;
     const minChars = this._minChars();
     if (minChars > 0 && this._input.value.length < Math.max(minChars, 1)) return;
+    // Remember an eligible query while its remote options are still arriving.
+    this._wantsOpen = true;
+    if (this._isOpen || this._optionEls.length === 0) return;
     this._isOpen = true;
     this._popover.hidden = false;
     this._input.setAttribute('aria-expanded', 'true');
@@ -312,6 +327,7 @@ class TfCombobox extends HTMLElement {
   }
 
   _close() {
+    this._wantsOpen = false;
     if (!this._isOpen) return;
     this._isOpen = false;
     this._popover.hidden = true;
@@ -326,6 +342,7 @@ class TfCombobox extends HTMLElement {
     const opt = this._options[idx];
     if (opt.disabled) return;
     this._input.value = opt.label || '';
+    this._committedText = this._input.value;
     this.setAttribute('value', opt.label || '');
     this._close();
     this._syncClear();
@@ -336,8 +353,10 @@ class TfCombobox extends HTMLElement {
   }
 
   _commitFreeText() {
+    if (this.hasAttribute('disabled')) return;
     const text = this._input.value;
-    if (text.length === 0) return;
+    if (text === this._committedText) return;
+    this._committedText = text;
     this.setAttribute('value', text);
     this._close();
     this._syncClear();
@@ -347,15 +366,20 @@ class TfCombobox extends HTMLElement {
     }));
   }
 
-  _onInput() {
+  _onInput(event) {
+    // Consumers receive the query event from this component, never an untyped inner-input event.
+    event.stopPropagation();
+    if (this.hasAttribute('disabled')) return;
     const q = this._input.value;
+    const committedText = this._committedText;
     this.setAttribute('value', q);
+    this._committedText = committedText;
     this._filterOptions(q);
     const minChars = this._minChars();
     if (minChars > 0 && q.length < minChars) {
       // Below the search threshold the popover must stay closed.
       if (this._isOpen) this._close();
-    } else if (!this._isOpen && q.length >= Math.max(minChars, 1) && this._optionEls.length > 0) {
+    } else if (!this._isOpen && q.length >= Math.max(minChars, 1)) {
       this._open();
     }
     this._syncClear();
@@ -401,22 +425,23 @@ class TfCombobox extends HTMLElement {
         }
         return;
       case 'Escape':
-        if (this._isOpen) { e.preventDefault(); this._close(); }
+        if (this._isOpen) e.preventDefault();
+        this._close();
         return;
       case 'Tab':
-        if (this._isOpen) this._close();
+        this._close();
         return;
     }
   }
 
   _onFocus() {
-    if (this.hasAttribute('disabled') || this._optionEls.length === 0) return;
+    if (this.hasAttribute('disabled')) return;
     if (this._input.value.length < this._minChars()) return;
     this._open();
   }
 
   _onDocClick(e) {
-    if (!this._isOpen) return;
+    if (!this._isOpen && !this._wantsOpen) return;
     if (this.contains(e.target)) return;
     this._close();
   }

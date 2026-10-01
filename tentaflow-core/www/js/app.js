@@ -235,19 +235,21 @@ async function bootstrap() {
   // auto-submitem. Sesja uzytkownika musi byc zalogowana.
   handlePairDeepLink();
 
-  // Service Worker registration — precache calego frontu + offline shell.
-  // Wymaga secure context (https albo localhost). Chrome odrzuca SW na
-  // self-signed HTTPS z cert error — to jest zlapane w .catch (SW to tylko
-  // optymalizacja; wykrywanie nieaktualnego frontu i tak dziala przez handshake
-  // WS niezaleznie od SW). Na zaufanym certcie/localhost SW sie zarejestruje.
-  if ('serviceWorker' in navigator && window.isSecureContext) {
-    // updateViaCache:'none' — sw.js ORAZ jego importScripts (sw-version.js) sa
-    // przy sprawdzaniu update'u pobierane z sieci, nie z HTTP cache, wiec zmiana
-    // build-hasha jest zawsze wykryta.
-    navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch((e) => {
-      console.debug('[app] SW register failed:', e?.message);
+}
+
+let serviceWorkerRegistration = null;
+
+function initializeServiceWorker() {
+  if (!ApiBinary.hasJwt() || !('serviceWorker' in navigator) || !window.isSecureContext) return null;
+  // Login, password rotation and authenticated startup all enter renderApp.
+  // One registration per page also keeps repeated shell renders from starting competing updates.
+  if (!serviceWorkerRegistration) {
+    serviceWorkerRegistration = navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch((e) => {
+      console.warn('[app] SW register failed:', e?.message);
+      return null;
     });
   }
+  return serviceWorkerRegistration;
 }
 
 // The SSO callback hands the session over in the URL fragment, which never
@@ -311,6 +313,7 @@ async function renderApp() {
     LoginScreen.mount({ onSuccess: () => renderApp(), passwordRotation: true, username: me.username });
     return;
   }
+  if (me) initializeServiceWorker();
   const role = (me?.role ?? 'user').toLowerCase();
   const isAdmin = role === 'admin';
   // Power User to rola posrednia miedzy `user` a `admin` (zob. users.js: role

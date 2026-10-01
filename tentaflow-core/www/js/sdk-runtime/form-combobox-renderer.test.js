@@ -644,6 +644,44 @@ test('Autocomplete change re-emits SDK {value, kind:tstr}', () => {
   assertEq(got, { value: 'final text', kind: 'tstr' });
 });
 
+test('Autocomplete editable commits keep the SDK text contract without duplicate Enter and blur changes', () => {
+  setup();
+  const engine = makeEngine();
+  const el = mount(engine.render(comp(AUTOCOMPLETE_TAG, acFields({
+    6: { kind: 'literal', value: 'S' },
+  }))));
+  assertEq(el.hasAttribute('free-input'), true);
+  const changes = [];
+  el.addEventListener('change', (event) => changes.push(event.detail));
+  const input = el.querySelector('input');
+  input.value = 'Final text';
+  input.dispatchEvent(new (globalThis.KeyboardEvent)('keydown', { key: 'Enter', bubbles: true }));
+  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  assertEq(changes, [{ value: 'Final text', kind: 'tstr' }]);
+  input.value = '';
+  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  assertEq(changes.at(-1), { value: '', kind: 'tstr' });
+});
+
+test('Autocomplete reactive store updates do not suppress a subsequent previous-text commit', () => {
+  setup();
+  const store = makeStore();
+  store.applySnapshot({ entries: [{ path: PATH('q'), value: '' }], state_revision: 0, truncated: false });
+  const engine = makeEngine(store);
+  const el = mount(engine.render(comp(AUTOCOMPLETE_TAG, acFields({
+    6: { kind: 'literal', value: 'S' },
+  }))));
+  const changes = [];
+  el.addEventListener('change', (event) => changes.push(event.detail));
+  const input = el.querySelector('input');
+  input.value = 'A'; input.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  store.applyPatch({ base_revision: 0, new_revision: 1, ops: [{ path: PATH('q'), op: { kind: 'set', value: 'B' } }] });
+  assertEq(input.value, 'B');
+  input.value = 'A'; input.dispatchEvent(new (globalThis.Event)('input', { bubbles: true }));
+  input.dispatchEvent(new (globalThis.Event)('change', { bubbles: true }));
+  assertEq(changes, [{ value: 'A', kind: 'tstr' }, { value: 'A', kind: 'tstr' }]);
+});
+
 test('Autocomplete focus/blur translated to SDK focus/blur events', () => {
   setup();
   const engine = makeEngine();

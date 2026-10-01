@@ -1006,7 +1006,7 @@ pub fn build_app_state(
     let meeting_manager =
         crate::meeting::MeetingManager::new(db.clone(), Some(service_manager.clone()));
     let live_handles = service_manager.live_handles.clone();
-    Arc::new(crate::dispatch::AppState {
+    let state = Arc::new(crate::dispatch::AppState {
         db,
         router,
         mesh_peer_store,
@@ -1029,7 +1029,9 @@ pub fn build_app_state(
         ui_sessions,
         progress_broker: crate::flow_engine::progress_broker::global_broker(),
         agent_run_manager: crate::agents::agent_run_manager_global(),
-    })
+    });
+    crate::project_studio::media::start_workers(state.clone());
+    state
 }
 
 pub async fn handle_request(

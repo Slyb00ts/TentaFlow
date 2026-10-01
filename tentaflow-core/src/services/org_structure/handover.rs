@@ -475,7 +475,7 @@ fn gather(pool: &DbPool, org_id: &str, subject: &Target<'_>, today: NaiveDate) -
     let reference = advice::reference_day(&conn, org_id, subject.user_id, today)?;
     let advice = Advice::load(&conn, org_id, subject.user_id, reference, date)?;
     let members = active_members(&conn, org_id)?;
-    let projects = ProjectDirectory::new(org_id);
+    let projects = ProjectDirectory::new(org_id, pool);
     let project = (subject.reason == Reason::ProjectRemoval)
         .then_some(subject.project_id)
         .flatten();
@@ -937,7 +937,7 @@ fn execute(
         note: &header.note,
         note_digest: &digest,
     };
-    let projects = ProjectDirectory::new(&header.org_id);
+    let projects = ProjectDirectory::new(&header.org_id, pool);
     let mut done: HashMap<String, ItemResult> = HashMap::new();
     let outcome = |item: &Planned, status: &str, reason: Option<&str>| ItemResult {
         key: item.key.clone(),

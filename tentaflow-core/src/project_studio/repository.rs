@@ -45,6 +45,7 @@ fn read_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
         project_id: row.get(0)?,
         org_id: row.get(1)?,
         name: row.get(2)?,
+        key_prefix: row.get(11)?,
         description: row.get(3)?,
         status: row.get(4)?,
         template: row.get(5)?,
@@ -57,7 +58,7 @@ fn read_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRecord> {
 }
 
 const PROJECT_COLS: &str = "project_id, org_id, name, description, status, template, \
-     modules_json, owner_user_id, dir_path, created_at, updated_at";
+     modules_json, owner_user_id, dir_path, created_at, updated_at, key_prefix";
 
 /// Inserts the project row together with the owner membership and any initial
 /// members in ONE transaction — a project can never exist without its owner.
@@ -71,6 +72,7 @@ pub fn create_project(
     modules_json: &str,
     owner_user_id: &str,
     dir_path: &str,
+    key_prefix: &str,
     members: &[MemberInput],
 ) -> Result<()> {
     let catalogue = super::models::default_project_functions();
@@ -81,9 +83,10 @@ pub fn create_project(
     let pool = super::db::pool()?;
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
+    let prefix = super::db::reserve_key_prefix(&tx, org_id, name, key_prefix)?;
     tx.execute(
         "INSERT INTO projects (project_id, org_id, name, description, template, \
-         modules_json, owner_user_id, dir_path) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         modules_json, owner_user_id, dir_path, key_prefix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             project_id,
             org_id,
@@ -92,7 +95,8 @@ pub fn create_project(
             template,
             modules_json,
             owner_user_id,
-            dir_path
+            dir_path,
+            prefix
         ],
     )?;
     super::db::seed_project_functions(&tx, project_id)?;
@@ -154,14 +158,70 @@ pub fn update_project_name_desc(
     project_id: &str,
     name: &str,
     description: &str,
+    key_prefix: Option<&str>,
 ) -> Result<bool> {
+    let content = super::project_db::open(project_id)?;
+    let content_conn = content.write().map_err(write_err)?;
+    let content_tx = content_conn.unchecked_transaction()?;
+    content_tx.execute(
+        "UPDATE settings SET value = value WHERE key = 'project_key_prefix'",
+        [],
+    )?;
     let pool = super::db::pool()?;
     let conn = pool.write().map_err(write_err)?;
-    let n = conn.execute(
-        "UPDATE projects SET name = ?1, description = ?2, updated_at = datetime('now') \
-         WHERE org_id = ?3 AND project_id = ?4",
-        params![name, description, org_id, project_id],
+    let tx = conn.unchecked_transaction()?;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT key_prefix FROM projects WHERE org_id = ?1 AND project_id = ?2",
+            params![org_id, project_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(existing) = existing else {
+        return Ok(false);
+    };
+    let prefix = match key_prefix {
+        Some(value) => super::db::normalize_key_prefix(value)
+            .ok_or_else(|| anyhow!("key prefix must match [A-Z][A-Z0-9]{{1,7}}"))?,
+        None => existing.clone(),
+    };
+    if prefix != existing {
+        let locked: String = content_tx.query_row(
+            "SELECT value FROM settings WHERE key = 'project_key_prefix_locked'",
+            [],
+            |row| row.get(0),
+        )?;
+        if locked == "1" {
+            return Err(anyhow!("project key prefix is locked after the first task"));
+        }
+        let taken: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM projects WHERE org_id = ?1 AND key_prefix = ?2 AND project_id <> ?3",
+                params![org_id, prefix, project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if taken.is_some() {
+            return Err(anyhow!("key prefix already exists in organization"));
+        }
+    }
+    let n = tx.execute(
+        "UPDATE projects SET name = ?1, description = ?2, key_prefix = ?3, updated_at = datetime('now') \
+         WHERE org_id = ?4 AND project_id = ?5",
+        params![name, description, prefix, org_id, project_id],
     )?;
+    if prefix != existing {
+        content_tx.execute(
+            "UPDATE settings SET value = ?1 WHERE key = 'project_key_prefix'",
+            params![prefix],
+        )?;
+        content_tx.execute(
+            "UPDATE tasks SET task_key = ?1 || '-' || task_no WHERE task_key <> ?1 || '-' || task_no",
+            params![prefix],
+        )?;
+    }
+    tx.commit()?;
+    content_tx.commit()?;
     Ok(n > 0)
 }
 
@@ -1251,7 +1311,14 @@ pub fn blob_ref_count(pool: &DbPool, sha256: &str) -> Result<u32> {
               + (SELECT COUNT(*) FROM test_run_steps t, json_each(t.attachments_json) j \
                  WHERE json_extract(j.value, '$.sha256') = ?1) \
               + (SELECT COUNT(*) FROM tasks t, json_each(t.attachments_json) j \
-                 WHERE json_extract(j.value, '$.sha256') = ?1)",
+                 WHERE json_extract(j.value, '$.sha256') = ?1) \
+              + (SELECT COUNT(*) FROM task_events e, \
+                 json_each(CASE WHEN e.kind = 'attachments_json' THEN json_extract(e.before_json,'$') \
+                 WHEN e.kind = 'created' THEN json_extract(e.after_json,'$.attachments_json') ELSE '[]' END) j \
+                 WHERE json_extract(j.value,'$.sha256') = ?1) \
+              + (SELECT COUNT(*) FROM task_events e, \
+                 json_each(CASE WHEN e.kind = 'attachments_json' THEN json_extract(e.after_json,'$') ELSE '[]' END) j \
+                 WHERE json_extract(j.value,'$.sha256') = ?1)",
         params![sha256],
         |row| row.get(0),
     )?;
@@ -1276,7 +1343,16 @@ pub fn referenced_blob_sha256s(pool: &DbPool) -> Result<std::collections::HashSe
            FROM test_run_steps t, json_each(t.attachments_json) j \
          UNION \
          SELECT json_extract(j.value, '$.sha256') \
-           FROM tasks t, json_each(t.attachments_json) j",
+           FROM tasks t, json_each(t.attachments_json) j \
+         UNION \
+         SELECT json_extract(j.value, '$.sha256') \
+           FROM task_events e, json_each(CASE WHEN e.kind = 'attachments_json' \
+               THEN json_extract(e.before_json,'$') WHEN e.kind = 'created' \
+               THEN json_extract(e.after_json,'$.attachments_json') ELSE '[]' END) j \
+         UNION \
+         SELECT json_extract(j.value, '$.sha256') \
+           FROM task_events e, json_each(CASE WHEN e.kind = 'attachments_json' \
+               THEN json_extract(e.after_json,'$') ELSE '[]' END) j",
     )?;
     let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0))?;
     let mut set = std::collections::HashSet::new();
@@ -1632,8 +1708,8 @@ pub fn project_f2_kpis(pool: &DbPool, user_id: &str) -> Result<super::models::Pr
         |row| row.get(0),
     )?;
     let (tasks_open, defects_open): (i64, i64) = conn.query_row(
-        "SELECT COALESCE(SUM(task_type = 'task'), 0), COALESCE(SUM(task_type = 'defect'), 0) \
-         FROM tasks WHERE status <> 'done'",
+        "SELECT COALESCE(SUM(task_type <> 'defect'), 0), COALESCE(SUM(task_type = 'defect'), 0) \
+         FROM tasks WHERE status <> 'done' AND archived_at IS NULL",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -1986,6 +2062,145 @@ mod unit_tests {
 }
 
 #[cfg(test)]
+mod key_prefix_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn concurrent_uncached_open_prefix_edit_and_first_task_agree() {
+        let registry_dir = tempfile::tempdir().expect("registry directory");
+        let _ = super::super::db::init(&registry_dir.path().join("projects.db"));
+        std::mem::forget(registry_dir);
+
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let org_id = format!("org-{}", uuid::Uuid::new_v4());
+        create_project(
+            &project_id,
+            &org_id,
+            &project_id,
+            "",
+            "custom",
+            "[\"tasks\"]",
+            "owner",
+            project_dir.path().to_str().expect("path"),
+            "OLD",
+            &[],
+        )
+        .expect("project");
+        let (seed_pool, _) =
+            super::super::project_db::open_pool_at(project_dir.path()).expect("schema");
+        drop(seed_pool);
+        let barrier = Arc::new(Barrier::new(3));
+        let open_id = project_id.clone();
+        let open_barrier = barrier.clone();
+        let opener = std::thread::spawn(move || {
+            open_barrier.wait();
+            super::super::project_db::open(&open_id).expect("uncached open");
+        });
+        let edit_id = project_id.clone();
+        let edit_org = org_id.clone();
+        let edit_barrier = barrier.clone();
+        let editor = std::thread::spawn(move || {
+            edit_barrier.wait();
+            update_project_name_desc(&edit_org, &edit_id, &edit_id, "", Some("NEW"))
+        });
+        let task_id = project_id.clone();
+        let task_barrier = barrier.clone();
+        let creator = std::thread::spawn(move || {
+            task_barrier.wait();
+            let pool = super::super::project_db::open(&task_id).expect("project pool");
+            super::super::tasks::create_task(
+                &pool,
+                &super::super::tasks::TaskInput {
+                    task_type: "feature",
+                    title: "First task",
+                    description_md: "",
+                    severity: "",
+                    priority: "medium",
+                    status: "todo",
+                    assigned_to: "",
+                    due_date: "",
+                    parent_task_id: None,
+                    links_json: "[]",
+                    attachments_json: "[]",
+                },
+                "owner",
+            )
+            .expect("task")
+        });
+        opener.join().expect("open thread");
+        let edit = editor.join().expect("edit thread");
+        let task = creator.join().expect("task thread");
+        let central = get_project(&org_id, &project_id)
+            .expect("project query")
+            .expect("project row");
+        let pool = super::super::project_db::open(&project_id).expect("project pool");
+        let local_prefix: String = pool
+            .read()
+            .expect("read")
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'project_key_prefix'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("local prefix");
+        assert_eq!(central.key_prefix, local_prefix);
+        assert_eq!(task.task_key, format!("{}-1", central.key_prefix));
+        assert_eq!(edit.is_ok(), central.key_prefix == "NEW");
+        super::super::project_db::close(&project_id);
+    }
+
+    #[test]
+    fn task_kpis_count_all_non_defect_types_and_exclude_done_or_archived() {
+        let project_dir = tempfile::tempdir().expect("project directory");
+        let (pool, _) =
+            super::super::project_db::open_pool_at(project_dir.path()).expect("project schema");
+        super::super::tasks::save_task_type(
+            &pool,
+            "incident",
+            "Incident",
+            "Response work",
+            70,
+            true,
+        )
+        .expect("custom type");
+        let create = |task_type: &str, title: &str, status: &str| {
+            super::super::tasks::create_task(
+                &pool,
+                &super::super::tasks::TaskInput {
+                    task_type,
+                    title,
+                    description_md: "",
+                    severity: if task_type == "defect" { "high" } else { "" },
+                    priority: "medium",
+                    status,
+                    assigned_to: "",
+                    due_date: "",
+                    parent_task_id: None,
+                    links_json: "[]",
+                    attachments_json: "[]",
+                },
+                "owner",
+            )
+            .expect("task")
+        };
+        create("technical", "Technical", "todo");
+        create("feature", "Feature", "review");
+        create("incident", "Incident", "in_progress");
+        create("defect", "Open defect", "todo");
+        create("defect", "Done defect", "done");
+        let archived = create("feature", "Archived feature", "todo");
+        super::super::tasks::set_task_archived(&pool, &archived.task_id, true, "owner")
+            .expect("archive")
+            .expect("task");
+        let kpis = project_f2_kpis(&pool, "owner").expect("KPI query");
+        assert_eq!(kpis.tasks_open, 3);
+        assert_eq!(kpis.defects_open, 1);
+    }
+}
+
+#[cfg(test)]
 mod code_studio_mirror_tests {
     use super::*;
     use crate::code_studio::models::{
@@ -2069,6 +2284,7 @@ mod code_studio_mirror_tests {
             "[\"knowledge\"]",
             owner,
             "/tmp/none",
+            "",
             &[],
         )
         .expect("create project");
@@ -2093,6 +2309,7 @@ mod code_studio_mirror_tests {
             "[\"knowledge\",\"tests\",\"tasks\"]",
             &owner,
             "unused",
+            "",
             &[],
         )
         .expect("project");

@@ -47,6 +47,10 @@ import { Sfx } from '/js/lib/sfx.js';
 
 let _zCounter = 1000;
 
+export function nextOverlayLayer() {
+  return ++_zCounter;
+}
+
 class TfWindow extends HTMLElement {
   static get observedAttributes() {
     return [
@@ -406,6 +410,9 @@ class TfWindow extends HTMLElement {
     // Only the top-most window reacts; lower windows ignore ESC so the
     // stack behaves like a true modal pile.
     if (!this._isTopmost()) return;
+    const menu = [...document.querySelectorAll('tf-menu[open]')]
+      .find((item) => this.contains(item.anchor) && item.contains(document.activeElement));
+    if (menu) return;
     if (e.key === 'Tab') { this._trapTab(e); return; }
     this.close();
   }
@@ -467,9 +474,9 @@ class TfWindow extends HTMLElement {
   // window opened before it (the folder picker under a folder-name prompt),
   // not only the page: those are out of reach until the modal one goes.
   _bringToFront() {
-    _zCounter += 2;
-    this._win.style.zIndex = String(_zCounter);
-    if (this._backdrop) this._backdrop.style.zIndex = String(_zCounter - 1);
+    const backdropLayer = nextOverlayLayer();
+    this._win.style.zIndex = String(nextOverlayLayer());
+    if (this._backdrop) this._backdrop.style.zIndex = String(backdropLayer);
   }
 
   // ========== controls ==========

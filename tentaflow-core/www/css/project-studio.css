@@ -3665,3 +3665,141 @@
   width: 13px;
   height: 13px;
 }
+
+/* ---- persisted task card --------------------------------------------------------- */
+
+.ps-task-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr);
+  align-items: start;
+  gap: 20px;
+}
+
+.ps-task-main,
+.ps-task-sidebar,
+.ps-task-metadata,
+.ps-task-comment-composer {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 12px;
+}
+
+.ps-task-card tf-section-card {
+  min-width: 0;
+}
+
+.ps-task-card .tf-section-card-title,
+.ps-task-type-name,
+.ps-task-types .tf-table td,
+.ps-task-relation .tf-button-label {
+  white-space: normal;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+
+.ps-task-card .ps-task-comments {
+  max-height: none;
+  overflow: visible;
+}
+
+.ps-task-markdown {
+  overflow-wrap: anywhere;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.ps-task-markdown pre {
+  overflow: auto;
+  max-width: 100%;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--bg-3);
+}
+
+.ps-task-markdown p:first-child { margin-top: 0; }
+.ps-task-markdown p:last-child { margin-bottom: 0; }
+
+.ps-task-comment-head,
+.ps-task-comment-tools,
+.ps-task-mentioned,
+.ps-task-archived {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.ps-task-comment-tools > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.ps-task-archived { margin-bottom: 16px; }
+.ps-task-archived > span { color: var(--text-2); font-size: 13px; }
+
+.ps-task-relation {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-task-relation > span {
+  grid-column: 1;
+  font-size: 12px;
+  color: var(--text-3);
+  padding-left: 8px;
+}
+
+.ps-task-relation > [data-unlink] { grid-column: 2; grid-row: 1 / span 2; }
+.ps-task-relation > [data-related-task] { min-width: 0; justify-self: start; }
+
+.ps-task-duration {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ps-task-duration > b { align-self: center; font-size: 12px; }
+.ps-task-duration > span { grid-column: 1 / -1; font-size: 11px; color: var(--text-3); }
+.ps-task-history-actor { color: var(--text-3); font-size: 11px; }
+.ps-task-history-values { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; margin-top: 4px; }
+.ps-task-gallery { display: flex; flex-direction: column; gap: 8px; }
+.ps-task-types .ps-members-toolbar { align-items: start; }
+.ps-task-types .ps-field-hint { flex: 1; min-width: 0; }
+
+.ps-task-handover-note { display: flex; flex-direction: column; gap: 8px; overflow-wrap: anywhere; }
+.ps-task-handover-note > span { color: var(--text-3); font-size: 12px; }
+.ps-task-target { outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 6px; }
+.ps-upload-row { display: flex; flex-direction: column; gap: 8px; padding: 12px; margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; min-width: 0; }
+.ps-upload-row > b { overflow-wrap: anywhere; }
+.ps-task-attachment { display: flex; flex-direction: column; gap: 8px; min-width: 0; width: min(260px, 100%); padding: 10px; border: 1px solid var(--border); border-radius: 8px; }
+.ps-task-attachment-meta { display: flex; flex-direction: column; gap: 5px; min-width: 0; overflow-wrap: anywhere; }
+.ps-task-attachment-meta > span { color: var(--text-3); font-size: 12px; }
+.ps-task-attachment-image { height: 136px; background: var(--bg-2); border-radius: 6px; }
+.ps-task-attachment-image img { width: 100%; height: 100%; object-fit: contain; }
+.ps-task-attachment-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.ps-attachment-usage-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.ps-task-card .ps-footer-left { flex-wrap: wrap; }
+.ps-project-window .tf-window-title-text,
+.ps-project-window .tf-window-subtitle-text { white-space: normal; overflow: visible; text-overflow: clip; overflow-wrap: anywhere; }
+
+@media (max-width: 900px) {
+  .ps-task-layout { grid-template-columns: minmax(0, 1fr); }
+  .ps-task-sidebar { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 600px) {
+  .ps-attachment-usage-summary { grid-template-columns: 1fr; }
+  .ps-task-sidebar { display: flex; }
+  .ps-task-card .ps-task-comment { flex-wrap: wrap; }
+  .ps-task-card .ps-task-comment-actions { margin-left: auto; }
+}

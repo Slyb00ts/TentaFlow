@@ -25,10 +25,13 @@ import { I18n } from '/js/i18n.js';
 import { Router } from '/js/router.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
+import { renderMarkdown } from '/js/lib/md-lite.js';
 import { activityLabels } from '/js/lib/agent-activity-bridge.js';
-import { openActionMenu, openConfirmWindow } from '/js/lib/actions/index.js';
+import { openActionMenu, openConfirmWindow, openHandoverWindow, showUndoToast } from '/js/lib/actions/index.js';
 import { openHandover } from '/js/modules/org-structure/handover-nav.js';
 import { PROJECT_AREAS, PERMISSION_LEVELS, BUILTIN_FUNCTIONS, allowsArea, canCreateTask, projectTabs, catalogueLabel, memberGroup, expiryToInstant, expiryToLocal } from './project-studio-access.js';
+import { TASK_LINK_KINDS, projectKeySuggestion, taskTypeLabel, taskTypeDescription, taskDuration, taskEventValue, taskEventTaskIds, taskEventAttachments, taskNotificationText, activeTaskTypes, parentCandidates } from './project-studio-tasks.js';
+import { uploadProjectAttachment, pendingAttachmentUploads, cancelAttachmentUpload, refreshAttachmentUpload, acknowledgeAttachmentUploads, openAttachmentStream, downloadProjectAttachment } from './project-studio-media.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-input.js';
@@ -61,6 +64,9 @@ import '/js/components/tf-status-pill.js';
 import '/js/components/tf-code-editor.js';
 import '/js/components/tf-kanban.js';
 import '/js/components/tf-combobox.js';
+import '/js/components/tf-person-picker.js';
+import '/js/components/tf-timeline.js';
+import '/js/components/tf-video-stream.js';
 
 // Wizard templates map 1:1 to the wire `template` field; modules are the
 // initial toggles for step 2 (knowledge is always locked on).
@@ -228,6 +234,8 @@ const state = {
   f2: null,
   // F2 — tasks module (Z01/Z02).
   tasksView: null,
+  taskTypes: [],
+  localAttachments: new Map(),
   // G02 — unread badge count (source of truth: NotificationsListRequest).
   notifUnread: 0,
   // F4 — X02 links tab ({ links, canManage, loaded }).
@@ -283,7 +291,7 @@ function freshF2State() {
 function freshTasksState() {
   return {
     rows: [], total: 0, page: 1,
-    filters: { type: '', status: '', severity: '', mine: false, search: '' },
+    filters: { type: '', status: '', severity: '', mine: false, search: '', includeArchived: false },
     // 'list' | 'board' — remembered per project in localStorage.
     mode: 'list',
     // Board rows are a separate, unpaginated fetch: a kanban with a page cut
@@ -327,6 +335,10 @@ function formatTimestamp(value) {
   return date.toLocaleString(I18n.getLanguage());
 }
 
+function selectOpt(value, current, label) {
+  return `<option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(label)}</option>`;
+}
+
 function initials(name) {
   const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
   if (!parts.length) return '?';
@@ -335,11 +347,13 @@ function initials(name) {
 
 // AuthMe user_id arrives as Uint8Array(16); project rows carry string ids
 // (hex/uuid). Compare on the normalized hex form.
-function isMe(userId) {
+function currentUserId() {
   const bytes = state.me?.userId;
-  if (!bytes || !userId) return false;
-  const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('');
-  return String(userId).toLowerCase().replace(/-/g, '') === hex;
+  return bytes ? Array.from(bytes).map((byte) => byte.toString(16).padStart(2, '0')).join('') : '';
+}
+
+function isMe(userId) {
+  return !!userId && String(userId).toLowerCase().replace(/-/g, '') === currentUserId();
 }
 
 function projectAccess(project = state.project) {
@@ -466,7 +480,7 @@ const ProjectStudioScreen = {
     `;
   },
 
-  async mount() {
+  async mount(params = {}) {
     const me = await ApiBinary.one('authMeRequest').catch(() => null);
     state.me = me;
     state.isAdmin = false;
@@ -499,6 +513,7 @@ const ProjectStudioScreen = {
     installNotifListener();
     refreshNotifBadge();
     await loadProjects();
+    if (params.projectId) await openProject(params.projectId, params);
   },
 
   unmount() {
@@ -527,6 +542,8 @@ const ProjectStudioScreen = {
     state.listFilter = 'active';
     state.f2 = null;
     state.tasksView = null;
+    state.taskTypes = [];
+    state.localAttachments.clear();
     state.connections = null;
   },
 };
@@ -545,7 +562,9 @@ function closeAllWindows() {
 // =============================================================================
 
 function openWindow({ title, subtitle, icon, width = 640 }) {
+  const lifetime = new AbortController();
   const win = document.createElement('tf-window');
+  win.classList.add('ps-project-window');
   win.setAttribute('title', title);
   if (subtitle) win.setAttribute('subtitle', subtitle);
   win.setAttribute('icon', icon || 'folder');
@@ -568,12 +587,14 @@ function openWindow({ title, subtitle, icon, width = 640 }) {
   document.body.append(backdrop, win);
 
   const cleanup = () => {
+    lifetime.abort();
     if (win.isConnected) win.close(true);
     if (backdrop.isConnected) backdrop.remove();
     state.wins.delete(cleanup);
   };
   state.wins.add(cleanup);
   win.addEventListener('close-request', () => {
+    lifetime.abort();
     if (backdrop.isConnected) backdrop.remove();
     state.wins.delete(cleanup);
   });
@@ -581,7 +602,7 @@ function openWindow({ title, subtitle, icon, width = 640 }) {
     if (e.detail?.action === 'close') cleanup();
   });
 
-  return { win, body, foot, cleanup };
+  return { win, body, foot, cleanup, signal: lifetime.signal };
 }
 
 // Small modal prompt built on tf-window + tf-input (rename flows). Resolves
@@ -976,6 +997,9 @@ function openWizard() {
         <tf-input id="ps-wz-name" label="${escapeAttr(t('wizard_name_label'))}" hint="${escapeAttr(t('wizard_name_hint'))}"></tf-input>
       </div>
       <div class="ps-field" style="margin-bottom:12px;">
+        <tf-input id="ps-wz-prefix" label="${escapeAttr(t('project_key_prefix'))}" hint="${escapeAttr(t('project_key_prefix_hint'))}" maxlength="8"></tf-input>
+      </div>
+      <div class="ps-field" style="margin-bottom:12px;">
         <tf-textarea id="ps-wz-desc" label="${escapeAttr(t('wizard_desc_label'))}" rows="3" hint="${escapeAttr(t('wizard_desc_hint'))}"></tf-textarea>
       </div>
       <div class="ps-field">
@@ -1122,10 +1146,13 @@ function openWizard() {
   const save = async () => {
     const name = String(body.querySelector('#ps-wz-name')?.value ?? '').trim();
     const description = String(body.querySelector('#ps-wz-desc')?.value ?? '').trim();
+    const keyPrefix = body.querySelector('#ps-wz-prefix').value.trim().toUpperCase();
+    if (keyPrefix && !/^[A-Z][A-Z0-9]{1,7}$/.test(keyPrefix)) { showError(t('err_project_key_prefix')); return; }
     try {
       const resp = await ApiBinary.one('projectStudioProjectCreateRequest', {
         name,
         description,
+        keyPrefix,
         template: wz.template,
         modules: [...wz.modules],
         members: wz.members.map((member, index) => ({ userId: member.userId, ...readMemberAccess(body.querySelector(`[data-team-member="${index}"]`)) })),
@@ -1161,6 +1188,12 @@ function openWizard() {
         await save();
       }
     }
+  });
+
+  let prefixEdited = false;
+  body.querySelector('#ps-wz-prefix').addEventListener('input', () => { prefixEdited = true; });
+  body.querySelector('#ps-wz-name').addEventListener('input', () => {
+    if (!prefixEdited) body.querySelector('#ps-wz-prefix').value = projectKeySuggestion(body.querySelector('#ps-wz-name').value);
   });
 
   body.querySelector('[data-template-grid]')?.addEventListener('click', (e) => {
@@ -1300,15 +1333,30 @@ async function openProject(projectId, deep = null) {
   await switchTab(state.tab);
   if (deep?.runId && state.tab === 'tests') await openRunByType(deep.runId, deep.runType);
   else if (deep?.genId && state.tab === 'tests') await openGenDetail(deep.genId);
-  else if (deep?.taskId && state.tab === 'tasks') await openTaskWindow({ taskId: deep.taskId });
+  else if (deep?.taskId && state.tab === 'tasks') await openTaskWindow({ taskId: deep.taskId, eventId: deep.eventId, commentId: deep.commentId });
+  else if (deep?.taskKey && (canArea('tasks') || canArea('board'))) {
+    try {
+      const response = await ApiBinary.one('projectStudioTasksListRequest', { projectId, taskType: '', status: '', assignedTo: '', search: deep.taskKey, severity: '', includeArchived: true, offset: 0, limit: 50 });
+      const task = response.tasks.find((row) => row.task_key === deep.taskKey);
+      if (!task) throw new Error(t('task_key_not_found', { key: deep.taskKey }));
+      await openTaskWindow({ taskId: task.task_id, eventId: deep.eventId, commentId: deep.commentId });
+    } catch (error) { toast(`${t('task_load_failed')}: ${error.message}`, 'error'); }
+  }
+}
+
+function updateProjectRoute(fields = {}) {
+  if (!Router.current()) return;
+  Router.replaceParams({ ...Router.currentParams(), projectId: projectId(), tab: state.tab, taskKey: null, eventId: null, commentId: null, ...fields });
 }
 
 function closeProject() {
+  state.localAttachments.clear();
   stopAllJobTracking();
   stopChatStream();
   stopArchiveJob();
   state.project = null;
   state.connections = null;
+  if (Router.current()) Router.replaceParams({ ...Router.currentParams(), projectId: null, tab: null, taskKey: null, taskId: null, eventId: null, commentId: null });
   const listView = byId('ps-list-view');
   const projectView = byId('ps-project-view');
   if (projectView) { projectView.hidden = true; projectView.innerHTML = ''; }
@@ -1443,6 +1491,7 @@ function selectTab(tab) {
 async function switchTab(tab) {
   if (!projectTabs(projectAccess()).includes(tab)) tab = 'overview';
   state.tab = tab;
+  updateProjectRoute();
   renderTabsValue();
   syncBreadcrumbTab();
   // Leaving the chat tab must not leak the active stream subscription.
@@ -1535,6 +1584,7 @@ async function renderOverview() {
   if (canArea('tasks')) {
     quickActions.push({ id: 'tasks', icon: 'check', name: t('qa_tasks'), sub: t('qa_tasks_sub') });
   }
+  if (canArea('tasks') || canArea('board') || canArea('tests')) quickActions.push({ id: 'storage', icon: 'database', name: t('attachment_usage_title'), sub: t('attachment_usage_hint') });
   if (canArea('chat')) {
     quickActions.push({ id: 'chat', icon: 'message', name: t('qa_chat'), sub: t('qa_chat_sub') });
   }
@@ -1633,6 +1683,7 @@ async function renderOverview() {
       else if (id === 'new-task') openTaskWindow({});
       else if (id === 'chat') selectTab('chat');
       else if (id === 'members') selectTab('members');
+      else if (id === 'storage') openAttachmentUsageWindow();
     });
   });
   panel.querySelector('[data-qa-generate]')?.addEventListener('click', (e) => {
@@ -3869,11 +3920,17 @@ async function renderSettings() {
           hint="${escapeAttr(t('settings_name_hint'))}"></tf-input>
       </div>
       <div class="ps-field" style="margin-bottom:12px;">
+        <tf-input id="ps-set-prefix" label="${escapeAttr(t('project_key_prefix'))}" value="${escapeAttr(fv(state.project, 'key_prefix'))}" maxlength="8" ${fv(state.project, 'key_prefix_locked') ? 'readonly' : ''}
+          hint="${escapeAttr(t(fv(state.project, 'key_prefix_locked') ? 'project_key_prefix_locked' : 'project_key_prefix_hint'))}"></tf-input>
+      </div>
+      <div class="ps-field" style="margin-bottom:12px;">
         <tf-textarea id="ps-set-desc" label="${escapeAttr(t('wizard_desc_label'))}" rows="3"
           hint="${escapeAttr(t('settings_desc_hint'))}"></tf-textarea>
       </div>
       <tf-button variant="primary" icon="check" id="ps-set-save">${escapeHtml(t('settings_save'))}</tf-button>
     </tf-section-card>
+
+    ${projectAccess().enabled_modules?.includes('tasks') ? `<tf-section-card title="${escapeAttr(t('task_types_title'))}" icon="list"><div id="ps-set-task-types" class="ps-task-types"></div></tf-section-card>` : ''}
 
     <tf-section-card title="${escapeAttr(t('settings_modules_title'))}" icon="grid-rows">
       <span slot="subtitle">${escapeHtml(t('settings_modules_hint'))}</span>
@@ -3969,14 +4026,18 @@ async function renderSettings() {
       toast(t('err_name_short'), 'error');
       return;
     }
+    const keyPrefix = fv(state.project, 'key_prefix_locked') ? null : byId('ps-set-prefix').value.trim().toUpperCase();
+    if (keyPrefix !== null && !/^[A-Z][A-Z0-9]{1,7}$/.test(keyPrefix)) { toast(t('err_project_key_prefix'), 'error'); return; }
     try {
-      await ApiBinary.one('projectStudioSettingsSaveRequest', { projectId: projectId(), name, description });
+      await ApiBinary.one('projectStudioSettingsSaveRequest', { projectId: projectId(), name, description, keyPrefix });
       toast(t('settings_saved'), 'success');
       await refreshProjectHeader();
     } catch (err) {
       toast(`${t('settings_save_failed')}: ${err.message}`, 'error');
     }
   });
+
+  if (byId('ps-set-task-types')) await renderTaskTypes(byId('ps-set-task-types'));
 
   // `modules` REPLACES the enabled set server-side, so the full list is read
   // off the toggles; `knowledge` is locked on and always submitted.
@@ -4118,7 +4179,6 @@ async function renderSettings() {
 
 const F2_PAGE_SIZE = 25;
 const GEN_POLL_MS = 3000;
-const ATTACHMENT_MAX_PREVIEW = 8 * 1024 * 1024;
 
 const CASE_STATUS_CHIP = { draft: 'info', review: 'warn', approved: 'ok', deprecated: 'err' };
 const PRIORITY_CHIP = { low: 'info', medium: 'accent', high: 'warn', critical: 'err' };
@@ -4138,6 +4198,12 @@ const NOTIF_KIND_ICON = {
   run_closed: 'check',
   generation_finished: 'sparkle',
   task_assigned: 'edit',
+  task_reassigned: 'users',
+  task_unassigned: 'edit',
+  task_status_changed: 'check',
+  task_mentioned: 'message',
+  task_handed_over: 'send',
+  task_handed_back: 'refresh',
   environment_pending: 'shield',
   environment_decided: 'globe',
 };
@@ -4227,7 +4293,7 @@ async function ensureF2Members() {
   return s.membersCache;
 }
 
-// Members allowed to execute tests (tester and above).
+// Only current test writers can execute an assigned run.
 function testerMembers() {
   return (f2().membersCache || []).filter((member) => member.active && allowsArea(member.access, 'tests', 'write'));
 }
@@ -4237,79 +4303,134 @@ function memberName(userId) {
   return m ? (fv(m, 'display_name') || '') : '';
 }
 
-// Uploads one attachment through the shared chunked-upload channel and returns
-// the AttachmentWire shape stored in attachments_json. The final chunk response
-// carries the content-hash file ref (optionally prefixed with "sha256:").
-async function uploadAttachmentFile(file) {
-  const uploadId = crypto.randomUUID();
-  const buffer = new Uint8Array(await file.arrayBuffer());
-  const totalChunks = Math.max(1, Math.ceil(buffer.length / UPLOAD_CHUNK_BYTES));
-  let fileRef = null;
-  for (let seq = 0; seq < totalChunks; seq += 1) {
-    const chunk = buffer.subarray(seq * UPLOAD_CHUNK_BYTES, Math.min((seq + 1) * UPLOAD_CHUNK_BYTES, buffer.length));
-    const resp = await ApiBinary.one('projectStudioSourceUploadChunkRequest', {
-      projectId: projectId(),
-      uploadId,
-      filename: file.name,
-      mime: file.type || 'application/octet-stream',
-      seq,
-      totalChunks,
-      bytes: chunk,
-    });
-    fileRef = fv(resp, 'file_ref') ?? fileRef;
-  }
-  if (!fileRef) throw new Error(t('upload_no_ref'));
-  return {
-    sha256: String(fileRef).replace(/^sha256:/, ''),
-    name: file.name,
-    size_bytes: file.size,
-    mime: file.type || 'application/octet-stream',
+function attachmentOwner(ownerKind, ownerId, stepIndex = null, pid = projectId()) {
+  return { projectId: pid, ownerKind, ownerId, stepIndex };
+}
+
+async function uploadAttachmentFile(file, options = {}) {
+  const attachment = await uploadProjectAttachment(file, { projectId: projectId(), userId: currentUserId(), ...options });
+  state.localAttachments.set(`${projectId()}:${attachment.sha256}`, file);
+  return attachment;
+}
+
+function attachmentError(error) {
+  return ['attachment_stream_reload', 'attachment_resume_file_mismatch'].includes(error.message) ? t(error.message) : error.message;
+}
+
+async function openAttachmentPreview(attachment, owner) {
+  const localFile = owner.ownerId ? null : state.localAttachments.get(`${owner.projectId}:${attachment.sha256}`);
+  if (!owner.ownerId && !localFile) { toast(t('attachment_save_first'), 'info'); return; }
+  const { body, foot, cleanup, signal } = openWindow({ title: attachment.name, subtitle: `${attachment.mime} · ${formatBytes(attachment.size_bytes)}`, icon: attachment.mime.startsWith('video/') ? 'play' : 'paperclip', width: 900 });
+  body.innerHTML = `<div class="ps-att-preview" data-preview-media></div><div class="ps-field-hint" data-preview-status></div><tf-button variant="ghost" icon="refresh" data-preview-retry hidden>${escapeHtml(t('attachment_preview_retry'))}</tf-button><div data-download-progress></div><div class="ps-form-error" data-form-error hidden></div>`;
+  foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="primary" icon="download" data-action="download">${escapeHtml(t('attachment_download_original'))}</tf-button><tf-button variant="ghost" data-action="close">${escapeHtml(t('action_close'))}</tf-button></div>`;
+  const media = body.querySelector('[data-preview-media]');
+  const status = body.querySelector('[data-preview-status]');
+  const retry = body.querySelector('[data-preview-retry]');
+  const errorEl = body.querySelector('[data-form-error]');
+  let stream = null;
+  let localUrl = null;
+  let pollTimer = null;
+  let closed = false;
+  const stop = () => {
+    if (closed) return;
+    closed = true; clearTimeout(pollTimer);
+    const player = media.querySelector('tf-video-stream');
+    player?.mediaElement?.pause();
+    if (player) player.remove();
+    media.querySelector('img')?.removeAttribute('src');
+    stream?.close(); if (localUrl) URL.revokeObjectURL(localUrl);
   };
-}
-
-async function fetchAttachmentBlob(att) {
-  const resp = await ApiBinary.one('projectStudioAttachmentGetRequest', {
-    projectId: projectId(),
-    sha256: fv(att, 'sha256'),
-    maxBytes: ATTACHMENT_MAX_PREVIEW,
-  });
-  const bytes = resp.bytes instanceof Uint8Array ? resp.bytes : new Uint8Array(resp.bytes || []);
-  const mime = resp.mime || fv(att, 'mime') || 'application/octet-stream';
-  return { blob: new Blob([bytes], { type: mime }), mime, truncated: !!resp.truncated };
-}
-
-// Preview window for images / plain text; other mime types download directly.
-async function openAttachmentPreview(att) {
-  let fetched = null;
-  try {
-    fetched = await fetchAttachmentBlob(att);
-  } catch (err) {
-    toast(`${t('attachment_failed')}: ${err.message}`, 'error');
-    return;
-  }
-  const url = URL.createObjectURL(fetched.blob);
-  const name = fv(att, 'name') || 'attachment';
-  if (fetched.mime.startsWith('image/')) {
-    const { body, foot, cleanup } = openWindow({ title: name, subtitle: fetched.mime, icon: 'image', width: 820 });
-    body.innerHTML = `<div class="ps-att-preview"><img alt="${escapeAttr(name)}"></div>`;
-    body.querySelector('img').src = url;
-    foot.innerHTML = `
-      <div class="ps-footer-left"></div>
-      <div class="ps-footer-right">
-        <tf-button variant="ghost" icon="download" data-action="download">${escapeHtml(t('attachment_download'))}</tf-button>
-        <tf-button variant="ghost" data-action="close-att">${escapeHtml(t('action_close'))}</tf-button>
-      </div>
-    `;
-    foot.addEventListener('click', (e) => {
-      const btn = e.target.closest('[data-action]');
-      if (!btn) return;
-      if (btn.dataset.action === 'download') downloadUrl(url, name);
-      else { cleanup(); URL.revokeObjectURL(url); }
+  signal.addEventListener('abort', stop);
+  const fail = (error) => { errorEl.hidden = false; errorEl.textContent = `${t('attachment_failed')}: ${attachmentError(error)}`; };
+  const showSource = (url, mime) => {
+    if (mime.startsWith('image/')) { media.innerHTML = `<img alt="${escapeAttr(attachment.name)}">`; media.querySelector('img').src = url; return; }
+    const player = document.createElement('tf-video-stream');
+    player.setAttribute('src', url); player.setAttribute('controls', ''); player.setAttribute('height-px', '420');
+    player.addEventListener('media-error', () => {
+      status.textContent = t('attachment_video_error'); retry.hidden = !owner.ownerId;
     });
-    return;
-  }
-  downloadUrl(url, name);
-  setTimeout(() => URL.revokeObjectURL(url), 30000);
+    media.replaceChildren(player);
+  };
+  const convertedPreview = async (explicitRetry = false) => {
+    clearTimeout(pollTimer); retry.hidden = true; errorEl.hidden = true;
+    try {
+      const result = await ApiBinary.one('projectStudioAttachmentPreviewRequest', { ...owner, sha256: attachment.sha256, retry: explicitRetry });
+      if (closed) return;
+      if (result.status === 'ready') {
+        const next = await openAttachmentStream(owner, attachment, { preview: true });
+        if (closed) { next.close(); return; }
+        stream?.close(); stream = next; showSource(next.url, result.mime);
+        status.textContent = t('attachment_preview_ready', { duration: taskDuration(Number(result.duration_ms) / 1000, t) });
+      } else if (result.status === 'error') {
+        status.textContent = `${t('attachment_preview_error')}: ${result.error}`; retry.hidden = false;
+      } else {
+        status.textContent = t(`attachment_preview_${result.status}`);
+        pollTimer = setTimeout(() => convertedPreview(), 2500);
+      }
+    } catch (error) { if (!closed) { fail(error); retry.hidden = false; } }
+  };
+  retry.addEventListener('click', () => convertedPreview(true));
+  const startPreview = async () => {
+    if (attachment.mime.startsWith('image/') || attachment.mime.startsWith('video/')) {
+    if (localFile) {
+      localUrl = URL.createObjectURL(localFile); showSource(localUrl, attachment.mime);
+      if (!owner.ownerId && attachment.mime.startsWith('video/')) status.textContent = t('attachment_save_first');
+    } else if (attachment.mime.startsWith('video/')) convertedPreview();
+    else {
+      try { stream = await openAttachmentStream(owner, attachment); if (!closed) showSource(stream.url, stream.mime); else stream.close(); }
+      catch (error) { if (!closed) fail(error); }
+    }
+    } else status.textContent = t('attachment_download_hint');
+  };
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]');
+    if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'close') { stop(); cleanup(); return; }
+    if (localFile) {
+      const url = URL.createObjectURL(localFile); downloadUrl(url, attachment.name); setTimeout(() => URL.revokeObjectURL(url), 30000); return;
+    }
+    button.setAttribute('disabled', '');
+    try {
+      const download = await downloadProjectAttachment(owner, attachment);
+      const progress = body.querySelector('[data-download-progress]');
+      progress.innerHTML = `<div class="ps-task-comment-tools"><span>${escapeHtml(t('attachment_download_started'))}</span><tf-button variant="ghost" data-download-cancel>${escapeHtml(t('action_cancel'))}</tf-button></div>`;
+      progress.querySelector('[data-download-cancel]').addEventListener('click', () => { download.close(); progress.textContent = t('attachment_download_canceled'); });
+      download.onProgress = ({ offset, total }) => {
+        const caption = progress.querySelector('span');
+        if (caption) caption.textContent = t('attachment_upload_bytes', { done: formatBytes(offset), total: formatBytes(total) });
+      };
+      download.onComplete = () => { if (progress.isConnected) progress.textContent = t('attachment_download_complete'); };
+      download.onCancel = () => { if (progress.isConnected) progress.textContent = t('attachment_download_canceled'); };
+      download.onError = (error) => { if (progress.isConnected) { progress.textContent = t('attachment_download_failed'); fail(error); } };
+    } catch (error) { fail(error); }
+    finally { button.removeAttribute('disabled'); }
+  });
+  startPreview();
+}
+
+function renderTaskAttachmentGallery(host, attachments, owner, { removable, onRemove }) {
+  const streams = [];
+  host.innerHTML = attachments.length ? attachments.map((attachment, index) => `<div class="ps-task-attachment"><div class="ps-task-attachment-image" data-gallery-image="${index}" ${attachment.mime.startsWith('image/') ? '' : 'hidden'}></div><div class="ps-task-attachment-meta"><b>${escapeHtml(attachment.name)}</b><span>${escapeHtml(attachment.mime)} · ${formatBytes(attachment.size_bytes)}</span></div><div class="ps-task-attachment-actions"><tf-button variant="ghost" size="sm" icon="${attachment.mime.startsWith('video/') ? 'play' : 'external-link'}" data-att-preview="${index}" title="${escapeAttr(t('kb_preview'))}">${escapeHtml(t('kb_preview'))}</tf-button>${removable ? `<tf-button variant="ghost" size="sm" icon="trash" data-att-remove="${index}" title="${escapeAttr(t('attachment_remove'))}"></tf-button>` : ''}</div></div>`).join('') : `<span class="ps-field-hint">${escapeHtml(t('attachments_empty'))}</span>`;
+  let disposed = false;
+  const showImage = async (cell) => {
+    if (cell.dataset.loaded) return;
+    cell.dataset.loaded = 'true';
+    const attachment = attachments[Number(cell.dataset.galleryImage)];
+    const localFile = owner.ownerId ? null : state.localAttachments.get(`${owner.projectId}:${attachment.sha256}`);
+    let url;
+    try {
+      if (localFile) { url = URL.createObjectURL(localFile); streams.push({ close: () => URL.revokeObjectURL(url) }); }
+      else if (owner.ownerId) { const stream = await openAttachmentStream(owner, attachment); if (disposed) { stream.close(); return; } streams.push(stream); url = stream.url; }
+      else return;
+      if (disposed || !cell.isConnected) return;
+      const image = document.createElement('img'); image.alt = attachment.name; image.loading = 'lazy'; image.src = url; cell.replaceChildren(image);
+    } catch { cell.hidden = true; }
+  };
+  const observer = typeof IntersectionObserver === 'function' ? new IntersectionObserver((entries) => { for (const entry of entries) if (entry.isIntersecting) { observer.unobserve(entry.target); showImage(entry.target); } }) : null;
+  host.querySelectorAll('[data-gallery-image]:not([hidden])').forEach((cell) => { if (observer) observer.observe(cell); else showImage(cell); });
+  host.querySelectorAll('[data-att-preview]').forEach((button) => button.addEventListener('click', () => openAttachmentPreview(attachments[Number(button.dataset.attPreview)], owner)));
+  host.querySelectorAll('[data-att-remove]').forEach((button) => button.addEventListener('click', () => onRemove(Number(button.dataset.attRemove))));
+  return () => { disposed = true; observer?.disconnect(); for (const stream of streams) stream.close(); };
 }
 
 function downloadUrl(url, name) {
@@ -4488,8 +4609,6 @@ async function renderCasesView() {
   if (state.tab !== 'tests' || s.view !== 'cases') return;
   const flt = s.cases.filters;
 
-  const selectOpt = (value, current, label) =>
-    `<option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(label)}</option>`;
 
   host.innerHTML = `
     <div class="ps-tests-toolbar">
@@ -5295,7 +5414,7 @@ function renderCaseAttachments(editable) {
     ? ed.attachments.map((att, i) => attachmentRowHtml(att, i, { removable: editable })).join('')
     : `<div class="ps-field-hint">${escapeHtml(t('attachments_empty'))}</div>`;
   host.querySelectorAll('[data-att-preview]').forEach((btn) => {
-    btn.addEventListener('click', () => openAttachmentPreview(ed.attachments[Number(btn.dataset.attPreview)]));
+    btn.addEventListener('click', () => openAttachmentPreview(ed.attachments[Number(btn.dataset.attPreview)], attachmentOwner('case', ed.caseId)));
   });
   host.querySelectorAll('[data-att-remove]').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -5885,6 +6004,7 @@ async function saveCaseFromEditor() {
       changeNote: ed.changeNote,
     });
     ed.caseId = fv(resp, 'case_id') || ed.caseId;
+    acknowledgeAttachmentUploads(projectId(), currentUserId(), ed.attachments);
     ed.changeNote = '';
     toast(t('case_saved', { version: Number(resp.version ?? 1) }), 'success');
     ed.loaded = false;
@@ -6706,8 +6826,6 @@ async function renderEnvironmentsView() {
   }
   if (state.tab !== 'tests' || s.view !== 'environments') return;
 
-  const selectOpt = (value, current, label) =>
-    `<option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(label)}</option>`;
 
   host.innerHTML = `
     <div class="ps-tests-toolbar">
@@ -8455,12 +8573,12 @@ function buildRunItemExpansion(item) {
       <div class="ps-exp-atts" data-exp-atts></div>
     `;
     const allAtts = [
-      ...itemAtts,
-      ...steps.flatMap((st) => (Array.isArray(st.attachments) ? st.attachments : [])),
+      ...itemAtts.map((att) => ({ att, owner: attachmentOwner('run_item', fv(item, 'item_id')) })),
+      ...steps.flatMap((step) => (Array.isArray(step.attachments) ? step.attachments : []).map((att) => ({ att, owner: attachmentOwner('run_step', fv(item, 'item_id'), fv(step, 'step_index')) }))),
     ];
     const attHost = wrap.querySelector('[data-exp-atts]');
     if (attHost && allAtts.length) {
-      for (const att of allAtts) {
+      for (const { att, owner } of allAtts) {
         const mime = fv(att, 'mime') || '';
         const cell = document.createElement('div');
         cell.className = 'ps-exp-att';
@@ -8469,13 +8587,17 @@ function buildRunItemExpansion(item) {
           const img = document.createElement('img');
           img.alt = fv(att, 'name') || '';
           cell.appendChild(img);
-          fetchAttachmentBlob(att).then(({ blob }) => {
-            if (img.isConnected || cell.isConnected) img.src = URL.createObjectURL(blob);
+          openAttachmentStream(owner, att).then((stream) => {
+            if (img.isConnected || cell.isConnected) {
+              img.src = stream.url;
+              const observer = new MutationObserver(() => { if (!cell.isConnected) { stream.close(); observer.disconnect(); } });
+              observer.observe(document.body, { childList: true, subtree: true });
+            } else stream.close();
           }).catch(() => { cell.textContent = fv(att, 'name') || ''; });
         } else {
           cell.textContent = fv(att, 'name') || '';
         }
-        cell.addEventListener('click', () => openAttachmentPreview(att));
+        cell.addEventListener('click', () => openAttachmentPreview(att, owner));
         attHost.appendChild(cell);
       }
     }
@@ -9371,7 +9493,7 @@ function renderExecSteps() {
     chipEl.addEventListener('click', () => {
       const [i, ai] = chipEl.dataset.stepAttOpen.split(':').map(Number);
       const att = ex.steps[i]?.attachments[ai];
-      if (att) openAttachmentPreview(att);
+      if (att) openAttachmentPreview(att, attachmentOwner('run_step', ex.itemId, ex.steps[i].index));
     });
   });
 }
@@ -9392,6 +9514,7 @@ async function sendExecStep(i, status) {
       attachmentsJson: JSON.stringify(step.attachments),
     });
     step.status = status;
+    acknowledgeAttachmentUploads(projectId(), currentUserId(), step.attachments);
     step.pendingStatus = '';
     renderExecSteps();
     updateExecProgress();
@@ -9418,7 +9541,7 @@ function renderExecItemAtts() {
     ? ex.attachments.map((att, i) => attachmentRowHtml(att, i, { removable: true })).join('')
     : `<div class="ps-field-hint">${escapeHtml(t('attachments_empty'))}</div>`;
   host.querySelectorAll('[data-att-preview]').forEach((btn) => {
-    btn.addEventListener('click', () => openAttachmentPreview(ex.attachments[Number(btn.dataset.attPreview)]));
+    btn.addEventListener('click', () => openAttachmentPreview(ex.attachments[Number(btn.dataset.attPreview)], attachmentOwner('run_item', ex.itemId)));
   });
   host.querySelectorAll('[data-att-remove]').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -9473,6 +9596,7 @@ async function finishExecItem() {
     return;
   }
   toast(t('exec_finished'), 'success');
+  acknowledgeAttachmentUploads(projectId(), currentUserId(), ex.attachments);
   const next = fv(resp, 'next_item');
   if (next) {
     const goNext = await TfWindow.confirm({
@@ -10167,7 +10291,75 @@ function renderTesterActivityReport() {
 // =============================================================================
 
 function taskNoLabel(task) {
-  return `${task.task_type === 'defect' || fv(task, 'task_type') === 'defect' ? 'D' : 'T'}-${fv(task, 'task_no')}`;
+  return fv(task, 'task_key');
+}
+
+async function loadTaskTypes() {
+  const response = await ApiBinary.one('projectStudioTaskTypesListRequest', { projectId: projectId() });
+  state.taskTypes = response.types;
+  return state.taskTypes;
+}
+
+function taskTypeName(typeId) {
+  const type = state.taskTypes.find((entry) => fv(entry, 'type_id') === typeId);
+  return type ? taskTypeLabel(type, t) : t('task_history_unavailable_type');
+}
+
+async function renderTaskTypes(host) {
+  if (!host) return;
+  try { await loadTaskTypes(); }
+  catch (error) { host.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('task_types_failed')}: ${error.message}`)}</div>`; return; }
+  const mutable = canArea('tasks', 'admin');
+  host.classList.add('ps-task-types');
+  host.innerHTML = `<div class="ps-members-toolbar"><span class="ps-field-hint">${escapeHtml(t('task_types_hint'))}</span>${mutable ? `<tf-button variant="primary" icon="plus" data-new-type>${escapeHtml(t('task_type_new'))}</tf-button>` : ''}</div><tf-table><tf-column key="name" label="${escapeAttr(t('task_type_name'))}" renderer="html"></tf-column><tf-column key="description" label="${escapeAttr(t('task_type_description'))}"></tf-column><tf-column key="active" label="${escapeAttr(t('task_type_state'))}" renderer="chip"></tf-column><tf-column key="order" label="${escapeAttr(t('task_type_order'))}" renderer="num"></tf-column></tf-table>`;
+  const table = host.querySelector('tf-table');
+  table.rows = state.taskTypes.map((type) => ({ _id: type.type_id, name: `<div class="ps-task-type-name">${escapeHtml(taskTypeLabel(type, t))}</div><div class="ps-field-hint">${escapeHtml(t(type.built_in ? 'task_type_builtin' : 'task_type_custom'))} · ${escapeHtml(type.type_id)}</div>`, description: taskTypeDescription(type, t), active: chipCell(type.active ? 'ok' : 'info', t(type.active ? 'task_type_active' : 'task_type_inactive')), order: type.sort_order }));
+  table.rowActions = (row) => {
+    const type = state.taskTypes.find((entry) => entry.type_id === row._id);
+    if (!mutable || type.built_in) return null;
+    const button = document.createElement('tf-button');
+    button.setAttribute('variant', 'ghost'); button.setAttribute('size', 'sm'); button.setAttribute('icon', 'more'); button.setAttribute('title', t('action_more'));
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      openActionMenu(button, [
+        { id: 'edit', label: t('action_edit'), icon: 'edit', run: () => openTaskTypeEditor(type, () => renderTaskTypes(host)) },
+        { id: 'active', label: t(type.active ? 'task_type_deactivate' : 'task_type_activate'), icon: type.active ? 'pause' : 'play', run: async () => {
+          try { await ApiBinary.one('projectStudioTaskTypeSaveRequest', { projectId: projectId(), typeId: type.type_id, name: type.name, description: type.description, sortOrder: type.sort_order, active: !type.active }); await renderTaskTypes(host); }
+          catch (error) { toast(`${t('task_types_failed')}: ${error.message}`, 'error'); }
+        } },
+      ]);
+    });
+    return button;
+  };
+  host.querySelector('[data-new-type]')?.addEventListener('click', () => openTaskTypeEditor(null, () => renderTaskTypes(host)));
+}
+
+function openTaskTypesWindow() {
+  if (!canArea('tasks', 'admin')) return;
+  const { body, foot, cleanup } = openWindow({ title: t('task_types_title'), icon: 'list', width: 980 });
+  foot.innerHTML = `<div></div><tf-button variant="ghost" data-action="close">${escapeHtml(t('action_close'))}</tf-button>`;
+  foot.querySelector('[data-action]').addEventListener('click', cleanup);
+  renderTaskTypes(body);
+}
+
+function openTaskTypeEditor(type, onSaved) {
+  if (!canArea('tasks', 'admin') || type?.built_in) return;
+  const { body, foot, cleanup } = openWindow({ title: t(type ? 'task_type_edit' : 'task_type_new'), icon: 'list', width: 600 });
+  body.innerHTML = `<tf-input id="ps-type-id" label="${escapeAttr(t('task_type_id'))}" hint="${escapeAttr(t('task_type_id_hint'))}" value="${escapeAttr(type?.type_id || '')}" ${type ? 'readonly' : ''}></tf-input><tf-input id="ps-type-name" label="${escapeAttr(t('task_type_name'))}" value="${escapeAttr(type?.name || '')}"></tf-input><tf-textarea id="ps-type-desc" label="${escapeAttr(t('task_type_description'))}" rows="3"></tf-textarea><tf-input id="ps-type-order" type="number" min="0" label="${escapeAttr(t('task_type_order'))}" value="${type?.sort_order ?? (Math.max(0, ...state.taskTypes.map((entry) => entry.sort_order)) + 10)}"></tf-input><div class="ps-toggle-inline"><tf-toggle id="ps-type-active" ${!type || type.active ? 'checked' : ''}></tf-toggle><span>${escapeHtml(t('task_type_active'))}</span></div><div class="ps-form-error" data-form-error hidden></div>`;
+  body.querySelector('#ps-type-desc').value = type?.description || '';
+  foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]');
+    if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    const typeId = body.querySelector('#ps-type-id').value.trim();
+    const name = body.querySelector('#ps-type-name').value.trim();
+    const errorEl = body.querySelector('[data-form-error]');
+    if (!/^[a-z][a-z0-9_]{1,31}$/.test(typeId) || !name || name.length > 80 || body.querySelector('#ps-type-desc').value.length > 500) { errorEl.hidden = false; errorEl.textContent = t('err_task_type'); return; }
+    button.setAttribute('disabled', '');
+    try { await ApiBinary.one('projectStudioTaskTypeSaveRequest', { projectId: projectId(), typeId, name, description: body.querySelector('#ps-type-desc').value.trim(), sortOrder: Number(body.querySelector('#ps-type-order').value), active: body.querySelector('#ps-type-active').hasAttribute('checked') }); await onSaved(); cleanup(); }
+    catch (error) { button.removeAttribute('disabled'); errorEl.hidden = false; errorEl.textContent = `${t('task_types_failed')}: ${error.message}`; }
+  });
 }
 
 async function loadTasksPage() {
@@ -10179,6 +10371,7 @@ async function loadTasksPage() {
     assignedTo: tv.filters.mine ? 'me' : '',
     search: tv.filters.search,
     severity: tv.filters.severity,
+    includeArchived: tv.filters.includeArchived,
     offset: (tv.page - 1) * F2_PAGE_SIZE,
     limit: F2_PAGE_SIZE,
   });
@@ -10197,6 +10390,7 @@ async function loadTasksBoard() {
     assignedTo: tv.filters.mine ? 'me' : '',
     search: tv.filters.search,
     severity: tv.filters.severity,
+    includeArchived: tv.filters.includeArchived,
     offset: 0,
     limit: BOARD_PAGE_SIZE,
   });
@@ -10212,6 +10406,7 @@ async function renderTasksTab() {
   const board = tv.mode === 'board';
   await ensureF2Members();
   try {
+    await loadTaskTypes();
     if (board) await loadTasksBoard();
     else await loadTasksPage();
   } catch (err) {
@@ -10227,11 +10422,10 @@ async function renderTasksTab() {
         <option value="board" ${canArea('board') ? '' : 'disabled'}>${escapeHtml(t('tasks_view_board'))}</option>
       </tf-segmented>
       <tf-searchbox id="ps-tasks-search" placeholder="${escapeAttr(t('tasks_search_placeholder'))}" debounce="300" value="${escapeAttr(tv.filters.search)}"></tf-searchbox>
-      <tf-segmented id="ps-tasks-f-type" value="${escapeAttr(tv.filters.type || 'all')}">
-        <option value="all">${escapeHtml(t('tasks_filter_all'))}</option>
-        <option value="task">${escapeHtml(t('task_type_task'))}</option>
-        <option value="defect">${escapeHtml(t('task_type_defect'))}</option>
-      </tf-segmented>
+      <tf-select id="ps-tasks-f-type" label="${escapeAttr(t('tasks_col_type'))}" value="${escapeAttr(tv.filters.type)}">
+        <option value="">${escapeHtml(t('tasks_filter_all'))}</option>
+        ${state.taskTypes.map((type) => `<option value="${escapeAttr(type.type_id)}" ${type.type_id === tv.filters.type ? 'selected' : ''}>${escapeHtml(taskTypeLabel(type, t))}</option>`).join('')}
+      </tf-select>
       ${board ? '' : `
         <tf-select id="ps-tasks-f-status" value="${escapeAttr(tv.filters.status)}">
           <option value="" ${tv.filters.status === '' ? 'selected' : ''}>${escapeHtml(t('tasks_filter_status_all'))}</option>
@@ -10246,7 +10440,13 @@ async function renderTasksTab() {
         <tf-toggle id="ps-tasks-f-mine" ${tv.filters.mine ? 'checked' : ''}></tf-toggle>
         <span>${escapeHtml(t('tasks_filter_mine'))}</span>
       </div>
+      <div class="ps-toggle-inline">
+        <tf-toggle id="ps-tasks-f-archived" ${tv.filters.includeArchived ? 'checked' : ''}></tf-toggle>
+        <span>${escapeHtml(t('tasks_filter_archived'))}</span>
+      </div>
       <span class="ps-toolbar-spacer"></span>
+      <tf-button variant="ghost" icon="database" id="ps-tasks-storage">${escapeHtml(t('attachment_usage_title'))}</tf-button>
+      ${canArea('tasks', 'admin') ? `<tf-button variant="ghost" icon="settings" id="ps-tasks-types">${escapeHtml(t('task_types_title'))}</tf-button>` : ''}
       ${canCreateTask(projectAccess()) ? `<tf-button variant="primary" icon="plus" id="ps-tasks-new">${escapeHtml(t('tasks_new'))}</tf-button>` : ''}
     </div>
     <div id="ps-tasks-table-host">
@@ -10264,14 +10464,16 @@ async function renderTasksTab() {
   });
   byId('ps-tasks-search')?.addEventListener('search', (e) => { tv.filters.search = String(e.detail?.value ?? ''); reload(); });
   byId('ps-tasks-f-type')?.addEventListener('change', (e) => {
-    const v = e.detail?.value ?? 'all';
-    tv.filters.type = v === 'all' ? '' : v;
+    tv.filters.type = e.detail?.value ?? '';
     reload();
   });
   byId('ps-tasks-f-status')?.addEventListener('change', (e) => { tv.filters.status = e.detail?.value ?? e.target.value ?? ''; reload(); });
   byId('ps-tasks-f-mine')?.addEventListener('change', (e) => { tv.filters.mine = !!(e.detail?.checked ?? e.target.checked); reload(); });
+  byId('ps-tasks-f-archived')?.addEventListener('change', (e) => { tv.filters.includeArchived = !!(e.detail?.checked ?? e.target.checked); reload(); });
   byId('ps-tasks-f-severity')?.addEventListener('change', (e) => { tv.filters.severity = e.detail?.value ?? ''; reload(); });
   byId('ps-tasks-new')?.addEventListener('click', () => openTaskWindow({}));
+  byId('ps-tasks-types')?.addEventListener('click', () => openTaskTypesWindow());
+  byId('ps-tasks-storage')?.addEventListener('click', () => openAttachmentUsageWindow());
 
   if (board) {
     if (tv.boardRows.length) renderTaskBoard();
@@ -10300,12 +10502,12 @@ async function renderTasksTab() {
         _id: fv(task, 'task_id'),
         no: taskNoLabel(task),
         title: task.title,
-        type: chipCell(type === 'defect' ? 'err' : 'info', t(`task_type_${type}`)),
+        type: chipCell(type === 'defect' ? 'err' : 'info', taskTypeName(type)),
         severity: task.severity
           ? chipCell(PRIORITY_CHIP[task.severity], t(`sev_${task.severity}`))
           : chipCell('info', '—'),
         priority: chipCell(PRIORITY_CHIP[task.priority], t(`prio_${task.priority}`)),
-        status: chipCell(TASK_STATUS_CHIP[task.status], t(`task_status_${task.status}`)),
+        status: task.archived_at ? chipCell('warn', t('task_archived')) : chipCell(TASK_STATUS_CHIP[task.status], t(`task_status_${task.status}`)),
         assignee: fv(task, 'assigned_to_name') || '—',
         due: fv(task, 'due_date') || '—',
         links: taskLinkLabels(task),
@@ -10354,347 +10556,564 @@ function syncTasksFooter() {
 // opts: { taskId } opens an existing task; without taskId the window is a
 // creation form ({ taskType?, links?, titlePrefill?, status? } — the tester
 // desk prefills defect links, the kanban prefills the column).
+function openAttachmentUsageWindow() {
+  if (!(canArea('tasks') || canArea('board') || canArea('tests'))) return;
+  const pid = projectId();
+  const { body, foot, cleanup } = openWindow({ title: t('attachment_usage_title'), icon: 'database', width: 960 });
+  let offset = 0;
+  const limit = 25;
+  foot.innerHTML = `<div></div><tf-button variant="ghost" data-action="close">${escapeHtml(t('action_close'))}</tf-button>`;
+  foot.querySelector('[data-action]').addEventListener('click', cleanup);
+  const load = async () => {
+    try {
+      const result = await ApiBinary.one('projectStudioAttachmentUsageRequest', { projectId: pid, offset, limit });
+      if (!body.isConnected) return;
+      body.innerHTML = `<div class="ps-attachment-usage-summary"><tf-stat-card label="${escapeAttr(t('attachment_usage_total'))}" value="${escapeAttr(formatBytes(Number(result.total_bytes)))}"></tf-stat-card><tf-stat-card label="${escapeAttr(t('attachment_usage_files'))}" value="${Number(result.file_count)}"></tf-stat-card><tf-stat-card label="${escapeAttr(t('attachment_usage_available'))}" value="${escapeAttr(result.available_bytes == null ? t('attachment_usage_unavailable') : formatBytes(Number(result.available_bytes)))}" accent="${result.warning ? 'danger' : 'info'}"></tf-stat-card></div>${result.warning ? `<div class="ps-form-error">${escapeHtml(t('attachment_usage_warning'))}</div>` : ''}${Number(result.missing_files) ? `<div class="ps-form-error">${escapeHtml(t('attachment_usage_missing', { count: result.missing_files }))}</div>` : ''}<span class="ps-field-hint">${escapeHtml(t('attachment_usage_shared'))}</span><tf-section-card title="${escapeAttr(t('attachment_usage_largest'))}" icon="paperclip"><tf-table data-largest><tf-column key="name" label="${escapeAttr(t('attachment_usage_file'))}"></tf-column><tf-column key="task" label="${escapeAttr(t('attachment_usage_owner'))}"></tf-column><tf-column key="size" label="${escapeAttr(t('attachment_usage_size'))}"></tf-column></tf-table></tf-section-card><tf-section-card title="${escapeAttr(t('attachment_usage_tasks'))}" icon="list"><tf-table data-per-task page-size="${limit}" page="${offset / limit + 1}" total="${result.total_tasks}"><tf-column key="key" label="${escapeAttr(t('attachment_usage_task'))}"></tf-column><tf-column key="count" label="${escapeAttr(t('attachment_usage_files'))}" renderer="num"></tf-column><tf-column key="size" label="${escapeAttr(t('attachment_usage_size'))}"></tf-column></tf-table></tf-section-card><div class="ps-field-hint">${escapeHtml(t('attachment_usage_no_retention'))}</div><div class="ps-form-error" data-form-error hidden></div>`;
+      const files = body.querySelector('[data-largest]');
+      files.rows = result.largest.map((file, index) => ({ _id: index, name: file.filename, task: file.task_key || t(`attachment_owner_${file.owner_kind}`), size: formatBytes(Number(file.size_bytes)) }));
+      files.rowActions = (row) => {
+        const file = result.largest[row._id];
+        const button = document.createElement('tf-button'); button.setAttribute('variant', 'ghost'); button.setAttribute('size', 'sm'); button.setAttribute('icon', 'download'); button.setAttribute('title', t('attachment_download_original'));
+        button.addEventListener('click', async (event) => {
+          event.stopPropagation(); button.setAttribute('disabled', '');
+          try { await downloadProjectAttachment(attachmentOwner(file.owner_kind, file.owner_id, file.step_index, pid), { sha256: file.sha256, name: file.filename }); }
+          catch (error) { const el = body.querySelector('[data-form-error]'); el.hidden = false; el.textContent = attachmentError(error); }
+          finally { button.removeAttribute('disabled'); }
+        });
+        return button;
+      };
+      const tasks = body.querySelector('[data-per-task]');
+      tasks.rows = result.per_task.map((task) => ({ _id: task.task_id, key: task.task_key, count: Number(task.file_count), size: formatBytes(Number(task.total_bytes)) }));
+      tasks.addEventListener('page-change', (event) => { offset = (Number(event.detail.page) - 1) * limit; load(); });
+      tasks.addEventListener('row-click', (event) => { if (event.detail.row?._id && (canArea('tasks') || canArea('board'))) { cleanup(); openTaskWindow({ taskId: event.detail.row._id }); } });
+    } catch (error) { body.innerHTML = `<div class="ps-form-error">${escapeHtml(`${t('attachment_usage_failed')}: ${error.message}`)}</div>`; }
+  };
+  load();
+}
+
+function wireTaskUploads({ body, foot, signal, attachments, onAdded, pid }) {
+  const host = body.querySelector('#ps-task-uploads');
+  if (!host) return { get busy() { return false; }, close() {} };
+  const userId = currentUserId();
+  const active = new Map();
+  let closed = false;
+  const showError = (error) => { const el = body.querySelector('[data-form-error]'); if (!el || closed) return; el.hidden = false; el.textContent = `${t('attachment_upload_failed')}: ${attachmentError(error)}`; };
+  const syncSave = () => { const button = foot.querySelector('[data-action="save"]'); if (active.size) button?.setAttribute('disabled', ''); else button?.removeAttribute('disabled'); };
+  const renderPending = () => {
+    if (closed) return;
+    host.querySelectorAll('[data-pending-upload]').forEach((row) => row.remove());
+    const selected = new Set(attachments.map((attachment) => attachment.sha256));
+    for (const record of pendingAttachmentUploads(pid, userId)) {
+      if ([...active.values()].some((operation) => operation.uploadId === record.uploadId) || record.complete && selected.has(record.sha256)) continue;
+      const row = document.createElement('div'); row.className = 'ps-upload-row'; row.dataset.pendingUpload = record.uploadId;
+      row.innerHTML = `<b>${escapeHtml(record.filename)}</b><span class="ps-field-hint">${escapeHtml(t(record.complete ? 'attachment_upload_recoverable' : 'attachment_upload_resume_hint'))}</span><tf-progress-bar value="${record.totalSize ? Math.floor(record.nextOffset / record.totalSize * 100) : record.complete ? 100 : 0}" label="${escapeAttr(`${formatBytes(record.nextOffset)} / ${formatBytes(record.totalSize)}`)}"></tf-progress-bar><div class="ps-task-comment-tools">${record.complete ? `<tf-button variant="primary" data-upload-recover>${escapeHtml(t('attachment_upload_recover'))}</tf-button>` : `<tf-file-input data-upload-resume label="${escapeAttr(t('attachment_upload_resume'))}"></tf-file-input>`}<tf-button variant="ghost" icon="refresh" data-upload-status>${escapeHtml(t('attachment_upload_status'))}</tf-button><tf-button variant="ghost" icon="trash" data-upload-cancel>${escapeHtml(t('attachment_upload_cancel'))}</tf-button></div><span class="ps-form-error" data-upload-error hidden></span>`;
+      const fail = (error) => { const el = row.querySelector('[data-upload-error]'); el.hidden = false; el.textContent = attachmentError(error); };
+      row.querySelector('[data-upload-resume]')?.addEventListener('change', (event) => { const file = event.detail?.files?.[0]; if (file) startUpload(file, record.uploadId); });
+      row.querySelector('[data-upload-status]').addEventListener('click', async (event) => {
+        const button = event.currentTarget; button.setAttribute('disabled', '');
+        try { await refreshAttachmentUpload(record); renderPending(); } catch (error) { fail(error); button.removeAttribute('disabled'); }
+      });
+      row.querySelector('[data-upload-cancel]').addEventListener('click', async (event) => {
+        const button = event.currentTarget; button.setAttribute('disabled', '');
+        try { await cancelAttachmentUpload(pid, record.uploadId); renderPending(); } catch (error) { fail(error); button.removeAttribute('disabled'); }
+      });
+      row.querySelector('[data-upload-recover]')?.addEventListener('click', async (event) => {
+        event.currentTarget.setAttribute('disabled', '');
+        try {
+          const current = await refreshAttachmentUpload(record);
+          if (!current.complete) throw new Error(t('attachment_upload_incomplete'));
+          onAdded({ sha256: current.sha256, name: current.filename, size_bytes: current.totalSize, mime: current.mime }); renderPending();
+        } catch (error) { fail(error); event.currentTarget.removeAttribute('disabled'); }
+      });
+      host.appendChild(row);
+    }
+  };
+  const startUpload = async (file, resumeUploadId = null) => {
+    if (closed) return;
+    const controller = new AbortController();
+    const key = resumeUploadId || crypto.randomUUID();
+    const row = document.createElement('div'); row.className = 'ps-upload-row'; row.dataset.activeUpload = key;
+    row.innerHTML = `<b>${escapeHtml(file.name)}</b><tf-progress-bar value="0"></tf-progress-bar><div class="ps-task-comment-tools"><span data-upload-state></span><tf-button variant="ghost" data-upload-pause>${escapeHtml(t('attachment_upload_pause'))}</tf-button></div>`;
+    host.appendChild(row);
+    const operation = { controller, row, uploadId: resumeUploadId };
+    active.set(key, operation); syncSave();
+    renderPending();
+    row.querySelector('[data-upload-pause]').addEventListener('click', () => { controller.abort(); row.querySelector('[data-upload-pause]').setAttribute('disabled', ''); });
+    try {
+      const attachment = await uploadAttachmentFile(file, { signal: controller.signal, resumeUploadId,
+        onProgress: (progress) => {
+          if (closed) return;
+          if (progress.uploadId && operation.uploadId !== progress.uploadId) { operation.uploadId = progress.uploadId; renderPending(); }
+          const percent = progress.total ? Math.floor(progress.offset / progress.total * 100) : progress.phase === 'complete' ? 100 : 0;
+          const bar = row.querySelector('tf-progress-bar');
+          bar.setAttribute('value', String(percent)); bar.setAttribute('label', t(`attachment_upload_${progress.phase}`, { percent }));
+          bar.setAttribute('role', 'progressbar'); bar.setAttribute('aria-valuenow', String(percent)); bar.setAttribute('aria-valuemin', '0'); bar.setAttribute('aria-valuemax', '100'); bar.setAttribute('aria-label', `${file.name}: ${t(`attachment_upload_${progress.phase}`, { percent })}`);
+          row.querySelector('[data-upload-state]').textContent = `${formatBytes(progress.offset)} / ${formatBytes(progress.total)}`;
+        },
+      });
+      if (!closed) onAdded(attachment);
+    } catch (error) { if (error.name !== 'AbortError') showError(error); }
+    finally { active.delete(key); if (!closed) { row.remove(); syncSave(); renderPending(); } }
+  };
+  body.querySelector('#ps-task-att-input').addEventListener('change', async (event) => {
+    for (const file of event.detail?.files || []) { if (closed) break; await startUpload(file); }
+  });
+  body.addEventListener('paste', async (event) => {
+    const images = [...(event.clipboardData?.items || [])].filter((item) => item.kind === 'file' && item.type.startsWith('image/'));
+    if (!images.length) return;
+    event.preventDefault();
+    for (const item of images) {
+      const source = item.getAsFile();
+      if (!source) continue;
+      const extension = source.type.split('/')[1].replace(/[^a-z0-9]/g, '') || 'png';
+      const file = new File([source], `clipboard-${new Date().toISOString().replace(/[:.]/g, '-')}.${extension}`, { type: source.type });
+      await startUpload(file);
+    }
+  });
+  const close = () => { if (closed) return; closed = true; for (const operation of active.values()) operation.controller.abort(); };
+  signal.addEventListener('abort', close);
+  renderPending();
+  return { get busy() { return active.size > 0; }, close };
+}
+
 async function openTaskWindow(opts = {}) {
   if (opts.taskId ? !(canArea('tasks') || canArea('board')) : !canCreateTask(projectAccess())) return;
+  const pid = projectId();
   const tw = {
-    taskId: opts.taskId || null,
-    taskType: opts.taskType || 'task',
-    title: opts.titlePrefill || '',
-    descriptionMd: '',
-    severity: '',
-    priority: 'medium',
-    // The board "add card" button prefills the column it was pressed in.
-    status: TASK_STATUSES.includes(opts.status) ? opts.status : 'todo',
-    assignedTo: '',
-    dueDate: '',
-    links: Array.isArray(opts.links) ? opts.links.slice() : [],
-    attachments: [],
-    comments: [],
-    info: null,
-    busy: false,
+    taskId: opts.taskId || null, taskType: opts.taskType || 'technical', title: opts.titlePrefill || '',
+    descriptionMd: '', severity: '', priority: 'medium', status: TASK_STATUSES.includes(opts.status) ? opts.status : 'todo',
+    assignedTo: '', dueDate: '', parentTaskId: opts.parentTaskId || null,
+    links: Array.isArray(opts.links) ? opts.links.slice() : [], taskLinks: [],
+    attachments: [], comments: [], events: [], eventsHasMore: false, durations: [], handoverCommentId: null, info: null, busy: false,
   };
   await ensureF2Members();
-  if (tw.taskId) {
-    try {
-      const resp = await ApiBinary.one('projectStudioTaskGetRequest', { projectId: projectId(), taskId: tw.taskId });
-      const detail = resp.detail || {};
-      const info = detail.info || {};
-      tw.info = info;
-      tw.taskType = fv(info, 'task_type') || 'task';
-      tw.title = info.title || '';
-      tw.descriptionMd = fv(detail, 'description_md') || '';
-      tw.severity = info.severity || '';
-      tw.priority = info.priority || 'medium';
-      tw.status = info.status || 'todo';
-      tw.assignedTo = fv(info, 'assigned_to') || '';
-      tw.dueDate = fv(info, 'due_date') || '';
-      try {
-        const links = JSON.parse(fv(info, 'links_json') || '[]');
-        tw.links = Array.isArray(links) ? links : [];
-      } catch { tw.links = []; }
-      tw.attachments = Array.isArray(detail.attachments) ? detail.attachments.slice() : [];
-      tw.comments = Array.isArray(detail.comments) ? detail.comments.slice() : [];
-    } catch (err) {
-      toast(`${t('task_load_failed')}: ${err.message}`, 'error');
-      return;
+  const readDetail = async () => {
+    const response = await ApiBinary.one('projectStudioTaskGetRequest', { projectId: pid, taskId: tw.taskId });
+    const detail = response.detail;
+    tw.info = detail.info;
+    tw.comments = detail.comments;
+    tw.events = detail.events;
+    tw.eventsHasMore = detail.events_has_more;
+    tw.durations = detail.status_durations;
+    tw.taskLinks = detail.task_links;
+    tw.handoverCommentId = detail.handover_comment_id;
+    return detail;
+  };
+  try {
+    await loadTaskTypes();
+    if (tw.taskId) {
+      const detail = await readDetail();
+      const info = detail.info;
+      tw.taskType = info.task_type;
+      tw.title = info.title;
+      tw.descriptionMd = detail.description_md;
+      tw.severity = info.severity;
+      tw.priority = info.priority;
+      tw.status = info.status;
+      tw.assignedTo = info.assigned_to;
+      tw.dueDate = info.due_date;
+      tw.parentTaskId = info.parent_task_id;
+      tw.links = JSON.parse(info.links_json);
+      tw.attachments = detail.attachments.slice();
+      while (opts.eventId && !tw.events.some((event) => String(event.event_id) === String(opts.eventId)) && tw.eventsHasMore) {
+        const page = await ApiBinary.one('projectStudioTaskEventsRequest', { projectId: pid, taskId: tw.taskId, beforeId: tw.events.at(-1).event_id, limit: 50 });
+        tw.events.push(...page.events); tw.eventsHasMore = page.has_more;
+      }
     }
+  } catch (error) {
+    toast(`${t('task_load_failed')}: ${error.message}`, 'error');
+    return;
   }
-
-  const isAuthor = tw.info ? isMe(fv(tw.info, 'created_by')) : true;
-  const mayEdit = tw.taskId ? canArea('tasks', 'write') : canCreateTask(projectAccess());
-  const maySetStatus = !!tw.taskId && (canArea('tasks', 'write') || canArea('board', 'write'));
-  const mayDelete = tw.taskId && canArea('tasks', 'write') && (canArea('tasks', 'admin') || (isAuthor && !Number(fv(tw.info, 'comment_count'))));
-
-  const { body, foot, cleanup } = openWindow({
+  const archived = !!tw.info?.archived_at;
+  const mayEdit = !archived && (tw.taskId ? canArea('tasks', 'write') : canCreateTask(projectAccess()));
+  const maySetStatus = !archived && !!tw.taskId && (canArea('tasks', 'write') || canArea('board', 'write'));
+  const mayArchive = !!tw.taskId && canArea('tasks', 'write');
+  const mayReadTasks = canArea('tasks') || canArea('board');
+  const mayComment = !archived && !!tw.taskId && canArea('tasks', 'write');
+  const mayHandover = !projectAccess().archived && !archived && tw.status !== 'done' && !!tw.taskId && (canArea('tasks', 'write') || isMe(tw.assignedTo));
+  const types = activeTaskTypes(state.taskTypes, tw.taskType);
+  const members = (f2().membersCache || []).filter((member) => member.active);
+  const assignees = members.filter((member) => allowsArea(member.access, 'tasks', 'write'));
+  const readers = members.filter((member) => allowsArea(member.access, 'tasks') || allowsArea(member.access, 'board'));
+  const { body, foot, cleanup, signal } = openWindow({
     title: tw.taskId ? t('task_win_title', { no: taskNoLabel(tw.info) }) : t('task_win_new_title'),
-    subtitle: tw.info ? `${fv(tw.info, 'created_by_name') || ''} · ${formatTimestamp(fv(tw.info, 'created_at'))}` : '',
-    icon: tw.taskType === 'defect' ? 'alert' : 'check',
-    width: 760,
+    subtitle: tw.info ? `${fv(tw.info, 'created_by_name')} · ${formatTimestamp(fv(tw.info, 'created_at'))}` : t('task_new_key_hint', { prefix: fv(state.project, 'key_prefix') }),
+    icon: tw.taskType === 'defect' ? 'alert' : 'check', width: 1080,
+  });
+  body.classList.add('ps-task-card');
+  if (tw.info) updateProjectRoute({ taskKey: tw.info.task_key, taskId: null, eventId: opts.eventId || null, commentId: opts.commentId || null });
+  body.innerHTML = `
+    ${archived ? `<div class="ps-task-archived"><tf-chip status="warn">${escapeHtml(t('task_archived'))}</tf-chip><span>${escapeHtml(t('task_archived_hint'))}</span></div>` : ''}
+    <div class="ps-task-layout">
+      <div class="ps-task-main">
+        <div id="ps-task-handover-note" hidden></div>
+        <tf-input id="ps-task-title" label="${escapeAttr(t('task_title_label'))}" value="${escapeAttr(tw.title)}" ${mayEdit ? '' : 'readonly'}></tf-input>
+        <tf-section-card title="${escapeAttr(t('task_desc_label'))}" icon="file-text">
+          ${mayEdit ? `<tf-segmented id="ps-task-desc-mode" value="edit"><option value="edit">${escapeHtml(t('action_edit'))}</option><option value="preview">${escapeHtml(t('task_description_preview'))}</option></tf-segmented><tf-textarea id="ps-task-desc" rows="6" autogrow hint="${escapeAttr(t('task_desc_hint'))}"></tf-textarea>` : ''}
+          <div id="ps-task-desc-preview" class="ps-task-markdown" ${mayEdit ? 'hidden' : ''}></div>
+        </tf-section-card>
+        <tf-section-card title="${escapeAttr(t('case_attachments_title'))}" icon="paperclip">
+          <div id="ps-task-atts" class="ps-task-gallery"></div>
+          ${mayEdit ? `<tf-file-input id="ps-task-att-input" multiple label="${escapeAttr(t('attachment_dropzone'))}"></tf-file-input><div id="ps-task-uploads"></div><span class="ps-field-hint">${escapeHtml(t('attachment_clipboard_hint'))}</span>` : ''}
+        </tf-section-card>
+        ${tw.taskId ? `<tf-section-card title="${escapeAttr(t('task_comments_title'))}" icon="message">
+          <div class="ps-task-comments" id="ps-task-comments"></div>
+          ${mayComment ? `<div class="ps-task-comment-composer">
+            <tf-textarea id="ps-task-comment-input" rows="3" autogrow label="${escapeAttr(t('task_comment_placeholder'))}"></tf-textarea>
+            <tf-person-picker id="ps-task-mentions" multiple label="${escapeAttr(t('task_mentions_label'))}" hidden></tf-person-picker>
+            <div class="ps-task-comment-tools"><tf-button variant="ghost" icon="users" id="ps-task-mention-toggle">${escapeHtml(t('task_mentions_add'))}</tf-button><span id="ps-task-mention-summary"></span><tf-button variant="primary" icon="send" id="ps-task-comment-send">${escapeHtml(t('task_comment_send'))}</tf-button></div>
+          </div>` : ''}
+        </tf-section-card>` : ''}
+      </div>
+      <aside class="ps-task-sidebar">
+        <tf-section-card title="${escapeAttr(t('task_metadata_title'))}" icon="settings">
+          <div class="ps-task-metadata">
+            <tf-select id="ps-task-type" label="${escapeAttr(t('task_type_label'))}" value="${escapeAttr(tw.taskType)}" ${mayEdit ? '' : 'disabled'}>
+              ${types.map((type) => `<option value="${escapeAttr(type.type_id)}" ${type.type_id === tw.taskType ? 'selected' : ''} ${!type.active && type.type_id !== tw.taskType || type.type_id === 'subtask' && !mayReadTasks ? 'disabled' : ''}>${escapeHtml(taskTypeLabel(type, t))}${type.active ? '' : ` · ${escapeHtml(t('task_type_inactive'))}`}</option>`).join('')}
+            </tf-select>
+            <span id="ps-task-type-hint" class="ps-field-hint"></span>
+            <tf-select id="ps-task-status" label="${escapeAttr(t('task_status_label'))}" value="${escapeAttr(tw.status)}" ${mayEdit || maySetStatus ? '' : 'disabled'}>
+              ${TASK_STATUSES.map((status) => selectOpt(status, tw.status, t(`task_status_${status}`))).join('')}
+            </tf-select>
+            <tf-select id="ps-task-severity" label="${escapeAttr(t('task_severity_label'))}" value="${escapeAttr(tw.severity)}" ${mayEdit ? '' : 'disabled'}>
+              ${selectOpt('', tw.severity, '—')}${PRIORITIES.map((priority) => selectOpt(priority, tw.severity, t(`sev_${priority}`))).join('')}
+            </tf-select>
+            <tf-select id="ps-task-priority" label="${escapeAttr(t('task_priority_label'))}" value="${escapeAttr(tw.priority)}" ${mayEdit ? '' : 'disabled'}>
+              ${PRIORITIES.map((priority) => selectOpt(priority, tw.priority, t(`prio_${priority}`))).join('')}
+            </tf-select>
+            <tf-select id="ps-task-assignee" label="${escapeAttr(t('task_assignee_label'))}" value="${escapeAttr(tw.assignedTo)}" ${mayEdit ? '' : 'disabled'}>
+              ${selectOpt('', tw.assignedTo, t('task_unassigned'))}${assignees.map((member) => selectOpt(member.user_id, tw.assignedTo, member.display_name)).join('')}
+            </tf-select>
+            ${mayHandover ? `<tf-button variant="ghost" icon="send" id="ps-task-handover">${escapeHtml(t('task_handover'))}</tf-button>` : ''}
+            <tf-input id="ps-task-due" type="date" label="${escapeAttr(t('task_due_label'))}" value="${escapeAttr(tw.dueDate)}" ${mayEdit ? '' : 'readonly'}></tf-input>
+            ${mayReadTasks ? `<tf-combobox id="ps-task-parent" label="${escapeAttr(t('task_parent_label'))}" placeholder="${escapeAttr(t('task_parent_search'))}" clearable ${mayEdit ? '' : 'disabled'}></tf-combobox><span class="ps-field-hint">${escapeHtml(t('task_parent_hint'))}</span>` : ''}
+          </div>
+        </tf-section-card>
+        <tf-section-card title="${escapeAttr(t('task_relations_title'))}" icon="branch">
+          <div id="ps-task-relations"></div>
+          ${mayEdit && tw.taskId ? `<tf-button variant="ghost" icon="plus" id="ps-task-link-add">${escapeHtml(t('task_relation_add'))}</tf-button>` : ''}
+          ${!tw.taskId ? `<div class="ps-field-hint">${escapeHtml(t('task_relation_save_first'))}</div>` : ''}
+          <div class="ps-task-links" id="ps-task-links"></div>
+        </tf-section-card>
+        ${tw.taskId ? `<tf-section-card title="${escapeAttr(t('task_status_time_title'))}" icon="clock"><div id="ps-task-durations"></div></tf-section-card>
+          <tf-section-card title="${escapeAttr(t('task_history_title'))}" icon="list"><tf-timeline id="ps-task-history"></tf-timeline><tf-button variant="ghost" id="ps-task-history-more">${escapeHtml(t('task_history_more'))}</tf-button></tf-section-card>` : ''}
+      </aside>
+    </div>
+    <div class="ps-form-error" data-form-error hidden></div>`;
+  foot.innerHTML = `<div class="ps-footer-left">${mayArchive ? `<tf-button variant="ghost" icon="${archived ? 'refresh' : 'archive'}" data-action="archive">${escapeHtml(t(archived ? 'task_restore' : 'action_archive'))}</tf-button>` : ''}${tw.info ? `<tf-button variant="ghost" icon="link" data-action="copy-link">${escapeHtml(t('task_copy_link'))}</tf-button>` : ''}</div>
+    <div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_close'))}</tf-button>${mayEdit || maySetStatus ? `<tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button>` : ''}</div>`;
+  const errorEl = body.querySelector('[data-form-error]');
+  const showError = (message) => { errorEl.hidden = !message; errorEl.textContent = message || ''; };
+  const description = body.querySelector('#ps-task-desc');
+  if (description) description.value = tw.descriptionMd;
+  const renderDescription = () => { body.querySelector('#ps-task-desc-preview').innerHTML = renderMarkdown(tw.descriptionMd) || `<span class="ps-field-hint">${escapeHtml(t('task_description_empty'))}</span>`; };
+  renderDescription();
+  body.querySelector('#ps-task-desc-mode')?.addEventListener('change', (event) => {
+    const preview = event.detail?.value === 'preview';
+    description.hidden = preview;
+    body.querySelector('#ps-task-desc-preview').hidden = !preview;
+    if (preview) renderDescription();
   });
 
-  const testers = (f2().membersCache || []).filter((member) => member.active && allowsArea(member.access, 'tasks', 'write'));
-  body.innerHTML = `
-    <div class="ps-field" style="margin-bottom:12px;">
-      <span class="ps-field-label">${escapeHtml(t('task_type_label'))}</span>
-      <tf-segmented id="ps-task-type" value="${escapeAttr(tw.taskType)}" ${mayEdit ? '' : 'disabled'}>
-        <option value="task">${escapeHtml(t('task_type_task'))}</option>
-        <option value="defect">${escapeHtml(t('task_type_defect'))}</option>
-      </tf-segmented>
-    </div>
-    <div class="ps-field" style="margin-bottom:12px;">
-      <tf-input id="ps-task-title" label="${escapeAttr(t('task_title_label'))}" value="${escapeAttr(tw.title)}" ${mayEdit ? '' : 'readonly'}></tf-input>
-    </div>
-    <div class="ps-field" style="margin-bottom:12px;">
-      <tf-textarea id="ps-task-desc" rows="4" label="${escapeAttr(t('task_desc_label'))}" hint="${escapeAttr(t('task_desc_hint'))}" ${mayEdit ? '' : 'disabled'}></tf-textarea>
-    </div>
-    <div class="ps-task-grid">
-      <tf-select id="ps-task-severity" label="${escapeAttr(t('task_severity_label'))}" value="${escapeAttr(tw.severity)}" ${mayEdit ? '' : 'disabled'}>
-        <option value="" ${tw.severity === '' ? 'selected' : ''}>—</option>
-        ${PRIORITIES.map((x) => `<option value="${x}" ${x === tw.severity ? 'selected' : ''}>${escapeHtml(t(`sev_${x}`))}</option>`).join('')}
-      </tf-select>
-      <tf-select id="ps-task-priority" label="${escapeAttr(t('task_priority_label'))}" value="${escapeAttr(tw.priority)}" ${mayEdit ? '' : 'disabled'}>
-        ${PRIORITIES.map((x) => `<option value="${x}" ${x === tw.priority ? 'selected' : ''}>${escapeHtml(t(`prio_${x}`))}</option>`).join('')}
-      </tf-select>
-      <tf-select id="ps-task-status" label="${escapeAttr(t('task_status_label'))}" value="${escapeAttr(tw.status)}" ${mayEdit || maySetStatus ? '' : 'disabled'}>
-        ${TASK_STATUSES.map((x) => `<option value="${x}" ${x === tw.status ? 'selected' : ''}>${escapeHtml(t(`task_status_${x}`))}</option>`).join('')}
-      </tf-select>
-      <tf-select id="ps-task-assignee" label="${escapeAttr(t('task_assignee_label'))}" value="${escapeAttr(tw.assignedTo)}" ${mayEdit ? '' : 'disabled'}>
-        <option value="" ${tw.assignedTo === '' ? 'selected' : ''}>${escapeHtml(t('task_unassigned'))}</option>
-        ${testers.map((m) => `<option value="${escapeAttr(fv(m, 'user_id'))}" ${fv(m, 'user_id') === tw.assignedTo ? 'selected' : ''}>${escapeHtml(fv(m, 'display_name') || '')}</option>`).join('')}
-      </tf-select>
-      <tf-input id="ps-task-due" type="date" label="${escapeAttr(t('task_due_label'))}" value="${escapeAttr(tw.dueDate)}" ${mayEdit ? '' : 'readonly'}></tf-input>
-    </div>
-    <div class="ps-field" style="margin-bottom:12px;">
-      <span class="ps-field-label">${escapeHtml(t('task_links_label'))}</span>
-      <div class="ps-task-links" id="ps-task-links"></div>
-    </div>
-    <div class="ps-field" style="margin-bottom:12px;">
-      <span class="ps-field-label">${escapeHtml(t('case_attachments_title'))}</span>
-      <div id="ps-task-atts"></div>
-      ${mayEdit && canArea('tasks', 'write') ? `<tf-file-input id="ps-task-att-input" multiple label="${escapeAttr(t('attachment_dropzone'))}"></tf-file-input>` : ''}
-    </div>
-    ${tw.taskId ? `
-      <div class="ps-field">
-        <span class="ps-field-label">${escapeHtml(t('task_comments_label', { count: tw.comments.length }))}</span>
-        <div class="ps-task-comments" id="ps-task-comments"></div>
-        ${canArea('tasks', 'write') ? `
-          <div class="ps-task-comment-add">
-            <tf-textarea id="ps-task-comment-input" rows="2" placeholder="${escapeAttr(t('task_comment_placeholder'))}"></tf-textarea>
-            <tf-button variant="ghost" icon="send" id="ps-task-comment-send">${escapeHtml(t('task_comment_send'))}</tf-button>
-          </div>
-        ` : ''}
-      </div>
-    ` : ''}
-    <div class="ps-form-error" data-form-error hidden></div>
-  `;
-  foot.innerHTML = `
-    <div class="ps-footer-left">
-      ${mayDelete ? `<tf-button variant="danger-solid" icon="trash" data-action="delete">${escapeHtml(t('action_delete'))}</tf-button>` : ''}
-    </div>
-    <div class="ps-footer-right">
-      <tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button>
-      ${mayEdit || maySetStatus ? `<tf-button variant="primary" icon="check" data-action="save">${escapeHtml(t('action_save'))}</tf-button>` : ''}
-    </div>
-  `;
-
-  const descEl = body.querySelector('#ps-task-desc');
-  if (descEl) descEl.value = tw.descriptionMd;
-  const showError = (msg) => {
-    const el = body.querySelector('[data-form-error]');
-    if (el) { el.hidden = !msg; el.textContent = msg || ''; }
+  const historyTaskNames = new Map();
+  const historyTaskRequests = new Set();
+  const rememberHistoryTask = (task) => historyTaskNames.set(task.task_id, `${task.task_key} · ${task.title}`);
+  for (const task of [...(state.tasksView?.rows || []), ...(state.tasksView?.boardRows || [])]) rememberHistoryTask(task);
+  if (tw.info) rememberHistoryTask(tw.info);
+  for (const link of tw.taskLinks) historyTaskNames.set(link.source_task_id === tw.taskId ? link.target_task_id : link.source_task_id, `${link.counterparty_task_key} · ${link.counterparty_task_title}`);
+  let renderHistory;
+  const parent = body.querySelector('#ps-task-parent');
+  let parentQuery = 0;
+  let parentRows = [];
+  const findParents = async (search = '') => {
+    if (!parent || !mayEdit || tw.taskType === 'epic') return;
+    const query = ++parentQuery;
+    const response = await ApiBinary.one('projectStudioTasksListRequest', { projectId: pid, taskType: tw.taskType === 'subtask' ? '' : 'epic', status: '', assignedTo: '', search, severity: '', offset: 0, limit: 50 });
+    if (!parent.isConnected || query !== parentQuery) return;
+    parentRows = parentCandidates(response.tasks, tw.taskType, tw.taskId);
+    for (const task of parentRows) rememberHistoryTask(task);
+    parent.options = parentRows.map((task) => ({ value: task.task_id, label: `${task.task_key} · ${task.title}` }));
+    renderHistory?.();
   };
+  const syncType = () => {
+    const type = state.taskTypes.find((entry) => entry.type_id === tw.taskType);
+    body.querySelector('#ps-task-type-hint').textContent = type ? taskTypeDescription(type, t) : '';
+    body.querySelector('#ps-task-severity').hidden = tw.taskType !== 'defect';
+    if (parent) { parent.disabled = !mayEdit || tw.taskType === 'epic'; parent.setAttribute('label', t(tw.taskType === 'subtask' ? 'task_parent_required' : 'task_parent_label')); }
+  };
+  syncType();
+  parent?.addEventListener('input', (event) => findParents(event.detail?.query || '').catch((error) => showError(`${t('task_load_failed')}: ${error.message}`)));
+  parent?.addEventListener('change', (event) => {
+    tw.parentTaskId = !event.detail?.free && parent.options.some((option) => option.value === event.detail?.value) ? event.detail.value : null;
+  });
+  if (tw.parentTaskId && parent) {
+    try {
+      const response = await ApiBinary.one('projectStudioTaskGetRequest', { projectId: pid, taskId: tw.parentTaskId });
+      parentRows.push(response.detail.info);
+      rememberHistoryTask(response.detail.info);
+      parent.value = `${response.detail.info.task_key} · ${response.detail.info.title}`;
+    } catch (error) { historyTaskNames.set(tw.parentTaskId, null); showError(`${t('task_load_failed')}: ${error.message}`); }
+  }
+  if (parent && mayEdit) findParents().catch((error) => showError(`${t('task_load_failed')}: ${error.message}`));
 
   const renderLinks = () => {
-    const hostEl = body.querySelector('#ps-task-links');
-    if (!hostEl) return;
-    hostEl.innerHTML = tw.links.length ? tw.links.map((link, i) => `
-      <tf-chip status="accent" ${mayEdit ? 'removable' : ''} data-task-link="${i}">
-        ${escapeHtml(t(`link_kind_${link.kind}`) )}: ${escapeHtml(link.label || link.id || '')}
-      </tf-chip>
-    `).join('') : `<span class="ps-field-hint">${escapeHtml(t('task_links_empty'))}</span>`;
-    hostEl.querySelectorAll('[data-task-link]').forEach((chipEl) => {
-      chipEl.addEventListener('remove', () => {
-        tw.links.splice(Number(chipEl.dataset.taskLink), 1);
-        renderLinks();
-      });
-    });
+    body.querySelector('#ps-task-links').innerHTML = tw.links.map((link, index) => `<tf-chip status="accent" ${mayEdit ? 'removable' : ''} data-task-link="${index}">${escapeHtml(t(`link_kind_${link.kind}`))}: ${escapeHtml(link.label || link.id)}</tf-chip>`).join('');
+    body.querySelectorAll('[data-task-link]').forEach((chip) => chip.addEventListener('remove', () => { tw.links.splice(Number(chip.dataset.taskLink), 1); renderLinks(); }));
+    const host = body.querySelector('#ps-task-relations');
+    host.innerHTML = tw.taskLinks.length ? tw.taskLinks.map((link) => {
+      const otherId = link.source_task_id === tw.taskId ? link.target_task_id : link.source_task_id;
+      const direction = ['related', 'duplicate'].includes(link.kind) ? '' : t(link.source_task_id === tw.taskId ? 'task_relation_outgoing' : 'task_relation_incoming');
+      return `<div class="ps-task-relation"><tf-button variant="ghost" data-related-task="${escapeAttr(otherId)}">${escapeHtml(link.counterparty_task_key)} · ${escapeHtml(link.counterparty_task_title)}</tf-button><span>${escapeHtml(t(`task_relation_${link.kind}`))}${direction ? ` · ${escapeHtml(direction)}` : ''}${link.lag_days ? ` · ${escapeHtml(t('task_relation_lag_value', { days: link.lag_days }))}` : ''}</span>${mayEdit ? `<tf-button variant="ghost" size="sm" icon="x" data-unlink="${link.link_id}" title="${escapeAttr(t('task_relation_remove'))}"></tf-button>` : ''}</div>`;
+    }).join('') : `<span class="ps-field-hint">${escapeHtml(t('task_relations_empty'))}</span>`;
+    host.querySelectorAll('[data-related-task]').forEach((button) => button.addEventListener('click', () => { cleanup(); openTaskWindow({ taskId: button.dataset.relatedTask }); }));
+    host.querySelectorAll('[data-unlink]').forEach((button) => button.addEventListener('click', async () => {
+      button.setAttribute('disabled', '');
+      try { await ApiBinary.one('projectStudioTaskLinkDeleteRequest', { projectId: pid, linkId: Number(button.dataset.unlink) }); await refreshRecorded(); }
+      catch (error) { button.removeAttribute('disabled'); showError(`${t('task_relation_failed')}: ${error.message}`); }
+    }));
   };
+  body.querySelector('#ps-task-link-add')?.addEventListener('click', () => openTaskLinkWindow(tw.taskId, refreshRecorded));
 
+  renderHistory = () => {
+    const history = body.querySelector('#ps-task-history');
+    if (!history) return;
+    const markedId = history.querySelector('.ps-task-target [data-task-event]')?.dataset.taskEvent;
+    const eventValue = (json, kind) => taskEventValue(json, { translate: t, memberName, taskName: (id) => historyTaskNames.get(id), typeName: taskTypeName, kind });
+    history.entries = tw.events.map((event) => ({
+      title: `<span data-task-event="${event.event_id}">${escapeHtml(t(`task_event_${event.kind}`))}</span>`, time: escapeHtml(formatTimestamp(event.at)),
+      description: `<span class="ps-task-history-actor">${escapeHtml(event.actor_kind === 'user' ? memberName(event.actor_id) || t('task_history_unavailable_person') : t(`task_actor_${event.actor_kind}`))}</span><div class="ps-task-history-values">${escapeHtml(eventValue(event.before_json, event.kind))}<span aria-hidden="true"> → </span>${escapeHtml(eventValue(event.after_json, event.kind))}</div>${taskEventAttachments(event).map((attachment, index) => `<tf-button variant="ghost" size="sm" icon="paperclip" data-history-attachment="${event.event_id}:${index}">${escapeHtml(attachment.name)}</tf-button>`).join('')}`,
+    }));
+    if (markedId) {
+      const marked = [...history.querySelectorAll('[data-task-event]')].find((element) => element.dataset.taskEvent === markedId)?.closest('.tf-timeline-item');
+      marked?.classList.add('ps-task-target'); marked?.setAttribute('tabindex', '-1');
+    }
+    history.querySelectorAll('[data-history-attachment]').forEach((button) => button.addEventListener('click', () => {
+      const [eventId, index] = button.dataset.historyAttachment.split(':').map(Number);
+      const event = tw.events.find((item) => Number(item.event_id) === eventId);
+      openAttachmentPreview(taskEventAttachments(event)[index], attachmentOwner('task', tw.taskId, null, pid));
+    }));
+    const more = body.querySelector('#ps-task-history-more');
+    more.hidden = !tw.eventsHasMore;
+    body.querySelector('#ps-task-durations').innerHTML = tw.durations.map((duration) => `<div class="ps-task-duration"><tf-chip status="${TASK_STATUS_CHIP[duration.status]}">${escapeHtml(t(`task_status_${duration.status}`))}</tf-chip><b>${escapeHtml(taskDuration(duration.seconds, t))}</b><span>${escapeHtml(formatTimestamp(duration.entered_at))}${duration.left_at ? ` → ${escapeHtml(formatTimestamp(duration.left_at))}` : ` · ${escapeHtml(t('task_status_current'))}`}</span></div>`).join('');
+  };
+  const resolveHistoryTasks = async (events) => {
+    if (!mayReadTasks || !tw.taskId) return;
+    const ids = [...new Set(events.flatMap(taskEventTaskIds))].filter((id) => !historyTaskNames.has(id) && !historyTaskRequests.has(id));
+    for (const id of ids) historyTaskRequests.add(id);
+    for (let i = 0; i < ids.length && !signal.aborted; i += 5) {
+      await Promise.all(ids.slice(i, i + 5).map(async (id) => {
+        try {
+          const response = await ApiBinary.one('projectStudioTaskGetRequest', { projectId: pid, taskId: id });
+          if (!signal.aborted) rememberHistoryTask(response.detail.info);
+        } catch { historyTaskNames.set(id, null); }
+      }));
+      if (!signal.aborted && body.isConnected) renderHistory();
+    }
+  };
+  body.querySelector('#ps-task-history-more')?.addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    button.setAttribute('disabled', '');
+    try {
+      const response = await ApiBinary.one('projectStudioTaskEventsRequest', { projectId: pid, taskId: tw.taskId, beforeId: tw.events.at(-1)?.event_id ?? null, limit: 50 });
+      tw.events.push(...response.events);
+      tw.eventsHasMore = response.has_more;
+      renderHistory();
+      await resolveHistoryTasks(response.events);
+      button.hidden = !response.has_more;
+    } catch (error) { showError(`${t('task_load_failed')}: ${error.message}`); }
+    finally { button.removeAttribute('disabled'); }
+  });
+
+  let galleryCleanup = null;
   const renderAtts = () => {
-    const hostEl = body.querySelector('#ps-task-atts');
-    if (!hostEl) return;
-    hostEl.innerHTML = tw.attachments.length
-      ? tw.attachments.map((att, i) => attachmentRowHtml(att, i, { removable: mayEdit })).join('')
-      : `<div class="ps-field-hint">${escapeHtml(t('attachments_empty'))}</div>`;
-    hostEl.querySelectorAll('[data-att-preview]').forEach((btn) => {
-      btn.addEventListener('click', () => openAttachmentPreview(tw.attachments[Number(btn.dataset.attPreview)]));
-    });
-    hostEl.querySelectorAll('[data-att-remove]').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        tw.attachments.splice(Number(btn.dataset.attRemove), 1);
-        renderAtts();
-      });
-    });
+    galleryCleanup?.();
+    const host = body.querySelector('#ps-task-atts');
+    galleryCleanup = renderTaskAttachmentGallery(host, tw.attachments, attachmentOwner('task', tw.taskId, null, pid), { removable: mayEdit, onRemove: (index) => { tw.attachments.splice(index, 1); renderAtts(); } });
   };
-
   const renderComments = () => {
-    const hostEl = body.querySelector('#ps-task-comments');
-    if (!hostEl) return;
-    hostEl.innerHTML = tw.comments.length ? tw.comments.map((c, i) => {
-      const own = isMe(fv(c, 'author_user_id'));
-      return `
-        <div class="ps-task-comment">
-          <div class="ps-av-mini">${escapeHtml(initials(fv(c, 'author_name')))}</div>
-          <div class="ps-task-comment-main">
-            <div class="ps-task-comment-head">
-              <b>${escapeHtml(fv(c, 'author_name') || '')}</b>
-              <span>${escapeHtml(formatTimestamp(fv(c, 'created_at')))}${fv(c, 'edited_at') ? ` · ${escapeHtml(t('task_comment_edited'))}` : ''}</span>
-            </div>
-            <div class="ps-task-comment-body">${escapeHtml(fv(c, 'body_md') || '')}</div>
-          </div>
-          <div class="ps-task-comment-actions">
-            ${own && canArea('tasks', 'write') ? `<tf-button variant="ghost" size="sm" icon="edit" data-comment-edit="${i}" title="${escapeAttr(t('action_edit'))}"></tf-button>` : ''}
-            ${canArea('tasks', 'write') && (own || canArea('tasks', 'admin')) ? `<tf-button variant="ghost" size="sm" icon="trash" data-comment-delete="${i}" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}
-          </div>
-        </div>
-      `;
-    }).join('') : `<div class="ps-field-hint">${escapeHtml(t('task_comments_empty'))}</div>`;
-
-    hostEl.querySelectorAll('[data-comment-edit]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const c = tw.comments[Number(btn.dataset.commentEdit)];
-        if (!c) return;
-        const next = await openPromptWindow({
-          title: t('task_comment_edit_title'),
-          label: t('task_comment_placeholder'),
-          value: fv(c, 'body_md') || '',
-        });
-        if (next == null || !next) return;
-        try {
-          await ApiBinary.one('projectStudioTaskCommentEditRequest', {
-            projectId: projectId(), commentId: fv(c, 'comment_id'), bodyMd: next,
-          });
-          c.body_md = next;
-          c.edited_at = new Date().toISOString();
-          renderComments();
-        } catch (err) {
-          toast(`${t('task_comment_failed')}: ${err.message}`, 'error');
-        }
-      });
-    });
-    hostEl.querySelectorAll('[data-comment-delete]').forEach((btn) => {
-      btn.addEventListener('click', async () => {
-        const c = tw.comments[Number(btn.dataset.commentDelete)];
-        if (!c) return;
-        const ok = await TfWindow.confirm({
-          title: t('task_comment_delete_title'),
-          message: t('task_comment_delete_message'),
-          confirmLabel: t('action_delete'),
-          cancelLabel: t('action_cancel'),
-          danger: true,
-        });
-        if (!ok) return;
-        try {
-          await ApiBinary.one('projectStudioTaskCommentDeleteRequest', {
-            projectId: projectId(), commentId: fv(c, 'comment_id'),
-          });
-          tw.comments.splice(Number(btn.dataset.commentDelete), 1);
-          renderComments();
-        } catch (err) {
-          toast(`${t('task_comment_failed')}: ${err.message}`, 'error');
-        }
-      });
-    });
+    const host = body.querySelector('#ps-task-comments');
+    if (!host) return;
+    const pin = body.querySelector('#ps-task-handover-note');
+    const note = isMe(tw.info?.assigned_to) && tw.handoverCommentId ? tw.comments.find((comment) => comment.comment_id === tw.handoverCommentId) : null;
+    pin.hidden = !note;
+    pin.innerHTML = note ? `<tf-section-card title="${escapeAttr(t('task_handover_note'))}" icon="pin"><div class="ps-task-handover-note"><b>${escapeHtml(note.author_name)}</b><span>${escapeHtml(formatTimestamp(note.created_at))}</span><div class="ps-task-markdown">${renderMarkdown(note.body_md)}</div></div></tf-section-card>` : '';
+    host.innerHTML = tw.comments.length ? tw.comments.map((comment, index) => {
+      const own = isMe(comment.author_user_id);
+      return `<div class="ps-task-comment" data-task-comment="${escapeAttr(comment.comment_id)}"><div class="ps-av-mini">${escapeHtml(initials(comment.author_name))}</div><div class="ps-task-comment-main"><div class="ps-task-comment-head"><b>${escapeHtml(comment.author_name)}</b><span>${escapeHtml(formatTimestamp(comment.created_at))}${comment.edited_at ? ` · ${escapeHtml(t('task_comment_edited'))}` : ''}</span></div><div class="ps-task-markdown">${renderMarkdown(comment.body_md)}</div><div class="ps-task-mentioned">${comment.mention_user_ids.map((id) => `<tf-chip status="accent">@${escapeHtml(memberName(id) || id)}</tf-chip>`).join('')}</div></div><div class="ps-task-comment-actions">${mayComment && own ? `<tf-button variant="ghost" size="sm" icon="edit" data-comment-edit="${index}" title="${escapeAttr(t('action_edit'))}"></tf-button>` : ''}${mayComment && (own || canArea('tasks', 'admin')) ? `<tf-button variant="ghost" size="sm" icon="trash" data-comment-delete="${index}" title="${escapeAttr(t('action_delete'))}"></tf-button>` : ''}</div></div>`;
+    }).join('') : `<span class="ps-field-hint">${escapeHtml(t('task_comments_empty'))}</span>`;
+    host.querySelectorAll('[data-comment-edit]').forEach((button) => button.addEventListener('click', () => openTaskCommentEditor(tw.comments[Number(button.dataset.commentEdit)], readers, refreshRecorded)));
+    host.querySelectorAll('[data-comment-delete]').forEach((button) => button.addEventListener('click', async () => {
+      const comment = tw.comments[Number(button.dataset.commentDelete)];
+      if (!await TfWindow.confirm({ title: t('task_comment_delete_title'), message: t('task_comment_delete_message'), confirmLabel: t('action_delete'), cancelLabel: t('action_cancel'), danger: true })) return;
+      try { await ApiBinary.one('projectStudioTaskCommentDeleteRequest', { projectId: pid, commentId: comment.comment_id }); await refreshRecorded(); }
+      catch (error) { showError(`${t('task_comment_failed')}: ${error.message}`); }
+    }));
   };
-
-  body.querySelector('#ps-task-type')?.addEventListener('change', (e) => { tw.taskType = e.detail?.value ?? tw.taskType; });
-  body.querySelector('#ps-task-title')?.addEventListener('input', (e) => { tw.title = String(e.target.value ?? ''); });
-  descEl?.addEventListener('input', () => { tw.descriptionMd = String(descEl.value ?? ''); });
-  body.querySelector('#ps-task-severity')?.addEventListener('change', (e) => { tw.severity = e.detail?.value ?? ''; });
-  body.querySelector('#ps-task-priority')?.addEventListener('change', (e) => { tw.priority = e.detail?.value ?? tw.priority; });
-  body.querySelector('#ps-task-status')?.addEventListener('change', (e) => { tw.status = e.detail?.value ?? tw.status; });
-  body.querySelector('#ps-task-assignee')?.addEventListener('change', (e) => { tw.assignedTo = e.detail?.value ?? ''; });
-  body.querySelector('#ps-task-due')?.addEventListener('change', (e) => { tw.dueDate = String(e.target.value ?? ''); });
-  body.querySelector('#ps-task-att-input')?.addEventListener('change', async (e) => {
-    const files = e.detail?.files;
-    if (!files || !files.length) return;
-    try {
-      for (const file of Array.from(files)) {
-        const att = await uploadAttachmentFile(file);
-        if (!tw.attachments.some((a) => fv(a, 'sha256') === att.sha256)) tw.attachments.push(att);
-      }
-      renderAtts();
-      toast(t('attachment_uploaded'), 'success');
-    } catch (err) {
-      toast(`${t('attachment_upload_failed')}: ${err.message}`, 'error');
-    }
+  async function refreshRecorded() {
+    await readDetail();
+    if (!body.isConnected) return;
+    rememberHistoryTask(tw.info);
+    renderLinks(); renderComments(); renderHistory();
+    await resolveHistoryTasks(tw.events.slice(0, 50));
+  }
+  body.querySelector('#ps-task-handover')?.addEventListener('click', (event) => {
+    const win = openHandoverWindow({ subject: `${tw.info.task_key} · ${tw.title}`, title: t('task_handover'), submitLabel: t('task_handover'), anchor: event.currentTarget,
+      note: { tone: 'info', text: t('task_handover_hint') },
+      people: assignees.filter((member) => member.user_id !== tw.info.assigned_to).map((member) => ({ id: member.user_id, name: member.display_name })),
+      onSubmit: async ({ personId, comment }) => {
+        await ApiBinary.one('projectStudioTaskHandoverRequest', { projectId: pid, taskId: tw.taskId, assignedTo: personId, noteMd: comment, mentionUserIds: [personId] });
+        cleanup();
+        if (projectId() === pid && state.tab === 'tasks') await renderTasksTab();
+        return { message: t('task_handover_saved') };
+      }, errorMessage: (error) => `${t('task_handover_failed')}: ${error.message}`,
+    });
+    const closeHandover = () => { win.close(true); state.wins.delete(closeHandover); };
+    state.wins.add(closeHandover);
+    win.addEventListener('close-request', () => state.wins.delete(closeHandover));
   });
-  body.querySelector('#ps-task-comment-send')?.addEventListener('click', async () => {
+  const mentionPicker = body.querySelector('#ps-task-mentions');
+  if (mentionPicker) {
+    mentionPicker.items = readers.map((member) => ({ id: member.user_id, name: member.display_name }));
+    body.querySelector('#ps-task-mention-toggle').addEventListener('click', () => { mentionPicker.hidden = !mentionPicker.hidden; if (!mentionPicker.hidden) mentionPicker.focusSearch(); });
+    mentionPicker.addEventListener('change', () => { body.querySelector('#ps-task-mention-summary').textContent = mentionPicker.selectedItems.map((member) => `@${member.name}`).join(', '); });
+  }
+  body.querySelector('#ps-task-comment-send')?.addEventListener('click', async (event) => {
     const input = body.querySelector('#ps-task-comment-input');
-    const text = String(input?.value ?? '').trim();
-    if (!text) return;
+    const bodyMd = input.value.trim();
+    if (!bodyMd) return;
+    const button = event.currentTarget;
+    button.setAttribute('disabled', '');
     try {
-      const resp = await ApiBinary.one('projectStudioTaskCommentAddRequest', {
-        projectId: projectId(), taskId: tw.taskId, bodyMd: text,
-      });
-      if (resp.comment) tw.comments.push(resp.comment);
-      if (input) input.value = '';
-      renderComments();
-    } catch (err) {
-      toast(`${t('task_comment_failed')}: ${err.message}`, 'error');
-    }
+      await ApiBinary.one('projectStudioTaskCommentAddRequest', { projectId: pid, taskId: tw.taskId, bodyMd, mentionUserIds: mentionPicker.value });
+      input.value = ''; mentionPicker.value = []; body.querySelector('#ps-task-mention-summary').textContent = '';
+      await refreshRecorded();
+    } catch (error) { showError(`${t('task_comment_failed')}: ${error.message}`); }
+    finally { button.removeAttribute('disabled'); }
   });
 
-  foot.addEventListener('click', async (e) => {
-    const btn = e.target.closest('[data-action]');
-    if (!btn || tw.busy) return;
-    if (btn.dataset.action === 'cancel') { cleanup(); return; }
-    if (btn.dataset.action === 'delete') {
-      const ok = await TfWindow.confirm({
-        title: t('task_delete_title'),
-        message: t('task_delete_message', { title: escapeHtml(tw.title) }),
-        confirmLabel: t('action_delete'),
-        cancelLabel: t('action_cancel'),
-        danger: true,
-      });
-      if (!ok) return;
-      try {
-        await ApiBinary.one('projectStudioTaskDeleteRequest', { projectId: projectId(), taskId: tw.taskId });
-        toast(t('task_deleted'), 'success');
-        cleanup();
-        if (state.tab === 'tasks' && (canArea('tasks') || canArea('board'))) await renderTasksTab();
-      } catch (err) {
-        showError(`${t('task_delete_failed')}: ${err.message}`);
-      }
+  body.querySelector('#ps-task-type').addEventListener('change', (event) => {
+    tw.taskType = event.detail?.value ?? tw.taskType;
+    if (tw.taskType === 'epic') { tw.parentTaskId = null; if (parent) parent.value = ''; }
+    syncType(); if (parent && mayEdit) findParents().catch((error) => showError(error.message));
+  });
+  body.querySelector('#ps-task-title').addEventListener('input', (event) => { tw.title = String(event.target.value ?? ''); });
+  description?.addEventListener('input', () => { tw.descriptionMd = description.value; });
+  for (const [id, field] of [['severity', 'severity'], ['priority', 'priority'], ['status', 'status'], ['assignee', 'assignedTo']]) body.querySelector(`#ps-task-${id}`).addEventListener('change', (event) => { tw[field] = event.detail?.value ?? ''; });
+  body.querySelector('#ps-task-due').addEventListener('change', (event) => { tw.dueDate = String(event.target.value ?? ''); });
+  const uploads = wireTaskUploads({ body, foot, signal, attachments: tw.attachments, pid, onAdded: (attachment) => { if (!tw.attachments.some((entry) => entry.sha256 === attachment.sha256)) tw.attachments.push(attachment); renderAtts(); } });
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]');
+    if (!button || button.hasAttribute('disabled') || tw.busy || uploads.busy && button.dataset.action !== 'cancel') return;
+    if (button.dataset.action === 'cancel') { uploads.close(); galleryCleanup?.(); cleanup(); return; }
+    if (button.dataset.action === 'copy-link') {
+      try { await navigator.clipboard.writeText(location.href); toast(t('task_link_copied'), 'success'); }
+      catch (error) { showError(`${t('task_link_copy_failed')}: ${error.message}`); }
       return;
     }
-    if (!mayEdit && maySetStatus) {
-      tw.busy = true;
-      btn.setAttribute('disabled', '');
-      try {
-        await ApiBinary.one('projectStudioTaskStatusSetRequest', { projectId: projectId(), taskId: tw.taskId, status: tw.status });
-        toast(t('task_saved', { no: taskNoLabel(tw.info) }), 'success');
-        cleanup();
-        if (state.tab === 'tasks' && (canArea('tasks') || canArea('board'))) await renderTasksTab();
-      } catch (error) {
-        tw.busy = false; btn.removeAttribute('disabled'); showError(`${t('task_save_failed')}: ${error.message}`);
-      }
+    if (button.dataset.action === 'archive') {
+      try { await setTaskArchived(tw.taskId, !archived, pid); cleanup(); }
+      catch (error) { showError(`${t('task_archive_failed')}: ${error.message}`); }
       return;
     }
-    // Save.
     const title = tw.title.trim();
-    if (title.length < 3) { showError(t('err_task_title')); return; }
-    if (tw.taskType === 'defect' && !tw.severity) { showError(t('err_task_severity')); return; }
-    tw.busy = true;
-    btn.setAttribute('disabled', '');
+    if (mayEdit && title.length < 3) { showError(t('err_task_title')); return; }
+    if (mayEdit && tw.taskType === 'defect' && !tw.severity) { showError(t('err_task_severity')); return; }
+    if (mayEdit && tw.taskType === 'subtask' && !tw.parentTaskId) { showError(t('err_task_parent')); return; }
+    tw.busy = true; button.setAttribute('disabled', '');
     try {
-      const resp = await ApiBinary.one('projectStudioTaskSaveRequest', {
-        projectId: projectId(),
-        taskId: tw.taskId,
-        taskType: tw.taskType,
-        title,
-        descriptionMd: tw.descriptionMd,
-        severity: tw.taskType === 'defect' ? tw.severity : '',
-        priority: tw.priority,
-        status: tw.status,
-        assignedTo: tw.assignedTo,
-        dueDate: tw.dueDate,
-        linksJson: JSON.stringify(tw.links),
-        attachmentsJson: JSON.stringify(tw.attachments),
-      });
-      toast(t('task_saved', { no: `${tw.taskType === 'defect' ? 'D' : 'T'}-${Number(fv(resp, 'task_no') ?? 0)}` }), 'success');
+      let response;
+      if (!mayEdit && maySetStatus) {
+        response = await ApiBinary.one('projectStudioTaskStatusSetRequest', { projectId: pid, taskId: tw.taskId, status: tw.status });
+      } else {
+        response = await ApiBinary.one('projectStudioTaskSaveRequest', { projectId: pid, taskId: tw.taskId, taskType: tw.taskType, title, descriptionMd: tw.descriptionMd,
+          severity: tw.taskType === 'defect' ? tw.severity : '', priority: tw.priority, status: tw.status, assignedTo: tw.assignedTo, dueDate: tw.dueDate,
+          parentTaskId: tw.parentTaskId, linksJson: JSON.stringify(tw.links), attachmentsJson: JSON.stringify(tw.attachments) });
+      }
+      toast(t('task_saved', { no: response.task_key || tw.info?.task_key }), 'success');
+      acknowledgeAttachmentUploads(pid, currentUserId(), tw.attachments);
+      uploads.close(); galleryCleanup?.();
       cleanup();
-      if (state.tab === 'tasks' && (canArea('tasks') || canArea('board'))) await renderTasksTab();
-    } catch (err) {
-      tw.busy = false;
-      btn.removeAttribute('disabled');
-      showError(`${t('task_save_failed')}: ${err.message}`);
-    }
+      if (state.tab === 'tasks' && mayReadTasks) await renderTasksTab();
+    } catch (error) { tw.busy = false; button.removeAttribute('disabled'); showError(`${t('task_save_failed')}: ${error.message}`); }
   });
+  renderLinks(); renderAtts(); renderComments(); renderHistory();
+  resolveHistoryTasks(tw.events.slice(0, 50)).catch((error) => showError(`${t('task_load_failed')}: ${error.message}`));
+  const target = [...body.querySelectorAll('[data-task-comment]')].find((element) => element.dataset.taskComment === String(opts.commentId))
+    || [...body.querySelectorAll('[data-task-event]')].find((element) => element.dataset.taskEvent === String(opts.eventId))?.closest('.tf-timeline-item');
+  if (target) {
+    target.classList.add('ps-task-target'); target.setAttribute('tabindex', '-1');
+    requestAnimationFrame(() => { if (!signal.aborted) { target.scrollIntoView({ block: 'center' }); target.focus(); } });
+  }
+  signal.addEventListener('abort', () => {
+    parentQuery += 1; galleryCleanup?.();
+    if (Router.currentParams()?.projectId === pid && Router.currentParams()?.taskKey === tw.info?.task_key) updateProjectRoute();
+  });
+}
 
-  renderLinks();
-  renderAtts();
-  if (tw.taskId) renderComments();
+async function setTaskArchived(taskId, archived, pid = projectId()) {
+  await ApiBinary.one('projectStudioTaskArchiveRequest', { projectId: pid, taskId, archived });
+  if (state.project && projectId() === pid && state.tab === 'tasks' && (canArea('tasks') || canArea('board'))) await renderTasksTab();
+  showUndoToast({ message: t(archived ? 'task_archived' : 'task_restored'), timeoutMs: 10000,
+    onUndo: async () => {
+      await ApiBinary.one('projectStudioTaskArchiveRequest', { projectId: pid, taskId, archived: !archived });
+      if (projectId() === pid && state.tab === 'tasks' && (canArea('tasks') || canArea('board'))) await renderTasksTab();
+    },
+  });
+}
+
+function openTaskCommentEditor(comment, readers, onSaved) {
+  const { body, foot, cleanup } = openWindow({ title: t('task_comment_edit_title'), icon: 'message', width: 620 });
+  body.innerHTML = `<tf-textarea id="ps-comment-edit-body" label="${escapeAttr(t('task_comment_placeholder'))}" rows="5" autogrow></tf-textarea><tf-person-picker id="ps-comment-edit-mentions" multiple label="${escapeAttr(t('task_mentions_label'))}"></tf-person-picker><div class="ps-form-error" data-form-error hidden></div>`;
+  body.querySelector('#ps-comment-edit-body').value = comment.body_md;
+  const picker = body.querySelector('#ps-comment-edit-mentions');
+  picker.items = readers.map((member) => ({ id: member.user_id, name: member.display_name }));
+  picker.value = comment.mention_user_ids;
+  foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]');
+    if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    const bodyMd = body.querySelector('#ps-comment-edit-body').value.trim();
+    if (!bodyMd) return;
+    button.setAttribute('disabled', '');
+    try { await ApiBinary.one('projectStudioTaskCommentEditRequest', { projectId: projectId(), commentId: comment.comment_id, bodyMd, mentionUserIds: picker.value }); await onSaved(); cleanup(); }
+    catch (error) { button.removeAttribute('disabled'); const errorEl = body.querySelector('[data-form-error]'); errorEl.hidden = false; errorEl.textContent = `${t('task_comment_failed')}: ${error.message}`; }
+  });
+}
+
+function openTaskLinkWindow(sourceTaskId, onSaved) {
+  const { body, foot, cleanup } = openWindow({ title: t('task_relation_add'), icon: 'branch', width: 620 });
+  body.innerHTML = `<tf-combobox id="ps-task-link-target" label="${escapeAttr(t('task_relation_target'))}" placeholder="${escapeAttr(t('task_parent_search'))}" clearable></tf-combobox><tf-select id="ps-task-link-kind" label="${escapeAttr(t('task_relation_kind'))}" value="related">${TASK_LINK_KINDS.map((kind) => selectOpt(kind, 'related', t(`task_relation_${kind}`))).join('')}</tf-select><tf-input id="ps-task-link-lag" type="number" label="${escapeAttr(t('task_relation_lag'))}" value="0" min="-3650" max="3650" hint="${escapeAttr(t('task_relation_lag_hint'))}" disabled></tf-input><div class="ps-form-error" data-form-error hidden></div>`;
+  foot.innerHTML = `<div></div><div class="ps-footer-right"><tf-button variant="ghost" data-action="cancel">${escapeHtml(t('action_cancel'))}</tf-button><tf-button variant="primary" data-action="save">${escapeHtml(t('action_save'))}</tf-button></div>`;
+  const target = body.querySelector('#ps-task-link-target');
+  let targetTaskId = null;
+  let queryId = 0;
+  const showError = (message) => { const el = body.querySelector('[data-form-error]'); el.hidden = !message; el.textContent = message || ''; };
+  const search = async (query = '') => {
+    const request = ++queryId;
+    const response = await ApiBinary.one('projectStudioTasksListRequest', { projectId: projectId(), taskType: '', status: '', assignedTo: '', search: query, severity: '', offset: 0, limit: 50 });
+    if (!target.isConnected || queryId !== request) return;
+    target.options = response.tasks.filter((task) => task.task_id !== sourceTaskId && !task.archived_at).map((task) => ({ value: task.task_id, label: `${task.task_key} · ${task.title}` }));
+  };
+  target.addEventListener('input', (event) => search(event.detail?.query || '').catch((error) => showError(error.message)));
+  target.addEventListener('change', (event) => {
+    targetTaskId = !event.detail?.free && target.options.some((option) => option.value === event.detail?.value) ? event.detail.value : null;
+  });
+  body.querySelector('#ps-task-link-kind').addEventListener('change', (event) => {
+    const symmetric = ['related', 'duplicate'].includes(event.detail?.value);
+    const lag = body.querySelector('#ps-task-link-lag');
+    if (symmetric) { lag.setAttribute('disabled', ''); lag.value = '0'; } else lag.removeAttribute('disabled');
+  });
+  foot.addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-action]');
+    if (!button || button.hasAttribute('disabled')) return;
+    if (button.dataset.action === 'cancel') { cleanup(); return; }
+    if (!targetTaskId) { showError(t('err_task_relation_target')); return; }
+    button.setAttribute('disabled', '');
+    try { await ApiBinary.one('projectStudioTaskLinkSaveRequest', { projectId: projectId(), sourceTaskId, targetTaskId, kind: body.querySelector('#ps-task-link-kind').value, lagDays: Number(body.querySelector('#ps-task-link-lag').value) }); await onSaved(); cleanup(); }
+    catch (error) { button.removeAttribute('disabled'); showError(`${t('task_relation_failed')}: ${error.message}`); }
+  });
+  search().catch((error) => showError(error.message));
 }
 
 // =============================================================================
@@ -10747,9 +11166,10 @@ function installNotifListener() {
     .then((client) => {
       client.addUnsolicitedListener(({ body }) => {
         if (!body || body.variant !== 'UserNotification') return;
-        // ws_binary already forwards the frame only to this user's connections;
-        // the payload is display-ready (title + body composed server-side).
-        toast(`${body.title || t('notif_title')}${body.body ? ` — ${body.body}` : ''}`, 'info');
+        const text = taskNotificationText(body, t);
+        const title = text ? text.title : body.title || t('notif_title');
+        const message = text ? text.body : body.body;
+        toast(`${title}${message ? ` — ${message}` : ''}`, 'info');
         refreshNotifBadge();
       });
     })
@@ -10785,12 +11205,13 @@ async function openNotifWindow() {
     listEl.innerHTML = `
       ${nw.items.map((n, i) => {
         const unread = !fv(n, 'read_at');
+        const text = taskNotificationText(n, t);
         return `
           <div class="ps-notif-item ${unread ? 'is-unread' : ''}" data-notif="${i}" role="button" tabindex="0">
             <div class="ps-notif-ico">${sprite(NOTIF_KIND_ICON[n.kind] || 'info')}</div>
             <div class="ps-notif-main">
-              <div class="ps-notif-title">${escapeHtml(n.title || t(`nk_${n.kind}`))}</div>
-              <div class="ps-notif-body">${escapeHtml(n.body || '')}</div>
+              <div class="ps-notif-title">${escapeHtml(text ? text.title : n.title || t(`nk_${n.kind}`))}</div>
+              <div class="ps-notif-body">${escapeHtml(text ? text.body : n.body || '')}</div>
               <div class="ps-notif-meta">${escapeHtml(fv(n, 'project_name') || '')} · ${escapeHtml(formatTimestamp(fv(n, 'created_at')))}</div>
             </div>
             ${unread ? '<span class="ps-notif-dot"></span>' : ''}
@@ -10877,9 +11298,9 @@ async function openNotifWindow() {
       if (sameProject) await openGenDetailFromNotif(genId);
       else await openProject(pid, { tab: 'tests', sub: 'generations', genId });
     } else if (sameProject) {
-      await openTaskWindowFromNotif(taskId);
+      await openTaskWindowFromNotif(taskId, { eventId: link.event_id, commentId: link.comment_id });
     } else {
-      await openProject(pid, { tab: 'tasks', taskId });
+      await openProject(pid, { tab: 'tasks', taskId, eventId: link.event_id, commentId: link.comment_id });
     }
   });
 
@@ -10925,13 +11346,13 @@ async function openGenDetailFromNotif(genId) {
   await openGenDetail(genId);
 }
 
-async function openTaskWindowFromNotif(taskId) {
+async function openTaskWindowFromNotif(taskId, target) {
   if (state.tab !== 'tasks') {
     state.tab = 'tasks';
     renderTabsValue();
     await switchTab('tasks');
   }
-  await openTaskWindow({ taskId });
+  await openTaskWindow({ taskId, ...target });
 }
 
 async function openMyWorkWindow() {
@@ -11084,8 +11505,6 @@ async function renderSchedulesView(reload = true) {
   const rows = visibleSchedules();
   const blocked = s.schedules.rows.filter((row) => scheduleBlocked(row) || fv(row, 'auto_disabled')).length;
   const active = s.schedules.rows.filter((row) => row.enabled && !fv(row, 'auto_disabled')).length;
-  const selectOpt = (value, current, label) =>
-    `<option value="${escapeAttr(value)}" ${value === current ? 'selected' : ''}>${escapeHtml(label)}</option>`;
 
   host.innerHTML = `
     <div class="ps-tests-toolbar ps-sch-toolbar">
@@ -12386,8 +12805,8 @@ function openMlSettingsWindow(link) {
 // Z01 (F4) — kanban task board
 // =============================================================================
 
-function canMoveTask() {
-  return canArea('board', 'write');
+function canMoveTask(task) {
+  return !task.archived_at && canArea('board', 'write');
 }
 
 // Card order is NOT persisted in F4 — the board sorts by priority and then by
@@ -12415,6 +12834,7 @@ function taskCardModel(task) {
     }
   })();
   const meta = [];
+  if (task.archived_at) meta.push({ text: t('task_archived'), tone: 'warning', icon: 'archive' });
   if (severity) {
     meta.push({
       text: t(`sev_${severity}`),
@@ -12428,8 +12848,8 @@ function taskCardModel(task) {
   }
 
   const menu = [{ id: 'open', label: t('action_open'), icon: 'external-link' }];
-  if (canArea('tasks', 'write') && (canArea('tasks', 'admin') || (isMe(fv(task, 'created_by')) && !Number(fv(task, 'comment_count'))))) {
-    menu.push({ id: 'delete', label: t('action_delete'), icon: 'trash', danger: true });
+  if (canArea('tasks', 'write')) {
+    menu.push({ id: task.archived_at ? 'restore' : 'archive', label: t(task.archived_at ? 'task_restore' : 'action_archive'), icon: task.archived_at ? 'refresh' : 'archive' });
   }
 
   return {
@@ -12440,7 +12860,7 @@ function taskCardModel(task) {
     badgeKind: type === 'defect' ? 'danger' : 'info',
     badgeIcon: type === 'defect' ? 'alert' : 'check',
     accent: severity === 'critical' ? 'danger' : null,
-    disabled: !canMoveTask(),
+    disabled: !canMoveTask(task),
     meta,
     footer: {
       left: dueDate ? { icon: 'clock', text: dueDate } : null,
@@ -12494,14 +12914,16 @@ function renderTaskBoard() {
     const task = tv.boardRows.find((row) => fv(row, 'task_id') === taskId);
     if (!task) return;
     if (e.detail?.actionId === 'open') { openTaskWindow({ taskId }); return; }
-    if (e.detail?.actionId === 'delete') confirmDeleteBoardTask(task);
+    if (e.detail?.actionId === 'archive') confirmArchiveBoardTask(task);
+    if (e.detail?.actionId === 'restore' && canArea('tasks', 'write')) setTaskArchived(taskId, false).catch((error) => toast(`${t('task_archive_failed')}: ${error.message}`, 'error'));
   });
   // The board already shows the new position when this fires; a rejected write
   // is undone with revertMove so the UI never drifts from the server.
   board.addEventListener('card-move', async (e) => {
     const { cardId, to } = e.detail || {};
     const task = tv.boardRows.find((row) => fv(row, 'task_id') === cardId);
-    if (!task || !to || task.status === to || !canArea('board', 'write')) return;
+    if (!task || !to || task.status === to) return;
+    if (!canMoveTask(task)) { board.revertMove(cardId); return; }
     const previous = task.status;
     task.status = to;
     try {
@@ -12520,23 +12942,12 @@ function renderTaskBoard() {
   host.replaceChildren(board);
 }
 
-function confirmDeleteBoardTask(task) {
-  openDeleteWindow({
-    title: t('task_delete_title'),
-    targetName: `${taskNoLabel(task)} ${task.title}`,
-    targetSub: t(`task_type_${fv(task, 'task_type')}`),
-    targetIcon: 'check',
-    warning: t('task_delete_message', { title: task.title }),
-    confirmLabel: t('delete_forever'),
-    onConfirm: async () => {
-      await ApiBinary.one('projectStudioTaskDeleteRequest', {
-        projectId: projectId(),
-        taskId: fv(task, 'task_id'),
-      });
-      toast(t('task_deleted'), 'success');
-      await renderTasksTab();
-    },
-  });
+async function confirmArchiveBoardTask(task) {
+  if (!canArea('tasks', 'write')) return;
+  const confirmed = await TfWindow.confirm({ title: t('task_archive_title'), message: t('task_archive_message', { key: taskNoLabel(task), title: task.title }), confirmLabel: t('action_archive'), cancelLabel: t('action_cancel') });
+  if (!confirmed) return;
+  try { await setTaskArchived(fv(task, 'task_id'), true); }
+  catch (error) { toast(`${t('task_archive_failed')}: ${error.message}`, 'error'); }
 }
 
 // =============================================================================

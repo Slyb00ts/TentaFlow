@@ -390,6 +390,7 @@ fn project(w: &World, name: &str, owner: &str, members: &[(&str, &str)], holder:
         "[\"knowledge\",\"tasks\",\"tests\"]",
         owner,
         &path.to_string_lossy(),
+        "",
         &members
             .iter()
             .filter(|(user, _)| *user != owner)
@@ -408,7 +409,7 @@ fn project(w: &World, name: &str, owner: &str, members: &[(&str, &str)], holder:
         tasks::create_task(
             &pool,
             &tasks::TaskInput {
-                task_type: "task",
+                task_type: "technical",
                 title,
                 description_md: "",
                 severity: "",
@@ -418,11 +419,12 @@ fn project(w: &World, name: &str, owner: &str, members: &[(&str, &str)], holder:
                 due_date: "",
                 links_json: "[]",
                 attachments_json: "[]",
+                parent_task_id: None,
             },
             owner,
         )
         .expect("task")
-        .0
+        .task_id
     };
     let task_a = task("Import OPC", "in_progress", holder);
     let task_b = task("Nakladka Gora", "todo", holder);
@@ -712,6 +714,14 @@ async fn a_departure_moves_the_work_the_seat_and_the_covers_and_leaves_an_audite
     assert!(comments
         .iter()
         .any(|c| c.body_md == note && c.author_user_id == w.admin));
+    let events = tasks::list_task_events(&pool, &p.task_a, None, 100).unwrap().0;
+    let handover_event = events.iter().find(|event| event.kind == "handed_over").expect("real atomic handover history");
+    assert_eq!(handover_event.actor_id, w.admin);
+    assert_eq!(handover_event.actor_kind, "user");
+    let after: serde_json::Value = serde_json::from_str(&handover_event.after_json).unwrap();
+    assert_eq!(after["assigned_to"], w.peer);
+    assert!(comments.iter().any(|comment| Some(comment.comment_id.as_str()) == after["comment_id"].as_str()));
+
 
     // The seat: the leaver's assignment ends today and the taker stands in as acting.
     let snapshot =
@@ -1272,8 +1282,11 @@ async fn an_absence_handover_is_temporary_and_the_work_comes_back_unless_the_tak
     // While away: the taker closes one task, somebody gives another to a third person.
     {
         let pool = project_db::open(&p.id).unwrap();
-        tasks::set_task_status(&pool, &p.task_a, "done").unwrap();
-        assert!(tasks::reassign_open(&pool, &p.task_b, &w.peer, &w.deputy_head).unwrap());
+        tasks::set_task_status(&pool, &p.task_a, "done", &w.peer).unwrap();
+        assert!(tasks::reassign_open(&pool, &p.task_b, &w.peer, &w.deputy_head, &tasks::TaskHandoverInput {
+            actor: &w.peer, note_md: "Changed assignment while away", mention_user_ids: &[],
+            direction: tasks::TaskHandoverDirection::Over, handover_id: None,
+        }).unwrap().expect("transferred").changed);
     }
 
     let due = |day: NaiveDate| handover::run_due(&w.state.db, DEFAULT_ORG_ID, day).unwrap();
@@ -1656,5 +1669,90 @@ async fn a_head_seat_is_proposed_to_the_deputy_head() {
     assert_eq!(
         (suggestion.user_id.as_str(), suggestion.reason.as_str()),
         (w.deputy_head.as_str(), "deputy_head")
+    );
+}
+
+
+#[tokio::test]
+async fn temporary_task_handover_and_return_record_actual_actor_and_atomic_notes_once() {
+    let w = world();
+    let p = project(
+        &w,
+        "history",
+        &w.boss,
+        &[
+            (&w.boss, "owner"),
+            (&w.leaver, "developer,tester"),
+            (&w.peer, "developer,tester"),
+        ],
+        &w.leaver,
+    );
+    let me = ctx(&w, &w.leaver, false);
+    let back = plus(w.today, 3);
+    let listing = list(&me, &w.leaver, Reason::Absence, None, None)
+        .await
+        .unwrap();
+    let note = "Finish the pending review while I am away";
+    let applied = apply(
+        &me,
+        &w.leaver,
+        Reason::Absence,
+        None,
+        None,
+        Some(s(back)),
+        note,
+        vec![choice(
+            listing.titled(Cat::Task, "Import OPC"),
+            Some(&w.peer),
+        )],
+    )
+    .await
+    .unwrap();
+    assert!(applied.ok, "{:?}", applied.items);
+    let pool = project_db::open(&p.id).unwrap();
+    let before = tasks::list_task_events(&pool, &p.task_a, None, 100)
+        .unwrap()
+        .0;
+    let over = before
+        .iter()
+        .find(|event| event.kind == "handed_over")
+        .expect("forward event");
+    assert_eq!(over.actor_id, w.leaver);
+    let pin = tasks::latest_handover_comment_id(&pool, &p.task_a)
+        .unwrap()
+        .expect("forward note pin");
+    assert!(over.after_json.contains(&pin));
+    let report = handover::run_due(&w.state.db, DEFAULT_ORG_ID, back).unwrap();
+    assert_eq!((report.returned, report.kept, report.failed), (1, 0, 0));
+    assert_eq!(assignee_of(&p.id, &p.task_a), w.leaver);
+    let events = tasks::list_task_events(&pool, &p.task_a, None, 100)
+        .unwrap()
+        .0;
+    let returned = events
+        .iter()
+        .find(|event| event.kind == "handed_back")
+        .expect("return event");
+    assert_eq!(returned.actor_id, w.leaver);
+    assert_eq!(returned.actor_kind, "user");
+    let new_pin = tasks::latest_handover_comment_id(&pool, &p.task_a)
+        .unwrap()
+        .expect("return note pin");
+    assert_ne!(pin, new_pin);
+    assert!(returned.after_json.contains(&new_pin));
+    let comments = tasks::list_comments(&pool, &p.task_a).unwrap();
+    assert_eq!(comments.len(), 2);
+    assert!(comments
+        .iter()
+        .all(|comment| comment.author_user_id == w.leaver && comment.body_md == note));
+    assert_eq!(
+        handover::run_due(&w.state.db, DEFAULT_ORG_ID, back).unwrap(),
+        handover::DueReport::default()
+    );
+    assert_eq!(
+        tasks::list_task_events(&pool, &p.task_a, None, 100)
+            .unwrap()
+            .0
+            .len(),
+        events.len()
     );
 }

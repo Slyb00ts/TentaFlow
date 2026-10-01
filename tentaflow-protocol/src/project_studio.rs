@@ -18,6 +18,8 @@ pub mod access;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectInfo {
     pub project_id: String,
+    pub key_prefix: String,
+    pub key_prefix_locked: bool,
     pub name: String,
     pub description: String,
     /// 'active' | 'archived'.
@@ -276,6 +278,8 @@ pub struct TagInfo {
 pub struct ProjectSettings {
     pub name: String,
     pub description: String,
+    pub key_prefix: String,
+    pub key_prefix_locked: bool,
     pub modules: Vec<String>,
     pub agents: Vec<ProjectAgentBinding>,
     pub tags: Vec<TagInfo>,
@@ -287,14 +291,42 @@ pub struct ProjectSettings {
 }
 
 /// Attachment reference stored on cases, run items, steps and tasks.
-/// Bytes are content-addressed by `sha256`; download goes through
-/// `AttachmentGetRequest`, upload reuses `SourceUploadChunkRequest`.
+/// Bytes are content-addressed by `sha256`; transfer uses the bounded
+/// attachment upload and download messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttachmentWire {
     pub sha256: String,
     pub name: String,
     pub size_bytes: u64,
     pub mime: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentOwnerKind {
+    Task,
+    Case,
+    RunItem,
+    RunStep,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentUsageFileWire {
+    pub owner_kind: AttachmentOwnerKind,
+    pub owner_id: String,
+    pub step_index: Option<u32>,
+    pub task_key: String,
+    pub filename: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskAttachmentUsageWire {
+    pub task_id: String,
+    pub task_key: String,
+    pub file_count: u64,
+    pub total_bytes: u64,
 }
 
 /// Manual test case row for lists. Cases with `review_state == "pending"`
@@ -491,7 +523,8 @@ pub struct TaskInfo {
     pub task_id: String,
     /// Human-friendly sequential number, unique per project.
     pub task_no: u32,
-    /// 'task' | 'defect'.
+    pub task_key: String,
+    /// Built-in or project-defined task type ID.
     pub task_type: String,
     pub title: String,
     /// Defect severity ('' for plain tasks).
@@ -502,6 +535,7 @@ pub struct TaskInfo {
     pub assigned_to: String,
     pub assigned_to_name: String,
     pub due_date: String,
+    pub parent_task_id: Option<String>,
     /// JSON array of `{kind:'case'|'run'|'run_item'|'step', id, label}`.
     pub links_json: String,
     pub comment_count: u32,
@@ -509,6 +543,7 @@ pub struct TaskInfo {
     pub created_by_name: String,
     pub created_at: String,
     pub updated_at: String,
+    pub archived_at: Option<String>,
 }
 
 /// Task comment with author display data resolved server-side.
@@ -520,6 +555,48 @@ pub struct TaskCommentWire {
     pub body_md: String,
     pub created_at: String,
     pub edited_at: Option<String>,
+    pub mention_user_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskTypeWire {
+    pub type_id: String,
+    pub name: String,
+    pub description: String,
+    pub sort_order: i32,
+    pub built_in: bool,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskEventWire {
+    pub event_id: i64,
+    pub task_id: String,
+    pub at: String,
+    pub actor_kind: String,
+    pub actor_id: String,
+    pub kind: String,
+    pub before_json: String,
+    pub after_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskLinkWire {
+    pub link_id: i64,
+    pub source_task_id: String,
+    pub target_task_id: String,
+    pub kind: String,
+    pub lag_days: i32,
+    pub counterparty_task_key: String,
+    pub counterparty_task_title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskStatusDurationWire {
+    pub status: String,
+    pub entered_at: String,
+    pub left_at: Option<String>,
+    pub seconds: u64,
 }
 
 /// Full task view for the detail panel.
@@ -529,6 +606,11 @@ pub struct TaskDetail {
     pub description_md: String,
     pub attachments: Vec<AttachmentWire>,
     pub comments: Vec<TaskCommentWire>,
+    pub task_links: Vec<TaskLinkWire>,
+    pub events: Vec<TaskEventWire>,
+    pub events_has_more: bool,
+    pub status_durations: Vec<TaskStatusDurationWire>,
+    pub handover_comment_id: Option<String>,
 }
 
 /// Agent generation run. Polling `GenerationGetRequest` every 2-4 s is the
@@ -886,6 +968,7 @@ pub enum ProjectStudioPayload {
     },
     ProjectCreateRequest {
         name: String,
+        key_prefix: String,
         description: String,
         template: String,
         modules: Vec<String>,
@@ -904,6 +987,7 @@ pub enum ProjectStudioPayload {
         project_id: String,
         name: String,
         description: String,
+        key_prefix: Option<String>,
     },
     ProjectUpdateResult {
         ok: bool,
@@ -1174,6 +1258,8 @@ pub enum ProjectStudioPayload {
         #[serde(default)]
         description: Option<String>,
         #[serde(default)]
+        key_prefix: Option<String>,
+        #[serde(default)]
         agents_json: Option<String>,
         /// Full replacement list of enabled modules. `None` leaves the current
         /// set untouched, `Some` REPLACES it — a partial diff would make the
@@ -1371,12 +1457,16 @@ pub enum ProjectStudioPayload {
         created: u32,
         errors: Vec<CsvImportError>,
     },
-    /// Attachment download by content hash (server clamps `max_bytes` to
-    /// 8 MiB); upload reuses the existing SourceUploadChunkRequest.
+    /// Authenticated, bounded read of an attachment referenced by a task.
     AttachmentGetRequest {
         project_id: String,
+        owner_kind: AttachmentOwnerKind,
+        owner_id: String,
+        step_index: Option<u32>,
         sha256: String,
+        offset: u64,
         max_bytes: u32,
+        preview: bool,
     },
     AttachmentGetResponse {
         /// Raw attachment bytes. `serde_bytes` forces a CBOR byte-string
@@ -1384,8 +1474,83 @@ pub enum ProjectStudioPayload {
         /// array-of-integers (~2x the size), unacceptable for downloads.
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
+        total_size: u64,
         mime: String,
-        truncated: bool,
+        filename: String,
+        eof: bool,
+    },
+    AttachmentUploadStatusRequest {
+        project_id: String,
+        upload_id: String,
+    },
+    AttachmentUploadStatusResponse {
+        upload_id: String,
+        filename: String,
+        mime: String,
+        sha256: String,
+        total_size: u64,
+        next_offset: u64,
+        complete: bool,
+        expires_at: String,
+    },
+    AttachmentUploadChunkRequest {
+        project_id: String,
+        upload_id: String,
+        filename: String,
+        mime: String,
+        sha256: String,
+        total_size: u64,
+        offset: u64,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    AttachmentUploadChunkResponse {
+        upload_id: String,
+        filename: String,
+        mime: String,
+        sha256: String,
+        total_size: u64,
+        next_offset: u64,
+        complete: bool,
+        expires_at: String,
+    },
+    AttachmentUploadCancelRequest {
+        project_id: String,
+        upload_id: String,
+    },
+    AttachmentUploadCancelResult {
+        ok: bool,
+    },
+    AttachmentPreviewRequest {
+        project_id: String,
+        owner_kind: AttachmentOwnerKind,
+        owner_id: String,
+        step_index: Option<u32>,
+        sha256: String,
+        retry: bool,
+    },
+    AttachmentPreviewResponse {
+        status: String,
+        error: String,
+        mime: String,
+        total_size: u64,
+        duration_ms: u64,
+    },
+    AttachmentUsageRequest {
+        project_id: String,
+        offset: u32,
+        limit: u32,
+    },
+    AttachmentUsageResponse {
+        total_bytes: u64,
+        file_count: u64,
+        missing_files: u64,
+        available_bytes: Option<u64>,
+        warning: bool,
+        largest: Vec<AttachmentUsageFileWire>,
+        per_task: Vec<TaskAttachmentUsageWire>,
+        total_tasks: u32,
+        has_more: bool,
     },
     // ---- F2: test suites (T04) ----
     SuitesListRequest {
@@ -1570,6 +1735,8 @@ pub enum ProjectStudioPayload {
         /// peers that omit it still decode.
         #[serde(default)]
         severity: String,
+        #[serde(default)]
+        include_archived: bool,
     },
     TasksListResponse {
         tasks: Vec<TaskInfo>,
@@ -1598,6 +1765,7 @@ pub enum ProjectStudioPayload {
         assigned_to: String,
         #[serde(default)]
         due_date: String,
+        parent_task_id: Option<String>,
         #[serde(default)]
         links_json: String,
         #[serde(default)]
@@ -1606,6 +1774,8 @@ pub enum ProjectStudioPayload {
     TaskSaveResponse {
         task_id: String,
         task_no: u32,
+        task_key: String,
+        event_ids: Vec<i64>,
     },
     TaskDeleteRequest {
         project_id: String,
@@ -1613,11 +1783,34 @@ pub enum ProjectStudioPayload {
     },
     TaskDeleteResult {
         ok: bool,
+        archived: bool,
+    },
+    TaskArchiveRequest {
+        project_id: String,
+        task_id: String,
+        archived: bool,
+    },
+    TaskArchiveResult {
+        ok: bool,
+        event_id: Option<i64>,
+    },
+    TaskHandoverRequest {
+        project_id: String,
+        task_id: String,
+        assigned_to: String,
+        note_md: String,
+        mention_user_ids: Vec<String>,
+    },
+    TaskHandoverResult {
+        ok: bool,
+        event_ids: Vec<i64>,
+        comment_id: Option<String>,
     },
     TaskCommentAddRequest {
         project_id: String,
         task_id: String,
         body_md: String,
+        mention_user_ids: Vec<String>,
     },
     TaskCommentAddResponse {
         comment: TaskCommentWire,
@@ -1626,6 +1819,7 @@ pub enum ProjectStudioPayload {
         project_id: String,
         comment_id: String,
         body_md: String,
+        mention_user_ids: Vec<String>,
     },
     TaskCommentEditResult {
         ok: bool,
@@ -1636,6 +1830,61 @@ pub enum ProjectStudioPayload {
     },
     TaskCommentDeleteResult {
         ok: bool,
+    },
+    TaskTypesListRequest {
+        project_id: String,
+    },
+    TaskTypesListResponse {
+        types: Vec<TaskTypeWire>,
+    },
+    TaskTypeSaveRequest {
+        project_id: String,
+        type_id: String,
+        name: String,
+        description: String,
+        sort_order: i32,
+        active: bool,
+    },
+    TaskTypeSaveResponse {
+        task_type: TaskTypeWire,
+    },
+    TaskEventsRequest {
+        project_id: String,
+        task_id: String,
+        before_id: Option<i64>,
+        limit: u32,
+    },
+    TaskEventsResponse {
+        events: Vec<TaskEventWire>,
+        has_more: bool,
+    },
+    TaskLinksListRequest {
+        project_id: String,
+        task_id: String,
+    },
+    TaskLinksListResponse {
+        links: Vec<TaskLinkWire>,
+    },
+    TaskLinkSaveRequest {
+        project_id: String,
+        source_task_id: String,
+        target_task_id: String,
+        kind: String,
+        lag_days: i32,
+    },
+    TaskLinkSaveResult {
+        link: TaskLinkWire,
+        source_event_id: i64,
+        target_event_id: i64,
+    },
+    TaskLinkDeleteRequest {
+        project_id: String,
+        link_id: i64,
+    },
+    TaskLinkDeleteResult {
+        ok: bool,
+        source_event_id: Option<i64>,
+        target_event_id: Option<i64>,
     },
     // ---- F2: agent case generation (G01/T05) ----
     /// `requested_count` 0 = server default (10); `agent_id: None` = the
@@ -2189,6 +2438,8 @@ pub enum ProjectStudioPayload {
     TaskStatusSetResult {
         ok: bool,
         updated_at: String,
+        previous_status: Option<String>,
+        event_id: Option<i64>,
     },
     // ---- F4: project export / import ----
     ProjectExportStartRequest {
@@ -2310,6 +2561,7 @@ mod tests {
     fn project_studio_payload_round_trip() {
         let payload = ProjectStudioPayload::ProjectCreateRequest {
             name: "Projekt QA".to_string(),
+            key_prefix: "PQA".to_string(),
             description: "opis".to_string(),
             template: "tests".to_string(),
             modules: vec!["knowledge".to_string(), "chat".to_string()],
@@ -2340,6 +2592,61 @@ mod tests {
         let bytes = crate::cbor::encode(&body).expect("encode");
         let decoded = crate::cbor::decode::<MessageBody>(&bytes).expect("decode");
         assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn task_history_and_media_ranges_round_trip() {
+        let cases = [
+            ProjectStudioPayload::TaskEventsRequest {
+                project_id: "p1".into(),
+                task_id: "t1".into(),
+                before_id: Some(42),
+                limit: 50,
+            },
+            ProjectStudioPayload::TaskLinkSaveRequest {
+                project_id: "p1".into(),
+                source_task_id: "t1".into(),
+                target_task_id: "t2".into(),
+                kind: "fs".into(),
+                lag_days: 2,
+            },
+            ProjectStudioPayload::TaskCommentAddRequest {
+                project_id: "p1".into(),
+                task_id: "t1".into(),
+                body_md: "Please review".into(),
+                mention_user_ids: vec!["u2".into()],
+            },
+            ProjectStudioPayload::AttachmentUsageRequest {
+                project_id: "p1".into(),
+                offset: 10,
+                limit: 25,
+            },
+            ProjectStudioPayload::AttachmentGetRequest {
+                project_id: "p1".into(),
+                owner_kind: AttachmentOwnerKind::Task,
+                owner_id: "t1".into(),
+                step_index: None,
+                sha256: "a".repeat(64),
+                offset: 4_194_304,
+                max_bytes: 4_194_304,
+                preview: true,
+            },
+            ProjectStudioPayload::AttachmentUploadChunkRequest {
+                project_id: "p1".into(),
+                upload_id: "up1".into(),
+                filename: "video.mp4".into(),
+                mime: "video/mp4".into(),
+                sha256: "b".repeat(64),
+                total_size: 100_000_000,
+                offset: 4_194_304,
+                bytes: vec![0, 1, 2, 255],
+            },
+        ];
+        for payload in cases {
+            let bytes = crate::cbor::encode(&payload).expect("encode");
+            let decoded = crate::cbor::decode::<ProjectStudioPayload>(&bytes).expect("decode");
+            assert_eq!(decoded, payload);
+        }
     }
 
     /// Golden wire snapshot: ciborium encodes enum variants as a 1-element map

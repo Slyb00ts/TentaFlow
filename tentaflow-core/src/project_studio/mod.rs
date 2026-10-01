@@ -20,6 +20,7 @@ pub mod git_source;
 pub mod ingest;
 pub mod knowledge;
 pub mod ml_link;
+pub mod media;
 pub mod models;
 pub mod notifications;
 pub mod project_db;

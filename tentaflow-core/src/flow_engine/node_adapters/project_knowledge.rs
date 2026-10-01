@@ -307,6 +307,7 @@ mod tests {
             r#"["knowledge"]"#,
             owner,
             &dir.to_string_lossy(),
+            "",
             &member_rows,
         )
         .expect("create project");

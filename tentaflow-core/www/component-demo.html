@@ -736,7 +736,7 @@ fetch('/index.html').then(r => r.text()).then(html => {
 <div class="section">
   <div class="section-label">Specialized (runtime-only)</div>
   <div style="font-size:12px;color:var(--tf-text-3);display:flex;flex-direction:column;gap:6px">
-    <div><strong style="color:var(--tf-text-2)">tf-video-stream</strong> — fMP4 playback via MediaSource Extensions (requires live stream)</div>
+    <div><strong style="color:var(--tf-text-2)">tf-video-stream</strong> — live fMP4 playback with <code>stream-id</code>, or recorded native playback with <code>src</code> and <code>controls</code>. Recorded sources support native seek; <code>mediaElement</code> exposes playback state. Set one source mode at a time.</div>
     <div><strong style="color:var(--tf-text-2)">tf-live-camera-tile</strong> — signed frame URL refresh cycle (requires running cameras)</div>
     <div><strong style="color:var(--tf-text-2)">tf-fps-counter</strong> — binary protocol stream subscription (requires active stream)</div>
     <div><strong style="color:var(--tf-text-2)">tf-alarm-feed</strong> — binary protocol alarm subscription (requires active detectors)</div>

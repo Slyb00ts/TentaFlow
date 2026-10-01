@@ -119,3 +119,38 @@ test('an item label that looks like markup is text', () => {
   assert.equal(menu.querySelector('img'), null);
   assert.equal(menu.getAttribute('heading'), '<b>s</b>');
 });
+
+test('a modal action menu stays above its window and selection returns focus before running', () => {
+  const win = document.createElement('tf-window');
+  win.setAttribute('modal', '');
+  const btn = document.createElement('button');
+  const body = document.createElement('div');
+  body.setAttribute('slot', 'body'); body.appendChild(btn); win.appendChild(body);
+  document.body.appendChild(win);
+  btn.focus();
+  const runs = [];
+  const menu = openActionMenu(btn, [{ label: 'Edit', run: () => runs.push(document.activeElement === btn) }], 'Task type');
+  assert.ok(Number(menu.shadowRoot.querySelector('.tf-menu').style.zIndex) > Number(win.shadowRoot.querySelector('.tf-window').style.zIndex));
+  rowOf(menu, 'Edit').click();
+  assert.deepEqual(runs, [true]);
+  assert.equal(win.isConnected, true);
+});
+
+test('Escape dismisses a focused modal menu before the window, and Tab returns to the modal anchor', () => {
+  const win = document.createElement('tf-window');
+  win.setAttribute('modal', '');
+  const btn = document.createElement('button');
+  const body = document.createElement('div');
+  body.setAttribute('slot', 'body'); body.appendChild(btn); win.appendChild(body);
+  document.body.appendChild(win);
+  const menu = openActionMenu(btn, [{ label: 'Edit', run() {} }], 'Task type');
+  key(document.activeElement, 'Escape');
+  assert.equal(menu.isConnected, false);
+  assert.equal(win._closing, undefined);
+  assert.equal(document.activeElement, btn);
+  const again = openActionMenu(btn, [{ label: 'Edit', run() {} }], 'Task type');
+  const tab = key(document.activeElement, 'Tab');
+  assert.equal(tab.defaultPrevented, false);
+  assert.equal(again.isConnected, false);
+  assert.equal(document.activeElement, btn);
+});

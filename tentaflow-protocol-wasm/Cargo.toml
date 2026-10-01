@@ -33,6 +33,7 @@ ed25519-dalek = { workspace = true }
 # Losowość w przeglądarce pochodzi z Crypto.getRandomValues.
 getrandom = { workspace = true, features = ["wasm_js"] }
 hex = { workspace = true, features = ["alloc"] }
+sha2 = { workspace = true }
 
 # Logging w browser
 console_error_panic_hook = { workspace = true, optional = true }

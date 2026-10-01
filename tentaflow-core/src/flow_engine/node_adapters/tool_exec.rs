@@ -1950,6 +1950,7 @@ mod tests {
                 "[\"knowledge\"]",
                 "tool-owner",
                 &dir.to_string_lossy(),
+                "",
                 &[MemberInput {
                     user_id: actor.clone(),
                     functions: vec!["developer".into()],

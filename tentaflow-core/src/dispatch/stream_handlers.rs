@@ -6705,6 +6705,7 @@ mod tests {
             r#"["knowledge","chat"]"#,
             &user_id,
             dir.to_str().expect("utf-8 project dir"),
+            "",
             &[],
         )
         .expect("create project");
@@ -6815,6 +6816,7 @@ mod tests {
             r#"["knowledge","chat"]"#,
             &user_id,
             dir.to_str().expect("utf-8 project dir"),
+            "",
             &[],
         )
         .expect("create project");
@@ -7051,6 +7053,7 @@ mod tests {
             "[\"tests\"]",
             "try-grants-owner",
             &dir.to_string_lossy(),
+            "",
             &[],
         )
         .expect("project");
@@ -7242,6 +7245,7 @@ mod tests {
             "[\"tests\"]",
             "queue-owner",
             &dir.to_string_lossy(),
+            "",
             &[MemberInput {
                 user_id: actor.clone(),
                 functions: vec!["tester".into()],
@@ -7460,6 +7464,7 @@ mod tests {
                     "[\"knowledge\",\"chat\",\"tests\"]",
                     "stream-owner",
                     &dir.to_string_lossy(),
+                    "",
                     &[MemberInput {
                         user_id: actor.clone(),
                         functions: vec!["developer".into(), "tester".into()],

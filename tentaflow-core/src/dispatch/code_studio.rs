@@ -12601,6 +12601,7 @@ mod tests {
             "[\"knowledge\"]",
             "project-owner",
             &dir.to_string_lossy(),
+            "",
             &[crate::project_studio::models::MemberInput {
                 user_id: "u-devops-link".into(),
                 functions: vec!["devops".into()],

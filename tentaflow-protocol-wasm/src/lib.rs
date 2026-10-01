@@ -12742,8 +12742,7 @@ fn decode_storage_admin_payload(
 /// without touching this crate. `bytes` of the upload request would arrive as
 /// a number array, but request variants never legitimately decode in the
 /// response path. AttachmentGetResponse and RunArtifactGetResponse are
-/// special-cased BEFORE the generic path: their serde_bytes payloads (up to
-/// 8 MiB / 32 MiB) must reach JS as a Uint8Array, not a per-byte number
+/// special-cased BEFORE the generic path: their serde_bytes payloads must reach JS as a Uint8Array, not a per-byte number
 /// array built through serde_json.
 fn decode_project_studio_payload(
     obj: &js_sys::Object,
@@ -12751,8 +12750,10 @@ fn decode_project_studio_payload(
 ) {
     if let tentaflow_protocol::project_studio::ProjectStudioPayload::AttachmentGetResponse {
         bytes,
+        total_size,
         mime,
-        truncated,
+        filename,
+        eof,
     } = payload
     {
         set(obj, "variant", "ProjectStudioAttachmentGetResponse".into());
@@ -12762,7 +12763,10 @@ fn decode_project_studio_payload(
             js_sys::Uint8Array::from(bytes.as_slice()).into(),
         );
         set(obj, "mime", mime.into());
-        set(obj, "truncated", truncated.into());
+        set(obj, "totalSize", (total_size as f64).into());
+        set(obj, "total_size", (total_size as f64).into());
+        set(obj, "filename", filename.into());
+        set(obj, "eof", eof.into());
         return;
     }
     if let tentaflow_protocol::project_studio::ProjectStudioPayload::RunArtifactGetResponse {
@@ -20822,6 +20826,7 @@ pub fn encode_project_studio_projects_list_request(
 #[wasm_bindgen(js_name = encodeProjectStudioProjectCreateRequest)]
 pub fn encode_project_studio_project_create_request(
     name: String,
+    key_prefix: String,
     description: String,
     template: String,
     modules_json: String,
@@ -20835,6 +20840,7 @@ pub fn encode_project_studio_project_create_request(
     encode_body_inner(&MessageBody::ProjectStudioBody(
         tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectCreateRequest {
             name,
+            key_prefix,
             description,
             template,
             modules,
@@ -20859,12 +20865,14 @@ pub fn encode_project_studio_project_update_request(
     project_id: String,
     name: String,
     description: String,
+    key_prefix: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ProjectStudioBody(
         tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectUpdateRequest {
             project_id,
             name,
             description,
+            key_prefix,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -21403,6 +21411,7 @@ pub fn encode_project_studio_settings_save_request(
     project_id: String,
     name: Option<String>,
     description: Option<String>,
+    key_prefix: Option<String>,
     agents_json: Option<String>,
     modules_json: Option<String>,
     graph_extraction: Option<bool>,
@@ -21423,6 +21432,7 @@ pub fn encode_project_studio_settings_save_request(
             project_id,
             name,
             description,
+            key_prefix,
             agents_json,
             modules,
             graph_extraction,
@@ -21687,19 +21697,37 @@ pub fn encode_project_studio_cases_import_csv_request(
     encode_project_studio_json_request("CasesImportCsvRequest", &request_json)
 }
 
-/// MessageBody::ProjectStudioBody(AttachmentGetRequest) — download by content
-/// hash; the server clamps `max_bytes` to 8 MiB.
+/// MessageBody::ProjectStudioBody(AttachmentGetRequest) — bounded attachment
+/// download by content hash and exact owner reference.
 #[wasm_bindgen(js_name = encodeProjectStudioAttachmentGetRequest)]
 pub fn encode_project_studio_attachment_get_request(
     project_id: String,
+    owner_kind: String,
+    owner_id: String,
+    step_index: Option<u32>,
     sha256: String,
+    offset: u64,
     max_bytes: u32,
+    preview: bool,
 ) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::project_studio::AttachmentOwnerKind;
+    let owner_kind = match owner_kind.as_str() {
+        "task" => AttachmentOwnerKind::Task,
+        "case" => AttachmentOwnerKind::Case,
+        "run_item" => AttachmentOwnerKind::RunItem,
+        "run_step" => AttachmentOwnerKind::RunStep,
+        _ => return Err(JsError::new("invalid attachment owner kind")),
+    };
     encode_body_inner(&MessageBody::ProjectStudioBody(
         tentaflow_protocol::project_studio::ProjectStudioPayload::AttachmentGetRequest {
             project_id,
+            owner_kind,
+            owner_id,
+            step_index,
             sha256,
+            offset,
             max_bytes,
+            preview,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -21917,6 +21945,7 @@ pub fn encode_project_studio_tasks_list_request(
     offset: u32,
     limit: u32,
     severity: Option<String>,
+    include_archived: bool,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ProjectStudioBody(
         tentaflow_protocol::project_studio::ProjectStudioPayload::TasksListRequest {
@@ -21928,6 +21957,7 @@ pub fn encode_project_studio_tasks_list_request(
             offset,
             limit,
             severity: severity.unwrap_or_default(),
+            include_archived,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -21976,12 +22006,16 @@ pub fn encode_project_studio_task_comment_add_request(
     project_id: String,
     task_id: String,
     body_md: String,
+    mention_user_ids_json: String,
 ) -> Result<Vec<u8>, JsError> {
+    let mention_user_ids: Vec<String> = serde_json::from_str(&mention_user_ids_json)
+        .map_err(|e| JsError::new(&format!("invalid mention_user_ids_json: {e}")))?;
     encode_body_inner(&MessageBody::ProjectStudioBody(
         tentaflow_protocol::project_studio::ProjectStudioPayload::TaskCommentAddRequest {
             project_id,
             task_id,
             body_md,
+            mention_user_ids,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -21993,12 +22027,16 @@ pub fn encode_project_studio_task_comment_edit_request(
     project_id: String,
     comment_id: String,
     body_md: String,
+    mention_user_ids_json: String,
 ) -> Result<Vec<u8>, JsError> {
+    let mention_user_ids: Vec<String> = serde_json::from_str(&mention_user_ids_json)
+        .map_err(|e| JsError::new(&format!("invalid mention_user_ids_json: {e}")))?;
     encode_body_inner(&MessageBody::ProjectStudioBody(
         tentaflow_protocol::project_studio::ProjectStudioPayload::TaskCommentEditRequest {
             project_id,
             comment_id,
             body_md,
+            mention_user_ids,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -22017,6 +22055,111 @@ pub fn encode_project_studio_task_comment_delete_request(
         },
     ))
     .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskArchiveRequest)]
+pub fn encode_project_studio_task_archive_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskArchiveRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskHandoverRequest)]
+pub fn encode_project_studio_task_handover_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskHandoverRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskTypesListRequest)]
+pub fn encode_project_studio_task_types_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskTypesListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskTypeSaveRequest)]
+pub fn encode_project_studio_task_type_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskTypeSaveRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskEventsRequest)]
+pub fn encode_project_studio_task_events_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskEventsRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskLinksListRequest)]
+pub fn encode_project_studio_task_links_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskLinksListRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskLinkSaveRequest)]
+pub fn encode_project_studio_task_link_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskLinkSaveRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioTaskLinkDeleteRequest)]
+pub fn encode_project_studio_task_link_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskLinkDeleteRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioAttachmentUploadStatusRequest)]
+pub fn encode_project_studio_attachment_upload_status_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("AttachmentUploadStatusRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioAttachmentUploadChunkRequest)]
+pub fn encode_project_studio_attachment_upload_chunk_request(
+    project_id: String,
+    upload_id: String,
+    filename: String,
+    mime: String,
+    sha256: String,
+    total_size: u64,
+    offset: u64,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::AttachmentUploadChunkRequest {
+            project_id, upload_id, filename, mime, sha256, total_size, offset, bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioAttachmentUploadCancelRequest)]
+pub fn encode_project_studio_attachment_upload_cancel_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("AttachmentUploadCancelRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioAttachmentPreviewRequest)]
+pub fn encode_project_studio_attachment_preview_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("AttachmentPreviewRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeProjectStudioAttachmentUsageRequest)]
+pub fn encode_project_studio_attachment_usage_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("AttachmentUsageRequest", &request_json)
+}
+
+#[wasm_bindgen]
+pub struct ProjectStudioSha256 {
+    inner: Option<sha2::Sha256>,
+}
+
+#[wasm_bindgen]
+impl ProjectStudioSha256 {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self { inner: Some(sha2::Sha256::default()) }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) -> Result<(), JsError> {
+        use sha2::Digest;
+        self.inner.as_mut().ok_or_else(|| JsError::new("hash is finalized"))?.update(bytes);
+        Ok(())
+    }
+
+    #[wasm_bindgen(js_name = digestHex)]
+    pub fn digest_hex(&mut self) -> Result<String, JsError> {
+        use sha2::Digest;
+        let inner = self.inner.take().ok_or_else(|| JsError::new("hash is finalized"))?;
+        Ok(hex::encode(inner.finalize()))
+    }
 }
 
 /// MessageBody::ProjectStudioBody(GenerationStartRequest). `request_json`

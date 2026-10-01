@@ -1,10 +1,8 @@
 // ===== File: project_studio/ingest.rs — chunked uploads + knowledge-source ingest jobs =====
 //
 // Three responsibilities:
-//   1. Chunked file uploads: an in-memory accumulator streams chunks into a
-//      part file under `<dir_path>/files/`, finalizes to a content-addressed
-//      blob `files/<sha256>` and remembers filename/mime metadata until
-//      `SourceCreate` consumes the refs (TTL-bounded).
+//   1. Chunked uploads persist owner metadata and committed offsets next to
+//      part files, then publish verified content-addressed originals.
 //   2. Ingest jobs: extract → chunk → embed → vector-store pipeline per file,
 //      run as a spawned task with its own cancel registry, progress re-emitted
 //      over `log_bus` (key = job_id) for the ingest stream handler, and
@@ -20,7 +18,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -187,292 +184,493 @@ fn close_job_as_cancelled(project_pool: &DbPool, payload: &JobPayload) {
 }
 
 // =============================================================================
-// Chunked upload accumulator
+// Durable chunked uploads
 // =============================================================================
 
 pub const MAX_UPLOAD_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_UPLOAD_FILE_BYTES: u64 = 64 * 1024 * 1024;
-const UPLOAD_TTL_MS: i64 = 30 * 60 * 1000;
+const UPLOAD_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// (org_id, user_id, project_id, upload_id) — a chunk stream is private to
-/// the uploader; another user cannot append to or finalize it.
-type UploadKey = (String, String, String, String);
-
-struct PendingUpload {
-    filename: String,
-    mime: String,
-    total_chunks: u32,
-    next_seq: u32,
-    received_bytes: u64,
-    part_path: PathBuf,
-    last_touch_ms: i64,
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UploadState {
+    pub org_id: String,
+    pub user_id: String,
+    pub project_id: String,
+    pub upload_id: String,
+    pub filename: String,
+    pub mime: String,
+    pub sha256: String,
+    pub total_size: u64,
+    pub next_offset: u64,
+    pub next_seq: u32,
+    pub complete: bool,
+    pub expires_at_ms: i64,
+    total_chunks: Option<u32>,
+    declared_size: Option<u64>,
+    last_offset: u64,
+    last_chunk_sha256: String,
 }
 
-/// Metadata of a finalized blob, kept until `SourceCreate` consumes the
-/// `file_ref` (or the TTL sweeps it). Keyed like uploads but by sha256.
-#[derive(Clone)]
+pub enum UploadPosition<'a> {
+    Sequence {
+        seq: u32,
+        total_chunks: u32,
+    },
+    Offset {
+        offset: u64,
+        total_size: u64,
+        sha256: &'a str,
+    },
+}
+
+pub struct UploadChunk<'a> {
+    pub org_id: &'a str,
+    pub user_id: &'a str,
+    pub project_id: &'a str,
+    pub dir_path: &'a Path,
+    pub upload_id: &'a str,
+    pub filename: &'a str,
+    pub mime: &'a str,
+    pub position: UploadPosition<'a>,
+    pub bytes: &'a [u8],
+    pub allowed: &'a dyn Fn() -> Result<()>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct FileMeta {
     pub filename: String,
     pub mime: String,
     pub size_bytes: u64,
-    finalized_at_ms: i64,
-}
-
-fn pending_uploads() -> &'static DashMap<UploadKey, PendingUpload> {
-    static MAP: OnceLock<DashMap<UploadKey, PendingUpload>> = OnceLock::new();
-    MAP.get_or_init(DashMap::new)
-}
-
-fn finalized_files() -> &'static DashMap<UploadKey, FileMeta> {
-    static MAP: OnceLock<DashMap<UploadKey, FileMeta>> = OnceLock::new();
-    MAP.get_or_init(DashMap::new)
 }
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
-/// Drops uploads/finalized metadata older than the TTL, removing orphan part
-/// files. Called lazily from `accept_upload_chunk` — no dedicated task.
-fn sweep_expired_uploads() {
-    let cutoff = now_ms() - UPLOAD_TTL_MS;
-    let stale: Vec<UploadKey> = pending_uploads()
-        .iter()
-        .filter(|e| e.value().last_touch_ms < cutoff)
-        .map(|e| e.key().clone())
-        .collect();
-    for key in stale {
-        if let Some((_, up)) = pending_uploads().remove(&key) {
-            let _ = std::fs::remove_file(&up.part_path);
-        }
-    }
-    let stale: Vec<UploadKey> = finalized_files()
-        .iter()
-        .filter(|e| e.value().finalized_at_ms < cutoff)
-        .map(|e| e.key().clone())
-        .collect();
-    for key in stale {
-        finalized_files().remove(&key);
-    }
+    chrono::Utc::now().timestamp_millis()
 }
 
 fn validate_upload_id(upload_id: &str) -> Result<()> {
-    if upload_id.is_empty() || upload_id.len() > 128 {
-        return Err(anyhow!("invalid upload_id"));
-    }
-    // The on-disk part name is a hash of the full upload key, so the id never
-    // touches the filesystem directly — the charset bound only keeps the wire
-    // value and accumulator keys sane.
-    if !upload_id
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    if upload_id.is_empty()
+        || upload_id.len() > 128
+        || !upload_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     {
         return Err(anyhow!("invalid upload_id"));
     }
     Ok(())
 }
 
-/// Part-file name derived from the FULL upload key. Hashing (org, user,
-/// project, upload_id) together prevents two users who happen to pick the
-/// same upload_id from appending into each other's part file.
-fn part_file_name(key: &UploadKey) -> String {
+fn upload_key(org: &str, user: &str, project: &str, id: &str) -> String {
     let mut hasher = Sha256::new();
-    for segment in [&key.0, &key.1, &key.2, &key.3] {
-        hasher.update(segment.as_bytes());
-        hasher.update(b"|");
+    for value in [org, user, project, id] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
     }
-    format!(".upload-{}.part", hex::encode(hasher.finalize()))
+    hex::encode(hasher.finalize())
 }
 
-pub enum UploadOutcome {
-    Buffered {
-        received_chunks: u32,
-        received_bytes: u64,
-    },
-    Finalized {
-        sha256: String,
-        received_chunks: u32,
-        size_bytes: u64,
-    },
+fn upload_lock(key: &str) -> &'static std::sync::Mutex<()> {
+    static LOCKS: OnceLock<[std::sync::Mutex<()>; 64]> = OnceLock::new();
+    let index = key
+        .bytes()
+        .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize))
+        % 64;
+    &LOCKS.get_or_init(|| std::array::from_fn(|_| std::sync::Mutex::new(())))[index]
 }
 
-/// Accepts one upload chunk (blocking disk IO — call from `spawn_blocking`).
-/// Chunks must arrive in order; `seq == 0` (re)starts the stream. The final
-/// chunk hashes the part file and renames it to `files/<sha256>`.
-#[allow(clippy::too_many_arguments)]
-pub fn accept_upload_chunk(
-    org_id: &str,
-    user_id: &str,
-    project_id: &str,
+fn uploads_dir(dir_path: &Path) -> Result<PathBuf> {
+    let files = super::media::safe_directory(dir_path, "files")?;
+    super::media::safe_directory(&files, ".uploads")
+}
+
+fn load_upload(path: &Path) -> Result<Option<UploadState>> {
+    match super::media::open_regular(path) {
+        Ok(file) => {
+            if file.metadata()?.len() > 16 * 1024 {
+                return Err(anyhow!("upload metadata exceeds limit"));
+            }
+            Ok(Some(serde_json::from_reader(file)?))
+        }
+        Err(e) if !path.exists() && std::fs::symlink_metadata(path).is_err() => {
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            {
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn save_upload(path: &Path, state: &UploadState) -> Result<()> {
+    super::media::write_metadata(path, state)
+}
+
+fn recover_upload(dir: &Path, key: &str, state: &mut UploadState) -> Result<()> {
+    let part = dir.join(format!("{key}.part"));
+    if state.complete {
+        return Ok(());
+    }
+    if state.declared_size == Some(state.next_offset)
+        && super::media::is_sha256(&state.sha256)
+        && !part.exists()
+    {
+        let blob = dir
+            .parent()
+            .ok_or_else(|| anyhow!("invalid upload directory"))?
+            .join(&state.sha256);
+        let file = super::media::open_regular(&blob)?;
+        if file.metadata()?.len() != state.next_offset
+            || super::media::hash_file(&blob, &|| Ok(()))? != state.sha256
+        {
+            return Err(anyhow!(
+                "published upload does not match committed metadata"
+            ));
+        }
+        state.complete = true;
+        save_upload(&dir.join(format!("{key}.json")), state)?;
+        save_blob_meta(dir, state)?;
+        return Ok(());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    let file = super::media::open_options_regular(&part, &mut options)?;
+    let size = file.metadata()?.len();
+    if size < state.next_offset {
+        return Err(anyhow!("upload is shorter than its committed offset"));
+    }
+    if size > state.next_offset {
+        file.set_len(state.next_offset)?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
+fn blob_metadata_lock(key: &str) -> &'static std::sync::Mutex<()> {
+    static LOCKS: OnceLock<[std::sync::Mutex<()>; 64]> = OnceLock::new();
+    let index = key
+        .bytes()
+        .fold(0usize, |n, b| n.wrapping_mul(31).wrapping_add(b as usize))
+        % 64;
+    &LOCKS.get_or_init(|| std::array::from_fn(|_| std::sync::Mutex::new(())))[index]
+}
+
+fn save_blob_meta(dir: &Path, state: &UploadState) -> Result<()> {
+    let key = upload_key(
+        &state.org_id,
+        &state.user_id,
+        &state.project_id,
+        &state.sha256,
+    );
+    let _guard = blob_metadata_lock(&key)
+        .lock()
+        .map_err(|_| anyhow!("blob metadata lock poisoned"))?;
+    save_upload(&dir.join(format!("{key}.blob.json")), state)
+}
+
+pub fn upload_status(
+    org: &str,
+    user: &str,
+    project: &str,
     dir_path: &Path,
-    upload_id: &str,
-    filename: &str,
-    mime: &str,
-    seq: u32,
-    total_chunks: u32,
-    bytes: &[u8],
-) -> Result<UploadOutcome> {
-    sweep_expired_uploads();
-    validate_upload_id(upload_id)?;
-    if total_chunks == 0 {
-        return Err(anyhow!("total_chunks must be >= 1"));
+    id: &str,
+) -> Result<Option<UploadState>> {
+    validate_upload_id(id)?;
+    let key = upload_key(org, user, project, id);
+    let _guard = upload_lock(&key)
+        .lock()
+        .map_err(|_| anyhow!("upload lock poisoned"))?;
+    let dir = uploads_dir(dir_path)?;
+    let Some(mut state) = load_upload(&dir.join(format!("{key}.json")))? else {
+        return Ok(None);
+    };
+    if state.org_id != org
+        || state.user_id != user
+        || state.project_id != project
+        || state.upload_id != id
+    {
+        return Err(anyhow!("upload identity does not match"));
     }
-    if seq >= total_chunks {
-        return Err(anyhow!("seq out of range"));
+    if state.expires_at_ms <= now_ms() {
+        return Err(anyhow!("upload expired"));
     }
-    if bytes.len() > MAX_UPLOAD_CHUNK_BYTES {
+    recover_upload(&dir, &key, &mut state)?;
+    Ok(Some(state))
+}
+
+pub fn cancel_upload(
+    org: &str,
+    user: &str,
+    project: &str,
+    dir_path: &Path,
+    id: &str,
+) -> Result<bool> {
+    validate_upload_id(id)?;
+    let key = upload_key(org, user, project, id);
+    let _guard = upload_lock(&key)
+        .lock()
+        .map_err(|_| anyhow!("upload lock poisoned"))?;
+    let dir = uploads_dir(dir_path)?;
+    let meta = dir.join(format!("{key}.json"));
+    if load_upload(&meta)?.is_none() {
+        return Ok(false);
+    }
+    let part = dir.join(format!("{key}.part"));
+    if std::fs::symlink_metadata(&part).is_ok() {
+        std::fs::remove_file(part)?;
+    }
+    std::fs::remove_file(meta)?;
+    Ok(true)
+}
+
+/// A committed offset is acknowledged only after both bytes and metadata reach disk.
+pub fn accept_upload_chunk(chunk: &UploadChunk<'_>) -> Result<UploadState> {
+    (chunk.allowed)()?;
+    validate_upload_id(chunk.upload_id)?;
+    if chunk.bytes.len() > MAX_UPLOAD_CHUNK_BYTES {
         return Err(anyhow!("chunk exceeds 4 MiB limit"));
     }
-    let filename = filename.trim();
-    if filename.is_empty() {
-        return Err(anyhow!("filename required"));
+    let filename = chunk.filename.trim();
+    if filename.is_empty()
+        || filename.chars().count() > 255
+        || filename.chars().any(char::is_control)
+        || chunk.mime.len() > 127
+        || chunk.mime.chars().any(char::is_control)
+    {
+        return Err(anyhow!("invalid upload filename or MIME"));
     }
-
-    let key: UploadKey = (
-        org_id.to_string(),
-        user_id.to_string(),
-        project_id.to_string(),
-        upload_id.to_string(),
-    );
-    let files_dir = dir_path.join("files");
-    std::fs::create_dir_all(&files_dir)?;
-    let part_path = files_dir.join(part_file_name(&key));
-
-    if seq == 0 {
-        // Restarting an upload id discards any previous partial stream.
-        if let Some((_, old)) = pending_uploads().remove(&key) {
-            let _ = std::fs::remove_file(&old.part_path);
-        }
-        std::fs::write(&part_path, bytes)?;
-        pending_uploads().insert(
-            key.clone(),
-            PendingUpload {
-                filename: filename.to_string(),
-                mime: mime.to_string(),
-                total_chunks,
-                next_seq: 1,
-                received_bytes: bytes.len() as u64,
-                part_path: part_path.clone(),
-                last_touch_ms: now_ms(),
-            },
-        );
-    } else {
-        let mut entry = pending_uploads()
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("unknown upload_id (expired or never started)"))?;
-        if entry.total_chunks != total_chunks || seq != entry.next_seq {
-            return Err(anyhow!("out-of-order upload chunk"));
-        }
-        if entry.received_bytes + bytes.len() as u64 > MAX_UPLOAD_FILE_BYTES {
-            let part = entry.part_path.clone();
-            drop(entry);
-            pending_uploads().remove(&key);
-            let _ = std::fs::remove_file(&part);
-            return Err(anyhow!("file exceeds 64 MiB limit"));
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&entry.part_path)?;
-        f.write_all(bytes)?;
-        entry.next_seq = seq + 1;
-        entry.received_bytes += bytes.len() as u64;
-        entry.last_touch_ms = now_ms();
-    }
-
-    let (received_chunks, received_bytes, complete, meta_filename, meta_mime) = {
-        let entry = pending_uploads()
-            .get(&key)
-            .ok_or_else(|| anyhow!("upload state lost"))?;
-        (
-            entry.next_seq,
-            entry.received_bytes,
-            entry.next_seq == entry.total_chunks,
-            entry.filename.clone(),
-            entry.mime.clone(),
-        )
-    };
-
-    if !complete {
-        return Ok(UploadOutcome::Buffered {
-            received_chunks,
-            received_bytes,
-        });
-    }
-
-    // Final chunk: hash the part file streaming, rename to the blob name.
-    let sha256 = {
-        use std::io::Read;
-        let mut file = std::fs::File::open(&part_path)?;
-        let mut hasher = Sha256::new();
-        let mut buf = vec![0u8; 1024 * 1024];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
+    let (offset, seq, total_chunks, declared_size, declared_sha) = match &chunk.position {
+        UploadPosition::Sequence { seq, total_chunks } => {
+            if *total_chunks == 0 || *seq >= *total_chunks {
+                return Err(anyhow!("invalid chunk sequence"));
             }
-            hasher.update(&buf[..n]);
+            (None, Some(*seq), Some(*total_chunks), None, "")
         }
-        hex::encode(hasher.finalize())
+        UploadPosition::Offset {
+            offset,
+            total_size,
+            sha256,
+        } => {
+            if !super::media::is_sha256(sha256)
+                || offset
+                    .checked_add(chunk.bytes.len() as u64)
+                    .is_none_or(|end| end > *total_size)
+            {
+                return Err(anyhow!("invalid upload hash, offset or size"));
+            }
+            (Some(*offset), None, None, Some(*total_size), *sha256)
+        }
     };
-    let blob_path = files_dir.join(&sha256);
-    if blob_path.exists() {
-        // Same content already stored (dedup) — drop the fresh copy.
-        let _ = std::fs::remove_file(&part_path);
-    } else {
-        std::fs::rename(&part_path, &blob_path)?;
-    }
-    pending_uploads().remove(&key);
-    finalized_files().insert(
-        (
-            org_id.to_string(),
-            user_id.to_string(),
-            project_id.to_string(),
-            sha256.clone(),
-        ),
-        FileMeta {
-            filename: meta_filename,
-            mime: meta_mime,
-            size_bytes: received_bytes,
-            finalized_at_ms: now_ms(),
-        },
+    let key = upload_key(
+        chunk.org_id,
+        chunk.user_id,
+        chunk.project_id,
+        chunk.upload_id,
     );
-    Ok(UploadOutcome::Finalized {
-        sha256,
-        received_chunks,
-        size_bytes: received_bytes,
+    let _guard = upload_lock(&key)
+        .lock()
+        .map_err(|_| anyhow!("upload lock poisoned"))?;
+    let dir = uploads_dir(chunk.dir_path)?;
+    let meta_path = dir.join(format!("{key}.json"));
+    let part = dir.join(format!("{key}.part"));
+    let mut state = match load_upload(&meta_path)? {
+        Some(mut state) => {
+            recover_upload(&dir, &key, &mut state)?;
+            state
+        }
+        None => {
+            if offset.is_some_and(|v| v != 0) || seq.is_some_and(|v| v != 0) {
+                return Err(anyhow!("upload has not started"));
+            }
+            if std::fs::symlink_metadata(&part).is_ok() {
+                if super::media::open_regular(&part)?.metadata()?.len() != 0 {
+                    return Err(anyhow!("upload has bytes without committed metadata"));
+                }
+                std::fs::remove_file(&part)?;
+            }
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            super::media::open_options_regular(&part, &mut options)?.sync_all()?;
+            let state = UploadState {
+                org_id: chunk.org_id.into(),
+                user_id: chunk.user_id.into(),
+                project_id: chunk.project_id.into(),
+                upload_id: chunk.upload_id.into(),
+                filename: filename.into(),
+                mime: chunk.mime.into(),
+                sha256: declared_sha.into(),
+                total_size: declared_size.unwrap_or(0),
+                next_offset: 0,
+                next_seq: 0,
+                complete: false,
+                expires_at_ms: now_ms() + UPLOAD_TTL_MS,
+                total_chunks,
+                declared_size,
+                last_offset: 0,
+                last_chunk_sha256: String::new(),
+            };
+            save_upload(&meta_path, &state)?;
+            state
+        }
+    };
+    if state.org_id != chunk.org_id
+        || state.user_id != chunk.user_id
+        || state.project_id != chunk.project_id
+        || state.upload_id != chunk.upload_id
+        || state.filename != filename
+        || state.mime != chunk.mime
+        || state.total_chunks != total_chunks
+        || (declared_size.is_some() && state.declared_size != declared_size)
+        || (!declared_sha.is_empty() && state.sha256 != declared_sha)
+    {
+        return Err(anyhow!("upload metadata does not match"));
+    }
+    if state.expires_at_ms <= now_ms() {
+        return Err(anyhow!("upload expired"));
+    }
+    let digest = hex::encode(Sha256::digest(chunk.bytes));
+    let replay = offset.is_some_and(|v| v == state.last_offset)
+        || seq.is_some_and(|v| state.next_seq > 0 && v == state.next_seq - 1);
+    if replay && state.last_chunk_sha256 == digest {
+        return Ok(state);
+    }
+    if state.complete
+        || offset.is_some_and(|v| v != state.next_offset)
+        || seq.is_some_and(|v| v != state.next_seq)
+    {
+        return Err(anyhow!("out-of-order upload chunk"));
+    }
+    super::media::ensure_write_space(chunk.dir_path, chunk.bytes.len() as u64)?;
+    (chunk.allowed)()?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).append(true);
+    let mut file = super::media::open_options_regular(&part, &mut options)?;
+    file.write_all(chunk.bytes)?;
+    file.sync_all()?;
+    state.last_offset = state.next_offset;
+    state.next_offset = state
+        .next_offset
+        .checked_add(chunk.bytes.len() as u64)
+        .ok_or_else(|| anyhow!("upload size overflow"))?;
+    state.next_seq = state
+        .next_seq
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("upload sequence overflow"))?;
+    state.last_chunk_sha256 = digest;
+    state.expires_at_ms = now_ms() + UPLOAD_TTL_MS;
+    let complete = state.declared_size == Some(state.next_offset)
+        || state.total_chunks == Some(state.next_seq);
+    if complete {
+        let sha = super::media::hash_file(&part, chunk.allowed)?;
+        if !declared_sha.is_empty() && sha != declared_sha {
+            return Err(anyhow!("upload SHA-256 mismatch"));
+        }
+        (chunk.allowed)()?;
+        state.sha256 = sha;
+        state.total_size = state.next_offset;
+        state.declared_size = Some(state.next_offset);
+        save_upload(&meta_path, &state)?;
+        let blob = dir
+            .parent()
+            .ok_or_else(|| anyhow!("invalid upload directory"))?
+            .join(&state.sha256);
+        if std::fs::symlink_metadata(&blob).is_ok() {
+            if super::media::hash_file(&blob, chunk.allowed)? != state.sha256 {
+                return Err(anyhow!("existing blob does not match its SHA-256"));
+            }
+            std::fs::remove_file(&part)?;
+        } else {
+            std::fs::rename(&part, &blob)?;
+        }
+        (chunk.allowed)()?;
+        state.complete = true;
+        save_blob_meta(&dir, &state)?;
+    }
+    (chunk.allowed)()?;
+    save_upload(&meta_path, &state)?;
+    Ok(state)
+}
+
+pub fn finalized_meta(
+    org: &str,
+    user: &str,
+    project: &str,
+    dir_path: &Path,
+    sha256: &str,
+) -> Option<FileMeta> {
+    if !super::media::is_sha256(sha256) {
+        return None;
+    }
+    let dir = uploads_dir(dir_path).ok()?;
+    let key = upload_key(org, user, project, sha256);
+    let state = load_upload(&dir.join(format!("{key}.blob.json"))).ok()??;
+    if !state.complete
+        || state.sha256 != sha256
+        || state.org_id != org
+        || state.user_id != user
+        || state.project_id != project
+        || state.expires_at_ms <= now_ms()
+    {
+        return None;
+    }
+    Some(FileMeta {
+        filename: state.filename,
+        mime: state.mime,
+        size_bytes: state.total_size,
     })
 }
 
-/// Metadata of a finalized upload, looked up by `SourceCreate` when it turns
-/// `file_refs` into `source_files` rows. Not consumed — the TTL sweeper
-/// removes it.
-pub fn finalized_meta(
-    org_id: &str,
-    user_id: &str,
-    project_id: &str,
-    sha256: &str,
-) -> Option<FileMeta> {
-    finalized_files()
-        .get(&(
-            org_id.to_string(),
-            user_id.to_string(),
-            project_id.to_string(),
-            sha256.to_string(),
-        ))
-        .map(|m| m.clone())
+fn cleanup_uploads(dir_path: &Path) -> Result<std::collections::HashSet<String>> {
+    let dir = uploads_dir(dir_path)?;
+    let mut protected = std::collections::HashSet::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let (key, blob_meta) = if let Some(key) = name.strip_suffix(".blob.json") {
+            (key, true)
+        } else if let Some(key) = name.strip_suffix(".json") {
+            (key, false)
+        } else {
+            continue;
+        };
+        if !super::media::is_sha256(key) {
+            continue;
+        }
+        let mutex = if blob_meta {
+            blob_metadata_lock(key)
+        } else {
+            upload_lock(key)
+        };
+        let _guard = mutex
+            .lock()
+            .map_err(|_| anyhow!("upload cleanup lock poisoned"))?;
+        let Some(state) = load_upload(&entry.path())? else {
+            continue;
+        };
+        if state.expires_at_ms > now_ms() {
+            if super::media::is_sha256(&state.sha256) {
+                protected.insert(state.sha256);
+            }
+        } else {
+            if !blob_meta {
+                let part = dir.join(format!("{key}.part"));
+                if std::fs::symlink_metadata(&part).is_ok() {
+                    std::fs::remove_file(part)?;
+                }
+            }
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(protected)
 }
 
-/// How old an on-disk `.upload-*.part` file must be before the GC removes it.
-/// Longer than the accumulator TTL, so only parts the in-memory sweeper
-/// already forgot (e.g. after a restart) are touched.
+/// Old source-upload part files predate the durable metadata directory and
+/// can only be abandoned uploads; live uploads are protected by their state.
 const PART_FILE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// How old an unreferenced `files/<sha256>` blob must be before the GC removes
-/// it. 24 h leaves ample room for the upload → SourceCreate window (the
-/// finalized-meta TTL is 30 min) without racing an in-flight wizard.
+/// it. Active durable uploads and every current or historical attachment
+/// reference protect originals independently of this orphan age.
 const ORPHAN_BLOB_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Best-effort GC of the project `files/` directory, run when a project pool
@@ -490,6 +688,7 @@ pub fn cleanup_files_dir(pool: &DbPool, dir_path: &Path) {
     // A read failure disables blob GC for this run — never treat a blob as
     // orphaned on uncertainty (stale part cleanup still proceeds).
     let referenced = repository::referenced_blob_sha256s(pool).ok();
+    let staged = cleanup_uploads(dir_path).ok();
     let mut removed = 0u32;
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
@@ -507,7 +706,8 @@ pub fn cleanup_files_dir(pool: &DbPool, dir_path: &Path) {
         let orphan_blob = name.len() == 64
             && name.bytes().all(|b| b.is_ascii_hexdigit())
             && age > ORPHAN_BLOB_MAX_AGE
-            && referenced.as_ref().is_some_and(|set| !set.contains(&name));
+            && referenced.as_ref().is_some_and(|set| !set.contains(&name))
+            && staged.as_ref().is_some_and(|set| !set.contains(&name));
         if (stale_part || orphan_blob) && std::fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
@@ -2874,6 +3074,7 @@ mod tests {
             "[\"knowledge\"]",
             "tester",
             &dir.to_string_lossy(),
+            "",
             &[],
         )
         .expect("registry row");
@@ -3400,166 +3601,221 @@ mod tests {
         }
     }
 
+    fn sequence_chunk<'a>(
+        dir: &'a Path,
+        user: &'a str,
+        id: &'a str,
+        seq: u32,
+        total_chunks: u32,
+        bytes: &'a [u8],
+    ) -> UploadChunk<'a> {
+        UploadChunk {
+            org_id: "org",
+            user_id: user,
+            project_id: "p1",
+            dir_path: dir,
+            upload_id: id,
+            filename: "a.txt",
+            mime: "text/plain",
+            position: UploadPosition::Sequence { seq, total_chunks },
+            bytes,
+            allowed: &|| Ok(()),
+        }
+    }
+
     #[test]
-    fn upload_accumulator_orders_limits_and_finalizes() {
+    fn upload_orders_limits_identity_and_finalizes() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path();
-
-        // Out-of-order start (seq=1 without seq=0) is rejected.
-        assert!(accept_upload_chunk(
-            "org",
-            "u1",
-            "p1",
-            dir,
-            "up1",
-            "a.txt",
-            "text/plain",
-            1,
-            2,
-            b"x"
-        )
-        .is_err());
-
-        // Two ordered chunks finalize to a content-addressed blob.
-        let r0 = accept_upload_chunk(
-            "org",
-            "u1",
-            "p1",
-            dir,
-            "up1",
-            "a.txt",
-            "text/plain",
-            0,
-            2,
-            b"hello ",
-        )
-        .expect("chunk 0");
-        assert!(matches!(
-            r0,
-            UploadOutcome::Buffered {
-                received_chunks: 1,
-                ..
-            }
-        ));
-        let r1 = accept_upload_chunk(
-            "org",
-            "u1",
-            "p1",
-            dir,
-            "up1",
-            "a.txt",
-            "text/plain",
-            1,
-            2,
-            b"world",
-        )
-        .expect("chunk 1");
-        let sha = match r1 {
-            UploadOutcome::Finalized {
-                sha256, size_bytes, ..
-            } => {
-                assert_eq!(size_bytes, 11);
-                sha256
-            }
-            _ => panic!("expected finalized"),
-        };
-        let blob = dir.join("files").join(&sha);
-        assert_eq!(std::fs::read(&blob).expect("blob"), b"hello world");
-        let meta = finalized_meta("org", "u1", "p1", &sha).expect("meta");
+        assert!(accept_upload_chunk(&sequence_chunk(dir, "u1", "up1", 1, 2, b"x")).is_err());
+        let first =
+            accept_upload_chunk(&sequence_chunk(dir, "u1", "up1", 0, 2, b"hello ")).expect("first");
+        assert!(!first.complete);
+        assert_eq!(first.next_seq, 1);
+        assert_eq!(first.next_offset, 6);
+        let replay = accept_upload_chunk(&sequence_chunk(dir, "u1", "up1", 0, 2, b"hello "))
+            .expect("retry first");
+        assert_eq!(replay.next_offset, 6);
+        assert!(accept_upload_chunk(&sequence_chunk(dir, "u1", "up1", 0, 2, b"other")).is_err());
+        let final_state =
+            accept_upload_chunk(&sequence_chunk(dir, "u1", "up1", 1, 2, b"world")).expect("last");
+        assert!(final_state.complete);
+        assert_eq!(final_state.total_size, 11);
+        assert_eq!(
+            std::fs::read(dir.join("files").join(&final_state.sha256)).expect("blob"),
+            b"hello world"
+        );
+        assert!(
+            accept_upload_chunk(&sequence_chunk(dir, "u1", "up1", 1, 2, b"world"))
+                .expect("retry final")
+                .complete
+        );
+        let meta =
+            finalized_meta("org", "u1", "p1", dir, &final_state.sha256).expect("durable metadata");
         assert_eq!(meta.filename, "a.txt");
         assert_eq!(meta.size_bytes, 11);
-
-        // Same upload_id from two different users must not collide: the part
-        // file name hashes the full (org, user, project, upload_id) key.
-        for (user, c0) in [("ua", b"aaa"), ("ub", b"bbb")] {
-            let r = accept_upload_chunk(
-                "org",
-                user,
-                "p1",
-                dir,
-                "shared",
-                "s.txt",
-                "text/plain",
-                0,
-                2,
-                c0,
-            )
-            .expect("chunk 0");
-            assert!(matches!(r, UploadOutcome::Buffered { .. }));
+        assert!(finalized_meta("org", "u2", "p1", dir, &final_state.sha256).is_none());
+        for (user, first) in [("ua", b"aaa"), ("ub", b"bbb")] {
+            accept_upload_chunk(&sequence_chunk(dir, user, "shared", 0, 2, first))
+                .expect("separate owner upload");
         }
-        let sha_a = match accept_upload_chunk(
-            "org",
-            "ua",
-            "p1",
-            dir,
-            "shared",
-            "s.txt",
-            "text/plain",
-            1,
-            2,
-            b"111",
-        )
-        .expect("ua finalize")
-        {
-            UploadOutcome::Finalized { sha256, .. } => sha256,
-            _ => panic!("expected finalized"),
-        };
-        let sha_b = match accept_upload_chunk(
-            "org",
-            "ub",
-            "p1",
-            dir,
-            "shared",
-            "s.txt",
-            "text/plain",
-            1,
-            2,
-            b"222",
-        )
-        .expect("ub finalize")
-        {
-            UploadOutcome::Finalized { sha256, .. } => sha256,
-            _ => panic!("expected finalized"),
-        };
-        assert_ne!(sha_a, sha_b);
+        let a = accept_upload_chunk(&sequence_chunk(dir, "ua", "shared", 1, 2, b"111")).expect("a");
+        let b = accept_upload_chunk(&sequence_chunk(dir, "ub", "shared", 1, 2, b"222")).expect("b");
+        assert_ne!(a.sha256, b.sha256);
         assert_eq!(
-            std::fs::read(dir.join("files").join(&sha_a)).expect("blob a"),
+            std::fs::read(dir.join("files").join(a.sha256)).expect("a bytes"),
             b"aaa111"
         );
         assert_eq!(
-            std::fs::read(dir.join("files").join(&sha_b)).expect("blob b"),
+            std::fs::read(dir.join("files").join(b.sha256)).expect("b bytes"),
             b"bbb222"
         );
-
-        // Traversal in upload_id is rejected before any FS access.
-        assert!(accept_upload_chunk(
-            "org",
-            "u1",
-            "p1",
-            dir,
-            "../evil",
-            "a.txt",
-            "text/plain",
-            0,
-            1,
-            b"x"
-        )
-        .is_err());
-        // Oversized single chunk is rejected.
+        assert!(accept_upload_chunk(&sequence_chunk(dir, "u1", "../evil", 0, 1, b"x")).is_err());
         let big = vec![0u8; MAX_UPLOAD_CHUNK_BYTES + 1];
-        assert!(accept_upload_chunk(
-            "org",
-            "u1",
-            "p1",
-            dir,
-            "up2",
-            "b.bin",
-            "application/octet-stream",
-            0,
-            1,
-            &big
-        )
+        assert!(accept_upload_chunk(&sequence_chunk(dir, "u1", "big", 0, 1, &big)).is_err());
+    }
+
+    #[test]
+    fn upload_over_64_mib_resumes_committed_disk_offsets_and_checks_hash() {
+        use std::io::Read;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bytes = vec![0x39u8; MAX_UPLOAD_CHUNK_BYTES];
+        let total = 17 * bytes.len() as u64;
+        let mut digest = Sha256::new();
+        for _ in 0..17 {
+            digest.update(&bytes);
+        }
+        let sha = hex::encode(digest.finalize());
+        let send = |offset| {
+            accept_upload_chunk(&UploadChunk {
+                org_id: "org",
+                user_id: "u1",
+                project_id: "p1",
+                dir_path: tmp.path(),
+                upload_id: "large",
+                filename: "recording.bin",
+                mime: "application/octet-stream",
+                position: UploadPosition::Offset {
+                    offset,
+                    total_size: total,
+                    sha256: &sha,
+                },
+                bytes: &bytes,
+                allowed: &|| Ok(()),
+            })
+        };
+        for index in 0..5 {
+            assert_eq!(
+                send(index * bytes.len() as u64)
+                    .expect("first session")
+                    .next_offset,
+                (index + 1) * bytes.len() as u64
+            );
+        }
+        let key = upload_key("org", "u1", "p1", "large");
+        let part = uploads_dir(tmp.path())
+            .expect("staging")
+            .join(format!("{key}.part"));
+        let mut interrupted = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&part)
+            .expect("uncommitted write");
+        interrupted
+            .write_all(b"bytes written before metadata commit")
+            .expect("write");
+        interrupted.sync_all().expect("sync");
+        drop(interrupted);
+        let recovered = upload_status("org", "u1", "p1", tmp.path(), "large")
+            .expect("new session disk recovery")
+            .expect("state");
+        assert_eq!(recovered.next_offset, 5 * bytes.len() as u64);
+        assert_eq!(
+            std::fs::metadata(&part).expect("part").len(),
+            recovered.next_offset
+        );
+        assert!(
+            upload_status("org", "other-user", "p1", tmp.path(), "large")
+                .expect("scope")
+                .is_none()
+        );
+        for index in 5..17 {
+            send(index * bytes.len() as u64).expect("resumed session");
+        }
+        let completed = upload_status("org", "u1", "p1", tmp.path(), "large")
+            .expect("load completed disk record")
+            .expect("completed");
+        assert!(completed.complete);
+        assert!(completed.total_size > 64 * 1024 * 1024);
+        assert_eq!(completed.sha256, sha);
+        let blob = tmp.path().join("files").join(&sha);
+        let mut file = super::super::media::open_regular(&blob).expect("original");
+        let mut read_hash = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let n = file.read(&mut buffer).expect("bounded read");
+            if n == 0 {
+                break;
+            }
+            read_hash.update(&buffer[..n]);
+        }
+        assert_eq!(hex::encode(read_hash.finalize()), sha);
+        assert!(cancel_upload("org", "u1", "p1", tmp.path(), "large").expect("clear own staging"));
+        assert_eq!(
+            std::fs::metadata(blob)
+                .expect("cancel preserves original")
+                .len(),
+            total
+        );
+    }
+
+    #[test]
+    fn upload_rejects_hash_changes_revocation_and_recovers_initial_crash() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let key = upload_key("org", "u1", "p1", "initial-crash");
+        let orphan = uploads_dir(tmp.path())
+            .expect("dir")
+            .join(format!("{key}.part"));
+        std::fs::File::create(&orphan)
+            .expect("initial write before metadata")
+            .sync_all()
+            .expect("sync");
+        assert!(
+            accept_upload_chunk(&sequence_chunk(
+                tmp.path(),
+                "u1",
+                "initial-crash",
+                0,
+                1,
+                b"hello"
+            ))
+            .expect("restart first chunk")
+            .complete
+        );
+        let wrong_sha = "a".repeat(64);
+        assert!(accept_upload_chunk(&UploadChunk {
+            org_id: "org",
+            user_id: "u1",
+            project_id: "p1",
+            dir_path: tmp.path(),
+            upload_id: "wrong-hash",
+            filename: "wrong.bin",
+            mime: "application/octet-stream",
+            position: UploadPosition::Offset {
+                offset: 0,
+                total_size: 5,
+                sha256: &wrong_sha
+            },
+            bytes: b"hello",
+            allowed: &|| Ok(())
+        })
         .is_err());
+        assert!(!tmp.path().join("files").join(wrong_sha).exists());
+        let mut denied = sequence_chunk(tmp.path(), "u1", "revoked", 0, 1, b"hello");
+        denied.allowed = &|| Err(anyhow!("access expired"));
+        assert!(accept_upload_chunk(&denied).is_err());
+        assert!(upload_status("org", "u1", "p1", tmp.path(), "revoked")
+            .expect("status")
+            .is_none());
     }
     /// The owner decision for Projects: a project ingest does NOT build a
     /// knowledge graph. The shared `graph_enabled` key means ON when absent, so

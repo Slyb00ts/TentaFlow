@@ -1387,6 +1387,7 @@ mod unit_tests {
             "[\"knowledge\",\"tests\"]",
             "owner-gen",
             &dir.to_string_lossy(),
+            "",
             &[super::super::models::MemberInput {
                 user_id: user_id.to_string(),
                 functions: vec!["tester".to_string()],

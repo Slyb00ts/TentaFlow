@@ -466,6 +466,7 @@ function renderAutocomplete(component, ctx) {
   // component popover never opens.
   const el = document.createElement('tf-combobox');
   el.classList.add('tf-autocomplete');
+  el.setAttribute('free-input', '');
   el.setAttribute('min-chars', String(minSearchChars));
   if (resultTemplateId) {
     // Host hint — which slot displays the results. The renderer does not
@@ -533,7 +534,7 @@ function renderAutocomplete(component, ctx) {
   el.addEventListener('input', onInput);
   ctx.registerCleanup(() => el.removeEventListener('input', onInput));
 
-  // Native 'change' from the inner text input → SDK 'change' {value, kind}.
+  // The component's semantic text commit becomes the SDK change event.
   const onChange = (e) => {
     if (e.__tfReemit) return;
     e.stopImmediatePropagation();

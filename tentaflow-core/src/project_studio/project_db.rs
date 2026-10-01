@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use rusqlite::Connection;
 use tracing::{info, warn};
 
@@ -34,6 +35,11 @@ struct Entry {
 fn registry() -> &'static DashMap<String, Arc<Entry>> {
     static REG: OnceLock<DashMap<String, Arc<Entry>>> = OnceLock::new();
     REG.get_or_init(DashMap::new)
+}
+
+fn opening_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 static FROZEN: AtomicBool = AtomicBool::new(false);
@@ -80,6 +86,17 @@ pub fn open(project_id: &str) -> Result<DbPool> {
         return Ok(entry.pool.clone());
     }
 
+    // Cold opens must publish one pool before another caller can migrate or
+    // write through a different SQLite connection to the same project.
+    let _opening = opening_lock().lock();
+    if FROZEN.load(Ordering::SeqCst) {
+        return Err(anyhow!("project storage is frozen (migration in progress)"));
+    }
+    if let Some(entry) = registry().get(project_id) {
+        entry.last_used_ms.store(now_ms(), Ordering::Relaxed);
+        return Ok(entry.pool.clone());
+    }
+
     let dir_path: String = {
         let central = super::db::pool()?;
         let conn = central
@@ -94,6 +111,36 @@ pub fn open(project_id: &str) -> Result<DbPool> {
     };
 
     let (pool, version) = open_pool_at(Path::new(&dir_path))?;
+    {
+        let content_conn = pool
+            .write()
+            .map_err(|e| anyhow!("project content write: {e}"))?;
+        let content_tx = content_conn.unchecked_transaction()?;
+        content_tx.execute(
+            "UPDATE settings SET value = value WHERE key = 'project_key_prefix'",
+            [],
+        )?;
+        let central = super::db::pool()?;
+        let central_conn = central
+            .read()
+            .map_err(|e| anyhow!("projects registry read: {e}"))?;
+        let prefix: String = central_conn.query_row(
+            "SELECT key_prefix FROM projects WHERE project_id = ?1",
+            rusqlite::params![project_id],
+            |row| row.get(0),
+        )?;
+        drop(central_conn);
+        content_tx.execute(
+            "INSERT INTO settings(key,value) VALUES ('project_key_prefix',?1) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![prefix],
+        )?;
+        content_tx.execute(
+            "UPDATE tasks SET task_key = ?1 || '-' || task_no WHERE task_key <> ?1 || '-' || task_no",
+            rusqlite::params![prefix],
+        )?;
+        content_tx.commit()?;
+    }
 
     // Fresh open only: close jobs orphaned by a restart, then GC stale upload
     // parts and unreferenced blobs — both need the pool but must not observe a
@@ -224,6 +271,7 @@ pub fn spawn_idle_sweeper() {
 /// pool; new opens are rejected until unfrozen (same contract as
 /// `addon::storage_sql::set_addon_storage_frozen`).
 pub fn set_frozen(frozen: bool) {
+    let _opening = opening_lock().lock();
     FROZEN.store(frozen, Ordering::SeqCst);
     if frozen {
         let keys: Vec<String> = registry().iter().map(|e| e.key().clone()).collect();
@@ -275,7 +323,7 @@ fn run_project_migrations(conn: &Connection) -> Result<i64> {
 
 /// Highest per-project schema version this binary knows. An archive produced by
 /// a NEWER node is refused on import rather than migrated blindly.
-pub const LATEST_SCHEMA_VERSION: i64 = 4;
+pub const LATEST_SCHEMA_VERSION: i64 = 5;
 
 /// Ordered per-project schema migrations (F4+ tables land as further entries).
 const MIGRATIONS_PROJECT: &[(i64, &str)] = &[
@@ -283,6 +331,7 @@ const MIGRATIONS_PROJECT: &[(i64, &str)] = &[
     (2, PROJECT_SCHEMA_V2),
     (3, PROJECT_SCHEMA_V3),
     (4, PROJECT_SCHEMA_V4),
+    (5, PROJECT_SCHEMA_V5),
 ];
 
 const PROJECT_SCHEMA_V1: &str = "
@@ -679,6 +728,92 @@ CREATE TABLE ml_links (
 );
 ";
 
+const PROJECT_SCHEMA_V5: &str = "
+DROP INDEX idx_tasks_filter;
+DROP INDEX idx_tasks_assignee;
+ALTER TABLE tasks RENAME TO tasks_legacy;
+CREATE TABLE tasks (
+    task_id TEXT PRIMARY KEY,
+    task_no INTEGER NOT NULL UNIQUE,
+    task_key TEXT NOT NULL UNIQUE,
+    task_type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description_md TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT '' CHECK(severity IN ('','low','medium','high','critical')),
+    priority TEXT NOT NULL DEFAULT 'medium' CHECK(priority IN ('low','medium','high','critical')),
+    status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo','in_progress','review','done')),
+    assigned_to TEXT NOT NULL DEFAULT '',
+    due_date TEXT NOT NULL DEFAULT '',
+    parent_task_id TEXT,
+    links_json TEXT NOT NULL DEFAULT '[]',
+    attachments_json TEXT NOT NULL DEFAULT '[]',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    archived_at TEXT
+);
+INSERT INTO tasks(task_id,task_no,task_key,task_type,title,description_md,severity,
+    priority,status,assigned_to,due_date,links_json,attachments_json,created_by,created_at,updated_at)
+SELECT task_id,task_no,'PR-' || task_no,
+    CASE WHEN task_type = 'task' THEN 'technical' ELSE task_type END,
+    title,description_md,severity,priority,status,assigned_to,due_date,
+    links_json,attachments_json,created_by,created_at,updated_at FROM tasks_legacy;
+DROP TABLE tasks_legacy;
+CREATE INDEX idx_tasks_filter ON tasks(task_type,status,updated_at DESC);
+CREATE INDEX idx_tasks_assignee ON tasks(assigned_to,status);
+CREATE INDEX idx_tasks_parent ON tasks(parent_task_id);
+CREATE TABLE task_types (
+    type_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    sort_order INTEGER NOT NULL,
+    built_in INTEGER NOT NULL CHECK(built_in IN (0,1)),
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+INSERT INTO task_types(type_id,name,description,sort_order,built_in) VALUES
+    ('feature','Feature','New product behavior',10,1),
+    ('defect','Defect','Incorrect behavior',20,1),
+    ('technical','Technical task','Engineering work',30,1),
+    ('security','Security task','Security work',40,1),
+    ('subtask','Subtask','Part of another task',50,1),
+    ('epic','Epic','Group of related tasks',60,1);
+CREATE TABLE task_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    actor_kind TEXT NOT NULL CHECK(actor_kind IN ('user','agent','system')),
+    actor_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    before_json TEXT NOT NULL DEFAULT 'null',
+    after_json TEXT NOT NULL DEFAULT 'null'
+);
+CREATE INDEX idx_task_events_task ON task_events(task_id,event_id DESC);
+INSERT INTO task_events(task_id,actor_kind,actor_id,kind,after_json)
+SELECT task_id,'system','','imported',
+    json_object('task_type',task_type,'status',status,'title',title)
+FROM tasks;
+CREATE TABLE task_links (
+    link_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_task_id TEXT NOT NULL REFERENCES tasks(task_id),
+    target_task_id TEXT NOT NULL REFERENCES tasks(task_id),
+    kind TEXT NOT NULL CHECK(kind IN ('related','duplicate','fs','ss','ff','sf')),
+    lag_days INTEGER NOT NULL DEFAULT 0,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    CHECK(source_task_id <> target_task_id),
+    UNIQUE(source_task_id,target_task_id,kind)
+);
+CREATE INDEX idx_task_links_target ON task_links(target_task_id);
+ALTER TABLE task_comments ADD COLUMN mention_user_ids_json TEXT NOT NULL DEFAULT '[]';
+INSERT INTO settings(key,value) VALUES ('project_key_prefix','PR')
+    ON CONFLICT(key) DO NOTHING;
+INSERT INTO settings(key,value)
+SELECT 'task_next_no',CAST(COALESCE(MAX(task_no),0)+1 AS TEXT) FROM tasks;
+INSERT INTO settings(key,value)
+SELECT 'project_key_prefix_locked',CASE WHEN COUNT(*) > 0 THEN '1' ELSE '0' END FROM tasks;
+";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,6 +869,76 @@ mod tests {
             )
             .expect("version row");
         assert_eq!(applied, 1, "migration recorded exactly once");
+    }
+
+    #[test]
+    fn migration_v5_preserves_legacy_tasks_and_records_only_a_baseline() {
+        let conn = Connection::open_in_memory().expect("database");
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON; CREATE TABLE project_schema_version( \
+             version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT (datetime('now')));",
+        )
+        .expect("version table");
+        for (version, sql) in MIGRATIONS_PROJECT.iter().take(4) {
+            conn.execute_batch(sql).expect("legacy migration");
+            conn.execute(
+                "INSERT INTO project_schema_version(version) VALUES (?1)",
+                [version],
+            )
+            .expect("version");
+        }
+        conn.execute(
+            "INSERT INTO tasks(task_id,task_no,task_type,title,description_md,status, \
+             attachments_json,created_by,created_at) VALUES \
+             ('legacy',7,'task','Old task','Original description','review', \
+             '[{\"sha256\":\"abc\",\"name\":\"old.png\",\"size_bytes\":3,\"mime\":\"image/png\"}]','u1','2020-01-01 00:00:00')",
+            [],
+        ).expect("legacy task");
+        conn.execute(
+            "INSERT INTO task_comments(comment_id,task_id,author_user_id,body_md) \
+             VALUES ('c1','legacy','u2','Existing comment')",
+            [],
+        )
+        .expect("legacy comment");
+        assert_eq!(run_project_migrations(&conn).expect("upgrade"), 5);
+        let migrated: (String, String, String, String) = conn.query_row(
+            "SELECT task_key,task_type,description_md,attachments_json FROM tasks WHERE task_id='legacy'",
+            [],
+            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+        ).expect("migrated task");
+        assert_eq!(migrated.0, "PR-7");
+        assert_eq!(migrated.1, "technical");
+        assert_eq!(migrated.2, "Original description");
+        assert!(migrated.3.contains("old.png"));
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_events WHERE task_id='legacy' AND kind='imported'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("baseline");
+        assert_eq!(count, 1);
+        let imported_at: String = conn
+            .query_row(
+                "SELECT at FROM task_events WHERE task_id='legacy' AND kind='imported'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migration time");
+        assert_ne!(imported_at, "2020-01-01 00:00:00");
+        assert_eq!(run_project_migrations(&conn).expect("reopen"), 5);
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_events", [], |row| row.get(0))
+            .expect("events");
+        assert_eq!(count, 1);
+        let comment: String = conn
+            .query_row(
+                "SELECT body_md FROM task_comments WHERE comment_id='c1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("comment survives");
+        assert_eq!(comment, "Existing comment");
     }
 
     /// Golden round-trip for the v3 12-step rebuild: a genuine v2 database
@@ -799,7 +1004,10 @@ mod tests {
         }
 
         let (pool, version) = open_pool_at(&dir).expect("migrate to v3");
-        assert_eq!(version, 4, "a seeded v2 database reaches the latest schema");
+        assert_eq!(
+            version, LATEST_SCHEMA_VERSION,
+            "a seeded v2 database reaches the latest schema"
+        );
         let conn = pool.write().expect("write");
 
         // Every pre-rebuild row survived with its values intact.
@@ -913,8 +1121,8 @@ mod tests {
     /// v3 → v4 on a REAL v3 database: existing rows survive, the three new
     /// tables are queryable with their CHECKs and UNIQUE in force, and the
     /// tables F4 writes through (`test_runs.run_type = 'perf'`, the four
-    /// kanban `tasks.status` values) still accept their values WITHOUT a
-    /// rebuild — that is the whole reason this migration is purely additive.
+    /// kanban `tasks.status` values) still accept their values after the
+    /// subsequent task-type migration.
     #[test]
     fn migration_v4_adds_schedule_and_ml_tables() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -961,7 +1169,7 @@ mod tests {
         }
 
         let (pool, version) = open_pool_at(&dir).expect("migrate to v4");
-        assert_eq!(version, 4);
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
         let conn = pool.write().expect("write");
 
         // Pre-migration rows are untouched.
@@ -1089,8 +1297,7 @@ mod tests {
             assert_eq!(n, 1, "index {idx} missing");
         }
 
-        // No rebuild was needed: the tables F4 writes through already accept
-        // every value it produces.
+        // The F4 values remain valid after every later migration.
         conn.execute(
             "INSERT INTO test_runs (run_id, run_no, name, run_type, assignment_mode, \
              created_by) VALUES ('r1', 1, 'perf nocny', 'perf', 'pool', 'u1')",
@@ -1104,11 +1311,11 @@ mod tests {
             ("k4", 5, "done"),
         ] {
             conn.execute(
-                "INSERT INTO tasks (task_id, task_no, title, status, created_by) \
-                 VALUES (?1, ?2, 'karta', ?3, 'u1')",
+                "INSERT INTO tasks (task_id, task_no, task_key, task_type, title, status, created_by) \
+                 VALUES (?1, ?2, 'PR-' || ?2, 'technical', 'karta', ?3, 'u1')",
                 rusqlite::params![id, no, status],
             )
-            .expect("tasks.status accepts every kanban column without a rebuild");
+            .expect("tasks.status accepts every kanban column after migration");
         }
     }
 }

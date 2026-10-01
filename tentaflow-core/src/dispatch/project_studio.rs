@@ -17,15 +17,17 @@ use tentaflow_protocol::project_studio::access::{
     ProjectPermissionLevel,
 };
 use tentaflow_protocol::project_studio::{
-    ActivityEntry, ArchiveInventoryWire, ArtifactRef, AttachmentWire, BuildProfileWire,
-    CaseVersionInfo, ChatInfo, ChatMessageWire, CreatorGrantInfo, CsvImportError, EnvApprovalItem,
-    EnvironmentInfo, GenerationRunInfo, IngestJobWire, KbHit, MemberInfo, MemberInputWire,
-    MlLinkInfo, MlProjectSummaryWire, MlRoleMapEntry, MlSyncOutcomeWire, MyWorkEntry,
-    NotificationWire, OverviewKpis, PerfStatsWire, PerfTimelinePoint, ProjectAgentBinding,
-    ProjectInfo, ProjectSettings, ProjectStudioPayload, RunAssignmentWire, RunItemWire,
-    RunStepWire, RunnerInfo, RunnerToolchain, ScheduleInfo, ScheduleRunWire, SourceFileInfo,
-    SourceInfo, SuiteCaseRef, SuiteInfo, TagInfo, TaskCommentWire, TaskDetail, TaskInfo,
-    TestCaseDetail, TestCaseInfo, TestRunInfo, TestRunItemAutoWire, UserRefWire,
+    ActivityEntry, ArchiveInventoryWire, ArtifactRef, AttachmentOwnerKind, AttachmentUsageFileWire,
+    AttachmentWire, BuildProfileWire, CaseVersionInfo, ChatInfo, ChatMessageWire, CreatorGrantInfo,
+    CsvImportError, EnvApprovalItem, EnvironmentInfo, GenerationRunInfo, IngestJobWire, KbHit,
+    MemberInfo, MemberInputWire, MlLinkInfo, MlProjectSummaryWire, MlRoleMapEntry,
+    MlSyncOutcomeWire, MyWorkEntry, NotificationWire, OverviewKpis, PerfStatsWire,
+    PerfTimelinePoint, ProjectAgentBinding, ProjectInfo, ProjectSettings, ProjectStudioPayload,
+    RunAssignmentWire, RunItemWire, RunStepWire, RunnerInfo, RunnerToolchain, ScheduleInfo,
+    ScheduleRunWire, SourceFileInfo, SourceInfo, SuiteCaseRef, SuiteInfo, TagInfo,
+    TaskAttachmentUsageWire, TaskCommentWire, TaskDetail, TaskEventWire, TaskInfo, TaskLinkWire,
+    TaskStatusDurationWire, TaskTypeWire, TestCaseDetail, TestCaseInfo, TestRunInfo,
+    TestRunItemAutoWire, UserRefWire,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
@@ -37,7 +39,7 @@ use crate::project_studio::models::{
 };
 use crate::project_studio::{
     activity, api_spec, archive, auto_runs, build_profiles, environments, generation, git_source,
-    ingest, ml_link, notifications, project_db, reports, repository, runs, schedules, tasks,
+    ingest, media, ml_link, notifications, project_db, reports, repository, runs, schedules, tasks,
     tests as ps_tests, zip_source,
 };
 use crate::services::rbac::OrgContext;
@@ -166,7 +168,7 @@ fn task_access(access: &ProjectAccessWire, minimum: ProjectPermissionLevel) -> b
     access.allows(ProjectArea::Tasks, minimum) || access.allows(ProjectArea::Board, minimum)
 }
 
-fn require_task_access(
+pub(crate) fn require_task_access(
     ctx: &HandlerContext,
     org: &OrgContext,
     project_id: &str,
@@ -530,6 +532,11 @@ fn project_info(
         };
     Ok(ProjectInfo {
         project_id: record.project_id.clone(),
+        key_prefix: record.key_prefix.clone(),
+        key_prefix_locked: tasks::project_key_prefix_locked(&open_project_pool(
+            &record.project_id,
+        )?)
+        .map_err(|e| db_error("key_prefix_locked", e))?,
         name: record.name.clone(),
         description: record.description.clone(),
         status: record.status.clone(),
@@ -575,14 +582,24 @@ pub async fn project_studio_dispatch(
             description,
             template,
             modules,
+            key_prefix,
             members,
-        } => project_create_v1(ctx, name, description, template, modules, members),
+        } => project_create_v1(
+            ctx,
+            name,
+            description,
+            template,
+            modules,
+            key_prefix,
+            members,
+        ),
         P::ProjectGetRequest { project_id } => project_get_v1(ctx, project_id),
         P::ProjectUpdateRequest {
             project_id,
             name,
             description,
-        } => project_update_v1(ctx, project_id, name, description),
+            key_prefix,
+        } => project_update_v1(ctx, project_id, name, description, key_prefix.as_deref()),
         P::ProjectArchiveRequest {
             project_id,
             archived,
@@ -725,6 +742,7 @@ pub async fn project_studio_dispatch(
             agents_json,
             modules,
             graph_extraction,
+            key_prefix,
         } => settings_save_v1(
             ctx,
             project_id,
@@ -733,6 +751,7 @@ pub async fn project_studio_dispatch(
             agents_json.as_deref(),
             modules.as_deref(),
             *graph_extraction,
+            key_prefix.as_deref(),
         ),
         P::TagSaveRequest {
             project_id,
@@ -828,9 +847,75 @@ pub async fn project_studio_dispatch(
         } => cases_import_csv_v1(ctx, project_id, csv_text, *dry_run),
         P::AttachmentGetRequest {
             project_id,
+            owner_kind,
+            owner_id,
+            step_index,
             sha256,
+            offset,
             max_bytes,
-        } => attachment_get_v1(ctx, project_id, sha256, *max_bytes),
+            preview,
+        } => {
+            let owner = media::AttachmentOwner {
+                kind: owner_kind.clone(),
+                id: owner_id.clone(),
+                step_index: *step_index,
+            };
+            attachment_get_v1(
+                ctx, project_id, &owner, sha256, *offset, *max_bytes, *preview,
+            )
+            .await
+        }
+        P::AttachmentUsageRequest {
+            project_id,
+            offset,
+            limit,
+        } => attachment_usage(ctx, project_id, *offset, *limit).await,
+        P::AttachmentUploadStatusRequest {
+            project_id,
+            upload_id,
+        } => attachment_upload_status(ctx, project_id, upload_id),
+        P::AttachmentUploadChunkRequest {
+            project_id,
+            upload_id,
+            filename,
+            mime,
+            sha256,
+            total_size,
+            offset,
+            bytes,
+        } => {
+            attachment_upload_chunk(
+                ctx,
+                project_id,
+                upload_id,
+                filename,
+                mime,
+                sha256,
+                *total_size,
+                *offset,
+                bytes,
+            )
+            .await
+        }
+        P::AttachmentUploadCancelRequest {
+            project_id,
+            upload_id,
+        } => attachment_upload_cancel(ctx, project_id, upload_id),
+        P::AttachmentPreviewRequest {
+            project_id,
+            owner_kind,
+            owner_id,
+            step_index,
+            sha256,
+            retry,
+        } => {
+            let owner = media::AttachmentOwner {
+                kind: owner_kind.clone(),
+                id: owner_id.clone(),
+                step_index: *step_index,
+            };
+            attachment_preview(ctx, project_id, &owner, sha256, *retry)
+        }
         P::SuitesListRequest { project_id } => suites_list_v1(ctx, project_id),
         P::SuiteGetRequest {
             project_id,
@@ -947,6 +1032,7 @@ pub async fn project_studio_dispatch(
             offset,
             limit,
             severity,
+            include_archived,
         } => tasks_list_v1(
             ctx,
             project_id,
@@ -957,6 +1043,7 @@ pub async fn project_studio_dispatch(
             *offset,
             *limit,
             severity,
+            *include_archived,
         ),
         P::TaskGetRequest {
             project_id,
@@ -973,6 +1060,7 @@ pub async fn project_studio_dispatch(
             status,
             assigned_to,
             due_date,
+            parent_task_id,
             links_json,
             attachments_json,
         } => task_save_v1(
@@ -987,9 +1075,74 @@ pub async fn project_studio_dispatch(
             status,
             assigned_to,
             due_date,
+            parent_task_id.as_deref(),
             links_json,
             attachments_json,
         ),
+        P::TaskHandoverRequest {
+            project_id,
+            task_id,
+            assigned_to,
+            note_md,
+            mention_user_ids,
+        } => task_handover(
+            ctx,
+            project_id,
+            task_id,
+            assigned_to,
+            note_md,
+            mention_user_ids,
+        ),
+        P::TaskArchiveRequest {
+            project_id,
+            task_id,
+            archived,
+        } => task_archive(ctx, project_id, task_id, *archived),
+        P::TaskTypesListRequest { project_id } => task_types_list(ctx, project_id),
+        P::TaskTypeSaveRequest {
+            project_id,
+            type_id,
+            name,
+            description,
+            sort_order,
+            active,
+        } => task_type_save(
+            ctx,
+            project_id,
+            type_id,
+            name,
+            description,
+            *sort_order,
+            *active,
+        ),
+        P::TaskEventsRequest {
+            project_id,
+            task_id,
+            before_id,
+            limit,
+        } => task_events(ctx, project_id, task_id, *before_id, *limit),
+        P::TaskLinksListRequest {
+            project_id,
+            task_id,
+        } => task_links_list(ctx, project_id, task_id),
+        P::TaskLinkSaveRequest {
+            project_id,
+            source_task_id,
+            target_task_id,
+            kind,
+            lag_days,
+        } => task_link_save(
+            ctx,
+            project_id,
+            source_task_id,
+            target_task_id,
+            kind,
+            *lag_days,
+        ),
+        P::TaskLinkDeleteRequest {
+            project_id,
+            link_id,
+        } => task_link_delete(ctx, project_id, *link_id),
         P::TaskDeleteRequest {
             project_id,
             task_id,
@@ -998,12 +1151,14 @@ pub async fn project_studio_dispatch(
             project_id,
             task_id,
             body_md,
-        } => task_comment_add_v1(ctx, project_id, task_id, body_md),
+            mention_user_ids,
+        } => task_comment_add_v1(ctx, project_id, task_id, body_md, mention_user_ids),
         P::TaskCommentEditRequest {
             project_id,
             comment_id,
             body_md,
-        } => task_comment_edit_v1(ctx, project_id, comment_id, body_md),
+            mention_user_ids,
+        } => task_comment_edit_v1(ctx, project_id, comment_id, body_md, mention_user_ids),
         P::TaskCommentDeleteRequest {
             project_id,
             comment_id,
@@ -1389,6 +1544,19 @@ pub async fn project_studio_dispatch(
         | P::TaskGetResponse { .. }
         | P::TaskSaveResponse { .. }
         | P::TaskDeleteResult { .. }
+        | P::TaskArchiveResult { .. }
+        | P::TaskHandoverResult { .. }
+        | P::TaskTypesListResponse { .. }
+        | P::TaskTypeSaveResponse { .. }
+        | P::TaskEventsResponse { .. }
+        | P::TaskLinksListResponse { .. }
+        | P::TaskLinkSaveResult { .. }
+        | P::TaskLinkDeleteResult { .. }
+        | P::AttachmentUploadStatusResponse { .. }
+        | P::AttachmentUploadChunkResponse { .. }
+        | P::AttachmentUploadCancelResult { .. }
+        | P::AttachmentPreviewResponse { .. }
+        | P::AttachmentUsageResponse { .. }
         | P::TaskCommentAddResponse { .. }
         | P::TaskCommentEditResult { .. }
         | P::TaskCommentDeleteResult { .. }
@@ -1943,6 +2111,61 @@ register_project_studio_variant!(
     "tentaflow_ws_handler_ps_member_access_set"
 );
 
+register_project_studio_variant!(
+    "ProjectStudioTaskArchiveRequest",
+    "tentaflow_ws_handler_ps_taskarchive"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskTypesListRequest",
+    "tentaflow_ws_handler_ps_tasktypeslist"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskTypeSaveRequest",
+    "tentaflow_ws_handler_ps_tasktypesave"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskEventsRequest",
+    "tentaflow_ws_handler_ps_taskevents"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskLinksListRequest",
+    "tentaflow_ws_handler_ps_tasklinkslist"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskLinkSaveRequest",
+    "tentaflow_ws_handler_ps_tasklinksave"
+);
+register_project_studio_variant!(
+    "ProjectStudioTaskLinkDeleteRequest",
+    "tentaflow_ws_handler_ps_tasklinkdelete"
+);
+register_project_studio_variant!(
+    "ProjectStudioAttachmentUploadStatusRequest",
+    "tentaflow_ws_handler_ps_attachmentuploadstatus"
+);
+register_project_studio_variant!(
+    "ProjectStudioAttachmentUploadChunkRequest",
+    "tentaflow_ws_handler_ps_attachmentuploadchunk"
+);
+register_project_studio_variant!(
+    "ProjectStudioAttachmentUploadCancelRequest",
+    "tentaflow_ws_handler_ps_attachmentuploadcancel"
+);
+register_project_studio_variant!(
+    "ProjectStudioAttachmentPreviewRequest",
+    "tentaflow_ws_handler_ps_attachmentpreview"
+);
+
+register_project_studio_variant!(
+    "ProjectStudioAttachmentUsageRequest",
+    "tentaflow_ws_handler_ps_attachment_usage"
+);
+
+register_project_studio_variant!(
+    "ProjectStudioTaskHandoverRequest",
+    "tentaflow_ws_handler_ps_task_handover"
+);
+
 // =============================================================================
 // Registry: list / create / get / update / archive / delete
 // =============================================================================
@@ -1988,6 +2211,7 @@ fn project_create_v1(
     description: &str,
     template: &str,
     modules: &[String],
+    key_prefix: &str,
     members: &[MemberInputWire],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
@@ -2040,6 +2264,7 @@ fn project_create_v1(
         &modules_json,
         &org.user_id,
         &dir.to_string_lossy(),
+        key_prefix,
         &initial,
     ) {
         // Registry insert failed (e.g. duplicate name) — the freshly created
@@ -2090,6 +2315,7 @@ fn project_update_v1(
     project_id: &str,
     name: &str,
     description: &str,
+    key_prefix: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (record, _access) = require_project(
@@ -2104,15 +2330,20 @@ fn project_update_v1(
     if name.is_empty() || name.len() > 200 {
         return Err(ProtocolError::bad_request("project name is required"));
     }
-    let ok =
-        repository::update_project_name_desc(&org.org_id, project_id, name, description.trim())
-            .map_err(|e| {
-                map_unique(
-                    "project_update",
-                    "a project with this name already exists",
-                    e,
-                )
-            })?;
+    let ok = repository::update_project_name_desc(
+        &org.org_id,
+        project_id,
+        name,
+        description.trim(),
+        key_prefix,
+    )
+    .map_err(|e| {
+        map_unique(
+            "project_update",
+            "a project with this name already exists",
+            e,
+        )
+    })?;
     if ok {
         if let Ok(pool) = project_db::open(project_id) {
             activity::record(
@@ -2602,22 +2833,7 @@ async fn source_upload_chunk_v1(
     bytes: &[u8],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, access) = require_project_access(ctx, org, project_id)?;
-    if !access.can_create_tasks
-        && ![
-            ProjectArea::Knowledge,
-            ProjectArea::Repos,
-            ProjectArea::Tests,
-        ]
-        .iter()
-        .any(|area| access.allows(*area, ProjectPermissionLevel::Write))
-    {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            "attachment upload access denied",
-        ));
-    }
-    require_active(&record)?;
+    let record = require_upload_access(ctx, project_id)?;
 
     let org_id = org.org_id.clone();
     let user_id = org.user_id.clone();
@@ -2627,35 +2843,33 @@ async fn source_upload_chunk_v1(
     let filename = filename.to_string();
     let mime = mime.to_string();
     let bytes = bytes.to_vec();
+    let context = ctx.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        ingest::accept_upload_chunk(
-            &org_id,
-            &user_id,
-            &project_id_owned,
-            &dir,
-            &upload_id_owned,
-            &filename,
-            &mime,
-            seq,
-            total_chunks,
-            &bytes,
-        )
+        ingest::accept_upload_chunk(&ingest::UploadChunk {
+            org_id: &org_id,
+            user_id: &user_id,
+            project_id: &project_id_owned,
+            dir_path: &dir,
+            upload_id: &upload_id_owned,
+            filename: &filename,
+            mime: &mime,
+            position: ingest::UploadPosition::Sequence { seq, total_chunks },
+            bytes: &bytes,
+            allowed: &|| {
+                require_upload_access(&context, &project_id_owned)
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!(e.message))
+            },
+        })
     })
     .await
     .map_err(|_| ProtocolError::internal("upload task panicked"))?
     .map_err(|e| ProtocolError::bad_request(format!("upload rejected: {e}")))?;
 
-    let (received_chunks, received_bytes, file_ref) = match outcome {
-        ingest::UploadOutcome::Buffered {
-            received_chunks,
-            received_bytes,
-        } => (received_chunks, received_bytes, None),
-        ingest::UploadOutcome::Finalized {
-            sha256,
-            received_chunks,
-            size_bytes,
-        } => (received_chunks, size_bytes, Some(sha256)),
-    };
+    require_upload_access(ctx, project_id)?;
+    let received_chunks = outcome.next_seq;
+    let received_bytes = outcome.next_offset;
+    let file_ref = outcome.complete.then_some(outcome.sha256);
     Ok(ps(ProjectStudioPayload::SourceUploadChunkResponse {
         upload_id: upload_id.to_string(),
         received_chunks,
@@ -2769,12 +2983,18 @@ async fn source_create_v1(
                 ));
             }
             for sha in file_refs {
-                let meta = ingest::finalized_meta(&org.org_id, &org.user_id, project_id, sha)
-                    .ok_or_else(|| {
-                        ProtocolError::bad_request(format!(
-                            "unknown file_ref '{sha}' (upload expired?)"
-                        ))
-                    })?;
+                let meta = ingest::finalized_meta(
+                    &org.org_id,
+                    &org.user_id,
+                    project_id,
+                    std::path::Path::new(&record.dir_path),
+                    sha,
+                )
+                .ok_or_else(|| {
+                    ProtocolError::bad_request(format!(
+                        "unknown file_ref '{sha}' (upload expired?)"
+                    ))
+                })?;
                 document_files.push((sha.clone(), meta));
             }
         }
@@ -3816,6 +4036,9 @@ fn settings_get_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody
 
     Ok(ps(ProjectStudioPayload::SettingsGetResponse {
         settings: ProjectSettings {
+            key_prefix: record.key_prefix.clone(),
+            key_prefix_locked: tasks::project_key_prefix_locked(&pool)
+                .map_err(|e| db_error("key_prefix_locked", e))?,
             name: record.name,
             description: record.description,
             modules: parse_modules_json(&record.modules_json),
@@ -3834,6 +4057,7 @@ fn settings_save_v1(
     agents_json: Option<&str>,
     modules: Option<&[String]>,
     graph_extraction: Option<bool>,
+    key_prefix: Option<&str>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (record, _access) = require_project(
@@ -3846,21 +4070,26 @@ fn settings_save_v1(
     require_active(&record)?;
     let pool = open_project_pool(project_id)?;
 
-    if name.is_some() || description.is_some() {
+    if name.is_some() || description.is_some() || key_prefix.is_some() {
         let new_name = name.map(str::trim).unwrap_or(&record.name);
         if new_name.is_empty() || new_name.len() > 200 {
             return Err(ProtocolError::bad_request("project name is required"));
         }
         let new_desc = description.map(str::trim).unwrap_or(&record.description);
-        repository::update_project_name_desc(&org.org_id, project_id, new_name, new_desc).map_err(
-            |e| {
-                map_unique(
-                    "settings_save",
-                    "a project with this name already exists",
-                    e,
-                )
-            },
-        )?;
+        repository::update_project_name_desc(
+            &org.org_id,
+            project_id,
+            new_name,
+            new_desc,
+            key_prefix,
+        )
+        .map_err(|e| {
+            map_unique(
+                "settings_save",
+                "a project with this name already exists",
+                e,
+            )
+        })?;
     }
     if let Some(raw) = agents_json {
         // Wire format is the array of bindings from the technical design
@@ -4036,21 +4265,68 @@ fn attachments_from_json(raw: &str) -> Vec<AttachmentWire> {
 
 /// Validates and canonicalizes an attachments payload ('' = none). Every
 /// entry must be a content hash of the project blob store.
-fn normalize_attachments(raw: &str) -> Result<String, ProtocolError> {
+fn normalize_attachments(
+    ctx: &HandlerContext,
+    record: &ProjectRecord,
+    owner: Option<&media::AttachmentOwner>,
+    raw: &str,
+) -> Result<String, ProtocolError> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok("[]".to_string());
     }
     let list: Vec<AttachmentWire> = serde_json::from_str(raw)
         .map_err(|e| ProtocolError::bad_request(format!("invalid attachments_json: {e}")))?;
-    if list.len() > 20 {
-        return Err(ProtocolError::bad_request("too many attachments (max 20)"));
-    }
+    let org = require_read(ctx)?;
+    let dir = std::path::Path::new(&record.dir_path);
+    let files = media::safe_directory(dir, "files")
+        .map_err(|_| ProtocolError::bad_request("attachment storage is unavailable"))?;
     for entry in &list {
         if !is_sha256_hex(&entry.sha256) {
             return Err(ProtocolError::bad_request(
                 "attachment sha256 must be 64 lowercase hex characters",
             ));
+        }
+        let staged = ingest::finalized_meta(
+            &org.org_id,
+            &org.user_id,
+            &record.project_id,
+            dir,
+            &entry.sha256,
+        );
+        let retained = owner
+            .and_then(|owner| {
+                require_attachment(ctx, &record.project_id, owner, &entry.sha256).ok()
+            })
+            .map(|(_, attachment)| attachment);
+        let authorized = match (staged, retained) {
+            (Some(meta), _) => meta.size_bytes == entry.size_bytes && meta.mime == entry.mime,
+            (None, Some(meta)) => meta.size_bytes == entry.size_bytes && meta.mime == entry.mime,
+            (None, None) => false,
+        };
+        if !authorized {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::PolicyDenied,
+                "attachment must be your completed upload or a readable reference of this record",
+            ));
+        }
+        let file = media::open_regular(&files.join(&entry.sha256))
+            .map_err(|_| ProtocolError::bad_request("attachment original is unavailable"))?;
+        if file
+            .metadata()
+            .map_err(|_| ProtocolError::bad_request("attachment metadata is unavailable"))?
+            .len()
+            != entry.size_bytes
+        {
+            return Err(ProtocolError::bad_request(
+                "attachment size does not match its original",
+            ));
+        }
+        if entry.name.trim().is_empty()
+            || entry.name.chars().count() > 255
+            || entry.name.chars().any(char::is_control)
+        {
+            return Err(ProtocolError::bad_request("invalid attachment filename"));
         }
     }
     serde_json::to_string(&list)
@@ -4286,6 +4562,9 @@ fn task_to_wire(record: TaskRecord, names: &HashMap<String, (String, String)>) -
         created_by_name: display_name(names, &record.created_by),
         task_id: record.task_id,
         task_no: record.task_no,
+        task_key: record.task_key,
+        parent_task_id: record.parent_task_id,
+        archived_at: record.archived_at,
         task_type: record.task_type,
         title: record.title,
         severity: record.severity,
@@ -4306,6 +4585,7 @@ fn comment_to_wire(
     names: &HashMap<String, (String, String)>,
 ) -> TaskCommentWire {
     TaskCommentWire {
+        mention_user_ids: serde_json::from_str(&record.mention_user_ids_json).unwrap_or_default(),
         author_name: display_name(names, &record.author_user_id),
         comment_id: record.comment_id,
         author_user_id: record.author_user_id,
@@ -4522,7 +4802,13 @@ fn case_save_v1(
     require_active(&record)?;
     let language = case_language(kind, content_json);
     validate_case_fields(kind, &language, title, priority, content_json)?;
-    let attachments_json = normalize_attachments(attachments_json)?;
+    let attachment_owner = case_id.map(|id| media::AttachmentOwner {
+        kind: AttachmentOwnerKind::Case,
+        id: id.into(),
+        step_index: None,
+    });
+    let attachments_json =
+        normalize_attachments(ctx, &record, attachment_owner.as_ref(), attachments_json)?;
     let pool = open_project_pool(project_id)?;
     let input = ps_tests::CaseContentInput {
         kind,
@@ -4935,57 +5221,460 @@ fn cases_import_csv_v1(
     }))
 }
 
-const ATTACHMENT_MAX_BYTES: u32 = 8 * 1024 * 1024;
-
-fn attachment_get_v1(
+pub(crate) fn require_attachment(
     ctx: &HandlerContext,
     project_id: &str,
+    owner: &media::AttachmentOwner,
     sha256: &str,
-    max_bytes: u32,
-) -> Result<MessageBody, ProtocolError> {
+) -> Result<(ProjectRecord, AttachmentWire), ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, access) = require_project_access(ctx, org, project_id)?;
-    if !is_sha256_hex(sha256) {
+    if !media::is_sha256(sha256) {
         return Err(ProtocolError::bad_request(
             "sha256 must be 64 lowercase hex characters",
         ));
     }
-    let pool = open_project_pool(project_id)?;
-    let referenced = {
-        let conn = pool
-            .read()
-            .map_err(|e| db_error("attachment_reference", e))?;
-        let exists = |sql: &str| -> Result<bool, ProtocolError> {
-            conn.query_row(sql, [sha256], |row| row.get::<_, bool>(0))
-                .map_err(|e| db_error("attachment_reference", e))
-        };
-        (task_access(&access, ProjectPermissionLevel::Read)
-            && exists("SELECT EXISTS(SELECT 1 FROM tasks t, json_each(t.attachments_json) j WHERE json_extract(j.value, '$.sha256') = ?1)")?)
-        || (access.allows(ProjectArea::Tests, ProjectPermissionLevel::Read)
-            && exists("SELECT EXISTS(SELECT 1 FROM (SELECT attachments_json FROM test_cases UNION ALL SELECT attachments_json FROM test_run_items UNION ALL SELECT attachments_json FROM test_run_steps) t, json_each(t.attachments_json) j WHERE json_extract(j.value, '$.sha256') = ?1)")?)
-        || (access.allows(ProjectArea::Knowledge, ProjectPermissionLevel::Read)
-            && exists("SELECT EXISTS(SELECT 1 FROM source_files WHERE sha256 = ?1)")?)
-    };
-    if !referenced {
-        return Err(ProtocolError::not_found("attachment not found"));
+    if (owner.kind == AttachmentOwnerKind::RunStep) != owner.step_index.is_some() {
+        return Err(ProtocolError::bad_request(
+            "step_index is required only for run_step attachments",
+        ));
     }
-    let cap = max_bytes.clamp(1, ATTACHMENT_MAX_BYTES) as usize;
-    let blob = std::path::Path::new(&record.dir_path)
-        .join("files")
-        .join(sha256);
-    let bytes =
-        std::fs::read(&blob).map_err(|_| ProtocolError::not_found("attachment not found"))?;
-    let truncated = bytes.len() > cap;
-    let mut bytes = bytes;
-    bytes.truncate(cap);
-    let mime = repository::attachment_mime(&pool, sha256)
-        .map_err(|e| db_error("attachment_mime", e))?
-        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let (record, _) = if owner.kind == AttachmentOwnerKind::Task {
+        require_task_access(ctx, org, project_id, ProjectPermissionLevel::Read)?
+    } else {
+        require_project(
+            ctx,
+            org,
+            project_id,
+            ProjectArea::Tests,
+            ProjectPermissionLevel::Read,
+        )?
+    };
+    let pool = open_project_pool(project_id)?;
+    let attachment = if owner.kind == AttachmentOwnerKind::Task {
+        tasks::task_attachment_metadata(&pool, &owner.id, sha256).map_err(|e| db_error("task_attachment", e))?
+    } else {
+        use rusqlite::OptionalExtension;
+        let conn = pool.read().map_err(|e| db_error("attachment_reference", e))?;
+        let raw: Option<String> = match owner.kind {
+            AttachmentOwnerKind::Case => conn.query_row("SELECT attachments_json FROM test_cases WHERE case_id = ?1", [&owner.id], |row| row.get(0)).optional(),
+            AttachmentOwnerKind::RunItem => conn.query_row("SELECT attachments_json FROM test_run_items WHERE item_id = ?1", [&owner.id], |row| row.get(0)).optional(),
+            AttachmentOwnerKind::RunStep => conn.query_row("SELECT attachments_json FROM test_run_steps WHERE item_id = ?1 AND step_index = ?2", rusqlite::params![owner.id, owner.step_index], |row| row.get(0)).optional(),
+            AttachmentOwnerKind::Task => unreachable!(),
+        }.map_err(|e| db_error("attachment_reference", e))?;
+        match raw {
+            Some(raw) => serde_json::from_str::<Vec<AttachmentWire>>(&raw).map_err(|e| db_error("attachment_reference", e))?
+                .into_iter().find(|entry| entry.sha256 == sha256),
+            None => None,
+        }
+    }.ok_or_else(|| ProtocolError::not_found("attachment not found"))?;
+    Ok((record, attachment))
+}
+
+async fn attachment_get_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    owner: &media::AttachmentOwner,
+    sha256: &str,
+    offset: u64,
+    max_bytes: u32,
+    preview: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let (record, attachment) = require_attachment(ctx, project_id, owner, sha256)?;
+    if max_bytes == 0 || max_bytes as usize > ingest::MAX_UPLOAD_CHUNK_BYTES {
+        return Err(ProtocolError::bad_request("read length must be 1..4 MiB"));
+    }
+    let files = media::safe_directory(std::path::Path::new(&record.dir_path), "files")
+        .map_err(|_| ProtocolError::not_found("attachment not found"))?;
+    let path = if preview {
+        media::preview_path(std::path::Path::new(&record.dir_path), sha256)
+            .map_err(|e| ProtocolError::bad_request(e.to_string()))?
+    } else {
+        files.join(sha256)
+    };
+    let (bytes, total_size, eof) =
+        tokio::task::spawn_blocking(move || media::read_range(&path, offset, max_bytes))
+            .await
+            .map_err(|_| ProtocolError::internal("attachment read worker failed"))?
+            .map_err(|_| ProtocolError::not_found("attachment range not found"))?;
+    require_attachment(ctx, project_id, owner, sha256)?;
+    let mime = if preview {
+        "video/mp4".to_string()
+    } else {
+        attachment.mime
+    };
+    let filename = if preview {
+        format!("{}.mp4", attachment.name)
+    } else {
+        attachment.name
+    };
     Ok(ps(ProjectStudioPayload::AttachmentGetResponse {
         bytes,
+        total_size,
         mime,
-        truncated,
+        filename,
+        eof,
     }))
+}
+
+fn require_upload_access(
+    ctx: &HandlerContext,
+    project_id: &str,
+) -> Result<ProjectRecord, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    if !access.can_create_tasks
+        && ![
+            ProjectArea::Knowledge,
+            ProjectArea::Repos,
+            ProjectArea::Tests,
+        ]
+        .iter()
+        .any(|area| access.allows(*area, ProjectPermissionLevel::Write))
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "attachment upload access denied",
+        ));
+    }
+    require_active(&record)?;
+    Ok(record)
+}
+
+fn upload_expiry(state: &ingest::UploadState) -> String {
+    chrono::DateTime::from_timestamp_millis(state.expires_at_ms)
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn attachment_upload_status(
+    ctx: &HandlerContext,
+    project_id: &str,
+    upload_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _) = require_project_access(ctx, org, project_id)?;
+    let state = ingest::upload_status(
+        &org.org_id,
+        &org.user_id,
+        project_id,
+        std::path::Path::new(&record.dir_path),
+        upload_id,
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?
+    .ok_or_else(|| ProtocolError::not_found("upload not found"))?;
+    let expires_at = upload_expiry(&state);
+    Ok(ps(ProjectStudioPayload::AttachmentUploadStatusResponse {
+        upload_id: state.upload_id,
+        filename: state.filename,
+        mime: state.mime,
+        sha256: state.sha256,
+        total_size: state.total_size,
+        next_offset: state.next_offset,
+        complete: state.complete,
+        expires_at,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn attachment_upload_chunk(
+    ctx: &HandlerContext,
+    project_id: &str,
+    upload_id: &str,
+    filename: &str,
+    mime: &str,
+    sha256: &str,
+    total_size: u64,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let record = require_upload_access(ctx, project_id)?;
+    let org_id = org.org_id.clone();
+    let user_id = org.user_id.clone();
+    let project = project_id.to_string();
+    let upload_id = upload_id.to_string();
+    let filename = filename.to_string();
+    let mime = mime.to_string();
+    let sha256 = sha256.to_string();
+    let bytes = bytes.to_vec();
+    let context = ctx.clone();
+    let state = tokio::task::spawn_blocking(move || {
+        require_upload_access(&context, &project).map_err(|e| anyhow::anyhow!(e.message))?;
+        ingest::accept_upload_chunk(&ingest::UploadChunk {
+            org_id: &org_id,
+            user_id: &user_id,
+            project_id: &project,
+            dir_path: std::path::Path::new(&record.dir_path),
+            upload_id: &upload_id,
+            filename: &filename,
+            mime: &mime,
+            position: ingest::UploadPosition::Offset {
+                offset,
+                total_size,
+                sha256: &sha256,
+            },
+            bytes: &bytes,
+            allowed: &|| {
+                require_upload_access(&context, &project)
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!(e.message))
+            },
+        })
+    })
+    .await
+    .map_err(|_| ProtocolError::internal("upload worker failed"))?
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    require_upload_access(ctx, project_id)?;
+    let expires_at = upload_expiry(&state);
+    Ok(ps(ProjectStudioPayload::AttachmentUploadChunkResponse {
+        upload_id: state.upload_id,
+        filename: state.filename,
+        mime: state.mime,
+        sha256: state.sha256,
+        total_size: state.total_size,
+        next_offset: state.next_offset,
+        complete: state.complete,
+        expires_at,
+    }))
+}
+
+fn attachment_upload_cancel(
+    ctx: &HandlerContext,
+    project_id: &str,
+    upload_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _) = require_project_access(ctx, org, project_id)?;
+    let ok = ingest::cancel_upload(
+        &org.org_id,
+        &org.user_id,
+        project_id,
+        std::path::Path::new(&record.dir_path),
+        upload_id,
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    Ok(ps(ProjectStudioPayload::AttachmentUploadCancelResult {
+        ok,
+    }))
+}
+
+fn attachment_preview(
+    ctx: &HandlerContext,
+    project_id: &str,
+    owner: &media::AttachmentOwner,
+    sha: &str,
+    retry: bool,
+) -> Result<MessageBody, ProtocolError> {
+    require_attachment(ctx, project_id, owner, sha)?;
+    let state = media::request_preview(ctx, project_id, owner, sha, retry)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    Ok(ps(ProjectStudioPayload::AttachmentPreviewResponse {
+        status: state.status,
+        error: state.error,
+        mime: "video/mp4".to_string(),
+        total_size: state.total_size,
+        duration_ms: state.duration_ms,
+    }))
+}
+
+async fn attachment_usage(
+    ctx: &HandlerContext,
+    project_id: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, access) = require_project_access(ctx, org, project_id)?;
+    let tasks_allowed = task_access(&access, ProjectPermissionLevel::Read);
+    let tests_allowed = access.allows(ProjectArea::Tests, ProjectPermissionLevel::Read);
+    if !tasks_allowed && !tests_allowed {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "attachment usage read access denied",
+        ));
+    }
+    let pool = open_project_pool(project_id)?;
+    let dir = std::path::PathBuf::from(record.dir_path);
+    let response = tokio::task::spawn_blocking(move || {
+        scan_attachment_usage(
+            &pool,
+            &dir,
+            tasks_allowed,
+            tests_allowed,
+            offset,
+            limit.clamp(1, 100),
+        )
+    })
+    .await
+    .map_err(|_| ProtocolError::internal("attachment usage worker failed"))?
+    .map_err(|e| db_error("attachment_usage", e))?;
+    let (_, current) = require_project_access(ctx, org, project_id)?;
+    if (tasks_allowed && !task_access(&current, ProjectPermissionLevel::Read))
+        || (tests_allowed && !current.allows(ProjectArea::Tests, ProjectPermissionLevel::Read))
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "attachment usage access revoked",
+        ));
+    }
+    Ok(ps(response))
+}
+
+fn scan_attachment_usage(
+    pool: &crate::db::DbPool,
+    dir: &std::path::Path,
+    tasks_allowed: bool,
+    tests_allowed: bool,
+    offset: u32,
+    limit: u32,
+) -> anyhow::Result<ProjectStudioPayload> {
+    let files_dir = media::safe_directory(dir, "files")?;
+    let mut unique = HashMap::<String, Option<u64>>::new();
+    let mut total_bytes = 0u64;
+    let mut file_count = 0u64;
+    let mut missing_files = 0u64;
+    let mut largest = Vec::<AttachmentUsageFileWire>::new();
+    let mut per_task = Vec::new();
+    let mut total_tasks = 0u32;
+    let mut add = |owner_kind: AttachmentOwnerKind,
+                   owner_id: &str,
+                   step_index: Option<u32>,
+                   task_key: &str,
+                   attachment: &AttachmentWire|
+     -> u64 {
+        if !media::is_sha256(&attachment.sha256) {
+            return 0;
+        }
+        if let Some(size) = unique.get(&attachment.sha256) {
+            return size.unwrap_or(0);
+        }
+        let size = media::open_regular(&files_dir.join(&attachment.sha256))
+            .and_then(|file| Ok(file.metadata()?.len()))
+            .ok();
+        unique.insert(attachment.sha256.clone(), size);
+        if let Some(size) = size {
+            total_bytes = total_bytes.saturating_add(size);
+            file_count += 1;
+            largest.push(AttachmentUsageFileWire {
+                owner_kind,
+                owner_id: owner_id.into(),
+                step_index,
+                task_key: task_key.into(),
+                filename: attachment.name.clone(),
+                sha256: attachment.sha256.clone(),
+                size_bytes: size,
+            });
+            largest.sort_by(|a, b| {
+                b.size_bytes
+                    .cmp(&a.size_bytes)
+                    .then_with(|| a.sha256.cmp(&b.sha256))
+            });
+            largest.truncate(limit as usize);
+            size
+        } else {
+            missing_files += 1;
+            0
+        }
+    };
+    if tasks_allowed {
+        let mut last_id = String::new();
+        loop {
+            let batch: Vec<(String, String)> = {
+                let conn = pool.read()?;
+                let mut statement = conn.prepare("SELECT task_id,task_key FROM tasks WHERE task_id > ?1 ORDER BY task_id LIMIT 100")?;
+                let rows = statement.query_map([&last_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if batch.is_empty() {
+                break;
+            }
+            for (task_id, task_key) in &batch {
+                let attachments = tasks::task_attachment_inventory(pool, task_id)?;
+                if attachments.is_empty() {
+                    continue;
+                }
+                let mut bytes = 0u64;
+                let mut count = 0u64;
+                for attachment in &attachments {
+                    let size = add(
+                        AttachmentOwnerKind::Task,
+                        task_id,
+                        None,
+                        task_key,
+                        attachment,
+                    );
+                    if media::open_regular(&files_dir.join(&attachment.sha256)).is_ok() {
+                        count += 1;
+                    }
+                    bytes = bytes.saturating_add(size);
+                }
+                if total_tasks >= offset && per_task.len() < limit as usize {
+                    per_task.push(TaskAttachmentUsageWire {
+                        task_id: task_id.clone(),
+                        task_key: task_key.clone(),
+                        file_count: count,
+                        total_bytes: bytes,
+                    });
+                }
+                total_tasks = total_tasks.saturating_add(1);
+            }
+            last_id = batch
+                .last()
+                .ok_or_else(|| anyhow::anyhow!("empty attachment batch"))?
+                .0
+                .clone();
+        }
+    }
+    if tests_allowed {
+        for (kind, table, id_column, step_column) in [
+            (AttachmentOwnerKind::Case, "test_cases", "case_id", "NULL"),
+            (
+                AttachmentOwnerKind::RunItem,
+                "test_run_items",
+                "item_id",
+                "NULL",
+            ),
+            (
+                AttachmentOwnerKind::RunStep,
+                "test_run_steps",
+                "item_id",
+                "step_index",
+            ),
+        ] {
+            let conn = pool.read()?;
+            let mut statement = conn.prepare(&format!("SELECT {id_column},{step_column},attachments_json FROM {table} ORDER BY {id_column}"))?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<u32>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (id, index, raw) = row?;
+                for attachment in serde_json::from_str::<Vec<AttachmentWire>>(&raw)? {
+                    add(kind, &id, index, "", &attachment);
+                }
+            }
+        }
+    }
+    let disk = crate::sync::storage_monitor::report_for_root(dir)?;
+    let warning = matches!(
+        disk.level,
+        crate::sync::storage_monitor::StoragePressureLevel::Warning
+            | crate::sync::storage_monitor::StoragePressureLevel::Critical
+    );
+    Ok(ProjectStudioPayload::AttachmentUsageResponse {
+        total_bytes,
+        file_count,
+        missing_files,
+        available_bytes: disk.available_bytes,
+        warning,
+        largest,
+        per_task,
+        total_tasks,
+        has_more: total_tasks > offset.saturating_add(limit),
+    })
 }
 
 // =============================================================================
@@ -5738,7 +6427,13 @@ fn run_step_set_v1(
             "failed/blocked steps require a note",
         ));
     }
-    let attachments_json = normalize_attachments(attachments_json)?;
+    let attachment_owner = Some(media::AttachmentOwner {
+        kind: AttachmentOwnerKind::RunStep,
+        id: item_id.into(),
+        step_index: Some(step_index),
+    });
+    let attachments_json =
+        normalize_attachments(ctx, &record, attachment_owner.as_ref(), attachments_json)?;
     let pool = open_project_pool(project_id)?;
     // Step verdicts are strictly the executing tester's (no manager override —
     // a manager reassigns instead of forging results).
@@ -5798,7 +6493,13 @@ fn run_item_finish_v1(
         ProjectPermissionLevel::Write,
     )?;
     require_active(&record)?;
-    let attachments_json = normalize_attachments(attachments_json)?;
+    let attachment_owner = Some(media::AttachmentOwner {
+        kind: AttachmentOwnerKind::RunItem,
+        id: item_id.into(),
+        step_index: None,
+    });
+    let attachments_json =
+        normalize_attachments(ctx, &record, attachment_owner.as_ref(), attachments_json)?;
     let pool = open_project_pool(project_id)?;
     let item = runs::get_run_item(&pool, item_id)
         .map_err(|e| db_error("item_get", e))?
@@ -5919,6 +6620,7 @@ fn tasks_list_v1(
     offset: u32,
     limit: u32,
     severity: &str,
+    include_archived: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (_record, _access) =
@@ -5937,6 +6639,7 @@ fn tasks_list_v1(
         assigned_to,
         search,
         severity,
+        include_archived,
     };
     let (rows, total) =
         tasks::list_tasks(&pool, &filters, offset, limit).map_err(|e| db_error("tasks_list", e))?;
@@ -5965,6 +6668,12 @@ fn task_get_v1(
     let record = tasks::get_task(&pool, task_id)
         .map_err(|e| db_error("task_get", e))?
         .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    let (events, events_has_more) = tasks::list_task_events(&pool, task_id, None, 50)
+        .map_err(|e| db_error("task_events", e))?;
+    let task_links =
+        tasks::list_task_links(&pool, task_id).map_err(|e| db_error("task_links", e))?;
+    let status_durations =
+        tasks::task_status_durations(&pool, task_id).map_err(|e| db_error("task_durations", e))?;
     let comments = tasks::list_comments(&pool, task_id).map_err(|e| db_error("comments", e))?;
     let mut ids: Vec<String> = comments.iter().map(|c| c.author_user_id.clone()).collect();
     ids.push(record.created_by.clone());
@@ -5974,6 +6683,20 @@ fn task_get_v1(
     let attachments = attachments_from_json(&record.attachments_json);
     Ok(ps(ProjectStudioPayload::TaskGetResponse {
         detail: TaskDetail {
+            handover_comment_id: tasks::latest_handover_comment_id(&pool, task_id)
+                .map_err(|e| db_error("handover_comment", e))?,
+            task_links: task_links.into_iter().map(task_link_to_wire).collect(),
+            events: events.into_iter().map(task_event_to_wire).collect(),
+            events_has_more,
+            status_durations: status_durations
+                .into_iter()
+                .map(|entry| TaskStatusDurationWire {
+                    status: entry.status,
+                    entered_at: entry.entered_at,
+                    left_at: entry.left_at,
+                    seconds: entry.seconds,
+                })
+                .collect(),
             info: task_to_wire(record, &names),
             description_md,
             attachments,
@@ -5983,6 +6706,52 @@ fn task_get_v1(
                 .collect(),
         },
     }))
+}
+
+fn task_mutation_error(scope: &str, error: anyhow::Error) -> ProtocolError {
+    if error.downcast_ref::<rusqlite::Error>().is_some()
+        || error.downcast_ref::<crate::db::DbError>().is_some()
+    {
+        db_error(scope, error)
+    } else {
+        ProtocolError::bad_request(error.to_string())
+    }
+}
+
+fn task_type_to_wire(record: crate::project_studio::models::TaskTypeRecord) -> TaskTypeWire {
+    TaskTypeWire {
+        type_id: record.type_id,
+        name: record.name,
+        description: record.description,
+        sort_order: record.sort_order,
+        built_in: record.built_in,
+        active: record.active,
+    }
+}
+
+fn task_event_to_wire(record: crate::project_studio::models::TaskEventRecord) -> TaskEventWire {
+    TaskEventWire {
+        event_id: record.event_id,
+        task_id: record.task_id,
+        at: record.at,
+        actor_kind: record.actor_kind,
+        actor_id: record.actor_id,
+        kind: record.kind,
+        before_json: record.before_json,
+        after_json: record.after_json,
+    }
+}
+
+fn task_link_to_wire(record: crate::project_studio::models::TaskLinkRecord) -> TaskLinkWire {
+    TaskLinkWire {
+        link_id: record.link_id,
+        source_task_id: record.source_task_id,
+        target_task_id: record.target_task_id,
+        kind: record.kind,
+        lag_days: record.lag_days,
+        counterparty_task_key: record.other_task_key,
+        counterparty_task_title: record.other_task_title,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5998,6 +6767,7 @@ fn task_save_v1(
     status: &str,
     assigned_to: &str,
     due_date: &str,
+    parent_task_id: Option<&str>,
     links_json: &str,
     attachments_json: &str,
 ) -> Result<MessageBody, ProtocolError> {
@@ -6021,11 +6791,6 @@ fn task_save_v1(
         result
     };
     require_active(&record)?;
-    if !tasks::TASK_TYPES.contains(&task_type) {
-        return Err(ProtocolError::bad_request(format!(
-            "unknown task_type '{task_type}'"
-        )));
-    }
     let title = title.trim();
     if title.is_empty() || title.chars().count() > 200 {
         return Err(ProtocolError::bad_request(
@@ -6033,14 +6798,10 @@ fn task_save_v1(
         ));
     }
     if !tasks::TASK_PRIORITIES.contains(&priority) {
-        return Err(ProtocolError::bad_request(format!(
-            "unknown priority '{priority}'"
-        )));
+        return Err(ProtocolError::bad_request("unknown task priority"));
     }
     if !tasks::TASK_STATUSES.contains(&status) {
-        return Err(ProtocolError::bad_request(format!(
-            "unknown status '{status}'"
-        )));
+        return Err(ProtocolError::bad_request("unknown task status"));
     }
     let severity = severity.trim();
     if task_type == "defect" {
@@ -6055,17 +6816,22 @@ fn task_save_v1(
         ));
     }
     if !assigned_to.is_empty()
-        && repository::project_access(&record, assigned_to, false)
+        && !repository::project_access(&record, assigned_to, false)
             .map_err(|e| db_error("member_access", e))?
             .allows(ProjectArea::Tasks, ProjectPermissionLevel::Write)
-            == false
     {
         return Err(ProtocolError::bad_request(
             "assigned_to must have task write access",
         ));
     }
     let links_json = normalize_links(links_json)?;
-    let attachments_json = normalize_attachments(attachments_json)?;
+    let attachment_owner = task_id.map(|id| media::AttachmentOwner {
+        kind: AttachmentOwnerKind::Task,
+        id: id.into(),
+        step_index: None,
+    });
+    let attachments_json =
+        normalize_attachments(ctx, &record, attachment_owner.as_ref(), attachments_json)?;
     let input = tasks::TaskInput {
         task_type,
         title,
@@ -6075,59 +6841,40 @@ fn task_save_v1(
         status,
         assigned_to,
         due_date: due_date.trim(),
+        parent_task_id,
         links_json: &links_json,
         attachments_json: &attachments_json,
     };
     let pool = open_project_pool(project_id)?;
-    let (task_id, task_no, assignment_changed) = match task_id {
-        None => {
-            let (id, no) = tasks::create_task(&pool, &input, &org.user_id)
-                .map_err(|e| db_error("task_create", e))?;
-            activity::record(
-                &pool,
-                &org.user_id,
-                "user",
-                "task.created",
-                "task",
-                &id,
-                &serde_json::json!({ "title": title, "task_type": task_type }).to_string(),
-            );
-            (id, no, !assigned_to.is_empty())
-        }
-        Some(id) => {
-            let existing = tasks::get_task(&pool, id)
-                .map_err(|e| db_error("task_get", e))?
-                .ok_or_else(|| ProtocolError::not_found("task not found"))?;
-            let changed = assigned_to != existing.assigned_to && !assigned_to.is_empty();
-            if !tasks::update_task(&pool, id, &input).map_err(|e| db_error("task_update", e))? {
-                return Err(ProtocolError::not_found("task not found"));
-            }
-            activity::record(
-                &pool,
-                &org.user_id,
-                "user",
-                "task.updated",
-                "task",
-                id,
-                &serde_json::json!({ "title": title, "status": status }).to_string(),
-            );
-            (id.to_string(), existing.task_no, changed)
-        }
+    let mutation = match task_id {
+        None => tasks::create_task(&pool, &input, &org.user_id)
+            .map_err(|e| task_mutation_error("task_create", e))?,
+        Some(id) => tasks::update_task(&pool, id, &input, &org.user_id)
+            .map_err(|e| task_mutation_error("task_update", e))?
+            .ok_or_else(|| ProtocolError::not_found("task not found"))?,
     };
-    if assignment_changed && assigned_to != org.user_id {
-        notifications::notify(
-            &org.org_id,
-            assigned_to,
-            project_id,
-            "task_assigned",
-            "Przypisano Ci zadanie",
-            &format!("#{task_no} „{title}”"),
-            &serde_json::json!({ "project_id": project_id, "task_id": task_id }).to_string(),
+    if mutation.changed {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            if task_id.is_none() {
+                "task.created"
+            } else {
+                "task.updated"
+            },
+            "task",
+            &mutation.task_id,
+            &serde_json::json!({"task_key":mutation.task_key,"event_ids":mutation.event_ids})
+                .to_string(),
         );
+        notifications::notify_task_changes(ctx, project_id, &mutation);
     }
     Ok(ps(ProjectStudioPayload::TaskSaveResponse {
-        task_id,
-        task_no,
+        task_id: mutation.task_id,
+        task_no: mutation.task_no,
+        task_key: mutation.task_key,
+        event_ids: mutation.event_ids,
     }))
 }
 
@@ -6149,38 +6896,47 @@ fn task_delete_v1(
     let task = tasks::get_task(&pool, task_id)
         .map_err(|e| db_error("task_get", e))?
         .ok_or_else(|| ProtocolError::not_found("task not found"))?;
-    // Authorship permits deletion only before a discussion needs preserving.
-    let allowed = access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Admin)
-        || (task.created_by == org.user_id && task.comment_count == 0);
-    if !allowed {
+    if !access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Admin)
+        && (task.created_by != org.user_id || task.comment_count != 0)
+    {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
             "deleting requires task administration or authorship of an uncommented task",
         ));
     }
-    let ok = tasks::delete_task(&pool, task_id).map_err(|e| db_error("task_delete", e))?;
-    if ok {
+    let mutation = tasks::delete_task(&pool, task_id, &org.user_id)
+        .map_err(|e| task_mutation_error("task_delete", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    if mutation.changed {
         activity::record(
             &pool,
             &org.user_id,
             "user",
-            "task.deleted",
+            if mutation.archived {
+                "task.archived"
+            } else {
+                "task.deleted"
+            },
             "task",
             task_id,
-            &serde_json::json!({ "title": task.title }).to_string(),
+            &serde_json::json!({"task_key":task.task_key,"event_ids":mutation.event_ids})
+                .to_string(),
         );
     }
-    Ok(ps(ProjectStudioPayload::TaskDeleteResult { ok }))
+    Ok(ps(ProjectStudioPayload::TaskDeleteResult {
+        ok: true,
+        archived: mutation.archived,
+    }))
 }
 
-fn task_comment_add_v1(
+fn task_archive(
     ctx: &HandlerContext,
     project_id: &str,
     task_id: &str,
-    body_md: &str,
+    archived: bool,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _access) = require_project(
+    let (record, _) = require_project(
         ctx,
         org,
         project_id,
@@ -6188,18 +6944,92 @@ fn task_comment_add_v1(
         ProjectPermissionLevel::Write,
     )?;
     require_active(&record)?;
-    let body = body_md.trim();
+    let pool = open_project_pool(project_id)?;
+    let mutation = tasks::set_task_archived(&pool, task_id, archived, &org.user_id)
+        .map_err(|e| task_mutation_error("task_archive", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    if mutation.changed {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            if archived {
+                "task.archived"
+            } else {
+                "task.restored"
+            },
+            "task",
+            task_id,
+            &serde_json::json!({"event_ids":mutation.event_ids}).to_string(),
+        );
+    }
+    Ok(ps(ProjectStudioPayload::TaskArchiveResult {
+        ok: true,
+        event_id: mutation.event_ids.first().copied(),
+    }))
+}
+
+fn validate_mentions(
+    ctx: &HandlerContext,
+    project_id: &str,
+    ids: &[String],
+) -> Result<Vec<String>, ProtocolError> {
+    let org = require_read(ctx)?;
+    let mut users: Vec<String> = ids
+        .iter()
+        .filter(|id| *id != &org.user_id)
+        .cloned()
+        .collect();
+    users.sort();
+    users.dedup();
+    for user in &users {
+        if !notifications::task_reader(ctx, project_id, user) {
+            return Err(ProtocolError::bad_request(
+                "mentioned user does not have current task read access",
+            ));
+        }
+    }
+    Ok(users)
+}
+
+fn comment_body(body: &str) -> Result<&str, ProtocolError> {
+    let body = body.trim();
     if body.is_empty() || body.chars().count() > 8000 {
         return Err(ProtocolError::bad_request(
             "comment must be 1..8000 characters",
         ));
     }
+    Ok(body)
+}
+
+fn task_comment_add_v1(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_id: &str,
+    body_md: &str,
+    mentions: &[String],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_active(&record)?;
+    let body = comment_body(body_md)?;
+    let mentions = validate_mentions(ctx, project_id, mentions)?;
     let pool = open_project_pool(project_id)?;
     tasks::get_task(&pool, task_id)
         .map_err(|e| db_error("task_get", e))?
         .ok_or_else(|| ProtocolError::not_found("task not found"))?;
-    let comment = tasks::add_comment(&pool, task_id, &org.user_id, body)
-        .map_err(|e| db_error("comment_add", e))?;
+    let mutation = tasks::add_comment(&pool, task_id, &org.user_id, body, &mentions)
+        .map_err(|e| task_mutation_error("comment_add", e))?;
+    notifications::notify_mentions(ctx, project_id, task_id, &mutation);
+    let comment = mutation
+        .comment
+        .ok_or_else(|| ProtocolError::internal("comment mutation returned no comment"))?;
     activity::record(
         &pool,
         &org.user_id,
@@ -6207,7 +7037,7 @@ fn task_comment_add_v1(
         "task_comment.added",
         "task",
         task_id,
-        "{}",
+        &serde_json::json!({"event_id":mutation.event_id}).to_string(),
     );
     let names = repository::resolve_user_refs(std::slice::from_ref(&comment.author_user_id));
     Ok(ps(ProjectStudioPayload::TaskCommentAddResponse {
@@ -6220,9 +7050,10 @@ fn task_comment_edit_v1(
     project_id: &str,
     comment_id: &str,
     body_md: &str,
+    mentions: &[String],
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _access) = require_project(
+    let (record, _) = require_project(
         ctx,
         org,
         project_id,
@@ -6230,29 +7061,30 @@ fn task_comment_edit_v1(
         ProjectPermissionLevel::Write,
     )?;
     require_active(&record)?;
-    let body = body_md.trim();
-    if body.is_empty() || body.chars().count() > 8000 {
-        return Err(ProtocolError::bad_request(
-            "comment must be 1..8000 characters",
-        ));
-    }
+    let body = comment_body(body_md)?;
+    let mentions = validate_mentions(ctx, project_id, mentions)?;
     let pool = open_project_pool(project_id)?;
-    // Author-scoped UPDATE: another user's comment simply does not match.
-    let ok = tasks::edit_comment(&pool, comment_id, &org.user_id, body)
-        .map_err(|e| db_error("comment_edit", e))?;
-    if !ok {
-        return Err(ProtocolError::not_found("comment not found"));
+    let mutation = tasks::edit_comment(&pool, comment_id, &org.user_id, body, &mentions)
+        .map_err(|e| task_mutation_error("comment_edit", e))?
+        .ok_or_else(|| ProtocolError::not_found("comment not found"))?;
+    if mutation.changed {
+        let task_id = &mutation
+            .comment
+            .as_ref()
+            .ok_or_else(|| ProtocolError::internal("comment mutation returned no comment"))?
+            .task_id;
+        notifications::notify_mentions(ctx, project_id, task_id, &mutation);
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "task_comment.edited",
+            "task",
+            task_id,
+            &serde_json::json!({"event_id":mutation.event_id}).to_string(),
+        );
     }
-    activity::record(
-        &pool,
-        &org.user_id,
-        "user",
-        "task_comment.edited",
-        "task_comment",
-        comment_id,
-        "{}",
-    );
-    Ok(ps(ProjectStudioPayload::TaskCommentEditResult { ok }))
+    Ok(ps(ProjectStudioPayload::TaskCommentEditResult { ok: true }))
 }
 
 fn task_comment_delete_v1(
@@ -6281,19 +7113,247 @@ fn task_comment_delete_v1(
             "only the author or a task administrator may delete a comment",
         ));
     }
-    let ok = tasks::delete_comment(&pool, comment_id).map_err(|e| db_error("comment_delete", e))?;
-    if ok {
+    let mutation = tasks::delete_comment(&pool, comment_id, &org.user_id)
+        .map_err(|e| task_mutation_error("comment_delete", e))?
+        .ok_or_else(|| ProtocolError::not_found("comment not found"))?;
+    if mutation.changed {
         activity::record(
             &pool,
             &org.user_id,
             "user",
             "task_comment.deleted",
-            "task_comment",
-            comment_id,
-            "{}",
+            "task",
+            &comment.task_id,
+            &serde_json::json!({"event_id":mutation.event_id}).to_string(),
         );
     }
-    Ok(ps(ProjectStudioPayload::TaskCommentDeleteResult { ok }))
+    Ok(ps(ProjectStudioPayload::TaskCommentDeleteResult {
+        ok: true,
+    }))
+}
+
+fn task_handover(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_id: &str,
+    assigned_to: &str,
+    note_md: &str,
+    mention_user_ids: &[String],
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, access) = require_task_access(ctx, org, project_id, ProjectPermissionLevel::Read)?;
+    require_active(&record)?;
+    let pool = open_project_pool(project_id)?;
+    let task = tasks::get_task(&pool, task_id)
+        .map_err(|e| db_error("task_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    if task.assigned_to != org.user_id
+        && !access.allows(ProjectArea::Tasks, ProjectPermissionLevel::Write)
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "handing over requires task write access or current self-assignment",
+        ));
+    }
+    if assigned_to.is_empty()
+        || !repository::project_access(&record, assigned_to, false)
+            .map_err(|e| db_error("handover_recipient", e))?
+            .allows(ProjectArea::Tasks, ProjectPermissionLevel::Write)
+    {
+        return Err(ProtocolError::bad_request(
+            "handover recipient must have current task write access",
+        ));
+    }
+    let note = comment_body(note_md)?;
+    let mentions = validate_mentions(ctx, project_id, mention_user_ids)?;
+    let mutation = tasks::reassign_open(
+        &pool,
+        task_id,
+        &task.assigned_to,
+        assigned_to,
+        &tasks::TaskHandoverInput {
+            actor: &org.user_id,
+            note_md: note,
+            mention_user_ids: &mentions,
+            direction: tasks::TaskHandoverDirection::Over,
+            handover_id: None,
+        },
+    )
+    .map_err(|e| task_mutation_error("task_handover", e))?
+    .ok_or_else(|| {
+        ProtocolError::bad_request("task is closed, archived or its assignee changed")
+    })?;
+    if mutation.changed {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "task.handed_over",
+            "task",
+            task_id,
+            &serde_json::json!({"event_ids":mutation.event_ids}).to_string(),
+        );
+        notifications::notify_task_handover(
+            &org.org_id,
+            &org.user_id,
+            project_id,
+            &mutation,
+            tasks::TaskHandoverDirection::Over,
+            &|user| notifications::task_reader(ctx, project_id, user),
+        );
+    }
+    Ok(ps(ProjectStudioPayload::TaskHandoverResult {
+        ok: true,
+        event_ids: mutation.event_ids,
+        comment_id: mutation.handover_comment_id,
+    }))
+}
+
+fn task_types_list(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (_, access) = require_project_access(ctx, org, project_id)?;
+    if !access
+        .enabled_modules
+        .iter()
+        .any(|module| module == "tasks")
+    {
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::PolicyDenied,
+            "task catalogue is disabled",
+        ));
+    }
+    let types = tasks::list_task_types(&open_project_pool(project_id)?)
+        .map_err(|e| db_error("task_types", e))?;
+    Ok(ps(ProjectStudioPayload::TaskTypesListResponse {
+        types: types.into_iter().map(task_type_to_wire).collect(),
+    }))
+}
+
+fn task_type_save(
+    ctx: &HandlerContext,
+    project_id: &str,
+    type_id: &str,
+    name: &str,
+    description: &str,
+    sort_order: i32,
+    active: bool,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Admin,
+    )?;
+    require_active(&record)?;
+    let task_type = tasks::save_task_type(
+        &open_project_pool(project_id)?,
+        type_id,
+        name,
+        description,
+        sort_order,
+        active,
+    )
+    .map_err(|e| task_mutation_error("task_type_save", e))?;
+    Ok(ps(ProjectStudioPayload::TaskTypeSaveResponse {
+        task_type: task_type_to_wire(task_type),
+    }))
+}
+
+fn task_events(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_id: &str,
+    before_id: Option<i64>,
+    limit: u32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    require_task_access(ctx, org, project_id, ProjectPermissionLevel::Read)?;
+    let pool = open_project_pool(project_id)?;
+    tasks::get_task(&pool, task_id)
+        .map_err(|e| db_error("task_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    let (events, has_more) =
+        tasks::list_task_events(&pool, task_id, before_id, limit.clamp(1, 100))
+            .map_err(|e| db_error("task_events", e))?;
+    Ok(ps(ProjectStudioPayload::TaskEventsResponse {
+        events: events.into_iter().map(task_event_to_wire).collect(),
+        has_more,
+    }))
+}
+
+fn task_links_list(
+    ctx: &HandlerContext,
+    project_id: &str,
+    task_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    require_task_access(ctx, org, project_id, ProjectPermissionLevel::Read)?;
+    let pool = open_project_pool(project_id)?;
+    tasks::get_task(&pool, task_id)
+        .map_err(|e| db_error("task_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    let links = tasks::list_task_links(&pool, task_id).map_err(|e| db_error("task_links", e))?;
+    Ok(ps(ProjectStudioPayload::TaskLinksListResponse {
+        links: links.into_iter().map(task_link_to_wire).collect(),
+    }))
+}
+
+fn task_link_save(
+    ctx: &HandlerContext,
+    project_id: &str,
+    source: &str,
+    target: &str,
+    kind: &str,
+    lag: i32,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_active(&record)?;
+    let mutation = tasks::add_task_link(
+        &open_project_pool(project_id)?,
+        source,
+        target,
+        kind,
+        lag,
+        &org.user_id,
+    )
+    .map_err(|e| task_mutation_error("task_link_save", e))?;
+    Ok(ps(ProjectStudioPayload::TaskLinkSaveResult {
+        link: task_link_to_wire(mutation.link),
+        source_event_id: mutation.source_event_id,
+        target_event_id: mutation.target_event_id,
+    }))
+}
+
+fn task_link_delete(
+    ctx: &HandlerContext,
+    project_id: &str,
+    link_id: i64,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let (record, _) = require_project(
+        ctx,
+        org,
+        project_id,
+        ProjectArea::Tasks,
+        ProjectPermissionLevel::Write,
+    )?;
+    require_active(&record)?;
+    let mutation = tasks::delete_task_link(&open_project_pool(project_id)?, link_id, &org.user_id)
+        .map_err(|e| task_mutation_error("task_link_delete", e))?;
+    Ok(ps(ProjectStudioPayload::TaskLinkDeleteResult {
+        ok: mutation.is_some(),
+        source_event_id: mutation.as_ref().map(|m| m.source_event_id),
+        target_event_id: mutation.map(|m| m.target_event_id),
+    }))
 }
 
 // =============================================================================
@@ -6716,7 +7776,7 @@ fn notification_area(kind: &str) -> ProjectArea {
     }
 }
 
-fn notification_visible(access: &ProjectAccessWire, kind: &str) -> bool {
+pub(crate) fn notification_visible(access: &ProjectAccessWire, kind: &str) -> bool {
     let area = notification_area(kind);
     if area == ProjectArea::Tasks {
         task_access(access, ProjectPermissionLevel::Read)
@@ -7051,13 +8111,12 @@ async fn code_source_create(
             let sha = file_refs.first().ok_or_else(|| {
                 ProtocolError::bad_request("zip source requires one uploaded file_ref")
             })?;
-            ingest::finalized_meta(&org.org_id, &org.user_id, &project_id, sha).ok_or_else(
-                || {
+            ingest::finalized_meta(&org.org_id, &org.user_id, &project_id, &dir_path, sha)
+                .ok_or_else(|| {
                     ProtocolError::bad_request(format!(
                         "unknown file_ref '{sha}' (upload expired?)"
                     ))
-                },
-            )?;
+                })?;
             let archive = dir_path.join("files").join(sha);
             let project = project_id.clone();
             let source = source_id.clone();
@@ -7076,12 +8135,13 @@ async fn code_source_create(
                     "api_spec source requires one uploaded OpenAPI/Swagger file_ref",
                 )
             })?;
-            let meta = ingest::finalized_meta(&org.org_id, &org.user_id, &project_id, sha)
-                .ok_or_else(|| {
-                    ProtocolError::bad_request(format!(
-                        "unknown file_ref '{sha}' (upload expired?)"
-                    ))
-                })?;
+            let meta =
+                ingest::finalized_meta(&org.org_id, &org.user_id, &project_id, &dir_path, sha)
+                    .ok_or_else(|| {
+                        ProtocolError::bad_request(format!(
+                            "unknown file_ref '{sha}' (upload expired?)"
+                        ))
+                    })?;
             let blob = dir_path.join("files").join(sha);
             let dir = dir_path.clone();
             let filename = meta.filename.clone();
@@ -9386,21 +10446,29 @@ fn task_status_set_v1(
     // Status-only write: TaskInfo (what the board renders) carries neither
     // `description_md` nor `attachments`, so routing a card move through
     // TaskSave would write both back empty.
-    let updated_at = tasks::set_task_status(&pool, task_id, status)
-        .map_err(|e| db_error("task_status_set", e))?
+    let mutation = tasks::set_task_status(&pool, task_id, status, &org.user_id)
+        .map_err(|e| task_mutation_error("task_status_set", e))?
         .ok_or_else(|| ProtocolError::not_found("task not found"))?;
-    activity::record(
-        &pool,
-        &org.user_id,
-        "user",
-        "task.status_changed",
-        "task",
-        task_id,
-        &serde_json::json!({ "status": status }).to_string(),
-    );
+    let task = tasks::get_task(&pool, task_id)
+        .map_err(|e| db_error("task_get", e))?
+        .ok_or_else(|| ProtocolError::not_found("task not found"))?;
+    if mutation.changed {
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "task.status_changed",
+            "task",
+            task_id,
+            &serde_json::json!({"status":status,"event_id":mutation.status_event_id}).to_string(),
+        );
+        notifications::notify_task_changes(ctx, project_id, &mutation);
+    }
     Ok(ps(ProjectStudioPayload::TaskStatusSetResult {
         ok: true,
-        updated_at,
+        updated_at: task.updated_at,
+        event_id: mutation.status_event_id,
+        previous_status: mutation.previous_status,
     }))
 }
 
@@ -9554,6 +10622,7 @@ fn project_export_start_v1(
         dir_path: std::path::PathBuf::from(&record.dir_path),
         project: archive::ProjectMeta {
             project_id: project_id.to_string(),
+            key_prefix: record.key_prefix.clone(),
             name: record.name.clone(),
             description: record.description.clone(),
             template: record.template.clone(),
@@ -9926,6 +10995,7 @@ mod tests {
             "[\"knowledge\",\"tests\",\"tasks\",\"chat\"]",
             "owner-gate",
             &dir.to_string_lossy(),
+            "",
             &[
                 member("developer-gate", &["developer"]),
                 member("tester-gate", &["tester"]),
@@ -9985,7 +11055,7 @@ mod tests {
             ps(ProjectStudioPayload::TaskSaveRequest {
                 project_id: project_id.clone(),
                 task_id: None,
-                task_type: "task".into(),
+                task_type: "technical".into(),
                 title: "Access task".into(),
                 description_md: String::new(),
                 severity: String::new(),
@@ -9995,6 +11065,7 @@ mod tests {
                 due_date: String::new(),
                 links_json: "[]".into(),
                 attachments_json: "[]".into(),
+                parent_task_id: None,
             })
         };
         let denied = project_studio_dispatch(&case(), &ctx("developer-gate"))
@@ -10349,6 +11420,7 @@ mod tests {
             "[\"knowledge\"]",
             "owner-a",
             &dir.to_string_lossy(),
+            "",
             &[],
         )
         .expect("create project");
@@ -10538,6 +11610,7 @@ mod tests {
             "[\"knowledge\"]",
             "owner-s",
             &dir.to_string_lossy(),
+            "",
             &[MemberInput {
                 user_id: "editor-s".to_string(),
                 functions: vec!["developer".to_string(), "devops".to_string()],
@@ -10657,6 +11730,7 @@ mod tests {
             "[\"tests\"]",
             "owner-h",
             &dir.to_string_lossy(),
+            "",
             &[],
         )
         .expect("create project");
@@ -10815,6 +11889,7 @@ mod tests {
             "[\"knowledge\"]",
             "export-owner",
             &dir.to_string_lossy(),
+            "",
             &[],
         )
         .expect("project");
@@ -10947,6 +12022,7 @@ mod tests {
             "[\"knowledge\"]",
             &owner,
             &dir.to_string_lossy(),
+            "",
             &[],
         )
         .expect("project");
@@ -11040,6 +12116,7 @@ mod tests {
             modules,
             &owner,
             &dir.to_string_lossy(),
+            "",
             &[MemberInput {
                 user_id: actor.clone(),
                 functions: functions
@@ -11298,22 +12375,25 @@ mod tests {
             let (ctx, project, pool) = access_fixture("[\"knowledge\"]", &["developer"]);
             let actor = ctx.org_context.as_ref().expect("org").user_id.clone();
             let bytes = br#"{"openapi":"3.0.3","info":{"title":"Delayed API","version":"1.0"},"paths":{"/ping":{"get":{"responses":{"200":{"description":"OK"}}}}}}"#;
-            let uploaded = ingest::accept_upload_chunk(
-                &project.org_id,
-                &actor,
-                &project.project_id,
-                std::path::Path::new(&project.dir_path),
-                &uuid::Uuid::new_v4().to_string(),
-                "api.json",
-                "application/json",
-                0,
-                1,
+            let upload_id = uuid::Uuid::new_v4().to_string();
+            let uploaded = ingest::accept_upload_chunk(&ingest::UploadChunk {
+                org_id: &project.org_id,
+                user_id: &actor,
+                project_id: &project.project_id,
+                dir_path: std::path::Path::new(&project.dir_path),
+                upload_id: &upload_id,
+                filename: "api.json",
+                mime: "application/json",
+                position: ingest::UploadPosition::Sequence {
+                    seq: 0,
+                    total_chunks: 1,
+                },
                 bytes,
-            )
+                allowed: &|| Ok(()),
+            })
             .expect("actual upload");
-            let ingest::UploadOutcome::Finalized { sha256, .. } = uploaded else {
-                panic!("completed upload")
-            };
+            assert!(uploaded.complete);
+            let sha256 = uploaded.sha256;
             let blob = std::path::Path::new(&project.dir_path)
                 .join("files")
                 .join(&sha256);
@@ -11751,5 +12831,1171 @@ mod tests {
             );
             git_source::remove_source_dir(&project.project_id, &source_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod p1_tests {
+    use super::*;
+    use sha2::Digest;
+
+    struct Fixture {
+        project: ProjectRecord,
+        pool: crate::db::DbPool,
+        contexts: Vec<HandlerContext>,
+    }
+
+    fn fixture() -> Fixture {
+        let root = tempfile::tempdir().expect("tempdir");
+        crate::project_studio::db::init(&root.path().join("projects.db")).expect("registry");
+        let state = crate::dispatch::AppState::for_test();
+        super::super::app_gate::test_support::install_app(&state, PACKAGE_ID, &[PERM_READ]);
+        let org_id = crate::services::org::DEFAULT_ORG_ID;
+        let mut users = Vec::new();
+        for name in ["owner", "developer", "observer", "empty"] {
+            let user = crate::db::repository::create_user_account(
+                &state.db,
+                name,
+                "hash",
+                name,
+                &format!("{name}@example.test"),
+            )
+            .expect("actual account");
+            crate::services::org::add_membership(
+                &state.db,
+                org_id,
+                &user,
+                "role-org-viewer",
+                "test",
+            )
+            .expect("actual organization membership");
+            state
+                .db
+                .write()
+                .expect("writer")
+                .execute(
+                    "UPDATE user_accounts SET must_change_password = 0 WHERE id = ?1",
+                    [&user],
+                )
+                .expect("active session");
+            users.push(user);
+        }
+        let project_id = format!("p1-{}", uuid::Uuid::new_v4());
+        let dir = root.path().join(&project_id);
+        std::fs::create_dir_all(dir.join("files")).expect("directory");
+        repository::create_project(
+            &project_id,
+            org_id,
+            &project_id,
+            "",
+            "custom",
+            "[\"tasks\",\"tests\",\"knowledge\"]",
+            &users[0],
+            &dir.to_string_lossy(),
+            "",
+            &[
+                MemberInput {
+                    user_id: users[1].clone(),
+                    functions: vec!["developer".into()],
+                    project_admin: false,
+                    expires_at: None,
+                },
+                MemberInput {
+                    user_id: users[2].clone(),
+                    functions: vec!["observer".into()],
+                    project_admin: false,
+                    expires_at: None,
+                },
+                MemberInput {
+                    user_id: users[3].clone(),
+                    functions: vec![],
+                    project_admin: false,
+                    expires_at: None,
+                },
+            ],
+        )
+        .expect("project");
+        let contexts = users
+            .iter()
+            .map(|user| HandlerContext {
+                session: tentaflow_protocol::SessionAuth::UserSession {
+                    user_id: *uuid::Uuid::parse_str(user).expect("UUID").as_bytes(),
+                    role: None,
+                },
+                correlation_id: 1,
+                connection_id: 0,
+                resume_secret: None,
+                state: state.clone(),
+                origin: crate::dispatch::RequestOrigin::Local,
+                org_context: Some(
+                    crate::services::rbac::resolve_org_context(&state.db, user, Some(org_id))
+                        .expect("actual org context"),
+                ),
+            })
+            .collect();
+        let project = repository::get_project(org_id, &project_id)
+            .expect("lookup")
+            .expect("record");
+        let pool = project_db::open(&project_id).expect("project pool");
+        std::mem::forget(root);
+        Fixture {
+            project,
+            pool,
+            contexts,
+        }
+    }
+
+    async fn call(
+        ctx: &HandlerContext,
+        request: ProjectStudioPayload,
+    ) -> Result<ProjectStudioPayload, ProtocolError> {
+        let (response, error) = super::super::dispatch(&ps(request), ctx).await;
+        match response {
+            MessageBody::ProjectStudioBody(payload) if !error => Ok(payload),
+            MessageBody::Error(error) => Err(error),
+            other => panic!("unexpected real dispatch response {other:?}"),
+        }
+    }
+
+    fn save(
+        f: &Fixture,
+        task_id: Option<String>,
+        assigned_to: &str,
+        status: &str,
+        attachments: &str,
+    ) -> ProjectStudioPayload {
+        ProjectStudioPayload::TaskSaveRequest {
+            project_id: f.project.project_id.clone(),
+            task_id,
+            task_type: "technical".into(),
+            title: "Actual P1 task".into(),
+            description_md: "Real task history".into(),
+            severity: String::new(),
+            priority: "medium".into(),
+            status: status.into(),
+            assigned_to: assigned_to.into(),
+            due_date: String::new(),
+            parent_task_id: None,
+            links_json: "[]".into(),
+            attachments_json: attachments.into(),
+        }
+    }
+
+    fn user(ctx: &HandlerContext) -> &str {
+        &ctx.org_context.as_ref().expect("org").user_id
+    }
+
+    async fn create(f: &Fixture, assigned: &str, attachments: &str) -> String {
+        let result = call(&f.contexts[0], save(f, None, assigned, "todo", attachments))
+            .await
+            .expect("real task create");
+        let ProjectStudioPayload::TaskSaveResponse {
+            task_id,
+            task_key,
+            event_ids,
+            ..
+        } = result
+        else {
+            panic!("task")
+        };
+        assert!(task_key.starts_with(&format!("{}-", f.project.key_prefix)));
+        assert!(!event_ids.is_empty());
+        task_id
+    }
+
+    async fn bell(ctx: &HandlerContext) -> Vec<NotificationWire> {
+        let result = call(
+            ctx,
+            ProjectStudioPayload::NotificationsListRequest {
+                only_unread: false,
+                before_id: None,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("actual private notification list");
+        let ProjectStudioPayload::NotificationsListResponse { notifications, .. } = result else {
+            panic!("bell")
+        };
+        notifications
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_task_events_mentions_noops_and_private_bell_follow_current_access() {
+        let f = fixture();
+        let actor = &f.contexts[0];
+        let assigned = user(&f.contexts[1]);
+        let observer = user(&f.contexts[2]);
+        let task_id = create(&f, assigned, "[]").await;
+        assert_eq!(
+            bell(&f.contexts[1])
+                .await
+                .iter()
+                .filter(|n| n.kind == "task_assigned")
+                .count(),
+            1
+        );
+        let status = || ProjectStudioPayload::TaskStatusSetRequest {
+            project_id: f.project.project_id.clone(),
+            task_id: task_id.clone(),
+            status: "in_progress".into(),
+        };
+        let first = call(actor, status()).await.expect("transition");
+        let ProjectStudioPayload::TaskStatusSetResult {
+            event_id: Some(event_id),
+            previous_status,
+            ..
+        } = first
+        else {
+            panic!("real transition ID")
+        };
+        assert_eq!(previous_status.as_deref(), Some("todo"));
+        let before = tasks::list_task_events(&f.pool, &task_id, None, 100)
+            .expect("events")
+            .0;
+        assert!(before.iter().any(|e| e.event_id == event_id
+            && e.actor_id == user(actor)
+            && e.kind == "status_changed"));
+        assert!(matches!(
+            call(actor, status()).await.expect("status no-op"),
+            ProjectStudioPayload::TaskStatusSetResult { event_id: None, .. }
+        ));
+        assert_eq!(
+            tasks::list_task_events(&f.pool, &task_id, None, 100)
+                .expect("events")
+                .0
+                .len(),
+            before.len()
+        );
+        assert_eq!(
+            bell(&f.contexts[1])
+                .await
+                .iter()
+                .filter(|n| n.kind == "task_status_changed")
+                .count(),
+            1
+        );
+        assert!(
+            bell(actor).await.is_empty(),
+            "actor receives no own notifications"
+        );
+        let comment = call(
+            actor,
+            ProjectStudioPayload::TaskCommentAddRequest {
+                project_id: f.project.project_id.clone(),
+                task_id: task_id.clone(),
+                body_md: "Please inspect this transition".into(),
+                mention_user_ids: vec![observer.into(), observer.into(), user(actor).into()],
+            },
+        )
+        .await
+        .expect("structured mentions");
+        let ProjectStudioPayload::TaskCommentAddResponse { comment } = comment else {
+            panic!("comment")
+        };
+        assert_eq!(comment.mention_user_ids, vec![observer]);
+        assert_eq!(
+            bell(&f.contexts[2])
+                .await
+                .iter()
+                .filter(|n| n.kind == "task_mentioned")
+                .count(),
+            1
+        );
+        call(
+            actor,
+            ProjectStudioPayload::TaskCommentEditRequest {
+                project_id: f.project.project_id.clone(),
+                comment_id: comment.comment_id.clone(),
+                body_md: comment.body_md.clone(),
+                mention_user_ids: comment.mention_user_ids.clone(),
+            },
+        )
+        .await
+        .expect("comment no-op");
+        assert_eq!(bell(&f.contexts[2]).await.len(), 1);
+        let denied = call(
+            actor,
+            ProjectStudioPayload::TaskCommentAddRequest {
+                project_id: f.project.project_id.clone(),
+                task_id: task_id.clone(),
+                body_md: "Invalid mention".into(),
+                mention_user_ids: vec![user(&f.contexts[3]).into()],
+            },
+        )
+        .await
+        .expect_err("no task read is not an eligible recipient");
+        assert_eq!(denied.code, ProtocolErrorCode::BadRequest);
+        let stored_notifications = notifications::list(observer, false, None, 100)
+            .expect("stored notification history")
+            .0
+            .len();
+        assert_eq!(stored_notifications, 1);
+        repository::set_member_access(
+            &f.project.project_id,
+            observer,
+            &["developer".into()],
+            false,
+            None,
+        )
+        .expect("next assignee has current task write");
+        let reassigned = call(
+            actor,
+            save(&f, Some(task_id.clone()), observer, "in_progress", "[]"),
+        )
+        .await
+        .expect("ordinary full-save reassignment");
+        let ProjectStudioPayload::TaskSaveResponse { event_ids, .. } = reassigned else {
+            panic!("save result");
+        };
+        let assignment_event = tasks::list_task_events(&f.pool, &task_id, None, 100)
+            .expect("actual events")
+            .0
+            .into_iter()
+            .find(|event| event_ids.contains(&event.event_id) && event.kind == "reassigned")
+            .expect("committed reassignment event");
+        let old_bell = bell(&f.contexts[1]).await;
+        let new_bell = bell(&f.contexts[2]).await;
+        for (rows, kind) in [(&old_bell, "task_reassigned"), (&new_bell, "task_assigned")] {
+            let notices: Vec<_> = rows
+                .iter()
+                .filter(|notification| notification.kind == kind)
+                .collect();
+            assert_eq!(
+                notices.len(),
+                1,
+                "each side receives its own assignment notification once"
+            );
+            let link: serde_json::Value =
+                serde_json::from_str(&notices[0].link_json).expect("link facts");
+            assert_eq!(link["event_id"], assignment_event.event_id);
+            assert_eq!(link["from_user_id"], assigned);
+            assert_eq!(link["to_user_id"], observer);
+            assert_eq!(link["task_title"], "Actual P1 task");
+        }
+        assert!(
+            bell(actor).await.is_empty(),
+            "reassigning actor remains excluded"
+        );
+        let unchanged = call(
+            actor,
+            save(&f, Some(task_id.clone()), observer, "in_progress", "[]"),
+        )
+        .await
+        .expect("ordinary reassignment no-op");
+        assert!(
+            matches!(unchanged, ProjectStudioPayload::TaskSaveResponse { event_ids, .. } if event_ids.is_empty())
+        );
+        assert_eq!(bell(&f.contexts[1]).await.len(), old_bell.len());
+        assert_eq!(bell(&f.contexts[2]).await.len(), new_bell.len());
+        let unassigned = call(
+            actor,
+            save(&f, Some(task_id.clone()), "", "in_progress", "[]"),
+        )
+        .await
+        .expect("actual unassignment");
+        let ProjectStudioPayload::TaskSaveResponse { event_ids, .. } = unassigned else {
+            panic!("save result");
+        };
+        let unassignment_event = tasks::list_task_events(&f.pool, &task_id, None, 100)
+            .expect("actual events")
+            .0
+            .into_iter()
+            .find(|event| event_ids.contains(&event.event_id) && event.kind == "unassigned")
+            .expect("committed unassignment event");
+        let after_unassignment = bell(&f.contexts[2]).await;
+        let notice = after_unassignment
+            .iter()
+            .find(|notification| notification.kind == "task_unassigned")
+            .expect("previous assignee is notified");
+        let link: serde_json::Value = serde_json::from_str(&notice.link_json).expect("link facts");
+        assert_eq!(link["event_id"], unassignment_event.event_id);
+        assert_eq!(link["from_user_id"], observer);
+        assert_eq!(link["to_user_id"], "");
+        assert_eq!(
+            bell(&f.contexts[1]).await.len(),
+            old_bell.len(),
+            "an unrelated previous assignee receives no unassignment notification"
+        );
+        call(
+            actor,
+            save(&f, Some(task_id.clone()), "", "in_progress", "[]"),
+        )
+        .await
+        .expect("unassignment no-op");
+        assert_eq!(bell(&f.contexts[2]).await.len(), after_unassignment.len());
+        repository::set_member_access(&f.project.project_id, observer, &[], false, None)
+            .expect("revoke read");
+        assert!(
+            bell(&f.contexts[2]).await.is_empty(),
+            "stored title and body are hidden after grant revocation"
+        );
+        crate::project_studio::db::pool().expect("registry").write().expect("writer").execute("UPDATE project_members SET expires_at = '2000-01-01T00:00:00Z' WHERE project_id = ?1 AND user_id = ?2", rusqlite::params![f.project.project_id, assigned]).expect("expire recipient");
+        assert!(
+            bell(&f.contexts[1]).await.is_empty(),
+            "expired membership hides old assignment and transition details"
+        );
+        assert!(
+            notifications::list(assigned, false, None, 100)
+                .expect("stored history")
+                .0
+                .len()
+                >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn real_binary_notification_push_rechecks_queued_task_visibility_after_revoke() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let f = fixture();
+        let task_id = create(&f, "", "[]").await;
+        let target = user(&f.contexts[2]).to_string();
+        let (server_stream, client_stream) = tokio::io::duplex(1024 * 1024);
+        let state = f.contexts[2].state.clone();
+        let target_for_socket = target.clone();
+        let server = tokio::spawn(crate::api::dashboard::ws_binary::handle_ws_connection(
+            server_stream,
+            Some(target_for_socket),
+            Some("user".into()),
+            std::sync::Arc::new(vec![1; 32]),
+            state,
+            "127.0.0.1".into(),
+        ));
+        let mut client = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            client_stream,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let body = tentaflow_protocol::cbor::encode(&MessageBody::MetaSchemaVersionCheck {
+            client_version: tentaflow_protocol::envelope::SCHEMA_VERSION,
+        })
+        .expect("body");
+        let envelope = tentaflow_protocol::Envelope::new_direct(
+            1,
+            1,
+            tentaflow_protocol::envelope::message_kind::META_HEARTBEAT,
+            body,
+        );
+        client
+            .send(Message::Binary(
+                tentaflow_protocol::cbor::encode(&envelope)
+                    .expect("binary handshake")
+                    .into(),
+            ))
+            .await
+            .expect("send");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let message = client.next().await.expect("socket").expect("frame");
+                if let Message::Binary(bytes) = message {
+                    let envelope: tentaflow_protocol::Envelope =
+                        tentaflow_protocol::cbor::decode(&bytes).expect("envelope");
+                    let body: MessageBody =
+                        tentaflow_protocol::cbor::decode(&envelope.body).expect("body");
+                    if matches!(
+                        body,
+                        MessageBody::MetaSchemaVersionAck { accepted: true, .. }
+                    ) {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("handshake confirms live pump");
+        task_comment_add_v1(
+            &f.contexts[0],
+            &f.project.project_id,
+            &task_id,
+            "First actual queued mention",
+            &[target.clone()],
+        )
+        .expect("actual committed notification");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let message = client.next().await.expect("socket").expect("frame");
+                if let Message::Binary(bytes) = message {
+                    let envelope: tentaflow_protocol::Envelope =
+                        tentaflow_protocol::cbor::decode(&bytes).expect("envelope");
+                    let body: MessageBody =
+                        tentaflow_protocol::cbor::decode(&envelope.body).expect("body");
+                    if let MessageBody::SystemEventBody(
+                        tentaflow_protocol::SystemEventPayload::UserNotification {
+                            user_id,
+                            kind,
+                            link_json,
+                            ..
+                        },
+                    ) = body
+                    {
+                        break (user_id, kind, link_json);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("authorized actual push");
+        assert_eq!(first.0, target);
+        assert_eq!(first.1, "task_mentioned");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first.2).expect("actual metadata")
+                ["task_title"],
+            "Actual P1 task"
+        );
+        task_comment_add_v1(
+            &f.contexts[0],
+            &f.project.project_id,
+            &task_id,
+            "Queued before access revocation",
+            &[target.clone()],
+        )
+        .expect("second committed notification");
+        repository::set_member_access(&f.project.project_id, &target, &[], false, None)
+            .expect("revoke before pump resumes on this current-thread runtime");
+        crate::dispatch::system_event_broadcast::publish_service_status(
+            "p1-sentinel",
+            "test",
+            "running",
+            "after queued private notification",
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let message = client.next().await.expect("socket").expect("frame");
+                if let Message::Binary(bytes) = message {
+                    let envelope: tentaflow_protocol::Envelope =
+                        tentaflow_protocol::cbor::decode(&bytes).expect("envelope");
+                    let body: MessageBody =
+                        tentaflow_protocol::cbor::decode(&envelope.body).expect("body");
+                    match body {
+                        MessageBody::SystemEventBody(
+                            tentaflow_protocol::SystemEventPayload::UserNotification { .. },
+                        ) => panic!("queued task details leaked after revocation"),
+                        MessageBody::SystemEventBody(
+                            tentaflow_protocol::SystemEventPayload::ServiceStatusChanged {
+                                service_name,
+                                ..
+                            },
+                        ) if service_name == "p1-sentinel" => break,
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .await
+        .expect("generic event remains visible after private event filtering");
+        client.close(None).await.expect("close");
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("server closes")
+            .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_catalogue_links_archive_and_self_handover_have_atomic_history() {
+        let f = fixture();
+        let owner = &f.contexts[0];
+        let reader = &f.contexts[1];
+        let observer = user(&f.contexts[2]);
+        let task_id = create(&f, user(reader), "[]").await;
+        let target_id = create(&f, "", "[]").await;
+        let custom = || ProjectStudioPayload::TaskTypeSaveRequest {
+            project_id: f.project.project_id.clone(),
+            type_id: "customer_note".into(),
+            name: "Customer note".into(),
+            description: "Real custom type".into(),
+            sort_order: 10,
+            active: true,
+        };
+        assert_eq!(
+            call(reader, custom())
+                .await
+                .expect_err("catalogue admin")
+                .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        call(owner, custom())
+            .await
+            .expect("custom catalogue persists");
+        let types = call(
+            &f.contexts[3],
+            ProjectStudioPayload::TaskTypesListRequest {
+                project_id: f.project.project_id.clone(),
+            },
+        )
+        .await
+        .expect("no-function creator can pick types");
+        let ProjectStudioPayload::TaskTypesListResponse { types } = types else {
+            panic!("types")
+        };
+        assert_eq!(types.iter().filter(|t| t.built_in).count(), 6);
+        assert!(types
+            .iter()
+            .any(|t| t.type_id == "customer_note" && t.active));
+        let linked = call(
+            owner,
+            ProjectStudioPayload::TaskLinkSaveRequest {
+                project_id: f.project.project_id.clone(),
+                source_task_id: task_id.clone(),
+                target_task_id: target_id.clone(),
+                kind: "fs".into(),
+                lag_days: 2,
+            },
+        )
+        .await
+        .expect("relation");
+        let ProjectStudioPayload::TaskLinkSaveResult {
+            link,
+            source_event_id,
+            target_event_id,
+            ..
+        } = linked
+        else {
+            panic!("relation")
+        };
+        assert_ne!(source_event_id, target_event_id);
+        repository::set_member_access(
+            &f.project.project_id,
+            user(reader),
+            &["observer".into()],
+            false,
+            None,
+        )
+        .expect("current assignee becomes reader");
+        let handed = call(
+            reader,
+            ProjectStudioPayload::TaskHandoverRequest {
+                project_id: f.project.project_id.clone(),
+                task_id: task_id.clone(),
+                assigned_to: user(owner).into(),
+                note_md: "Finish the pending review".into(),
+                mention_user_ids: vec![observer.into()],
+            },
+        )
+        .await
+        .expect("self handover exception");
+        let ProjectStudioPayload::TaskHandoverResult {
+            event_ids,
+            comment_id: Some(comment_id),
+            ..
+        } = handed
+        else {
+            panic!("atomic handover")
+        };
+        assert_eq!(event_ids.len(), 2);
+        let events = tasks::list_task_events(&f.pool, &task_id, None, 100)
+            .expect("history")
+            .0;
+        assert!(events.iter().any(|e| e.kind == "handed_over"
+            && e.actor_id == user(reader)
+            && e.after_json.contains(&comment_id)));
+        assert_eq!(
+            tasks::latest_handover_comment_id(&f.pool, &task_id).expect("pin"),
+            Some(comment_id.clone())
+        );
+        assert_eq!(
+            bell(&f.contexts[2])
+                .await
+                .iter()
+                .filter(|n| n.kind == "task_mentioned")
+                .count(),
+            1,
+            "committed handover mentions are sent"
+        );
+        assert_eq!(
+            call(
+                reader,
+                save(&f, Some(task_id.clone()), user(owner), "todo", "[]")
+            )
+            .await
+            .expect_err("reader cannot edit ordinary fields")
+            .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        repository::set_member_access(
+            &f.project.project_id,
+            user(reader),
+            &["developer".into()],
+            false,
+            None,
+        )
+        .expect("comment author regains task write before archive tests");
+        call(
+            owner,
+            ProjectStudioPayload::TaskArchiveRequest {
+                project_id: f.project.project_id.clone(),
+                task_id: task_id.clone(),
+                archived: true,
+            },
+        )
+        .await
+        .expect("archive");
+        let snapshot_events = |id: &str| {
+            tasks::list_task_events(&f.pool, id, None, 100)
+                .expect("event snapshot")
+                .0
+                .into_iter()
+                .map(|event| {
+                    (
+                        event.event_id,
+                        event.kind,
+                        event.actor_id,
+                        event.before_json,
+                        event.after_json,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let archived_history = snapshot_events(&task_id);
+        let counterpart_history = snapshot_events(&target_id);
+        let before_comment = tasks::get_comment(&f.pool, &comment_id)
+            .expect("comment")
+            .expect("row");
+        let edit_comment = || ProjectStudioPayload::TaskCommentEditRequest {
+            project_id: f.project.project_id.clone(),
+            comment_id: comment_id.clone(),
+            body_md: "Edited after actual restore".into(),
+            mention_user_ids: vec![],
+        };
+        let delete_comment = || ProjectStudioPayload::TaskCommentDeleteRequest {
+            project_id: f.project.project_id.clone(),
+            comment_id: comment_id.clone(),
+        };
+        let delete_link = || ProjectStudioPayload::TaskLinkDeleteRequest {
+            project_id: f.project.project_id.clone(),
+            link_id: link.link_id,
+        };
+        for request in [edit_comment(), delete_comment()] {
+            assert_eq!(
+                call(reader, request)
+                    .await
+                    .expect_err("archived task comment is read-only")
+                    .code,
+                ProtocolErrorCode::BadRequest
+            );
+        }
+        assert_eq!(
+            call(owner, delete_link())
+                .await
+                .expect_err("link touching an archived task is read-only")
+                .code,
+            ProtocolErrorCode::BadRequest
+        );
+        let after_comment = tasks::get_comment(&f.pool, &comment_id)
+            .expect("comment")
+            .expect("row preserved");
+        assert_eq!(
+            (
+                after_comment.body_md,
+                after_comment.mention_user_ids_json,
+                after_comment.edited_at
+            ),
+            (
+                before_comment.body_md,
+                before_comment.mention_user_ids_json,
+                before_comment.edited_at
+            )
+        );
+        assert!(tasks::list_task_links(&f.pool, &task_id)
+            .expect("relation preserved")
+            .iter()
+            .any(|row| row.link_id == link.link_id));
+        assert_eq!(snapshot_events(&task_id), archived_history);
+        assert_eq!(snapshot_events(&target_id), counterpart_history);
+        let list = |include_archived| ProjectStudioPayload::TasksListRequest {
+            project_id: f.project.project_id.clone(),
+            task_type: String::new(),
+            status: String::new(),
+            assigned_to: String::new(),
+            search: String::new(),
+            offset: 0,
+            limit: 100,
+            severity: String::new(),
+            include_archived,
+        };
+        let ProjectStudioPayload::TasksListResponse { tasks: active, .. } =
+            call(owner, list(false)).await.expect("active list")
+        else {
+            panic!("list")
+        };
+        assert!(!active.iter().any(|t| t.task_id == task_id));
+        let ProjectStudioPayload::TasksListResponse { tasks: history, .. } =
+            call(owner, list(true)).await.expect("archived list")
+        else {
+            panic!("list")
+        };
+        assert!(history
+            .iter()
+            .any(|t| t.task_id == task_id && t.archived_at.is_some()));
+        call(
+            owner,
+            ProjectStudioPayload::TaskArchiveRequest {
+                project_id: f.project.project_id.clone(),
+                task_id: task_id.clone(),
+                archived: false,
+            },
+        )
+        .await
+        .expect("undo archive");
+        assert!(tasks::get_task(&f.pool, &task_id)
+            .expect("task")
+            .expect("row")
+            .archived_at
+            .is_none());
+        call(reader, edit_comment())
+            .await
+            .expect("restored task permits author comment edit");
+        call(reader, delete_comment())
+            .await
+            .expect("restored task permits author comment delete");
+        call(owner, delete_link())
+            .await
+            .expect("restored endpoints permit relation delete");
+        assert!(tasks::get_comment(&f.pool, &comment_id)
+            .expect("comment")
+            .is_none());
+        assert!(tasks::list_task_links(&f.pool, &task_id)
+            .expect("relations")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_case_item_step_attachment_scopes_and_module_revocation() {
+        let f = fixture();
+        let bytes = b"Exact execution attachment";
+        let sha = hex::encode(sha2::Sha256::digest(bytes));
+        let upload_id = uuid::Uuid::new_v4().to_string();
+        call(
+            &f.contexts[0],
+            ProjectStudioPayload::AttachmentUploadChunkRequest {
+                project_id: f.project.project_id.clone(),
+                upload_id,
+                filename: "execution.bin".into(),
+                mime: "application/octet-stream".into(),
+                sha256: sha.clone(),
+                total_size: bytes.len() as u64,
+                offset: 0,
+                bytes: bytes.to_vec(),
+            },
+        )
+        .await
+        .expect("actual durable upload");
+        let raw = serde_json::to_string(&vec![AttachmentWire {
+            sha256: sha.clone(),
+            name: "execution.bin".into(),
+            mime: "application/octet-stream".into(),
+            size_bytes: bytes.len() as u64,
+        }])
+        .expect("refs");
+        let result = call(
+            &f.contexts[0],
+            ProjectStudioPayload::CaseSaveRequest {
+                project_id: f.project.project_id.clone(),
+                case_id: None,
+                kind: "manual".into(),
+                title: "Actual execution case".into(),
+                priority: "medium".into(),
+                content_json: r#"{"steps":[{"action":"Open","expected":"Visible"}]}"#.into(),
+                tag_ids: vec![],
+                linked_source_ids: vec![],
+                attachments_json: raw.clone(),
+                expected_version: None,
+                change_note: String::new(),
+            },
+        )
+        .await
+        .expect("case");
+        let ProjectStudioPayload::CaseSaveResponse { case_id, .. } = result else {
+            panic!("case")
+        };
+        {
+            let conn = f.pool.write().expect("writer");
+            conn.execute("INSERT INTO test_runs (run_id,run_no,name,assignment_mode,status,created_by) VALUES ('execution-run',1,'Manual execution','single','running',?1)", [user(&f.contexts[0])]).expect("real run");
+            conn.execute("INSERT INTO test_run_items (item_id,run_id,case_id,case_title,case_version,position,attachments_json) VALUES ('execution-item','execution-run',?1,'Actual execution case',1,0,?2)", rusqlite::params![case_id,raw]).expect("item");
+            conn.execute("INSERT INTO test_run_steps (item_id,step_index,action,attachments_json) VALUES ('execution-item',0,'Open',?1)", [&raw]).expect("step");
+            conn.execute("INSERT INTO test_run_steps (item_id,step_index,action) VALUES ('execution-item',1,'Close')", []).expect("other step");
+        }
+        let read = |kind, owner_id: &str, step_index| ProjectStudioPayload::AttachmentGetRequest {
+            project_id: f.project.project_id.clone(),
+            owner_kind: kind,
+            owner_id: owner_id.into(),
+            step_index,
+            sha256: sha.clone(),
+            offset: 6,
+            max_bytes: 4,
+            preview: false,
+        };
+        for (kind, id, index) in [
+            (AttachmentOwnerKind::Case, case_id.as_str(), None),
+            (AttachmentOwnerKind::RunItem, "execution-item", None),
+            (AttachmentOwnerKind::RunStep, "execution-item", Some(0)),
+        ] {
+            let result = call(&f.contexts[1], read(kind, id, index))
+                .await
+                .expect("actual Tests Read scope");
+            let ProjectStudioPayload::AttachmentGetResponse {
+                bytes: result,
+                total_size,
+                ..
+            } = result
+            else {
+                panic!("read")
+            };
+            assert_eq!(result, &bytes[6..10]);
+            assert_eq!(total_size, bytes.len() as u64);
+            assert_eq!(
+                call(&f.contexts[3], read(kind, id, index))
+                    .await
+                    .expect_err("no-function cannot read tests")
+                    .code,
+                ProtocolErrorCode::PolicyDenied
+            );
+        }
+        assert_eq!(
+            call(
+                &f.contexts[1],
+                read(AttachmentOwnerKind::RunStep, "execution-item", Some(1))
+            )
+            .await
+            .expect_err("wrong step cannot reuse sibling SHA")
+            .code,
+            ProtocolErrorCode::NotFound
+        );
+        assert_eq!(
+            call(
+                &f.contexts[1],
+                read(AttachmentOwnerKind::RunStep, "execution-item", None)
+            )
+            .await
+            .expect_err("step index is required")
+            .code,
+            ProtocolErrorCode::BadRequest
+        );
+        assert_eq!(
+            call(
+                &f.contexts[1],
+                read(AttachmentOwnerKind::Case, &case_id, Some(0))
+            )
+            .await
+            .expect_err("step index cannot scope a case")
+            .code,
+            ProtocolErrorCode::BadRequest
+        );
+        repository::update_project_modules(&f.project.org_id, &f.project.project_id, "[\"tasks\"]")
+            .expect("disable tests");
+        assert_eq!(
+            call(
+                &f.contexts[1],
+                read(AttachmentOwnerKind::Case, &case_id, None)
+            )
+            .await
+            .expect_err("disabled module revokes media")
+            .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_attachment_save_requires_upload_or_exact_readable_owner_reference() {
+        let f = fixture();
+        let bytes = b"Original owned recording";
+        let sha = hex::encode(sha2::Sha256::digest(bytes));
+        let upload = |upload_id: &str| ProjectStudioPayload::AttachmentUploadChunkRequest {
+            project_id: f.project.project_id.clone(),
+            upload_id: upload_id.into(),
+            filename: "recording.bin".into(),
+            mime: "application/octet-stream".into(),
+            sha256: sha.clone(),
+            total_size: bytes.len() as u64,
+            offset: 0,
+            bytes: bytes.to_vec(),
+        };
+        call(&f.contexts[0], upload("original-owner"))
+            .await
+            .expect("owner upload");
+        let raw = serde_json::to_string(&vec![AttachmentWire {
+            sha256: sha.clone(),
+            name: "recording.bin".into(),
+            mime: "application/octet-stream".into(),
+            size_bytes: bytes.len() as u64,
+        }])
+        .expect("reference");
+        let task_id = create(&f, "", &raw).await;
+        let denied = call(&f.contexts[1], save(&f, None, "", "todo", &raw))
+            .await
+            .expect_err("a known SHA from another record is not a new authorized upload");
+        assert_eq!(denied.code, ProtocolErrorCode::PolicyDenied);
+        call(&f.contexts[1], save(&f, Some(task_id), "", "todo", &raw))
+            .await
+            .expect("retaining exact readable owner reference");
+        call(&f.contexts[3], upload("no-function-owner"))
+            .await
+            .expect("no-function creator uploads own bytes");
+        call(&f.contexts[3], save(&f, None, "", "todo", &raw))
+            .await
+            .expect("no-function creator may attach their verified upload");
+        let mut wrong_size: Vec<AttachmentWire> = serde_json::from_str(&raw).expect("reference");
+        wrong_size[0].size_bytes += 1;
+        assert_eq!(
+            call(
+                &f.contexts[0],
+                save(
+                    &f,
+                    None,
+                    "",
+                    "todo",
+                    &serde_json::to_string(&wrong_size).expect("JSON")
+                )
+            )
+            .await
+            .expect_err("untrusted size metadata")
+            .code,
+            ProtocolErrorCode::PolicyDenied
+        );
+        #[cfg(unix)]
+        {
+            let original = std::path::Path::new(&f.project.dir_path)
+                .join("files")
+                .join(&sha);
+            let other = std::path::Path::new(&f.project.dir_path).join("outside");
+            std::fs::rename(&original, &other).expect("move original");
+            std::os::unix::fs::symlink(&other, &original).expect("symlink");
+            assert_eq!(
+                call(&f.contexts[0], save(&f, None, "", "todo", &raw))
+                    .await
+                    .expect_err("symlink cannot be persisted as original")
+                    .code,
+                ProtocolErrorCode::BadRequest
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn real_dispatch_more_than_20_attachments_retains_original_history_and_bounds_reads() {
+        let f = fixture();
+        let mut attachments = Vec::new();
+        for index in 0..21u8 {
+            let bytes = vec![index; 1024];
+            let sha = hex::encode(sha2::Sha256::digest(&bytes));
+            call(
+                &f.contexts[0],
+                ProjectStudioPayload::AttachmentUploadChunkRequest {
+                    project_id: f.project.project_id.clone(),
+                    upload_id: format!("asset-{index}"),
+                    filename: format!("recording-{index}.bin"),
+                    mime: "application/octet-stream".into(),
+                    sha256: sha.clone(),
+                    total_size: bytes.len() as u64,
+                    offset: 0,
+                    bytes,
+                },
+            )
+            .await
+            .expect("actual original upload");
+            attachments.push(AttachmentWire {
+                sha256: sha,
+                name: format!("recording-{index}.bin"),
+                mime: "application/octet-stream".into(),
+                size_bytes: 1024,
+            });
+        }
+        let raw = serde_json::to_string(&attachments).expect("refs");
+        let task_id = create(&f, "", &raw).await;
+        let sha = &attachments[20].sha256;
+        let read = |sha: &str, owner_id: &str, offset, max_bytes| {
+            ProjectStudioPayload::AttachmentGetRequest {
+                project_id: f.project.project_id.clone(),
+                owner_kind: AttachmentOwnerKind::Task,
+                owner_id: owner_id.into(),
+                step_index: None,
+                sha256: sha.into(),
+                offset,
+                max_bytes,
+                preview: false,
+            }
+        };
+        let ProjectStudioPayload::AttachmentGetResponse {
+            bytes,
+            total_size,
+            eof,
+            ..
+        } = call(&f.contexts[2], read(sha, &task_id, 1000, 1024))
+            .await
+            .expect("bounded exact task ref")
+        else {
+            panic!("bytes")
+        };
+        assert_eq!(total_size, 1024);
+        assert_eq!(bytes, vec![20u8; 24]);
+        assert!(eof);
+        assert_eq!(
+            call(&f.contexts[2], read(sha, "another-task", 0, 1024))
+                .await
+                .expect_err("unlinked blob hidden")
+                .code,
+            ProtocolErrorCode::NotFound
+        );
+        assert_eq!(
+            call(&f.contexts[2], read(sha, &task_id, 0, 4 * 1024 * 1024 + 1))
+                .await
+                .expect_err("transport bound")
+                .code,
+            ProtocolErrorCode::BadRequest
+        );
+        call(
+            &f.contexts[0],
+            save(&f, Some(task_id.clone()), "", "todo", "[]"),
+        )
+        .await
+        .expect("remove current refs");
+        call(&f.contexts[2], read(sha, &task_id, 0, 1024))
+            .await
+            .expect("historical original remains authorized");
+        call(
+            &f.contexts[0],
+            ProjectStudioPayload::TaskArchiveRequest {
+                project_id: f.project.project_id.clone(),
+                task_id: task_id.clone(),
+                archived: true,
+            },
+        )
+        .await
+        .expect("archive task");
+        let ProjectStudioPayload::AttachmentUsageResponse {
+            file_count,
+            total_bytes,
+            per_task,
+            ..
+        } = call(
+            &f.contexts[2],
+            ProjectStudioPayload::AttachmentUsageRequest {
+                project_id: f.project.project_id.clone(),
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("actual historical usage")
+        else {
+            panic!("usage")
+        };
+        assert_eq!(file_count, 21);
+        assert_eq!(total_bytes, 21 * 1024);
+        assert_eq!(per_task.len(), 1);
+        assert_eq!(per_task[0].file_count, 21);
+        repository::set_project_archived(&f.project.org_id, &f.project.project_id, true)
+            .expect("archive project");
+        call(&f.contexts[2], read(sha, &task_id, 0, 1024))
+            .await
+            .expect("archived read remains valid");
+        crate::project_studio::db::pool().expect("registry").write().expect("writer").execute("UPDATE project_members SET expires_at = '2000-01-01T00:00:00Z' WHERE project_id = ?1 AND user_id = ?2", rusqlite::params![f.project.project_id,user(&f.contexts[2])]).expect("expire reader");
+        assert_eq!(
+            call(&f.contexts[2], read(sha, &task_id, 0, 1024))
+                .await
+                .expect_err("expired media access")
+                .code,
+            ProtocolErrorCode::NotFound
+        );
     }
 }

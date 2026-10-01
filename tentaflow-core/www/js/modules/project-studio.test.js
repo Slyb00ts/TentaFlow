@@ -20,7 +20,8 @@ globalThis.fetch = (url, options) => {
   return hostFetch(url, options);
 };
 const { I18n } = await import('../i18n.js');
-await I18n.setLanguage('en');
+localStorage.setItem('tentaflow_lang', 'en');
+await I18n.init();
 const { ApiBinary } = await import('../protocol/api-binary-shim.js');
 const { Router } = await import('../router.js');
 const { default: screen } = await import('./project-studio.js');
@@ -48,11 +49,15 @@ function catalogue() {
   }));
 }
 
-async function mount(projectAccess, overrides = {}) {
+function taskTypes() {
+  return ['feature', 'defect', 'technical', 'security', 'subtask', 'epic'].map((type_id, i) => ({ type_id, name: type_id, description: type_id, sort_order: i * 10, built_in: true, active: true }));
+}
+
+async function mount(projectAccess, overrides = {}, params = null) {
   screen.unmount();
   calls.length = 0;
   navigation.length = 0;
-  const project = { project_id: 'p0-project', name: 'Workflow', description: '', template: 'custom', status: projectAccess.archived ? 'archived' : 'active', modules: ['knowledge', 'tasks'], access: projectAccess, member_count: 3 };
+  const project = { project_id: 'p0-project', name: 'Workflow', description: '', template: 'custom', status: projectAccess.archived ? 'archived' : 'active', modules: ['knowledge', 'tasks'], key_prefix: 'WF', key_prefix_locked: false, access: projectAccess, member_count: 3 };
   const fixtures = {
     // An AuthMe role never substitutes for project or application permissions.
     authMeRequest: { userId: new Uint8Array(16), username: 'Creator', role: 'admin' },
@@ -62,7 +67,8 @@ async function mount(projectAccess, overrides = {}) {
     projectStudioOverviewRequest: { kpis: {}, activity: [] },
     projectStudioNotificationsListRequest: { notifications: [], unread_count: 0 },
     projectStudioMembersListRequest: { members: [] },
-    projectStudioTaskSaveRequest: { task_id: 'created-task', task_no: 1 },
+    projectStudioTaskSaveRequest: { task_id: 'created-task', task_no: 1, task_key: 'WF-1', event_ids: [1] },
+    projectStudioTaskTypesListRequest: { types: taskTypes() },
     ...overrides,
   };
   ApiBinary.one = async (kind, payload) => {
@@ -71,7 +77,8 @@ async function mount(projectAccess, overrides = {}) {
     return typeof fixtures[kind] === 'function' ? fixtures[kind](payload) : fixtures[kind];
   };
   document.body.innerHTML = `<main>${screen.render()}</main>`;
-  await screen.mount();
+  await screen.mount(params || {});
+  if (params) return;
   document.querySelector('#ps-filter').dispatchEvent(new CustomEvent('change', { detail: { id: 'all' }, bubbles: true }));
   for (let i = 0; i < 4; i += 1) await flush();
   document.querySelector('[data-project-id]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -104,7 +111,9 @@ test('a member with no functions creates through the header without unreadable r
   assert.ok(title);
   title.value = 'A task from a member without functions';
   title.dispatchEvent(new Event('input', { bubbles: true }));
-  assert.equal(document.querySelector('#ps-task-att-input'), null, 'no inaccessible attachment API is exposed');
+  assert.ok(document.querySelector('#ps-task-att-input'), 'creation includes the authorized staged upload path');
+  assert.equal(document.querySelector('#ps-task-parent'), null, 'parent search does not imply Tasks Read');
+  assert.ok(document.querySelector('#ps-task-type option[value="subtask"]').hasAttribute('disabled'));
   document.querySelector('tf-window [data-action="save"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
   for (let i = 0; i < 4; i += 1) await flush();
   assert.equal(calls.filter((call) => call.kind === 'projectStudioTaskSaveRequest').length, 1);
@@ -369,11 +378,11 @@ test('Tests Write can run a manual schedule without offering administrative chan
 });
 
 test('Board Write without Tasks Read moves cards and saves only status from the card window', async () => {
-  const task = { task_id: 'task-one', task_no: 1, task_type: 'task', title: 'Keep all task content', priority: 'medium', status: 'todo', created_by: 'author', comment_count: 0 };
+  const task = { task_id: 'task-one', task_no: 1, task_key: 'WF-1', task_type: 'technical', title: 'Keep all task content', priority: 'medium', status: 'todo', assigned_to: '', due_date: '', links_json: '[]', parent_task_id: null, archived_at: null, created_by: 'author', comment_count: 0 };
   const boardAccess = access({ areas: PROJECT_AREAS.map((area) => ({ area, enabled: true, level: area === 'board' ? 'write' : 'none' })) });
   await mount(boardAccess, {
     projectStudioTasksListRequest: { tasks: [task], total: 1 },
-    projectStudioTaskGetRequest: { detail: { info: task, description_md: 'Existing content', attachments: [], comments: [] } },
+    projectStudioTaskGetRequest: { detail: { info: task, description_md: 'Existing content', attachments: [], comments: [], task_links: [], events: [], events_has_more: false, status_durations: [], handover_comment_id: null } },
     projectStudioTaskStatusSetRequest: { ok: true },
   });
   document.querySelector('#ps-project-tabs').dispatchEvent(new CustomEvent('change', { detail: { value: 'tasks' }, bubbles: true }));
@@ -386,7 +395,8 @@ test('Board Write without Tasks Read moves cards and saves only status from the 
   board.dispatchEvent(new CustomEvent('card-open', { detail: { cardId: 'task-one' }, bubbles: true }));
   for (let i = 0; i < 4; i += 1) await flush();
   assert.ok(document.querySelector('#ps-task-title').hasAttribute('readonly'));
-  assert.ok(document.querySelector('#ps-task-desc').hasAttribute('disabled'));
+  assert.equal(document.querySelector('#ps-task-desc'), null);
+  assert.equal(document.querySelector('#ps-task-desc-preview').textContent.trim(), 'Existing content');
   assert.ok(!document.querySelector('#ps-task-status').hasAttribute('disabled'));
   document.querySelector('#ps-task-status').dispatchEvent(new CustomEvent('change', { detail: { value: 'review' }, bubbles: true }));
   document.querySelector('tf-window [data-action="save"]').dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -432,4 +442,378 @@ test('editing a function saves one complete row of the matrix in one mutation', 
   assert.deepEqual(saves[0].payload.function.grants.find((grant) => grant.area === 'tasks'), { area: 'tasks', level: 'admin' });
   assert.deepEqual(saves[0].payload.function.grants.find((grant) => grant.area === 'knowledge'), { area: 'knowledge', level: 'read' });
   screen.unmount();
+});
+
+function tasksAccess(level = 'write', board = 'read') {
+  return access({ areas: PROJECT_AREAS.map((area) => ({ area, enabled: true, level: area === 'tasks' ? level : area === 'board' ? board : 'none' })) });
+}
+
+function taskFixture(overrides = {}) {
+  return { task_id: 'task-one', task_no: 7, task_key: 'WF-7', task_type: 'technical', title: 'Persistent task', description_md: '', severity: '', priority: 'medium', status: 'in_progress', assigned_to: '', assigned_to_name: '', due_date: '', parent_task_id: null, links_json: '[]', comment_count: 0, created_by: 'author', created_by_name: 'Author', created_at: '2026-10-01T10:00:00Z', updated_at: '2026-10-01T10:00:00Z', archived_at: null, ...overrides };
+}
+
+function detailFixture(info, overrides = {}) {
+  return { info, description_md: '**Actual description**', attachments: [], comments: [], task_links: [], events: [], events_has_more: false, status_durations: [], handover_comment_id: null, ...overrides };
+}
+
+async function openTasks() {
+  document.querySelector('#ps-project-tabs').dispatchEvent(new CustomEvent('change', { detail: { value: 'tasks' }, bubbles: true }));
+  for (let i = 0; i < 6; i += 1) await flush();
+}
+
+async function openTaskCard() {
+  await openTasks();
+  const table = document.querySelector('#ps-tasks-table');
+  table.dispatchEvent(new CustomEvent('row-click', { detail: { row: table.rows[0] }, bubbles: true }));
+  for (let i = 0; i < 8; i += 1) await flush();
+  assert.ok(document.querySelector('#ps-task-title'));
+}
+
+const click = (element) => { assert.ok(element); element.dispatchEvent(new MouseEvent('click', { bubbles: true })); };
+const settle = async () => { for (let i = 0; i < 8; i += 1) await flush(); };
+
+function menuAction(label) {
+  const item = [...document.querySelectorAll('tf-menu tf-menu-item')].find((node) => node.getAttribute('label') === label);
+  assert.ok(item, `menu action ${label}`);
+  item.closest('tf-menu').dispatchEvent(new CustomEvent('action', { detail: { action: item.getAttribute('action') }, bubbles: true }));
+}
+
+for (const taskType of ['technical', 'subtask']) test(`${taskType} creation preserves the chosen Epic after input blur and Save`, async () => {
+  const epic = taskFixture({ task_id: 'epic-id', task_key: 'WF-1', task_type: 'epic', title: 'Epic parent' });
+  await mount(tasksAccess(), { projectStudioTasksListRequest: { tasks: [epic], total: 1 } });
+  click(document.querySelector('[data-new-task]')); await settle();
+  const title = document.querySelector('#ps-task-title input');
+  title.value = 'Task with a persisted parent'; title.dispatchEvent(new Event('input', { bubbles: true }));
+  const type = document.querySelector('#ps-task-type select');
+  type.value = taskType; type.dispatchEvent(new Event('change', { bubbles: true })); await settle();
+  const save = document.querySelector('tf-window tf-button[data-action="save"]');
+  if (taskType === 'subtask') {
+    click(save); await settle();
+    assert.equal(calls.some((call) => call.kind === 'projectStudioTaskSaveRequest'), false, 'a subtask without a selected parent is rejected');
+    assert.match(document.querySelector('[data-form-error]').textContent, /parent/i);
+  }
+  const parent = document.querySelector('#ps-task-parent');
+  const input = parent.querySelector('input');
+  input.focus(); input.value = 'WF-1'; input.dispatchEvent(new Event('input', { bubbles: true })); await settle();
+  parent.querySelector('[role="option"]').dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+  input.blur(); input.dispatchEvent(new Event('change', { bubbles: true }));
+  click(save); await settle();
+  const writes = calls.filter((call) => call.kind === 'projectStudioTaskSaveRequest');
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].payload.parentTaskId, 'epic-id');
+  assert.equal(writes[0].payload.taskType, taskType);
+});
+
+test('Tasks Admin with Settings None creates, edits and deactivates a custom type from Tasks', async () => {
+  const types = taskTypes();
+  await mount(tasksAccess('admin'), {
+    projectStudioTasksListRequest: { tasks: [], total: 0 },
+    projectStudioTaskTypesListRequest: () => ({ types }),
+    projectStudioTaskTypeSaveRequest: (input) => {
+      const type = { type_id: input.typeId, name: input.name, description: input.description, sort_order: input.sortOrder, active: input.active, built_in: false };
+      const existing = types.findIndex((item) => item.type_id === type.type_id);
+      if (existing >= 0) types[existing] = type; else types.push(type);
+      return { task_type: type };
+    },
+  });
+  assert.equal(document.querySelector('[data-goto-settings]'), null);
+  await openTasks(); click(document.querySelector('#ps-tasks-types')); await settle();
+  const catalogue = document.querySelector('.ps-task-types');
+  assert.ok(catalogue);
+  const table = catalogue.querySelector('tf-table');
+  assert.equal(table.rowActions(table.rows[0]), null, 'built-in definitions are immutable');
+  click(catalogue.querySelector('[data-new-type]'));
+  document.querySelector('#ps-type-id').value = 'customer_review';
+  document.querySelector('#ps-type-name').value = 'Customer <review>';
+  document.querySelector('#ps-type-desc').value = 'Actual per-project description';
+  click(document.querySelector('#ps-type-name').closest('tf-window').querySelector('[data-action="save"]'));
+  await settle(); await new Promise((resolve) => setTimeout(resolve, 260));
+  let row = catalogue.querySelector('tf-table').rows.find((entry) => entry._id === 'customer_review');
+  assert.match(row.name, /Customer &lt;review&gt;/);
+  let action = catalogue.querySelector('tf-table').rowActions(row); document.body.appendChild(action); click(action); menuAction('Edit');
+  assert.ok(document.querySelector('#ps-type-id').hasAttribute('readonly'));
+  document.querySelector('#ps-type-name').value = 'Release review';
+  click(document.querySelector('#ps-type-name').closest('tf-window').querySelector('[data-action="save"]'));
+  await settle(); await new Promise((resolve) => setTimeout(resolve, 260));
+  row = catalogue.querySelector('tf-table').rows.find((entry) => entry._id === 'customer_review');
+  action = catalogue.querySelector('tf-table').rowActions(row); document.body.appendChild(action); click(action); menuAction('Deactivate'); await settle();
+  assert.equal(types.find((entry) => entry.type_id === 'customer_review').active, false);
+  assert.deepEqual(calls.filter((call) => call.kind === 'projectStudioTaskTypeSaveRequest').map((call) => [call.payload.typeId, call.payload.name, call.payload.active]), [['customer_review', 'Customer <review>', true], ['customer_review', 'Release review', true], ['customer_review', 'Release review', false]]);
+});
+
+test('a task card renders inbound relationships, escaped history, historical attachments and cursor pages', async () => {
+  const info = taskFixture();
+  const attachment = { sha256: 'a'.repeat(64), name: 'Previous recording.avi', size_bytes: 90000000, mime: 'video/x-msvideo' };
+  const events = [{ event_id: 8, task_id: info.task_id, at: '2026-10-01T12:00:00Z', actor_kind: 'user', actor_id: 'author', kind: 'title', before_json: '"Original"', after_json: '"<img src=x onerror=bad()>"' },
+    { event_id: 7, task_id: info.task_id, at: '2026-10-01T11:00:00Z', actor_kind: 'user', actor_id: 'author', kind: 'attachments_json', before_json: JSON.stringify(JSON.stringify([attachment])), after_json: '"[]"' }];
+  const detail = detailFixture(info, { events, events_has_more: true, task_links: [{ link_id: 11, source_task_id: 'epic', target_task_id: info.task_id, kind: 'fs', lag_days: 2, counterparty_task_key: 'WF-1', counterparty_task_title: 'Prior task' }], status_durations: [{ status: 'todo', entered_at: '2026-10-01T10:00:00Z', left_at: '2026-10-01T11:00:00Z', seconds: 3600 }, { status: 'in_progress', entered_at: '2026-10-01T11:00:00Z', left_at: null, seconds: 120 }] });
+  await mount(tasksAccess('read'), { projectStudioTasksListRequest: { tasks: [info], total: 1 }, projectStudioTaskGetRequest: { detail }, projectStudioTaskEventsRequest: { events: [{ ...events[0], event_id: 6, kind: 'created', before_json: 'null', after_json: '{"title":"Initial"}' }], has_more: false } });
+  await openTaskCard();
+  assert.match(document.querySelector('#ps-task-relations').textContent, /WF-1.*Prior task/);
+  assert.match(document.querySelector('#ps-task-relations').textContent, /successor/);
+  assert.match(document.querySelector('#ps-task-durations').textContent, /1h 0m/);
+  const history = document.querySelector('#ps-task-history');
+  assert.equal(history.querySelector('img'), null);
+  assert.match(history.textContent, /<img src=x onerror=bad\(\)>/);
+  assert.match(history.querySelector('[data-history-attachment]').textContent, /Previous recording/);
+  click(document.querySelector('#ps-task-history-more')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioTaskEventsRequest').payload, { projectId: 'p0-project', taskId: info.task_id, beforeId: 7, limit: 50 });
+  assert.equal(history.entries.length, 3);
+  assert.equal(document.querySelector('#ps-task-history-more').hidden, true);
+});
+
+test('attachment gallery actions render localized preview and remove labels in every language', async () => {
+  const originalAction = ApiBinary.action;
+  ApiBinary.action = async (kind, payload) => {
+    assert.equal(kind, 'mePreferencesUpdateRequest');
+    assert.ok(['pl', 'en', 'de', 'es', 'fr'].includes(payload.language));
+    return { ok: true };
+  };
+  try {
+    for (const language of ['pl', 'en', 'de', 'es', 'fr']) {
+      await I18n.setLanguage(language);
+      const info = taskFixture();
+      const attachment = { sha256: 'c'.repeat(64), name: 'Actual original.avi', size_bytes: 124709766, mime: 'video/avi' };
+      await mount(tasksAccess(), { projectStudioTasksListRequest: { tasks: [info], total: 1 }, projectStudioTaskGetRequest: { detail: detailFixture(info, { attachments: [attachment] }) } });
+      await openTaskCard();
+      const preview = document.querySelector('#ps-task-atts [data-att-preview]');
+      const remove = document.querySelector('#ps-task-atts [data-att-remove]');
+      assert.equal(preview.textContent, I18n.t('project_studio.kb_preview'));
+      assert.equal(preview.title, I18n.t('project_studio.kb_preview'));
+      assert.equal(remove.title, I18n.t('project_studio.attachment_remove'));
+      assert.equal(preview.textContent.includes('project_studio.'), false);
+      assert.equal(remove.title.includes('project_studio.'), false);
+      click(remove);
+      assert.equal(document.querySelector('#ps-task-atts [data-att-preview]'), null);
+      click(document.querySelector('#ps-task-title').closest('tf-window').querySelector('[data-action="save"]')); await settle();
+      assert.equal(calls.find((call) => call.kind === 'projectStudioTaskSaveRequest').payload.attachmentsJson, '[]');
+    }
+  } finally { await I18n.setLanguage('en'); ApiBinary.action = originalAction; }
+});
+
+test('history resolves authorized task labels asynchronously and keeps denied references private', async () => {
+  const info = taskFixture();
+  let release;
+  const resolved = new Promise((resolve) => { release = resolve; });
+  const deniedId = 'private-task-id';
+  const event = (id, kind, before, after) => ({ event_id: id, task_id: info.task_id, at: '2026-10-01T11:00:00Z', actor_kind: 'user', actor_id: 'removed-person-id', kind, before_json: JSON.stringify(before), after_json: JSON.stringify(after) });
+  const events = [event(9, 'parent_task_id', 'previous-parent-id', null),
+    event(8, 'link_deleted', { link_id: 4, source_task_id: info.task_id, target_task_id: deniedId, kind: 'related', lag_days: 0 }, null),
+    event(7, 'created', null, { task_type: 'release_review', priority: 'high', status: 'review', parent_task_id: 'previous-parent-id' })];
+  await mount(tasksAccess('read'), {
+    projectStudioTasksListRequest: { tasks: [info], total: 1 },
+    projectStudioTaskTypesListRequest: { types: [...taskTypes(), { type_id: 'release_review', name: 'Release review', description: '', active: false, built_in: false, sort_order: 70 }] },
+    projectStudioTaskGetRequest: async ({ taskId, projectId }) => {
+      assert.equal(projectId, 'p0-project');
+      if (taskId === info.task_id) return { detail: detailFixture(info, { events }) };
+      if (taskId === 'previous-parent-id') { await resolved; return { detail: detailFixture(taskFixture({ task_id: taskId, task_key: 'WF-1', title: '<Saved parent>' })) }; }
+      if (taskId === deniedId) throw new Error('Project access was denied');
+      throw new Error(`unexpected task ${taskId}`);
+    },
+  });
+  await openTaskCard();
+  const history = document.querySelector('#ps-task-history');
+  assert.equal(history.textContent.includes('previous-parent-id'), false);
+  assert.equal(history.textContent.includes(deniedId), false);
+  assert.match(history.textContent, /Record unavailable or removed/);
+  release(); await settle();
+  assert.match(history.textContent, /WF-1 · <Saved parent>/);
+  assert.match(history.textContent, /Release review/);
+  assert.match(history.textContent, /High/);
+  assert.ok(history.textContent.includes(I18n.t('project_studio.task_status_review')));
+  assert.match(history.textContent, /Related/);
+  assert.equal(history.textContent.includes('removed-person-id'), false);
+  assert.equal(history.textContent.includes('release_review'), false);
+  assert.equal(history.textContent.includes('Relationship identifier'), false);
+  assert.equal(history.querySelector('saved'), null);
+  assert.equal(calls.filter((call) => call.kind === 'projectStudioTaskGetRequest' && call.payload.taskId === deniedId).length, 1);
+});
+
+test('a full history page resolves every before and after reference with bounded request concurrency', async () => {
+  const info = taskFixture();
+  const events = Array.from({ length: 50 }, (_, i) => ({ event_id: 50 - i, task_id: info.task_id, at: '2026-10-01T11:00:00Z', actor_kind: 'system', actor_id: '', kind: 'parent_task_id', before_json: JSON.stringify(`previous-${i}`), after_json: JSON.stringify(`current-${i}`) }));
+  let active = 0, peak = 0, resolved = 0;
+  await mount(tasksAccess('read'), {
+    projectStudioTasksListRequest: { tasks: [info], total: 1 },
+    projectStudioTaskGetRequest: async ({ projectId, taskId }) => {
+      assert.equal(projectId, 'p0-project');
+      if (taskId === info.task_id) return { detail: detailFixture(info, { events }) };
+      active += 1; peak = Math.max(peak, active); await flush(); active -= 1; resolved += 1;
+      return { detail: detailFixture(taskFixture({ task_id: taskId, task_key: `WF-${taskId}`, title: 'Authorized historical parent' })) };
+    },
+  });
+  await openTaskCard();
+  for (let i = 0; resolved < 100 && i < 100; i += 1) await flush();
+  assert.equal(resolved, 100); assert.ok(peak > 1 && peak <= 5);
+  const history = document.querySelector('#ps-task-history');
+  assert.match(history.textContent, /WF-previous-49 · Authorized historical parent/);
+  assert.match(history.textContent, /WF-current-49 · Authorized historical parent/);
+  assert.equal(history.textContent.includes('Record unavailable or removed'), false);
+  assert.equal(calls.filter((call) => call.kind === 'projectStudioTaskGetRequest').length, 101);
+});
+
+test('comment add and edit retain structural mention IDs with equal display names', async () => {
+  const info = taskFixture();
+  const actor = '0'.repeat(32);
+  const members = [{ user_id: 'reader-one', display_name: 'Same name', active: true, access: tasksAccess('read') }, { user_id: 'reader-two', display_name: 'Same name', active: true, access: tasksAccess('read') }];
+  const detail = detailFixture(info);
+  await mount(tasksAccess(), { projectStudioTasksListRequest: { tasks: [info], total: 1 }, projectStudioMembersListRequest: { members }, projectStudioTaskGetRequest: () => ({ detail }),
+    projectStudioTaskCommentAddRequest: (input) => { detail.comments = [{ comment_id: 'comment', author_user_id: actor, author_name: 'Creator', body_md: input.bodyMd, mention_user_ids: input.mentionUserIds, created_at: '2026-10-01T12:00:00Z', edited_at: null }]; return { comment: detail.comments[0] }; },
+    projectStudioTaskCommentEditRequest: (input) => { Object.assign(detail.comments[0], { body_md: input.bodyMd, mention_user_ids: input.mentionUserIds, edited_at: '2026-10-01T12:05:00Z' }); return { comment: detail.comments[0] }; },
+  });
+  await openTaskCard();
+  document.querySelector('#ps-task-comment-input').value = '**Please review**';
+  document.querySelector('#ps-task-mentions').value = ['reader-two'];
+  click(document.querySelector('#ps-task-comment-send')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioTaskCommentAddRequest').payload.mentionUserIds, ['reader-two']);
+  assert.match(document.querySelector('#ps-task-comments strong').textContent, /Please review/);
+  click(document.querySelector('[data-comment-edit]'));
+  const picker = document.querySelector('#ps-comment-edit-mentions');
+  assert.deepEqual(picker.value, ['reader-two']);
+  picker.value = ['reader-one', 'reader-two'];
+  document.querySelector('#ps-comment-edit-body').value = 'Please review both';
+  click(picker.closest('tf-window').querySelector('[data-action="save"]')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioTaskCommentEditRequest').payload, { projectId: 'p0-project', commentId: 'comment', bodyMd: 'Please review both', mentionUserIds: ['reader-one', 'reader-two'] });
+  assert.match(document.querySelector('#ps-task-comments').textContent, /edited/);
+});
+
+test('self-assigned readers hand over atomically with a mandatory note and no future-feature switches', async () => {
+  const actor = '0'.repeat(32);
+  const info = taskFixture({ assigned_to: actor });
+  const detail = detailFixture(info);
+  const successor = { user_id: 'successor', display_name: 'Successor', active: true, access: tasksAccess() };
+  await mount(tasksAccess('read'), { projectStudioTasksListRequest: { tasks: [info], total: 1 }, projectStudioTaskGetRequest: { detail }, projectStudioMembersListRequest: { members: [successor] }, projectStudioTaskHandoverRequest: { ok: true, event_ids: [20, 21], comment_id: 'note' } });
+  await openTaskCard(); click(document.querySelector('#ps-task-handover'));
+  const win = document.querySelector('.tf-act-window');
+  assert.ok(win);
+  assert.equal(win.querySelector('tf-checkbox'), null);
+  win.querySelector('tf-person-picker').value = 'successor';
+  click(win.querySelector('[data-act="submit"]')); await settle();
+  assert.equal(calls.some((call) => call.kind === 'projectStudioTaskHandoverRequest'), false);
+  win.querySelector('tf-textarea').value = 'Continue the verified reproduction steps.';
+  click(win.querySelector('[data-act="submit"]')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioTaskHandoverRequest').payload, { projectId: 'p0-project', taskId: 'task-one', assignedTo: 'successor', noteMd: 'Continue the verified reproduction steps.', mentionUserIds: ['successor'] });
+  assert.equal(calls.some((call) => ['projectStudioTaskSaveRequest', 'projectStudioTaskCommentAddRequest'].includes(call.kind)), false);
+});
+
+test('handover notes are pinned only for the current recipient and disappear after ordinary reassignment', async () => {
+  const actor = '0'.repeat(32);
+  const info = taskFixture({ assigned_to: actor });
+  const detail = detailFixture(info, { handover_comment_id: 'note', comments: [{ comment_id: 'note', body_md: '**Next steps**', author_user_id: 'giver', author_name: 'Giver', mention_user_ids: [actor], created_at: '2026-10-01T12:00:00Z', edited_at: null }] });
+  await mount(tasksAccess('read'), { projectStudioTasksListRequest: { tasks: [info], total: 1 }, projectStudioTaskGetRequest: { detail } });
+  await openTaskCard();
+  const pin = document.querySelector('#ps-task-handover-note');
+  assert.equal(pin.hidden, false);
+  assert.equal(pin.querySelector('strong').textContent, 'Next steps');
+  screen.unmount();
+  info.assigned_to = 'other-person'; detail.handover_comment_id = null;
+  await mount(tasksAccess('read'), { projectStudioTasksListRequest: { tasks: [info], total: 1 }, projectStudioTaskGetRequest: { detail } });
+  await openTaskCard();
+  assert.equal(document.querySelector('#ps-task-handover-note').hidden, true);
+});
+
+test('archived tasks are discoverable and immutable while explicit restore and archive undo use real mutations', async () => {
+  const info = taskFixture({ archived_at: '2026-10-01T12:00:00Z' });
+  await mount(tasksAccess(), { projectStudioTasksListRequest: (input) => ({ tasks: input.includeArchived ? [info] : [], total: input.includeArchived ? 1 : 0 }), projectStudioTaskGetRequest: { detail: detailFixture(info) }, projectStudioTaskArchiveRequest: { ok: true, event_id: 30 } });
+  await openTasks();
+  assert.equal(document.querySelector('#ps-tasks-table'), null);
+  document.querySelector('#ps-tasks-f-archived').dispatchEvent(new CustomEvent('change', { detail: { checked: true }, bubbles: true })); await settle();
+  const table = document.querySelector('#ps-tasks-table');
+  assert.equal(table.rows[0].no, 'WF-7');
+  table.dispatchEvent(new CustomEvent('row-click', { detail: { row: table.rows[0] }, bubbles: true })); await settle();
+  assert.ok(document.querySelector('#ps-task-title').hasAttribute('readonly'));
+  assert.equal(document.querySelector('#ps-task-handover'), null);
+  const win = document.querySelector('#ps-task-title').closest('tf-window');
+  assert.equal(win.querySelector('[data-action="save"]'), null);
+  assert.match(win.querySelector('[data-action="archive"]').textContent, /Restore/);
+  click(win.querySelector('[data-action="archive"]')); await settle();
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioTaskArchiveRequest').payload, { projectId: 'p0-project', taskId: 'task-one', archived: false });
+  click(document.querySelector('tf-toast tf-button')); await settle();
+  assert.deepEqual(calls.filter((call) => call.kind === 'projectStudioTaskArchiveRequest').map((call) => call.payload.archived), [false, true]);
+});
+
+test('a key deep link resolves the exact archived task and closing the card preserves the project route', async () => {
+  const info = taskFixture({ archived_at: '2026-10-01T12:00:00Z' });
+  const original = { current: Router.current, currentParams: Router.currentParams, replaceParams: Router.replaceParams };
+  let params = { instance: 'native-projects', projectId: 'p0-project', tab: 'tasks', taskKey: 'WF-7' };
+  Router.current = () => 'projekty'; Router.currentParams = () => params; Router.replaceParams = (next) => { params = next; };
+  try {
+    await mount(tasksAccess('read'), { projectStudioTasksListRequest: (input) => ({ tasks: input.search === 'WF-7' ? [info, taskFixture({ task_id: 'other', task_key: 'WF-70' })] : [], total: 2 }), projectStudioTaskGetRequest: { detail: detailFixture(info) } }, params);
+    assert.ok(document.querySelector('#ps-task-title'));
+    assert.equal(params.taskKey, 'WF-7');
+    assert.equal(params.instance, 'native-projects');
+    const resolve = calls.find((call) => call.kind === 'projectStudioTasksListRequest' && call.payload.search === 'WF-7');
+    assert.equal(resolve.payload.includeArchived, true);
+    click(document.querySelector('#ps-task-title').closest('tf-window').querySelector('[data-action="cancel"]'));
+    assert.equal(params.taskKey, null);
+    assert.equal(params.projectId, 'p0-project');
+    assert.equal(params.tab, 'tasks');
+  } finally { Object.assign(Router, original); }
+});
+
+test('a status notification renders structured text and loads the exact older history event', async () => {
+  const info = taskFixture();
+  const event = (id) => ({ event_id: id, task_id: info.task_id, at: '2026-10-01T12:00:00Z', actor_kind: 'user', actor_id: 'author', kind: 'title', before_json: '"Previous"', after_json: '"Current"' });
+  const notification = { notification_id: 35, kind: 'task_status_changed', project_id: 'p0-project', project_name: 'Workflow', title: 'Raw server title', body: 'Raw server body', created_at: '2026-10-01T12:00:00Z', read_at: null,
+    link_json: JSON.stringify({ project_id: 'p0-project', task_id: info.task_id, task_key: info.task_key, task_title: '<img src=x onerror=bad()>', event_id: 80, from_status: 'todo', to_status: 'in_progress' }) };
+  await mount(tasksAccess('read'), {
+    projectStudioTasksListRequest: { tasks: [info], total: 1 },
+    projectStudioTaskGetRequest: { detail: detailFixture(info, { events: [event(100)], events_has_more: true }) },
+    projectStudioTaskEventsRequest: (input) => ({ events: [event(input.beforeId === 100 ? 90 : 80)], has_more: input.beforeId === 100 }),
+    projectStudioNotificationsListRequest: { notifications: [notification], unread_count: 1, has_more: false },
+    projectStudioNotificationsMarkReadRequest: { ok: true },
+  });
+  click(document.querySelector('[data-bell]')); await settle();
+  const item = document.querySelector('[data-notif="0"]');
+  assert.equal(item.querySelector('img'), null);
+  assert.match(item.textContent, /WF-7 · <img src=x onerror=bad\(\)>: To do → In progress/);
+  assert.equal(item.textContent.includes('Raw server'), false);
+  click(item); await settle();
+  assert.deepEqual(calls.filter((call) => call.kind === 'projectStudioTaskEventsRequest').map((call) => call.payload.beforeId), [100, 90]);
+  const target = document.querySelector('[data-task-event="80"]').closest('.tf-timeline-item');
+  assert.ok(target.classList.contains('ps-task-target'));
+  assert.equal(target.getAttribute('tabindex'), '-1');
+  assert.deepEqual(calls.find((call) => call.kind === 'projectStudioNotificationsMarkReadRequest').payload, { notificationIds: [35] });
+});
+
+test('a mention notification opens and highlights its exact persisted comment', async () => {
+  const info = taskFixture();
+  const comments = ['older-comment', 'mentioned-comment'].map((comment_id) => ({ comment_id, author_user_id: 'author', author_name: 'Author', body_md: `**${comment_id}**`, mention_user_ids: [], created_at: '2026-10-01T12:00:00Z', edited_at: null }));
+  const notification = { notification_id: 36, kind: 'task_mentioned', project_id: 'p0-project', project_name: 'Workflow', created_at: '2026-10-01T12:00:00Z', read_at: '2026-10-01T12:01:00Z',
+    link_json: JSON.stringify({ project_id: 'p0-project', task_id: info.task_id, task_key: info.task_key, task_title: info.title, comment_id: 'mentioned-comment', event_id: 9 }) };
+  await mount(tasksAccess('read'), {
+    projectStudioTasksListRequest: { tasks: [info], total: 1 }, projectStudioTaskGetRequest: { detail: detailFixture(info, { comments }) },
+    projectStudioNotificationsListRequest: { notifications: [notification], unread_count: 0, has_more: false },
+  });
+  click(document.querySelector('[data-bell]')); await settle();
+  click(document.querySelector('[data-notif="0"]')); await settle();
+  assert.ok(document.querySelector('[data-task-comment="mentioned-comment"]').classList.contains('ps-task-target'));
+  assert.equal(document.querySelector('[data-task-comment="older-comment"]').classList.contains('ps-task-target'), false);
+  assert.equal(calls.find((call) => call.kind === 'projectStudioTaskGetRequest').payload.taskId, info.task_id);
+  assert.equal(calls.some((call) => call.kind === 'projectStudioTaskEventsRequest'), false);
+});
+
+test('previous assignees see localized reassignment and removal notifications linked to their actual events', async () => {
+  for (const [kind, toUserId, expectedTitle, eventId] of [
+    ['task_reassigned', 'next-assignee', 'Task assigned to another person', 41],
+    ['task_unassigned', '', 'Your task assignment was removed', 42],
+  ]) {
+    const info = taskFixture({ assigned_to: toUserId });
+    const event = { event_id: eventId, task_id: info.task_id, at: '2026-10-01T12:00:00Z', actor_kind: 'user', actor_id: 'author', kind: kind === 'task_reassigned' ? 'reassigned' : 'unassigned', before_json: '"previous-assignee"', after_json: JSON.stringify(toUserId) };
+    const notification = { notification_id: eventId, kind, project_id: 'p0-project', project_name: 'Workflow', title: 'Unlocalized server title', body: 'Unlocalized server body', created_at: '2026-10-01T12:00:00Z', read_at: '2026-10-01T12:01:00Z',
+      link_json: JSON.stringify({ project_id: 'p0-project', task_id: info.task_id, task_key: info.task_key, task_title: '<b>Persistent task</b>', event_id: eventId, from_user_id: 'previous-assignee', to_user_id: toUserId }) };
+    await mount(tasksAccess('read'), {
+      projectStudioTasksListRequest: { tasks: [info], total: 1 }, projectStudioTaskGetRequest: { detail: detailFixture(info, { events: [event] }) },
+      projectStudioNotificationsListRequest: { notifications: [notification], unread_count: 0, has_more: false },
+    });
+    click(document.querySelector('[data-bell]')); await settle();
+    const item = document.querySelector('[data-notif="0"]');
+    assert.equal(item.querySelector('.ps-notif-title').textContent, expectedTitle);
+    assert.equal(item.querySelector('.ps-notif-body').textContent, 'WF-7 · <b>Persistent task</b>');
+    assert.equal(item.querySelector('b'), null);
+    assert.equal(item.textContent.includes('Unlocalized server'), false);
+    click(item); await settle();
+    assert.ok(document.querySelector(`[data-task-event="${eventId}"]`).closest('.tf-timeline-item').classList.contains('ps-task-target'));
+    assert.equal(calls.find((call) => call.kind === 'projectStudioTaskGetRequest').payload.taskId, info.task_id);
+  }
 });

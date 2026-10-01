@@ -326,6 +326,8 @@ pub async fn handle_ws_connection<S>(
         let tx_sys = control_tx.clone();
         let mut sys_rx = crate::dispatch::system_event_broadcast::subscribe();
         let sys_user_id = user_id.clone();
+        let sys_state = app_state.clone();
+        let sys_session = session.clone();
         tokio::spawn(async move {
             while let Ok(event) = sys_rx.recv().await {
                 // UserNotification is private per user: the broadcast channel
@@ -334,11 +336,52 @@ pub async fn handle_ws_connection<S>(
                 // SystemEvent variants stay broadcast.
                 if let tentaflow_protocol::SystemEventPayload::UserNotification {
                     user_id: target_user_id,
+                    project_id,
+                    kind,
                     ..
                 } = &event
                 {
                     if sys_user_id.as_deref() != Some(target_user_id.as_str()) {
                         continue;
+                    }
+                    if !project_id.is_empty() {
+                        let Ok(org) = crate::services::rbac::resolve_org_context(
+                            &sys_state.db,
+                            target_user_id,
+                            None,
+                        ) else {
+                            continue;
+                        };
+                        let ctx = HandlerContext {
+                            session: sys_session.clone(),
+                            correlation_id: 0,
+                            connection_id,
+                            resume_secret: None,
+                            state: sys_state.clone(),
+                            org_context: Some(org),
+                            origin: crate::dispatch::RequestOrigin::Local,
+                        };
+                        if kind.starts_with("task_")
+                            && !crate::project_studio::notifications::task_reader(
+                                &ctx,
+                                project_id,
+                                target_user_id,
+                            )
+                        {
+                            continue;
+                        }
+                        let visible = crate::dispatch::project_studio::require_read(&ctx)
+                            .and_then(|org| {
+                                crate::dispatch::project_studio::require_project_access(
+                                    &ctx, org, project_id,
+                                )
+                            })
+                            .is_ok_and(|(_, access)| {
+                                crate::dispatch::project_studio::notification_visible(&access, kind)
+                            });
+                        if !visible {
+                            continue;
+                        }
                     }
                 }
                 if send_body(

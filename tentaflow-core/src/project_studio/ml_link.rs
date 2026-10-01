@@ -1199,6 +1199,7 @@ mod unit_tests {
             "[\"knowledge\"]",
             &creator,
             &tmp.path().join(&project_id).to_string_lossy(),
+            "",
             &[
                 super::super::models::MemberInput {
                     user_id: manager.clone(),
@@ -1336,6 +1337,7 @@ mod unit_tests {
             "[]",
             &ghost,
             &tmp.path().join(&project_id).to_string_lossy(),
+            "",
             &[],
         )
         .expect("create project");
@@ -1420,6 +1422,7 @@ mod unit_tests {
             "[\"knowledge\"]",
             &owner,
             &tmp.path().join(&project_id).to_string_lossy(),
+            "",
             &[super::super::models::MemberInput {
                 user_id: mate.clone(),
                 functions: vec!["pm".into()],
@@ -1516,6 +1519,7 @@ mod unit_tests {
             "[\"knowledge\"]",
             &owner,
             &dir.to_string_lossy(),
+            "",
             &[super::super::models::MemberInput {
                 user_id: user.clone(),
                 functions: vec!["developer".into()],
@@ -1740,6 +1744,7 @@ mod unit_tests {
             "[]",
             &owner,
             &missing.to_string_lossy(),
+            "",
             &[],
         )
         .expect("broken registry fixture");

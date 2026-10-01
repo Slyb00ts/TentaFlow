@@ -13,6 +13,7 @@ pub use access::{
 pub struct ProjectRecord {
     pub project_id: String,
     pub org_id: String,
+    pub key_prefix: String,
     pub name: String,
     pub description: String,
     pub status: String,
@@ -296,6 +297,7 @@ pub struct RunStepRecord {
 pub struct TaskRecord {
     pub task_id: String,
     pub task_no: u32,
+    pub task_key: String,
     pub task_type: String,
     pub title: String,
     pub description_md: String,
@@ -304,12 +306,14 @@ pub struct TaskRecord {
     pub status: String,
     pub assigned_to: String,
     pub due_date: String,
+    pub parent_task_id: Option<String>,
     pub links_json: String,
     pub attachments_json: String,
     pub comment_count: u32,
     pub created_by: String,
     pub created_at: String,
     pub updated_at: String,
+    pub archived_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -320,6 +324,48 @@ pub struct TaskCommentRecord {
     pub body_md: String,
     pub created_at: String,
     pub edited_at: Option<String>,
+    pub mention_user_ids_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskTypeRecord {
+    pub type_id: String,
+    pub name: String,
+    pub description: String,
+    pub sort_order: i32,
+    pub built_in: bool,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskEventRecord {
+    pub event_id: i64,
+    pub task_id: String,
+    pub at: String,
+    pub actor_kind: String,
+    pub actor_id: String,
+    pub kind: String,
+    pub before_json: String,
+    pub after_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskLinkRecord {
+    pub link_id: i64,
+    pub source_task_id: String,
+    pub target_task_id: String,
+    pub kind: String,
+    pub lag_days: i32,
+    pub other_task_key: String,
+    pub other_task_title: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskStatusDurationRecord {
+    pub status: String,
+    pub entered_at: String,
+    pub left_at: Option<String>,
+    pub seconds: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -541,6 +587,7 @@ mod tests {
         ProjectRecord {
             project_id: "p".to_string(),
             org_id: "o".to_string(),
+            key_prefix: "AC".to_string(),
             name: "Access".to_string(),
             description: String::new(),
             status: "active".to_string(),
