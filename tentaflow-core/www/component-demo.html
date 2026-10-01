@@ -564,6 +564,10 @@ fetch('/index.html').then(r => r.text()).then(html => {
   <div class="row">
     <tf-datepicker id="demo-datepicker"></tf-datepicker>
   </div>
+  <div class="section-label">Date field — tf-date-field (UI-language format, ISO value)</div>
+  <div class="row">
+    <tf-date-field label="Since" value="2026-09-30" hint="Typed as in the UI language, picked from the calendar"></tf-date-field>
+  </div>
 </div>
 
 <!-- ========== COMMAND PALETTE ========== -->
@@ -675,6 +679,14 @@ fetch('/index.html').then(r => r.text()).then(html => {
   <div class="section-label">Multiselect — tf-multiselect</div>
   <div class="box w400">
     <tf-multiselect placeholder="Select detectors..." id="demo-multiselect"></tf-multiselect>
+  </div>
+</div>
+
+<!-- ========== PERSON PICKER ========== -->
+<div class="section">
+  <div class="section-label">Person picker — tf-person-picker</div>
+  <div class="box w400">
+    <tf-person-picker id="demo-person-picker"></tf-person-picker>
   </div>
 </div>
 
@@ -883,6 +895,19 @@ if (cb) cb.options = [
   { value: 'pj', label: 'Piotr Jarocki', description: 'Admin · DevOps' },
   { value: 'jw', label: 'Jakub Wojtczak', description: 'CIO · Santander' },
   { value: 'mw', label: 'Magda Wiśniewska', description: 'VP Sales · VW' },
+];
+
+// Person picker (labels come from i18n, so it has to be initialised first)
+import { I18n } from '/js/i18n.js';
+await I18n.init();
+const picker = document.getElementById('demo-person-picker');
+if (picker) picker.items = [
+  { id: 'u1', name: 'Anna Kowalska', role: 'PM', load: 70 },
+  { id: 'u2', name: 'Marek Nowak', role: 'Developer', load: 95 },
+  { id: 'u3', name: 'Piotr Zieliński', role: 'Developer', load: 130 },
+  { id: 'u4', name: 'Paweł Szymański', role: 'Developer', load: 80, suggestion: 'module deputy' },
+  { id: 'u5', name: 'Ewa Wiśniewska', role: 'Tester', load: 85, absence: 'away until 24.10' },
+  { id: 'a1', name: 'Coding agent', role: 'local model', kind: 'agent' },
 ];
 
 // Multiselect

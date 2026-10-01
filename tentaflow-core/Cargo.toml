@@ -205,6 +205,10 @@ r2d2_sqlite = { workspace = true }
 # reads the first worksheet without spawning a process; csv streams rows.
 csv = { workspace = true }
 calamine = { workspace = true, default-features = true }
+# Org-structure import/export: encoding_rs decodes the Windows-1250 files a
+# Polish Excel saves as "CSV", rust_xlsxwriter writes the XLSX export.
+encoding_rs = { workspace = true }
+rust_xlsxwriter = { workspace = true }
 
 # Klasyczny ML on-device — smartcore to czysty Rust (drzewa cargo: num/rand,
 # zero C/Python/sys), wiec kompiluje sie tak samo na Androidzie jak na desktopie.

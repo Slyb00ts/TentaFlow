@@ -371,6 +371,13 @@ pub fn start_unified_server_with_permissions(
         local_node_id.clone(),
     );
 
+    // Dated org-structure changes take effect at midnight in each organization's
+    // timezone; every node runs the recompute (idempotent, writes only diffs).
+    crate::services::org_structure::nightly::start(db.clone());
+    // Work handed over for an absence goes back on the return day, and a membership scheduled
+    // for a departure ends on its day; both are recorded, so every node's run is idempotent.
+    crate::services::org_structure::handover::start(db.clone());
+
     info!("Inicjalizacja unified HTTPS server na {}...", bind_addr);
 
     // Subskrybuj shutdown signal z ServiceManager — przy shutdown zamykamy

@@ -11158,6 +11158,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::RobotCloudBody(payload) => decode_robot_cloud_payload(&obj, payload),
         MessageBody::MapBody(payload) => decode_map_payload(&obj, payload),
+        MessageBody::OrgStructureBody(payload) => decode_org_structure_payload(&obj, payload),
     }
     Ok(obj.into())
 }
@@ -12872,6 +12873,33 @@ fn decode_provider_account_payload(
 
 fn decode_map_payload(obj: &js_sys::Object, payload: tentaflow_protocol::map::MapPayload) {
     decode_json_family_payload(obj, "Map", serde_json::to_value(&payload));
+}
+
+/// `ExportResponse` is special-cased BEFORE the generic path: its file must
+/// reach JS as a Uint8Array, not as a per-byte number array built through
+/// serde_json.
+fn decode_org_structure_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::org_structure::OrgStructurePayload,
+) {
+    if let tentaflow_protocol::org_structure::OrgStructurePayload::ExportResponse {
+        file_name,
+        mime,
+        bytes,
+    } = payload
+    {
+        set(obj, "variant", "OrgStructureExportResponse".into());
+        set(obj, "fileName", file_name.clone().into());
+        set(obj, "file_name", file_name.into());
+        set(obj, "mime", mime.into());
+        set(
+            obj,
+            "bytes",
+            js_sys::Uint8Array::from(bytes.as_slice()).into(),
+        );
+        return;
+    }
+    decode_json_family_payload(obj, "OrgStructure", serde_json::to_value(&payload));
 }
 
 fn decode_robot_cloud_payload(
@@ -23433,6 +23461,393 @@ pub fn encode_map_device_assign_request(request_json: String) -> Result<Vec<u8>,
 #[wasm_bindgen(js_name = encodeMapDeviceUnassignRequest)]
 pub fn encode_map_device_unassign_request(request_json: String) -> Result<Vec<u8>, JsError> {
     encode_map_json_request("DeviceUnassignRequest", &request_json)
+}
+
+// =============================================================================
+// Organizational structure — `MessageBody::OrgStructureBody`. Effective-dated
+// units, positions, reporting lines and assignments. Built from a JSON object
+// of the variant's fields, like the shared-map family. Every write needs
+// `org.admin`; the server answers validation failures inside `WriteResponse`.
+// =============================================================================
+
+fn encode_org_structure_json_request(variant: &str, fields_json: &str) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let payload: tentaflow_protocol::org_structure::OrgStructurePayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    encode_body_inner(&MessageBody::OrgStructureBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// The whole structure on a day, the unit types and what the caller may do.
+#[wasm_bindgen(js_name = encodeOrgStructureStructureRequest)]
+pub fn encode_org_structure_structure_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("StructureRequest", &request_json)
+}
+
+/// Positions above (up) or below (down) a user or position.
+#[wasm_bindgen(js_name = encodeOrgStructureReportsChainRequest)]
+pub fn encode_org_structure_reports_chain_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ReportsChainRequest", &request_json)
+}
+
+/// Direct or transitive subordinates of a user or position.
+#[wasm_bindgen(js_name = encodeOrgStructureSubordinatesRequest)]
+pub fn encode_org_structure_subordinates_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("SubordinatesRequest", &request_json)
+}
+
+/// The manager of a user on a day.
+#[wasm_bindgen(js_name = encodeOrgStructureManagerRequest)]
+pub fn encode_org_structure_manager_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ManagerRequest", &request_json)
+}
+
+/// The positions a user holds on a day, the primary one apart.
+#[wasm_bindgen(js_name = encodeOrgStructureAssignmentRequest)]
+pub fn encode_org_structure_assignment_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("AssignmentRequest", &request_json)
+}
+
+/// Broken structure rules found in the stored data.
+#[wasm_bindgen(js_name = encodeOrgStructureIntegrityReportRequest)]
+pub fn encode_org_structure_integrity_report_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("IntegrityReportRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureUnitTypeCreateRequest)]
+pub fn encode_org_structure_unit_type_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("UnitTypeCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureUnitTypeUpdateRequest)]
+pub fn encode_org_structure_unit_type_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("UnitTypeUpdateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureUnitTypeDeleteRequest)]
+pub fn encode_org_structure_unit_type_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("UnitTypeDeleteRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureUnitCreateRequest)]
+pub fn encode_org_structure_unit_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("UnitCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureUnitUpdateRequest)]
+pub fn encode_org_structure_unit_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("UnitUpdateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureUnitMoveRequest)]
+pub fn encode_org_structure_unit_move_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("UnitMoveRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureUnitEndRequest)]
+pub fn encode_org_structure_unit_end_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("UnitEndRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureHeadSetRequest)]
+pub fn encode_org_structure_head_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("HeadSetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureDeputyHeadsSetRequest)]
+pub fn encode_org_structure_deputy_heads_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("DeputyHeadsSetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructurePositionCreateRequest)]
+pub fn encode_org_structure_position_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("PositionCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructurePositionUpdateRequest)]
+pub fn encode_org_structure_position_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("PositionUpdateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructurePositionMoveRequest)]
+pub fn encode_org_structure_position_move_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("PositionMoveRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructurePositionEndRequest)]
+pub fn encode_org_structure_position_end_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("PositionEndRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureReportingLineSetRequest)]
+pub fn encode_org_structure_reporting_line_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ReportingLineSetRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureExternalPersonCreateRequest)]
+pub fn encode_org_structure_external_person_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ExternalPersonCreateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureAssignRequest)]
+pub fn encode_org_structure_assign_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("AssignRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureAssignmentUpdateRequest)]
+pub fn encode_org_structure_assignment_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("AssignmentUpdateRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureAssignmentEndRequest)]
+pub fn encode_org_structure_assignment_end_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("AssignmentEndRequest", &request_json)
+}
+
+#[wasm_bindgen(js_name = encodeOrgStructureTimezoneSetRequest)]
+pub fn encode_org_structure_timezone_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("TimezoneSetRequest", &request_json)
+}
+
+/// Rewrites the derived profiles of the organization ("Przelicz").
+#[wasm_bindgen(js_name = encodeOrgStructureRecomputeRequest)]
+pub fn encode_org_structure_recompute_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("RecomputeRequest", &request_json)
+}
+
+/// A request that carries a file. The scalar fields come as JSON like every
+/// other request of the family; the file is a separate argument so it crosses
+/// as a Uint8Array and is never turned into a JSON array of numbers.
+fn encode_org_structure_file_request(
+    variant: &str,
+    fields_json: &str,
+    file: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::org_structure::OrgStructurePayload as P;
+    let mut fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    if let Some(map) = fields.as_object_mut() {
+        map.insert("bytes".to_string(), serde_json::json!([]));
+    }
+    let mut payload: P = serde_json::from_value(serde_json::json!({ variant: fields }))
+        .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    match &mut payload {
+        P::ImportDryRunRequest { bytes, .. }
+        | P::ImportApplyRequest { bytes, .. }
+        | P::ExportErrorsRequest { bytes, .. } => *bytes = file,
+        _ => return Err(JsError::new(&format!("{variant} carries no file"))),
+    }
+    encode_body_inner(&MessageBody::OrgStructureBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// Tries a structure file without writing anything. JSON: `{ format, mode,
+/// as_of, confirm_backdated, resolutions }`; the file is `file`.
+#[wasm_bindgen(js_name = encodeOrgStructureImportDryRunRequest)]
+pub fn encode_org_structure_import_dry_run_request(
+    request_json: String,
+    file: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_file_request("ImportDryRunRequest", &request_json, file)
+}
+
+/// Applies a structure file (one transaction). Same fields as the dry run.
+#[wasm_bindgen(js_name = encodeOrgStructureImportApplyRequest)]
+pub fn encode_org_structure_import_apply_request(
+    request_json: String,
+    file: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_file_request("ImportApplyRequest", &request_json, file)
+}
+
+/// The errors of a dry run of the file as a CSV. Same fields as the dry run.
+#[wasm_bindgen(js_name = encodeOrgStructureExportErrorsRequest)]
+pub fn encode_org_structure_export_errors_request(
+    request_json: String,
+    file: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_file_request("ExportErrorsRequest", &request_json, file)
+}
+
+/// The edit mode's draft in one call. JSON: `{ ops: [{ temp_id, request:
+/// { <WriteRequestVariant>: { ...its fields } } }], dry_run, confirm_backdated }`.
+#[wasm_bindgen(js_name = encodeOrgStructureBatchRequest)]
+pub fn encode_org_structure_batch_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("BatchRequest", &request_json)
+}
+
+/// The active members of the organization, for choosing a deputy. JSON: `{}`.
+#[wasm_bindgen(js_name = encodeOrgStructureMemberListRequest)]
+pub fn encode_org_structure_member_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("MemberListRequest", &request_json)
+}
+
+/// A person's absences, deputies and presence, filtered by privacy. JSON: `{ user_id, at, include_past }`.
+#[wasm_bindgen(js_name = encodeOrgStructureCoverRequest)]
+pub fn encode_org_structure_cover_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("CoverRequest", &request_json)
+}
+
+/// Who is away and which deputies are in force on a day. JSON: `{ at }`.
+#[wasm_bindgen(js_name = encodeOrgStructureAvailabilityRequest)]
+pub fn encode_org_structure_availability_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("AvailabilityRequest", &request_json)
+}
+
+/// The people to ask, one after another, from a person's manager up. JSON: `{ user_id, scope, at }`.
+#[wasm_bindgen(js_name = encodeOrgStructureEscalationChainRequest)]
+pub fn encode_org_structure_escalation_chain_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("EscalationChainRequest", &request_json)
+}
+
+/// Whether a person is present on a day. JSON: `{ user_id, at }`.
+#[wasm_bindgen(js_name = encodeOrgStructureIsAvailableRequest)]
+pub fn encode_org_structure_is_available_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("IsAvailableRequest", &request_json)
+}
+
+/// Whether a viewer may see a kind of personal data of a person. JSON: `{ viewer_user_id, subject_user_id, kind, at }`.
+#[wasm_bindgen(js_name = encodeOrgStructureCanViewPersonDataRequest)]
+pub fn encode_org_structure_can_view_person_data_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("CanViewPersonDataRequest", &request_json)
+}
+
+/// What a person sees, area by area. JSON: `{ user_id, at }`.
+#[wasm_bindgen(js_name = encodeOrgStructureVisibilityRequest)]
+pub fn encode_org_structure_visibility_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("VisibilityRequest", &request_json)
+}
+
+/// Who sees the personal data of a person. JSON: `{ subject_user_id, at }`.
+#[wasm_bindgen(js_name = encodeOrgStructureWhoSeesRequest)]
+pub fn encode_org_structure_who_sees_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("WhoSeesRequest", &request_json)
+}
+
+/// Appoints a deputy (`org.admin`). JSON: `{ user_id, deputy_user_id, scope, valid_from, valid_to, confirm_backdated }`.
+#[wasm_bindgen(js_name = encodeOrgStructureDeputySetRequest)]
+pub fn encode_org_structure_deputy_set_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("DeputySetRequest", &request_json)
+}
+
+/// Changes a deputy (`org.admin`). JSON: `{ id, scope, valid_from, valid_to, clear, confirm_backdated }`.
+#[wasm_bindgen(js_name = encodeOrgStructureDeputyUpdateRequest)]
+pub fn encode_org_structure_deputy_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("DeputyUpdateRequest", &request_json)
+}
+
+/// Ends a deputy from a day (`org.admin`). JSON: `{ id, from, confirm_backdated }`.
+#[wasm_bindgen(js_name = encodeOrgStructureDeputyEndRequest)]
+pub fn encode_org_structure_deputy_end_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("DeputyEndRequest", &request_json)
+}
+
+/// Adds an absence: the caller's own, or anybody's for `org.admin`. JSON: `{ user_id, valid_from, valid_to, kind, reason, confirm_backdated }`.
+#[wasm_bindgen(js_name = encodeOrgStructureAbsenceAddRequest)]
+pub fn encode_org_structure_absence_add_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("AbsenceAddRequest", &request_json)
+}
+
+/// Changes an absence. JSON: `{ id, valid_from, valid_to, kind, reason, clear, confirm_backdated }`.
+#[wasm_bindgen(js_name = encodeOrgStructureAbsenceUpdateRequest)]
+pub fn encode_org_structure_absence_update_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("AbsenceUpdateRequest", &request_json)
+}
+
+/// Deletes an absence. JSON: `{ id, confirm_backdated }`.
+#[wasm_bindgen(js_name = encodeOrgStructureAbsenceDeleteRequest)]
+pub fn encode_org_structure_absence_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("AbsenceDeleteRequest", &request_json)
+}
+
+/// The structure on a day as a CSV or XLSX file. JSON: `{ format, at }`.
+#[wasm_bindgen(js_name = encodeOrgStructureExportRequest)]
+pub fn encode_org_structure_export_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ExportRequest", &request_json)
+}
+
+/// The changes of the structure, planned ones on top. JSON: `{ from, to, unit_id, offset, limit }`.
+#[wasm_bindgen(js_name = encodeOrgStructureHistoryListRequest)]
+pub fn encode_org_structure_history_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("HistoryListRequest", &request_json)
+}
+
+/// What differs between the structure on two days. JSON: `{ from, to, unit_id }`.
+#[wasm_bindgen(js_name = encodeOrgStructureHistoryDiffRequest)]
+pub fn encode_org_structure_history_diff_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("HistoryDiffRequest", &request_json)
+}
+
+/// The planned reorganizations. JSON: `{}`.
+#[wasm_bindgen(js_name = encodeOrgStructureChangeSetListRequest)]
+pub fn encode_org_structure_change_set_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ChangeSetListRequest", &request_json)
+}
+
+/// One planned reorganization with its operations. JSON: `{ id }`.
+#[wasm_bindgen(js_name = encodeOrgStructureChangeSetGetRequest)]
+pub fn encode_org_structure_change_set_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ChangeSetGetRequest", &request_json)
+}
+
+/// Creates or replaces a draft. JSON: `{ id, name, effective_date, ops: [{ temp_id, request }] }`.
+#[wasm_bindgen(js_name = encodeOrgStructureChangeSetSaveRequest)]
+pub fn encode_org_structure_change_set_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ChangeSetSaveRequest", &request_json)
+}
+
+/// draft -> pending. JSON: `{ id }`.
+#[wasm_bindgen(js_name = encodeOrgStructureChangeSetSubmitRequest)]
+pub fn encode_org_structure_change_set_submit_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ChangeSetSubmitRequest", &request_json)
+}
+
+/// pending -> applied by another administrator. JSON: `{ id }`.
+#[wasm_bindgen(js_name = encodeOrgStructureChangeSetApproveRequest)]
+pub fn encode_org_structure_change_set_approve_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ChangeSetApproveRequest", &request_json)
+}
+
+/// draft or pending -> withdrawn. JSON: `{ id }`.
+#[wasm_bindgen(js_name = encodeOrgStructureChangeSetWithdrawRequest)]
+pub fn encode_org_structure_change_set_withdraw_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ChangeSetWithdrawRequest", &request_json)
+}
+
+/// The structure on the reorganization's day with and without it. JSON: `{ id, unit_id }`.
+#[wasm_bindgen(js_name = encodeOrgStructureChangeSetPreviewRequest)]
+pub fn encode_org_structure_change_set_preview_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("ChangeSetPreviewRequest", &request_json)
+}
+
+/// What a person holds, for a handover. JSON: `{ user_id, reason, project_id, date, return_date }`.
+#[wasm_bindgen(js_name = encodeOrgStructureHandoverListRequest)]
+pub fn encode_org_structure_handover_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("HandoverListRequest", &request_json)
+}
+
+/// Moves the chosen items to their takers. JSON: `{ user_id, reason, project_id, date, return_date, note, items: [{ key, taker_user_id }] }`.
+#[wasm_bindgen(js_name = encodeOrgStructureHandoverApplyRequest)]
+pub fn encode_org_structure_handover_apply_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("HandoverApplyRequest", &request_json)
+}
+
+/// Tries the failed items of a handover again. JSON: `{ handover_id, keys }`.
+#[wasm_bindgen(js_name = encodeOrgStructureHandoverRetryRequest)]
+pub fn encode_org_structure_handover_retry_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("HandoverRetryRequest", &request_json)
+}
+
+/// The people who still hold work after their assignment ended (`org.admin`). JSON: `{}`.
+#[wasm_bindgen(js_name = encodeOrgStructureHandoverPendingRequest)]
+pub fn encode_org_structure_handover_pending_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("HandoverPendingRequest", &request_json)
+}
+
+/// The handovers made for a person. JSON: `{ user_id }`.
+#[wasm_bindgen(js_name = encodeOrgStructureHandoverRecordsRequest)]
+pub fn encode_org_structure_handover_records_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_org_structure_json_request("HandoverRecordsRequest", &request_json)
 }
 
 // =============================================================================

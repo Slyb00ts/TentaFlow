@@ -29,9 +29,9 @@
 
 #roles-catalog-root .rc-topbar {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: 1fr auto;
   align-items: center;
-  gap: 18px;
+  gap: 10px 18px;
   padding: 6px 0 12px;
   border-bottom: 1px solid var(--border);
   margin-bottom: 14px;
@@ -63,8 +63,14 @@
   height: 100%;
 }
 
+/* The strip sits on its own row, as on the org-structure screen: next to the
+   breadcrumb and the search it did not fit at 1280-1440 px and the active
+   tab ended up behind the scroll chevron. */
 #roles-catalog-root #rc-org-tabs {
-  justify-self: center;
+  grid-row: 2;
+  grid-column: 1 / -1;
+  justify-self: start;
+  max-width: 100%;
 }
 
 #roles-catalog-root .rc-topbar-actions {

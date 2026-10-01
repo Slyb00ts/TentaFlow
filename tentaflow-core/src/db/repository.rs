@@ -6918,6 +6918,19 @@ pub fn reseed_core_state_from_current_rows(pool: &DbPool) -> Result<usize> {
                     }
                 }
             }
+            K::OrgUnitType
+            | K::OrgUnit
+            | K::OrgPosition
+            | K::OrgUnitDeputyHead
+            | K::OrgReportingLine
+            | K::OrgExternalPerson
+            | K::OrgAssignment
+            | K::OrgStructureSettings
+            | K::OrgChangeSet
+            | K::OrgDeputy
+            | K::OrgAbsence => {
+                emitted += crate::services::org_structure::replication::reseed(&tx, descriptor.kind)?;
+            }
         }
     }
 
@@ -12546,6 +12559,8 @@ pub fn delete_user_account(pool: &DbPool, id: &str, actor: Option<&str>) -> Resu
         // run explicitly — inside THIS transaction, or an interrupted commit
         // would leave a personal account, and its credential, owned by nobody.
         crate::provider_accounts::repository::forget_user_tx(&tx, id, actor)?;
+        // Same reasoning for org positions: the person no longer holds any.
+        crate::services::org_structure::end_user_assignments_everywhere_tx(&tx, id, actor)?;
         let mut fields = BTreeMap::new();
         fields.insert("id".to_string(), field_string(id));
         record_core_capture_tx(
@@ -15226,17 +15241,17 @@ fn row_to_sync_resource_acl(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncRes
     })
 }
 
-/// Aktualizuje profil organizacyjny usera uzywany do effective permissions.
+/// Aktualizuje profil organizacyjny usera uzywany do effective permissions,
+/// w transakcji wolajacego (projekcja struktury pisze go razem ze zmiana, ktora
+/// go wywolala). Nie commituje.
 pub fn upsert_sync_user_org_profile(
-    pool: &DbPool,
+    tx: &rusqlite::Transaction<'_>,
     org_id: &str,
     user_id: &str,
     department_id: Option<&str>,
     manager_user_id: Option<&str>,
     is_department_manager: bool,
 ) -> Result<()> {
-    let mut conn = acquire(pool)?;
-    let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO sync_user_org_profiles \
          (org_id, user_id, department_id, manager_user_id, is_department_manager) \
@@ -15269,7 +15284,7 @@ pub fn upsert_sync_user_org_profile(
         crate::sync::ledger::FieldValue::Bool(is_department_manager),
     );
     record_core_capture_for_org_tx(
-        &tx,
+        tx,
         crate::sync::core_registry::CoreSyncResourceKind::SyncUserOrgProfile,
         org_id,
         sync_user_org_profile_core_id(org_id, user_id),
@@ -15277,9 +15292,39 @@ pub fn upsert_sync_user_org_profile(
         fields,
         Some(user_id.to_string()),
     )?;
-    bump_sync_permission_epoch_with_conn(&tx, org_id)?;
-    tx.commit()?;
+    bump_sync_permission_epoch_with_conn(tx, org_id)?;
     Ok(())
+}
+
+/// Usuwa profil organizacyjny usera (osoba nie ma juz zadnego stanowiska).
+/// Brak profilu oznacza brak dostepu departamentowego i brak podwladnych,
+/// czyli to samo co profil z pustymi polami. Nic nie robi, gdy profilu nie ma.
+pub fn delete_sync_user_org_profile(
+    tx: &rusqlite::Transaction<'_>,
+    org_id: &str,
+    user_id: &str,
+) -> Result<bool> {
+    let removed = tx.execute(
+        "DELETE FROM sync_user_org_profiles WHERE org_id = ?1 AND user_id = ?2",
+        rusqlite::params![org_id, user_id],
+    )?;
+    if removed == 0 {
+        return Ok(false);
+    }
+    let mut fields = BTreeMap::new();
+    fields.insert("org_id".to_string(), field_string(org_id));
+    fields.insert("user_id".to_string(), field_string(user_id));
+    record_core_capture_for_org_tx(
+        tx,
+        crate::sync::core_registry::CoreSyncResourceKind::SyncUserOrgProfile,
+        org_id,
+        sync_user_org_profile_core_id(org_id, user_id),
+        crate::sync::runtime::SqlWriteAction::Delete,
+        fields,
+        Some(user_id.to_string()),
+    )?;
+    bump_sync_permission_epoch_with_conn(tx, org_id)?;
+    Ok(true)
 }
 
 /// Aktualizuje metadata dostepu dla pojedynczego zasobu.
@@ -15876,11 +15921,15 @@ fn user_manages_subject_with_conn(
         return Ok(true);
     }
     let count: i64 = conn.query_row(
-        "WITH RECURSIVE subtree(user_id) AS ( \
-            SELECT user_id FROM sync_user_org_profiles WHERE org_id = ?1 AND manager_user_id = ?2 \
-            UNION ALL \
-            SELECT p.user_id FROM sync_user_org_profiles p JOIN subtree s ON p.manager_user_id = s.user_id \
-            WHERE p.org_id = ?1 \
+        // Profile rows replicate from several nodes and may momentarily form a
+        // loop of people (A -> B on one node, B -> A on another). UNION drops
+        // repeated (user, depth) pairs and the depth bound ends what is left, so
+        // the check always terminates; real chains are far shorter than 64.
+        "WITH RECURSIVE subtree(user_id, depth) AS ( \
+            SELECT user_id, 1 FROM sync_user_org_profiles WHERE org_id = ?1 AND manager_user_id = ?2 \
+            UNION \
+            SELECT p.user_id, s.depth + 1 FROM sync_user_org_profiles p JOIN subtree s ON p.manager_user_id = s.user_id \
+            WHERE p.org_id = ?1 AND s.depth < 64 \
          ) \
          SELECT COUNT(*) FROM subtree WHERE user_id = ?3",
         rusqlite::params![org_id, manager_user_id, subject_user_id],

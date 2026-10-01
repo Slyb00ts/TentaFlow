@@ -492,11 +492,11 @@ class TfTabs extends HTMLElement {
       return;
     }
     const hostTab = active.parentElement;
-    // Measure within the scroller's content box so the indicator tracks the
-    // tab correctly regardless of scrollLeft.
-    const scrollerRect = this._scroller.getBoundingClientRect();
-    const tabRect = hostTab.getBoundingClientRect();
-    const offsetX = (tabRect.left - scrollerRect.left) + this._scroller.scrollLeft;
+    // Layout metrics, not on-screen rects: a screen that scales in (page-enter animation) would
+    // otherwise size the pill to a transient, smaller tab and leave the label touching its edge.
+    // `offsetLeft` is measured from the scroller's padding box, which is where the pill is placed.
+    const tabRect = { width: hostTab.offsetWidth };
+    const offsetX = hostTab.offsetLeft;
     const inset = this._indicatorInset(tabRect.width);
     this._indicator.style.transform = `translateX(${offsetX + inset}px)`;
     this._indicator.style.width = `${Math.max(0, tabRect.width - inset * 2)}px`;

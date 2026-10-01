@@ -397,6 +397,7 @@ pub fn delete_organization(pool: &DbPool, org_id: &str) -> Result<bool> {
             organization_changed_fields(None, None, None, None, None, Some("deleted")),
             None,
         )?;
+        crate::services::org_structure::purge_org_structure_tx(&tx, org_id).map_err(map_db)?;
     }
     tx.commit().map_err(map_db)?;
     drop(conn);
@@ -571,6 +572,9 @@ pub fn remove_membership(pool: &DbPool, org_id: &str, user_id: &str) -> Result<b
             org_membership_changed_fields(org_id, user_id, None, None),
             None,
         )?;
+        // Someone who left the organization no longer holds its positions.
+        crate::services::org_structure::end_user_assignments_tx(&tx, org_id, user_id, None)
+            .map_err(map_db)?;
     }
     tx.commit().map_err(map_db)?;
     drop(conn);

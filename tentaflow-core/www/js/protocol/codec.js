@@ -75,6 +75,225 @@ function numOrNull(v) {
   return Number.isFinite(n) ? n : null;
 }
 
+/** A field of a request payload under its camelCase or wire snake_case name. */
+function orgField(payload, camel) {
+  return payload[camel] ?? payload[camel.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`)];
+}
+
+/** The `{ kind, id }` pair the org-structure wire uses for a person or target. */
+function orgRef(ref) {
+  return { kind: String(ref?.kind ?? ''), id: String(ref?.id ?? '') };
+}
+
+/** Names of the fields a patch clears — the wire's way to say "set to null". */
+function orgClear(payload) {
+  const list = orgField(payload, 'clear');
+  return Array.isArray(list) ? list.map(String) : [];
+}
+
+/** The decisions taken on a dry run: `[{ row, action }]` with the wire's snake_case actions. */
+function orgResolutions(payload) {
+  const list = orgField(payload, 'resolutions');
+  return Array.isArray(list)
+    ? list.map((r) => ({ row: Number(r?.row ?? 0), action: String(r?.action ?? ''), login: strOrNull(r?.login) }))
+    : [];
+}
+
+/** The scalar fields the three file requests share; the file itself is a separate wasm argument. */
+function orgFileRequestFields(payload) {
+  return JSON.stringify({
+    format: String(orgField(payload, 'format') ?? 'csv'),
+    mode: String(orgField(payload, 'mode') ?? 'upsert'),
+    as_of: strOrNull(orgField(payload, 'asOf')),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+    confirm_ended: Boolean(orgField(payload, 'confirmEnded')),
+    resolutions: orgResolutions(payload),
+  });
+}
+
+/**
+ * The fields of every org-structure write request as the wire's JSON, from a
+ * camelCase (or snake_case) payload. One table serves the single requests and
+ * the operations of `orgBatchRequest`, so the two cannot drift apart.
+ */
+const ORG_WRITE_FIELDS = {
+  unitTypeCreate: (payload) => ({
+    name: String(orgField(payload, 'name') ?? ''),
+    color: strOrNull(orgField(payload, 'color')),
+    icon: strOrNull(orgField(payload, 'icon')),
+  }),
+  unitTypeUpdate: (payload) => ({
+    id: String(orgField(payload, 'id') ?? ''),
+    name: strOrNull(orgField(payload, 'name')),
+    color: strOrNull(orgField(payload, 'color')),
+    icon: strOrNull(orgField(payload, 'icon')),
+    clear: orgClear(payload),
+  }),
+  unitTypeDelete: (payload) => ({
+    id: String(orgField(payload, 'id') ?? ''),
+  }),
+  unitCreate: (payload) => ({
+    name: String(orgField(payload, 'name') ?? ''),
+    code: strOrNull(orgField(payload, 'code')),
+    type_id: strOrNull(orgField(payload, 'typeId')),
+    parent_unit_id: strOrNull(orgField(payload, 'parentUnitId')),
+    color: strOrNull(orgField(payload, 'color')),
+    valid_from: String(orgField(payload, 'validFrom') ?? ''),
+    valid_to: strOrNull(orgField(payload, 'validTo')),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  unitUpdate: (payload) => ({
+    unit_id: String(orgField(payload, 'unitId') ?? ''),
+    name: strOrNull(orgField(payload, 'name')),
+    code: strOrNull(orgField(payload, 'code')),
+    type_id: strOrNull(orgField(payload, 'typeId')),
+    color: strOrNull(orgField(payload, 'color')),
+    clear: orgClear(payload),
+    from: String(orgField(payload, 'from') ?? ''),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  unitMove: (payload) => ({
+    unit_id: String(orgField(payload, 'unitId') ?? ''),
+    new_parent_unit_id: strOrNull(orgField(payload, 'newParentUnitId')),
+    from: String(orgField(payload, 'from') ?? ''),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  unitEnd: (payload) => ({
+    unit_id: String(orgField(payload, 'unitId') ?? ''),
+    from: String(orgField(payload, 'from') ?? ''),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  headSet: (payload) => ({
+    unit_id: String(orgField(payload, 'unitId') ?? ''),
+    head_position_id: strOrNull(orgField(payload, 'headPositionId')),
+    from: String(orgField(payload, 'from') ?? ''),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  deputyHeadsSet: (payload) => ({
+    unit_id: String(orgField(payload, 'unitId') ?? ''),
+    position_ids: (orgField(payload, 'positionIds') ?? []).map(String),
+    from: String(orgField(payload, 'from') ?? ''),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  positionCreate: (payload) => ({
+    unit_id: String(orgField(payload, 'unitId') ?? ''),
+    name: String(orgField(payload, 'name') ?? ''),
+    code: strOrNull(orgField(payload, 'code')),
+    role_id: strOrNull(orgField(payload, 'roleId')),
+    is_manager: orgField(payload, 'isManager') === undefined || orgField(payload, 'isManager') === null ? null : Boolean(orgField(payload, 'isManager')),
+    is_staff: Boolean(orgField(payload, 'isStaff')),
+    parent_position_id: strOrNull(orgField(payload, 'parentPositionId')),
+    valid_from: String(orgField(payload, 'validFrom') ?? ''),
+    valid_to: strOrNull(orgField(payload, 'validTo')),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  positionUpdate: (payload) => ({
+    position_id: String(orgField(payload, 'positionId') ?? ''),
+    name: strOrNull(orgField(payload, 'name')),
+    code: strOrNull(orgField(payload, 'code')),
+    role_id: strOrNull(orgField(payload, 'roleId')),
+    is_manager: orgField(payload, 'isManager') === undefined || orgField(payload, 'isManager') === null ? null : Boolean(orgField(payload, 'isManager')),
+    is_staff: orgField(payload, 'isStaff') === undefined || orgField(payload, 'isStaff') === null ? null : Boolean(orgField(payload, 'isStaff')),
+    clear: orgClear(payload),
+    from: String(orgField(payload, 'from') ?? ''),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  positionMove: (payload) => ({
+    position_id: String(orgField(payload, 'positionId') ?? ''),
+    new_parent_position_id: strOrNull(orgField(payload, 'newParentPositionId')),
+    from: String(orgField(payload, 'from') ?? ''),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  positionEnd: (payload) => ({
+    position_id: String(orgField(payload, 'positionId') ?? ''),
+    from: String(orgField(payload, 'from') ?? ''),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  reportingLineSet: (payload) => ({
+    position_id: String(orgField(payload, 'positionId') ?? ''),
+    parent_position_id: String(orgField(payload, 'parentPositionId') ?? ''),
+    kind: String(orgField(payload, 'kind') ?? 'primary'),
+    priority: Number(orgField(payload, 'priority') ?? 0),
+    valid_from: String(orgField(payload, 'validFrom') ?? ''),
+    valid_to: strOrNull(orgField(payload, 'validTo')),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  externalPersonCreate: (payload) => ({
+    display_name: String(orgField(payload, 'displayName') ?? ''),
+    email: strOrNull(orgField(payload, 'email')),
+    note: strOrNull(orgField(payload, 'note')),
+  }),
+  assign: (payload) => ({
+    position_id: String(orgField(payload, 'positionId') ?? ''),
+    subject: orgRef(orgField(payload, 'subject')),
+    assignment_type: String(orgField(payload, 'assignmentType') ?? 'permanent'),
+    share: Number(orgField(payload, 'share') ?? 1),
+    is_primary: orgField(payload, 'isPrimary') === undefined || orgField(payload, 'isPrimary') === null ? null : Boolean(orgField(payload, 'isPrimary')),
+    valid_from: String(orgField(payload, 'validFrom') ?? ''),
+    valid_to: strOrNull(orgField(payload, 'validTo')),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  assignmentUpdate: (payload) => ({
+    assignment_id: String(orgField(payload, 'assignmentId') ?? ''),
+    assignment_type: strOrNull(orgField(payload, 'assignmentType')),
+    share: numOrNull(orgField(payload, 'share')),
+    is_primary: orgField(payload, 'isPrimary') === undefined || orgField(payload, 'isPrimary') === null ? null : Boolean(orgField(payload, 'isPrimary')),
+    from: String(orgField(payload, 'from') ?? ''),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+  assignmentEnd: (payload) => ({
+    assignment_id: String(orgField(payload, 'assignmentId') ?? ''),
+    from: String(orgField(payload, 'from') ?? ''),
+    confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+  }),
+};
+
+/**
+ * The operations of a batch or of a planned reorganization as the wire's
+ * `OrgWriteOp` list, from `{ kind, tempId?, ...the fields of that write }`.
+ * Throws `unknown_batch_op` for a kind the wire does not know.
+ */
+export function orgWriteOpsToWire(list) {
+  return list.map((op, index) => {
+    const kind = String(op?.kind ?? '');
+    const fields = ORG_WRITE_FIELDS[kind];
+    if (!fields) {
+      const error = new Error(`org batch operation ${index} has an unknown kind '${kind}'`);
+      error.code = 'unknown_batch_op';
+      throw error;
+    }
+    return {
+      temp_id: strOrNull(orgField(op, 'tempId')),
+      request: { [`${kind[0].toUpperCase()}${kind.slice(1)}Request`]: fields(op) },
+    };
+  });
+}
+
+/** The most operations one `orgBatchRequest` takes; the server states it as `batchMaxOps`. */
+export const ORG_BATCH_MAX_OPS = 500;
+
+/**
+ * The largest file an org-structure import takes. The dashboard socket closes
+ * (1009) on a frame over 1 MiB, so the file leaves 100 KiB for the envelope
+ * and the decisions. The server states the same number as
+ * `importMaxFileBytes` (structure answer) and `maxFileBytes` (report); check
+ * a file BEFORE sending it — an oversized frame gets no answer, only a closed
+ * connection.
+ */
+export const ORG_IMPORT_MAX_FILE_BYTES = 900 * 1024;
+
+/** The file of an import request as bytes: a Uint8Array as it is, an ArrayBuffer or a plain array wrapped. */
+function orgFileBytes(payload) {
+  const raw = payload.bytes;
+  const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw ?? []);
+  if (bytes.length > ORG_IMPORT_MAX_FILE_BYTES) {
+    const error = new Error(`org import file is ${bytes.length} bytes; the limit is ${ORG_IMPORT_MAX_FILE_BYTES}`);
+    error.code = 'file_too_large';
+    throw error;
+  }
+  return bytes;
+}
+
 /**
  * Typed factory dla frameow do wyslania.
  *
@@ -8808,6 +9027,658 @@ export const encode = {
     const body = _wasm.encodeMapDeviceUnassignRequest(JSON.stringify({
       node_id: String(payload.nodeId ?? payload.node_id ?? ''),
       device_id: String(payload.deviceId ?? payload.device_id ?? ''),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // ===========================================================================
+  // Organizational structure — MessageBody::OrgStructureBody. Effective-dated
+  // units, positions, reporting lines and assignments. Fields are the wire's
+  // snake_case; a date is `YYYY-MM-DD`; an absent optional is `null`. Every
+  // write needs org.admin and a change dated before today needs
+  // `confirmBackdated`. A patch changes a field when it is set and clears it
+  // when its name is listed in `clear`.
+  // ===========================================================================
+
+  /** The whole structure on a day (default today), the unit types and what the caller may do. */
+  // wire: OrgStructureBody::StructureRequest
+  orgStructureRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureStructureRequest(JSON.stringify({
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Positions above (up) or below (down) a user or position on a day; `seatScope` `all` follows secondary seats too. */
+  // wire: OrgStructureBody::ReportsChainRequest
+  orgReportsChainRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureReportsChainRequest(JSON.stringify({
+      target: orgRef(orgField(payload, 'target')),
+      direction: String(orgField(payload, 'direction') ?? 'up'),
+      seat_scope: String(orgField(payload, 'seatScope') ?? 'primary'),
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Direct or transitive subordinates of a user or position on a day. */
+  // wire: OrgStructureBody::SubordinatesRequest
+  orgSubordinatesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureSubordinatesRequest(JSON.stringify({
+      target: orgRef(orgField(payload, 'target')),
+      transitive: Boolean(orgField(payload, 'transitive')),
+      seat_scope: String(orgField(payload, 'seatScope') ?? 'primary'),
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The manager of a user on a day. */
+  // wire: OrgStructureBody::ManagerRequest
+  orgManagerRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureManagerRequest(JSON.stringify({
+      user_id: String(orgField(payload, 'userId') ?? ''),
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The positions a user holds on a day, the primary one apart. */
+  // wire: OrgStructureBody::AssignmentRequest
+  orgAssignmentRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureAssignmentRequest(JSON.stringify({
+      user_id: String(orgField(payload, 'userId') ?? ''),
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Broken structure rules found in the stored data. */
+  // wire: OrgStructureBody::IntegrityReportRequest
+  orgIntegrityReportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureIntegrityReportRequest(JSON.stringify({
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::UnitTypeCreateRequest
+  orgUnitTypeCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureUnitTypeCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitTypeCreate(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** A field is changed when set, cleared when named in `clear`. */
+  // wire: OrgStructureBody::UnitTypeUpdateRequest
+  orgUnitTypeUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureUnitTypeUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitTypeUpdate(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::UnitTypeDeleteRequest
+  orgUnitTypeDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureUnitTypeDeleteRequest(JSON.stringify(ORG_WRITE_FIELDS.unitTypeDelete(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::UnitCreateRequest
+  orgUnitCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureUnitCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitCreate(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Applied from `from`; earlier days keep the old values. */
+  // wire: OrgStructureBody::UnitUpdateRequest
+  orgUnitUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureUnitUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.unitUpdate(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** A null parent makes the unit a root. */
+  // wire: OrgStructureBody::UnitMoveRequest
+  orgUnitMoveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureUnitMoveRequest(JSON.stringify(ORG_WRITE_FIELDS.unitMove(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::UnitEndRequest
+  orgUnitEndRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureUnitEndRequest(JSON.stringify(ORG_WRITE_FIELDS.unitEnd(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** A null head leaves the unit without one. */
+  // wire: OrgStructureBody::HeadSetRequest
+  orgHeadSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureHeadSetRequest(JSON.stringify(ORG_WRITE_FIELDS.headSet(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The whole ordered list; an empty one removes every deputy. */
+  // wire: OrgStructureBody::DeputyHeadsSetRequest
+  orgDeputyHeadsSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureDeputyHeadsSetRequest(JSON.stringify(ORG_WRITE_FIELDS.deputyHeadsSet(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::PositionCreateRequest
+  orgPositionCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructurePositionCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.positionCreate(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Applied from `from`; earlier days keep the old values. */
+  // wire: OrgStructureBody::PositionUpdateRequest
+  orgPositionUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructurePositionUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.positionUpdate(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Re-points the primary reporting line; a null parent leaves no manager. */
+  // wire: OrgStructureBody::PositionMoveRequest
+  orgPositionMoveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructurePositionMoveRequest(JSON.stringify(ORG_WRITE_FIELDS.positionMove(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::PositionEndRequest
+  orgPositionEndRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructurePositionEndRequest(JSON.stringify(ORG_WRITE_FIELDS.positionEnd(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::ReportingLineSetRequest
+  orgReportingLineSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureReportingLineSetRequest(JSON.stringify(ORG_WRITE_FIELDS.reportingLineSet(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::ExternalPersonCreateRequest
+  orgExternalPersonCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureExternalPersonCreateRequest(JSON.stringify(ORG_WRITE_FIELDS.externalPersonCreate(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::AssignRequest
+  orgAssignRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureAssignRequest(JSON.stringify(ORG_WRITE_FIELDS.assign(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::AssignmentUpdateRequest
+  orgAssignmentUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureAssignmentUpdateRequest(JSON.stringify(ORG_WRITE_FIELDS.assignmentUpdate(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::AssignmentEndRequest
+  orgAssignmentEndRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureAssignmentEndRequest(JSON.stringify(ORG_WRITE_FIELDS.assignmentEnd(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * The edit mode's draft, saved in ONE call (or only tried with `dryRun`).
+   * payload: { ops: [{ kind, tempId?, ...the fields of that write }], dryRun?, confirmBackdated? }
+   * where `kind` is the write without "Request" and with a lower-case first
+   * letter: unitTypeCreate, unitTypeUpdate, unitTypeDelete, unitCreate,
+   * unitUpdate, unitMove, unitEnd, headSet, deputyHeadsSet, positionCreate,
+   * positionUpdate, positionMove, positionEnd, reportingLineSet,
+   * externalPersonCreate, assign, assignmentUpdate, assignmentEnd — and the
+   * fields are the ones of the single request (`orgUnitCreateRequest`...).
+   * `tempId` ("tmp:" + anything) names what a creating operation makes; later
+   * operations may use it wherever the request takes that id.
+   * Throws `too_many_ops` (over ORG_BATCH_MAX_OPS) or `batch_too_large` (over
+   * ORG_IMPORT_MAX_FILE_BYTES) BEFORE encoding a frame the socket would close on.
+   */
+  // wire: OrgStructureBody::BatchRequest
+  orgBatchRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const list = Array.isArray(payload.ops) ? payload.ops : [];
+    if (list.length > ORG_BATCH_MAX_OPS) {
+      const error = new Error(`org batch has ${list.length} operations; the limit is ${ORG_BATCH_MAX_OPS}`);
+      error.code = 'too_many_ops';
+      throw error;
+    }
+    const ops = orgWriteOpsToWire(list);
+    const body = _wasm.encodeOrgStructureBatchRequest(JSON.stringify({
+      ops,
+      dry_run: Boolean(orgField(payload, 'dryRun')),
+      confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+    }));
+    if (body.length > ORG_IMPORT_MAX_FILE_BYTES) {
+      const error = new Error(`org batch is ${body.length} bytes; the limit is ${ORG_IMPORT_MAX_FILE_BYTES}`);
+      error.code = 'batch_too_large';
+      throw error;
+    }
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The active members of the organization, for choosing a deputy (open to every member). */
+  // wire: OrgStructureBody::MemberListRequest
+  orgMemberListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureMemberListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** A person's absences, deputies and presence as the caller may see them. `userId` defaults to the caller. */
+  // wire: OrgStructureBody::CoverRequest
+  orgCoverRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureCoverRequest(JSON.stringify({
+      user_id: strOrNull(orgField(payload, 'userId')),
+      at: strOrNull(orgField(payload, 'at')),
+      include_past: Boolean(orgField(payload, 'includePast')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Who is away and which deputies are in force on a day (default today) — no reasons. */
+  // wire: OrgStructureBody::AvailabilityRequest
+  orgAvailabilityRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureAvailabilityRequest(JSON.stringify({
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The people to ask one after another from a person's manager up; `scope` all | approvals | escalations (default) | project:<id>. */
+  // wire: OrgStructureBody::EscalationChainRequest
+  orgEscalationChainRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureEscalationChainRequest(JSON.stringify({
+      user_id: String(orgField(payload, 'userId') ?? ''),
+      scope: strOrNull(orgField(payload, 'scope')),
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Whether a person is present on a day. */
+  // wire: OrgStructureBody::IsAvailableRequest
+  orgIsAvailableRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureIsAvailableRequest(JSON.stringify({
+      user_id: String(orgField(payload, 'userId') ?? ''),
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Whether a viewer (default the caller) may see `kind` of a person's data: absence_reason | absence_dates | time_utilization | position_history. */
+  // wire: OrgStructureBody::CanViewPersonDataRequest
+  orgCanViewPersonDataRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureCanViewPersonDataRequest(JSON.stringify({
+      viewer_user_id: strOrNull(orgField(payload, 'viewerUserId')),
+      subject_user_id: String(orgField(payload, 'subjectUserId') ?? ''),
+      kind: String(orgField(payload, 'kind') ?? ''),
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** What a person sees, area by area, with the rule behind each answer (another person than the caller needs org.admin). */
+  // wire: OrgStructureBody::VisibilityRequest
+  orgVisibilityRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureVisibilityRequest(JSON.stringify({
+      user_id: strOrNull(orgField(payload, 'userId')),
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Who sees the personal data of a person (another person than the caller needs org.admin). */
+  // wire: OrgStructureBody::WhoSeesRequest
+  orgWhoSeesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureWhoSeesRequest(JSON.stringify({
+      subject_user_id: strOrNull(orgField(payload, 'subjectUserId')),
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Appoints a deputy (org.admin). `validTo` is exclusive. */
+  // wire: OrgStructureBody::DeputySetRequest
+  orgDeputySetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureDeputySetRequest(JSON.stringify({
+      user_id: String(orgField(payload, 'userId') ?? ''),
+      deputy_user_id: String(orgField(payload, 'deputyUserId') ?? ''),
+      scope: String(orgField(payload, 'scope') ?? 'all'),
+      valid_from: String(orgField(payload, 'validFrom') ?? ''),
+      valid_to: strOrNull(orgField(payload, 'validTo')),
+      confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Changes a deputy (org.admin); `clear` may list valid_to. */
+  // wire: OrgStructureBody::DeputyUpdateRequest
+  orgDeputyUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureDeputyUpdateRequest(JSON.stringify({
+      id: String(orgField(payload, 'id') ?? ''),
+      scope: strOrNull(orgField(payload, 'scope')),
+      valid_from: strOrNull(orgField(payload, 'validFrom')),
+      valid_to: strOrNull(orgField(payload, 'validTo')),
+      clear: orgClear(payload),
+      confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Ends a deputy from a day (org.admin). */
+  // wire: OrgStructureBody::DeputyEndRequest
+  orgDeputyEndRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureDeputyEndRequest(JSON.stringify({
+      id: String(orgField(payload, 'id') ?? ''),
+      from: String(orgField(payload, 'from') ?? ''),
+      confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Adds an absence — the caller's own, or anybody's for org.admin. `validTo` is exclusive; `kind` leave | training | other. */
+  // wire: OrgStructureBody::AbsenceAddRequest
+  orgAbsenceAddRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureAbsenceAddRequest(JSON.stringify({
+      user_id: strOrNull(orgField(payload, 'userId')),
+      valid_from: String(orgField(payload, 'validFrom') ?? ''),
+      valid_to: strOrNull(orgField(payload, 'validTo')),
+      kind: String(orgField(payload, 'kind') ?? 'other'),
+      reason: strOrNull(orgField(payload, 'reason')),
+      confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Changes an absence; `clear` may list valid_to and reason. */
+  // wire: OrgStructureBody::AbsenceUpdateRequest
+  orgAbsenceUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureAbsenceUpdateRequest(JSON.stringify({
+      id: String(orgField(payload, 'id') ?? ''),
+      valid_from: strOrNull(orgField(payload, 'validFrom')),
+      valid_to: strOrNull(orgField(payload, 'validTo')),
+      kind: strOrNull(orgField(payload, 'kind')),
+      reason: strOrNull(orgField(payload, 'reason')),
+      clear: orgClear(payload),
+      confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Deletes an absence. */
+  // wire: OrgStructureBody::AbsenceDeleteRequest
+  orgAbsenceDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureAbsenceDeleteRequest(JSON.stringify({
+      id: String(orgField(payload, 'id') ?? ''),
+      confirm_backdated: Boolean(orgField(payload, 'confirmBackdated')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** What a person holds for a handover, grouped, with a proposed taker for each. reason: departure | absence | project_removal. */
+  // wire: OrgStructureBody::HandoverListRequest
+  orgHandoverListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureHandoverListRequest(JSON.stringify({
+      user_id: String(orgField(payload, 'userId') ?? ''),
+      reason: String(orgField(payload, 'reason') ?? ''),
+      project_id: strOrNull(orgField(payload, 'projectId')),
+      date: strOrNull(orgField(payload, 'date')),
+      return_date: strOrNull(orgField(payload, 'returnDate')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Moves the chosen items (`items: [{ key, takerUserId }]`) and records the handover; the note is required. */
+  // wire: OrgStructureBody::HandoverApplyRequest
+  orgHandoverApplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const items = orgField(payload, 'items');
+    const body = _wasm.encodeOrgStructureHandoverApplyRequest(JSON.stringify({
+      user_id: String(orgField(payload, 'userId') ?? ''),
+      reason: String(orgField(payload, 'reason') ?? ''),
+      project_id: strOrNull(orgField(payload, 'projectId')),
+      date: strOrNull(orgField(payload, 'date')),
+      return_date: strOrNull(orgField(payload, 'returnDate')),
+      note: String(orgField(payload, 'note') ?? ''),
+      items: (Array.isArray(items) ? items : []).map((item) => ({
+        key: String(orgField(item, 'key') ?? ''),
+        taker_user_id: strOrNull(orgField(item, 'takerUserId')),
+      })),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Tries the failed items of a recorded handover again (all of them when `keys` is empty). */
+  // wire: OrgStructureBody::HandoverRetryRequest
+  orgHandoverRetryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const keys = orgField(payload, 'keys');
+    const body = _wasm.encodeOrgStructureHandoverRetryRequest(JSON.stringify({
+      handover_id: String(orgField(payload, 'handoverId') ?? ''),
+      keys: Array.isArray(keys) ? keys.map(String) : [],
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The people whose assignment ended and who still hold work (org.admin). */
+  // wire: OrgStructureBody::HandoverPendingRequest
+  orgHandoverPendingRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureHandoverPendingRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The handovers made for a person (default the caller), newest first. */
+  // wire: OrgStructureBody::HandoverRecordsRequest
+  orgHandoverRecordsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureHandoverRecordsRequest(JSON.stringify({
+      user_id: strOrNull(orgField(payload, 'userId')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // wire: OrgStructureBody::TimezoneSetRequest
+  orgTimezoneSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureTimezoneSetRequest(JSON.stringify({
+      timezone: String(orgField(payload, 'timezone') ?? ''),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Rewrites the derived profiles of the organization ("Przelicz"). */
+  // wire: OrgStructureBody::RecomputeRequest
+  orgRecomputeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureRecomputeRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * Tries a structure file (CSV or XLSX) without writing anything.
+   * payload: { format, bytes: Uint8Array, mode?: 'upsert' | 'replace', asOf?, confirmBackdated?,
+   * confirmEnded?: true when the administrator confirmed what a replace ends,
+   * resolutions?: [{ row, action: 'use_suggested_login' | 'leave_vacant' | 'skip_row', login? }] } —
+   * `login` pins the login the administrator saw suggested.
+   */
+  // wire: OrgStructureBody::ImportDryRunRequest
+  orgImportDryRunRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureImportDryRunRequest(orgFileRequestFields(payload), orgFileBytes(payload));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The same run as the dry run, kept when the file has no error. Same payload. */
+  // wire: OrgStructureBody::ImportApplyRequest
+  orgImportApplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureImportApplyRequest(orgFileRequestFields(payload), orgFileBytes(payload));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The errors of a dry run of the file as a CSV. Same payload as the dry run. */
+  // wire: OrgStructureBody::ExportErrorsRequest
+  orgExportErrorsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureExportErrorsRequest(orgFileRequestFields(payload), orgFileBytes(payload));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The structure on a day as a file. payload: { format: 'csv' | 'xlsx', at? }. */
+  // wire: OrgStructureBody::ExportRequest
+  orgExportRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureExportRequest(JSON.stringify({
+      format: String(orgField(payload, 'format') ?? 'csv'),
+      at: strOrNull(orgField(payload, 'at')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // ===========================================================================
+  // Organizational structure — history and planned reorganizations
+  // (OrgStructureBody::History*, ::ChangeSet*). A planned reorganization is an
+  // administrator's document: its operations are the ones of `orgBatchRequest`
+  // (`{ kind, tempId?, ...fields }`), stored and run as a batch on approval.
+  // ===========================================================================
+
+  /** The changes of the structure. payload: { from?, to?, unitId?, offset?, limit? } (days `YYYY-MM-DD`). */
+  // wire: OrgStructureBody::HistoryListRequest
+  orgHistoryListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureHistoryListRequest(JSON.stringify({
+      from: strOrNull(orgField(payload, 'from')),
+      to: strOrNull(orgField(payload, 'to')),
+      unit_id: strOrNull(orgField(payload, 'unitId')),
+      offset: Number(orgField(payload, 'offset') ?? 0),
+      limit: Number(orgField(payload, 'limit') ?? 0),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** What differs between two days. payload: { from, to, unitId? }. */
+  // wire: OrgStructureBody::HistoryDiffRequest
+  orgHistoryDiffRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureHistoryDiffRequest(JSON.stringify({
+      from: String(orgField(payload, 'from') ?? ''),
+      to: String(orgField(payload, 'to') ?? ''),
+      unit_id: strOrNull(orgField(payload, 'unitId')),
+    }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The planned reorganizations (org.admin). */
+  // wire: OrgStructureBody::ChangeSetListRequest
+  orgChangeSetListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureChangeSetListRequest(JSON.stringify({}));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** One reorganization with its operations. payload: { id }. */
+  // wire: OrgStructureBody::ChangeSetGetRequest
+  orgChangeSetGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureChangeSetGetRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * Creates (no `id`) or replaces a draft, and dry-runs its operations.
+   * payload: { id?, name, effectiveDate, ops: [{ kind, tempId?, ...fields }] } — every operation dated on or after `effectiveDate`.
+   */
+  // wire: OrgStructureBody::ChangeSetSaveRequest
+  orgChangeSetSaveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const list = Array.isArray(payload.ops) ? payload.ops : [];
+    if (list.length > ORG_BATCH_MAX_OPS) {
+      const error = new Error(`org change set has ${list.length} operations; the limit is ${ORG_BATCH_MAX_OPS}`);
+      error.code = 'too_many_ops';
+      throw error;
+    }
+    const body = _wasm.encodeOrgStructureChangeSetSaveRequest(JSON.stringify({
+      id: strOrNull(orgField(payload, 'id')),
+      name: String(orgField(payload, 'name') ?? ''),
+      effective_date: String(orgField(payload, 'effectiveDate') ?? ''),
+      ops: orgWriteOpsToWire(list),
+    }));
+    if (body.length > ORG_IMPORT_MAX_FILE_BYTES) {
+      const error = new Error(`org change set is ${body.length} bytes; the limit is ${ORG_IMPORT_MAX_FILE_BYTES}`);
+      error.code = 'batch_too_large';
+      throw error;
+    }
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** draft -> pending, after a clean dry run. payload: { id }. */
+  // wire: OrgStructureBody::ChangeSetSubmitRequest
+  orgChangeSetSubmitRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureChangeSetSubmitRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** pending -> applied by an administrator other than the author. payload: { id }. */
+  // wire: OrgStructureBody::ChangeSetApproveRequest
+  orgChangeSetApproveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureChangeSetApproveRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** draft or pending -> withdrawn; the live structure is untouched. payload: { id }. */
+  // wire: OrgStructureBody::ChangeSetWithdrawRequest
+  orgChangeSetWithdrawRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureChangeSetWithdrawRequest(JSON.stringify({ id: String(orgField(payload, 'id') ?? '') }));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** The structure on the day of the reorganization with and without it. payload: { id, unitId? }. */
+  // wire: OrgStructureBody::ChangeSetPreviewRequest
+  orgChangeSetPreviewRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeOrgStructureChangeSetPreviewRequest(JSON.stringify({
+      id: String(orgField(payload, 'id') ?? ''),
+      unit_id: strOrNull(orgField(payload, 'unitId')),
     }));
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

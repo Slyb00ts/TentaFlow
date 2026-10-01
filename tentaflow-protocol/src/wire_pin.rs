@@ -685,7 +685,10 @@ pub fn assert_parseable(source: &str) {
         let in_wire_region = i < wire_region_end;
         if in_wire_region && trimmed.starts_with("#[") {
             assert!(
-                trimmed.starts_with("#[derive(") || trimmed.starts_with("#[serde("),
+                trimmed.starts_with("#[derive(")
+                    || trimmed.starts_with("#[serde(")
+                    // Names the variant `Default` builds; serde never reads it.
+                    || trimmed == "#[default]",
                 "unrecognised attribute above a wire declaration — the pin cannot tell \
                  whether it rewrites the wire: '{}'",
                 lines[i].raw.trim()

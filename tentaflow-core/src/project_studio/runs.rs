@@ -206,6 +206,52 @@ pub fn get_run_item(pool: &DbPool, item_id: &str) -> Result<Option<RunItemRecord
     .map_err(Into::into)
 }
 
+/// A test-run item somebody still has to run, as the handover screen lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRunItem {
+    pub item_id: String,
+    pub run_no: u32,
+    pub run_name: String,
+    pub case_title: String,
+    pub status: String,
+}
+
+/// The unfinished items of RUNNING test runs assigned to `user_id`.
+pub fn open_items_of(pool: &DbPool, user_id: &str) -> Result<Vec<OpenRunItem>> {
+    let conn = pool.read().map_err(read_err)?;
+    let mut stmt = conn.prepare(
+        "SELECT i.item_id, r.run_no, r.name, i.case_title, i.status \
+         FROM test_run_items i JOIN test_runs r ON r.run_id = i.run_id \
+         WHERE i.assigned_to = ?1 AND i.status IN ('pending','in_progress') \
+           AND r.status = 'running' \
+         ORDER BY r.run_no, i.position",
+    )?;
+    let rows = stmt.query_map(params![user_id], |row| {
+        Ok(OpenRunItem {
+            item_id: row.get(0)?,
+            run_no: row.get::<_, i64>(1)? as u32,
+            run_name: row.get(2)?,
+            case_title: row.get(3)?,
+            status: row.get(4)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Moves an UNFINISHED item of a running run from `from` to `to`. The
+/// conditions are part of the statement (see `tasks::reassign_open`).
+pub fn reassign_open_item(pool: &DbPool, item_id: &str, from: &str, to: &str) -> Result<bool> {
+    let conn = pool.write().map_err(write_err)?;
+    let n = conn.execute(
+        "UPDATE test_run_items SET assigned_to = ?1 \
+         WHERE item_id = ?2 AND assigned_to = ?3 AND status IN ('pending','in_progress') \
+           AND run_id IN (SELECT run_id FROM test_runs WHERE status = 'running')",
+        params![to, item_id, from],
+    )?;
+    Ok(n > 0)
+}
+
 pub fn list_item_steps(pool: &DbPool, item_id: &str) -> Result<Vec<RunStepRecord>> {
     let conn = pool.read().map_err(read_err)?;
     let mut stmt = conn.prepare(

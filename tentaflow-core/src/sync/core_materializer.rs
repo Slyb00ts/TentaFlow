@@ -138,6 +138,20 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::MapSite
             | CoreSyncResourceKind::MapScene
             | CoreSyncResourceKind::MapDevicePlacement
+            // Org structure: units are moved, positions reassigned and people
+            // taken off a position from any node; a removal must beat an older
+            // add that arrived the long way round.
+            | CoreSyncResourceKind::OrgUnitType
+            | CoreSyncResourceKind::OrgUnit
+            | CoreSyncResourceKind::OrgPosition
+            | CoreSyncResourceKind::OrgUnitDeputyHead
+            | CoreSyncResourceKind::OrgReportingLine
+            | CoreSyncResourceKind::OrgExternalPerson
+            | CoreSyncResourceKind::OrgAssignment
+            | CoreSyncResourceKind::OrgStructureSettings
+            | CoreSyncResourceKind::OrgChangeSet
+            | CoreSyncResourceKind::OrgDeputy
+            | CoreSyncResourceKind::OrgAbsence
     )
 }
 
@@ -312,6 +326,19 @@ pub fn apply_core_operation(pool: &DbPool, operation: &SyncOperation) -> LedgerR
         CoreSyncResourceKind::MapSite => apply_map_site(&tx, operation)?,
         CoreSyncResourceKind::MapScene => apply_map_scene(&tx, operation)?,
         CoreSyncResourceKind::MapDevicePlacement => apply_map_device_placement(&tx, operation)?,
+        CoreSyncResourceKind::OrgUnitType
+        | CoreSyncResourceKind::OrgUnit
+        | CoreSyncResourceKind::OrgPosition
+        | CoreSyncResourceKind::OrgUnitDeputyHead
+        | CoreSyncResourceKind::OrgReportingLine
+        | CoreSyncResourceKind::OrgExternalPerson
+        | CoreSyncResourceKind::OrgAssignment
+        | CoreSyncResourceKind::OrgStructureSettings
+        | CoreSyncResourceKind::OrgChangeSet
+        | CoreSyncResourceKind::OrgDeputy
+        | CoreSyncResourceKind::OrgAbsence => {
+            crate::services::org_structure::replication::apply(&tx, descriptor.kind, operation)?
+        }
     };
 
     if lww_tracked && authorized {

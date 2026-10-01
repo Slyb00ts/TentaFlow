@@ -1,0 +1,150 @@
+/* =============================================================================
+   org-structure-cover.css — the Widoczność tab (who sees what) and the org
+   sections of the profile page (absences, deputies). Layout only: controls
+   are tf-* components styled by controls.css.
+   ============================================================================= */
+
+/* ---- Widoczność ---- */
+
+.org-vis-top {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--tf-space-md, 12px);
+  margin-bottom: var(--tf-space-md, 12px);
+}
+
+.org-vis-pick { flex: 0 1 340px; min-width: 220px; }
+.org-vis-self { font-size: 13px; color: var(--tf-text-2); }
+.org-vis-chips { display: flex; flex-wrap: wrap; gap: var(--tf-space-sm, 8px); }
+
+.org-vis-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+  gap: var(--tf-space-md, 12px);
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .org-vis-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+.org-vis-card {
+  min-width: 0;
+  padding: var(--tf-space-md, 12px) var(--tf-space-lg, 16px);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg, 12px);
+  background: var(--tf-bg-card);
+}
+
+.org-vis-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+  margin-bottom: var(--tf-space-sm, 8px);
+}
+
+.org-vis-card-head h3 { margin: 0; font-size: 15px; font-weight: 600; color: var(--tf-text); }
+.org-vis-hint { font-size: 12px; color: var(--tf-text-3); }
+
+.org-vis-scroll { overflow-x: auto; }
+
+.org-vis-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+
+.org-vis-table th {
+  padding: 6px 8px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--tf-text-3);
+}
+
+.org-vis-table td {
+  padding: 10px 8px;
+  border-top: 1px solid var(--tf-border);
+  vertical-align: top;
+  color: var(--tf-text-2);
+}
+
+.org-vis-area b { display: block; color: var(--tf-text); font-weight: 600; }
+.org-vis-sub { display: block; margin-top: 2px; font-size: 12px; color: var(--tf-text-3); overflow-wrap: anywhere; }
+
+.org-vis-verdict {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.org-vis-yes { color: var(--tf-success); }
+.org-vis-part { color: var(--tf-warning); }
+.org-vis-no { color: var(--tf-danger); }
+
+.org-vis-rule { font-size: 12px; color: var(--tf-text-2); }
+.org-vis-rule-none { color: var(--tf-text-3); font-style: italic; }
+
+.org-vis-who-ask { margin-bottom: var(--tf-space-sm, 8px); font-size: 12px; color: var(--tf-text-3); }
+.org-vis-who { display: flex; flex-direction: column; }
+
+.org-vis-who-row {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-sm, 8px);
+  padding: 8px 0;
+  border-top: 1px solid var(--tf-border);
+}
+
+.org-vis-who-main { flex: 1 1 auto; min-width: 0; }
+.org-vis-who-name { font-size: 13px; font-weight: 600; color: var(--tf-text); overflow-wrap: anywhere; }
+.org-vis-who-kinds { font-size: 12px; color: var(--tf-text-3); overflow-wrap: anywhere; }
+.org-vis-who-row .org-vis-rule { flex: 0 0 auto; max-width: 42%; text-align: right; }
+
+.org-vis-note {
+  margin: var(--tf-space-md, 12px) 0 0;
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+/* ---- Profile sections: absences and deputies ---- */
+
+.org-cover { display: flex; flex-direction: column; gap: var(--tf-space-md, 12px); margin-top: var(--tf-space-md, 12px); }
+
+.org-cover-section {
+  padding: var(--tf-space-md, 12px) var(--tf-space-lg, 16px);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg, 12px);
+  background: var(--tf-bg-card);
+}
+
+.org-cover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--tf-space-sm, 8px);
+  margin-bottom: var(--tf-space-sm, 8px);
+}
+
+.org-cover-head h2 { margin: 0; font-size: 15px; font-weight: 600; color: var(--tf-text); }
+.org-cover-note { margin: 0 0 var(--tf-space-sm, 8px); font-size: 12px; color: var(--tf-text-3); }
+.org-cover-empty { padding: var(--tf-space-sm, 8px) 0; font-size: 13px; color: var(--tf-text-3); }
+
+.org-cover-row {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-sm, 8px);
+  padding: 8px 0;
+  border-top: 1px solid var(--tf-border);
+}
+
+.org-cover-main { flex: 1 1 auto; min-width: 0; }
+.org-cover-title { font-size: 13px; font-weight: 600; color: var(--tf-text); overflow-wrap: anywhere; }
+.org-cover-meta { font-size: 12px; color: var(--tf-text-3); overflow-wrap: anywhere; }
+.org-cover-tags { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; flex: 0 0 auto; }
+.org-cover-more { flex: 0 0 32px; min-width: 32px; }

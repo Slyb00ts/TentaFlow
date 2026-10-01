@@ -117,7 +117,7 @@ fn locale_to_summary(loc: PlatformLocale) -> PlatformLocaleSummary {
 fn map_repo_err(err: RoleCatalogError) -> ProtocolError {
     match err {
         RoleCatalogError::NotFound(_) => ProtocolError::not_found(err.to_string()),
-        RoleCatalogError::SlugConflict { .. } => {
+        RoleCatalogError::SlugConflict { .. } | RoleCatalogError::InUse { .. } => {
             ProtocolError::new(ProtocolErrorCode::Conflict, err.to_string())
         }
         RoleCatalogError::InvalidSlug(_)

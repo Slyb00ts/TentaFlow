@@ -7,6 +7,10 @@
 //       Ustawienie `.anchor = element` przenosi panel na position:fixed i
 //       ustawia go POD (albo, gdy brak miejsca, NAD) kotwica — kotwica nigdy
 //       nie jest zaslonieta. Bez `.anchor` panel dziala jak dotad.
+//       Atrybut `heading` pokazuje nieklikalny naglowek nad pozycjami (o czym jest
+//       menu), a atrybut `hint` pozycji dokleja pod etykieta krotkie wyjasnienie
+//       (np. dlaczego pozycja jest wylaczona). Strzalki, Home/End i Enter/Spacja
+//       obsluguja pozycje z klawiatury, gdy fokus jest w menu.
 //       Atrybut `compact` zdejmuje 180px min-width i zweza wiersze — dla menu
 //       kotwiczonego w tabeli, gdzie panel wisi nad rekordami. Tylko dla
 //       wskaznika: zwezony wiersz jest ponizej celu dotykowego 44px.
@@ -38,7 +42,7 @@ function safeIconName(value) {
 
 class TfMenuItem extends HTMLElement {
   static get observedAttributes() {
-    return ['icon', 'danger', 'action', 'disabled', 'shortcut', 'label'];
+    return ['icon', 'danger', 'action', 'disabled', 'shortcut', 'label', 'hint'];
   }
 
   constructor() {
@@ -91,7 +95,13 @@ class TfMenuItem extends HTMLElement {
     const shortcutHtml = shortcut
       ? `<span class="tf-menu-item-shortcut">${escapeHtml(shortcut)}</span>`
       : '';
-    this._btn.innerHTML = `${iconHtml}<span>${escapeHtml(this._label)}</span>${shortcutHtml}`;
+    const hint = this.getAttribute('hint');
+    const textHtml = hint
+      ? `<span class="tf-menu-item-text"><span>${escapeHtml(this._label)}</span><small class="tf-menu-item-hint">${escapeHtml(hint)}</small></span>`
+      : `<span>${escapeHtml(this._label)}</span>`;
+    if (hint) this._btn.setAttribute('title', hint);
+    else this._btn.removeAttribute('title');
+    this._btn.innerHTML = `${iconHtml}${textHtml}${shortcutHtml}`;
   }
 
   _onClick(e) {
@@ -123,7 +133,7 @@ customElements.define('tf-menu-divider', TfMenuDivider);
 
 class TfMenu extends HTMLElement {
   static get observedAttributes() {
-    return ['open', 'placement'];
+    return ['open', 'placement', 'heading'];
   }
 
   constructor() {
@@ -132,6 +142,7 @@ class TfMenu extends HTMLElement {
     this._box = null;
     this._anchor = null;
     this._staggerTimers = [];
+    this._headingEl = null;
     this._onDocClick = this._onDocClick.bind(this);
     this._onSelect = this._onSelect.bind(this);
     this._onKey = this._onKey.bind(this);
@@ -165,7 +176,7 @@ class TfMenu extends HTMLElement {
   attributeChangedCallback(name) {
     if (!this._box) return;
     if (name === 'open') this._update();
-    if (name === 'placement') this._update();
+    if (name === 'placement' || name === 'heading') this._update();
   }
 
   open() { this.setAttribute('open', ''); }
@@ -177,6 +188,11 @@ class TfMenu extends HTMLElement {
     const box = document.createElement('div');
     box.className = 'tf-menu';
     box.setAttribute('role', 'menu');
+    const heading = document.createElement('div');
+    heading.className = 'tf-menu-heading';
+    heading.hidden = true;
+    box.appendChild(heading);
+    this._headingEl = heading;
     const slot = document.createElement('slot');
     box.appendChild(slot);
     this._shadow.appendChild(box);
@@ -186,6 +202,9 @@ class TfMenu extends HTMLElement {
   _update() {
     const placement = this.getAttribute('placement') || 'bottom-start';
     this._box.setAttribute('data-placement', placement);
+    const heading = this.getAttribute('heading') || '';
+    this._headingEl.textContent = heading;
+    this._headingEl.hidden = !heading;
     const isOpen = this.hasAttribute('open');
     if (isOpen) {
       if (!this._wasOpen) Sfx.play('menu-open');
@@ -294,6 +313,20 @@ class TfMenu extends HTMLElement {
     if (e.key === 'Escape') {
       e.stopPropagation();
       this.close();
+      return;
+    }
+    if (!this.contains(document.activeElement)) return;
+    const rows = [...this.querySelectorAll(':scope > tf-menu-item > .tf-menu-item')];
+    const at = rows.indexOf(document.activeElement);
+    if (at < 0) return;
+    const go = (i) => { e.preventDefault(); rows[(i + rows.length) % rows.length].focus(); };
+    if (e.key === 'ArrowDown') go(at + 1);
+    else if (e.key === 'ArrowUp') go(at - 1);
+    else if (e.key === 'Home') go(0);
+    else if (e.key === 'End') go(rows.length - 1);
+    else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      rows[at].click();
     }
   }
 

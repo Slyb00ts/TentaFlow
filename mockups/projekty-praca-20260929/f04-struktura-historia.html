@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Struktura organizacyjna · historia i reorganizacja (F04)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<link rel="stylesheet" href="shared/projekty.css">
+<link rel="stylesheet" href="shared/praca.css">
+<link rel="stylesheet" href="shared/akcje.css">
+<style>
+
+.screen-frame { position: relative; }
+.org-toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+.org-toolbar .search-box { min-width: 290px; }
+.org-toolbar .grow { flex: 1; }
+.path-strip { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12px; color: var(--text-3); min-width: 0; }
+.path-strip .ps { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px 3px 4px; border-radius: 999px; background: var(--soft); border: 1px solid var(--border); color: var(--text-2); font-weight: 600; }
+.path-strip .ps .av { width: 20px; height: 20px; font-size: 8px; }
+.path-strip .ps.end { color: var(--text); border-color: rgba(99,102,241,.55); background: rgba(99,102,241,.12); }
+.path-strip .icon { width: 12px; height: 12px; }
+.org-canvas { height: 700px; }
+.org-scroll { position: absolute; inset: 0; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--border-hover) transparent; }
+.org-zoom { position: relative; }
+.org-plane { position: relative; transform-origin: 0 0; }
+.org-plane > svg.org-lines { position: absolute; left: 0; top: 0; pointer-events: none; overflow: visible; }
+.org-card { height: 52px; padding: 8px 10px 8px 13px; gap: 9px; animation-fill-mode: backwards; cursor: pointer; }
+.org-card .av { width: 30px; height: 30px; font-size: 10.5px; }
+.org-card { width: 206px; }
+.oc-txt { min-width: 0; flex: 1; }
+.oc-name, .oc-role { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.oc-name { font-size: 12.5px; letter-spacing: -0.005em; }
+.oc-tag { position: absolute; top: -8px; right: 10px; font-size: 9.5px; font-weight: 800; padding: 1px 7px; border-radius: 999px; background: var(--bg-3); border: 1px solid var(--border-hover); color: var(--text-2); letter-spacing: .02em; white-space: nowrap; }
+.oc-tag.acc { background: rgba(99,102,241,.18); border-color: rgba(99,102,241,.5); color: #c7d2fe; }
+.oc-tag.me { background: rgba(45,212,191,.14); border-color: rgba(45,212,191,.5); color: var(--agent); }
+.oc-tag.plan { background: rgba(245,158,11,.14); border-color: rgba(245,158,11,.45); color: var(--warning); }
+.oc-tag.staff { background: rgba(167,139,250,.16); border-color: rgba(167,139,250,.45); color: var(--accent-2); }
+.oc-count { position: absolute; right: 10px; bottom: -9px; font-size: 10px; font-weight: 800; padding: 0 7px; border-radius: 999px; background: var(--bg-3); border: 1px solid var(--border-hover); color: var(--text-2); }
+.org-card.on-path { border-color: rgba(99,102,241,.5); }
+.org-card.vacancy .oc-name { color: var(--text-3); font-style: italic; font-weight: 700; }
+.org-card.ghost { border-style: dashed; background: transparent; box-shadow: none; opacity: .55; }
+.org-card.ghost .oc-name { color: var(--text-3); }
+.av-vac { background: transparent; border: 1.5px dashed var(--border-hover); color: var(--text-3); }
+.av-vac .icon { width: 14px; height: 14px; }
+.org-card.me { box-shadow: 0 0 0 3px rgba(45,212,191,.14); }
+.org-card.pulse { animation: pr-pop .5s var(--ease-overshoot); }
+.org-more { transform: translateX(-50%); cursor: pointer; }
+.org-lines path.staff { stroke: rgba(167,139,250,.6); }
+.org-lines path.planned { stroke: var(--accent-2); stroke-dasharray: 5 5; animation: none; }
+.canvas-tools { z-index: 6; align-items: center; }
+.canvas-tools .ct { width: 30px; height: 30px; border-radius: 7px; border: 0; background: transparent; color: var(--text-2); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; font: inherit; font-size: 11.5px; font-weight: 800; }
+.canvas-tools .ct:hover { background: var(--bg-3); color: var(--text); }
+.canvas-tools .ct.wide { width: auto; padding: 0 8px; }
+.canvas-tools .sep { width: 1px; align-self: stretch; background: var(--border); margin: 3px 3px; }
+.minimap { z-index: 6; }
+.minimap svg { width: 100%; height: 100%; display: block; }
+.canvas-hint { position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%); z-index: 6; font-size: 11.5px; color: var(--text-3); background: rgba(10,13,36,.85); border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; display: flex; gap: 8px; align-items: center; white-space: nowrap; }
+.org-legend { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: center; margin-top: 12px; font-size: 11.5px; color: var(--text-2); }
+.org-legend .lg { display: inline-flex; align-items: center; gap: 7px; }
+.org-legend .lg i { width: 10px; height: 10px; border-radius: 3px; background: var(--c); display: inline-block; }
+.org-legend .lg b { color: var(--text); font-variant-numeric: tabular-nums; }
+.org-legend .lg-sep { width: 1px; height: 14px; background: var(--border); }
+.org-legend .sym { width: 22px; height: 12px; border-radius: 4px; border: 1px solid var(--border-hover); display: inline-block; }
+.org-legend .sym.vac { border-style: dashed; }
+.org-legend .sym.stf { border-color: rgba(167,139,250,.6); }
+
+.org-canvas.cmp { padding: 8px 0; overflow: hidden; }
+.org-card.mini { padding: 0 8px 0 10px; gap: 7px; border-radius: 9px; }
+.org-card.mini .av { width: 22px; height: 22px; font-size: 8.5px; }
+.org-card.mini .oc-name { font-size: 11.5px; }
+.org-card.mini::before { top: 8px; bottom: 8px; }
+.org-card.mini .oc-tag { top: -8px; font-size: 9px; }
+.oc-tag.new { background: rgba(34,197,94,.16); border-color: rgba(34,197,94,.5); color: #86efac; }
+.org-card.moved { border-color: rgba(245,158,11,.65); box-shadow: 0 0 0 3px rgba(245,158,11,.1); }
+.org-card.new { border-color: rgba(34,197,94,.6); box-shadow: 0 0 0 3px rgba(34,197,94,.1); }
+.org-card.moved.vacancy { border-style: dashed; }
+.org-lines path.moved { stroke: rgba(245,158,11,.7); stroke-dasharray: 5 5; animation: none; }
+.date-card { padding: 20px 22px; }
+.date-top { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+.date-top .big { font-size: 30px; font-weight: 800; letter-spacing: -.02em; line-height: 1; }
+.date-top .sm { font-size: 12px; color: var(--text-3); }
+.slider { position: relative; height: 64px; margin: 8px 16px 0; }
+.slider .rail { position: absolute; left: 0; right: 0; top: 24px; height: 6px; border-radius: 3px; background: var(--bg-3); }
+.slider .past { position: absolute; left: 0; top: 24px; height: 6px; width: 74%; border-radius: 3px 0 0 3px; background: var(--gradient-accent); transform-origin: left; animation: pr-grow-x var(--dur-deliberate) var(--ease-emphasized) both; }
+.slider .future { position: absolute; left: 74%; right: 0; top: 24px; height: 6px; border-radius: 0 3px 3px 0; background: repeating-linear-gradient(45deg, rgba(245,158,11,.5) 0 5px, rgba(245,158,11,.15) 5px 10px); }
+.slider .mk { position: absolute; top: 18px; width: 2px; height: 18px; background: var(--border-hover); transform: translateX(-1px); }
+.slider .mk.plan { background: var(--warning); }
+.slider .mk::after { content: attr(data-d); position: absolute; top: 24px; left: 50%; transform: translateX(-50%); font-size: 10.5px; color: var(--text-3); white-space: nowrap; font-weight: 600; }
+.slider .mk.edge::after { color: var(--text-2); }
+.slider .today { position: absolute; top: 4px; left: 74%; transform: translateX(-50%); font-size: 10px; font-weight: 800; color: var(--accent-2); }
+.slider .today::after { content: ''; position: absolute; left: 50%; top: 14px; width: 2px; height: 10px; background: var(--accent-1); transform: translateX(-50%); }
+.slider .knob { position: absolute; left: 96%; top: 16px; width: 22px; height: 22px; margin-left: -11px; border-radius: 50%; background: #fff; border: 4px solid var(--accent-1); box-shadow: 0 0 0 5px rgba(99,102,241,.2), var(--shadow-sm); cursor: grab; }
+.slider .tick-lbl { position: absolute; top: -14px; white-space: nowrap; font-size: 10.5px; font-weight: 800; color: var(--warning); transform: translateX(-50%); left: 96%; }
+.quick { display: flex; gap: 8px; align-items: center; margin-top: 4px; flex-wrap: wrap; }
+.cols { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 16px; align-items: start; margin-top: 16px; }
+.tl-item .who { font-size: 11px; color: var(--text-3); }
+.tl-item.tl-plan .tl-dot { border-style: dashed; color: var(--warning); border-color: rgba(245,158,11,.7); background: rgba(245,158,11,.1); }
+.diff { display: inline-flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 11.5px; flex-wrap: wrap; }
+.diff .o { color: var(--text-3); text-decoration: line-through; }
+.diff .n { color: var(--text); font-weight: 700; }
+.diff .icon { width: 11px; height: 11px; color: var(--text-3); }
+.reorg h3 { display: flex; align-items: center; gap: 10px; }
+.reorg .r-title { font-size: 15px; font-weight: 800; }
+.reorg .r-sub { font-size: 12px; color: var(--text-3); margin: 2px 0 14px; }
+.r-changes { display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+.r-ch { display: flex; gap: 10px; align-items: flex-start; font-size: 12.5px; padding: 8px 10px; border-radius: 9px; background: var(--soft); border: 1px solid var(--border); }
+.r-ch .n { width: 20px; height: 20px; border-radius: 50%; background: var(--bg-3); font-size: 10.5px; font-weight: 800; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; color: var(--text-2); }
+.r-ch span.s { display: block; font-size: 11.5px; color: var(--text-3); }
+.appr { display: flex; flex-direction: column; gap: 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-card); margin-bottom: 14px; }
+.appr-row { display: flex; align-items: center; gap: 10px; font-size: 12.5px; }
+.appr-row .st { margin-left: auto; }
+.appr-row .av { width: 26px; height: 26px; font-size: 9.5px; }
+.cmp-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.cmp-head .t { font-weight: 800; font-size: 13px; }
+.cmp-grid { display: grid; grid-template-columns: minmax(0, 1fr) 40px minmax(0, 1fr); gap: 0; align-items: center; }
+.cmp-arrow { display: flex; justify-content: center; color: var(--accent-2); }
+.cmp-arrow .icon { width: 22px; height: 22px; }
+.cmp-legend { display: flex; gap: 16px; margin-top: 12px; font-size: 11.5px; color: var(--text-3); flex-wrap: wrap; }
+.cmp-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.cmp-legend i { width: 11px; height: 11px; border-radius: 3px; border: 1.5px solid; display: inline-block; }
+
+</style>
+</head>
+<body>
+<!-- IKONY: sprite z shared/icons.html + kilka lokalnych symboli tego ekranu -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+<symbol id="i-sitemap" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="5" rx="1"/><rect x="2" y="17" width="6" height="5" rx="1"/><rect x="16" y="17" width="6" height="5" rx="1"/><path d="M12 7v4M5 17v-3h14v3"/></symbol>
+<symbol id="i-gantt" viewBox="0 0 24 24"><line x1="3" y1="4" x2="3" y2="20"/><rect x="5" y="5" width="8" height="3" rx="1"/><rect x="9" y="10.5" width="10" height="3" rx="1"/><rect x="7" y="16" width="6" height="3" rx="1"/></symbol>
+<symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></symbol>
+<symbol id="i-flag" viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+<symbol id="i-timer" viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6"/></symbol>
+<symbol id="i-user-x" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="18" y1="8" x2="23" y2="13"/><line x1="23" y1="8" x2="18" y2="13"/></symbol>
+<symbol id="i-merge" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></symbol>
+<symbol id="i-branch" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-package" viewBox="0 0 24 24"><path d="M16.5 9.4 7.5 4.21M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+<symbol id="i-radar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><path d="M12 2v10l7 5"/></symbol>
+<symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M2 16h.01M21.8 16c.2-2 .131-5.354 0-6"/><path d="M9 6.8a6 6 0 0 1 9 5.2c0 .47 0 1.17-.02 2"/></symbol>
+<symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+<symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+<symbol id="i-maximize" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></symbol>
+<symbol id="i-move" viewBox="0 0 24 24"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></symbol>
+<symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-palette" viewBox="0 0 24 24"><circle cx="13.5" cy="6.5" r="1"/><circle cx="17.5" cy="10.5" r="1"/><circle cx="8.5" cy="7.5" r="1"/><circle cx="6.5" cy="12.5" r="1"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.5-.75 1.5-1.5 0-.4-.15-.74-.4-1-.25-.25-.4-.6-.4-1 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.96-4.48-9-10-9z"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+<symbol id="i-scale" viewBox="0 0 24 24"><path d="M16 16l3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1zM2 16l3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1z"/><path d="M7 21h10M12 3v18M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+<symbol id="i-lightning" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+<symbol id="i-undo" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></symbol>
+<symbol id="i-redo" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.13-9.36L23 10"/></symbol>
+<symbol id="i-grip" viewBox="0 0 24 24"><circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/></symbol>
+<symbol id="i-crosshair" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><line x1="12" y1="2" x2="12" y2="6"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="2" y1="12" x2="6" y2="12"/><line x1="18" y1="12" x2="22" y2="12"/></symbol>
+<symbol id="i-hand" viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 0 0-4 0M14 10V4a2 2 0 0 0-4 0v2M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></symbol>
+<symbol id="i-git-compare" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7M11 18H8a2 2 0 0 1-2-2V9"/></symbol>
+</defs></svg>
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">F04</span>
+    <h2>Struktura — historia i reorganizacja</h2>
+    <div class="desc">Suwak „stan na dzień”, lista zmian z diffem, reorganizacja planowana z zatwierdzeniem i porównanie przed / po.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+<aside class="sidebar">
+  <div class="logo"><span class="name">TentaFlow</span></div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-home"/></svg>Pulpit</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-services"/></svg>Serwisy</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</a>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+    <a class="nav-item" href="p01-lista.html"><svg class="icon"><use href="#i-folder"/></svg>Projekty</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-bot"/></svg>Agenci</a>
+    <a class="nav-item" href="d01-edytor-workflow.html"><svg class="icon"><use href="#i-branch"/></svg>Flow Builder</a>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</a>
+    <a class="nav-item active" href="f01-struktura.html"><svg class="icon"><use href="#i-sitemap"/></svg>Struktura organizacyjna</a>
+    <a class="nav-item" href="f05-prywatnosc.html"><svg class="icon"><use href="#i-fingerprint"/></svg>Prywatność</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</a>
+  </div>
+  <div class="footer">
+    <a class="user-chip" href="g01-profil.html" title="Mój profil"><div class="av av-1">AK</div><div><div class="name-t">Anna Kowalska</div><div class="role">PM · Dział Realizacji</div></div></a>
+  </div>
+</aside>
+      <main class="main">
+        <div class="breadcrumb"><span>Zarządzanie</span><svg class="icon icon-sm"><use href="#i-chevron-r"/></svg><span class="current">Struktura organizacyjna</span></div>
+
+        <div class="detail-header pr-enter">
+          <div class="big-ico"><svg><use href="#i-sitemap"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Struktura organizacyjna</div>
+            <div class="d-sub">Solutio sp. z o.o. · 212 osób · 34 jednostki · stan na dziś</div>
+            <div class="d-badges"><span class="chip"><svg class="icon"><use href="#i-history"/></svg>6 zmian w 2026</span><span class="chip warning"><svg class="icon"><use href="#i-calendar"/></svg>1 reorganizacja zaplanowana</span></div>
+          </div>
+          <div class="d-actions">
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport stanu na dzień</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-plus"/></svg>Nowa reorganizacja</button><!-- otwiera: F02 · tryb edycji z datą przyszłą -->
+          </div>
+        </div>
+        <div class="tabs-bar">
+          <a class="tab" href="f01-struktura.html"><svg class="icon"><use href="#i-sitemap"/></svg>Drzewo</a>
+          <a class="tab" href="f03-struktura-lista-import.html"><svg class="icon"><use href="#i-list"/></svg>Lista i import</a>
+          <a class="tab" href="f06-struktura-widocznosc.html"><svg class="icon"><use href="#i-eye"/></svg>Widoczność</a>
+          <a class="tab active" href="f04-struktura-historia.html"><svg class="icon"><use href="#i-history"/></svg>Historia</a>
+          <a class="tab" href="f01-struktura.html"><svg class="icon"><use href="#i-tag"/></svg>Katalog ról</a>
+        </div>
+        <div class="section-card date-card pr-enter">
+          <div class="date-top">
+            <div><div class="sm">Stan struktury na dzień</div><div class="big">01.11.2026</div></div>
+            <span class="chip warning"><svg class="icon"><use href="#i-calendar"/></svg>za 33 dni · po reorganizacji</span>
+            <span style="flex:1"></span>
+            <div class="quick"><span class="calm-note">Skocz do:</span>
+              <div class="pill-tabs"><button>01.01.2026</button><button>Dziś, 29.09</button><button class="active">01.11.2026</button></div></div>
+          </div>
+          <div class="slider" role="slider" aria-label="Stan na dzień" aria-valuetext="01.11.2026" tabindex="0">
+            <div class="rail"></div><div class="past"></div><div class="future"></div>
+            <span class="mk edge" style="left:0" data-d="01.01.2026"></span>
+            <span class="mk" style="left:24%" data-d="12.05"></span>
+            <span class="mk" style="left:47%" data-d="01.07"></span>
+            <span class="mk" style="left:70%" data-d="15.09"></span>
+            <span class="today">dziś</span>
+            <span class="mk plan" style="left:96%" data-d="01.11"></span>
+            <span class="tick-lbl">3 zmiany</span>
+            <span class="knob"></span>
+            <span class="mk edge" style="left:100%" data-d=""></span>
+          </div>
+        </div>
+        <div class="cols">
+          <div class="section-card pr-enter" style="margin:0">
+            <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-history"/></svg>Zmiany w strukturze</div><span class="hint">od 01.01.2026 do 01.11.2026</span></div>
+            <div class="timeline pr-stagger">
+              <div class="tl-item tl-plan"><span class="tl-dot"><svg class="icon"><use href="#i-calendar"/></svg></span><b>01.11.2026</b><span class="tl-time">planowana</span><div>Reorganizacja Q4: nowy Zespół Jakości (3 zmiany)</div><div class="who">przygotowała Hanna Krawczyk · czeka na zatwierdzenie</div></div>
+              <div class="tl-item tl-accent"><span class="tl-dot"><svg class="icon"><use href="#i-plus"/></svg></span><b>15.09.2026</b><div>Nowe stanowisko: Tester automatyzujący (wakat)</div><div class="diff"><span class="n">Zespół NextApp</span><span class="o">brak</span></div><div class="who">źródło: ręcznie · Hanna Krawczyk</div></div>
+              <div class="tl-item tl-good"><span class="tl-dot"><svg class="icon"><use href="#i-users"/></svg></span><b>01.09.2026</b><div>Paweł Szymański: zastępca kierownika zespołu</div><div class="diff"><span class="o">brak zastępcy</span><svg class="icon"><use href="#i-chevron-r"/></svg><span class="n">Paweł Szymański</span></div><div class="who">źródło: import</div></div>
+              <div class="tl-item"><span class="tl-dot"><svg class="icon"><use href="#i-git"/></svg></span><b>01.07.2026</b><div>Zespół DevOps przeniesiony do Działu Realizacji</div><div class="diff"><span class="o">Adam Woźniak</span><svg class="icon"><use href="#i-chevron-r"/></svg><span class="n">Magdalena Kamińska</span></div><div class="who">Jan Wójcik · źródło: import</div></div>
+              <div class="tl-item"><span class="tl-dot"><svg class="icon"><use href="#i-user-x"/></svg></span><b>12.05.2026</b><div>Odejście: stanowisko „Specjalista ds. wdrożeń” staje się wakatem</div><div class="who">otwarte sprawy przekazano przełożonemu · źródło: eDokumenty</div></div>
+              <div class="tl-item"><span class="tl-dot"><svg class="icon"><use href="#i-upload"/></svg></span><b>01.01.2026</b><div>Import początkowy struktury: 199 stanowisk</div><div class="who">źródło: import · Hanna Krawczyk</div></div>
+            </div>
+          </div>
+          <div class="section-card reorg pr-enter" style="margin:0">
+            <h3><svg class="icon"><use href="#i-layers"/></svg>Reorganizacja planowana</h3>
+            <div class="r-title">Zespół Jakości w Dziale Realizacji</div>
+            <div class="r-sub">Wchodzi w życie 01.11.2026 automatycznie · 3 zmiany · 3 osoby, 1 wakat</div>
+            <div class="r-changes">
+              <div class="r-ch"><span class="n">1</span><div>Nowa jednostka <b>Zespół Jakości</b><span class="s">kierownik: Karolina Dąbrowska (dotąd Zespół NextApp)</span></div></div>
+              <div class="r-ch"><span class="n">2</span><div>Wakat <b>Tester automatyzujący</b> przechodzi do nowej jednostki<span class="s">z Zespołu NextApp</span></div></div>
+              <div class="r-ch"><span class="n">3</span><div><b>Ewa Wiśniewska</b> zmienia przełożoną<span class="s">Anna Kowalska → Karolina Dąbrowska</span></div></div>
+            </div>
+            <div class="appr">
+              <div class="appr-row"><span class="av av-8">MK</span>Magdalena Kamińska<span class="st chip success"><svg class="icon"><use href="#i-check"/></svg>zatwierdziła 28.09</span></div>
+              <div class="appr-row"><span class="av av-5">AW</span>Adam Woźniak<span class="st chip success"><svg class="icon"><use href="#i-check"/></svg>zatwierdził 28.09</span></div>
+              <div class="appr-row"><span class="av av-3">KM</span>Krzysztof Malinowski<span class="st chip warning"><span class="dot"></span>czeka na decyzję</span></div>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <button class="btn btn-primary"><svg class="icon"><use href="#i-check-circle"/></svg>Zatwierdź reorganizację</button><!-- otwiera: F04 · potwierdzenie zatwierdzenia -->
+              <a class="btn btn-ghost" href="f02-struktura-edycja.html">Edytuj w trybie edycji</a>
+              <button class="btn btn-ghost" data-act="archive" data-menu="reorganization" data-label="Wycofaj reorganizację…" data-subject="Zespół Jakości w Dziale Realizacji"><svg class="icon"><use href="#i-history"/></svg>Wycofaj reorganizację</button>
+            </div>
+            <div class="calm-note" style="margin-top:10px">Do 01.11 nic się nie zmienia. Możesz wycofać reorganizację w każdej chwili.</div>
+          </div>
+        </div>
+        <div class="section-card pr-enter" style="margin-top:16px">
+          <div class="section-card-head"><div class="title"><svg class="icon"><use href="#i-git-compare"/></svg>Przed i po — Dział Realizacji</div><span class="hint">porównanie stanu na dziś i na 01.11.2026</span></div>
+          <div class="cmp-grid">
+            <div><div class="cmp-head"><span class="t">Dziś, 29.09.2026</span><span class="chip">31 osób</span></div><div class="org-canvas cmp" style="height:414px"><div class="org-plane" style="width:330px;height:398px;margin:0 auto"><svg class="org-lines" width="330" height="398" viewBox="0 0 330 398"><path d="M20 122V142Q20 150 28 150H26" style="--len:31;animation-delay:200ms"/><path d="M20 122V184Q20 192 28 192H26" style="--len:73;animation-delay:200ms"/><path d="M20 122V226Q20 234 28 234H26" style="--len:115;animation-delay:200ms"/><path class="moved" d="M20 122V268Q20 276 28 276H26" style="--len:157;animation-delay:200ms"/><path class="moved" d="M20 122V310Q20 318 28 318H26" style="--len:199;animation-delay:200ms"/><path class="moved" d="M20 122V352Q20 360 28 360H26" style="--len:241;animation-delay:200ms"/><path d="M182 122V142Q182 150 190 150H188" style="--len:31;animation-delay:200ms"/><path d="M182 122V184Q182 192 190 192H188" style="--len:73;animation-delay:200ms"/><path d="M157 50V60Q157 68 149 68H84Q76 68 76 76V86" style="--len:110;animation-delay:200ms"/><path d="M157 50V60Q157 68 165 68H230Q238 68 238 76V86" style="--len:110;animation-delay:200ms"/></svg><div class="org-card mini " style="left:10px;top:86px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-1">AK</span><div class="oc-txt"><div class="oc-name">A. Kowalska</div></div><span class="oc-tag acc">NextApp</span></div><div class="org-card mini " style="left:26px;top:132px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-2">PS</span><div class="oc-txt"><div class="oc-name">P. Szymański</div></div></div><div class="org-card mini " style="left:26px;top:174px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-2">MN</span><div class="oc-txt"><div class="oc-name">M. Nowak</div></div></div><div class="org-card mini " style="left:26px;top:216px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-3">PZ</span><div class="oc-txt"><div class="oc-name">P. Zieliński</div></div></div><div class="org-card mini moved" style="left:26px;top:258px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-4">EW</span><div class="oc-txt"><div class="oc-name">E. Wiśniewska</div></div></div><div class="org-card mini moved" style="left:26px;top:300px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-6">KD</span><div class="oc-txt"><div class="oc-name">K. Dąbrowska</div></div></div><div class="org-card mini moved vacancy" style="left:26px;top:342px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-vac"><svg class="icon"><use href="#i-user"/></svg></span><div class="oc-txt"><div class="oc-name">wakat: tester</div></div></div><div class="org-card mini " style="left:172px;top:86px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-7">JW</span><div class="oc-txt"><div class="oc-name">J. Wójcik</div></div><span class="oc-tag acc">DevOps</span></div><div class="org-card mini " style="left:188px;top:132px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-7">KR</span><div class="oc-txt"><div class="oc-name">K. Rutkowski</div></div></div><div class="org-card mini " style="left:188px;top:174px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-4">NG</span><div class="oc-txt"><div class="oc-name">N. Górska</div></div></div><div class="org-card mini " style="left:91px;top:14px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-8">MK</span><div class="oc-txt"><div class="oc-name">M. Kamińska</div></div></div></div></div></div>
+            <div class="cmp-arrow"><svg class="icon" style="transform:scaleX(-1)"><use href="#i-arrow-left"/></svg></div>
+            <div><div class="cmp-head"><span class="t">01.11.2026</span><span class="chip warning">po reorganizacji</span></div><div class="org-canvas cmp" style="height:414px"><div class="org-plane" style="width:492px;height:398px;margin:0 auto"><svg class="org-lines" width="492" height="398" viewBox="0 0 492 398"><path d="M20 122V142Q20 150 28 150H26" style="--len:31;animation-delay:200ms"/><path d="M20 122V184Q20 192 28 192H26" style="--len:73;animation-delay:200ms"/><path d="M20 122V226Q20 234 28 234H26" style="--len:115;animation-delay:200ms"/><path d="M182 122V142Q182 150 190 150H188" style="--len:31;animation-delay:200ms"/><path d="M182 122V184Q182 192 190 192H188" style="--len:73;animation-delay:200ms"/><path class="moved" d="M344 122V142Q344 150 352 150H350" style="--len:31;animation-delay:200ms"/><path class="moved" d="M344 122V184Q344 192 352 192H350" style="--len:73;animation-delay:200ms"/><path d="M238 50V60Q238 68 230 68H84Q76 68 76 76V86" style="--len:191;animation-delay:200ms"/><path d="M238 50V86" style="--len:36;animation-delay:200ms"/><path class="moved" d="M238 50V60Q238 68 246 68H392Q400 68 400 76V86" style="--len:191;animation-delay:200ms"/></svg><div class="org-card mini " style="left:10px;top:86px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-1">AK</span><div class="oc-txt"><div class="oc-name">A. Kowalska</div></div><span class="oc-tag acc">NextApp</span></div><div class="org-card mini " style="left:26px;top:132px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-2">PS</span><div class="oc-txt"><div class="oc-name">P. Szymański</div></div></div><div class="org-card mini " style="left:26px;top:174px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-2">MN</span><div class="oc-txt"><div class="oc-name">M. Nowak</div></div></div><div class="org-card mini " style="left:26px;top:216px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-3">PZ</span><div class="oc-txt"><div class="oc-name">P. Zieliński</div></div></div><div class="org-card mini " style="left:172px;top:86px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-7">JW</span><div class="oc-txt"><div class="oc-name">J. Wójcik</div></div><span class="oc-tag acc">DevOps</span></div><div class="org-card mini " style="left:188px;top:132px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-7">KR</span><div class="oc-txt"><div class="oc-name">K. Rutkowski</div></div></div><div class="org-card mini " style="left:188px;top:174px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-4">NG</span><div class="oc-txt"><div class="oc-name">N. Górska</div></div></div><div class="org-card mini new" style="left:334px;top:86px;width:132px;height:36px;--unit:#f472b6"><span class="av av-6">KD</span><div class="oc-txt"><div class="oc-name">K. Dąbrowska</div></div><span class="oc-tag new">nowy zespół</span></div><div class="org-card mini moved" style="left:350px;top:132px;width:132px;height:36px;--unit:#f472b6"><span class="av av-4">EW</span><div class="oc-txt"><div class="oc-name">E. Wiśniewska</div></div></div><div class="org-card mini moved vacancy" style="left:350px;top:174px;width:132px;height:36px;--unit:#f472b6"><span class="av av-vac"><svg class="icon"><use href="#i-user"/></svg></span><div class="oc-txt"><div class="oc-name">wakat: tester</div></div></div><div class="org-card mini " style="left:172px;top:14px;width:132px;height:36px;--unit:#38bdf8"><span class="av av-8">MK</span><div class="oc-txt"><div class="oc-name">M. Kamińska</div></div></div></div></div></div>
+          </div>
+          <div class="cmp-legend"><span><i style="border-color:rgba(245,158,11,.8)"></i>przeniesione</span><span><i style="border-color:rgba(34,197,94,.8)"></i>nowa jednostka</span><span><i style="border-color:var(--border-hover);border-style:dashed"></i>wakat</span></div>
+        </div>
+        <div class="toast-stack"></div>
+      </main>
+    </div>
+
+  </div>
+</section>
+<script src="shared/praca.js"></script>
+<script src="shared/akcje.js"></script>
+
+</body>
+</html>

@@ -60,6 +60,7 @@ pub mod mobile_camera;
 pub mod mobile_sensors;
 pub mod onnx_cv_service;
 pub mod org;
+pub mod org_structure;
 pub mod pickup_tokens;
 pub mod policy;
 pub mod ports;

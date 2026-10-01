@@ -50,6 +50,10 @@ pub enum RoleCatalogError {
     #[error("no active platform_locales found for org_id={0}")]
     NoActiveLocales(String),
 
+    /// Positions of the organization structure still point at the role.
+    #[error("role {id} is still used by {positions} position(s)")]
+    InUse { id: String, positions: i64 },
+
     #[error("role catalog DB error: {0}")]
     DbError(String),
 }

@@ -9,6 +9,8 @@
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { Router } from '/js/router.js';
+import { I18n } from '/js/i18n.js';
 
 // =============================================================================
 // Stale UI
@@ -19,12 +21,6 @@ const STRINGS = {
   crumbManagement: 'Struktura organizacyjna',
   crumbCatalog: 'Katalog ról',
   subtitle: 'Definicje ról biznesowych — kto kim jest. Co rola może zrobić konfigurujesz w Uprawnieniach.',
-
-  tabTree: 'Drzewo',
-  tabList: 'Lista',
-  tabCatalog: 'Katalog ról',
-  tabVisibility: 'Widoczność danych',
-  tabHistory: 'Historia zmian',
 
   actionNew: '+ Nowa rola',
   actionSave: 'Zapisz',
@@ -267,15 +263,15 @@ function renderScreen() {
     ? ''
     : `<div class="rc-readonly-banner">${escapeHtml(STRINGS.readOnlyBanner)}</div>`;
 
-  // Pill-tabs ekranow O-tool. Tylko `roles` jest aktywne; reszta to placeholder
-  // dla przyszlych ekranow (O1 drzewo, lista, widocznosc, historia).
+  // The strip is shared with the org-structure screen (same order and names as
+  // its own); every tab but this one navigates there.
   const orgTabs = `
     <tf-tabs variant="solid" value="roles" id="rc-org-tabs">
-      <tf-tab id="tree" disabled>${escapeHtml(STRINGS.tabTree)}</tf-tab>
-      <tf-tab id="list" disabled>${escapeHtml(STRINGS.tabList)}</tf-tab>
-      <tf-tab id="roles">${escapeHtml(STRINGS.tabCatalog)}</tf-tab>
-      <tf-tab id="visibility" disabled>${escapeHtml(STRINGS.tabVisibility)}</tf-tab>
-      <tf-tab id="history" disabled>${escapeHtml(STRINGS.tabHistory)}</tf-tab>
+      <tf-tab id="tree" icon="sitemap">${escapeHtml(I18n.t('org_structure.tab_tree'))}</tf-tab>
+      <tf-tab id="list" icon="list">${escapeHtml(I18n.t('org_structure.tab_list'))}</tf-tab>
+      <tf-tab id="visibility" icon="eye">${escapeHtml(I18n.t('org_structure.tab_visibility'))}</tf-tab>
+      <tf-tab id="history" icon="history">${escapeHtml(I18n.t('org_structure.tab_history'))}</tf-tab>
+      <tf-tab id="roles" icon="tag">${escapeHtml(I18n.t('org_structure.tab_roles'))}</tf-tab>
     </tf-tabs>
   `;
 
@@ -480,6 +476,16 @@ function pickTranslation(translations, preferredLocale) {
 
 function wireScreen(root) {
   byId('rc-new')?.addEventListener('click', () => openEditor('create', null));
+
+  // On a narrow screen the strip scrolls; the tab of this screen must be in view.
+  requestAnimationFrame(() => {
+    byId('rc-org-tabs')?.querySelector('tf-tab[id="roles"]')?.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+  });
+
+  byId('rc-org-tabs')?.addEventListener('change', (e) => {
+    const tab = e.detail?.value;
+    if (tab && tab !== 'roles') Router.navigate('org-structure', tab === 'tree' ? null : { tab });
+  });
 
   const sb = byId('rc-search');
   if (sb) {

@@ -563,10 +563,33 @@ pub fn update_role(
 
 /// Soft-delete: ustawia `is_active = 0`. Drugi deactivate na tym samym
 /// wpisie zwraca `NotFound` (nie aktualizuje juz nieaktywnego rekordu).
+///
+/// Refused while a current or planned position of the org structure uses the
+/// role: silently orphaning the reference would leave positions whose
+/// manager flag and permissions no longer resolve. Ended positions do not block.
 pub fn deactivate_role(pool: &DbPool, actor_user_id: &str, org_id: &str, id: &str) -> Result<()> {
     let now = now_utc();
+    // The organization's day, like every other date of the org structure.
+    let today = crate::services::org_structure::org_today(pool, org_id)
+        .map_err(map_db)?
+        .format("%Y-%m-%d")
+        .to_string();
     let affected = {
         let conn = pool.write().map_err(map_db)?;
+        let positions: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT position_id) FROM org_positions \
+                 WHERE org_id = ?1 AND role_id = ?2 AND (valid_to IS NULL OR valid_to > ?3)",
+                params![org_id, id, today],
+                |r| r.get(0),
+            )
+            .map_err(map_db)?;
+        if positions > 0 {
+            return Err(RoleCatalogError::InUse {
+                id: id.to_string(),
+                positions,
+            });
+        }
         conn.execute(
             "UPDATE role_catalog SET is_active = 0, updated_at = ?1 \
              WHERE org_id = ?2 AND id = ?3 AND is_active = 1",

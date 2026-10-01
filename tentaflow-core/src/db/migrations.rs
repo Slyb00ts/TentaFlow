@@ -1106,8 +1106,260 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "topic_acl_addon_subjects",
             MigrationStep::Sql(TOPIC_ACL_ADDON_SUBJECTS),
         ),
+        (178, "org_structure", MigrationStep::Sql(ORG_STRUCTURE)),
+        (179, "org_deputies_absences", MigrationStep::Sql(ORG_DEPUTIES_ABSENCES)),
+        (180, "org_handovers", MigrationStep::Sql(ORG_HANDOVERS)),
     ]
 }
+
+// v178 — organizational structure (docs/ORG_STRUCTURE_PLAN.md §1).
+//
+// Dates are TEXT 'YYYY-MM-DD' and every interval is half-open,
+// `[valid_from, valid_to)`, `valid_to IS NULL` meaning open-ended. The day is
+// the ORGANIZATION's day (`org_structure_settings.timezone`), so no column
+// stores an instant.
+//
+// `org_units` and `org_positions` rows are VERSIONS: `unit_id` / `position_id`
+// is the stable identity that everything else points at, `id` names one row of
+// its history. A change from date D (parent, head, name, role...) closes the
+// row with `valid_to = D` and opens the next with `valid_from = D`, so "state
+// on a day" shows the old name. Every other table's `id` is the identity itself
+// and its intervals are the lifetime of the fact.
+//
+// No SQL foreign keys, on purpose: every table replicates, and a row may reach
+// a peer before the row it names (same reason as the shared map, v169).
+// References are enforced by `services::org_structure` inside the write
+// transaction, together with what SQLite cannot express as a constraint
+// (one primary reporting line per position per day, no cycles over any
+// overlapping interval). For the same reason there is no UNIQUE constraint:
+// two nodes creating the same type name at once must both materialize, and the
+// duplicate is a visible data problem rather than a refused replication write.
+//
+// `org_positions.code` (and `org_units.code`) is the stable key the file
+// import and export match on (docs §2.5); a position without one is addressed
+// by a code derived from its id.
+//
+// User columns are TEXT UUIDs without REFERENCES and are listed in
+// `child_remaps()`, like every other column that names a `user_accounts` row.
+const ORG_STRUCTURE: &str = r#"
+CREATE TABLE IF NOT EXISTS org_unit_types (
+    id     TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    name   TEXT NOT NULL,
+    color  TEXT,
+    icon   TEXT
+);
+CREATE INDEX IF NOT EXISTS org_unit_types_org ON org_unit_types(org_id);
+
+CREATE TABLE IF NOT EXISTS org_units (
+    id               TEXT PRIMARY KEY,
+    org_id           TEXT NOT NULL,
+    unit_id          TEXT NOT NULL,
+    name             TEXT NOT NULL,
+    code             TEXT,
+    type_id          TEXT,
+    parent_unit_id   TEXT,
+    color            TEXT,
+    head_position_id TEXT,
+    valid_from       TEXT NOT NULL,
+    valid_to         TEXT,
+    CHECK (valid_to IS NULL OR valid_from < valid_to)
+);
+CREATE INDEX IF NOT EXISTS org_units_identity ON org_units(org_id, unit_id, valid_from);
+CREATE INDEX IF NOT EXISTS org_units_validity ON org_units(org_id, valid_from, valid_to);
+CREATE INDEX IF NOT EXISTS org_units_parent   ON org_units(org_id, parent_unit_id);
+CREATE INDEX IF NOT EXISTS org_units_head     ON org_units(org_id, head_position_id);
+
+CREATE TABLE IF NOT EXISTS org_positions (
+    id          TEXT PRIMARY KEY,
+    org_id      TEXT NOT NULL,
+    position_id TEXT NOT NULL,
+    unit_id     TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    code       TEXT,
+    role_id    TEXT,
+    is_manager INTEGER CHECK (is_manager IS NULL OR is_manager IN (0,1)),
+    is_staff   INTEGER NOT NULL DEFAULT 0 CHECK (is_staff IN (0,1)),
+    valid_from TEXT NOT NULL,
+    valid_to   TEXT,
+    CHECK (valid_to IS NULL OR valid_from < valid_to)
+);
+CREATE INDEX IF NOT EXISTS org_positions_identity ON org_positions(org_id, position_id, valid_from);
+CREATE INDEX IF NOT EXISTS org_positions_unit     ON org_positions(org_id, unit_id);
+CREATE INDEX IF NOT EXISTS org_positions_validity ON org_positions(org_id, valid_from, valid_to);
+CREATE INDEX IF NOT EXISTS org_positions_code     ON org_positions(org_id, code);
+
+CREATE TABLE IF NOT EXISTS org_unit_deputy_heads (
+    id          TEXT PRIMARY KEY,
+    org_id      TEXT NOT NULL,
+    unit_id     TEXT NOT NULL,
+    position_id TEXT NOT NULL,
+    ord         INTEGER NOT NULL,
+    valid_from  TEXT NOT NULL,
+    valid_to    TEXT,
+    CHECK (valid_to IS NULL OR valid_from < valid_to)
+);
+CREATE INDEX IF NOT EXISTS org_unit_deputy_heads_unit     ON org_unit_deputy_heads(org_id, unit_id, ord);
+CREATE INDEX IF NOT EXISTS org_unit_deputy_heads_position ON org_unit_deputy_heads(org_id, position_id);
+
+CREATE TABLE IF NOT EXISTS org_reporting_lines (
+    id                 TEXT PRIMARY KEY,
+    org_id             TEXT NOT NULL,
+    position_id        TEXT NOT NULL,
+    parent_position_id TEXT NOT NULL,
+    kind               TEXT NOT NULL CHECK (kind IN ('primary','functional')),
+    priority           INTEGER NOT NULL DEFAULT 0,
+    valid_from         TEXT NOT NULL,
+    valid_to           TEXT,
+    CHECK (valid_to IS NULL OR valid_from < valid_to),
+    CHECK (position_id <> parent_position_id)
+);
+CREATE INDEX IF NOT EXISTS org_reporting_lines_child    ON org_reporting_lines(org_id, position_id, kind, valid_from);
+CREATE INDEX IF NOT EXISTS org_reporting_lines_parent   ON org_reporting_lines(org_id, parent_position_id);
+CREATE INDEX IF NOT EXISTS org_reporting_lines_validity ON org_reporting_lines(org_id, valid_from, valid_to);
+
+CREATE TABLE IF NOT EXISTS org_external_persons (
+    id           TEXT PRIMARY KEY,
+    org_id       TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    email        TEXT,
+    note         TEXT
+);
+CREATE INDEX IF NOT EXISTS org_external_persons_org ON org_external_persons(org_id);
+
+CREATE TABLE IF NOT EXISTS org_assignments (
+    id                    TEXT PRIMARY KEY,
+    org_id                TEXT NOT NULL,
+    position_id           TEXT NOT NULL,
+    user_id               TEXT,
+    external_person_id    TEXT,
+    type                  TEXT NOT NULL CHECK (type IN ('permanent','acting','contractor')),
+    share                 REAL NOT NULL DEFAULT 1.0 CHECK (share > 0 AND share <= 1.0),
+    is_primary            INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0,1)),
+    valid_from            TEXT NOT NULL,
+    valid_to              TEXT,
+    CHECK (valid_to IS NULL OR valid_from < valid_to),
+    CHECK ((user_id IS NULL) <> (external_person_id IS NULL))
+);
+CREATE INDEX IF NOT EXISTS org_assignments_position ON org_assignments(org_id, position_id, valid_from);
+CREATE INDEX IF NOT EXISTS org_assignments_user     ON org_assignments(org_id, user_id, valid_from);
+CREATE INDEX IF NOT EXISTS org_assignments_external ON org_assignments(org_id, external_person_id);
+CREATE INDEX IF NOT EXISTS org_assignments_validity ON org_assignments(org_id, valid_from, valid_to);
+
+CREATE TABLE IF NOT EXISTS org_structure_settings (
+    org_id   TEXT PRIMARY KEY,
+    timezone TEXT NOT NULL DEFAULT 'Europe/Warsaw'
+);
+
+CREATE TABLE IF NOT EXISTS org_change_sets (
+    id               TEXT PRIMARY KEY,
+    org_id           TEXT NOT NULL,
+    name             TEXT NOT NULL,
+    effective_date   TEXT NOT NULL,
+    state            TEXT NOT NULL CHECK (state IN ('draft','pending','approved','withdrawn','applied')),
+    author_user_id   TEXT NOT NULL,
+    approver_user_id TEXT,
+    created_at_ms    INTEGER NOT NULL,
+    payload          TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(payload))
+);
+CREATE INDEX IF NOT EXISTS org_change_sets_org ON org_change_sets(org_id, state, effective_date);
+"#;
+
+// v179 — deputies and absences of the organizational structure
+// (docs/ORG_STRUCTURE_PLAN.md §1, §2.1a, §6.3). Same conventions as v178: TEXT
+// days, half-open `[valid_from, valid_to)`, no foreign keys (both tables
+// replicate), references and overlaps enforced by `services::org_structure`.
+//
+// `org_deputies` is a TEMPORARY or standing cover of one person by another,
+// for a `scope`: `all`, `approvals`, `escalations` or `project:<id>`. It is not
+// the deputy head of a unit (`org_unit_deputy_heads`, a position of the
+// structure). `org_absences.reason` is private: the read side hands it only to
+// the person, the manager on the primary line and administrators (§6.3), but
+// the column replicates like the rest, so it is protected by the API, not by
+// the table.
+const ORG_DEPUTIES_ABSENCES: &str = r#"
+CREATE TABLE IF NOT EXISTS org_deputies (
+    id             TEXT PRIMARY KEY,
+    org_id         TEXT NOT NULL,
+    user_id        TEXT NOT NULL,
+    deputy_user_id TEXT NOT NULL,
+    scope          TEXT NOT NULL DEFAULT 'all',
+    valid_from     TEXT NOT NULL,
+    valid_to       TEXT,
+    created_by     TEXT,
+    CHECK (valid_to IS NULL OR valid_from < valid_to),
+    CHECK (user_id <> deputy_user_id),
+    CHECK (scope IN ('all','approvals','escalations') OR (scope LIKE 'project:%' AND length(scope) > 8))
+);
+CREATE INDEX IF NOT EXISTS org_deputies_user   ON org_deputies(org_id, user_id, valid_from);
+CREATE INDEX IF NOT EXISTS org_deputies_deputy ON org_deputies(org_id, deputy_user_id, valid_from);
+
+CREATE TABLE IF NOT EXISTS org_absences (
+    id         TEXT PRIMARY KEY,
+    org_id     TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    valid_from TEXT NOT NULL,
+    valid_to   TEXT,
+    kind       TEXT NOT NULL DEFAULT 'other' CHECK (kind IN ('leave','training','other')),
+    reason     TEXT,
+    source     TEXT NOT NULL DEFAULT 'manual',
+    created_by TEXT,
+    CHECK (valid_to IS NULL OR valid_from < valid_to)
+);
+CREATE INDEX IF NOT EXISTS org_absences_user     ON org_absences(org_id, user_id, valid_from);
+CREATE INDEX IF NOT EXISTS org_absences_validity ON org_absences(org_id, valid_from, valid_to);
+"#;
+
+// v180 — handovers of the work a person holds (docs/ORG_STRUCTURE_PLAN.md §2.6,
+// docs/PROJECT_STUDIO_WORKFLOW_PLAN.md §4.5). NODE-LOCAL, unlike every other
+// org table and on purpose: a handover moves rows of Project Studio, whose
+// databases (`projects.db`, one `project.db` per project) are not replicated, so
+// the record of what was moved, to whom and what still has to come back lives
+// on the node that moved it. The org-side effects of a handover (ended
+// assignments, deputies) are ordinary org writes and replicate as such.
+//
+// `org_handover_items.status` is the resumable state of one item: `pending`
+// (recorded before the write), `done`, `scheduled` (a membership that ends on
+// the departure date), `failed` (`reason` names the rule), `skipped` (nothing
+// to do any more), and for a temporary handover `returned` or `kept` (the taker
+// closed or changed it). `detail` is what the item's provider needs to put the
+// work back. No foreign keys, like the rest of the org tables.
+const ORG_HANDOVERS: &str = r#"
+CREATE TABLE IF NOT EXISTS org_handovers (
+    id            TEXT PRIMARY KEY,
+    org_id        TEXT NOT NULL,
+    user_id       TEXT NOT NULL,
+    reason        TEXT NOT NULL CHECK (reason IN ('departure','absence','project_removal')),
+    project_id    TEXT,
+    effective_on  TEXT NOT NULL,
+    return_on     TEXT,
+    note          TEXT NOT NULL,
+    created_by    TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    CHECK (reason <> 'absence' OR return_on IS NOT NULL),
+    CHECK (reason <> 'project_removal' OR project_id IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS org_handovers_user ON org_handovers(org_id, user_id, created_at_ms);
+CREATE INDEX IF NOT EXISTS org_handovers_return ON org_handovers(org_id, return_on);
+
+CREATE TABLE IF NOT EXISTS org_handover_items (
+    id             TEXT PRIMARY KEY,
+    handover_id    TEXT NOT NULL,
+    item_key       TEXT NOT NULL,
+    category       TEXT NOT NULL CHECK (category IN ('task','test_item','membership','position','deputy')),
+    project_id     TEXT,
+    title          TEXT NOT NULL,
+    from_user_id   TEXT NOT NULL,
+    taker_user_id  TEXT,
+    status         TEXT NOT NULL CHECK (status IN ('pending','done','scheduled','failed','skipped','returned','kept')),
+    reason         TEXT,
+    detail         TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(detail)),
+    updated_at_ms  INTEGER NOT NULL,
+    UNIQUE (handover_id, item_key)
+);
+CREATE INDEX IF NOT EXISTS org_handover_items_status ON org_handover_items(status, handover_id);
+CREATE INDEX IF NOT EXISTS org_handover_items_person ON org_handover_items(from_user_id, status);
+"#;
 
 /// Tombstones written before `set_status` released the slug on delete still
 /// hold `UNIQUE(org_id, owner_user_id, slug)`, so their owner could never reuse
@@ -4742,6 +4994,21 @@ fn child_remaps() -> Vec<ChildRemap> {
         f("map_sites", "created_by", UserAccounts),
         f("map_scenes", "created_by", UserAccounts),
         f("map_device_placements", "set_by", UserAccounts),
+        // -- org structure (178): who holds a position, who proposed and who approved a reorganization --
+        f("org_assignments", "user_id", UserAccounts),
+        f("org_change_sets", "author_user_id", UserAccounts),
+        f("org_change_sets", "approver_user_id", UserAccounts),
+        // -- org structure (179): who is covered, who covers, who was away --
+        f("org_deputies", "user_id", UserAccounts),
+        f("org_deputies", "deputy_user_id", UserAccounts),
+        f("org_deputies", "created_by", UserAccounts),
+        f("org_absences", "user_id", UserAccounts),
+        f("org_absences", "created_by", UserAccounts),
+        // -- org structure (180): who handed work over, from whom, to whom --
+        f("org_handovers", "user_id", UserAccounts),
+        f("org_handovers", "created_by", UserAccounts),
+        f("org_handover_items", "from_user_id", UserAccounts),
+        f("org_handover_items", "taker_user_id", UserAccounts),
         f("sync_explicit_shares", "granted_by", UserAccounts),
         f(
             "__tentaflow_core_sync_captures",

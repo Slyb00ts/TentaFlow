@@ -8651,6 +8651,13 @@ pub enum MessageBody {
     // which scene. Geometry never travels here — it goes over the `map:`
     // stream and the mesh chunk pull.
     MapBody(crate::map::MapPayload),
+    // ----- Organizational structure (units, positions, lines, assignments) -----
+    // Placed after `MapBody`; the position is irrelevant on the wire because
+    // ciborium tags by variant NAME, but the NAME must never change. ONE
+    // variant for the family (request+response) in `OrgStructurePayload`:
+    // effective-dated structure reads for every member of the organization and
+    // the writes only `org.admin` may make.
+    OrgStructureBody(crate::org_structure::OrgStructurePayload),
     // ----- Addon requirement install (addon settings) -----
     // Appended at the END of the enum (ciborium tags by variant NAME).
     AddonRequirementInstallRequestBody(AddonRequirementInstallRequest),

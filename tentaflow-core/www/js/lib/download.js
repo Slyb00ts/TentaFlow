@@ -21,3 +21,10 @@ export function downloadText(filename, text, mime = 'text/plain') {
   downloadUrl(url, filename);
   URL.revokeObjectURL(url);
 }
+
+/** Saves bytes a server produced (a CSV or XLSX export) under `filename`; the object URL is released after the click. */
+export function downloadBytes(filename, bytes, mime = 'application/octet-stream') {
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+  downloadUrl(url, filename);
+  URL.revokeObjectURL(url);
+}

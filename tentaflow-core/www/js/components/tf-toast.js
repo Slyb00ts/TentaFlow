@@ -12,6 +12,8 @@
 // after the message respectively.
 // =============================================================================
 
+import './tf-button.js';
+
 class TfToast extends HTMLElement {
   static get observedAttributes() { return ['tone', 'title', 'message', 'duration', 'persistent']; }
 
@@ -42,6 +44,7 @@ class TfToast extends HTMLElement {
     this.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'tf-toast';
+    el.setAttribute('role', 'status');
 
     const titleEl = document.createElement('div');
     titleEl.className = 'tf-toast-title';
@@ -90,6 +93,8 @@ class TfToast extends HTMLElement {
     this._timer = setTimeout(() => this._dismiss(), duration);
   }
 
+  dismiss() { this._dismiss(); }
+
   _dismiss() {
     clearTimeout(this._timer);
     if (!this._root) return;
@@ -116,10 +121,22 @@ class TfToast extends HTMLElement {
    * @param {string} [opts.title]
    * @param {string} [opts.message]
    * @param {number} [opts.duration=4000]
+   * @param {{label: string, onClick: (toast: HTMLElement) => void}} [opts.action]
+   *   A button after the message (e.g. "Undo"); the handler decides when the
+   *   toast goes away, via `toast.dismiss()`.
    */
-  static show({ tone = 'info', title = '', message = '', duration = 4000 } = {}) {
+  static show({ tone = 'info', title = '', message = '', duration = 4000, action = null } = {}) {
     const container = TfToast._getContainer();
     const toast = document.createElement('tf-toast');
+    if (action) {
+      const button = document.createElement('tf-button');
+      button.setAttribute('slot', 'action');
+      button.setAttribute('variant', 'ghost');
+      button.setAttribute('size', 'sm');
+      button.setAttribute('label', action.label);
+      button.addEventListener('click', () => action.onClick(toast));
+      toast.appendChild(button);
+    }
     if (tone) toast.setAttribute('tone', tone);
     if (title) toast.setAttribute('title', title);
     if (message) toast.setAttribute('message', message);

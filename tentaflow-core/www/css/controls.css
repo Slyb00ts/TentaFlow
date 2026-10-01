@@ -1864,6 +1864,33 @@ tf-menu[open] .tf-menu-item {
   background: var(--tf-border);
   margin: 4px 0;
 }
+.tf-menu-heading {
+  padding: 6px 10px 8px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--tf-border);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--tf-text-3);
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tf-menu-item:focus-visible {
+  outline: 2px solid var(--tf-accent-2);
+  outline-offset: -2px;
+}
+.tf-menu-item-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.tf-menu-item-hint { font-size: 11px; color: var(--tf-text-3); line-height: 1.3; }
+.tf-menu-item.disabled,
+tf-menu[open] .tf-menu-item.disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.tf-menu-item.disabled:hover {
+  background: transparent;
+  color: var(--tf-text-2);
+}
 
 /* =============================================================================
    tf-window
@@ -3887,6 +3914,15 @@ tf-detail-header {
   gap: 8px;
   flex-shrink: 0;
 }
+/* `compact`: one short row (icon, title, subtitle and badges side by side) for screens that
+   need their height for content. */
+tf-detail-header[compact] .tf-detail-header { padding: 6px 0; gap: 12px; }
+tf-detail-header[compact] .tf-detail-icon { width: 38px; height: 38px; box-shadow: none; }
+tf-detail-header[compact] .tf-detail-icon-svg { width: 18px; height: 18px; }
+tf-detail-header[compact] .tf-detail-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 14px; }
+tf-detail-header[compact] .tf-detail-title { font-size: 17px; }
+tf-detail-header[compact] .tf-detail-subtitle { margin: 0; }
+tf-detail-header[compact] .tf-detail-badges { margin: 0; }
 
 /* =============================================================================
    tf-calendar
@@ -4177,6 +4213,10 @@ tf-detail-header {
   letter-spacing: 0.04em;
 }
 .tf-dp-day {
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+  padding: 0;
   width: 34px;
   height: 34px;
   display: inline-flex;
@@ -4207,6 +4247,10 @@ tf-detail-header {
   color: #fff;
   font-weight: 600;
 }
+.tf-dp-day:focus-visible {
+  outline: 2px solid var(--tf-accent-1);
+  outline-offset: 1px;
+}
 .tf-dp-day.disabled {
   opacity: 0.3;
   pointer-events: none;
@@ -4225,6 +4269,21 @@ tf-detail-header {
   background: rgba(96, 165, 250, 0.15);
   border-radius: 0;
 }
+
+/* tf-date-field: the input and the calendar toggle on one row, the calendar as a fixed popup */
+tf-date-field { display: block; min-width: 0; }
+tf-date-field[hidden] { display: none; }
+.tf-date-field__row { position: relative; }
+tf-date-field .tf-input-wrap { position: relative; padding-right: 40px; }
+.tf-date-field__toggle { position: absolute; right: 2px; top: 50%; transform: translateY(-50%); }
+.tf-date-field__pop {
+  position: fixed;
+  z-index: 2147483000;
+  background: var(--tf-bg-card);
+  border-radius: var(--tf-radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+}
+.tf-date-field__pop[hidden] { display: none; }
 
 /* =============================================================================
    tf-command-palette
@@ -11681,3 +11740,299 @@ tf-run-timeline {
   .tf-hist__bar,
   .tf-timeline__col { transition: none; }
 }
+
+/* =============================================================================
+   tf-org-tree — organization chart (SVG). Rules inside the <svg> are by class:
+   the chart re-renders its slice as markup strings, so nothing is styled inline.
+   ============================================================================= */
+
+tf-org-tree {
+  display: block;
+  position: relative;
+  min-height: 420px;
+  height: 100%;
+  overflow: hidden;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  background:
+    radial-gradient(ellipse 70% 60% at 30% 20%, rgba(99, 102, 241, 0.07), transparent 70%),
+    var(--tf-bg-2);
+}
+.tf-orgtree { position: absolute; inset: 0; }
+.tf-orgtree__svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+}
+.tf-orgtree__svg:focus-visible { box-shadow: inset 0 0 0 2px var(--tf-accent-2); }
+tf-org-tree.tf-orgtree--dragging .tf-orgtree__svg { cursor: grabbing; }
+
+.tf-orgtree__tools {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  background: var(--tf-bg-card);
+  box-shadow: var(--tf-shadow-sm);
+}
+.tf-orgtree__minimap {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 2;
+  width: 190px;
+  height: 120px;
+  border: 1px solid var(--tf-border-hover);
+  border-radius: var(--tf-radius);
+  background: var(--tf-bg-card);
+  box-shadow: var(--tf-shadow-sm);
+  overflow: hidden;
+  cursor: crosshair;
+}
+.tf-orgtree__minimap[hidden] { display: none; }
+.tf-orgtree__minimap svg { display: block; width: 100%; height: 100%; }
+.ot-mini-view { fill: rgba(99, 102, 241, 0.08); stroke: var(--tf-accent-3); }
+.tf-orgtree__hint {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  z-index: 2;
+  transform: translateX(-50%);
+  padding: 4px 12px;
+  border: 1px solid var(--tf-border);
+  border-radius: 999px;
+  background: var(--tf-bg-card);
+  font-size: 11.5px;
+  color: var(--tf-text-3);
+  white-space: nowrap;
+  pointer-events: none;
+}
+.tf-orgtree__hint[hidden] { display: none; }
+
+/* cards */
+.ot-card, .ot-tile, .ot-frame, .ot-lod { cursor: pointer; }
+.ot-card-bg, .ot-tile-bg { fill: var(--tf-bg-card); stroke: var(--tf-border-hover); stroke-width: 1; transition: stroke 0.12s ease; }
+/* A vacancy is drawn without fill, but its whole area is still the card: click and drop land on it. */
+.ot-card-bg, .ot-tile-bg, .ot-frame-bg { pointer-events: all; }
+.ot-card:hover .ot-card-bg, .ot-tile:hover .ot-tile-bg { stroke: var(--tf-accent-2); }
+.ot-name { fill: var(--tf-text); font-weight: 700; letter-spacing: -0.005em; }
+.ot-role { fill: var(--tf-text-3); }
+.ot-vacant .ot-card-bg, .ot-vacant .ot-tile-bg { fill: none; stroke-dasharray: 5 4; }
+.ot-vacant .ot-name { fill: var(--tf-text-3); font-style: italic; }
+.ot-staff .ot-card-bg { stroke: rgba(167, 139, 250, 0.6); }
+.ot-path .ot-card-bg, .ot-path .ot-tile-bg, .ot-path .ot-frame-bg { stroke: rgba(99, 102, 241, 0.7); }
+.ot-match .ot-card-bg, .ot-match .ot-tile-bg { stroke: var(--tf-warning); stroke-width: 1.5; }
+.ot-selected .ot-card-bg, .ot-selected .ot-tile-bg, .ot-selected .ot-frame-bg { stroke: var(--tf-accent-2); stroke-width: 2; }
+.ot-active .ot-card-bg { stroke: var(--tf-text); stroke-dasharray: none; stroke-width: 2; }
+.ot-me .ot-card-bg { stroke: rgba(45, 212, 191, 0.7); }
+/* Import preview: what the file does to a position (added / changed / to be corrected). */
+.ot-mark-added .ot-card-bg { stroke: rgba(34, 197, 94, 0.75); stroke-width: 1.5; }
+.ot-mark-changed .ot-card-bg { stroke: rgba(96, 165, 250, 0.75); stroke-width: 1.5; }
+.ot-mark-error .ot-card-bg { stroke: rgba(239, 68, 68, 0.85); stroke-width: 1.5; }
+.ot-mark-added .ot-frame-bg { stroke: rgba(34, 197, 94, 0.8); stroke-width: 2; }
+.ot-mark-changed .ot-frame-bg { stroke: rgba(96, 165, 250, 0.8); stroke-width: 2; }
+.ot-mark-error .ot-frame-bg { stroke: rgba(239, 68, 68, 0.9); stroke-width: 2; }
+.ot-lod.ot-mark-added rect { stroke: rgba(34, 197, 94, 0.9); stroke-width: 3; }
+.ot-lod.ot-mark-changed rect { stroke: rgba(96, 165, 250, 0.9); stroke-width: 3; }
+.ot-lod.ot-mark-error rect { stroke: rgba(239, 68, 68, 0.95); stroke-width: 3; }
+.ot-av { fill: rgba(99, 102, 241, 0.22); }
+.ot-av-1 { fill: rgba(45, 212, 191, 0.22); }
+.ot-av-2 { fill: rgba(245, 158, 11, 0.22); }
+.ot-av-3 { fill: rgba(244, 114, 182, 0.22); }
+.ot-av-4 { fill: rgba(56, 189, 248, 0.22); }
+.ot-av-5 { fill: rgba(167, 139, 250, 0.26); }
+.ot-av-6 { fill: rgba(52, 211, 153, 0.22); }
+.ot-av-7 { fill: rgba(251, 113, 133, 0.22); }
+.ot-av-text { fill: var(--tf-accent-2); font-weight: 800; pointer-events: none; }
+.ot-av-vac { fill: none; stroke: var(--tf-border-hover); stroke-width: 1.5; stroke-dasharray: 3 3; }
+.ot-glyph { fill: none; stroke: var(--tf-text-3); stroke-width: 2; }
+.ot-name, .ot-role, .ot-av-text, .ot-tag text, .ot-more text, .ot-frame-title, .ot-frame-stats { pointer-events: none; }
+
+/* edit mode: the "⋯" handle, the card being dragged and the outline of a drop target */
+.ot-menu { cursor: pointer; }
+.ot-menu-bg { fill: transparent; stroke: transparent; }
+.ot-menu:hover .ot-menu-bg, .ot-menu:focus-visible .ot-menu-bg { fill: var(--tf-bg-3); stroke: var(--tf-border-hover); }
+.ot-menu-dot { fill: var(--tf-text-2); pointer-events: none; }
+.ot-dragging { opacity: 0.4; }
+.ot-drop-ok .ot-card-bg, .ot-drop-ok .ot-frame-bg { stroke: var(--tf-success); stroke-width: 2.5; stroke-dasharray: none; }
+.ot-drop-bad .ot-card-bg, .ot-drop-bad .ot-frame-bg { stroke: var(--tf-danger); stroke-width: 2.5; stroke-dasharray: 6 4; }
+tf-org-tree.tf-orgtree--card-drag .tf-orgtree__svg { cursor: grabbing; }
+.tf-orgtree__ghost {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 4;
+  max-width: 260px;
+  padding: 6px 10px;
+  border: 1px solid var(--tf-accent-2);
+  border-radius: var(--tf-radius);
+  background: var(--tf-bg-card);
+  box-shadow: var(--tf-shadow-sm);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--tf-text);
+  pointer-events: none;
+  overflow-wrap: anywhere;
+}
+.tf-orgtree__ghost[data-state="ok"] { border-color: var(--tf-success); }
+.tf-orgtree__ghost[data-state="bad"] { border-color: var(--tf-danger); }
+
+/* pills: badges, counts, "+N" */
+.ot-tag rect, .ot-more rect { fill: var(--tf-bg-3); stroke: var(--tf-border-hover); }
+.ot-tag text, .ot-more text { fill: var(--tf-text-2); font-weight: 800; letter-spacing: 0.02em; }
+.ot-tag-acting rect { fill: rgba(245, 158, 11, 0.14); stroke: rgba(245, 158, 11, 0.45); }
+.ot-tag-acting text { fill: var(--tf-warning); }
+.ot-tag-deputy rect { fill: rgba(99, 102, 241, 0.18); stroke: rgba(99, 102, 241, 0.5); }
+.ot-tag-deputy text { fill: var(--tf-accent-2); }
+.ot-tag-staff rect { fill: rgba(167, 139, 250, 0.16); stroke: rgba(167, 139, 250, 0.45); }
+.ot-tag-staff text { fill: var(--tf-accent-3); }
+.ot-tag-me rect { fill: rgba(45, 212, 191, 0.14); stroke: rgba(45, 212, 191, 0.5); }
+.ot-tag-me text { fill: #2dd4bf; }
+.ot-tag-absent rect { fill: rgba(239, 68, 68, 0.14); stroke: rgba(239, 68, 68, 0.45); }
+.ot-tag-absent text { fill: var(--tf-danger); }
+.ot-tag-covering rect { fill: rgba(56, 189, 248, 0.14); stroke: rgba(56, 189, 248, 0.45); }
+.ot-tag-covering text { fill: #38bdf8; }
+.ot-count[data-toggle], .ot-more { cursor: pointer; }
+.ot-count[data-toggle]:hover rect, .ot-more:hover rect { stroke: var(--tf-accent-2); }
+
+/* connectors */
+.ot-lines path { fill: none; stroke: var(--tf-border-hover); stroke-width: 1.5; }
+.ot-lines path.hl { stroke: var(--tf-accent-1); stroke-width: 2.5; }
+.ot-lines path.staff { stroke: rgba(167, 139, 250, 0.6); }
+.ot-functional path { fill: none; stroke: var(--tf-warning); stroke-width: 1.5; stroke-dasharray: 2 5; stroke-linecap: round; opacity: 0.85; }
+
+/* unit frames */
+.ot-frame-bg { fill: rgba(19, 23, 54, 0.55); stroke: var(--tf-border-hover); stroke-width: 1; }
+.ot-frame-title { fill: var(--tf-text); font-weight: 800; }
+.ot-frame-stats, .ot-frame-more { fill: var(--tf-text-3); font-weight: 600; }
+.ot-tile.ot-head .ot-tile-bg { fill: var(--tf-bg-3); }
+
+/* level of detail */
+.ot-lod-name { fill: var(--tf-text); font-weight: 800; pointer-events: none; }
+.ot-lod-count { fill: var(--tf-text-2); font-weight: 600; pointer-events: none; }
+.ot-lod.ot-selected rect { stroke: var(--tf-text); stroke-width: 3; }
+.ot-lod.ot-path rect { stroke: var(--tf-accent-1); stroke-width: 3; }
+.ot-lod.ot-active rect { stroke: var(--tf-text); stroke-width: 3; }
+
+/* motion (respects prefers-reduced-motion below) */
+.ot-pulse { animation: ot-pulse 0.6s var(--tf-spring-snappy); }
+@keyframes ot-pulse { 0% { opacity: 0.4; } 60% { opacity: 1; } }
+tf-org-tree.tf-orgtree--settle .ot-cards { animation: ot-settle 0.22s ease-out; }
+@keyframes ot-settle { from { opacity: 0.45; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .ot-pulse,
+  tf-org-tree.tf-orgtree--settle .ot-cards { animation: none; }
+  .ot-card-bg, .ot-tile-bg { transition: none; }
+}
+
+/* =============================================================================
+   tf-person-picker — searchable listbox of people and agents
+   ============================================================================= */
+
+tf-person-picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-sm);
+  min-width: 0;
+}
+.tf-pp__list {
+  max-height: min(320px, 38vh);
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  background: var(--tf-bg-2);
+  outline: none;
+}
+.tf-pp__list:focus-visible { box-shadow: 0 0 0 2px var(--tf-accent-2); }
+.tf-pp__list[hidden],
+.tf-pp__empty[hidden] { display: none; }
+.tf-pp__group {
+  padding: 8px 8px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--tf-text-3);
+}
+.tf-pp__row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  border: 1px solid transparent;
+  border-radius: var(--tf-radius-sm);
+  cursor: pointer;
+}
+.tf-pp__row:hover { background: var(--tf-bg-3); }
+.tf-pp__row.is-selected {
+  background: rgba(99, 102, 241, 0.12);
+  border-color: var(--tf-accent-3);
+}
+.tf-pp__list:focus-visible .tf-pp__row.is-active { outline: 2px solid var(--tf-accent-2); outline-offset: -2px; }
+.tf-pp__row.is-disabled { opacity: 0.5; cursor: not-allowed; }
+.tf-pp__row.is-disabled:hover { background: transparent; }
+.tf-pp__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tf-pp__name { font-size: 13px; font-weight: 600; color: var(--tf-text); }
+.tf-pp__role { font-size: 12px; color: var(--tf-text-3); }
+.tf-pp__tags { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-top: 2px; }
+.tf-pp__agent-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  color: var(--tf-accent-2);
+  background: rgba(99, 102, 241, 0.14);
+}
+.tf-pp__agent-icon svg { stroke: currentColor; fill: none; stroke-width: 1.75; stroke-linecap: round; stroke-linejoin: round; }
+.tf-pp__load { flex-shrink: 0; }
+
+/* =============================================================================
+   Shared action windows and bulk bar (js/lib/actions)
+   ============================================================================= */
+
+.tf-act { display: flex; flex-direction: column; gap: var(--tf-space-md); min-width: 0; }
+.tf-act__subject { font-size: 13px; font-weight: 600; color: var(--tf-text); overflow-wrap: anywhere; }
+.tf-act__content { display: flex; flex-direction: column; gap: var(--tf-space-md); min-width: 0; }
+.tf-act__fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.tf-act__field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.tf-act__field--wide { grid-column: 1 / -1; }
+.tf-act__label { font-size: 12px; font-weight: 600; color: var(--tf-text-2); }
+.tf-act__field-error { font-size: 12px; color: var(--tf-danger); }
+.tf-act__field-error[hidden],
+.tf-act__error[hidden] { display: none; }
+.tf-act__checks { display: flex; flex-direction: column; gap: 8px; }
+.tf-act tf-radio[hidden] { display: none; }
+.tf-act[aria-busy="true"] { opacity: 0.7; }
+
+.tf-bulkbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--tf-accent-3);
+  border-radius: var(--tf-radius);
+  background: rgba(99, 102, 241, 0.08);
+}
+.tf-bulkbar[hidden] { display: none; }
+.tf-bulkbar__count { margin-right: auto; font-size: 13px; font-weight: 600; color: var(--tf-text); }

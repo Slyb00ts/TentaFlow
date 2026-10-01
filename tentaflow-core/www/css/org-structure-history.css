@@ -1,0 +1,483 @@
+/* =============================================================================
+   org-structure-history.css — the Historia tab (date jumper, timeline of
+   changes, planned reorganizations, "przed i po") and the "Stan na" control of
+   the Drzewo toolbar. Layout only: every control is a tf-* component styled by
+   controls.css.
+   ============================================================================= */
+
+.org-hist {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-md, 12px);
+}
+
+.org-hist-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+}
+
+.org-hist-head .org-section-title { margin: 0; }
+
+.org-hist-grow { flex: 1 1 auto; }
+
+.org-hist-card {
+  min-width: 0;
+  padding: var(--tf-space-md, 12px) var(--tf-space-lg, 16px);
+  background: var(--tf-bg-card);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg, 12px);
+}
+
+.org-hist-card-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+  margin-bottom: var(--tf-space-sm, 8px);
+}
+
+.org-hist-card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--tf-text);
+}
+
+.org-hist-hint {
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+.org-hist-empty {
+  padding: var(--tf-space-md, 12px) 0;
+  font-size: 13px;
+  color: var(--tf-text-3);
+}
+
+.org-hist-empty.is-error { color: var(--tf-danger); }
+
+/* ---- date jumper ---- */
+
+.org-hist-date-top {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--tf-space-md, 12px);
+}
+
+.org-hist-sm {
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+.org-hist-big {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--tf-text);
+}
+
+.org-hist-quick {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+}
+
+.org-hist-slider {
+  position: relative;
+  margin: var(--tf-space-md, 12px) 0 var(--tf-space-xs, 4px);
+  padding-bottom: 34px;
+}
+
+.org-hist-slider tf-slider { display: block; }
+
+.org-hist-rail {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 20px;
+  height: 10px;
+  pointer-events: none;
+}
+
+.org-hist-mk {
+  position: absolute;
+  left: var(--pos);
+  top: 0;
+  width: 2px;
+  height: 10px;
+  margin-left: -1px;
+  border-radius: 1px;
+  background: var(--tf-text-3);
+}
+
+.org-hist-ticks {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 0;
+  height: 16px;
+  pointer-events: none;
+}
+
+.org-hist-tick {
+  position: absolute;
+  left: var(--pos);
+  bottom: 0;
+  transform: translateX(-50%);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--tf-text-3);
+}
+
+.org-hist-tick.is-today { color: var(--tf-success); font-weight: 700; }
+
+.org-hist-mk.is-plan { background: var(--tf-accent-2); height: 14px; }
+.org-hist-mk.is-today { background: var(--tf-success); height: 14px; }
+
+.org-hist-date-tools {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--tf-space-md, 12px);
+}
+
+.org-hist-date-input { flex: 0 1 200px; min-width: 160px; }
+
+.org-hist-stats {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+}
+
+/* ---- columns ---- */
+
+.org-hist-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: var(--tf-space-md, 12px);
+  align-items: start;
+}
+
+.org-hist-cols.is-single { grid-template-columns: minmax(0, 1fr); }
+
+@media (max-width: 980px) {
+  .org-hist-cols { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* ---- timeline ---- */
+
+/* The unit on its own row, the two days and the reset under it: the day fields need their width. */
+.org-hist-filters {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+  align-items: end;
+  gap: var(--tf-space-sm, 8px);
+  margin-bottom: var(--tf-space-sm, 8px);
+}
+
+.org-hist-filters > [data-role="unit-filter"] { grid-column: 1 / -1; }
+
+.org-hist-timeline {
+  position: relative;
+  margin: 0;
+  padding: 0 0 0 4px;
+  list-style: none;
+}
+
+.org-hist-timeline::before {
+  content: "";
+  position: absolute;
+  left: 9px;
+  top: 6px;
+  bottom: 6px;
+  width: 2px;
+  background: var(--tf-border);
+}
+
+.org-hist-item {
+  position: relative;
+  padding: 0 0 var(--tf-space-md, 12px) 26px;
+}
+
+.org-hist-dot {
+  position: absolute;
+  left: 3px;
+  top: 7px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--tf-bg-card);
+  border: 2px solid var(--tf-text-3);
+}
+
+.org-hist-item.is-plan .org-hist-dot { border-color: var(--tf-accent-2); border-style: dashed; }
+.org-hist-item.is-good .org-hist-dot { border-color: var(--tf-success); }
+.org-hist-item.is-bad .org-hist-dot { border-color: var(--tf-danger); }
+
+.org-hist-item-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+}
+
+.org-hist-title {
+  font-size: 13px;
+  color: var(--tf-text);
+  overflow-wrap: anywhere;
+}
+
+.org-hist-diff {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--tf-space-xs, 4px) var(--tf-space-sm, 8px);
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+.org-hist-field { color: var(--tf-text-3); }
+.org-hist-diff .o {
+  padding: 1px 6px;
+  border-radius: var(--tf-radius, 6px);
+  color: var(--tf-text-2);
+  background: rgba(239, 68, 68, 0.12);
+  text-decoration: line-through;
+  text-decoration-color: rgba(239, 68, 68, 0.6);
+  overflow-wrap: anywhere;
+}
+.org-hist-diff .n {
+  padding: 1px 6px;
+  border-radius: var(--tf-radius, 6px);
+  color: var(--tf-text);
+  background: rgba(34, 197, 94, 0.14);
+  overflow-wrap: anywhere;
+}
+
+.org-hist-ops {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--tf-text-2);
+}
+
+.org-hist-who {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--tf-text-3);
+}
+
+/* ---- planned reorganizations ---- */
+
+.org-reorg {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-sm, 8px);
+  padding: var(--tf-space-md, 12px);
+  margin-bottom: var(--tf-space-sm, 8px);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius, 8px);
+  background: var(--tf-bg-2, transparent);
+}
+
+.org-reorg.is-closed { opacity: 0.85; }
+
+.org-reorg-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--tf-text);
+  overflow-wrap: anywhere;
+}
+
+.org-reorg-sub {
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+.org-reorg-changes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs, 4px);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.org-reorg-change {
+  display: flex;
+  gap: var(--tf-space-sm, 8px);
+  font-size: 13px;
+  color: var(--tf-text-2);
+}
+
+.org-reorg-change .num {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--tf-text);
+  background: var(--tf-border);
+}
+
+.org-reorg-change b { display: block; color: var(--tf-text); font-weight: 600; overflow-wrap: anywhere; }
+.org-reorg-change .s { display: block; font-size: 12px; color: var(--tf-text-3); overflow-wrap: anywhere; }
+.org-reorg-change .o { text-decoration: line-through; }
+.org-reorg-change .n { color: var(--tf-text-2); }
+
+.org-reorg-more { font-size: 12px; color: var(--tf-text-3); padding-left: 28px; }
+
+.org-reorg-failed {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--tf-text-2);
+}
+
+.org-reorg-approval {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs, 4px);
+}
+
+.org-reorg-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+  font-size: 13px;
+  color: var(--tf-text-2);
+}
+
+.org-reorg-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+}
+
+.org-reorg-note {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-sm, 8px);
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+.org-reorg-note.is-error { color: var(--tf-danger); }
+.org-reorg-calm { font-size: 12px; color: var(--tf-text-3); }
+
+.org-reorg-ops {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs, 4px);
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.org-reorg-op {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--tf-space-sm, 8px);
+  padding: 2px 0;
+  font-size: 13px;
+  color: var(--tf-text-2);
+}
+
+/* ---- przed i po ---- */
+
+.org-hist-unit-select { min-width: 220px; }
+
+.org-hist-compare {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: stretch;
+  gap: var(--tf-space-md, 12px);
+}
+
+@media (max-width: 900px) {
+  .org-hist-compare { grid-template-columns: minmax(0, 1fr); }
+  .org-hist-compare-arrow { display: none; }
+}
+
+.org-hist-compare[hidden],
+.org-hist-legend[hidden] { display: none; }
+
+.org-hist-compare-side { min-width: 0; }
+
+.org-hist-compare-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--tf-space-sm, 8px);
+  margin-bottom: var(--tf-space-xs, 4px);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--tf-text);
+}
+
+.org-hist-compare-arrow {
+  align-self: center;
+  font-size: 22px;
+  color: var(--tf-text-3);
+}
+
+.org-hist-tree-box {
+  height: 380px;
+  min-width: 0;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius, 8px);
+  overflow: hidden;
+}
+
+.org-hist-tree { display: block; width: 100%; height: 100%; }
+
+.org-hist-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--tf-space-md, 12px);
+  margin-top: var(--tf-space-sm, 8px);
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+.org-hist-swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  vertical-align: -2px;
+  border-radius: 3px;
+  border: 2px solid var(--tf-text-3);
+}
+
+.org-hist-swatch.is-added { border-color: rgba(34, 197, 94, 0.85); }
+.org-hist-swatch.is-changed { border-color: rgba(96, 165, 250, 0.85); }
+.org-hist-swatch.is-removed { border-color: rgba(239, 68, 68, 0.9); }
+
+/* ---- "Stan na" in the Drzewo toolbar: the button in the bar, the marks and the way back on a row of their own ---- */
+
+.org-tree-asof { display: inline-flex; align-items: center; }
+
+.org-tree-asof-note {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+  margin: 0 0 var(--tf-space-sm, 8px);
+}
+
+.org-tree-asof-note[hidden] { display: none; }

@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Projekty · Przesunięcie pozycji roadmapy (C05)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<link rel="stylesheet" href="shared/projekty.css">
+<link rel="stylesheet" href="shared/praca.css">
+<link rel="stylesheet" href="shared/akcje.css">
+<style>
+
+  :root { --lw: 232px; --tw: 852.6px; --wk: 40.60px; }
+  @keyframes ms-fade { from { opacity: 0; transform: rotate(45deg) scale(.6); } to { opacity: 1; transform: rotate(45deg); } }
+  .gantt { background: var(--bg-2); }
+  .g-scroll { overflow-x: auto; }
+  .g-inner { position: relative; min-width: 100%; }
+  .g-under, .g-over { position: absolute; top: 0; bottom: 0; pointer-events: none; }
+  .g-over { z-index: 3; }
+  .g-arrows { position: absolute; left: 0; top: 0; overflow: visible; }
+  .g-hol { position: absolute; top: 52px; bottom: 0; background: repeating-linear-gradient(135deg, rgba(160,168,200,.07) 0 4px, transparent 4px 9px); border-left: 1px dashed rgba(160,168,200,.18); border-right: 1px dashed rgba(160,168,200,.18); }
+  .g-hol span { position: absolute; top: 4px; left: 0; right: 0; text-align: center; font-size: 9.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); font-weight: 700; }
+  .g-head { display: grid; grid-template-columns: var(--lw) var(--tw); height: 52px; border-bottom: 1px solid var(--border); background: #0d1130; }
+  .g-head-l { position: sticky; left: 0; z-index: 5; background: #0d1130; border-right: 1px solid var(--border); padding: 0 14px; display: flex; align-items: flex-end; padding-bottom: 8px; font-size: 10.5px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--text-3); }
+  .g-head-t { position: relative; }
+  .g-mon { position: absolute; top: 0; height: 22px; padding: 5px 8px; font-size: 10.5px; font-weight: 800; letter-spacing: .04em; color: var(--text-2); border-left: 1px solid var(--border); white-space: nowrap; overflow: hidden; }
+  .g-wk { position: absolute; top: 22px; height: 30px; border-left: 1px solid rgba(160,168,200,.10); display: flex; flex-direction: column; align-items: center; justify-content: center; font-size: 10px; line-height: 1.25; color: var(--text-3); font-weight: 600; font-variant-numeric: tabular-nums; }
+  .g-wk b { font-size: 10px; color: var(--text-2); font-weight: 800; }
+  .g-wk.now { background: rgba(99,102,241,.14); color: var(--accent-2); }
+  .g-wk.now b { color: var(--accent-2); }
+  .gantt-row { grid-template-columns: var(--lw) var(--tw); min-height: 0; }
+  .gantt-row:last-of-type { border-bottom: 0; }
+  .gantt-label { position: sticky; left: 0; z-index: 4; background: var(--bg-2); padding: 4px 12px; gap: 8px; justify-content: space-between; }
+  .gantt-row:hover .gantt-label { background: #0e1230; }
+  .gantt-track { height: 100%; background-image: linear-gradient(to right, rgba(160,168,200,.07) 1px, transparent 1px); background-size: var(--wk) 100%; }
+  .gl-main { display: flex; flex-direction: column; min-width: 0; }
+  .gl-name { font-size: 12px; font-weight: 700; line-height: 1.3; }
+  .gl-sub { font-size: 10.5px; color: var(--text-3); font-weight: 500; }
+  .g-g { background: rgba(99,102,241,.06); }
+  .g-g .gantt-label { background: #0e1131; }
+  .g-glabel { justify-content: flex-start; font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .1em; color: var(--accent-2); }
+  .g-glabel .icon { width: 14px; height: 14px; color: var(--accent-1); }
+  .g-gpct { margin-left: auto; font-size: 10.5px; color: var(--text-3); letter-spacing: 0; text-transform: none; font-weight: 700; }
+  .dev { flex-shrink: 0; font-size: 10.5px; font-weight: 800; padding: 2px 7px; border-radius: 999px; white-space: nowrap; }
+  .dev.late { color: #fda4af; background: rgba(244,63,94,.13); }
+  .dev.good { color: var(--success); background: rgba(34,197,94,.12); }
+  .dev.ok { color: var(--text-3); background: rgba(255,255,255,.04); font-weight: 700; }
+  .bar { font-size: 10px; }
+  .bar-plan.crit { border-color: rgba(244,63,94,.6); }
+  .bar-plan.future { background: rgba(99,102,241,.07); }
+  .bar-forecast { color: #ddd6fe; }
+  .bar.critical { outline-color: rgba(244,63,94,.9); }
+  .ms-txt { position: absolute; top: 14px; font-size: 11px; line-height: 18px; font-weight: 700; color: var(--text-2); white-space: nowrap; }
+  .ms-txt.late { color: #fda4af; }
+  .ms-txt.ghost-txt { color: var(--text-3); font-weight: 600; font-size: 10.5px; }
+  .milestone { top: 14px; }
+  .milestone.ghost { background: transparent; box-shadow: none; border: 2px dashed var(--text-3); animation-name: ms-fade; animation-duration: var(--dur-deliberate); animation-timing-function: var(--ease-standard); }
+  .ms-link { position: absolute; top: 22px; height: 0; border-top: 2px dotted rgba(244,63,94,.55); }
+  .dep { fill: none; stroke: rgba(160,168,200,.55); stroke-width: 1.5; stroke-linejoin: round; stroke-dasharray: 1; --len: 1; animation: pr-draw .7s var(--ease-emphasized) both; }
+  .dep.crit { stroke: #f43f5e; stroke-width: 2; }
+  .head { fill: rgba(160,168,200,.85); animation: pr-fade-in .3s both; }
+  .head.crit { fill: #f43f5e; }
+  .today-line::before { content: 'dziś 29.09'; top: 60px; background: var(--bg-2); padding: 1px 4px; left: 3px; border-radius: 4px; white-space: nowrap; }
+  .gantt.only-critical .gantt-row:not([data-crit]):not(.g-g) { opacity: .28; transition: opacity var(--dur-slow) var(--ease-standard); }
+  .g-legend { display: flex; flex-wrap: wrap; gap: 8px 20px; padding: 12px 4px 0; font-size: 11.5px; color: var(--text-2); align-items: center; }
+  .g-legend .lg { display: inline-flex; align-items: center; gap: 7px; }
+  .g-legend .sw { width: 22px; height: 10px; border-radius: 3px; display: inline-block; }
+  .sw.plan { border: 1.5px dashed rgba(160,168,200,.5); }
+  .sw.done { background: linear-gradient(90deg,#16a34a,#22c55e); }
+  .sw.act { background: linear-gradient(90deg,#6366f1,#8b5cf6); }
+  .sw.late { background: linear-gradient(90deg,#f59e0b,#ef4444); }
+  .sw.fc { background: repeating-linear-gradient(45deg, rgba(139,92,246,.5) 0 4px, rgba(139,92,246,.2) 4px 8px); border: 1px solid rgba(167,139,250,.5); }
+  .sw.crit { border: 2px solid #f43f5e; background: transparent; }
+  .lg .dia { width: 10px; height: 10px; transform: rotate(45deg); background: var(--accent-2); display: inline-block; }
+  .lg .dia.late { background: var(--danger); }
+  .lg .arw { width: 22px; height: 2px; background: rgba(160,168,200,.6); display: inline-block; position: relative; }
+  .lg .arw.crit { background: #f43f5e; }
+  .tb { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin-bottom: 14px; }
+  .tb .lab { font-size: 11.5px; color: var(--text-3); font-weight: 700; margin-right: -8px; }
+  .tb .sp { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .crit-toggle.on { border-color: rgba(244,63,94,.6); color: #fda4af; background: rgba(244,63,94,.1); }
+
+  .banner { align-items: center; }
+  .banner .btn { flex-shrink: 0; }
+
+  .window-backdrop { z-index: 60; }
+  .screen-frame:has(.window-backdrop) .app { min-height: 1240px; }
+  .screen-frame:has(.window-backdrop) .app > * { filter: saturate(.85); }
+  .window.mv { width: min(860px, 94%); animation: pr-scale-in var(--dur-slow) var(--ease-emphasized) both; box-shadow: var(--shadow-lg), var(--glow-indigo); }
+  .mv .sec { margin-bottom: 20px; }
+  .mv .sec:last-child { margin-bottom: 0; }
+  .mv .sec-t { font-size: 11px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--accent-2); margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  .mv .sec-t .n { width: 18px; height: 18px; border-radius: 50%; background: var(--accent-glow); color: var(--accent-2); display: inline-flex; align-items: center; justify-content: center; font-size: 10.5px; letter-spacing: 0; }
+  .mv-sum { display: grid; grid-template-columns: 1fr 1.5fr; gap: 16px; align-items: center; padding: 14px 16px; }
+  .mv-sum .nm { font-size: 14px; font-weight: 800; }
+  .mv-sum .sm { font-size: 12px; color: var(--text-3); margin-top: 3px; }
+  .mv-axis { position: relative; height: 62px; font-size: 10px; color: var(--text-3); }
+  .mv-axis .ln { position: absolute; left: 0; right: 0; height: 16px; border-radius: 5px; }
+  .mv-axis .l1 { top: 4px; border: 1.5px dashed var(--plan); }
+  .mv-axis .l2 { top: 28px; background: linear-gradient(90deg,#f59e0b,#ef4444); transform-origin: left; animation: pr-grow-x var(--dur-deliberate) var(--ease-emphasized) both; }
+  .mv-axis .l2 i { position: absolute; right: 0; top: 0; bottom: 0; background: repeating-linear-gradient(45deg, rgba(139,92,246,.7) 0 5px, rgba(139,92,246,.35) 5px 10px); border-radius: 0 5px 5px 0; }
+  .mv-axis .cap { position: absolute; top: 46px; font-weight: 700; white-space: nowrap; }
+  .mv-axis .lab1 { position: absolute; top: 5px; left: 8px; font-weight: 700; color: var(--text-3); }
+  .choice-card { cursor: pointer; display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px; border: 1.5px solid var(--border); border-radius: var(--radius); background: var(--bg-card); }
+  .choice-card.selected { box-shadow: 0 0 0 4px rgba(99,102,241,.12); }
+  .mv .textarea { min-height: 72px; margin-top: 10px; line-height: 1.5; }
+  .mv-note { font-size: 11.5px; color: var(--text-3); margin-top: 6px; display: flex; gap: 6px; align-items: center; }
+  .mv-note .icon { width: 12px; height: 12px; }
+  .rp-list { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  .rp-head { display: flex; align-items: center; padding: 8px 14px; background: var(--bg-3); font-size: 11.5px; color: var(--text-3); font-weight: 700; gap: 10px; }
+  .rp-head .lnk { margin-left: auto; color: var(--accent-2); cursor: pointer; }
+  .rp-row { display: grid; grid-template-columns: 22px 1fr auto auto; gap: 12px; align-items: center; padding: 11px 14px; border-top: 1px solid var(--border); font-size: 12.5px; transition: background var(--dur-normal) var(--ease-standard); }
+  .rp-row:hover { background: rgba(255,255,255,.02); }
+  .rp-row input { width: 16px; height: 16px; accent-color: #6366f1; }
+  .rp-row .nm { font-weight: 700; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .rp-row .why { font-size: 11px; color: var(--text-3); margin-top: 2px; font-weight: 500; }
+  .rp-row .dt { font-variant-numeric: tabular-nums; font-size: 12px; color: var(--text-2); white-space: nowrap; display: flex; gap: 8px; align-items: center; }
+  .rp-row .dt s { color: var(--text-3); }
+  .rp-row .dt .icon { width: 12px; height: 12px; color: var(--text-3); }
+  .rp-row.off { opacity: .6; }
+  .cr-tag { font-size: 9.5px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; padding: 1px 6px; border-radius: 999px; color: #fda4af; background: rgba(244,63,94,.12); }
+  .imp { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .imp-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; background: var(--bg-card); }
+  .imp-card.bad { border-color: rgba(244,63,94,.45); background: linear-gradient(135deg, rgba(244,63,94,.08), var(--bg-card)); }
+  .imp-card.warn { border-color: rgba(245,158,11,.4); }
+  .imp-card .k { font-size: 11px; color: var(--text-3); font-weight: 700; display: flex; gap: 6px; align-items: center; }
+  .imp-card .k .dia { width: 8px; height: 8px; transform: rotate(45deg); background: var(--accent-2); display: inline-block; }
+  .imp-card.bad .k .dia { background: var(--danger); }
+  .imp-card .v { font-size: 15px; font-weight: 800; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .imp-card .v s { color: var(--text-3); font-weight: 600; font-size: 13px; margin-right: 4px; }
+  .imp-card .d { font-size: 11.5px; color: var(--text-2); margin-top: 4px; line-height: 1.45; }
+  .imp-card.bad .v .n { color: #fda4af; }
+.flipx { transform: scaleX(-1); }
+</style>
+</head>
+<body>
+<!-- IKONY: wklejone 1:1 z shared/icons.html -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+<symbol id="i-sitemap" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="5" rx="1"/><rect x="2" y="17" width="6" height="5" rx="1"/><rect x="16" y="17" width="6" height="5" rx="1"/><path d="M12 7v4M5 17v-3h14v3"/></symbol>
+<symbol id="i-gantt" viewBox="0 0 24 24"><line x1="3" y1="4" x2="3" y2="20"/><rect x="5" y="5" width="8" height="3" rx="1"/><rect x="9" y="10.5" width="10" height="3" rx="1"/><rect x="7" y="16" width="6" height="3" rx="1"/></symbol>
+<symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></symbol>
+<symbol id="i-flag" viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+<symbol id="i-timer" viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6"/></symbol>
+<symbol id="i-user-x" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="18" y1="8" x2="23" y2="13"/><line x1="23" y1="8" x2="18" y2="13"/></symbol>
+<symbol id="i-merge" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></symbol>
+<symbol id="i-branch" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-package" viewBox="0 0 24 24"><path d="M16.5 9.4 7.5 4.21M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+<symbol id="i-radar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><path d="M12 2v10l7 5"/></symbol>
+<symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M2 16h.01M21.8 16c.2-2 .131-5.354 0-6"/><path d="M9 6.8a6 6 0 0 1 9 5.2c0 .47 0 1.17-.02 2"/></symbol>
+<symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+<symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+<symbol id="i-maximize" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></symbol>
+<symbol id="i-move" viewBox="0 0 24 24"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></symbol>
+<symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-palette" viewBox="0 0 24 24"><circle cx="13.5" cy="6.5" r="1"/><circle cx="17.5" cy="10.5" r="1"/><circle cx="8.5" cy="7.5" r="1"/><circle cx="6.5" cy="12.5" r="1"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.5-.75 1.5-1.5 0-.4-.15-.74-.4-1-.25-.25-.4-.6-.4-1 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.96-4.48-9-10-9z"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+<symbol id="i-scale" viewBox="0 0 24 24"><path d="M16 16l3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1zM2 16l3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1z"/><path d="M7 21h10M12 3v18M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+<symbol id="i-lightning" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+</defs></svg>
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">C05</span>
+    <h2>Przesunięcie pozycji roadmapy</h2>
+    <div class="desc">Okno nad C01: przyczyna opóźnienia, propozycja przeplanowania następników i wpływ na kamienie milowe.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+  <div class="logo"><span class="name">TentaFlow</span></div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-home"/></svg>Pulpit</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-services"/></svg>Serwisy</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</a>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+    <a class="nav-item active" href="p01-lista.html"><svg class="icon"><use href="#i-folder"/></svg>Projekty</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-bot"/></svg>Agenci</a>
+    <a class="nav-item" href="d01-edytor-workflow.html"><svg class="icon"><use href="#i-branch"/></svg>Flow Builder</a>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</a>
+    <a class="nav-item" href="f01-struktura.html"><svg class="icon"><use href="#i-sitemap"/></svg>Struktura organizacyjna</a>
+    <a class="nav-item" href="f05-prywatnosc.html"><svg class="icon"><use href="#i-fingerprint"/></svg>Prywatność</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</a>
+  </div>
+  <div class="footer">
+    <a class="user-chip" href="g01-profil.html" title="Mój profil"><div class="av av-1">AK</div><div><div class="name-t">Anna Kowalska</div><div class="role">PM · Dział Realizacji</div></div></a>
+  </div>
+</aside>
+      <main class="main">
+        <div class="breadcrumb"><a class="crumb-link" href="p01-lista.html">Projekty</a><svg class="icon icon-sm" aria-hidden="true"><use href="#i-chevron-r"/></svg><a class="crumb-link" href="a02-tablica.html">NextApp</a><svg class="icon icon-sm" aria-hidden="true"><use href="#i-chevron-r"/></svg><a class="crumb-link" href="#" title="Węzeł klienta — ekran spoza zestawu">Energetyka Centrum</a><svg class="icon icon-sm" aria-hidden="true"><use href="#i-chevron-r"/></svg><span class="current">Wdrożenie DCIM</span></div>
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-gantt"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Wdrożenie DCIM <span class="sub-switch-wrap"><button class="sub-switch" data-node="ecw" aria-haspopup="dialog" title="Przełącz projekt w drzewie"><svg class="icon"><use href="#i-sitemap"/></svg>Zmień podprojekt<svg class="icon chev"><use href="#i-chevron-d"/></svg></button></span> <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">Projekt wdrożeniowy · plan v2 po aneksie · go-live 12.01.2027</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-check-circle"/></svg>31 otwartych</span>
+              <span class="chip danger"><svg class="icon"><use href="#i-flag"/></svg>1 kamień zagrożony</span>
+              <span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Moduły: 5 włączonych</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">PM</b></span>
+            </div>
+            <div class="inherit-line"><span>Z NextApp dziedziczy:</span><span class="inh">członkowie i funkcje</span><span class="inh">SLA i kalendarz</span><span class="inh">moduły aplikacji</span><span>własne:</span><span class="own">roadmapa</span><span class="own">workflow wdrożenia</span></div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">2</span></button>
+            <button class="btn"><svg class="icon"><use href="#i-users"/></svg>Członkowie</button>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport</button>
+            <button class="btn"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          </div>
+        </div>
+        <div class="tabs-bar">
+          <a class="tab" href="#" title="Ekran podprojektu spoza tego zestawu mockupów"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</a>
+          <a class="tab" href="e01-wiedza-plan.html"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">7</span></a>
+          <a class="tab" href="#" title="Ekran podprojektu spoza tego zestawu mockupów"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">74</span></a>
+          <a class="tab" href="#" title="Ekran podprojektu spoza tego zestawu mockupów"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">4</span></a>
+          <a class="tab" href="#" title="Ekran podprojektu spoza tego zestawu mockupów"><svg class="icon"><use href="#i-message"/></svg>Chat</a>
+          <a class="tab" href="#" title="Ekran podprojektu spoza tego zestawu mockupów"><svg class="icon"><use href="#i-check-circle"/></svg>Zadania <span class="count">31</span></a>
+          <a class="tab active" href="c01-roadmapa.html"><svg class="icon"><use href="#i-gantt"/></svg>Roadmapa</a>
+          <a class="tab" href="#" title="Ekran podprojektu spoza tego zestawu mockupów"><svg class="icon"><use href="#i-rocket"/></svg>Wydania</a>
+          <a class="tab" href="#" title="Ekran podprojektu spoza tego zestawu mockupów"><svg class="icon"><use href="#i-shield"/></svg>Bezpieczeństwo</a>
+          <a class="tab" href="#" title="Ekran podprojektu spoza tego zestawu mockupów"><svg class="icon"><use href="#i-link"/></svg>Połączenia</a>
+        </div>
+        <div class="subnav-wrap">
+  <div class="segmented subnav">
+    <a class="active" href="c01-roadmapa.html"><svg class="icon"><use href="#i-gantt"/></svg>Oś czasu</a>
+    <a href="c02-teraz-nastepnie.html"><svg class="icon"><use href="#i-grid"/></svg>Teraz / Następnie / Później</a>
+    <a href="c03-alokacje.html"><svg class="icon"><use href="#i-users"/></svg>Alokacje</a>
+    <a href="e02-propozycja-planu.html"><svg class="icon"><use href="#i-sparkles"/></svg>Propozycje planu <span class="count">1</span></a>
+  </div>
+</div>
+        <div class="banner warn pr-enter" style="animation-delay:60ms">
+          <svg class="icon " aria-hidden="true"><use href="#i-alert"/></svg>
+          <div class="b-text"><b>Migracja szaf i urządzeń opóźnia się o 6 dni rob.</b> Bez przeplanowania kamień „Odbiór środowiska testowego” przesunie się z 17.11 na 25.11, a Go-live 12.01.2027 zostanie z buforem 1 dnia rob.</div>
+          <a class="btn btn-primary" href="c05-przesuniecie.html"><svg class="icon " aria-hidden="true"><use href="#i-move"/></svg>Zaplanuj przesunięcie</a><!-- otwiera: C05 -->
+        </div>
+        <div class="tb pr-enter" style="animation-delay:100ms">
+          <span class="lab">Porównaj z:</span>
+          <div class="pill-tabs" aria-label="Plan porównawczy"><button>Plan v1 · zatw. 01.09</button><button class="active">Plan v2 · po aneksie 22.09</button></div>
+          <div class="sp">
+            <button class="btn btn-sm crit-toggle" aria-pressed="false"><svg class="icon " aria-hidden="true"><use href="#i-target"/></svg>Tylko ścieżka krytyczna</button>
+            <button class="btn btn-sm"><svg class="icon " aria-hidden="true"><use href="#i-plus"/></svg>Dodaj pozycję</button><!-- otwiera: nowa pozycja roadmapy (poza zestawem) -->
+          </div>
+        </div>
+        <div class="pr-enter" style="animation-delay:140ms">
+<div class="gantt ">
+  <div class="g-scroll"><div class="g-inner" style="width:1084.6px;height:810px">
+    <div class="g-under" style="left:232px;width:852.6px"><div class="g-hol" style="left:626.4px;width:52.2px"><span>święta</span></div></div>
+    <div class="g-head"><div class="g-head-l">Pozycje roadmapy</div><div class="g-head-t"><span class="g-mon" style="left:0px;width:139.2px">Wrzesień 2026</span><span class="g-mon" style="left:139.2px;width:179.79999999999998px">Październik</span><span class="g-mon" style="left:319px;width:174px">Listopad</span><span class="g-mon" style="left:493px;width:179.79999999999998px">Grudzień</span><span class="g-mon" style="left:672.8px;width:179.79999999999998px">Styczeń 2027</span><span class="g-wk" style="left:0.0px;width:40.6px"><b>T37</b>07.09</span><span class="g-wk" style="left:40.6px;width:40.6px"><b>T38</b>14.09</span><span class="g-wk" style="left:81.2px;width:40.6px"><b>T39</b>21.09</span><span class="g-wk now" style="left:121.8px;width:40.6px"><b>T40</b>28.09</span><span class="g-wk" style="left:162.4px;width:40.6px"><b>T41</b>05.10</span><span class="g-wk" style="left:203.0px;width:40.6px"><b>T42</b>12.10</span><span class="g-wk" style="left:243.6px;width:40.6px"><b>T43</b>19.10</span><span class="g-wk" style="left:284.2px;width:40.6px"><b>T44</b>26.10</span><span class="g-wk" style="left:324.8px;width:40.6px"><b>T45</b>02.11</span><span class="g-wk" style="left:365.4px;width:40.6px"><b>T46</b>09.11</span><span class="g-wk" style="left:406.0px;width:40.6px"><b>T47</b>16.11</span><span class="g-wk" style="left:446.6px;width:40.6px"><b>T48</b>23.11</span><span class="g-wk" style="left:487.2px;width:40.6px"><b>T49</b>30.11</span><span class="g-wk" style="left:527.8px;width:40.6px"><b>T50</b>07.12</span><span class="g-wk" style="left:568.4px;width:40.6px"><b>T51</b>14.12</span><span class="g-wk" style="left:609.0px;width:40.6px"><b>T52</b>21.12</span><span class="g-wk" style="left:649.6px;width:40.6px"><b>T53</b>28.12</span><span class="g-wk" style="left:690.2px;width:40.6px"><b>T1</b>04.01</span><span class="g-wk" style="left:730.8px;width:40.6px"><b>T2</b>11.01</span><span class="g-wk" style="left:771.4px;width:40.6px"><b>T3</b>18.01</span><span class="g-wk" style="left:812.0px;width:40.6px"><b>T4</b>25.01</span></div></div>
+<div class="gantt-row g-g" style="height:32px"><div class="gantt-label g-glabel"><svg class="icon " aria-hidden="true"><use href="#i-server"/></svg><span>Infrastruktura</span><span class="g-gpct">68%</span></div><div class="gantt-track"></div></div>
+<div class="gantt-row g-i" style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Serwery i sieć u klienta</span></div><span class="dev good">−1 dzień</span></div><div class="gantt-track"><div class="bar bar-plan" style="left:0px;width:69.6px;animation-delay:245ms" title="Zakończone 17.09, plan 18.09"></div><div class="bar bar-done" style="left:0px;width:63.8px;animation-delay:305ms" title="Zakończone 17.09, plan 18.09">100%</div></div></div>
+<div class="gantt-row g-i" style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Instalacja platformy DCIM</span></div><span class="dev ok">w planie</span></div><div class="gantt-track"><div class="bar bar-plan" style="left:81.2px;width:150.8px;animation-delay:290ms"></div><div class="bar bar-actual" style="left:81.2px;width:52.2px;animation-delay:350ms">35%</div><div class="bar bar-forecast" style="left:133.4px;width:98.6px;animation-delay:410ms"></div></div></div>
+<div class="gantt-row g-g" style="height:32px"><div class="gantt-label g-glabel"><svg class="icon " aria-hidden="true"><use href="#i-layers"/></svg><span>Migracja danych</span><span class="g-gpct">41%</span></div><div class="gantt-track"></div></div>
+<div class="gantt-row g-i" data-crit style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Inwentaryzacja i mapowanie</span></div><span class="dev ok">w planie</span></div><div class="gantt-track"><div class="bar bar-plan crit" style="left:0px;width:29.0px;animation-delay:380ms"></div><div class="bar bar-done critical" style="left:0px;width:29.0px;animation-delay:440ms"></div></div></div>
+<div class="gantt-row g-i" data-crit style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Migracja szaf i urządzeń</span></div><span class="dev late">+6 dni rob.</span></div><div class="gantt-track"><div class="bar bar-plan crit" style="left:40.6px;width:191.4px;animation-delay:425ms" title="Plan v2: 14.09–16.10 · prognoza koniec 26.10"></div><div class="bar bar-late critical" style="left:40.6px;width:92.8px;animation-delay:485ms" title="Plan v2: 14.09–16.10 · prognoza koniec 26.10">45%</div><div class="bar bar-forecast critical" style="left:133.4px;width:156.6px;animation-delay:545ms" title="Plan v2: 14.09–16.10 · prognoza koniec 26.10"></div></div></div>
+<div class="gantt-row g-i" data-crit style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Weryfikacja danych z klientem</span></div><span class="dev late">+6 dni rob.</span></div><div class="gantt-track"><div class="bar bar-plan crit" style="left:243.6px;width:69.6px;animation-delay:470ms" title="Plan v2: 19.10–30.10 · prognoza 27.10–09.11"></div><div class="bar bar-forecast critical" style="left:290px;width:81.2px;animation-delay:590ms" title="Plan v2: 19.10–30.10 · prognoza 27.10–09.11"></div></div></div>
+<div class="gantt-row g-i" data-crit style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Import danych do środowiska</span></div><span class="dev late">+6 dni rob.</span></div><div class="gantt-track"><div class="bar bar-plan crit" style="left:324.8px;width:69.6px;animation-delay:515ms"></div><div class="bar bar-forecast critical" style="left:371.2px;width:81.2px;animation-delay:635ms"></div></div></div>
+<div class="gantt-row g-g" style="height:32px"><div class="gantt-label g-glabel"><svg class="icon " aria-hidden="true"><use href="#i-flag"/></svg><span>Odbiory</span><span class="g-gpct">0%</span></div><div class="gantt-track"></div></div>
+<div class="gantt-row g-ms g-i" data-crit style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Odbiór środowiska testowego</span></div><span class="dev late">+6 dni rob.</span></div><div class="gantt-track"><div class="ms-link" style="left:424.7px;width:26.4px"></div><div class="milestone ghost" style="left:406.7px" title="Plan v2: 17.11"></div><div class="milestone late" style="left:453.1px;animation-delay:665ms" title="Kamień milowy: plan 17.11, prognoza 25.11"></div><span class="ms-txt late" style="left:477.1px">25.11 · +6 dni rob.</span><span class="ms-txt ghost-txt" style="left:336.7px;width:62px;text-align:right">plan 17.11</span></div></div>
+<div class="gantt-row g-i" data-crit style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Testy akceptacyjne</span></div><span class="dev late">+6 dni rob.</span></div><div class="gantt-track"><div class="bar bar-plan crit" style="left:417.6px;width:179.8px;animation-delay:650ms"></div><div class="bar bar-forecast critical" style="left:464px;width:203.0px;animation-delay:770ms"></div></div></div>
+<div class="gantt-row g-i" data-crit style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Poprawki i odbiór końcowy</span></div><span class="dev ok">w planie</span></div><div class="gantt-track"><div class="bar bar-plan crit future" style="left:690.2px;width:29.0px;animation-delay:695ms"></div><div class="milestone" style="left:731.5px;animation-delay:875ms" title="Kamień milowy: Go-live"></div><span class="ms-txt" style="left:755.5px">Go-live 12.01.2027</span></div></div>
+<div class="gantt-row g-g" style="height:32px"><div class="gantt-label g-glabel"><svg class="icon " aria-hidden="true"><use href="#i-link"/></svg><span>Integracje</span><span class="g-gpct">0%</span></div><div class="gantt-track"></div></div>
+<div class="gantt-row g-i" style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Integracja z SDP i Active Directory</span></div><span class="dev ok">w planie</span></div><div class="gantt-track"><div class="bar bar-plan future" style="left:203px;width:232.0px;animation-delay:785ms"></div></div></div>
+<div class="gantt-row g-i" style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Integracja z BMS klienta (OPC)</span></div><span class="dev ok">w planie</span></div><div class="gantt-track"><div class="bar bar-plan future" style="left:243.6px;width:272.6px;animation-delay:830ms"></div></div></div>
+<div class="gantt-row g-g" style="height:32px"><div class="gantt-label g-glabel"><svg class="icon " aria-hidden="true"><use href="#i-book"/></svg><span>Szkolenia</span><span class="g-gpct">0%</span></div><div class="gantt-track"></div></div>
+<div class="gantt-row g-i" style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Materiały szkoleniowe</span></div><span class="dev ok">w planie</span></div><div class="gantt-track"><div class="bar bar-plan future" style="left:365.4px;width:110.2px;animation-delay:920ms"></div></div></div>
+<div class="gantt-row g-i" style="height:46px"><div class="gantt-label"><div class="gl-main"><span class="gl-name">Szkolenia administratorów</span></div><span class="dev ok">w planie</span></div><div class="gantt-track"><div class="bar bar-plan future" style="left:487.2px;width:29.0px;animation-delay:965ms"></div><div class="milestone" style="left:528.5px;animation-delay:1145ms" title="Kamień milowy: Szkolenia administratorów"></div><span class="ms-txt" style="left:552.5px">08.12</span></div></div>
+    <div class="g-over" style="left:232px;width:852.6px"><svg class="g-arrows" width="852.6" height="810" viewBox="0 0 852.6 810" aria-hidden="true"><path class="dep" pathLength="1" d="M69.6 107H74.6V153H75.2" style="animation-delay:500ms"/><path class="dep crit" pathLength="1" d="M29 231H34V277H34.6" style="animation-delay:560ms"/><path class="dep crit" pathLength="1" d="M290 277H298V306" style="animation-delay:620ms"/><path class="dep crit" pathLength="1" d="M371.2 323H379.2V352" style="animation-delay:680ms"/><path class="dep crit" pathLength="1" d="M452.4 369H461.1V429" style="animation-delay:740ms"/><path class="dep crit" pathLength="1" d="M461.1 459V464H470V476" style="animation-delay:800ms"/><path class="dep crit" pathLength="1" d="M667 493H672V539H684.2" style="animation-delay:860ms"/><path class="dep crit" pathLength="1" d="M719.2 539H722.0" style="animation-delay:920ms"/><path class="dep" pathLength="1" d="M435 617H440V493H458.0" style="animation-delay:980ms"/><path class="dep" pathLength="1" d="M475.6 741H480.6V787H481.2" style="animation-delay:1040ms"/><path class="dep" pathLength="1" d="M516.2 787H519.0" style="animation-delay:1100ms"/><polygon class="head" points="81.2,153 74.7,149.4 74.7,156.6" style="animation-delay:900ms"/><polygon class="head crit" points="40.6,277 34.1,273.4 34.1,280.6" style="animation-delay:960ms"/><polygon class="head crit" points="298,312 294.4,305.5 301.6,305.5" style="animation-delay:1020ms"/><polygon class="head crit" points="379.2,358 375.59999999999997,351.5 382.8,351.5" style="animation-delay:1080ms"/><polygon class="head crit" points="461.1,435 457.5,428.5 464.70000000000005,428.5" style="animation-delay:1140ms"/><polygon class="head crit" points="470,482 466.4,475.5 473.6,475.5" style="animation-delay:1200ms"/><polygon class="head crit" points="690.2,539 683.7,535.4 683.7,542.6" style="animation-delay:1260ms"/><polygon class="head crit" points="728,539 721.5,535.4 721.5,542.6" style="animation-delay:1320ms"/><polygon class="head" points="464,493 457.5,489.4 457.5,496.6" style="animation-delay:1380ms"/><polygon class="head" points="487.2,787 480.7,783.4 480.7,790.6" style="animation-delay:1440ms"/><polygon class="head" points="525,787 518.5,783.4 518.5,790.6" style="animation-delay:1500ms"/></svg><div class="today-line" style="left:130.5px" title="Dziś: wtorek 29.09.2026"></div></div>
+  </div></div>
+</div>
+<div class="g-legend">
+  <span class="lg"><span class="sw plan"></span>Plan v2 (przerywany obrys)</span>
+  <span class="lg"><span class="sw done"></span>Zakończone</span>
+  <span class="lg"><span class="sw act"></span>W toku</span>
+  <span class="lg"><span class="sw late"></span>W toku, za planem</span>
+  <span class="lg"><span class="sw fc"></span>Prognoza</span>
+  <span class="lg"><span class="sw crit"></span>Ścieżka krytyczna</span>
+  <span class="lg"><span class="dia"></span>Kamień milowy</span>
+  <span class="lg"><span class="dia late"></span>Kamień zagrożony</span>
+  <span class="lg"><span class="arw"></span>Zależność</span>
+</div>
+        </div>
+        <div class="toast-stack"></div>
+      </main>
+    </div>
+    <div class="window-backdrop">
+      <div class="window mv" role="dialog" aria-labelledby="mvtitle">
+        <div class="window-head">
+          <div class="window-title"><svg class="icon " aria-hidden="true"><use href="#i-move"/></svg><span id="mvtitle">Przesunięcie pozycji: Migracja szaf i urządzeń</span></div>
+          <button class="window-close" title="Zamknij"><svg class="icon " aria-hidden="true"><use href="#i-x"/></svg></button>
+        </div>
+        <div class="window-body">
+          <div class="sec">
+            <div class="muted-box mv-sum">
+              <div><div class="nm">Migracja szaf i urządzeń</div><div class="sm">Koniec: <b style="color:var(--text)">16.10</b> → <b style="color:#fda4af">26.10</b> · <span class="dev late">+6 dni rob.</span></div></div>
+              <div class="mv-axis" aria-hidden="true">
+                <div class="ln l1" style="right:0px;width:297px"><span class="lab1">Plan v2</span></div>
+                <div class="ln l2" style="width:387px"><i style="width:90px"></i></div>
+                <span class="cap" style="left:0">14.09</span>
+                <span class="cap" style="left:279px;color:var(--text-3)">16.10</span>
+                <span class="cap" style="left:393px;color:#fda4af">26.10 (prognoza)</span>
+              </div>
+            </div>
+          </div>
+          <div class="sec">
+            <div class="sec-t"><span class="n">1</span>Co jest przyczyną?</div>
+            <div class="choice-grid">
+              <div class="choice-card selected" tabindex="0"><div class="cc-ico"><svg class="icon " aria-hidden="true"><use href="#i-user"/></svg></div><div><div class="cc-name">Po stronie klienta</div><div class="cc-desc">Dane, dostępy albo decyzje dostarczone później niż w planie.</div></div></div>
+              <div class="choice-card" tabindex="0"><div class="cc-ico"><svg class="icon " aria-hidden="true"><use href="#i-users"/></svg></div><div><div class="cc-name">Po naszej stronie</div><div class="cc-desc">Obłożenie zespołu, błąd w szacunku, niedostępność osoby.</div></div></div>
+              <div class="choice-card" tabindex="0"><div class="cc-ico"><svg class="icon " aria-hidden="true"><use href="#i-globe"/></svg></div><div><div class="cc-name">Przyczyna zewnętrzna</div><div class="cc-desc">Dostawca, infrastruktura, siła wyższa.</div></div></div>
+              <div class="choice-card" tabindex="0"><div class="cc-ico"><svg class="icon " aria-hidden="true"><use href="#i-layers"/></svg></div><div><div class="cc-name">Zmiana zakresu</div><div class="cc-desc">Dodatkowe szafy albo urządzenia poza pierwotną listą.</div></div></div>
+            </div>
+            <textarea class="textarea" aria-label="Uzasadnienie">Klient dostarczył pliki z inwentaryzacją szaf DC-2 i DC-3 dopiero 24.09 (plan: 14.09). Migracja pozostałych szaf trwa zgodnie z harmonogramem.</textarea>
+            <div class="mv-note"><svg class="icon " aria-hidden="true"><use href="#i-history"/></svg>Przyczyna trafi do historii planu (v2 → v3) i do raportu dla klienta.</div>
+          </div>
+          <div class="sec">
+            <div class="sec-t"><span class="n">2</span>Propozycja przeplanowania następników</div>
+            <div class="rp-list">
+              <div class="rp-head"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-sparkles"/></svg>Wyliczone z zależności i kalendarza roboczego. Odznacz to, czego nie chcesz przesuwać.<span class="lnk">Odznacz wszystkie</span></div>
+              <label class="rp-row">
+        <input type="checkbox" checked>
+        <div><div class="nm">Weryfikacja danych z klientem<span class="cr-tag">ścieżka krytyczna</span></div><div class="why">Następnik bezpośredni · start po zakończeniu migracji</div></div>
+        <div class="dt"><s>19.10 – 30.10</s><svg class="icon flipx " aria-hidden="true"><use href="#i-arrow-left"/></svg><b>27.10 – 09.11</b></div>
+        <span class="dev late">+6 dni rob.</span>
+      </label>
+              <label class="rp-row">
+        <input type="checkbox" checked>
+        <div><div class="nm">Import danych do środowiska testowego<span class="cr-tag">ścieżka krytyczna</span></div><div class="why">Następnik · zależy od zweryfikowanych danych</div></div>
+        <div class="dt"><s>02.11 – 13.11</s><svg class="icon flipx " aria-hidden="true"><use href="#i-arrow-left"/></svg><b>10.11 – 23.11</b></div>
+        <span class="dev late">+6 dni rob.</span>
+      </label>
+              <label class="rp-row">
+        <input type="checkbox" checked>
+        <div><div class="nm">Testy akceptacyjne<span class="cr-tag">ścieżka krytyczna</span></div><div class="why">Start po odbiorze środowiska · koniec wypada w przerwie świątecznej</div></div>
+        <div class="dt"><s>18.11 – 18.12</s><svg class="icon flipx " aria-hidden="true"><use href="#i-arrow-left"/></svg><b>26.11 – 30.12</b></div>
+        <span class="dev late">+6 dni rob.</span>
+      </label>
+              <label class="rp-row off">
+        <input type="checkbox">
+        <div><div class="nm">Szkolenia administratorów</div><div class="why">Nie zależą od migracji, więc termin 30.11 – 04.12 zostaje</div></div>
+        <div class="dt"><s>30.11 – 04.12</s><svg class="icon flipx " aria-hidden="true"><use href="#i-arrow-left"/></svg><b>30.11 – 04.12</b></div>
+        <span class="dev ok">bez zmian</span>
+      </label>
+            </div>
+          </div>
+          <div class="sec">
+            <div class="sec-t"><span class="n">3</span>Alokacje do przesunięcia</div>
+            <div class="rp-list">
+              <div class="rp-head"><svg class="icon icon-sm" aria-hidden="true"><use href="#i-users"/></svg>Osoby przypisane do przesuwanych pozycji. Odznacz przydział, którego okres ma zostać bez zmian.<span class="lnk">Odznacz wszystkie</span></div>
+              <label class="rp-row" data-menu="allocation" data-subject="Piotr Zieliński · 60% · Migracja szaf i urządzeń">
+        <input type="checkbox" checked>
+        <div><div class="nm">Piotr Zieliński · 60% · Migracja szaf i urządzeń</div><div class="why">Przydział wydłuża się razem z zadaniem</div></div>
+        <div class="dt"><s>14.09 – 16.10</s><svg class="icon flipx " aria-hidden="true"><use href="#i-arrow-left"/></svg><b>14.09 – 26.10</b></div>
+        <span class="dev late">konflikt: 130% w T44</span>
+      </label>
+              <label class="rp-row" data-menu="allocation" data-subject="Paweł Szymański · 40% · Migracja szaf i urządzeń">
+        <input type="checkbox" checked>
+        <div><div class="nm">Paweł Szymański · 40% · Migracja szaf i urządzeń</div><div class="why">Przydział wydłuża się razem z zadaniem</div></div>
+        <div class="dt"><s>12.10 – 16.10</s><svg class="icon flipx " aria-hidden="true"><use href="#i-arrow-left"/></svg><b>12.10 – 26.10</b></div>
+        <span class="dev ok">bez konfliktu</span>
+      </label>
+              <label class="rp-row" data-menu="allocation" data-subject="Ewa Wiśniewska · 25% · Migracja szaf i urządzeń">
+        <input type="checkbox" checked>
+        <div><div class="nm">Ewa Wiśniewska · 25% · Migracja szaf i urządzeń</div><div class="why">Nowy koniec wypada po urlopie 20–24.10</div></div>
+        <div class="dt"><s>12.10 – 16.10</s><svg class="icon flipx " aria-hidden="true"><use href="#i-arrow-left"/></svg><b>12.10 – 26.10</b></div>
+        <span class="dev late">konflikt: urlop 20–24.10</span>
+      </label>
+              <label class="rp-row" data-menu="allocation" data-subject="Piotr Zieliński · 60% · Weryfikacja danych z klientem">
+        <input type="checkbox" checked>
+        <div><div class="nm">Piotr Zieliński · 60% · Weryfikacja danych z klientem</div><div class="why">Przydział przesuwa się razem z następnikiem</div></div>
+        <div class="dt"><s>19.10 – 30.10</s><svg class="icon flipx " aria-hidden="true"><use href="#i-arrow-left"/></svg><b>27.10 – 09.11</b></div>
+        <span class="dev late">konflikt: 130% w T44</span>
+      </label>
+              <label class="rp-row" data-menu="allocation" data-subject="Anna Kowalska · 30% · Weryfikacja danych z klientem">
+        <input type="checkbox" checked>
+        <div><div class="nm">Anna Kowalska · 30% · Weryfikacja danych z klientem</div><div class="why">Przydział przesuwa się razem z następnikiem</div></div>
+        <div class="dt"><s>19.10 – 30.10</s><svg class="icon flipx " aria-hidden="true"><use href="#i-arrow-left"/></svg><b>27.10 – 09.11</b></div>
+        <span class="dev ok">bez konfliktu</span>
+      </label>
+              <label class="rp-row" data-menu="allocation" data-subject="Piotr Zieliński · 70% · Załadowanie danych">
+        <input type="checkbox" checked>
+        <div><div class="nm">Piotr Zieliński · 70% · Załadowanie danych</div><div class="why">Przydział przesuwa się razem z następnikiem</div></div>
+        <div class="dt"><s>02.11 – 13.11</s><svg class="icon flipx " aria-hidden="true"><use href="#i-arrow-left"/></svg><b>10.11 – 23.11</b></div>
+        <span class="dev ok">bez konfliktu</span>
+      </label>
+            </div>
+          </div>
+          <div class="sec">
+            <div class="sec-t"><span class="n">4</span>Wpływ na kamienie milowe</div>
+            <div class="imp">
+              <div class="imp-card bad"><div class="k"><span class="dia"></span>Odbiór środowiska testowego</div><div class="v"><s>17.11</s><span class="n">25.11</span></div><div class="d">+6 dni rob. Klient zostanie poinformowany przy zatwierdzeniu planu v3.</div></div>
+              <div class="imp-card"><div class="k"><span class="dia"></span>Szkolenia administratorów</div><div class="v">08.12</div><div class="d">Bez zmian. Materiały szkoleniowe powstają równolegle.</div></div>
+              <div class="imp-card warn"><div class="k"><span class="dia"></span>Go-live</div><div class="v">12.01.2027</div><div class="d">Bez zmian, ale bufor przed poprawkami spada z 7 do 1 dnia rob.</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="window-foot">
+          <button class="btn">Anuluj</button>
+          <button class="btn btn-primary"><svg class="icon " aria-hidden="true"><use href="#i-check"/></svg>Zastosuj i zapisz jako plan v3 (3 pozycje, 6 alokacji)</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<script src="shared/praca.js"></script>
+<script src="shared/akcje.js"></script>
+
+</body>
+</html>

@@ -233,6 +233,7 @@ ron = "0.8"
 roxmltree = "0.21.1"
 rsa = "0.9"
 rusqlite = "0.39.0"
+rust_xlsxwriter = "0.99.1"
 rustc-hash = "2.1.2"
 rustfft = "6.2"
 rustls = {version = "0.23.40", default-features = false}

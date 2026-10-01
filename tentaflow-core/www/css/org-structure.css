@@ -1,0 +1,327 @@
+/* =============================================================================
+   org-structure.css — organization structure screen (tabs, summary tiles,
+   unit and position tables). Layout only: every control is a tf-* component
+   styled by controls.css.
+   ============================================================================= */
+
+.org-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--tf-space-md, 12px);
+  flex-wrap: wrap;
+  margin-bottom: var(--tf-space-md, 12px);
+}
+
+.org-loading {
+  padding: var(--tf-space-xl, 24px);
+  text-align: center;
+  color: var(--tf-text-3);
+}
+
+.org-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--tf-space-md, 12px);
+  margin-bottom: var(--tf-space-lg, 16px);
+}
+
+.org-section-title {
+  margin: var(--tf-space-lg, 16px) 0 var(--tf-space-sm, 8px);
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--tf-text);
+}
+
+.org-table-footer,
+.org-meta {
+  padding: var(--tf-space-sm, 8px) 2px 0;
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+.org-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-xs, 4px);
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--tf-text-2);
+}
+
+.org-history-date {
+  max-width: 260px;
+  margin-bottom: var(--tf-space-md, 12px);
+}
+
+.org-visibility {
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-sm, 8px);
+  max-width: 720px;
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--tf-text-2);
+}
+
+/* ---- Drzewo tab: chips, toolbar, path, stage, detail panel, legend ---- */
+
+.org-tree-search-wrap {
+  position: relative;
+  flex: 0 1 auto;
+  width: clamp(300px, 30vw, 440px);
+}
+
+.org-tree-search { width: 100%; }
+
+.org-kbd {
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  transform: translateY(-50%);
+  padding: 1px 7px;
+  border: 1px solid var(--tf-border-hover);
+  border-radius: 5px;
+  font: 700 11px var(--tf-mono, 'JetBrains Mono', ui-monospace, monospace);
+  color: var(--tf-text-3);
+  pointer-events: none;
+}
+
+/* While the box has focus the hint is noise, and the clear button needs the spot. */
+.org-tree-search-wrap:focus-within .org-kbd { display: none; }
+
+.org-tree-toolbar {
+  flex-wrap: nowrap;
+  margin-bottom: var(--tf-space-sm, 8px);
+}
+
+.org-tree-path {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: var(--tf-space-md, 12px);
+  font-size: 12px;
+  color: var(--tf-text-3);
+}
+
+.org-tree-path[hidden] { display: none; }
+.org-path-chip { cursor: pointer; }
+.org-path-sep { width: 12px; height: 12px; }
+.org-path-matches {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: var(--tf-space-sm, 8px);
+}
+
+.org-stage {
+  position: relative;
+  display: flex;
+  gap: var(--tf-space-md, 12px);
+  /* The chart fills what is left of the window below the compact header, tabs and toolbar: no page
+     scroll to see it. */
+  height: var(--org-stage-h, max(360px, calc(100dvh - 300px)));
+}
+
+/* The menu host is a zero-size flex item; without this the row's gap would still be spent on it. */
+.org-stage > tf-menu {
+  position: absolute;
+  width: 0;
+  height: 0;
+}
+
+.org-stage-tree { flex: 1 1 auto; min-width: 0; }
+
+.org-detail {
+  flex: 0 0 320px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--tf-space-md, 12px);
+  padding: var(--tf-space-md, 12px);
+  overflow-y: auto;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  background: var(--tf-bg-card);
+}
+
+.org-detail[hidden] { display: none; }
+
+/* The panel is 320px wide: a long key (in German, "Durchschnittliche Führungsspanne") wraps instead of pushing the value out of the box. */
+.org-detail .tf-kv-table { table-layout: fixed; }
+.org-detail .tf-kv-key { width: 42%; white-space: normal; overflow-wrap: anywhere; padding-right: 12px !important; }
+.org-detail .tf-kv-value { min-width: 0; overflow-wrap: anywhere; }
+.org-detail-head { display: flex; align-items: center; gap: var(--tf-space-sm, 8px); }
+.org-detail-titles { flex: 1; min-width: 0; }
+.org-detail-title { font-size: 15px; font-weight: 700; color: var(--tf-text); overflow-wrap: anywhere; }
+.org-detail-sub { font-size: 12px; color: var(--tf-text-3); overflow-wrap: anywhere; }
+
+.org-stage-overlay { display: none; }
+
+.org-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  margin-top: var(--tf-space-md, 12px);
+  font-size: 11.5px;
+  color: var(--tf-text-2);
+}
+
+.org-legend-item { display: inline-flex; align-items: center; gap: 7px; }
+.org-legend-item i { width: 10px; height: 10px; border-radius: 3px; background: var(--c); display: inline-block; }
+.org-legend-item b { color: var(--tf-text); font-variant-numeric: tabular-nums; }
+.org-legend-sep { width: 1px; height: 14px; background: var(--tf-border); }
+.org-legend-sym { display: inline-block; width: 22px; height: 12px; border-radius: 4px; border: 1px solid var(--tf-border-hover); }
+.org-legend-sym--vacancy { border-style: dashed; }
+.org-legend-sym--staff { border-color: rgba(167, 139, 250, 0.6); }
+
+/* Presentation: the stage alone. Fullscreen takes it over natively; when the browser refuses,
+   the same rules pin it over the page. */
+.org-stage.org-present {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  height: auto;
+  padding: var(--tf-space-md, 12px);
+  background: var(--tf-bg);
+}
+
+.org-stage.org-present .org-stage-overlay {
+  position: absolute;
+  top: calc(var(--tf-space-md, 12px) + 14px);
+  right: calc(var(--tf-space-md, 12px) + 14px);
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-sm, 8px);
+}
+
+.org-stage.org-present .org-detail { flex-basis: 380px; margin-top: 56px; font-size: 1.1em; }
+.org-stage:fullscreen { padding: var(--tf-space-md, 12px); background: var(--tf-bg); }
+
+.org-print-frame {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  width: 1px;
+  height: 1px;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+#org-header { display: block; margin-bottom: var(--tf-space-xs, 4px); }
+
+/* The header card takes ONE element for its actions slot: the tabs' actions live inside it, and it adds
+   no box of its own. */
+.org-header-actions-host { display: contents; }
+#org-list-actions { display: inline-flex; align-items: center; gap: var(--tf-space-sm, 8px); }
+#org-list-actions[hidden] { display: none; }
+
+/* ---- Lista tab: search, chips, the people table ---- */
+
+.org-list-tools {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px) var(--tf-space-md, 12px);
+  margin-bottom: var(--tf-space-md, 12px);
+}
+
+.org-list-search { flex: 0 1 auto; width: clamp(320px, 30vw, 440px); max-width: 100%; }
+/* The buttons stay together and keep to the right, on the first row when it fits and on the next when not. */
+.org-list-tools-end { display: flex; flex-wrap: wrap; gap: var(--tf-space-sm, 8px); margin-left: auto; }
+.org-list-since { flex: 0 0 auto; width: 190px; }
+.org-list-since[hidden] { display: none; }
+.org-list-table { display: block; }
+
+/* ---- Import window ---- */
+
+.org-imp { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.org-imp-top { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: start; gap: 12px 24px; }
+.org-imp-file { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.org-imp-file .tf-file-input-dropzone { min-height: 0; padding: 12px 16px; gap: 2px; }
+.org-imp-meta { font-size: 12px; color: var(--tf-text-3); overflow-wrap: anywhere; }
+.org-imp-caption { font-size: 12px; font-weight: 800; color: var(--tf-text); }
+.org-imp-mode { display: flex; flex-direction: column; gap: 6px; }
+.org-imp-asof { width: 200px; }
+.org-imp-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.org-imp-cols { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+.org-imp-left, .org-imp-right { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.org-imp-left tf-segmented { align-self: flex-start; }
+
+.org-imp-decisions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.org-imp-decisions:empty { display: none; }
+
+/* The list is its own scroll area, so a long report never pushes the preview or the footer away. */
+.org-imp-list {
+  max-height: 420px;
+  overflow: auto;
+  padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--tf-border-hover) transparent;
+}
+
+.org-imp-cards { display: flex; flex-direction: column; gap: 10px; }
+
+.org-imp-card {
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(239, 68, 68, 0.38);
+  border-radius: var(--tf-radius-lg);
+  background: rgba(239, 68, 68, 0.06);
+}
+
+.org-imp-card-icon { flex: 0 0 auto; color: var(--tf-danger); }
+.org-imp-card-icon .icon { width: 18px; height: 18px; }
+.org-imp-card-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.org-imp-card-title { font-size: 13.5px; font-weight: 700; color: var(--tf-text); overflow-wrap: anywhere; }
+.org-imp-card-where { font-size: 12px; color: var(--tf-text-3); overflow-wrap: anywhere; }
+.org-imp-card-hint { font-size: 12.5px; color: var(--tf-text-2); overflow-wrap: anywhere; }
+.org-imp-card-hint b { color: var(--tf-text); }
+.org-imp-card-fix { display: flex; flex-wrap: wrap; gap: 6px 8px; margin-top: 6px; }
+
+.org-imp-empty { padding: 18px 4px; font-size: 13px; color: var(--tf-text-3); }
+.org-imp-warnings { margin-top: 12px; }
+.org-imp-warnings ul { margin: 6px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--tf-text-2); }
+.org-imp-warnings li { overflow-wrap: anywhere; }
+
+.org-imp-preview-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+.org-imp-preview {
+  position: relative;
+  height: 348px;
+  overflow: hidden;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  background: var(--tf-bg-card);
+}
+
+.org-imp-preview .org-imp-empty { padding: 18px; }
+.org-imp-tree { display: block; width: 100%; height: 100%; }
+
+.org-imp-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 11.5px; color: var(--tf-text-3); }
+.org-imp-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.org-imp-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; border: 1.5px solid; }
+.org-imp-swatch--added { border-color: rgba(34, 197, 94, 0.75); }
+.org-imp-swatch--changed { border-color: rgba(96, 165, 250, 0.75); }
+.org-imp-swatch--error { border-color: rgba(239, 68, 68, 0.85); }
+
+.org-imp-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; width: 100%; }
+.org-imp-foot-note { display: flex; align-items: center; gap: 8px; flex: 1 1 260px; min-width: 0; font-size: 12px; color: var(--tf-text-3); }
+.org-imp-foot-note .icon { flex: 0 0 auto; width: 14px; height: 14px; }
+.org-imp-foot-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.org-imp-ack[hidden] { display: none; }
+
+.org-imp-show-body { display: flex; flex-direction: column; gap: 12px; }
+.org-imp-show-list { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; margin: 0; font-size: 13px; }
+.org-imp-show-list dt { color: var(--tf-text-3); }
+.org-imp-show-list dd { margin: 0; color: var(--tf-text); overflow-wrap: anywhere; }
+
+@media (max-width: 900px) {
+  .org-imp-top, .org-imp-cols { grid-template-columns: minmax(0, 1fr); }
+  .org-imp-asof { width: 100%; }
+}

@@ -68,6 +68,8 @@ class TfSearchbox extends HTMLElement {
     input.spellcheck = false;
     input.addEventListener('input', this._onInput);
     input.addEventListener('keydown', this._onKeyDown);
+    // The browser's own `search` event (Enter on a type=search input) has no detail and would read as an empty query.
+    input.addEventListener('search', (e) => e.stopPropagation());
 
     const clearBtn = document.createElement('button');
     clearBtn.type = 'button';
@@ -105,17 +107,26 @@ class TfSearchbox extends HTMLElement {
     const debounceMs = parseInt(this.getAttribute('debounce') || '200', 10);
     clearTimeout(this._debounceId);
     const value = this._input.value;
-    this._debounceId = setTimeout(() => {
-      this.setAttribute('value', value);
-      this.dispatchEvent(new CustomEvent('search', {
-        bubbles: true,
-        detail: { value },
-      }));
-    }, Math.max(0, debounceMs));
+    this._debounceId = setTimeout(() => this._emitSearch(value), Math.max(0, debounceMs));
+  }
+
+  _emitSearch(value) {
+    this.setAttribute('value', value);
+    this.dispatchEvent(new CustomEvent('search', {
+      bubbles: true,
+      detail: { value },
+    }));
   }
 
   _onKeyDown(e) {
-    if (e.key === 'Escape') {
+    // Enter asks for the answer now instead of after the typing pause.
+    if (e.key === 'Enter') {
+      clearTimeout(this._debounceId);
+      this._emitSearch(this._input.value);
+    }
+    // Escape only belongs to the box while there is text to clear; on an empty
+    // box it must reach the window or dialog the box sits in.
+    if (e.key === 'Escape' && this._input.value) {
       this._onClear();
       e.stopPropagation();
     }

@@ -123,9 +123,19 @@ class TfRadio extends HTMLElement {
       this._input.setAttribute('tabindex', '-1');
       this._input.setAttribute('aria-disabled', 'true');
     } else {
-      this._input.setAttribute('tabindex', selected ? '0' : '-1');
+      this._input.setAttribute('tabindex', selected || this._isEntryPoint(group) ? '0' : '-1');
       this._input.removeAttribute('aria-disabled');
     }
+  }
+
+  // Roving tabindex: the selected radio is the group's one tab stop. A group
+  // with nothing selected still needs one, or the keyboard cannot enter it —
+  // the first radio that can take focus stands in until a choice is made.
+  _isEntryPoint(group) {
+    // The group element may not be upgraded yet when a radio built first asks.
+    if (typeof group?.enabledRadios !== 'function') return false;
+    const radios = group.enabledRadios();
+    return !radios.some((r) => r.value === group.value) && radios[0] === this;
   }
 
   // A card option may contain its own control (a select that belongs to the
@@ -150,7 +160,17 @@ class TfRadio extends HTMLElement {
     if (e.key === ' ' || e.key === 'Enter') {
       e.preventDefault();
       this._onClick(e);
+      return;
     }
+    const step = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 }[e.key];
+    const group = this.closest('tf-radio-group');
+    if (!step || !group) return;
+    const radios = group.enabledRadios();
+    const next = radios[(radios.indexOf(this) + step + radios.length) % radios.length];
+    if (!next) return;
+    e.preventDefault();
+    group.value = next.value;
+    next._input.focus();
   }
 }
 
@@ -224,6 +244,14 @@ class TfRadioGroup extends HTMLElement {
     this._labelEl = label;
     this._wrap = wrap;
   }
+
+  /** The radios that can take focus now: not disabled, not hidden. */
+  enabledRadios() {
+    return [...this.querySelectorAll('tf-radio')].filter((r) => !r.hasAttribute('disabled') && !r.hidden);
+  }
+
+  /** Re-derives every radio's state; call after hiding or showing radios. */
+  refresh() { this._sync(); }
 
   _sync() {
     if (this._labelEl) {

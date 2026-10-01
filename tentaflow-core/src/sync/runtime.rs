@@ -354,8 +354,61 @@ pub fn record_kv_capture(capture: KvWriteCapture) -> LedgerResult<Option<SqlCapt
 /// captures still receive a monotonic timestamp inside their write transaction.
 pub fn core_hlc_now() -> HybridLogicalTimestamp {
     match SYNC_RUNTIME.get() {
-        Some(runtime) => runtime.hlc_now(),
+        Some(runtime) => {
+            if HLC_DEFERRED.with(|d| d.borrow().is_some()) {
+                let stamp = runtime.hlc.now();
+                HLC_DEFERRED.with(|d| {
+                    if let Some(last) = d.borrow_mut().as_mut() {
+                        *last = Some(stamp.clone());
+                    }
+                });
+                stamp
+            } else {
+                runtime.hlc_now()
+            }
+        }
         None => fallback_hlc().now(),
+    }
+}
+
+thread_local! {
+    /// `Some` while a bulk write defers the clock's persistence on this
+    /// thread; the inner value is the last stamp minted meanwhile.
+    static HLC_DEFERRED: std::cell::RefCell<Option<Option<HybridLogicalTimestamp>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Lets a bulk write on this thread mint thousands of capture stamps without
+/// persisting the clock for each (a write to the ledger store per stamp made a
+/// 2000-position import spend seconds there). The last stamp is persisted once
+/// when the guard drops, so a restart still resumes after everything minted.
+/// Nested guards are inert.
+pub fn defer_hlc_persistence() -> HlcPersistenceGuard {
+    let outermost = HLC_DEFERRED.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.is_none() {
+            *d = Some(None);
+            true
+        } else {
+            false
+        }
+    });
+    HlcPersistenceGuard { outermost }
+}
+
+pub struct HlcPersistenceGuard {
+    outermost: bool,
+}
+
+impl Drop for HlcPersistenceGuard {
+    fn drop(&mut self) {
+        if !self.outermost {
+            return;
+        }
+        let last = HLC_DEFERRED.with(|d| d.borrow_mut().take()).flatten();
+        if let (Some(stamp), Some(runtime)) = (last, SYNC_RUNTIME.get()) {
+            let _ = runtime.ledger.save_hlc(&stamp);
+        }
     }
 }
 

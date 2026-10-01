@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Projekty · Zasoby zespołów (C04)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<link rel="stylesheet" href="shared/projekty.css">
+<link rel="stylesheet" href="shared/praca.css">
+<link rel="stylesheet" href="shared/akcje.css">
+<style>
+
+  .pg-head { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 18px; flex-wrap: wrap; }
+  .pg-head h1 { font-size: 22px; font-weight: 800; letter-spacing: -.01em; }
+  .pg-head .sub { font-size: 12.5px; color: var(--text-3); margin-top: 3px; }
+  .pg-head .pill-tabs { margin-left: auto; }
+  .fl { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin-bottom: 14px; }
+  .fl .lab { font-size: 11.5px; color: var(--text-3); font-weight: 700; }
+  .fl .sp { margin-left: auto; }
+  .zs { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; align-items: start; }
+  .hm { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 14px 14px 12px; }
+  .hm-row { display: grid; grid-template-columns: 200px repeat(12, minmax(0, 1fr)); align-items: center; }
+  .hm-head { margin-bottom: 4px; }
+  .hm-mon { grid-column: 2 / -1; display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); font-size: 10.5px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; color: var(--text-2); }
+  .hm-mon span { border-left: 1px solid var(--border); padding: 0 6px 4px; }
+  .hm-wk { display: flex; flex-direction: column; align-items: center; font-size: 10.5px; color: var(--text-3); line-height: 1.3; padding: 3px 0; border-radius: 6px; font-variant-numeric: tabular-nums; }
+  .hm-wk b { color: var(--text-2); font-size: 10.5px; }
+  .hm-wk.now { background: rgba(99,102,241,.14); color: var(--accent-2); } .hm-wk.now b { color: var(--accent-2); }
+  .hm-c { padding: 2px; }
+  .hm-c .heat { width: 100%; height: 30px; }
+  .hm-l { display: flex; align-items: center; gap: 9px; padding: 3px 8px 3px 4px; min-width: 0; }
+  .hm-n { min-width: 0; } .hm-n b { display: block; font-size: 12.5px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; } .hm-n small { font-size: 10.5px; color: var(--text-3); }
+  .hm-grp { margin-top: 10px; }
+  .hm-grp .hm-l { padding-left: 4px; } .hm-gn { font-size: 10.5px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; color: var(--accent-2); }
+  .hm-avg { display: block; text-align: center; font-size: 10.5px; font-weight: 700; color: var(--text-3); padding: 4px 0 3px; border-bottom: 1px solid var(--border); }
+  .hm-avg.over { color: var(--danger); }
+  .hm-p { border-radius: 8px; cursor: pointer; transition: background var(--dur-normal) var(--ease-standard); }
+  .hm-p:hover, .hm-p:focus-visible { background: rgba(255,255,255,.025); outline: none; }
+  .hm-tg { width: 14px; height: 14px; color: var(--text-3); display: inline-flex; flex-shrink: 0; } .hm-tg .icon { width: 14px; height: 14px; }
+  .hm-sub .hm-l { padding-left: 34px; } .hm-sub .hm-n b { font-weight: 600; font-size: 12px; color: var(--text-2); }
+  .hm-sub .heat { height: 22px; font-size: 10px; opacity: .85; }
+  .hm-sub { background: rgba(255,255,255,.015); }
+  .hm-branch { width: 10px; height: 10px; border-left: 1.5px solid var(--border-hover); border-bottom: 1.5px solid var(--border-hover); border-radius: 0 0 0 5px; flex-shrink: 0; margin-top: -8px; }
+  .av-open { background: transparent; border: 1.5px dashed rgba(244,63,94,.7); color: #fda4af; }
+  .heat-open { background: repeating-linear-gradient(45deg, rgba(244,63,94,.28) 0 5px, rgba(244,63,94,.1) 5px 10px); border: 1.5px dashed rgba(244,63,94,.7); color: #fecdd3; }
+  .heat-absent { border: 1px solid rgba(160,168,200,.18); }
+  .hm-gap .hm-n b { color: #fda4af; }
+  .hm-leg { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 14px 4px 2px; font-size: 11.5px; color: var(--text-2); align-items: center; border-top: 1px solid var(--border); margin-top: 12px; }
+  .hm-leg .lg { display: inline-flex; gap: 7px; align-items: center; } .hm-leg .sq { width: 18px; height: 12px; border-radius: 3px; display: inline-block; }
+  .sq.a0 { background: rgba(255,255,255,.05); } .sq.a1 { background: rgba(96,165,250,.35); } .sq.a2 { background: rgba(34,197,94,.55); } .sq.a3 { background: rgba(245,158,11,.65); } .sq.a4 { background: rgba(239,68,68,.75); }
+  .sq.ab { background: repeating-linear-gradient(45deg, rgba(255,255,255,.2) 0 3px, transparent 3px 6px); border: 1px solid rgba(160,168,200,.3); }
+  .sq.op { border: 1.5px dashed rgba(244,63,94,.7); background: rgba(244,63,94,.2); }
+  .side { display: flex; flex-direction: column; gap: 14px; }
+  .sd-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px 18px; }
+  .sd-card.gap { border-color: rgba(244,63,94,.4); background: linear-gradient(160deg, rgba(244,63,94,.09), var(--bg-2) 60%); }
+  .sd-k { font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; color: var(--text-3); display: flex; gap: 6px; align-items: center; }
+  .sd-k .icon { width: 13px; height: 13px; color: #fb7185; }
+  .sd-big { font-size: 34px; font-weight: 800; letter-spacing: -.02em; margin-top: 8px; font-variant-numeric: tabular-nums; }
+  .sd-big small { font-size: 14px; font-weight: 700; color: var(--text-2); letter-spacing: 0; }
+  .sd-sub { font-size: 12px; color: var(--text-3); margin-top: 2px; }
+  .sd-bars { display: flex; align-items: flex-end; gap: 5px; height: 46px; margin: 14px 0 4px; }
+  .sd-bars i { flex: 1; background: linear-gradient(180deg, #fb7185, rgba(244,63,94,.35)); border-radius: 3px 3px 0 0; transform-origin: bottom; animation: pr-grow-y var(--dur-deliberate) var(--ease-emphasized) both; }
+  .sd-bars-l { display: flex; gap: 5px; font-size: 9.5px; color: var(--text-3); } .sd-bars-l span { flex: 1; text-align: center; }
+  .sd-list { list-style: none; display: flex; flex-direction: column; gap: 9px; margin-top: 14px; font-size: 12px; color: var(--text-2); }
+  .sd-list li { display: flex; gap: 8px; line-height: 1.45; } .sd-list li b { color: var(--text); }
+  .sd-list .dot { width: 6px; height: 6px; border-radius: 50%; background: #fb7185; margin-top: 6px; flex-shrink: 0; }
+  .sd-list.ok .dot { background: var(--accent-2); }
+  .sd-card .btn-primary { width: 100%; justify-content: center; margin-top: 14px; }
+  .sd-item { display: flex; gap: 10px; align-items: flex-start; font-size: 12px; color: var(--text-2); line-height: 1.45; padding: 8px 0; border-top: 1px solid var(--border); }
+  .sd-item:first-of-type { border-top: 0; padding-top: 0; }
+  .sd-item b { color: var(--text); }
+
+</style>
+</head>
+<body>
+<!-- IKONY: wklejone 1:1 z shared/icons.html -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+<symbol id="i-sitemap" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="5" rx="1"/><rect x="2" y="17" width="6" height="5" rx="1"/><rect x="16" y="17" width="6" height="5" rx="1"/><path d="M12 7v4M5 17v-3h14v3"/></symbol>
+<symbol id="i-gantt" viewBox="0 0 24 24"><line x1="3" y1="4" x2="3" y2="20"/><rect x="5" y="5" width="8" height="3" rx="1"/><rect x="9" y="10.5" width="10" height="3" rx="1"/><rect x="7" y="16" width="6" height="3" rx="1"/></symbol>
+<symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></symbol>
+<symbol id="i-flag" viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+<symbol id="i-timer" viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6"/></symbol>
+<symbol id="i-user-x" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="18" y1="8" x2="23" y2="13"/><line x1="23" y1="8" x2="18" y2="13"/></symbol>
+<symbol id="i-merge" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></symbol>
+<symbol id="i-branch" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-package" viewBox="0 0 24 24"><path d="M16.5 9.4 7.5 4.21M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+<symbol id="i-radar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><path d="M12 2v10l7 5"/></symbol>
+<symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M2 16h.01M21.8 16c.2-2 .131-5.354 0-6"/><path d="M9 6.8a6 6 0 0 1 9 5.2c0 .47 0 1.17-.02 2"/></symbol>
+<symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+<symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+<symbol id="i-maximize" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></symbol>
+<symbol id="i-move" viewBox="0 0 24 24"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></symbol>
+<symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-palette" viewBox="0 0 24 24"><circle cx="13.5" cy="6.5" r="1"/><circle cx="17.5" cy="10.5" r="1"/><circle cx="8.5" cy="7.5" r="1"/><circle cx="6.5" cy="12.5" r="1"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.5-.75 1.5-1.5 0-.4-.15-.74-.4-1-.25-.25-.4-.6-.4-1 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.96-4.48-9-10-9z"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+<symbol id="i-scale" viewBox="0 0 24 24"><path d="M16 16l3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1zM2 16l3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1z"/><path d="M7 21h10M12 3v18M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+<symbol id="i-lightning" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+</defs></svg>
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">C04</span>
+    <h2>Zasoby zespołów</h2>
+    <div class="desc">Poziom organizacji: osoby w tygodniach na mapie obłożenia, nieobecności i niedobór testerów w listopadzie.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+  <div class="logo"><span class="name">TentaFlow</span></div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-home"/></svg>Pulpit</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-services"/></svg>Serwisy</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</a>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+    <a class="nav-item active" href="p01-lista.html"><svg class="icon"><use href="#i-folder"/></svg>Projekty</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-bot"/></svg>Agenci</a>
+    <a class="nav-item" href="d01-edytor-workflow.html"><svg class="icon"><use href="#i-branch"/></svg>Flow Builder</a>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</a>
+    <a class="nav-item" href="f01-struktura.html"><svg class="icon"><use href="#i-sitemap"/></svg>Struktura organizacyjna</a>
+    <a class="nav-item" href="f05-prywatnosc.html"><svg class="icon"><use href="#i-fingerprint"/></svg>Prywatność</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</a>
+  </div>
+  <div class="footer">
+    <a class="user-chip" href="g01-profil.html" title="Mój profil"><div class="av av-1">AK</div><div><div class="name-t">Anna Kowalska</div><div class="role">PM · Dział Realizacji</div></div></a>
+  </div>
+</aside>
+      <main class="main">
+        <div class="tabs-bar">
+          <a class="tab" href="p01-lista.html"><svg class="icon"><use href="#i-folder"/></svg>Projekty</a>
+          <a class="tab" href="a01-moja-praca.html"><svg class="icon"><use href="#i-home"/></svg>Moja praca</a>
+          <a class="tab active" href="c04-zasoby.html"><svg class="icon"><use href="#i-users"/></svg>Zasoby</a>
+        </div>
+        <div class="page-head">
+          <div>
+            <div class="page-title">Zasoby zespołów</div>
+            <div class="page-sub">Obłożenie osób w tygodniach, ze wszystkich projektów organizacji Solutio sp. z o.o.</div>
+          </div>
+          <div class="page-actions"></div>
+        </div>
+        <div class="fl pr-enter" style="animation-delay:60ms">
+          <span class="lab">Zespół</span><button class="btn btn-sm">Wszystkie zespoły<svg class="icon " aria-hidden="true"><use href="#i-chevron-d"/></svg></button>
+          <span class="lab">Funkcja</span><button class="btn btn-sm">Wszystkie funkcje<svg class="icon " aria-hidden="true"><use href="#i-chevron-d"/></svg></button>
+          <span class="lab">Zakres</span><button class="btn btn-sm"><svg class="icon " aria-hidden="true"><use href="#i-calendar"/></svg>T40–T51 · 28.09–20.12<svg class="icon " aria-hidden="true"><use href="#i-chevron-d"/></svg></button>
+          <span class="sp"><button class="btn btn-sm" data-act="toast:Osoba dodana do widoku zasobów" data-subject="osoba w widoku"><svg class="icon " aria-hidden="true"><use href="#i-user-plus"/></svg>Dodaj osobę do widoku</button></span>
+        </div>
+        <div class="zs">
+          <div class="hm pr-enter" style="animation-delay:100ms">
+            <div class="hm-row hm-head"><div></div><div class="hm-mon"><span style="grid-column:span 1">Wrz</span><span style="grid-column:span 4">Październik</span><span style="grid-column:span 5">Listopad</span><span style="grid-column:span 2">Grudzień</span></div></div>
+            <div class="hm-row hm-head"><div class="hm-l" style="font-size:10.5px;color:var(--text-3);font-weight:800;letter-spacing:.08em;text-transform:uppercase">Osoba</div><span class="hm-wk now"><b>T40</b>28.09</span><span class="hm-wk"><b>T41</b>05.10</span><span class="hm-wk"><b>T42</b>12.10</span><span class="hm-wk"><b>T43</b>19.10</span><span class="hm-wk"><b>T44</b>26.10</span><span class="hm-wk"><b>T45</b>02.11</span><span class="hm-wk"><b>T46</b>09.11</span><span class="hm-wk"><b>T47</b>16.11</span><span class="hm-wk"><b>T48</b>23.11</span><span class="hm-wk"><b>T49</b>30.11</span><span class="hm-wk"><b>T50</b>07.12</span><span class="hm-wk"><b>T51</b>14.12</span></div>
+<div class="hm-row hm-grp"><div class="hm-l"><span class="hm-gn">Dział Realizacji</span></div><div class="hm-c"><span class="hm-avg">50%</span></div><div class="hm-c"><span class="hm-avg">60%</span></div><div class="hm-c"><span class="hm-avg">60%</span></div><div class="hm-c"><span class="hm-avg">60%</span></div><div class="hm-c"><span class="hm-avg">60%</span></div><div class="hm-c"><span class="hm-avg">70%</span></div><div class="hm-c"><span class="hm-avg">70%</span></div><div class="hm-c"><span class="hm-avg">70%</span></div><div class="hm-c"><span class="hm-avg">70%</span></div><div class="hm-c"><span class="hm-avg">60%</span></div><div class="hm-c"><span class="hm-avg">60%</span></div><div class="hm-c"><span class="hm-avg">40%</span></div></div><div data-subject="Anna Kowalska" data-menu="person-load" class="hm-row hm-p" tabindex="0"><div class="hm-l"><span class="hm-tg"><svg class="icon " aria-hidden="true"><use href="#i-chevron-r"/></svg></span><span class="av av-sm av-1">AK</span><div class="hm-n"><b>Anna Kowalska</b><small>PM</small></div><button class="icon-btn" title="Więcej" data-menu="person-load" style="width:22px;height:22px;margin-left:auto;flex-shrink:0;"><svg class="icon"><use href="#i-more"/></svg></button></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:120ms">50%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:138ms">60%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:156ms">60%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:174ms">60%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:192ms">60%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:210ms">70%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:228ms">70%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:246ms">70%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:264ms">70%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:282ms">60%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:300ms">60%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:318ms">40%</span></div></div><div data-subject="Magdalena Kamińska" data-menu="person-load" class="hm-row hm-p" tabindex="0"><div class="hm-l"><span class="hm-tg"><svg class="icon " aria-hidden="true"><use href="#i-chevron-r"/></svg></span><span class="av av-sm av-8">MK</span><div class="hm-n"><b>Magdalena Kamińska</b><small>Dyrektor</small></div><button class="icon-btn" title="Więcej" data-menu="person-load" style="width:22px;height:22px;margin-left:auto;flex-shrink:0;"><svg class="icon"><use href="#i-more"/></svg></button></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:148ms">30%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:166ms">30%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:184ms">30%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:202ms">30%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:220ms">30%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:238ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:256ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:274ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:292ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:310ms">30%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:328ms">30%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:346ms">20%</span></div></div><div class="hm-row hm-grp"><div class="hm-l"><span class="hm-gn">Deweloperzy</span></div><div class="hm-c"><span class="hm-avg">87%</span></div><div class="hm-c"><span class="hm-avg">90%</span></div><div class="hm-c"><span class="hm-avg">95%</span></div><div class="hm-c"><span class="hm-avg">90%</span></div><div class="hm-c"><span class="hm-avg">97%</span></div><div class="hm-c"><span class="hm-avg">89%</span></div><div class="hm-c"><span class="hm-avg">87%</span></div><div class="hm-c"><span class="hm-avg">88%</span></div><div class="hm-c"><span class="hm-avg">87%</span></div><div class="hm-c"><span class="hm-avg">70%</span></div><div class="hm-c"><span class="hm-avg">55%</span></div><div class="hm-c"><span class="hm-avg">43%</span></div></div><div data-subject="Marek Nowak" data-menu="person-load" class="hm-row hm-p" tabindex="0"><div class="hm-l"><span class="hm-tg"><svg class="icon " aria-hidden="true"><use href="#i-chevron-r"/></svg></span><span class="av av-sm av-2">MN</span><div class="hm-n"><b>Marek Nowak</b><small>Dev · Security</small></div><button class="icon-btn" title="Więcej" data-menu="person-load" style="width:22px;height:22px;margin-left:auto;flex-shrink:0;"><svg class="icon"><use href="#i-more"/></svg></button></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:176ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:194ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:212ms">95%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:230ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:248ms">70%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:266ms">80%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:284ms">90%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:302ms">85%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:320ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:338ms">70%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:356ms">50%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:374ms">50%</span></div></div><div data-subject="Piotr Zieliński" data-menu="person-load" class="hm-row hm-p" tabindex="0"><div class="hm-l"><span class="hm-tg open"><svg class="icon " aria-hidden="true"><use href="#i-chevron-d"/></svg></span><span class="av av-sm av-3">PZ</span><div class="hm-n"><b>Piotr Zieliński</b><small>Developer</small></div><button class="icon-btn" title="Więcej" data-menu="person-load" style="width:22px;height:22px;margin-left:auto;flex-shrink:0;"><svg class="icon"><use href="#i-more"/></svg></button></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:204ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:222ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:240ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:258ms">100%</span></div><div class="hm-c"><span class="heat heat-over" style="animation-delay:276ms">130%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:294ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:312ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:330ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:348ms">100%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:366ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:384ms">60%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:402ms">40%</span></div></div><div class="hm-row hm-sub"><div class="hm-l"><span class="hm-branch"></span><div class="hm-n"><b>NextApp</b></div></div><div class="hm-c"><span class="heat heat-low sub" style="animation-delay:232ms">30%</span></div><div class="hm-c"><span class="heat heat-low sub" style="animation-delay:250ms">40%</span></div><div class="hm-c"><span class="heat heat-low sub" style="animation-delay:268ms">40%</span></div><div class="hm-c"><span class="heat heat-low sub" style="animation-delay:286ms">40%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:304ms">70%</span></div><div class="hm-c"><span class="heat heat-low sub" style="animation-delay:322ms">30%</span></div><div class="hm-c"><span class="heat heat-low sub" style="animation-delay:340ms">20%</span></div><div class="hm-c"><span class="heat heat-low sub" style="animation-delay:358ms">20%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:376ms">80%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:394ms">80%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:412ms">60%</span></div><div class="hm-c"><span class="heat heat-low sub" style="animation-delay:430ms">40%</span></div></div><div class="hm-row hm-sub"><div class="hm-l"><span class="hm-branch"></span><div class="hm-n"><b>Wdrożenie DCIM</b></div></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:260ms">60%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:278ms">60%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:296ms">60%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:314ms">60%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:332ms">60%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:350ms">60%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:368ms">70%</span></div><div class="hm-c"><span class="heat heat-mid sub" style="animation-delay:386ms">70%</span></div><div class="hm-c"><span class="heat heat-low sub" style="animation-delay:404ms">20%</span></div><div class="hm-c"><span class="heat heat-0 sub" style="animation-delay:422ms"></span></div><div class="hm-c"><span class="heat heat-0 sub" style="animation-delay:440ms"></span></div><div class="hm-c"><span class="heat heat-0 sub" style="animation-delay:458ms"></span></div></div><div data-subject="Paweł Szymański" data-menu="person-load" class="hm-row hm-p" tabindex="0"><div class="hm-l"><span class="hm-tg"><svg class="icon " aria-hidden="true"><use href="#i-chevron-r"/></svg></span><span class="av av-sm av-2">PS</span><div class="hm-n"><b>Paweł Szymański</b><small>Developer</small></div><button class="icon-btn" title="Więcej" data-menu="person-load" style="width:22px;height:22px;margin-left:auto;flex-shrink:0;"><svg class="icon"><use href="#i-more"/></svg></button></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:288ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:306ms">80%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:324ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:342ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:360ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:378ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:396ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:414ms">100%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:432ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:450ms">60%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:468ms">50%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:486ms">40%</span></div></div><div class="hm-row hm-grp"><div class="hm-l"><span class="hm-gn">Testerzy</span></div><div class="hm-c"><span class="hm-avg">100%</span></div><div class="hm-c"><span class="hm-avg">100%</span></div><div class="hm-c"><span class="hm-avg">100%</span></div><div class="hm-c"><span class="hm-avg"></span></div><div class="hm-c"><span class="hm-avg">90%</span></div><div class="hm-c"><span class="hm-avg">100%</span></div><div class="hm-c"><span class="hm-avg">100%</span></div><div class="hm-c"><span class="hm-avg">100%</span></div><div class="hm-c"><span class="hm-avg">100%</span></div><div class="hm-c"><span class="hm-avg">100%</span></div><div class="hm-c"><span class="hm-avg">100%</span></div><div class="hm-c"><span class="hm-avg">100%</span></div></div><div data-subject="Ewa Wiśniewska" data-menu="person-load" class="hm-row hm-p" tabindex="0"><div class="hm-l"><span class="hm-tg"><svg class="icon " aria-hidden="true"><use href="#i-chevron-r"/></svg></span><span class="av av-sm av-4">EW</span><div class="hm-n"><b>Ewa Wiśniewska</b><small>Tester</small></div><button class="icon-btn" title="Więcej" data-menu="person-load" style="width:22px;height:22px;margin-left:auto;flex-shrink:0;"><svg class="icon"><use href="#i-more"/></svg></button></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:316ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:334ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:352ms">100%</span></div><div class="hm-c"><span class="heat heat-absent" style="animation-delay:370ms" title="Nieobecność"></span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:388ms">90%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:406ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:424ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:442ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:460ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:478ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:496ms">100%</span></div><div class="hm-c"><span class="heat heat-high" style="animation-delay:514ms">100%</span></div></div><div data-subject="Tester (brak obsady)" data-menu="demand" class="hm-row hm-p hm-gap" ><div class="hm-l"><span class="hm-tg"></span><span class="av av-sm av-open">?</span><div class="hm-n"><b>Tester (brak obsady)</b><small>zapotrzebowanie</small></div><button class="icon-btn" title="Więcej" data-menu="demand" style="width:22px;height:22px;margin-left:auto;flex-shrink:0;"><svg class="icon"><use href="#i-more"/></svg></button></div><div class="hm-c"><span class="heat heat-0" style="animation-delay:344ms"></span></div><div class="hm-c"><span class="heat heat-0" style="animation-delay:362ms"></span></div><div class="hm-c"><span class="heat heat-0" style="animation-delay:380ms"></span></div><div class="hm-c"><span class="heat heat-0" style="animation-delay:398ms"></span></div><div class="hm-c"><span class="heat heat-0" style="animation-delay:416ms"></span></div><div class="hm-c"><span class="heat heat-0" style="animation-delay:434ms"></span></div><div class="hm-c"><span class="heat heat-open" style="animation-delay:452ms">50%</span></div><div class="hm-c"><span class="heat heat-open" style="animation-delay:470ms">50%</span></div><div class="hm-c"><span class="heat heat-open" style="animation-delay:488ms">150%</span></div><div class="hm-c"><span class="heat heat-open" style="animation-delay:506ms">100%</span></div><div class="hm-c"><span class="heat heat-open" style="animation-delay:524ms">100%</span></div><div class="hm-c"><span class="heat heat-open" style="animation-delay:542ms">100%</span></div></div><div class="hm-row hm-grp"><div class="hm-l"><span class="hm-gn">Design, wydania, infrastruktura</span></div><div class="hm-c"><span class="hm-avg">57%</span></div><div class="hm-c"><span class="hm-avg">70%</span></div><div class="hm-c"><span class="hm-avg">77%</span></div><div class="hm-c"><span class="hm-avg">60%</span></div><div class="hm-c"><span class="hm-avg">57%</span></div><div class="hm-c"><span class="hm-avg">53%</span></div><div class="hm-c"><span class="hm-avg">53%</span></div><div class="hm-c"><span class="hm-avg">60%</span></div><div class="hm-c"><span class="hm-avg">60%</span></div><div class="hm-c"><span class="hm-avg">53%</span></div><div class="hm-c"><span class="hm-avg">43%</span></div><div class="hm-c"><span class="hm-avg">37%</span></div></div><div data-subject="Tomasz Lewandowski" data-menu="person-load" class="hm-row hm-p" tabindex="0"><div class="hm-l"><span class="hm-tg"><svg class="icon " aria-hidden="true"><use href="#i-chevron-r"/></svg></span><span class="av av-sm av-5">TL</span><div class="hm-n"><b>Tomasz Lewandowski</b><small>Designer UI/UX</small></div><button class="icon-btn" title="Więcej" data-menu="person-load" style="width:22px;height:22px;margin-left:auto;flex-shrink:0;"><svg class="icon"><use href="#i-more"/></svg></button></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:372ms">60%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:390ms">70%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:408ms">70%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:426ms">50%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:444ms">50%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:462ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:480ms">40%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:498ms">60%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:516ms">60%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:534ms">50%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:552ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:570ms">30%</span></div></div><div data-subject="Karolina Dąbrowska" data-menu="person-load" class="hm-row hm-p" tabindex="0"><div class="hm-l"><span class="hm-tg"><svg class="icon " aria-hidden="true"><use href="#i-chevron-r"/></svg></span><span class="av av-sm av-6">KD</span><div class="hm-n"><b>Karolina Dąbrowska</b><small>Release Manager</small></div><button class="icon-btn" title="Więcej" data-menu="person-load" style="width:22px;height:22px;margin-left:auto;flex-shrink:0;"><svg class="icon"><use href="#i-more"/></svg></button></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:400ms">40%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:418ms">60%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:436ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:454ms">60%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:472ms">50%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:490ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:508ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:526ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:544ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:562ms">40%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:580ms">30%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:598ms">30%</span></div></div><div data-subject="Jan Wójcik" data-menu="person-load" class="hm-row hm-p" tabindex="0"><div class="hm-l"><span class="hm-tg"><svg class="icon " aria-hidden="true"><use href="#i-chevron-r"/></svg></span><span class="av av-sm av-7">JW</span><div class="hm-n"><b>Jan Wójcik</b><small>DevOps</small></div><button class="icon-btn" title="Więcej" data-menu="person-load" style="width:22px;height:22px;margin-left:auto;flex-shrink:0;"><svg class="icon"><use href="#i-more"/></svg></button></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:428ms">70%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:446ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:464ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:482ms">70%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:500ms">70%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:518ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:536ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:554ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:572ms">80%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:590ms">70%</span></div><div class="hm-c"><span class="heat heat-mid" style="animation-delay:608ms">60%</span></div><div class="hm-c"><span class="heat heat-low" style="animation-delay:626ms">50%</span></div></div>
+            <div class="hm-leg">
+              <span class="lg"><span class="sq a0"></span>0%</span>
+              <span class="lg"><span class="sq a1"></span>1–50%</span>
+              <span class="lg"><span class="sq a2"></span>51–85%</span>
+              <span class="lg"><span class="sq a3"></span>86–100%</span>
+              <span class="lg"><span class="sq a4"></span>ponad 100%</span>
+              <span class="lg"><span class="sq ab"></span>Nieobecność</span>
+              <span class="lg"><span class="sq op"></span>Zapotrzebowanie bez osoby</span>
+            </div>
+          </div>
+          <div class="side pr-stagger">
+            <div class="sd-card gap">
+              <div class="sd-k"><svg class="icon " aria-hidden="true"><use href="#i-alert"/></svg>Brakuje w listopadzie</div>
+              <div class="sd-big"><span data-count="1.5">1,5</span> <small>etatu testera</small></div>
+              <div class="sd-sub">Szczyt w tygodniu 48 (23–29.11)</div>
+              <div class="sd-bars" aria-hidden="true"><i style="height:0%"></i><i style="height:33%;animation-delay:80ms"></i><i style="height:33%;animation-delay:120ms"></i><i style="height:100%;animation-delay:160ms"></i><i style="height:66%;animation-delay:200ms"></i></div>
+              <div class="sd-bars-l"><span>T45</span><span>T46</span><span>T47</span><span>T48</span><span>T49</span></div>
+              <ul class="sd-list">
+                <li><span class="dot"></span><span><b>Wdrożenie DCIM:</b> Testy akceptacyjne, 1,0 etatu od 26.11</span></li>
+                <li><span class="dot"></span><span><b>Wdrożenie DCIM:</b> Import danych do środowiska, 0,5 etatu w T46–T48</span></li>
+              </ul>
+              <button class="btn btn-primary" data-act="toast:Propozycja wyrównania gotowa do przeglądu"><svg class="icon " aria-hidden="true"><use href="#i-wand"/></svg>Zaproponuj wyrównanie</button>
+            </div>
+            <div class="sd-card">
+              <div class="sd-k"><svg class="icon " aria-hidden="true"><use href="#i-trend"/></svg>Do rozważenia</div>
+              <ul class="sd-list ok">
+                <li><span class="dot"></span><span>Powierzyć regresję Agentowi testującemu (model lokalny: qwen3-coder), decyzje odbioru zostają przy człowieku.</span></li>
+                <li><span class="dot"></span><span>Przesunąć część testów akceptacyjnych na grudzień.</span></li>
+              </ul>
+            </div>
+            <div class="sd-card">
+              <div class="sd-k"><svg class="icon " aria-hidden="true"><use href="#i-users"/></svg>Przeciążenia w zakresie</div>
+              <div style="margin-top:12px">
+                <div class="sd-item"><span class="av av-sm av-3">PZ</span><span><b>Piotr Zieliński</b> 130% w T44 (26.10–01.11), NextApp 70% i Wdrożenie DCIM 60%.</span></div>
+                <div class="sd-item"><span class="av av-sm av-4">EW</span><span><b>Ewa Wiśniewska</b> nieobecna w T43 (20–24.10).</span></div>
+                <div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap;"><a class="btn btn-sm" href="g01-profil.html"><svg class="icon" aria-hidden="true"><use href="#i-calendar"/></svg>Nieobecności w strukturze</a><a class="btn btn-sm" href="f07-do-przekazania.html"><svg class="icon" aria-hidden="true"><use href="#i-move"/></svg>Przenieś alokacje osoby…</a></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="toast-stack"></div>
+      </main>
+    </div>
+
+  </div>
+</section>
+<script src="shared/praca.js"></script>
+<script src="shared/akcje.js"></script>
+
+</body>
+</html>

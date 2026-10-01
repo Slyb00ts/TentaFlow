@@ -144,6 +144,22 @@ pub enum CoreSyncResourceKind {
     /// the scene's owner — which is what keeps LWW from ever deciding between
     /// a human's placement and a drift correction.
     MapDevicePlacement,
+    /// Organization structure (migration 178). Every one of these is a fact
+    /// about the organization itself, edited by an administrator on any node,
+    /// so all nine travel; see `services::org_structure::replication` for the
+    /// shared row shape.
+    OrgUnitType,
+    OrgUnit,
+    OrgPosition,
+    OrgUnitDeputyHead,
+    OrgReportingLine,
+    OrgExternalPerson,
+    OrgAssignment,
+    OrgStructureSettings,
+    OrgChangeSet,
+    /// Deputies and absences (migration 179).
+    OrgDeputy,
+    OrgAbsence,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1156,6 +1172,109 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "maps",
+    },
+    // ---------------------------------------------------------------------
+    // Organization structure (docs/ORG_STRUCTURE_PLAN.md §1). One partition:
+    // a position cannot be ordered before its unit, nor an assignment before
+    // its position, and the writes of one operation must stay on one stream.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgUnitType,
+        table_name: "org_unit_types",
+        resource_type: "core.org_unit_type",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgUnit,
+        table_name: "org_units",
+        resource_type: "core.org_unit",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgPosition,
+        table_name: "org_positions",
+        resource_type: "core.org_position",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgUnitDeputyHead,
+        table_name: "org_unit_deputy_heads",
+        resource_type: "core.org_unit_deputy_head",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgReportingLine,
+        table_name: "org_reporting_lines",
+        resource_type: "core.org_reporting_line",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgExternalPerson,
+        table_name: "org_external_persons",
+        resource_type: "core.org_external_person",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgAssignment,
+        table_name: "org_assignments",
+        resource_type: "core.org_assignment",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgStructureSettings,
+        table_name: "org_structure_settings",
+        resource_type: "core.org_structure_settings",
+        primary_key_column: "org_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgChangeSet,
+        table_name: "org_change_sets",
+        resource_type: "core.org_change_set",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgDeputy,
+        table_name: "org_deputies",
+        resource_type: "core.org_deputy",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::OrgAbsence,
+        table_name: "org_absences",
+        resource_type: "core.org_absence",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "org-structure",
     },
 ];
 

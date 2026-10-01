@@ -1,7 +1,8 @@
 // =============================================================================
 // Plik: tf-toggle.js
 // Opis: Komponent <tf-toggle> — switch on/off. Klik/space/enter przelacza.
-//       Emituje "change" z detail.checked. Reflektuje atrybut "checked".
+//       Emituje "change" z detail.checked. Reflektuje atrybut "checked";
+//       `aria-label` z hosta trafia na element z rola switch.
 // Przyklad: <tf-toggle checked></tf-toggle>
 // =============================================================================
 
@@ -9,7 +10,7 @@ import { Sfx } from '/js/lib/sfx.js';
 
 class TfToggle extends HTMLElement {
   static get observedAttributes() {
-    return ['checked', 'disabled'];
+    return ['checked', 'disabled', 'aria-label'];
   }
 
   constructor() {
@@ -51,6 +52,9 @@ class TfToggle extends HTMLElement {
     const disabled = this.hasAttribute('disabled');
     this._root.classList.toggle('on', on);
     this._root.setAttribute('aria-checked', String(on));
+    // The host is not the switch, so its accessible name has to be carried onto the element that is.
+    const name = this.getAttribute('aria-label');
+    if (name) this._root.setAttribute('aria-label', name);
     if (disabled) {
       this._root.setAttribute('aria-disabled', 'true');
       this._root.setAttribute('tabindex', '-1');

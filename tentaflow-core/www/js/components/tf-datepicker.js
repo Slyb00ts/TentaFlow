@@ -2,11 +2,17 @@
 // File: tf-datepicker.js
 // Description: <tf-datepicker> — calendar date selector with month navigation,
 //              range selection support, min/max constraints. Light DOM.
+//              Weekday names, month names and the first day of the week come
+//              from Intl in the UI language; the value is always `YYYY-MM-DD`.
+//              Arrow keys move between days, PageUp/PageDown between months.
 // Example:
 //   <tf-datepicker value="2026-05-26"></tf-datepicker>
 // =============================================================================
 
-const WDAY_LABELS = ['Pn', 'Wt', 'Śr', 'Cz', 'Pt', 'So', 'Nd'];
+import { I18n } from '/js/i18n.js';
+import { firstWeekday, monthTitle, weekdayLabels } from '/js/lib/date-format.js';
+
+const t = (key) => I18n.t(`date_field.${key}`);
 
 function toIso(d) {
   const y = d.getFullYear();
@@ -29,6 +35,12 @@ function sameDay(a, b) {
     a.getDate() === b.getDate();
 }
 
+// The selected day (or the first of the month when nothing is selected) is the one tab stop of the grid.
+function dayCell(classes, date, label, tabStop) {
+  const disabled = classes.includes('disabled');
+  return `<button type="button" class="${classes.join(' ')}" data-date="${toIso(date)}" tabindex="${tabStop ? 0 : -1}"${disabled ? ' disabled' : ''}>${label}</button>`;
+}
+
 class TfDatepicker extends HTMLElement {
   static get observedAttributes() { return ['value', 'min', 'max', 'range-start', 'range-end']; }
 
@@ -38,21 +50,25 @@ class TfDatepicker extends HTMLElement {
     this._viewYear = null;
     this._viewMonth = null;
     this._onClick = this._onClick.bind(this);
+    this._onKeydown = this._onKeydown.bind(this);
   }
 
   connectedCallback() {
-    const focus = parseIso(this.getAttribute('value')) || new Date();
-    this._viewYear = focus.getFullYear();
-    this._viewMonth = focus.getMonth();
+    this._showMonthOf(parseIso(this.getAttribute('value')) || new Date());
     if (!this._container) this._build();
     this._render();
   }
 
-  disconnectedCallback() {
-    if (this._container) this._container.removeEventListener('click', this._onClick);
+  attributeChangedCallback(name, oldVal, newVal) {
+    if (oldVal === newVal || !this._container) return;
+    if (name === 'value') this._showMonthOf(parseIso(newVal) || new Date());
+    this._render();
   }
 
-  attributeChangedCallback() { if (this._container) this._render(); }
+  _showMonthOf(date) {
+    this._viewYear = date.getFullYear();
+    this._viewMonth = date.getMonth();
+  }
 
   get value() { return this.getAttribute('value') || ''; }
   set value(v) {
@@ -64,6 +80,7 @@ class TfDatepicker extends HTMLElement {
     const el = document.createElement('div');
     el.className = 'tf-datepicker';
     el.addEventListener('click', this._onClick);
+    el.addEventListener('keydown', this._onKeydown);
     this.appendChild(el);
     this._container = el;
   }
@@ -89,6 +106,23 @@ class TfDatepicker extends HTMLElement {
     }
   }
 
+  _onKeydown(e) {
+    const day = e.target.closest?.('.tf-dp-day');
+    if (!day) return;
+    const step = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7 }[e.key];
+    const pageStep = { PageUp: -1, PageDown: 1 }[e.key];
+    if (step === undefined && pageStep === undefined) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const from = parseIso(day.dataset.date);
+    const target = step !== undefined
+      ? new Date(from.getFullYear(), from.getMonth(), from.getDate() + step)
+      : new Date(from.getFullYear(), from.getMonth() + pageStep, 1);
+    this._showMonthOf(target);
+    this._render();
+    this._container.querySelector(`.tf-dp-day[data-date="${toIso(target)}"]`)?.focus();
+  }
+
   _render() {
     const selected = parseIso(this.value);
     const minD = parseIso(this.getAttribute('min'));
@@ -99,25 +133,25 @@ class TfDatepicker extends HTMLElement {
 
     const y = this._viewYear;
     const m = this._viewMonth;
-    const monthNames = ['Styczen', 'Luty', 'Marzec', 'Kwiecien', 'Maj', 'Czerwiec', 'Lipiec', 'Sierpien', 'Wrzesien', 'Pazdziernik', 'Listopad', 'Grudzien'];
 
     let html = `<div class="tf-dp-header">
-      <button type="button" class="tf-btn tf-btn-ghost tf-btn-sm" data-nav="prev">
+      <button type="button" class="tf-btn tf-btn-ghost tf-btn-sm" data-nav="prev" aria-label="${t('prev_month')}">
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M10 3L5 8l5 5"/></svg>
       </button>
-      <span>${monthNames[m]} ${y}</span>
-      <button type="button" class="tf-btn tf-btn-ghost tf-btn-sm" data-nav="next">
+      <span aria-live="polite">${monthTitle(y, m)}</span>
+      <button type="button" class="tf-btn tf-btn-ghost tf-btn-sm" data-nav="next" aria-label="${t('next_month')}">
         <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 3l5 5-5 5"/></svg>
       </button>
     </div>`;
 
     html += '<div class="tf-dp-grid">';
-    for (const wd of WDAY_LABELS) {
+    for (const wd of weekdayLabels()) {
       html += `<div class="tf-dp-wday">${wd}</div>`;
     }
 
+    const tabDay = selected && selected.getFullYear() === y && selected.getMonth() === m ? selected.getDate() : 1;
     const first = new Date(y, m, 1);
-    const startPad = (first.getDay() + 6) % 7;
+    const startPad = (first.getDay() - firstWeekday() + 7) % 7;
     const daysInMonth = new Date(y, m + 1, 0).getDate();
     const prevDays = new Date(y, m, 0).getDate();
 
@@ -125,7 +159,7 @@ class TfDatepicker extends HTMLElement {
     for (let i = startPad - 1; i >= 0; i--) {
       const dayNum = prevDays - i;
       const d = new Date(y, m - 1, dayNum);
-      html += `<div class="tf-dp-day other" data-date="${toIso(d)}">${dayNum}</div>`;
+      html += dayCell(['tf-dp-day', 'other'], d, dayNum, false);
     }
 
     // Current month
@@ -144,7 +178,7 @@ class TfDatepicker extends HTMLElement {
       if (rangeEnd && sameDay(d, rangeEnd)) classes.push('range-end');
       if (rangeStart && rangeEnd && d > rangeStart && d < rangeEnd) classes.push('range');
 
-      html += `<div class="${classes.join(' ')}" data-date="${iso}">${day}</div>`;
+      html += dayCell(classes, d, day, day === tabDay);
     }
 
     // Next month padding
@@ -152,7 +186,7 @@ class TfDatepicker extends HTMLElement {
     const remaining = (7 - (totalCells % 7)) % 7;
     for (let i = 1; i <= remaining; i++) {
       const d = new Date(y, m + 1, i);
-      html += `<div class="tf-dp-day other" data-date="${toIso(d)}">${i}</div>`;
+      html += dayCell(['tf-dp-day', 'other'], d, i, false);
     }
 
     html += '</div>';

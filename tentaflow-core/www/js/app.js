@@ -63,6 +63,7 @@ import MlStudioScreen from '/js/modules/ml-studio.js';
 import RobotsScreen from '/js/modules/robots.js';
 import MapsScreen from '/js/modules/maps.js';
 import RolesCatalogScreen from '/js/modules/roles_catalog.js';
+import OrgStructureScreen from '/js/modules/org-structure/index.js';
 import SkillsScreen from '/js/modules/skills.js';
 import AgentsScreen from '/js/modules/agents.js';
 import ProjectStudioScreen from '/js/modules/project-studio.js';
@@ -146,6 +147,7 @@ const ADMIN_NAV = [
       { id: 'access-keys', labelKey: 'nav.access_keys', icon: 'key' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
       { id: 'events', labelKey: 'nav.events', icon: 'clock-glance', userVisible: true },
+      { id: 'org-structure', labelKey: 'nav.org_structure', icon: 'sitemap', userVisible: true },
       { id: 'analytics', labelKey: 'nav.analytics', icon: 'trend' },
       { id: 'legal', labelKey: 'nav.legal', icon: 'audit' },
       { id: 'profiling-sessions', labelKey: 'nav.profiling_sessions', icon: 'trend' },
@@ -613,6 +615,7 @@ async function renderApp() {
   Router.register('users', UsersScreen);
   Router.register('access-keys', AccessKeysScreen);
   Router.register('roles-catalog', RolesCatalogScreen);
+  Router.register('org-structure', OrgStructureScreen);
   Router.register('rules', RulesScreen);
   Router.register('settings', SettingsScreen);
   Router.register('audit', AuditScreen);

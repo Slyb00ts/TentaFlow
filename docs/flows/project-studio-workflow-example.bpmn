@@ -1,0 +1,216 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:modeler="http://camunda.org/schema/modeler/1.0" id="Definitions_TASKFLOW" targetNamespace="http://bpmn.io/schema/bpmn" exporter="CyberSecurity/procesy generator" exporterVersion="1.0" modeler:executionPlatform="Camunda Platform" modeler:executionPlatformVersion="7.24.0">
+  <bpmn:collaboration id="Collaboration_TASKFLOW">
+    <bpmn:participant id="Participant_TASKFLOW" name="Workflow zadania — wytwarzanie z UI, testami i security (przykład)" processRef="Process_TASKFLOW" />
+  </bpmn:collaboration>
+  <bpmn:process id="Process_TASKFLOW" name="Workflow zadania — wytwarzanie z UI, testami i security (przykład)" isExecutable="false">
+    <bpmn:laneSet id="LaneSet_TASKFLOW">
+      <bpmn:lane id="Lane_PM" name="PM / Analityk">
+        <bpmn:flowNodeRef>Start</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_Analysis</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Gw_UI</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_DesignAccept</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Gw_Accept</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_Designer" name="Designer UI/UX">
+        <bpmn:flowNodeRef>Task_Design</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_Dev" name="Developer">
+        <bpmn:flowNodeRef>Gw_Join</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_Implement</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_CodeReview</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Gw_CR</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_Auto" name="Automat i agent security">
+        <bpmn:flowNodeRef>Service_Deploy</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Service_AgentSec</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_Tester" name="Tester">
+        <bpmn:flowNodeRef>Par_Tests</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_HumanTest</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Par_TestsJoin</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Gw_Verdict</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_AgentTest" name="Agent testujący">
+        <bpmn:flowNodeRef>Service_AgentTest</bpmn:flowNodeRef>
+      </bpmn:lane>
+      <bpmn:lane id="Lane_Release" name="Release Manager">
+        <bpmn:flowNodeRef>Task_Ready</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>Task_Release</bpmn:flowNodeRef>
+        <bpmn:flowNodeRef>End</bpmn:flowNodeRef>
+      </bpmn:lane>
+    </bpmn:laneSet>
+    <bpmn:startEvent id="Start" name="Nowe zadanie">
+      <bpmn:outgoing>F1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:userTask id="Task_Analysis" name="Analiza, kryteria akceptacji (agent analityk podpowiada)">
+      <bpmn:incoming>F1</bpmn:incoming>
+      <bpmn:outgoing>F2</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="Gw_UI" name="Wymaga projektu UI?" default="Flow_UI_No">
+      <bpmn:incoming>F2</bpmn:incoming>
+      <bpmn:outgoing>Flow_UI_Yes</bpmn:outgoing>
+      <bpmn:outgoing>Flow_UI_No</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="Task_Design" name="Projekt UI (pliki, zrzuty, Figma)">
+      <bpmn:incoming>Flow_UI_Yes</bpmn:incoming>
+      <bpmn:incoming>Flow_Accept_No</bpmn:incoming>
+      <bpmn:outgoing>F3</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="Task_DesignAccept" name="Akceptacja projektu">
+      <bpmn:incoming>F3</bpmn:incoming>
+      <bpmn:outgoing>F4</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="Gw_Accept" name="Zaakceptowany?" default="Flow_Accept_Yes">
+      <bpmn:incoming>F4</bpmn:incoming>
+      <bpmn:outgoing>Flow_Accept_No</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Accept_Yes</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:exclusiveGateway id="Gw_Join" name="">
+      <bpmn:incoming>Flow_UI_No</bpmn:incoming>
+      <bpmn:incoming>Flow_Accept_Yes</bpmn:incoming>
+      <bpmn:outgoing>F5</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="Task_Implement" name="Realizacja na gałęzi NA-123 (ten sam developer w każdej rundzie)">
+      <bpmn:incoming>F5</bpmn:incoming>
+      <bpmn:incoming>Flow_CR_Yes</bpmn:incoming>
+      <bpmn:incoming>Flow_Verdict_No</bpmn:incoming>
+      <bpmn:outgoing>F6</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="Task_CodeReview" name="Code review: inny developer + agent review">
+      <bpmn:incoming>F6</bpmn:incoming>
+      <bpmn:outgoing>F7</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:exclusiveGateway id="Gw_CR" name="Uwagi?" default="Flow_CR_No">
+      <bpmn:incoming>F7</bpmn:incoming>
+      <bpmn:outgoing>Flow_CR_Yes</bpmn:outgoing>
+      <bpmn:outgoing>Flow_CR_No</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:serviceTask id="Service_Deploy" name="MR scalony → wdrożenie środowiska testowego wersji">
+      <bpmn:incoming>Flow_CR_No</bpmn:incoming>
+      <bpmn:outgoing>F8</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="Par_Tests" name="">
+      <bpmn:incoming>F8</bpmn:incoming>
+      <bpmn:outgoing>F9</bpmn:outgoing>
+      <bpmn:outgoing>F10</bpmn:outgoing>
+      <bpmn:outgoing>F11</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:userTask id="Task_HumanTest" name="Testy manualne po kryteriach akceptacji">
+      <bpmn:incoming>F9</bpmn:incoming>
+      <bpmn:outgoing>F12</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:serviceTask id="Service_AgentTest" name="Agent testujący: Playwright, zrzuty, nagranie błędu">
+      <bpmn:incoming>F10</bpmn:incoming>
+      <bpmn:outgoing>F13</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="Service_AgentSec" name="Agent security (gdy security_impact ≠ none)">
+      <bpmn:incoming>F11</bpmn:incoming>
+      <bpmn:outgoing>F14</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:parallelGateway id="Par_TestsJoin" name="">
+      <bpmn:incoming>F12</bpmn:incoming>
+      <bpmn:incoming>F13</bpmn:incoming>
+      <bpmn:incoming>F14</bpmn:incoming>
+      <bpmn:outgoing>F15</bpmn:outgoing>
+    </bpmn:parallelGateway>
+    <bpmn:exclusiveGateway id="Gw_Verdict" name="Wszystkie werdykty OK?" default="Flow_Verdict_Yes">
+      <bpmn:incoming>F15</bpmn:incoming>
+      <bpmn:outgoing>Flow_Verdict_No</bpmn:outgoing>
+      <bpmn:outgoing>Flow_Verdict_Yes</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+    <bpmn:userTask id="Task_Ready" name="Gotowe do wydania (wersja docelowa)">
+      <bpmn:incoming>Flow_Verdict_Yes</bpmn:incoming>
+      <bpmn:outgoing>F16</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:userTask id="Task_Release" name="Wydanie: tag, bramki, noty wydania">
+      <bpmn:incoming>F16</bpmn:incoming>
+      <bpmn:outgoing>F17</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:endEvent id="End" name="Wydane">
+      <bpmn:incoming>F17</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="F1" name="" sourceRef="Start" targetRef="Task_Analysis" />
+    <bpmn:sequenceFlow id="F2" name="" sourceRef="Task_Analysis" targetRef="Gw_UI" />
+    <bpmn:sequenceFlow id="Flow_UI_Yes" name="tak" sourceRef="Gw_UI" targetRef="Task_Design" />
+    <bpmn:sequenceFlow id="Flow_UI_No" name="nie" sourceRef="Gw_UI" targetRef="Gw_Join" />
+    <bpmn:sequenceFlow id="F3" name="" sourceRef="Task_Design" targetRef="Task_DesignAccept" />
+    <bpmn:sequenceFlow id="F4" name="" sourceRef="Task_DesignAccept" targetRef="Gw_Accept" />
+    <bpmn:sequenceFlow id="Flow_Accept_No" name="poprawki" sourceRef="Gw_Accept" targetRef="Task_Design" />
+    <bpmn:sequenceFlow id="Flow_Accept_Yes" name="tak" sourceRef="Gw_Accept" targetRef="Gw_Join" />
+    <bpmn:sequenceFlow id="F5" name="" sourceRef="Gw_Join" targetRef="Task_Implement" />
+    <bpmn:sequenceFlow id="F6" name="MR otwarty" sourceRef="Task_Implement" targetRef="Task_CodeReview" />
+    <bpmn:sequenceFlow id="F7" name="" sourceRef="Task_CodeReview" targetRef="Gw_CR" />
+    <bpmn:sequenceFlow id="Flow_CR_Yes" name="tak" sourceRef="Gw_CR" targetRef="Task_Implement" />
+    <bpmn:sequenceFlow id="Flow_CR_No" name="nie → merge" sourceRef="Gw_CR" targetRef="Service_Deploy" />
+    <bpmn:sequenceFlow id="F8" name="" sourceRef="Service_Deploy" targetRef="Par_Tests" />
+    <bpmn:sequenceFlow id="F9" name="" sourceRef="Par_Tests" targetRef="Task_HumanTest" />
+    <bpmn:sequenceFlow id="F10" name="" sourceRef="Par_Tests" targetRef="Service_AgentTest" />
+    <bpmn:sequenceFlow id="F11" name="" sourceRef="Par_Tests" targetRef="Service_AgentSec" />
+    <bpmn:sequenceFlow id="F12" name="" sourceRef="Task_HumanTest" targetRef="Par_TestsJoin" />
+    <bpmn:sequenceFlow id="F13" name="" sourceRef="Service_AgentTest" targetRef="Par_TestsJoin" />
+    <bpmn:sequenceFlow id="F14" name="" sourceRef="Service_AgentSec" targetRef="Par_TestsJoin" />
+    <bpmn:sequenceFlow id="F15" name="" sourceRef="Par_TestsJoin" targetRef="Gw_Verdict" />
+    <bpmn:sequenceFlow id="Flow_Verdict_No" name="błędy → runda +1" sourceRef="Gw_Verdict" targetRef="Task_Implement" />
+    <bpmn:sequenceFlow id="Flow_Verdict_Yes" name="tak" sourceRef="Gw_Verdict" targetRef="Task_Ready" />
+    <bpmn:sequenceFlow id="F16" name="" sourceRef="Task_Ready" targetRef="Task_Release" />
+    <bpmn:sequenceFlow id="F17" name="" sourceRef="Task_Release" targetRef="End" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diagram_TASKFLOW">
+    <bpmndi:BPMNPlane id="Plane_TASKFLOW" bpmnElement="Collaboration_TASKFLOW">
+      <bpmndi:BPMNShape id="Participant_TASKFLOW_di" bpmnElement="Participant_TASKFLOW" isHorizontal="true"><dc:Bounds x="160" y="80" width="2790" height="1050" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_PM_di" bpmnElement="Lane_PM" isHorizontal="true"><dc:Bounds x="190" y="80" width="2760" height="150" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Designer_di" bpmnElement="Lane_Designer" isHorizontal="true"><dc:Bounds x="190" y="230" width="2760" height="150" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Dev_di" bpmnElement="Lane_Dev" isHorizontal="true"><dc:Bounds x="190" y="380" width="2760" height="150" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Auto_di" bpmnElement="Lane_Auto" isHorizontal="true"><dc:Bounds x="190" y="530" width="2760" height="150" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Tester_di" bpmnElement="Lane_Tester" isHorizontal="true"><dc:Bounds x="190" y="680" width="2760" height="150" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_AgentTest_di" bpmnElement="Lane_AgentTest" isHorizontal="true"><dc:Bounds x="190" y="830" width="2760" height="150" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Lane_Release_di" bpmnElement="Lane_Release" isHorizontal="true"><dc:Bounds x="190" y="980" width="2760" height="150" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Start_di" bpmnElement="Start"><dc:Bounds x="272" y="137" width="36" height="36" /><bpmndi:BPMNLabel><dc:Bounds x="235" y="179" width="110" height="28" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Analysis_di" bpmnElement="Task_Analysis"><dc:Bounds x="380" y="115" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_UI_di" bpmnElement="Gw_UI" isMarkerVisible="true"><dc:Bounds x="565" y="130" width="50" height="50" /><bpmndi:BPMNLabel><dc:Bounds x="535" y="96" width="110" height="28" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Design_di" bpmnElement="Task_Design"><dc:Bounds x="680" y="265" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_DesignAccept_di" bpmnElement="Task_DesignAccept"><dc:Bounds x="830" y="115" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Accept_di" bpmnElement="Gw_Accept" isMarkerVisible="true"><dc:Bounds x="1015" y="130" width="50" height="50" /><bpmndi:BPMNLabel><dc:Bounds x="985" y="96" width="110" height="28" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Join_di" bpmnElement="Gw_Join" isMarkerVisible="true"><dc:Bounds x="1165" y="430" width="50" height="50" /><bpmndi:BPMNLabel><dc:Bounds x="1135" y="396" width="110" height="28" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Implement_di" bpmnElement="Task_Implement"><dc:Bounds x="1280" y="415" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_CodeReview_di" bpmnElement="Task_CodeReview"><dc:Bounds x="1430" y="415" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_CR_di" bpmnElement="Gw_CR" isMarkerVisible="true"><dc:Bounds x="1615" y="430" width="50" height="50" /><bpmndi:BPMNLabel><dc:Bounds x="1585" y="396" width="110" height="28" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Service_Deploy_di" bpmnElement="Service_Deploy"><dc:Bounds x="1730" y="565" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Par_Tests_di" bpmnElement="Par_Tests"><dc:Bounds x="1915" y="730" width="50" height="50" /><bpmndi:BPMNLabel><dc:Bounds x="1885" y="696" width="110" height="28" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_HumanTest_di" bpmnElement="Task_HumanTest"><dc:Bounds x="2030" y="715" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Service_AgentTest_di" bpmnElement="Service_AgentTest"><dc:Bounds x="2030" y="865" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Service_AgentSec_di" bpmnElement="Service_AgentSec"><dc:Bounds x="2030" y="565" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Par_TestsJoin_di" bpmnElement="Par_TestsJoin"><dc:Bounds x="2215" y="730" width="50" height="50" /><bpmndi:BPMNLabel><dc:Bounds x="2185" y="696" width="110" height="28" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Verdict_di" bpmnElement="Gw_Verdict" isMarkerVisible="true"><dc:Bounds x="2365" y="730" width="50" height="50" /><bpmndi:BPMNLabel><dc:Bounds x="2335" y="696" width="110" height="28" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Ready_di" bpmnElement="Task_Ready"><dc:Bounds x="2480" y="1015" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Release_di" bpmnElement="Task_Release"><dc:Bounds x="2630" y="1015" width="120" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_di" bpmnElement="End"><dc:Bounds x="2822" y="1037" width="36" height="36" /><bpmndi:BPMNLabel><dc:Bounds x="2785" y="1079" width="110" height="28" /></bpmndi:BPMNLabel></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="F1_di" bpmnElement="F1"><di:waypoint x="308" y="155" /><di:waypoint x="380" y="155" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F2_di" bpmnElement="F2"><di:waypoint x="500" y="155" /><di:waypoint x="565" y="155" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_UI_Yes_di" bpmnElement="Flow_UI_Yes"><di:waypoint x="590" y="180" /><di:waypoint x="590" y="305" /><di:waypoint x="680" y="305" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_UI_No_di" bpmnElement="Flow_UI_No"><di:waypoint x="590" y="180" /><di:waypoint x="590" y="455" /><di:waypoint x="1165" y="455" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F3_di" bpmnElement="F3"><di:waypoint x="800" y="305" /><di:waypoint x="815" y="305" /><di:waypoint x="815" y="155" /><di:waypoint x="830" y="155" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F4_di" bpmnElement="F4"><di:waypoint x="950" y="155" /><di:waypoint x="1015" y="155" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Accept_No_di" bpmnElement="Flow_Accept_No"><di:waypoint x="1040" y="130" /><di:waypoint x="1040" y="94" /><di:waypoint x="740" y="94" /><di:waypoint x="740" y="265" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Accept_Yes_di" bpmnElement="Flow_Accept_Yes"><di:waypoint x="1040" y="180" /><di:waypoint x="1040" y="455" /><di:waypoint x="1165" y="455" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F5_di" bpmnElement="F5"><di:waypoint x="1215" y="455" /><di:waypoint x="1280" y="455" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F6_di" bpmnElement="F6"><di:waypoint x="1400" y="455" /><di:waypoint x="1430" y="455" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F7_di" bpmnElement="F7"><di:waypoint x="1550" y="455" /><di:waypoint x="1615" y="455" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_CR_Yes_di" bpmnElement="Flow_CR_Yes"><di:waypoint x="1640" y="480" /><di:waypoint x="1640" y="516" /><di:waypoint x="1365" y="516" /><di:waypoint x="1365" y="495" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_CR_No_di" bpmnElement="Flow_CR_No"><di:waypoint x="1640" y="480" /><di:waypoint x="1640" y="605" /><di:waypoint x="1730" y="605" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F8_di" bpmnElement="F8"><di:waypoint x="1850" y="605" /><di:waypoint x="1882" y="605" /><di:waypoint x="1882" y="755" /><di:waypoint x="1915" y="755" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F9_di" bpmnElement="F9"><di:waypoint x="1965" y="755" /><di:waypoint x="2030" y="755" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F10_di" bpmnElement="F10"><di:waypoint x="1940" y="780" /><di:waypoint x="1940" y="905" /><di:waypoint x="2030" y="905" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F11_di" bpmnElement="F11"><di:waypoint x="1940" y="730" /><di:waypoint x="1940" y="605" /><di:waypoint x="2030" y="605" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F12_di" bpmnElement="F12"><di:waypoint x="2150" y="755" /><di:waypoint x="2215" y="755" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F13_di" bpmnElement="F13"><di:waypoint x="2150" y="905" /><di:waypoint x="2182" y="905" /><di:waypoint x="2182" y="755" /><di:waypoint x="2215" y="755" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F14_di" bpmnElement="F14"><di:waypoint x="2150" y="605" /><di:waypoint x="2182" y="605" /><di:waypoint x="2182" y="755" /><di:waypoint x="2215" y="755" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F15_di" bpmnElement="F15"><di:waypoint x="2265" y="755" /><di:waypoint x="2365" y="755" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Verdict_No_di" bpmnElement="Flow_Verdict_No"><di:waypoint x="2390" y="780" /><di:waypoint x="2390" y="816" /><di:waypoint x="1315" y="816" /><di:waypoint x="1315" y="495" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Verdict_Yes_di" bpmnElement="Flow_Verdict_Yes"><di:waypoint x="2390" y="780" /><di:waypoint x="2390" y="1055" /><di:waypoint x="2480" y="1055" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F16_di" bpmnElement="F16"><di:waypoint x="2600" y="1055" /><di:waypoint x="2630" y="1055" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="F17_di" bpmnElement="F17"><di:waypoint x="2750" y="1055" /><di:waypoint x="2822" y="1055" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

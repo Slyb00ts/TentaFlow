@@ -128,6 +128,47 @@ pub fn get_task(pool: &DbPool, task_id: &str) -> Result<Option<TaskRecord>> {
     .map_err(Into::into)
 }
 
+/// A task somebody still has to do, as the handover screen lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTask {
+    pub task_id: String,
+    pub task_no: u32,
+    pub title: String,
+    pub status: String,
+}
+
+/// The unfinished tasks assigned to `user_id`, oldest number first.
+pub fn open_tasks_of(pool: &DbPool, user_id: &str) -> Result<Vec<OpenTask>> {
+    let conn = pool.read().map_err(read_err)?;
+    let mut stmt = conn.prepare(
+        "SELECT task_id, task_no, title, status FROM tasks \
+         WHERE assigned_to = ?1 AND status <> 'done' ORDER BY task_no",
+    )?;
+    let rows = stmt.query_map(params![user_id], |row| {
+        Ok(OpenTask {
+            task_id: row.get(0)?,
+            task_no: row.get::<_, i64>(1)? as u32,
+            title: row.get(2)?,
+            status: row.get(3)?,
+        })
+    })?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+/// Moves an UNFINISHED task from `from` to `to` and touches nothing else. The
+/// conditions are part of the statement, so a task somebody closed or gave to
+/// another person in the meantime is left alone: `false` = not moved.
+pub fn reassign_open(pool: &DbPool, task_id: &str, from: &str, to: &str) -> Result<bool> {
+    let conn = pool.write().map_err(write_err)?;
+    let n = conn.execute(
+        "UPDATE tasks SET assigned_to = ?1, updated_at = datetime('now') \
+         WHERE task_id = ?2 AND assigned_to = ?3 AND status <> 'done'",
+        params![to, task_id, from],
+    )?;
+    Ok(n > 0)
+}
+
 /// Field payload of a task create/update.
 #[derive(Debug)]
 pub struct TaskInput<'a> {

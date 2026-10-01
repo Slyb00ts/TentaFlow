@@ -1,5 +1,7 @@
 # 01 · Platform — Struktura organizacyjna
 
+> **Zastąpiony przez [`docs/ORG_STRUCTURE_PLAN.md`](../../../../docs/ORG_STRUCTURE_PLAN.md)** (2026-09-29). Ten dokument zostaje jako tło decyzji.
+
 **Mockup:** [O1 Org Structure](../../../../../.gstack/projects/Slyb00ts-TentaFlow/designs/crm-v1/o01-org-structure.html)
 
 ## Cel

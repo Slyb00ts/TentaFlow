@@ -108,9 +108,12 @@ export const Router = {
     // button meaningful — one entry per navigation, not per repaint.
     this.replaceParams(params);
 
-    // Sidebar active — drill-down widoki (params != null) nie sa pozycjami
-    // w sidebarze, wiec nie czyscimy podswietlenia gdy nawigujemy z parametrami.
-    if (!params) {
+    // Sidebar active — drill-down views (params != null) are not sidebar items, so
+    // the highlight stays where it was. A screen that IS an item and merely takes
+    // parameters (a tab, a deep link) still moves it onto itself.
+    const ownItem = params && !params.instance
+      && [...document.querySelectorAll('.sidebar .nav-item[data-view]')].some((el) => el.dataset.view === id && !el.dataset.instance);
+    if (!params || ownItem) {
       document.querySelectorAll('.sidebar .nav-item[data-view]').forEach((el) => {
         el.classList.toggle('active', el.dataset.view === id);
       });

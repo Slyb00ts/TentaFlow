@@ -1,0 +1,208 @@
+<!-- Fragmenty nawigacji — rewizja 3 (oryginalny układ Projektów + nowe zakładki). Wklejaj 1:1, zmieniaj tylko active. -->
+
+<!-- ===== SIDEBAR (active=projekty, użytkownik Anna) — w pozostałych przypadkach zmień tylko klasę active i ewentualnie użytkownika (MN = Marek, HK = Hanna/administrator) ===== -->
+<aside class="sidebar">
+  <div class="logo"><span class="name">TentaFlow</span></div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-home"/></svg>Pulpit</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-services"/></svg>Serwisy</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</a>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+    <a class="nav-item active" href="p01-lista.html"><svg class="icon"><use href="#i-folder"/></svg>Projekty</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-bot"/></svg>Agenci</a>
+    <a class="nav-item" href="d01-edytor-workflow.html"><svg class="icon"><use href="#i-branch"/></svg>Flow Builder</a>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</a>
+    <a class="nav-item" href="f01-struktura.html"><svg class="icon"><use href="#i-sitemap"/></svg>Struktura organizacyjna</a>
+    <a class="nav-item" href="f05-prywatnosc.html"><svg class="icon"><use href="#i-fingerprint"/></svg>Prywatność</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</a>
+  </div>
+  <div class="footer">
+    <a class="user-chip" href="g01-profil.html" title="Mój profil"><div class="av av-1">AK</div><div><div class="name-t">Anna Kowalska</div><div class="role">PM · Dział Realizacji</div></div></a>
+  </div>
+</aside>
+
+<!-- ===== POZIOM APLIKACJI: zakładki Projekty · Moja praca · Zasoby (active=projekty), pod nimi .page-head jak w p01 ===== -->
+
+<div class="tabs-bar">
+  <a class="tab active" href="p01-lista.html"><svg class="icon"><use href="#i-folder"/></svg>Projekty</a>
+  <a class="tab" href="a01-moja-praca.html"><svg class="icon"><use href="#i-home"/></svg>Moja praca</a>
+  <a class="tab" href="c04-zasoby.html"><svg class="icon"><use href="#i-users"/></svg>Zasoby</a>
+</div>
+
+<!-- ===== NAGŁÓWEK PROJEKTU NextApp (oryginalny format detail-header) ===== -->
+
+<div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-folder"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">NextApp <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">DCIM i procesy zmian w szafach · Sprint 42, dzień 6 z 10 · wersja 2.5.0 w stabilizacji</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-check-circle"/></svg>48 otwartych</span>
+              <span class="chip danger"><svg class="icon"><use href="#i-bug"/></svg>1 po terminie SLA</span>
+              <span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Moduły: Zadania + Testy + Wydania + Bezpieczeństwo</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">PM</b></span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">3</span></button>
+            <a class="btn" href="d02-czlonkowie.html"><svg class="icon"><use href="#i-users"/></svg>Członkowie</a>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport</button>
+            <a class="btn" href="d03-funkcje-projektu.html"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</a>
+          </div>
+        </div>
+
+<!-- ===== ZAKŁADKI NextApp: oryginalne 7 + Roadmapa, Wydania, Bezpieczeństwo po Zadaniach (active=zadania). href="#" = istniejący ekran w projekty-20260723 ===== -->
+
+<div class="tabs-bar">
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">6</span></a>
+          <a class="tab" href="d06-srodowiska.html"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-message"/></svg>Chat</a>
+          <a class="tab active" href="a02-tablica.html"><svg class="icon"><use href="#i-check-circle"/></svg>Zadania <span class="count">48</span></a>
+          <a class="tab" href="c01-roadmapa.html"><svg class="icon"><use href="#i-gantt"/></svg>Roadmapa</a>
+          <a class="tab" href="b05-wersja-wydanie.html"><svg class="icon"><use href="#i-rocket"/></svg>Wydania</a>
+          <a class="tab" href="e03-bezpieczenstwo.html"><svg class="icon"><use href="#i-shield"/></svg>Bezpieczeństwo</a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></a>
+        </div>
+
+<!-- ===== NAGŁÓWEK PROJEKTU Wdrożenie DCIM ===== -->
+
+<div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-gantt"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Wdrożenie DCIM — Klient Energetyka <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">Projekt wdrożeniowy · plan v2 po aneksie · go-live 12.01.2027</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-check-circle"/></svg>31 otwartych</span>
+              <span class="chip danger"><svg class="icon"><use href="#i-flag"/></svg>1 kamień zagrożony</span>
+              <span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Moduły: Roadmapa + Zadania + Wiedza</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">PM</b></span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">2</span></button>
+            <button class="btn"><svg class="icon"><use href="#i-users"/></svg>Członkowie</button>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport</button>
+            <button class="btn"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          </div>
+        </div>
+
+<!-- ===== ZAKŁADKI Wdrożenie DCIM (active=roadmapa) ===== -->
+
+<div class="tabs-bar">
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</a>
+          <a class="tab" href="e01-wiedza-plan.html"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">7</span></a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">4</span></a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-message"/></svg>Chat</a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-check-circle"/></svg>Zadania <span class="count">31</span></a>
+          <a class="tab active" href="c01-roadmapa.html"><svg class="icon"><use href="#i-gantt"/></svg>Roadmapa</a>
+        </div>
+
+<!-- ===== ZADANIA: oryginalny pasek (przełącznik widoków + Nowe zadanie), active=tablica ===== -->
+
+<div class="toolbar">
+          <div class="segmented subnav">
+              <a href="a06-lista.html"><svg class="icon"><use href="#i-list"/></svg>Lista</a>
+              <a class="active" href="a02-tablica.html"><svg class="icon"><use href="#i-grid"/></svg>Tablica</a>
+              <a href="b01-backlog-sprint.html"><svg class="icon"><use href="#i-layers"/></svg>Backlog i sprinty</a>
+              <a href="a05-do-weryfikacji.html"><svg class="icon"><use href="#i-inbox"/></svg>Do weryfikacji <span class="count warn">3</span></a>
+              <a href="b02-daily.html"><svg class="icon"><use href="#i-sun"/></svg>Daily</a>
+              <a href="b03-weekly.html"><svg class="icon"><use href="#i-chart"/></svg>Raport tygodniowy</a>
+              <a href="b04-ewidencja-czasu.html"><svg class="icon"><use href="#i-timer"/></svg>Czas pracy</a>
+          </div>
+          <div class="actions">
+            <a class="btn btn-primary" href="a04-nowe-zadanie.html"><svg class="icon"><use href="#i-plus"/></svg>Nowe zadanie</a>
+          </div>
+        </div>
+
+<!-- ===== PODWIDOKI: Roadmapa (active=os) ===== -->
+<div class="subnav-wrap">
+  <div class="segmented subnav">
+    <a class="active" href="c01-roadmapa.html"><svg class="icon"><use href="#i-gantt"/></svg>Oś czasu</a>
+    <a href="c02-teraz-nastepnie.html"><svg class="icon"><use href="#i-grid"/></svg>Teraz / Następnie / Później</a>
+    <a href="c03-alokacje.html"><svg class="icon"><use href="#i-users"/></svg>Alokacje</a>
+    <a href="e02-propozycja-planu.html"><svg class="icon"><use href="#i-sparkles"/></svg>Propozycje planu <span class="count">1</span></a>
+  </div>
+</div>
+
+<!-- ===== PODWIDOKI: Wydania (active=wersje) ===== -->
+<div class="subnav-wrap">
+  <div class="segmented subnav">
+    <a class="active" href="b05-wersja-wydanie.html"><svg class="icon"><use href="#i-rocket"/></svg>Wersje</a>
+    <a href="b06-changelog.html"><svg class="icon"><use href="#i-doc"/></svg>Changelog</a>
+  </div>
+</div>
+
+<!-- ===== PODWIDOKI: Testy (active=srodowiska) ===== -->
+<div class="subnav-wrap">
+  <div class="segmented subnav">
+    <a href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-clipboard"/></svg>Przypadki</a>
+    <a href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-layers"/></svg>Zestawy</a>
+    <a href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-play"/></svg>Przebiegi</a>
+    <a class="active" href="d06-srodowiska.html"><svg class="icon"><use href="#i-server"/></svg>Środowiska</a>
+    <a href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-calendar"/></svg>Harmonogramy</a>
+    <a href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-chart"/></svg>Raporty</a>
+  </div>
+</div>
+
+<!-- ===== PODWIDOKI: Bezpieczeństwo (active=pulpit) ===== -->
+<div class="subnav-wrap">
+  <div class="segmented subnav">
+    <a class="active" href="e03-bezpieczenstwo.html"><svg class="icon"><use href="#i-activity"/></svg>Pulpit</a>
+    <a href="e04-znaleziska.html"><svg class="icon"><use href="#i-bug"/></svg>Znaleziska <span class="count warn">7</span></a>
+    <a href="e07-sbom-wydania.html"><svg class="icon"><use href="#i-package"/></svg>Wydania i SBOM</a>
+    <a href="e05-psirt.html"><svg class="icon"><use href="#i-lock"/></svg>PSIRT</a>
+    <a href="e06-pentest.html"><svg class="icon"><use href="#i-target"/></svg>Pentesty</a>
+    <a href="e08-wyjatki-obowiazki.html"><svg class="icon"><use href="#i-clock"/></svg>Wyjątki i obowiązki</a>
+  </div>
+</div>
+
+<!-- ===== PODWIDOKI: Wiedza (active=zrodla) ===== -->
+<div class="subnav-wrap">
+  <div class="segmented subnav">
+    <a class="active" href="e01-wiedza-plan.html"><svg class="icon"><use href="#i-book"/></svg>Źródła i pliki</a>
+    <a href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-search"/></svg>Przeszukaj</a>
+    <a href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-file"/></svg>Drzewo plików</a>
+  </div>
+</div>
+
+<!-- ===== USTAWIENIA PROJEKTU (strona ustawień — nagłówek projektu bez zakładek, pod nim ten pasek; active=funkcje) ===== -->
+<div class="subnav-wrap">
+  <div class="segmented subnav">
+    <a href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</a>
+    <a class="active" href="d03-funkcje-projektu.html"><svg class="icon"><use href="#i-layers"/></svg>Funkcje projektu</a>
+    <a href="d01-edytor-workflow.html"><svg class="icon"><use href="#i-branch"/></svg>Workflow</a>
+    <a href="d04-sla-kalendarz.html"><svg class="icon"><use href="#i-timer"/></svg>SLA i kalendarz</a>
+    <a href="d05-moduly.html"><svg class="icon"><use href="#i-grid"/></svg>Moduły</a>
+    <a href="d02-czlonkowie.html"><svg class="icon"><use href="#i-users"/></svg>Członkowie</a>
+    <a href="d08-integracje-git.html"><svg class="icon"><use href="#i-git"/></svg>Integracje git</a>
+    <a href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-bot"/></svg>Agenci</a>
+  </div>
+</div>
+
+
+<!-- ===== STRUKTURA ORGANIZACYJNA — zakładki (active=drzewo) ===== -->
+<div class="tabs-bar">
+  <a class="tab active" href="f01-struktura.html"><svg class="icon"><use href="#i-sitemap"/></svg>Drzewo</a>
+  <a class="tab" href="f03-struktura-lista-import.html"><svg class="icon"><use href="#i-list"/></svg>Lista i import</a>
+  <a class="tab" href="f06-struktura-widocznosc.html"><svg class="icon"><use href="#i-eye"/></svg>Widoczność</a>
+  <a class="tab" href="f04-struktura-historia.html"><svg class="icon"><use href="#i-history"/></svg>Historia</a>
+  <a class="tab" href="f01-struktura.html"><svg class="icon"><use href="#i-tag"/></svg>Katalog ról</a>
+</div>
+
+<!-- ===== MÓJ PROFIL (globalny, TentaFlow) — zakładki (active=profil) ===== -->
+<div class="tabs-bar">
+  <a class="tab active" href="g01-profil.html"><svg class="icon"><use href="#i-user"/></svg>Profil</a>
+  <a class="tab" href="g01-profil.html#konta"><svg class="icon"><use href="#i-link"/></svg>Konta zewnętrzne</a>
+  <a class="tab" href="g01-profil.html#nieobecnosci"><svg class="icon"><use href="#i-calendar"/></svg>Nieobecności i zastępstwa</a>
+  <a class="tab" href="g01-profil.html#powiadomienia"><svg class="icon"><use href="#i-bell"/></svg>Powiadomienia</a>
+</div>

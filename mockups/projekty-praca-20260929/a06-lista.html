@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Projekty · Zadania — Lista (A06)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<link rel="stylesheet" href="shared/projekty.css">
+<link rel="stylesheet" href="shared/praca.css">
+<link rel="stylesheet" href="shared/akcje.css">
+<link rel="stylesheet" href="shared/zadania.css">
+<style>
+  .screen-frame { position: relative; }
+  @keyframes meter-grow { from { transform: scaleX(0); } }
+  .meter > span { animation-name: meter-grow; }
+
+  .lane-label { font-size: 10.5px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-3); padding: 2px 6px 0; display: flex; align-items: center; gap: 6px; }
+  .lane-label.bad { color: #fca5a5; }
+  .lane-label.bad::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--danger); }
+  .verdicts { display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; color: var(--text-2); font-weight: 700; }
+  .verdicts i { width: 9px; height: 9px; border-radius: 50%; border: 1.5px solid var(--border-hover); }
+  .verdicts i.ok { background: var(--success); border-color: var(--success); }
+  .verdicts b { margin-left: 4px; font-weight: 700; }
+  .tcard .chip { font-size: 10.5px; padding: 1px 7px; }
+  .tcard .chip .icon { width: 10px; height: 10px; }
+  .board { grid-auto-columns: minmax(206px, 1fr); gap: 10px; }
+  .board-col { min-height: 380px; padding: 8px; }
+  .tcard { padding: 10px; }
+  .tcard.is-agent { overflow: hidden; }
+  .board-col-head { padding: 4px 4px 6px; gap: 6px; }
+  .board-col-head .name { font-weight: 800; font-size: 11.5px; white-space: nowrap; }
+  .board-col-head .count { min-width: 18px; text-align: right; }
+  .board-col-head .wip { margin-left: 2px; }
+  .board-col[data-locked="true"] { border-style: dashed; }
+
+  .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .toolbar .spacer { margin-left: auto; }
+  .fchip { font: inherit; font-size: 12.5px; font-weight: 700; color: var(--text-2); background: var(--bg-2); border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; transition: all var(--dur-normal) var(--ease-standard); }
+  .fchip:hover { border-color: var(--border-hover); color: var(--text); }
+  .fchip.active { color: var(--accent-2); border-color: rgba(167,139,250,0.45); background: rgba(99,102,241,0.12); }
+  .fchip .icon { width: 13px; height: 13px; }
+  .toolbar .select { width: auto; min-width: 150px; padding-top: 6px; padding-bottom: 6px; border-radius: 999px; background-color: var(--bg-2); }
+  .search-mini { display: inline-flex; align-items: center; gap: 8px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px; font-size: 12.5px; color: var(--text-3); min-width: 190px; }
+  .search-mini .icon { width: 13px; height: 13px; }
+  .board-note { display: flex; align-items: center; gap: 14px; font-size: 12px; color: var(--text-3); margin: 0 0 10px 2px; flex-wrap: wrap; }
+  .board-note b { color: var(--text-2); font-weight: 700; }
+  .board-note .dot-legend { display: inline-flex; align-items: center; gap: 6px; }
+  .toast-stack { position: fixed; right: 26px; bottom: 26px; }
+
+</style>
+<style>
+  .task-table td:nth-child(7) { white-space: normal; max-width: 150px; }
+  .task-table td:nth-child(7) .rel-chips { flex-wrap: wrap; }
+  .task-table td.t-title { min-width: 210px; max-width: 250px; }
+  .task-table td:nth-child(5) .who { white-space: nowrap; }
+  .task-table th, .task-table td { padding-left: 10px; padding-right: 10px; }
+  .task-table .ak-c { width: 28px; padding-left: 8px; padding-right: 0; }
+</style>
+</head>
+<body data-menu="task">
+<!-- IKONY: wklejone 1:1 z shared/icons.html -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+<symbol id="i-sitemap" viewBox="0 0 24 24"><rect x="9" y="2" width="6" height="5" rx="1"/><rect x="2" y="17" width="6" height="5" rx="1"/><rect x="16" y="17" width="6" height="5" rx="1"/><path d="M12 7v4M5 17v-3h14v3"/></symbol>
+<symbol id="i-gantt" viewBox="0 0 24 24"><line x1="3" y1="4" x2="3" y2="20"/><rect x="5" y="5" width="8" height="3" rx="1"/><rect x="9" y="10.5" width="10" height="3" rx="1"/><rect x="7" y="16" width="6" height="3" rx="1"/></symbol>
+<symbol id="i-rocket" viewBox="0 0 24 24"><path d="M4.5 16.5c-1.5 1.26-2 5-2 5s3.74-.5 5-2c.71-.84.7-2.13-.09-2.91a2.18 2.18 0 0 0-2.91-.09z"/><path d="m12 15-3-3a22 22 0 0 1 2-3.95A12.88 12.88 0 0 1 22 2c0 2.72-.78 7.5-6 11a22.35 22.35 0 0 1-4 2z"/><path d="M9 12H4s.55-3.03 2-4c1.62-1.08 5 0 5 0M12 15v5s3.03-.55 4-2c1.08-1.62 0-5 0-5"/></symbol>
+<symbol id="i-flag" viewBox="0 0 24 24"><path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"/><line x1="4" y1="22" x2="4" y2="15"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-video" viewBox="0 0 24 24"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2"/></symbol>
+<symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></symbol>
+<symbol id="i-timer" viewBox="0 0 24 24"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2M9 2h6"/></symbol>
+<symbol id="i-user-x" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="18" y1="8" x2="23" y2="13"/><line x1="23" y1="8" x2="18" y2="13"/></symbol>
+<symbol id="i-merge" viewBox="0 0 24 24"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M6 21V9a9 9 0 0 0 9 9"/></symbol>
+<symbol id="i-branch" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-package" viewBox="0 0 24 24"><path d="M16.5 9.4 7.5 4.21M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+<symbol id="i-radar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/><path d="M12 2v10l7 5"/></symbol>
+<symbol id="i-fingerprint" viewBox="0 0 24 24"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M2 16h.01M21.8 16c.2-2 .131-5.354 0-6"/><path d="M9 6.8a6 6 0 0 1 9 5.2c0 .47 0 1.17-.02 2"/></symbol>
+<symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="11" y1="8" x2="11" y2="14"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+<symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/><line x1="8" y1="11" x2="14" y2="11"/></symbol>
+<symbol id="i-maximize" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></symbol>
+<symbol id="i-move" viewBox="0 0 24 24"><polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/></symbol>
+<symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></symbol>
+<symbol id="i-inbox" viewBox="0 0 24 24"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></symbol>
+<symbol id="i-palette" viewBox="0 0 24 24"><circle cx="13.5" cy="6.5" r="1"/><circle cx="17.5" cy="10.5" r="1"/><circle cx="8.5" cy="7.5" r="1"/><circle cx="6.5" cy="12.5" r="1"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.5-.75 1.5-1.5 0-.4-.15-.74-.4-1-.25-.25-.4-.6-.4-1 0-.83.67-1.5 1.5-1.5H16c3.31 0 6-2.69 6-6 0-4.96-4.48-9-10-9z"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+<symbol id="i-scale" viewBox="0 0 24 24"><path d="M16 16l3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1zM2 16l3-8 3 8c-.87.65-1.92 1-3 1s-2.13-.35-3-1z"/><path d="M7 21h10M12 3v18M3 7h2c2 0 5-1 7-2 2 1 5 2 7 2h2"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></symbol>
+<symbol id="i-lightning" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-user" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></symbol>
+</defs></svg>
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">A06</span>
+    <h2>Zadania — Lista</h2>
+    <div class="desc">Te same zadania co na tablicy, w tabeli: typ, waga, status z workflow, SLA, przypisany człowiek lub agent, powiązania z git i testami. Przełącznik Lista/Tablica w tym samym miejscu.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+  <div class="logo"><span class="name">TentaFlow</span></div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-home"/></svg>Pulpit</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-services"/></svg>Serwisy</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</a>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+    <a class="nav-item active" href="p01-lista.html"><svg class="icon"><use href="#i-folder"/></svg>Projekty</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-bot"/></svg>Agenci</a>
+    <a class="nav-item" href="d01-edytor-workflow.html"><svg class="icon"><use href="#i-branch"/></svg>Flow Builder</a>
+  </div>
+  <div class="nav-section">
+    <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</a>
+    <a class="nav-item" href="f01-struktura.html"><svg class="icon"><use href="#i-sitemap"/></svg>Struktura organizacyjna</a>
+    <a class="nav-item" href="f05-prywatnosc.html"><svg class="icon"><use href="#i-fingerprint"/></svg>Prywatność</a>
+    <a class="nav-item" href="#"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</a>
+  </div>
+  <div class="footer">
+    <a class="user-chip" href="g01-profil.html" title="Mój profil"><div class="av av-1">AK</div><div><div class="name-t">Anna Kowalska</div><div class="role">PM · Dział Realizacji</div></div></a>
+  </div>
+</aside>
+      <main class="main">
+        <div class="breadcrumb"><a class="crumb-link" href="p01-lista.html">Projekty</a><svg class="icon icon-sm"><use href="#i-chevron-r"/></svg><span class="current">NextApp</span></div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-folder"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">NextApp <span class="sub-switch-wrap"><button class="sub-switch" data-node="na" aria-haspopup="dialog" title="Przełącz projekt w drzewie"><svg class="icon"><use href="#i-sitemap"/></svg>8 podprojektów<svg class="icon chev"><use href="#i-chevron-d"/></svg></button></span> <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">DCIM i procesy zmian w szafach · Sprint 42, dzień 6 z 10 · wersja 2.5.0 w stabilizacji</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-check-circle"/></svg>48 otwartych</span>
+              <span class="chip" title="Otwarte zadania w podprojektach, które widzisz"><svg class="icon"><use href="#i-sitemap"/></svg>+64 w podprojektach</span>
+              <span class="chip danger"><svg class="icon"><use href="#i-bug"/></svg>1 po terminie SLA</span>
+              <span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Moduły: 8 włączonych</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">PM</b></span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">3</span></button>
+            <a class="btn" href="d02-czlonkowie.html"><svg class="icon"><use href="#i-users"/></svg>Członkowie</a>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport</button>
+            <a class="btn" href="d03-funkcje-projektu.html"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</a>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">6</span></a>
+          <a class="tab" href="d06-srodowiska.html"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-message"/></svg>Chat</a>
+          <a class="tab active" href="a02-tablica.html"><svg class="icon"><use href="#i-check-circle"/></svg>Zadania <span class="count">48</span></a>
+          <a class="tab" href="c01-roadmapa.html"><svg class="icon"><use href="#i-gantt"/></svg>Roadmapa</a>
+          <a class="tab" href="b05-wersja-wydanie.html"><svg class="icon"><use href="#i-rocket"/></svg>Wydania</a>
+          <a class="tab" href="e03-bezpieczenstwo.html"><svg class="icon"><use href="#i-shield"/></svg>Bezpieczeństwo</a>
+          <a class="tab" href="#" title="Istniejący ekran — w mockupach projekty-20260723"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></a>
+        </div>
+
+        <div class="toolbar">
+          <div class="segmented subnav">
+              <a class="active" href="a06-lista.html"><svg class="icon"><use href="#i-list"/></svg>Lista</a>
+              <a href="a02-tablica.html"><svg class="icon"><use href="#i-grid"/></svg>Tablica</a>
+              <a href="b01-backlog-sprint.html"><svg class="icon"><use href="#i-layers"/></svg>Backlog i sprinty</a>
+              <a href="a05-do-weryfikacji.html"><svg class="icon"><use href="#i-inbox"/></svg>Do weryfikacji <span class="count warn">3</span></a>
+              <a href="b02-daily.html"><svg class="icon"><use href="#i-sun"/></svg>Daily</a>
+              <a href="b03-weekly.html"><svg class="icon"><use href="#i-chart"/></svg>Raport tygodniowy</a>
+              <a href="b04-ewidencja-czasu.html"><svg class="icon"><use href="#i-timer"/></svg>Czas pracy</a>
+          </div>
+          <div class="actions">
+            <a class="btn btn-primary" href="a04-nowe-zadanie.html"><svg class="icon"><use href="#i-plus"/></svg>Nowe zadanie</a>
+          </div>
+        </div>
+
+        <!-- Rząd filtrów -->
+        <div class="filters">
+          <div class="scope-toggle" role="group" aria-label="Zakres widoku"><button data-scope="own"><svg class="icon"><use href="#i-folder"/></svg>Ten projekt</button><button class="active" data-scope="all"><svg class="icon"><use href="#i-sitemap"/></svg>Z podprojektami</button></div>
+          <span class="filter-chip"><svg class="icon"><use href="#i-sitemap"/></svg>Projekt: wszystkie 6 <svg class="icon"><use href="#i-chevron-d"/></svg></span>
+          <select class="select" aria-label="Filtr typu"><option>Typ: wszystkie</option><option>Funkcjonalność</option><option>Błąd</option><option>Techniczne</option><option>Bezpieczeństwo</option></select>
+          <select class="select" aria-label="Filtr wagi"><option>Waga: wszystkie</option><option>Krytyczny</option><option>Istotny</option><option>Mało istotny</option></select>
+          <select class="select" aria-label="Wersja"><option>Wersja: 2.5.0</option><option>Wszystkie</option></select>
+          <span class="filter-chip"><svg class="icon"><use href="#i-users"/></svg>Moje</span>
+          <span class="filter-chip active"><svg class="icon"><use href="#i-timer"/></svg>Po terminie SLA na górze</span>
+          <span class="filter-chip"><svg class="icon"><use href="#i-filter"/></svg>Więcej filtrów</span>
+          <div class="search-box" style="min-width:200px;margin-left:auto;"><svg class="icon"><use href="#i-search"/></svg><input placeholder="Szukaj zadania…"></div>
+        </div>
+
+        <!-- Lista zadań -->
+        <div class="ak-bulkbar" data-menu="task"><b>Zaznaczono <span class="ak-n">0</span></b>
+          <button class="btn btn-sm" data-act="assign" data-label="Przypisz zaznaczone…"><svg class="icon"><use href="#i-user-plus"/></svg>Przypisz…</button>
+          <button class="btn btn-sm" data-act="handover" data-label="Przekaż zaznaczone…"><svg class="icon"><use href="#i-send"/></svg>Przekaż…</button>
+          <button class="btn btn-sm" data-act="move:sprints" data-label="Do sprintu…"><svg class="icon"><use href="#i-layers"/></svg>Do sprintu…</button>
+          <button class="btn btn-sm" data-act="move:versions" data-label="Ustaw wersję…"><svg class="icon"><use href="#i-package"/></svg>Ustaw wersję…</button>
+          <button class="btn btn-sm" data-act="move:projects" data-label="Przenieś do projektu…"><svg class="icon"><use href="#i-sitemap"/></svg>Przenieś do projektu…</button>
+          <button class="btn btn-sm" data-act="archive" data-label="Archiwizuj zaznaczone"><svg class="icon"><use href="#i-history"/></svg>Archiwizuj</button>
+        </div>
+        <div class="section-card" style="padding:0">
+          <div class="table-wrap">
+          <table class="tf-table task-table" data-bulk>
+            <thead><tr><th class="ak-c"><input type="checkbox" class="ak-sel-all" aria-label="Zaznacz wszystkie"></th><th>Zadanie</th><th>Waga</th><th>Status</th><th>Przypisany</th><th>Termin / SLA</th><th>Powiązania</th><th class="t-act"></th></tr></thead>
+            <tbody class="pr-stagger">
+              <tr class="crit">
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-bug" title="błąd" style="margin-right:6px"></span><span class="task-key">NA-231</span> <a href="a03-zadanie.html">Import OPC zawiesza się przy arkuszu &gt; 100 tys. wierszy</a></div><div class="t-id">Import OPC · poprawka po rundzie 3</div></td>
+                <td><span class="sev crit"><span class="d"></span>krytyczny</span></td>
+                <td><span class="status-pill run">W realizacji</span></td>
+                <td><span class="who"><span class="av-mini">PZ</span>Piotr Z.</span></td>
+                <td><span class="sla sla-danger" data-left="0.02">20 min po terminie</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-merge"/></svg>MR !481</span><span class="rel"><svg class="icon"><use href="#i-lock"/></svg>czeka na NA-220</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr class="from-sub">
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-bug" title="błąd" style="margin-right:6px"></span><span class="task-key">ECU-12</span> <a href="a07-tablica-utrzymanie.html">Po aktualizacji do 2.5.0 alarmy EMI nie odświeżają licznika</a></div><div class="t-id"><span class="proj-tag"><svg class="icon icon-sm"><use href="#i-layers"/></svg>Energetyka Centrum · Utrzymanie</span> Dashboard EMI · zgłoszenie klienta</div></td>
+                <td><span class="sev high"><span class="d"></span>istotny</span></td>
+                <td><span class="status-pill run">Do zrobienia</span><div class="own-status">u siebie: <b>Analiza</b></div></td>
+                <td><span class="who"><span class="av-mini">EW</span>Ewa W.</span></td>
+                <td><span class="sla sla-warn" data-left="0.3">7 h rob.</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-package"/></svg>u klienta 2.5.0</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-security" title="bezpieczeństwo" style="margin-right:6px"></span><span class="task-key">NA-219</span> Poprawka bezpieczeństwa SEC-2026-014</div><div class="t-id">poufne</div></td>
+                <td><span class="sev crit"><span class="d"></span>krytyczny</span></td>
+                <td><span class="status-pill run">W realizacji</span></td>
+                <td><span class="who"><span class="av-mini">MN</span>Marek N.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>01.10</span></td>
+                <td><div class="rel-chips"><span class="conf-lock"><svg class="icon icon-sm"><use href="#i-lock"/></svg>poufne</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-bug" title="błąd" style="margin-right:6px"></span><span class="task-key">NA-224</span> Zegar SLA nie pauzuje w statusie Czeka na informacje</div><div class="t-id">Integracja SDP</div></td>
+                <td><span class="sev high"><span class="d"></span>istotny</span></td>
+                <td><span class="status-pill run">W realizacji</span></td>
+                <td><span class="who"><span class="av-mini" style="background:#0b2a2a;color:var(--agent)">AG</span>Agent programista</span></td>
+                <td><span class="sla sla-ok" data-left="0.6">2 dni rob.</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-merge"/></svg>MR !482</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-bug" title="błąd" style="margin-right:6px"></span><span class="task-key">NA-230</span> Brak odświeżenia wykresu w Dashboard EMI</div><div class="t-id">Dashboard EMI · runda 1</div></td>
+                <td><span class="sev high"><span class="d"></span>istotny</span></td>
+                <td><span class="status-pill run">Testy</span></td>
+                <td><span class="who"><span class="av-mini" style="background:#0b2a2a;color:var(--agent)">AG</span>Agent testujący</span></td>
+                <td><span class="sla sla-ok" data-left="0.7">3 dni rob.</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-play"/></svg>przebieg #612</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-bug" title="błąd" style="margin-right:6px"></span><span class="task-key">NA-233</span> Błąd 500 po dwukrotnym kliknięciu Zapisz w Ustawieniach</div><div class="t-id">zgłosił Agent eksplorator · 3 wystąpienia</div></td>
+                <td><span class="sev-none">—</span></td>
+                <td><span class="status-pill idle">Do weryfikacji</span></td>
+                <td><span class="who none">—</span></td>
+                <td><span class="due">waga do ustalenia</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-video"/></svg>nagranie</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-feature" title="funkcjonalność" style="margin-right:6px"></span><span class="task-key">NA-228</span> Nakładka Góra szafy — kafelki mocy</div><div class="t-id">OMS / Widok szafy</div></td>
+                <td><span class="sev-none">—</span></td>
+                <td><span class="status-pill run">Code review</span></td>
+                <td><span class="who"><span class="av-mini">MN</span>Marek N.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>30.09</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-merge"/></svg>MR !479</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-feature" title="funkcjonalność" style="margin-right:6px"></span><span class="task-key">NA-226</span> Nowy widok struktury przełożonych</div><div class="t-id">Uprawnienia i hasła · projekt UI ✓</div></td>
+                <td><span class="sev-none">—</span></td>
+                <td><span class="status-pill run">W realizacji</span></td>
+                <td><span class="who"><span class="av-mini">TL</span>Tomasz L.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>02.10</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-image"/></svg>projekt v2</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-tech" title="techniczne" style="margin-right:6px"></span><span class="task-key">NA-220</span> Aktualizacja jQuery 3.7.0 → 3.7.1 w wwwroot/lib</div><div class="t-id">Import OPC</div></td>
+                <td><span class="sev-none">—</span></td>
+                <td><span class="status-pill run">W realizacji</span></td>
+                <td><span class="who"><span class="av-mini">JW</span>Jan W.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>dziś</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-lock"/></svg>blokuje NA-231</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-feature" title="funkcjonalność" style="margin-right:6px"></span><span class="task-key">NA-229</span> Kolejność portów na kartce technika</div><div class="t-id">Procedury zmiany</div></td>
+                <td><span class="sev-none">—</span></td>
+                <td><span class="status-pill run">Testy</span></td>
+                <td><span class="who"><span class="av-mini">EW</span>Ewa W.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>01.10</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-clipboard"/></svg>TC-214</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-bug" title="błąd" style="margin-right:6px"></span><span class="task-key">NA-215</span> Literówka w oknie Procedury zmiany</div><div class="t-id">Procedury zmiany</div></td>
+                <td><span class="sev med"><span class="d"></span>mało istotny</span></td>
+                <td><span class="status-pill idle">Do zrobienia</span></td>
+                <td><span class="who"><span class="av-mini">MN</span>Marek N.</span></td>
+                <td><span class="sla sla-ok" data-left="0.9">9 dni rob.</span></td>
+                <td><div class="rel-chips"><span class="rel-none">—</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-feature" title="funkcjonalność" style="margin-right:6px"></span><span class="task-key">NA-221</span> Filtr po statusie na liście procedur</div><div class="t-id">Procedury zmiany</div></td>
+                <td><span class="sev-none">—</span></td>
+                <td><span class="status-pill idle">Do zrobienia</span></td>
+                <td><span class="who"><span class="av-mini">PZ</span>Piotr Z.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-clock"/></svg>Sprint 42</span></td>
+                <td><div class="rel-chips"><span class="rel-none">—</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+              <tr>
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-feature" title="funkcjonalność" style="margin-right:6px"></span><span class="task-key">NA-217</span> Import OPC bez rozróżniania wielkości liter</div><div class="t-id">Import OPC</div></td>
+                <td><span class="sev-none">—</span></td>
+                <td><span class="status-pill ok">Gotowe do wydania</span></td>
+                <td><span class="who"><span class="av-mini">PZ</span>Piotr Z.</span></td>
+                <td><span class="due"><svg class="icon"><use href="#i-check"/></svg>28.09</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-rocket"/></svg>2.5.0</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+                          <tr class="from-sub">
+                <td class="ak-c"><input type="checkbox" class="ak-sel" aria-label="Zaznacz"></td>
+                <td class="t-title"><div class="tt"><span class="type-dot type-bug" title="błąd" style="margin-right:6px"></span><span class="task-key">BRU-5</span> <a href="a07-tablica-utrzymanie.html">Raport zmian w szafach nie uwzględnia strefy czasowej oddziału</a></div><div class="t-id"><span class="proj-tag"><svg class="icon icon-sm"><use href="#i-layers"/></svg>Bank Regionalny · Utrzymanie</span> Procedury zmiany · zgłoszenie klienta</div></td>
+                <td><span class="sev med"><span class="d"></span>mało istotny</span></td>
+                <td><span class="status-pill run">W realizacji</span><div class="own-status">u siebie: <b>Realizacja</b></div></td>
+                <td><span class="who"><span class="av-mini">PZ</span>Piotr Z.</span></td>
+                <td><span class="sla sla-ok" data-left="0.8">6 dni rob.</span></td>
+                <td><div class="rel-chips"><span class="rel"><svg class="icon"><use href="#i-package"/></svg>u klienta 2.5.0</span></div></td>
+                <td class="t-act"><div class="row-menu"><button class="icon-btn" style="width:28px;height:28px;" title="Akcje"><svg class="icon"><use href="#i-more"/></svg></button></div></td>
+              </tr>
+</tbody>
+          </table>
+          </div>
+        </div>
+        <div class="board-foot"><svg class="icon icon-sm"><use href="#i-check-circle"/></svg>Pokazano 14 ze 112 zadań (48 w NextApp, 64 w podprojektach) · sortowanie: po terminie SLA na górze · kliknij tytuł, aby otworzyć kartę</div>
+        <div class="toast-stack" style="position:fixed"></div>
+      </main>
+    </div>
+  </div>
+</section>
+<script src="shared/praca.js"></script>
+<script src="shared/akcje.js"></script>
+
+</body>
+</html>

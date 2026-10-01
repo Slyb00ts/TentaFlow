@@ -1,0 +1,121 @@
+/* =============================================================================
+   Zadania — style przeniesione 1:1 z mockups/projekty-20260723/z01-zadania.html (oryginalny
+   wygląd listy i tablicy). Nowe ekrany Zadań używają tych samych klas.
+   ============================================================================= */
+
+  /* Z01 — drobiazgi ekranowe (reszta z shared) */
+  @keyframes cardIn { from { opacity: 0; transform: translateY(-6px) scale(.98); } to { opacity: 1; transform: none; } }
+  @keyframes pulseDot { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+  /* pasek narzędzi: przełącznik widoku + akcje */
+  .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+  .toolbar .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+  /* rząd filtrów */
+  .filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+  .filters .select { width: auto; min-width: 150px; padding-top: 6px; padding-bottom: 6px; }
+
+  /* tabela zadań */
+  .table-wrap { overflow-x: auto; }
+  .task-table td, .task-table th { white-space: nowrap; }
+  .task-table td.t-title { white-space: normal; min-width: 240px; }
+  .task-table td.t-act, .task-table th.t-act { width: 40px; text-align: right; }
+  .task-table tr.crit td { background: rgba(239,68,68,0.06); }
+  .task-table tr.crit td.t-title { box-shadow: inset 3px 0 0 var(--danger); }
+  .t-title .tt { font-weight: 700; font-size: 12.5px; }
+  .t-id { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 10.5px; color: var(--text-3); margin-top: 2px; }
+
+  /* typ zadania (task/defect) */
+  .ttype { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 700; padding: 3px 9px; border-radius: 12px; border: 1px solid var(--border); }
+  .ttype .icon { width: 12px; height: 12px; }
+  .ttype.defect { background: rgba(239,68,68,0.12); color: var(--danger); border-color: rgba(239,68,68,0.3); }
+  .ttype.task { background: rgba(167,139,250,0.12); color: var(--accent-2); border-color: rgba(167,139,250,0.35); }
+
+  /* severity */
+  .sev { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 800; padding: 3px 9px; border-radius: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  .sev .d { width: 6px; height: 6px; border-radius: 50%; background: currentColor; box-shadow: 0 0 6px currentColor; }
+  .sev.crit { background: rgba(239,68,68,0.15); color: var(--danger); }
+  .sev.high { background: rgba(245,158,11,0.15); color: var(--warning); }
+  .sev.med  { background: rgba(96,165,250,0.15); color: var(--info); }
+  .sev.low  { background: var(--bg-3); color: var(--text-3); }
+  .sev-none { color: var(--text-3); font-weight: 700; }
+
+  /* status pill: w toku (pulsujący) */
+  .status-pill.run { color: var(--accent-2); background: var(--accent-glow); }
+  .status-pill.run::before { animation: pulseDot 1.2s infinite; }
+
+  /* przypisany */
+  .who { display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--text-2); }
+  .who.none { color: var(--text-3); }
+
+  /* termin */
+  .due { font-size: 11.5px; color: var(--text-2); display: inline-flex; align-items: center; gap: 5px; }
+  .due .icon { width: 12px; height: 12px; color: var(--text-3); }
+  .due.over { color: var(--danger); font-weight: 700; }
+  .due.over .icon { color: var(--danger); }
+
+  /* powiązania */
+  .rel-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .rel { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 10px; background: var(--bg-3); border: 1px solid var(--border); color: var(--text-2); cursor: pointer; }
+  .rel:hover { border-color: var(--accent-1); color: var(--accent-2); }
+  .rel .icon { width: 11px; height: 11px; color: var(--text-3); }
+  .rel:hover .icon { color: var(--accent-2); }
+  .rel-none { color: var(--text-3); font-size: 11.5px; }
+
+  /* menu wiersza (⋯) */
+  .row-menu { position: relative; display: inline-block; }
+  .tf-menu { position: absolute; top: 32px; right: 0; width: 208px; background: var(--bg-2); border: 1px solid var(--border-hover); border-radius: var(--radius); box-shadow: var(--shadow-lg); z-index: 30; padding: 4px; animation: cardIn .16s ease; }
+  .tf-menu .mi { display: flex; align-items: center; gap: 9px; padding: 8px 10px; font-size: 12px; color: var(--text-2); border-radius: var(--radius-sm); cursor: pointer; }
+  .tf-menu .mi:hover { background: var(--bg-3); color: var(--text); }
+  .tf-menu .mi .icon { width: 14px; height: 14px; }
+  .tf-menu .mi.danger { color: var(--danger); }
+  .tf-menu .mi.danger:hover { background: rgba(239,68,68,0.12); }
+  .tf-menu .mi-sep { height: 1px; background: var(--border); margin: 4px 2px; }
+
+  /* nagłówek kolumny kanban z akcją dodania */
+  .kanban-col .kc-head { align-items: center; }
+  .kc-head .kc-left { display: flex; align-items: center; gap: 8px; }
+  .kc-head .kc-add { width: 24px; height: 24px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--bg-3); color: var(--text-3); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+  .kc-head .kc-add:hover { color: var(--accent-2); border-color: var(--accent-1); }
+  .kc-head .kc-add .icon { width: 13px; height: 13px; }
+
+  /* karta kanban — nagłówek z typem + menu, meta */
+  .kanban-card.crit { border-left: 3px solid var(--danger); }
+  .kanban-card .kk-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+  .kanban-card .kk-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  .kanban-card .kk-id { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 10px; color: var(--text-3); }
+  .card-menu { position: relative; }
+  .card-menu > .icon-btn { width: 24px; height: 24px; }
+  .card-menu .tf-menu { top: 28px; width: 190px; }
+
+  /* stopka kanban z relacją + terminem + avatar */
+  .kanban-card .kk-foot { justify-content: space-between; }
+  .kanban-card .kk-foot .kk-left { display: flex; align-items: center; gap: 8px; }
+
+  /* pusta kolumna – wskazówka */
+  .kc-empty { text-align: center; color: var(--text-3); font-size: 11px; padding: 18px 8px; border: 1px dashed var(--border); border-radius: var(--radius-sm); }
+
+/* ----- Rozszerzenia (2026-09-29): więcej kolumn workflow, nowe znaczniki na karcie ----- */
+.kanban.wf { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(250px, 1fr); grid-template-columns: none; overflow-x: auto; padding-bottom: 6px; gap: 14px; }
+.kanban-card .kk-extra { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.kanban-card.agent { border-color: rgba(45, 212, 191, 0.35); }
+.kanban-card.is-dragging { transform: rotate(-2deg) scale(1.03); box-shadow: var(--shadow-lg), var(--glow-indigo); border-color: var(--accent-1); }
+.kanban-col.drop { border-color: var(--accent-1); background: rgba(99, 102, 241, 0.06); }
+.kc-head .wip { font-size: 10.5px; color: var(--text-3); font-weight: 700; margin-left: 6px; }
+.kc-head .wip.full { color: var(--warning); }
+.kk-av.agent { background: #0b2a2a; color: var(--agent); border: 1.5px solid rgba(45, 212, 191, 0.55); }
+.kk-av.agent .icon { width: 12px; height: 12px; }
+.kk-title a { color: inherit; }
+.kk-title a:hover { color: var(--accent-2); }
+.toolbar .segmented a .count { margin-left: 2px; }
+.ttype.tech { background: rgba(148,163,184,0.12); color: #cbd5e1; border-color: rgba(148,163,184,0.3); }
+.ttype.sec { background: rgba(244,114,182,0.12); color: #f9a8d4; border-color: rgba(244,114,182,0.35); }
+.ttype.feat { background: rgba(129,140,248,0.12); color: #a5b4fc; border-color: rgba(129,140,248,0.35); }
+.kk-title .task-key { margin-right: 4px; }
+.kk-mod { font-size: 11px; color: var(--text-3); }
+.verd { display: inline-flex; gap: 3px; align-items: center; font-size: 10.5px; color: var(--text-3); }
+.verd i { width: 7px; height: 7px; border-radius: 50%; background: var(--bg-3); border: 1px solid var(--border-hover); display: inline-block; }
+.verd i.ok { background: var(--success); border-color: var(--success); }
+.board-foot { font-size: 11.5px; color: var(--text-3); margin-top: 12px; display: flex; gap: 6px; align-items: center; }
+.filters .select { min-width: 128px; }
+.filters .search-box { min-width: 170px !important; }

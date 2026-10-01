@@ -1,0 +1,165 @@
+/* =============================================================================
+   org-structure-handover.css — the handover screen "Do przekazania" (mockup
+   F07) of the org structure and its counter in the header. Layout only:
+   controls are tf-* components styled by controls.css. Nothing here clips
+   text: every cell wraps, so a long task title or a long German label grows
+   its row instead of being cut.
+   ============================================================================= */
+
+.org-ho { display: flex; flex-direction: column; gap: var(--tf-space-md, 12px); }
+
+.org-ho-top { display: flex; }
+
+.org-ho-titlebar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-md, 12px) var(--tf-space-lg, 16px);
+}
+
+.org-ho-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-md, 12px);
+}
+
+.org-ho-title h2 { margin: 0; font-size: 17px; font-weight: 800; color: var(--tf-text); overflow-wrap: anywhere; }
+
+.org-ho-ctx {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--tf-space-md, 12px);
+}
+
+.org-ho-titlebar tf-segmented { flex: 0 1 auto; max-width: 100%; }
+.org-ho-dates { flex: 0 0 220px; min-width: 200px; }
+.org-ho-dates:empty { display: none; }
+.org-ho-ctx tf-alert { flex: 1 1 320px; min-width: 260px; }
+
+.org-ho-card {
+  min-width: 0;
+  padding: var(--tf-space-md, 12px) var(--tf-space-lg, 16px);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg, 12px);
+  background: var(--tf-bg-card);
+}
+
+/* ---- "hand everything to" bar ---- */
+
+.org-ho-bulk {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+  margin-bottom: var(--tf-space-md, 12px);
+  padding: 8px 12px;
+  border: 1px solid var(--tf-accent, #6366f1);
+  border-radius: var(--tf-radius-md, 10px);
+  background: var(--tf-bg-elevated, transparent);
+}
+
+.org-ho-bulk[hidden] { display: none; }
+.org-ho-selected { margin-right: 6px; font-weight: 700; }
+.org-ho-bulklabel { font-size: 12px; color: var(--tf-text-3); }
+.org-ho-bulk tf-select { flex: 0 1 260px; min-width: 200px; }
+
+/* ---- rows ---- */
+
+.org-ho-row {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1.5fr) minmax(200px, 260px) minmax(0, 1.2fr);
+  gap: 14px;
+  align-items: center;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--tf-border);
+  font-size: 12.5px;
+}
+
+.org-ho-row:last-child { border-bottom: 0; }
+.org-ho-row-error { background: color-mix(in srgb, var(--tf-danger, #ef4444) 8%, transparent); }
+.org-ho-colhead { padding-top: 0; }
+.org-ho-colname { font-size: 12px; color: var(--tf-text-3); }
+
+.org-ho-item { min-width: 0; }
+.org-ho-item b { font-weight: 700; color: var(--tf-text); overflow-wrap: anywhere; }
+.org-ho-item small { display: block; margin-top: 1px; font-size: 11px; color: var(--tf-text-3); overflow-wrap: anywhere; }
+.org-ho-row tf-select { min-width: 0; width: 100%; }
+.org-ho-why { min-width: 0; font-size: 11.5px; color: var(--tf-text-3); overflow-wrap: anywhere; }
+.org-ho-why b { font-weight: 700; color: var(--tf-text-2); }
+.org-ho-end { font-size: 12px; color: var(--tf-text-2); overflow-wrap: anywhere; }
+
+.org-ho-group { margin-bottom: 14px; }
+.org-ho-group:last-child { margin-bottom: 0; }
+
+.org-ho-ghead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--tf-border);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.org-ho-count { font-size: 12px; font-weight: 600; color: var(--tf-text-3); }
+.org-ho-gsub { margin-left: auto; font-size: 11.5px; font-weight: 500; color: var(--tf-text-3); }
+
+.org-ho-error { padding: 12px 0; color: var(--tf-danger, #ef4444); overflow-wrap: anywhere; }
+
+/* ---- foot ---- */
+
+.org-ho-foot {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 16px;
+  align-items: end;
+}
+
+.org-ho-sumnote { margin-top: 8px; font-size: 12px; color: var(--tf-text-3); }
+
+/* ---- result of an apply ---- */
+
+.org-ho-result.tone-warning { border-color: var(--tf-warning, #f59e0b); }
+.org-ho-result.tone-success { border-color: var(--tf-success, #22c55e); }
+
+.org-ho-result-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--tf-space-sm, 8px);
+  margin-bottom: var(--tf-space-sm, 8px);
+}
+
+.org-ho-result-head h3 { margin: 0; font-size: 15px; font-weight: 700; }
+.org-ho-result-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.org-ho-result tf-alert { display: block; margin-bottom: var(--tf-space-sm, 8px); }
+
+.org-ho-result-row {
+  display: grid;
+  grid-template-columns: minmax(150px, auto) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  padding: 7px 0;
+  border-top: 1px solid var(--tf-border);
+  font-size: 12.5px;
+}
+
+.org-ho-result-main { min-width: 0; }
+.org-ho-result-main b { overflow-wrap: anywhere; }
+.org-ho-result-main small { display: block; font-size: 11px; color: var(--tf-text-3); overflow-wrap: anywhere; }
+.org-ho-result-actions { display: flex; gap: var(--tf-space-sm, 8px); margin-top: var(--tf-space-md, 12px); }
+
+/* ---- header counter ---- */
+
+.org-ho-pending { display: inline-flex; }
+
+@media (max-width: 900px) {
+  .org-ho-row { grid-template-columns: 24px minmax(0, 1fr); }
+  .org-ho-row > tf-select,
+  .org-ho-row > .org-ho-end,
+  .org-ho-row > .org-ho-why { grid-column: 2; }
+  .org-ho-foot { grid-template-columns: minmax(0, 1fr); }
+}
