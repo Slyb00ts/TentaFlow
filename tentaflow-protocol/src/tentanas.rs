@@ -4799,6 +4799,7 @@ mod tests {
             protocol: "iscsi".to_string(),
             wwn: "iqn.2026-09.pl.euvic:helios.vm-store".to_string(),
             enabled: true,
+            allowlist_mode: false,
             luns: vec![NasTargetLun {
                 index: 0,
                 source: "tank/vm-store".to_string(),
